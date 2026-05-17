@@ -407,6 +407,12 @@ async fn auth_middleware(
         || path == "/api/v1/shutdown"
         || path == "/api/v1/restart"
         || path == "/api/v1/restart-dismiss"
+        // A2A v1.0: bypass gateway-level auth so the protocol's own
+        // bearer/X-API-Key schemes (declared in Agent Card securitySchemes
+        // and enforced by `a2a_auth_layer`) are the authoritative gate.
+        // Otherwise the gateway token would override the A2A-advertised
+        // auth and any A2A v1.0 client following the spec would 401.
+        || path == "/api/v1/a2a"
     {
         return next.run(request).await;
     }
