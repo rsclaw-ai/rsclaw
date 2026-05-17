@@ -153,15 +153,17 @@ async fn spawn_streaming_task(
     // Completed/Failed and the final Artifact when the agent's turn finishes.
     let (reply_tx, reply_rx) = oneshot::channel::<AgentReply>();
 
-    // mpsc channel from runtime → bus bridge.
+    // mpsc channel from runtime → bus bridge. Does NOT close the bus on
+    // drop — the bus stays open until the reply-watcher (below) publishes
+    // the terminal status event. Otherwise the bus would close as soon as
+    // the agent destructured AgentMessage (dropping event_tx) and any later
+    // Completed publish would land on a fresh channel with no subscribers.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<AgentEvent>(64);
-    let bus = state.task_event_bus.clone();
-    let bus_task_id = task_id.clone();
+    let bus_for_bridge = state.task_event_bus.clone();
     tokio::spawn(async move {
         while let Some(ev) = event_rx.recv().await {
-            bus.publish(ev);
+            bus_for_bridge.publish(ev);
         }
-        bus.close(&bus_task_id);
     });
 
     let cancel_token = tokio_util::sync::CancellationToken::new();
@@ -287,6 +289,8 @@ async fn spawn_streaming_task(
             }
         }
         cancels_for_reply.remove(&task_id_for_reply);
+        // Now safe to drop the broadcast channel — terminal event delivered.
+        bus_for_reply.close(&task_id_for_reply);
     });
 
     let msg = AgentMessage {
