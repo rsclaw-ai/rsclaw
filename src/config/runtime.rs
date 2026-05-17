@@ -18,7 +18,7 @@ use anyhow::Result;
 
 use super::schema::{
     AgentDefaults, AgentEntry, AuthConfig, BindMode, BindingConfig, ChannelsConfig, Config,
-    CronConfig, DmScope, ExternalAgentConfig, GatewayMode, HooksConfig, LoggingConfig,
+    CronConfig, DmScope, A2aPeerConfig, GatewayMode, HooksConfig, LoggingConfig,
     ModelsConfig, PluginsConfig, ReloadMode, SandboxConfig, SecretOrString, SecretsConfig,
     SessionConfig, SkillsConfig, ToolsConfig,
 };
@@ -63,7 +63,7 @@ pub struct AgentsRuntime {
     pub defaults: AgentDefaults,
     pub list: Vec<AgentEntry>,
     pub bindings: Vec<BindingConfig>,
-    pub external: Vec<ExternalAgentConfig>,
+    pub a2a: Vec<A2aPeerConfig>,
 }
 
 /// Channel drivers + session routing.  Swappable per-channel.
@@ -191,7 +191,7 @@ impl IntoRuntime for Config {
                 defaults: agents_cfg.defaults.unwrap_or_default(),
                 list: agents_cfg.list.unwrap_or_default(),
                 bindings: self.bindings.unwrap_or_default(),
-                external: agents_cfg.external.unwrap_or_default(),
+                a2a: agents_cfg.a2a.unwrap_or_default(),
             },
             channel: ChannelRuntime {
                 channels: self.channels.unwrap_or_default(),

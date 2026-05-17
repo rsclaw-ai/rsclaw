@@ -197,7 +197,7 @@ Each agent can use a different execution backend:
       { id: "coder", model: { primary: "deepseek-chat", toolset: "code" },
         claudecode: { command: "claude-agent-acp" } },  // uses Claude Code backend
     ],
-    external: [
+    a2a: [
       { id: "gpu-worker", url: "http://gpu-server:18888", token: "${TOKEN}" },
     ],
   },

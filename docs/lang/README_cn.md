@@ -539,7 +539,7 @@ LLM 提供商从以下来源自动注册：
       },
     ],
     // 远程智能体（A2A 协议）
-    external: [
+    a2a: [
       {
         id: "remote-agent",
         url: "https://remote-gateway.example.com",
@@ -685,7 +685,7 @@ export RSCLAW_A2A_API_KEYS="key-1,key-2"            # X-API-Key: <key>
       },
     ],
     // 连接远程 A2A 网关上的智能体
-    external: [
+    a2a: [
       {
         id: "remote-analyst",
         url: "https://remote-gateway.example.com",

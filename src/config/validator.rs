@@ -62,7 +62,7 @@ fn validate_agents(cfg: &RuntimeConfig) -> Result<()> {
             bail!("duplicate agent id: \"{}\"", agent.id);
         }
     }
-    for ext in &cfg.agents.external {
+    for ext in &cfg.agents.a2a {
         if !seen.insert(ext.id.clone()) {
             bail!("duplicate agent id (external conflicts with local): \"{}\"", ext.id);
         }

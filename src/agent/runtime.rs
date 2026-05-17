@@ -2838,7 +2838,7 @@ impl AgentRuntime {
                 &self.skills,
                 self.agents.as_deref(),
                 &self.handle.id,
-                &self.config.agents.external,
+                &self.config.agents.a2a,
             );
             all.extend(extra_tools.iter().cloned());
             all.extend(super::tools_builder::build_wasm_tool_defs(&self.wasm_plugins));
@@ -6077,7 +6077,7 @@ impl AgentRuntime {
         if let Some(ext) = self
             .config
             .agents
-            .external
+            .a2a
             .iter()
             .find(|e| e.id == agent_id || e.id == normalized_id)
         {

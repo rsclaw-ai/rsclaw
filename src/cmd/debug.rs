@@ -120,7 +120,7 @@ async fn dump_prompt_spec(args: DumpPromptSpecArgs) -> Result<()> {
         &skills,
         None,
         &agent_id,
-        &config.agents.external,
+        &config.agents.a2a,
     );
     for entry in &config.agents.list {
         if entry.id == agent_id {

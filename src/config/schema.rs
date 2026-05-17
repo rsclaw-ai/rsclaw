@@ -224,9 +224,16 @@ pub struct EnvConfig(pub HashMap<String, String>);
 // agents
 // ---------------------------------------------------------------------------
 
+/// A remote A2A peer this gateway outbound-calls via the `agent_<id>` tool.
+///
+/// Renamed from `ExternalAgentConfig` once the A2A v1.0 wire shape landed;
+/// the old name was protocol-agnostic ("external" could mean shell, HTTP,
+/// anything), the new name pins down that the transport is A2A. Hard switch
+/// — no back-compat alias since the prior implementation was incomplete and
+/// not deployed anywhere.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ExternalAgentConfig {
+pub struct A2aPeerConfig {
     /// Logical agent ID (used as `agent_<id>` tool name).
     pub id: String,
     /// Base URL of the remote rsclaw/OpenClaw gateway, e.g. "http://host:18888".
@@ -244,7 +251,8 @@ pub struct ExternalAgentConfig {
 pub struct AgentsConfig {
     pub defaults: Option<AgentDefaults>,
     pub list: Option<Vec<AgentEntry>>,
-    pub external: Option<Vec<ExternalAgentConfig>>,
+    /// Remote A2A peers. JSON5 key: `a2a`.
+    pub a2a: Option<Vec<A2aPeerConfig>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]

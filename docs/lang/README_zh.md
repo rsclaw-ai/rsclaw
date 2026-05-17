@@ -524,7 +524,7 @@ LLM 提供商从以下来源自动注册：
       },
     ],
     // 远程智能体（A2A 协议）
-    external: [
+    a2a: [
       {
         id: "remote-agent",
         url: "https://remote-gateway.example.com",

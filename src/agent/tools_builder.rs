@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use super::registry::AgentRegistry;
 use crate::{
-    config::schema::ExternalAgentConfig,
+    config::schema::A2aPeerConfig,
     plugin::{PluginRegistry, WasmPlugin},
     provider::ToolDef,
     skill::SkillRegistry,
@@ -230,7 +230,7 @@ pub fn build_tool_list(
     skills: &SkillRegistry,
     agents: Option<&AgentRegistry>,
     caller_id: &str,
-    external_agents: &[ExternalAgentConfig],
+    a2a_peers: &[A2aPeerConfig],
 ) -> Vec<ToolDef> {
     let mut tools = Vec::new();
 
@@ -1558,10 +1558,10 @@ pub fn build_tool_list(
 
     // External remote agent A2A tools (remote gateways).
     tracing::debug!(
-        count = external_agents.len(),
+        count = a2a_peers.len(),
         "build_tool_list: external agents"
     );
-    for ext in external_agents {
+    for ext in a2a_peers {
         if ext.id == caller_id {
             continue;
         }
