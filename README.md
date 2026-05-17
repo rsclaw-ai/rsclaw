@@ -214,7 +214,7 @@ Permission model:
 
 ### A2A Protocol
 
-Implements [Google A2A v0.3](https://a2a-protocol.org/) for cross-network agent collaboration. Auto-discovery via `/.well-known/agent.json`, JSON-RPC 2.0 task dispatch, streaming support.
+Implements [Google A2A v1.0](https://a2a-protocol.org/) for cross-network agent collaboration. Auto-discovery via `/.well-known/agent.json`, JSON-RPC 2.0 task dispatch, streaming support.
 
 ### Security
 
@@ -326,7 +326,7 @@ Import copies config, workspace, and sessions into `~/.rsclaw/`. OpenClaw data i
 | **Long-term memory** | Three-layer (redb + tantivy + hnsw_rs) | — |
 | **Self-learning** | Learns from your usage patterns | — |
 | **Multi-backend agents** | Native Rust / Claude Code / OpenCode / ACP | — |
-| **A2A cross-machine** | Google A2A v0.3 | — |
+| **A2A cross-machine** | Google A2A v1.0 | — |
 | **Browser automation** | Built-in headless Chrome (CDP) | — |
 | **Exec safety** | 50+ deny patterns, deny/confirm/allow | — |
 
@@ -374,7 +374,7 @@ src/
   server/      Axum HTTP, REST API, OpenAI-compat endpoints
   store/       redb + tantivy + hnsw_rs
   browser/     Chrome CDP automation
-  a2a/         Google A2A v0.3
+  a2a/         Google A2A v1.0
   acp/         ACP protocol
   ws/          WebSocket v3
 ```
