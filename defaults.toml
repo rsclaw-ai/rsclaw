@@ -7,6 +7,17 @@
 # Providers
 # ──────────────────────────────────────────────────────────────────────────────
 
+# RsClaw stateful incremental session protocol (kvCacheMode=2). Default
+# fleet at api.rsclaw.ai; self-host by pointing base_url at a local
+# rsclaw-llm worker. See: src/provider/rsclaw.rs.
+[[providers]]
+name       = "rsclaw"
+label      = "RsClaw (recommended)"
+env_var    = "RSCLAW_API_KEY"
+model      = "rsclaw/rsclaw-agent-v1"
+base_url   = "https://api.rsclaw.ai/v1/agent"
+needs_key  = true
+
 [[providers]]
 name       = "doubao"
 label      = "Doubao (ByteDance)"

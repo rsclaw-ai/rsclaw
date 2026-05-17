@@ -149,7 +149,13 @@ fn default_config(lang: &str) -> String {
   }},
   models: {{
     providers: {{
-      anthropic: {{ apiKey: "${{ANTHROPIC_API_KEY}}" }},
+      // RsClaw stateful incremental session protocol (kvCacheMode=2).
+      // Recommended default. The bare name `rsclaw` auto-resolves to the
+      // managed fleet at api.rsclaw.ai using the rsclaw API format — set
+      // `baseUrl` here only if you want to point at a self-hosted
+      // rsclaw-llm worker (e.g. http://localhost:9999).
+      rsclaw: {{ apiKey: "${{RSCLAW_API_KEY}}" }},
+      // anthropic: {{ apiKey: "${{ANTHROPIC_API_KEY}}" }},
       // openai: {{ apiKey: "${{OPENAI_API_KEY}}" }},
       // ollama: {{ baseUrl: "http://localhost:11434" }},
       // minimax: {{ apiKey: "${{MINIMAX_API_KEY}}" }},
@@ -158,6 +164,7 @@ fn default_config(lang: &str) -> String {
   }},
   agents: {{
     defaults: {{
+      model: {{ primary: "rsclaw/rsclaw-agent-v1" }},
       contextTokens: 64000,          // max context window tokens
       stripThinkTags: false,         // strip <think> tags (auto when thinking disabled)
       frequencyPenalty: 0.3,         // reduce repetition (0.0-2.0)
@@ -173,8 +180,6 @@ fn default_config(lang: &str) -> String {
     list: [
       {{
         id: "main",
-        default: true,
-        model: {{ primary: "rsclaw/rsclaw-agent-v1" }},
       }},
     ],
   }},
@@ -505,22 +510,26 @@ struct ExistingConfig {
     provider_models: std::collections::HashMap<String, String>,
 }
 
-/// `load_defaults` + locale-aware reorder. In Chinese mode the China-region
-/// providers (Qwen / DeepSeek / Doubao) get surfaced first; other locales
-/// keep the defaults.toml order. Used by both `cmd_onboard` (initial
-/// wizard) and `cmd_configure` (interactive section editor) so a user
-/// running either entry point sees the same picker order.
+/// `load_defaults` + locale-aware reorder. `rsclaw` is always the
+/// recommended first option (stateful kvCacheMode=2 fleet). In Chinese
+/// mode the China-region providers (Qwen / DeepSeek / Doubao) follow;
+/// other locales keep the defaults.toml order after rsclaw. Used by
+/// both `cmd_onboard` (initial wizard) and `cmd_configure` (interactive
+/// section editor) so a user running either entry point sees the same
+/// picker order.
 fn load_defaults_for_lang(lang: &str) -> Defaults {
     let mut defs = load_defaults();
-    if lang == "zh" {
-        let priority = ["qwen", "deepseek", "doubao"];
-        defs.providers.sort_by_key(|p| {
-            priority
-                .iter()
-                .position(|n| n == &p.name)
-                .unwrap_or(priority.len())
-        });
-    }
+    let priority: &[&str] = if lang == "zh" {
+        &["rsclaw", "qwen", "deepseek", "doubao"]
+    } else {
+        &["rsclaw"]
+    };
+    defs.providers.sort_by_key(|p| {
+        priority
+            .iter()
+            .position(|n| n == &p.name)
+            .unwrap_or(priority.len())
+    });
     defs
 }
 
@@ -1163,10 +1172,17 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
             _ => ("all", None),
         }
     };
-    let effective_base_url = if !base_url.is_empty() {
+    // Only persist `baseUrl` to the config file when the user actually
+    // overrode the provider's well-known default (e.g. pointing at a
+    // self-hosted worker). Writing the same string that defaults.toml
+    // already carries adds noise and ties the user's config to a
+    // specific fleet endpoint — when the official baseUrl changes,
+    // users with the pinned value miss the update. Empty string here
+    // means "use the provider's built-in default" and the gateway
+    // already knows how to fall back at request time
+    // (provider/rsclaw.rs RSCLAW_DEFAULT_BASE, etc.).
+    let effective_base_url = if !base_url.is_empty() && base_url != provider.base_url {
         base_url.clone()
-    } else if !provider.base_url.is_empty() {
-        provider.base_url.to_string()
     } else {
         String::new()
     };
@@ -1261,31 +1277,30 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
         let list = agents_obj.entry("list").or_insert_with(|| json!([]));
         if let Some(arr) = list.as_array_mut() {
             if arr.is_empty() {
+                // New install: main is the implicit default by virtue of
+                // being list[0] (RuntimeConfig::default_agent falls back to
+                // the first entry when no `default: true` is set). The model
+                // is configured at agents.defaults.model.primary below — no
+                // need to repeat it here.
                 arr.push(json!({
                     "id": agent_name,
-                    "default": true,
                     "workspace": workspace_path,
-                    "model": { "primary": default_model_value },
                 }));
             } else {
-                // Update the first agent in-place.
+                // Update the first agent in-place. Preserve any existing
+                // `default` / `model` fields the user (or a prior setup
+                // run) wrote — only refresh id and workspace.
                 let first = &mut arr[0];
                 if let Some(obj) = first.as_object_mut() {
                     obj.insert("id".into(), json!(agent_name));
-                    obj.insert("default".into(), json!(true));
                     obj.insert("workspace".into(), json!(workspace_path));
-                    let model_obj = obj.entry("model").or_insert_with(|| json!({}));
-                    if let Some(m) = model_obj.as_object_mut() {
-                        m.insert("primary".into(), json!(default_model_value));
-                    }
                 }
             }
         }
 
-        // Mirror to agents.defaults.model.primary (openclaw compat). Without
-        // this, the loader has no fleet-level fallback and only the main
-        // agent ends up with a model — sub-agents and any future agent
-        // entry inherit nothing.
+        // Write fleet-level default to agents.defaults.model.primary. This
+        // is the single source of truth for the default model — main and any
+        // future agent inherit from here unless they override.
         let defaults = agents_obj.entry("defaults").or_insert_with(|| json!({}));
         if let Some(d_obj) = defaults.as_object_mut() {
             let model_obj = d_obj.entry("model").or_insert_with(|| json!({}));
@@ -1868,12 +1883,35 @@ async fn configure_model(
         set_nested_value(val, &api_key_path, serde_json::json!(key_val))?;
     }
 
-    if !new_base_url.is_empty() {
+    // Only persist `baseUrl` when the user overrode the provider's
+    // well-known default. Writing the default verbatim ties this
+    // machine's config to a specific fleet endpoint and prevents users
+    // from picking up a fleet relocation without re-editing config.
+    // Empty value means "let the provider builder fall back to its
+    // built-in default" (rsclaw → RSCLAW_DEFAULT_BASE, etc.).
+    if !new_base_url.is_empty() && new_base_url != provider.base_url {
         let url_path = format!("models.providers.{}.baseUrl", provider.name);
         ensure_json_path(val, &["models"]);
         ensure_json_path(val, &["models", "providers"]);
         ensure_json_path(val, &["models", "providers", &provider.name]);
         set_nested_value(val, &url_path, serde_json::json!(new_base_url))?;
+    } else if new_base_url == provider.base_url || new_base_url.is_empty() {
+        // If the file currently carries the (no-op) default, clean it
+        // out so config stays minimal. Safe: the provider builder's
+        // fallback covers the same value.
+        if let Some(prov_obj) = val
+            .pointer_mut(&format!("/models/providers/{}", provider.name))
+            .and_then(|v| v.as_object_mut())
+        {
+            if prov_obj
+                .get("baseUrl")
+                .and_then(|v| v.as_str())
+                .map(|s| s == provider.base_url)
+                .unwrap_or(false)
+            {
+                prov_obj.remove("baseUrl");
+            }
+        }
     }
 
     // Write api type and user_agent for custom/codingplan
@@ -1896,7 +1934,12 @@ async fn configure_model(
     };
 
     if final_model != current_model {
-        // Write to agents.list[0].model.primary (rsclaw format)
+        // Source of truth lives at agents.defaults.model.primary. If the
+        // user's config still carries a per-agent override on list[0]
+        // (legacy structure or explicit override), keep it in sync with the
+        // new selection — but do NOT create the field when it isn't there.
+        // Empty agents-list configs and any agent that already inherits
+        // from defaults stay unmodified.
         if let Some(arr) = val
             .get_mut("agents")
             .and_then(|a| a.get_mut("list"))
@@ -1907,7 +1950,7 @@ async fn configure_model(
             m.insert("primary".to_string(), serde_json::json!(final_model));
         }
 
-        // Also write to agents.defaults.model.primary (openclaw compat)
+        // Fleet-level default — single source of truth.
         ensure_json_path(val, &["agents"]);
         ensure_json_path(val, &["agents", "defaults"]);
         ensure_json_path(val, &["agents", "defaults", "model"]);
@@ -2767,6 +2810,16 @@ async fn test_provider_connectivity(
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
 
+    // RsClaw uses the stateful session protocol (kvCacheMode=2). It has
+    // no `/v1/models` endpoint — only `/sessions`, `/sessions/<id>/turn`,
+    // and `/sessions/replay`. The generic OpenAI-style probe below would
+    // hit a non-existent path and trigger a 401 from the LB, falsely
+    // reporting an invalid API key. Probe `POST /sessions` with a
+    // minimal body instead and interpret common server responses.
+    if provider_name == "rsclaw" {
+        return probe_rsclaw_connectivity(&client, base_url, api_key).await;
+    }
+
     let url = match provider_name {
         "anthropic" => "https://api.anthropic.com/v1/models".to_owned(),
         "gemini" => return Ok(()), // Gemini uses query param auth, skip
@@ -2801,6 +2854,79 @@ async fn test_provider_connectivity(
         let body = resp.text().await.unwrap_or_default();
         anyhow::bail!("{status}: {}", &body[..body.len().min(200)]);
     }
+}
+
+/// RsClaw-specific connectivity probe. Hits `GET /v1/agent/models`,
+/// which the rsclaw-server fronts behind a 308-redirecting LB pointing
+/// at the resolved worker host (e.g. `api.duoduoyun.work:8443`). The
+/// **critical** difference from the generic OpenAI probe is that we
+/// must manually follow the redirect while re-attaching the
+/// Authorization header — reqwest's default redirect policy strips
+/// sensitive headers on cross-origin hops as a security measure, so a
+/// naive `client.get(url).send()` would arrive at the worker with no
+/// auth and get rejected as 401 even when the key is perfectly valid.
+/// This is the same redirect-handling contract `provider::rsclaw`
+/// implements for real traffic; see RsclawProvider::new for the
+/// `Policy::none()` baseline.
+async fn probe_rsclaw_connectivity(
+    _client: &reqwest::Client,
+    base_url: &str,
+    api_key: Option<&str>,
+) -> anyhow::Result<()> {
+    let base = if base_url.is_empty() {
+        crate::provider::rsclaw::RSCLAW_DEFAULT_BASE
+    } else {
+        base_url
+    };
+    let url = format!("{}/models", base.trim_end_matches('/'));
+
+    // Build a client with redirects disabled so we can capture the 308
+    // and re-issue the request to the worker with the auth header
+    // preserved.
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    let mut current = url.clone();
+    // Cap at 5 hops — matches MAX_REDIRECT_HOPS in provider/rsclaw.rs.
+    for _ in 0..5 {
+        let mut req = client.get(&current);
+        if let Some(key) = api_key {
+            req = req.header("authorization", format!("Bearer {key}"));
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("connection failed: {e}"))?;
+        let status = resp.status();
+        if status.is_redirection() {
+            if let Some(loc) = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+            {
+                current = loc.to_owned();
+                continue;
+            }
+            anyhow::bail!("rsclaw probe: {status} without Location header");
+        }
+        if status.is_success() {
+            return Ok(());
+        }
+        let body = resp.text().await.unwrap_or_default();
+        return match status.as_u16() {
+            401 | 403 => Err(anyhow::anyhow!(
+                "connected but API key is invalid ({})",
+                status.as_u16()
+            )),
+            _ => Err(anyhow::anyhow!(
+                "{status}: {}",
+                &body[..body.len().min(200)]
+            )),
+        };
+    }
+    anyhow::bail!("rsclaw probe: redirect loop (>5 hops)")
 }
 
 /// Rotate config backups: keep last 3 (.bak.1 = newest, .bak.3 = oldest).

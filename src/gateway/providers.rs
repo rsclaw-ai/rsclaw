@@ -23,10 +23,34 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
 
     if let Some(models_cfg) = &config.model.models {
         for (name, provider_cfg) in &models_cfg.providers {
+            // `load_json5` runs `expand_env_vars` at parse time, so a
+            // value like `"${RSCLAW_API_KEY}"` becomes the env var's
+            // actual contents — UNLESS the variable isn't set, in
+            // which case the placeholder is left verbatim with only a
+            // `debug!` notice. Without this filter, an unset env var
+            // would silently turn into `Authorization: Bearer ${RSCLAW_API_KEY}`
+            // on the wire and surface as a baffling "invalid api key"
+            // from the upstream worker. Treat unresolved placeholders
+            // as "no key configured" and fall through to the explicit
+            // env-var fallback below, while logging a warning so the
+            // user can see what happened.
             let api_key = provider_cfg
                 .api_key
                 .as_ref()
                 .and_then(|k| k.as_plain().map(str::to_owned))
+                .filter(|s| {
+                    if s.contains("${") && s.contains('}') {
+                        tracing::warn!(
+                            provider = %name,
+                            placeholder = %s,
+                            "provider apiKey is an unresolved ${{VAR}} placeholder \
+                             (env var not set); falling back to direct env lookup"
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                })
                 .or_else(|| std::env::var(format!("{}_API_KEY", name.to_uppercase())).ok());
 
             let base_url = provider_cfg.base_url.clone().or_else(|| {
