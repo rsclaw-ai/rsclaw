@@ -377,10 +377,23 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             session = %event.session_id,
                             done = event.done,
                             delta_len = event.delta.len(),
+                            has_question = event.question.is_some(),
                             "ws auto-relay event"
                         );
                         let seq = relay_conn.write().await.next_seq();
-                        let payload = if event.done {
+                        let payload = if let Some(ref prompt) = event.question {
+                            // ask_user side-channel: structured multi-choice
+                            // question. Capable UIs render native modal /
+                            // buttons; others fall through to the agent's
+                            // text reply that follows.
+                            serde_json::json!({
+                                "runId": format!("auto-{}", event.session_id),
+                                "sessionKey": event.session_id,
+                                "type": "ask_user",
+                                "agentId": event.agent_id,
+                                "prompt": prompt,
+                            })
+                        } else if event.done {
                             serde_json::json!({
                                 "runId": format!("auto-{}", event.session_id),
                                 "sessionKey": event.session_id,
