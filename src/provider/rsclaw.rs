@@ -67,6 +67,23 @@ pub const RSCLAW_DEFAULT_BASE: &str = "https://api.rsclaw.ai/v1/agent";
 /// the new identifier.
 pub const RSCLAW_DEFAULT_PREFIX_ID: &str = "rsclaw/2026.5.15";
 
+/// Well-known model names served by the managed rsclaw fleet (see
+/// `GET /v1/agent/models`). Used by `agent::runtime` to auto-resolve
+/// `flash` and `vision` when the user only configured a `rsclaw/*`
+/// primary model. The contract: as long as your `model.primary` lives
+/// under the `rsclaw/` namespace, you get the rsclaw flash and vision
+/// slots for free without repeating them in config. Override via
+/// `agents.defaults.model.flash` / `agents.defaults.model.vision` when
+/// you want a different model.
+///
+/// Keep these in sync with whatever the fleet ingests under the
+/// version named by [`RSCLAW_DEFAULT_PREFIX_ID`]. When the fleet bumps
+/// a model name (e.g. `rsclaw-flash-v2`), bump both — clients on the
+/// new gateway version pick up the new defaults automatically without
+/// every user having to edit their config.
+pub const RSCLAW_DEFAULT_FLASH: &str = "rsclaw/rsclaw-flash-v1";
+pub const RSCLAW_DEFAULT_VISION: &str = "rsclaw/rsclaw-vision-v1";
+
 /// How long to wait for `/sessions/<id>/turn` to start responding
 /// (TCP connect + TLS + send body + receive headers + first byte).
 /// Once the body stream begins this deadline no longer applies — the
@@ -1051,6 +1068,7 @@ impl RsclawProvider {
     async fn open(&self, split: &SplitRequest<'_>) -> Result<CreateSessionResp> {
         let body = CreateSessionReq {
             prefix_id: &split.prefix_id,
+            model: &split.model,
             dynamic_prefix: DynamicPrefixWire {
                 system: split.dynamic_system,
                 tools: &split.dynamic_tools,
@@ -1113,6 +1131,7 @@ impl RsclawProvider {
         let history: Vec<Value> = serialize_replay_history(&filtered);
         let body = ReplayReq {
             prefix_id: &split.prefix_id,
+            model: &split.model,
             dynamic_prefix: DynamicPrefixWire {
                 system: split.dynamic_system,
                 tools: &split.dynamic_tools,
@@ -1244,15 +1263,30 @@ impl RsclawProvider {
         if let Some(mt) = req.max_tokens {
             body.insert("max_tokens".to_owned(), Value::from(mt));
         }
-        // Strip the rsclaw/ namespace prefix so the server records the
-        // bare model id in its response. The model field is REQUIRED on
-        // /v1/agent/* — server returns 400 model_slot_mismatch if it
-        // doesn't match the route's whitelisted slot.
-        let bare_model = req.model.strip_prefix("rsclaw/").unwrap_or(&req.model);
-        if bare_model.is_empty() {
-            anyhow::bail!("rsclaw {path}: model field is required");
-        }
-        body.insert("model".to_owned(), Value::String(bare_model.to_owned()));
+        // Hard-bind the model id to the endpoint per the fleet's
+        // model-slot whitelist:
+        //   /fastshot → rsclaw-flash-v1
+        //   /vision   → rsclaw-vision-v1
+        //   /oneshot  → rsclaw-agent-v1
+        // The dispatch chain in `route_for` (rules 1–3 + 5–6) already
+        // routes requests here based on the caller's model hint or
+        // endpoint hint, so by the time we land in this function the
+        // path uniquely determines which slot the worker accepts.
+        // Forwarding `req.model` verbatim risks
+        // `model_slot_mismatch` 400s when the caller mixes
+        // (model=anthropic/..., endpoint=Flash) — we already routed to
+        // /fastshot, but the wire model field would have been wrong.
+        // Stamping the canonical id keeps callers from having to know
+        // the exact slot strings.
+        let canonical_model = match path {
+            "/fastshot" => "rsclaw-flash-v1",
+            "/vision" => "rsclaw-vision-v1",
+            _ => "rsclaw-agent-v1", // /oneshot and any future stateless variant
+        };
+        body.insert(
+            "model".to_owned(),
+            Value::String(canonical_model.to_owned()),
+        );
         let mut options = serde_json::Map::new();
         if let Some(t) = req.temperature {
             options.insert("temperature".to_owned(), super::json_f32(t));
@@ -1432,6 +1466,13 @@ struct CreateSessionReq<'a> {
     /// accepts the legacy `rsclaw_version` field name as an alias, but
     /// we always send the post-rename name on new traffic.
     prefix_id: &'a str,
+    /// Bare model id (no `rsclaw/` namespace prefix) — required since
+    /// 2026-05 to route the request to the correct model slot on the
+    /// worker. The session retains this binding for its lifetime, so
+    /// `/turn` and `/replay` traffic against the same session_id never
+    /// needs to repeat it. Strip the `rsclaw/` namespace before
+    /// sending because the server records the bare id.
+    model: &'a str,
     /// Hybrid mode (§2.1.3) — always sent. When `prefix_id` hits the
     /// static registry the worker forks from there; otherwise the
     /// dynamic-LRU keyed by hash of `system + tools` is used.
@@ -1443,6 +1484,11 @@ struct CreateSessionReq<'a> {
 #[derive(Debug, Serialize)]
 struct ReplayReq<'a> {
     prefix_id: &'a str,
+    /// Same bare model id contract as `CreateSessionReq` — replay
+    /// rebuilds the session from scratch, so the model binding must be
+    /// declared again. Worker returns
+    /// `missing_model` 400 if omitted.
+    model: &'a str,
     dynamic_prefix: DynamicPrefixWire<'a>,
     history: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1697,6 +1743,10 @@ impl TurnOptions {
 struct SplitRequest<'a> {
     /// Namespaced `rsclaw/<id>` per protocol §2.10.1.
     prefix_id: String,
+    /// Bare model id with the `rsclaw/` namespace prefix stripped. Required
+    /// in the wire body for both `POST /sessions` and `/sessions/replay`
+    /// as of 2026-05; sessions carry this binding for their lifetime.
+    model: String,
     dynamic_system: &'a str,
     dynamic_user_system: &'a str,
     dynamic_tools: Vec<Value>,
@@ -1907,6 +1957,19 @@ fn split_request<'a>(req: &'a LlmRequest, prefix_id: &str) -> Result<SplitReques
     // the wire shape valid, so this function passes it through as-is.
     let prefix_id = prefix_id.to_owned();
 
+    // `model` is required in the open/replay wire body since 2026-05.
+    // Strip the `rsclaw/` namespace prefix so the server records the
+    // bare slot id (e.g. `rsclaw-agent-v1`) — passing the namespaced
+    // form trips the worker's model-slot whitelist check.
+    let model = req
+        .model
+        .strip_prefix("rsclaw/")
+        .unwrap_or(req.model.as_str())
+        .to_owned();
+    if model.is_empty() {
+        anyhow::bail!("rsclaw: req.model is empty; cannot open session without a model id");
+    }
+
     // Each tool's wire JSON is `to_canonical_value`-flattened to give
     // byte-stable output across gateway runs. Without this pass the
     // serialized `input_schema` carries whatever key order `serde_json`
@@ -1966,6 +2029,7 @@ fn split_request<'a>(req: &'a LlmRequest, prefix_id: &str) -> Result<SplitReques
 
     Ok(SplitRequest {
         prefix_id,
+        model,
         dynamic_system,
         dynamic_user_system,
         dynamic_tools,
