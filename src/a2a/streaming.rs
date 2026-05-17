@@ -36,18 +36,26 @@ pub async fn handle_streaming_rpc(
     req: JsonRpcRequest,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let req_id = req.id.clone();
-    let task_id = match req.method.as_str() {
+    let (task_id, rx) = match req.method.as_str() {
         "SendStreamingMessage" => spawn_streaming_task(state.clone(), req.params).await,
-        "SubscribeToTask" => req
-            .params
-            .get("id")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-            .unwrap_or_default(),
-        _ => String::new(),
+        "SubscribeToTask" => {
+            let tid = req
+                .params
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+                .unwrap_or_default();
+            let rx = state.task_event_bus.subscribe(&tid);
+            (tid, rx)
+        }
+        _ => {
+            let empty = String::new();
+            let rx = state.task_event_bus.subscribe(&empty);
+            (empty, rx)
+        }
     };
 
-    let rx = state.task_event_bus.subscribe(&task_id);
+    drop(task_id);
     let stream = BroadcastStream::new(rx).filter_map(move |result| {
         let req_id = req_id.clone();
         async move {
@@ -73,14 +81,20 @@ pub async fn handle_streaming_rpc(
     Sse::new(stream).keep_alive(KeepAlive::new())
 }
 
-/// Spawn an agent task and return the assigned task_id. Events flow back via
-/// the per-task broadcast bus.
-async fn spawn_streaming_task(state: AppState, params: Value) -> String {
+/// Spawn an agent task and return `(task_id, subscriber)`. The subscriber is
+/// taken BEFORE any events are published to the bus so the SSE consumer
+/// observes the full Submitted → Working → Completed sequence.
+async fn spawn_streaming_task(
+    state: AppState,
+    params: Value,
+) -> (String, tokio::sync::broadcast::Receiver<AgentEvent>) {
     let params: SendMessageParams = match serde_json::from_value(params) {
         Ok(p) => p,
         Err(e) => {
             warn!(err = %e, "SendStreamingMessage: invalid params");
-            return Uuid::new_v4().to_string();
+            let tid = Uuid::new_v4().to_string();
+            let rx = state.task_event_bus.subscribe(&tid);
+            return (tid, rx);
         }
     };
 
@@ -89,6 +103,10 @@ async fn spawn_streaming_task(state: AppState, params: Value) -> String {
         .task_id
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    // CRITICAL: subscribe BEFORE any publish so the SSE consumer sees
+    // Submitted/Working frames. broadcast channels don't replay history.
+    let early_rx = state.task_event_bus.subscribe(&task_id);
 
     let session_key = params
         .message
@@ -120,7 +138,15 @@ async fn spawn_streaming_task(state: AppState, params: Value) -> String {
     };
     let Ok(handle) = handle else {
         warn!("SendStreamingMessage: no agent available");
-        return task_id;
+        // Still publish a Failed terminal status so the subscriber sees something.
+        state.task_event_bus.publish(AgentEvent::Status {
+            task_id: task_id.clone(),
+            context_id: session_key.clone(),
+            state: TaskState::Failed,
+            message: None,
+            final_: true,
+        });
+        return (task_id, early_rx);
     };
 
     // Reply oneshot — we await this in a spawned task so we can publish
@@ -284,5 +310,5 @@ async fn spawn_streaming_task(state: AppState, params: Value) -> String {
     } else {
         info!(task_id = %task_id, "A2A SendStreamingMessage spawned");
     }
-    task_id
+    (task_id, early_rx)
 }
