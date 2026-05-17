@@ -14,11 +14,17 @@ use tokio::sync::oneshot;
 use tracing::info;
 use uuid::Uuid;
 
+use serde::Deserialize;
+
 use crate::{
-    a2a::types::{
-        A2aArtifact, A2aMessage, A2aPart, AgentCapabilities, AgentCard, AgentExtension,
-        AgentInterface, AgentProvider, AgentSkill, JsonRpcRequest, JsonRpcResponse,
-        SendMessageParams,
+    a2a::{
+        errors as a2a_errors,
+        types::{
+            A2aArtifact, A2aMessage, A2aPart, A2aTask, A2aTaskStatus, AgentCapabilities,
+            AgentCard, AgentExtension, AgentInterface, AgentProvider, AgentSkill,
+            JsonRpcRequest, JsonRpcResponse, PushNotificationConfig, SendMessageParams,
+            TaskState,
+        },
     },
     agent::{AgentMessage, AgentReply},
     config::schema::BindMode,
@@ -151,17 +157,19 @@ pub async fn a2a_rpc_handler_inner(state: AppState, req: JsonRpcRequest) -> Json
             -32601,
             "use Accept: text/event-stream for streaming methods",
         )),
-        "GetTask"
-        | "ListTasks"
-        | "CancelTask"
-        | "CreateTaskPushNotificationConfig"
-        | "GetTaskPushNotificationConfig"
-        | "ListTaskPushNotificationConfigs"
-        | "DeleteTaskPushNotificationConfig" => Json(JsonRpcResponse::err(
-            id,
-            -32601,
-            format!("method not implemented yet: {}", req.method),
-        )),
+        "GetTask" => handle_get_task(state, id, req.params).await,
+        "ListTasks" => handle_list_tasks(state, id, req.params).await,
+        "CancelTask" => handle_cancel_task(state, id, req.params).await,
+        "CreateTaskPushNotificationConfig" => {
+            handle_create_push_config(state, id, req.params).await
+        }
+        "GetTaskPushNotificationConfig" => handle_get_push_config(state, id, req.params).await,
+        "ListTaskPushNotificationConfigs" => {
+            handle_list_push_configs(state, id, req.params).await
+        }
+        "DeleteTaskPushNotificationConfig" => {
+            handle_delete_push_config(state, id, req.params).await
+        }
         other => Json(JsonRpcResponse::err(
             id,
             -32601,
@@ -240,6 +248,64 @@ async fn handle_send_message(
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
+    // Resume path: if the client is sending follow-up input to a paused task,
+    // route it to the suspended runtime and return the task's current state.
+    if let Some((_, suspended)) = state.suspended_tasks.remove(&task_id) {
+        let _ = suspended.resume_tx.send(text);
+        let task = state
+            .task_store
+            .get(&task_id)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| A2aTask {
+                id: task_id.clone(),
+                context_id: Some(session_key.clone()),
+                status: A2aTaskStatus {
+                    state: TaskState::Working,
+                    message: None,
+                    timestamp: Some(chrono::Utc::now().to_rfc3339()),
+                },
+                history: vec![],
+                artifacts: vec![],
+                metadata: None,
+            });
+        return Json(JsonRpcResponse::ok(
+            id,
+            serde_json::to_value(task).unwrap_or(Value::Null),
+        ));
+    }
+
+    // Persist the initial task (Submitted).
+    let initial_history = A2aMessage {
+        message_id: params.message.message_id.clone(),
+        role: params.message.role.clone(),
+        parts: params.message.parts.clone(),
+        context_id: Some(session_key.clone()),
+        task_id: Some(task_id.clone()),
+        metadata: params.message.metadata.clone(),
+    };
+    let initial_task = A2aTask {
+        id: task_id.clone(),
+        context_id: Some(session_key.clone()),
+        status: A2aTaskStatus {
+            state: TaskState::Submitted,
+            message: None,
+            timestamp: Some(chrono::Utc::now().to_rfc3339()),
+        },
+        history: vec![initial_history],
+        artifacts: vec![],
+        metadata: None,
+    };
+    if let Err(e) = state.task_store.put(&initial_task) {
+        info!(err = %e, "failed to persist initial task");
+    }
+
+    // Register a cancellation token so CancelTask can stop the in-flight turn.
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    state
+        .task_cancels
+        .insert(task_id.clone(), cancel_token.clone());
+
     let (reply_tx, reply_rx) = oneshot::channel::<AgentReply>();
     let msg = AgentMessage {
         session_key: session_key.clone(),
@@ -249,7 +315,7 @@ async fn handle_send_message(
         chat_id: String::new(),
         reply_tx,
         event_tx: None,
-        cancel_token: None,
+        cancel_token: Some(cancel_token),
         input_request_tx: None,
         extra_tools: vec![],
         images: vec![],
@@ -295,6 +361,10 @@ async fn handle_send_message(
         metadata: None,
     };
 
+    let _ = state.task_store.append_artifact(&task_id, artifact.clone());
+    let _ = state.task_store.set_status(&task_id, TaskState::Completed);
+    state.task_cancels.remove(&task_id);
+
     let result = json!({
         "id": task_id,
         "contextId": session_key,
@@ -305,4 +375,303 @@ async fn handle_send_message(
 
     info!(task_id, agent = %handle.id, "A2A SendMessage completed");
     Json(JsonRpcResponse::ok(id, result))
+}
+
+// ---------------------------------------------------------------------------
+// GetTask / ListTasks / CancelTask
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetTaskParams {
+    id: String,
+    #[serde(default)]
+    history_length: Option<usize>,
+}
+
+async fn handle_get_task(state: AppState, id: Value, params: Value) -> Json<JsonRpcResponse> {
+    let params: GetTaskParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => {
+            return Json(JsonRpcResponse::err_struct(
+                id,
+                a2a_errors::invalid_argument(format!("invalid params: {e}"), "params"),
+            ));
+        }
+    };
+    match state.task_store.get(&params.id) {
+        Ok(Some(mut task)) => {
+            if let Some(n) = params.history_length
+                && task.history.len() > n
+            {
+                let skip = task.history.len() - n;
+                task.history = task.history.split_off(skip);
+            }
+            Json(JsonRpcResponse::ok(
+                id,
+                serde_json::to_value(task).unwrap_or(Value::Null),
+            ))
+        }
+        Ok(None) => Json(JsonRpcResponse::err_struct(
+            id,
+            a2a_errors::not_found(format!("tasks/{}", params.id)),
+        )),
+        Err(e) => Json(JsonRpcResponse::err_struct(
+            id,
+            a2a_errors::internal(format!("store error: {e}")),
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListTasksParams {
+    #[serde(default)]
+    page_size: Option<usize>,
+    #[serde(default)]
+    page_token: Option<String>,
+}
+
+async fn handle_list_tasks(state: AppState, id: Value, params: Value) -> Json<JsonRpcResponse> {
+    let params: ListTasksParams = serde_json::from_value(params).unwrap_or(ListTasksParams {
+        page_size: None,
+        page_token: None,
+    });
+    let offset: usize = params
+        .page_token
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let limit = params.page_size.unwrap_or(50).min(500);
+    match state.task_store.list(offset, limit) {
+        Ok(tasks) => {
+            let next_token = if tasks.len() == limit {
+                Some((offset + limit).to_string())
+            } else {
+                None
+            };
+            Json(JsonRpcResponse::ok(
+                id,
+                json!({ "tasks": tasks, "nextPageToken": next_token }),
+            ))
+        }
+        Err(e) => Json(JsonRpcResponse::err_struct(
+            id,
+            a2a_errors::internal(format!("store error: {e}")),
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelTaskParams {
+    id: String,
+}
+
+async fn handle_cancel_task(
+    state: AppState,
+    id: Value,
+    params: Value,
+) -> Json<JsonRpcResponse> {
+    let params: CancelTaskParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => {
+            return Json(JsonRpcResponse::err_struct(
+                id,
+                a2a_errors::invalid_argument(format!("invalid params: {e}"), "params"),
+            ));
+        }
+    };
+    match state.task_cancels.remove(&params.id) {
+        Some((_, token)) => {
+            token.cancel();
+            let _ = state.task_store.set_status(&params.id, TaskState::Canceled);
+            match state.task_store.get(&params.id) {
+                Ok(Some(task)) => Json(JsonRpcResponse::ok(
+                    id,
+                    serde_json::to_value(task).unwrap_or(Value::Null),
+                )),
+                _ => Json(JsonRpcResponse::ok(
+                    id,
+                    json!({ "id": params.id, "status": { "state": "TASK_STATE_CANCELED" } }),
+                )),
+            }
+        }
+        None => match state.task_store.get(&params.id) {
+            Ok(Some(t)) if t.status.state.is_terminal() => Json(JsonRpcResponse::err_struct(
+                id,
+                a2a_errors::precondition_failed(format!(
+                    "task already terminal: {:?}",
+                    t.status.state
+                )),
+            )),
+            Ok(Some(_)) => Json(JsonRpcResponse::err_struct(
+                id,
+                a2a_errors::precondition_failed(
+                    "task running but no cancel token (gateway restart?)".to_owned(),
+                ),
+            )),
+            Ok(None) => Json(JsonRpcResponse::err_struct(
+                id,
+                a2a_errors::not_found(format!("tasks/{}", params.id)),
+            )),
+            Err(e) => Json(JsonRpcResponse::err_struct(
+                id,
+                a2a_errors::internal(format!("store error: {e}")),
+            )),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Push notification CRUD
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreatePushConfigParams {
+    task_id: String,
+    push_notification_config: PushNotificationConfig,
+}
+
+async fn handle_create_push_config(
+    state: AppState,
+    id: Value,
+    params: Value,
+) -> Json<JsonRpcResponse> {
+    let mut params: CreatePushConfigParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => {
+            return Json(JsonRpcResponse::err_struct(
+                id,
+                a2a_errors::invalid_argument(format!("invalid params: {e}"), "params"),
+            ));
+        }
+    };
+    params.push_notification_config.task_id = params.task_id.clone();
+    if params.push_notification_config.id.is_empty() {
+        params.push_notification_config.id = Uuid::new_v4().to_string();
+    }
+    match state.task_store.put_push_config(&params.push_notification_config) {
+        Ok(_) => Json(JsonRpcResponse::ok(
+            id,
+            serde_json::to_value(&params.push_notification_config).unwrap_or(Value::Null),
+        )),
+        Err(e) => Json(JsonRpcResponse::err_struct(
+            id,
+            a2a_errors::internal(format!("store error: {e}")),
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetPushConfigParams {
+    task_id: String,
+    push_notification_config_id: String,
+}
+
+async fn handle_get_push_config(
+    state: AppState,
+    id: Value,
+    params: Value,
+) -> Json<JsonRpcResponse> {
+    let params: GetPushConfigParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => {
+            return Json(JsonRpcResponse::err_struct(
+                id,
+                a2a_errors::invalid_argument(format!("invalid params: {e}"), "params"),
+            ));
+        }
+    };
+    match state
+        .task_store
+        .get_push_config(&params.task_id, &params.push_notification_config_id)
+    {
+        Ok(Some(c)) => Json(JsonRpcResponse::ok(
+            id,
+            serde_json::to_value(c).unwrap_or(Value::Null),
+        )),
+        Ok(None) => Json(JsonRpcResponse::err_struct(
+            id,
+            a2a_errors::not_found(format!(
+                "tasks/{}/pushNotificationConfigs/{}",
+                params.task_id, params.push_notification_config_id
+            )),
+        )),
+        Err(e) => Json(JsonRpcResponse::err_struct(
+            id,
+            a2a_errors::internal(format!("store error: {e}")),
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListPushConfigsParams {
+    task_id: String,
+}
+
+async fn handle_list_push_configs(
+    state: AppState,
+    id: Value,
+    params: Value,
+) -> Json<JsonRpcResponse> {
+    let params: ListPushConfigsParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => {
+            return Json(JsonRpcResponse::err_struct(
+                id,
+                a2a_errors::invalid_argument(format!("invalid params: {e}"), "params"),
+            ));
+        }
+    };
+    match state.task_store.list_push_configs(&params.task_id) {
+        Ok(configs) => Json(JsonRpcResponse::ok(id, json!({ "configs": configs }))),
+        Err(e) => Json(JsonRpcResponse::err_struct(
+            id,
+            a2a_errors::internal(format!("store error: {e}")),
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeletePushConfigParams {
+    task_id: String,
+    push_notification_config_id: String,
+}
+
+async fn handle_delete_push_config(
+    state: AppState,
+    id: Value,
+    params: Value,
+) -> Json<JsonRpcResponse> {
+    let params: DeletePushConfigParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => {
+            return Json(JsonRpcResponse::err_struct(
+                id,
+                a2a_errors::invalid_argument(format!("invalid params: {e}"), "params"),
+            ));
+        }
+    };
+    match state
+        .task_store
+        .delete_push_config(&params.task_id, &params.push_notification_config_id)
+    {
+        Ok(true) => Json(JsonRpcResponse::ok(id, json!({ "deleted": true }))),
+        Ok(false) => Json(JsonRpcResponse::err_struct(
+            id,
+            a2a_errors::not_found(format!(
+                "tasks/{}/pushNotificationConfigs/{}",
+                params.task_id, params.push_notification_config_id
+            )),
+        )),
+        Err(e) => Json(JsonRpcResponse::err_struct(
+            id,
+            a2a_errors::internal(format!("store error: {e}")),
+        )),
+    }
 }

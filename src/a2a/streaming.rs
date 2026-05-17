@@ -20,7 +20,10 @@ use uuid::Uuid;
 use crate::{
     a2a::{
         event::AgentEvent,
-        types::{A2aPart, JsonRpcRequest, SendMessageParams},
+        types::{
+            A2aArtifact, A2aMessage, A2aPart, A2aTask, A2aTaskStatus, JsonRpcRequest,
+            SendMessageParams, TaskState,
+        },
     },
     agent::{AgentMessage, AgentReply},
     server::AppState,
@@ -139,6 +142,71 @@ async fn spawn_streaming_task(state: AppState, params: Value) -> String {
     state
         .task_cancels
         .insert(task_id.clone(), cancel_token.clone());
+
+    // Persist initial task state (Submitted).
+    let initial_history = A2aMessage {
+        message_id: params.message.message_id.clone(),
+        role: params.message.role.clone(),
+        parts: params.message.parts.clone(),
+        context_id: Some(session_key.clone()),
+        task_id: Some(task_id.clone()),
+        metadata: params.message.metadata.clone(),
+    };
+    let initial_task = A2aTask {
+        id: task_id.clone(),
+        context_id: Some(session_key.clone()),
+        status: A2aTaskStatus {
+            state: TaskState::Submitted,
+            message: None,
+            timestamp: Some(chrono::Utc::now().to_rfc3339()),
+        },
+        history: vec![initial_history],
+        artifacts: vec![],
+        metadata: None,
+    };
+    if let Err(e) = state.task_store.put(&initial_task) {
+        warn!(err = %e, "failed to persist initial streaming task");
+    }
+
+    // Mirror events into the persistent store as they arrive.
+    let persist_store = state.task_store.clone();
+    let persist_task_id = task_id.clone();
+    let mut persist_rx = state.task_event_bus.subscribe(&task_id);
+    tokio::spawn(async move {
+        while let Ok(ev) = persist_rx.recv().await {
+            match ev {
+                AgentEvent::Artifact {
+                    artifact_id,
+                    parts,
+                    ..
+                } => {
+                    let _ = persist_store.append_artifact(
+                        &persist_task_id,
+                        A2aArtifact {
+                            artifact_id,
+                            parts,
+                            name: None,
+                            description: None,
+                            metadata: None,
+                        },
+                    );
+                }
+                AgentEvent::Status { state, final_, .. } => {
+                    let _ = persist_store.set_status(&persist_task_id, state);
+                    if final_ {
+                        break;
+                    }
+                }
+                AgentEvent::InputRequired { .. } => {
+                    let _ = persist_store
+                        .set_status(&persist_task_id, TaskState::InputRequired);
+                }
+            }
+        }
+    });
+
+    // Push notification fan-out.
+    state.push_dispatcher.clone().watch(task_id.clone());
 
     let msg = AgentMessage {
         session_key,

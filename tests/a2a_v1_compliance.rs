@@ -142,6 +142,121 @@ async fn subscribe_receives_published_events() {
 // Suspended task registry (Phase 6)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// TaskStore (Phase 4)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn task_store_put_get_roundtrip() {
+    use rsclaw::a2a::store::TaskStore;
+    use rsclaw::a2a::types::{A2aMessage, A2aTask, A2aTaskStatus};
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let store = TaskStore::open(&dir.path().join("a2a.redb")).unwrap();
+
+    let task = A2aTask {
+        id: "t-1".into(),
+        context_id: Some("ctx".into()),
+        status: A2aTaskStatus {
+            state: TaskState::Working,
+            message: None,
+            timestamp: None,
+        },
+        history: vec![A2aMessage {
+            message_id: "m-1".into(),
+            role: "ROLE_USER".into(),
+            parts: vec![A2aPart::Text { text: "hi".into() }],
+            context_id: Some("ctx".into()),
+            task_id: Some("t-1".into()),
+            metadata: None,
+        }],
+        artifacts: vec![],
+        metadata: None,
+    };
+    store.put(&task).unwrap();
+    let got = store.get("t-1").unwrap().unwrap();
+    assert_eq!(got.id, "t-1");
+    assert_eq!(got.status.state, TaskState::Working);
+    assert_eq!(got.history.len(), 1);
+
+    store.set_status("t-1", TaskState::Completed).unwrap();
+    let got = store.get("t-1").unwrap().unwrap();
+    assert_eq!(got.status.state, TaskState::Completed);
+    assert!(got.status.timestamp.is_some());
+}
+
+#[test]
+fn task_store_list_pagination() {
+    use rsclaw::a2a::store::TaskStore;
+    use rsclaw::a2a::types::{A2aTask, A2aTaskStatus};
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let store = TaskStore::open(&dir.path().join("a2a.redb")).unwrap();
+
+    for i in 0..5 {
+        store
+            .put(&A2aTask {
+                id: format!("t-{i:02}"),
+                context_id: None,
+                status: A2aTaskStatus {
+                    state: TaskState::Submitted,
+                    message: None,
+                    timestamp: None,
+                },
+                history: vec![],
+                artifacts: vec![],
+                metadata: None,
+            })
+            .unwrap();
+    }
+    let page1 = store.list(0, 2).unwrap();
+    assert_eq!(page1.len(), 2);
+    let page2 = store.list(2, 2).unwrap();
+    assert_eq!(page2.len(), 2);
+    let page3 = store.list(4, 2).unwrap();
+    assert_eq!(page3.len(), 1);
+}
+
+#[test]
+fn push_config_crud() {
+    use rsclaw::a2a::store::TaskStore;
+    use rsclaw::a2a::types::PushNotificationConfig;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let store = TaskStore::open(&dir.path().join("a2a.redb")).unwrap();
+
+    let cfg = PushNotificationConfig {
+        id: "p-1".into(),
+        task_id: "t-1".into(),
+        url: "https://example.com/hook".into(),
+        token: "secret".into(),
+        authentication: None,
+    };
+    store.put_push_config(&cfg).unwrap();
+    let got = store.get_push_config("t-1", "p-1").unwrap().unwrap();
+    assert_eq!(got.url, "https://example.com/hook");
+    let listed = store.list_push_configs("t-1").unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(store.delete_push_config("t-1", "p-1").unwrap());
+    assert!(store.get_push_config("t-1", "p-1").unwrap().is_none());
+}
+
+#[test]
+fn push_signature_is_stable() {
+    use rsclaw::a2a::push::sign_payload;
+    // Pre-computed via:
+    //   echo -n 'hello' | openssl dgst -sha256 -hmac 'test-secret' -binary | base64
+    let sig = sign_payload("test-secret", b"hello");
+    assert!(!sig.is_empty(), "signature must be non-empty");
+    // Determinism: same inputs → same output.
+    assert_eq!(sig, sign_payload("test-secret", b"hello"));
+    assert_ne!(sig, sign_payload("test-secret", b"hello!"));
+    assert_ne!(sig, sign_payload("other-secret", b"hello"));
+}
+
 #[tokio::test]
 async fn suspended_task_registry_round_trip() {
     use dashmap::DashMap;

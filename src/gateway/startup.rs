@@ -700,6 +700,19 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         }
     }
 
+    // A2A v1.0 plumbing — task event bus, persistent store, push dispatcher
+    // all share the same instances so events flow end-to-end.
+    let a2a_bus = crate::a2a::event::TaskEventBus::new();
+    let a2a_task_store = {
+        let path = crate::config::loader::base_dir()
+            .join("var/data/a2a/tasks.redb");
+        Arc::new(crate::a2a::store::TaskStore::open(&path).expect("open A2A task store"))
+    };
+    let a2a_push_dispatcher = Arc::new(crate::a2a::push::PushDispatcher::new(
+        Arc::clone(&a2a_task_store),
+        a2a_bus.clone(),
+    ));
+
     let state = AppState {
         config: Arc::clone(&config),
         live: Arc::clone(&live),
@@ -727,9 +740,11 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         restart_request_tx: restart_request_tx.clone(),
         pending_restart: Arc::clone(&pending_restart),
         shutdown: shutdown.clone(),
-        task_event_bus: crate::a2a::event::TaskEventBus::new(),
+        task_event_bus: a2a_bus,
         task_cancels: Arc::new(dashmap::DashMap::new()),
         suspended_tasks: Arc::new(dashmap::DashMap::new()),
+        task_store: a2a_task_store,
+        push_dispatcher: a2a_push_dispatcher,
     };
     crate::ws::tick::start_tick_loop(Arc::clone(&state.ws_conns));
 
