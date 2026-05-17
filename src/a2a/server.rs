@@ -306,6 +306,11 @@ async fn handle_send_message(
         .task_cancels
         .insert(task_id.clone(), cancel_token.clone());
 
+    // Push notification fan-out — same as the streaming path. Without this,
+    // synchronous SendMessage tasks emit events to the bus but no push
+    // webhooks ever fire.
+    state.push_dispatcher.clone().watch(task_id.clone());
+
     // Publish Submitted → Working status events on the bus so any SSE
     // subscriber (or push webhook listener) can observe progress.
     state.task_event_bus.publish(crate::a2a::event::AgentEvent::Status {
@@ -323,6 +328,30 @@ async fn handle_send_message(
         final_: false,
     });
 
+    // Wire the INPUT_REQUIRED resume channel. If the runtime ever requests
+    // additional input mid-turn, an entry lands in `state.suspended_tasks`;
+    // the client's next SendMessage with the same taskId hits the
+    // resume-path at the top of this handler.
+    let (ireq_tx, mut ireq_rx) =
+        tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<String>>(4);
+    {
+        let suspended = state.suspended_tasks.clone();
+        let sus_task_id = task_id.clone();
+        let sus_ctx = session_key.clone();
+        tokio::spawn(async move {
+            while let Some(resume_tx) = ireq_rx.recv().await {
+                suspended.insert(
+                    sus_task_id.clone(),
+                    crate::a2a::event::SuspendedTask {
+                        task_id: sus_task_id.clone(),
+                        context_id: sus_ctx.clone(),
+                        resume_tx,
+                    },
+                );
+            }
+        });
+    }
+
     let (reply_tx, reply_rx) = oneshot::channel::<AgentReply>();
     let msg = AgentMessage {
         session_key: session_key.clone(),
@@ -333,7 +362,7 @@ async fn handle_send_message(
         reply_tx,
         event_tx: None,
         cancel_token: Some(cancel_token),
-        input_request_tx: None,
+        input_request_tx: Some(ireq_tx),
         extra_tools: vec![],
         images: vec![],
         files: vec![],
@@ -341,6 +370,7 @@ async fn handle_send_message(
     };
 
     if handle.tx.send(msg).await.is_err() {
+        finalize_failed_task(&state, &task_id, &session_key);
         return Json(JsonRpcResponse::err(id, -32603, "agent inbox closed"));
     }
 
@@ -350,9 +380,11 @@ async fn handle_send_message(
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), reply_rx).await {
             Ok(Ok(r)) => r,
             Ok(Err(_)) => {
+                finalize_failed_task(&state, &task_id, &session_key);
                 return Json(JsonRpcResponse::err(id, -32603, "reply channel dropped"));
             }
             Err(_) => {
+                finalize_failed_task(&state, &task_id, &session_key);
                 return Json(JsonRpcResponse::err(
                     id,
                     -32000,
@@ -725,4 +757,24 @@ async fn handle_delete_push_config(
             a2a_errors::internal(format!("store error: {e}")),
         )),
     }
+}
+
+/// Mark a task as Failed and clean up its in-memory state.
+/// Used by every early-error return in `handle_send_message` so a task
+/// that never reached `Completed` doesn't linger as `Working` in the store
+/// (GetTask/ListTasks would surface it as stuck) and so the cancel token
+/// + broadcast channel don't leak.
+fn finalize_failed_task(state: &AppState, task_id: &str, context_id: &str) {
+    let _ = state.task_store.set_status(task_id, TaskState::Failed);
+    state.task_cancels.remove(task_id);
+    state
+        .task_event_bus
+        .publish(crate::a2a::event::AgentEvent::Status {
+            task_id: task_id.to_owned(),
+            context_id: context_id.to_owned(),
+            state: TaskState::Failed,
+            message: None,
+            final_: true,
+        });
+    state.task_event_bus.close(task_id);
 }

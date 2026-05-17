@@ -229,6 +229,10 @@ async fn spawn_streaming_task(
                     let _ = persist_store
                         .set_status(&persist_task_id, TaskState::InputRequired);
                 }
+                AgentEvent::AuthRequired { .. } => {
+                    let _ = persist_store
+                        .set_status(&persist_task_id, TaskState::AuthRequired);
+                }
             }
         }
     });
@@ -293,6 +297,27 @@ async fn spawn_streaming_task(
         bus_for_reply.close(&task_id_for_reply);
     });
 
+    // Wire the INPUT_REQUIRED resume channel.
+    let (ireq_tx, mut ireq_rx) =
+        tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<String>>(4);
+    {
+        let suspended = state.suspended_tasks.clone();
+        let sus_task_id = task_id.clone();
+        let sus_ctx = session_key.clone();
+        tokio::spawn(async move {
+            while let Some(resume_tx) = ireq_rx.recv().await {
+                suspended.insert(
+                    sus_task_id.clone(),
+                    crate::a2a::event::SuspendedTask {
+                        task_id: sus_task_id.clone(),
+                        context_id: sus_ctx.clone(),
+                        resume_tx,
+                    },
+                );
+            }
+        });
+    }
+
     let msg = AgentMessage {
         session_key,
         text,
@@ -302,7 +327,7 @@ async fn spawn_streaming_task(
         reply_tx,
         event_tx: Some(event_tx),
         cancel_token: Some(cancel_token),
-        input_request_tx: None,
+        input_request_tx: Some(ireq_tx),
         extra_tools: vec![],
         images: vec![],
         files: vec![],

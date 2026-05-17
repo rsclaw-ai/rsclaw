@@ -34,6 +34,14 @@ pub enum AgentEvent {
         context_id: String,
         prompt: A2aMessage,
     },
+    /// Agent encountered an auth challenge mid-turn
+    /// (TASK_STATE_AUTH_REQUIRED). Same resume semantics as `InputRequired`:
+    /// the caller re-sends with credentials, runtime resumes.
+    AuthRequired {
+        task_id: String,
+        context_id: String,
+        prompt: A2aMessage,
+    },
 }
 
 impl AgentEvent {
@@ -41,7 +49,8 @@ impl AgentEvent {
         match self {
             Self::Status { task_id, .. }
             | Self::Artifact { task_id, .. }
-            | Self::InputRequired { task_id, .. } => task_id,
+            | Self::InputRequired { task_id, .. }
+            | Self::AuthRequired { task_id, .. } => task_id,
         }
     }
 
@@ -96,6 +105,20 @@ impl AgentEvent {
                 "contextId": context_id,
                 "status": {
                     "state": TaskState::InputRequired,
+                    "message": prompt,
+                },
+                "final": false,
+            }),
+            Self::AuthRequired {
+                task_id,
+                context_id,
+                prompt,
+            } => json!({
+                "kind": "status-update",
+                "taskId": task_id,
+                "contextId": context_id,
+                "status": {
+                    "state": TaskState::AuthRequired,
                     "message": prompt,
                 },
                 "final": false,
