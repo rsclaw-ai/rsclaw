@@ -362,6 +362,12 @@ pub struct RunContext {
     /// `RSCLAW_CAPTURE_TRACES=1`; flushed to the JSONL path in
     /// `RSCLAW_TRACES_PATH` on normal turn completion.
     pub full_trace: Option<super::trace_capture::FullTrace>,
+    /// Per-turn observability/control wires for A2A callers
+    /// (cancel_token, event_tx, input_request_tx, task/context ids).
+    /// Default-constructed for non-A2A turns; `agent_loop` polls
+    /// `is_cancelled()` between iterations and at tool-dispatch
+    /// boundaries, and calls `emit_working()` before each tool.
+    pub turn_ctx: super::registry::TurnContext,
 }
 
 fn init_full_trace(user_text: &str) -> Option<super::trace_capture::FullTrace> {
@@ -1310,6 +1316,7 @@ impl AgentRuntime {
         extra_tools: Vec<ToolDef>,
         images: Vec<super::registry::ImageAttachment>,
         files: Vec<super::registry::FileAttachment>,
+        turn_ctx: super::registry::TurnContext,
     ) -> Result<AgentReply> {
         // Resolve @file references (e.g. @up_i_202604271325ab.png → full path
         // under workspace/uploads/, @dl_v_... → ~/Downloads/rsclaw/videos/).
@@ -2138,6 +2145,7 @@ impl AgentRuntime {
                             turn_metrics: super::turn_metrics::TurnMetrics::new(),
                             user_text: String::new(),
                             full_trace: None,
+                            turn_ctx: super::registry::TurnContext::default(),
                         },
                         "",
                         &tool,
@@ -2341,6 +2349,7 @@ impl AgentRuntime {
                     extra_tools,
                     images,
                     vec![],
+                    turn_ctx,
                 ))
                 .await;
             } else if !transcriptions.is_empty() {
@@ -2359,6 +2368,7 @@ impl AgentRuntime {
                     extra_tools,
                     images,
                     files,
+                    turn_ctx,
                 ))
                 .await;
             }
@@ -3010,6 +3020,7 @@ impl AgentRuntime {
             turn_metrics: super::turn_metrics::TurnMetrics::new(),
             user_text: text.to_owned(),
             full_trace: init_full_trace(text),
+            turn_ctx,
         };
 
         // Plugins + Skills rendering now lives inside `build_user_system`
@@ -3682,6 +3693,15 @@ impl AgentRuntime {
                     pending_analysis: None,
                     needs_outer_done_emit: false,
                 });
+            }
+            // Check A2A cancel_token at start of each iteration. Same intent
+            // as the user-side /abort path below, just from a different source
+            // (the AppState.task_cancels entry that handle_cancel_task fires).
+            // Returns Err so the gateway worker reports `canceled by A2A
+            // CancelTask` and the dispatcher publishes TaskState::Canceled.
+            if ctx.turn_ctx.is_cancelled() {
+                info!(session = %ctx.session_key, iteration, "agent_loop: canceled by A2A");
+                return Err(anyhow!("canceled by A2A CancelTask"));
             }
             // Check abort flag at start of each iteration (allows /abort to
             // interrupt even when tool dispatch is blocking between LLM calls).
@@ -4903,6 +4923,16 @@ impl AgentRuntime {
                 // Clone for the per-turn metrics record (after dispatch
                 // moves the value).
                 let tool_input_for_metrics = tool_input.clone();
+                // A2A progress signal: publish "calling tool X" before
+                // dispatch so the client / push subscribers can render
+                // tool-level progress. No-op for non-A2A turns. Cancel
+                // check too — a long-running prior tool may have
+                // observed the token between iterations.
+                ctx.turn_ctx
+                    .emit_working(&format!("calling tool {tool_name}"));
+                if ctx.turn_ctx.is_cancelled() {
+                    return Err(anyhow!("canceled by A2A CancelTask"));
+                }
                 let result = self
                     .dispatch_tool(ctx, &tool_id, &tool_name, tool_input)
                     .await;
@@ -5792,6 +5822,8 @@ impl AgentRuntime {
                 peer_id: ctx.agent_id.clone(),
                 chat_id: String::new(),
                 reply_tx,
+                task_id: None,
+                context_id: None,
                 event_tx: None,
                 cancel_token: None,
                 input_request_tx: None,

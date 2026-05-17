@@ -8,6 +8,24 @@ use tokio::sync::broadcast;
 
 use super::types::{A2aMessage, A2aPart, TaskState};
 
+/// Build an `A2aMessage` carrying a single text part — used by progress
+/// `Status` events the runtime publishes mid-turn (e.g. "calling tool X").
+/// Role is fixed to `agent` since these originate from the runtime, not the
+/// user. `message_id` is freshly generated; no `task_id`/`context_id`
+/// because the enclosing `AgentEvent::Status` already carries those.
+pub fn text_message(text: &str) -> A2aMessage {
+    A2aMessage {
+        message_id: uuid::Uuid::new_v4().to_string(),
+        role: "agent".to_owned(),
+        parts: vec![A2aPart::Text {
+            text: text.to_owned(),
+        }],
+        context_id: None,
+        task_id: None,
+        metadata: None,
+    }
+}
+
 /// An event emitted by the agent runtime as a task makes progress.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {

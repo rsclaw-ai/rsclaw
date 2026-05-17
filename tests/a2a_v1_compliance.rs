@@ -279,3 +279,123 @@ async fn suspended_task_registry_round_trip() {
     let got = rx.await.unwrap();
     assert_eq!(got, "my answer");
 }
+
+// ---- TurnContext: per-turn observability + control wires ---------------
+
+#[test]
+fn turn_context_default_is_no_op() {
+    let tc = rsclaw::agent::registry::TurnContext::default();
+    assert!(!tc.is_cancelled());
+    // No event_tx → emit_working is a silent drop, must not panic.
+    tc.emit_working("calling tool memory_search");
+}
+
+#[tokio::test]
+async fn turn_context_is_cancelled_flips_on_token_fire() {
+    let token = tokio_util::sync::CancellationToken::new();
+    let tc = rsclaw::agent::registry::TurnContext {
+        cancel_token: Some(token.clone()),
+        ..Default::default()
+    };
+    assert!(!tc.is_cancelled());
+    token.cancel();
+    assert!(tc.is_cancelled());
+}
+
+#[tokio::test]
+async fn turn_context_emit_working_publishes_status_update() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let tc = rsclaw::agent::registry::TurnContext {
+        task_id: Some("t-42".into()),
+        context_id: Some("ctx-42".into()),
+        event_tx: Some(tx),
+        ..Default::default()
+    };
+    tc.emit_working("calling tool memory_search");
+
+    let ev = rx.recv().await.expect("event");
+    match ev {
+        rsclaw::a2a::event::AgentEvent::Status {
+            task_id, context_id, state, message, final_,
+        } => {
+            assert_eq!(task_id, "t-42");
+            assert_eq!(context_id, "ctx-42");
+            assert_eq!(state, rsclaw::a2a::types::TaskState::Working);
+            assert!(!final_);
+            let msg = message.expect("progress message");
+            assert_eq!(msg.role, "agent");
+            // First part should be Text with the progress string.
+            match &msg.parts[0] {
+                rsclaw::a2a::types::A2aPart::Text { text } => {
+                    assert_eq!(text, "calling tool memory_search");
+                }
+                other => panic!("expected Text part, got {other:?}"),
+            }
+        }
+        other => panic!("expected Status event, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn turn_context_request_input_publishes_input_required_and_resumes() {
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+    let (ireq_tx, mut ireq_rx) =
+        tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<String>>(4);
+    let tc = rsclaw::agent::registry::TurnContext {
+        task_id: Some("t-42".into()),
+        context_id: Some("ctx-42".into()),
+        event_tx: Some(event_tx),
+        input_request_tx: Some(ireq_tx),
+        ..Default::default()
+    };
+
+    // Mock the caller: as soon as the runtime registers a resume handle,
+    // reply with "from-client" — simulating the next SendMessage carrying
+    // the answer.
+    let mock = tokio::spawn(async move {
+        let resume_tx = ireq_rx.recv().await.expect("resume handle");
+        let _ = resume_tx.send("from-client".to_owned());
+    });
+
+    let got = tc.request_input("need more info", false).await;
+    assert_eq!(got.as_deref(), Some("from-client"));
+
+    // The InputRequired event should have hit event_rx.
+    let ev = event_rx.recv().await.expect("event");
+    assert!(matches!(
+        ev,
+        rsclaw::a2a::event::AgentEvent::InputRequired { .. }
+    ));
+
+    mock.await.unwrap();
+}
+
+#[tokio::test]
+async fn turn_context_request_input_with_auth_publishes_auth_required() {
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+    let (ireq_tx, mut ireq_rx) =
+        tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<String>>(4);
+    let tc = rsclaw::agent::registry::TurnContext {
+        task_id: Some("t-42".into()),
+        context_id: Some("ctx-42".into()),
+        event_tx: Some(event_tx),
+        input_request_tx: Some(ireq_tx),
+        ..Default::default()
+    };
+
+    let mock = tokio::spawn(async move {
+        let resume_tx = ireq_rx.recv().await.expect("resume handle");
+        let _ = resume_tx.send("bearer xyz".to_owned());
+    });
+
+    let got = tc.request_input("need bearer token", true).await;
+    assert_eq!(got.as_deref(), Some("bearer xyz"));
+
+    let ev = event_rx.recv().await.expect("event");
+    assert!(matches!(
+        ev,
+        rsclaw::a2a::event::AgentEvent::AuthRequired { .. }
+    ));
+
+    mock.await.unwrap();
+}

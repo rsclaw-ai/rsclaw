@@ -307,6 +307,8 @@ pub(crate) fn start_zalo_if_configured(
                                 peer_id: sender_id.clone(),
                                 chat_id: String::new(),
                                 reply_tx,
+                                task_id: None,
+                                context_id: None,
                                 event_tx: None,
                                 cancel_token: None,
                                 input_request_tx: None,

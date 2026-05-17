@@ -486,6 +486,8 @@ impl HeartbeatRunner {
             peer_id: "heartbeat".to_owned(),
             chat_id: String::new(),
             reply_tx,
+            task_id: None,
+            context_id: None,
             event_tx: None,
             cancel_token: None,
             input_request_tx: None,

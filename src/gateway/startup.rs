@@ -1167,27 +1167,31 @@ fn spawn_agent_tasks(
                     images,
                     files,
                     account: _,
+                    task_id,
+                    context_id,
                     cancel_token,
-                    event_tx: _a2a_event_tx,
-                    input_request_tx: _a2a_input_req_tx,
+                    event_tx,
+                    input_request_tx,
                 } = msg;
-                // Honor an A2A cancel_token at the turn level. Cancellation
-                // doesn't reach inside the LLM/tool loop yet — that needs
-                // runtime-internal plumbing — but at least the worker stops
-                // waiting on a long turn and reports Canceled cleanly.
-                let turn_fut = runtime.run_turn(
-                    &session_key, &text, &channel, &peer_id, &chat_id,
-                    extra_tools, images, files,
-                );
-                let result = if let Some(token) = cancel_token.as_ref() {
-                    tokio::select! {
-                        biased;
-                        _ = token.cancelled() => Err(anyhow::anyhow!("canceled by A2A CancelTask")),
-                        r = turn_fut => r,
-                    }
-                } else {
-                    turn_fut.await
+                // Build a TurnContext from the A2A wires on AgentMessage;
+                // empty for non-A2A callers. The runtime polls
+                // `is_cancelled()` between iterations and at every
+                // tool-dispatch boundary, so the worker stops waiting on
+                // a long turn as soon as the cancel token fires —
+                // no outer tokio::select shim needed.
+                let turn_ctx = crate::agent::registry::TurnContext {
+                    task_id,
+                    context_id,
+                    event_tx,
+                    cancel_token,
+                    input_request_tx,
                 };
+                let result = runtime
+                    .run_turn(
+                        &session_key, &text, &channel, &peer_id, &chat_id,
+                        extra_tools, images, files, turn_ctx,
+                    )
+                    .await;
                 let turn_errored = result.is_err();
                 let reply = result.unwrap_or_else(|e| {
                     error!(agent = %handle.id, "turn error: {e:#}");
@@ -1354,6 +1358,8 @@ pub(crate) async fn handle_pending_analysis(
         peer_id: analysis.peer_id.clone(),
         chat_id: String::new(),
         reply_tx,
+        task_id: None,
+        context_id: None,
         event_tx: None,
         cancel_token: None,
         input_request_tx: None,

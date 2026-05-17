@@ -319,12 +319,14 @@ async fn spawn_streaming_task(
     }
 
     let msg = AgentMessage {
-        session_key,
+        session_key: session_key.clone(),
         text,
         channel: "a2a".to_owned(),
         peer_id: "a2a-client".to_owned(),
         chat_id: String::new(),
         reply_tx,
+        task_id: Some(task_id.clone()),
+        context_id: Some(session_key),
         event_tx: Some(event_tx),
         cancel_token: Some(cancel_token),
         input_request_tx: Some(ireq_tx),

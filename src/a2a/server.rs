@@ -352,6 +352,21 @@ async fn handle_send_message(
         });
     }
 
+    // Bridge runtime → bus for mid-turn AgentEvents (Working progress with
+    // tool names, InputRequired/AuthRequired, etc.). Streaming has the same
+    // bridge; without it the sync path's bus only sees Submitted/Working/
+    // Completed/Failed and push webhooks miss the per-tool progress.
+    let (event_tx, mut event_rx) =
+        tokio::sync::mpsc::channel::<crate::a2a::event::AgentEvent>(64);
+    {
+        let bus = state.task_event_bus.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = event_rx.recv().await {
+                bus.publish(ev);
+            }
+        });
+    }
+
     let (reply_tx, reply_rx) = oneshot::channel::<AgentReply>();
     let msg = AgentMessage {
         session_key: session_key.clone(),
@@ -360,7 +375,9 @@ async fn handle_send_message(
         peer_id: "a2a-client".to_owned(),
         chat_id: String::new(),
         reply_tx,
-        event_tx: None,
+        task_id: Some(task_id.clone()),
+        context_id: Some(session_key.clone()),
+        event_tx: Some(event_tx),
         cancel_token: Some(cancel_token),
         input_request_tx: Some(ireq_tx),
         extra_tools: vec![],

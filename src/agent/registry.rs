@@ -194,6 +194,87 @@ pub struct FileAttachment {
     pub mime_type: String,
 }
 
+/// Per-turn observability + control wires that an A2A caller threads into the
+/// runtime. Built from the three optional channels on `AgentMessage` plus the
+/// A2A task/context identifiers; mirrored onto `RunContext` so the agent loop
+/// can publish progress, observe cancellation, and request user input mid-turn.
+///
+/// Default-constructed `TurnContext` is the legacy no-op: every method is a
+/// no-op or returns false. Non-A2A channels (WebSocket, ACP, runtime
+/// self-calls) keep using `TurnContext::default()`.
+#[derive(Debug, Clone, Default)]
+pub struct TurnContext {
+    pub task_id: Option<String>,
+    pub context_id: Option<String>,
+    pub event_tx: Option<tokio::sync::mpsc::Sender<crate::a2a::event::AgentEvent>>,
+    pub cancel_token: Option<tokio_util::sync::CancellationToken>,
+    pub input_request_tx:
+        Option<tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<String>>>,
+}
+
+impl TurnContext {
+    /// True once the A2A caller fired `tasks/cancel` (or the task's cancel
+    /// token was tripped for any other reason). Runtime polls this between
+    /// iterations of the agent loop and at every tool-dispatch boundary.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel_token
+            .as_ref()
+            .is_some_and(|t| t.is_cancelled())
+    }
+
+    /// Publish a `TASK_STATE_WORKING` status-update with a human-readable
+    /// progress message (e.g. "calling tool memory_search"). Non-A2A turns
+    /// (no event_tx) drop the message silently. `try_send` is used so a
+    /// full subscriber queue can never stall the agent loop.
+    pub fn emit_working(&self, message: &str) {
+        let (Some(tx), Some(task_id), Some(context_id)) =
+            (&self.event_tx, &self.task_id, &self.context_id)
+        else {
+            return;
+        };
+        let _ = tx.try_send(crate::a2a::event::AgentEvent::Status {
+            task_id: task_id.clone(),
+            context_id: context_id.clone(),
+            state: crate::a2a::types::TaskState::Working,
+            message: Some(crate::a2a::event::text_message(message)),
+            final_: false,
+        });
+    }
+
+    /// Suspend the turn awaiting client input. Publishes `InputRequired`
+    /// (or `AuthRequired` if `auth`), registers a `SuspendedTask` resume
+    /// handle via `input_request_tx`, and awaits the resume. Returns the
+    /// client-supplied text, or `None` if the wire is absent / the
+    /// resume channel was dropped (treat as cancellation).
+    pub async fn request_input(&self, prompt: &str, auth: bool) -> Option<String> {
+        let ireq_tx = self.input_request_tx.as_ref()?;
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<String>();
+        if ireq_tx.send(resume_tx).await.is_err() {
+            return None;
+        }
+        if let (Some(tx), Some(task_id), Some(context_id)) =
+            (&self.event_tx, &self.task_id, &self.context_id)
+        {
+            let prompt_msg = crate::a2a::event::text_message(prompt);
+            let ev = if auth {
+                crate::a2a::event::AgentEvent::AuthRequired {
+                    task_id: task_id.clone(),
+                    context_id: context_id.clone(),
+                    prompt: prompt_msg,
+                }
+            } else {
+                crate::a2a::event::AgentEvent::InputRequired {
+                    task_id: task_id.clone(),
+                    context_id: context_id.clone(),
+                    prompt: prompt_msg,
+                }
+            };
+            let _ = tx.try_send(ev);
+        }
+        resume_rx.await.ok()
+    }
+}
+
 /// A message delivered to an agent.
 #[derive(Debug)]
 pub struct AgentMessage {
@@ -213,6 +294,12 @@ pub struct AgentMessage {
     pub chat_id: String,
     /// One-shot sender for the agent's response.
     pub reply_tx: tokio::sync::oneshot::Sender<AgentReply>,
+    /// A2A task id, if the caller is the A2A protocol. Carried on
+    /// `TurnContext` so the runtime can tag emitted events with the
+    /// right `taskId` / `contextId`.
+    pub task_id: Option<String>,
+    /// A2A context id (== session key for our impl).
+    pub context_id: Option<String>,
     /// Optional streaming event channel. Runtime emits intermediate
     /// `AgentEvent`s (status changes, artifact chunks) here when the caller
     /// (e.g. A2A SendStreamingMessage) wants to observe progress. Legacy

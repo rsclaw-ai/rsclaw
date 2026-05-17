@@ -577,6 +577,8 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                     peer_id: peer_id.clone(),
                     chat_id: chat_id.clone(),
                     reply_tx: wake_tx,
+                    task_id: None,
+                    context_id: None,
                     event_tx: None,
                     cancel_token: None,
                     input_request_tx: None,

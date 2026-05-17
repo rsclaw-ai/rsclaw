@@ -169,6 +169,7 @@ impl AgentSpawner {
                         extra_tools,
                         images,
                         files,
+                        crate::agent::registry::TurnContext::default(),
                     )
                     .await;
                 let reply = result.unwrap_or_else(|e| {
