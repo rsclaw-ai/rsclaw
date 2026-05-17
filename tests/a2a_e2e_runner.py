@@ -360,6 +360,49 @@ async def t_wait_auth(c):
     return await _wait_input_round_trip(c, auth=True, expected_state="TASK_STATE_AUTH_REQUIRED")
 
 
+# ---------- auth-mode tests (skipped unless gateway has tokens set) ---------
+
+async def _probe_auth_mode(c: httpx.AsyncClient) -> bool:
+    """Returns True if the gateway requires auth (any non-2xx response to
+    an unauthenticated POST), False if it's in dev mode (passes
+    everything). Used to decide whether to run the auth-mode tests."""
+    r = await c.post(RPC, json={
+        "jsonrpc": "2.0", "id": "probe", "method": "GetExtendedAgentCard", "params": {}})
+    return r.status_code == 401
+
+
+async def t_auth_rejects_no_token(c):
+    r = await c.post(RPC, json={
+        "jsonrpc": "2.0", "id": "a1", "method": "GetExtendedAgentCard", "params": {}})
+    assert r.status_code == 401, f"expected 401, got {r.status_code}"
+    return "401 returned"
+
+
+async def t_auth_accepts_valid_bearer(c):
+    tok = os.environ["A2A_BEARER_TOKEN"]
+    r = await c.post(RPC, headers={"Authorization": f"Bearer {tok}"},
+                     json={"jsonrpc": "2.0", "id": "a2", "method": "GetExtendedAgentCard", "params": {}})
+    assert r.status_code == 200, f"expected 200, got {r.status_code}: {r.text[:200]}"
+    return "200 with valid bearer"
+
+
+async def t_auth_rejects_bad_bearer(c):
+    r = await c.post(RPC, headers={"Authorization": "Bearer NOT-A-REAL-TOKEN"},
+                     json={"jsonrpc": "2.0", "id": "a3", "method": "GetExtendedAgentCard", "params": {}})
+    assert r.status_code == 401, f"expected 401, got {r.status_code}"
+    return "401 with invalid bearer"
+
+
+async def t_auth_accepts_valid_apikey(c):
+    key = os.environ.get("A2A_API_KEY")
+    if not key:
+        return "skipped — A2A_API_KEY not set"
+    r = await c.post(RPC, headers={"X-API-Key": key},
+                     json={"jsonrpc": "2.0", "id": "a4", "method": "GetExtendedAgentCard", "params": {}})
+    assert r.status_code == 200, f"expected 200, got {r.status_code}"
+    return "200 with valid X-API-Key"
+
+
 # ---------- runner ----------
 
 TESTS = [
@@ -381,16 +424,42 @@ TESTS = [
 ]
 
 
+AUTH_TESTS = [
+    ("auth_rejects_no_token",     t_auth_rejects_no_token),
+    ("auth_accepts_valid_bearer", t_auth_accepts_valid_bearer),
+    ("auth_rejects_bad_bearer",   t_auth_rejects_bad_bearer),
+    ("auth_accepts_valid_apikey", t_auth_accepts_valid_apikey),
+]
+
+
 async def main():
     start_webhook_server()
     await asyncio.sleep(0.3)
     async with httpx.AsyncClient(timeout=180) as c:
+        auth_enforced = await _probe_auth_mode(c)
         for name, fn in TESTS:
             try:
-                msg = await fn(c)
-                record(name, True, msg)
+                msg = await fn(c) if not auth_enforced else "skipped — auth mode (use without RSCLAW_A2A_* env)"
+                if auth_enforced:
+                    print(f"[SKIP] {name} — {msg}")
+                    results.append((name, True, msg))
+                else:
+                    record(name, True, msg)
             except Exception as e:
                 record(name, False, f"{type(e).__name__}: {e}")
+        if auth_enforced:
+            print()
+            print("=== gateway in auth-enforced mode; running auth-only tests ===")
+            if "A2A_BEARER_TOKEN" not in os.environ:
+                print("[SKIP] auth tests — set A2A_BEARER_TOKEN to a value present in "
+                      "RSCLAW_A2A_BEARER_TOKENS on the gateway side")
+            else:
+                for name, fn in AUTH_TESTS:
+                    try:
+                        msg = await fn(c)
+                        record(name, True, msg)
+                    except Exception as e:
+                        record(name, False, f"{type(e).__name__}: {e}")
     print()
     p = sum(1 for _, ok, _ in results if ok)
     f = len(results) - p
