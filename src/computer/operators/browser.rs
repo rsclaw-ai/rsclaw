@@ -33,13 +33,13 @@ impl Operator for BrowserOperator {
     fn action_spaces(&self) -> Vec<ActionSpec> {
         // Browser has no hotkey / drag — but supports navigation.
         vec![
-            ActionSpec::new("click(start_box='<|box_start|>(x1,y1)<|box_end|>')"),
+            ActionSpec::new("click(start_box='<box>x1,y1</box>')"),
             ActionSpec::with_note(
                 "type(content='')",
                 "# Add \\n at end of content to submit",
             ),
             ActionSpec::new(
-                "scroll(start_box='<|box_start|>(x1,y1)<|box_end|>', direction='down or up or right or left')",
+                "scroll(start_box='<box>x1,y1</box>', direction='down or up or right or left')",
             ),
             ActionSpec::with_note("wait()", "# Sleep 2s and re-screenshot"),
             ActionSpec::with_note("navigate(url='')", "# Navigate to a URL"),

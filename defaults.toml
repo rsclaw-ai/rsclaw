@@ -45,7 +45,7 @@ label      = "Kimi"
 env_var    = "MOONSHOT_API_KEY"
 model      = "kimi/kimi-k2.6"
 base_url   = "https://api.moonshot.cn/v1"
-user_agent = "rsclaw/2026.5.5"
+user_agent = "rsclaw/2026.5.15"
 needs_key  = true
 
 [[providers]]

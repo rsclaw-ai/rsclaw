@@ -985,18 +985,14 @@ async fn execute_tool(
     Json(serde_json::json!({"error": "use 'plugin.tool' format, e.g. 'jimeng.txt2img'"}))
 }
 
-async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let uptime_secs = state.started_at.elapsed().as_secs();
-    let hours = uptime_secs / 3600;
-    let mins = (uptime_secs % 3600) / 60;
-    let secs = uptime_secs % 60;
-    let port = state.live.gateway.read().await.port;
-    Json(serde_json::json!({
-        "status": "ok",
-        "version": option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
-        "port": port,
-        "uptime": format!("{:02}:{:02}:{:02}", hours, mins, secs),
-    }))
+async fn health(State(_state): State<AppState>) -> impl IntoResponse {
+    // Minimal unauthenticated health payload (R4 review I2).
+    // Previously leaked `version` + `port` to anyone reaching the
+    // bare `/health` alias — useful for CVE fingerprinting against
+    // a public-facing gateway, and the port is redundant since the
+    // caller already connected to it. Rich uptime / build info now
+    // lives only on the auth-gated `/api/v1/status` endpoint.
+    Json(serde_json::json!({"status": "ok"}))
 }
 
 async fn status(State(state): State<AppState>) -> impl IntoResponse {

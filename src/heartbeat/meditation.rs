@@ -75,10 +75,27 @@ pub async fn meditate(
 ) -> Result<MeditationReport> {
     let mut report = MeditationReport::default();
 
-    let merged = dedup_phase(store, scope, config).await?;
+    // Phase isolation (R2 review I2): one failing phase must not skip
+    // the others. Previously `?` propagated dedup errors and skipped
+    // cleanup entirely — that left stale records around longer than
+    // necessary and silently dropped the cleanup-counter from the
+    // report. Match-and-log so each phase runs independently.
+    let merged = match dedup_phase(store, scope, config).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(scope, "meditate dedup phase failed: {e:#}");
+            0
+        }
+    };
     report.duplicates_merged = merged;
 
-    let cleaned = cleanup_phase(store, scope, config).await?;
+    let cleaned = match cleanup_phase(store, scope, config).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(scope, "meditate cleanup phase failed: {e:#}");
+            0
+        }
+    };
     report.crystallized_cleaned = cleaned;
 
     report.total_processed = merged + cleaned;

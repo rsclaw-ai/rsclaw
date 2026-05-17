@@ -65,7 +65,7 @@ pub const RSCLAW_DEFAULT_BASE: &str = "https://api.rsclaw.ai/v1/agent";
 /// `tests/fixtures/baseline-<ver>.json`) actually changes, and
 /// coordinate with rsclaw-llm to re-ingest the new fixture under
 /// the new identifier.
-pub const RSCLAW_DEFAULT_PREFIX_ID: &str = "rsclaw/2026.5.5";
+pub const RSCLAW_DEFAULT_PREFIX_ID: &str = "rsclaw/2026.5.15";
 
 /// How long to wait for `/sessions/<id>/turn` to start responding
 /// (TCP connect + TLS + send body + receive headers + first byte).
@@ -336,7 +336,7 @@ impl RsclawProvider {
     /// would otherwise produce an invalid wire value).
     ///
     /// Also validates the §2.10.1 contract: exactly one `/` separator.
-    /// Inputs like `"rsclaw-2026.5.5"` (zero slashes) or
+    /// Inputs like `"rsclaw-2026.5.15"` (zero slashes) or
     /// `"foo/bar/baz"` (two slashes) are rejected at the builder so a
     /// typo in config doesn't survive gateway boot and only surface as
     /// a per-session 400 from the server. Rejected inputs are logged at
@@ -478,6 +478,110 @@ fn evict_if_oversized(map: &mut HashMap<String, SessionEntry>) {
 // LlmProvider impl
 // ---------------------------------------------------------------------------
 
+/// Outcome of [`dispatch_decision`] — either a stateless one-shot route
+/// or a sentinel telling the caller to continue down the stateful
+/// `/v1/agent/sessions/*` protocol path.
+#[derive(Debug, PartialEq, Eq)]
+enum DispatchRoute {
+    OneShot(&'static str),
+    Sessions,
+}
+
+/// Pure routing classification for an `LlmRequest` on the rsclaw provider.
+///
+/// Single source of truth: this is what `stream()` consults and what the
+/// test suite asserts against. Both bail conditions live here so callers
+/// can't silently misroute by forgetting the safety checks.
+///
+/// Server enforces per-route model whitelists (400 model_slot_mismatch on
+/// violations), so canonical model names take priority over endpoint
+/// variants. The endpoint variant only matters when the model name is
+/// non-canonical.
+///
+/// Precedence:
+///   1. model rsclaw-flash-*                            → /fastshot
+///   2. model rsclaw-vision-*                           → /vision
+///   3. model rsclaw-agent-* + session_key=None         → /oneshot
+///   4. model rsclaw-agent-* + session_key=Some         → /sessions (kvCacheMode=2 required)
+///   5. non-canonical model + endpoint=Flash            → /fastshot (server may 400)
+///   6. non-canonical model + endpoint=Vision           → /vision (server may 400)
+///   7. Primary + session_key=Some                      → /sessions (kvCacheMode=2 required)
+///   8. Primary + session_key=None                      → /oneshot
+///
+/// Bails (before any rule fires):
+///   • kv_cache_mode=2 + session_key=None — caller asked for stateful
+///     traffic but forgot the session key; would silently drop kvCache.
+///   • session_key=Some + kv_cache_mode!=2 — sessions path requires
+///     mode 2.
+///
+/// Trailing-dash on prefixes prevents collisions with hypothetical names
+/// like `rsclaw-flashy`.
+fn dispatch_decision(req: &LlmRequest) -> Result<DispatchRoute> {
+    let bare_model = req.model.strip_prefix("rsclaw/").unwrap_or(&req.model);
+    let is_flash_model = bare_model.starts_with("rsclaw-flash-");
+    let is_vision_model = bare_model.starts_with("rsclaw-vision-");
+    let is_agent_model = bare_model.starts_with("rsclaw-agent-");
+
+    // Safety net: kv_cache_mode=2 requires session_key. Catching this
+    // BEFORE the rule chain prevents a stateless misroute (rule 8) from
+    // silently dropping kvCache continuity.
+    if req.kv_cache_mode == 2 && req.session_key.is_none() {
+        anyhow::bail!(
+            "rsclaw kv_cache_mode=2 requires session_key (got None); \
+             set session_key=Some(...) for stateful traffic or \
+             kv_cache_mode=0 + session_key=None for /oneshot"
+        );
+    }
+
+    // Rules 1–3.
+    if is_flash_model {
+        return Ok(DispatchRoute::OneShot("/fastshot"));
+    }
+    if is_vision_model {
+        return Ok(DispatchRoute::OneShot("/vision"));
+    }
+    if is_agent_model && req.session_key.is_none() {
+        return Ok(DispatchRoute::OneShot("/oneshot"));
+    }
+
+    // Surface an "agent-* model overrides your endpoint hint" warning
+    // so operators can debug "I asked for Flash but the request went
+    // to /sessions". The canonical model wins by design, but silently
+    // (R1 review I1) is debug-hostile in a 1000-worker fleet.
+    if is_agent_model && !matches!(req.endpoint, AgentEndpoint::Primary) {
+        tracing::warn!(
+            model = %req.model,
+            endpoint = ?req.endpoint,
+            "rsclaw dispatch: agent-* model overrides endpoint hint; routing to /sessions"
+        );
+    }
+
+    // Rules 5–6: non-canonical model honors endpoint variant hint.
+    if !is_agent_model {
+        if matches!(req.endpoint, AgentEndpoint::Flash) {
+            return Ok(DispatchRoute::OneShot("/fastshot"));
+        }
+        if matches!(req.endpoint, AgentEndpoint::Vision) {
+            return Ok(DispatchRoute::OneShot("/vision"));
+        }
+    }
+
+    // Rule 8.
+    if req.session_key.is_none() {
+        return Ok(DispatchRoute::OneShot("/oneshot"));
+    }
+
+    // Rules 4 / 7: stateful sessions path requires kv_cache_mode=2.
+    if req.kv_cache_mode != 2 {
+        anyhow::bail!(
+            "rsclaw session-mode call requires kv_cache_mode=2 (got {}); \
+             pass session_key=None to route to /oneshot instead",
+            req.kv_cache_mode
+        );
+    }
+    Ok(DispatchRoute::Sessions)
+}
+
 impl LlmProvider for RsclawProvider {
     fn name(&self) -> &str {
         "rsclaw"
@@ -485,64 +589,11 @@ impl LlmProvider for RsclawProvider {
 
     fn stream(&self, mut req: LlmRequest) -> BoxFuture<'_, Result<LlmStream>> {
         Box::pin(async move {
-            // Unified dispatch. Server enforces per-route model whitelists
-            // (400 model_slot_mismatch on violations), so canonical model
-            // names take priority over endpoint variants. The endpoint
-            // variant only matters when the model name is non-canonical.
-            //
-            // Precedence:
-            //   1. model rsclaw-flash-*                            → /fastshot
-            //   2. model rsclaw-vision-*                           → /vision
-            //   3. model rsclaw-agent-* + session_key=None         → /oneshot (stateless agent call)
-            //   4. model rsclaw-agent-* + session_key=Some         → /sessions (kvCacheMode=2 enforced)
-            //   5. non-canonical model + endpoint=Flash            → /fastshot (server may 400)
-            //   6. non-canonical model + endpoint=Vision           → /vision (server may 400)
-            //   7. Primary + session_key=Some                      → /sessions
-            //   8. Primary + session_key=None                      → /oneshot
-            //
-            // Trailing-dash on prefixes prevents collisions with
-            // hypothetical names like `rsclaw-flashy`.
-            let bare_model = req.model.strip_prefix("rsclaw/").unwrap_or(&req.model);
-            let is_flash_model = bare_model.starts_with("rsclaw-flash-");
-            let is_vision_model = bare_model.starts_with("rsclaw-vision-");
-            let is_agent_model = bare_model.starts_with("rsclaw-agent-");
-
-            // Rules 1–3: canonical model name decides the route.
-            if is_flash_model {
-                return self.stream_oneshot(req, "/fastshot").await;
-            }
-            if is_vision_model {
-                return self.stream_oneshot(req, "/vision").await;
-            }
-            if is_agent_model && req.session_key.is_none() {
-                return self.stream_oneshot(req, "/oneshot").await;
-            }
-
-            // Rules 5–6: non-canonical model — honor endpoint variant hint.
-            // Skip these when the model is agent-* (rule 4 handled in
-            // session path below).
-            if !is_agent_model {
-                if matches!(req.endpoint, AgentEndpoint::Flash) {
-                    return self.stream_oneshot(req, "/fastshot").await;
-                }
-                if matches!(req.endpoint, AgentEndpoint::Vision) {
-                    return self.stream_oneshot(req, "/vision").await;
-                }
-            }
-
-            // Rule 8: stateless primary → /oneshot.
-            if req.session_key.is_none() {
-                return self.stream_oneshot(req, "/oneshot").await;
-            }
-
-            // Rules 4/7: session-mode primary → /sessions, kvCacheMode=2
-            // required (agent-* models live here in the typical case).
-            if req.kv_cache_mode != 2 {
-                anyhow::bail!(
-                    "rsclaw session-mode call requires kv_cache_mode=2 (got {}); \
-                     pass session_key=None to route to /oneshot instead",
-                    req.kv_cache_mode
-                );
+            // Single source of truth for dispatch routing — see
+            // [`dispatch_decision`] for the full precedence table.
+            match dispatch_decision(&req)? {
+                DispatchRoute::OneShot(path) => return self.stream_oneshot(req, path).await,
+                DispatchRoute::Sessions => { /* fall through to stateful path */ }
             }
             let session_key = req
                 .session_key
@@ -587,7 +638,7 @@ impl LlmProvider for RsclawProvider {
                         // upstream canonical. open()'s response echoes
                         // the resolved prefix_id (per §2.1.6), which can
                         // differ from the requested alias — e.g. request
-                        // `rsclaw/latest`, response `rsclaw/2026.5.5`.
+                        // `rsclaw/latest`, response `rsclaw/2026.5.15`.
                         // `lookup_and_bump` compares the cached value
                         // against the next call's `split.prefix_id` (also
                         // the alias), so caching the canonical
@@ -3402,7 +3453,7 @@ data: {"type":"message_stop"}
 
     fn req_with(messages: Vec<Message>, mode: u8, key: Option<&str>) -> LlmRequest {
         LlmRequest {
-            model: "2026.5.5".into(),
+            model: "2026.5.15".into(),
             messages,
             system: Some("you are an agent".into()),
             kv_cache_mode: mode,
@@ -3542,11 +3593,11 @@ data: {"type":"message_stop"}
         let mut req = req_with(vec![], 2, Some("k"));
         req.model = "qwen3-235b".into();
         let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
-        assert_eq!(split.prefix_id, "rsclaw/2026.5.5");
+        assert_eq!(split.prefix_id, "rsclaw/2026.5.15");
 
         req.model = "myorg/qwen3-235b".into();
         let split2 = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
-        assert_eq!(split2.prefix_id, "rsclaw/2026.5.5");
+        assert_eq!(split2.prefix_id, "rsclaw/2026.5.15");
     }
 
     #[test]
@@ -3556,8 +3607,8 @@ data: {"type":"message_stop"}
         // override verbatim, independent of req.model.
         let mut req = req_with(vec![], 2, Some("k"));
         req.model = "qwen3-235b".into();
-        let split = split_request(&req, "myorg/2026.5.5").unwrap();
-        assert_eq!(split.prefix_id, "myorg/2026.5.5");
+        let split = split_request(&req, "myorg/2026.5.15").unwrap();
+        assert_eq!(split.prefix_id, "myorg/2026.5.15");
     }
 
     #[test]
@@ -3578,13 +3629,13 @@ data: {"type":"message_stop"}
     #[test]
     fn with_prefix_id_rejects_invalid_slash_count() {
         // §2.10.1 mandates exactly one '/' separator. A config typo with
-        // zero slashes (e.g. "rsclaw-2026.5.5") or two+ ("foo/bar/baz")
+        // zero slashes (e.g. "rsclaw-2026.5.15") or two+ ("foo/bar/baz")
         // would survive boot and only fail on the first wire call, which
         // is annoying to debug. Validate at the builder so the override
         // is dropped early and we boot with the safe default.
         let default = RSCLAW_DEFAULT_PREFIX_ID;
 
-        let p = RsclawProvider::new("http://x", None).with_prefix_id("rsclaw-2026.5.5");
+        let p = RsclawProvider::new("http://x", None).with_prefix_id("rsclaw-2026.5.15");
         assert_eq!(p.prefix_id, default, "no slash → reject");
 
         let p = RsclawProvider::new("http://x", None).with_prefix_id("foo/bar/baz");
@@ -3680,7 +3731,7 @@ data: {"type":"message_stop"}
             options: Some(split.options.clone()),
         };
         let v = serde_json::to_value(&body).unwrap();
-        assert_eq!(v["prefix_id"], "rsclaw/2026.5.5");
+        assert_eq!(v["prefix_id"], "rsclaw/2026.5.15");
         assert_eq!(v["dynamic_prefix"]["system"], "<sys>");
         assert_eq!(v["dynamic_prefix"]["user_system"], "<suf>");
         assert_eq!(v["dynamic_prefix"]["tools"][0]["name"], "memory");
@@ -3967,20 +4018,20 @@ data: {"type":"message_stop"}
             "k",
             SessionEntry {
                 session_id: "rs_w7_abc".into(),
-                prefix_id: "rsclaw/2026.5.5".into(),
+                prefix_id: "rsclaw/2026.5.15".into(),
                 last_seen_msgs_len: 12,
             },
         );
         // Same len → cached entry returned, last_seen unchanged.
-        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.5", 12).is_some());
+        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.15", 12).is_some());
         // Growth → bumped, returned.
-        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.5", 14).is_some());
+        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.15", 14).is_some());
         // Shrink (compaction trimmed history) → None, caller re-hydrates.
-        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.5", 8).is_none());
+        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.15", 8).is_none());
         // Version drift → None even if len matches.
         assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.6", 14).is_none());
         // Missing key → None.
-        assert!(provider.lookup_and_bump("missing", "rsclaw/2026.5.5", 14).is_none());
+        assert!(provider.lookup_and_bump("missing", "rsclaw/2026.5.15", 14).is_none());
     }
 
     #[test]
@@ -4477,10 +4528,10 @@ data: {"type":"message_stop"}
         // `prefix_id`. New servers send this name natively.
         let body = r#"{
             "session_id": "rs_w7_8a3c1f2b",
-            "prefix_id": "rsclaw/2026.5.5"
+            "prefix_id": "rsclaw/2026.5.15"
         }"#;
         let resp: CreateSessionResp = serde_json::from_str(body).expect("create shape parses");
-        assert_eq!(resp.prefix_id.as_deref(), Some("rsclaw/2026.5.5"));
+        assert_eq!(resp.prefix_id.as_deref(), Some("rsclaw/2026.5.15"));
     }
 
     #[test]
@@ -4541,9 +4592,204 @@ data: {"type":"message_stop"}
     fn create_session_resp_parses_populated_prefix_id() {
         // Round-trip the happy path so the Option<String> change
         // doesn't accidentally start coercing real values to None.
-        let body = r#"{"session_id":"rs_a_b","prefix_id":"rsclaw/2026.5.5"}"#;
+        let body = r#"{"session_id":"rs_a_b","prefix_id":"rsclaw/2026.5.15"}"#;
         let resp: CreateSessionResp = serde_json::from_str(body).expect("string field must parse");
-        assert_eq!(resp.prefix_id.as_deref(), Some("rsclaw/2026.5.5"));
+        assert_eq!(resp.prefix_id.as_deref(), Some("rsclaw/2026.5.15"));
+    }
+
+    // -- 8-rule dispatch precedence (R1 C3) -----------------------------
+    //
+    // Table-driven coverage so a future drift between the comment-table
+    // in `dispatch_decision` and the runtime decision is caught.
+
+    fn dispatch_req(
+        model: &str,
+        endpoint: AgentEndpoint,
+        session_key: Option<&str>,
+        kv_cache_mode: u8,
+    ) -> LlmRequest {
+        LlmRequest {
+            model: model.into(),
+            endpoint,
+            kv_cache_mode,
+            session_key: session_key.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn dispatch_rule_1_flash_model_routes_fastshot() {
+        // Rule 1: rsclaw-flash-* wins regardless of endpoint hint.
+        let route = dispatch_decision(&dispatch_req(
+            "rsclaw/rsclaw-flash-v1",
+            AgentEndpoint::Primary,
+            None,
+            0,
+        ))
+        .unwrap();
+        assert_eq!(route, DispatchRoute::OneShot("/fastshot"));
+
+        // Even with explicit Vision endpoint hint, model name still wins.
+        let route = dispatch_decision(&dispatch_req(
+            "rsclaw/rsclaw-flash-v1",
+            AgentEndpoint::Vision,
+            None,
+            0,
+        ))
+        .unwrap();
+        assert_eq!(route, DispatchRoute::OneShot("/fastshot"));
+    }
+
+    #[test]
+    fn dispatch_rule_2_vision_model_routes_vision() {
+        let route = dispatch_decision(&dispatch_req(
+            "rsclaw/rsclaw-vision-v1",
+            AgentEndpoint::Primary,
+            None,
+            0,
+        ))
+        .unwrap();
+        assert_eq!(route, DispatchRoute::OneShot("/vision"));
+    }
+
+    #[test]
+    fn dispatch_rule_3_agent_model_no_session_routes_oneshot() {
+        // Per R2 review: stateless agent call must NOT bail; routes to
+        // /oneshot per server hint "use /v1/agent/oneshot for agent model".
+        let route = dispatch_decision(&dispatch_req(
+            "rsclaw/rsclaw-agent-v1",
+            AgentEndpoint::Primary,
+            None,
+            0,
+        ))
+        .unwrap();
+        assert_eq!(route, DispatchRoute::OneShot("/oneshot"));
+    }
+
+    #[test]
+    fn dispatch_rule_4_agent_model_with_session_routes_sessions() {
+        let route = dispatch_decision(&dispatch_req(
+            "rsclaw/rsclaw-agent-v1",
+            AgentEndpoint::Primary,
+            Some("sess-x"),
+            2,
+        ))
+        .unwrap();
+        assert_eq!(route, DispatchRoute::Sessions);
+    }
+
+    #[test]
+    fn dispatch_rule_5_non_canonical_flash_endpoint_routes_fastshot() {
+        // Rule 5: non-canonical model + endpoint=Flash hint → /fastshot.
+        let route = dispatch_decision(&dispatch_req(
+            "anthropic/claude-3-5-haiku",
+            AgentEndpoint::Flash,
+            None,
+            0,
+        ))
+        .unwrap();
+        assert_eq!(route, DispatchRoute::OneShot("/fastshot"));
+    }
+
+    #[test]
+    fn dispatch_rule_6_non_canonical_vision_endpoint_routes_vision() {
+        let route = dispatch_decision(&dispatch_req(
+            "anthropic/claude-3-5-sonnet",
+            AgentEndpoint::Vision,
+            None,
+            0,
+        ))
+        .unwrap();
+        assert_eq!(route, DispatchRoute::OneShot("/vision"));
+    }
+
+    #[test]
+    fn dispatch_rule_7_primary_with_session_routes_sessions() {
+        let route = dispatch_decision(&dispatch_req(
+            "anthropic/claude-3-5-sonnet",
+            AgentEndpoint::Primary,
+            Some("sess-y"),
+            2,
+        ))
+        .unwrap();
+        assert_eq!(route, DispatchRoute::Sessions);
+    }
+
+    #[test]
+    fn dispatch_rule_8_primary_stateless_routes_oneshot() {
+        let route = dispatch_decision(&dispatch_req(
+            "anthropic/claude-3-5-sonnet",
+            AgentEndpoint::Primary,
+            None,
+            0,
+        ))
+        .unwrap();
+        assert_eq!(route, DispatchRoute::OneShot("/oneshot"));
+    }
+
+    #[test]
+    fn dispatch_bail_kv2_without_session_key() {
+        // Safety net (R1 C2): kv_cache_mode=2 + no session_key bails
+        // BEFORE routing, so caller can't silently downgrade to /oneshot
+        // and lose kvCache continuity.
+        let err = dispatch_decision(&dispatch_req(
+            "anthropic/claude-3-5-sonnet",
+            AgentEndpoint::Primary,
+            None,
+            2,
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("session_key"), "got: {err}");
+        assert!(err.contains("kv_cache_mode=2"), "got: {err}");
+    }
+
+    #[test]
+    fn dispatch_bail_session_without_kv2() {
+        // Sessions path requires kv_cache_mode=2.
+        let err = dispatch_decision(&dispatch_req(
+            "anthropic/claude-3-5-sonnet",
+            AgentEndpoint::Primary,
+            Some("sess-z"),
+            1,
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("kv_cache_mode=2"), "got: {err}");
+    }
+
+    #[test]
+    fn dispatch_canonical_model_overrides_endpoint_hint() {
+        // Rule 1 wins over endpoint=Vision when model is flash family.
+        // Important: covers the case where a misconfigured caller sets
+        // a Flash endpoint hint but resolved a non-flash agent model.
+        let route = dispatch_decision(&dispatch_req(
+            "rsclaw/rsclaw-flash-v1",
+            AgentEndpoint::Primary,
+            Some("sess-q"),
+            2,
+        ))
+        .unwrap();
+        // Rule 1 fires regardless of session_key / kv_cache_mode,
+        // because the server-side /fastshot whitelist accepts only
+        // rsclaw-flash-*. (Server may 400 on the session_key field but
+        // routing is correct at the client.)
+        assert_eq!(route, DispatchRoute::OneShot("/fastshot"));
+    }
+
+    #[test]
+    fn dispatch_rule_3_overrides_rule_5_for_agent_model() {
+        // Rule 3 (agent + no session) fires before rule 5 (endpoint=Flash).
+        // Caller passing Flash hint on an agent-* model → /oneshot, NOT
+        // /fastshot (server would 400 the agent model on /fastshot).
+        let route = dispatch_decision(&dispatch_req(
+            "rsclaw/rsclaw-agent-v1",
+            AgentEndpoint::Flash,
+            None,
+            0,
+        ))
+        .unwrap();
+        assert_eq!(route, DispatchRoute::OneShot("/oneshot"));
     }
 
     #[test]

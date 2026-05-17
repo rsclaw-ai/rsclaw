@@ -774,6 +774,9 @@ fn watch_help_text(lang: &str) -> String {
          \u{0020}\u{0020}/watch shell tail -f x                 原生 shell\n\n\
          Flags：\n\
          \u{0020}\u{0020}--grep <regex>             仅推送匹配的事件\n\
+         \u{0020}\u{0020}--event <type>             仅推送指定 SSE event 类型\n\
+         \u{0020}\u{0020}--jq <expr>                jq 表达式过滤/转换（支持 `.codes[]` 数组展开）\n\
+         \u{0020}\u{0020}--template <tpl>           输出模板：`${{.field}}` 取 JSON 字段\n\
          \u{0020}\u{0020}--rate <ms>                限流（默认 2000；0 = 不限）\n\
          \u{0020}\u{0020}-H 'Header: value'         SSE auth/header；value 可含 ${VAR}\n\n\
          管理：\n\
@@ -790,6 +793,9 @@ fn watch_help_text(lang: &str) -> String {
          \u{0020}\u{0020}/watch shell tail -f x                raw shell\n\n\
          Flags:\n\
          \u{0020}\u{0020}--grep <regex>            push only matching events\n\
+         \u{0020}\u{0020}--event <type>            push only the given SSE event type\n\
+         \u{0020}\u{0020}--jq <expr>               jq filter/transform (supports `.codes[]` array expansion)\n\
+         \u{0020}\u{0020}--template <tpl>          output template: `${{.field}}` interpolates a JSON field\n\
          \u{0020}\u{0020}--rate <ms>               rate limit (default 2000; 0 = unlimited)\n\
          \u{0020}\u{0020}-H 'Header: value'        SSE auth/header; value may contain ${VAR}\n\n\
          Management:\n\

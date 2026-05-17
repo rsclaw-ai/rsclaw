@@ -77,13 +77,13 @@ impl Operator for AdbOperator {
 
     fn action_spaces(&self) -> Vec<ActionSpec> {
         vec![
-            ActionSpec::new("tap(start_box='<|box_start|>(x1,y1)<|box_end|>')"),
+            ActionSpec::new("tap(start_box='<box>x1,y1</box>')"),
             ActionSpec::with_note(
-                "long_press(start_box='<|box_start|>(x1,y1)<|box_end|>')",
+                "long_press(start_box='<box>x1,y1</box>')",
                 "# Touch and hold ~1s",
             ),
             ActionSpec::new(
-                "swipe(start_box='<|box_start|>(x1,y1)<|box_end|>', end_box='<|box_start|>(x3,y3)<|box_end|>')",
+                "swipe(start_box='<box>x1,y1</box>', end_box='<box>x3,y3</box>')",
             ),
             ActionSpec::with_note(
                 "type(content='')",
@@ -261,6 +261,23 @@ impl Operator for AdbOperator {
                     // ONLY if you escape them as %s. Submit on trailing \n.
                     let stripped = text.trim_end_matches('\n').trim_end_matches("\\n");
                     if !stripped.is_empty() {
+                        // adb's `shell input text` runs through the device-side
+                        // shell — characters like ;, &, |, >, <, $, `, \ would
+                        // break out of the `input text <arg>` slot and execute
+                        // arbitrary commands as the shell user. VLMs hallucinate
+                        // these (and prompt-injected web pages can deliberately
+                        // smuggle them via `type(content='hello; rm -rf /sdcard')`).
+                        // Reject loudly instead of escaping — escaping is fragile
+                        // across adb backends and the failure surfaces back to
+                        // the VLM so it can retry with a sanitized string.
+                        const SHELL_META: &[char] =
+                            &[';', '&', '|', '>', '<', '$', '`', '\\', '"', '\''];
+                        if let Some(bad) = stripped.chars().find(|c| SHELL_META.contains(c)) {
+                            return Ok(ActionOutput::err(format!(
+                                "adb type: refusing content with shell metachar '{bad}' \
+                                 (would inject into device shell); strip and retry"
+                            )));
+                        }
                         let escaped = stripped.replace(' ', "%s");
                         let args = self.argv(&["shell", "input", "text", &escaped]);
                         let _ = run_adb(&args).await?;

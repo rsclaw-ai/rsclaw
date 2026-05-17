@@ -385,15 +385,77 @@ fn init_full_trace(user_text: &str) -> Option<super::trace_capture::FullTrace> {
     Some(t)
 }
 
-fn maybe_emit_trace(trace: &super::trace_capture::FullTrace) {
+/// Lazily-spawned single-writer task for RSCLAW_TRACES_PATH JSONL output.
+///
+/// Two correctness requirements drove the refactor away from a direct
+/// sync write inside `maybe_emit_trace`:
+///   1. Hot path: the previous implementation ran `std::fs::File` +
+///      `BufWriter::write_all` synchronously on the tokio worker thread
+///      that just finished an agent turn. Under disk pressure / slow
+///      network FS that thread blocked, stalling other agents sharing
+///      the runtime.
+///   2. Concurrency safety: two agent loops emitting traces for the
+///      same path interleaved bytes (POSIX `O_APPEND` is only atomic
+///      for writes ≤ PIPE_BUF). A realistic trace is tens of KB and
+///      torn lines fail to parse, silently dropping training samples.
+///
+/// The dedicated writer task owns the file handle, receives owned
+/// FullTrace values over an unbounded mpsc, and serializes async writes
+/// via tokio::io::BufWriter. Emit becomes O(1) channel-send on the hot
+/// path; the writer drains in the background.
+static TRACE_TX: std::sync::OnceLock<
+    tokio::sync::mpsc::UnboundedSender<super::trace_capture::FullTrace>,
+> = std::sync::OnceLock::new();
+
+fn spawn_trace_writer(
+    path: std::path::PathBuf,
+) -> tokio::sync::mpsc::UnboundedSender<super::trace_capture::FullTrace> {
+    use tokio::io::AsyncWriteExt;
+    let (tx, mut rx) =
+        tokio::sync::mpsc::unbounded_channel::<super::trace_capture::FullTrace>();
+    tokio::spawn(async move {
+        let file = match tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+        {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(?path, "trace writer: open failed: {e:#}");
+                return;
+            }
+        };
+        let mut w = tokio::io::BufWriter::new(file);
+        while let Some(trace) = rx.recv().await {
+            let entry = match serde_json::to_string(
+                &super::sft_exporter::trace_to_sharegpt(&trace),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(trace_id = %trace.trace_id, "trace writer: serialize failed: {e:#}");
+                    continue;
+                }
+            };
+            if w.write_all(entry.as_bytes()).await.is_err()
+                || w.write_all(b"\n").await.is_err()
+                || w.flush().await.is_err()
+            {
+                warn!(?path, "trace writer: write failed; dropping trace");
+                continue;
+            }
+        }
+    });
+    tx
+}
+
+fn maybe_emit_trace(trace: super::trace_capture::FullTrace) {
     let Ok(path_str) = std::env::var("RSCLAW_TRACES_PATH") else {
         return;
     };
-    let path = std::path::PathBuf::from(&path_str);
-    if let Err(e) =
-        super::sft_exporter::write_sharegpt_jsonl(&path, std::slice::from_ref(trace))
-    {
-        warn!(?path, "trace export failed: {e:#}");
+    let tx = TRACE_TX.get_or_init(|| spawn_trace_writer(std::path::PathBuf::from(&path_str)));
+    if tx.send(trace).is_err() {
+        warn!("trace dropped: writer task is dead");
     }
 }
 
@@ -4098,6 +4160,21 @@ impl AgentRuntime {
             } else {
                 (None, None)
             };
+            // Populate trace metadata on first iteration so SFT export
+            // carries model + system_prompt + tools_schema. These don't
+            // change within a turn, so init-once is correct. Without this
+            // patch, `init_full_trace` left them as empty strings/`[]`,
+            // producing ShareGPT JSONL with `tools: []` and no `system`
+            // entry — unreplayable for training. R2 review C3.
+            if let Some(ft) = ctx.full_trace.as_mut() {
+                if ft.model.is_empty() {
+                    ft.model = model.to_owned();
+                    ft.system_prompt = effective_system.clone();
+                    ft.tools_schema = serde_json::to_value(&tools)
+                        .unwrap_or_else(|_| serde_json::json!([]));
+                }
+            }
+
             let req = LlmRequest {
                 model: model.to_owned(),
                 messages,
@@ -4379,6 +4456,18 @@ impl AgentRuntime {
                 text_buf = reasoning_buf.clone();
             }
 
+            // Capture per-iteration thinking into the trace so SFT data
+            // preserves the <think>...</think> reasoning content that
+            // preceded the tool call (or final reply) this round. Push
+            // once per iteration, only when reasoning content exists.
+            // R2 review C3 — `push_thinking` had zero production call
+            // sites before this; reasoning was invisible to SFT export.
+            if let Some(ft) = ctx.full_trace.as_mut() {
+                if !reasoning_buf.trim().is_empty() {
+                    ft.push_thinking(reasoning_buf.clone());
+                }
+            }
+
             // Finalize streaming tool calls: parse accumulated argument strings.
             for (_id, _name, input) in &mut tool_calls {
                 if let serde_json::Value::String(s) = input {
@@ -4641,7 +4730,7 @@ impl AgentRuntime {
                         ft.push_assistant_text(&final_text);
                     }
                 }
-                if let Some(ft) = ctx.full_trace.as_ref() {
+                if let Some(ft) = ctx.full_trace.take() {
                     maybe_emit_trace(ft);
                 }
                 self.maybe_crystallize_workflow(&ctx, &final_text);

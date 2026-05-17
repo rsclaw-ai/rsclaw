@@ -26,6 +26,14 @@ pub(super) enum SseOutcome {
     Disconnect(String),
 }
 
+/// Render a reqwest::Error for user-visible chat without leaking the URL
+/// (which often carries `?token=...` or other query-string credentials
+/// substituted from `${VAR}` env vars). `reqwest::Error::without_url()`
+/// returns a new Error whose Display impl omits the URL component.
+fn redact_reqwest_err(e: reqwest::Error) -> String {
+    e.without_url().to_string()
+}
+
 async fn run_sse_single_tracking(
     src: &SseSource,
     tx: &mpsc::Sender<EventRecord>,
@@ -53,7 +61,7 @@ async fn run_sse_single_tracking(
 
     let resp = match req.send().await {
         Ok(r) => r,
-        Err(e) => return SseOutcome::Disconnect(format!("connect: {e}")),
+        Err(e) => return SseOutcome::Disconnect(format!("connect: {}", redact_reqwest_err(e))),
     };
     let status = resp.status();
     if matches!(status.as_u16(), 401 | 403 | 404) {
@@ -110,7 +118,9 @@ async fn run_sse_single_tracking(
                         *out_backoff_ms = rt.min(30_000);
                     }
                 }
-                Some(Err(e)) => return SseOutcome::Disconnect(format!("stream: {e}")),
+                Some(Err(e)) => {
+                    return SseOutcome::Disconnect(format!("stream: {}", redact_reqwest_err(e)));
+                }
                 None => return SseOutcome::Disconnect("server_closed".into()),
             }
         }

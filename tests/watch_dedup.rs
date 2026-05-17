@@ -16,8 +16,8 @@ async fn dedup_returns_already_running_for_user_origin() {
     let src = format!("{}", path.display());
 
     let reg = fresh_registry();
-    let r1 = reg.clone().handle_command("cli", "user1", &src, Origin::User).await;
-    let r2 = reg.clone().handle_command("cli", "user1", &src, Origin::User).await;
+    let r1 = reg.clone().handle_command("cli", "user1", None, &src, Origin::User).await;
+    let r2 = reg.clone().handle_command("cli", "user1", None, &src, Origin::User).await;
 
     match (&r1, &r2) {
         (WatchCommandReply::Reply(a), WatchCommandReply::Reply(b)) => {
@@ -42,8 +42,8 @@ async fn dedup_returns_silent_for_cron_origin() {
     let src = format!("{}", path.display());
 
     let reg = fresh_registry();
-    let r1 = reg.clone().handle_command("cli", "user2", &src, Origin::Cron).await;
-    let r2 = reg.clone().handle_command("cli", "user2", &src, Origin::Cron).await;
+    let r1 = reg.clone().handle_command("cli", "user2", None, &src, Origin::Cron).await;
+    let r2 = reg.clone().handle_command("cli", "user2", None, &src, Origin::Cron).await;
 
     assert!(matches!(r1, WatchCommandReply::Reply(_)), "first call should reply (re)started");
     assert!(matches!(r2, WatchCommandReply::Silent), "cron dedup hit should be silent");
@@ -61,8 +61,8 @@ async fn dedup_keys_on_normalized_source() {
     let src_b = format!("file  {}", p); // extra whitespace
 
     let reg = fresh_registry();
-    let r1 = reg.clone().handle_command("cli", "user3", &src_a, Origin::User).await;
-    let r2 = reg.clone().handle_command("cli", "user3", &src_b, Origin::User).await;
+    let r1 = reg.clone().handle_command("cli", "user3", None, &src_a, Origin::User).await;
+    let r2 = reg.clone().handle_command("cli", "user3", None, &src_b, Origin::User).await;
 
     let started_id = match r1 {
         WatchCommandReply::Reply(s) => s,
@@ -87,9 +87,9 @@ async fn dedup_distinguishes_channel_and_peer() {
 
     let reg = fresh_registry();
     // Same source under three different (channel, peer) pairs — each gets its own watch.
-    let r1 = reg.clone().handle_command("cli", "alice", &src, Origin::User).await;
-    let r2 = reg.clone().handle_command("cli", "bob", &src, Origin::User).await;
-    let r3 = reg.clone().handle_command("feishu", "alice", &src, Origin::User).await;
+    let r1 = reg.clone().handle_command("cli", "alice", None, &src, Origin::User).await;
+    let r2 = reg.clone().handle_command("cli", "bob", None, &src, Origin::User).await;
+    let r3 = reg.clone().handle_command("feishu", "alice", None, &src, Origin::User).await;
     for (i, r) in [r1, r2, r3].iter().enumerate() {
         if let WatchCommandReply::Reply(s) = r {
             assert!(s.starts_with("Watch started: w_"), "#{i}: {s}");
@@ -117,7 +117,7 @@ async fn limit_enforced_at_six_concurrent_watches() {
     let reg = fresh_registry();
     for (i, p) in paths.iter().enumerate().take(5) {
         let src = format!("{}", p.display());
-        let r = reg.clone().handle_command("cli", "capped", &src, Origin::User).await;
+        let r = reg.clone().handle_command("cli", "capped", None, &src, Origin::User).await;
         if let WatchCommandReply::Reply(s) = r {
             assert!(s.starts_with("Watch started: w_"), "watch #{i}: {s}");
         } else {
@@ -126,7 +126,7 @@ async fn limit_enforced_at_six_concurrent_watches() {
     }
 
     let src = format!("{}", paths[5].display());
-    let r = reg.clone().handle_command("cli", "capped", &src, Origin::User).await;
+    let r = reg.clone().handle_command("cli", "capped", None, &src, Origin::User).await;
     match r {
         WatchCommandReply::Reply(s) => {
             assert!(s.contains("limit reached") && s.contains("5/5"), "got: {s}");
@@ -147,7 +147,7 @@ async fn stop_removes_dedup_entry_so_restart_is_fresh() {
     let reg = fresh_registry();
     let started = reg
         .clone()
-        .handle_command("cli", "carol", &src, Origin::User)
+        .handle_command("cli", "carol", None, &src, Origin::User)
         .await;
     let id1 = match started {
         WatchCommandReply::Reply(s) => extract_id(&s),
@@ -156,14 +156,14 @@ async fn stop_removes_dedup_entry_so_restart_is_fresh() {
 
     let stop_reply = reg
         .clone()
-        .handle_command("cli", "carol", &format!("stop {id1}"), Origin::User)
+        .handle_command("cli", "carol", None, &format!("stop {id1}"), Origin::User)
         .await;
     assert!(matches!(stop_reply, WatchCommandReply::Reply(_)));
 
     // Re-start the same source — should get a fresh id, not the prior one.
     let restarted = reg
         .clone()
-        .handle_command("cli", "carol", &src, Origin::User)
+        .handle_command("cli", "carol", None, &src, Origin::User)
         .await;
     let id2 = match restarted {
         WatchCommandReply::Reply(s) => extract_id(&s),

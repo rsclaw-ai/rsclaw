@@ -23,6 +23,43 @@ use std::sync::atomic::AtomicBool;
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
+/// Hard ceiling on async (background) `vlm_drive` task duration. The sync
+/// path has its own 240s timeout; async tasks were previously unbounded —
+/// a parseable-but-non-terminating model loop could burn hours of GPU
+/// time before max_loop tripped. 1h is generous enough for legitimate
+/// WeChat-group / multi-step automations and short enough to bound cost
+/// on a runaway. R3 review I1.
+const ASYNC_VLM_DRIVE_HARD_TIMEOUT_SECS: u64 = 3600;
+
+/// RAII guard that deregisters a `vlm_drive` run_id from the abort-flag
+/// registry on drop. Replaces the manual `reg.write().await.remove(...)`
+/// call at end-of-task so the dereg runs even if the spawned future
+/// panics partway through `driver.run()` (R3 review I2). Without this,
+/// the registry entry leaks on panic — harmless individually but the
+/// map grows unbounded over time on a long-running gateway.
+struct VlmDriveRunGuard {
+    reg: Option<
+        Arc<tokio::sync::RwLock<std::collections::HashMap<String, Arc<AtomicBool>>>>,
+    >,
+    run_id: String,
+}
+
+impl Drop for VlmDriveRunGuard {
+    fn drop(&mut self) {
+        if let Some(reg) = self.reg.take() {
+            let id = std::mem::take(&mut self.run_id);
+            // Best-effort async cleanup. If the runtime is being torn
+            // down `try_current` returns Err and we silently skip —
+            // fine, the whole map is going away with the runtime.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    reg.write().await.remove(&id);
+                });
+            }
+        }
+    }
+}
+
 use super::platform::{display_logical_scale, jpeg_dimensions, powershell_hidden};
 use crate::computer::{
     Action, ExecCtx, MouseButton, ScrollDir,
@@ -497,6 +534,14 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                     agent = %agent_id,
                     "vlm_drive: detached task started"
                 );
+                // Registry dereg via RAII guard so a panic inside the
+                // spawned body still cleans up the abort-flag entry
+                // (R3 review I2). The guard fires on every exit path:
+                // normal return, error return, panic.
+                let _run_guard = VlmDriveRunGuard {
+                    reg: computer_runs_clone.clone(),
+                    run_id: run_id_for_dereg.clone(),
+                };
                 // Build the driver inside the spawned task — NativeOperator
                 // has no state and is cheap to construct; this avoids
                 // Send/Sync complications around borrowing operator/
@@ -508,7 +553,7 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                     model_name: model_name_clone,
                     coord_format: CoordFormat::Auto,
                     max_loop: max_steps,
-                    abort: abort_clone,
+                    abort: Arc::clone(&abort_clone),
                     app_rules: &app_rules_clone,
                     permission: permission_clone,
                     agent_id: agent_id.clone(),
@@ -518,16 +563,39 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                     run_id: run_id_clone,
                 };
 
-                let outcome = driver.run(&instruction_owned).await
-                    .unwrap_or_else(|e| DriverOutcome::OperatorError {
+                // Hard ceiling on async task duration (R3 review I1).
+                // Previously the sync path enforced 240s but async was
+                // unbounded — a parseable runaway loop could burn the
+                // whole max_steps budget at ~30s/step. On timeout we
+                // flip the abort flag (caught by the driver loop's
+                // per-step check) and surface a clear error.
+                let run_fut = driver.run(&instruction_owned);
+                let outcome = match tokio::time::timeout(
+                    std::time::Duration::from_secs(ASYNC_VLM_DRIVE_HARD_TIMEOUT_SECS),
+                    run_fut,
+                )
+                .await
+                {
+                    Ok(Ok(o)) => o,
+                    Ok(Err(e)) => DriverOutcome::OperatorError {
                         message: format!("driver run failed: {e}"),
                         steps: 0,
-                    });
-                // Driver has exited — drop the abort-flag registry entry
-                // so the run_id is no longer abortable.
-                if let Some(reg) = computer_runs_clone.as_ref() {
-                    reg.write().await.remove(&run_id_for_dereg);
-                }
+                    },
+                    Err(_elapsed) => {
+                        abort_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!(
+                            task_id = %task_id_for_log,
+                            timeout_secs = ASYNC_VLM_DRIVE_HARD_TIMEOUT_SECS,
+                            "async vlm_drive exceeded hard timeout; aborting"
+                        );
+                        DriverOutcome::OperatorError {
+                            message: format!(
+                                "async vlm_drive exceeded the {ASYNC_VLM_DRIVE_HARD_TIMEOUT_SECS}s hard timeout"
+                            ),
+                            steps: 0,
+                        }
+                    }
+                };
 
                 // Build a human-readable result for the wake message.
                 let result_text = match &outcome {
@@ -1163,6 +1231,26 @@ fn get_app_rule(args: &Value) -> Result<Value> {
     let name = args["name"]
         .as_str()
         .ok_or_else(|| anyhow!("get_app_rule: `name` required"))?;
+    // Reject any path-traversal / namespace-busting name. The VLM (or a
+    // prompt-injected page it just read) controls this value, so a bare
+    // `app_rules_dir.join(name)` would happily read arbitrary `.md` on
+    // disk (private notes, work docs, neighbouring app templates) via
+    // `name="../../some/file"`. Constrain to a conservative slug.
+    let valid = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphanumeric() || c == '_')
+            .unwrap_or(false)
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !valid {
+        return Err(anyhow!(
+            "get_app_rule: invalid name '{name}' (must match [A-Za-z0-9_][A-Za-z0-9_-]{{0,63}})"
+        ));
+    }
     let app_rules_dir = crate::config::loader::base_dir()
         .join("tools")
         .join("computer_use")

@@ -695,7 +695,7 @@ pub struct ProviderConfig {
     pub user_agent: Option<String>,
     /// Override the wire `prefix_id` for `rsclaw` providers (protocol
     /// §2.1.1 / §2.10.1, namespaced `<ns>/<ver>`). Defaults to
-    /// `provider::rsclaw::RSCLAW_DEFAULT_PREFIX_ID` (`rsclaw/2026.5.5`)
+    /// `provider::rsclaw::RSCLAW_DEFAULT_PREFIX_ID` (`rsclaw/2026.5.15`)
     /// when omitted. Ignored for non-rsclaw `api` formats.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_id: Option<String>,

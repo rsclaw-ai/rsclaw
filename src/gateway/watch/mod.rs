@@ -303,7 +303,16 @@ impl WatchRegistry {
         };
         let mut rate_tick = tokio::time::interval(tick_interval);
         rate_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut heartbeat_tick = tokio::time::interval(HEARTBEAT_INTERVAL);
+        // Skew the first heartbeat tick out by one full interval. The
+        // default `tokio::time::interval(...)` fires immediately on the
+        // first tick, which would send a spurious "watch w_xxx active,
+        // 0 events in last 10m" to chat right after /watch start —
+        // confusing and noisy. interval_at(now + interval, interval)
+        // shifts the first fire to the natural cadence.
+        let mut heartbeat_tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + HEARTBEAT_INTERVAL,
+            HEARTBEAT_INTERVAL,
+        );
         heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_count_at_tick = 0u64;
         // Deduplicate consecutive identical lifecycle events so a SSE
