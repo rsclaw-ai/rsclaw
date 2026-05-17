@@ -76,6 +76,36 @@ impl RestartRequest {
     }
 }
 
+/// One option in an `AskUserPrompt`.
+#[derive(Debug, Clone, Serialize)]
+pub struct AskUserOption {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Structured multi-choice question emitted by the `ask_user` tool.
+///
+/// Channels that support interactive UI (Desktop / Telegram / Feishu / etc.)
+/// can render this as buttons or a modal. Channels that don't (WeChat, Signal)
+/// receive the agent's plain-text reply which already lists numbered options.
+#[derive(Debug, Clone, Serialize)]
+pub struct AskUserPrompt {
+    /// The full question.
+    pub question: String,
+    /// 2-8 distinct choices.
+    pub options: Vec<AskUserOption>,
+    /// True if multiple selections are allowed.
+    #[serde(default)]
+    pub multi_select: bool,
+    /// 0-based index of the option the agent recommends (if any).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_index: Option<usize>,
+    /// Optional short tag (e.g. "Library", "Approach").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+}
+
 /// Emitted by `AgentRuntime` and broadcast to SSE subscribers via the
 /// `AppState::event_bus` channel.
 #[derive(Debug, Clone, Serialize)]
@@ -98,4 +128,9 @@ pub struct AgentEvent {
     /// Non-empty only on the final `done = true` event.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_log: Vec<(String, String, String)>,
+    /// Structured multi-choice question from the `ask_user` tool. Present
+    /// only on the event that carries the ask. Capable channels render
+    /// this as native UI; others rely on the agent's text reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<AskUserPrompt>,
 }

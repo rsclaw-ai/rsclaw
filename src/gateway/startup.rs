@@ -1235,6 +1235,7 @@ fn spawn_agent_tasks(
                             files: vec![],
                             images: vec![],
                             tool_log: vec![],
+                            question: None,
                         });
                     }
                     // receiver may have been dropped
@@ -1246,6 +1247,7 @@ fn spawn_agent_tasks(
                         files: vec![],
                         images: vec![],
                         tool_log: vec![],
+                        question: None,
                     });
                 }
                 // receiver may have been dropped (e.g. channel timeout)

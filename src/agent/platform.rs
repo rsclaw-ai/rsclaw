@@ -417,3 +417,78 @@ pub(crate) fn powershell_hidden() -> tokio::process::Command {
         cmd
     }
 }
+
+/// Detected PowerShell major edition.
+///
+/// `Desktop` = Windows PowerShell 5.1 (legacy, .NET Framework, shipped with
+/// Windows). `Core` = PowerShell 7+ (cross-platform, .NET Core). Their
+/// language surfaces diverge sharply (`&&`, `??`, ternary, `2>&1` semantics,
+/// default file encoding) so we steer the model with different prompts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PowerShellEdition {
+    /// Windows PowerShell 5.1.
+    Desktop,
+    /// PowerShell 7+ (pwsh).
+    Core,
+}
+
+/// Detect the installed PowerShell edition once per process.
+///
+/// Cheap probe: shells out to `powershell -NoProfile -Command "$PSVersionTable.PSVersion.Major"`
+/// and reads the integer. Returns `None` if PowerShell is unavailable or the
+/// probe fails. Result is cached for the process lifetime.
+pub(crate) fn detect_powershell_edition() -> Option<PowerShellEdition> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Option<PowerShellEdition>> = OnceLock::new();
+    *CACHE.get_or_init(probe_powershell_edition)
+}
+
+fn probe_powershell_edition() -> Option<PowerShellEdition> {
+    // Prefer pwsh (7+) when present; fall back to powershell (typically 5.1
+    // on Windows, or possibly 7+ on PATH on Linux/macOS).
+    let bin = if which_in_path("pwsh") {
+        "pwsh"
+    } else if which_in_path("powershell") {
+        "powershell"
+    } else {
+        return None;
+    };
+
+    let output = std::process::Command::new(bin)
+        .args(["-NoProfile", "-Command", "$PSVersionTable.PSVersion.Major"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let major: u32 = String::from_utf8_lossy(&output.stdout).trim().parse().ok()?;
+    if major >= 6 {
+        Some(PowerShellEdition::Core)
+    } else {
+        Some(PowerShellEdition::Desktop)
+    }
+}
+
+/// Cheap PATH lookup avoiding the `which` crate dependency.
+fn which_in_path(bin: &str) -> bool {
+    let path = match std::env::var_os("PATH") {
+        Some(p) => p,
+        None => return false,
+    };
+    let exts: &[&str] = if cfg!(target_os = "windows") {
+        &[".exe", ".cmd", ".bat", ""]
+    } else {
+        &[""]
+    };
+    for dir in std::env::split_paths(&path) {
+        for ext in exts {
+            let candidate = dir.join(format!("{bin}{ext}"));
+            if candidate.is_file() {
+                return true;
+            }
+        }
+    }
+    false
+}

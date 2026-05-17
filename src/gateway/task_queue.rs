@@ -50,6 +50,12 @@ pub enum TaskStatus {
 }
 
 /// Outcome of a single agent turn, used by the auto-continue supervisor.
+///
+/// `Done` / `Partial` / `Stuck` / `Error` are produced by the legacy
+/// string-matching `classify_outcome` fallback. `Structured` carries an
+/// agent-declared outcome from the `task_finish` tool and takes precedence
+/// when present. `NeedsInput` lets the agent surface a clarifying question
+/// to the user without triggering auto-continue.
 #[derive(Debug)]
 pub enum TaskOutcome {
     /// Agent clearly completed the task.
@@ -60,6 +66,144 @@ pub enum TaskOutcome {
     Stuck(String),
     /// Infrastructure error (timeout, channel closed, rate limit).
     Error(String),
+    /// Agent self-reported via `task_finish` tool. Replaces string-matching.
+    Structured(StructuredOutcome),
+    /// Agent explicitly asked the user for input. Worker should NOT
+    /// auto-continue; the question is surfaced back to the channel.
+    NeedsInput(String),
+}
+
+/// Self-reported outcome an agent fills in via the `task_finish` tool when
+/// it believes its task is finished (or deliberately abandoned).
+///
+/// Provides structured signal that replaces the fragile string-matching path
+/// in `classify_outcome`. Also serialised into `A2aTask.metadata.outcome`
+/// for protocol-compliant A2A v1.0 reporting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct StructuredOutcome {
+    /// How complete the work is. Drives the orchestrator's continue/stop call.
+    pub completion: Completion,
+
+    /// The agent's own recommendation for what to do next. Orchestrator
+    /// treats this as a strong hint but applies its own decision matrix.
+    pub recommend: Recommend,
+
+    /// Did the agent actually run tests/build/lint/curl that confirmed the
+    /// claimed work? `false` is honest; `true` without `verification_log`
+    /// is downgraded to `false` by the orchestrator.
+    #[serde(default)]
+    pub verified: bool,
+
+    /// Evidence backing `verified=true`. Short excerpt of command + output.
+    /// Required when `verified=true`; absence downgrades to `verified=false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_log: Option<String>,
+
+    /// Concrete things the agent did. Each entry should map to an observable
+    /// artifact (file changed, command run, message sent). Empty list with
+    /// `completion=Full` is suspicious — orchestrator may downgrade.
+    #[serde(default)]
+    pub accomplished: Vec<String>,
+
+    /// Things the agent deliberately skipped, paired with the reason.
+    /// Distinct from `blocked_on` — these are choices, not obstacles.
+    #[serde(default)]
+    pub skipped: Vec<SkipEntry>,
+
+    /// Unresolved blockers. Non-empty implies `completion != Full`.
+    /// When `recommend = NeedsHuman`, these are surfaced to the user verbatim.
+    #[serde(default)]
+    pub blocked_on: Vec<String>,
+
+    /// Assumptions the agent made when the spec was ambiguous. Non-empty
+    /// with `completion < Full` triggers orchestrator to confirm with user.
+    #[serde(default)]
+    pub assumptions: Vec<String>,
+
+    /// Suggested next tasks. Each entry is a self-contained task description,
+    /// not a TODO note. Auto-spawned when `recommend = Continue`.
+    #[serde(default)]
+    pub follow_up_tasks: Vec<String>,
+
+    /// Optional one-paragraph prose summary for the channel reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+/// How complete the agent's work is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Completion {
+    /// Everything the user asked for, done and (ideally) verified.
+    Full,
+    /// Meaningful subset done. Coverage implied by `accomplished` length.
+    Partial,
+    /// Almost nothing achieved. Agent should explain in `blocked_on`.
+    Minimal,
+    /// Agent attempted, work was wrong/rolled back, nothing landed.
+    Failed,
+}
+
+/// Recommended next action for the orchestrator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Recommend {
+    /// Done, deliver to user, close the task.
+    Ship,
+    /// Spawn the next task automatically using `follow_up_tasks`.
+    Continue,
+    /// Stop the auto-continue loop; surface `blocked_on` to the user.
+    NeedsHuman,
+    /// Same task, fresh attempt. Agent thinks a retry with the same prompt
+    /// might succeed (transient failure, flaky env).
+    Retry,
+    /// Agent gave up; orchestrator should not retry without changed inputs.
+    Abandon,
+}
+
+/// A deliberate skip, paired with its reason.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkipEntry {
+    /// What was skipped.
+    pub what: String,
+    /// Why it was skipped.
+    pub why: String,
+}
+
+// ---------------------------------------------------------------------------
+// Pending-outcome stash
+// ---------------------------------------------------------------------------
+//
+// Bridge between the `task_finish` tool (called from agent runtime, no direct
+// access to the queue worker) and the auto-continue supervisor in
+// `TaskQueueWorker::run`. The tool stages an outcome under the session key;
+// the worker drains the slot after each turn and converts it into
+// `TaskOutcome::Structured`, taking precedence over the string classifier.
+//
+// `OnceLock<Mutex<HashMap>>` is intentional — no DashMap dependency, and the
+// contention profile (one writer per turn per session) doesn't warrant it.
+
+static PENDING_OUTCOMES: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<String, StructuredOutcome>>,
+> = std::sync::OnceLock::new();
+
+fn pending_outcomes_map() -> &'static std::sync::Mutex<HashMap<String, StructuredOutcome>> {
+    PENDING_OUTCOMES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Stage a structured outcome produced by the `task_finish` tool. The next
+/// call to [`drain_pending_outcome`] for the same `session_key` consumes it.
+pub fn stage_pending_outcome(session_key: &str, outcome: StructuredOutcome) {
+    if let Ok(mut map) = pending_outcomes_map().lock() {
+        map.insert(session_key.to_owned(), outcome);
+    }
+}
+
+/// Remove and return the staged outcome for `session_key`, if any. Called
+/// by [`TaskQueueWorker`] once per turn before string-classifying the reply.
+pub fn drain_pending_outcome(session_key: &str) -> Option<StructuredOutcome> {
+    pending_outcomes_map().lock().ok()?.remove(session_key)
 }
 
 /// A file attachment staged on disk for queue persistence.
@@ -723,6 +867,8 @@ fn classify_outcome(reply: &crate::agent::AgentReply) -> TaskOutcome {
     }
 
     // Stuck patterns — agent explicitly says it cannot proceed.
+    // English uses lower-cased `lower`; Chinese keywords are matched on the
+    // original `text` because lowercasing CJK is a no-op anyway.
     for pat in [
         "i can't",
         "i cannot",
@@ -736,6 +882,21 @@ fn classify_outcome(reply: &crate::agent::AgentReply) -> TaskOutcome {
         "i'm stuck",
     ] {
         if lower.contains(pat) {
+            return TaskOutcome::Stuck(pat.to_string());
+        }
+    }
+    for pat in [
+        "无法完成",
+        "做不到",
+        "我没法",
+        "我不知道怎么",
+        "需要更多信息",
+        "请提供",
+        "请告诉我",
+        "卡住了",
+        "我不太确定",
+    ] {
+        if text.contains(pat) {
             return TaskOutcome::Stuck(pat.to_string());
         }
     }
@@ -755,6 +916,22 @@ fn classify_outcome(reply: &crate::agent::AgentReply) -> TaskOutcome {
         "partially done",
     ] {
         if lower.contains(pat) {
+            return TaskOutcome::Partial;
+        }
+    }
+    for pat in [
+        "继续",
+        "下一步",
+        "未完成",
+        "还需要",
+        "稍后",
+        "进行中",
+        "正在",
+        "待办",
+        "尚未完成",
+        "部分完成",
+    ] {
+        if text.contains(pat) {
             return TaskOutcome::Partial;
         }
     }
@@ -783,6 +960,11 @@ fn continuation_prompt(outcome: &TaskOutcome, turn: u32) -> String {
             )
         }
         TaskOutcome::Done => String::new(),
+        // Structured / NeedsInput cannot be produced by the current
+        // `classify_outcome` path; they appear only once `task_finish` wiring
+        // lands. Return empty so the worker treats them as no-continuation
+        // (terminal) for now.
+        TaskOutcome::Structured(_) | TaskOutcome::NeedsInput(_) => String::new(),
     }
 }
 
@@ -1100,7 +1282,23 @@ impl TaskQueueWorker {
             };
 
             // Classify outcome before moving fields out of reply.
-            let outcome = classify_outcome(&reply);
+            //
+            // First check for an agent-declared structured outcome from the
+            // `task_finish` tool (staged under the session key). Falling back
+            // to the string classifier preserves behaviour for agents that
+            // don't (yet) call `task_finish`.
+            let outcome = match drain_pending_outcome(&task.session_key) {
+                Some(structured) => {
+                    info!(
+                        task_id = %task_id,
+                        completion = ?structured.completion,
+                        recommend = ?structured.recommend,
+                        "task queue worker: using agent-declared structured outcome"
+                    );
+                    TaskOutcome::Structured(structured)
+                }
+                None => classify_outcome(&reply),
+            };
             let pending = reply.pending_analysis;
 
             // Route reply to user (every turn, so they see progress).
@@ -1190,7 +1388,12 @@ impl TaskQueueWorker {
             }
 
             match outcome {
-                TaskOutcome::Done => {
+                // Done / Structured / NeedsInput are all terminal here: no auto-
+                // continue. Structured carries a self-reported outcome from
+                // `task_finish` (wiring TBD — handled like Done for now);
+                // NeedsInput means the agent explicitly asked the user, so the
+                // task should rest and let the user reply (not loop).
+                TaskOutcome::Done | TaskOutcome::Structured(_) | TaskOutcome::NeedsInput(_) => {
                     info!(task_id = %task_id, turn, "task queue worker: task completed");
                     if let Err(e) = self.manager.complete(&task_id) {
                         error!(task_id = %task_id, "complete() error: {e:#}");

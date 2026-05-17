@@ -78,6 +78,36 @@ impl TaskStore {
         self.put(&task)
     }
 
+    /// Merge `{ outcome: ... }` into the task's `metadata` object. Creates
+    /// the metadata object if absent; preserves any pre-existing keys.
+    ///
+    /// Used to surface agent-declared structured outcomes (from the
+    /// `task_finish` tool) to A2A consumers in a protocol-compliant way —
+    /// `metadata` is the A2A v1.0 extension slot, so unknown keys are
+    /// ignored by strict consumers but available to richer ones.
+    pub fn attach_outcome_metadata(
+        &self,
+        id: &str,
+        outcome: &crate::gateway::task_queue::StructuredOutcome,
+    ) -> Result<()> {
+        let mut task = self
+            .get(id)?
+            .ok_or_else(|| anyhow!("task not found: {id}"))?;
+
+        let outcome_value = serde_json::to_value(outcome)
+            .map_err(|e| anyhow!("serialize outcome: {e}"))?;
+
+        let mut meta = task
+            .metadata
+            .clone()
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        meta.insert("outcome".to_owned(), outcome_value);
+        task.metadata = Some(serde_json::Value::Object(meta));
+
+        self.put(&task)
+    }
+
     pub fn append_history(&self, id: &str, msg: A2aMessage) -> Result<()> {
         let mut task = self
             .get(id)?

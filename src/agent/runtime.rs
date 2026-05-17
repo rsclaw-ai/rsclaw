@@ -3839,6 +3839,7 @@ impl AgentRuntime {
                         files: vec![],
                         images: vec![],
                         tool_log: vec![],
+                        question: None,
                     });
                 }
                 return Ok(AgentReply {
@@ -3876,6 +3877,7 @@ impl AgentRuntime {
                         files: tool_files.clone(),
                         images: tool_images.clone(),
                         tool_log: tool_log.clone(),
+                        question: None,
                     });
                 }
                 return Ok(AgentReply {
@@ -3912,6 +3914,7 @@ impl AgentRuntime {
                         files: tool_files.clone(),
                         images: tool_images.clone(),
                         tool_log: tool_log.clone(),
+                        question: None,
                     });
                 }
                 return Ok(AgentReply {
@@ -3951,6 +3954,7 @@ impl AgentRuntime {
                         files: tool_files.clone(),
                         images: tool_images.clone(),
                         tool_log: tool_log.clone(),
+                        question: None,
                     });
                 }
                 return Ok(AgentReply {
@@ -4390,6 +4394,7 @@ impl AgentRuntime {
                                     files: vec![],
                                     images: vec![],
                                     tool_log: vec![],
+                                    question: None,
                                 });
                             }
                             last_delta_flush = now;
@@ -4527,6 +4532,7 @@ impl AgentRuntime {
                         files: vec![],
                         images: vec![],
                         tool_log: vec![],
+                        question: None,
                     });
                 }
             }
@@ -4821,6 +4827,7 @@ impl AgentRuntime {
                         files: tool_files.clone(),
                         images: tool_images.clone(),
                         tool_log: tool_log.clone(),
+                        question: None,
                     });
                 }
 
@@ -5068,6 +5075,7 @@ impl AgentRuntime {
                                 files: tool_files.clone(),
                                 images: tool_images.clone(),
                                 tool_log: tool_log.clone(),
+                                question: None,
                             });
                         }
                         return Ok(AgentReply {
@@ -5330,6 +5338,7 @@ impl AgentRuntime {
                             files: vec![],
                             images: vec![],
                             tool_log: vec![],
+                            question: None,
                         });
                     }
                 }
@@ -5849,9 +5858,12 @@ impl AgentRuntime {
             }
             "read_file" | "read" => return self.tool_read(args).await,
             "write_file" | "write" => return self.tool_write(args).await,
+            "edit_file" | "edit" => return self.tool_edit(args).await,
             "shell" | "execute_command" | "exec" => return self.tool_exec(ctx, _id, args).await,
             "use_skill" => return self.tool_use_skill(args),
             "task" => return self.tool_task(ctx, args).await,
+            "task_finish" => return self.tool_task_finish(ctx, args).await,
+            "ask_user" => return self.tool_ask_user(ctx, args).await,
             "install_tool" | "tool_install" => return self.tool_install(args).await,
             "list_dir" => return self.tool_list_dir(args).await,
             "search_file" => return self.tool_search_file(args).await,
