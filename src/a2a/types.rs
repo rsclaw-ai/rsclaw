@@ -162,7 +162,24 @@ pub struct A2aMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum A2aPart {
-    Text { text: String },
+    Text {
+        text: String,
+    },
+    Raw {
+        /// Base64-encoded bytes.
+        bytes: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+    Url {
+        url: String,
+        #[serde(
+            rename = "mimeType",
+            skip_serializing_if = "Option::is_none",
+            default
+        )]
+        mime_type: Option<String>,
+    },
     Data { data: Value },
 }
 
