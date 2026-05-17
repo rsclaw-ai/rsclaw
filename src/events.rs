@@ -77,7 +77,11 @@ impl RestartRequest {
 }
 
 /// One option in an `AskUserPrompt`.
+///
+/// Wire format is camelCase (`label`, `description`) — UI consumes via WS
+/// relays in `ws::handshake` / `ws::methods::sessions`.
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AskUserOption {
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -89,7 +93,11 @@ pub struct AskUserOption {
 /// Channels that support interactive UI (Desktop / Telegram / Feishu / etc.)
 /// can render this as buttons or a modal. Channels that don't (WeChat, Signal)
 /// receive the agent's plain-text reply which already lists numbered options.
+///
+/// Wire format is camelCase (`multiSelect`, `recommendedIndex`) per project
+/// convention — Rust fields stay snake_case, serde renames at the boundary.
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AskUserPrompt {
     /// The full question.
     pub question: String,
