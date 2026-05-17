@@ -263,6 +263,7 @@ async fn request_body_maps_messages() {
         temperature: Some(0.3),
         frequency_penalty: None,
         thinking_budget: None,
+        endpoint: Default::default(),
         kv_cache_mode: 0,
         session_key: None,
         system_shared: None,

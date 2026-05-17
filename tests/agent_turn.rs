@@ -182,6 +182,23 @@ async fn start_echo_server(addr: SocketAddr) {
         restart_request_tx: broadcast::channel(16).0,
         pending_restart: Arc::new(std::sync::RwLock::new(None)),
         shutdown: rsclaw::gateway::ShutdownCoordinator::new(),
+        task_event_bus: rsclaw::a2a::event::TaskEventBus::new(),
+        task_cancels: Arc::new(dashmap::DashMap::new()),
+        suspended_tasks: Arc::new(dashmap::DashMap::new()),
+        task_store: {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let path = tmp.path().join("a2a-tasks.redb");
+            std::mem::forget(tmp);
+            Arc::new(rsclaw::a2a::store::TaskStore::open(&path).expect("a2a store"))
+        },
+        push_dispatcher: {
+            let bus = rsclaw::a2a::event::TaskEventBus::new();
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let path = tmp.path().join("a2a-tasks.redb");
+            std::mem::forget(tmp);
+            let store = Arc::new(rsclaw::a2a::store::TaskStore::open(&path).expect("a2a store"));
+            Arc::new(rsclaw::a2a::push::PushDispatcher::new(store, bus))
+        },
     };
 
     // Leak the tempdir so the store stays valid for the server's lifetime.
