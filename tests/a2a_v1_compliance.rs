@@ -407,6 +407,36 @@ fn agent_reply_carries_outcome_field() {
 }
 
 #[tokio::test]
+async fn turn_context_request_input_returns_none_when_resume_tx_dropped() {
+    // Mirrors the timeout path: the listener spawn drops the resume_tx
+    // (e.g. RSCLAW_A2A_WAIT_INPUT_TIMEOUT_SECS expired before any client
+    // resumed). `request_input` must return None so `wait_input` can
+    // surface the timeout as a tool error rather than hang forever.
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+    let (ireq_tx, mut ireq_rx) =
+        tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<String>>(4);
+    let tc = rsclaw::agent::registry::TurnContext {
+        task_id: Some("t-42".into()),
+        context_id: Some("ctx-42".into()),
+        event_tx: Some(event_tx),
+        input_request_tx: Some(ireq_tx),
+        ..Default::default()
+    };
+
+    let mock = tokio::spawn(async move {
+        // Receive the resume handle, then deliberately drop it without
+        // sending anything — simulates the timeout cleanup tearing the
+        // SuspendedTask entry down without a client resume.
+        let resume_tx = ireq_rx.recv().await.expect("resume handle");
+        drop(resume_tx);
+    });
+
+    let got = tc.request_input("need more info", false).await;
+    assert!(got.is_none(), "expected None on dropped resume_tx, got {got:?}");
+    mock.await.unwrap();
+}
+
+#[tokio::test]
 async fn turn_context_request_input_with_auth_publishes_auth_required() {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
     let (ireq_tx, mut ireq_rx) =

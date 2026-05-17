@@ -367,26 +367,18 @@ async fn spawn_streaming_task(
         bus_for_reply.close(&task_id_for_reply);
     });
 
-    // Wire the INPUT_REQUIRED resume channel.
-    let (ireq_tx, mut ireq_rx) =
+    // Wire the INPUT_REQUIRED resume channel — with the same timeout
+    // semantics as the sync path. Helper handles registration + timeout
+    // cleanup so a client that never sends the resume SendMessage
+    // doesn't leak a suspended entry.
+    let (ireq_tx, ireq_rx) =
         tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<String>>(4);
-    {
-        let suspended = state.suspended_tasks.clone();
-        let sus_task_id = task_id.clone();
-        let sus_ctx = session_key.clone();
-        tokio::spawn(async move {
-            while let Some(resume_tx) = ireq_rx.recv().await {
-                suspended.insert(
-                    sus_task_id.clone(),
-                    crate::a2a::event::SuspendedTask {
-                        task_id: sus_task_id.clone(),
-                        context_id: sus_ctx.clone(),
-                        resume_tx,
-                    },
-                );
-            }
-        });
-    }
+    crate::a2a::server::spawn_input_request_listener(
+        state.clone(),
+        task_id.clone(),
+        session_key.clone(),
+        ireq_rx,
+    );
 
     let msg = AgentMessage {
         session_key: session_key.clone(),

@@ -325,26 +325,17 @@ async fn handle_send_message(
     // Wire the INPUT_REQUIRED resume channel. If the runtime ever requests
     // additional input mid-turn, an entry lands in `state.suspended_tasks`;
     // the client's next SendMessage with the same taskId hits the
-    // resume-path at the top of this handler.
-    let (ireq_tx, mut ireq_rx) =
+    // resume-path at the top of this handler. A per-suspension timeout
+    // (RSCLAW_A2A_WAIT_INPUT_TIMEOUT_SECS, default 30 min) tears the
+    // entry down so a never-resumed task doesn't leak forever.
+    let (ireq_tx, ireq_rx) =
         tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<String>>(4);
-    {
-        let suspended = state.suspended_tasks.clone();
-        let sus_task_id = task_id.clone();
-        let sus_ctx = session_key.clone();
-        tokio::spawn(async move {
-            while let Some(resume_tx) = ireq_rx.recv().await {
-                suspended.insert(
-                    sus_task_id.clone(),
-                    crate::a2a::event::SuspendedTask {
-                        task_id: sus_task_id.clone(),
-                        context_id: sus_ctx.clone(),
-                        resume_tx,
-                    },
-                );
-            }
-        });
-    }
+    spawn_input_request_listener(
+        state.clone(),
+        task_id.clone(),
+        session_key.clone(),
+        ireq_rx,
+    );
 
     // Bridge runtime → bus for mid-turn AgentEvents (Working progress with
     // tool names, InputRequired/AuthRequired, etc.). Streaming has the same
@@ -842,6 +833,77 @@ pub(crate) async fn resolve_agent_workspace_pub(
     agent_id: Option<&str>,
 ) -> std::path::PathBuf {
     resolve_agent_workspace(state, agent_id).await
+}
+
+/// Spawn a listener that pulls `resume_tx` handles off the runtime's
+/// `input_request_tx` channel, registers them as `SuspendedTask` entries
+/// for the resume short-path to consume, and arms a per-suspension
+/// timeout so a client that never sends the follow-up SendMessage
+/// doesn't leak the entry forever.
+///
+/// On timeout: drops the entry (which drops `resume_tx`, making the
+/// runtime's `resume_rx.await` resolve `Err` so `request_input` returns
+/// `None` and `wait_input` reports a failure), publishes a terminal
+/// `TASK_STATE_FAILED` carrying a "wait_input timed out" message, and
+/// closes the bus so subscribers see the final event.
+///
+/// Timeout is read from `RSCLAW_A2A_WAIT_INPUT_TIMEOUT_SECS` (default
+/// 1800 = 30 min). Both the sync `SendMessage` and streaming
+/// `SendStreamingMessage` paths use this helper so they agree on the
+/// suspend lifetime.
+pub(crate) fn spawn_input_request_listener(
+    state: AppState,
+    task_id: String,
+    context_id: String,
+    mut ireq_rx: tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<String>>,
+) {
+    let timeout_secs: u64 = std::env::var("RSCLAW_A2A_WAIT_INPUT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n: &u64| n > 0)
+        .unwrap_or(1800);
+    tokio::spawn(async move {
+        while let Some(resume_tx) = ireq_rx.recv().await {
+            state.suspended_tasks.insert(
+                task_id.clone(),
+                crate::a2a::event::SuspendedTask {
+                    task_id: task_id.clone(),
+                    context_id: context_id.clone(),
+                    resume_tx,
+                },
+            );
+            // Arm timeout. Spawned per-suspension so successive resumes
+            // (rare but possible: agent re-suspends after the first resume)
+            // each get their own deadline.
+            let state_t = state.clone();
+            let task_id_t = task_id.clone();
+            let context_id_t = context_id.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)).await;
+                // If the entry was already consumed by the resume short-
+                // path, `.remove` returns None and we do nothing. Only if
+                // the suspension is still live do we tear it down.
+                if state_t.suspended_tasks.remove(&task_id_t).is_some() {
+                    let _ = state_t
+                        .task_store
+                        .set_status(&task_id_t, TaskState::Failed);
+                    state_t.task_cancels.remove(&task_id_t);
+                    state_t.task_event_bus.publish(
+                        crate::a2a::event::AgentEvent::Status {
+                            task_id: task_id_t.clone(),
+                            context_id: context_id_t,
+                            state: TaskState::Failed,
+                            message: Some(crate::a2a::event::text_message(&format!(
+                                "wait_input timed out after {timeout_secs}s without a resume SendMessage on the same taskId"
+                            ))),
+                            final_: true,
+                        },
+                    );
+                    state_t.task_event_bus.close(&task_id_t);
+                }
+            });
+        }
+    });
 }
 
 /// Resolve the workspace path for the agent that will run this A2A turn.
