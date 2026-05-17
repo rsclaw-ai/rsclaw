@@ -161,23 +161,18 @@ async fn spawn_streaming_task(
         .clone()
         .unwrap_or_else(|| format!("a2a:{}", Uuid::new_v4()));
 
-    let text = params
-        .message
-        .parts
-        .iter()
-        .find_map(|p| {
-            if let A2aPart::Text { text } = p {
-                Some(text.clone())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
-
     let agent_id = params
         .metadata
         .as_ref()
         .and_then(|m| m.get("agentId").and_then(|v| v.as_str()).map(str::to_owned));
+
+    // Ingest non-text parts (Raw/Url/Data) before the runtime sees the
+    // message, so `@a2a_<kind>_...` references appear in the text and the
+    // runtime's existing `resolve_file_refs` pipeline loads them as image
+    // attachments / file references on the agent loop entry.
+    let workspace = crate::a2a::server::resolve_agent_workspace_pub(&state, agent_id.as_deref()).await;
+    let ingested = crate::a2a::files::ingest_message_parts(&workspace, &params.message.parts).await;
+    let text = ingested.text;
 
     let handle = match agent_id {
         Some(aid) => state.agents.get(&aid),
@@ -324,7 +319,11 @@ async fn spawn_streaming_task(
                         task_id: task_id_for_reply.clone(),
                         context_id: ctx_id_for_reply.clone(),
                         artifact_id,
-                        parts: vec![A2aPart::Text { text: reply.text }],
+                        parts: crate::a2a::files::emit_reply_parts(
+                            &reply.text,
+                            &reply.images,
+                            &reply.files,
+                        ),
                         append: false,
                         last_chunk: true,
                     });

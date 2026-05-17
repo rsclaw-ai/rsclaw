@@ -194,27 +194,21 @@ async fn handle_send_message(
         }
     };
 
-    let text = params
-        .message
-        .parts
-        .iter()
-        .find_map(|p| {
-            if let A2aPart::Text { text } = p {
-                Some(text.clone())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
-
-    if text.is_empty() {
-        return Json(JsonRpcResponse::err(id, -32602, "no text part in message"));
-    }
-
     let agent_id = params
         .metadata
         .as_ref()
         .and_then(|m| m.get("agentId").and_then(|v| v.as_str()).map(str::to_owned));
+
+    // Resolve workspace per-agent so the A2A ingest writes files to the
+    // same `workspace/a2a/<category>/` tree the runtime will later look
+    // for `@a2a_<kind>_...` references in.
+    let workspace = resolve_agent_workspace(&state, agent_id.as_deref()).await;
+    let ingested = crate::a2a::files::ingest_message_parts(&workspace, &params.message.parts).await;
+    let text = ingested.text;
+
+    if text.is_empty() {
+        return Json(JsonRpcResponse::err(id, -32602, "no text part in message"));
+    }
 
     let handle = if let Some(ref aid) = agent_id {
         match state.agents.get(aid) {
@@ -422,17 +416,36 @@ async fn handle_send_message(
     // Branch on the reply outcome — without this, every `run_turn` Err
     // (LLM unreachable, tool exception, A2A cancel) came back wrapped as a
     // text reply and was published as Completed, silently masking failure.
+    // Drain any agent-declared structured outcome for this session. Both
+    // success and failure paths attach it to the persisted task's metadata
+    // so A2A consumers can read the agent's own assessment (completion
+    // level, blockers, follow-ups) without re-parsing the artifact text.
+    let pending_outcome =
+        crate::gateway::task_queue::drain_pending_outcome(&session_key);
+
     match reply.outcome {
         crate::agent::registry::ReplyOutcome::Ok => {
+            // Pack text + every image / file the runtime produced into a
+            // single artifact. `emit_reply_parts` normalises data URIs and
+            // disk paths to `A2aPart::Raw`, and lets `http(s)://...` file
+            // entries pass through as `A2aPart::Url`.
+            let artifact_parts = crate::a2a::files::emit_reply_parts(
+                &reply.text,
+                &reply.images,
+                &reply.files,
+            );
             let artifact = A2aArtifact {
                 artifact_id: Uuid::new_v4().to_string(),
-                parts: vec![A2aPart::Text { text: reply.text }],
+                parts: artifact_parts,
                 name: None,
                 description: None,
                 metadata: None,
             };
 
             let _ = state.task_store.append_artifact(&task_id, artifact.clone());
+            if let Some(ref outcome) = pending_outcome {
+                let _ = state.task_store.attach_outcome_metadata(&task_id, outcome);
+            }
             let _ = state.task_store.set_status(&task_id, TaskState::Completed);
             state.task_cancels.remove(&task_id);
 
@@ -464,6 +477,9 @@ async fn handle_send_message(
             Json(JsonRpcResponse::ok(id, result))
         }
         crate::agent::registry::ReplyOutcome::Error => {
+            if let Some(ref outcome) = pending_outcome {
+                let _ = state.task_store.attach_outcome_metadata(&task_id, outcome);
+            }
             let _ = state.task_store.set_status(&task_id, TaskState::Failed);
             state.task_cancels.remove(&task_id);
             state.task_event_bus.publish(crate::a2a::event::AgentEvent::Status {
@@ -816,6 +832,45 @@ async fn handle_delete_push_config(
             a2a_errors::internal(format!("store error: {e}")),
         )),
     }
+}
+
+/// Public wrapper for `resolve_agent_workspace` used by `streaming.rs`
+/// (same module crate but separate file). Kept `_pub` suffix to flag the
+/// asymmetric visibility.
+pub(crate) async fn resolve_agent_workspace_pub(
+    state: &AppState,
+    agent_id: Option<&str>,
+) -> std::path::PathBuf {
+    resolve_agent_workspace(state, agent_id).await
+}
+
+/// Resolve the workspace path for the agent that will run this A2A turn.
+/// Mirrors the chain inside `AgentRuntime::run_turn`: per-agent override →
+/// gateway-default workspace → `<base_dir>/workspace`. Used by the A2A
+/// ingest path so received files land in the same bucket the runtime's
+/// `resolve_file_refs` will later look for `@a2a_<kind>_...` tokens in.
+async fn resolve_agent_workspace(
+    state: &AppState,
+    agent_id: Option<&str>,
+) -> std::path::PathBuf {
+    let per_agent = if let Some(aid) = agent_id {
+        state
+            .agents
+            .get(aid)
+            .ok()
+            .and_then(|h| h.config.workspace.clone())
+    } else {
+        state
+            .agents
+            .default_agent()
+            .ok()
+            .and_then(|h| h.config.workspace.clone())
+    };
+    let default = state.live.agents.read().await.defaults.workspace.clone();
+    per_agent
+        .or(default)
+        .map(|p| crate::config::loader::expand_tilde_path_pub(&p))
+        .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"))
 }
 
 /// Mark a task as Failed and clean up its in-memory state.

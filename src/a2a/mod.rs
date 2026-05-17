@@ -6,6 +6,7 @@ pub mod auth;
 pub mod client;
 pub mod errors;
 pub mod event;
+pub mod files;
 pub mod push;
 pub mod server;
 pub mod store;
