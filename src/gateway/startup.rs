@@ -727,6 +727,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         restart_request_tx: restart_request_tx.clone(),
         pending_restart: Arc::clone(&pending_restart),
         shutdown: shutdown.clone(),
+        task_event_bus: crate::a2a::event::TaskEventBus::new(),
+        task_cancels: Arc::new(dashmap::DashMap::new()),
+        suspended_tasks: Arc::new(dashmap::DashMap::new()),
     };
     crate::ws::tick::start_tick_loop(Arc::clone(&state.ws_conns));
 
@@ -1149,6 +1152,7 @@ fn spawn_agent_tasks(
                     images,
                     files,
                     account: _,
+                    ..
                 } = msg;
                 let result = runtime
                     .run_turn(
@@ -1328,6 +1332,9 @@ pub(crate) async fn handle_pending_analysis(
         peer_id: analysis.peer_id.clone(),
         chat_id: String::new(),
         reply_tx,
+        event_tx: None,
+        cancel_token: None,
+        input_request_tx: None,
         extra_tools: vec![],
         images: vec![],
         files: vec![],

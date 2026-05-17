@@ -213,6 +213,20 @@ pub struct AgentMessage {
     pub chat_id: String,
     /// One-shot sender for the agent's response.
     pub reply_tx: tokio::sync::oneshot::Sender<AgentReply>,
+    /// Optional streaming event channel. Runtime emits intermediate
+    /// `AgentEvent`s (status changes, artifact chunks) here when the caller
+    /// (e.g. A2A SendStreamingMessage) wants to observe progress. Legacy
+    /// channels pass `None`.
+    pub event_tx: Option<tokio::sync::mpsc::Sender<crate::a2a::event::AgentEvent>>,
+    /// Optional cancellation token. Runtime checks this between LLM/tool
+    /// turns; if cancelled, emits TASK_STATE_CANCELED and exits. Legacy
+    /// channels pass `None`.
+    pub cancel_token: Option<tokio_util::sync::CancellationToken>,
+    /// Optional channel for the runtime to register a `SuspendedTask` resume
+    /// handle when it needs to ask the caller for more input (TASK_STATE_INPUT_REQUIRED).
+    /// Legacy channels pass `None`.
+    pub input_request_tx:
+        Option<tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<String>>>,
     /// External tool definitions forwarded from the OAI /v1/chat/completions
     /// caller. These are merged into the agent's tool list for the turn.
     pub extra_tools: Vec<crate::provider::ToolDef>,

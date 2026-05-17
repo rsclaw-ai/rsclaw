@@ -15,6 +15,9 @@ path = "src/main.rs"
 # Async runtime
 tokio        = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util   = { version = "0.7", features = ["rt"] }
+dashmap      = "6"
+eventsource-stream = "0.2"
 
 # Web framework
 axum         = { version = "0.8", features = ["ws", "multipart"] }

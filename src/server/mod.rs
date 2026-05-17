@@ -160,6 +160,15 @@ pub struct AppState {
     /// in-flight HTTP requests, task queue tasks, and channel handlers
     /// before re-exec.
     pub shutdown: crate::gateway::ShutdownCoordinator,
+    /// A2A v1.0 per-task event broadcast bus (fan-out for SSE subscribers
+    /// and the push notification dispatcher).
+    pub task_event_bus: crate::a2a::event::TaskEventBus,
+    /// Cancellation tokens for in-flight A2A tasks, keyed by task_id.
+    /// Inserted on SendMessage / SendStreamingMessage entry; fired by CancelTask.
+    pub task_cancels: Arc<dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
+    /// Tasks paused on TASK_STATE_INPUT_REQUIRED / AUTH_REQUIRED, keyed by task_id.
+    /// Resumed when the client sends another SendMessage with the matching taskId.
+    pub suspended_tasks: Arc<dashmap::DashMap<String, crate::a2a::event::SuspendedTask>>,
 }
 
 // AgentEvent is defined in crate::events to avoid circular deps with agent.
@@ -268,7 +277,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/workspace/files", get(list_workspace_files))
         .route("/workspace/files/{*path}", get(read_workspace_file).put(write_workspace_file))
         .route("/stream", get(stream_sse))
-        .route("/a2a", post(crate::a2a::server::a2a_rpc_handler))
+        .route("/a2a", post(crate::a2a::server::a2a_dispatch))
         .route("/tools/execute", post(execute_tool))
         .route("/computer-use/permissions", get(computer_use_permissions_list))
         .route(
@@ -475,6 +484,9 @@ async fn send_message(
         peer_id: req.peer_id.unwrap_or_else(|| "api-client".to_string()),
         chat_id: String::new(),
         reply_tx,
+        event_tx: None,
+        cancel_token: None,
+        input_request_tx: None,
         extra_tools: vec![],
         images: file_images,
         files: file_files,
@@ -1528,6 +1540,9 @@ async fn cron_trigger(State(state): State<AppState>, Path(id): Path<String>) -> 
             peer_id: format!("cron:{id}"),
             chat_id: String::new(),
             reply_tx,
+            event_tx: None,
+            cancel_token: None,
+            input_request_tx: None,
             extra_tools: vec![],
             images: vec![],
             files: vec![],
@@ -2077,6 +2092,9 @@ async fn openai_chat_completions(
         peer_id,
         chat_id: String::new(),
         reply_tx,
+        event_tx: None,
+        cancel_token: None,
+        input_request_tx: None,
         extra_tools,
         images: file_images,
         files: file_files,

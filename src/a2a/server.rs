@@ -122,6 +122,22 @@ pub async fn a2a_rpc_handler(
     a2a_rpc_handler_inner(state, req).await
 }
 
+/// Top-level dispatcher. Streaming methods route to `crate::a2a::streaming`
+/// and return an SSE stream; everything else returns a JSON-RPC response.
+pub async fn a2a_dispatch(
+    State(state): State<AppState>,
+    Json(req): Json<JsonRpcRequest>,
+) -> axum::response::Response {
+    match req.method.as_str() {
+        "SendStreamingMessage" | "SubscribeToTask" => {
+            crate::a2a::streaming::handle_streaming_rpc(state, req)
+                .await
+                .into_response()
+        }
+        _ => a2a_rpc_handler_inner(state, req).await.into_response(),
+    }
+}
+
 pub async fn a2a_rpc_handler_inner(state: AppState, req: JsonRpcRequest) -> Json<JsonRpcResponse> {
     let id = req.id.clone();
     match req.method.as_str() {
@@ -232,6 +248,9 @@ async fn handle_send_message(
         peer_id: "a2a-client".to_owned(),
         chat_id: String::new(),
         reply_tx,
+        event_tx: None,
+        cancel_token: None,
+        input_request_tx: None,
         extra_tools: vec![],
         images: vec![],
         files: vec![],

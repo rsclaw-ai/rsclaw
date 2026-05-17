@@ -157,6 +157,7 @@ impl AgentSpawner {
                     images,
                     files,
                     chat_id,
+                    ..
                 } = msg;
                 let result = runtime
                     .run_turn(
