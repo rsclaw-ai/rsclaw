@@ -44,10 +44,16 @@ impl PushDispatcher {
 
     /// Watch a task's event stream. Spawn-and-forget; the spawn exits when
     /// the broadcast bus closes (final status event seen).
+    ///
+    /// `subscribe` runs synchronously here (before the spawn) so the
+    /// receiver is registered before this function returns. Without that,
+    /// a caller that immediately publishes Submitted/Working into the bus
+    /// loses those events: the spawn hadn't yet reached `bus.subscribe()`
+    /// when the publishes happened, and broadcast channels don't replay.
     pub fn watch(self: Arc<Self>, task_id: String) {
         let me = self;
+        let mut rx = me.bus.subscribe(&task_id);
         tokio::spawn(async move {
-            let mut rx = me.bus.subscribe(&task_id);
             loop {
                 match rx.recv().await {
                     Ok(ev) => {
