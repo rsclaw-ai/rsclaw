@@ -51,6 +51,11 @@ pub struct WatchInfo {
     pub started_at_ms: u64,
     pub event_count: u64,
     pub error_count: u64,
+    /// Account label this watch's deliveries are pinned to (Feishu /
+    /// WeCom multi-tenant routing). Surfaced in `/watch list` so an
+    /// operator can attribute a long-running watch to the app it's
+    /// posting under. R4 review I1.
+    pub account: Option<String>,
 }
 
 /// Single point of entry for `/watch` slash command.
@@ -460,6 +465,7 @@ impl WatchRegistry {
                 started_at_ms: t.started_at_ms,
                 event_count: t.event_count.load(std::sync::atomic::Ordering::Relaxed),
                 error_count: t.error_count.load(std::sync::atomic::Ordering::Relaxed),
+                account: t.account.clone(),
             })
             .collect();
 
@@ -478,9 +484,22 @@ impl WatchRegistry {
                 SourceKind::Sse => "sse",
                 SourceKind::Shell => "shell",
             };
+            // Annotate with `@<account>` when present so multi-tenant
+            // Feishu / WeCom operators can tell which app a watch
+            // posts under without grepping logs (R4 review I1).
+            let account_tag = w
+                .account
+                .as_deref()
+                .map(|a| format!("@{a} "))
+                .unwrap_or_default();
             lines.push(format!(
-                "  {}  {}:{}  {}s  {} events",
-                w.id, kind_str, truncate(&w.raw_source, 50), elapsed, w.event_count
+                "  {}  {}{}:{}  {}s  {} events",
+                w.id,
+                account_tag,
+                kind_str,
+                truncate(&w.raw_source, 50),
+                elapsed,
+                w.event_count
             ));
         }
         lines.push(String::new());

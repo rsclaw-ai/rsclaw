@@ -1768,17 +1768,29 @@ fn dump_turn_for_debug(
     // Nesting them under a `delta` wrapper would make the dump non-replayable
     // — the worker returns 400 `invalid_request: turn must include exactly
     // one of user_message (string) or tool_results (non-empty array)`.
-    let turn_body = serde_json::to_value(&TurnReq {
-        delta,
-        options: Some(opts.clone()),
-        stream: true,
-    })
-    .unwrap_or(Value::Null);
+    // Canonicalize through to_canonical_value so the dumped bytes match
+    // the actual wire bytes the provider sends. The crate uses
+    // serde_json's `preserve_order` feature, which keeps insertion-order
+    // keys; the wire send path runs the body through `to_canonical_value`
+    // (BTreeMap-sorted) so worker-side hashes are byte-stable. Without
+    // the same pass on the dump, an operator using RSCLAW_DUMP_TURN to
+    // bisect a "truncation in rsclaw protocol but not in OpenAI compat"
+    // symptom would see *different* bytes from what `/sessions/.../turn`
+    // received — masking exactly the kind of byte-level bug the dump
+    // tool exists to diagnose. R1 review I2.
+    let turn_body = to_canonical_value(
+        serde_json::to_value(&TurnReq {
+            delta,
+            options: Some(opts.clone()),
+            stream: true,
+        })
+        .unwrap_or(Value::Null),
+    );
 
     // Wire body that would rehydrate this session from scratch via
     // `/sessions/replay`. Useful when the session_id is no longer alive
     // on the worker and the operator wants to recreate the exact state.
-    let replay_body = json!({
+    let replay_body = to_canonical_value(json!({
         "prefix_id": split.prefix_id,
         "dynamic_prefix": {
             "system": split.dynamic_system,
@@ -1787,7 +1799,7 @@ fn dump_turn_for_debug(
         },
         "history": history_values,
         "options": serde_json::to_value(&opts).unwrap_or(Value::Null),
-    });
+    }));
 
     let dump = json!({
         "schema_version": 1,

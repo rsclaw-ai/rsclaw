@@ -559,6 +559,10 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                     agent_id: agent_id.clone(),
                     app: app_label,
                     permission_emit: permission_emit_clone,
+                    // Gateway-side: a missing emit means the broadcast
+                    // channel is mis-wired, not a deliberate headless
+                    // setup. Deny (don't silently bypass). R3 review I4.
+                    headless_auto_allow: false,
                     status_emit: status_emit_clone,
                     run_id: run_id_clone,
                 };
@@ -720,6 +724,8 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
             agent_id,
             app: app_label,
             permission_emit,
+            // Gateway-side: see async-path comment above. R3 review I4.
+            headless_auto_allow: false,
             status_emit,
             run_id,
         };

@@ -100,10 +100,19 @@ pub struct VlmDriver<'a> {
     pub app: String,
     /// Optional sender for `PermissionRequest` events — when set, the
     /// driver emits a request rather than auto-allowing. When `None`
-    /// (e.g. CLI / headless), the driver behaves as if the user had
-    /// answered AllowOnce.
+    /// AND `headless_auto_allow == true`, the driver behaves as if the
+    /// user had answered AllowOnce (CLI use case). When `None` AND
+    /// `headless_auto_allow == false`, the driver returns
+    /// `PermissionDenied` — defends against a misconfigured gateway
+    /// where the broadcast channel is missing but the permission gate
+    /// must still block. R3 review I4.
     pub permission_emit:
         Option<Arc<dyn Fn(PermissionRequest) + Send + Sync + 'a>>,
+    /// When true and `permission_emit` is None, silently auto-grant
+    /// AllowOnce instead of denying. Set explicitly by CLI callers
+    /// (`true`); gateway callers leave `false` so a wiring bug
+    /// surfaces as a permission denial instead of a silent bypass.
+    pub headless_auto_allow: bool,
     /// Optional sender for `ComputerUseStatus` events — when set, the
     /// driver emits a `Started` at the top of the loop, a `Step` after
     /// each executed action, and a `Finished` on exit. Surfaced to the
@@ -209,6 +218,13 @@ impl VlmDriver<'_> {
             let screen_w = snap.physical_size.0;
             let screen_h = snap.physical_size.1;
             let scale = snap.scale_factor;
+
+            // Signal "model call starting" BEFORE the VLM round-trip
+            // (typically 5–30 s on heavy VLMs). Without this, the UI
+            // shows nothing between `Started` and the first `Step`,
+            // and users / operators assume the agent hung.
+            // R3 review I3.
+            self.emit_thinking(steps + 1);
 
             // 3b. Build the LLM request.
             let user_text = build_user_message(instruction, &history);
@@ -451,15 +467,31 @@ impl VlmDriver<'_> {
             None => {
                 // First-time decision: emit a request to the UI and
                 // await the user's response. When `permission_emit` is
-                // None (CLI / headless), auto-allow once so the loop
-                // can proceed without UI plumbing.
+                // None we fall back to one of two behaviors based on
+                // `headless_auto_allow`:
+                //   - true  (CLI / headless test rigs): auto-AllowOnce
+                //     so the loop can proceed without UI plumbing.
+                //   - false (default; gateway with mis-wired channel):
+                //     return PermissionDenied. The pre-fix code silently
+                //     auto-allowed in both cases, so a gateway that
+                //     somehow ended up with permission_emit=None would
+                //     bypass every permission gate without an audit
+                //     trail. R3 review I4.
                 let Some(emit) = self.permission_emit.as_ref() else {
-                    info!("no permission emitter configured; treating as AllowOnce");
-                    self.permission
-                        .record(&self.agent_id, &app, PermissionDecision::AllowOnce)
-                        .await
-                        .ok();
-                    return Ok(None);
+                    if self.headless_auto_allow {
+                        info!("no permission emitter; headless_auto_allow → AllowOnce");
+                        self.permission
+                            .record(&self.agent_id, &app, PermissionDecision::AllowOnce)
+                            .await
+                            .ok();
+                        return Ok(None);
+                    }
+                    tracing::warn!(
+                        agent_id = %self.agent_id,
+                        app = %app,
+                        "permission gate: no emitter wired AND headless_auto_allow=false; denying"
+                    );
+                    return Ok(Some(DriverOutcome::PermissionDenied));
                 };
 
                 let request_id = format!(
@@ -540,6 +572,13 @@ impl VlmDriver<'_> {
             app: self.app.clone(),
             instruction: truncate(instruction, 200),
             max_steps: self.max_loop,
+        });
+    }
+
+    fn emit_thinking(&self, step_index: usize) {
+        self.emit_status(ComputerUseStatus::Thinking {
+            run_id: self.run_id.clone(),
+            step_index,
         });
     }
 

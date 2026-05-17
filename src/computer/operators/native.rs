@@ -568,7 +568,21 @@ fn activate_app_blocking(app: &str) -> ActionOutput {
         // matches and hand its main window to SetForegroundWindow.
         // TODO(v2): replace with `windows` crate EnumWindows + per-PID
         // SetForegroundWindow to bring secondary windows too.
-        let escaped = app.replace('\'', "''");
+        // Two layers of escaping inside one literal:
+        //   - PowerShell single-quoted strings: `'` is doubled.
+        //   - `-like` glob pattern: `*` and `?` are wildcards; escape with
+        //     PowerShell's backtick so an app name literally containing
+        //     them matches only that character. Without this, an app named
+        //     `Microsoft Edge*` (or VLM hallucinating a trailing `*`) would
+        //     match every process — bringing a random app forward instead
+        //     of the requested one. R3 review I5.
+        let escaped = app
+            .replace('`', "``")
+            .replace('*', "`*")
+            .replace('?', "`?")
+            .replace('[', "`[")
+            .replace(']', "`]")
+            .replace('\'', "''");
         let ps = format!(
             r#"Add-Type -Name W -Namespace N -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);'; Get-Process | Where-Object {{$_.ProcessName -like '*{}*'}} | ForEach-Object {{ if ($_.MainWindowHandle -ne 0) {{ [N.W]::SetForegroundWindow($_.MainWindowHandle) }} }}"#,
             escaped
