@@ -370,6 +370,42 @@ async fn turn_context_request_input_publishes_input_required_and_resumes() {
     mock.await.unwrap();
 }
 
+// ---- ReplyOutcome wiring ------------------------------------------------
+
+#[test]
+fn reply_outcome_default_is_ok() {
+    assert_eq!(
+        rsclaw::agent::registry::ReplyOutcome::default(),
+        rsclaw::agent::registry::ReplyOutcome::Ok
+    );
+}
+
+#[test]
+fn agent_reply_carries_outcome_field() {
+    // Build a reply with each variant — purely a struct-shape pin so a
+    // future refactor that drops the field fails compilation visibly.
+    fn make(outcome: rsclaw::agent::registry::ReplyOutcome) -> rsclaw::agent::AgentReply {
+        rsclaw::agent::AgentReply {
+            text: "x".into(),
+            is_empty: false,
+            tool_calls: None,
+            images: vec![],
+            files: vec![],
+            pending_analysis: None,
+            needs_outer_done_emit: false,
+            outcome,
+        }
+    }
+    assert_eq!(
+        make(rsclaw::agent::registry::ReplyOutcome::Error).outcome,
+        rsclaw::agent::registry::ReplyOutcome::Error
+    );
+    assert_eq!(
+        make(rsclaw::agent::registry::ReplyOutcome::Canceled).outcome,
+        rsclaw::agent::registry::ReplyOutcome::Canceled
+    );
+}
+
 #[tokio::test]
 async fn turn_context_request_input_with_auth_publishes_auth_required() {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);

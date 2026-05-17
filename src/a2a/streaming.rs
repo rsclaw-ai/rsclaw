@@ -45,13 +45,46 @@ pub async fn handle_streaming_rpc(
                 .and_then(|v| v.as_str())
                 .map(str::to_owned)
                 .unwrap_or_default();
-            let rx = state.task_event_bus.subscribe(&tid);
-            (tid, rx)
+            // Empty id or unknown task: emit a synthetic Failed and close so
+            // the SSE doesn't hang waiting on a channel that will never
+            // receive a publish. Existing tasks still in flight have a live
+            // sender, so subscribing returns events as expected.
+            if tid.is_empty() || state.task_store.get(&tid).ok().flatten().is_none() {
+                let rx = state.task_event_bus.subscribe(&tid);
+                state.task_event_bus.publish(AgentEvent::Status {
+                    task_id: tid.clone(),
+                    context_id: String::new(),
+                    state: TaskState::Failed,
+                    message: Some(crate::a2a::event::text_message(if tid.is_empty() {
+                        "SubscribeToTask: missing task id"
+                    } else {
+                        "SubscribeToTask: task not found"
+                    })),
+                    final_: true,
+                });
+                state.task_event_bus.close(&tid);
+                (tid, rx)
+            } else {
+                let rx = state.task_event_bus.subscribe(&tid);
+                (tid, rx)
+            }
         }
-        _ => {
-            let empty = String::new();
-            let rx = state.task_event_bus.subscribe(&empty);
-            (empty, rx)
+        other => {
+            // Unknown method on the SSE entry — emit Failed + close so the
+            // client doesn't hang on an empty broadcast channel.
+            let tid = Uuid::new_v4().to_string();
+            let rx = state.task_event_bus.subscribe(&tid);
+            state.task_event_bus.publish(AgentEvent::Status {
+                task_id: tid.clone(),
+                context_id: String::new(),
+                state: TaskState::Failed,
+                message: Some(crate::a2a::event::text_message(&format!(
+                    "unsupported streaming method: {other}"
+                ))),
+                final_: true,
+            });
+            state.task_event_bus.close(&tid);
+            (tid, rx)
         }
     };
 
@@ -92,8 +125,22 @@ async fn spawn_streaming_task(
         Ok(p) => p,
         Err(e) => {
             warn!(err = %e, "SendStreamingMessage: invalid params");
+            // Without a terminal Failed + bus close the SSE stream stays
+            // open with no events and the client hangs until its read
+            // timeout. Emit a synthetic Failed carrying the parse error
+            // and close the bus so BroadcastStream sees Closed and ends.
             let tid = Uuid::new_v4().to_string();
             let rx = state.task_event_bus.subscribe(&tid);
+            state.task_event_bus.publish(AgentEvent::Status {
+                task_id: tid.clone(),
+                context_id: String::new(),
+                state: TaskState::Failed,
+                message: Some(crate::a2a::event::text_message(&format!(
+                    "invalid params: {e}"
+                ))),
+                final_: true,
+            });
+            state.task_event_bus.close(&tid);
             return (tid, rx);
         }
     };
@@ -138,14 +185,20 @@ async fn spawn_streaming_task(
     };
     let Ok(handle) = handle else {
         warn!("SendStreamingMessage: no agent available");
-        // Still publish a Failed terminal status so the subscriber sees something.
+        // Publish Failed AND close the bus so the SSE stream actually
+        // terminates — without the close the subscriber sees Failed but
+        // BroadcastStream stays subscribed forever waiting for the next
+        // event that will never come.
         state.task_event_bus.publish(AgentEvent::Status {
             task_id: task_id.clone(),
             context_id: session_key.clone(),
             state: TaskState::Failed,
-            message: None,
+            message: Some(crate::a2a::event::text_message(
+                "no agent available for this task",
+            )),
             final_: true,
         });
+        state.task_event_bus.close(&task_id);
         return (task_id, early_rx);
     };
 
@@ -264,24 +317,42 @@ async fn spawn_streaming_task(
     let cancels_for_reply = state.task_cancels.clone();
     tokio::spawn(async move {
         match reply_rx.await {
-            Ok(reply) => {
-                let artifact_id = uuid::Uuid::new_v4().to_string();
-                bus_for_reply.publish(AgentEvent::Artifact {
-                    task_id: task_id_for_reply.clone(),
-                    context_id: ctx_id_for_reply.clone(),
-                    artifact_id,
-                    parts: vec![A2aPart::Text { text: reply.text }],
-                    append: false,
-                    last_chunk: true,
-                });
-                bus_for_reply.publish(AgentEvent::Status {
-                    task_id: task_id_for_reply.clone(),
-                    context_id: ctx_id_for_reply,
-                    state: TaskState::Completed,
-                    message: None,
-                    final_: true,
-                });
-            }
+            Ok(reply) => match reply.outcome {
+                crate::agent::registry::ReplyOutcome::Ok => {
+                    let artifact_id = uuid::Uuid::new_v4().to_string();
+                    bus_for_reply.publish(AgentEvent::Artifact {
+                        task_id: task_id_for_reply.clone(),
+                        context_id: ctx_id_for_reply.clone(),
+                        artifact_id,
+                        parts: vec![A2aPart::Text { text: reply.text }],
+                        append: false,
+                        last_chunk: true,
+                    });
+                    bus_for_reply.publish(AgentEvent::Status {
+                        task_id: task_id_for_reply.clone(),
+                        context_id: ctx_id_for_reply,
+                        state: TaskState::Completed,
+                        message: None,
+                        final_: true,
+                    });
+                }
+                crate::agent::registry::ReplyOutcome::Error => {
+                    // Surface the error text in the terminal Failed message so
+                    // SSE/push subscribers see the cause; no Artifact (Artifact
+                    // implies usable output).
+                    bus_for_reply.publish(AgentEvent::Status {
+                        task_id: task_id_for_reply.clone(),
+                        context_id: ctx_id_for_reply,
+                        state: TaskState::Failed,
+                        message: Some(crate::a2a::event::text_message(&reply.text)),
+                        final_: true,
+                    });
+                }
+                crate::agent::registry::ReplyOutcome::Canceled => {
+                    // CancelTask dispatcher already published the terminal
+                    // Canceled event and closed the bus. Don't republish.
+                }
+            },
             Err(_) => {
                 bus_for_reply.publish(AgentEvent::Status {
                     task_id: task_id_for_reply.clone(),

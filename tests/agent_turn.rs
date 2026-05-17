@@ -134,6 +134,7 @@ async fn start_echo_server(addr: SocketAddr) {
                     files: vec![],
                     pending_analysis: None,
                     needs_outer_done_emit: false,
+                    outcome: rsclaw::agent::registry::ReplyOutcome::Ok,
                 });
             }
         });

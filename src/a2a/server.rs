@@ -419,46 +419,88 @@ async fn handle_send_message(
         metadata: params.message.metadata.clone(),
     };
 
-    let artifact = A2aArtifact {
-        artifact_id: Uuid::new_v4().to_string(),
-        parts: vec![A2aPart::Text { text: reply.text }],
-        name: None,
-        description: None,
-        metadata: None,
-    };
+    // Branch on the reply outcome — without this, every `run_turn` Err
+    // (LLM unreachable, tool exception, A2A cancel) came back wrapped as a
+    // text reply and was published as Completed, silently masking failure.
+    match reply.outcome {
+        crate::agent::registry::ReplyOutcome::Ok => {
+            let artifact = A2aArtifact {
+                artifact_id: Uuid::new_v4().to_string(),
+                parts: vec![A2aPart::Text { text: reply.text }],
+                name: None,
+                description: None,
+                metadata: None,
+            };
 
-    let _ = state.task_store.append_artifact(&task_id, artifact.clone());
-    let _ = state.task_store.set_status(&task_id, TaskState::Completed);
-    state.task_cancels.remove(&task_id);
+            let _ = state.task_store.append_artifact(&task_id, artifact.clone());
+            let _ = state.task_store.set_status(&task_id, TaskState::Completed);
+            state.task_cancels.remove(&task_id);
 
-    // Publish artifact + final Completed status, then close the bus.
-    state.task_event_bus.publish(crate::a2a::event::AgentEvent::Artifact {
-        task_id: task_id.clone(),
-        context_id: session_key.clone(),
-        artifact_id: artifact.artifact_id.clone(),
-        parts: artifact.parts.clone(),
-        append: false,
-        last_chunk: true,
-    });
-    state.task_event_bus.publish(crate::a2a::event::AgentEvent::Status {
-        task_id: task_id.clone(),
-        context_id: session_key.clone(),
-        state: TaskState::Completed,
-        message: None,
-        final_: true,
-    });
-    state.task_event_bus.close(&task_id);
+            state.task_event_bus.publish(crate::a2a::event::AgentEvent::Artifact {
+                task_id: task_id.clone(),
+                context_id: session_key.clone(),
+                artifact_id: artifact.artifact_id.clone(),
+                parts: artifact.parts.clone(),
+                append: false,
+                last_chunk: true,
+            });
+            state.task_event_bus.publish(crate::a2a::event::AgentEvent::Status {
+                task_id: task_id.clone(),
+                context_id: session_key.clone(),
+                state: TaskState::Completed,
+                message: None,
+                final_: true,
+            });
+            state.task_event_bus.close(&task_id);
 
-    let result = json!({
-        "id": task_id,
-        "contextId": session_key,
-        "status": { "state": "TASK_STATE_COMPLETED" },
-        "artifacts": [artifact],
-        "history": [history_msg],
-    });
-
-    info!(task_id, agent = %handle.id, "A2A SendMessage completed");
-    Json(JsonRpcResponse::ok(id, result))
+            let result = json!({
+                "id": task_id,
+                "contextId": session_key,
+                "status": { "state": "TASK_STATE_COMPLETED" },
+                "artifacts": [artifact],
+                "history": [history_msg],
+            });
+            info!(task_id, agent = %handle.id, "A2A SendMessage completed");
+            Json(JsonRpcResponse::ok(id, result))
+        }
+        crate::agent::registry::ReplyOutcome::Error => {
+            let _ = state.task_store.set_status(&task_id, TaskState::Failed);
+            state.task_cancels.remove(&task_id);
+            state.task_event_bus.publish(crate::a2a::event::AgentEvent::Status {
+                task_id: task_id.clone(),
+                context_id: session_key.clone(),
+                state: TaskState::Failed,
+                message: Some(crate::a2a::event::text_message(&reply.text)),
+                final_: true,
+            });
+            state.task_event_bus.close(&task_id);
+            let result = json!({
+                "id": task_id,
+                "contextId": session_key,
+                "status": {
+                    "state": "TASK_STATE_FAILED",
+                    "message": crate::a2a::event::text_message(&reply.text),
+                },
+                "history": [history_msg],
+            });
+            info!(task_id, agent = %handle.id, err = %reply.text, "A2A SendMessage failed");
+            Json(JsonRpcResponse::ok(id, result))
+        }
+        crate::agent::registry::ReplyOutcome::Canceled => {
+            // CancelTask dispatcher already published Canceled and closed the
+            // bus. Don't republish; just return the persisted task snapshot.
+            state.task_cancels.remove(&task_id);
+            let task_snapshot = state.task_store.get(&task_id).ok().flatten();
+            let result = serde_json::to_value(task_snapshot).unwrap_or_else(|_| json!({
+                "id": task_id,
+                "contextId": session_key,
+                "status": { "state": "TASK_STATE_CANCELED" },
+                "history": [history_msg],
+            }));
+            info!(task_id, agent = %handle.id, "A2A SendMessage canceled");
+            Json(JsonRpcResponse::ok(id, result))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

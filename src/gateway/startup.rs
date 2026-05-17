@@ -1195,6 +1195,16 @@ fn spawn_agent_tasks(
                 let turn_errored = result.is_err();
                 let reply = result.unwrap_or_else(|e| {
                     error!(agent = %handle.id, "turn error: {e:#}");
+                    // A2A consumers key off `outcome` to publish the right
+                    // terminal status (Failed vs Canceled). Without this
+                    // distinction the A2A reply-watcher saw `Ok(reply)` and
+                    // always published Completed — so cancellations and
+                    // LLM/tool errors were silently reported as success.
+                    let outcome = if e.to_string().contains("canceled by A2A CancelTask") {
+                        crate::agent::registry::ReplyOutcome::Canceled
+                    } else {
+                        crate::agent::registry::ReplyOutcome::Error
+                    };
                     AgentReply {
                         text: format!("[error: {e}]"),
                         is_empty: false,
@@ -1203,6 +1213,7 @@ fn spawn_agent_tasks(
                         files: vec![],
                         pending_analysis: None,
                         needs_outer_done_emit: false,
+                        outcome,
                     }
                 });
                 // Emit to event_bus for any reply path that bypassed

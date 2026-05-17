@@ -443,6 +443,28 @@ pub struct AgentReply {
     /// Without this flag, WS subscribers (the desktop chat UI) wait forever
     /// for the terminator and the input freezes.
     pub needs_outer_done_emit: bool,
+    /// Why the turn ended. `Ok` = normal success (publish Artifact + Completed).
+    /// `Error(_)` = `run_turn` returned `Err` and the gateway wrapped it as
+    /// a text reply; A2A consumers should publish `Failed`, not `Completed`.
+    /// `Canceled` = `run_turn` returned `Err` because the A2A cancel_token
+    /// fired; the CancelTask dispatcher has already published `Canceled` and
+    /// closed the bus, so A2A consumers must NOT republish a terminal status.
+    pub outcome: ReplyOutcome,
+}
+
+/// How a turn finished, surfaced from the gateway worker so A2A consumers
+/// can emit the right terminal state. Non-A2A channels (WebSocket, channels/*)
+/// ignore this — they show `reply.text` to the user regardless.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ReplyOutcome {
+    #[default]
+    Ok,
+    /// Turn errored — `text` is the rendered error message.
+    Error,
+    /// Turn was cancelled via the A2A cancel_token. The cancel handler has
+    /// already published the terminal `Canceled` status event; A2A consumers
+    /// must not emit another terminal event.
+    Canceled,
 }
 
 // ---------------------------------------------------------------------------

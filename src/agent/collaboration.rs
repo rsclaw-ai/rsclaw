@@ -60,6 +60,7 @@ pub async fn run_sequential(
             files: vec![],
             pending_analysis: None,
             needs_outer_done_emit: false,
+            outcome: crate::agent::registry::ReplyOutcome::Ok,
         });
     }
 
@@ -80,6 +81,7 @@ pub async fn run_sequential(
         files: vec![],
         pending_analysis: None,
         needs_outer_done_emit: false,
+        outcome: crate::agent::registry::ReplyOutcome::Ok,
     })
 }
 

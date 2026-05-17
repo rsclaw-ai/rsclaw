@@ -1039,6 +1039,35 @@ pub fn build_tool_list(
             "required": ["task"]
         }),
     });
+    // A2A v1.0 INPUT_REQUIRED / AUTH_REQUIRED suspend-resume bridge.
+    // Calling this on a non-A2A turn returns an error result (no hang);
+    // the LLM should fall back to a plain reply in that case.
+    tools.push(ToolDef {
+        name: "wait_input".to_owned(),
+        description:
+            "Pause the turn and wait for the calling A2A client to supply additional \
+             input (a missing parameter, a confirmation, etc.). Publishes a \
+             TASK_STATE_INPUT_REQUIRED (or TASK_STATE_AUTH_REQUIRED when \
+             auth=true) status event, suspends until the client re-sends with the \
+             same taskId, and returns the new text as `input`. Only meaningful on \
+             A2A turns — returns an error on other channels."
+                .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "Human-readable prompt the client should render."
+                },
+                "auth": {
+                    "type": "boolean",
+                    "description": "If true, publish AUTH_REQUIRED (for credentials / OAuth handoff) instead of INPUT_REQUIRED. Defaults to false."
+                }
+            },
+            "required": ["prompt"]
+        }),
+    });
+
     tools.push(ToolDef {
         name: "channel".to_owned(),
         description: "Perform channel-specific actions (send, reply, pin, delete messages). Channel is auto-detected from current session or can be specified explicitly: telegram, discord, slack, whatsapp, feishu, weixin, qq, dingtalk.".to_owned(),
