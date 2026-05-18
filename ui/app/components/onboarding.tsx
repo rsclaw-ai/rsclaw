@@ -26,6 +26,8 @@ import {
   API_TYPE_NEEDS_KEY,
 } from "../lib/provider-defaults";
 import { isTauri, invoke as tauriInvokeV2 } from "../utils/tauri";
+import { RsclawRecommendedCard } from "./onboarding-rsclaw-card";
+import type { InstalledKeyData } from "../lib/rsclaw-console";
 
 // ── i18n translations for the wizard ──
 
@@ -784,7 +786,7 @@ export interface ProviderDef {
 
 // All providers (unordered lookup table)
 export const ALL_PROVIDERS: Record<string, ProviderDef> = {
-  rsclaw:      { id: "rsclaw",      name: "RsClaw",             tag: "\u63A8\u8350 \u00B7 kvCache=2", tagEn: "Recommended \u00B7 kvCache=2", keyLabel: "RsClaw API Key", keyPlaceholder: "sk-...", hasBaseUrl: true, defaultBaseUrl: "https://api.rsclaw.ai/v1/agent" },
+  rsclaw:      { id: "rsclaw",      name: "RsClaw",             tag: "\u589E\u91CF\u534F\u8BAE \u00B7 \u4E1A\u5185\u9996\u53D1", tagEn: "Incremental \u00B7 Industry-first", keyLabel: "RsClaw API Key", keyPlaceholder: "sk-...", hasBaseUrl: true, defaultBaseUrl: "https://api.rsclaw.ai/v1/agent" },
   qwen:        { id: "qwen",        name: "Qwen (\u5343\u95EE)", tag: "\u56FD\u5185\u76F4\u8FDE",      tagEn: "China direct",      keyLabel: "DashScope API Key",   keyPlaceholder: "sk-..." },
   doubao:      { id: "doubao",      name: "Doubao (\u8C46\u5305)", tag: "\u5B57\u8282\u8DF3\u52A8",     tagEn: "ByteDance",         keyLabel: "ARK API Key",         keyPlaceholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", hasBaseUrl: true, defaultBaseUrl: "https://ark.cn-beijing.volces.com/api/v3" },
   minimax:     { id: "minimax",     name: "MiniMax",            tag: "\u56FD\u5185",                  tagEn: "China",             keyLabel: "MiniMax API Key",     keyPlaceholder: "eyJ..." },
@@ -2522,6 +2524,41 @@ export function OnboardingPage() {
             <div style={S.card}>
               <div style={S.cardTitle}>{t.step2Title}</div>
               <div style={S.cardSub}>{t.step2Sub}</div>
+
+              {/* Recommended provider card — sits above the regular
+                  list so it visually leads the choice. On install the
+                  callback flips `provs.rsclaw` to selected + apiKey-set
+                  so the rest of step 2 (model picker, test button)
+                  picks it up without the user re-entering anything. */}
+              <RsclawRecommendedCard
+                zh={isZh}
+                onInstalled={(data: InstalledKeyData) => {
+                  setProvs((prev) => {
+                    const next: Record<string, ProvState> = {};
+                    for (const [k, v] of Object.entries(prev)) {
+                      next[k] = {
+                        ...v,
+                        // Deselect all others so the active provider
+                        // dropdown below jumps straight to rsclaw.
+                        selected: k === "rsclaw",
+                      };
+                    }
+                    // Make sure rsclaw exists in the map (it should
+                    // already, but defensive) and fill in the key.
+                    const existing = next["rsclaw"] || ({} as ProvState);
+                    next["rsclaw"] = {
+                      ...existing,
+                      selected: true,
+                      apiKey: data.key,
+                      // Reset any stale test/model state from a prior
+                      // attempt so the user sees a fresh flow.
+                      inputState: "",
+                      models: existing.models || null,
+                    };
+                    return next;
+                  });
+                }}
+              />
 
               {/* List selector */}
               <div style={{ border: "1px solid rgba(255,255,255,0.055)", borderRadius: 10, maxHeight: 155, overflowY: "auto", background: "#141618", marginBottom: 0 }}>

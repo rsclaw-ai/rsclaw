@@ -1,3 +1,20 @@
+[build]
+# sccache caches rustc invocations across projects and worktrees.
+# Biggest win: switching git worktrees (each has its own target/) — sccache
+# shares the rustc cache so the new worktree doesn't recompile from scratch.
+# Install: brew install sccache. Inspect: sccache --show-stats.
+# Disable per-shell: CARGO_BUILD_RUSTC_WRAPPER=""  cargo build
+rustc-wrapper = "sccache"
+
+[alias]
+# Developer-local release — thin LTO + 16 codegen units. Builds much faster
+# than `--release` at a small runtime cost. Use for local dogfooding.
+brd = "build --profile release-dev"
+rrd = "run --profile release-dev --"
+
+# CI-grade release — catches release-only issues without fat LTO.
+brc = "build --profile ci"
+
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
 
