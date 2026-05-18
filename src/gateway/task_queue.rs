@@ -171,6 +171,89 @@ pub struct SkipEntry {
     pub why: String,
 }
 
+/// What the worker should do after grading a turn's outcome.
+///
+/// Extracted as a pure function ([`decide_action`]) so the worker's giant
+/// run loop can stay thin and the routing matrix is unit-testable in
+/// isolation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchAction {
+    /// Mark the task `Done` (success path), close, deliver to user.
+    Complete,
+    /// Mark the task `Failed`. Used for `Recommend::Abandon` and for
+    /// `Recommend::Retry` when no turn budget remains.
+    Fail,
+    /// Continue the same task with the given continuation prompt as next
+    /// agent input. Used for `Partial` / `Stuck` / `Error` / `Retry`.
+    AutoContinue { prompt: String, slow: bool },
+    /// Spawn each task description as a new queued task, then mark the
+    /// current task `Done`. Used for `Recommend::Continue` with
+    /// `follow_up_tasks` populated.
+    Spawn { tasks: Vec<String> },
+}
+
+/// Pure decision function: given an outcome and the turn-budget state, what
+/// should the worker do? Lifted out of `TaskQueueWorker::run` for testability.
+pub fn decide_action(outcome: &TaskOutcome, turn: u32, max_turns: u32) -> DispatchAction {
+    let at_max = max_turns == 0 || turn >= max_turns;
+
+    match outcome {
+        TaskOutcome::Done => DispatchAction::Complete,
+
+        // Structured outcome routes by the agent's own `recommend` field.
+        TaskOutcome::Structured(out) => match out.recommend {
+            // Ship: standard completion. NeedsHuman: also terminal — the
+            // agent's text reply already contains the blocker question; the
+            // user's next message resumes naturally as a fresh task.
+            Recommend::Ship | Recommend::NeedsHuman => DispatchAction::Complete,
+            // Abandon: agent gave up; mark Failed so retry/replay paths skip it.
+            Recommend::Abandon => DispatchAction::Fail,
+            Recommend::Retry => {
+                if at_max {
+                    DispatchAction::Fail
+                } else {
+                    DispatchAction::AutoContinue {
+                        prompt: format!(
+                            "[auto-continue turn {turn}] Retry the task — \
+                             your previous attempt asked for a fresh retry. \
+                             Try again, change something if you can."
+                        ),
+                        slow: true, // brief delay to avoid tight retry loops
+                    }
+                }
+            }
+            Recommend::Continue => {
+                if out.follow_up_tasks.is_empty() {
+                    // recommend=continue but no follow-ups specified — treat
+                    // as Ship rather than wedge the task open.
+                    DispatchAction::Complete
+                } else {
+                    DispatchAction::Spawn {
+                        tasks: out.follow_up_tasks.clone(),
+                    }
+                }
+            }
+        },
+
+        // Agent explicitly asked the user — its reply already carries the
+        // question, complete the task and let the user's reply start a
+        // fresh inbound message.
+        TaskOutcome::NeedsInput(_) => DispatchAction::Complete,
+
+        // Legacy string-classifier path: auto-continue until max turns.
+        TaskOutcome::Partial | TaskOutcome::Stuck(_) | TaskOutcome::Error(_) => {
+            if at_max {
+                DispatchAction::Complete
+            } else {
+                DispatchAction::AutoContinue {
+                    prompt: continuation_prompt(outcome, turn),
+                    slow: matches!(outcome, TaskOutcome::Error(_)),
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pending-outcome stash
 // ---------------------------------------------------------------------------
@@ -1387,14 +1470,12 @@ impl TaskQueueWorker {
                 tracing::warn!(task_id = %task_id, "record_turn failed: {e:#}");
             }
 
-            match outcome {
-                // Done / Structured / NeedsInput are all terminal here: no auto-
-                // continue. Structured carries a self-reported outcome from
-                // `task_finish` (wiring TBD — handled like Done for now);
-                // NeedsInput means the agent explicitly asked the user, so the
-                // task should rest and let the user reply (not loop).
-                TaskOutcome::Done | TaskOutcome::Structured(_) | TaskOutcome::NeedsInput(_) => {
-                    info!(task_id = %task_id, turn, "task queue worker: task completed");
+            // Routing matrix lives in `decide_action` so the logic is
+            // testable in isolation.
+            let action = decide_action(&outcome, turn, max_turns);
+            info!(task_id = %task_id, turn, ?action, "task queue worker: action");
+            match action {
+                DispatchAction::Complete => {
                     if let Err(e) = self.manager.complete(&task_id) {
                         error!(task_id = %task_id, "complete() error: {e:#}");
                     }
@@ -1406,32 +1487,80 @@ impl TaskQueueWorker {
                     cleanup_staged_files(&task);
                     break;
                 }
-                TaskOutcome::Partial | TaskOutcome::Stuck(_) | TaskOutcome::Error(_) => {
-                    if max_turns == 0 || turn >= max_turns {
-                        info!(
-                            task_id = %task_id, turn, max_turns,
-                            "task queue worker: max turns reached, marking done"
-                        );
-                        if let Err(e) = self.manager.complete(&task_id) {
-                            error!(task_id = %task_id, "complete() error: {e:#}");
+                DispatchAction::Fail => {
+                    // Agent declared abandon / retry exhausted. Mark Failed
+                    // so the queue's retry/replay logic doesn't loop.
+                    if let Err(e) = self.manager.fail(&task_id, "agent abandoned", 0) {
+                        error!(task_id = %task_id, "fail() error: {e:#}");
+                    }
+                    if last_send_ok {
+                        if let Err(e) = self.manager.mark_notified(&task_id) {
+                            error!(task_id = %task_id, "mark_notified() error: {e:#}");
                         }
-                        if last_send_ok {
-                            if let Err(e) = self.manager.mark_notified(&task_id) {
-                                error!(task_id = %task_id, "mark_notified() error: {e:#}");
+                    }
+                    cleanup_staged_files(&task);
+                    break;
+                }
+                DispatchAction::Spawn { tasks } => {
+                    // Recommend::Continue with follow_up_tasks. Spawn each as
+                    // a fresh queued task on the same session so the agent
+                    // keeps its conversational context, then mark this turn's
+                    // task complete.
+                    let base = task.messages.first().cloned();
+                    let now = chrono::Utc::now().timestamp();
+                    let spawned = tasks.len();
+                    for follow_up in tasks {
+                        let Some(ref base_msg) = base else {
+                            warn!(task_id = %task_id, "spawn: no base message to inherit channel from");
+                            break;
+                        };
+                        let msg = QueuedMessage {
+                            text: follow_up,
+                            sender: format!("{}:follow_up", base_msg.sender),
+                            channel: base_msg.channel.clone(),
+                            account: base_msg.account.clone(),
+                            chat_id: base_msg.chat_id.clone(),
+                            is_group: base_msg.is_group,
+                            reply_to: None,
+                            timestamp: now,
+                            images: vec![],
+                            files: vec![],
+                        };
+                        // Inherit budget from the parent task. Use System
+                        // priority so follow-ups jump the queue ahead of new
+                        // user input (the chain shouldn't get starved).
+                        match self.manager.submit_task(
+                            &task.session_key,
+                            msg,
+                            Priority::System,
+                            task.max_turns,
+                            task.ttl_secs,
+                        ) {
+                            Ok((new_id, _)) => {
+                                info!(parent = %task_id, child = %new_id, "spawn: follow-up enqueued");
+                            }
+                            Err(e) => {
+                                warn!(parent = %task_id, "spawn: submit_task failed: {e:#}");
                             }
                         }
-                        cleanup_staged_files(&task);
-                        break;
                     }
-
-                    // Auto-continue: send continuation prompt to the same session.
-                    let prompt = continuation_prompt(&outcome, turn);
-                    info!(task_id = %task_id, turn, "task queue worker: auto-continue");
+                    info!(task_id = %task_id, spawned, "spawn: parent task completing");
+                    if let Err(e) = self.manager.complete(&task_id) {
+                        error!(task_id = %task_id, "complete() error: {e:#}");
+                    }
+                    if last_send_ok {
+                        if let Err(e) = self.manager.mark_notified(&task_id) {
+                            error!(task_id = %task_id, "mark_notified() error: {e:#}");
+                        }
+                    }
+                    cleanup_staged_files(&task);
+                    break;
+                }
+                DispatchAction::AutoContinue { prompt, slow } => {
                     next_text = prompt;
                     next_images = vec![];
                     next_files = vec![];
-                    // Small delay before retry to avoid tight loops on errors.
-                    if matches!(outcome, TaskOutcome::Error(_)) {
+                    if slow {
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                 }
@@ -1495,5 +1624,209 @@ mod tests {
         let (turns, _ttl) = parse_task_prefix(&mut text);
         assert_eq!(turns, TASK_DEFAULT_MAX_TURNS);
         assert_eq!(text, "-n investigate logs");
+    }
+
+    // -----------------------------------------------------------------------
+    // Structured outcome — schema + dispatch matrix
+    // -----------------------------------------------------------------------
+
+    fn make_outcome(
+        completion: Completion,
+        recommend: Recommend,
+    ) -> StructuredOutcome {
+        StructuredOutcome {
+            completion,
+            recommend,
+            verified: false,
+            verification_log: None,
+            accomplished: vec!["did the thing".into()],
+            skipped: vec![],
+            blocked_on: vec![],
+            assumptions: vec![],
+            follow_up_tasks: vec![],
+            summary: None,
+        }
+    }
+
+    #[test]
+    fn structured_outcome_serializes_snake_case() {
+        // Outcome serializes with snake_case keys so A2A consumers and the
+        // task_finish tool schema agree on the wire format.
+        let mut out = make_outcome(Completion::Partial, Recommend::Continue);
+        out.follow_up_tasks = vec!["task A".into(), "task B".into()];
+        out.blocked_on = vec!["disk full".into()];
+
+        let json = serde_json::to_value(&out).expect("serialize");
+        assert_eq!(json["completion"], "partial");
+        assert_eq!(json["recommend"], "continue");
+        assert_eq!(json["follow_up_tasks"][0], "task A");
+        assert_eq!(json["blocked_on"][0], "disk full");
+    }
+
+    #[test]
+    fn pending_outcome_stash_roundtrip() {
+        let session = "test:stash:roundtrip";
+        // No outcome staged → drain returns None.
+        assert!(drain_pending_outcome(session).is_none());
+
+        let outcome = make_outcome(Completion::Full, Recommend::Ship);
+        stage_pending_outcome(session, outcome);
+
+        let drained = drain_pending_outcome(session).expect("staged outcome");
+        assert_eq!(drained.completion, Completion::Full);
+        assert_eq!(drained.recommend, Recommend::Ship);
+
+        // Second drain is empty — drain consumes.
+        assert!(drain_pending_outcome(session).is_none());
+    }
+
+    #[test]
+    fn decide_action_done_completes() {
+        assert_eq!(
+            decide_action(&TaskOutcome::Done, 1, 10),
+            DispatchAction::Complete
+        );
+    }
+
+    #[test]
+    fn decide_action_structured_ship_completes() {
+        let outcome = TaskOutcome::Structured(make_outcome(Completion::Full, Recommend::Ship));
+        assert_eq!(decide_action(&outcome, 1, 10), DispatchAction::Complete);
+    }
+
+    #[test]
+    fn decide_action_structured_needs_human_completes() {
+        let outcome =
+            TaskOutcome::Structured(make_outcome(Completion::Partial, Recommend::NeedsHuman));
+        assert_eq!(decide_action(&outcome, 1, 10), DispatchAction::Complete);
+    }
+
+    #[test]
+    fn decide_action_structured_abandon_fails() {
+        let outcome =
+            TaskOutcome::Structured(make_outcome(Completion::Failed, Recommend::Abandon));
+        assert_eq!(decide_action(&outcome, 1, 10), DispatchAction::Fail);
+    }
+
+    #[test]
+    fn decide_action_structured_retry_continues() {
+        let outcome = TaskOutcome::Structured(make_outcome(Completion::Minimal, Recommend::Retry));
+        match decide_action(&outcome, 2, 10) {
+            DispatchAction::AutoContinue { prompt, slow } => {
+                assert!(prompt.contains("Retry"));
+                assert!(slow, "retry should rate-limit");
+            }
+            other => panic!("expected AutoContinue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_action_structured_retry_at_max_fails() {
+        // At the turn budget cap, Retry is downgraded to Fail (we can't
+        // retry forever).
+        let outcome = TaskOutcome::Structured(make_outcome(Completion::Minimal, Recommend::Retry));
+        assert_eq!(decide_action(&outcome, 5, 5), DispatchAction::Fail);
+    }
+
+    #[test]
+    fn decide_action_structured_continue_with_followups_spawns() {
+        let mut out = make_outcome(Completion::Partial, Recommend::Continue);
+        out.follow_up_tasks = vec!["step 1".into(), "step 2".into()];
+        let outcome = TaskOutcome::Structured(out);
+        match decide_action(&outcome, 1, 10) {
+            DispatchAction::Spawn { tasks } => {
+                assert_eq!(tasks, vec!["step 1".to_string(), "step 2".to_string()]);
+            }
+            other => panic!("expected Spawn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_action_structured_continue_without_followups_completes() {
+        // recommend=continue but no follow-ups specified → don't wedge open,
+        // treat as Complete.
+        let outcome =
+            TaskOutcome::Structured(make_outcome(Completion::Partial, Recommend::Continue));
+        assert_eq!(decide_action(&outcome, 1, 10), DispatchAction::Complete);
+    }
+
+    #[test]
+    fn decide_action_needs_input_completes() {
+        let outcome = TaskOutcome::NeedsInput("which file?".into());
+        assert_eq!(decide_action(&outcome, 1, 10), DispatchAction::Complete);
+    }
+
+    #[test]
+    fn decide_action_partial_continues_under_budget() {
+        match decide_action(&TaskOutcome::Partial, 2, 10) {
+            DispatchAction::AutoContinue { prompt, slow } => {
+                assert!(prompt.contains("Continue"));
+                assert!(!slow, "partial should not rate-limit");
+            }
+            other => panic!("expected AutoContinue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_action_partial_at_max_completes() {
+        // Legacy behaviour preserved: at max turns, Partial/Stuck/Error fall
+        // back to Complete (deliver whatever the agent has produced).
+        assert_eq!(
+            decide_action(&TaskOutcome::Partial, 5, 5),
+            DispatchAction::Complete
+        );
+    }
+
+    #[test]
+    fn decide_action_error_slow_retry() {
+        match decide_action(&TaskOutcome::Error("rate limit".into()), 1, 10) {
+            DispatchAction::AutoContinue { slow, .. } => {
+                assert!(slow, "Error should rate-limit before retry");
+            }
+            other => panic!("expected AutoContinue, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_outcome — Chinese keyword coverage
+    // -----------------------------------------------------------------------
+
+    fn fake_reply(text: &str) -> crate::agent::AgentReply {
+        crate::agent::AgentReply {
+            text: text.to_string(),
+            is_empty: text.is_empty(),
+            tool_calls: None,
+            images: vec![],
+            files: vec![],
+            pending_analysis: None,
+            needs_outer_done_emit: false,
+            outcome: crate::agent::registry::ReplyOutcome::Ok,
+        }
+    }
+
+    #[test]
+    fn classify_chinese_stuck_phrase() {
+        let reply = fake_reply("抱歉，我无法完成这个任务");
+        assert!(matches!(classify_outcome(&reply), TaskOutcome::Stuck(_)));
+    }
+
+    #[test]
+    fn classify_chinese_partial_phrase() {
+        let reply = fake_reply("先做了一半，下一步来处理剩下的");
+        assert!(matches!(classify_outcome(&reply), TaskOutcome::Partial));
+    }
+
+    #[test]
+    fn classify_empty_reply_is_stuck() {
+        assert!(matches!(
+            classify_outcome(&fake_reply("")),
+            TaskOutcome::Stuck(_)
+        ));
+    }
+
+    #[test]
+    fn classify_plain_reply_is_done() {
+        let reply = fake_reply("Sure, here's the result: 42.");
+        assert!(matches!(classify_outcome(&reply), TaskOutcome::Done));
     }
 }
