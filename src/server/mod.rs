@@ -109,7 +109,7 @@ pub struct AppState {
         broadcast::Sender<crate::computer::status::ComputerUseStatus>,
     /// Live registry of in-flight `computer_use` runs.
     /// Maps `run_id` -> the driver's abort flag. Inserted when
-    /// `tool_ui_tars` mints a run and removed on driver exit. The
+    /// `tool_vlm_drive` mints a run and removed on driver exit. The
     /// `POST /computer-use/runs/{run_id}/abort` HTTP endpoint sets the
     /// flag; the driver's loop checks it between steps and exits with
     /// `DriverOutcome::UserAbort` -> `Finished { outcome_kind: "user_abort" }`,
@@ -160,6 +160,19 @@ pub struct AppState {
     /// in-flight HTTP requests, task queue tasks, and channel handlers
     /// before re-exec.
     pub shutdown: crate::gateway::ShutdownCoordinator,
+    /// A2A v1.0 per-task event broadcast bus (fan-out for SSE subscribers
+    /// and the push notification dispatcher).
+    pub task_event_bus: crate::a2a::event::TaskEventBus,
+    /// Cancellation tokens for in-flight A2A tasks, keyed by task_id.
+    /// Inserted on SendMessage / SendStreamingMessage entry; fired by CancelTask.
+    pub task_cancels: Arc<dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
+    /// Tasks paused on TASK_STATE_INPUT_REQUIRED / AUTH_REQUIRED, keyed by task_id.
+    /// Resumed when the client sends another SendMessage with the matching taskId.
+    pub suspended_tasks: Arc<dashmap::DashMap<String, crate::a2a::event::SuspendedTask>>,
+    /// Persistent A2A task / push-config store (redb).
+    pub task_store: Arc<crate::a2a::store::TaskStore>,
+    /// Push notification dispatcher (subscribes to event bus, signs payloads).
+    pub push_dispatcher: Arc<crate::a2a::push::PushDispatcher>,
 }
 
 // AgentEvent is defined in crate::events to avoid circular deps with agent.
@@ -268,7 +281,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/workspace/files", get(list_workspace_files))
         .route("/workspace/files/{*path}", get(read_workspace_file).put(write_workspace_file))
         .route("/stream", get(stream_sse))
-        .route("/a2a", post(crate::a2a::server::a2a_rpc_handler))
+        .route(
+            "/a2a",
+            post(crate::a2a::server::a2a_dispatch)
+                .layer(axum::middleware::from_fn(crate::a2a::version::a2a_version_layer))
+                .layer(axum::middleware::from_fn(crate::a2a::auth::a2a_auth_layer)),
+        )
         .route("/tools/execute", post(execute_tool))
         .route("/computer-use/permissions", get(computer_use_permissions_list))
         .route(
@@ -286,6 +304,13 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .nest("/api/v1", api)
+        // Convenience alias: bare `/health` resolves to the same handler
+        // as `/api/v1/health`. Container orchestrators (Docker, k8s,
+        // generic uptime monitors) default to `/health`; aliasing avoids
+        // a misleading 401 in their logs when they probe an unmatched
+        // path. See auth_middleware's bypass list for the matching
+        // allowance.
+        .route("/health", get(health))
         .route("/hooks/feishu", post(feishu_webhook))
         .route("/hooks/wecom", get(wecom_verify).post(wecom_webhook))
         .route(
@@ -297,7 +322,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/hooks/{*path}", post(crate::hooks::handle_webhook))
         .route(
             "/.well-known/agent.json",
-            get(crate::a2a::server::agent_card_handler),
+            get(crate::a2a::server::agent_card_handler).layer(axum::middleware::from_fn(
+                crate::a2a::version::a2a_version_layer,
+            )),
         )
         // OpenAI-compatible endpoints — allow any OpenAI API client to connect.
         .route("/v1/chat/completions", post(openai_chat_completions))
@@ -358,8 +385,19 @@ async fn auth_middleware(
 ) -> Response {
     // Health, agent card discovery, WS, and internal reload endpoints are always open
     // (WS performs its own handshake-level auth).
+    //
+    // Both the bare `/health` and the namespaced `/api/v1/health` are
+    // listed: the bare path is the default for container orchestrators
+    // (Docker HEALTHCHECK, k8s probes, generic uptime monitors) and
+    // operator muscle memory; without the bypass the auth middleware
+    // would respond 401 BEFORE the request reached the routing layer,
+    // surfacing as a misleading "unauthorized" instead of the honest
+    // "path does not exist on this server". Both routes resolve to the
+    // same handler — see the top-level alias just below the `nest`
+    // call in `build_router`.
     let path = request.uri().path();
     if path == "/"
+        || path == "/health"
         || path == "/api/v1/health"
         || path == "/.well-known/agent.json"
         || path == "/ws"
@@ -369,6 +407,12 @@ async fn auth_middleware(
         || path == "/api/v1/shutdown"
         || path == "/api/v1/restart"
         || path == "/api/v1/restart-dismiss"
+        // A2A v1.0: bypass gateway-level auth so the protocol's own
+        // bearer/X-API-Key schemes (declared in Agent Card securitySchemes
+        // and enforced by `a2a_auth_layer`) are the authoritative gate.
+        // Otherwise the gateway token would override the A2A-advertised
+        // auth and any A2A v1.0 client following the spec would 401.
+        || path == "/api/v1/a2a"
     {
         return next.run(request).await;
     }
@@ -457,6 +501,11 @@ async fn send_message(
         peer_id: req.peer_id.unwrap_or_else(|| "api-client".to_string()),
         chat_id: String::new(),
         reply_tx,
+        task_id: None,
+        context_id: None,
+        event_tx: None,
+        cancel_token: None,
+        input_request_tx: None,
         extra_tools: vec![],
         images: file_images,
         files: file_files,
@@ -967,18 +1016,14 @@ async fn execute_tool(
     Json(serde_json::json!({"error": "use 'plugin.tool' format, e.g. 'jimeng.txt2img'"}))
 }
 
-async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let uptime_secs = state.started_at.elapsed().as_secs();
-    let hours = uptime_secs / 3600;
-    let mins = (uptime_secs % 3600) / 60;
-    let secs = uptime_secs % 60;
-    let port = state.live.gateway.read().await.port;
-    Json(serde_json::json!({
-        "status": "ok",
-        "version": option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
-        "port": port,
-        "uptime": format!("{:02}:{:02}:{:02}", hours, mins, secs),
-    }))
+async fn health(State(_state): State<AppState>) -> impl IntoResponse {
+    // Minimal unauthenticated health payload (R4 review I2).
+    // Previously leaked `version` + `port` to anyone reaching the
+    // bare `/health` alias — useful for CVE fingerprinting against
+    // a public-facing gateway, and the port is redundant since the
+    // caller already connected to it. Rich uptime / build info now
+    // lives only on the auth-gated `/api/v1/status` endpoint.
+    Json(serde_json::json!({"status": "ok"}))
 }
 
 async fn status(State(state): State<AppState>) -> impl IntoResponse {
@@ -1510,6 +1555,11 @@ async fn cron_trigger(State(state): State<AppState>, Path(id): Path<String>) -> 
             peer_id: format!("cron:{id}"),
             chat_id: String::new(),
             reply_tx,
+            task_id: None,
+            context_id: None,
+            event_tx: None,
+            cancel_token: None,
+            input_request_tx: None,
             extra_tools: vec![],
             images: vec![],
             files: vec![],
@@ -2059,6 +2109,11 @@ async fn openai_chat_completions(
         peer_id,
         chat_id: String::new(),
         reply_tx,
+        task_id: None,
+        context_id: None,
+        event_tx: None,
+        cancel_token: None,
+        input_request_tx: None,
         extra_tools,
         images: file_images,
         files: file_files,

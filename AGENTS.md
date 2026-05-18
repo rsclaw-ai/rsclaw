@@ -15,7 +15,7 @@ a Tauri desktop app. The user-visible identity is **"Crab AI Assistant"**.
 **Core responsibilities:**
 
 - Receive user input from 13 messaging channels and dispatch to agent runtimes
-- Speak OpenAI-compatible, A2A v0.3, ACP, and WebSocket v3 protocols on the **inbound** side
+- Speak OpenAI-compatible, A2A v1.0, ACP, and WebSocket v3 protocols on the **inbound** side
 - Drive an agent loop with heartbeat / meditation / evolution / tool dispatch
 - Manage LLM providers with cross-provider failover (internal plumbing, not a customer product)
 - Store conversation history (redb KV + tantivy full-text + hnsw_rs vector)
@@ -73,7 +73,7 @@ src/
   store/      redb KV + tantivy full-text + hnsw_rs vector
   ws/         WebSocket protocol v3 (OpenClaw-compatible)
   acp/        Agent Client Protocol
-  a2a/        Google A2A v0.3 (cross-network agent collaboration)
+  a2a/        Google A2A v1.0 (cross-network agent collaboration)
   mcp/        MCP client (stdin/stdout JSON-RPC)
   plugin/     Shell bridge, hook registration
   skill/      Skill loader, ClawHub/SkillHub client

@@ -37,7 +37,7 @@ use cmd::{
     cmd_dns, cmd_docs, cmd_doctor, cmd_gateway, cmd_health, cmd_hooks, cmd_logs, cmd_memory,
     cmd_message, cmd_migrate, cmd_models, cmd_onboard, cmd_plugins, cmd_qr, cmd_reset, cmd_sandbox,
     cmd_secrets, cmd_security, cmd_sessions, cmd_setup, cmd_skills, cmd_status, cmd_system,
-    cmd_tools, cmd_tray, cmd_tui, cmd_uninstall, cmd_update, cmd_webhooks,
+    cmd_tools, cmd_tray, cmd_tui, cmd_uninstall, cmd_update, cmd_watch, cmd_webhooks,
 };
 use rsclaw::{cli, cmd, sys};
 use tracing_subscriber::EnvFilter;
@@ -212,6 +212,7 @@ async fn run() -> Result<()> {
         Command::Qr(args) => cmd_qr(args).await,
         Command::Uninstall(args) => cmd_uninstall(args).await,
         Command::Webhooks(sub) => cmd_webhooks(sub).await,
+        Command::Watch(args) => cmd_watch(args).await,
         Command::Debug(sub) => cmd_debug(sub).await,
     }
 }

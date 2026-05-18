@@ -35,6 +35,7 @@ pub mod setup;
 pub mod skills;
 pub mod system;
 pub mod tools;
+pub mod watch;
 pub mod webhooks;
 
 pub use acp::AcpCommand;
@@ -75,6 +76,7 @@ pub use setup::{ConfigureArgs, OnboardArgs, SetupArgs};
 pub use skills::SkillsCommand;
 pub use system::{HeartbeatCommand, SystemCommand};
 pub use tools::ToolsCommand;
+pub use watch::WatchArgs;
 pub use webhooks::WebhooksCommand;
 
 // ---------------------------------------------------------------------------
@@ -320,6 +322,10 @@ pub enum Command {
     /// Webhook helpers.
     #[command(subcommand)]
     Webhooks(WebhooksCommand),
+
+    /// Stream a file / SSE / shell source to stdout (same grammar as
+    /// the `/watch` chat slash command, but delivered to the terminal).
+    Watch(WatchArgs),
 
     /// Debug utilities — prompt-spec dumps, internal state inspection.
     #[command(subcommand)]

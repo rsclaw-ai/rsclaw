@@ -1,6 +1,6 @@
 [package]
 name = "rsclaw"
-version = "2026.5.5"
+version = "2026.5.15"
 edition = "2024"
 rust-version = "1.91"
 description = "AI Agent Engine Compatible with OpenClaw"
@@ -15,6 +15,9 @@ path = "src/main.rs"
 # Async runtime
 tokio        = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util   = { version = "0.7", features = ["rt"] }
+dashmap      = "6"
+eventsource-stream = "0.2"
 
 # Web framework
 axum         = { version = "0.8", features = ["ws", "multipart"] }
@@ -55,6 +58,13 @@ crossterm = "0.28"
 # Utilities
 uuid    = { version = "1", features = ["v4"] }
 regex   = "1"
+
+# jq interpreter for /watch --jq <expr> and built-in templates.
+# `sync` feature makes jaq_json::Val use Arc instead of Rc, so the
+# compiled filter can cross tokio task boundaries.
+jaq-core = "3"
+jaq-json = { version = "2", features = ["sync"] }
+jaq-std  = "3"
 chrono  = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 tracing = "0.1"
@@ -156,6 +166,9 @@ overflow-checks = false
 # Reduce stack usage in debug builds
 [profile.dev]
 opt-level = 1
+# Trim DWARF: keep file:line for backtraces, drop variable/type info.
+# Cuts target/debug size ~40-60% without affecting panic location info.
+debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 0

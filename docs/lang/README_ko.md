@@ -26,7 +26,7 @@ RsClaw는 [OpenClaw](https://github.com/openclaw/openclaw)를 Rust로 완전히 
 - **32개 내장 도구** -- 파일 작업, 셸 실행, 웹 검색/브라우저, 이미지 생성, 메모리, 메시징, cron, A2A 에이전트 협업
 - **40개 이상의 프리파스 명령** -- LLM 바이패스, 토큰 소비 제로, 밀리초 미만 응답
 - **CDP 브라우저 자동화** -- 내장 headless Chrome 제어 (20개 동작)
-- **A2A 프로토콜** -- Google A2A v0.3 (네트워크 간 에이전트 협업)
+- **A2A 프로토콜** -- Google A2A v1.0 (네트워크 간 에이전트 협업)
 - **실행 보안** -- deny/confirm/allow 규칙, 50개 이상의 거부 패턴
 - **멀티에이전트** -- 순차, 병렬, 오케스트레이션 실행 모드
 
@@ -77,7 +77,7 @@ rsclaw doctor --fix
 | 메시지 채널 | 13 + 커스텀 Webhook | 8 |
 | LLM 프로바이더 | 15 | ~10 |
 | 내장 도구 | 32 | ~25 |
-| A2A 프로토콜 | Google A2A v0.3 | -- |
+| A2A 프로토콜 | Google A2A v1.0 | -- |
 | 브라우저 자동화 | 내장 CDP (20개 동작) | -- |
 | computer_use | 네이티브 스크린샷/마우스/키보드 | -- |
 

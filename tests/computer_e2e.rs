@@ -62,11 +62,13 @@ fn prompt_includes_all_sections() {
     assert!(prompt.contains("You are a GUI agent"));
     assert!(prompt.contains("## Output Format"));
     assert!(prompt.contains("## Action Space"));
-    // Action Space samples wrap coordinates in `<|box_start|>...<|box_end|>`
-    // markers — that's the chat-template tokenizer's bbox sentinel format,
-    // distinct from the older `[x1,y1,x2,y2]` shape some VLMs accept. The
-    // worker's tokenizer relies on the markers being present verbatim.
-    assert!(prompt.contains("click(start_box='<|box_start|>(x1,y1)<|box_end|>')"));
+    // Action Space samples wrap coordinates in the portable `<box>x,y</box>`
+    // form (R3 review C1). Prior versions used UI-TARS-tokenizer-specific
+    // `<|box_start|>...<|box_end|>` markers — but those force every VLM
+    // to have those special tokens in its vocabulary. The `<box>` form
+    // is plain text any VLM can emit, and the parser (CoordFormat::Auto)
+    // still accepts the legacy UiTarsBoxPair format as a fallback.
+    assert!(prompt.contains("click(start_box='<box>x1,y1</box>')"));
     assert!(prompt.contains("## Note"));
     assert!(prompt.contains("Use Chinese in `Thought` part"));
     assert!(prompt.contains("## Thought Examples"));

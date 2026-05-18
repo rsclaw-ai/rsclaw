@@ -653,6 +653,11 @@ impl AgentRuntime {
                 peer_id: self_peer_id,
                 chat_id: self_chat_id,
                 reply_tx,
+                task_id: None,
+                context_id: None,
+                event_tx: None,
+                cancel_token: None,
+                input_request_tx: None,
                 extra_tools: vec![],
                 images: vec![],
                 files: vec![],
@@ -1623,6 +1628,11 @@ impl AgentRuntime {
                         images: vec![],
                         files: vec![],
                         account: None,
+                        task_id: None,
+                        context_id: None,
+                        event_tx: None,
+                        cancel_token: None,
+                        input_request_tx: None,
                     };
                     if self_tx.send(inject_msg).await.is_err() {
                         tracing::warn!("tool_codex: failed to inject result back to agent inbox");

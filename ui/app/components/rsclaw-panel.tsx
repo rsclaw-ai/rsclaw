@@ -3620,11 +3620,23 @@ function TauriConfigPageInner() {
           apiModels = Array.from(families.values()).sort();
         }
         if (apiModels.length > 0) {
+          // Always surface MODELS[provId] presets at the top of the list,
+          // even when they aren't returned by the upstream /v1/models call
+          // (e.g. doubao's "rolling alias" ids like `doubao-seed-2.0-pro`
+          // never appear in the API \u2014 only dated snapshots do). Dedup by
+          // id so a preset that DOES appear upstream isn't duplicated, and
+          // cap the API tail at 30 so the picker stays manageable.
+          const presets = (MODELS[provId] || []).map((m) => ({ id: m.id, tag: zh ? m.tag : m.tagEn }));
+          const presetIds = new Set(presets.map((m) => m.id));
+          const apiEntries = apiModels
+            .filter((id) => !presetIds.has(id))
+            .slice(0, 30)
+            .map((id) => {
+              const fallback = (MODELS[provId] || []).find((fm) => fm.id === id);
+              return { id, tag: fallback ? (zh ? fallback.tag : fallback.tagEn) : "" };
+            });
           setProvTest((prev) => ({ ...prev, [provId]: "ok" }));
-          setProvModels((prev) => ({ ...prev, [provId]: apiModels.slice(0, 30).map((id) => {
-            const fallback = (MODELS[provId] || []).find((fm) => fm.id === id);
-            return { id, tag: fallback ? (zh ? fallback.tag : fallback.tagEn) : "" };
-          }) }));
+          setProvModels((prev) => ({ ...prev, [provId]: [...presets, ...apiEntries] }));
           toast.success(zh ? `${provId} \u8FDE\u63A5\u6210\u529F (${apiModels.length} \u4E2A\u6A21\u578B)` : `${provId} connected (${apiModels.length} models)`);
         } else {
           // API key works but no models returned

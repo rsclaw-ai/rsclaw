@@ -23,8 +23,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
-    ContentPart, LlmProvider, LlmRequest, LlmStream, Message, MessageContent, Role, StreamEvent,
-    TokenUsage,
+    AgentEndpoint, ContentPart, LlmProvider, LlmRequest, LlmStream, Message, MessageContent, Role,
+    StreamEvent, TokenUsage,
 };
 
 /// Default base for the rsclaw-server fleet. The `/v1/agent` suffix
@@ -41,6 +41,48 @@ use super::{
 /// instance pays the redirect cost; everything within the TTL after
 /// goes direct, so steady-state latency matches a direct deployment.
 pub const RSCLAW_DEFAULT_BASE: &str = "https://api.rsclaw.ai/v1/agent";
+
+/// Default `prefix_id` per protocol §2.1.1 / §2.10.1 — namespaced
+/// `<ns>/<ver>` string the gateway sends on `POST /sessions`. It's a
+/// STATIC identifier (config-driven, never derived from `req.model` or
+/// any hash of the request body) so the worker can route the call to
+/// its static-registry prefix when one is registered, and otherwise
+/// fall back to the dynamic-LRU keyed by `hash(system + tools)`
+/// computed worker-side. `req.model` deliberately does NOT participate
+/// in prefix_id construction — model selection is independent from the
+/// prefix-cache identity. Override via the per-provider config field
+/// `prefix_id` (see `ProviderConfig::prefix_id`).
+///
+/// The `<ver>` component here is the **baseline** version, NOT the
+/// gateway's `CARGO_PKG_VERSION`. They are decoupled on purpose:
+/// rsclaw-llm has to manually pre-register a base-layer KV slot for
+/// each unique prefix_id, and a typical Cargo bump (patch release,
+/// channel hot-fix, debug toggle) does not change the canonical
+/// `shared_prefix + builtin_tools` payload that this identifier
+/// names. Auto-tracking `CARGO_PKG_VERSION` would invalidate the
+/// worker's registered slot on every gateway release. Bump this
+/// string by hand only when the canonical baseline (asserted by
+/// `tests/fixtures/baseline-<ver>.json`) actually changes, and
+/// coordinate with rsclaw-llm to re-ingest the new fixture under
+/// the new identifier.
+pub const RSCLAW_DEFAULT_PREFIX_ID: &str = "rsclaw/2026.5.15";
+
+/// Well-known model names served by the managed rsclaw fleet (see
+/// `GET /v1/agent/models`). Used by `agent::runtime` to auto-resolve
+/// `flash` and `vision` when the user only configured a `rsclaw/*`
+/// primary model. The contract: as long as your `model.primary` lives
+/// under the `rsclaw/` namespace, you get the rsclaw flash and vision
+/// slots for free without repeating them in config. Override via
+/// `agents.defaults.model.flash` / `agents.defaults.model.vision` when
+/// you want a different model.
+///
+/// Keep these in sync with whatever the fleet ingests under the
+/// version named by [`RSCLAW_DEFAULT_PREFIX_ID`]. When the fleet bumps
+/// a model name (e.g. `rsclaw-flash-v2`), bump both — clients on the
+/// new gateway version pick up the new defaults automatically without
+/// every user having to edit their config.
+pub const RSCLAW_DEFAULT_FLASH: &str = "rsclaw/rsclaw-flash-v1";
+pub const RSCLAW_DEFAULT_VISION: &str = "rsclaw/rsclaw-vision-v1";
 
 /// How long to wait for `/sessions/<id>/turn` to start responding
 /// (TCP connect + TLS + send body + receive headers + first byte).
@@ -99,6 +141,16 @@ pub struct RsclawProvider {
     client: Client,
     base_url: String,
     bearer: Option<String>,
+    /// Namespaced `<ns>/<ver>` string sent verbatim as the wire
+    /// `prefix_id` on every `POST /sessions` / `POST /sessions/replay`.
+    /// Resolved at provider construction from the per-provider config
+    /// `prefix_id` field, falling back to [`RSCLAW_DEFAULT_PREFIX_ID`]
+    /// when the field is absent. It is intentionally static for the
+    /// lifetime of the provider: the worker-side dynamic-LRU is keyed
+    /// by `hash(system + tools)` (not `user_system`, not `req.model`),
+    /// so threading model or per-request data into this field would
+    /// only fragment the cache.
+    prefix_id: String,
     sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
     /// Cache of 308 redirects, keyed by *origin* (scheme + host + port)
     /// of the requested URL. Lets a single LB call amortise across the
@@ -288,9 +340,42 @@ impl RsclawProvider {
             client,
             base_url,
             bearer,
+            prefix_id: RSCLAW_DEFAULT_PREFIX_ID.to_owned(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             redirect_cache: Arc::new(Mutex::new(RedirectCache::default())),
         }
+    }
+
+    /// Override the default `prefix_id` sent on the wire. Used by the
+    /// provider builder in `gateway::providers` when the config carries
+    /// an explicit `prefix_id`. Trims whitespace and ignores empty
+    /// strings (dotenv-style trailing newlines or unset config keys
+    /// would otherwise produce an invalid wire value).
+    ///
+    /// Also validates the §2.10.1 contract: exactly one `/` separator.
+    /// Inputs like `"rsclaw-2026.5.15"` (zero slashes) or
+    /// `"foo/bar/baz"` (two slashes) are rejected at the builder so a
+    /// typo in config doesn't survive gateway boot and only surface as
+    /// a per-session 400 from the server. Rejected inputs are logged at
+    /// `warn` and the override is dropped (falls back to the default).
+    pub fn with_prefix_id(mut self, prefix_id: impl Into<String>) -> Self {
+        let s = prefix_id.into().trim().to_owned();
+        if s.is_empty() {
+            return self;
+        }
+        let slash_count = s.matches('/').count();
+        if slash_count != 1 {
+            tracing::warn!(
+                requested_prefix_id = %s,
+                slash_count,
+                default_prefix_id = RSCLAW_DEFAULT_PREFIX_ID,
+                "rsclaw with_prefix_id: ignoring override that violates §2.10.1 \
+                 (need exactly one '/' separator); falling back to default"
+            );
+            return self;
+        }
+        self.prefix_id = s;
+        self
     }
 
     fn auth_header(&self) -> Option<(String, String)> {
@@ -410,6 +495,110 @@ fn evict_if_oversized(map: &mut HashMap<String, SessionEntry>) {
 // LlmProvider impl
 // ---------------------------------------------------------------------------
 
+/// Outcome of [`dispatch_decision`] — either a stateless one-shot route
+/// or a sentinel telling the caller to continue down the stateful
+/// `/v1/agent/sessions/*` protocol path.
+#[derive(Debug, PartialEq, Eq)]
+enum DispatchRoute {
+    OneShot(&'static str),
+    Sessions,
+}
+
+/// Pure routing classification for an `LlmRequest` on the rsclaw provider.
+///
+/// Single source of truth: this is what `stream()` consults and what the
+/// test suite asserts against. Both bail conditions live here so callers
+/// can't silently misroute by forgetting the safety checks.
+///
+/// Server enforces per-route model whitelists (400 model_slot_mismatch on
+/// violations), so canonical model names take priority over endpoint
+/// variants. The endpoint variant only matters when the model name is
+/// non-canonical.
+///
+/// Precedence:
+///   1. model rsclaw-flash-*                            → /fastshot
+///   2. model rsclaw-vision-*                           → /vision
+///   3. model rsclaw-agent-* + session_key=None         → /oneshot
+///   4. model rsclaw-agent-* + session_key=Some         → /sessions (kvCacheMode=2 required)
+///   5. non-canonical model + endpoint=Flash            → /fastshot (server may 400)
+///   6. non-canonical model + endpoint=Vision           → /vision (server may 400)
+///   7. Primary + session_key=Some                      → /sessions (kvCacheMode=2 required)
+///   8. Primary + session_key=None                      → /oneshot
+///
+/// Bails (before any rule fires):
+///   • kv_cache_mode=2 + session_key=None — caller asked for stateful
+///     traffic but forgot the session key; would silently drop kvCache.
+///   • session_key=Some + kv_cache_mode!=2 — sessions path requires
+///     mode 2.
+///
+/// Trailing-dash on prefixes prevents collisions with hypothetical names
+/// like `rsclaw-flashy`.
+fn dispatch_decision(req: &LlmRequest) -> Result<DispatchRoute> {
+    let bare_model = req.model.strip_prefix("rsclaw/").unwrap_or(&req.model);
+    let is_flash_model = bare_model.starts_with("rsclaw-flash-");
+    let is_vision_model = bare_model.starts_with("rsclaw-vision-");
+    let is_agent_model = bare_model.starts_with("rsclaw-agent-");
+
+    // Safety net: kv_cache_mode=2 requires session_key. Catching this
+    // BEFORE the rule chain prevents a stateless misroute (rule 8) from
+    // silently dropping kvCache continuity.
+    if req.kv_cache_mode == 2 && req.session_key.is_none() {
+        anyhow::bail!(
+            "rsclaw kv_cache_mode=2 requires session_key (got None); \
+             set session_key=Some(...) for stateful traffic or \
+             kv_cache_mode=0 + session_key=None for /oneshot"
+        );
+    }
+
+    // Rules 1–3.
+    if is_flash_model {
+        return Ok(DispatchRoute::OneShot("/fastshot"));
+    }
+    if is_vision_model {
+        return Ok(DispatchRoute::OneShot("/vision"));
+    }
+    if is_agent_model && req.session_key.is_none() {
+        return Ok(DispatchRoute::OneShot("/oneshot"));
+    }
+
+    // Surface an "agent-* model overrides your endpoint hint" warning
+    // so operators can debug "I asked for Flash but the request went
+    // to /sessions". The canonical model wins by design, but silently
+    // (R1 review I1) is debug-hostile in a 1000-worker fleet.
+    if is_agent_model && !matches!(req.endpoint, AgentEndpoint::Primary) {
+        tracing::warn!(
+            model = %req.model,
+            endpoint = ?req.endpoint,
+            "rsclaw dispatch: agent-* model overrides endpoint hint; routing to /sessions"
+        );
+    }
+
+    // Rules 5–6: non-canonical model honors endpoint variant hint.
+    if !is_agent_model {
+        if matches!(req.endpoint, AgentEndpoint::Flash) {
+            return Ok(DispatchRoute::OneShot("/fastshot"));
+        }
+        if matches!(req.endpoint, AgentEndpoint::Vision) {
+            return Ok(DispatchRoute::OneShot("/vision"));
+        }
+    }
+
+    // Rule 8.
+    if req.session_key.is_none() {
+        return Ok(DispatchRoute::OneShot("/oneshot"));
+    }
+
+    // Rules 4 / 7: stateful sessions path requires kv_cache_mode=2.
+    if req.kv_cache_mode != 2 {
+        anyhow::bail!(
+            "rsclaw session-mode call requires kv_cache_mode=2 (got {}); \
+             pass session_key=None to route to /oneshot instead",
+            req.kv_cache_mode
+        );
+    }
+    Ok(DispatchRoute::Sessions)
+}
+
 impl LlmProvider for RsclawProvider {
     fn name(&self) -> &str {
         "rsclaw"
@@ -417,12 +606,11 @@ impl LlmProvider for RsclawProvider {
 
     fn stream(&self, mut req: LlmRequest) -> BoxFuture<'_, Result<LlmStream>> {
         Box::pin(async move {
-            if req.kv_cache_mode != 2 {
-                anyhow::bail!(
-                    "rsclaw provider only handles kv_cache_mode=2 (got {}); \
-                     route mode 0/1 traffic through openai/anthropic providers",
-                    req.kv_cache_mode
-                );
+            // Single source of truth for dispatch routing — see
+            // [`dispatch_decision`] for the full precedence table.
+            match dispatch_decision(&req)? {
+                DispatchRoute::OneShot(path) => return self.stream_oneshot(req, path).await,
+                DispatchRoute::Sessions => { /* fall through to stateful path */ }
             }
             let session_key = req
                 .session_key
@@ -438,7 +626,7 @@ impl LlmProvider for RsclawProvider {
             // preceding User delta so the model still gets the context.
             normalize_trailing_system(&mut req.messages);
 
-            let split = split_request(&req)?;
+            let split = split_request(&req, &self.prefix_id)?;
 
             // Lookup or hydrate. Cache miss / mutation happens on first
             // call, version drift, after a prior replay failure, or
@@ -467,7 +655,7 @@ impl LlmProvider for RsclawProvider {
                         // upstream canonical. open()'s response echoes
                         // the resolved prefix_id (per §2.1.6), which can
                         // differ from the requested alias — e.g. request
-                        // `rsclaw/latest`, response `rsclaw/2026.5.5`.
+                        // `rsclaw/latest`, response `rsclaw/2026.5.15`.
                         // `lookup_and_bump` compares the cached value
                         // against the next call's `split.prefix_id` (also
                         // the alias), so caching the canonical
@@ -489,6 +677,20 @@ impl LlmProvider for RsclawProvider {
             };
 
             let delta = TurnDelta::from_request(&req)?;
+
+            // Optional debug dump — when RSCLAW_DUMP_TURN env is set we
+            // write the full request shape (LlmRequest + rsclaw turn body
+            // + rsclaw replay body + equivalent OpenAI chat-completions
+            // body) to `<base_dir>/debug/turn-<ms>-<sess>.json`. Lets
+            // operators replay the SAME turn against different worker
+            // endpoints (rsclaw `/sessions/<id>/turn`, `/sessions/replay`,
+            // vanilla `/v1/chat/completions`) to bisect protocol-vs-model
+            // truncation behavior. No-op when the env var is unset, so
+            // production stays untouched.
+            if std::env::var("RSCLAW_DUMP_TURN").is_ok() {
+                dump_turn_for_debug(&session_key, &entry, &split, &delta, &req);
+            }
+
             // Forget the cached session entry on any non-recoverable
             // turn failure. Without this, an Err here leaves the
             // SessionEntry in cache with a `last_seen_msgs_len` that
@@ -569,6 +771,92 @@ impl LlmProvider for RsclawProvider {
                 Arc::clone(&self.sessions),
                 session_key,
             ))
+        })
+    }
+
+    /// Resolve `session_key` → wire `session_id` via the cached
+    /// `SessionEntry`, then delegate to the inner `compact_splice`
+    /// helper. On HTTP success, update the cached entry's
+    /// `last_seen_msgs_len` to the post-splice value so subsequent
+    /// `lookup_and_bump` calls don't (incorrectly) detect the message
+    /// drop as "history was trimmed under us" and force a replay.
+    ///
+    /// Per the 2026-05-16 decision (Listen-first), the cached
+    /// `last_seen_msgs_len` is updated from the gateway-local
+    /// computation (`keep_head_messages + 1 + keep_tail_messages`) NOT
+    /// from `resp.msgs_count`. The server-reported `msgs_count` is
+    /// returned to the caller for cross-check / telemetry only.
+    ///
+    /// Returns `Err` when no `SessionEntry` exists for `session_key`
+    /// (no point splicing what we don't think is open) — caller falls
+    /// back to the replay path which will re-open the session anyway.
+    fn compact_splice<'a>(
+        &'a self,
+        session_key: &'a str,
+        keep_head_messages: usize,
+        summary: &'a str,
+        keep_tail_messages: usize,
+        expected_msgs_count: Option<usize>,
+    ) -> BoxFuture<'a, Result<usize>> {
+        Box::pin(async move {
+            // Snapshot the session_id under the lock, drop the lock
+            // before the network call. Holding the mutex across an
+            // await would block every other turn on this provider for
+            // the duration of the splice.
+            let session_id = {
+                let map = self.lock_sessions();
+                map.get(session_key)
+                    .map(|e| e.session_id.clone())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "rsclaw compact splice: no cached session for key {session_key} — \
+                             falling back to replay"
+                        )
+                    })?
+            };
+
+            let resp = self
+                .compact_splice_inner(
+                    &session_id,
+                    keep_head_messages,
+                    summary,
+                    keep_tail_messages,
+                    expected_msgs_count,
+                )
+                .await?;
+
+            // Optimistically update last_seen_msgs_len with the
+            // gateway-local computation (head + summary(1) + tail).
+            // The server's resp.msgs_count is also tracked but kept as
+            // a sanity cross-check at log level.
+            let local_msgs_count = keep_head_messages + 1 + keep_tail_messages;
+            if resp.msgs_count != local_msgs_count {
+                tracing::warn!(
+                    session_key,
+                    server_count = resp.msgs_count,
+                    local_count = local_msgs_count,
+                    "rsclaw compact splice: server msgs_count diverges from gateway computation"
+                );
+            }
+            // Emit the server's authoritative post-splice counters here
+            // (rather than at the call site in `compact_inner`) because
+            // tokens_count is exposed only by the wire response — the
+            // trait surface itself returns msgs_count alone. Telemetry
+            // tools that need to track KV slot tokens over time should
+            // scrape this log.
+            tracing::info!(
+                session_key,
+                msgs_count = resp.msgs_count,
+                tokens_count = resp.tokens_count,
+                "rsclaw compact splice: server-side splice complete"
+            );
+            {
+                let mut map = self.lock_sessions();
+                if let Some(entry) = map.get_mut(session_key) {
+                    entry.last_seen_msgs_len = local_msgs_count;
+                }
+            }
+            Ok(resp.msgs_count)
         })
     }
 }
@@ -780,10 +1068,11 @@ impl RsclawProvider {
     async fn open(&self, split: &SplitRequest<'_>) -> Result<CreateSessionResp> {
         let body = CreateSessionReq {
             prefix_id: &split.prefix_id,
+            model: &split.model,
             dynamic_prefix: DynamicPrefixWire {
                 system: split.dynamic_system,
                 tools: &split.dynamic_tools,
-                user_suffix: split.dynamic_user_suffix,
+                user_system: split.dynamic_user_system,
             },
             options: Some(split.options.clone()),
         };
@@ -818,34 +1107,35 @@ impl RsclawProvider {
         // dynamic /ctx blocks (see agent/runtime.rs ~4054). Sending
         // those through as-is would trigger `400 invalid_history`
         // and tank every replay. Pull them out and append their
-        // text to `user_suffix` so the content still reaches the
+        // text to `user_system` so the content still reaches the
         // server — at the static-prefix slot, the only place the
         // protocol allows non-conversational system content.
         let (filtered, extra_suffix) = split_system_messages(messages);
         // System-Role messages threaded through the conversation list
         // (plugins/skills/ctx blocks — see comment above) get folded
-        // back into `dynamic_prefix.user_suffix`, the only protocol
+        // back into `dynamic_prefix.user_system`, the only protocol
         // slot that accepts non-conversational system content. Without
         // this they'd hit `400 invalid_history` on the worker side.
-        let user_suffix_owned: String = if extra_suffix.is_empty() {
+        let user_system_owned: String = if extra_suffix.is_empty() {
             String::new()
-        } else if split.dynamic_user_suffix.is_empty() {
+        } else if split.dynamic_user_system.is_empty() {
             extra_suffix
         } else {
-            format!("{}\n\n{}", split.dynamic_user_suffix, extra_suffix)
+            format!("{}\n\n{}", split.dynamic_user_system, extra_suffix)
         };
-        let user_suffix: &str = if user_suffix_owned.is_empty() {
-            split.dynamic_user_suffix
+        let user_system: &str = if user_system_owned.is_empty() {
+            split.dynamic_user_system
         } else {
-            &user_suffix_owned
+            &user_system_owned
         };
         let history: Vec<Value> = serialize_replay_history(&filtered);
         let body = ReplayReq {
             prefix_id: &split.prefix_id,
+            model: &split.model,
             dynamic_prefix: DynamicPrefixWire {
                 system: split.dynamic_system,
                 tools: &split.dynamic_tools,
-                user_suffix,
+                user_system,
             },
             history,
             options: Some(split.options.clone()),
@@ -871,6 +1161,191 @@ impl RsclawProvider {
         resp.json::<CreateSessionResp>()
             .await
             .context("rsclaw replay: parse response")
+    }
+
+    /// In-place compact splice (protocol §2.4). Issues
+    /// `POST /v1/agent/sessions/<session_id>/compact` to ask the server to
+    /// drop the KV pages for the middle of the conversation, prefill the
+    /// new summary in their place, and leave head/tail KV unchanged. The
+    /// session's KV slot — and therefore its `session_id` — survives.
+    ///
+    /// Caller responsibilities:
+    /// - Provide `session_id` from the cached `SessionEntry`. Server
+    ///   returns 410 if the slot has been evicted.
+    /// - Choose `keep_head_messages` consistently across the lifetime of
+    ///   a session (typically 2 = first user/assistant pair carrying
+    ///   `[Session started: ...]`). Changing it mid-session breaks the
+    ///   head-byte-stability invariant and forces a head re-prefill on
+    ///   the server.
+    /// - Provide a self-contained `summary` (no `[Session started:]` —
+    ///   that's preserved in head — but a fresh `[CONTEXT COMPACTION
+    ///   compacted at <ISO ts>]` header is the convention so the model
+    ///   has a "recent-vs-summarized" temporal anchor; this struct does
+    ///   not enforce that format).
+    /// - On any `Err`, callers MUST fall back to `/sessions/replay` —
+    ///   `compact_inner` does this unconditionally (per user 2026-05-16
+    ///   decision). 409 / 410 / 422 are the documented fallback codes but
+    ///   the contract is "any non-2xx + any transport error → replay".
+    ///
+    /// Timeout: 180s. The server-side splice involves dropping KV pages
+    /// and prefilling the summary (~2K tokens by default), which is
+    /// fast — comparable to a small turn prefill. The deadline matches
+    /// `open()` so we don't have an inconsistent ceiling between the
+    /// two new-KV-content code paths.
+    ///
+    /// Named with the `_inner` suffix to disambiguate from the
+    /// `LlmProvider::compact_splice` trait method, which sits one layer
+    /// above and resolves `session_key` → `session_id` before delegating
+    /// here. The trait method is the public API; this is the wire-level
+    /// implementation.
+    async fn compact_splice_inner(
+        &self,
+        session_id: &str,
+        keep_head_messages: usize,
+        summary: &str,
+        keep_tail_messages: usize,
+        expected_msgs_count: Option<usize>,
+    ) -> Result<CompactSpliceResp> {
+        let path = format!("/sessions/{}/compact", session_id);
+        let body = CompactSpliceReq {
+            keep_head_messages,
+            summary,
+            keep_tail_messages,
+            expected_msgs_count,
+        };
+        let resp = self
+            .send_following_redirects(&path, &body, Some(Duration::from_secs(180)))
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("rsclaw compact splice failed {status}: {body}");
+        }
+        resp.json::<CompactSpliceResp>()
+            .await
+            .context("rsclaw compact: parse response")
+    }
+
+    /// Dispatch a one-shot stateless request to `/fastshot`, `/vision`,
+    /// or `/oneshot`. Route selection is made by the unified dispatcher
+    /// in `stream()`; this method just sends the bytes.
+    ///
+    /// Wire shape (identical across all three paths — only `/vision`
+    /// adds the `images: [...]` array; see protocol spec
+    /// `docs/adr` notes 2026-05-15):
+    ///
+    /// ```text
+    /// POST {base_url}/{fastshot|vision|oneshot}
+    /// {
+    ///   "prompt": "...",
+    ///   "max_tokens": N,
+    ///   "options": { "temperature": 0.7 },
+    ///   "stream": true,
+    ///   "model": "rsclaw-flash-v1"
+    /// }
+    /// ```
+    ///
+    /// Response is OAI chat.completion.chunk SSE. We always stream —
+    /// the agent's stream consumer collapses to a single `Done` event
+    /// for non-streaming callers. Reuses the OpenAI SSE chunk parser
+    /// since the response shape is byte-for-byte identical.
+    async fn stream_oneshot(&self, req: LlmRequest, path: &'static str) -> Result<LlmStream> {
+        use futures::StreamExt;
+
+        let prompt = flatten_prompt_for_oneshot(&req);
+        if prompt.trim().is_empty() {
+            anyhow::bail!("rsclaw {path}: empty prompt after flattening req.messages");
+        }
+
+        let mut body = serde_json::Map::new();
+        body.insert("prompt".to_owned(), Value::String(prompt));
+        body.insert("stream".to_owned(), Value::Bool(true));
+        if let Some(mt) = req.max_tokens {
+            body.insert("max_tokens".to_owned(), Value::from(mt));
+        }
+        // Hard-bind the model id to the endpoint per the fleet's
+        // model-slot whitelist:
+        //   /fastshot → rsclaw-flash-v1
+        //   /vision   → rsclaw-vision-v1
+        //   /oneshot  → rsclaw-agent-v1
+        // The dispatch chain in `route_for` (rules 1–3 + 5–6) already
+        // routes requests here based on the caller's model hint or
+        // endpoint hint, so by the time we land in this function the
+        // path uniquely determines which slot the worker accepts.
+        // Forwarding `req.model` verbatim risks
+        // `model_slot_mismatch` 400s when the caller mixes
+        // (model=anthropic/..., endpoint=Flash) — we already routed to
+        // /fastshot, but the wire model field would have been wrong.
+        // Stamping the canonical id keeps callers from having to know
+        // the exact slot strings.
+        let canonical_model = match path {
+            "/fastshot" => "rsclaw-flash-v1",
+            "/vision" => "rsclaw-vision-v1",
+            _ => "rsclaw-agent-v1", // /oneshot and any future stateless variant
+        };
+        body.insert(
+            "model".to_owned(),
+            Value::String(canonical_model.to_owned()),
+        );
+        let mut options = serde_json::Map::new();
+        if let Some(t) = req.temperature {
+            options.insert("temperature".to_owned(), super::json_f32(t));
+        }
+        if !options.is_empty() {
+            body.insert("options".to_owned(), Value::Object(options));
+        }
+        if path == "/vision" {
+            let images = extract_images_for_oneshot(&req);
+            if images.is_empty() {
+                anyhow::bail!("rsclaw /vision: request has no image content");
+            }
+            body.insert(
+                "images".to_owned(),
+                Value::Array(images.into_iter().map(Value::String).collect()),
+            );
+        }
+        let body = Value::Object(body);
+
+        // Send via the same redirect-cache + 308-aware pipeline that
+        // session traffic uses, so a fastshot worker pinned under the
+        // LB benefits from the same per-origin caching as the primary
+        // pool.
+        let resp = self
+            .send_following_redirects(path, &body, Some(Duration::from_secs(60)))
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("rsclaw {path} failed {status}: {body}");
+        }
+
+        // Native rsclaw fastshot/vision SSE — distinct from the
+        // primary sessions endpoint's OAI-style frames. The three
+        // event types per `docs/fastshot-vision-protocol.md §3`:
+        //
+        //   data: {"type":"delta","content":"..."}
+        //   data: {"type":"done","finish_reason":"stop","usage":{...}}
+        //   data: {"type":"error","error":"..."}
+        //   data: [DONE]
+        //
+        // Line buffering + UTF-8 boundary handling mirrors the
+        // openai.rs implementation (worker can split frames across
+        // TCP segments) but the JSON shape is fastshot-native so we
+        // parse it locally.
+        let byte_stream = resp.bytes_stream();
+        let line_buffer = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let utf8_remainder = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let event_stream = byte_stream
+            .map_err(|e| anyhow::anyhow!("stream read error: {e}"))
+            .then(move |chunk| {
+                let line_buffer = line_buffer.clone();
+                let utf8_remainder = utf8_remainder.clone();
+                async move {
+                    parse_oneshot_sse_chunk(chunk, &line_buffer, &utf8_remainder).await
+                }
+            })
+            .flat_map(|events| futures::stream::iter(events));
+        Ok(Box::pin(event_stream) as LlmStream)
     }
 
     async fn turn(
@@ -957,7 +1432,12 @@ enum TurnOutcome {
 // Wire types — mirror rsclaw-protocol.md §2
 // ---------------------------------------------------------------------------
 
-/// Wire shape of `dynamic_prefix` per protocol §2.1.2.
+/// Wire shape of `dynamic_prefix` per protocol §2.1.2 (post-2026-05-16
+/// rename: the per-session non-hashed segment is named `user_system`,
+/// not `user_suffix`). Both `system` and `tools` participate in the
+/// worker's content-addressed LRU hash; `user_system` does NOT — it's
+/// stored as a per-session prefix layer between `base` (builtin tools
+/// + base_system) and `session_tail` (history + delta).
 #[derive(Debug, Serialize)]
 struct DynamicPrefixWire<'a> {
     #[serde(skip_serializing_if = "str::is_empty")]
@@ -972,8 +1452,12 @@ struct DynamicPrefixWire<'a> {
     /// LCP trim something to share between clients whose only
     /// difference is per-machine MCP / plugin tools.
     tools: &'a [Value],
+    /// Per-session text that does NOT participate in the worker's
+    /// system+tools hash. Maps to the worker's `user_system` KV cache
+    /// layer. Server treats this as opaque text to prefill after the
+    /// base layer and before session_tail.
     #[serde(skip_serializing_if = "str::is_empty")]
-    user_suffix: &'a str,
+    user_system: &'a str,
 }
 
 #[derive(Debug, Serialize)]
@@ -982,6 +1466,13 @@ struct CreateSessionReq<'a> {
     /// accepts the legacy `rsclaw_version` field name as an alias, but
     /// we always send the post-rename name on new traffic.
     prefix_id: &'a str,
+    /// Bare model id (no `rsclaw/` namespace prefix) — required since
+    /// 2026-05 to route the request to the correct model slot on the
+    /// worker. The session retains this binding for its lifetime, so
+    /// `/turn` and `/replay` traffic against the same session_id never
+    /// needs to repeat it. Strip the `rsclaw/` namespace before
+    /// sending because the server records the bare id.
+    model: &'a str,
     /// Hybrid mode (§2.1.3) — always sent. When `prefix_id` hits the
     /// static registry the worker forks from there; otherwise the
     /// dynamic-LRU keyed by hash of `system + tools` is used.
@@ -993,10 +1484,51 @@ struct CreateSessionReq<'a> {
 #[derive(Debug, Serialize)]
 struct ReplayReq<'a> {
     prefix_id: &'a str,
+    /// Same bare model id contract as `CreateSessionReq` — replay
+    /// rebuilds the session from scratch, so the model binding must be
+    /// declared again. Worker returns
+    /// `missing_model` 400 if omitted.
+    model: &'a str,
     dynamic_prefix: DynamicPrefixWire<'a>,
     history: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<TurnOptions>,
+}
+
+/// Wire body for `POST /v1/agent/sessions/<id>/compact` per protocol §2.4.
+/// In-place splice: keep first `keep_head_messages` messages' KV unchanged,
+/// drop the middle KV pages, prefill `summary` in place, keep the last
+/// `keep_tail_messages` messages' KV unchanged. Server returns the same
+/// `session_id` (no slot reallocation).
+///
+/// `expected_msgs_count` is optimistic concurrency — gateway tells server
+/// what total `msgs_count` it thinks the session has right now. Mismatch
+/// returns 409 and gateway must fall back to `/sessions/replay`.
+///
+/// The wire excludes `prefix_id` / `dynamic_prefix` because compact targets
+/// an already-open session by `session_id`; the slot's existing prefix
+/// stays bound to whatever was used at open time.
+#[derive(Debug, Serialize)]
+struct CompactSpliceReq<'a> {
+    keep_head_messages: usize,
+    summary: &'a str,
+    keep_tail_messages: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_msgs_count: Option<usize>,
+}
+
+/// Response from `POST /sessions/<id>/compact`. `session_id` mirrors the
+/// path parameter and exists for sanity-check / log correlation only —
+/// the §2.4 spec guarantees it does NOT change across splice. `msgs_count`
+/// and `tokens_count` are server's authoritative post-splice counts; the
+/// gateway uses them for cross-check against its own local computation
+/// (head_count + 1 summary + tail_count, summed tokens of those).
+#[derive(Debug, Deserialize, Clone)]
+struct CompactSpliceResp {
+    #[allow(dead_code)] // kept for log correlation when paired with session_id-keyed metrics
+    session_id: String,
+    msgs_count: usize,
+    tokens_count: usize,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1187,13 +1719,15 @@ impl TurnOptions {
 /// Maps an `LlmRequest` onto the protocol's split fields per
 /// rsclaw-protocol §2.1 (post-rename, hybrid path).
 ///
-/// When the runtime populated `req.system_shared` / `req.system_user`
+/// When the runtime populated `req.system_shared` / `req.user_system`
 /// (kvCacheMode=2 path on the main agent loop), the split lands in the
 /// "real" hybrid shape:
 /// - `dynamic_system`        ← shared system prefix (byte-stable across
 ///   every RsClaw client of this version) → wire `dynamic_prefix.system`
-/// - `dynamic_user_suffix`   ← per-machine user suffix → wire
-///   `dynamic_prefix.user_suffix`
+/// - `dynamic_user_system`   ← per-machine non-hashed segment → wire
+///   `dynamic_prefix.user_system` (worker layer-2 cache key
+///   intentionally EXCLUDES this, so it can vary per session without
+///   collapsing the hit rate)
 /// - `dynamic_tools`         ← all tools, builtin-first then per-client.
 ///   Encoded as a single array because rsclaw-server's post-rename
 ///   contract drops top-level `user_tools` (verified by its own
@@ -1204,40 +1738,261 @@ impl TurnOptions {
 /// When the split fields are missing (internal sessions / non-runtime
 /// callers) we degrade gracefully: stuff `req.system` into
 /// `dynamic_system`, every tool into `dynamic_tools` in input order,
-/// leave `dynamic_user_suffix` empty. Same effective cache behaviour
+/// leave `dynamic_user_system` empty. Same effective cache behaviour
 /// as before this change.
 struct SplitRequest<'a> {
     /// Namespaced `rsclaw/<id>` per protocol §2.10.1.
     prefix_id: String,
+    /// Bare model id with the `rsclaw/` namespace prefix stripped. Required
+    /// in the wire body for both `POST /sessions` and `/sessions/replay`
+    /// as of 2026-05; sessions carry this binding for their lifetime.
+    model: String,
     dynamic_system: &'a str,
-    dynamic_user_suffix: &'a str,
+    dynamic_user_system: &'a str,
     dynamic_tools: Vec<Value>,
     options: TurnOptions,
 }
 
-fn split_request<'a>(req: &'a LlmRequest) -> Result<SplitRequest<'a>> {
-    // `parse_model` strips any leading `rsclaw/` before the request
-    // reaches this provider, so by the time we see `req.model` it's
-    // typically the bare id (`qwen3-235b`). Re-namespace it before
-    // putting it on the wire — protocol §2.10.1 mandates exactly one
-    // `/` separator, and `400 prefix_id_invalid` rejects unprefixed
-    // ids at the worker layer.
-    let prefix_id = if req.model.contains('/') {
-        req.model.clone()
-    } else {
-        format!("rsclaw/{}", req.model)
-    };
+/// Dump the full request shape for one turn so the operator can
+/// replay the same logical input against several rsclaw-llm endpoints
+/// (rsclaw stateful `/sessions/<id>/turn`, `/sessions/replay`, vanilla
+/// `/v1/chat/completions`) and compare the model's output. Used to
+/// bisect a "truncation happens via rsclaw protocol but not via OpenAI
+/// compat" symptom into "rsclaw-llm side problem" vs "model side
+/// problem".
+///
+/// Writes one JSON file per turn to:
+///   `<base_dir>/debug/turn-<unix_ms>-<session_suffix>.json`
+///
+/// Gated on `RSCLAW_DUMP_TURN` env var being set (any non-empty value).
+/// Write failures are logged at WARN but don't abort the turn.
+fn dump_turn_for_debug(
+    session_key: &str,
+    entry: &SessionEntry,
+    split: &SplitRequest<'_>,
+    delta: &TurnDelta,
+    req: &LlmRequest,
+) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
 
+    // Compose the replay history slice (everything before the trailing
+    // delta — same logic `replay()` uses on the recovery path).
+    let history_owned: Vec<&Message> = history_for_replay(&req.messages).iter().collect();
+    let history_values = serialize_replay_history(&history_owned);
+
+    // Equivalent OpenAI-compatible chat body — message-array + tools
+    // shape that vanilla `/v1/chat/completions` accepts. The model id
+    // is the bare form (no `rsclaw/` namespace prefix) since the local
+    // llama-server's OpenAI surface doesn't recognize prefixed names.
+    let openai_model = req.model.strip_prefix("rsclaw/").unwrap_or(&req.model);
+    let openai_messages: Vec<Value> = req
+        .messages
+        .iter()
+        .filter_map(|m| serde_json::to_value(m).ok())
+        .collect();
+    let openai_tools: Vec<Value> = req
+        .tools
+        .iter()
+        .map(|t| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                }
+            })
+        })
+        .collect();
+
+    let opts = TurnOptions::from_request(req);
+
+    // Wire body of the actual `/sessions/<id>/turn` request we're about
+    // to send. Must match what `Provider::turn()` puts on the wire: the
+    // TurnDelta uses `#[serde(flatten)]` inside TurnReq, so `user_message`
+    // or `tool_results` sit at the TOP level alongside `options`/`stream`.
+    // Nesting them under a `delta` wrapper would make the dump non-replayable
+    // — the worker returns 400 `invalid_request: turn must include exactly
+    // one of user_message (string) or tool_results (non-empty array)`.
+    // Canonicalize through to_canonical_value so the dumped bytes match
+    // the actual wire bytes the provider sends. The crate uses
+    // serde_json's `preserve_order` feature, which keeps insertion-order
+    // keys; the wire send path runs the body through `to_canonical_value`
+    // (BTreeMap-sorted) so worker-side hashes are byte-stable. Without
+    // the same pass on the dump, an operator using RSCLAW_DUMP_TURN to
+    // bisect a "truncation in rsclaw protocol but not in OpenAI compat"
+    // symptom would see *different* bytes from what `/sessions/.../turn`
+    // received — masking exactly the kind of byte-level bug the dump
+    // tool exists to diagnose. R1 review I2.
+    let turn_body = to_canonical_value(
+        serde_json::to_value(&TurnReq {
+            delta,
+            options: Some(opts.clone()),
+            stream: true,
+        })
+        .unwrap_or(Value::Null),
+    );
+
+    // Wire body that would rehydrate this session from scratch via
+    // `/sessions/replay`. Useful when the session_id is no longer alive
+    // on the worker and the operator wants to recreate the exact state.
+    let replay_body = to_canonical_value(json!({
+        "prefix_id": split.prefix_id,
+        "dynamic_prefix": {
+            "system": split.dynamic_system,
+            "tools": split.dynamic_tools,
+            "user_system": split.dynamic_user_system,
+        },
+        "history": history_values,
+        "options": serde_json::to_value(&opts).unwrap_or(Value::Null),
+    }));
+
+    let dump = json!({
+        "schema_version": 1,
+        "timestamp_ms": now_ms,
+        "session_key": session_key,
+        "model": req.model,
+        "rsclaw_session": {
+            "session_id": entry.session_id,
+            "prefix_id": entry.prefix_id,
+            "last_seen_msgs_len": entry.last_seen_msgs_len,
+        },
+        "llm_request_summary": {
+            "msg_count": req.messages.len(),
+            "tool_count": req.tools.len(),
+            "system_len": req.system.as_deref().map(|s| s.len()).unwrap_or(0),
+            "max_tokens": req.max_tokens,
+            "temperature": req.temperature,
+            "kv_cache_mode": req.kv_cache_mode,
+        },
+        "rsclaw_turn_body": turn_body,
+        "rsclaw_replay_body": replay_body,
+        "openai_chat_completions_body": {
+            "model": openai_model,
+            "messages": openai_messages,
+            "tools": openai_tools,
+            "temperature": req.temperature,
+            "max_tokens": req.max_tokens,
+            "stream": true,
+        },
+        "replay_instructions": [
+            "Pick ONE of the three replay paths and POST against the worker:",
+            "  A. Stateful turn against a LIVE session (only works while session is alive):",
+            "     curl -X POST $BASE/sessions/<session_id>/turn -d @<this-file>[.rsclaw_turn_body]",
+            "  B. Re-hydrate then turn — recreates session deterministically:",
+            "     curl -X POST $BASE/sessions/replay  -d @<this-file>[.rsclaw_replay_body]",
+            "     curl -X POST $BASE/sessions/<new_session_id>/turn -d @<this-file>[.rsclaw_turn_body]",
+            "  C. Stateless OpenAI-compat for comparison (no session, full history each time):",
+            "     curl -X POST $BASE/v1/chat/completions -d @<this-file>[.openai_chat_completions_body]"
+        ]
+    });
+
+    // Pick a short suffix for the file name — session_id's tail hex is
+    // unique enough to disambiguate within one millisecond.
+    let sess_suffix: String = entry
+        .session_id
+        .rsplit('_')
+        .next()
+        .unwrap_or("unknown")
+        .chars()
+        .take(8)
+        .collect();
+    let dir = crate::config::loader::base_dir().join("debug");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(error = %e, "RSCLAW_DUMP_TURN: create_dir_all failed");
+        return;
+    }
+    let path = dir.join(format!("turn-{now_ms}-{sess_suffix}.json"));
+    match serde_json::to_string_pretty(&dump) {
+        Ok(s) => match std::fs::write(&path, s) {
+            Ok(_) => tracing::info!(path = %path.display(), "RSCLAW_DUMP_TURN: turn dumped"),
+            Err(e) => tracing::warn!(error = %e, path = %path.display(), "RSCLAW_DUMP_TURN: write failed"),
+        },
+        Err(e) => tracing::warn!(error = %e, "RSCLAW_DUMP_TURN: serialize failed"),
+    }
+}
+
+/// Walk a `serde_json::Value`, returning a deep copy with every
+/// `Object` map's keys reordered alphabetically. Arrays preserve
+/// input order (they're inherently positional). Primitives are
+/// cloned as-is.
+///
+/// Purpose: the crate-wide `preserve_order` feature on `serde_json`
+/// makes `Map<String, Value>` an `IndexMap` that keeps insertion
+/// order — fine for round-tripping JSON5 configs, but it lets the
+/// non-determinism of upstream `HashMap` iteration leak into the
+/// wire JSON sent to rsclaw-server. The worker hashes the
+/// `dynamic_prefix.tools` payload byte-by-byte to form its prefix
+/// cache key, so even one swapped key triggers a `dynamic_miss`
+/// and a full prefill (~200s on a 28k-token prefix). Sorting keys
+/// here gives a content-addressed canonical form: identical tool
+/// definitions → identical bytes → identical hash → `dynamic_hit`.
+fn to_canonical_value(v: serde_json::Value) -> serde_json::Value {
+    use std::collections::BTreeMap;
+    match v {
+        serde_json::Value::Object(map) => {
+            // BTreeMap forces alphabetical key order regardless of
+            // the original IndexMap's insertion sequence.
+            let sorted: BTreeMap<String, serde_json::Value> =
+                map.into_iter().map(|(k, v)| (k, to_canonical_value(v))).collect();
+            let canon: serde_json::Map<String, serde_json::Value> = sorted.into_iter().collect();
+            serde_json::Value::Object(canon)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.into_iter().map(to_canonical_value).collect())
+        }
+        other => other,
+    }
+}
+
+fn split_request<'a>(req: &'a LlmRequest, prefix_id: &str) -> Result<SplitRequest<'a>> {
+    // `prefix_id` is config-driven (provider-level, default
+    // [`RSCLAW_DEFAULT_PREFIX_ID`]) — NOT derived from `req.model` or
+    // any per-turn data. Protocol §2.10.1 only mandates exactly one
+    // `/` separator; the provider builder is responsible for keeping
+    // the wire shape valid, so this function passes it through as-is.
+    let prefix_id = prefix_id.to_owned();
+
+    // `model` is required in the open/replay wire body since 2026-05.
+    // Strip the `rsclaw/` namespace prefix so the server records the
+    // bare slot id (e.g. `rsclaw-agent-v1`) — passing the namespaced
+    // form trips the worker's model-slot whitelist check.
+    let model = req
+        .model
+        .strip_prefix("rsclaw/")
+        .unwrap_or(req.model.as_str())
+        .to_owned();
+    if model.is_empty() {
+        anyhow::bail!("rsclaw: req.model is empty; cannot open session without a model id");
+    }
+
+    // Each tool's wire JSON is `to_canonical_value`-flattened to give
+    // byte-stable output across gateway runs. Without this pass the
+    // serialized `input_schema` carries whatever key order `serde_json`
+    // observed when each field was inserted — and because the crate is
+    // compiled with the `preserve_order` feature globally, ordering is
+    // whatever the source `HashMap` / macro / derive happened to emit,
+    // which is non-deterministic across runs. A flipped key in any of
+    // the dozens of schema entries flips the worker-side dynamic_prefix
+    // hash, forces `dynamic_miss`, and triggers a fresh 30-200s prefill
+    // on every gateway restart even though the agent's tool list is
+    // logically unchanged. Worker hash is content-addressed, so
+    // alphabetical key order alone makes "same tools" map to the same
+    // slot reliably.
     let tool_json = |t: &super::ToolDef| {
-        json!({
+        to_canonical_value(json!({
             "name": t.name,
             "description": t.description,
             "input_schema": t.parameters,
-        })
+        }))
     };
 
-    let (dynamic_system, dynamic_user_suffix, dynamic_tools) =
-        if req.system_shared.is_some() || req.system_user.is_some() {
+    let (dynamic_system, dynamic_user_system, dynamic_tools) =
+        if req.system_shared.is_some() || req.user_system.is_some() {
             // Real split — sort tools [builtin..., per-client...] so
             // the rendered chat-template prefix is byte-stable across
             // every client of this version up to the per-client tool
@@ -1256,7 +2011,7 @@ fn split_request<'a>(req: &'a LlmRequest) -> Result<SplitRequest<'a>> {
             builtin_t.extend(user_t);
             (
                 req.system_shared.as_deref().unwrap_or(""),
-                req.system_user.as_deref().unwrap_or(""),
+                req.user_system.as_deref().unwrap_or(""),
                 builtin_t,
             )
         } else {
@@ -1274,8 +2029,9 @@ fn split_request<'a>(req: &'a LlmRequest) -> Result<SplitRequest<'a>> {
 
     Ok(SplitRequest {
         prefix_id,
+        model,
         dynamic_system,
-        dynamic_user_suffix,
+        dynamic_user_system,
         dynamic_tools,
         options: TurnOptions::from_request(req),
     })
@@ -1293,6 +2049,179 @@ fn split_request<'a>(req: &'a LlmRequest) -> Result<SplitRequest<'a>> {
 /// must drop every consecutive trailing `Role::Tool` — dropping just
 /// one would leave the other N-1 in history, the server would replay
 /// them into the KV, and then the turn would re-send the same
+/// Flatten an `LlmRequest`'s system + messages into a single prompt
+/// string for the one-shot `/fastshot` and `/vision` endpoints, which
+/// take a bare `prompt` field instead of OpenAI-style messages.
+///
+/// Concatenation order: system → message texts in order, joined by
+/// blank lines. Image parts are skipped here (the caller pulls them
+/// into the `images` array via `extract_images_for_oneshot`). Tool
+/// use/result parts and reasoning parts are also skipped — fastshot
+/// is a tool-less endpoint and historical tool traffic isn't
+/// meaningful in that context.
+fn flatten_prompt_for_oneshot(req: &LlmRequest) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(sys) = req.system.as_deref() {
+        let trimmed = sys.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_owned());
+        }
+    }
+    for msg in &req.messages {
+        match &msg.content {
+            MessageContent::Text(t) => {
+                let trimmed = t.trim();
+                if !trimmed.is_empty() {
+                    parts.push(trimmed.to_owned());
+                }
+            }
+            MessageContent::Parts(content_parts) => {
+                for p in content_parts {
+                    if let ContentPart::Text { text } = p {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            parts.push(trimmed.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    parts.join("\n\n")
+}
+
+/// Parse one SSE chunk from the native fastshot/vision wire and
+/// emit `StreamEvent`s. Buffers partial lines across chunks so a
+/// frame split mid-JSON resolves cleanly; mirrors the strategy used
+/// by `openai::parse_sse_chunk_with_buffer` but with the
+/// fastshot-native JSON shape.
+async fn parse_oneshot_sse_chunk(
+    chunk: anyhow::Result<bytes::Bytes>,
+    line_buffer: &tokio::sync::Mutex<String>,
+    utf8_remainder: &tokio::sync::Mutex<Vec<u8>>,
+) -> Vec<anyhow::Result<StreamEvent>> {
+    let bytes = match chunk {
+        Ok(b) => b,
+        Err(e) => return vec![Err(e)],
+    };
+
+    // Carry forward any UTF-8 continuation bytes that landed at the
+    // tail of the previous chunk — without this, CJK / emoji
+    // characters that straddle a chunk boundary corrupt into U+FFFD.
+    let mut remainder = utf8_remainder.lock().await;
+    let combined = if remainder.is_empty() {
+        bytes.to_vec()
+    } else {
+        let mut c = std::mem::take(&mut *remainder);
+        c.extend_from_slice(&bytes);
+        c
+    };
+    let text: String = match std::str::from_utf8(&combined) {
+        Ok(t) => {
+            drop(remainder);
+            t.to_owned()
+        }
+        Err(e) => {
+            let valid_up_to = e.valid_up_to();
+            *remainder = combined[valid_up_to..].to_vec();
+            drop(remainder);
+            if valid_up_to == 0 {
+                return Vec::new();
+            }
+            // SAFETY: valid_up_to is at a valid UTF-8 boundary by
+            // construction of the `Utf8Error`.
+            unsafe { std::str::from_utf8_unchecked(&combined[..valid_up_to]) }.to_owned()
+        }
+    };
+
+    let mut buffer = line_buffer.lock().await;
+    buffer.push_str(&text);
+    let Some(last_newline) = buffer.rfind('\n') else {
+        return Vec::new();
+    };
+    let complete = buffer[..last_newline].to_owned();
+    let leftover = buffer[last_newline + 1..].to_owned();
+    buffer.clear();
+    buffer.push_str(&leftover);
+    drop(buffer);
+
+    let mut events: Vec<anyhow::Result<StreamEvent>> = Vec::new();
+    for line in complete.lines() {
+        let Some(payload) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim_start();
+        if payload.is_empty() {
+            continue;
+        }
+        if payload == "[DONE]" {
+            // Spec §3: server always sends `data: [DONE]` after the
+            // terminal frame. We only emit our own Done if the
+            // worker never sent one — typical path is `done` event
+            // first (which we already turned into StreamEvent::Done
+            // with usage) then `[DONE]` which we swallow here.
+            continue;
+        }
+        let val: Value = match serde_json::from_str(payload) {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::debug!(payload, "rsclaw fastshot: ignoring unparseable SSE line");
+                continue;
+            }
+        };
+        let ty = val.get("type").and_then(Value::as_str).unwrap_or("");
+        match ty {
+            "delta" => {
+                if let Some(content) = val.get("content").and_then(Value::as_str) {
+                    if !content.is_empty() {
+                        events.push(Ok(StreamEvent::TextDelta(content.to_owned())));
+                    }
+                }
+            }
+            "done" => {
+                let usage = val.get("usage").and_then(|u| {
+                    let input = u.get("input_tokens").and_then(Value::as_u64)? as u32;
+                    let output = u.get("output_tokens").and_then(Value::as_u64)? as u32;
+                    Some(TokenUsage { input, output })
+                });
+                events.push(Ok(StreamEvent::Done { usage }));
+            }
+            "error" => {
+                let msg = val
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown fastshot error")
+                    .to_owned();
+                events.push(Ok(StreamEvent::Error(msg)));
+            }
+            other => {
+                tracing::debug!(ty = other, payload, "rsclaw fastshot: unknown event type");
+            }
+        }
+    }
+    events
+}
+
+/// Pull every image URL/data-URI out of an `LlmRequest`'s message
+/// content parts, preserving order. Used by the `/vision` one-shot
+/// endpoint which expects an `images: [...]` array alongside the
+/// flattened prompt.
+fn extract_images_for_oneshot(req: &LlmRequest) -> Vec<String> {
+    let mut images = Vec::new();
+    for msg in &req.messages {
+        if let MessageContent::Parts(parts) = &msg.content {
+            for p in parts {
+                if let ContentPart::Image { url } = p {
+                    if !url.is_empty() {
+                        images.push(url.clone());
+                    }
+                }
+            }
+        }
+    }
+    images
+}
+
 /// tool_results, hydrating duplicates.
 ///
 /// For a User-trailing list (the iter-1 case after
@@ -1317,7 +2246,7 @@ fn history_for_replay(messages: &[Message]) -> &[Message] {
 /// system text). The runtime threads `Role::System` messages through
 /// the conversation list for plugins/skills/ctx blocks, but protocol
 /// §2.2 only accepts `user` / `assistant` in history — so we lift the
-/// system text out and let the caller append it to `user_suffix`.
+/// system text out and let the caller append it to `user_system`.
 /// Order of system blocks is preserved within the returned String;
 /// blocks are joined with a blank line. Non-text content on a
 /// `Role::System` message is dropped (system messages are documented
@@ -1329,7 +2258,7 @@ fn split_system_messages(messages: &[Message]) -> (Vec<&Message>, String) {
         if matches!(m.role, Role::System) {
             // Text(t) and Parts(...) must skip empties symmetrically —
             // otherwise an empty System(Text("")) leaks a blank entry
-            // into sys_parts and pollutes user_suffix with a leading
+            // into sys_parts and pollutes user_system with a leading
             // `\n\n` once `sys_parts.join("\n\n")` runs.
             let txt = match &m.content {
                 MessageContent::Text(t) => t.clone(),
@@ -1369,7 +2298,7 @@ fn split_system_messages(messages: &[Message]) -> (Vec<&Message>, String) {
 /// `Role::Tool` (parallel tool_results case, theoretical — runtime
 /// doesn't currently inject System after Tool, but defend anyway),
 /// drop the System text. Persistent system content already lives in
-/// `user_suffix` from the prior open/replay; only the per-iteration
+/// `user_system` from the prior open/replay; only the per-iteration
 /// dynamic context would be lost, which the protocol has no slot
 /// for in a tool_results delta.
 fn normalize_trailing_system(messages: &mut Vec<Message>) {
@@ -2600,7 +3529,7 @@ data: {"type":"message_stop"}
 
     fn req_with(messages: Vec<Message>, mode: u8, key: Option<&str>) -> LlmRequest {
         LlmRequest {
-            model: "2026.5.5".into(),
+            model: "2026.5.15".into(),
             messages,
             system: Some("you are an agent".into()),
             kv_cache_mode: mode,
@@ -2610,24 +3539,188 @@ data: {"type":"message_stop"}
     }
 
     #[test]
-    fn split_request_namespaces_bare_model_id() {
-        // `parse_model` strips the `rsclaw/` prefix before reaching the
-        // provider, so by the time we see `req.model` it's the bare id.
-        // `split_request` MUST re-namespace it — protocol §2.10.1 rejects
-        // `prefix_id` without exactly one `/` separator.
-        let req = req_with(vec![], 2, Some("k"));
-        let split = split_request(&req).unwrap();
-        assert_eq!(split.prefix_id, "rsclaw/2026.5.5");
+    fn canonical_value_sorts_object_keys_alphabetically() {
+        // `preserve_order` keeps the IndexMap insertion order; passing
+        // a JSON literal in a non-alphabetical order verifies the
+        // canonical pass reorders keys.
+        let input = json!({
+            "z_last": 1,
+            "a_first": 2,
+            "m_mid": 3,
+        });
+        let canon = to_canonical_value(input);
+        let serialized = serde_json::to_string(&canon).unwrap();
+        // BTreeMap-sourced canonical output must emit keys alphabetically.
+        assert_eq!(serialized, r#"{"a_first":2,"m_mid":3,"z_last":1}"#);
     }
 
     #[test]
-    fn split_request_keeps_already_namespaced_model() {
-        // If the caller already gave a namespaced id (e.g. configured a
-        // direct prefix_id, no alias), don't double-prefix.
+    fn canonical_value_recurses_into_nested_objects() {
+        // The whole point of canonicalization is that nested schema
+        // bodies (input_schema.properties.{...}) also get a stable
+        // order — that's where actual tool parameter HashMaps surface.
+        let input = json!({
+            "outer_b": {"y": 1, "x": 2},
+            "outer_a": {"inner": {"z": 0, "a": 1}},
+        });
+        let canon = to_canonical_value(input);
+        let s = serde_json::to_string(&canon).unwrap();
+        assert_eq!(
+            s,
+            r#"{"outer_a":{"inner":{"a":1,"z":0}},"outer_b":{"x":2,"y":1}}"#
+        );
+    }
+
+    #[test]
+    fn canonical_value_preserves_array_order() {
+        // Arrays are positional, not associative — order is meaningful
+        // (e.g. tool ordering, message history). Don't touch.
+        let input = json!([3, 1, 2, {"b": 1, "a": 2}]);
+        let canon = to_canonical_value(input);
+        let s = serde_json::to_string(&canon).unwrap();
+        assert_eq!(s, r#"[3,1,2,{"a":2,"b":1}]"#);
+    }
+
+    #[test]
+    fn canonical_value_is_idempotent() {
+        // Running canonicalization twice must produce identical output —
+        // worker prefix hashing depends on byte equality across runs,
+        // so the operation must be a fixed point.
+        let input = json!({
+            "tools": [{
+                "name": "search",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}, "k": {"type": "integer"}},
+                    "required": ["q"]
+                }
+            }]
+        });
+        let once = to_canonical_value(input.clone());
+        let twice = to_canonical_value(once.clone());
+        assert_eq!(
+            serde_json::to_string(&once).unwrap(),
+            serde_json::to_string(&twice).unwrap()
+        );
+    }
+
+    #[test]
+    fn canonical_value_byte_stable_across_input_orderings() {
+        // The smoking-gun assertion: two logically-identical JSON
+        // values constructed with different insertion orders MUST
+        // serialize to the same bytes after canonicalization. This
+        // is the exact property the worker's prefix hash depends on.
+        let a = json!({
+            "z": [{"b": 1, "a": 2}],
+            "a": {"inner_z": 1, "inner_a": 2},
+        });
+        let b = json!({
+            "a": {"inner_a": 2, "inner_z": 1},
+            "z": [{"a": 2, "b": 1}],
+        });
+        let canon_a = to_canonical_value(a);
+        let canon_b = to_canonical_value(b);
+        assert_eq!(
+            serde_json::to_string(&canon_a).unwrap(),
+            serde_json::to_string(&canon_b).unwrap()
+        );
+    }
+
+    #[test]
+    fn split_request_dynamic_tools_are_canonical() {
+        // End-to-end: feed a tool whose input_schema has keys in a
+        // non-alphabetical order, verify the dynamic_tools entry the
+        // provider would put on the wire is in alphabetical order.
         let mut req = req_with(vec![], 2, Some("k"));
+        req.tools = vec![crate::provider::ToolDef {
+            name: "search".into(),
+            description: "look stuff up".into(),
+            parameters: json!({
+                "type": "object",
+                "required": ["q"],
+                "properties": {
+                    "q": {"type": "string"},
+                    "k": {"type": "integer"},
+                }
+            }),
+        }];
+        let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
+        assert_eq!(split.dynamic_tools.len(), 1);
+        let serialized = serde_json::to_string(&split.dynamic_tools[0]).unwrap();
+        // Top level keys: description, input_schema, name (alphabetical).
+        // input_schema body: properties, required, type. properties body: k, q.
+        // Property bodies: type only (single key — order irrelevant).
+        assert_eq!(
+            serialized,
+            concat!(
+                r#"{"description":"look stuff up","input_schema":"#,
+                r#"{"properties":{"k":{"type":"integer"},"q":{"type":"string"}},"#,
+                r#""required":["q"],"type":"object"},"name":"search"}"#
+            )
+        );
+    }
+
+    #[test]
+    fn split_request_uses_provided_prefix_id_verbatim() {
+        // prefix_id is config-driven; split_request passes it through
+        // without inspecting req.model. Two distinct model strings on
+        // the same request must yield the SAME wire prefix_id when the
+        // caller supplied the same value.
+        let mut req = req_with(vec![], 2, Some("k"));
+        req.model = "qwen3-235b".into();
+        let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
+        assert_eq!(split.prefix_id, "rsclaw/2026.5.15");
+
         req.model = "myorg/qwen3-235b".into();
-        let split = split_request(&req).unwrap();
-        assert_eq!(split.prefix_id, "myorg/qwen3-235b");
+        let split2 = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
+        assert_eq!(split2.prefix_id, "rsclaw/2026.5.15");
+    }
+
+    #[test]
+    fn split_request_honours_custom_prefix_id_override() {
+        // Provider configured with a non-default prefix_id (e.g. a
+        // tenant's private namespace) — split_request forwards the
+        // override verbatim, independent of req.model.
+        let mut req = req_with(vec![], 2, Some("k"));
+        req.model = "qwen3-235b".into();
+        let split = split_request(&req, "myorg/2026.5.15").unwrap();
+        assert_eq!(split.prefix_id, "myorg/2026.5.15");
+    }
+
+    #[test]
+    fn with_prefix_id_overrides_default_and_ignores_blank() {
+        // Builder swaps in the override; whitespace-only / empty input
+        // is rejected so a misconfigured config file can't produce a
+        // §2.10.1-invalid wire value.
+        let p = RsclawProvider::new("http://x", None);
+        assert_eq!(p.prefix_id, RSCLAW_DEFAULT_PREFIX_ID);
+
+        let p = RsclawProvider::new("http://x", None).with_prefix_id("tenant/2026.6.1");
+        assert_eq!(p.prefix_id, "tenant/2026.6.1");
+
+        let p = RsclawProvider::new("http://x", None).with_prefix_id("   \n  ");
+        assert_eq!(p.prefix_id, RSCLAW_DEFAULT_PREFIX_ID);
+    }
+
+    #[test]
+    fn with_prefix_id_rejects_invalid_slash_count() {
+        // §2.10.1 mandates exactly one '/' separator. A config typo with
+        // zero slashes (e.g. "rsclaw-2026.5.15") or two+ ("foo/bar/baz")
+        // would survive boot and only fail on the first wire call, which
+        // is annoying to debug. Validate at the builder so the override
+        // is dropped early and we boot with the safe default.
+        let default = RSCLAW_DEFAULT_PREFIX_ID;
+
+        let p = RsclawProvider::new("http://x", None).with_prefix_id("rsclaw-2026.5.15");
+        assert_eq!(p.prefix_id, default, "no slash → reject");
+
+        let p = RsclawProvider::new("http://x", None).with_prefix_id("foo/bar/baz");
+        assert_eq!(p.prefix_id, default, "two slashes → reject");
+
+        // Surrounding whitespace gets trimmed before validation — a
+        // valid value with stray dotenv newline still works.
+        let p = RsclawProvider::new("http://x", None).with_prefix_id("  tenant/v1\n");
+        assert_eq!(p.prefix_id, "tenant/v1", "trim before count");
     }
 
     #[test]
@@ -2642,7 +3735,7 @@ data: {"type":"message_stop"}
         // `v1 top-level user_tools must not be sent` test.
         let mut req = req_with(vec![], 2, Some("k"));
         req.system_shared = Some("<shared system>".into());
-        req.system_user = Some("<user suffix>".into());
+        req.user_system = Some("<user suffix>".into());
         // Push user-tool first to prove the split sorts it after the
         // builtin regardless of input order.
         req.tools.push(ToolDef {
@@ -2655,7 +3748,7 @@ data: {"type":"message_stop"}
             description: "memory tool".into(),
             parameters: json!({"type":"object","properties":{}}),
         });
-        let split = split_request(&req).unwrap();
+        let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
         assert_eq!(split.dynamic_tools.len(), 2);
         assert_eq!(
             split.dynamic_tools[0]["name"], "memory",
@@ -2663,7 +3756,7 @@ data: {"type":"message_stop"}
         );
         assert_eq!(split.dynamic_tools[1]["name"], "search");
         assert_eq!(split.dynamic_system, "<shared system>");
-        assert_eq!(split.dynamic_user_suffix, "<user suffix>");
+        assert_eq!(split.dynamic_user_system, "<user suffix>");
     }
 
     #[test]
@@ -2678,47 +3771,51 @@ data: {"type":"message_stop"}
             description: "search".into(),
             parameters: json!({"type":"object"}),
         });
-        let split = split_request(&req).unwrap();
+        let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
         assert_eq!(split.dynamic_tools.len(), 1);
         assert_eq!(split.dynamic_tools[0]["name"], "search");
         assert_eq!(split.dynamic_system, "you are an agent");
-        assert_eq!(split.dynamic_user_suffix, "");
+        assert_eq!(split.dynamic_user_system, "");
     }
 
     #[test]
     fn create_session_req_serialises_post_rename_shape() {
         // Matches the wire body rsclaw-server's backend/rsclaw_llm.rs
         // tests assert: `prefix_id` + `dynamic_prefix{system,tools,
-        // user_suffix}` + `options`, and explicitly NO top-level
+        // user_system}` + `options`, and explicitly NO top-level
         // `user_tools` / `rsclaw_version` / `user_suffix` /
-        // `plugins_system` / `skills_system`. Those are all pre-rename
-        // fields that the user said will be retired soon.
+        // `user_system` / `plugins_system` / `skills_system`. The
+        // `user_suffix` legacy name (and `user_system` accidentally
+        // promoted to top-level) is asserted absent so a refactor that
+        // re-emits either at top-level gets caught by the test.
         let mut req = req_with(vec![], 2, Some("k"));
         req.system_shared = Some("<sys>".into());
-        req.system_user = Some("<suf>".into());
+        req.user_system = Some("<suf>".into());
         req.tools.push(ToolDef {
             name: "memory".into(),
             description: "memory tool".into(),
             parameters: json!({"type":"object"}),
         });
-        let split = split_request(&req).unwrap();
+        let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
         let body = CreateSessionReq {
             prefix_id: &split.prefix_id,
+            model: &split.model,
             dynamic_prefix: DynamicPrefixWire {
                 system: split.dynamic_system,
                 tools: &split.dynamic_tools,
-                user_suffix: split.dynamic_user_suffix,
+                user_system: split.dynamic_user_system,
             },
             options: Some(split.options.clone()),
         };
         let v = serde_json::to_value(&body).unwrap();
-        assert_eq!(v["prefix_id"], "rsclaw/2026.5.5");
+        assert_eq!(v["prefix_id"], "rsclaw/2026.5.15");
         assert_eq!(v["dynamic_prefix"]["system"], "<sys>");
-        assert_eq!(v["dynamic_prefix"]["user_suffix"], "<suf>");
+        assert_eq!(v["dynamic_prefix"]["user_system"], "<suf>");
         assert_eq!(v["dynamic_prefix"]["tools"][0]["name"], "memory");
         assert!(v.get("user_tools").is_none(), "post-rename body must omit top-level user_tools");
         assert!(v.get("rsclaw_version").is_none(), "rsclaw_version is the pre-rename name; never send");
-        assert!(v.get("user_suffix").is_none(), "user_suffix lives inside dynamic_prefix");
+        assert!(v.get("user_suffix").is_none(), "user_suffix is the legacy name; never send (top-level or otherwise)");
+        assert!(v.get("user_system").is_none(), "user_system lives inside dynamic_prefix, never at top-level");
         assert!(v.get("plugins_system").is_none(), "pre-rename field; folded into dynamic_prefix.system");
         assert!(v.get("skills_system").is_none(), "pre-rename field; folded into dynamic_prefix.system");
     }
@@ -2998,20 +4095,20 @@ data: {"type":"message_stop"}
             "k",
             SessionEntry {
                 session_id: "rs_w7_abc".into(),
-                prefix_id: "rsclaw/2026.5.5".into(),
+                prefix_id: "rsclaw/2026.5.15".into(),
                 last_seen_msgs_len: 12,
             },
         );
         // Same len → cached entry returned, last_seen unchanged.
-        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.5", 12).is_some());
+        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.15", 12).is_some());
         // Growth → bumped, returned.
-        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.5", 14).is_some());
+        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.15", 14).is_some());
         // Shrink (compaction trimmed history) → None, caller re-hydrates.
-        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.5", 8).is_none());
+        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.15", 8).is_none());
         // Version drift → None even if len matches.
         assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.6", 14).is_none());
         // Missing key → None.
-        assert!(provider.lookup_and_bump("missing", "rsclaw/2026.5.5", 14).is_none());
+        assert!(provider.lookup_and_bump("missing", "rsclaw/2026.5.15", 14).is_none());
     }
 
     #[test]
@@ -3508,10 +4605,10 @@ data: {"type":"message_stop"}
         // `prefix_id`. New servers send this name natively.
         let body = r#"{
             "session_id": "rs_w7_8a3c1f2b",
-            "prefix_id": "rsclaw/2026.5.5"
+            "prefix_id": "rsclaw/2026.5.15"
         }"#;
         let resp: CreateSessionResp = serde_json::from_str(body).expect("create shape parses");
-        assert_eq!(resp.prefix_id.as_deref(), Some("rsclaw/2026.5.5"));
+        assert_eq!(resp.prefix_id.as_deref(), Some("rsclaw/2026.5.15"));
     }
 
     #[test]
@@ -3572,9 +4669,204 @@ data: {"type":"message_stop"}
     fn create_session_resp_parses_populated_prefix_id() {
         // Round-trip the happy path so the Option<String> change
         // doesn't accidentally start coercing real values to None.
-        let body = r#"{"session_id":"rs_a_b","prefix_id":"rsclaw/2026.5.5"}"#;
+        let body = r#"{"session_id":"rs_a_b","prefix_id":"rsclaw/2026.5.15"}"#;
         let resp: CreateSessionResp = serde_json::from_str(body).expect("string field must parse");
-        assert_eq!(resp.prefix_id.as_deref(), Some("rsclaw/2026.5.5"));
+        assert_eq!(resp.prefix_id.as_deref(), Some("rsclaw/2026.5.15"));
+    }
+
+    // -- 8-rule dispatch precedence (R1 C3) -----------------------------
+    //
+    // Table-driven coverage so a future drift between the comment-table
+    // in `dispatch_decision` and the runtime decision is caught.
+
+    fn dispatch_req(
+        model: &str,
+        endpoint: AgentEndpoint,
+        session_key: Option<&str>,
+        kv_cache_mode: u8,
+    ) -> LlmRequest {
+        LlmRequest {
+            model: model.into(),
+            endpoint,
+            kv_cache_mode,
+            session_key: session_key.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn dispatch_rule_1_flash_model_routes_fastshot() {
+        // Rule 1: rsclaw-flash-* wins regardless of endpoint hint.
+        let route = dispatch_decision(&dispatch_req(
+            "rsclaw/rsclaw-flash-v1",
+            AgentEndpoint::Primary,
+            None,
+            0,
+        ))
+        .unwrap();
+        assert_eq!(route, DispatchRoute::OneShot("/fastshot"));
+
+        // Even with explicit Vision endpoint hint, model name still wins.
+        let route = dispatch_decision(&dispatch_req(
+            "rsclaw/rsclaw-flash-v1",
+            AgentEndpoint::Vision,
+            None,
+            0,
+        ))
+        .unwrap();
+        assert_eq!(route, DispatchRoute::OneShot("/fastshot"));
+    }
+
+    #[test]
+    fn dispatch_rule_2_vision_model_routes_vision() {
+        let route = dispatch_decision(&dispatch_req(
+            "rsclaw/rsclaw-vision-v1",
+            AgentEndpoint::Primary,
+            None,
+            0,
+        ))
+        .unwrap();
+        assert_eq!(route, DispatchRoute::OneShot("/vision"));
+    }
+
+    #[test]
+    fn dispatch_rule_3_agent_model_no_session_routes_oneshot() {
+        // Per R2 review: stateless agent call must NOT bail; routes to
+        // /oneshot per server hint "use /v1/agent/oneshot for agent model".
+        let route = dispatch_decision(&dispatch_req(
+            "rsclaw/rsclaw-agent-v1",
+            AgentEndpoint::Primary,
+            None,
+            0,
+        ))
+        .unwrap();
+        assert_eq!(route, DispatchRoute::OneShot("/oneshot"));
+    }
+
+    #[test]
+    fn dispatch_rule_4_agent_model_with_session_routes_sessions() {
+        let route = dispatch_decision(&dispatch_req(
+            "rsclaw/rsclaw-agent-v1",
+            AgentEndpoint::Primary,
+            Some("sess-x"),
+            2,
+        ))
+        .unwrap();
+        assert_eq!(route, DispatchRoute::Sessions);
+    }
+
+    #[test]
+    fn dispatch_rule_5_non_canonical_flash_endpoint_routes_fastshot() {
+        // Rule 5: non-canonical model + endpoint=Flash hint → /fastshot.
+        let route = dispatch_decision(&dispatch_req(
+            "anthropic/claude-3-5-haiku",
+            AgentEndpoint::Flash,
+            None,
+            0,
+        ))
+        .unwrap();
+        assert_eq!(route, DispatchRoute::OneShot("/fastshot"));
+    }
+
+    #[test]
+    fn dispatch_rule_6_non_canonical_vision_endpoint_routes_vision() {
+        let route = dispatch_decision(&dispatch_req(
+            "anthropic/claude-3-5-sonnet",
+            AgentEndpoint::Vision,
+            None,
+            0,
+        ))
+        .unwrap();
+        assert_eq!(route, DispatchRoute::OneShot("/vision"));
+    }
+
+    #[test]
+    fn dispatch_rule_7_primary_with_session_routes_sessions() {
+        let route = dispatch_decision(&dispatch_req(
+            "anthropic/claude-3-5-sonnet",
+            AgentEndpoint::Primary,
+            Some("sess-y"),
+            2,
+        ))
+        .unwrap();
+        assert_eq!(route, DispatchRoute::Sessions);
+    }
+
+    #[test]
+    fn dispatch_rule_8_primary_stateless_routes_oneshot() {
+        let route = dispatch_decision(&dispatch_req(
+            "anthropic/claude-3-5-sonnet",
+            AgentEndpoint::Primary,
+            None,
+            0,
+        ))
+        .unwrap();
+        assert_eq!(route, DispatchRoute::OneShot("/oneshot"));
+    }
+
+    #[test]
+    fn dispatch_bail_kv2_without_session_key() {
+        // Safety net (R1 C2): kv_cache_mode=2 + no session_key bails
+        // BEFORE routing, so caller can't silently downgrade to /oneshot
+        // and lose kvCache continuity.
+        let err = dispatch_decision(&dispatch_req(
+            "anthropic/claude-3-5-sonnet",
+            AgentEndpoint::Primary,
+            None,
+            2,
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("session_key"), "got: {err}");
+        assert!(err.contains("kv_cache_mode=2"), "got: {err}");
+    }
+
+    #[test]
+    fn dispatch_bail_session_without_kv2() {
+        // Sessions path requires kv_cache_mode=2.
+        let err = dispatch_decision(&dispatch_req(
+            "anthropic/claude-3-5-sonnet",
+            AgentEndpoint::Primary,
+            Some("sess-z"),
+            1,
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("kv_cache_mode=2"), "got: {err}");
+    }
+
+    #[test]
+    fn dispatch_canonical_model_overrides_endpoint_hint() {
+        // Rule 1 wins over endpoint=Vision when model is flash family.
+        // Important: covers the case where a misconfigured caller sets
+        // a Flash endpoint hint but resolved a non-flash agent model.
+        let route = dispatch_decision(&dispatch_req(
+            "rsclaw/rsclaw-flash-v1",
+            AgentEndpoint::Primary,
+            Some("sess-q"),
+            2,
+        ))
+        .unwrap();
+        // Rule 1 fires regardless of session_key / kv_cache_mode,
+        // because the server-side /fastshot whitelist accepts only
+        // rsclaw-flash-*. (Server may 400 on the session_key field but
+        // routing is correct at the client.)
+        assert_eq!(route, DispatchRoute::OneShot("/fastshot"));
+    }
+
+    #[test]
+    fn dispatch_rule_3_overrides_rule_5_for_agent_model() {
+        // Rule 3 (agent + no session) fires before rule 5 (endpoint=Flash).
+        // Caller passing Flash hint on an agent-* model → /oneshot, NOT
+        // /fastshot (server would 400 the agent model on /fastshot).
+        let route = dispatch_decision(&dispatch_req(
+            "rsclaw/rsclaw-agent-v1",
+            AgentEndpoint::Flash,
+            None,
+            0,
+        ))
+        .unwrap();
+        assert_eq!(route, DispatchRoute::OneShot("/oneshot"));
     }
 
     #[test]
@@ -3588,14 +4880,183 @@ data: {"type":"message_stop"}
         assert!(err.to_string().contains("kv_cache_mode=2"));
     }
 
-    #[test]
-    fn rejects_missing_session_key() {
+    // Renamed + re-scoped: the previous version expected an error when
+    // session_key was `None` with kv_cache_mode=2, but the dispatch
+    // refactor (commit cc6314a) now routes session_key=None to /oneshot
+    // regardless of kv_cache_mode. The remaining session-mode contract
+    // worth pinning is the inverse: session_key=Some + kv_cache_mode!=2
+    // must error rather than silently mis-route. (Also: tokio::test
+    // instead of futures::executor::block_on — provider.stream calls
+    // into reqwest, which needs a tokio reactor on the current thread.)
+    #[tokio::test]
+    async fn rejects_session_mode_without_kv_cache_mode_2() {
         let provider = RsclawProvider::new("http://x", None);
-        let req = req_with(vec![], 2, None);
-        let err = match futures::executor::block_on(provider.stream(req)) {
-            Ok(_) => panic!("expected error for missing session_key"),
+        let req = req_with(vec![], 0, Some("session-xyz"));
+        let err = match provider.stream(req).await {
+            Ok(_) => panic!("expected error for session_key + kv_cache_mode!=2"),
             Err(e) => e,
         };
-        assert!(err.to_string().contains("session_key"));
+        assert!(
+            err.to_string().contains("kv_cache_mode=2"),
+            "unexpected error text: {err}"
+        );
+    }
+
+    // ----- compact splice wire shape (§2.4) -------------------------------
+
+    #[test]
+    fn compact_splice_req_serialises_post_2_4_shape() {
+        // Pin the wire shape so rsclaw-server and gateway can't drift
+        // independently. expected_msgs_count is optional; when None it
+        // MUST be omitted from the body (not emitted as `"expected_msgs_count": null`)
+        // so a server that hasn't shipped the field yet doesn't 400.
+        let body = CompactSpliceReq {
+            keep_head_messages: 2,
+            summary: "<sum>",
+            keep_tail_messages: 10,
+            expected_msgs_count: Some(80),
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["keep_head_messages"], 2);
+        assert_eq!(v["summary"], "<sum>");
+        assert_eq!(v["keep_tail_messages"], 10);
+        assert_eq!(v["expected_msgs_count"], 80);
+
+        let body_no_expect = CompactSpliceReq {
+            keep_head_messages: 2,
+            summary: "<sum>",
+            keep_tail_messages: 10,
+            expected_msgs_count: None,
+        };
+        let v_no_expect = serde_json::to_value(&body_no_expect).unwrap();
+        assert!(
+            v_no_expect.get("expected_msgs_count").is_none(),
+            "None must be omitted from the wire body, not emitted as null"
+        );
+    }
+
+    #[test]
+    fn compact_splice_resp_parses_happy_shape() {
+        let body = r#"{"session_id":"rs_w7_abc","msgs_count":13,"tokens_count":8421}"#;
+        let resp: CompactSpliceResp =
+            serde_json::from_str(body).expect("happy compact response must parse");
+        assert_eq!(resp.session_id, "rs_w7_abc");
+        assert_eq!(resp.msgs_count, 13);
+        assert_eq!(resp.tokens_count, 8421);
+    }
+
+    #[test]
+    fn compact_splice_trait_default_returns_err_for_non_rsclaw() {
+        // Trait-level default impl: non-rsclaw providers should bail
+        // with a "not supported" error so callers can fall back cleanly.
+        // Sanity-check on a placeholder provider via the public trait.
+        use crate::provider::LlmProvider;
+        struct StubProvider;
+        impl LlmProvider for StubProvider {
+            fn name(&self) -> &str { "stub" }
+            fn stream(
+                &self,
+                _req: crate::provider::LlmRequest,
+            ) -> futures::future::BoxFuture<'_, anyhow::Result<crate::provider::LlmStream>> {
+                Box::pin(async { anyhow::bail!("stub provider has no streaming") })
+            }
+        }
+        let p = StubProvider;
+        let err = futures::executor::block_on(
+            p.compact_splice("k", 2, "x", 10, None)
+        ).expect_err("default impl must Err");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not supported") && msg.contains("stub"),
+            "default impl Err should name the provider: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_splice_errs_when_no_cached_session() {
+        // Splice short-circuits BEFORE any HTTP call when the cached
+        // SessionEntry for `session_key` is missing — no point splicing
+        // a session we don't think is open. Caller (compact_inner)
+        // observes the Err and falls back to replay path.
+        use crate::provider::LlmProvider;
+        let provider = RsclawProvider::new("http://nonexistent-host.invalid", None);
+        let err = provider
+            .compact_splice("missing-key", 2, "summary", 10, None)
+            .await
+            .expect_err("should Err when no cached SessionEntry exists");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no cached session"),
+            "Err message should mention missing cached session, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_splice_updates_last_seen_msgs_len_on_success() {
+        // Pin the critical post-splice state mutation: on HTTP success
+        // the cached SessionEntry.last_seen_msgs_len MUST be updated to
+        // the gateway-local computation (head + 1 + tail). Without this
+        // update, the next turn's lookup_and_bump would (incorrectly)
+        // see msgs.len() < last_seen and force an unnecessary replay.
+        use crate::provider::LlmProvider;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let session_id = "rs_w7_abc";
+
+        Mock::given(method("POST"))
+            .and(path(format!("/sessions/{}/compact", session_id)))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "session_id": session_id,
+                    "msgs_count": 13,
+                    "tokens_count": 8421,
+                })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let provider = RsclawProvider::new(mock_server.uri(), None);
+
+        // Pre-populate the cached SessionEntry so the splice has
+        // something to operate against. last_seen_msgs_len starts at 50
+        // (a typical pre-compact value) so we can verify it's updated
+        // to 13 (head=2 + summary=1 + tail=10) after success.
+        {
+            let mut map = provider.lock_sessions();
+            map.insert(
+                "test-key".to_owned(),
+                SessionEntry {
+                    session_id: session_id.to_owned(),
+                    prefix_id: RSCLAW_DEFAULT_PREFIX_ID.to_owned(),
+                    last_seen_msgs_len: 50,
+                },
+            );
+        }
+
+        let result = provider
+            .compact_splice("test-key", 2, "<summary>", 10, Some(50))
+            .await
+            .expect("happy-path splice should succeed");
+        assert_eq!(result, 13, "trait method returns server's msgs_count");
+
+        let map = provider.lock_sessions();
+        let entry = map
+            .get("test-key")
+            .expect("SessionEntry must still exist after splice — id is preserved");
+        assert_eq!(
+            entry.last_seen_msgs_len, 13,
+            "last_seen_msgs_len must be updated to head(2) + summary(1) + tail(10)"
+        );
+        assert_eq!(
+            entry.session_id, session_id,
+            "session_id MUST be unchanged across splice (§2.4 invariant)"
+        );
+        assert_eq!(
+            entry.prefix_id, RSCLAW_DEFAULT_PREFIX_ID,
+            "prefix_id must be unchanged"
+        );
     }
 }

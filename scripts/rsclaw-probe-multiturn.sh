@@ -45,6 +45,12 @@ GATEWAY="${GATEWAY:-http://127.0.0.1:18888}"
 AGENT_ID="${AGENT_ID:-rsctest}"
 SESSION_KEY="${SESSION_KEY:-multiturn:$(date +%s)}"
 TURN_TIMEOUT="${TURN_TIMEOUT:-240}"
+GATEWAY_TOKEN="${GATEWAY_TOKEN:-}"
+
+AUTH_HEADER_ARGS=()
+if [[ -n "${GATEWAY_TOKEN}" ]]; then
+  AUTH_HEADER_ARGS=(-H "Authorization: Bearer ${GATEWAY_TOKEN}")
+fi
 
 # Per-turn long-context filler. Four ~1400-char blocks concatenated
 # (~5600 chars ≈ 1300 tokens) so each fill / push / more turn adds
@@ -97,6 +103,7 @@ run_turn() {
   local resp http_code
   resp=$(curl -sS --max-time "${TURN_TIMEOUT}" \
     -H "Content-Type: application/json" \
+    "${AUTH_HEADER_ARGS[@]}" \
     -w '\n%{http_code}' \
     "${GATEWAY}/api/v1/message" \
     -d "${body}" \

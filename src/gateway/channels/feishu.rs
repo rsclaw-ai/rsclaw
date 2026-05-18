@@ -11,7 +11,7 @@ use crate::{
 };
 
 use super::super::preparse::{
-    btw_direct_call, is_fast_preparse, try_preparse_locally,
+    btw_direct_call, is_fast_preparse, try_preparse_locally_with_account,
 };
 use super::default_dm_scope;
 
@@ -314,7 +314,7 @@ pub(crate) fn start_feishu_if_configured(
                                 Err(_) => return,
                             }
                         };
-                        if let Some(mut reply) = try_preparse_locally(&text, &handle, "feishu", &sender_id).await {
+                        if let Some(mut reply) = try_preparse_locally_with_account(&text, &handle, "feishu", &sender_id, Some(&w_acct_outer), crate::gateway::preparse::PreparseOrigin::User).await {
                             reply.target_id = outbound_target.clone();
                             reply.is_group = is_group;
                             if !reply.text.is_empty() || !reply.images.is_empty() {
@@ -479,6 +479,7 @@ pub(crate) fn start_feishu_if_configured(
                         let chat_id = chat_id.clone();
                         let outbound_target = outbound_target.clone();
                         let bound = bound.clone();
+                        let w_acct_for_preparse = w_acct_outer.clone();
                         tokio::spawn(async move {
                             let handle = if let Some(ref agent_id) = bound {
                                 match reg.get(agent_id) {
@@ -509,7 +510,7 @@ pub(crate) fn start_feishu_if_configured(
                                 peer_id: sender_id.clone(),
                                 dm_scope,
                             });
-                            if let Some(mut reply) = try_preparse_locally(&text, &handle, "feishu", &sender_id).await {
+                            if let Some(mut reply) = try_preparse_locally_with_account(&text, &handle, "feishu", &sender_id, Some(&w_acct_for_preparse), crate::gateway::preparse::PreparseOrigin::User).await {
                                 reply.target_id = outbound_target.clone();
                                 reply.is_group = is_group;
                                 if !reply.text.is_empty() || !reply.images.is_empty() {
@@ -529,6 +530,11 @@ pub(crate) fn start_feishu_if_configured(
                                 peer_id: sender_id,
                                 chat_id: outbound_target.clone(),
                                 reply_tx,
+                                task_id: None,
+                                context_id: None,
+                                event_tx: None,
+                                cancel_token: None,
+                                input_request_tx: None,
                                 extra_tools: vec![],
                                 images,
                                 files: file_attachments,
@@ -584,8 +590,27 @@ pub(crate) fn start_feishu_if_configured(
         if feishu_slot.set(Arc::clone(&fs)).is_err() {
             tracing::debug!("slot already set, skipping");
         }
-        if let Err(e) = manager.register(Arc::clone(&fs) as Arc<dyn crate::channel::Channel>) {
-            tracing::warn!("failed to register channel: {e}");
+        // Register under both `feishu/<acct>` (account-keyed; lets /watch
+        // route deliveries back through the SAME app that received the
+        // inbound message — open_ids are per-app, so cross-app routing
+        // gets rejected with 99992361 "open_id cross app") and bare
+        // `feishu` (first-account wins; matches the existing
+        // `_channel_senders` semantic so legacy single-account callers
+        // keep working unchanged).
+        let acct_key = format!("feishu/{}", acct_for_log);
+        if let Err(e) = manager.register_with_name(
+            acct_key.clone(),
+            Arc::clone(&fs) as Arc<dyn crate::channel::Channel>,
+        ) {
+            tracing::warn!("failed to register channel `{acct_key}`: {e}");
+        }
+        if manager.get("feishu").is_none()
+            && let Err(e) = manager.register_with_name(
+                "feishu".to_owned(),
+                Arc::clone(&fs) as Arc<dyn crate::channel::Channel>,
+            )
+        {
+            tracing::warn!("failed to register bare `feishu` channel: {e}");
         }
 
         let fs_send = Arc::clone(&fs);

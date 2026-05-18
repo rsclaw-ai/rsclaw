@@ -79,7 +79,7 @@ rsclaw start
 | 上传运行时调参 | /set_upload_size, /set_upload_chars | -- |
 | 技能仓库 | ClawHub + SkillHub（自动回退） | 仅 ClawHub |
 | computer_use | 原生截图/鼠标/键盘控制 | 仅通过浏览器 |
-| A2A 协议 | Google A2A v0.3（跨网络 agent 协作） | -- |
+| A2A 协议 | Google A2A v1.0（跨网络 agent 协作） | -- |
 | 配置格式 | JSON5 | JSON5 |
 | 热重载 | 通道变更自动重启 | 支持 |
 | 自更新 | `rsclaw update` 从 GitHub 下载 | npm update |
@@ -129,7 +129,6 @@ rsclaw start
 | `/models` | 列出可用模型 |
 | `/model <name>` | 切换主模型 |
 | `/clear` | 清除当前会话 |
-| `/reset` | 重置会话 |
 | `/history [n]` | 显示最近 N 条消息（默认 20） |
 | `/sessions` | 列出所有会话 |
 | `/cron list` | 列出定时任务 |
@@ -540,7 +539,7 @@ LLM 提供商从以下来源自动注册：
       },
     ],
     // 远程智能体（A2A 协议）
-    external: [
+    a2a: [
       {
         id: "remote-agent",
         url: "https://remote-gateway.example.com",
@@ -636,22 +635,34 @@ rsclaw --profile test gateway run # 使用 ~/.rsclaw-test
 
 ### A2A 协议（Agent-to-Agent）
 
-rsclaw 实现了 [Google A2A Protocol v0.3](https://a2a-protocol.org/latest/specification/)，支持跨网络的 agent 间通信。这是 rsclaw 的独有功能，OpenClaw 不支持此协议。
+rsclaw 实现了 [Google A2A Protocol v1.0](https://a2a-protocol.org/latest/specification/)，支持跨网络的 agent 间通信。这是 rsclaw 的独有功能，OpenClaw 不支持此协议。
 
 **核心能力：**
 
-- **Agent Card 自动发现** -- 符合规范的 `/.well-known/agent.json` 端点，远程 agent 可自动发现本网关的能力和技能列表
-- **JSON-RPC 2.0 任务分发** -- 通过标准 `tasks/send` 方法向指定 agent 发送任务，支持会话保持和超时控制
-- **跨机器 agent 协作** -- 本地 agent 和远程 agent 通过 A2A 协议无缝协作，Bearer token 认证
+- **Agent Card 自动发现** -- `/.well-known/agent.json` 端点声明 `protocolVersion: "1.0"`、streaming/pushNotifications/extendedAgentCard 三项 capability、bearer + X-API-Key 两套 securityScheme
+- **完整的 11 个 RPC 方法** -- `SendMessage` / `SendStreamingMessage` / `GetTask` / `ListTasks` / `CancelTask` / `SubscribeToTask` / 4 个 push 配置 CRUD / `GetExtendedAgentCard`
+- **持久化任务** -- redb 落盘，重启后 `GetTask`/`ListTasks` 仍可查
+- **流式 SSE** -- `Accept: text/event-stream` 即得 Submitted → Working → Artifact → Completed 事件流，runtime 每次工具调度前还会发 `WORKING msg="calling tool X"` 进度
+- **真实可中断** -- `CancelTask` 在 agent 主循环每次迭代和每个工具边界自检 cancel_token
+- **INPUT_REQUIRED suspend/resume** -- agent 调用内置 `wait_input(prompt, auth?)` 工具即可让 client 提供补充输入，client 用同一 `taskId` 再发 SendMessage 续接
+- **Push 通知** -- 每任务可注册 webhook，gateway 用 HMAC-SHA256 签名 (`X-A2A-Signature` 头) 推送生命周期事件
 - **三种协作模式** -- 顺序执行（链式）、并行执行（扇出）、编排执行（LLM 驱动的 `agent_<id>` 工具调用）
-- **流式支持** -- Agent Card 声明 streaming 能力，支持流式任务响应
 
 **端点：**
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/.well-known/agent.json` | GET | Agent Card 发现，返回网关所有 agent 的能力描述 |
-| `/api/v1/a2a` | POST | JSON-RPC 2.0 任务端点，接收 `tasks/send` 请求 |
+| `/.well-known/agent.json` | GET | Agent Card（v1.0 发现） |
+| `/api/v1/a2a` | POST | JSON-RPC 2.0 入口；`Accept: text/event-stream` 走 SSE |
+
+**认证（可选，生产环境推荐）：**
+
+```bash
+export RSCLAW_A2A_BEARER_TOKENS="token-1,token-2"   # Authorization: Bearer <token>
+export RSCLAW_A2A_API_KEYS="key-1,key-2"            # X-API-Key: <key>
+```
+
+两个变量都不设 → 端点开放（dev 模式）。设了任一即开启鉴权，gateway 自身的 `gateway.auth.token` 不再覆盖 A2A 端点。
 
 **配置示例 -- 启用跨网络 A2A：**
 
@@ -674,7 +685,7 @@ rsclaw 实现了 [Google A2A Protocol v0.3](https://a2a-protocol.org/latest/spec
       },
     ],
     // 连接远程 A2A 网关上的智能体
-    external: [
+    a2a: [
       {
         id: "remote-analyst",
         url: "https://remote-gateway.example.com",
@@ -689,11 +700,16 @@ rsclaw 实现了 [Google A2A Protocol v0.3](https://a2a-protocol.org/latest/spec
 
 ```json
 {
-  "protocolVersion": "0.3",
+  "protocolVersion": "1.0",
   "name": "rsclaw",
   "description": "OpenClaw-compatible multi-agent AI gateway",
   "url": "http://host:18888/api/v1/a2a",
-  "capabilities": { "streaming": true, "pushNotifications": false },
+  "capabilities": { "streaming": true, "pushNotifications": true, "extendedAgentCard": true },
+  "securitySchemes": {
+    "bearer": { "type": "http", "scheme": "bearer" },
+    "apiKey":  { "type": "apiKey", "in": "header", "name": "X-API-Key" }
+  },
+  "security": [{ "bearer": [] }, { "apiKey": [] }],
   "defaultInputModes": ["text/plain"],
   "defaultOutputModes": ["text/plain"],
   "skills": [
@@ -709,7 +725,7 @@ rsclaw 实现了 [Google A2A Protocol v0.3](https://a2a-protocol.org/latest/spec
 {
   "jsonrpc": "2.0",
   "id": "task-001",
-  "method": "tasks/send",
+  "method": "SendMessage",
   "params": {
     "id": "task-001",
     "message": {
@@ -730,6 +746,37 @@ rsclaw 实现了 [Google A2A Protocol v0.3](https://a2a-protocol.org/latest/spec
 | **编排执行**（Orchestrated） | 主 LLM 通过 `agent_<id>` 工具调用决定调度哪个 agent | 复杂任务分解，LLM 自主编排子任务 |
 
 编排模式下，主 agent 的 LLM 可调用 `agent_researcher`、`agent_coder` 等工具，每个工具接受 `{"message": "子任务描述"}` 参数，返回子 agent 的文本回复。子 agent 使用独立的子会话（`{session}:a2a:{agent_id}`），不污染主会话上下文。
+
+**INPUT_REQUIRED suspend / resume：**
+
+每个 agent 自动获得内置工具 `wait_input(prompt, auth?)`。LLM 一旦调用它，runtime 会：
+
+1. 推送 `TASK_STATE_INPUT_REQUIRED`（`auth: true` 时是 `TASK_STATE_AUTH_REQUIRED`）状态事件，prompt 文本以 `role: agent` 形式带在 status.message 里
+2. 挂起回合，等待 client 用**同一个 `taskId`** 再发一次 SendMessage
+3. 收到补充输入后，把文本作为 `wait_input` 工具的返回值，agent 继续推理直到 COMPLETED
+
+完整往返脚本见 [tests/a2a_interop_python.md](../../tests/a2a_interop_python.md) 的 Test 6。
+
+**Push 通知：**
+
+`CreateTaskPushNotificationConfig` 注册 webhook → gateway 在每个生命周期事件 POST 到该 url，body 是事件 JSON，header 携带：
+
+```
+X-A2A-Signature: <base64(hmac_sha256(token, body))>
+X-A2A-Task-Id:   <taskId>
+```
+
+3 次指数退避重试（2/4/8s）。Python 端验签：
+
+```python
+import hmac, hashlib, base64
+expected = base64.b64encode(hmac.new(token.encode(), body, hashlib.sha256).digest()).decode()
+assert expected == request.headers["X-A2A-Signature"]
+```
+
+**取消语义：**
+
+`CancelTask` 触发 cancel_token，runtime 在 agent 主循环每次迭代顶部 + 每次工具调度前自检 → 中断颗粒度是"工具之间"。一个 30s 阻塞工具会跑完才退出；但 dispatcher 端会立即发 `TASK_STATE_CANCELED` final 事件并关 SSE，client 不会被那个长工具阻塞观测。
 
 ### 定时任务
 
@@ -835,7 +882,7 @@ src/
   ws/          # WebSocket 协议 v3
   cmd/         # CLI 命令：setup、configure、security 等
   acp/         # ACP 协议（智能体 spawn/connect/run）
-  a2a/         # Google A2A v0.3 协议（server + client，跨网络 agent 协作）
+  a2a/         # Google A2A v1.0 协议（server + client，跨网络 agent 协作）
 ```
 
 ### Matrix E2EE

@@ -11,11 +11,19 @@ use crate::{
     channel::OutboundMessage,
     config::runtime::RuntimeConfig,
     provider::{
-        LlmRequest, Message, MessageContent, Role, StreamEvent,
+        AgentEndpoint, LlmRequest, Message, MessageContent, Role, StreamEvent,
         failover::FailoverManager,
         registry::ProviderRegistry,
     },
 };
+
+/// Where a `/...` command text came from. `/watch` uses this to suppress
+/// dedup-hit replies fired by /loop's cron-replayed text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparseOrigin {
+    User,
+    Cron,
+}
 
 /// Handle certain fast preparse commands locally — without going through the agent queue.
 /// Returns `Some(reply_text)` for commands that can be answered immediately, `None` otherwise.
@@ -23,12 +31,31 @@ use crate::{
 ///
 /// `channel` (e.g. "telegram", "wechat") and `peer_id` are passed through so commands
 /// that need to schedule deliveries back to the originating channel/peer (e.g. `/loop`)
-/// can populate a `CronDelivery` correctly.
+/// can populate a `CronDelivery` correctly. `origin` tells preparse whether the call
+/// came from a real user or from cron's replay of `/loop`-scheduled text.
 pub(crate) async fn try_preparse_locally(
     text: &str,
     handle: &crate::agent::AgentHandle,
     channel: &str,
     peer_id: &str,
+    origin: PreparseOrigin,
+) -> Option<OutboundMessage> {
+    try_preparse_locally_with_account(text, handle, channel, peer_id, None, origin).await
+}
+
+/// Account-aware variant. Channels that need multi-account routing
+/// (e.g. feishu with several `appId`s) call this with the account name
+/// so deliveries to long-running registrations (notably `/watch`) can
+/// route back through the SAME app that received the inbound message.
+/// Open IDs are per-app in feishu — sending via the wrong app fails
+/// with 99992361 "open_id cross app".
+pub(crate) async fn try_preparse_locally_with_account(
+    text: &str,
+    handle: &crate::agent::AgentHandle,
+    channel: &str,
+    peer_id: &str,
+    account: Option<&str>,
+    origin: PreparseOrigin,
 ) -> Option<OutboundMessage> {
     use std::sync::atomic::Ordering;
     let t = text.trim();
@@ -107,14 +134,6 @@ pub(crate) async fn try_preparse_locally(
         drop(flags);
         handle.new_session_signal.store(true, Ordering::SeqCst);
         return Some(txt(crate::i18n::t("session_new", crate::i18n::default_lang()).to_owned()));
-    }
-    // /reset — reset current session (no summary, same generation)
-    if lower == "/reset" {
-        let flags = handle.abort_flags.read().expect("abort_flags lock poisoned");
-        for f in flags.values() { f.store(true, Ordering::SeqCst); }
-        drop(flags);
-        handle.reset_signal.store(true, Ordering::SeqCst);
-        return Some(txt(crate::i18n::t("session_reset", crate::i18n::default_lang()).to_owned()));
     }
     // /status
     if lower == "/status" {
@@ -456,6 +475,32 @@ $g.Dispose();$b.Dispose()"#
             format!("Scheduled loop (every {human}): {prompt}\nID: {id}\nStop with: /cron remove {id} (via agent)")
         }));
     }
+    // /watch — live event stream → chat. See docs/superpowers/specs/2026-05-13-watch-design.md
+    if lower == "/watch" || lower == "/watch -h" || lower == "/watch --help" || lower == "/watch help" {
+        return Some(txt(watch_help_text(crate::i18n::default_lang())));
+    }
+    if let Some(body) = t.strip_prefix("/watch ") {
+        let body = body.trim();
+        let registry = match crate::gateway::watch::WatchRegistry::global() {
+            Some(r) => r,
+            None => {
+                return Some(txt(
+                    "/watch: registry not initialized (gateway still starting?)".to_owned(),
+                ))
+            }
+        };
+        let origin_for_watch = match origin {
+            PreparseOrigin::User => crate::gateway::watch::Origin::User,
+            PreparseOrigin::Cron => crate::gateway::watch::Origin::Cron,
+        };
+        return match registry
+            .handle_command(channel, peer_id, account.map(str::to_owned), body, origin_for_watch)
+            .await
+        {
+            crate::gateway::watch::WatchCommandReply::Reply(s) => Some(txt(s)),
+            crate::gateway::watch::WatchCommandReply::Silent => Some(OutboundMessage::default()),
+        };
+    }
     // /task with no args or -h/--help → print task help (short-circuit;
     // otherwise it would route into the task queue with an empty message).
     if lower == "/task" || lower == "/task -h" || lower == "/task --help" || lower == "/task help" {
@@ -542,8 +587,8 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
     matches!(
         lower.as_str(),
         "/ls" | "/status" | "/version" | "/help" | "/?" | "/health" | "/uptime"
-            | "/model" | "/models" | "/cron" | "/clear" | "/new" | "/reset" | "/abort" | "/sessions"
-            | "/loop" | "/task"
+            | "/model" | "/models" | "/cron" | "/clear" | "/new" | "/abort" | "/sessions"
+            | "/loop" | "/task" | "/watch"
     )
     // Commands with optional/required args
     || lower.starts_with("/ls ")
@@ -559,6 +604,7 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
     || lower.starts_with("/sh ")
     || lower.starts_with("/exec ")
     || lower.starts_with("/loop ")
+    || lower.starts_with("/watch ")
     // /task only short-circuits on help variants; non-help forms must NOT
     // bypass the queue (the task queue worker owns the multi-turn flow).
     || lower == "/task -h"
@@ -634,7 +680,6 @@ fn help_text(lang: &str) -> String {
          会话\n\
          \u{0020}\u{0020}/new      新会话\n\
          \u{0020}\u{0020}/clear    清当前会话历史\n\
-         \u{0020}\u{0020}/reset    重置会话（含中止）\n\
          \u{0020}\u{0020}/abort    中止当前/所有运行中的回合\n\
          \u{0020}\u{0020}/sessions 列出会话\n\n\
          模型\n\
@@ -664,7 +709,6 @@ fn help_text(lang: &str) -> String {
          Session\n\
          \u{0020}\u{0020}/new      start a new session\n\
          \u{0020}\u{0020}/clear    wipe current session history\n\
-         \u{0020}\u{0020}/reset    full reset (incl. abort)\n\
          \u{0020}\u{0020}/abort    abort the current / all running turns\n\
          \u{0020}\u{0020}/sessions list sessions\n\n\
          Model\n\
@@ -713,6 +757,52 @@ fn loop_help_text(lang: &str) -> String {
          \u{0020}\u{0020}/loop 5m check for new mail\n\
          \u{0020}\u{0020}/loop 1h /status\n\n\
          List: /cron list    Stop: ask the agent to /cron remove <id>"
+            .to_owned()
+    }
+}
+
+/// Help text for /watch. Localized en/zh. Lists only flags actually
+/// implemented in v1 — `--jq`, `--only`, `--tee` are stretch goals
+/// (see plan §Stretch); they're documented in the spec but rejected at
+/// parse time today.
+fn watch_help_text(lang: &str) -> String {
+    if lang == "zh" {
+        "/watch <源> [flags]      实时把事件推回 chat（不过 agent）\n\n\
+         源类型（auto-detect 或显式前缀）：\n\
+         \u{0020}\u{0020}/watch /path/to/file.log               跟踪文件（跨平台 tail -f）\n\
+         \u{0020}\u{0020}/watch https://api/events              订阅 SSE 流\n\
+         \u{0020}\u{0020}/watch shell tail -f x                 原生 shell\n\n\
+         Flags：\n\
+         \u{0020}\u{0020}--grep <regex>             仅推送匹配的事件\n\
+         \u{0020}\u{0020}--event <type>             仅推送指定 SSE event 类型\n\
+         \u{0020}\u{0020}--jq <expr>                jq 表达式过滤/转换（支持 `.codes[]` 数组展开）\n\
+         \u{0020}\u{0020}--template <tpl>           输出模板：`${{.field}}` 取 JSON 字段\n\
+         \u{0020}\u{0020}--rate <ms>                限流（默认 2000；0 = 不限）\n\
+         \u{0020}\u{0020}-H 'Header: value'         SSE auth/header；value 可含 ${VAR}\n\n\
+         管理：\n\
+         \u{0020}\u{0020}/watch list                列出当前活跃 watch\n\
+         \u{0020}\u{0020}/watch stop <id>           停一个\n\
+         \u{0020}\u{0020}/watch stop all            全停\n\n\
+         持久化：本身不持久（重启即清）；要跨重启用 /loop 10m /watch <源>。"
+            .to_owned()
+    } else {
+        "/watch <source> [flags]    Push live events back to chat (no agent involved)\n\n\
+         Sources (auto-detected or explicit prefix):\n\
+         \u{0020}\u{0020}/watch /path/to/file.log              follow file (cross-platform tail -f)\n\
+         \u{0020}\u{0020}/watch https://api/events             subscribe SSE\n\
+         \u{0020}\u{0020}/watch shell tail -f x                raw shell\n\n\
+         Flags:\n\
+         \u{0020}\u{0020}--grep <regex>            push only matching events\n\
+         \u{0020}\u{0020}--event <type>            push only the given SSE event type\n\
+         \u{0020}\u{0020}--jq <expr>               jq filter/transform (supports `.codes[]` array expansion)\n\
+         \u{0020}\u{0020}--template <tpl>          output template: `${{.field}}` interpolates a JSON field\n\
+         \u{0020}\u{0020}--rate <ms>               rate limit (default 2000; 0 = unlimited)\n\
+         \u{0020}\u{0020}-H 'Header: value'        SSE auth/header; value may contain ${VAR}\n\n\
+         Management:\n\
+         \u{0020}\u{0020}/watch list               list active watches\n\
+         \u{0020}\u{0020}/watch stop <id>          stop one\n\
+         \u{0020}\u{0020}/watch stop all           stop everything\n\n\
+         Persistence: in-memory only. Cross-restart via /loop 10m /watch <source>."
             .to_owned()
     }
 }
@@ -788,7 +878,7 @@ pub(crate) async fn btw_direct_call(
         .model
         .as_ref()
         .and_then(|m| m.primary.as_deref())
-        .unwrap_or("anthropic/claude-sonnet-4-6");
+        .unwrap_or("rsclaw/rsclaw-agent-v1");
 
     let system = format!(
         "You are answering a quick side question (/btw). Be concise and direct. \
@@ -807,8 +897,8 @@ pub(crate) async fn btw_direct_call(
         max_tokens: Some(500),
         temperature: None,
         frequency_penalty: None,
-        thinking_budget: None, kv_cache_mode: 0, session_key: None,
-        system_shared: None, system_user: None,
+        thinking_budget: None, endpoint: AgentEndpoint::Flash, kv_cache_mode: 0, session_key: None,
+        system_shared: None, user_system: None,
     };
 
     // 3. Create a simple failover manager (no fallbacks needed for /btw).

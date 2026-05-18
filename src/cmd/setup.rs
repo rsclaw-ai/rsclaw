@@ -3,7 +3,9 @@ use dialoguer::{Input, Password, Select};
 use serde_json::json;
 use tracing::info;
 
-use super::config_json::{get_nested_value, load_config_json, set_nested_value};
+use super::config_json::{
+    get_nested_value, load_config_json, remove_nested_value, set_nested_value,
+};
 use crate::{
     agent,
     cli::{ConfigureArgs, OnboardArgs, SetupArgs},
@@ -147,7 +149,13 @@ fn default_config(lang: &str) -> String {
   }},
   models: {{
     providers: {{
-      anthropic: {{ apiKey: "${{ANTHROPIC_API_KEY}}" }},
+      // RsClaw stateful incremental session protocol (kvCacheMode=2).
+      // Recommended default. The bare name `rsclaw` auto-resolves to the
+      // managed fleet at api.rsclaw.ai using the rsclaw API format — set
+      // `baseUrl` here only if you want to point at a self-hosted
+      // rsclaw-llm worker (e.g. http://localhost:9999).
+      rsclaw: {{ apiKey: "${{RSCLAW_API_KEY}}" }},
+      // anthropic: {{ apiKey: "${{ANTHROPIC_API_KEY}}" }},
       // openai: {{ apiKey: "${{OPENAI_API_KEY}}" }},
       // ollama: {{ baseUrl: "http://localhost:11434" }},
       // minimax: {{ apiKey: "${{MINIMAX_API_KEY}}" }},
@@ -156,6 +164,7 @@ fn default_config(lang: &str) -> String {
   }},
   agents: {{
     defaults: {{
+      model: {{ primary: "rsclaw/rsclaw-agent-v1" }},
       contextTokens: 64000,          // max context window tokens
       stripThinkTags: false,         // strip <think> tags (auto when thinking disabled)
       frequencyPenalty: 0.3,         // reduce repetition (0.0-2.0)
@@ -171,8 +180,6 @@ fn default_config(lang: &str) -> String {
     list: [
       {{
         id: "main",
-        default: true,
-        model: {{ primary: "anthropic/claude-sonnet-4-6" }},
       }},
     ],
   }},
@@ -426,6 +433,10 @@ struct ChannelDef {
     /// If true, run `channels login` flow (QR/OAuth) instead of prompting fields.
     #[serde(default)]
     login: bool,
+    /// If true, gateway reads `channels.<name>.accounts.<acct>.<field>` and the
+    /// editor exposes add/edit/remove account UI on top of the single-account flow.
+    #[serde(default)]
+    multi_account: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -499,22 +510,26 @@ struct ExistingConfig {
     provider_models: std::collections::HashMap<String, String>,
 }
 
-/// `load_defaults` + locale-aware reorder. In Chinese mode the China-region
-/// providers (Qwen / DeepSeek / Doubao) get surfaced first; other locales
-/// keep the defaults.toml order. Used by both `cmd_onboard` (initial
-/// wizard) and `cmd_configure` (interactive section editor) so a user
-/// running either entry point sees the same picker order.
+/// `load_defaults` + locale-aware reorder. `rsclaw` is always the
+/// recommended first option (stateful kvCacheMode=2 fleet). In Chinese
+/// mode the China-region providers (Qwen / DeepSeek / Doubao) follow;
+/// other locales keep the defaults.toml order after rsclaw. Used by
+/// both `cmd_onboard` (initial wizard) and `cmd_configure` (interactive
+/// section editor) so a user running either entry point sees the same
+/// picker order.
 fn load_defaults_for_lang(lang: &str) -> Defaults {
     let mut defs = load_defaults();
-    if lang == "zh" {
-        let priority = ["qwen", "deepseek", "doubao"];
-        defs.providers.sort_by_key(|p| {
-            priority
-                .iter()
-                .position(|n| n == &p.name)
-                .unwrap_or(priority.len())
-        });
-    }
+    let priority: &[&str] = if lang == "zh" {
+        &["rsclaw", "qwen", "deepseek", "doubao"]
+    } else {
+        &["rsclaw"]
+    };
+    defs.providers.sort_by_key(|p| {
+        priority
+            .iter()
+            .position(|n| n == &p.name)
+            .unwrap_or(priority.len())
+    });
     defs
 }
 
@@ -1157,10 +1172,17 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
             _ => ("all", None),
         }
     };
-    let effective_base_url = if !base_url.is_empty() {
+    // Only persist `baseUrl` to the config file when the user actually
+    // overrode the provider's well-known default (e.g. pointing at a
+    // self-hosted worker). Writing the same string that defaults.toml
+    // already carries adds noise and ties the user's config to a
+    // specific fleet endpoint — when the official baseUrl changes,
+    // users with the pinned value miss the update. Empty string here
+    // means "use the provider's built-in default" and the gateway
+    // already knows how to fall back at request time
+    // (provider/rsclaw.rs RSCLAW_DEFAULT_BASE, etc.).
+    let effective_base_url = if !base_url.is_empty() && base_url != provider.base_url {
         base_url.clone()
-    } else if !provider.base_url.is_empty() {
-        provider.base_url.to_string()
     } else {
         String::new()
     };
@@ -1255,31 +1277,30 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
         let list = agents_obj.entry("list").or_insert_with(|| json!([]));
         if let Some(arr) = list.as_array_mut() {
             if arr.is_empty() {
+                // New install: main is the implicit default by virtue of
+                // being list[0] (RuntimeConfig::default_agent falls back to
+                // the first entry when no `default: true` is set). The model
+                // is configured at agents.defaults.model.primary below — no
+                // need to repeat it here.
                 arr.push(json!({
                     "id": agent_name,
-                    "default": true,
                     "workspace": workspace_path,
-                    "model": { "primary": default_model_value },
                 }));
             } else {
-                // Update the first agent in-place.
+                // Update the first agent in-place. Preserve any existing
+                // `default` / `model` fields the user (or a prior setup
+                // run) wrote — only refresh id and workspace.
                 let first = &mut arr[0];
                 if let Some(obj) = first.as_object_mut() {
                     obj.insert("id".into(), json!(agent_name));
-                    obj.insert("default".into(), json!(true));
                     obj.insert("workspace".into(), json!(workspace_path));
-                    let model_obj = obj.entry("model").or_insert_with(|| json!({}));
-                    if let Some(m) = model_obj.as_object_mut() {
-                        m.insert("primary".into(), json!(default_model_value));
-                    }
                 }
             }
         }
 
-        // Mirror to agents.defaults.model.primary (openclaw compat). Without
-        // this, the loader has no fleet-level fallback and only the main
-        // agent ends up with a model — sub-agents and any future agent
-        // entry inherit nothing.
+        // Write fleet-level default to agents.defaults.model.primary. This
+        // is the single source of truth for the default model — main and any
+        // future agent inherit from here unless they override.
         let defaults = agents_obj.entry("defaults").or_insert_with(|| json!({}));
         if let Some(d_obj) = defaults.as_object_mut() {
             let model_obj = d_obj.entry("model").or_insert_with(|| json!({}));
@@ -1862,12 +1883,35 @@ async fn configure_model(
         set_nested_value(val, &api_key_path, serde_json::json!(key_val))?;
     }
 
-    if !new_base_url.is_empty() {
+    // Only persist `baseUrl` when the user overrode the provider's
+    // well-known default. Writing the default verbatim ties this
+    // machine's config to a specific fleet endpoint and prevents users
+    // from picking up a fleet relocation without re-editing config.
+    // Empty value means "let the provider builder fall back to its
+    // built-in default" (rsclaw → RSCLAW_DEFAULT_BASE, etc.).
+    if !new_base_url.is_empty() && new_base_url != provider.base_url {
         let url_path = format!("models.providers.{}.baseUrl", provider.name);
         ensure_json_path(val, &["models"]);
         ensure_json_path(val, &["models", "providers"]);
         ensure_json_path(val, &["models", "providers", &provider.name]);
         set_nested_value(val, &url_path, serde_json::json!(new_base_url))?;
+    } else if new_base_url == provider.base_url || new_base_url.is_empty() {
+        // If the file currently carries the (no-op) default, clean it
+        // out so config stays minimal. Safe: the provider builder's
+        // fallback covers the same value.
+        if let Some(prov_obj) = val
+            .pointer_mut(&format!("/models/providers/{}", provider.name))
+            .and_then(|v| v.as_object_mut())
+        {
+            if prov_obj
+                .get("baseUrl")
+                .and_then(|v| v.as_str())
+                .map(|s| s == provider.base_url)
+                .unwrap_or(false)
+            {
+                prov_obj.remove("baseUrl");
+            }
+        }
     }
 
     // Write api type and user_agent for custom/codingplan
@@ -1890,7 +1934,12 @@ async fn configure_model(
     };
 
     if final_model != current_model {
-        // Write to agents.list[0].model.primary (rsclaw format)
+        // Source of truth lives at agents.defaults.model.primary. If the
+        // user's config still carries a per-agent override on list[0]
+        // (legacy structure or explicit override), keep it in sync with the
+        // new selection — but do NOT create the field when it isn't there.
+        // Empty agents-list configs and any agent that already inherits
+        // from defaults stay unmodified.
         if let Some(arr) = val
             .get_mut("agents")
             .and_then(|a| a.get_mut("list"))
@@ -1901,7 +1950,7 @@ async fn configure_model(
             m.insert("primary".to_string(), serde_json::json!(final_model));
         }
 
-        // Also write to agents.defaults.model.primary (openclaw compat)
+        // Fleet-level default — single source of truth.
         ensure_json_path(val, &["agents"]);
         ensure_json_path(val, &["agents", "defaults"]);
         ensure_json_path(val, &["agents", "defaults", "model"]);
@@ -1959,7 +2008,164 @@ fn channel_is_configured(val: &serde_json::Value, ch_name: &str) -> bool {
     val.get("channels")
         .and_then(|c| c.get(ch_name))
         .and_then(|ch| ch.as_object())
-        .is_some_and(|obj| obj.keys().any(|k| k != "enabled"))
+        .is_some_and(|obj| {
+            obj.iter().any(|(k, v)| {
+                if k == "enabled" {
+                    return false;
+                }
+                if k == "accounts" {
+                    return v.as_object().is_some_and(|a| !a.is_empty());
+                }
+                true
+            })
+        })
+}
+
+/// Sorted account names under `channels.<ch>.accounts`. Empty if none.
+fn account_names(val: &serde_json::Value, ch_name: &str) -> Vec<String> {
+    val.get("channels")
+        .and_then(|c| c.get(ch_name))
+        .and_then(|ch| ch.get("accounts"))
+        .and_then(|a| a.as_object())
+        .map(|m| {
+            let mut names: Vec<String> = m.keys().cloned().collect();
+            names.sort();
+            names
+        })
+        .unwrap_or_default()
+}
+
+/// Returns true if any field listed in `fields` is set at the top-level
+/// `channels.<ch>.<field>` path (i.e. single-account legacy layout).
+fn has_top_level_fields(
+    val: &serde_json::Value,
+    ch_name: &str,
+    fields: &[ChannelFieldDef],
+) -> bool {
+    fields.iter().any(|f| {
+        let path = format!("channels.{}.{}", ch_name, f.key);
+        get_nested_value(val, &path)
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty())
+    })
+}
+
+/// Move `channels.<ch>.<field>` values to `channels.<ch>.accounts.default.<field>`,
+/// leaving non-account keys (enabled / dmPolicy / groupPolicy / accounts) intact.
+fn migrate_top_to_accounts(
+    val: &mut serde_json::Value,
+    ch_name: &str,
+    fields: &[ChannelFieldDef],
+    account_name: &str,
+) {
+    ensure_json_path(val, &["channels"]);
+    ensure_json_path(val, &["channels", ch_name]);
+    ensure_json_path(val, &["channels", ch_name, "accounts"]);
+    ensure_json_path(val, &["channels", ch_name, "accounts", account_name]);
+
+    for f in fields {
+        let src = format!("channels.{}.{}", ch_name, f.key);
+        let Some(v) = get_nested_value(val, &src).cloned() else { continue };
+        let dst = format!("channels.{}.accounts.{}.{}", ch_name, account_name, f.key);
+        let _ = set_nested_value(val, &dst, v);
+        remove_nested_value(val, &src);
+    }
+}
+
+/// Remove `channels.<ch>.accounts.<acct>`. Also drops the `accounts` key
+/// itself if it becomes empty.
+fn remove_account(val: &mut serde_json::Value, ch_name: &str, acct: &str) {
+    let acct_path = format!("channels.{}.accounts.{}", ch_name, acct);
+    remove_nested_value(val, &acct_path);
+
+    let still_has_accts = val
+        .get("channels")
+        .and_then(|c| c.get(ch_name))
+        .and_then(|ch| ch.get("accounts"))
+        .and_then(|a| a.as_object())
+        .is_some_and(|m| !m.is_empty());
+    if !still_has_accts {
+        remove_nested_value(val, &format!("channels.{}.accounts", ch_name));
+    }
+}
+
+fn mask_secret(current: &str) -> String {
+    if current.starts_with("${") {
+        current.to_owned()
+    } else if current.chars().count() > 8 {
+        let prefix: String = current.chars().take(4).collect();
+        let suffix: String = current
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        format!("{prefix}...{suffix}")
+    } else {
+        "*".repeat(current.len().min(8))
+    }
+}
+
+/// Edit `fields` at JSON path `<prefix>.<field.key>` for each field. Prompts
+/// reuse the existing input/password/keep helpers; secrets are masked.
+/// Returns true if any field changed.
+fn edit_fields_at_prefix(
+    val: &mut serde_json::Value,
+    fields: &[ChannelFieldDef],
+    prefix: &str,
+    lang: &str,
+) -> bool {
+    let mut changed = false;
+    let prefix_parts: Vec<String> = prefix.split('.').map(|s| s.to_owned()).collect();
+
+    for field in fields {
+        let path = format!("{}.{}", prefix, field.key);
+        let current = get_nested_value(val, &path)
+            .and_then(|v| v.as_str().map(|s| s.to_owned()))
+            .unwrap_or_default();
+
+        let result = if field.secret && !current.is_empty() {
+            let masked = mask_secret(&current);
+            let keep_label = crate::i18n::t_fmt("cli_keep", lang, &[("value", &masked)]);
+            let edit_label = crate::i18n::t("cli_edit", lang);
+            let back_label = crate::i18n::t("cli_back", lang);
+            let items = &[
+                keep_label.as_str(),
+                edit_label.as_str(),
+                back_label.as_str(),
+            ];
+            match Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
+                .with_prompt(&format!("  {}", field.prompt))
+                .items(items)
+                .default(0)
+                .interact_opt()
+            {
+                Ok(Some(0)) => continue,
+                Ok(Some(1)) => password_step(&format!("  {}", field.prompt)),
+                _ => StepResult::Back,
+            }
+        } else {
+            input_step(&format!("  {}", field.prompt), current.clone())
+        };
+
+        match result {
+            StepResult::Next(new_val) => {
+                if new_val != current && !new_val.is_empty() {
+                    let parts_ref: Vec<&str> =
+                        prefix_parts.iter().map(|s| s.as_str()).collect();
+                    for i in 1..=parts_ref.len() {
+                        ensure_json_path(val, &parts_ref[..i]);
+                    }
+                    let _ = set_nested_value(val, &path, serde_json::json!(new_val));
+                    changed = true;
+                }
+            }
+            StepResult::Back | StepResult::Cancel => break,
+        }
+    }
+    changed
 }
 
 async fn edit_channel_config(
@@ -2030,12 +2236,33 @@ async fn edit_channel_config(
     }
 
     let mut changed = false;
-    let is_configured = ch.fields.iter().any(|f| {
-        let path = format!("channels.{}.{}", ch.name, f.key);
-        get_nested_value(val, &path)
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| !s.is_empty())
-    });
+    let has_accounts = !account_names(val, &ch.name).is_empty();
+    let has_top = has_top_level_fields(val, &ch.name, &ch.fields);
+
+    // Multi-account routing: enter multi-account UI when supported and either
+    // (a) accounts.* already exists, or (b) user opts in via "Add another".
+    if ch.multi_account && (has_accounts || has_top) {
+        let want_multi = if has_accounts {
+            true
+        } else {
+            prompt_add_another_account(&ch.label, lang)
+        };
+        if want_multi {
+            if !has_accounts && has_top {
+                migrate_top_to_accounts(val, &ch.name, &ch.fields, "default");
+                changed = true;
+            }
+            if edit_channel_multi_account(val, ch, lang) {
+                changed = true;
+            }
+            if edit_channel_policies(val, &ch.name, lang) {
+                changed = true;
+            }
+            return changed;
+        }
+    }
+
+    let is_configured = has_top;
 
     println!();
     if is_configured {
@@ -2044,61 +2271,22 @@ async fn edit_channel_config(
         println!("  {}", crate::i18n::t_fmt("cli_config_label", lang, &[("label", &ch.label)]));
     }
 
-    for field in &ch.fields {
-        let path = format!("channels.{}.{}", ch.name, field.key);
-        let current = get_nested_value(val, &path)
-            .and_then(|v| v.as_str().map(|s| s.to_owned()))
-            .unwrap_or_default();
-
-        let result = if field.secret && !current.is_empty() {
-            // Show masked value for secrets, ask to change
-            let masked = if current.starts_with("${") {
-                current.clone()
-            } else if current.chars().count() > 8 {
-                let prefix: String = current.chars().take(4).collect();
-                let suffix: String = current.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
-                format!("{prefix}...{suffix}")
-            } else {
-                "*".repeat(current.len().min(8))
-            };
-            let keep_label = crate::i18n::t_fmt("cli_keep", lang, &[("value", &masked)]);
-            let edit_label = crate::i18n::t("cli_edit", lang);
-            let back_label = crate::i18n::t("cli_back", lang);
-            let items = &[
-                keep_label.as_str(),
-                edit_label.as_str(),
-                back_label.as_str(),
-            ];
-            match Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
-                .with_prompt(&format!("  {}", field.prompt))
-                .items(items)
-                .default(0)
-                .interact_opt()
-            {
-                Ok(Some(0)) => continue,  // Keep
-                Ok(Some(1)) => password_step(&format!("  {}", field.prompt)),
-                _ => StepResult::Back,
-            }
-        } else {
-            input_step(&format!("  {}", field.prompt), current.clone())
-        };
-
-        match result {
-            StepResult::Next(new_val) => {
-                if new_val != current && !new_val.is_empty() {
-                    ensure_json_path(val, &["channels"]);
-                    ensure_json_path(val, &["channels", &ch.name]);
-                    let _ = set_nested_value(val, &path, serde_json::json!(new_val));
-                    // Don't auto-enable; user controls enabled via Space toggle
-                    changed = true;
-                }
-            }
-            StepResult::Back | StepResult::Cancel => break,
-        }
+    if edit_fields_at_prefix(val, &ch.fields, &format!("channels.{}", ch.name), lang) {
+        changed = true;
     }
 
-    // DM Policy selector (common to all channels)
-    let dm_path = format!("channels.{}.dmPolicy", ch.name);
+    if edit_channel_policies(val, &ch.name, lang) {
+        changed = true;
+    }
+
+    changed
+}
+
+/// DM + Group policy selectors. Returns true if either changed.
+fn edit_channel_policies(val: &mut serde_json::Value, ch_name: &str, lang: &str) -> bool {
+    let mut changed = false;
+
+    let dm_path = format!("channels.{}.dmPolicy", ch_name);
     let current_dm = get_nested_value(val, &dm_path)
         .and_then(|v| v.as_str())
         .unwrap_or("pairing")
@@ -2106,25 +2294,17 @@ async fn edit_channel_config(
     let dm_policies = &["pairing", "open", "allowlist", "disabled"];
     let dm_idx = dm_policies.iter().position(|&p| p == current_dm).unwrap_or(0);
     let dm_prompt = crate::i18n::t_fmt("cli_dm_policy", lang, &[("policy", &current_dm)]);
-    match select_step(
-        &format!("  {dm_prompt}"),
-        dm_policies,
-        dm_idx,
-    ) {
-        StepResult::Next(idx) => {
-            let new_policy = dm_policies[idx];
-            if new_policy != current_dm {
-                ensure_json_path(val, &["channels"]);
-                ensure_json_path(val, &["channels", &ch.name]);
-                let _ = set_nested_value(val, &dm_path, serde_json::json!(new_policy));
-                changed = true;
-            }
+    if let StepResult::Next(idx) = select_step(&format!("  {dm_prompt}"), dm_policies, dm_idx) {
+        let new_policy = dm_policies[idx];
+        if new_policy != current_dm {
+            ensure_json_path(val, &["channels"]);
+            ensure_json_path(val, &["channels", ch_name]);
+            let _ = set_nested_value(val, &dm_path, serde_json::json!(new_policy));
+            changed = true;
         }
-        _ => {}
     }
 
-    // Group Policy selector
-    let gp_path = format!("channels.{}.groupPolicy", ch.name);
+    let gp_path = format!("channels.{}.groupPolicy", ch_name);
     let current_gp = get_nested_value(val, &gp_path)
         .and_then(|v| v.as_str())
         .unwrap_or("allowlist")
@@ -2132,23 +2312,109 @@ async fn edit_channel_config(
     let gp_policies = &["allowlist", "open", "disabled"];
     let gp_idx = gp_policies.iter().position(|&p| p == current_gp).unwrap_or(0);
     let gp_prompt = crate::i18n::t_fmt("cli_group_policy", lang, &[("policy", &current_gp)]);
-    match select_step(
-        &format!("  {gp_prompt}"),
-        gp_policies,
-        gp_idx,
-    ) {
-        StepResult::Next(idx) => {
-            let new_policy = gp_policies[idx];
-            if new_policy != current_gp {
-                ensure_json_path(val, &["channels"]);
-                ensure_json_path(val, &["channels", &ch.name]);
-                let _ = set_nested_value(val, &gp_path, serde_json::json!(new_policy));
-                changed = true;
-            }
+    if let StepResult::Next(idx) = select_step(&format!("  {gp_prompt}"), gp_policies, gp_idx) {
+        let new_policy = gp_policies[idx];
+        if new_policy != current_gp {
+            ensure_json_path(val, &["channels"]);
+            ensure_json_path(val, &["channels", ch_name]);
+            let _ = set_nested_value(val, &gp_path, serde_json::json!(new_policy));
+            changed = true;
         }
-        _ => {}
     }
 
+    changed
+}
+
+/// Asks the user whether to migrate a single-account config to multi-account
+/// layout. Returns true when the user picks "Add another account".
+fn prompt_add_another_account(label: &str, lang: &str) -> bool {
+    let keep = crate::i18n::t("cli_account_keep_single", lang);
+    let add = crate::i18n::t("cli_account_add_another", lang);
+    let prompt = crate::i18n::t_fmt("cli_account_choose_mode", lang, &[("label", label)]);
+    matches!(
+        select_step(&format!("  {prompt}"), &[keep.as_str(), add.as_str()], 0),
+        StepResult::Next(1)
+    )
+}
+
+/// Multi-account editor: list accounts under `channels.<ch>.accounts`, with
+/// Add / Edit / Remove / Back actions. Returns true if anything changed.
+fn edit_channel_multi_account(
+    val: &mut serde_json::Value,
+    ch: &ChannelDef,
+    lang: &str,
+) -> bool {
+    let mut changed = false;
+    loop {
+        let names = account_names(val, &ch.name);
+        let add_label = crate::i18n::t("cli_account_add_new", lang);
+        let back_label = crate::i18n::t("cli_back", lang);
+
+        let mut items: Vec<String> = names.clone();
+        items.push(add_label);
+        items.push(back_label);
+        let items_ref: Vec<&str> = items.iter().map(|s| s.as_str()).collect();
+        let title = crate::i18n::t_fmt("cli_account_list_title", lang, &[("label", &ch.label)]);
+
+        let sel = match select_step(&format!("  {title}"), &items_ref, 0) {
+            StepResult::Next(i) => i,
+            _ => break,
+        };
+
+        if sel == names.len() {
+            // [+ Add account]
+            let name_prompt = crate::i18n::t("cli_account_name_prompt", lang);
+            let new_name = match input_step(&format!("  {name_prompt}"), String::new()) {
+                StepResult::Next(s) => s.trim().to_owned(),
+                _ => continue,
+            };
+            if new_name.is_empty() {
+                continue;
+            }
+            if new_name.contains('.') || new_name.contains(' ') {
+                println!(
+                    "  [!] {}",
+                    crate::i18n::t("cli_account_name_invalid", lang)
+                );
+                continue;
+            }
+            if names.iter().any(|n| n == &new_name) {
+                println!(
+                    "  [!] {}",
+                    crate::i18n::t_fmt("cli_account_exists", lang, &[("name", &new_name)])
+                );
+                continue;
+            }
+            let prefix = format!("channels.{}.accounts.{}", ch.name, new_name);
+            if edit_fields_at_prefix(val, &ch.fields, &prefix, lang) {
+                changed = true;
+            }
+        } else if sel == names.len() + 1 {
+            // Back
+            break;
+        } else {
+            let acct = names[sel].clone();
+            let edit_label = crate::i18n::t("cli_edit", lang);
+            let remove_label = crate::i18n::t("cli_account_remove", lang);
+            let back_label2 = crate::i18n::t("cli_back", lang);
+            let inner = [edit_label.as_str(), remove_label.as_str(), back_label2.as_str()];
+            let inner_prompt =
+                crate::i18n::t_fmt("cli_account_action", lang, &[("name", &acct)]);
+            match select_step(&format!("  {inner_prompt}"), &inner, 0) {
+                StepResult::Next(0) => {
+                    let prefix = format!("channels.{}.accounts.{}", ch.name, acct);
+                    if edit_fields_at_prefix(val, &ch.fields, &prefix, lang) {
+                        changed = true;
+                    }
+                }
+                StepResult::Next(1) => {
+                    remove_account(val, &ch.name, &acct);
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
+    }
     changed
 }
 
@@ -2172,8 +2438,15 @@ async fn configure_channels(val: &mut serde_json::Value, defs: &Defaults) -> Res
                 let enabled = get_channel_enabled(val, &ch.name);
                 let configured = channel_is_configured(val, &ch.name);
                 let check = if enabled { "\x1b[32m\u{25c9}\x1b[0m" } else { "\u{25cb}" };
-                let tag = if configured { &configured_label } else { "" };
-                format!("{} {}{}", check, ch.label, if tag.is_empty() { String::new() } else { format!(" ({})", tag.trim()) })
+                let accts = if ch.multi_account { account_names(val, &ch.name).len() } else { 0 };
+                let tag: String = if accts > 0 {
+                    crate::i18n::t_fmt("cli_accounts_count", lang, &[("n", &accts.to_string())])
+                } else if configured {
+                    configured_label.clone()
+                } else {
+                    String::new()
+                };
+                format!("{} {}{}", check, ch.label, if tag.trim().is_empty() { String::new() } else { format!(" ({})", tag.trim()) })
             }));
 
         // Render list
@@ -2537,6 +2810,16 @@ async fn test_provider_connectivity(
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
 
+    // RsClaw uses the stateful session protocol (kvCacheMode=2). It has
+    // no `/v1/models` endpoint — only `/sessions`, `/sessions/<id>/turn`,
+    // and `/sessions/replay`. The generic OpenAI-style probe below would
+    // hit a non-existent path and trigger a 401 from the LB, falsely
+    // reporting an invalid API key. Probe `POST /sessions` with a
+    // minimal body instead and interpret common server responses.
+    if provider_name == "rsclaw" {
+        return probe_rsclaw_connectivity(&client, base_url, api_key).await;
+    }
+
     let url = match provider_name {
         "anthropic" => "https://api.anthropic.com/v1/models".to_owned(),
         "gemini" => return Ok(()), // Gemini uses query param auth, skip
@@ -2571,6 +2854,79 @@ async fn test_provider_connectivity(
         let body = resp.text().await.unwrap_or_default();
         anyhow::bail!("{status}: {}", &body[..body.len().min(200)]);
     }
+}
+
+/// RsClaw-specific connectivity probe. Hits `GET /v1/agent/models`,
+/// which the rsclaw-server fronts behind a 308-redirecting LB pointing
+/// at the resolved worker host (e.g. `api.duoduoyun.work:8443`). The
+/// **critical** difference from the generic OpenAI probe is that we
+/// must manually follow the redirect while re-attaching the
+/// Authorization header — reqwest's default redirect policy strips
+/// sensitive headers on cross-origin hops as a security measure, so a
+/// naive `client.get(url).send()` would arrive at the worker with no
+/// auth and get rejected as 401 even when the key is perfectly valid.
+/// This is the same redirect-handling contract `provider::rsclaw`
+/// implements for real traffic; see RsclawProvider::new for the
+/// `Policy::none()` baseline.
+async fn probe_rsclaw_connectivity(
+    _client: &reqwest::Client,
+    base_url: &str,
+    api_key: Option<&str>,
+) -> anyhow::Result<()> {
+    let base = if base_url.is_empty() {
+        crate::provider::rsclaw::RSCLAW_DEFAULT_BASE
+    } else {
+        base_url
+    };
+    let url = format!("{}/models", base.trim_end_matches('/'));
+
+    // Build a client with redirects disabled so we can capture the 308
+    // and re-issue the request to the worker with the auth header
+    // preserved.
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    let mut current = url.clone();
+    // Cap at 5 hops — matches MAX_REDIRECT_HOPS in provider/rsclaw.rs.
+    for _ in 0..5 {
+        let mut req = client.get(&current);
+        if let Some(key) = api_key {
+            req = req.header("authorization", format!("Bearer {key}"));
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("connection failed: {e}"))?;
+        let status = resp.status();
+        if status.is_redirection() {
+            if let Some(loc) = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+            {
+                current = loc.to_owned();
+                continue;
+            }
+            anyhow::bail!("rsclaw probe: {status} without Location header");
+        }
+        if status.is_success() {
+            return Ok(());
+        }
+        let body = resp.text().await.unwrap_or_default();
+        return match status.as_u16() {
+            401 | 403 => Err(anyhow::anyhow!(
+                "connected but API key is invalid ({})",
+                status.as_u16()
+            )),
+            _ => Err(anyhow::anyhow!(
+                "{status}: {}",
+                &body[..body.len().min(200)]
+            )),
+        };
+    }
+    anyhow::bail!("rsclaw probe: redirect loop (>5 hops)")
 }
 
 /// Rotate config backups: keep last 3 (.bak.1 = newest, .bak.3 = oldest).
@@ -2612,5 +2968,112 @@ fn ensure_json_path(val: &mut serde_json::Value, keys: &[&str]) {
             Some(v) => v,
             None => return,
         };
+    }
+}
+
+#[cfg(test)]
+mod account_helper_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn fields() -> Vec<ChannelFieldDef> {
+        vec![
+            ChannelFieldDef {
+                key: "appId".into(),
+                prompt: "App ID".into(),
+                secret: false,
+            },
+            ChannelFieldDef {
+                key: "appSecret".into(),
+                prompt: "App Secret".into(),
+                secret: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn account_names_empty_when_no_channels() {
+        let v = json!({});
+        assert!(account_names(&v, "feishu").is_empty());
+    }
+
+    #[test]
+    fn account_names_sorted() {
+        let v = json!({
+            "channels": { "feishu": { "accounts": {
+                "zeta": { "appId": "z" },
+                "alpha": { "appId": "a" },
+                "mu":    { "appId": "m" },
+            } } }
+        });
+        assert_eq!(account_names(&v, "feishu"), vec!["alpha", "mu", "zeta"]);
+    }
+
+    #[test]
+    fn has_top_level_fields_detects_legacy_layout() {
+        let v = json!({ "channels": { "feishu": { "appId": "x" } } });
+        assert!(has_top_level_fields(&v, "feishu", &fields()));
+        let v2 = json!({ "channels": { "feishu": { "enabled": true } } });
+        assert!(!has_top_level_fields(&v2, "feishu", &fields()));
+    }
+
+    #[test]
+    fn migrate_top_to_accounts_moves_fields_under_default() {
+        let mut v = json!({
+            "channels": { "feishu": {
+                "appId": "id1",
+                "appSecret": "sec1",
+                "enabled": true,
+            } }
+        });
+        migrate_top_to_accounts(&mut v, "feishu", &fields(), "default");
+
+        let feishu = &v["channels"]["feishu"];
+        assert_eq!(feishu["accounts"]["default"]["appId"], "id1");
+        assert_eq!(feishu["accounts"]["default"]["appSecret"], "sec1");
+        assert!(feishu.get("appId").is_none(), "appId should have moved");
+        assert!(feishu.get("appSecret").is_none(), "appSecret should have moved");
+        assert_eq!(feishu["enabled"], true, "enabled should stay top-level");
+    }
+
+    #[test]
+    fn remove_account_drops_accounts_key_when_last() {
+        let mut v = json!({
+            "channels": { "feishu": { "accounts": {
+                "work": { "appId": "w" }
+            } } }
+        });
+        remove_account(&mut v, "feishu", "work");
+        assert!(
+            v["channels"]["feishu"].get("accounts").is_none(),
+            "accounts key should be dropped when empty"
+        );
+    }
+
+    #[test]
+    fn remove_account_keeps_accounts_key_when_others_remain() {
+        let mut v = json!({
+            "channels": { "feishu": { "accounts": {
+                "work":     { "appId": "w" },
+                "personal": { "appId": "p" }
+            } } }
+        });
+        remove_account(&mut v, "feishu", "work");
+        assert!(v["channels"]["feishu"]["accounts"].get("work").is_none());
+        assert_eq!(v["channels"]["feishu"]["accounts"]["personal"]["appId"], "p");
+    }
+
+    #[test]
+    fn channel_is_configured_recognises_accounts() {
+        let v = json!({
+            "channels": { "feishu": { "accounts": { "work": { "appId": "w" } } } }
+        });
+        assert!(channel_is_configured(&v, "feishu"));
+
+        let v2 = json!({ "channels": { "feishu": { "accounts": {} } } });
+        assert!(!channel_is_configured(&v2, "feishu"));
+
+        let v3 = json!({ "channels": { "feishu": { "enabled": true } } });
+        assert!(!channel_is_configured(&v3, "feishu"));
     }
 }

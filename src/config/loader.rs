@@ -28,7 +28,14 @@ pub fn expand_env_vars(raw: &str) -> String {
         .replace_all(raw, |caps: &regex::Captures<'_>| {
             let var = &caps[1];
             std::env::var(var).unwrap_or_else(|_| {
-                debug!(var, "env var not set (referenced in config)");
+                // Promote from debug to warn: unresolved placeholders
+                // silently survive into runtime and surface as cryptic
+                // upstream errors (e.g. an apiKey of literal
+                // "${RSCLAW_API_KEY}" gets sent as a Bearer token →
+                // "invalid api key" 401 from the provider). The user
+                // needs to see this at gateway boot, not buried under
+                // debug-level traffic.
+                tracing::warn!(var, "env var referenced in config is not set; placeholder left verbatim");
                 caps[0].to_string()
             })
         })

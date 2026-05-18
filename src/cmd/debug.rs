@@ -10,7 +10,7 @@
 use anyhow::{Context as _, Result};
 use serde_json::json;
 
-use crate::agent::prompt_builder::{build_shared_system_prefix, build_user_system_suffix};
+use crate::agent::prompt_builder::{build_shared_system_prefix, build_user_system};
 use crate::agent::tools_builder::build_tool_list;
 use crate::agent::workspace::WorkspaceContext;
 use crate::cli::{DebugCommand, DumpPromptSpecArgs};
@@ -26,7 +26,7 @@ use crate::skill::loader::load_skills;
 /// new built-in tool is added, both lists must grow together.
 const BUILTIN_TOOLS: &[&str] = &[
     "memory", "use_skill", "task", "read_file", "write_file", "send_file",
-    "execute_command", "agent", "install_tool", "list_dir", "search_file",
+    "shell", "agent", "install_tool", "list_dir", "search_file",
     "search_content", "web_search", "web_fetch", "web_download", "web_browser",
     "computer_use", "image_gen", "video_gen", "pdf", "text_to_voice",
     "send_message", "cron", "session", "gateway", "opencode", "claudecode",
@@ -101,9 +101,13 @@ async fn dump_prompt_spec(args: DumpPromptSpecArgs) -> Result<()> {
     )
     .unwrap_or_default();
 
-    // 5. Build the prompt halves.
+    // 5. Build the prompt halves. `rsclaw debug` runs offline without
+    // any live plugin runtime; pass empty plugin sources so the
+    // resulting user_system reflects "no plugins installed" rather
+    // than a divergent live state. Skills load from disk via the
+    // SkillRegistry above; that's enough for the prompt-spec dump.
     let shared_prefix = build_shared_system_prefix();
-    let user_suffix = build_user_system_suffix(&ws_ctx, &skills, &config.raw);
+    let user_system = build_user_system(&ws_ctx, &skills, &[], None, &config.raw);
 
     // 6. Build the merged tool list, then split by name into the
     //    cacheable built-ins vs the per-machine remainder.
@@ -116,7 +120,7 @@ async fn dump_prompt_spec(args: DumpPromptSpecArgs) -> Result<()> {
         &skills,
         None,
         &agent_id,
-        &config.agents.external,
+        &config.agents.a2a,
     );
     for entry in &config.agents.list {
         if entry.id == agent_id {
@@ -157,32 +161,32 @@ async fn dump_prompt_spec(args: DumpPromptSpecArgs) -> Result<()> {
     // 7. Emit. `--shared-only` strips per-user fields entirely so the
     //    output is suitable for ingest into rsclaw-llm without any
     //    machine-specific state leaking through.
+    //
+    // `rsclaw_version` here is the BASELINE version (the `<ver>`
+    // component of `RSCLAW_DEFAULT_PREFIX_ID`), NOT the Cargo crate
+    // version. The two are deliberately decoupled — see the doc on
+    // `RSCLAW_DEFAULT_PREFIX_ID` for why. This dump documents the
+    // canonical wire bytes for a specific prefix_id, so its version
+    // label must track the prefix_id, not the gateway release.
+    let rsclaw_version = crate::provider::rsclaw::RSCLAW_DEFAULT_PREFIX_ID
+        .split('/')
+        .nth(1)
+        .unwrap_or(env!("CARGO_PKG_VERSION"));
+
     let payload = if args.shared_only {
         json!({
-            "rsclaw_version": env!("CARGO_PKG_VERSION"),
+            "rsclaw_version": rsclaw_version,
             "shared_prefix": shared_prefix,
             "builtin_tools": builtin_tools,
         })
     } else {
-        let model = agent_cfg
-            .model
-            .as_ref()
-            .and_then(|m| m.primary.clone())
-            .unwrap_or_default();
-        let system_prompt = if user_suffix.is_empty() {
-            shared_prefix.clone()
-        } else {
-            format!("{shared_prefix}\n\n{user_suffix}")
-        };
         json!({
-            "rsclaw_version": env!("CARGO_PKG_VERSION"),
+            "rsclaw_version": rsclaw_version,
             "agent_id": agent_id,
-            "model": model,
             "shared_prefix": shared_prefix,
+            "user_system": user_system,
             "builtin_tools": builtin_tools,
-            "user_suffix": user_suffix,
             "user_tools": user_tools,
-            "system_prompt": system_prompt,
         })
     };
     let s = serde_json::to_string_pretty(&payload)

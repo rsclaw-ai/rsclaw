@@ -26,6 +26,17 @@ pub enum ComputerUseStatus {
         instruction: String,
         max_steps: usize,
     },
+    /// Emitted at the start of each iteration, immediately after the
+    /// screenshot is captured and BEFORE the VLM call. Without this the
+    /// UI shows nothing between `Started` and the first `Step` (5-30 s
+    /// on heavy VLMs) — operators / users assume the agent is hung.
+    /// `step_index` is the iteration about to be processed (1-indexed,
+    /// same numbering the subsequent `Step` will use).
+    /// R3 review I3.
+    Thinking {
+        run_id: String,
+        step_index: usize,
+    },
     /// One executed step. Emitted after the operator returns, including
     /// failed actions so the UI can surface "step failed" feedback.
     Step {

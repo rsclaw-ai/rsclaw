@@ -341,7 +341,7 @@ pub(crate) fn start_qq_if_configured(
                                 peer_id: sender_id.clone(),
                                 dm_scope,
                             });
-                            if let Some(mut reply) = try_preparse_locally(&text, &handle, "qq", &sender_id).await {
+                            if let Some(mut reply) = try_preparse_locally(&text, &handle, "qq", &sender_id, crate::gateway::preparse::PreparseOrigin::User).await {
                                 reply.target_id = target_id.clone();
                                 reply.is_group = is_group;
                                 if !reply.text.is_empty() || !reply.images.is_empty() {
@@ -361,6 +361,11 @@ pub(crate) fn start_qq_if_configured(
                                 peer_id: sender_id,
                                 chat_id: String::new(),
                                 reply_tx,
+                                task_id: None,
+                                context_id: None,
+                                event_tx: None,
+                                cancel_token: None,
+                                input_request_tx: None,
                                 extra_tools: vec![],
                                 images,
                                 files: file_attachments,

@@ -254,22 +254,41 @@ impl super::runtime::AgentRuntime {
         let max_results = args["max_results"].as_u64().unwrap_or(20) as usize;
 
         let glob_pattern = format!("{}/**/{}", root_path.display(), pattern);
-        let mut results: Vec<Value> = Vec::new();
         let entries_iter = match glob::glob(&glob_pattern) {
             Ok(iter) => iter,
             Err(e) => return Ok(json!({"error": format!("invalid pattern: {e}")})),
         };
-        for entry in entries_iter {
-            if results.len() >= max_results { break; }
-            if let Ok(p) = entry {
-                let size = p.metadata().map(|m| m.len()).unwrap_or(0);
-                results.push(json!({
+
+        // Collect (path, metadata, mtime) so we can sort by most-recent
+        // before truncating to max_results. Files without readable metadata
+        // sink to the bottom with mtime=0.
+        let mut entries: Vec<(std::path::PathBuf, u64, std::time::SystemTime)> = entries_iter
+            .filter_map(|e| e.ok())
+            .map(|p| {
+                let meta = p.metadata().ok();
+                let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                let mtime = meta
+                    .and_then(|m| m.modified().ok())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                (p, size, mtime)
+            })
+            .collect();
+
+        // Newest first — most recently modified files are usually the most
+        // relevant when an agent is investigating recent activity.
+        entries.sort_by(|a, b| b.2.cmp(&a.2));
+        entries.truncate(max_results);
+
+        let results: Vec<Value> = entries
+            .into_iter()
+            .map(|(p, size, _)| {
+                json!({
                     "path": p.to_string_lossy(),
                     "size": size,
                     "is_dir": p.is_dir(),
-                }));
-            }
-        }
+                })
+            })
+            .collect();
 
         Ok(json!({
             "pattern": pattern,
@@ -281,7 +300,10 @@ impl super::runtime::AgentRuntime {
 
     /// Search file contents by pattern (structured alternative to `exec grep`).
     ///
-    /// Cross-platform: uses `grep -rn` on Unix, `Select-String` on Windows.
+    /// Prefers `ripgrep` when on PATH (cross-platform, supports `output_mode`
+    /// and `multiline`). Falls back to `grep -rn` on Unix / `Select-String`
+    /// on Windows when `rg` is not installed; `output_mode` and `multiline`
+    /// are ignored on that path.
     pub(crate) async fn tool_search_content(&self, args: Value) -> Result<Value> {
         let fallback_ws = crate::config::loader::base_dir().join("workspace");
         let default_ws = self.handle.config.workspace.as_deref()
@@ -295,6 +317,21 @@ impl super::runtime::AgentRuntime {
         let include = args["include"].as_str();
         let ignore_case = args["ignore_case"].as_bool().unwrap_or(false);
         let max_results = args["max_results"].as_u64().unwrap_or(20) as usize;
+        let multiline = args["multiline"].as_bool().unwrap_or(false);
+        let output_mode = args["output_mode"].as_str().unwrap_or("content");
+
+        if has_ripgrep().await {
+            return run_ripgrep(
+                pattern,
+                &root_path,
+                include,
+                ignore_case,
+                multiline,
+                output_mode,
+                max_results,
+            )
+            .await;
+        }
 
         #[cfg(not(target_os = "windows"))]
         let output = {
@@ -917,4 +954,159 @@ impl super::runtime::AgentRuntime {
             }))
         }
     }
+
+    /// Edit a file by exact-string replacement (Edit-style, not full overwrite).
+    ///
+    /// Fails fast if `old_string` is absent or non-unique (unless `replace_all`).
+    /// The agent is expected to `read_file` first so it can copy a verbatim
+    /// substring; the check is not enforced server-side.
+    pub(crate) async fn tool_edit(&self, args: Value) -> Result<Value> {
+        let path = args["path"]
+            .as_str()
+            .or_else(|| args["file_path"].as_str())
+            .ok_or_else(|| anyhow!("edit_file: `path` required"))?;
+        let old_string = args["old_string"]
+            .as_str()
+            .ok_or_else(|| anyhow!("edit_file: `old_string` required"))?;
+        let new_string = args["new_string"]
+            .as_str()
+            .ok_or_else(|| anyhow!("edit_file: `new_string` required"))?;
+        let replace_all = args["replace_all"].as_bool().unwrap_or(false);
+
+        if old_string.is_empty() {
+            bail!("edit_file: `old_string` must be non-empty — use write_file to create new files");
+        }
+        if old_string == new_string {
+            bail!("edit_file: `old_string` and `new_string` are identical — no change requested");
+        }
+
+        let fallback_ws = crate::config::loader::base_dir().join("workspace");
+        let workspace = self
+            .handle
+            .config
+            .workspace
+            .as_deref()
+            .or(self.config.agents.defaults.workspace.as_deref())
+            .map(expand_tilde)
+            .unwrap_or(fallback_ws);
+        let full = canonicalize_external_path(path, &workspace);
+
+        let safety_enabled = self
+            .config
+            .ext
+            .tools
+            .as_ref()
+            .and_then(|t| t.exec.as_ref())
+            .and_then(|e| e.safety)
+            .unwrap_or(false);
+        let content = tokio::fs::read_to_string(&full)
+            .await
+            .map_err(|e| anyhow!("edit_file: cannot read `{}`: {e}", full.display()))?;
+
+        let count = content.matches(old_string).count();
+        if count == 0 {
+            bail!(
+                "edit_file: `old_string` not found in `{}`. Read the file first and copy the exact substring (including whitespace).",
+                path
+            );
+        }
+        if count > 1 && !replace_all {
+            bail!(
+                "edit_file: `old_string` matches {count} locations in `{}`. Add surrounding context to make it unique, or pass `replace_all: true` to replace every occurrence.",
+                path
+            );
+        }
+
+        let new_content = if replace_all {
+            content.replace(old_string, new_string)
+        } else {
+            content.replacen(old_string, new_string, 1)
+        };
+
+        if safety_enabled {
+            // Reuse the write-safety gate: same predicate as write_file —
+            // checks both the destination path and the post-edit content.
+            check_write_safety(path, &full, &new_content)?;
+        }
+
+        tokio::fs::write(&full, &new_content)
+            .await
+            .map_err(|e| anyhow!("edit_file: cannot write `{}`: {e}", full.display()))?;
+
+        Ok(json!({
+            "ok": true,
+            "path": path,
+            "replacements": if replace_all { count } else { 1 },
+            "bytes": new_content.len(),
+        }))
+    }
+}
+
+/// Check whether `ripgrep` (`rg`) is on PATH. Re-checked per call (~20 ms);
+/// the cost is dwarfed by the actual search and avoids a global mutable.
+async fn has_ripgrep() -> bool {
+    tokio::process::Command::new("rg")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Run a ripgrep search with full support for `output_mode` and `multiline`.
+async fn run_ripgrep(
+    pattern: &str,
+    root: &std::path::Path,
+    include: Option<&str>,
+    ignore_case: bool,
+    multiline: bool,
+    output_mode: &str,
+    max_results: usize,
+) -> Result<Value> {
+    let mut cmd = tokio::process::Command::new("rg");
+
+    match output_mode {
+        "files_with_matches" => {
+            cmd.arg("--files-with-matches");
+        }
+        "count" => {
+            cmd.arg("--count");
+        }
+        _ => {
+            cmd.args(["--line-number", "--no-heading"]);
+        }
+    }
+
+    if ignore_case {
+        cmd.arg("--ignore-case");
+    }
+    if multiline {
+        cmd.args(["--multiline", "--multiline-dotall"]);
+    }
+    if let Some(inc) = include {
+        cmd.arg("--glob").arg(inc);
+    }
+
+    cmd.arg("--").arg(pattern).arg(root);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::null());
+
+    let output = tokio::time::timeout(Duration::from_secs(15), cmd.output())
+        .await
+        .map_err(|_| anyhow!("search_content: timed out"))?
+        .map_err(|e| anyhow!("search_content: {e}"))?;
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let results: Vec<String> = text.lines().take(max_results).map(String::from).collect();
+
+    Ok(json!({
+        "pattern": pattern,
+        "root": root.to_string_lossy(),
+        "count": results.len(),
+        "output_mode": output_mode,
+        "engine": "ripgrep",
+        "results": results,
+    }))
 }

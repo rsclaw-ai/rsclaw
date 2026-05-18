@@ -105,7 +105,7 @@ fn runtime_with_agent(agent_id: &str) -> RuntimeConfig {
                 temperature: None,
             }],
             bindings: vec![],
-            external: vec![],
+            a2a: vec![],
         },
         channel: ChannelRuntime {
             channels: Default::default(),
@@ -165,6 +165,7 @@ async fn test_cron_job_runs() {
                     files: vec![],
                     pending_analysis: None,
                     needs_outer_done_emit: false,
+                    outcome: rsclaw::agent::registry::ReplyOutcome::Ok,
                 });
             }
         });
@@ -211,6 +212,7 @@ async fn test_cron_enable_disable() {
                     files: vec![],
                     pending_analysis: None,
                     needs_outer_done_emit: false,
+                    outcome: rsclaw::agent::registry::ReplyOutcome::Ok,
                 });
             }
         });

@@ -78,9 +78,6 @@ pub struct AgentHandle {
     /// Signal to start a new session (set by /new bypass, consumed by runtime).
     /// Unlike clear_signal, this increments the archive generation.
     pub new_session_signal: Arc<AtomicBool>,
-    /// Signal to reset current session (set by /reset bypass, consumed by runtime).
-    /// Clears session without summary or generation increment.
-    pub reset_signal: Arc<AtomicBool>,
     /// Shared memory store for this agent (used by meditation heartbeat).
     pub memory: Option<Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>>,
     /// Context window in tokens for this agent's primary model. Resolved
@@ -197,6 +194,87 @@ pub struct FileAttachment {
     pub mime_type: String,
 }
 
+/// Per-turn observability + control wires that an A2A caller threads into the
+/// runtime. Built from the three optional channels on `AgentMessage` plus the
+/// A2A task/context identifiers; mirrored onto `RunContext` so the agent loop
+/// can publish progress, observe cancellation, and request user input mid-turn.
+///
+/// Default-constructed `TurnContext` is the legacy no-op: every method is a
+/// no-op or returns false. Non-A2A channels (WebSocket, ACP, runtime
+/// self-calls) keep using `TurnContext::default()`.
+#[derive(Debug, Clone, Default)]
+pub struct TurnContext {
+    pub task_id: Option<String>,
+    pub context_id: Option<String>,
+    pub event_tx: Option<tokio::sync::mpsc::Sender<crate::a2a::event::AgentEvent>>,
+    pub cancel_token: Option<tokio_util::sync::CancellationToken>,
+    pub input_request_tx:
+        Option<tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<String>>>,
+}
+
+impl TurnContext {
+    /// True once the A2A caller fired `tasks/cancel` (or the task's cancel
+    /// token was tripped for any other reason). Runtime polls this between
+    /// iterations of the agent loop and at every tool-dispatch boundary.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel_token
+            .as_ref()
+            .is_some_and(|t| t.is_cancelled())
+    }
+
+    /// Publish a `TASK_STATE_WORKING` status-update with a human-readable
+    /// progress message (e.g. "calling tool memory_search"). Non-A2A turns
+    /// (no event_tx) drop the message silently. `try_send` is used so a
+    /// full subscriber queue can never stall the agent loop.
+    pub fn emit_working(&self, message: &str) {
+        let (Some(tx), Some(task_id), Some(context_id)) =
+            (&self.event_tx, &self.task_id, &self.context_id)
+        else {
+            return;
+        };
+        let _ = tx.try_send(crate::a2a::event::AgentEvent::Status {
+            task_id: task_id.clone(),
+            context_id: context_id.clone(),
+            state: crate::a2a::types::TaskState::Working,
+            message: Some(crate::a2a::event::text_message(message)),
+            final_: false,
+        });
+    }
+
+    /// Suspend the turn awaiting client input. Publishes `InputRequired`
+    /// (or `AuthRequired` if `auth`), registers a `SuspendedTask` resume
+    /// handle via `input_request_tx`, and awaits the resume. Returns the
+    /// client-supplied text, or `None` if the wire is absent / the
+    /// resume channel was dropped (treat as cancellation).
+    pub async fn request_input(&self, prompt: &str, auth: bool) -> Option<String> {
+        let ireq_tx = self.input_request_tx.as_ref()?;
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<String>();
+        if ireq_tx.send(resume_tx).await.is_err() {
+            return None;
+        }
+        if let (Some(tx), Some(task_id), Some(context_id)) =
+            (&self.event_tx, &self.task_id, &self.context_id)
+        {
+            let prompt_msg = crate::a2a::event::text_message(prompt);
+            let ev = if auth {
+                crate::a2a::event::AgentEvent::AuthRequired {
+                    task_id: task_id.clone(),
+                    context_id: context_id.clone(),
+                    prompt: prompt_msg,
+                }
+            } else {
+                crate::a2a::event::AgentEvent::InputRequired {
+                    task_id: task_id.clone(),
+                    context_id: context_id.clone(),
+                    prompt: prompt_msg,
+                }
+            };
+            let _ = tx.try_send(ev);
+        }
+        resume_rx.await.ok()
+    }
+}
+
 /// A message delivered to an agent.
 #[derive(Debug)]
 pub struct AgentMessage {
@@ -216,6 +294,26 @@ pub struct AgentMessage {
     pub chat_id: String,
     /// One-shot sender for the agent's response.
     pub reply_tx: tokio::sync::oneshot::Sender<AgentReply>,
+    /// A2A task id, if the caller is the A2A protocol. Carried on
+    /// `TurnContext` so the runtime can tag emitted events with the
+    /// right `taskId` / `contextId`.
+    pub task_id: Option<String>,
+    /// A2A context id (== session key for our impl).
+    pub context_id: Option<String>,
+    /// Optional streaming event channel. Runtime emits intermediate
+    /// `AgentEvent`s (status changes, artifact chunks) here when the caller
+    /// (e.g. A2A SendStreamingMessage) wants to observe progress. Legacy
+    /// channels pass `None`.
+    pub event_tx: Option<tokio::sync::mpsc::Sender<crate::a2a::event::AgentEvent>>,
+    /// Optional cancellation token. Runtime checks this between LLM/tool
+    /// turns; if cancelled, emits TASK_STATE_CANCELED and exits. Legacy
+    /// channels pass `None`.
+    pub cancel_token: Option<tokio_util::sync::CancellationToken>,
+    /// Optional channel for the runtime to register a `SuspendedTask` resume
+    /// handle when it needs to ask the caller for more input (TASK_STATE_INPUT_REQUIRED).
+    /// Legacy channels pass `None`.
+    pub input_request_tx:
+        Option<tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<String>>>,
     /// External tool definitions forwarded from the OAI /v1/chat/completions
     /// caller. These are merged into the agent's tool list for the turn.
     pub extra_tools: Vec<crate::provider::ToolDef>,
@@ -345,6 +443,28 @@ pub struct AgentReply {
     /// Without this flag, WS subscribers (the desktop chat UI) wait forever
     /// for the terminator and the input freezes.
     pub needs_outer_done_emit: bool,
+    /// Why the turn ended. `Ok` = normal success (publish Artifact + Completed).
+    /// `Error(_)` = `run_turn` returned `Err` and the gateway wrapped it as
+    /// a text reply; A2A consumers should publish `Failed`, not `Completed`.
+    /// `Canceled` = `run_turn` returned `Err` because the A2A cancel_token
+    /// fired; the CancelTask dispatcher has already published `Canceled` and
+    /// closed the bus, so A2A consumers must NOT republish a terminal status.
+    pub outcome: ReplyOutcome,
+}
+
+/// How a turn finished, surfaced from the gateway worker so A2A consumers
+/// can emit the right terminal state. Non-A2A channels (WebSocket, channels/*)
+/// ignore this — they show `reply.text` to the user regardless.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ReplyOutcome {
+    #[default]
+    Ok,
+    /// Turn errored — `text` is the rendered error message.
+    Error,
+    /// Turn was cancelled via the A2A cancel_token. The cancel handler has
+    /// already published the terminal `Canceled` status event; A2A consumers
+    /// must not emit another terminal event.
+    Canceled,
 }
 
 // ---------------------------------------------------------------------------
@@ -477,7 +597,6 @@ impl AgentRegistry {
                     last_msg_tokens: Arc::new(AtomicUsize::new(0)),
                     clear_signal: Arc::new(AtomicBool::new(false)),
                     new_session_signal: Arc::new(AtomicBool::new(false)),
-                    reset_signal: Arc::new(AtomicBool::new(false)),
                     memory: None, // populated by agent runtime after memory store opens
                     context_window,
                 });
@@ -656,7 +775,7 @@ mod tests {
                 defaults: Default::default(),
                 list: agents,
                 bindings: vec![],
-                external: vec![],
+                a2a: vec![],
             },
             channel: ChannelRuntime {
                 channels: Default::default(),

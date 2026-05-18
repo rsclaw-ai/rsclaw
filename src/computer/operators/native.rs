@@ -60,14 +60,17 @@ impl Operator for NativeOperator {
     }
 
     fn action_spaces(&self) -> Vec<ActionSpec> {
-        // Mirrors the UI-TARS-desktop NutJSOperator action space —
-        // matches what the GUI VLM training data expects.
+        // Action shape mirrors the UI-TARS-desktop NutJSOperator surface
+        // for compatibility with existing GUI-VLM playbooks, but the
+        // coordinate envelope is the portable `<box>x,y</box>` form so
+        // any VLM (not just UI-TARS-trained) can emit it without
+        // special-token tokenizer support.
         vec![
-            ActionSpec::new("click(start_box='<|box_start|>(x1,y1)<|box_end|>')"),
-            ActionSpec::new("left_double(start_box='<|box_start|>(x1,y1)<|box_end|>')"),
-            ActionSpec::new("right_single(start_box='<|box_start|>(x1,y1)<|box_end|>')"),
+            ActionSpec::new("click(start_box='<box>x1,y1</box>')"),
+            ActionSpec::new("left_double(start_box='<box>x1,y1</box>')"),
+            ActionSpec::new("right_single(start_box='<box>x1,y1</box>')"),
             ActionSpec::new(
-                "drag(start_box='<|box_start|>(x1,y1)<|box_end|>', end_box='<|box_start|>(x3,y3)<|box_end|>')",
+                "drag(start_box='<box>x1,y1</box>', end_box='<box>x3,y3</box>')",
             ),
             ActionSpec::with_note(
                 "hotkey(key='')",
@@ -78,7 +81,7 @@ impl Operator for NativeOperator {
                 "# Add \\n at end of content to submit",
             ),
             ActionSpec::new(
-                "scroll(start_box='<|box_start|>(x1,y1)<|box_end|>', direction='down or up or right or left')",
+                "scroll(start_box='<box>x1,y1</box>', direction='down or up or right or left')",
             ),
             ActionSpec::with_note(
                 "wait()",
@@ -565,7 +568,21 @@ fn activate_app_blocking(app: &str) -> ActionOutput {
         // matches and hand its main window to SetForegroundWindow.
         // TODO(v2): replace with `windows` crate EnumWindows + per-PID
         // SetForegroundWindow to bring secondary windows too.
-        let escaped = app.replace('\'', "''");
+        // Two layers of escaping inside one literal:
+        //   - PowerShell single-quoted strings: `'` is doubled.
+        //   - `-like` glob pattern: `*` and `?` are wildcards; escape with
+        //     PowerShell's backtick so an app name literally containing
+        //     them matches only that character. Without this, an app named
+        //     `Microsoft Edge*` (or VLM hallucinating a trailing `*`) would
+        //     match every process — bringing a random app forward instead
+        //     of the requested one. R3 review I5.
+        let escaped = app
+            .replace('`', "``")
+            .replace('*', "`*")
+            .replace('?', "`?")
+            .replace('[', "`[")
+            .replace(']', "`]")
+            .replace('\'', "''");
         let ps = format!(
             r#"Add-Type -Name W -Namespace N -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);'; Get-Process | Where-Object {{$_.ProcessName -like '*{}*'}} | ForEach-Object {{ if ($_.MainWindowHandle -ne 0) {{ [N.W]::SetForegroundWindow($_.MainWindowHandle) }} }}"#,
             escaped

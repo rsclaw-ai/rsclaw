@@ -11,7 +11,7 @@ AI Agent Engine with long-term memory, self-learning, and multi-agent orchestrat
 - 50+ browser automation actions (agent-browser parity)
 - Three-layer memory (redb KV + tantivy FTS + hnsw_rs vector)
 - AnyCLI structured web data extraction
-- A2A v0.3 cross-machine orchestration
+- A2A v1.0 cross-machine orchestration
 - WASM plugin system (wasmtime v29)
 - Skill auto-crystallization from usage patterns
 - KV cache optimization (API key isolation, TTL, incremental messages)

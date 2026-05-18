@@ -209,7 +209,7 @@ mod tests {
         let mut m = TurnMetrics::new();
         m.record_tool("read_file", "{}".into(), "ok".into(), false);
         m.record_tool("read_file", "{}".into(), "ok".into(), false);
-        m.record_tool("execute_command", "{}".into(), "err".into(), true);
+        m.record_tool("shell", "{}".into(), "err".into(), true);
         assert_eq!(m.tool_calls, 3);
         assert_eq!(m.distinct_tools.len(), 2);
         assert_eq!(m.tool_errors, 1);

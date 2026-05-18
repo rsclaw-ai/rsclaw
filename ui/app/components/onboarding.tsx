@@ -784,6 +784,7 @@ export interface ProviderDef {
 
 // All providers (unordered lookup table)
 export const ALL_PROVIDERS: Record<string, ProviderDef> = {
+  rsclaw:      { id: "rsclaw",      name: "RsClaw",             tag: "\u63A8\u8350 \u00B7 kvCache=2", tagEn: "Recommended \u00B7 kvCache=2", keyLabel: "RsClaw API Key", keyPlaceholder: "sk-...", hasBaseUrl: true, defaultBaseUrl: "https://api.rsclaw.ai/v1/agent" },
   qwen:        { id: "qwen",        name: "Qwen (\u5343\u95EE)", tag: "\u56FD\u5185\u76F4\u8FDE",      tagEn: "China direct",      keyLabel: "DashScope API Key",   keyPlaceholder: "sk-..." },
   doubao:      { id: "doubao",      name: "Doubao (\u8C46\u5305)", tag: "\u5B57\u8282\u8DF3\u52A8",     tagEn: "ByteDance",         keyLabel: "ARK API Key",         keyPlaceholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", hasBaseUrl: true, defaultBaseUrl: "https://ark.cn-beijing.volces.com/api/v3" },
   minimax:     { id: "minimax",     name: "MiniMax",            tag: "\u56FD\u5185",                  tagEn: "China",             keyLabel: "MiniMax API Key",     keyPlaceholder: "eyJ..." },
@@ -803,8 +804,8 @@ export const ALL_PROVIDERS: Record<string, ProviderDef> = {
   siliconflow: { id: "siliconflow", name: "SiliconFlow",        tag: "\u56FD\u5185\u52A0\u901F",      tagEn: "China accel",       keyLabel: "SiliconFlow Key",     keyPlaceholder: "sk-..." },
 };
 
-export const PROV_ORDER_ZH = ["qwen","deepseek","doubao","custom","codingplan","minimax","kimi","zhipu","ollama","gaterouter","openrouter","anthropic","openai","gemini","grok","groq","siliconflow"];
-export const PROV_ORDER_EN = ["anthropic","openai","gemini","grok","openrouter","ollama","custom","codingplan","groq","doubao","qwen","minimax","deepseek","kimi","zhipu","gaterouter","siliconflow"];
+export const PROV_ORDER_ZH = ["rsclaw","qwen","deepseek","doubao","custom","codingplan","minimax","kimi","zhipu","ollama","gaterouter","openrouter","anthropic","openai","gemini","grok","groq","siliconflow"];
+export const PROV_ORDER_EN = ["rsclaw","anthropic","openai","gemini","grok","openrouter","ollama","custom","codingplan","groq","doubao","qwen","minimax","deepseek","kimi","zhipu","gaterouter","siliconflow"];
 
 function getProviders(lang?: string): ProviderDef[] {
   const isZhOrder = (lang || getLang()) === "cn";
@@ -820,6 +821,9 @@ interface ModelDef {
 }
 
 export const MODELS: Record<string, ModelDef[]> = {
+  rsclaw: [
+    { id: "rsclaw-agent-v1", tag: "推荐", tagEn: "Recommended", rec: true },
+  ],
   qwen: [
     { id: "qwen3.6-plus", tag: "\u6700\u65B0", tagEn: "Latest", rec: true },
     { id: "qwen-max", tag: "\u63A8\u8350", tagEn: "Recommended", rec: false },
@@ -2078,6 +2082,12 @@ export function OnboardingPage() {
         // silently drop and the gateway would have to autodetect.
         if (id === "doubao") entry.api = ps.apiType || "openai-responses";
         if (id === "kimi") entry.api = ps.apiType || "openai";
+        // RsClaw: the bare provider name `rsclaw` auto-resolves to
+        // ApiFormat::Rsclaw + the managed fleet baseUrl in
+        // gateway/providers.rs (build_providers, RSCLAW_DEFAULT_BASE
+        // fallback). No `api` / `baseUrl` keys needed unless the user
+        // pointed at a self-hosted worker — `ps.baseUrl` above is
+        // already preserved when set.
         providers[id] = entry;
       } else {
         providers[id] = {};

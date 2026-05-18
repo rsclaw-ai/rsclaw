@@ -23,10 +23,34 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
 
     if let Some(models_cfg) = &config.model.models {
         for (name, provider_cfg) in &models_cfg.providers {
+            // `load_json5` runs `expand_env_vars` at parse time, so a
+            // value like `"${RSCLAW_API_KEY}"` becomes the env var's
+            // actual contents — UNLESS the variable isn't set, in
+            // which case the placeholder is left verbatim with only a
+            // `debug!` notice. Without this filter, an unset env var
+            // would silently turn into `Authorization: Bearer ${RSCLAW_API_KEY}`
+            // on the wire and surface as a baffling "invalid api key"
+            // from the upstream worker. Treat unresolved placeholders
+            // as "no key configured" and fall through to the explicit
+            // env-var fallback below, while logging a warning so the
+            // user can see what happened.
             let api_key = provider_cfg
                 .api_key
                 .as_ref()
                 .and_then(|k| k.as_plain().map(str::to_owned))
+                .filter(|s| {
+                    if s.contains("${") && s.contains('}') {
+                        tracing::warn!(
+                            provider = %name,
+                            placeholder = %s,
+                            "provider apiKey is an unresolved ${{VAR}} placeholder \
+                             (env var not set); falling back to direct env lookup"
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                })
                 .or_else(|| std::env::var(format!("{}_API_KEY", name.to_uppercase())).ok());
 
             let base_url = provider_cfg.base_url.clone().or_else(|| {
@@ -60,6 +84,12 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                     "gemini" => ApiFormat::Gemini,
                     "doubao" | "bytedance" => ApiFormat::OpenAiResponses,
                     "ollama" => ApiFormat::Ollama,
+                    // Bare `rsclaw` name implies the stateful session
+                    // protocol — same shortcut as `anthropic`/`gemini`
+                    // above. Users who name their provider differently
+                    // (e.g. a self-hosted worker called `local-llm`)
+                    // must set `api: "rsclaw"` explicitly.
+                    "rsclaw" => ApiFormat::Rsclaw,
                     _ => ApiFormat::OpenAiCompletions,
                 }
             });
@@ -92,6 +122,29 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                     let url = base_url
                         .unwrap_or_else(|| crate::provider::openai::OPENAI_API_BASE.to_owned());
                     Arc::new(OpenAiProvider::responses_with_ua(url, key, user_agent))
+                }
+                (_, &crate::config::schema::ApiFormat::Rsclaw) => {
+                    // rsclaw stateful session protocol (kvCacheMode=2).
+                    // `baseUrl` should point at either rsclaw-server
+                    // (e.g. `https://api.rsclaw.ai/v1/agent`) or a
+                    // direct rsclaw-llm worker (e.g.
+                    // `http://localhost:9999`). `apiKey` is the bearer
+                    // token; falls back to RSCLAW_KEY env, then to
+                    // None (acceptable when targeting an unauth'd
+                    // local worker).
+                    let key = api_key
+                        .or_else(|| std::env::var("RSCLAW_KEY").ok())
+                        .or_else(|| std::env::var("RSCLAW_SERVER_KEY").ok())
+                        .filter(|s| !s.is_empty());
+                    let url = base_url.unwrap_or_else(|| {
+                        crate::provider::rsclaw::RSCLAW_DEFAULT_BASE.to_owned()
+                    });
+                    let provider = crate::provider::rsclaw::RsclawProvider::new(url, key);
+                    let provider = match provider_cfg.prefix_id.clone() {
+                        Some(pid) => provider.with_prefix_id(pid),
+                        None => provider,
+                    };
+                    Arc::new(provider)
                 }
                 _ => {
                     // OpenAI-compatible (covers openai-completions,

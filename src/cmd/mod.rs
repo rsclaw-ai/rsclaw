@@ -39,6 +39,7 @@ pub mod system;
 pub mod tools;
 pub mod tray;
 pub mod uninstall;
+pub mod watch;
 pub mod webhooks;
 
 pub use agent_turn::cmd_agent_turn;
@@ -80,4 +81,5 @@ pub use system::cmd_system;
 pub use tools::cmd_tools;
 pub use tray::cmd_tray;
 pub use uninstall::cmd_uninstall;
+pub use watch::cmd_watch;
 pub use webhooks::cmd_webhooks;

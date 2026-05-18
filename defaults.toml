@@ -7,6 +7,17 @@
 # Providers
 # ──────────────────────────────────────────────────────────────────────────────
 
+# RsClaw stateful incremental session protocol (kvCacheMode=2). Default
+# fleet at api.rsclaw.ai; self-host by pointing base_url at a local
+# rsclaw-llm worker. See: src/provider/rsclaw.rs.
+[[providers]]
+name       = "rsclaw"
+label      = "RsClaw (recommended)"
+env_var    = "RSCLAW_API_KEY"
+model      = "rsclaw/rsclaw-agent-v1"
+base_url   = "https://api.rsclaw.ai/v1/agent"
+needs_key  = true
+
 [[providers]]
 name       = "doubao"
 label      = "Doubao (ByteDance)"
@@ -45,7 +56,7 @@ label      = "Kimi"
 env_var    = "MOONSHOT_API_KEY"
 model      = "kimi/kimi-k2.6"
 base_url   = "https://api.moonshot.cn/v1"
-user_agent = "rsclaw/2026.5.5"
+user_agent = "rsclaw/2026.5.15"
 needs_key  = true
 
 [[providers]]
@@ -155,6 +166,7 @@ needs_key  = false
 name  = "feishu"
 label = "Feishu / Lark"
 login = true
+multi_account = true
 fields = [
   { key = "appId",     prompt = "App ID",     secret = false },
   { key = "appSecret", prompt = "App Secret", secret = true  },
@@ -164,6 +176,7 @@ fields = [
 name  = "wechat"
 label = "Weixin"
 login = true
+multi_account = true
 fields = [
   { key = "botToken", prompt = "Bot Token (from QR login)", secret = true  },
   { key = "botId",    prompt = "Bot ID",                     secret = false },
@@ -172,6 +185,7 @@ fields = [
 [[channels]]
 name  = "wecom"
 label = "WeCom"
+multi_account = true
 fields = [
   { key = "botId",  prompt = "Bot ID",  secret = false },
   { key = "secret",  prompt = "Secret",  secret = true  },
@@ -196,6 +210,7 @@ fields = [
 [[channels]]
 name  = "telegram"
 label = "Telegram"
+multi_account = true
 fields = [
   { key = "botToken", prompt = "Bot Token", secret = true },
 ]
@@ -203,6 +218,7 @@ fields = [
 [[channels]]
 name  = "matrix"
 label = "Matrix"
+multi_account = true
 fields = [
   { key = "homeserver",  prompt = "Homeserver URL (e.g. https://matrix.org)", secret = false },
   { key = "accessToken", prompt = "Access Token", secret = true },
@@ -221,6 +237,7 @@ fields = [
 [[channels]]
 name  = "slack"
 label = "Slack"
+multi_account = true
 fields = [
   { key = "botToken", prompt = "Bot Token", secret = true },
   { key = "appToken", prompt = "App Token", secret = true },
@@ -229,6 +246,7 @@ fields = [
 [[channels]]
 name  = "whatsapp"
 label = "WhatsApp"
+multi_account = true
 fields = [
   { key = "phoneNumberId", prompt = "Phone Number ID", secret = false },
   { key = "accessToken",   prompt = "Access Token",    secret = true  },
@@ -337,6 +355,49 @@ install_url_template = "http://ms.10jqka.com.cn/gateway/market/api/v1/skills/squ
 base_url_env         = "IWENCAI_BASE_URL"
 env_var              = "IWENCAI_API_KEY"
 needs_key            = false
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Direct API sources — invoked by query_planner intent dispatchers.
+# Only URLs and parser anchor strings (e.g. the JS variable name an
+# endpoint wraps its JSON in) live here, since those occasionally
+# change with no algorithm change (jinse → jinse2.com kind of rebrand).
+# Response parsing logic stays in code.
+# Schema lives in src/agent/direct_apis.rs.
+# ──────────────────────────────────────────────────────────────────────────────
+
+[direct_apis.weather.weather_cn]
+# Chinese national weather service — 15-day precise forecast + 40-day
+# projection for CN cities. Two-step: search to resolve cityid, then
+# pull the calendar payload (wrapped in `var fc40 = [...]`).
+city_search_url = "https://toy1.weather.com.cn/search?cityname={name}"
+calendar_url    = "https://d1.weather.com.cn/calendar_new/{year}/{cityid}_{yyyymm}.html?_={now_ms}"
+js_var_name     = "fc40"
+referer         = "https://www.weather.com.cn/"
+cityid_prefix   = "10"
+
+[direct_apis.weather.openmeteo]
+# Free 7-day forecast, lat/lon based, worldwide coverage.
+url = "https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,weathercode&forecast_days=7&timezone=Asia/Shanghai"
+
+[direct_apis.weather.wttr]
+# Universal fallback. Accepts city names in any language; 3-day forecast.
+url = "https://wttr.in/{location}?format=j1"
+
+[direct_apis.crypto.coingecko]
+# Multi-coin, multi-currency. Returns USD + CNY in one call. Primary.
+url = "https://api.coingecko.com/api/v3/simple/price?ids={coin}&vs_currencies=usd,cny"
+
+[direct_apis.crypto.cryptocompare]
+# Lightweight single-coin quote. Backup when CoinGecko throttles or
+# its DNS is degraded (both observed intermittently in CN networks).
+url = "https://min-api.cryptocompare.com/data/price?fsym={symbol}&tsyms=USD,CNY"
+
+[direct_apis.crypto.jinse]
+# 金色财经 — Chinese crypto news aggregator. News only (no price quotes).
+# Domain rebranded from `jinse.com` to `jinse2.com` in 2026-05 — the
+# externalisation of this URL specifically avoided a code+rebuild cycle
+# for the rename.
+news_url = "https://api.jinse2.com/v6/information/list?catelogue_key=news&limit={limit}"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Exec Safety Rules

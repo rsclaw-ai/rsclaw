@@ -277,19 +277,6 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "de" => "Sitzung gelöscht.",
     );
 
-    msg!("session_reset",
-        "en" => "Session reset.",
-        "zh" => "会话已重置。",
-        "th" => "รีเซ็ตเซสชันแล้ว",
-        "vi" => "Phien lam viec da dat lai.",
-        "ja" => "セッションをリセットしました。",
-        "es" => "Sesion restablecida.",
-        "ko" => "세션이 재설정되었습니다.",
-        "ru" => "Сессия сброшена.",
-        "fr" => "Session réinitialisée.",
-        "de" => "Sitzung zurückgesetzt.",
-    );
-
     msg!("session_new",
         "en" => "New session started.",
         "zh" => "已开启新会话。",
@@ -1270,6 +1257,51 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "ko" => "구성됨",
         "ru" => "настроено",
     );
+    // Setup: multi-account editor
+    msg!("cli_accounts_count",
+        "en" => "{n} accounts",
+        "zh" => "{n} 个账号",
+    );
+    msg!("cli_account_choose_mode",
+        "en" => "{label}: already configured. Keep single account or add another?",
+        "zh" => "{label}: 已配置。保持单账号，还是再加一个？",
+    );
+    msg!("cli_account_keep_single",
+        "en" => "Keep single account (edit fields)",
+        "zh" => "保持单账号（编辑字段）",
+    );
+    msg!("cli_account_add_another",
+        "en" => "Add another account",
+        "zh" => "添加另一个账号",
+    );
+    msg!("cli_account_list_title",
+        "en" => "{label} accounts",
+        "zh" => "{label} 账号列表",
+    );
+    msg!("cli_account_add_new",
+        "en" => "[+ Add account]",
+        "zh" => "[+ 添加账号]",
+    );
+    msg!("cli_account_name_prompt",
+        "en" => "Account name (e.g. work, personal)",
+        "zh" => "账号名（例如 work、personal）",
+    );
+    msg!("cli_account_name_invalid",
+        "en" => "Invalid name. Avoid dots and spaces.",
+        "zh" => "账号名非法，不能含点号或空格。",
+    );
+    msg!("cli_account_exists",
+        "en" => "Account '{name}' already exists.",
+        "zh" => "账号 '{name}' 已存在。",
+    );
+    msg!("cli_account_action",
+        "en" => "Account '{name}': edit / remove?",
+        "zh" => "账号 '{name}'：编辑还是删除？",
+    );
+    msg!("cli_account_remove",
+        "en" => "Remove account",
+        "zh" => "删除账号",
+    );
     msg!("cli_starting_login",
         "en" => "Starting login flow...",
         "zh" => "正在启动登录流程...",
@@ -1935,91 +1967,6 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "ru" => "{count} файлов рабочего пространства в {path}",
     );
 
-    // --- Background context (/btw) ---
-    msg!("btw_added",
-        "en" => "Added background context #{id}",
-        "zh" => "已添加背景上下文 #{id}",
-        "th" => "เพิ่มบริบทพื้นหลัง #{id} แล้ว",
-        "vi" => "Da them ngu canh nen #{id}",
-        "ja" => "バックグラウンドコンテキスト #{id} を追加しました",
-        "es" => "Contexto de fondo #{id} agregado",
-        "ko" => "배경 컨텍스트 #{id} 추가됨",
-        "ru" => "Добавлен фоновый контекст #{id}",
-        "fr" => "Contexte d'arrière-plan #{id} ajouté",
-        "de" => "Hintergrundkontext #{id} hinzugefügt",
-    );
-    msg!("btw_added_ttl",
-        "en" => "Added background context #{id} (expires in {turns} turns)",
-        "zh" => "已添加背景上下文 #{id}（{turns}轮后过期）",
-        "th" => "เพิ่มบริบทพื้นหลัง #{id} (หมดอายุใน {turns} รอบ)",
-        "vi" => "Da them ngu canh nen #{id} (het han sau {turns} luot)",
-        "ja" => "バックグラウンドコンテキスト #{id} を追加しました（{turns}ターンで期限切れ）",
-        "es" => "Contexto de fondo #{id} agregado (expira en {turns} turnos)",
-        "ko" => "배경 컨텍스트 #{id} 추가됨 ({turns}턴 후 만료)",
-        "ru" => "Добавлен фоновый контекст #{id} (истекает через {turns} ходов)",
-        "fr" => "Contexte d'arrière-plan #{id} ajouté (expire dans {turns} tours)",
-        "de" => "Hintergrundkontext #{id} hinzugefügt (läuft in {turns} Runden ab)",
-    );
-    msg!("btw_added_global",
-        "en" => "Added global background context #{id}",
-        "zh" => "已添加全局背景上下文 #{id}",
-        "th" => "เพิ่มบริบทพื้นหลังทั่วไป #{id} แล้ว",
-        "vi" => "Da them ngu canh nen toan cuc #{id}",
-        "ja" => "グローバルバックグラウンドコンテキスト #{id} を追加しました",
-        "es" => "Contexto de fondo global #{id} agregado",
-        "ko" => "글로벌 배경 컨텍스트 #{id} 추가됨",
-        "ru" => "Добавлен глобальный фоновый контекст #{id}",
-        "fr" => "Contexte d'arrière-plan global #{id} ajouté",
-        "de" => "Globaler Hintergrundkontext #{id} hinzugefügt",
-    );
-    msg!("btw_list_empty",
-        "en" => "No active background context",
-        "zh" => "没有活跃的背景上下文",
-        "th" => "ไม่มีบริบทพื้นหลังที่ใช้งานอยู่",
-        "vi" => "Khong co ngu canh nen dang hoat dong",
-        "ja" => "アクティブなバックグラウンドコンテキストはありません",
-        "es" => "Sin contexto de fondo activo",
-        "ko" => "활성 배경 컨텍스트 없음",
-        "ru" => "Нет активного фонового контекста",
-        "fr" => "Aucun contexte d'arrière-plan actif",
-        "de" => "Kein aktiver Hintergrundkontext",
-    );
-    msg!("btw_cleared",
-        "en" => "Background context cleared",
-        "zh" => "背景上下文已清除",
-        "th" => "ล้างบริบทพื้นหลังแล้ว",
-        "vi" => "Da xoa ngu canh nen",
-        "ja" => "バックグラウンドコンテキストをクリアしました",
-        "es" => "Contexto de fondo limpiado",
-        "ko" => "배경 컨텍스트 지워짐",
-        "ru" => "Фоновый контекст очищен",
-        "fr" => "Contexte d'arrière-plan effacé",
-        "de" => "Hintergrundkontext gelöscht",
-    );
-    msg!("btw_removed",
-        "en" => "Removed background context #{id}",
-        "zh" => "已删除背景上下文 #{id}",
-        "th" => "ลบบริบทพื้นหลัง #{id} แล้ว",
-        "vi" => "Da xoa ngu canh nen #{id}",
-        "ja" => "バックグラウンドコンテキスト #{id} を削除しました",
-        "es" => "Contexto de fondo #{id} eliminado",
-        "ko" => "배경 컨텍스트 #{id} 삭제됨",
-        "ru" => "Удален фоновый контекст #{id}",
-        "fr" => "Contexte d'arrière-plan #{id} supprimé",
-        "de" => "Hintergrundkontext #{id} entfernt",
-    );
-    msg!("btw_not_found",
-        "en" => "Background context #{id} not found",
-        "zh" => "未找到背景上下文 #{id}",
-        "th" => "ไม่พบบริบทพื้นหลัง #{id}",
-        "vi" => "Khong tim thay ngu canh nen #{id}",
-        "ja" => "バックグラウンドコンテキスト #{id} が見つかりません",
-        "es" => "Contexto de fondo #{id} no encontrado",
-        "ko" => "배경 컨텍스트 #{id}를 찾을 수 없음",
-        "ru" => "Фоновый контекст #{id} не найден",
-        "fr" => "Contexte d'arrière-plan #{id} introuvable",
-        "de" => "Hintergrundkontext #{id} nicht gefunden",
-    );
 
     // --- Processing indicator (timeout-triggered) ---
     msg!("processing",

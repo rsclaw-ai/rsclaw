@@ -37,6 +37,27 @@ use super::channels::{start_channels, start_custom_channels};
 use super::providers::build_providers;
 
 // ---------------------------------------------------------------------------
+// Sync-only channel allow-list
+// ---------------------------------------------------------------------------
+
+/// Channels whose responses arrive back at the caller through a non-
+/// notification transport — currently the HTTP `/api/v1/message`
+/// endpoint, which uses a `oneshot::reply_tx` on the `AgentMessage`
+/// plus an optional SSE byte stream.
+///
+/// The agent runtime still fans the assistant reply out onto the
+/// notification bus for observers (UI, telemetry), so this list
+/// suppresses the otherwise-misleading `WARN: no channel sender
+/// registered` log for those known-by-design absences. Future
+/// sync-only entry points (stdio MCP, in-process embeds, etc.)
+/// should be added here.
+const SYNC_ONLY_CHANNELS: &[&str] = &["api"];
+
+fn is_sync_only_channel(name: &str) -> bool {
+    SYNC_ONLY_CHANNELS.contains(&name)
+}
+
+// ---------------------------------------------------------------------------
 // Gateway entry point
 // ---------------------------------------------------------------------------
 
@@ -58,6 +79,13 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     //     in the config file instead of shell rc / launchctl. Done here,
     //     pre-runtime, while the process is still single-threaded.
     propagate_skill_registry_env(&config);
+
+    // 0c. Propagate the root-level `env: { … }` map into process env.
+    //     Same purpose as 0b but generic: lets users define arbitrary
+    //     KV pairs (e.g. ASTOCK, LOG_DIR) used by /watch slash command
+    //     and gateway-spawned subprocesses. Shell-provided env wins so
+    //     `ASTOCK=... cargo run -- gateway restart` still overrides.
+    propagate_user_env(&config);
 
     // 1. Resolve data directory — respects RSCLAW_BASE_DIR for --dev/--profile.
     let base_dir = crate::config::loader::base_dir();
@@ -416,6 +444,21 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                         if let Err(e) = tx.send(msg.clone()).await {
                             tracing::warn!(error = %e, "notification send failed");
                         }
+                    } else if is_sync_only_channel(ch_name) {
+                        // sync-only channels (HTTP /api/v1/message, future stdio
+                        // MCP, etc.) carry their reply back through their own
+                        // transport — the oneshot reply_tx on the AgentMessage,
+                        // an SSE byte stream, etc. The notification fan-out
+                        // here is a fire-and-forget event-bus emit for
+                        // observers (UI, telemetry) and the absence of a
+                        // registered sender is by design, not a misconfig.
+                        // Surface at debug so operators can still see the
+                        // dispatch path without flooding logs on every API
+                        // call.
+                        tracing::debug!(
+                            channel = %ch_name,
+                            "notification: sync-only channel, no sender expected"
+                        );
                     } else {
                         warn!(channel = %ch_name, "no channel sender registered for notification");
                     }
@@ -601,6 +644,12 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // All channels registered - now wrap for sharing with cron runner
     let channel_manager = Arc::new(channel_manager);
 
+    // /watch registry — events fly directly from sources to chat without going
+    // through the agent. Must be initialized after channels are registered so
+    // delivery can resolve any channel name (esp. for /loop /watch composition).
+    crate::gateway::watch::WatchRegistry::init(Arc::clone(&channel_manager));
+    tracing::info!("watch registry initialized");
+
     // Create cron reload broadcast channel (used to notify CronRunner of new jobs)
     let (cron_reload_tx, _cron_reload_rx) = tokio::sync::broadcast::channel::<()>(16);
     // Make the sender reachable from non-server paths (fast preparse `/loop`).
@@ -651,6 +700,19 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         }
     }
 
+    // A2A v1.0 plumbing — task event bus, persistent store, push dispatcher
+    // all share the same instances so events flow end-to-end.
+    let a2a_bus = crate::a2a::event::TaskEventBus::new();
+    let a2a_task_store = {
+        let path = crate::config::loader::base_dir()
+            .join("var/data/a2a/tasks.redb");
+        Arc::new(crate::a2a::store::TaskStore::open(&path).expect("open A2A task store"))
+    };
+    let a2a_push_dispatcher = Arc::new(crate::a2a::push::PushDispatcher::new(
+        Arc::clone(&a2a_task_store),
+        a2a_bus.clone(),
+    ));
+
     let state = AppState {
         config: Arc::clone(&config),
         live: Arc::clone(&live),
@@ -678,6 +740,11 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         restart_request_tx: restart_request_tx.clone(),
         pending_restart: Arc::clone(&pending_restart),
         shutdown: shutdown.clone(),
+        task_event_bus: a2a_bus,
+        task_cancels: Arc::new(dashmap::DashMap::new()),
+        suspended_tasks: Arc::new(dashmap::DashMap::new()),
+        task_store: a2a_task_store,
+        push_dispatcher: a2a_push_dispatcher,
     };
     crate::ws::tick::start_tick_loop(Arc::clone(&state.ws_conns));
 
@@ -792,6 +859,11 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                     return;
                 }
                 info!("Ctrl-C received, beginning graceful shutdown");
+            }
+            // Stop /watch source/processor tasks before draining HTTP so SSE
+            // and subprocesses get a clean exit instead of dangling.
+            if let Some(reg) = crate::gateway::watch::WatchRegistry::global() {
+                reg.shutdown_all().await;
             }
             sd.begin_drain();
         });
@@ -934,6 +1006,42 @@ fn registry_env_names(name: &str) -> Option<(&'static str, &'static str)> {
     }
 }
 
+/// Read the root-level `env: { K: V, ... }` map and export each entry to
+/// the gateway process env. Values may reference other env vars via
+/// `${VAR}` — those are expanded against the current process env at the
+/// time this function runs (so `${HOME}` etc work out of the box).
+///
+/// **Precedence:** shell-provided env wins. If a key already exists in
+/// the process env (e.g. inherited from the launching shell), the config
+/// value is skipped. This lets users override per-launch without editing
+/// rsclaw.json5.
+///
+/// SAFETY: called once during single-threaded gateway startup, before
+/// any async runtime tasks spawn — matches the existing precedent in
+/// `apply_proxy_env` and `propagate_skill_registry_env`.
+fn propagate_user_env(config: &RuntimeConfig) {
+    let Some(env_map) = config.raw.env.as_ref() else { return };
+    apply_user_env_map(&env_map.0);
+}
+
+/// Inner helper, separated from `propagate_user_env` so it can be unit-tested
+/// without constructing a full `RuntimeConfig`.
+fn apply_user_env_map(env_map: &std::collections::HashMap<String, String>) {
+    for (key, raw_val) in env_map {
+        if key.is_empty() {
+            continue;
+        }
+        if std::env::var(key).is_ok() {
+            // Already set by shell / launchd / systemd — don't clobber.
+            continue;
+        }
+        let expanded = crate::config::loader::expand_env_vars(raw_val);
+        // SAFETY: pre-async-runtime, single-threaded.
+        unsafe { std::env::set_var(key, &expanded) };
+        info!(key = %key, "exported user env var from rsclaw.json5");
+    }
+}
+
 /// Read `skill_registries.<name>.{apiKey,baseUrl}` from the resolved
 /// config and export each non-empty value to the corresponding env var.
 /// SAFETY: called once during single-threaded gateway startup, before any
@@ -1031,7 +1139,7 @@ fn spawn_agent_tasks(
         runtime.wasm_plugins = Arc::clone(&wasm_plugins);
 
         // Share the computer_use permission store + broadcast channel
-        // so `tool_ui_tars` can register pending requests that the WS
+        // so `tool_vlm_drive` can register pending requests that the WS
         // handler can resolve.
         runtime.computer_permission = Some(Arc::clone(&computer_permission));
         runtime.computer_permission_tx = Some(computer_permission_tx.clone());
@@ -1059,22 +1167,44 @@ fn spawn_agent_tasks(
                     images,
                     files,
                     account: _,
+                    task_id,
+                    context_id,
+                    cancel_token,
+                    event_tx,
+                    input_request_tx,
                 } = msg;
+                // Build a TurnContext from the A2A wires on AgentMessage;
+                // empty for non-A2A callers. The runtime polls
+                // `is_cancelled()` between iterations and at every
+                // tool-dispatch boundary, so the worker stops waiting on
+                // a long turn as soon as the cancel token fires —
+                // no outer tokio::select shim needed.
+                let turn_ctx = crate::agent::registry::TurnContext {
+                    task_id,
+                    context_id,
+                    event_tx,
+                    cancel_token,
+                    input_request_tx,
+                };
                 let result = runtime
                     .run_turn(
-                        &session_key,
-                        &text,
-                        &channel,
-                        &peer_id,
-                        &chat_id,
-                        extra_tools,
-                        images,
-                        files,
+                        &session_key, &text, &channel, &peer_id, &chat_id,
+                        extra_tools, images, files, turn_ctx,
                     )
                     .await;
                 let turn_errored = result.is_err();
                 let reply = result.unwrap_or_else(|e| {
                     error!(agent = %handle.id, "turn error: {e:#}");
+                    // A2A consumers key off `outcome` to publish the right
+                    // terminal status (Failed vs Canceled). Without this
+                    // distinction the A2A reply-watcher saw `Ok(reply)` and
+                    // always published Completed — so cancellations and
+                    // LLM/tool errors were silently reported as success.
+                    let outcome = if e.to_string().contains("canceled by A2A CancelTask") {
+                        crate::agent::registry::ReplyOutcome::Canceled
+                    } else {
+                        crate::agent::registry::ReplyOutcome::Error
+                    };
                     AgentReply {
                         text: format!("[error: {e}]"),
                         is_empty: false,
@@ -1083,6 +1213,7 @@ fn spawn_agent_tasks(
                         files: vec![],
                         pending_analysis: None,
                         needs_outer_done_emit: false,
+                        outcome,
                     }
                 });
                 // Emit to event_bus for any reply path that bypassed
@@ -1104,6 +1235,7 @@ fn spawn_agent_tasks(
                             files: vec![],
                             images: vec![],
                             tool_log: vec![],
+                            question: None,
                         });
                     }
                     // receiver may have been dropped
@@ -1115,6 +1247,7 @@ fn spawn_agent_tasks(
                         files: vec![],
                         images: vec![],
                         tool_log: vec![],
+                        question: None,
                     });
                 }
                 // receiver may have been dropped (e.g. channel timeout)
@@ -1238,6 +1371,11 @@ pub(crate) async fn handle_pending_analysis(
         peer_id: analysis.peer_id.clone(),
         chat_id: String::new(),
         reply_tx,
+        task_id: None,
+        context_id: None,
+        event_tx: None,
+        cancel_token: None,
+        input_request_tx: None,
         extra_tools: vec![],
         images: vec![],
         files: vec![],
@@ -1814,4 +1952,55 @@ pub(crate) fn publish_restart(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod user_env_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn sets_unset_variables() {
+        unsafe { std::env::remove_var("RSCLAW_TEST_USER_ENV_NEW") };
+        let mut map = HashMap::new();
+        map.insert("RSCLAW_TEST_USER_ENV_NEW".to_owned(), "from-config".to_owned());
+        apply_user_env_map(&map);
+        assert_eq!(
+            std::env::var("RSCLAW_TEST_USER_ENV_NEW").as_deref(),
+            Ok("from-config")
+        );
+        unsafe { std::env::remove_var("RSCLAW_TEST_USER_ENV_NEW") };
+    }
+
+    #[test]
+    fn preexisting_shell_value_wins() {
+        unsafe { std::env::set_var("RSCLAW_TEST_USER_ENV_KEEP", "from-shell") };
+        let mut map = HashMap::new();
+        map.insert("RSCLAW_TEST_USER_ENV_KEEP".to_owned(), "from-config".to_owned());
+        apply_user_env_map(&map);
+        assert_eq!(
+            std::env::var("RSCLAW_TEST_USER_ENV_KEEP").as_deref(),
+            Ok("from-shell"),
+            "shell-provided value must not be overwritten"
+        );
+        unsafe { std::env::remove_var("RSCLAW_TEST_USER_ENV_KEEP") };
+    }
+
+    #[test]
+    fn expands_nested_var_refs() {
+        unsafe { std::env::set_var("RSCLAW_TEST_USER_ENV_REF", "/var/log/foo") };
+        unsafe { std::env::remove_var("RSCLAW_TEST_USER_ENV_TARGET") };
+        let mut map = HashMap::new();
+        map.insert(
+            "RSCLAW_TEST_USER_ENV_TARGET".to_owned(),
+            "${RSCLAW_TEST_USER_ENV_REF}/app.log".to_owned(),
+        );
+        apply_user_env_map(&map);
+        assert_eq!(
+            std::env::var("RSCLAW_TEST_USER_ENV_TARGET").as_deref(),
+            Ok("/var/log/foo/app.log")
+        );
+        unsafe { std::env::remove_var("RSCLAW_TEST_USER_ENV_REF") };
+        unsafe { std::env::remove_var("RSCLAW_TEST_USER_ENV_TARGET") };
+    }
 }
