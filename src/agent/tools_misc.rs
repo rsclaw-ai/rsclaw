@@ -726,6 +726,185 @@ $synth.Speak('{}')
             )
         }))
     }
+
+    /// Format a multi-choice question for the user and return the rendered
+    /// text. The agent should use the returned `formatted_text` as its reply
+    /// and end the turn; the user's response will arrive as a normal message
+    /// on the next turn.
+    ///
+    /// L1 implementation: text-only rendering that works across all 13
+    /// channels uniformly. L2 (per-channel structured cards — Feishu/Discord/
+    /// Telegram inline keyboards) is a follow-up PR.
+    pub(crate) async fn tool_ask_user(
+        &self,
+        ctx: &RunContext,
+        args: Value,
+    ) -> Result<Value> {
+        let question = args["question"]
+            .as_str()
+            .ok_or_else(|| anyhow!("ask_user: `question` required"))?
+            .trim()
+            .to_owned();
+        if question.is_empty() {
+            bail!("ask_user: `question` must be non-empty");
+        }
+
+        let raw_options = args["options"]
+            .as_array()
+            .ok_or_else(|| anyhow!("ask_user: `options` array required (2-8 entries)"))?;
+        if raw_options.len() < 2 {
+            bail!("ask_user: at least 2 options required (a single-choice 'question' isn't a question)");
+        }
+        if raw_options.len() > 8 {
+            bail!("ask_user: at most 8 options allowed — collapse rarely-picked variants into 'Other (free text)'");
+        }
+
+        let multi_select = args["multi_select"].as_bool().unwrap_or(false);
+        let recommended_index = args["recommended_index"].as_u64().map(|n| n as usize);
+        let header = args["header"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+
+        // Build structured options once, used for both the WS prompt payload
+        // (L2: capable channels render natively) and the formatted text
+        // fallback (L1: every channel works).
+        let mut options: Vec<crate::events::AskUserOption> = Vec::with_capacity(raw_options.len());
+        for (idx, opt) in raw_options.iter().enumerate() {
+            let label = opt["label"]
+                .as_str()
+                .ok_or_else(|| anyhow!("ask_user: option[{idx}].label required"))?
+                .trim()
+                .to_owned();
+            if label.is_empty() {
+                bail!("ask_user: option[{idx}].label must be non-empty");
+            }
+            let description = opt["description"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            options.push(crate::events::AskUserOption { label, description });
+        }
+
+        // Render the L1 text fallback. Numbered list with optional
+        // recommendation marker and description suffix.
+        let mut formatted = String::new();
+        if let Some(ref h) = header {
+            formatted.push_str(&format!("[{h}] "));
+        }
+        formatted.push_str("❓ ");
+        formatted.push_str(&question);
+        formatted.push_str("\n\n");
+        for (idx, opt) in options.iter().enumerate() {
+            let is_recommended = recommended_index == Some(idx);
+            formatted.push_str(&format!("{}) {}", idx + 1, opt.label));
+            if is_recommended {
+                formatted.push_str(" (Recommended)");
+            }
+            if let Some(ref d) = opt.description {
+                formatted.push_str(&format!(" — {d}"));
+            }
+            formatted.push('\n');
+        }
+        formatted.push('\n');
+        if multi_select {
+            formatted.push_str("请回复一个或多个选项编号 (逗号分隔, e.g. \"1,3\"), 或自由输入。");
+        } else {
+            formatted.push_str("请回复选项编号 (e.g. \"1\"), 或自由输入。");
+        }
+
+        // L2 path: emit a side-channel AgentEvent carrying the structured
+        // prompt. Capable subscribers (Desktop, Telegram, Feishu, ...) render
+        // native UI; uncapable subscribers ignore the `question` field and
+        // fall back to the agent's plain-text reply.
+        if let Some(ref bus) = self.event_bus {
+            let prompt = crate::events::AskUserPrompt {
+                question: question.clone(),
+                options,
+                multi_select,
+                recommended_index,
+                header,
+            };
+            let _ = bus.send(crate::events::AgentEvent {
+                session_id: ctx.session_key.clone(),
+                agent_id: ctx.agent_id.clone(),
+                delta: String::new(),
+                done: false,
+                files: vec![],
+                images: vec![],
+                tool_log: vec![],
+                question: Some(prompt),
+            });
+        }
+
+        Ok(json!({
+            "ok": true,
+            "formatted_text": formatted,
+            "option_count": raw_options.len(),
+            "multi_select": multi_select,
+            "instruction": "Send `formatted_text` as your reply to the user verbatim, then \
+                            STOP this turn. The user's answer arrives as a normal message \
+                            on the next turn — parse a digit as option index, or treat \
+                            free text as 'Other'."
+        }))
+    }
+
+    /// Validate and stage a structured task outcome declared by the agent.
+    ///
+    /// Stages the outcome in a session-keyed stash that the task-queue worker
+    /// drains before classifying the turn — once drained, it becomes
+    /// `TaskOutcome::Structured`, taking precedence over the string classifier.
+    pub(crate) async fn tool_task_finish(
+        &self,
+        ctx: &RunContext,
+        args: Value,
+    ) -> Result<Value> {
+        let outcome: crate::gateway::task_queue::StructuredOutcome =
+            serde_json::from_value(args.clone()).map_err(|e| {
+                anyhow!(
+                    "task_finish: invalid outcome payload: {e}. Required fields: \
+                     completion (full|partial|minimal|failed) and recommend \
+                     (ship|continue|needs_human|retry|abandon)."
+                )
+            })?;
+
+        if outcome.verified && outcome.verification_log.is_none() {
+            bail!(
+                "task_finish: verified=true requires verification_log with command + \
+                 output excerpt. Either provide evidence or set verified=false."
+            );
+        }
+
+        if matches!(
+            outcome.completion,
+            crate::gateway::task_queue::Completion::Full
+        ) && outcome.accomplished.is_empty()
+        {
+            bail!(
+                "task_finish: completion=full requires non-empty `accomplished`. \
+                 List the concrete things you did, each mapped to an observable \
+                 artifact (file changed, command run, message sent)."
+            );
+        }
+
+        tracing::info!(
+            session_key = %ctx.session_key,
+            completion = ?outcome.completion,
+            recommend = ?outcome.recommend,
+            verified = outcome.verified,
+            accomplished_count = outcome.accomplished.len(),
+            blocked_count = outcome.blocked_on.len(),
+            follow_up_count = outcome.follow_up_tasks.len(),
+            "task_finish: agent declared outcome"
+        );
+
+        crate::gateway::task_queue::stage_pending_outcome(&ctx.session_key, outcome);
+
+        Ok(json!({
+            "ok": true,
+            "recorded": true,
+            "note": "Outcome staged. Worker will use it instead of string-classifier \
+                     fallback when grading this turn."
+        }))
+    }
 }
 
 /// Located VITS TTS model under `<base>/models/vits-*/`.

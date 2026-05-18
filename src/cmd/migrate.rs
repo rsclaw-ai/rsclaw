@@ -310,6 +310,27 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
         // Agents: defaults + list (rewrite workspace paths, strip agentDir).
         if let Some(agents) = config.get("agents") {
             let mut agents_cfg = agents.clone();
+
+            // Promote the default agent's model.primary to defaults.model.primary
+            // BEFORE cleaning up `defaults`, so the openclaw config's existing
+            // `defaults.model.primary` (if any) wins over a per-agent override.
+            // Rsclaw treats `agents.defaults.model.primary` as the single source
+            // of truth for the fleet-level default, matching the new setup
+            // template layout.
+            let promoted_model: Option<serde_json::Value> = agents_cfg
+                .pointer("/defaults/model/primary")
+                .cloned()
+                .or_else(|| {
+                    // Find the openclaw default agent — the one with
+                    // `default: true`, or list[0] when no flag is set.
+                    let list = agents_cfg.pointer("/list").and_then(|v| v.as_array())?;
+                    let default_entry = list
+                        .iter()
+                        .find(|a| a.get("default").and_then(|d| d.as_bool()).unwrap_or(false))
+                        .or_else(|| list.first())?;
+                    default_entry.pointer("/model/primary").cloned()
+                });
+
             // Clean up defaults: keep only supported fields, set rsclaw defaults.
             if let Some(defaults) = agents_cfg.pointer_mut("/defaults") {
                 if let Some(obj) = defaults.as_object_mut() {
@@ -326,6 +347,33 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
                     );
                     obj.insert("compaction".to_owned(),
                         serde_json::json!({"mode": "layered"}));
+                    // Write the resolved default model into defaults.model.primary.
+                    if let Some(primary) = promoted_model.as_ref() {
+                        let model_obj = obj
+                            .entry("model".to_owned())
+                            .or_insert_with(|| serde_json::json!({}));
+                        if let Some(m) = model_obj.as_object_mut() {
+                            m.insert("primary".to_owned(), primary.clone());
+                        }
+                    }
+                }
+            } else if promoted_model.is_some() {
+                // openclaw config had no `defaults` block at all — create one
+                // so the promoted model survives.
+                let mut d = serde_json::Map::new();
+                d.insert(
+                    "workspace".to_owned(),
+                    serde_json::Value::String(
+                        rsclaw_dir.join("workspace").to_string_lossy().into_owned(),
+                    ),
+                );
+                d.insert("compaction".to_owned(), serde_json::json!({"mode": "layered"}));
+                d.insert(
+                    "model".to_owned(),
+                    serde_json::json!({ "primary": promoted_model.clone().unwrap() }),
+                );
+                if let Some(agents_obj) = agents_cfg.as_object_mut() {
+                    agents_obj.insert("defaults".to_owned(), serde_json::Value::Object(d));
                 }
             }
             // Build agent->channels map from OpenClaw bindings.
@@ -347,9 +395,24 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
                 }
             }
 
+            // Identify which entry to treat as the default agent so we can
+            // strip its now-redundant `default: true` + `model` (model was
+            // promoted to defaults.model.primary above). Match the openclaw
+            // resolution order: explicit `default: true` wins; otherwise the
+            // first entry (or "main" if missing) is the default.
+            let default_idx: Option<usize> = agents_cfg
+                .pointer("/list")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| {
+                    arr.iter().position(|a| {
+                        a.get("default").and_then(|d| d.as_bool()).unwrap_or(false)
+                    })
+                    .or_else(|| if arr.is_empty() { None } else { Some(0) })
+                });
+
             // Rewrite per-agent workspaces, strip agentDir, add channels from bindings.
             if let Some(list) = agents_cfg.pointer_mut("/list").and_then(|v| v.as_array_mut()) {
-                for agent in list.iter_mut() {
+                for (idx, agent) in list.iter_mut().enumerate() {
                     if let Some(obj) = agent.as_object_mut() {
                         let agent_id = obj.get("id")
                             .and_then(|v| v.as_str())
@@ -373,6 +436,13 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
                                 .map(|c| serde_json::Value::String(c.clone()))
                                 .collect();
                             obj.insert("channels".to_owned(), serde_json::Value::Array(ch_values));
+                        }
+                        // Default agent: drop `default: true` and `model` —
+                        // both were promoted to fleet-level defaults. Non-
+                        // default agents keep their own model overrides.
+                        if Some(idx) == default_idx {
+                            obj.remove("default");
+                            obj.remove("model");
                         }
                     }
                 }

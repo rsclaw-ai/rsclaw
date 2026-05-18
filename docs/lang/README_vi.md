@@ -26,7 +26,7 @@ RsClaw la ban viet lai hoan toan cua [OpenClaw](https://github.com/openclaw/open
 - **32 cong cu tich hop** -- Quan ly file, Shell, Tim kiem web/Trinh duyet, Tao anh, Bo nho, Nhan tin, cron, A2A
 - **40+ lenh PreParse** -- Bo qua LLM, khong ton token, phan hoi duoi mili giay
 - **Tu dong hoa trinh duyet CDP** -- Dieu khien headless Chrome tich hop (20 thao tac)
-- **Giao thuc A2A** -- Google A2A v0.3 (hop tac tac tu xuyen mang)
+- **Giao thuc A2A** -- Google A2A v1.0 (hop tac tac tu xuyen mang)
 - **Bao mat thuc thi** -- Quy tac deny/confirm/allow, 50+ mau tu choi
 
 ## Cai dat nhanh

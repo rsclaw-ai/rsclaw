@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicegoodthings/tauri-v2-schema/refs/heads/main/tauri.conf.json",
   "productName": "RsClaw",
-  "version": "2026.5.5",
+  "version": "2026.5.15",
   "identifier": "ai.rsclaw.app",
   "build": {
     "beforeBuildCommand": "yarn export && node ../scripts/fetch-bundled-model.mjs",
@@ -10,6 +10,7 @@
     "frontendDist": "../out"
   },
   "app": {
+    "macOSPrivateApi": true,
     "withGlobalTauri": true,
     "security": {
       "csp": null,
@@ -28,8 +29,8 @@
         "fullscreen": false,
         "width": 1000,
         "height": 720,
-        "minWidth": 700,
-        "minHeight": 500,
+        "minWidth": 320,
+        "minHeight": 400,
         "resizable": true,
         "title": "RsClaw",
         "hiddenTitle": true,

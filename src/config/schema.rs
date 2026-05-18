@@ -95,6 +95,14 @@ pub struct GatewayConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind_address: Option<String>,
     pub auth: Option<GatewayAuth>,
+    /// A2A endpoint (`/api/v1/a2a`) authentication. When any field here is
+    /// populated, the A2A middleware accepts these credentials. `gateway.auth.token`
+    /// is also accepted as a Bearer when set (single-token convenience).
+    /// Falls back to env vars `RSCLAW_A2A_BEARER_TOKENS` / `RSCLAW_A2A_API_KEYS`
+    /// for back-compat — env-set lists are merged into the accepted set.
+    /// When everything is empty, the middleware passes through (dev mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a2a_auth: Option<GatewayA2aAuth>,
     pub control_ui: Option<ControlUiConfig>,
     pub reload: Option<ReloadMode>,
     pub push: Option<PushConfig>,
@@ -171,6 +179,21 @@ pub struct GatewayAuth {
     pub allow_local: Option<bool>,
 }
 
+/// A2A inbound credentials configured in the gateway block. JSON5 key
+/// `gateway.a2aAuth`. Both fields are optional Vecs of `SecretOrString` so
+/// they support plain strings, `${VAR}` expansion, and `{ source: "env",
+/// id: "..." }` refs.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayA2aAuth {
+    /// Accepted Bearer tokens for `/api/v1/a2a`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<Vec<SecretOrString>>,
+    /// Accepted `X-API-Key` values for `/api/v1/a2a`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_keys: Option<Vec<SecretOrString>>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ControlUiConfig {
@@ -224,9 +247,16 @@ pub struct EnvConfig(pub HashMap<String, String>);
 // agents
 // ---------------------------------------------------------------------------
 
+/// A remote A2A peer this gateway outbound-calls via the `agent_<id>` tool.
+///
+/// Renamed from `ExternalAgentConfig` once the A2A v1.0 wire shape landed;
+/// the old name was protocol-agnostic ("external" could mean shell, HTTP,
+/// anything), the new name pins down that the transport is A2A. Hard switch
+/// — no back-compat alias since the prior implementation was incomplete and
+/// not deployed anywhere.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ExternalAgentConfig {
+pub struct A2aPeerConfig {
     /// Logical agent ID (used as `agent_<id>` tool name).
     pub id: String,
     /// Base URL of the remote rsclaw/OpenClaw gateway, e.g. "http://host:18888".
@@ -244,7 +274,8 @@ pub struct ExternalAgentConfig {
 pub struct AgentsConfig {
     pub defaults: Option<AgentDefaults>,
     pub list: Option<Vec<AgentEntry>>,
-    pub external: Option<Vec<ExternalAgentConfig>>,
+    /// Remote A2A peers. JSON5 key: `a2a`.
+    pub a2a: Option<Vec<A2aPeerConfig>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -279,7 +310,8 @@ pub struct AgentDefaults {
     pub context_tokens: Option<u32>,
     /// KV cache mode: 0 = off, 1 = full/append-only (default), 2 = delta/incremental.
     pub kv_cache_mode: Option<u8>,
-    /// Maximum token budget for /ctx (btw) side queries. Default: 10000.
+    /// Maximum token budget for `/btw` side-channel quick queries
+    /// (handled by `handle_side_query`). Default: 10000.
     pub btw_tokens: Option<u32>,
     pub timezone: Option<String>,
     pub timestamp: Option<Value>,
@@ -478,7 +510,7 @@ pub struct ModelConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flash: Option<String>,
     /// Vision model used by the GUI agent (`computer_use`) — must support
-    /// image inputs. Resolution chain when ui_tars / VlmDriver runs:
+    /// image inputs. Resolution chain when vlm_drive / VlmDriver runs:
     ///   1. per-agent `model.vision`
     ///   2. `agents.defaults.model.vision`
     ///   3. per-agent `model.primary`  ← fallback (assumes primary handles vision)
@@ -692,6 +724,12 @@ pub struct ProviderConfig {
     /// Falls back to gateway.user_agent if not set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_agent: Option<String>,
+    /// Override the wire `prefix_id` for `rsclaw` providers (protocol
+    /// §2.1.1 / §2.10.1, namespaced `<ns>/<ver>`). Defaults to
+    /// `provider::rsclaw::RSCLAW_DEFAULT_PREFIX_ID` (`rsclaw/2026.5.15`)
+    /// when omitted. Ignored for non-rsclaw `api` formats.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -706,6 +744,15 @@ pub enum ApiFormat {
     AnthropicMessages,
     Gemini,
     Ollama,
+    /// rsclaw stateful incremental session protocol (kvCacheMode=2).
+    /// Provider sends `POST /sessions` / `POST /sessions/<id>/turn` /
+    /// `POST /sessions/replay`. The runtime auto-forces kv_cache_mode=2
+    /// when the resolved provider is `rsclaw`, so model entries don't
+    /// need their own `kvCacheMode` field. Set on a `models.providers.*`
+    /// entry whose `baseUrl` points at either `rsclaw-server` (e.g.
+    /// `https://api.rsclaw.ai/v1/agent`) or a self-hosted rsclaw-llm
+    /// worker (e.g. `http://localhost:9999`).
+    Rsclaw,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1479,6 +1526,11 @@ pub struct WebBrowserConfig {
 #[serde(rename_all = "camelCase")]
 pub struct ComputerUseConfig {
     pub enabled: Option<bool>,
+    /// Bypass the permission gate — every action auto-approved. Defaults
+    /// to `false`. Used by power users / CI runs. `RedbPermissionStore`
+    /// also exposes a runtime toggle (`set_bypass_all`) for the settings
+    /// UI; this field is the value applied at gateway startup.
+    pub bypass_all: Option<bool>,
     // Note: `ui_analyze_*` fields were removed when the standalone
     // ui_analyze tool was deleted. The new VlmDriver consumes the
     // screenshot directly via the configured vision model — no

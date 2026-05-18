@@ -60,6 +60,7 @@ pub async fn run_sequential(
             files: vec![],
             pending_analysis: None,
             needs_outer_done_emit: false,
+            outcome: crate::agent::registry::ReplyOutcome::Ok,
         });
     }
 
@@ -80,6 +81,7 @@ pub async fn run_sequential(
         files: vec![],
         pending_analysis: None,
         needs_outer_done_emit: false,
+        outcome: crate::agent::registry::ReplyOutcome::Ok,
     })
 }
 
@@ -218,6 +220,11 @@ pub(crate) async fn invoke_agent(
             peer_id: peer_id.to_owned(),
             chat_id: String::new(),
             reply_tx,
+            task_id: None,
+            context_id: None,
+            event_tx: None,
+            cancel_token: None,
+            input_request_tx: None,
             extra_tools: vec![],
             images: vec![],
             files: vec![],
@@ -285,6 +292,8 @@ mod tests {
                 bind_address: None,
                 reload: ReloadMode::Hybrid,
                 auth_token: None,
+            a2a_bearer_tokens: vec![],
+            a2a_api_keys: vec![],
                 allow_tailscale: false,
                 channel_health_check_minutes: 5,
                 channel_stale_event_threshold_minutes: 30,
@@ -298,7 +307,7 @@ mod tests {
                 defaults: Default::default(),
                 list: agents,
                 bindings: vec![],
-                external: vec![],
+                a2a: vec![],
             },
             channel: ChannelRuntime {
                 channels: Default::default(),

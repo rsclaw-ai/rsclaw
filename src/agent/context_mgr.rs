@@ -5,8 +5,8 @@
 use crate::{
     config::schema::ContextPruningConfig,
     provider::{
-        failover::FailoverManager, registry::ProviderRegistry, ContentPart, LlmRequest, Message,
-        MessageContent, Role, StreamEvent, ToolDef,
+        failover::FailoverManager, registry::ProviderRegistry, AgentEndpoint, ContentPart,
+        LlmRequest, Message, MessageContent, Role, StreamEvent, ToolDef,
     },
 };
 use futures::StreamExt as _;
@@ -657,7 +657,8 @@ pub(crate) async fn extract_entities_via_llm(
         max_tokens: Some(512),
         temperature: Some(0.0),
         frequency_penalty: None,
-        thinking_budget: None, kv_cache_mode: 0, session_key: None,
+        thinking_budget: None, endpoint: AgentEndpoint::Flash, kv_cache_mode: 0, session_key: None,
+        system_shared: None, user_system: None,
     };
 
     let mut stream = match failover.call(req, providers).await {
@@ -809,7 +810,8 @@ pub(crate) async fn describe_image_via_llm(
         max_tokens: Some(300),
         temperature: Some(0.0),
         frequency_penalty: None,
-        thinking_budget: None, kv_cache_mode: 0, session_key: None,
+        thinking_budget: None, endpoint: AgentEndpoint::Vision, kv_cache_mode: 0, session_key: None,
+        system_shared: None, user_system: None,
     };
 
     let mut stream = match failover.call(req, providers).await {

@@ -144,7 +144,7 @@ fn parse_file(path: &Path) -> Result<Option<AppRule>> {
     for t in fm_triggers {
         push_unique(t, &mut triggers);
     }
-    for alias in canonical_aliases(&name).into_iter().chain(canonical_aliases(&stem)) {
+    for alias in canonical_aliases(&name).iter().chain(canonical_aliases(&stem)) {
         push_unique(alias.to_string(), &mut triggers);
     }
 

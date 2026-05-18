@@ -1,20 +1,22 @@
 //! Format-tolerant VLM response parser.
 //!
-//! Accepts the four common coordinate formats emitted by GUI VLMs:
+//! Accepts the five common coordinate formats emitted by GUI VLMs:
 //!
-//!   1. `<|box_start|>(x, y)<|box_end|>`  (UI-TARS native, single point)
-//!   2. `<point>x y</point>`              (Doubao, space-separated point)
-//!   3. `(x, y)`                          (plain parenthesised tuple)
-//!   4. `[x1, y1, x2, y2]`                (UI-TARS-desktop bbox; we collapse
-//!                                          to the centre point)
+//!   1. `<box>x1,y1,x2,y2</box>`          (portable bbox; recommended default)
+//!   2. `<|box_start|>(x, y)<|box_end|>`  (UI-TARS native, single point)
+//!   3. `<point>x y</point>`              (Doubao, space-separated point)
+//!   4. `(x, y)`                          (plain parenthesised tuple)
+//!   5. `[x1, y1, x2, y2]` — UI-TARS-desktop bbox; the parser collapses to
+//!      the centre point so downstream actions stay scalar.
 //!
 //! And the action types: click / left_double / right_single / drag /
 //! hotkey / type / scroll / wait / finished / call_user / ... .
 //!
 //! In `Auto` mode the parser tries the formats in this priority order:
-//! `BoxQuad` → `UiTarsBoxPair` → `DoubaoPoint` → `PlainTuple`. `BoxQuad`
-//! goes first because it is the default emitted by UI-TARS-desktop and
-//! the most distinctive (square brackets + 4 numbers).
+//! `BoxTag` → `BoxQuad` → `UiTarsBoxPair` → `DoubaoPoint` → `PlainTuple`.
+//! `BoxTag` goes first because `<box>...</box>` is the most distinctive
+//! delimiter (no tokenizer dependency, unambiguous boundaries) and the
+//! recommended format for new prompts.
 //!
 //! Returns a `Vec<ParsedAction>` — drivers handle coordinate scaling via
 //! `ExecCtx.factors`. The parser keeps the model-emitted numbers
@@ -28,6 +30,7 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoordFormat {
     Auto,
+    BoxTag,
     UiTarsBoxPair,
     DoubaoPoint,
     PlainTuple,
@@ -347,23 +350,44 @@ fn strip_outer_quotes(s: &str) -> String {
 /// Parse a box/point value into a model-space `(x, y)` pair.
 ///
 /// In `Auto` mode the formats are tried in priority order:
-///   1. `BoxQuad`       — `[x1, y1, x2, y2]` (collapsed to centre)
-///   2. `UiTarsBoxPair` — `<|box_start|>(x, y)<|box_end|>`
-///   3. `DoubaoPoint`   — `<point>x y</point>`
-///   4. `PlainTuple`    — `(x, y)`
+///   1. `BoxTag`        — `<box>x1,y1,x2,y2</box>` (collapsed to centre)
+///   2. `BoxQuad`       — `[x1, y1, x2, y2]` (collapsed to centre)
+///   3. `UiTarsBoxPair` — `<|box_start|>(x, y)<|box_end|>`
+///   4. `DoubaoPoint`   — `<point>x y</point>`
+///   5. `PlainTuple`    — `(x, y)`
 ///
 /// Returns `None` if no format matches.
 fn parse_coord(value: &str, hint: CoordFormat) -> Option<(f32, f32)> {
     let v = value.trim();
     match hint {
+        CoordFormat::BoxTag => parse_box_tag(v),
         CoordFormat::BoxQuad => parse_box_quad(v),
         CoordFormat::UiTarsBoxPair => parse_ui_tars_box_pair(v),
         CoordFormat::DoubaoPoint => parse_doubao_point(v),
         CoordFormat::PlainTuple => parse_plain_tuple(v),
-        CoordFormat::Auto => parse_box_quad(v)
+        CoordFormat::Auto => parse_box_tag(v)
+            .or_else(|| parse_box_quad(v))
             .or_else(|| parse_ui_tars_box_pair(v))
             .or_else(|| parse_doubao_point(v))
             .or_else(|| parse_plain_tuple(v)),
+    }
+}
+
+/// `<box>x1,y1,x2,y2</box>` → centre `((x1+x2)/2, (y1+y2)/2)`. Also
+/// accepts the 2-tuple `<box>x,y</box>` (returns the point as-is).
+/// Tokenizer-independent — works on any VLM that can emit text.
+fn parse_box_tag(v: &str) -> Option<(f32, f32)> {
+    let start = v.find("<box>")?;
+    let end = v.find("</box>")?;
+    if end <= start {
+        return None;
+    }
+    let inner = v[start + "<box>".len()..end].trim();
+    let nums = parse_numeric_tuple(inner, &[','])?;
+    match nums.len() {
+        2 => Some((nums[0], nums[1])),
+        4 => Some(((nums[0] + nums[2]) / 2.0, (nums[1] + nums[3]) / 2.0)),
+        _ => None,
     }
 }
 
@@ -493,6 +517,21 @@ mod tests {
     #[test]
     fn plain_tuple() {
         let text = "Thought: click\nAction: click(start_box='(133, 487)')";
+        let a = one(text);
+        assert_eq!(a.start, Some((133.0, 487.0)));
+    }
+
+    #[test]
+    fn box_tag_centre() {
+        let text = "Thought: click\nAction: click(start_box='<box>133,487,156,510</box>')";
+        let a = one(text);
+        assert_eq!(a.action_type, "click");
+        assert_eq!(a.start, Some((144.5, 498.5)));
+    }
+
+    #[test]
+    fn box_tag_point() {
+        let text = "Thought: click\nAction: click(start_box='<box>133,487</box>')";
         let a = one(text);
         assert_eq!(a.start, Some((133.0, 487.0)));
     }

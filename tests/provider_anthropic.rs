@@ -23,14 +23,8 @@ fn simple_request(model: &str) -> LlmRequest {
             role: Role::User,
             content: MessageContent::Text("hello".to_owned()),
         }],
-        tools: vec![],
-        system: None,
         max_tokens: Some(1024),
-        temperature: None,
-        frequency_penalty: None,
-        thinking_budget: None,
-        kv_cache_mode: 0,
-        session_key: None,
+        ..Default::default()
     }
 }
 
@@ -269,8 +263,11 @@ async fn request_body_maps_messages() {
         temperature: Some(0.3),
         frequency_penalty: None,
         thinking_budget: None,
+        endpoint: Default::default(),
         kv_cache_mode: 0,
         session_key: None,
+        system_shared: None,
+        user_system: None,
     };
 
     let provider = AnthropicProvider::with_base_url("key", server.uri());

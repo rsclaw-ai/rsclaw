@@ -467,8 +467,11 @@ pub fn upload_subdir(mime_type: &str, filename: &str) -> &'static str {
     }
 }
 
-/// Single-letter prefix for the upload filename.
-fn upload_prefix(mime_type: &str, filename: &str) -> char {
+/// Single-letter kind for a (mime, filename) pair: `i`/`v`/`a`/`d`/`f`.
+/// Shared by `upload_filename` (user uploads, `up_` prefix), the
+/// `a2a` ingest path (`a2a_` prefix), and the plugin/agent download
+/// path (`dl_` prefix) so all three naming schemes agree on category.
+pub fn kind_for_mime(mime_type: &str, filename: &str) -> char {
     if is_video_attachment(mime_type, filename) {
         'v'
     } else if is_audio_attachment(mime_type, filename) {
@@ -482,17 +485,19 @@ fn upload_prefix(mime_type: &str, filename: &str) -> char {
     }
 }
 
-/// Generate a standardized upload filename.
+/// Generic canonical filename factory used by every provenance bucket.
 ///
-/// Format: `up_{kind}_{YYYYMMDDHHmm}{abc}.{ext}`
-/// - kind: i/v/a/d/f (image / video / audio / doc / file)
-/// - timestamp: 12 digits (4-digit year)
-/// - abc: 3 random lowercase letters (~17 576 combinations — well under
-///   the birthday-collision threshold for any realistic per-minute rate)
+/// Format: `{prefix}_{kind}_{YYYYMMDDHHmm}{abc}.{ext}`
+/// where `prefix` is one of:
+///   `up`  — user upload via a messaging channel
+///   `dl`  — generated/downloaded by a plugin or agent tool
+///   `a2a` — received from an A2A peer over the protocol
 ///
-/// Example: `up_i_202604271325abc.png`, `up_v_202604271325xkr.mp4`
-pub fn upload_filename(mime_type: &str, original_filename: &str) -> String {
-    let kind = upload_prefix(mime_type, original_filename);
+/// `kind` is `i`/`v`/`a`/`d`/`f` per `kind_for_mime`. `abc` is 3 random
+/// lowercase letters (~17 576 combinations — well under the
+/// birthday-collision threshold for any realistic per-minute rate).
+pub fn canonical_filename(prefix: &str, mime_type: &str, original_filename: &str) -> String {
+    let kind = kind_for_mime(mime_type, original_filename);
     let ts = canonical_timestamp();
     let abc = random_suffix3();
     let ext = std::path::Path::new(original_filename)
@@ -505,7 +510,14 @@ pub fn upload_filename(mime_type: &str, original_filename: &str) -> String {
             'd' => "pdf",
             _ => "bin",
         });
-    format!("up_{kind}_{ts}{abc}.{ext}")
+    format!("{prefix}_{kind}_{ts}{abc}.{ext}")
+}
+
+/// User-upload filename (prefix `up_`). Thin wrapper kept for back-compat
+/// with the existing channel-side call sites; new code should call
+/// `canonical_filename` directly with an explicit prefix.
+pub fn upload_filename(mime_type: &str, original_filename: &str) -> String {
+    canonical_filename("up", mime_type, original_filename)
 }
 
 /// Map a file extension to the single-letter kind used in canonical
@@ -571,6 +583,7 @@ pub struct ResolvedRefs {
 /// load them as vision attachments.
 pub fn resolve_file_refs(text: &str, workspace: &std::path::Path) -> ResolvedRefs {
     let uploads = workspace.join("uploads");
+    let a2a_root = workspace.join("a2a");
     let downloads_root = dirs_next::download_dir()
         .unwrap_or_else(|| {
             dirs_next::home_dir()
@@ -579,7 +592,11 @@ pub fn resolve_file_refs(text: &str, workspace: &std::path::Path) -> ResolvedRef
         })
         .join("rsclaw");
 
-    let re = regex::Regex::new(r"@(up|dl)_([ivdaf])_([a-z0-9_]+)\.(\w+)")
+    // Three provenance buckets: up/ (channel uploads), dl/ (plugin or agent
+    // downloads), a2a/ (received from A2A peers). Filenames share the
+    // `<prefix>_<kind>_<ts><suffix>.<ext>` shape; the prefix decides which
+    // bucket the file lives under.
+    let re = regex::Regex::new(r"@(up|dl|a2a)_([ivdaf])_([a-z0-9_]+)\.(\w+)")
         .expect("valid regex");
 
     let mut resolved = Vec::new();
@@ -591,6 +608,7 @@ pub fn resolve_file_refs(text: &str, workspace: &std::path::Path) -> ResolvedRef
         let subdir = category_for_kind(kind);
         let path = match source {
             "dl" => downloads_root.join(subdir).join(full_name),
+            "a2a" => a2a_root.join(subdir).join(full_name),
             _ => uploads.join(subdir).join(full_name),
         };
         if path.exists() {
@@ -647,6 +665,15 @@ impl ChannelManager {
     }
 
     pub fn register(&mut self, ch: Arc<dyn Channel>) -> Result<()> {
+        let name = ch.name().to_owned();
+        self.register_with_name(name, ch)
+    }
+
+    /// Register a channel under a specific name (defaults to `ch.name()`).
+    /// Used for multi-account channels that need both an account-keyed
+    /// alias (e.g. `"feishu/main"`) and a bare-name fallback so callers
+    /// can route by account when they know it.
+    pub fn register_with_name(&mut self, name: String, ch: Arc<dyn Channel>) -> Result<()> {
         if self.channels.len() >= self.max_concurrent() {
             anyhow::bail!(
                 "channel limit reached ({}) for memory tier {:?}",
@@ -654,7 +681,7 @@ impl ChannelManager {
                 self.tier
             );
         }
-        self.channels.insert(ch.name().to_owned(), ch);
+        self.channels.insert(name, ch);
         Ok(())
     }
 

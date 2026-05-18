@@ -117,7 +117,7 @@ pub enum ScrollDir {
 #[derive(Debug, Clone)]
 pub struct ActionSpec {
     /// LLM-facing signature line, e.g.
-    /// `click(start_box='[x1,y1,x2,y2]')`.
+    /// `click(start_box='<|box_start|>(x1,y1)<|box_end|>')`.
     pub signature: &'static str,
     /// Optional inline annotation, e.g. `# Use \\n at end to submit`.
     pub note: Option<&'static str>,

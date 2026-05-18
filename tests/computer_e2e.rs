@@ -62,13 +62,23 @@ fn prompt_includes_all_sections() {
     assert!(prompt.contains("You are a GUI agent"));
     assert!(prompt.contains("## Output Format"));
     assert!(prompt.contains("## Action Space"));
-    assert!(prompt.contains("click(start_box='[x1,y1,x2,y2]')"));
+    // Action Space samples wrap coordinates in the portable `<box>x,y</box>`
+    // form (R3 review C1). Prior versions used UI-TARS-tokenizer-specific
+    // `<|box_start|>...<|box_end|>` markers — but those force every VLM
+    // to have those special tokens in its vocabulary. The `<box>` form
+    // is plain text any VLM can emit, and the parser (CoordFormat::Auto)
+    // still accepts the legacy UiTarsBoxPair format as a fallback.
+    assert!(prompt.contains("click(start_box='<box>x1,y1</box>')"));
     assert!(prompt.contains("## Note"));
     assert!(prompt.contains("Use Chinese in `Thought` part"));
     assert!(prompt.contains("## Thought Examples"));
     assert!(prompt.contains("RsClaw 测试群"));
     assert!(prompt.contains("## Coordinate Space"));
-    assert!(prompt.contains("2880×1800 physical pixels"));
+    // Coordinate Space switched to a resolution-independent 0-1000
+    // normalized grid; the prompt no longer leaks the host's physical
+    // pixel size since most VLM checkpoints train on the normalized
+    // shape and don't need (or want) the raw screen extent.
+    assert!(prompt.contains("0-1000 normalized grid"));
     assert!(prompt.contains("## Output Examples"));
     assert!(prompt.contains("## User Instruction"));
     assert!(prompt.contains("微信群里看看新消息"));

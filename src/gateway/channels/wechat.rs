@@ -372,7 +372,7 @@ pub(crate) fn start_wechat_personal_if_configured(
                                 peer_id: from_user.clone(),
                                 dm_scope,
                             });
-                            if let Some(mut reply) = try_preparse_locally(&text, &handle, "wechat", &from_user).await {
+                            if let Some(mut reply) = try_preparse_locally(&text, &handle, "wechat", &from_user, crate::gateway::preparse::PreparseOrigin::User).await {
                                 reply.target_id = from_user.clone();
                                 reply.is_group = false;
                                 if !reply.text.is_empty() || !reply.images.is_empty() {
@@ -392,6 +392,11 @@ pub(crate) fn start_wechat_personal_if_configured(
                                 peer_id: from_user.clone(),
                                 chat_id: String::new(),
                                 reply_tx,
+                                task_id: None,
+                                context_id: None,
+                                event_tx: None,
+                                cancel_token: None,
+                                input_request_tx: None,
                                 extra_tools: vec![],
                                 images,
                                 files: file_attachments,

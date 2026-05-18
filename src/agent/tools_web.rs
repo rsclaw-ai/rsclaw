@@ -20,7 +20,7 @@ use super::web_parsers::{
 };
 
 use crate::config::loader::{applicable_site_rules, applicable_site_rules_body};
-use crate::provider::{Message, MessageContent, Role, StreamEvent};
+use crate::provider::{AgentEndpoint, Message, MessageContent, Role, StreamEvent};
 use crate::agent::query_planner::{Intent, QueryPlan};
 
 /// Extract host from a URL without pulling in the `url` crate. Strips the
@@ -460,8 +460,24 @@ impl AgentRuntime {
             let lang = self.config.raw.gateway.as_ref()
                 .and_then(|g| g.language.as_deref())
                 .unwrap_or("");
-            let is_zh = lang.starts_with("zh")
-                || std::env::var("LANG").unwrap_or_default().to_lowercase().contains("zh");
+            // Match the same Chinese-detection rule the DDG-empty
+            // fallback path uses above (line ~423). Previously this
+            // branch was case-sensitive AND only matched the locale
+            // code "zh*", so users who set `gateway.language: "Chinese"`
+            // (the human-readable label that the rest of i18n accepts)
+            // silently routed to `[bing-free, duckduckgo-free]` instead
+            // of the Chinese-friendly pair from
+            // `[bing-free, baidu-free, sogou-free]` — exactly the
+            // wrong cohort for queries originating in Chinese
+            // contexts, and the reason a Mac with DDG CAPTCHA'd kept
+            // returning empty results even when Baidu/Sogou were
+            // perfectly reachable.
+            let is_zh = lang.to_lowercase().starts_with("zh")
+                || lang.to_lowercase().starts_with("chinese")
+                || std::env::var("LANG")
+                    .unwrap_or_default()
+                    .to_lowercase()
+                    .contains("zh");
 
             let pair: [&str; 2] = if is_zh {
                 // Chinese: random 2 from 3 free Chinese-friendly providers
@@ -514,70 +530,20 @@ impl AgentRuntime {
             }
         }
 
-        // --- Auto-fetch relevant results for deeper content ---
-        // Score each result by relevance to the query, only deep-fetch those
-        // that are likely useful.  This avoids wasting time on unrelated pages.
-        let query_terms: Vec<String> = query.to_lowercase()
-            .split_whitespace()
-            .filter(|w| w.len() > 1)
-            .map(String::from)
-            .collect();
-
-        let fetch_urls: Vec<String> = results.iter()
-            .filter(|r| {
-                let title = r["title"].as_str().unwrap_or("").to_lowercase();
-                let snippet = r["snippet"].as_str().unwrap_or("").to_lowercase();
-                let haystack = format!("{title} {snippet}");
-
-                // Count how many query terms appear in title+snippet.
-                let hits = query_terms.iter()
-                    .filter(|t| haystack.contains(t.as_str()))
-                    .count();
-
-                // Require at least half the query terms to match, or always
-                // include the first 2 results as fallback.
-                hits * 2 >= query_terms.len() || hits > 0
-            })
-            .take(5)
-            .filter_map(|r| r["url"].as_str().map(String::from))
-            .collect();
-
-        if !fetch_urls.is_empty() {
-            let fetch_client = reqwest::Client::builder()
-                .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
-                    AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                .timeout(Duration::from_secs(10))
-                .redirect(reqwest::redirect::Policy::limited(5))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new());
-
-            // Fetch all URLs concurrently.
-            let fetches = fetch_urls.iter().map(|url| {
-                let client = fetch_client.clone();
-                let url = url.clone();
-                async move {
-                    let resp = client.get(&url).send().await.ok()?;
-                    let html = resp.text().await.ok()?;
-                    let content_type = "text/html"; // assume HTML
-                    let md = if content_type.contains("text/html") {
-                        html_dehydrate_to_text(&html)
-                    } else {
-                        html
-                    };
-                    // Truncate to 2000 chars.
-                    let truncated = truncate_chars(&md, 2000);
-                    Some((url, truncated))
-                }
-            });
-            let fetched: Vec<Option<(String, String)>> = futures::future::join_all(fetches).await;
-
-            // Attach content to matching results.
-            for (url, content) in fetched.into_iter().flatten() {
-                for r in results.iter_mut() {
-                    if r["url"].as_str() == Some(url.as_str()) {
-                        r["content"] = json!(content);
-                        break;
-                    }
+        // Cap each snippet at 400 chars so a chatty provider can't bloat
+        // the search result blob. Snippets from search engines are normally
+        // 150-300 chars; the 400 cap is a safety net for providers like
+        // Firecrawl whose `description` can run longer. We do NOT auto-fetch
+        // page content here — `web_search` returns snippets only, and the
+        // agent calls `web_fetch` on URLs it wants to read. This keeps each
+        // search-result blob ~2 KB instead of the 12-15 KB the previous
+        // parallel auto-fetch pipeline produced (5 results × 2 KB content
+        // each), which routinely evicted the main session's prefix cache
+        // when results were stored verbatim into conversation history.
+        for r in results.iter_mut() {
+            if let Some(s) = r["snippet"].as_str() {
+                if s.chars().count() > 400 {
+                    r["snippet"] = json!(truncate_chars(s, 400));
                 }
             }
         }
@@ -1122,10 +1088,22 @@ impl AgentRuntime {
             }
         };
 
+        // Hard cap on the flash-compression input so a huge page (already
+        // dehydrated by lol-html but still >100K chars) doesn't blow the
+        // flash model's context window or balloon per-call cost. Matches
+        // the cap used by compress_tool_result_for_session.
+        // 40K chars ≈ 10K tokens (ASCII) / ~27K tokens (CJK).
+        const FLASH_INPUT_CAP_CHARS: usize = 40_000;
+        let content_capped: String = if content.chars().count() > FLASH_INPUT_CAP_CHARS {
+            content.chars().take(FLASH_INPUT_CAP_CHARS).collect()
+        } else {
+            content.to_owned()
+        };
+
         let messages = vec![Message {
             role: Role::User,
             content: MessageContent::Text(format!(
-                "Web page content:\n---\n{content}\n---\n\n{prompt}\n\n\
+                "Web page content:\n---\n{content_capped}\n---\n\n{prompt}\n\n\
                  Provide a concise response based on the content above."
             )),
         }];
@@ -1138,7 +1116,8 @@ impl AgentRuntime {
             max_tokens: Some(2000),
             temperature: None,
             frequency_penalty: None,
-            thinking_budget: None, kv_cache_mode: 0, session_key: None,
+            thinking_budget: None, endpoint: AgentEndpoint::Flash, kv_cache_mode: 0, session_key: None,
+            system_shared: None, user_system: None,
         };
 
         match provider.stream(req).await {
@@ -1866,7 +1845,23 @@ impl AgentRuntime {
 // -----------------------------------------------------------------------------
 
 async fn fetch_weather(client: &reqwest::Client, location: &str) -> (&'static str, Value) {
-    let url = format!("https://wttr.in/{}?format=j1", urlencoding::encode(location));
+    // Try the authoritative CN national weather service first — it gives a
+    // 15-day precise forecast plus a 40-day projection in one JSON-ish
+    // payload, with humidity, precipitation, wind, comfort indices, and
+    // 农历/节气 metadata that wttr.in/Open-Meteo lack. The endpoint only
+    // returns useful data for cities whose `cityid` lookup resolves to a
+    // CN province code; foreign cities (Bangkok 106…, Sydney 601…) also
+    // resolve but the calendar endpoint 302s for them — see
+    // `fetch_weather_cn` for the bail logic. On any failure we fall
+    // through to wttr.in, which has been the previous workhorse and
+    // covers international cities.
+    match fetch_weather_cn(client, location).await {
+        Some(cn) => return cn,
+        None => tracing::info!(location, "weather.com.cn path declined, falling back to wttr.in"),
+    }
+
+    let cfg = &super::direct_apis::config().weather.wttr;
+    let url = cfg.url.replace("{location}", &urlencoding::encode(location));
     match client.get(&url).send().await {
         Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
             Ok(j) => {
@@ -1881,6 +1876,206 @@ async fn fetch_weather(client: &reqwest::Client, location: &str) -> (&'static st
         ),
         Err(e) => ("wttr.in", json!({ "error": e.to_string() })),
     }
+}
+
+/// Authoritative-Chinese-weather path.
+///
+/// Resolves `location` to a `cityid` via the national weather service's
+/// search endpoint, then pulls the 40-day calendar projection (which
+/// also contains the 15-day precise forecast) and trims it down to
+/// what an LLM actually needs to answer "未来 X 天天气" questions.
+///
+/// Returns `None` on:
+///   - city search failure (network / parse / 0 matches)
+///   - non-CN cityid (foreign cities resolve but the calendar endpoint
+///     302s for them)
+///   - calendar fetch failure
+///   - JS-wrapped-JSON parse failure
+///
+/// Caller (`fetch_weather`) falls through to wttr.in on `None`.
+async fn fetch_weather_cn(
+    client: &reqwest::Client,
+    location: &str,
+) -> Option<(&'static str, Value)> {
+    let cfg = &super::direct_apis::config().weather.weather_cn;
+
+    let cityid = match lookup_cn_city_id(client, &cfg.city_search_url, location).await {
+        Some(id) => id,
+        None => {
+            tracing::warn!(location, "weather.com.cn: city lookup returned no match");
+            return None;
+        }
+    };
+    tracing::info!(location, cityid, "weather.com.cn: resolved cityid");
+    // Foreign cityids resolve via search (Bangkok 106…, Sydney 601…) but
+    // the calendar endpoint 302s for them — bail early so the caller
+    // can fall through to wttr.in. The CN prefix lives in
+    // `defaults.toml` (`direct_apis.weather.weather_cn.cityid_prefix`)
+    // for cases where the upstream renumbers in the future.
+    if !cityid.starts_with(&cfg.cityid_prefix) {
+        tracing::info!(location, cityid, "weather.com.cn: non-CN cityid, bailing");
+        return None;
+    }
+
+    use chrono::Datelike;
+    let now = chrono::Local::now();
+    let year = now.year();
+    let yyyymm = format!("{:04}{:02}", year, now.month());
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let url = cfg
+        .calendar_url
+        .replace("{year}", &year.to_string())
+        .replace("{cityid}", &cityid)
+        .replace("{yyyymm}", &yyyymm)
+        .replace("{now_ms}", &now_ms.to_string());
+
+    let resp = client
+        .get(&url)
+        .header("Referer", &cfg.referer)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        tracing::warn!(cityid, status = %resp.status(), "weather.com.cn: calendar fetch non-200");
+        return None;
+    }
+    let body = resp.text().await.ok()?;
+    tracing::info!(cityid, body_len = body.len(), "weather.com.cn: calendar body received");
+
+    // The payload is a JS assignment, not raw JSON: `var fc40 = [...];`
+    // The variable name is config-driven (currently "fc40") so an
+    // upstream rename only needs a `defaults.toml` tweak.
+    let trimmed = body.trim_start();
+    let prefix_with_space = format!("var {} = ", cfg.js_var_name);
+    let prefix_no_space = format!("var {}=", cfg.js_var_name);
+    let after_prefix = trimmed
+        .strip_prefix(prefix_with_space.as_str())
+        .or_else(|| trimmed.strip_prefix(prefix_no_space.as_str()));
+    let after_prefix = match after_prefix {
+        Some(s) => s,
+        None => {
+            tracing::warn!(
+                expected_var = %cfg.js_var_name,
+                head = %&body[..body.len().min(80)],
+                "weather.com.cn: body doesn't start with expected JS var assignment"
+            );
+            return None;
+        }
+    };
+    let json_text = after_prefix.trim_end().trim_end_matches(';');
+    let arr: Value = match serde_json::from_str(json_text) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "weather.com.cn: JSON parse failed");
+            return None;
+        }
+    };
+
+    let summary = summarize_cn_weather(&arr, 15);
+    Some((
+        "weather.com.cn",
+        json!({ "location": location, "cityid": cityid, "summary": summary }),
+    ))
+}
+
+/// Resolve a city name → 10-digit cityid via the configured
+/// `weather.com.cn` search endpoint. First match wins; subsequent
+/// matches are usually districts of the same city (e.g. 北京 → main
+/// 101010100, 海淀 101010200, …).
+///
+/// The endpoint only matches against the Chinese name field
+/// ("Beijing" returns `()`, "北京" returns hits), so this relies on
+/// `query_planner` preserving the user's original-language input —
+/// see the planner prompt's "preserve original" rule. An earlier
+/// EN→ZH alias map lived here as a band-aid; deleted once the
+/// planner stopped normalising to English.
+///
+/// Response is JSONP-flavored, wrapped in `(…)`:
+///   ([{"ref":"101010100~beijing~北京~Beijing~北京~Beijing~10~100000~BJ~北京"}, …])
+async fn lookup_cn_city_id(
+    client: &reqwest::Client,
+    search_url_tmpl: &str,
+    name: &str,
+) -> Option<String> {
+    let url = search_url_tmpl.replace("{name}", &urlencoding::encode(name));
+    let body = client
+        .get(&url)
+        .header("Referer", "https://www.weather.com.cn/")
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    // Strip the JSONP-style `(` and `)` wrapping that the search service
+    // emits even though no callback is registered.
+    let stripped = body.trim();
+    let inner = stripped
+        .strip_prefix('(')
+        .unwrap_or(stripped)
+        .strip_suffix(')')
+        .unwrap_or(stripped);
+    let arr: Value = serde_json::from_str(inner).ok()?;
+    let first = arr.as_array()?.first()?;
+    let r = first.get("ref")?.as_str()?;
+    // `ref` is tilde-delimited; the cityid is the very first segment.
+    r.split('~').next().map(str::to_owned)
+}
+
+/// Trim the 40-day fc40 array down to (at most) `max_days` future entries
+/// starting from today's `obs`/`d15`/`d40` rows, dropping the leading
+/// `history` rows that the service emits for chart continuity.
+///
+/// Output fields are chosen for LLM consumption: date / max-min temps /
+/// weather text / wind / rain / humidity / 农历 / 节气 / comfort hints.
+fn summarize_cn_weather(arr: &Value, max_days: usize) -> Value {
+    let entries: Vec<Value> = arr
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|e| {
+                    // Drop `history` rows (past-day historical averages); keep
+                    // `obs` (today as observed), `d15` (precise forecast),
+                    // `d40` and `d40 pre/next` (longer projection).
+                    matches!(
+                        e.get("cla").and_then(Value::as_str),
+                        Some(c) if !c.starts_with("history")
+                    )
+                })
+                .take(max_days)
+                .map(|e| {
+                    let get = |k: &str| {
+                        e.get(k).and_then(Value::as_str).unwrap_or("").to_owned()
+                    };
+                    json!({
+                        "date":   get("date"),       // YYYYMMDD
+                        "weekday": get("wk"),         // 一/二/三 ...
+                        "max":    get("max"),         // forecast max ℃
+                        "min":    get("min"),         // forecast min ℃
+                        "weather": get("w1"),         // 晴/雨/阴...
+                        "wind":   get("wd1"),         // 东北风3-4级
+                        "rainProb": get("hgl"),       // 27%
+                        "rain":   get("rain1"),       // mm
+                        "humidityMax": get("rhmax"),
+                        "humidityMin": get("rhmin"),
+                        "lunar":  get("nl"),          // 廿九
+                        "lunarMonth": get("nlyf"),    // 三月
+                        "solarTerm": get("jq"),       // 立夏
+                        "holiday": get("yl"),         // 劳动节
+                        "tier":   get("cla"),         // obs / d15 / d40
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({
+        "source": "中央气象台 (中国天气网)",
+        "days": entries.len(),
+        "forecast": entries,
+    })
 }
 
 /// Extract the 7-day summary most useful for an LLM answer. Keeps payload

@@ -574,6 +574,91 @@ fn get_version() -> Result<String, String> {
     run_rsclaw_command(&["--version"])
 }
 
+/// HTML payload for the full-screen glow overlay. Inline so we don't
+/// need a separate static file or Next.js route — the overlay is a
+/// trivial CSS-animation page that doesn't share anything with the
+/// main UI bundle.
+const GLOW_OVERLAY_HTML: &str = r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>RsClaw Activity</title><style>
+html,body{margin:0;padding:0;width:100vw;height:100vh;background:transparent;overflow:hidden;pointer-events:none;-webkit-user-select:none;user-select:none}
+.glow{position:fixed;inset:0;pointer-events:none;background:radial-gradient(ellipse at center, transparent 55%, rgba(255,165,0,0) 65%, rgba(255,140,0,0.18) 80%, rgba(255,100,0,0.42) 100%);box-shadow:inset 0 0 200px 60px rgba(255,140,0,0.5),inset 0 0 80px 25px rgba(255,165,0,0.7);animation:pulse 2.4s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:0.65}50%{opacity:1}}
+</style></head><body><div class="glow"></div></body></html>"#;
+
+/// Open a borderless transparent click-through window covering the
+/// primary monitor with a pulsing orange glow on the edges. Used by
+/// the `computer_use` overlay so the user gets a screen-wide visual
+/// signal that an agent is driving the desktop, not just a glow on
+/// the (now-shrunken) main window. Idempotent: re-invoking when the
+/// window already exists is a no-op.
+#[tauri::command]
+async fn open_glow_overlay(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::{LogicalPosition, LogicalSize, WebviewUrl, WebviewWindowBuilder};
+
+    if app.get_webview_window("computer-use-glow").is_some() {
+        return Ok(());
+    }
+
+    let monitor = app
+        .primary_monitor()
+        .map_err(|e| format!("primary_monitor: {e}"))?
+        .ok_or_else(|| "no primary monitor".to_string())?;
+    let scale = monitor.scale_factor();
+    let size = monitor.size();
+    let pos = monitor.position();
+    let logical_w = size.width as f64 / scale;
+    let logical_h = size.height as f64 / scale;
+    let logical_x = pos.x as f64 / scale;
+    let logical_y = pos.y as f64 / scale;
+
+    use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+    let encoded = utf8_percent_encode(GLOW_OVERLAY_HTML, NON_ALPHANUMERIC).to_string();
+    let html_url = format!("data:text/html;charset=utf-8,{encoded}");
+    let parsed_url: url::Url = html_url
+        .parse()
+        .map_err(|e: url::ParseError| format!("parse data url: {e}"))?;
+    let webview_url = WebviewUrl::External(parsed_url);
+
+    let window = WebviewWindowBuilder::new(&app, "computer-use-glow", webview_url)
+        .title("RsClaw Activity Overlay")
+        .decorations(false)
+        .transparent(true)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .resizable(false)
+        .focused(false)
+        .visible(false) // shown after geometry is set so the user doesn't see a flicker
+        .inner_size(logical_w, logical_h)
+        .position(logical_x, logical_y)
+        .build()
+        .map_err(|e| format!("build glow window: {e}"))?;
+
+    // Ignore cursor events so the overlay is fully click-through.
+    window
+        .set_ignore_cursor_events(true)
+        .map_err(|e| format!("set_ignore_cursor_events: {e}"))?;
+    // Resize/reposition once visible to be sure the geometry stuck.
+    window
+        .set_size(LogicalSize::new(logical_w, logical_h))
+        .map_err(|e| format!("set_size: {e}"))?;
+    window
+        .set_position(LogicalPosition::new(logical_x, logical_y))
+        .map_err(|e| format!("set_position: {e}"))?;
+    window.show().map_err(|e| format!("show: {e}"))?;
+    Ok(())
+}
+
+/// Close the full-screen glow overlay window if open. No-op when the
+/// window doesn't exist.
+#[tauri::command]
+async fn close_glow_overlay(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("computer-use-glow") {
+        window
+            .close()
+            .map_err(|e| format!("close glow window: {e}"))?;
+    }
+    Ok(())
+}
+
 /// Scan OpenClaw data and return summary (agents, sessions, jsonl files).
 #[tauri::command]
 fn scan_openclaw(path: String) -> Result<serde_json::Value, String> {
@@ -1457,6 +1542,8 @@ fn main() {
             open_path,
             save_attach_image,
             read_file_as_data_url,
+            open_glow_overlay,
+            close_glow_overlay,
         ])
         .setup(|app| {
             // Seed the bundled BGE embedding model into the standard rsclaw

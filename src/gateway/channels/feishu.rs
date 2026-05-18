@@ -11,13 +11,34 @@ use crate::{
 };
 
 use super::super::preparse::{
-    btw_direct_call, is_fast_preparse, try_preparse_locally,
+    btw_direct_call, is_fast_preparse, try_preparse_locally_with_account,
 };
 use super::default_dm_scope;
 
 // ---------------------------------------------------------------------------
 // Feishu (飞书)
 // ---------------------------------------------------------------------------
+
+/// Pick the Feishu identifier the bot should send replies to.
+///
+/// - Groups address by `chat_id` (`oc_xxx`).
+/// - P2P addresses by `open_id` (`ou_xxx` — the same value the runtime
+///   tracks as `sender_id` on inbound events).
+///
+/// P2P over `chat_id` is technically accepted by the Feishu API but
+/// returns `230002` ("Bot/User can NOT be out of the chat") whenever
+/// the per-user p2p chat session has been GC'd / rebuilt by the
+/// platform — most visibly on delayed proactive pushes (plugin
+/// notifications fired minutes after the user's last message).
+/// `open_id` is identity-keyed and survives p2p session lifecycle
+/// changes, so it's the safe address for any deferred outbound work.
+fn outbound_addr_for(is_group: bool, chat_id: &str, sender_id: &str) -> String {
+    if is_group {
+        chat_id.to_owned()
+    } else {
+        sender_id.to_owned()
+    }
+}
 
 pub(crate) fn start_feishu_if_configured(
     config: &RuntimeConfig,
@@ -205,6 +226,7 @@ pub(crate) fn start_feishu_if_configured(
                 let tq = Arc::clone(&tq);
                 let w_acct_outer = w_acct_outer.clone();
                 tokio::spawn(async move {
+                    let outbound_target = outbound_addr_for(is_group, &chat_id, &sender_id);
                     // Group policy check.
                     if is_group {
                         match group_policy.as_ref() {
@@ -233,7 +255,7 @@ pub(crate) fn start_feishu_if_configured(
                             PolicyResult::SendPairingCode(code) => {
                                 if let Err(e) = tx
                                     .send(OutboundMessage {
-                                        target_id: chat_id.clone(),
+                                        target_id: outbound_target.clone(),
                                         is_group: false,
                                         text: crate::i18n::t_fmt(
                                             "pairing_required",
@@ -255,7 +277,7 @@ pub(crate) fn start_feishu_if_configured(
                             PolicyResult::PairingQueueFull => {
                                 if let Err(e) = tx
                                     .send(OutboundMessage {
-                                        target_id: chat_id.clone(),
+                                        target_id: outbound_target.clone(),
                                         is_group: false,
                                         text: crate::i18n::t(
                                             "pairing_queue_full",
@@ -292,8 +314,8 @@ pub(crate) fn start_feishu_if_configured(
                                 Err(_) => return,
                             }
                         };
-                        if let Some(mut reply) = try_preparse_locally(&text, &handle, "feishu", &sender_id).await {
-                            reply.target_id = chat_id.clone();
+                        if let Some(mut reply) = try_preparse_locally_with_account(&text, &handle, "feishu", &sender_id, Some(&w_acct_outer), crate::gateway::preparse::PreparseOrigin::User).await {
+                            reply.target_id = outbound_target.clone();
                             reply.is_group = is_group;
                             if !reply.text.is_empty() || !reply.images.is_empty() {
                                 if let Err(e) = tx.send(reply).await {
@@ -374,12 +396,22 @@ pub(crate) fn start_feishu_if_configured(
                                     // `account` carries the originating Feishu app name so the
                                     // task worker can route the reply via the same app's API
                                     // token (multi-account routing fix for 230002).
+                                    //
+                                    // `outbound_addr_for` resolves the
+                                    // identity-keyed outbound target (groups
+                                    // → chat_id, p2p → open_id/sender_id).
+                                    // `chat_id` and `sender_id` here are the
+                                    // per-message values flowing through the
+                                    // worker channel — the outer-scope
+                                    // `outbound_target` is owned by a
+                                    // different spawn and isn't visible from
+                                    // inside this worker, so we recompute.
                                     let qmsg = crate::gateway::task_queue::QueuedMessage {
                                         text,
                                         sender: sender_id.clone(),
                                         channel: "feishu".to_string(),
                                         account: Some(w_acct.clone()),
-                                        chat_id: chat_id.clone(),
+                                        chat_id: outbound_addr_for(is_group, &chat_id, &sender_id),
                                         is_group,
                                         reply_to: None,
                                         timestamp: chrono::Utc::now().timestamp(),
@@ -405,7 +437,7 @@ pub(crate) fn start_feishu_if_configured(
                         let tx = tx.clone();
                         let cfg = cfg.clone();
                         let question = text[5..].to_owned();
-                        let chat_id = chat_id.clone();
+                        let target = outbound_target.clone();
                         tokio::spawn(async move {
                             let handle = match reg.route_account("feishu", None) {
                                 Ok(h) => h,
@@ -421,7 +453,7 @@ pub(crate) fn start_feishu_if_configured(
                             {
                                 if let Err(e) = tx
                                     .send(OutboundMessage {
-                                        target_id: chat_id,
+                                        target_id: target,
                                         is_group: false,
                                         text: format!("[/btw] {}", reply_text),
                                         reply_to: None,
@@ -445,7 +477,9 @@ pub(crate) fn start_feishu_if_configured(
                         let cfg = cfg.clone();
                         let sender_id = sender_id.clone();
                         let chat_id = chat_id.clone();
+                        let outbound_target = outbound_target.clone();
                         let bound = bound.clone();
+                        let w_acct_for_preparse = w_acct_outer.clone();
                         tokio::spawn(async move {
                             let handle = if let Some(ref agent_id) = bound {
                                 match reg.get(agent_id) {
@@ -476,8 +510,8 @@ pub(crate) fn start_feishu_if_configured(
                                 peer_id: sender_id.clone(),
                                 dm_scope,
                             });
-                            if let Some(mut reply) = try_preparse_locally(&text, &handle, "feishu", &sender_id).await {
-                                reply.target_id = chat_id.clone();
+                            if let Some(mut reply) = try_preparse_locally_with_account(&text, &handle, "feishu", &sender_id, Some(&w_acct_for_preparse), crate::gateway::preparse::PreparseOrigin::User).await {
+                                reply.target_id = outbound_target.clone();
                                 reply.is_group = is_group;
                                 if !reply.text.is_empty() || !reply.images.is_empty() {
                                     if let Err(e) = tx.send(reply).await {
@@ -489,14 +523,18 @@ pub(crate) fn start_feishu_if_configured(
                                 return;
                             }
                             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                            let fs_target2 = if is_group { chat_id.clone() } else { chat_id.clone() };
                             let msg = AgentMessage {
                                 session_key,
                                 text,
                                 channel: "feishu".to_string(),
                                 peer_id: sender_id,
-                                chat_id: fs_target2,
+                                chat_id: outbound_target.clone(),
                                 reply_tx,
+                                task_id: None,
+                                context_id: None,
+                                event_tx: None,
+                                cancel_token: None,
+                                input_request_tx: None,
                                 extra_tools: vec![],
                                 images,
                                 files: file_attachments,
@@ -508,7 +546,7 @@ pub(crate) fn start_feishu_if_configured(
                             if let Ok(Ok(r)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
                                 if !r.is_empty {
                                     if let Err(e) = tx.send(OutboundMessage {
-                                        target_id: chat_id,
+                                        target_id: outbound_target,
                                         is_group,
                                         text: r.text,
                                         reply_to: None,
@@ -552,8 +590,27 @@ pub(crate) fn start_feishu_if_configured(
         if feishu_slot.set(Arc::clone(&fs)).is_err() {
             tracing::debug!("slot already set, skipping");
         }
-        if let Err(e) = manager.register(Arc::clone(&fs) as Arc<dyn crate::channel::Channel>) {
-            tracing::warn!("failed to register channel: {e}");
+        // Register under both `feishu/<acct>` (account-keyed; lets /watch
+        // route deliveries back through the SAME app that received the
+        // inbound message — open_ids are per-app, so cross-app routing
+        // gets rejected with 99992361 "open_id cross app") and bare
+        // `feishu` (first-account wins; matches the existing
+        // `_channel_senders` semantic so legacy single-account callers
+        // keep working unchanged).
+        let acct_key = format!("feishu/{}", acct_for_log);
+        if let Err(e) = manager.register_with_name(
+            acct_key.clone(),
+            Arc::clone(&fs) as Arc<dyn crate::channel::Channel>,
+        ) {
+            tracing::warn!("failed to register channel `{acct_key}`: {e}");
+        }
+        if manager.get("feishu").is_none()
+            && let Err(e) = manager.register_with_name(
+                "feishu".to_owned(),
+                Arc::clone(&fs) as Arc<dyn crate::channel::Channel>,
+            )
+        {
+            tracing::warn!("failed to register bare `feishu` channel: {e}");
         }
 
         let fs_send = Arc::clone(&fs);

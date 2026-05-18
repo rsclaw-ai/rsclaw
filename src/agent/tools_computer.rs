@@ -5,31 +5,60 @@
 //! translates between the legacy `serde_json::Value` tool-call schema
 //! and those typed building blocks.
 //!
-//! Action routing
-//! - `screenshot`                     — `tool_screenshot` (kept here so we
-//!                                       preserve the resize / disk-save
-//!                                       contract used by chat history).
-//! - `mouse_*` / `click` / `drag` /
-//!   `scroll` / `type` / `key` /
-//!   `hold_key` / `wait`              — translated to [`Action`] and
-//!                                       executed via [`NativeOperator`].
-//! - `triple_click` /
-//!   `cursor_position` /
-//!   `get_active_window` / `ui_tree`  — kept as inline subprocess helpers
-//!                                       (they're queries, not really
-//!                                       part of the operator action
-//!                                       space).
-//! - `list_app_rules` /
-//!   `get_app_rule`                   — backed by [`AppRuleSet`].
-//! - `ui_tars`                        — end-to-end VLM loop via
-//!                                       [`VlmDriver`]; supports any
-//!                                       vision-capable LLM provider.
+//! Action routing:
+//! - `screenshot` → `tool_screenshot`. Kept here so the resize / disk-save
+//!   contract used by chat history is preserved.
+//! - `mouse_*` / `click` / `drag` / `scroll` / `type` / `key` / `hold_key` /
+//!   `wait` → translated to [`Action`] and executed via [`NativeOperator`].
+//! - `triple_click` / `cursor_position` / `get_active_window` / `ui_tree`
+//!   → inline subprocess helpers; they're queries, not part of the
+//!   operator action space.
+//! - `list_app_rules` / `get_app_rule` → backed by [`AppRuleSet`].
+//! - `vlm_drive` → end-to-end VLM loop via [`VlmDriver`]; supports any
+//!   vision-capable LLM provider.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
+
+/// Hard ceiling on async (background) `vlm_drive` task duration. The sync
+/// path has its own 240s timeout; async tasks were previously unbounded —
+/// a parseable-but-non-terminating model loop could burn hours of GPU
+/// time before max_loop tripped. 1h is generous enough for legitimate
+/// WeChat-group / multi-step automations and short enough to bound cost
+/// on a runaway. R3 review I1.
+const ASYNC_VLM_DRIVE_HARD_TIMEOUT_SECS: u64 = 3600;
+
+/// RAII guard that deregisters a `vlm_drive` run_id from the abort-flag
+/// registry on drop. Replaces the manual `reg.write().await.remove(...)`
+/// call at end-of-task so the dereg runs even if the spawned future
+/// panics partway through `driver.run()` (R3 review I2). Without this,
+/// the registry entry leaks on panic — harmless individually but the
+/// map grows unbounded over time on a long-running gateway.
+struct VlmDriveRunGuard {
+    reg: Option<
+        Arc<tokio::sync::RwLock<std::collections::HashMap<String, Arc<AtomicBool>>>>,
+    >,
+    run_id: String,
+}
+
+impl Drop for VlmDriveRunGuard {
+    fn drop(&mut self) {
+        if let Some(reg) = self.reg.take() {
+            let id = std::mem::take(&mut self.run_id);
+            // Best-effort async cleanup. If the runtime is being torn
+            // down `try_current` returns Err and we silently skip —
+            // fine, the whole map is going away with the runtime.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    reg.write().await.remove(&id);
+                });
+            }
+        }
+    }
+}
 
 use super::platform::{display_logical_scale, jpeg_dimensions, powershell_hidden};
 use crate::computer::{
@@ -40,6 +69,7 @@ use crate::computer::{
     operators::native::NativeOperator,
     parser::CoordFormat,
     permission::{PermissionRequest, RedbPermissionStore},
+    status::ComputerUseStatus,
 };
 
 impl super::runtime::AgentRuntime {
@@ -96,13 +126,13 @@ impl super::runtime::AgentRuntime {
             "get_app_rule" | "get_skill" => get_app_rule(&args),
 
             // ---- End-to-end VLM driver -----------------------------------
-            "ui_tars" => self.tool_ui_tars(ctx, &args).await,
+            "vlm_drive" => self.tool_vlm_drive(ctx, &args).await,
 
             other => Err(anyhow!(
                 "computer_use: unsupported action `{other}` \
                  (supported: screenshot, mouse_move, mouse_click, double_click, triple_click, \
                  right_click, middle_click, drag, scroll, type, key, hold_key, cursor_position, \
-                 get_active_window, ui_tree, list_app_rules, get_app_rule, wait, ui_tars)"
+                 get_active_window, ui_tree, list_app_rules, get_app_rule, wait, vlm_drive)"
             )),
         }
     }
@@ -387,17 +417,17 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
     }
 
     // -----------------------------------------------------------------------
-    // ui_tars — end-to-end VLM loop. Resolves vision model -> provider,
+    // vlm_drive — end-to-end VLM loop. Resolves vision model -> provider,
     // builds VlmDriver, runs the instruction, translates outcome to JSON.
     // -----------------------------------------------------------------------
-    async fn tool_ui_tars(
+    async fn tool_vlm_drive(
         &self,
         ctx: &super::runtime::RunContext,
         args: &Value,
     ) -> Result<Value> {
         let instruction = args["instruction"]
             .as_str()
-            .ok_or_else(|| anyhow!("computer_use ui_tars: `instruction` required"))?;
+            .ok_or_else(|| anyhow!("computer_use vlm_drive: `instruction` required"))?;
         let max_steps = args["max_steps"].as_u64().unwrap_or(30) as usize;
         // Plan B: fire-and-forget mode. Default opt-in via `async: true`
         // (or alias `background: true`). When set, the driver runs in a
@@ -448,19 +478,47 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
             }) as Arc<dyn Fn(PermissionRequest) + Send + Sync>
         });
 
+        // Status events feed the live status panel. Same `None`-as-no-op
+        // pattern as permission_emit.
+        let status_emit: Option<
+            Arc<dyn Fn(ComputerUseStatus) + Send + Sync>,
+        > = self.computer_status_tx.as_ref().map(|tx| {
+            let tx = tx.clone();
+            Arc::new(move |ev: ComputerUseStatus| {
+                let _ = tx.send(ev);
+            }) as Arc<dyn Fn(ComputerUseStatus) + Send + Sync>
+        });
+
         let abort = Arc::new(AtomicBool::new(false));
         let agent_id = self.handle.id.clone();
         let app_label = derive_app_label(instruction);
+        // Run id is `vlm_drive-<uuid>` for both sync and async paths so the
+        // UI status panel can correlate Started → Step* → Finished.
+        let run_id = format!("vlm_drive-{}", uuid::Uuid::new_v4().simple());
+
+        // Register this run's abort flag so the HTTP abort endpoint can
+        // flip it. Cleared in a guard pattern at every driver-exit path
+        // (ok / err / timeout / panic). Outside the gateway
+        // (`computer_runs == None`) this is a no-op.
+        if let Some(reg) = self.computer_runs.as_ref() {
+            reg.write().await.insert(run_id.clone(), Arc::clone(&abort));
+        }
 
         // ---------- ASYNC PATH (fire-and-forget) ----------
         if async_mode {
-            let task_id = format!("ui_tars-{}", uuid::Uuid::new_v4().simple());
+            // Reuse `run_id` as the task id so logs / status events / wake
+            // messages all correlate via a single identifier.
+            let task_id = run_id.clone();
             let instruction_owned = instruction.to_owned();
             let permission_clone = Arc::clone(&permission);
             let provider_clone = Arc::clone(&provider);
             let model_name_clone = model_name.clone();
             let app_rules_clone = app_rules.clone();
             let permission_emit_clone = permission_emit.clone();
+            let status_emit_clone = status_emit.clone();
+            let run_id_clone = run_id.clone();
+            let run_id_for_dereg = run_id.clone();
+            let computer_runs_clone = self.computer_runs.clone();
             let self_handle = Arc::clone(&self.handle);
             let notification_tx = self.notification_tx.clone();
             let session_key = ctx.session_key.clone();
@@ -474,8 +532,16 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                 tracing::info!(
                     task_id = %task_id_for_log,
                     agent = %agent_id,
-                    "ui_tars: detached task started"
+                    "vlm_drive: detached task started"
                 );
+                // Registry dereg via RAII guard so a panic inside the
+                // spawned body still cleans up the abort-flag entry
+                // (R3 review I2). The guard fires on every exit path:
+                // normal return, error return, panic.
+                let _run_guard = VlmDriveRunGuard {
+                    reg: computer_runs_clone.clone(),
+                    run_id: run_id_for_dereg.clone(),
+                };
                 // Build the driver inside the spawned task — NativeOperator
                 // has no state and is cheap to construct; this avoids
                 // Send/Sync complications around borrowing operator/
@@ -487,53 +553,87 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                     model_name: model_name_clone,
                     coord_format: CoordFormat::Auto,
                     max_loop: max_steps,
-                    abort: abort_clone,
+                    abort: Arc::clone(&abort_clone),
                     app_rules: &app_rules_clone,
                     permission: permission_clone,
                     agent_id: agent_id.clone(),
                     app: app_label,
                     permission_emit: permission_emit_clone,
+                    // Gateway-side: a missing emit means the broadcast
+                    // channel is mis-wired, not a deliberate headless
+                    // setup. Deny (don't silently bypass). R3 review I4.
+                    headless_auto_allow: false,
+                    status_emit: status_emit_clone,
+                    run_id: run_id_clone,
                 };
 
-                let outcome = driver.run(&instruction_owned).await
-                    .unwrap_or_else(|e| DriverOutcome::OperatorError {
+                // Hard ceiling on async task duration (R3 review I1).
+                // Previously the sync path enforced 240s but async was
+                // unbounded — a parseable runaway loop could burn the
+                // whole max_steps budget at ~30s/step. On timeout we
+                // flip the abort flag (caught by the driver loop's
+                // per-step check) and surface a clear error.
+                let run_fut = driver.run(&instruction_owned);
+                let outcome = match tokio::time::timeout(
+                    std::time::Duration::from_secs(ASYNC_VLM_DRIVE_HARD_TIMEOUT_SECS),
+                    run_fut,
+                )
+                .await
+                {
+                    Ok(Ok(o)) => o,
+                    Ok(Err(e)) => DriverOutcome::OperatorError {
                         message: format!("driver run failed: {e}"),
                         steps: 0,
-                    });
+                    },
+                    Err(_elapsed) => {
+                        abort_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!(
+                            task_id = %task_id_for_log,
+                            timeout_secs = ASYNC_VLM_DRIVE_HARD_TIMEOUT_SECS,
+                            "async vlm_drive exceeded hard timeout; aborting"
+                        );
+                        DriverOutcome::OperatorError {
+                            message: format!(
+                                "async vlm_drive exceeded the {ASYNC_VLM_DRIVE_HARD_TIMEOUT_SECS}s hard timeout"
+                            ),
+                            steps: 0,
+                        }
+                    }
+                };
 
                 // Build a human-readable result for the wake message.
                 let result_text = match &outcome {
                     DriverOutcome::Finished { content, steps } => {
                         format!(
-                            "[ui_tars task {task_id_for_log} completed in {steps} steps] {content}"
+                            "[vlm_drive task {task_id_for_log} completed in {steps} steps] {content}"
                         )
                     }
                     DriverOutcome::CallUser { reason, steps } => {
                         format!(
-                            "[ui_tars task {task_id_for_log} needs user input after {steps} steps] {reason}"
+                            "[vlm_drive task {task_id_for_log} needs user input after {steps} steps] {reason}"
                         )
                     }
                     DriverOutcome::MaxLoop { steps } => {
                         format!(
-                            "[ui_tars task {task_id_for_log}] hit max_loop ({steps} steps) without finishing — task may be incomplete"
+                            "[vlm_drive task {task_id_for_log}] hit max_loop ({steps} steps) without finishing — task may be incomplete"
                         )
                     }
                     DriverOutcome::UserAbort { steps } => {
-                        format!("[ui_tars task {task_id_for_log}] aborted after {steps} steps")
+                        format!("[vlm_drive task {task_id_for_log}] aborted after {steps} steps")
                     }
                     DriverOutcome::PermissionDenied => {
-                        format!("[ui_tars task {task_id_for_log}] permission denied — user declined")
+                        format!("[vlm_drive task {task_id_for_log}] permission denied — user declined")
                     }
                     DriverOutcome::OperatorError { message, steps } => {
                         format!(
-                            "[ui_tars task {task_id_for_log}] failed after {steps} steps: {message}"
+                            "[vlm_drive task {task_id_for_log}] failed after {steps} steps: {message}"
                         )
                     }
                 };
 
                 tracing::info!(
                     task_id = %task_id_for_log,
-                    "ui_tars: detached task finished, waking parent agent"
+                    "vlm_drive: detached task finished, waking parent agent"
                 );
 
                 // Wake the parent agent: send an internal message so the
@@ -549,6 +649,11 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                     peer_id: peer_id.clone(),
                     chat_id: chat_id.clone(),
                     reply_tx: wake_tx,
+                    task_id: None,
+                    context_id: None,
+                    event_tx: None,
+                    cancel_token: None,
+                    input_request_tx: None,
                     extra_tools: vec![],
                     images: vec![],
                     files: vec![],
@@ -557,7 +662,7 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                 if let Err(e) = self_handle.tx.send(wake_msg).await {
                     tracing::warn!(
                         task_id = %task_id_for_log,
-                        "ui_tars: failed to wake parent agent: {e}"
+                        "vlm_drive: failed to wake parent agent: {e}"
                     );
                     return;
                 }
@@ -596,7 +701,7 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
             });
 
             return Ok(json!({
-                "action":     "ui_tars",
+                "action":     "vlm_drive",
                 "task_id":    task_id,
                 "status":     "started",
                 "instruction": instruction,
@@ -611,6 +716,7 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
         //    or AdbOperator.
         let operator = NativeOperator::new();
 
+        let run_id_for_dereg = run_id.clone();
         let driver = VlmDriver {
             operator: &operator,
             provider,
@@ -623,33 +729,44 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
             agent_id,
             app: app_label,
             permission_emit,
+            // Gateway-side: see async-path comment above. R3 review I4.
+            headless_auto_allow: false,
+            status_emit,
+            run_id,
         };
 
         // Hard timeout safety net. The agent runtime processes one
-        // message at a time per agent; a runaway ui_tars loop here
+        // message at a time per agent; a runaway vlm_drive loop here
         // blocks heartbeats and other channels until it returns. Cap
         // the whole driver run at 4 minutes so the heartbeat (300s
         // timeout) never fires while we're inside.
         // The async path above is the proper fix; this safety net
         // covers the (legacy) sync path.
-        const UI_TARS_HARD_TIMEOUT_SECS: u64 = 240;
-        let outcome = match tokio::time::timeout(
-            std::time::Duration::from_secs(UI_TARS_HARD_TIMEOUT_SECS),
+        const VLM_DRIVE_HARD_TIMEOUT_SECS: u64 = 240;
+        let driver_result = tokio::time::timeout(
+            std::time::Duration::from_secs(VLM_DRIVE_HARD_TIMEOUT_SECS),
             driver.run(instruction),
         )
-        .await
-        {
+        .await;
+        // Driver has exited (or hard-timed out) — drop the abort-flag
+        // registry entry. Done here, before unwrapping the result, so
+        // the entry never outlives the driver regardless of which exit
+        // path fires.
+        if let Some(reg) = self.computer_runs.as_ref() {
+            reg.write().await.remove(&run_id_for_dereg);
+        }
+        let outcome = match driver_result {
             Ok(res) => res?,
             Err(_) => {
                 abort.store(true, std::sync::atomic::Ordering::SeqCst);
                 tracing::warn!(
                     instruction,
-                    timeout_secs = UI_TARS_HARD_TIMEOUT_SECS,
-                    "ui_tars hard timeout exceeded; aborting driver"
+                    timeout_secs = VLM_DRIVE_HARD_TIMEOUT_SECS,
+                    "vlm_drive hard timeout exceeded; aborting driver"
                 );
                 DriverOutcome::OperatorError {
                     message: format!(
-                        "ui_tars exceeded the {UI_TARS_HARD_TIMEOUT_SECS}s hard timeout. \
+                        "vlm_drive exceeded the {VLM_DRIVE_HARD_TIMEOUT_SECS}s hard timeout. \
                          For long-running tasks, pass `async: true` to run \
                          in the background instead."
                     ),
@@ -662,42 +779,42 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
         //    callers (chat history rendering, agent loop) keep working.
         Ok(match outcome {
             DriverOutcome::Finished { content, steps } => json!({
-                "action": "ui_tars",
+                "action": "vlm_drive",
                 "instruction": instruction,
                 "completed": true,
                 "steps_taken": steps,
                 "result": content,
             }),
             DriverOutcome::CallUser { reason, steps } => json!({
-                "action": "ui_tars",
+                "action": "vlm_drive",
                 "instruction": instruction,
                 "completed": false,
                 "steps_taken": steps,
                 "call_user": reason,
             }),
             DriverOutcome::MaxLoop { steps } => json!({
-                "action": "ui_tars",
+                "action": "vlm_drive",
                 "instruction": instruction,
                 "completed": false,
                 "steps_taken": steps,
                 "error": "max_loop reached",
             }),
             DriverOutcome::UserAbort { steps } => json!({
-                "action": "ui_tars",
+                "action": "vlm_drive",
                 "instruction": instruction,
                 "completed": false,
                 "steps_taken": steps,
                 "error": "user aborted",
             }),
             DriverOutcome::PermissionDenied => json!({
-                "action": "ui_tars",
+                "action": "vlm_drive",
                 "instruction": instruction,
                 "completed": false,
                 "steps_taken": 0,
                 "error": "permission denied",
             }),
             DriverOutcome::OperatorError { message, steps } => json!({
-                "action": "ui_tars",
+                "action": "vlm_drive",
                 "instruction": instruction,
                 "completed": false,
                 "steps_taken": steps,
@@ -1125,6 +1242,26 @@ fn get_app_rule(args: &Value) -> Result<Value> {
     let name = args["name"]
         .as_str()
         .ok_or_else(|| anyhow!("get_app_rule: `name` required"))?;
+    // Reject any path-traversal / namespace-busting name. The VLM (or a
+    // prompt-injected page it just read) controls this value, so a bare
+    // `app_rules_dir.join(name)` would happily read arbitrary `.md` on
+    // disk (private notes, work docs, neighbouring app templates) via
+    // `name="../../some/file"`. Constrain to a conservative slug.
+    let valid = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphanumeric() || c == '_')
+            .unwrap_or(false)
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !valid {
+        return Err(anyhow!(
+            "get_app_rule: invalid name '{name}' (must match [A-Za-z0-9_][A-Za-z0-9_-]{{0,63}})"
+        ));
+    }
     let app_rules_dir = crate::config::loader::base_dir()
         .join("tools")
         .join("computer_use")

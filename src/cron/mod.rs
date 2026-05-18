@@ -1705,11 +1705,19 @@ CronPayload::Structured { timeout_seconds, .. } => *timeout_seconds,
             handle.as_ref(),
             preparse_channel,
             preparse_peer,
+            crate::gateway::preparse::PreparseOrigin::Cron,
         )
         .await
         {
             // Clear the abort flag (we never dispatched to the agent).
             abort_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+            // Empty reply text = preparse handled silently (e.g. /watch dedup-hit
+            // triggered by /loop replay). Skip delivery — don't send blank chat
+            // messages or fall through to the agent.
+            if reply.text.is_empty() && reply.images.is_empty() {
+                info!(job_id = %job.id, "cron job handled silently by preparse");
+                return Ok(String::new());
+            }
             info!(
                 job_id = %job.id,
                 len = reply.text.len(),
@@ -1727,6 +1735,11 @@ CronPayload::Structured { timeout_seconds, .. } => *timeout_seconds,
         peer_id: format!("cron:{}", job.id),
         chat_id: String::new(),
         reply_tx,
+        task_id: None,
+        context_id: None,
+        event_tx: None,
+        cancel_token: None,
+        input_request_tx: None,
         extra_tools: vec![],
         images: vec![],
         files: vec![],
@@ -2109,6 +2122,11 @@ async fn run_exec_command(
             peer_id: format!("cron:{}", job.id),
             chat_id: String::new(),
             reply_tx,
+            task_id: None,
+            context_id: None,
+            event_tx: None,
+            cancel_token: None,
+            input_request_tx: None,
             extra_tools: vec![], // No tools - only summarize
             images: vec![],
             files: vec![],

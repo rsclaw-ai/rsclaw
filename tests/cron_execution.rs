@@ -73,6 +73,8 @@ fn runtime_with_agent(agent_id: &str) -> RuntimeConfig {
             bind_address: None,
             reload: ReloadMode::Hybrid,
             auth_token: None,
+            a2a_bearer_tokens: vec![],
+            a2a_api_keys: vec![],
             auth_token_configured: false,
             auth_token_is_plaintext: false,
             allow_tailscale: false,
@@ -105,7 +107,7 @@ fn runtime_with_agent(agent_id: &str) -> RuntimeConfig {
                 temperature: None,
             }],
             bindings: vec![],
-            external: vec![],
+            a2a: vec![],
         },
         channel: ChannelRuntime {
             channels: Default::default(),
@@ -165,6 +167,7 @@ async fn test_cron_job_runs() {
                     files: vec![],
                     pending_analysis: None,
                     needs_outer_done_emit: false,
+                    outcome: rsclaw::agent::registry::ReplyOutcome::Ok,
                 });
             }
         });
@@ -211,6 +214,7 @@ async fn test_cron_enable_disable() {
                     files: vec![],
                     pending_analysis: None,
                     needs_outer_done_emit: false,
+                    outcome: rsclaw::agent::registry::ReplyOutcome::Ok,
                 });
             }
         });

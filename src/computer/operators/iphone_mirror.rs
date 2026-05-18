@@ -64,13 +64,13 @@ impl Operator for IphoneMirrorOperator {
 
     fn action_spaces(&self) -> Vec<ActionSpec> {
         vec![
-            ActionSpec::new("tap(start_box='[x1,y1,x2,y2]')"),
+            ActionSpec::new("tap(start_box='<box>x1,y1</box>')"),
             ActionSpec::with_note(
-                "long_press(start_box='[x1,y1,x2,y2]')",
+                "long_press(start_box='<box>x1,y1</box>')",
                 "# Press and hold ~1s",
             ),
             ActionSpec::new(
-                "swipe(start_box='[x1,y1,x2,y2]', end_box='[x3,y3,x4,y4]')",
+                "swipe(start_box='<box>x1,y1</box>', end_box='<box>x3,y3</box>')",
             ),
             ActionSpec::with_note(
                 "type(content='')",

@@ -300,6 +300,12 @@ main() {
                 macos)    targets+=("${TARGETS_MACOS[@]}") ;;
                 linux)    targets+=("${TARGETS_LINUX[@]}") ;;
                 windows)  targets+=("${TARGETS_WINDOWS[@]}") ;;
+                --release)
+                    # Release is the only mode build_target supports, so the
+                    # flag is purely cosmetic — accept it so muscle-memory
+                    # `./scripts/build.sh --release` matches common cargo
+                    # invocations instead of erroring with "Unknown target".
+                    ;;
                 clean)
                     log "Cleaning dist/ ..."
                     rm -rf "$DIST_DIR"

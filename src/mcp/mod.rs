@@ -304,10 +304,20 @@ impl McpRegistry {
     }
 
     /// Get all tool defs from all registered MCP servers.
+    ///
+    /// Iteration order is canonicalized by MCP server name (the HashMap
+    /// key). Without sorting, `HashMap::values()` returns servers in a
+    /// non-deterministic order which leaks into the rsclaw provider's
+    /// `dynamic_prefix.tools` payload — the worker hashes those bytes
+    /// to form its prefix cache key, so any reordering would force a
+    /// fresh decode on every gateway restart even when the MCP server
+    /// list is logically identical.
     pub async fn all_tool_defs(&self) -> Vec<ToolDef> {
         let clients = self.clients.lock().await;
+        let mut keyed: Vec<(&String, &Arc<McpClient>)> = clients.iter().collect();
+        keyed.sort_by(|a, b| a.0.cmp(b.0));
         let mut defs = Vec::new();
-        for client in clients.values() {
+        for (_, client) in keyed {
             defs.extend(client.as_tool_defs());
         }
         defs

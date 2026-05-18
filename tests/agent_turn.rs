@@ -43,6 +43,8 @@ fn config_with_echo_agent(port: u16) -> RuntimeConfig {
             bind_address: None,
             reload: ReloadMode::Hybrid,
             auth_token: None,
+            a2a_bearer_tokens: vec![],
+            a2a_api_keys: vec![],
             auth_token_configured: false,
             auth_token_is_plaintext: false,
             allow_tailscale: false,
@@ -75,7 +77,7 @@ fn config_with_echo_agent(port: u16) -> RuntimeConfig {
                 temperature: None,
             }],
             bindings: vec![],
-            external: vec![],
+            a2a: vec![],
         },
         channel: ChannelRuntime {
             channels: Default::default(),
@@ -134,10 +136,25 @@ async fn start_echo_server(addr: SocketAddr) {
                     files: vec![],
                     pending_analysis: None,
                     needs_outer_done_emit: false,
+                    outcome: rsclaw::agent::registry::ReplyOutcome::Ok,
                 });
             }
         });
     }
+
+    let computer_permission = Arc::new(
+        rsclaw::computer::permission::RedbPermissionStore::new(
+            Arc::clone(&store.db),
+            false,
+        ),
+    );
+    let (computer_permission_tx, _) =
+        broadcast::channel::<rsclaw::computer::permission::PermissionRequest>(64);
+    let (computer_status_tx, _) =
+        broadcast::channel::<rsclaw::computer::status::ComputerUseStatus>(256);
+    let computer_runs: Arc<
+        tokio::sync::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    > = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
 
     let state = AppState {
         config,
@@ -145,6 +162,10 @@ async fn start_echo_server(addr: SocketAddr) {
         agents: Arc::new(registry),
         store,
         event_bus: event_tx,
+        computer_permission,
+        computer_permission_tx,
+        computer_status_tx,
+        computer_runs,
         devices: Arc::new(rsclaw::ws::DeviceStore::new(std::path::PathBuf::from(
             "/tmp/test-devices.json",
         ))),
@@ -164,6 +185,23 @@ async fn start_echo_server(addr: SocketAddr) {
         restart_request_tx: broadcast::channel(16).0,
         pending_restart: Arc::new(std::sync::RwLock::new(None)),
         shutdown: rsclaw::gateway::ShutdownCoordinator::new(),
+        task_event_bus: rsclaw::a2a::event::TaskEventBus::new(),
+        task_cancels: Arc::new(dashmap::DashMap::new()),
+        suspended_tasks: Arc::new(dashmap::DashMap::new()),
+        task_store: {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let path = tmp.path().join("a2a-tasks.redb");
+            std::mem::forget(tmp);
+            Arc::new(rsclaw::a2a::store::TaskStore::open(&path).expect("a2a store"))
+        },
+        push_dispatcher: {
+            let bus = rsclaw::a2a::event::TaskEventBus::new();
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let path = tmp.path().join("a2a-tasks.redb");
+            std::mem::forget(tmp);
+            let store = Arc::new(rsclaw::a2a::store::TaskStore::open(&path).expect("a2a store"));
+            Arc::new(rsclaw::a2a::push::PushDispatcher::new(store, bus))
+        },
     };
 
     // Leak the tempdir so the store stays valid for the server's lifetime.

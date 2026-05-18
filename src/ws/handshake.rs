@@ -377,10 +377,23 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             session = %event.session_id,
                             done = event.done,
                             delta_len = event.delta.len(),
+                            has_question = event.question.is_some(),
                             "ws auto-relay event"
                         );
                         let seq = relay_conn.write().await.next_seq();
-                        let payload = if event.done {
+                        let payload = if let Some(ref prompt) = event.question {
+                            // ask_user side-channel: structured multi-choice
+                            // question. Capable UIs render native modal /
+                            // buttons; others fall through to the agent's
+                            // text reply that follows.
+                            serde_json::json!({
+                                "runId": format!("auto-{}", event.session_id),
+                                "sessionKey": event.session_id,
+                                "type": "ask_user",
+                                "agentId": event.agent_id,
+                                "prompt": prompt,
+                            })
+                        } else if event.done {
                             serde_json::json!({
                                 "runId": format!("auto-{}", event.session_id),
                                 "sessionKey": event.session_id,
@@ -477,6 +490,40 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 }
             }
             info!(conn = %relay_id, "ws permission-relay exited");
+        });
+    }
+
+    // 8d. computer_use status relay: forward Started/Step/Finished events
+    //     so the live status panel in the settings UI can render the
+    //     ongoing GUI-agent run. Lossy by design — broadcast lag drops
+    //     events; the next Step/Finished resyncs the panel.
+    {
+        let rx = state.computer_status_tx.subscribe();
+        let relay_tx = outbound_tx.clone();
+        let relay_conn = Arc::clone(&conn);
+        let relay_id = conn_id.clone();
+        tokio::spawn(async move {
+            use futures::StreamExt as _;
+            info!(conn = %relay_id, "ws computer-status-relay started");
+            let mut stream = tokio_stream::wrappers::BroadcastStream::new(rx);
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(ev) => {
+                        let seq = relay_conn.write().await.next_seq();
+                        let payload = serde_json::to_value(&ev).unwrap_or(json!({}));
+                        let frame = EventFrame::new("computer_use_status", payload, seq);
+                        let json = serde_json::to_string(&frame).unwrap_or_default();
+                        if relay_tx.send(json).await.is_err() {
+                            info!(conn = %relay_id, "ws computer-status-relay: outbound closed");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(conn = %relay_id, error = %e, "ws computer-status-relay: recv error");
+                    }
+                }
+            }
+            info!(conn = %relay_id, "ws computer-status-relay exited");
         });
     }
 
