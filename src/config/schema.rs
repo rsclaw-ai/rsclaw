@@ -95,6 +95,14 @@ pub struct GatewayConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind_address: Option<String>,
     pub auth: Option<GatewayAuth>,
+    /// A2A endpoint (`/api/v1/a2a`) authentication. When any field here is
+    /// populated, the A2A middleware accepts these credentials. `gateway.auth.token`
+    /// is also accepted as a Bearer when set (single-token convenience).
+    /// Falls back to env vars `RSCLAW_A2A_BEARER_TOKENS` / `RSCLAW_A2A_API_KEYS`
+    /// for back-compat — env-set lists are merged into the accepted set.
+    /// When everything is empty, the middleware passes through (dev mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a2a_auth: Option<GatewayA2aAuth>,
     pub control_ui: Option<ControlUiConfig>,
     pub reload: Option<ReloadMode>,
     pub push: Option<PushConfig>,
@@ -169,6 +177,21 @@ pub struct GatewayAuth {
     pub password: Option<SecretOrString>,
     pub allow_tailscale: Option<bool>,
     pub allow_local: Option<bool>,
+}
+
+/// A2A inbound credentials configured in the gateway block. JSON5 key
+/// `gateway.a2aAuth`. Both fields are optional Vecs of `SecretOrString` so
+/// they support plain strings, `${VAR}` expansion, and `{ source: "env",
+/// id: "..." }` refs.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayA2aAuth {
+    /// Accepted Bearer tokens for `/api/v1/a2a`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<Vec<SecretOrString>>,
+    /// Accepted `X-API-Key` values for `/api/v1/a2a`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_keys: Option<Vec<SecretOrString>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
