@@ -94,6 +94,101 @@
       }
     },
     {
+      "name": "task_finish",
+      "description": "Declare your task complete (or deliberately abandoned) and report a structured outcome to the orchestrator. Call this as your LAST tool of the turn when you believe the work is done — do not emit additional narrative text after it. Failing to call task_finish leaves the orchestrator guessing from your prose and can trigger a spurious auto-continue.\n\nWhen to call:\n- You finished the user's ask                → completion=full,    recommend=ship\n- You did a useful subset, more work obvious → completion=partial, recommend=continue, populate follow_up_tasks\n- You're blocked and need the user           → completion=partial|minimal, recommend=needs_human, populate blocked_on\n- Transient failure, retry might work        → recommend=retry\n- You give up                                → completion=failed,  recommend=abandon, explain in blocked_on\n\nHonesty contract (the orchestrator may verify):\n- verified=true REQUIRES verification_log with actual command + output excerpt.\n\"I read the code and it looks right\" is NOT verification.\n- accomplished entries must map to observable artifacts (file changed, command\nrun, message sent). Vague claims like 'improved the code' are not allowed.\n- Asking the user a clarifying question is NOT completion=full — use\nrecommend=needs_human and put the question in blocked_on.\n- completion=full with empty accomplished is rejected.\n\nThis tool only RECORDS the outcome. Worker dispatch wiring is being built — for now the auto-continue supervisor still falls back to its string classifier if task_finish is omitted, but adopting it now ensures correct routing once wiring lands.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "completion": {
+            "type": "string",
+            "enum": [
+              "full",
+              "partial",
+              "minimal",
+              "failed"
+            ],
+            "description": "How complete the work is. full=everything asked, partial=useful subset, minimal=almost nothing, failed=attempted but nothing landed."
+          },
+          "recommend": {
+            "type": "string",
+            "enum": [
+              "ship",
+              "continue",
+              "needs_human",
+              "retry",
+              "abandon"
+            ],
+            "description": "What the orchestrator should do next. ship=deliver to user; continue=auto-spawn follow_up_tasks; needs_human=surface blocked_on to user; retry=same task fresh attempt; abandon=stop."
+          },
+          "verified": {
+            "type": "boolean",
+            "description": "True only if you actually ran tests/build/lint/curl and saw success. Lying is the worst possible move — orchestrator may verify."
+          },
+          "verification_log": {
+            "type": "string",
+            "description": "REQUIRED when verified=true. Short excerpt of the command + its output (e.g. 'cargo test → 47 passed, 0 failed')."
+          },
+          "accomplished": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Concrete things you did. Each entry should map to an observable artifact, e.g. 'Added enum variant TaskOutcome::Structured in task_queue.rs:64', 'Ran rg \"old_pattern\" — 0 matches confirms rename complete'."
+          },
+          "skipped": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "what": {
+                  "type": "string"
+                },
+                "why": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "what",
+                "why"
+              ]
+            },
+            "description": "Things you deliberately skipped, with reasons. Explicit skips beat silent omissions."
+          },
+          "blocked_on": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Concrete unresolved blockers. When recommend=needs_human, each entry is surfaced verbatim to the user — phrase as questions or precise requests, not vague concerns."
+          },
+          "assumptions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Assumptions you made about ambiguous spec. Non-empty + completion<full triggers orchestrator to confirm with user."
+          },
+          "follow_up_tasks": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Self-contained next-task descriptions (each will be spawned as its own task if recommend=continue). NOT 'TODO comments' — must be actionable."
+          },
+          "summary": {
+            "type": "string",
+            "description": "Optional one-paragraph prose summary for the channel reply."
+          }
+        },
+        "required": [
+          "completion",
+          "recommend"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      }
+    },
+    {
       "name": "read_file",
       "description": "Read a file from the agent workspace.\nPath is relative to workspace root.\nSupports text files, code, config, markdown; .pdf / .docx / .xlsx / .pptx are auto-extracted to plain text.\nExample: {\"path\":\"config.json\"} or {\"path\":\"src/main.py\"}\n\nThe whole file is read at once — there is no offset/limit yet. For very large files (logs, dumps), use `search_content` to grep for the relevant slice and read only the file(s) that match, or read after narrowing with `search_file`.\n\nIf you just edited the file in this turn, you do not need to read it again — the prior `read_file` result still reflects what you wrote. Re-reading on every edit wastes a turn.",
       "input_schema": {
@@ -133,6 +228,91 @@
         "required": [
           "path",
           "content"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      }
+    },
+    {
+      "name": "ask_user",
+      "description": "Pose a structured multi-choice question to the user.\n\nWhen to use:\n- Multiple genuinely-viable approaches and the choice affects later work\n- User's instruction omits a key parameter with no safe default\n- Scope differs by an order of magnitude (small fix vs. big refactor)\n- Aesthetic / preference decisions with no right answer\n\nDo NOT use for:\n- 'Proceed?' / 'OK?' confirmations — just do the work the user asked for\n- Fake-choice asks where one option is obviously right from context\n- More than one ask_user in the same turn (collapse into one multi_select or wait for the user's reply before the next ask)\n\nHow it works (important — this is FIRE-AND-FORGET, not blocking):\n- You call ask_user(question, options).\n- The tool returns a `formatted_text` string. Send EXACTLY that text as your reply to the user, then STOP this turn — do not continue working.\n- The user's answer arrives as a normal message on your next turn. Parse it: the number (\"1\", \"2\"), the option label, or free text (\"other\") are all valid responses.\n\nIf you recommend one option, set `recommended_index` (0-based). The formatter marks it with '(Recommended)' so the user sees your steer.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "question": {
+            "type": "string",
+            "description": "The full question. Be specific — vague questions waste the user's time."
+          },
+          "options": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 8,
+            "items": {
+              "type": "object",
+              "properties": {
+                "label": {
+                  "type": "string",
+                  "description": "Short option text (1-5 words)."
+                },
+                "description": {
+                  "type": "string",
+                  "description": "Optional one-sentence explanation of what choosing this means."
+                }
+              },
+              "required": [
+                "label"
+              ]
+            },
+            "description": "2-8 distinct choices. Always include enough that 'Other' (free-text) isn't needed for the common path."
+          },
+          "multi_select": {
+            "type": "boolean",
+            "description": "If true, user may pick multiple options (comma-separated). Default: false."
+          },
+          "recommended_index": {
+            "type": "integer",
+            "description": "0-based index of the option YOU recommend. The formatter appends '(Recommended)'."
+          },
+          "header": {
+            "type": "string",
+            "description": "Optional short tag (e.g. 'Library', 'Approach') shown before the question."
+          }
+        },
+        "required": [
+          "question",
+          "options"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      }
+    },
+    {
+      "name": "edit_file",
+      "description": "Modify an existing file by exact-string replacement.\n\nPREFER edit_file over write_file for any modification of an existing file — it sends a small diff (old_string → new_string) instead of rewriting the whole file, dramatically cheaper in tokens and far less likely to lose content.\n\nUsage:\n- You must have called read_file on this path in the current session, so you can copy a verbatim substring (including exact whitespace) as old_string.\n- old_string must be UNIQUE in the file. If it appears more than once, either extend old_string with surrounding lines until it's unique, or set replace_all=true to replace every occurrence.\n- old_string must be NON-EMPTY. To create a new file, use write_file.\n- old_string and new_string must differ — identical strings are rejected.\n\nCommon errors and how to fix them:\n- 'not found': you misremembered the substring (whitespace, casing, or it was\nedited earlier this turn). Re-read the file and copy verbatim.\n- 'matches N locations': add 2-4 lines of surrounding context to old_string to\nmake it unique, OR pass replace_all=true if you really want every occurrence.\n\nReturns: { ok, path, replacements, bytes }. The 'replacements' field tells you\nhow many sites were rewritten (1 for normal mode, N for replace_all).",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Relative file path within the workspace. Example: 'src/main.rs'"
+          },
+          "old_string": {
+            "type": "string",
+            "description": "Exact substring to replace (verbatim, including whitespace). Must be unique unless replace_all=true."
+          },
+          "new_string": {
+            "type": "string",
+            "description": "Replacement text. May be empty (= deletion of old_string)."
+          },
+          "replace_all": {
+            "type": "boolean",
+            "description": "If true, replace ALL occurrences of old_string. Default: false (requires uniqueness)."
+          }
+        },
+        "required": [
+          "path",
+          "old_string",
+          "new_string"
         ],
         "additionalProperties": false,
         "$schema": "http://json-schema.org/draft-07/schema#"

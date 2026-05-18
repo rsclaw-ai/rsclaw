@@ -73,6 +73,43 @@ fn baseline_skill_registry() -> SkillRegistry {
 // Tests
 // -----------------------------------------------------------------------
 
+/// Regenerate the fixture from the live code using the same controlled
+/// setup the byte-stable tests run. Ignored by default — opt in with
+///   cargo test --test baseline_2026_5_15 -- --ignored regenerate_fixture
+/// after intentional builtin-tool or shared-prefix changes.
+#[test]
+#[ignore]
+fn regenerate_fixture() {
+    let skills = baseline_skill_registry();
+    let all_tools = build_tool_list(&skills, None, "main", &[]);
+    let builtin: Vec<&ToolDef> = all_tools
+        .iter()
+        .filter(|t| BUILTIN_TOOL_NAMES.contains(&t.name.as_str()))
+        .collect();
+    let builtin_json: Vec<Value> = builtin
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "name": t.name,
+                "description": t.description,
+                "input_schema": t.parameters,
+            })
+        })
+        .collect();
+    let fixture = serde_json::json!({
+        "rsclaw_version": "2026.5.15",
+        "shared_prefix": build_shared_system_prefix(),
+        "builtin_tools": builtin_json,
+    });
+    let pretty = serde_json::to_string_pretty(&fixture).expect("serialize");
+    std::fs::write(FIXTURE_PATH, pretty).expect("write fixture");
+    eprintln!(
+        "regenerated {FIXTURE_PATH}: {} builtin tools, {} chars shared prefix",
+        builtin.len(),
+        build_shared_system_prefix().len(),
+    );
+}
+
 #[test]
 fn baseline_rsclaw_version_pinned() {
     let fixture = load_baseline();
@@ -197,9 +234,10 @@ fn baseline_builtin_tools_byte_stable() {
 
     assert_eq!(
         builtin.len(),
-        37,
-        "Expected 37 builtin tools in the 2026.5.15 baseline; got {}. \
-         If a builtin tool was added or removed intentionally, regenerate the fixture.",
+        40,
+        "Expected 40 builtin tools in the 2026.5.15 baseline; got {}. \
+         If a builtin tool was added or removed intentionally, regenerate the fixture \
+         and bump this count.",
         builtin.len()
     );
 }

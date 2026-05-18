@@ -566,12 +566,12 @@ pub(crate) fn build_system_prompt(
 /// `user_tools` (the per-client subset). Also dumped in the
 /// `RSCLAW_DUMP_PROMPT` debug payload.
 pub const BUILTIN_TOOL_NAMES: &[&str] = &[
-    "memory","use_skill","task","read_file","write_file","send_file",
-    "shell","agent","install_tool","list_dir","search_file",
-    "search_content","web_search","web_fetch","web_download","web_browser",
-    "computer_use","image_gen","video_gen","pdf","text_to_voice",
-    "send_message","cron","session","gateway","opencode","claudecode",
-    "codex","channel","anycli","clarify","pairing",
+    "memory","use_skill","task","task_finish","read_file","write_file",
+    "edit_file","send_file","shell","agent","ask_user","install_tool",
+    "list_dir","search_file","search_content","web_search","web_fetch",
+    "web_download","web_browser","computer_use","image_gen","video_gen",
+    "pdf","text_to_voice","send_message","cron","session","gateway",
+    "opencode","claudecode","codex","channel","anycli","clarify","pairing",
     "create_docx","create_pdf","create_xlsx","create_pptx","doc",
 ];
 
