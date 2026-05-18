@@ -9,6 +9,15 @@ const cn = {
   Error: {
     Unauthorized: `获取访问密钥失败，请检查配置文件 rsclaw.json5 或到[设置](/#/settings)重新运行引导程序。`,
   },
+  AskUser: {
+    Recommended: "推荐",
+    Send: "发送",
+    Cancel: "取消",
+    Other: "其他",
+    OtherPlaceholder: "输入你的回答…",
+    EscHint: "按 Esc 取消",
+    MultiSelectHint: "可多选",
+  },
   Auth: {
     Return: "返回",
     Title: "需要密码",
