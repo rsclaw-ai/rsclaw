@@ -340,6 +340,76 @@ Tasks (history + artifacts + push configs + status) persist to `var/data/a2a/tas
 
 See [tests/a2a_interop_python.md](tests/a2a_interop_python.md) for an end-to-end harness against the Google Python SDK (covers all 11 methods + the `wait_input` resume flow).
 
+### Exposing A2A to the internet
+
+The gateway listens on `127.0.0.1:18888` by default, so remote A2A peers can't reach it without a tunnel. Pick the option that matches your network:
+
+#### 🌍 International users — Cloudflare Tunnel
+
+Free, no VPS, HTTPS-by-default. Best for outside-China deployments.
+
+```bash
+brew install cloudflared                            # or: see cloudflare docs
+cloudflared tunnel --url http://127.0.0.1:18888     # gives you https://<random>.trycloudflare.com
+```
+
+For a stable URL with your own domain, use a [named tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/create-remote-tunnel/) with `cloudflared tunnel route dns`.
+
+Remote peers configure rsclaw to call it:
+
+```json5
+{
+  agents: {
+    a2a: [
+      { id: "alice",
+        url: "https://your-tunnel.trycloudflare.com",
+        auth_token: "${ALICE_BEARER}" },
+    ],
+  },
+}
+```
+
+Always set `RSCLAW_A2A_BEARER_TOKENS` on the gateway before going public — without it the endpoint accepts everything (dev mode).
+
+#### 🇨🇳 中国国内 — `frp` + 国内 VPS
+
+Cloudflare's edge nodes are unreliable from inside mainland China (GFW interferes, especially for the WebSocket / SSE long connections A2A streaming uses). Deploy [frp](https://github.com/fatedier/frp) on a domestic VPS (aliyun / tencent cloud / huawei cloud, ~5-10 RMB/month):
+
+VPS side (`frps.toml`):
+
+```toml
+bindPort = 7000
+auth.token = "your-frp-secret"
+
+[[httpsVhost]]
+type = "https"
+listenPort = 443
+customDomains = ["a2a.example.cn"]
+```
+
+Local side next to rsclaw (`frpc.toml`):
+
+```toml
+serverAddr = "your-vps-ip"
+serverPort = 7000
+auth.token = "your-frp-secret"
+
+[[proxies]]
+name = "rsclaw-a2a"
+type = "https"
+localIP = "127.0.0.1"
+localPort = 18888
+customDomains = ["a2a.example.cn"]
+```
+
+Same peer config as above — point `agents.a2a[].url` at `https://a2a.example.cn`. Always set `RSCLAW_A2A_BEARER_TOKENS` since a `frp` tunnel is open by default.
+
+`nps` is a similar tool with a Web UI if `frp`'s config style isn't to taste. For zero-config one-shots, [Sakura Frp 樱花穿透](https://www.natfrp.com/) has a free tier (with bandwidth caps).
+
+#### 🏗️ Self-hosted multi-tenant — [`rsclaw-tunnel`](https://github.com/rsclaw-ai/rsclaw-tunnel)
+
+For multi-agent platform deployments (one server hosting many rsclaw clients with shared edge auth, JSON-RPC method-aware rate limits, and full data control), the companion [`rsclaw-tunnel`](https://github.com/rsclaw-ai/rsclaw-tunnel) repo is in early development. It's not a Cloudflare replacement for individuals — only worth standing up when you need protocol-aware multi-tenancy that off-the-shelf tunnels don't provide. See its [`docs/why.md`](https://github.com/rsclaw-ai/rsclaw-tunnel/blob/main/docs/why.md) for the trade-off discussion.
+
 ---
 
 ## Configuration
@@ -367,6 +437,21 @@ See [tests/a2a_interop_python.md](tests/a2a_interop_python.md) for an end-to-end
 ```
 
 All string values support `${VAR}` env substitution. Config priority: CLI flag > `$RSCLAW_BASE_DIR/rsclaw.json5` > `~/.rsclaw/rsclaw.json5` > `./rsclaw.json5`.
+
+### Upgrading from earlier A2A betas
+
+If your `rsclaw.json5` has `agents.external: [...]`, rename it to `agents.a2a: [...]` — the field shape is identical, only the key + struct name changed when A2A v1.0 landed:
+
+```json5
+agents: {
+  // before:
+  // external: [{ id: "remote-analyst", url: "https://…", auth_token: "${TOKEN}" }],
+  // after:
+  a2a: [{ id: "remote-analyst", url: "https://…", auth_token: "${TOKEN}" }],
+}
+```
+
+No back-compat alias — the gateway rejects unknown keys (which `external` now is) on startup. The runtime structs are also renamed: `ExternalAgentConfig` → `A2aPeerConfig`.
 
 ---
 
