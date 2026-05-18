@@ -307,6 +307,8 @@ fn build_shared_system_prefix_uncached() -> String {
 
     parts.push(
         "## Tool Usage Guidelines\n\
+         ### Permission errors\n\
+         If a tool returns \"Permission denied\" with an \"Allowed:\" list, pick a tool from that list and continue. Do NOT retry the denied tool. If nothing on the list can complete the task, tell the user honestly what's missing.\n\
          ### File Operations (use dedicated tools, NOT shell)\n\
          - List directory: `list_dir`. Find files: `search_file`. Search contents: `search_content`.\n\
          - Read file: `read_file`. Write/create file: `write_file`.\n\
