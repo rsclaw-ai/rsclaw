@@ -1872,6 +1872,32 @@ export function OnboardingPage() {
       return p;
     });
 
+    // rsclaw short-circuit: the cloud agent endpoint doesn't expose an
+    // OpenAI-compatible `/models` listing, and we're often clicking
+    // this button before the local gateway has started (onboarding
+    // step 2 runs pre-launch). Trust the key, use the hardcoded model
+    // list — if it's actually invalid the user finds out at the
+    // gateway-start step's health check.
+    if (id === "rsclaw") {
+      const fallback = MODELS["rsclaw"] || [];
+      const defaultModel =
+        fallback.find((m) => m.rec)?.id || fallback[0]?.id || "rsclaw-agent-v1";
+      setProvs((prev) => {
+        const p = { ...prev };
+        p[id] = {
+          ...p[id],
+          testStatus: "success",
+          inputState: "ok",
+          testError: "",
+          modelsLoading: false,
+          models: fallback,
+          selectedModel: p[id].selectedModel || defaultModel,
+        };
+        return p;
+      });
+      return;
+    }
+
     try {
       // Test provider API directly (Tauri) or via gateway (browser)
       const provDef = PROVIDERS.find((p) => p.id === id);
@@ -2533,6 +2559,16 @@ export function OnboardingPage() {
               <RsclawRecommendedCard
                 zh={isZh}
                 onInstalled={(data: InstalledKeyData) => {
+                  // Auto-callback path: web side handed back a valid
+                  // key, gateway-side ownership is implied. Synthesize
+                  // a "tested successfully" state so `canNextStep2`
+                  // flips immediately — no need for the user to click
+                  // 获取模型 (which would fail anyway, see below).
+                  const rsclawModels = MODELS["rsclaw"] || [];
+                  const defaultModel =
+                    rsclawModels.find((m) => m.rec)?.id ||
+                    rsclawModels[0]?.id ||
+                    "rsclaw-agent-v1";
                   setProvs((prev) => {
                     const next: Record<string, ProvState> = {};
                     for (const [k, v] of Object.entries(prev)) {
@@ -2543,17 +2579,17 @@ export function OnboardingPage() {
                         selected: k === "rsclaw",
                       };
                     }
-                    // Make sure rsclaw exists in the map (it should
-                    // already, but defensive) and fill in the key.
                     const existing = next["rsclaw"] || ({} as ProvState);
                     next["rsclaw"] = {
                       ...existing,
                       selected: true,
                       apiKey: data.key,
-                      // Reset any stale test/model state from a prior
-                      // attempt so the user sees a fresh flow.
-                      inputState: "",
-                      models: existing.models || null,
+                      testStatus: "success",
+                      inputState: "ok",
+                      testError: "",
+                      modelsLoading: false,
+                      models: rsclawModels,
+                      selectedModel: defaultModel,
                     };
                     return next;
                   });

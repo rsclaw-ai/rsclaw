@@ -147,9 +147,9 @@ export function RsclawRecommendedCard(props: Props) {
   const handleOneClick = async () => {
     setState({ kind: "opening" });
     try {
-      // Land directly on the keys page — the user comes here to
-      // create+install, not to read marketing copy.
-      await openRsclawConsole({ path: "/keys" });
+      // Always land on the console root — sub-paths aren't part of the
+      // public URL contract, the web side handles routing internally.
+      await openRsclawConsole();
       setState({ kind: "waiting" });
     } catch (e) {
       setState({

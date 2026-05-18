@@ -806,13 +806,20 @@ async fn open_rsclaw_console(
         return Ok(());
     }
 
+    // Base is stored without trailing slash so sub-paths join cleanly
+    // (e.g. base + "/keys" → ".../console/keys"). The canonical root
+    // URL is `.../console/` WITH trailing slash though, so when no
+    // sub-path is requested we explicitly append one — landing on
+    // `.../console` and relying on the server to 301 us would be
+    // sloppy and breaks on staging deploys that don't redirect.
     let suffix = path.unwrap_or_default();
+    let trimmed = RSCLAW_CONSOLE_BASE.trim_end_matches('/');
     let full_url = if suffix.is_empty() {
-        RSCLAW_CONSOLE_BASE.to_string()
+        format!("{}/", trimmed)
     } else if suffix.starts_with('/') {
-        format!("{}{}", RSCLAW_CONSOLE_BASE, suffix)
+        format!("{}{}", trimmed, suffix)
     } else {
-        format!("{}/{}", RSCLAW_CONSOLE_BASE, suffix)
+        format!("{}/{}", trimmed, suffix)
     };
 
     let parsed: url::Url = full_url
@@ -863,6 +870,30 @@ async fn rsclaw_console_install_key(
 ) -> Result<(), String> {
     app.emit("rsclaw:console-install-key", data)
         .map_err(|e| format!("emit install-key event: {e}"))?;
+
+    // Close the console webview right here on the Rust side. Previously
+    // we left this to a frontend `closeRsclawConsole()` call in the
+    // main window's install listener, but that path was flaky in
+    // practice — the close apparently never fired even when the
+    // install event reached the card. Closing from the same Tauri
+    // command the webview calls in to is the simplest reliable
+    // sequencing: emit-then-close, synchronous, no JS round-trip.
+    if let Some(console) = app.get_webview_window("rsclaw-console") {
+        let _ = console.close();
+    }
+
+    // Surface the main window — the user just installed a key inside
+    // the console webview, but the main RsClaw window (where the
+    // onboarding card lives) might be backgrounded behind other apps.
+    // Pop it to the front so the "Connected" state is actually seen.
+    // All operations are best-effort: failures here shouldn't block
+    // the install path (the key is already written to config by the
+    // listener that fires off the emit above).
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.unminimize();
+        let _ = main.show();
+        let _ = main.set_focus();
+    }
     Ok(())
 }
 
@@ -1950,13 +1981,21 @@ fn main() {
                         let _ = window.set_focus();
                     }
                 }
-                // Window close:
-                // - Gateway stopped by user → quit app
-                // - Gateway running → hide to tray
+                // Window close — only intercept for the MAIN window.
+                // Child webviews (rsclaw-console, computer-use-glow,
+                // any future ones) must close normally; previously
+                // this arm fired for every window's close request and
+                //   (a) blocked the console webview from ever closing
+                //       via `api.prevent_close()`, and
+                //   (b) hid the main window because `window.hide()`
+                //       wasn't filtered by which window asked to close.
+                // The `if label == "main"` guard scopes the hide-to-tray
+                // logic to its intended target.
                 tauri::RunEvent::WindowEvent {
+                    label,
                     event: tauri::WindowEvent::CloseRequested { api, .. },
                     ..
-                } => {
+                } if label == "main" => {
                     if GATEWAY_USER_STOPPED.load(Ordering::Relaxed) {
                         // Gateway already stopped — let the window close (app will exit)
                         stop_gateway_sync();

@@ -49,8 +49,15 @@ export async function openRsclawConsole(opts?: { path?: string }): Promise<void>
     // callback won't fire (no Tauri channel), so the user has to copy
     // their key manually — which is what the onboarding card's paste
     // fallback is there for.
+    //
+    // URL handling mirrors the Rust side: canonical root is
+    // `.../console/` with trailing slash, sub-paths join with exactly
+    // one `/` between base and path.
     const base = "https://api.rsclaw.ai/console";
-    const url = opts?.path ? `${base}${opts.path}` : base;
+    const p = opts?.path ?? "";
+    const url = p
+      ? `${base}${p.startsWith("/") ? p : "/" + p}`
+      : `${base}/`;
     window.open(url, "_blank", "noopener,noreferrer");
     return;
   }
