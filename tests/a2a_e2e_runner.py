@@ -90,6 +90,34 @@ async def rpc(c: httpx.AsyncClient, method: str, params: dict, rpc_id: str = "1"
 # 1x1 transparent PNG.
 PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
 
+# Minimal fixtures for the multi-part file-transfer test. None of these has to
+# be valid for the agent to *process* — the test only asserts ingest routing:
+# bytes land in the right `workspace/a2a/<bucket>/` directory with the right
+# canonical filename prefix (`a2a_<kind>_…`). Real validity matters for
+# downstream OCR / video / audio pipelines, not for this protocol-layer test.
+import base64 as _b64  # avoid shadowing the module-level `base64` import.
+_MP4 = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 40
+_MP3 = b"\xff\xfb\x90\x00" + b"\x00" * 60
+_PDF = (
+    b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n1 0 obj<<>>endobj\n"
+    b"xref\n0 1\n0000000000 65535 f\ntrailer<<>>\n%%EOF\n"
+)
+_BIN = b"\x42" + b"\x99" * 64 + b"\x00ENDOFTEST"
+MP4_B64 = _b64.b64encode(_MP4).decode()
+MP3_B64 = _b64.b64encode(_MP3).decode()
+PDF_B64 = _b64.b64encode(_PDF).decode()
+BIN_B64 = _b64.b64encode(_BIN).decode()
+# (image, video, audio, doc, binary) — labels mirror the bucket names in
+# `src/a2a/files.rs` (`workspace/a2a/{images,videos,audios,docs,files}`).
+FILE_FIXTURES = [
+    # (logical-name, mime, base64, expected-bucket, expected-kind-letter, byte-count)
+    ("snapshot.png", "image/png",                base64.b64decode(PNG_B64), "images", "i"),
+    ("clip.mp4",     "video/mp4",                _MP4,                       "videos", "v"),
+    ("voice.mp3",    "audio/mpeg",               _MP3,                       "audios", "a"),
+    ("notes.pdf",    "application/pdf",          _PDF,                       "docs",   "d"),
+    ("rawbytes.bin", "application/octet-stream", _BIN,                       "files",  "f"),
+]
+
 
 async def t_agent_card(c):
     r = await c.get(f"{BASE}/.well-known/agent.json")
@@ -163,6 +191,64 @@ async def t_send_message_with_data_part(c):
     types = [p["type"] for p in parts]
     assert "text" in types and "data" in types, types
     return f"history parts={types}, status={r['status']['state']}"
+
+
+async def t_send_message_all_file_types(c):
+    """Send a single SendMessage carrying every file-kind we support
+    (image / video / audio / doc / binary) and verify each lands in its
+    own `workspace/a2a/<bucket>/` directory with the canonical
+    `a2a_<kind>_<ts><abc>.<ext>` filename prefix.
+
+    The agent's reply itself is irrelevant for this test — ingest runs
+    BEFORE the LLM call, so the file write is testable even with a
+    rate-limited / offline provider."""
+    ws = os.path.expanduser("~/.rsclaw-a2atest/workspace")
+
+    def snap():
+        out = {}
+        for _, _, _, bucket, _ in FILE_FIXTURES:
+            p = os.path.join(ws, "a2a", bucket)
+            out[bucket] = (
+                {f: os.path.getsize(os.path.join(p, f)) for f in os.listdir(p)}
+                if os.path.isdir(p)
+                else {}
+            )
+        return out
+
+    before = snap()
+    parts = [{"type": "text",
+              "text": "Five attachments follow — just acknowledge receipt."}]
+    for name, mime, data, _bucket, _kind in FILE_FIXTURES:
+        parts.append({
+            "type": "raw",
+            "bytes": base64.b64encode(data).decode(),
+            "mimeType": mime,
+            "name": name,
+        })
+    res = await rpc(c, "SendMessage", {
+        "message": {"messageId": str(uuid.uuid4()), "role": "user", "parts": parts}})
+    state = res["result"]["status"]["state"]
+    after = snap()
+
+    # Audit each bucket: find one new file whose size matches the fixture
+    # AND whose prefix matches the canonical `a2a_<kind>_` convention.
+    failures = []
+    matched = []
+    for name, _mime, data, bucket, kind in FILE_FIXTURES:
+        new = set(after[bucket]) - set(before[bucket])
+        hit = None
+        for fname in new:
+            if (after[bucket][fname] == len(data)
+                    and fname.startswith(f"a2a_{kind}_")):
+                hit = fname
+                break
+        if hit:
+            matched.append(f"{bucket}:{hit}")
+        else:
+            failures.append(f"{bucket}/{name} not ingested (new files: {new})")
+
+    assert not failures, "; ".join(failures)
+    return f"5 buckets, all 5 files ingested (status={state})"
 
 
 async def t_streaming(c):
@@ -411,6 +497,7 @@ TESTS = [
     ("send_message_text", t_send_message_text),
     ("send_message_raw_image", t_send_message_with_raw_image),
     ("send_message_data_part", t_send_message_with_data_part),
+    ("send_message_all_file_types", t_send_message_all_file_types),
     ("streaming", t_streaming),
     ("list_tasks", t_list_tasks),
     ("get_task", t_get_task),
