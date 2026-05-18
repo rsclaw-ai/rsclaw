@@ -70,7 +70,7 @@ pub fn minimal_config(port: u16) -> RuntimeConfig {
             defaults: Default::default(),
             list: vec![],
             bindings: vec![],
-            external: vec![],
+            a2a: vec![],
         },
         channel: ChannelRuntime {
             channels: Default::default(),

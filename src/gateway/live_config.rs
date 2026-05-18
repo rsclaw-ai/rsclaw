@@ -393,7 +393,7 @@ mod tests {
                 defaults: Default::default(),
                 list: vec![],
                 bindings: vec![],
-                external: vec![],
+                a2a: vec![],
             },
             channel: ChannelRuntime {
                 channels: Default::default(),
@@ -449,7 +449,7 @@ mod tests {
                 defaults: Default::default(),
                 list: vec![],
                 bindings: vec![],
-                external: vec![],
+                a2a: vec![],
             },
             channel: ChannelRuntime {
                 channels: Default::default(),

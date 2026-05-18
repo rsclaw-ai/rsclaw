@@ -75,7 +75,7 @@ fn config_with_echo_agent(port: u16) -> RuntimeConfig {
                 temperature: None,
             }],
             bindings: vec![],
-            external: vec![],
+            a2a: vec![],
         },
         channel: ChannelRuntime {
             channels: Default::default(),

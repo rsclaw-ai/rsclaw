@@ -105,7 +105,7 @@ fn runtime_with_agent(agent_id: &str) -> RuntimeConfig {
                 temperature: None,
             }],
             bindings: vec![],
-            external: vec![],
+            a2a: vec![],
         },
         channel: ChannelRuntime {
             channels: Default::default(),
