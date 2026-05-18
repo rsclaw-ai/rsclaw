@@ -316,7 +316,7 @@ pub(crate) fn start_wecom_if_configured(
                                 peer_id: from.clone(),
                                 dm_scope,
                             });
-                            if let Some(mut reply) = try_preparse_locally(&text, &handle, "wecom", &from).await {
+                            if let Some(mut reply) = try_preparse_locally(&text, &handle, "wecom", &from, crate::gateway::preparse::PreparseOrigin::User).await {
                                 reply.target_id = if is_group { chat_id.clone() } else { from.clone() };
                                 reply.is_group = is_group;
                                 if !reply.text.is_empty() || !reply.images.is_empty() {
@@ -336,6 +336,11 @@ pub(crate) fn start_wecom_if_configured(
                                 peer_id: from.clone(),
                                 chat_id: String::new(),
                                 reply_tx,
+                                task_id: None,
+                                context_id: None,
+                                event_tx: None,
+                                cancel_token: None,
+                                input_request_tx: None,
                                 extra_tools: vec![],
                                 images,
                                 files,

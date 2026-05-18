@@ -10,7 +10,6 @@ use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
-use super::prompt_builder::build_base_system_prompt;
 use super::registry::{AgentMessage, AgentReply};
 use super::runtime::{persist_agent_to_config, update_agent_in_config, AgentRuntime, RunContext, DEFAULT_TIMEOUT_SECONDS};
 
@@ -19,13 +18,15 @@ impl AgentRuntime {
     // Agent-related tools
     // -------------------------------------------------------------------
 
-    /// Build a full system prompt for a sub-agent by combining the shared base
-    /// (date, platform, safety rules, agent loop guidance) with the role-specific
-    /// description provided by the main agent.
+    /// Build the role-specific portion of a sub-agent's system prompt.
+    ///
+    /// Only emits `## Your Role` + `## Sub-Agent Guidelines`. The sub-agent
+    /// runtime loads SOUL.md through `WorkspaceContext::to_prompt_segment`
+    /// and prepends the shared system prefix + per-user suffix on top —
+    /// duplicating `<agent_loop>` / output rules / platform here would
+    /// land in the prompt twice.
     fn build_subagent_system_prompt(&self, role_desc: &str) -> String {
-        let base_parts = build_base_system_prompt(&self.config.raw);
-        let mut prompt = base_parts.join("\n\n");
-        prompt.push_str("\n\n## Your Role\n");
+        let mut prompt = String::from("## Your Role\n");
         prompt.push_str(role_desc);
         prompt.push_str(
             "\n\n## Sub-Agent Guidelines\n\
@@ -91,6 +92,7 @@ impl AgentRuntime {
                 context_tokens: None,
                 max_tokens: None,
                 flash: None,
+                vision: None,
             }),
             flash_model: None,
             lane: None,
@@ -205,6 +207,7 @@ impl AgentRuntime {
                 context_tokens: None,
                 max_tokens: None,
                 flash: None,
+                vision: None,
             }),
             flash_model: None,
             lane: None,
@@ -239,6 +242,11 @@ impl AgentRuntime {
             peer_id: ctx.agent_id.clone(),
             chat_id: String::new(),
             reply_tx,
+            task_id: None,
+            context_id: None,
+            event_tx: None,
+            cancel_token: None,
+            input_request_tx: None,
             extra_tools: vec![],
             images: vec![],
             files: vec![],
@@ -291,6 +299,11 @@ impl AgentRuntime {
                 peer_id: peer_id.clone(),
                 chat_id: chat_id.clone(),
                 reply_tx: wake_tx,
+                task_id: None,
+                context_id: None,
+                event_tx: None,
+                cancel_token: None,
+                input_request_tx: None,
                 extra_tools: vec![],
                 images: vec![],
                 files: vec![],
@@ -378,6 +391,11 @@ impl AgentRuntime {
             peer_id: ctx.agent_id.clone(),
             chat_id: String::new(),
             reply_tx,
+            task_id: None,
+            context_id: None,
+            event_tx: None,
+            cancel_token: None,
+            input_request_tx: None,
             extra_tools: vec![],
             images: vec![],
             files: vec![],
@@ -426,6 +444,11 @@ impl AgentRuntime {
                 peer_id: peer_id.clone(),
                 chat_id: chat_id.clone(),
                 reply_tx: wake_tx,
+                task_id: None,
+                context_id: None,
+                event_tx: None,
+                cancel_token: None,
+                input_request_tx: None,
                 extra_tools: vec![],
                 images: vec![],
                 files: vec![],

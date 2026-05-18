@@ -435,26 +435,11 @@ impl HeartbeatRunner {
                     return Ok(());
                 }
             };
-            let flash_model = crate::agent::runtime::resolve_flash_model_for(
+            let primary_model = crate::agent::runtime::resolve_primary_model_for(
                 &handle.config,
                 &deps.config.agents.defaults,
             )
-            .unwrap_or_else(|| {
-                handle
-                    .config
-                    .model
-                    .as_ref()
-                    .and_then(|m| m.primary.clone())
-                    .or_else(|| {
-                        deps.config
-                            .agents
-                            .defaults
-                            .model
-                            .as_ref()
-                            .and_then(|m| m.primary.clone())
-                    })
-                    .unwrap_or_else(|| "anthropic/claude-sonnet-4-6".to_owned())
-            });
+            .unwrap_or_else(|| "rsclaw/rsclaw-agent-v1".to_owned());
             let skills_dir = crate::skill::default_global_skills_dir()
                 .unwrap_or_else(|| crate::config::loader::base_dir().join("skills"));
 
@@ -462,7 +447,7 @@ impl HeartbeatRunner {
                 mem,
                 &scope,
                 &handle.providers,
-                &flash_model,
+                &primary_model,
                 &skills_dir,
             )
             .await
@@ -490,6 +475,22 @@ impl HeartbeatRunner {
 
     /// Send a heartbeat message to the agent and wait for reply.
     async fn send_heartbeat(&self, agent_id: &str, state_key: &str, content: &str) -> Result<()> {
+        // Reject state_key values that would collide with reserved
+        // session_key namespaces. `format!("heartbeat:{state_key}")`
+        // produces the session_key the runtime stores against; the
+        // is_internal_session / is_minimal_context_session checks
+        // only look at the FIRST ":"-delimited token. If a state_key
+        // ever contained ":" (e.g. "heartbeat:cron:foo" from a
+        // mis-handled cron channel), a user-channel session matching
+        // that literal prefix could be classified as internal and
+        // silently lose all tools. R2 review I4.
+        if state_key.contains(':') {
+            bail!(
+                "heartbeat state_key must not contain ':' (got {state_key:?}); \
+                 the colon would collide with the heartbeat:* namespace prefix"
+            );
+        }
+
         let handle = self.registry.get(agent_id)
             .map_err(|e| anyhow!("agent not found: {e:#}"))?;
 
@@ -501,6 +502,11 @@ impl HeartbeatRunner {
             peer_id: "heartbeat".to_owned(),
             chat_id: String::new(),
             reply_tx,
+            task_id: None,
+            context_id: None,
+            event_tx: None,
+            cancel_token: None,
+            input_request_tx: None,
             extra_tools: vec![],
             images: vec![],
             files: vec![],

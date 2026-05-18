@@ -55,6 +55,7 @@ export enum Path {
   AgentManager = "/agents",
   ChannelConfig = "/channels",
   CronManager = "/cron",
+  ComputerUseControl = "/computer-use",
   RsClawPanel = "/rsclaw",
   Onboarding = "/onboarding",
 }
@@ -338,6 +339,8 @@ export const KnowledgeCutOffDate: Record<string, string> = {
   "gemini-pro": "2023-12",
   "gemini-pro-vision": "2023-12",
   "deepseek-chat": "2024-07",
+  "deepseek-v4-flash": "2024-07",
+  "deepseek-v4-pro": "2024-07",
   "deepseek-coder": "2024-07",
 };
 
@@ -517,7 +520,7 @@ const iflytekModels = [
   "4.0Ultra",
 ];
 
-const deepseekModels = ["deepseek-chat", "deepseek-coder", "deepseek-reasoner"];
+const deepseekModels = ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-coder"];
 
 const xAIModes = [
   "grok-beta",
@@ -585,11 +588,11 @@ const siliconflowModels = [
 ];
 
 const ai302Models = [
-  "deepseek-chat",
+  "deepseek-v4-flash",
   "gpt-4o",
   "chatgpt-4o-latest",
   "llama3.3-70b",
-  "deepseek-reasoner",
+  "deepseek-v4-pro",
   "gemini-2.0-flash",
   "claude-3-7-sonnet-20250219",
   "claude-3-7-sonnet-latest",

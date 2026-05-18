@@ -30,6 +30,8 @@ import {
   useNavigate,
 } from "react-router-dom";
 import { SideBar } from "./sidebar";
+import { ComputerUsePermissionDialog } from "./computer-use-permission";
+import { ComputerUseOverlay } from "./computer-use-overlay";
 import { useAppConfig } from "../store/config";
 import { AuthPage } from "./auth";
 import { getClientConfig } from "../config/client";
@@ -119,6 +121,13 @@ const ChannelConfigPage = dynamic(
 
 const CronManagerPage = dynamic(
   async () => (await import("./cron-manager")).CronManagerPage,
+  {
+    loading: () => <Loading noLogo />,
+  },
+);
+
+const ComputerUseControlPage = dynamic(
+  async () => (await import("./computer-use-control")).ComputerUseControlPage,
   {
     loading: () => <Loading noLogo />,
   },
@@ -275,10 +284,27 @@ function Screen() {
             <Route path={Path.AgentManager} element={<AgentManagerPage />} />
             <Route path={Path.ChannelConfig} element={<ChannelConfigPage />} />
             <Route path={Path.CronManager} element={<CronManagerPage />} />
+            <Route
+              path={Path.ComputerUseControl}
+              element={<ComputerUseControlPage />}
+            />
             <Route path={Path.RsClawPanel} element={<RsClawPanel />} />
             <Route path={Path.Onboarding} element={<OnboardingPage />} />
           </Routes>
         </WindowContent>
+        {/* Top-level overlay — security-significant prompt before any
+            GUI-agent loop touches the desktop. Subscribes to the
+            gateway's `permission_request` WS event and stays mounted
+            until the user clicks one of the four buttons (or Esc =
+            Deny). Position here (not inside SideBar) so the dialog
+            survives sidebar collapse / route changes. */}
+        <ComputerUsePermissionDialog />
+        {/* Full-viewport status overlay shown while a `computer_use`
+            run is active. Subscribes to the same WS feed as the
+            control page; mounted here so it survives sidebar
+            collapse / route changes the same way the permission
+            dialog does. */}
+        <ComputerUseOverlay />
       </>
     );
   };

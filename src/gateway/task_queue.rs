@@ -50,6 +50,12 @@ pub enum TaskStatus {
 }
 
 /// Outcome of a single agent turn, used by the auto-continue supervisor.
+///
+/// `Done` / `Partial` / `Stuck` / `Error` are produced by the legacy
+/// string-matching `classify_outcome` fallback. `Structured` carries an
+/// agent-declared outcome from the `task_finish` tool and takes precedence
+/// when present. `NeedsInput` lets the agent surface a clarifying question
+/// to the user without triggering auto-continue.
 #[derive(Debug)]
 pub enum TaskOutcome {
     /// Agent clearly completed the task.
@@ -60,6 +66,227 @@ pub enum TaskOutcome {
     Stuck(String),
     /// Infrastructure error (timeout, channel closed, rate limit).
     Error(String),
+    /// Agent self-reported via `task_finish` tool. Replaces string-matching.
+    Structured(StructuredOutcome),
+    /// Agent explicitly asked the user for input. Worker should NOT
+    /// auto-continue; the question is surfaced back to the channel.
+    NeedsInput(String),
+}
+
+/// Self-reported outcome an agent fills in via the `task_finish` tool when
+/// it believes its task is finished (or deliberately abandoned).
+///
+/// Provides structured signal that replaces the fragile string-matching path
+/// in `classify_outcome`. Also serialised into `A2aTask.metadata.outcome`
+/// for protocol-compliant A2A v1.0 reporting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct StructuredOutcome {
+    /// How complete the work is. Drives the orchestrator's continue/stop call.
+    pub completion: Completion,
+
+    /// The agent's own recommendation for what to do next. Orchestrator
+    /// treats this as a strong hint but applies its own decision matrix.
+    pub recommend: Recommend,
+
+    /// Did the agent actually run tests/build/lint/curl that confirmed the
+    /// claimed work? `false` is honest; `true` without `verification_log`
+    /// is downgraded to `false` by the orchestrator.
+    #[serde(default)]
+    pub verified: bool,
+
+    /// Evidence backing `verified=true`. Short excerpt of command + output.
+    /// Required when `verified=true`; absence downgrades to `verified=false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_log: Option<String>,
+
+    /// Concrete things the agent did. Each entry should map to an observable
+    /// artifact (file changed, command run, message sent). Empty list with
+    /// `completion=Full` is suspicious — orchestrator may downgrade.
+    #[serde(default)]
+    pub accomplished: Vec<String>,
+
+    /// Things the agent deliberately skipped, paired with the reason.
+    /// Distinct from `blocked_on` — these are choices, not obstacles.
+    #[serde(default)]
+    pub skipped: Vec<SkipEntry>,
+
+    /// Unresolved blockers. Non-empty implies `completion != Full`.
+    /// When `recommend = NeedsHuman`, these are surfaced to the user verbatim.
+    #[serde(default)]
+    pub blocked_on: Vec<String>,
+
+    /// Assumptions the agent made when the spec was ambiguous. Non-empty
+    /// with `completion < Full` triggers orchestrator to confirm with user.
+    #[serde(default)]
+    pub assumptions: Vec<String>,
+
+    /// Suggested next tasks. Each entry is a self-contained task description,
+    /// not a TODO note. Auto-spawned when `recommend = Continue`.
+    #[serde(default)]
+    pub follow_up_tasks: Vec<String>,
+
+    /// Optional one-paragraph prose summary for the channel reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+/// How complete the agent's work is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Completion {
+    /// Everything the user asked for, done and (ideally) verified.
+    Full,
+    /// Meaningful subset done. Coverage implied by `accomplished` length.
+    Partial,
+    /// Almost nothing achieved. Agent should explain in `blocked_on`.
+    Minimal,
+    /// Agent attempted, work was wrong/rolled back, nothing landed.
+    Failed,
+}
+
+/// Recommended next action for the orchestrator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Recommend {
+    /// Done, deliver to user, close the task.
+    Ship,
+    /// Spawn the next task automatically using `follow_up_tasks`.
+    Continue,
+    /// Stop the auto-continue loop; surface `blocked_on` to the user.
+    NeedsHuman,
+    /// Same task, fresh attempt. Agent thinks a retry with the same prompt
+    /// might succeed (transient failure, flaky env).
+    Retry,
+    /// Agent gave up; orchestrator should not retry without changed inputs.
+    Abandon,
+}
+
+/// A deliberate skip, paired with its reason.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkipEntry {
+    /// What was skipped.
+    pub what: String,
+    /// Why it was skipped.
+    pub why: String,
+}
+
+/// What the worker should do after grading a turn's outcome.
+///
+/// Extracted as a pure function ([`decide_action`]) so the worker's giant
+/// run loop can stay thin and the routing matrix is unit-testable in
+/// isolation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchAction {
+    /// Mark the task `Done` (success path), close, deliver to user.
+    Complete,
+    /// Mark the task `Failed`. Used for `Recommend::Abandon` and for
+    /// `Recommend::Retry` when no turn budget remains.
+    Fail,
+    /// Continue the same task with the given continuation prompt as next
+    /// agent input. Used for `Partial` / `Stuck` / `Error` / `Retry`.
+    AutoContinue { prompt: String, slow: bool },
+    /// Spawn each task description as a new queued task, then mark the
+    /// current task `Done`. Used for `Recommend::Continue` with
+    /// `follow_up_tasks` populated.
+    Spawn { tasks: Vec<String> },
+}
+
+/// Pure decision function: given an outcome and the turn-budget state, what
+/// should the worker do? Lifted out of `TaskQueueWorker::run` for testability.
+pub fn decide_action(outcome: &TaskOutcome, turn: u32, max_turns: u32) -> DispatchAction {
+    let at_max = max_turns == 0 || turn >= max_turns;
+
+    match outcome {
+        TaskOutcome::Done => DispatchAction::Complete,
+
+        // Structured outcome routes by the agent's own `recommend` field.
+        TaskOutcome::Structured(out) => match out.recommend {
+            // Ship: standard completion. NeedsHuman: also terminal — the
+            // agent's text reply already contains the blocker question; the
+            // user's next message resumes naturally as a fresh task.
+            Recommend::Ship | Recommend::NeedsHuman => DispatchAction::Complete,
+            // Abandon: agent gave up; mark Failed so retry/replay paths skip it.
+            Recommend::Abandon => DispatchAction::Fail,
+            Recommend::Retry => {
+                if at_max {
+                    DispatchAction::Fail
+                } else {
+                    DispatchAction::AutoContinue {
+                        prompt: format!(
+                            "[auto-continue turn {turn}] Retry the task — \
+                             your previous attempt asked for a fresh retry. \
+                             Try again, change something if you can."
+                        ),
+                        slow: true, // brief delay to avoid tight retry loops
+                    }
+                }
+            }
+            Recommend::Continue => {
+                if out.follow_up_tasks.is_empty() {
+                    // recommend=continue but no follow-ups specified — treat
+                    // as Ship rather than wedge the task open.
+                    DispatchAction::Complete
+                } else {
+                    DispatchAction::Spawn {
+                        tasks: out.follow_up_tasks.clone(),
+                    }
+                }
+            }
+        },
+
+        // Agent explicitly asked the user — its reply already carries the
+        // question, complete the task and let the user's reply start a
+        // fresh inbound message.
+        TaskOutcome::NeedsInput(_) => DispatchAction::Complete,
+
+        // Legacy string-classifier path: auto-continue until max turns.
+        TaskOutcome::Partial | TaskOutcome::Stuck(_) | TaskOutcome::Error(_) => {
+            if at_max {
+                DispatchAction::Complete
+            } else {
+                DispatchAction::AutoContinue {
+                    prompt: continuation_prompt(outcome, turn),
+                    slow: matches!(outcome, TaskOutcome::Error(_)),
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pending-outcome stash
+// ---------------------------------------------------------------------------
+//
+// Bridge between the `task_finish` tool (called from agent runtime, no direct
+// access to the queue worker) and the auto-continue supervisor in
+// `TaskQueueWorker::run`. The tool stages an outcome under the session key;
+// the worker drains the slot after each turn and converts it into
+// `TaskOutcome::Structured`, taking precedence over the string classifier.
+//
+// `OnceLock<Mutex<HashMap>>` is intentional — no DashMap dependency, and the
+// contention profile (one writer per turn per session) doesn't warrant it.
+
+static PENDING_OUTCOMES: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<String, StructuredOutcome>>,
+> = std::sync::OnceLock::new();
+
+fn pending_outcomes_map() -> &'static std::sync::Mutex<HashMap<String, StructuredOutcome>> {
+    PENDING_OUTCOMES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Stage a structured outcome produced by the `task_finish` tool. The next
+/// call to [`drain_pending_outcome`] for the same `session_key` consumes it.
+pub fn stage_pending_outcome(session_key: &str, outcome: StructuredOutcome) {
+    if let Ok(mut map) = pending_outcomes_map().lock() {
+        map.insert(session_key.to_owned(), outcome);
+    }
+}
+
+/// Remove and return the staged outcome for `session_key`, if any. Called
+/// by [`TaskQueueWorker`] once per turn before string-classifying the reply.
+pub fn drain_pending_outcome(session_key: &str) -> Option<StructuredOutcome> {
+    pending_outcomes_map().lock().ok()?.remove(session_key)
 }
 
 /// A file attachment staged on disk for queue persistence.
@@ -723,6 +950,8 @@ fn classify_outcome(reply: &crate::agent::AgentReply) -> TaskOutcome {
     }
 
     // Stuck patterns — agent explicitly says it cannot proceed.
+    // English uses lower-cased `lower`; Chinese keywords are matched on the
+    // original `text` because lowercasing CJK is a no-op anyway.
     for pat in [
         "i can't",
         "i cannot",
@@ -736,6 +965,21 @@ fn classify_outcome(reply: &crate::agent::AgentReply) -> TaskOutcome {
         "i'm stuck",
     ] {
         if lower.contains(pat) {
+            return TaskOutcome::Stuck(pat.to_string());
+        }
+    }
+    for pat in [
+        "无法完成",
+        "做不到",
+        "我没法",
+        "我不知道怎么",
+        "需要更多信息",
+        "请提供",
+        "请告诉我",
+        "卡住了",
+        "我不太确定",
+    ] {
+        if text.contains(pat) {
             return TaskOutcome::Stuck(pat.to_string());
         }
     }
@@ -755,6 +999,22 @@ fn classify_outcome(reply: &crate::agent::AgentReply) -> TaskOutcome {
         "partially done",
     ] {
         if lower.contains(pat) {
+            return TaskOutcome::Partial;
+        }
+    }
+    for pat in [
+        "继续",
+        "下一步",
+        "未完成",
+        "还需要",
+        "稍后",
+        "进行中",
+        "正在",
+        "待办",
+        "尚未完成",
+        "部分完成",
+    ] {
+        if text.contains(pat) {
             return TaskOutcome::Partial;
         }
     }
@@ -783,6 +1043,11 @@ fn continuation_prompt(outcome: &TaskOutcome, turn: u32) -> String {
             )
         }
         TaskOutcome::Done => String::new(),
+        // Structured / NeedsInput cannot be produced by the current
+        // `classify_outcome` path; they appear only once `task_finish` wiring
+        // lands. Return empty so the worker treats them as no-continuation
+        // (terminal) for now.
+        TaskOutcome::Structured(_) | TaskOutcome::NeedsInput(_) => String::new(),
     }
 }
 
@@ -1046,6 +1311,11 @@ impl TaskQueueWorker {
                 peer_id: peer_id.clone(),
                 chat_id: chat_id.clone(),
                 reply_tx,
+                task_id: None,
+                context_id: None,
+                event_tx: None,
+                cancel_token: None,
+                input_request_tx: None,
                 extra_tools: vec![],
                 images: next_images,
                 files: next_files,
@@ -1095,7 +1365,23 @@ impl TaskQueueWorker {
             };
 
             // Classify outcome before moving fields out of reply.
-            let outcome = classify_outcome(&reply);
+            //
+            // First check for an agent-declared structured outcome from the
+            // `task_finish` tool (staged under the session key). Falling back
+            // to the string classifier preserves behaviour for agents that
+            // don't (yet) call `task_finish`.
+            let outcome = match drain_pending_outcome(&task.session_key) {
+                Some(structured) => {
+                    info!(
+                        task_id = %task_id,
+                        completion = ?structured.completion,
+                        recommend = ?structured.recommend,
+                        "task queue worker: using agent-declared structured outcome"
+                    );
+                    TaskOutcome::Structured(structured)
+                }
+                None => classify_outcome(&reply),
+            };
             let pending = reply.pending_analysis;
 
             // Route reply to user (every turn, so they see progress).
@@ -1184,9 +1470,12 @@ impl TaskQueueWorker {
                 tracing::warn!(task_id = %task_id, "record_turn failed: {e:#}");
             }
 
-            match outcome {
-                TaskOutcome::Done => {
-                    info!(task_id = %task_id, turn, "task queue worker: task completed");
+            // Routing matrix lives in `decide_action` so the logic is
+            // testable in isolation.
+            let action = decide_action(&outcome, turn, max_turns);
+            info!(task_id = %task_id, turn, ?action, "task queue worker: action");
+            match action {
+                DispatchAction::Complete => {
                     if let Err(e) = self.manager.complete(&task_id) {
                         error!(task_id = %task_id, "complete() error: {e:#}");
                     }
@@ -1198,32 +1487,80 @@ impl TaskQueueWorker {
                     cleanup_staged_files(&task);
                     break;
                 }
-                TaskOutcome::Partial | TaskOutcome::Stuck(_) | TaskOutcome::Error(_) => {
-                    if max_turns == 0 || turn >= max_turns {
-                        info!(
-                            task_id = %task_id, turn, max_turns,
-                            "task queue worker: max turns reached, marking done"
-                        );
-                        if let Err(e) = self.manager.complete(&task_id) {
-                            error!(task_id = %task_id, "complete() error: {e:#}");
+                DispatchAction::Fail => {
+                    // Agent declared abandon / retry exhausted. Mark Failed
+                    // so the queue's retry/replay logic doesn't loop.
+                    if let Err(e) = self.manager.fail(&task_id, "agent abandoned", 0) {
+                        error!(task_id = %task_id, "fail() error: {e:#}");
+                    }
+                    if last_send_ok {
+                        if let Err(e) = self.manager.mark_notified(&task_id) {
+                            error!(task_id = %task_id, "mark_notified() error: {e:#}");
                         }
-                        if last_send_ok {
-                            if let Err(e) = self.manager.mark_notified(&task_id) {
-                                error!(task_id = %task_id, "mark_notified() error: {e:#}");
+                    }
+                    cleanup_staged_files(&task);
+                    break;
+                }
+                DispatchAction::Spawn { tasks } => {
+                    // Recommend::Continue with follow_up_tasks. Spawn each as
+                    // a fresh queued task on the same session so the agent
+                    // keeps its conversational context, then mark this turn's
+                    // task complete.
+                    let base = task.messages.first().cloned();
+                    let now = chrono::Utc::now().timestamp();
+                    let spawned = tasks.len();
+                    for follow_up in tasks {
+                        let Some(ref base_msg) = base else {
+                            warn!(task_id = %task_id, "spawn: no base message to inherit channel from");
+                            break;
+                        };
+                        let msg = QueuedMessage {
+                            text: follow_up,
+                            sender: format!("{}:follow_up", base_msg.sender),
+                            channel: base_msg.channel.clone(),
+                            account: base_msg.account.clone(),
+                            chat_id: base_msg.chat_id.clone(),
+                            is_group: base_msg.is_group,
+                            reply_to: None,
+                            timestamp: now,
+                            images: vec![],
+                            files: vec![],
+                        };
+                        // Inherit budget from the parent task. Use System
+                        // priority so follow-ups jump the queue ahead of new
+                        // user input (the chain shouldn't get starved).
+                        match self.manager.submit_task(
+                            &task.session_key,
+                            msg,
+                            Priority::System,
+                            task.max_turns,
+                            task.ttl_secs,
+                        ) {
+                            Ok((new_id, _)) => {
+                                info!(parent = %task_id, child = %new_id, "spawn: follow-up enqueued");
+                            }
+                            Err(e) => {
+                                warn!(parent = %task_id, "spawn: submit_task failed: {e:#}");
                             }
                         }
-                        cleanup_staged_files(&task);
-                        break;
                     }
-
-                    // Auto-continue: send continuation prompt to the same session.
-                    let prompt = continuation_prompt(&outcome, turn);
-                    info!(task_id = %task_id, turn, "task queue worker: auto-continue");
+                    info!(task_id = %task_id, spawned, "spawn: parent task completing");
+                    if let Err(e) = self.manager.complete(&task_id) {
+                        error!(task_id = %task_id, "complete() error: {e:#}");
+                    }
+                    if last_send_ok {
+                        if let Err(e) = self.manager.mark_notified(&task_id) {
+                            error!(task_id = %task_id, "mark_notified() error: {e:#}");
+                        }
+                    }
+                    cleanup_staged_files(&task);
+                    break;
+                }
+                DispatchAction::AutoContinue { prompt, slow } => {
                     next_text = prompt;
                     next_images = vec![];
                     next_files = vec![];
-                    // Small delay before retry to avoid tight loops on errors.
-                    if matches!(outcome, TaskOutcome::Error(_)) {
+                    if slow {
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                 }
@@ -1287,5 +1624,209 @@ mod tests {
         let (turns, _ttl) = parse_task_prefix(&mut text);
         assert_eq!(turns, TASK_DEFAULT_MAX_TURNS);
         assert_eq!(text, "-n investigate logs");
+    }
+
+    // -----------------------------------------------------------------------
+    // Structured outcome — schema + dispatch matrix
+    // -----------------------------------------------------------------------
+
+    fn make_outcome(
+        completion: Completion,
+        recommend: Recommend,
+    ) -> StructuredOutcome {
+        StructuredOutcome {
+            completion,
+            recommend,
+            verified: false,
+            verification_log: None,
+            accomplished: vec!["did the thing".into()],
+            skipped: vec![],
+            blocked_on: vec![],
+            assumptions: vec![],
+            follow_up_tasks: vec![],
+            summary: None,
+        }
+    }
+
+    #[test]
+    fn structured_outcome_serializes_snake_case() {
+        // Outcome serializes with snake_case keys so A2A consumers and the
+        // task_finish tool schema agree on the wire format.
+        let mut out = make_outcome(Completion::Partial, Recommend::Continue);
+        out.follow_up_tasks = vec!["task A".into(), "task B".into()];
+        out.blocked_on = vec!["disk full".into()];
+
+        let json = serde_json::to_value(&out).expect("serialize");
+        assert_eq!(json["completion"], "partial");
+        assert_eq!(json["recommend"], "continue");
+        assert_eq!(json["follow_up_tasks"][0], "task A");
+        assert_eq!(json["blocked_on"][0], "disk full");
+    }
+
+    #[test]
+    fn pending_outcome_stash_roundtrip() {
+        let session = "test:stash:roundtrip";
+        // No outcome staged → drain returns None.
+        assert!(drain_pending_outcome(session).is_none());
+
+        let outcome = make_outcome(Completion::Full, Recommend::Ship);
+        stage_pending_outcome(session, outcome);
+
+        let drained = drain_pending_outcome(session).expect("staged outcome");
+        assert_eq!(drained.completion, Completion::Full);
+        assert_eq!(drained.recommend, Recommend::Ship);
+
+        // Second drain is empty — drain consumes.
+        assert!(drain_pending_outcome(session).is_none());
+    }
+
+    #[test]
+    fn decide_action_done_completes() {
+        assert_eq!(
+            decide_action(&TaskOutcome::Done, 1, 10),
+            DispatchAction::Complete
+        );
+    }
+
+    #[test]
+    fn decide_action_structured_ship_completes() {
+        let outcome = TaskOutcome::Structured(make_outcome(Completion::Full, Recommend::Ship));
+        assert_eq!(decide_action(&outcome, 1, 10), DispatchAction::Complete);
+    }
+
+    #[test]
+    fn decide_action_structured_needs_human_completes() {
+        let outcome =
+            TaskOutcome::Structured(make_outcome(Completion::Partial, Recommend::NeedsHuman));
+        assert_eq!(decide_action(&outcome, 1, 10), DispatchAction::Complete);
+    }
+
+    #[test]
+    fn decide_action_structured_abandon_fails() {
+        let outcome =
+            TaskOutcome::Structured(make_outcome(Completion::Failed, Recommend::Abandon));
+        assert_eq!(decide_action(&outcome, 1, 10), DispatchAction::Fail);
+    }
+
+    #[test]
+    fn decide_action_structured_retry_continues() {
+        let outcome = TaskOutcome::Structured(make_outcome(Completion::Minimal, Recommend::Retry));
+        match decide_action(&outcome, 2, 10) {
+            DispatchAction::AutoContinue { prompt, slow } => {
+                assert!(prompt.contains("Retry"));
+                assert!(slow, "retry should rate-limit");
+            }
+            other => panic!("expected AutoContinue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_action_structured_retry_at_max_fails() {
+        // At the turn budget cap, Retry is downgraded to Fail (we can't
+        // retry forever).
+        let outcome = TaskOutcome::Structured(make_outcome(Completion::Minimal, Recommend::Retry));
+        assert_eq!(decide_action(&outcome, 5, 5), DispatchAction::Fail);
+    }
+
+    #[test]
+    fn decide_action_structured_continue_with_followups_spawns() {
+        let mut out = make_outcome(Completion::Partial, Recommend::Continue);
+        out.follow_up_tasks = vec!["step 1".into(), "step 2".into()];
+        let outcome = TaskOutcome::Structured(out);
+        match decide_action(&outcome, 1, 10) {
+            DispatchAction::Spawn { tasks } => {
+                assert_eq!(tasks, vec!["step 1".to_string(), "step 2".to_string()]);
+            }
+            other => panic!("expected Spawn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_action_structured_continue_without_followups_completes() {
+        // recommend=continue but no follow-ups specified → don't wedge open,
+        // treat as Complete.
+        let outcome =
+            TaskOutcome::Structured(make_outcome(Completion::Partial, Recommend::Continue));
+        assert_eq!(decide_action(&outcome, 1, 10), DispatchAction::Complete);
+    }
+
+    #[test]
+    fn decide_action_needs_input_completes() {
+        let outcome = TaskOutcome::NeedsInput("which file?".into());
+        assert_eq!(decide_action(&outcome, 1, 10), DispatchAction::Complete);
+    }
+
+    #[test]
+    fn decide_action_partial_continues_under_budget() {
+        match decide_action(&TaskOutcome::Partial, 2, 10) {
+            DispatchAction::AutoContinue { prompt, slow } => {
+                assert!(prompt.contains("Continue"));
+                assert!(!slow, "partial should not rate-limit");
+            }
+            other => panic!("expected AutoContinue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_action_partial_at_max_completes() {
+        // Legacy behaviour preserved: at max turns, Partial/Stuck/Error fall
+        // back to Complete (deliver whatever the agent has produced).
+        assert_eq!(
+            decide_action(&TaskOutcome::Partial, 5, 5),
+            DispatchAction::Complete
+        );
+    }
+
+    #[test]
+    fn decide_action_error_slow_retry() {
+        match decide_action(&TaskOutcome::Error("rate limit".into()), 1, 10) {
+            DispatchAction::AutoContinue { slow, .. } => {
+                assert!(slow, "Error should rate-limit before retry");
+            }
+            other => panic!("expected AutoContinue, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_outcome — Chinese keyword coverage
+    // -----------------------------------------------------------------------
+
+    fn fake_reply(text: &str) -> crate::agent::AgentReply {
+        crate::agent::AgentReply {
+            text: text.to_string(),
+            is_empty: text.is_empty(),
+            tool_calls: None,
+            images: vec![],
+            files: vec![],
+            pending_analysis: None,
+            needs_outer_done_emit: false,
+            outcome: crate::agent::registry::ReplyOutcome::Ok,
+        }
+    }
+
+    #[test]
+    fn classify_chinese_stuck_phrase() {
+        let reply = fake_reply("抱歉，我无法完成这个任务");
+        assert!(matches!(classify_outcome(&reply), TaskOutcome::Stuck(_)));
+    }
+
+    #[test]
+    fn classify_chinese_partial_phrase() {
+        let reply = fake_reply("先做了一半，下一步来处理剩下的");
+        assert!(matches!(classify_outcome(&reply), TaskOutcome::Partial));
+    }
+
+    #[test]
+    fn classify_empty_reply_is_stuck() {
+        assert!(matches!(
+            classify_outcome(&fake_reply("")),
+            TaskOutcome::Stuck(_)
+        ));
+    }
+
+    #[test]
+    fn classify_plain_reply_is_done() {
+        let reply = fake_reply("Sure, here's the result: 42.");
+        assert!(matches!(classify_outcome(&reply), TaskOutcome::Done));
     }
 }

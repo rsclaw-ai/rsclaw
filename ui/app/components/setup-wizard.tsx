@@ -47,9 +47,15 @@ const CONFIG_LANG_TO_CODE: Record<string, string> = {
 
 const PROVIDERS = [
   {
+    id: "rsclaw",
+    name: "RsClaw",
+    desc: "Stateful kvCache=2 fleet (recommended)",
+    placeholder: "sk-...",
+  },
+  {
     id: "anthropic",
     name: "Anthropic",
-    desc: "Claude models (recommended)",
+    desc: "Claude models",
     placeholder: "sk-ant-...",
   },
   {
@@ -99,7 +105,7 @@ export function SetupWizardPage() {
   const [step, setStep] = useState(0);
   const [config, setConfig] = useState<WizardConfig>({
     language: "zh-CN",
-    provider: "anthropic",
+    provider: "rsclaw",
     apiKey: "",
     baseUrl: "",
     apiType: "openai",
@@ -160,6 +166,17 @@ export function SetupWizardPage() {
         providerConfig.ollama = {
           api: "ollama",
           baseUrl: config.baseUrl || "http://localhost:11434",
+          enabled: true,
+        };
+      } else if (config.provider === "rsclaw") {
+        // The bare name `rsclaw` auto-resolves to the stateful
+        // kvCacheMode=2 protocol + default fleet baseUrl in
+        // gateway/providers.rs (see ApiFormat::Rsclaw inference and
+        // RSCLAW_DEFAULT_BASE fallback). Only write `baseUrl` when the
+        // user pointed at a self-hosted worker.
+        providerConfig.rsclaw = {
+          ...(config.apiKey ? { apiKey: config.apiKey } : {}),
+          ...(config.baseUrl ? { baseUrl: config.baseUrl } : {}),
           enabled: true,
         };
       } else if (config.apiKey) {

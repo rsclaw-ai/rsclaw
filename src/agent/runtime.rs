@@ -73,8 +73,8 @@ use crate::{
     gateway::live_config::LiveConfig,
     plugin::PluginRegistry,
     provider::{
-        ContentPart, LlmRequest, Message, MessageContent, Role, StreamEvent, ToolDef,
-        failover::FailoverManager, registry::ProviderRegistry,
+        AgentEndpoint, ContentPart, LlmRequest, Message, MessageContent, Role, StreamEvent,
+        ToolDef, failover::FailoverManager, registry::ProviderRegistry,
     },
     skill::{RunOptions, SkillRegistry, run_tool},
     store::Store,
@@ -358,6 +358,111 @@ pub struct RunContext {
     /// so the workflow distiller has the verbatim ask without re-walking
     /// session history.
     pub user_text: String,
+    /// Optional lossless trace for SFT data export. Populated only when
+    /// `RSCLAW_CAPTURE_TRACES=1`; flushed to the JSONL path in
+    /// `RSCLAW_TRACES_PATH` on normal turn completion.
+    pub full_trace: Option<super::trace_capture::FullTrace>,
+    /// Per-turn observability/control wires for A2A callers
+    /// (cancel_token, event_tx, input_request_tx, task/context ids).
+    /// Default-constructed for non-A2A turns; `agent_loop` polls
+    /// `is_cancelled()` between iterations and at tool-dispatch
+    /// boundaries, and calls `emit_working()` before each tool.
+    pub turn_ctx: super::registry::TurnContext,
+}
+
+fn init_full_trace(user_text: &str) -> Option<super::trace_capture::FullTrace> {
+    if std::env::var("RSCLAW_CAPTURE_TRACES").ok().as_deref() != Some("1") {
+        return None;
+    }
+    let trace_id = format!(
+        "trace-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let mut t = super::trace_capture::FullTrace::new(
+        trace_id,
+        String::new(),
+        String::new(),
+        json!([]),
+    );
+    t.push_user(user_text);
+    Some(t)
+}
+
+/// Lazily-spawned single-writer task for RSCLAW_TRACES_PATH JSONL output.
+///
+/// Two correctness requirements drove the refactor away from a direct
+/// sync write inside `maybe_emit_trace`:
+///   1. Hot path: the previous implementation ran `std::fs::File` +
+///      `BufWriter::write_all` synchronously on the tokio worker thread
+///      that just finished an agent turn. Under disk pressure / slow
+///      network FS that thread blocked, stalling other agents sharing
+///      the runtime.
+///   2. Concurrency safety: two agent loops emitting traces for the
+///      same path interleaved bytes (POSIX `O_APPEND` is only atomic
+///      for writes ≤ PIPE_BUF). A realistic trace is tens of KB and
+///      torn lines fail to parse, silently dropping training samples.
+///
+/// The dedicated writer task owns the file handle, receives owned
+/// FullTrace values over an unbounded mpsc, and serializes async writes
+/// via tokio::io::BufWriter. Emit becomes O(1) channel-send on the hot
+/// path; the writer drains in the background.
+static TRACE_TX: std::sync::OnceLock<
+    tokio::sync::mpsc::UnboundedSender<super::trace_capture::FullTrace>,
+> = std::sync::OnceLock::new();
+
+fn spawn_trace_writer(
+    path: std::path::PathBuf,
+) -> tokio::sync::mpsc::UnboundedSender<super::trace_capture::FullTrace> {
+    use tokio::io::AsyncWriteExt;
+    let (tx, mut rx) =
+        tokio::sync::mpsc::unbounded_channel::<super::trace_capture::FullTrace>();
+    tokio::spawn(async move {
+        let file = match tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+        {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(?path, "trace writer: open failed: {e:#}");
+                return;
+            }
+        };
+        let mut w = tokio::io::BufWriter::new(file);
+        while let Some(trace) = rx.recv().await {
+            let entry = match serde_json::to_string(
+                &super::sft_exporter::trace_to_sharegpt(&trace),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(trace_id = %trace.trace_id, "trace writer: serialize failed: {e:#}");
+                    continue;
+                }
+            };
+            if w.write_all(entry.as_bytes()).await.is_err()
+                || w.write_all(b"\n").await.is_err()
+                || w.flush().await.is_err()
+            {
+                warn!(?path, "trace writer: write failed; dropping trace");
+                continue;
+            }
+        }
+    });
+    tx
+}
+
+fn maybe_emit_trace(trace: super::trace_capture::FullTrace) {
+    let Ok(path_str) = std::env::var("RSCLAW_TRACES_PATH") else {
+        return;
+    };
+    let tx = TRACE_TX.get_or_init(|| spawn_trace_writer(std::path::PathBuf::from(&path_str)));
+    if tx.send(trace).is_err() {
+        warn!("trace dropped: writer task is dead");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +486,27 @@ pub struct AgentRuntime {
     /// SSE broadcast channel — None when running outside the gateway (e.g.
     /// tests).
     pub event_bus: Option<broadcast::Sender<AgentEvent>>,
+    /// Shared permission store for computer_use. Same `Arc` is held by
+    /// `AppState` so the WS handler can resolve pending requests minted
+    /// inside an agent run. `None` outside the gateway (tests / CLI).
+    pub computer_permission: Option<Arc<crate::computer::permission::RedbPermissionStore>>,
+    /// Broadcast channel that surfaces `PermissionRequest` to the WS
+    /// gateway. The Tauri UI subscribes and shows the modal. `None`
+    /// outside the gateway.
+    pub computer_permission_tx:
+        Option<broadcast::Sender<crate::computer::permission::PermissionRequest>>,
+    /// Broadcast channel that surfaces VlmDriver progress
+    /// (`ComputerUseStatus::Started/Step/Finished`) to the WS gateway
+    /// for the live status panel. `None` outside the gateway.
+    pub computer_status_tx:
+        Option<broadcast::Sender<crate::computer::status::ComputerUseStatus>>,
+    /// Shared registry of in-flight `computer_use` run abort flags.
+    /// `tool_vlm_drive` inserts on driver start and removes on exit; the
+    /// HTTP abort endpoint flips the bool to wake the driver loop.
+    /// `None` outside the gateway.
+    pub computer_runs: Option<
+        Arc<tokio::sync::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
+    >,
     /// Dynamic agent spawner — None when running outside the gateway.
     pub spawner: Option<Arc<crate::agent::AgentSpawner>>,
     /// Plugin registry — None when running outside the gateway or with no
@@ -415,18 +541,9 @@ pub struct AgentRuntime {
     /// Cached minimal system prompt for internal sessions (heartbeat/cron/system).
     /// Built on first internal session use.
     pub(crate) cached_minimal_prompt: Option<String>,
-    /// Cached plugins system message — frozen at session start, rebuilt
-    /// on compact or `/new`. Sorted by name for byte-stable output.
-    pub(crate) cached_plugins_system: Option<String>,
-    /// Cached skills system message — same lifecycle as plugins.
-    pub(crate) cached_skills_system: Option<String>,
-    /// Snapshot of installed skill names (sorted) for change detection.
-    pub(crate) cached_skills_snapshot: Vec<String>,
     /// Cached tool definitions from the last run_turn — reused by compaction
     /// to match the KV cache prefix exactly.
     pub(crate) cached_tools: Vec<crate::provider::ToolDef>,
-    /// Background context manager (/ctx command, formerly /btw).
-    btw_manager: super::btw::BtwManager,
     pub(crate) notification_tx: Option<tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>>,
     pub(crate) opencode_client: Arc<tokio::sync::OnceCell<crate::acp::client::AcpClient>>,
     pub(crate) claudecode_client: Arc<tokio::sync::OnceCell<crate::acp::client::AcpClient>>,
@@ -475,7 +592,6 @@ impl AgentRuntime {
             fallback_models,
         );
         let session_aliases = store.db.load_all_aliases().unwrap_or_default();
-        let btw_manager = super::btw::BtwManager::new(Some(Arc::clone(&store.db)));
         let live_status = Arc::clone(&handle.live_status);
         let max_concurrent = config
             .agents
@@ -494,6 +610,10 @@ impl AgentRuntime {
             memory,
             agents,
             event_bus,
+            computer_permission: None,
+            computer_permission_tx: None,
+            computer_status_tx: None,
+            computer_runs: None,
             spawner,
             plugins,
             mcp,
@@ -509,11 +629,7 @@ impl AgentRuntime {
             workspace_cache: None,
             cached_system_prompt: None,
             cached_minimal_prompt: None,
-            cached_plugins_system: None,
-            cached_skills_system: None,
-            cached_skills_snapshot: Vec::new(),
             cached_tools: Vec::new(),
-            btw_manager,
             pending_task_results: Arc::new(std::sync::Mutex::new(Vec::new())),
             voice_mode_sessions: std::collections::HashSet::new(),
             notification_tx,
@@ -579,9 +695,33 @@ impl AgentRuntime {
                     .as_ref()
                     .and_then(|m| m.primary.as_deref())
             })
-            .unwrap_or("anthropic/claude-sonnet-4-6")
+            .unwrap_or("rsclaw/rsclaw-agent-v1")
             .to_owned()
     }
+}
+
+/// Resolve the primary model name from per-agent + defaults config,
+/// without needing an `AgentRuntime` instance. Returns `None` if nothing
+/// is configured — caller decides on a fallback.
+///
+/// Lookup chain mirrors [`AgentRuntime::resolve_model_name`]:
+///   1. per-agent `model.primary`
+///   2. `defaults.model.primary`
+pub fn resolve_primary_model_for(
+    per_agent: &crate::config::schema::AgentEntry,
+    defaults: &crate::config::schema::AgentDefaults,
+) -> Option<String> {
+    per_agent
+        .model
+        .as_ref()
+        .and_then(|m| m.primary.as_deref())
+        .or_else(|| {
+            defaults
+                .model
+                .as_ref()
+                .and_then(|m| m.primary.as_deref())
+        })
+        .map(str::to_owned)
 }
 
 /// Resolve the flash (cheap/fast) model name from per-agent + defaults config,
@@ -593,11 +733,17 @@ impl AgentRuntime {
 ///   2. per-agent `flash_model.primary` (legacy)
 ///   3. `defaults.model.flash`
 ///   4. `defaults.flash_model.primary` (legacy)
+///   5. **RsClaw provider inference**: if the effective primary lives
+///      under the `rsclaw/` namespace (managed fleet), auto-pick
+///      [`RSCLAW_DEFAULT_FLASH`]. Saves users from having to repeat the
+///      rsclaw flash slot when their primary already names a rsclaw
+///      model — the same "convention over configuration" treatment the
+///      provider gets for api/baseUrl/prefix_id.
 pub fn resolve_flash_model_for(
     per_agent: &crate::config::schema::AgentEntry,
     defaults: &crate::config::schema::AgentDefaults,
 ) -> Option<String> {
-    per_agent
+    let explicit = per_agent
         .model
         .as_ref()
         .and_then(|m| m.flash.as_deref())
@@ -619,7 +765,337 @@ pub fn resolve_flash_model_for(
                 .as_ref()
                 .and_then(|m| m.primary.as_deref())
         })
+        .map(str::to_owned);
+    if explicit.is_some() {
+        return explicit;
+    }
+
+    // RsClaw fleet inference (see RSCLAW_DEFAULT_FLASH).
+    let primary = per_agent
+        .model
+        .as_ref()
+        .and_then(|m| m.primary.as_deref())
+        .or_else(|| {
+            defaults
+                .model
+                .as_ref()
+                .and_then(|m| m.primary.as_deref())
+        });
+    if let Some(p) = primary {
+        if p.starts_with("rsclaw/") {
+            return Some(crate::provider::rsclaw::RSCLAW_DEFAULT_FLASH.to_owned());
+        }
+    }
+    None
+}
+
+/// Outcome of vision-model resolution. The four cases are distinguished
+/// so the caller can format actionable error messages — "you have no
+/// vision model AND no primary, configure one", vs "your primary
+/// {name} is text-only, set agents.defaults.model.vision".
+#[derive(Debug, Clone)]
+pub enum VisionResolution {
+    /// An explicit `model.vision` was configured (per-agent or in
+    /// defaults). The string is the model identifier.
+    Configured(String),
+    /// No `vision` set; falling back to the agent's primary model.
+    /// Caller may want to verify the primary actually supports images
+    /// before proceeding.
+    FallbackToPrimary(String),
+    /// Neither `vision` nor `primary` is configured anywhere — the
+    /// runtime can't proceed. Caller surfaces a "configure
+    /// agents.defaults.model.{vision,primary}" message.
+    NoneConfigured,
+}
+
+/// Resolve the vision model for `computer_use` (and any other VLM-backed
+/// path). Lookup chain:
+///
+///   1. per-agent `model.vision`
+///   2. `defaults.model.vision`
+///   3. per-agent `model.primary`
+///   4. `defaults.model.primary`
+///
+/// (1) and (2) return `Configured`. (3) and (4) return
+/// `FallbackToPrimary`. Nothing → `NoneConfigured`.
+pub fn resolve_vision_model_for(
+    per_agent: &crate::config::schema::AgentEntry,
+    defaults: &crate::config::schema::AgentDefaults,
+) -> VisionResolution {
+    if let Some(name) = per_agent
+        .model
+        .as_ref()
+        .and_then(|m| m.vision.as_deref())
         .map(str::to_owned)
+    {
+        return VisionResolution::Configured(name);
+    }
+    if let Some(name) = defaults
+        .model
+        .as_ref()
+        .and_then(|m| m.vision.as_deref())
+        .map(str::to_owned)
+    {
+        return VisionResolution::Configured(name);
+    }
+
+    // No explicit vision configured. Before declaring a primary fallback,
+    // check if the primary lives under the `rsclaw/` namespace — in that
+    // case the fleet exposes a dedicated vision slot
+    // ([`RSCLAW_DEFAULT_VISION`]) which is what the user almost
+    // certainly wants. The default `rsclaw/rsclaw-agent-v1` primary is
+    // text-only, so falling back to it would surface a "primary is
+    // text-only" error to the user even though a perfectly good vision
+    // slot is sitting one HTTP hop away. Treat the inferred rsclaw
+    // vision model as `Configured` (not `FallbackToPrimary`) so callers
+    // skip the text-only check below — the rsclaw fleet vouches for it.
+    let primary = per_agent
+        .model
+        .as_ref()
+        .and_then(|m| m.primary.as_deref())
+        .or_else(|| {
+            defaults
+                .model
+                .as_ref()
+                .and_then(|m| m.primary.as_deref())
+        });
+    if let Some(p) = primary {
+        if p.starts_with("rsclaw/") {
+            return VisionResolution::Configured(
+                crate::provider::rsclaw::RSCLAW_DEFAULT_VISION.to_owned(),
+            );
+        }
+    }
+
+    if let Some(name) = per_agent
+        .model
+        .as_ref()
+        .and_then(|m| m.primary.as_deref())
+        .map(str::to_owned)
+    {
+        return VisionResolution::FallbackToPrimary(name);
+    }
+    if let Some(name) = defaults
+        .model
+        .as_ref()
+        .and_then(|m| m.primary.as_deref())
+        .map(str::to_owned)
+    {
+        return VisionResolution::FallbackToPrimary(name);
+    }
+    VisionResolution::NoneConfigured
+}
+
+/// Look up `model_name` (e.g. `"kimi/kimi-for-coding"` or just
+/// `"kimi-for-coding"`) in the provider config and return whether its
+/// `input` array contains `image`. Returns:
+///   - `Some(true)` — explicitly declared as image-capable.
+///   - `Some(false)` — explicitly declared as text-only (no `image` in the
+///     array).
+///   - `None` — no `models[].input` entry found; caller should fall back
+///     to the blocklist heuristic.
+///
+/// The lookup is fuzzy: it tries `provider/model_id` first (when the
+/// name contains `/`), then falls back to scanning every provider for a
+/// matching `model.id`. This way users who write `"kimi-for-coding"`
+/// (without provider prefix) still get the declaration honoured.
+pub fn model_supports_image_input(
+    config: &crate::config::schema::Config,
+    model_name: &str,
+) -> Option<bool> {
+    use crate::config::schema::InputType;
+
+    let models_cfg = config.models.as_ref()?;
+    let (prov_name, model_id) = match model_name.split_once('/') {
+        Some((p, m)) => (Some(p), m),
+        None => (None, model_name),
+    };
+
+    // Closure: probe one provider's models[] for a matching id.
+    let probe = |entries: &Option<Vec<crate::config::schema::ModelDef>>| {
+        entries.as_ref().and_then(|defs| {
+            defs.iter()
+                .find(|d| d.id == model_id)
+                .and_then(|d| d.input.as_ref())
+                .map(|inputs| inputs.contains(&InputType::Image))
+        })
+    };
+
+    // Targeted lookup first.
+    if let Some(prov) = prov_name {
+        if let Some(pc) = models_cfg.providers.get(prov) {
+            if let Some(verdict) = probe(&pc.models) {
+                return Some(verdict);
+            }
+        }
+    }
+
+    // Otherwise scan every provider — first hit wins.
+    for pc in models_cfg.providers.values() {
+        if let Some(verdict) = probe(&pc.models) {
+            return Some(verdict);
+        }
+    }
+    None
+}
+
+/// Heuristic substring list of model names known to be **vision-capable**
+/// (accept image input). When the schema-driven check
+/// (`models.providers[].models[].input` array) is missing, the resolver
+/// falls back to this allow-list. Models NOT in this list are treated as
+/// text-only by default — safer than the inverse (an unknown new model
+/// is more likely text-only than vision-capable, and forcing the user
+/// to opt in by either listing it here or declaring `input: ["image"]`
+/// in their config produces a clear error message instead of a cryptic
+/// API failure later).
+///
+/// Match is `model.to_lowercase().contains(s)`. Add a substring when
+/// you've confirmed a model family ships with image input.
+pub fn is_known_vision_model(model: &str) -> bool {
+    let m = model.to_lowercase();
+    [
+        // -------- universal suffixes (covers most "-vision" / "-vl"
+        // -------- variants across vendors without per-model entries)
+        "-vision",
+        "-vl-", "-vl/", "-vl:",
+        "-omni",
+
+        // -------- OpenAI
+        "gpt-4o", "gpt-4-vision", "gpt-4-turbo", "gpt-4.1",
+        "gpt-5", "chatgpt-4o", "o1-", "o3-", "o4-",
+        // (bare "gpt-4" intentionally NOT included — original GPT-4 base is text-only)
+
+        // -------- Anthropic Claude 3+
+        "claude-3", "claude-sonnet-4", "claude-opus-4", "claude-haiku-4",
+        "claude-4", "claude-5",
+        // (claude-instant / claude-2 are text-only)
+
+        // -------- Google Gemini + Gemma 3+
+        "gemini-1.5", "gemini-2", "gemini-3", "gemini-pro-vision",
+        "gemma-3", "gemma-4",
+        "paligemma",
+        // (gemma-1/-2 text-only)
+
+        // -------- Meta Llama (3.2 vision + Llama 4 multimodal)
+        "llama-3.2-11b-vision", "llama-3.2-90b-vision", "llama-3.2-vision",
+        "llama-4",
+        // (llama-3 / llama-3.1 / llama-3.3 / llama-3.2-1b / llama-3.2-3b are text-only)
+
+        // -------- Mistral
+        "pixtral",
+        "mistral-small-3.1", "mistral-small-3.2", "mistral-small-4",
+        "mistral-medium-3",
+
+        // -------- Cohere
+        "aya-vision", "command-a-vision",
+
+        // -------- xAI Grok (3+ natively multimodal; older variants need -vision)
+        "grok-2-vision", "grok-1.5-vision",
+        "grok-3", "grok-4", "grok-5",
+
+        // -------- ByteDance Doubao
+        // Seed 1.x: required `-vision` suffix to be multimodal.
+        "doubao-seed-1.5-vision", "doubao-1.5-vision", "doubao-1-5-vision",
+        "doubao-seed-1.6-vision",
+        // Seed 2+ family: entire subtree is multimodal-by-default
+        // (pro / lite / code / flash / vision all accept image input).
+        // List 2..=9 explicitly so future generations (3.x, 4.x, ...)
+        // are auto-recognised without a code change.
+        "doubao-seed-2", "doubao-seed-3", "doubao-seed-4", "doubao-seed-5",
+        "doubao-seed-6", "doubao-seed-7", "doubao-seed-8", "doubao-seed-9",
+        // Other vision lines.
+        "doubao-pro-vision", "doubao-vision",
+        "seedream", "seedance",
+
+        // -------- Alibaba Qwen
+        "qwen-vl", "qwen2-vl", "qwen2.5-vl", "qwen3-vl",
+        "qwen-max-vision",
+        // Qwen 3.5+ base series multimodal; both spellings.
+        "qwen3.5", "qwen-3.5",
+        "qwen3.6", "qwen-3.6",
+        "qwen3.7", "qwen-3.7",
+        "qwen3.8", "qwen-3.8",
+        "qwen3.9", "qwen-3.9",
+        "qwen4", "qwen-4",
+        "qvq",  // Qwen visual-question
+
+        // -------- Moonshot Kimi
+        "kimi-for-coding",
+        "kimi-k2.5", "kimi-k2.6", "kimi-k2.7", "kimi-k2.8", "kimi-k2.9",
+        "kimi-vl",
+        "moonshot-v1-vision",
+
+        // -------- Zhipu GLM (look for "vN" suffix — glm-4v, glm-4.5v, ...)
+        "glm-4v", "glm-4.1v", "glm-4.5v", "glm-4.6v", "glm-5v",
+        "cogvlm", "cogagent",
+
+        // -------- Baidu ERNIE
+        "ernie-vl", "ernie-4.5-vl", "ernie-5",
+        "ernie-vision",
+
+        // -------- SenseTime SenseChat
+        "sensechat-vision", "sensechat-v",
+        "sensenova-v6",
+
+        // -------- 01.AI Yi
+        "yi-vl", "yi-vision",
+
+        // -------- Baichuan
+        "baichuan-omni", "baichuan-vl", "baichuan2-vl",
+
+        // -------- DeepSeek
+        "deepseek-vl", "deepseek-vl2",
+        "janus",
+
+        // -------- Tencent Hunyuan
+        "hunyuan-vision", "hunyuan-vl", "hunyuanocr",
+
+        // -------- MiniMax
+        // NOTE: M2 / M2.5 / M2.7 base models are TEXT-ONLY despite
+        // marketing claims of "native multimodality" — confirmed by
+        // Artificial Analysis (artificialanalysis.ai) and the official
+        // model card on build.nvidia.com (text input only). Only the
+        // explicitly vision-tagged variants accept images.
+        "minimax-vl", "abab-vision", "abab6.5-vision",
+
+        // -------- StepFun
+        "step-1v", "step-1o", "step-2-vision",
+        "step-3", "step-3.5",
+
+        // -------- Open-source major VLMs
+        "llava",
+        "internvl", "mini-internvl", "xcomposer",
+        "minicpm-v", "minicpm-o", "minicpm-llama3-v",
+        "phi-3-vision", "phi-3.5-vision", "phi-4-multimodal",
+        "idefics",
+        "blip", "instructblip", "xgen-mm",
+        "fuyu", "kosmos",
+        "ferret", "openelm-vision", "mm1",
+        "florence-2", "florence-vl",
+        "smolvlm",
+        "vila", "nvila", "eagle2", "nvlm", "nemotron-vl",
+        "pali-3",
+
+        // -------- GUI-agent / screen-understanding VLMs (RsClaw's core
+        //          user community — keep this list eager)
+        "ui-tars",
+        "showui", "os-atlas", "seeclick", "screenagent",
+        "aria-ui", "omniparser",
+        "mobileagent", "appagent", "autoui",
+    ]
+    .iter()
+    .any(|needle| m.contains(needle))
+}
+
+/// User-facing error message emitted when vision-model resolution lands
+/// on a configuration that can't drive `computer_use`. Localised — the
+/// gateway language is read from `crate::i18n::default_lang()` so the
+/// message reaches the user in the channel they configured (Feishu /
+/// WeChat / Telegram / etc.). Falls back to English when the language
+/// is unset.
+pub fn vision_unavailable_message(reason: &str) -> String {
+    let lang = crate::i18n::default_lang();
+    crate::i18n::t_fmt("vision_unavailable", lang, &[("reason", reason)])
 }
 
 impl AgentRuntime {
@@ -650,6 +1126,64 @@ impl AgentRuntime {
     pub(crate) fn resolve_flash_model_name(&self) -> String {
         resolve_flash_model_for(&self.handle.config, &self.config.agents.defaults)
             .unwrap_or_else(|| self.resolve_model_name())
+    }
+
+    /// Resolve the vision model for `computer_use` via the
+    /// `model.vision → primary` fallback chain. Returns
+    /// `Err(actionable message)` when the resolved model is known to
+    /// be text-only or when nothing is configured at all — caller
+    /// surfaces this directly to the user.
+    ///
+    /// Use this from anywhere that wants to drive a VLM-backed loop
+    /// (`computer_use vlm_drive`).
+    pub(crate) fn resolve_vision_model_name(&self) -> Result<String, String> {
+        match resolve_vision_model_for(
+            &self.handle.config,
+            &self.config.agents.defaults,
+        ) {
+            VisionResolution::Configured(name) => Ok(name),
+            VisionResolution::FallbackToPrimary(name) => {
+                // 1. Honour the per-model `input` declaration in
+                //    `models.providers[].models[]` first. If the user
+                //    has listed `image` we trust them; if they
+                //    explicitly listed only `text` we surface that as
+                //    a config error.
+                match model_supports_image_input(&self.config.raw, &name) {
+                    Some(true) => return Ok(name),
+                    Some(false) => {
+                        return Err(vision_unavailable_message(&format!(
+                            "model `{name}` is declared as text-only \
+                             (`input: [\"text\"]`) in its provider config. \
+                             Add `\"image\"` to the model's `input` array \
+                             or set `agents.defaults.model.vision`."
+                        )));
+                    }
+                    None => {} // no declaration → fall through to heuristic
+                }
+
+                // 2. No declaration: fall back to a vision-allow-list.
+                //    Defaulting to text-only here is the safer choice
+                //    — an unknown model name is more likely text-only
+                //    than vision-capable, and a clear error pointing
+                //    at the config beats a cryptic API failure later.
+                if is_known_vision_model(&name) {
+                    Ok(name)
+                } else {
+                    Err(vision_unavailable_message(&format!(
+                        "primary model `{name}` is not in the built-in \
+                         vision allow-list and its provider config does \
+                         not declare `input: [\"image\"]`. Either set \
+                         `agents.defaults.model.vision` to a vision \
+                         model, or declare `input: [\"text\", \"image\"]` \
+                         on the `{name}` entry under \
+                         `models.providers.<provider>.models[]`."
+                    )))
+                }
+            }
+            VisionResolution::NoneConfigured => Err(vision_unavailable_message(
+                "no model is configured for this agent.",
+            )),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -729,8 +1263,11 @@ impl AgentRuntime {
             temperature: None,
             frequency_penalty: None,
             thinking_budget: None,
+            endpoint: AgentEndpoint::Flash,
             kv_cache_mode: 0,
             session_key: None,
+            system_shared: None,
+            user_system: None,
         };
 
         let providers = Arc::clone(&self.providers);
@@ -763,6 +1300,7 @@ impl AgentRuntime {
             pending_analysis: None,
             // /btw bypasses agent_loop — outer must emit done.
             needs_outer_done_emit: true,
+            outcome: crate::agent::registry::ReplyOutcome::Ok,
         })
     }
 
@@ -823,9 +1361,17 @@ impl AgentRuntime {
             format!("User question: {user_question}\n\nTool ({tool_name}) returned:\n{capped}")
         };
 
-        // Step 5: single LLM call — extract the answer, no cache markers,
-        // no tools.  Like vision: raw content goes in, structured answer comes out.
-        let model = self.resolve_model_name();
+        // Step 5: single LLM call on the flash model — raw content + the
+        // user question goes in, a targeted compressed answer comes out.
+        // Routes via the rsclaw fastshot endpoint
+        // (`AgentEndpoint::Flash` → POST /v1/agent/fastshot) which is a
+        // one-shot stateless OpenAI-compat stream — no session, no
+        // kv_cache_mode, no session_key. The fastshot worker pool is
+        // filtered server-side via `fastshot_enabled`, so this call
+        // never competes with the primary agent's session slots.
+        // Non-rsclaw providers (OpenAI, Anthropic, etc.) ignore the
+        // endpoint field and just see a normal chat completion.
+        let model = self.resolve_flash_model_name();
         let req = LlmRequest {
             model,
             messages: vec![Message {
@@ -846,9 +1392,16 @@ impl AgentRuntime {
             temperature: None,
             frequency_penalty: None,
             thinking_budget: None,
+            endpoint: AgentEndpoint::Flash,
             kv_cache_mode: 0,
             session_key: None,
+            system_shared: None,
+            user_system: None,
         };
+        // session_key keeps it lints-quiet now that fastshot doesn't
+        // route through a stateful session — callers still pass one
+        // and we may revive use for telemetry / cache-tag later.
+        let _ = session_key;
 
         let providers = Arc::clone(&self.providers);
         let mut stream = self.failover.call(req, &providers).await?;
@@ -882,6 +1435,7 @@ impl AgentRuntime {
         extra_tools: Vec<ToolDef>,
         images: Vec<super::registry::ImageAttachment>,
         files: Vec<super::registry::FileAttachment>,
+        turn_ctx: super::registry::TurnContext,
     ) -> Result<AgentReply> {
         // Resolve @file references (e.g. @up_i_202604271325ab.png → full path
         // under workspace/uploads/, @dl_v_... → ~/Downloads/rsclaw/videos/).
@@ -1014,27 +1568,6 @@ impl AgentRuntime {
                     Err(e) => tracing::warn!("failed to start new generation: {e:#}"),
                 }
             }
-            self.invalidate_plugins_skills_cache();
-        }
-
-        // /reset — clear current session without summary or generation change.
-        if self.handle.reset_signal.load(Ordering::SeqCst) {
-            self.handle.reset_signal.store(false, Ordering::SeqCst);
-            info!("reset_signal received, resetting sessions");
-
-            // Save session summary to memory before clearing.
-            let compaction_model2 = self.live.agents.read().await.defaults.compaction
-                .as_ref().and_then(|c| c.model.clone())
-                .or_else(|| self.handle.config.model.as_ref()?.primary.clone())
-                .unwrap_or_else(|| "default".to_owned());
-            self.save_session_summaries_to_memory(&compaction_model2).await;
-
-            self.sessions.clear();
-            self.compaction_state.clear();
-            if let Ok(mut map) = self.handle.session_tokens.write() { map.clear(); }
-            for key in self.store.db.list_sessions().unwrap_or_default() {
-                let _ = self.store.db.delete_session(&key);
-            }
         }
 
         // Reclaim idle browser session (kills Chrome process) to free memory.
@@ -1158,6 +1691,7 @@ impl AgentRuntime {
                             pending_analysis: None,
                             // File-handling short-circuit bypasses agent_loop.
                             needs_outer_done_emit: true,
+                            outcome: crate::agent::registry::ReplyOutcome::Ok,
                         });
                     }
                     // Has extractable text: return "analyzing..." immediately,
@@ -1176,6 +1710,7 @@ impl AgentRuntime {
                         }),
                         // pending_analysis short-circuit bypasses agent_loop.
                         needs_outer_done_emit: true,
+                        outcome: crate::agent::registry::ReplyOutcome::Ok,
                     });
                 }
                 "2" => {
@@ -1235,6 +1770,7 @@ impl AgentRuntime {
                             pending_analysis: None,
                             // File-handling short-circuit bypasses agent_loop.
                             needs_outer_done_emit: true,
+                            outcome: crate::agent::registry::ReplyOutcome::Ok,
                         });
                     }
                     // Has extractable text: return "analyzing..." immediately,
@@ -1259,6 +1795,7 @@ impl AgentRuntime {
                         }),
                         // pending_analysis short-circuit bypasses agent_loop.
                         needs_outer_done_emit: true,
+                        outcome: crate::agent::registry::ReplyOutcome::Ok,
                     });
                 }
                 _ => {
@@ -1276,6 +1813,7 @@ impl AgentRuntime {
                         pending_analysis: None,
                         // File-handling short-circuit bypasses agent_loop.
                         needs_outer_done_emit: true,
+                        outcome: crate::agent::registry::ReplyOutcome::Ok,
                     });
                 }
             }
@@ -1372,8 +1910,19 @@ impl AgentRuntime {
                                 None
                             } else {
                                 let model = self.resolve_model_name();
-                                let context_tokens = self.live.agents.read().await.defaults.context_tokens.unwrap_or(64_000) as usize;
-                                let cfg = self.live.agents.read().await.defaults.compaction.clone().unwrap_or_default();
+                                // Single read guard for both defaults — the
+                                // prior code held two consecutive
+                                // `self.live.agents.read().await` calls a few
+                                // tokens apart. Compaction-on-/clear runs on
+                                // the user-input path so the contention is
+                                // observable, not theoretical.
+                                let (context_tokens, cfg) = {
+                                    let agents = self.live.agents.read().await;
+                                    (
+                                        agents.defaults.context_tokens.unwrap_or(64_000) as usize,
+                                        agents.defaults.compaction.clone().unwrap_or_default(),
+                                    )
+                                };
                                 let default_transcript = (context_tokens * 7 / 10).max(16_000);
                                 let max_transcript = cfg.max_transcript_tokens.map(|t| t as usize).unwrap_or(default_transcript);
                                 // Render transcript (reuse the same logic as compaction).
@@ -1466,15 +2015,6 @@ impl AgentRuntime {
                         } else {
                             "No active task found for this session.".to_owned()
                         }
-                    }
-                    "__RESET__" => {
-                        // Clear in-memory cache AND redb session data.
-                        let key = self.resolve_session_key(session_key).to_owned();
-                        self.sessions.remove(&key);
-                        let _ = self.store.db.delete_session(&key);
-                        self.voice_mode_sessions.remove(&key);
-                        self.handle.remove_session_tokens(&key);
-                        crate::i18n::t("session_reset", crate::i18n::default_lang()).to_owned()
                     }
                     "__TEXT_MODE__" => {
                         self.voice_mode_sessions.remove(session_key);
@@ -1650,97 +2190,6 @@ impl AgentRuntime {
                             ),
                         }
                     }
-                    // --- Background context (/ctx, formerly /btw) ---
-                    s if s.starts_with("__CTX_ADD__:") => {
-                        let content = s.strip_prefix("__CTX_ADD__:").unwrap_or("");
-                        let id = self
-                            .btw_manager
-                            .add(
-                                content,
-                                super::btw::BtwScope::Session(session_key.to_owned()),
-                                None,
-                            )
-                            .await;
-                        let lang = crate::i18n::default_lang();
-                        crate::i18n::t_fmt("btw_added", lang, &[("id", &id.to_string())])
-                    }
-                    s if s.starts_with("__CTX_TTL__:") => {
-                        let rest = s.strip_prefix("__CTX_TTL__:").unwrap_or("");
-                        let (turns_str, content) = rest.split_once(':').unwrap_or(("0", rest));
-                        let turns: u32 = turns_str.parse().unwrap_or(0);
-                        let id = self
-                            .btw_manager
-                            .add(
-                                content,
-                                super::btw::BtwScope::Session(session_key.to_owned()),
-                                Some(turns),
-                            )
-                            .await;
-                        let lang = crate::i18n::default_lang();
-                        crate::i18n::t_fmt(
-                            "btw_added_ttl",
-                            lang,
-                            &[("id", &id.to_string()), ("turns", &turns.to_string())],
-                        )
-                    }
-                    s if s.starts_with("__CTX_GLOBAL__:") => {
-                        if !is_default {
-                            format!("Command not available on agent `{}`.", self.handle.id)
-                        } else {
-                            let content = s.strip_prefix("__CTX_GLOBAL__:").unwrap_or("");
-                            let id = self.btw_manager.add(
-                                content,
-                                super::btw::BtwScope::Global,
-                                None,
-                            ).await;
-                            let lang = crate::i18n::default_lang();
-                            crate::i18n::t_fmt("btw_added_global", lang, &[("id", &id.to_string())])
-                        }
-                    }
-                    "__CTX_LIST__" => {
-                        let entries = self.btw_manager.list(session_key, channel).await;
-                        if entries.is_empty() {
-                            let lang = crate::i18n::default_lang();
-                            crate::i18n::t("btw_list_empty", lang)
-                        } else {
-                            let mut lines = Vec::new();
-                            for e in &entries {
-                                let ttl_info = if let Some(remaining) = e.remaining_turns {
-                                    format!("{remaining} turns left")
-                                } else {
-                                    "permanent".to_owned()
-                                };
-                                let scope_info = match &e.scope {
-                                    super::btw::BtwScope::Session(_) => "",
-                                    super::btw::BtwScope::Channel(_) => " [channel]",
-                                    super::btw::BtwScope::Global => " [global]",
-                                };
-                                lines.push(format!(
-                                    "[{}] ({}{}) {}",
-                                    e.id, ttl_info, scope_info, e.content
-                                ));
-                            }
-                            lines.join("\n")
-                        }
-                    }
-                    "__CTX_CLEAR__" => {
-                        self.btw_manager.clear(Some(session_key)).await;
-                        let lang = crate::i18n::default_lang();
-                        crate::i18n::t("btw_cleared", lang)
-                    }
-                    s if s.starts_with("__CTX_REMOVE__:") => {
-                        let id_str = s.strip_prefix("__CTX_REMOVE__:").unwrap_or("0");
-                        let id: u32 = id_str.parse().unwrap_or(0);
-                        let lang = crate::i18n::default_lang();
-                        if self.btw_manager.remove(id).await {
-                            crate::i18n::t_fmt("btw_removed", lang, &[("id", &id.to_string())])
-                        } else {
-                            crate::i18n::t_fmt("btw_not_found", lang, &[("id", &id.to_string())])
-                        }
-                    }
-                    "__CTX_USAGE__" => {
-                        "Usage:\n  /ctx <text>           Add context (session)\n  /ctx --ttl <N> <text> Add context (expires in N turns)\n  /ctx --global <text>  Add global context\n  /ctx --list           List entries\n  /ctx --remove <id>    Remove entry\n  /ctx --clear          Clear all".to_owned()
-                    }
                     // --- Side-channel quick query (/btw) ---
                     s if s.starts_with("__SIDE_QUERY__:") => {
                         let question = s.strip_prefix("__SIDE_QUERY__:").unwrap_or("");
@@ -1759,6 +2208,7 @@ impl AgentRuntime {
                             files: vec![],
                             pending_analysis: None,
                             needs_outer_done_emit: true,
+                            outcome: crate::agent::registry::ReplyOutcome::Ok,
                         });
                     }
                     other => other.to_owned(),
@@ -1772,6 +2222,7 @@ impl AgentRuntime {
                         files: vec![],
                         pending_analysis: None,
                         needs_outer_done_emit: true,
+                        outcome: crate::agent::registry::ReplyOutcome::Ok,
                     });
                 }
                 // Fall through to LLM for unhandled directives
@@ -1781,7 +2232,7 @@ impl AgentRuntime {
             {
                 // Group chat safety: block dangerous preparse commands (/run, /ls, /cat, etc.)
                 let is_group = session_key.contains(":group:");
-                if is_group && matches!(tool.as_str(), "execute_command" | "exec" | "read_file" | "read" | "write_file" | "write") {
+                if is_group && matches!(tool.as_str(), "shell" | "execute_command" | "exec" | "read_file" | "read" | "write_file" | "write") {
                     return Ok(AgentReply {
                         text: "[Blocked] Shell/file commands are not allowed in group chats for security.".to_owned(),
                         is_empty: false,
@@ -1790,6 +2241,7 @@ impl AgentRuntime {
                         files: vec![],
                         pending_analysis: None,
                         needs_outer_done_emit: true,
+                        outcome: crate::agent::registry::ReplyOutcome::Ok,
                     });
                 }
                 info!(tool = %tool, "pre-parse: executing tool directly");
@@ -1819,6 +2271,8 @@ impl AgentRuntime {
                             loop_warning_triggered: false,
                             turn_metrics: super::turn_metrics::TurnMetrics::new(),
                             user_text: String::new(),
+                            full_trace: None,
+                            turn_ctx: super::registry::TurnContext::default(),
                         },
                         "",
                         &tool,
@@ -1843,6 +2297,7 @@ impl AgentRuntime {
                             files: vec![],
                             pending_analysis: None,
                             needs_outer_done_emit: true,
+                            outcome: crate::agent::registry::ReplyOutcome::Ok,
                         });
                     }
                     Err(e) => {
@@ -1854,6 +2309,7 @@ impl AgentRuntime {
                             files: vec![],
                             pending_analysis: None,
                             needs_outer_done_emit: true,
+                            outcome: crate::agent::registry::ReplyOutcome::Ok,
                         });
                     }
                 }
@@ -1877,6 +2333,7 @@ impl AgentRuntime {
                         files: vec![],
                         pending_analysis: None,
                         needs_outer_done_emit: true,
+                        outcome: crate::agent::registry::ReplyOutcome::Ok,
                     });
                 }
                 // Safety off: fall through to execute anyway
@@ -1901,6 +2358,7 @@ impl AgentRuntime {
                         files: vec![],
                         pending_analysis: None,
                         needs_outer_done_emit: true,
+                        outcome: crate::agent::registry::ReplyOutcome::Ok,
                     });
                 }
                 // Safety off: fall through to execute anyway
@@ -1917,6 +2375,7 @@ impl AgentRuntime {
                     files: vec![],
                     pending_analysis: None,
                     needs_outer_done_emit: true,
+                    outcome: crate::agent::registry::ReplyOutcome::Ok,
                 });
             }
         }
@@ -1935,6 +2394,7 @@ impl AgentRuntime {
                 pending_analysis: None,
                 // __DIRECT_REPLY__ bypasses agent_loop.
                 needs_outer_done_emit: true,
+                outcome: crate::agent::registry::ReplyOutcome::Ok,
             });
         }
 
@@ -2022,6 +2482,7 @@ impl AgentRuntime {
                     extra_tools,
                     images,
                     vec![],
+                    turn_ctx,
                 ))
                 .await;
             } else if !transcriptions.is_empty() {
@@ -2040,6 +2501,7 @@ impl AgentRuntime {
                     extra_tools,
                     images,
                     files,
+                    turn_ctx,
                 ))
                 .await;
             }
@@ -2096,6 +2558,7 @@ impl AgentRuntime {
                     pending_analysis: None,
                     // File-size-exceeded short-circuit bypasses agent_loop.
                     needs_outer_done_emit: true,
+                    outcome: crate::agent::registry::ReplyOutcome::Ok,
                 });
             }
             let files = accepted;
@@ -2123,6 +2586,7 @@ impl AgentRuntime {
                     pending_analysis: None,
                     // Disk-low short-circuit bypasses agent_loop.
                     needs_outer_done_emit: true,
+                    outcome: crate::agent::registry::ReplyOutcome::Ok,
                 });
             }
 
@@ -2237,6 +2701,7 @@ impl AgentRuntime {
                 pending_analysis: None,
                 // File-saved short-circuit bypasses agent_loop.
                 needs_outer_done_emit: true,
+                outcome: crate::agent::registry::ReplyOutcome::Ok,
             });
         }
 
@@ -2279,7 +2744,13 @@ impl AgentRuntime {
             self.cached_minimal_prompt.clone().expect("just set")
         } else {
             if self.cached_system_prompt.is_none() {
-                let prompt = build_system_prompt(&ws_ctx, &self.skills, &self.config.raw);
+                let prompt = build_system_prompt(
+                    &ws_ctx,
+                    &self.skills,
+                    &self.wasm_plugins,
+                    self.plugins.as_deref(),
+                    &self.config.raw,
+                );
                 // DEBUG: dump full system prompt to file for inspection
                 if std::env::var("RSCLAW_DUMP_PROMPT").is_ok() {
                     let dump_path = crate::config::loader::base_dir().join("debug_system_prompt.txt");
@@ -2293,45 +2764,11 @@ impl AgentRuntime {
             self.cached_system_prompt.clone().expect("just set")
         };
 
-        // --- Dynamic context: injected into system prompt suffix ---
-        // Only truly dynamic, per-turn content goes here. Static rules belong
-        // in the base system prompt. Auto-recall memories are removed — LLM
-        // uses the memory tool to search when needed.
-        let mut dynamic_ctx = Vec::<String>::new();
-
-        // Inject current date/time — essential for file naming, scheduling, etc.
-        // This is per-turn dynamic content, NOT part of the KV cache stable prefix.
-        let now = chrono::Local::now();
-        use chrono::Datelike;
-        let weekday = now.date_naive().weekday().num_days_from_monday();
-        let last_friday = if weekday >= 4 {
-            now.date_naive() - chrono::Duration::days((weekday - 4) as i64)
-        } else {
-            now.date_naive() - chrono::Duration::days((weekday + 3) as i64)
-        };
-        let yesterday = now.date_naive() - chrono::Duration::days(1);
-        dynamic_ctx.push(format!(
-            "Current date: {} ({}). Yesterday: {}. Last Friday: {}.",
-            now.format("%Y-%m-%d %H:%M"),
-            now.format("%A"),
-            yesterday.format("%Y-%m-%d"),
-            last_friday.format("%Y-%m-%d"),
-        ));
-
         // Loop A (organic evolution): collect recalled memory IDs for feedback.
         // Auto-recall is disabled — LLM uses the memory tool to search when needed.
         // This avoids injecting dynamic content into user messages which would break
         // prefix KV cache across turns.
         let auto_recalled_ids = std::collections::HashSet::<String>::new();
-
-        // Background context injection (/ctx).
-        let btw_block = self
-            .btw_manager
-            .to_prompt_block_relevant(session_key, channel, text)
-            .await;
-        if !btw_block.is_empty() {
-            dynamic_ctx.push(btw_block);
-        }
 
         // Plugin hook: before_prompt_build (AGENTS.md §20).
         self.fire_hook(
@@ -2345,20 +2782,35 @@ impl AgentRuntime {
         .await;
 
         // Resolve model.
-        let model = agent_cfg
-            .model
-            .as_ref()
-            .and_then(|m| m.primary.as_deref())
-            .or_else(|| {
-                self.config
-                    .agents
-                    .defaults
-                    .model
-                    .as_ref()
-                    .and_then(|m| m.primary.as_deref())
-            })
-            .unwrap_or("anthropic/claude-sonnet-4-6")
-            .to_owned();
+        //
+        // Internal auto-tick sessions (heartbeat / system) only hold the
+        // `memory` tool and run on a cadence — the primary slot is wasted
+        // on memory upkeep / HEARTBEAT_OK replies. Route them through the
+        // flash model when configured. `resolve_flash_model_name` already
+        // falls back to the primary if no flash model is set, so this is
+        // safe with any provider configuration.
+        //
+        // Cron is intentionally excluded from this fast path: cron-fired
+        // agentTurns carry real user instructions and need primary-tier
+        // reasoning.
+        let model = if is_internal {
+            self.resolve_flash_model_name()
+        } else {
+            agent_cfg
+                .model
+                .as_ref()
+                .and_then(|m| m.primary.as_deref())
+                .or_else(|| {
+                    self.config
+                        .agents
+                        .defaults
+                        .model
+                        .as_ref()
+                        .and_then(|m| m.primary.as_deref())
+                })
+                .unwrap_or("rsclaw/rsclaw-agent-v1")
+                .to_owned()
+        };
 
         // Build tool list from skills and registered agents (local + remote).
         // Tool selection: toolsEnabled -> toolset level -> tools whitelist
@@ -2386,7 +2838,7 @@ impl AgentRuntime {
                 &self.skills,
                 self.agents.as_deref(),
                 &self.handle.id,
-                &self.config.agents.external,
+                &self.config.agents.a2a,
             );
             all.extend(extra_tools.iter().cloned());
             all.extend(super::tools_builder::build_wasm_tool_defs(&self.wasm_plugins));
@@ -2398,8 +2850,13 @@ impl AgentRuntime {
             }
 
             // Apply toolset level + custom tools list
-            // Default agent uses "full", others use "standard"
-            let is_default = self.handle.config.default.unwrap_or(false);
+            // Default agent uses "full", others use "standard". Fall back to
+            // `id == "main"` so configs that omit the explicit `default: true`
+            // flag (newer setup template) still resolve main as the default —
+            // matches the convention used at runtime.rs:1763 and
+            // RuntimeConfig::default_agent.
+            let is_default = self.handle.config.default.unwrap_or(false)
+                || self.handle.id == "main";
             let default_toolset = if is_default { "full" } else { "standard" };
             let toolset = model_cfg
                 .and_then(|m| m.toolset.as_deref())
@@ -2415,7 +2872,7 @@ impl AgentRuntime {
             // Group chat safety: strip dangerous tools to prevent exec via LLM
             let is_group = session_key.contains(":group:");
             if is_group {
-                const GROUP_BLOCKED_TOOLS: &[&str] = &["execute_command", "exec", "read_file", "read", "write_file", "write", "computer_use"];
+                const GROUP_BLOCKED_TOOLS: &[&str] = &["shell", "execute_command", "exec", "read_file", "read", "write_file", "write", "computer_use"];
                 all.retain(|t| !GROUP_BLOCKED_TOOLS.contains(&t.name.as_str()));
             }
 
@@ -2458,6 +2915,81 @@ impl AgentRuntime {
 
         // Cache tools for compaction KV cache reuse.
         self.cached_tools = tools.clone();
+
+        // DEBUG: when RSCLAW_DUMP_PROMPT is set, dump a JSON document
+        // describing this turn's prompt + tool list, split into the
+        // shared (cacheable across all RsClaw clients of this version)
+        // and user (per-machine) halves. Lets an upstream LLM gateway
+        // (rsclaw-llm with kvCacheMode=2) seed its global cache with
+        // the shared bytes once per version and dedupe across users.
+        // Per session_key in the filename so multiple inspected
+        // sessions don't clobber.
+        if std::env::var("RSCLAW_DUMP_PROMPT").is_ok() {
+            let safe_key = session_key
+                .chars()
+                .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                .collect::<String>();
+            let dump_path = crate::config::loader::base_dir()
+                .join(format!("debug_prompt_spec.{safe_key}.json"));
+
+            let tool_json = |t: &crate::provider::ToolDef| {
+                serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.parameters,
+                })
+            };
+            let mut builtin_tools = Vec::new();
+            let mut user_tools = Vec::new();
+            for t in &tools {
+                if crate::agent::prompt_builder::BUILTIN_TOOL_NAMES.contains(&t.name.as_str()) {
+                    builtin_tools.push(tool_json(t));
+                } else {
+                    user_tools.push(tool_json(t));
+                }
+            }
+
+            let shared_prefix = crate::agent::prompt_builder::build_shared_system_prefix();
+            // user_system is what's left after the shared prefix +
+            // "\n\n". Recompute by trimming since the prompt was built
+            // by concatenation with that exact separator.
+            let user_system = system_prompt
+                .strip_prefix(&shared_prefix)
+                .map(|rest| rest.trim_start_matches("\n\n").to_owned())
+                .unwrap_or_else(|| system_prompt.clone());
+
+            let payload = serde_json::json!({
+                "session_key": session_key,
+                "agent_id": self.handle.id,
+                "model": model,
+                "rsclaw_version": env!("CARGO_PKG_VERSION"),
+                // SHARED: cacheable, byte-identical for every client of this version.
+                "shared_prefix": shared_prefix,
+                "builtin_tools": builtin_tools,
+                // USER: per-machine, per-session.
+                "user_system": user_system,
+                "user_tools": user_tools,
+                // Convenience: full reconstructed prompt.
+                "system_prompt": system_prompt,
+            });
+            match serde_json::to_string_pretty(&payload) {
+                Ok(s) => {
+                    if let Err(e) = std::fs::write(&dump_path, &s) {
+                        tracing::warn!("failed to dump prompt-spec: {e}");
+                    } else {
+                        tracing::info!(
+                            path = %dump_path.display(),
+                            builtin_tool_count = builtin_tools.len(),
+                            user_tool_count = user_tools.len(),
+                            shared_prefix_len = shared_prefix.len(),
+                            user_system_len = user_system.len(),
+                            "dumped prompt-spec JSON"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!("prompt-spec serialize failed: {e}"),
+            }
+        }
 
         // Check vision support before loading session (avoids borrow conflict).
         let kv_mode = self.live.agents.read().await.defaults.kv_cache_mode.unwrap_or(1);
@@ -2574,6 +3106,7 @@ impl AgentRuntime {
                 pending_analysis: None,
                 // Pre-loop abort bypasses agent_loop.
                 needs_outer_done_emit: true,
+                outcome: crate::agent::registry::ReplyOutcome::Ok,
             });
         }
 
@@ -2643,62 +3176,25 @@ impl AgentRuntime {
             loop_warning_triggered: false,
             turn_metrics: super::turn_metrics::TurnMetrics::new(),
             user_text: text.to_owned(),
+            full_trace: init_full_trace(text),
+            turn_ctx,
         };
 
-        // --- Plugins & Skills: cached, frozen at session start ---
-        // On first turn: build and cache. On subsequent turns: detect new
-        // additions and append as trailing system messages. On compact/`/new`:
-        // rebuild (handled by invalidate_plugins_skills_cache()).
-
-        // Build/cache plugins system message.
-        if self.cached_plugins_system.is_none() {
-            self.cached_plugins_system = super::tools_builder::build_plugins_system(
-                &self.wasm_plugins,
-                self.plugins.as_deref(),
-            );
-        }
-
-        // Build/cache skills system message.
-        if self.cached_skills_system.is_none() {
-            let (msg, snapshot) = Self::build_skills_system_msg(&self.skills);
-            self.cached_skills_system = msg;
-            self.cached_skills_snapshot = snapshot;
-        }
-
-        // Detect newly added skills since cache was frozen.
-        // New skills are appended as trailing system messages, not merged
-        // into the cached [2] — this preserves KV cache prefix.
-        let mut new_skills_tail: Vec<String> = Vec::new();
-        {
-            let mut current_names: Vec<String> = self.skills.all()
-                .map(|s| s.name.clone())
-                .collect();
-            current_names.sort();
-            for name in &current_names {
-                if !self.cached_skills_snapshot.contains(name) {
-                    if let Some(skill) = self.skills.all().find(|s| &s.name == name) {
-                        new_skills_tail.push(format!(
-                            "<skill name=\"{}\" version=\"{}\">\n{}\n</skill>",
-                            skill.name,
-                            skill.version.as_deref().unwrap_or(""),
-                            skill.prompt.trim(),
-                        ));
-                    }
-                }
-            }
-        }
-
-        let plugins_system = self.cached_plugins_system.clone();
-        let skills_system = self.cached_skills_system.clone();
+        // Plugins + Skills rendering now lives inside `build_user_system`
+        // (called when assembling `system_prompt` above). No separate
+        // Role::System injection / cached_*_system / new_skills_tail
+        // diff path needed: every turn rebuilds user_system from the
+        // current SkillRegistry + plugin state, so freshly installed
+        // skills show up in the next turn's `## Installed Skills`
+        // section automatically. Worker-side KV layer-2 cache re-prefills
+        // when the user_system bytes change (i.e. install/uninstall),
+        // which is the correct behaviour.
 
         let reply = time::timeout(
             Duration::from_secs(timeout_secs),
             self.agent_loop(
                 &mut ctx, &model, &system_prompt,
-                plugins_system.as_deref(),
-                skills_system.as_deref(),
                 tools, extra_tools, abort_flag.clone(),
-                dynamic_ctx, new_skills_tail,
             ),
         )
         .await
@@ -2768,7 +3264,7 @@ impl AgentRuntime {
             if !candidates.is_empty() {
                 let mem_clone = Arc::clone(mem);
                 let providers = Arc::clone(&self.providers);
-                let flash_model = self.resolve_flash_model_name();
+                let primary_model = self.resolve_model_name();
                 // Crystallized skills go to the global skill directory so the
                 // existing load_skills() call sites pick them up on next reload.
                 let skills_dir = crate::skill::default_global_skills_dir()
@@ -2781,7 +3277,7 @@ impl AgentRuntime {
                             &doc_id,
                             &scope,
                             &providers,
-                            &flash_model,
+                            &primary_model,
                             &skills_dir,
                         )
                         .await
@@ -2871,9 +3367,6 @@ impl AgentRuntime {
 
         // Evict stale sessions if the cache has grown too large.
         self.evict_stale_sessions();
-
-        // Tick ctx TTL counters after each turn.
-        self.btw_manager.tick_turn(session_key).await;
 
         // Auto-TTS: if session is in voice mode, generate audio for the reply.
         let mut reply = reply;
@@ -2965,8 +3458,8 @@ impl AgentRuntime {
 
     /// Save summaries of all active sessions to long-term memory.
     ///
-    /// Called before `/new` and `/reset` — since no summary is injected into
-    /// the new session, memory is the only way the LLM can find prior context.
+    /// Called before `/new` — since no summary is injected into the new
+    /// session, memory is the only way the LLM can find prior context.
     /// Uses KV cache mode when available (session is still in memory).
     async fn save_session_summaries_to_memory(&mut self, model: &str) {
         if self.memory.is_none() { return; }
@@ -3020,97 +3513,6 @@ impl AgentRuntime {
                 info!(session = %session_key, "session summary saved to memory before clear");
             }
         }
-    }
-
-    /// Build the skills system message from the registry (sorted by name).
-    /// Returns (message, sorted_name_snapshot).
-    fn build_skills_system_msg(skills: &crate::skill::SkillRegistry) -> (Option<String>, Vec<String>) {
-        let mut all_skills: Vec<_> = skills.all().collect();
-        all_skills.sort_by(|a, b| a.name.cmp(&b.name));
-        let snapshot: Vec<String> = all_skills.iter().map(|s| s.name.clone()).collect();
-
-        if all_skills.is_empty() {
-            return (None, snapshot);
-        }
-
-        // Inject only `name + version + description + dir`, NOT the full
-        // SKILL.md body. With ~22 hithink-* skills installed the bodies
-        // sum to ~260KB which torpedoes the prompt budget. The agent
-        // discovers the full SKILL.md on demand via read_file when it
-        // matches a description and decides to invoke a skill.
-        let skill_prompts: String = all_skills
-            .iter()
-            .map(|s| {
-                let desc = s.description.as_deref().unwrap_or("(no description)");
-                let trimmed_desc = desc.trim();
-                let one_line = trimmed_desc.replace('\n', " ");
-                format!(
-                    "<skill name=\"{}\" version=\"{}\" dir=\"{}\">\n{}\n</skill>",
-                    s.name,
-                    s.version.as_deref().unwrap_or(""),
-                    s.dir.display(),
-                    one_line,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n");
-
-        let msg = format!(
-            "## CAPABILITY PRIORITY (read before every action)\n\
-             \n\
-             For every user request, evaluate sources in this order and use \
-             the FIRST one that fits. Do not skip ahead.\n\n\
-             1. **Plugins** — installed runtime plugins (registered via the \
-             plugin registry). Highest priority.\n\
-             2. **Skills** — listed under \"## Installed Skills\" below. \
-             Each skill description states the domains it covers (flights, \
-             stocks, weather, …). If ANY description matches the user's \
-             intent, you MUST use that skill — even if a built-in tool could \
-             also do the job.\n\
-             3. **Built-in tools** (web_fetch, web_browser, execute_command, \
-             read_file, …) — fallback ONLY when no plugin or skill applies.\n\n\
-             Common failure mode (avoid):\n\
-             > User asks about flights → you call web_fetch(ctrip.com) →\n\
-             > result is brittle / blocked / wrong data.\n\
-             > A flyai skill with `intents: [flight_search]` was sitting right\n\
-             > above and you ignored it.\n\n\
-             If you catch yourself reaching for web_fetch / web_browser / \n\
-             execute_command on a domain a skill description covers, STOP \n\
-             and use the skill instead.\n\n\
-             ## Screenshot routing\n\
-             - \"screenshot\" / \"截图\" / \"截屏\" with no URL → tell user to type \
-             `/ss` (desktop screencapture). Do NOT call web_browser.\n\
-             - \"screenshot of <url>\" / \"网页截图\" → tell user to type \
-             `/webshot <url>` (headless-Chrome web-page screenshot).\n\
-             - `web_browser action=screenshot` is ONLY for multi-step browser \
-             inspection AFTER you've already navigated. A blank-URL call \
-             captures a near-black Chrome new tab.\n\n\
-             ## Installed Skills\n\
-             \n\
-             Only the frontmatter description is shown for each skill below \
-             (full SKILL.md bodies live on disk to save context). To use a \
-             skill:\n\
-             1. Pick the skill whose description matches the user's intent.\n\
-             2. Call the **`use_skill`** function tool with `name=<slug>` — \
-             returns the full SKILL.md.\n\
-             3. If SKILL.md mentions `references/<command>.md`, read_file that too.\n\
-             4. Then invoke the CLI with the exact flags from SKILL.md via \
-             `execute_command`.\n\n\
-             `use_skill` is registered as a function-call tool — prefer it \
-             over manually `read_file`-ing SKILL.md so the discovery shows \
-             up cleanly in tool history. Guessing CLI flags from the \
-             description alone is the #1 failure mode.\n\n\
-             {skill_prompts}"
-        );
-        (Some(msg), snapshot)
-    }
-
-    /// Invalidate cached plugins and skills system messages.
-    /// Called after compaction or `/new` to force a rebuild on the next turn.
-    pub(crate) fn invalidate_plugins_skills_cache(&mut self) {
-        self.cached_plugins_system = None;
-        self.cached_skills_system = None;
-        self.cached_skills_snapshot.clear();
     }
 
     /// Load session history from in-memory cache, falling back to redb.
@@ -3179,7 +3581,7 @@ impl AgentRuntime {
         // Snapshot the data the background task needs — agent_loop's stack
         // frame goes away as soon as we return.
         let providers = Arc::clone(&self.providers);
-        let flash_model = self.resolve_flash_model_name();
+        let primary_model = self.resolve_model_name();
         let skills_dir = crate::skill::default_global_skills_dir()
             .unwrap_or_else(|| crate::config::loader::base_dir().join("skills"));
         let user_text = ctx.user_text.clone();
@@ -3200,7 +3602,7 @@ impl AgentRuntime {
                 &metrics,
                 signature,
                 &providers,
-                &flash_model,
+                &primary_model,
                 &skills_dir,
             )
             .await
@@ -3229,15 +3631,22 @@ impl AgentRuntime {
         ctx: &mut RunContext,
         model: &str,
         system_prompt: &str,
-        plugins_system: Option<&str>,
-        skills_system: Option<&str>,
         tools: Vec<ToolDef>,
         extra_tools: Vec<ToolDef>,
         abort_flag: Arc<AtomicBool>,
-        dynamic_ctx: Vec<String>,
-        new_skills_tail: Vec<String>,
     ) -> Result<AgentReply> {
-        let pruning_cfg = self.live.agents.read().await.defaults.context_pruning.clone();
+        // Pull both defaults the agent loop's prelude needs under a
+        // single read guard. Previously these were two adjacent
+        // `self.live.agents.read().await` calls — once for
+        // `context_pruning`, once for `context_tokens` — paying the
+        // RwLock acquisition cost twice on every agent_loop entry.
+        let (pruning_cfg, defaults_context_tokens) = {
+            let agents = self.live.agents.read().await;
+            (
+                agents.defaults.context_pruning.clone(),
+                agents.defaults.context_tokens,
+            )
+        };
 
         // Resolve context budget (tokens) for history trimming.
         // Priority: agent model config > defaults.contextTokens >
@@ -3248,7 +3657,7 @@ impl AgentRuntime {
             .model
             .as_ref()
             .and_then(|m| m.context_tokens)
-            .or(self.live.agents.read().await.defaults.context_tokens)
+            .or(defaults_context_tokens)
             .or_else(|| {
                 self.config
                     .agents
@@ -3430,6 +3839,7 @@ impl AgentRuntime {
                         files: vec![],
                         images: vec![],
                         tool_log: vec![],
+                        question: None,
                     });
                 }
                 return Ok(AgentReply {
@@ -3440,7 +3850,17 @@ impl AgentRuntime {
                     files: vec![],
                     pending_analysis: None,
                     needs_outer_done_emit: false,
+                    outcome: crate::agent::registry::ReplyOutcome::Ok,
                 });
+            }
+            // Check A2A cancel_token at start of each iteration. Same intent
+            // as the user-side /abort path below, just from a different source
+            // (the AppState.task_cancels entry that handle_cancel_task fires).
+            // Returns Err so the gateway worker reports `canceled by A2A
+            // CancelTask` and the dispatcher publishes TaskState::Canceled.
+            if ctx.turn_ctx.is_cancelled() {
+                info!(session = %ctx.session_key, iteration, "agent_loop: canceled by A2A");
+                return Err(anyhow!("canceled by A2A CancelTask"));
             }
             // Check abort flag at start of each iteration (allows /abort to
             // interrupt even when tool dispatch is blocking between LLM calls).
@@ -3457,6 +3877,7 @@ impl AgentRuntime {
                         files: tool_files.clone(),
                         images: tool_images.clone(),
                         tool_log: tool_log.clone(),
+                        question: None,
                     });
                 }
                 return Ok(AgentReply {
@@ -3467,6 +3888,7 @@ impl AgentRuntime {
                     files: vec![],
                     pending_analysis: None,
                     needs_outer_done_emit: false,
+                    outcome: crate::agent::registry::ReplyOutcome::Ok,
                 });
             }
             if iteration > max_iterations {
@@ -3492,6 +3914,7 @@ impl AgentRuntime {
                         files: tool_files.clone(),
                         images: tool_images.clone(),
                         tool_log: tool_log.clone(),
+                        question: None,
                     });
                 }
                 return Ok(AgentReply {
@@ -3502,6 +3925,7 @@ impl AgentRuntime {
                     files: vec![],
                     pending_analysis: None,
                     needs_outer_done_emit: false,
+                    outcome: crate::agent::registry::ReplyOutcome::Ok,
                 });
             }
             // Check consecutive tool errors — stop early when tools keep failing.
@@ -3530,6 +3954,7 @@ impl AgentRuntime {
                         files: tool_files.clone(),
                         images: tool_images.clone(),
                         tool_log: tool_log.clone(),
+                        question: None,
                     });
                 }
                 return Ok(AgentReply {
@@ -3540,6 +3965,7 @@ impl AgentRuntime {
                     files: tool_files,
                     pending_analysis: None,
                     needs_outer_done_emit: false,
+                    outcome: crate::agent::registry::ReplyOutcome::Ok,
                 });
             }
             // Apply legacy context pruning (hard clear / soft trim) as fallback.
@@ -3565,17 +3991,13 @@ impl AgentRuntime {
             // Build API copy of messages for this LLM call.
             //
             // Final message order (stable prefix → volatile tail):
-            //   [0]   system  — main prompt           (KV-cache anchor, never changes)
-            //   [1]   system  — plugins               (inserted at front)
-            //   [2]   system  — skills                (inserted at front)
-            //   [3…n] history — session user/assistant messages
-            //   [n+1] system  — new_skills_tail        (rare, appended)
-            //   [n+2] system  — dynamic_ctx (/ctx/btw) (stable within a turn)
-            //   [tail] …      — turn_scratchpad        (grows per iteration, cleared next turn)
-            //
-            // Keeping dynamic_ctx before turn_scratchpad means the prefix
-            // [session + ctx] is identical on every LLM call within a turn,
-            // allowing the KV cache to cover it. Session storage is NOT modified.
+            //   [0]   system  — main prompt   (KV-cache anchor; contains
+            //                                  ## Installed Plugins +
+            //                                  ## Installed Skills via
+            //                                  build_user_system — see
+            //                                  prompt_builder.rs)
+            //   [1…n] history — session user/assistant messages
+            //   [tail] …      — turn_scratchpad  (per-iteration tools)
             let mut messages = {
                 let mut raw = self
                     .sessions
@@ -3593,42 +4015,6 @@ impl AgentRuntime {
                             *last = ctx.user_msg_with_images.clone().unwrap_or(last.clone());
                         }
                     }
-                }
-
-                // Insert plugins and skills as system messages at the front
-                // of history. Insert in reverse order since each insert(0, …)
-                // pushes previous ones down.
-                if let Some(skills) = skills_system {
-                    raw.insert(0, Message {
-                        role: Role::System,
-                        content: MessageContent::Text(skills.to_owned()),
-                    });
-                }
-                if let Some(plugins) = plugins_system {
-                    raw.insert(0, Message {
-                        role: Role::System,
-                        content: MessageContent::Text(plugins.to_owned()),
-                    });
-                }
-
-                // Append newly installed skills as trailing system messages.
-                for skill_block in &new_skills_tail {
-                    raw.push(Message {
-                        role: Role::System,
-                        content: MessageContent::Text(format!(
-                            "## New Skill Installed\n{skill_block}"
-                        )),
-                    });
-                }
-
-                // Inject dynamic context (/ctx, btw) before the scratchpad so
-                // the [session + ctx] prefix stays stable across loop iterations.
-                if !dynamic_ctx.is_empty() {
-                    let ctx_block = dynamic_ctx.join("\n\n");
-                    raw.push(Message {
-                        role: Role::System,
-                        content: MessageContent::Text(ctx_block),
-                    });
                 }
 
                 // Append current-turn scratch-paper (tool calls + results).
@@ -3780,19 +4166,33 @@ impl AgentRuntime {
                 );
             }
 
+            // Resolve temperature + context_limit under one read guard.
+            // Both blocks consult the same `agents_live` snapshot
+            // (per-agent overrides + global defaults) and run
+            // back-to-back with no await in between, so a single
+            // acquisition is strictly correct and halves RwLock
+            // traffic on the hot path.
+            //
             // Temperature resolution order (read live so hot-reload takes
             // effect on the next turn without a restart):
             //   1. Per-agent override (live.agents.list[id].temperature)
             //   2. Global defaults (live.agents.defaults.temperature)
             //   3. "Auto" heuristic — 0.6 with tools, 0.7 chat, None for thinking
-            let temperature = {
+            //
+            // context_limit chain (matches AgentHandle.context_window so
+            // /status and the pre-flight emergency compact agree):
+            // per-agent model.context_tokens → defaults.context_tokens
+            // → 64000. Previously read defaults only, so a per-agent
+            // override of 200_000 was ignored here and emergency
+            // compaction kicked in too early.
+            let (temperature, context_limit) = {
                 let agents_live = self.live.agents.read().await;
-                let per_agent = agents_live
+                let per_agent_entry = agents_live
                     .list
                     .iter()
-                    .find(|a| a.id == self.handle.id)
-                    .and_then(|a| a.temperature);
-                per_agent
+                    .find(|a| a.id == self.handle.id);
+                let per_agent_temp = per_agent_entry.and_then(|a| a.temperature);
+                let temperature = per_agent_temp
                     .or(agents_live.defaults.temperature)
                     .map(Some)
                     .unwrap_or_else(|| {
@@ -3803,26 +4203,16 @@ impl AgentRuntime {
                         } else {
                             Some(0.6)
                         }
-                    })
+                    });
+                let per_agent_ctx = per_agent_entry
+                    .and_then(|a| a.model.as_ref().and_then(|m| m.context_tokens));
+                let context_limit = per_agent_ctx
+                    .or(agents_live.defaults.context_tokens)
+                    .unwrap_or(64_000) as usize;
+                (temperature, context_limit)
             };
 
-// Pre-flight check: emergency compact if we'd exceed context.
-            // Same resolution chain as AgentHandle.context_window (the
-            // value /status displays): per-agent model.contextTokens →
-            // agents.defaults.contextTokens → 64000. Previously this only
-            // read defaults, so a per-agent override of 200_000 was
-            // ignored here and emergency compaction kicked in too early.
-            let context_limit = {
-                let agents_live = self.live.agents.read().await;
-                let per_agent = agents_live
-                    .list
-                    .iter()
-                    .find(|a| a.id == self.handle.id)
-                    .and_then(|a| a.model.as_ref().and_then(|m| m.context_tokens));
-                per_agent
-                    .or(agents_live.defaults.context_tokens)
-                    .unwrap_or(64_000) as usize
-            };
+            // Pre-flight check: emergency compact if we'd exceed context.
             let overhead = self.estimate_fixed_overhead();
             let session_tokens: usize = self.sessions
                 .get(&ctx.session_key)
@@ -3848,7 +4238,66 @@ impl AgentRuntime {
                     .unwrap_or_default();
             }
 
-            let kv_cache_mode = self.live.agents.read().await.defaults.kv_cache_mode.unwrap_or(1);
+            // Single live-config read per LLM iteration. Previously this
+            // call site held two independent `self.live.agents.read().await`
+            // acquisitions (kv_cache_mode + frequency_penalty) — minor
+            // contention on the hot path, and a refactor hazard if more
+            // defaults migrate in. Pull every default this iteration
+            // needs at once; drop the guard before constructing the
+            // request so the LLM call doesn't hold the lock.
+            let (mut kv_cache_mode, frequency_penalty) = {
+                let agents = self.live.agents.read().await;
+                (
+                    agents.defaults.kv_cache_mode.unwrap_or(1),
+                    agents.defaults.frequency_penalty,
+                )
+            };
+            // rsclaw provider only handles kv_cache_mode=2 — force it
+            // when this turn's resolved provider is rsclaw, regardless
+            // of agents.defaults.kv_cache_mode. The provider IS the
+            // mode-2 protocol implementation, so routing-to-rsclaw is
+            // itself the opt-in: no per-agent override needed.
+            let (resolved_provider, _) = self.providers.resolve_model(&model);
+            if resolved_provider == "rsclaw" {
+                kv_cache_mode = 2;
+            }
+            // For kvCacheMode=2 expose the shared/user split so the rsclaw
+            // provider can populate `dynamic_prefix.system` (cacheable across
+            // every client of this RsClaw version) separately from
+            // `dynamic_prefix.user_system` (per-client). Only the rsclaw
+            // provider reads these; openai/anthropic ignore them. Internal
+            // sessions use a minimal prompt that doesn't follow the
+            // shared-prefix layout — leave the split unset for those (the
+            // provider falls back to `system` as a single blob, with no
+            // cross-client cache reuse, which matches today's behaviour).
+            let (system_shared, user_system) = if kv_cache_mode >= 2
+                && !is_minimal_context_session(&ctx.session_key)
+            {
+                let shared = crate::agent::prompt_builder::build_shared_system_prefix();
+                if let Some(rest) = effective_system.strip_prefix(&shared) {
+                    let user = rest.trim_start_matches("\n\n").to_owned();
+                    (Some(shared), Some(user))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+            // Populate trace metadata on first iteration so SFT export
+            // carries model + system_prompt + tools_schema. These don't
+            // change within a turn, so init-once is correct. Without this
+            // patch, `init_full_trace` left them as empty strings/`[]`,
+            // producing ShareGPT JSONL with `tools: []` and no `system`
+            // entry — unreplayable for training. R2 review C3.
+            if let Some(ft) = ctx.full_trace.as_mut() {
+                if ft.model.is_empty() {
+                    ft.model = model.to_owned();
+                    ft.system_prompt = effective_system.clone();
+                    ft.tools_schema = serde_json::to_value(&tools)
+                        .unwrap_or_else(|_| serde_json::json!([]));
+                }
+            }
+
             let req = LlmRequest {
                 model: model.to_owned(),
                 messages,
@@ -3856,10 +4305,13 @@ impl AgentRuntime {
                 system: Some(effective_system.clone()),
                 max_tokens: configured_max_tokens,
                 temperature,
-                frequency_penalty: self.live.agents.read().await.defaults.frequency_penalty,
+                frequency_penalty,
                 thinking_budget,
+                endpoint: Default::default(),
                 kv_cache_mode,
                 session_key: if kv_cache_mode >= 2 { Some(ctx.session_key.clone()) } else { None },
+                system_shared,
+                user_system,
             };
 
             // Update live status: LLM call starting.
@@ -3942,6 +4394,7 @@ impl AgentRuntime {
                                     files: vec![],
                                     images: vec![],
                                     tool_log: vec![],
+                                    question: None,
                                 });
                             }
                             last_delta_flush = now;
@@ -4079,6 +4532,7 @@ impl AgentRuntime {
                         files: vec![],
                         images: vec![],
                         tool_log: vec![],
+                        question: None,
                     });
                 }
             }
@@ -4125,6 +4579,18 @@ impl AgentRuntime {
             {
                 tracing::info!(reasoning_len = reasoning_buf.len(), "agent_loop: using reasoning as reply text");
                 text_buf = reasoning_buf.clone();
+            }
+
+            // Capture per-iteration thinking into the trace so SFT data
+            // preserves the <think>...</think> reasoning content that
+            // preceded the tool call (or final reply) this round. Push
+            // once per iteration, only when reasoning content exists.
+            // R2 review C3 — `push_thinking` had zero production call
+            // sites before this; reasoning was invisible to SFT export.
+            if let Some(ft) = ctx.full_trace.as_mut() {
+                if !reasoning_buf.trim().is_empty() {
+                    ft.push_thinking(reasoning_buf.clone());
+                }
             }
 
             // Finalize streaming tool calls: parse accumulated argument strings.
@@ -4283,7 +4749,7 @@ impl AgentRuntime {
                         parts.iter().any(|p| {
                             matches!(p, crate::provider::ContentPart::ToolUse { name, .. }
                                 if name == "opencode" || name == "claudecode" || name == "codex"
-                                    || name == "web_search" || name == "execute_command")
+                                    || name == "web_search" || name == "shell" || name == "execute_command")
                         })
                     } else {
                         false
@@ -4361,6 +4827,7 @@ impl AgentRuntime {
                         files: tool_files.clone(),
                         images: tool_images.clone(),
                         tool_log: tool_log.clone(),
+                        question: None,
                     });
                 }
 
@@ -4384,6 +4851,14 @@ impl AgentRuntime {
                 // (non-error_streak / non-max-iter / non-abort) completion
                 // path so we never persist failed workflows as skills.
                 ctx.turn_metrics.final_text_len = final_text.len();
+                if let Some(ft) = ctx.full_trace.as_mut() {
+                    if !final_text.is_empty() {
+                        ft.push_assistant_text(&final_text);
+                    }
+                }
+                if let Some(ft) = ctx.full_trace.take() {
+                    maybe_emit_trace(ft);
+                }
                 self.maybe_crystallize_workflow(&ctx, &final_text);
 
                 if !tool_images.is_empty() {
@@ -4409,6 +4884,7 @@ impl AgentRuntime {
                     files: tool_files,
                     pending_analysis: None,
                     needs_outer_done_emit: false,
+                    outcome: crate::agent::registry::ReplyOutcome::Ok,
                 });
             }
 
@@ -4458,6 +4934,11 @@ impl AgentRuntime {
             if !text_buf.is_empty() && tool_calls.is_empty() {
                 // Only save text if there are no tool calls (final reply).
                 parts.push(crate::provider::ContentPart::Text { text: text_buf });
+            }
+            // Persist reasoning_content so providers that require it (e.g.
+            // kimi-for-coding) see it on subsequent turns.
+            if !reasoning_buf.is_empty() {
+                parts.push(crate::provider::ContentPart::Reasoning { text: reasoning_buf });
             }
             for (id, name, input) in &tool_calls {
                 parts.push(crate::provider::ContentPart::ToolUse {
@@ -4510,6 +4991,7 @@ impl AgentRuntime {
                     files: vec![],
                     pending_analysis: None,
                     needs_outer_done_emit: false,
+                    outcome: crate::agent::registry::ReplyOutcome::Ok,
                 });
             }
 
@@ -4593,6 +5075,7 @@ impl AgentRuntime {
                                 files: tool_files.clone(),
                                 images: tool_images.clone(),
                                 tool_log: tool_log.clone(),
+                                question: None,
                             });
                         }
                         return Ok(AgentReply {
@@ -4603,6 +5086,7 @@ impl AgentRuntime {
                             files: vec![],
                             pending_analysis: None,
                             needs_outer_done_emit: false,
+                            outcome: crate::agent::registry::ReplyOutcome::Ok,
                         });
                     }
                 } else {
@@ -4613,7 +5097,7 @@ impl AgentRuntime {
                 // Upgrade iteration limit when complex or multi-step tools are used.
                 if matches!(tool_name.as_str(),
                     "web_browser" | "opencode" | "claudecode" | "agent"
-                    | "search_content" | "search_file" | "execute_command" | "exec"
+                    | "search_content" | "search_file" | "shell" | "execute_command" | "exec"
                 ) {
                     max_iterations = max_iterations.max(configured_complex);
                 }
@@ -4638,6 +5122,16 @@ impl AgentRuntime {
                 // Clone for the per-turn metrics record (after dispatch
                 // moves the value).
                 let tool_input_for_metrics = tool_input.clone();
+                // A2A progress signal: publish "calling tool X" before
+                // dispatch so the client / push subscribers can render
+                // tool-level progress. No-op for non-A2A turns. Cancel
+                // check too — a long-running prior tool may have
+                // observed the token between iterations.
+                ctx.turn_ctx
+                    .emit_working(&format!("calling tool {tool_name}"));
+                if ctx.turn_ctx.is_cancelled() {
+                    return Err(anyhow!("canceled by A2A CancelTask"));
+                }
                 let result = self
                     .dispatch_tool(ctx, &tool_id, &tool_name, tool_input)
                     .await;
@@ -4706,10 +5200,18 @@ impl AgentRuntime {
                             result_summary,
                             has_error,
                         );
+                        if let Some(ft) = ctx.full_trace.as_mut() {
+                            ft.push_tool_call(
+                                &tool_name,
+                                tool_input_for_metrics.clone(),
+                                &tool_id,
+                            );
+                            ft.push_tool_result(&tool_id, v.to_string(), has_error);
+                        }
                         // Record result for progress-aware loop detection.
                         // Same args + different results = making progress, not a loop.
                         // For exec tool: exclude task_id (uuid changes each call) to properly detect loops.
-                        let result_for_loop = if tool_name == "exec" || tool_name == "execute_command" {
+                        let result_for_loop = if tool_name == "shell" || tool_name == "exec" || tool_name == "execute_command" {
                             // Strip task_id from exec results - it's a uuid that changes every call
                             match &v {
                                 serde_json::Value::Object(obj) => {
@@ -4749,7 +5251,13 @@ impl AgentRuntime {
                                 .filter(|u| u.starts_with("data:image/"))
                         });
                         let img_path = v.get("image_path").and_then(|p| p.as_str());
-                        if let Some(img) = img_data.or(img_path) {
+                        // computer_use screenshots are internal agent state —
+                        // never auto-send to the user. Only image-gen and explicit uploads
+                        // should forward images.
+                        let is_internal_screenshot = tool_name == "computer_use";
+                        if !is_internal_screenshot
+                            && let Some(img) = img_data.or(img_path)
+                        {
                             let desc = v
                                 .get("revised_prompt")
                                 .and_then(|p| p.as_str())
@@ -4805,7 +5313,7 @@ impl AgentRuntime {
                     if let Some(ref bus) = self.event_bus {
                         // Prepend `$ command` line for exec tools so the
                         // desktop UI can show a command preview in the header.
-                        let display_out = if matches!(tool_name.as_str(), "execute_command" | "exec") {
+                        let display_out = if matches!(tool_name.as_str(), "shell" | "execute_command" | "exec") {
                             if let Ok(a) = serde_json::from_str::<serde_json::Value>(&args_str) {
                                 if let Some(cmd) = a.get("command").and_then(|c| c.as_str()) {
                                     format!("$ {cmd}\n{out_str}")
@@ -4830,6 +5338,7 @@ impl AgentRuntime {
                             files: vec![],
                             images: vec![],
                             tool_log: vec![],
+                            question: None,
                         });
                     }
                 }
@@ -4885,7 +5394,7 @@ impl AgentRuntime {
                 }
 
                 // Collect sendable file attachments from write/exec tool results.
-                if matches!(tool_name.as_str(), "write_file" | "write" | "execute_command" | "exec") {
+                if matches!(tool_name.as_str(), "write_file" | "write" | "shell" | "execute_command" | "exec") {
                     let workspace = self.handle.config.workspace.as_deref()
                         .or(self.live.agents.read().await.defaults.workspace.as_deref())
                         .map(expand_tilde)
@@ -5017,127 +5526,97 @@ impl AgentRuntime {
                     }
                 }
 
-                // Compress or truncate tool result for session storage.
+                // Cap or compress tool result for session storage.
                 //
-                // Web tools (web_fetch / web_browser / web_search) with large
-                // results go through an ephemeral LLM call that extracts only
-                // the answer.  Raw HTML / search-result JSON never enters the
-                // conversation history.  Other tools are truncated as before.
+                // Routing per tool:
+                //   - web_search       -> truncate to limits.web_search (snippets
+                //                         only; no inline page content since the
+                //                         auto-fetch pipeline was removed).
+                //   - web_fetch        -> compress on the flash model when raw
+                //                         exceeds limits.web_fetch, else truncate.
+                //   - web_browser/browser -> compress on the flash model when raw
+                //                         exceeds limits.web_browser, else
+                //                         truncate. Stateful browser tasks fire
+                //                         many snapshots per turn, so compression
+                //                         must NOT compete with the primary
+                //                         model's KV cache — see
+                //                         compress_tool_result_for_session.
+                //   - everything else  -> per-tool truncate, with use_skill
+                //                         kept large because SKILL.md must
+                //                         arrive verbatim.
                 let session_text = {
-                    // Was 1000 bytes — too aggressive. Any clean JSON / API
-                    // response above 1KB triggered a 30-60 s LLM "compression"
-                    // pass that lost structure for no benefit. The threshold
-                    // now reflects what *actually* needs compression: raw HTML
-                    // dumps that survive the dehydrate pipeline.
-                    const WEB_COMPRESS_THRESHOLD: usize = 32_000;
-                    let is_web_tool = matches!(
+                    use super::web_parsers::truncate_chars;
+
+                    let limits_owned = self
+                        .live
+                        .ext
+                        .read()
+                        .await
+                        .tools
+                        .as_ref()
+                        .and_then(|t| t.session_result_limits.clone());
+                    let limits = limits_owned.as_ref();
+
+                    let max_chars = match tool_name.as_str() {
+                        "shell" | "execute_command" | "exec" => {
+                            limits.and_then(|l| l.exec).unwrap_or(3000)
+                        }
+                        "web_search" => {
+                            limits.and_then(|l| l.web_search).unwrap_or(2000)
+                        }
+                        "web_fetch" => {
+                            limits.and_then(|l| l.web_fetch).unwrap_or(5000)
+                        }
+                        "web_browser" | "browser" => {
+                            limits.and_then(|l| l.web_browser).unwrap_or(2000)
+                        }
+                        // use_skill returns SKILL.md, which is a contract
+                        // document the LLM MUST see in full. Truncating it
+                        // caused the agent to hallucinate CLI invocations
+                        // (e.g. flyai's SKILL.md says `npm i -g
+                        // @fly-ai/flyai-cli` on line 60 — past the 3000-char
+                        // cut — so the agent saw only `runtime: node` in
+                        // frontmatter and made up `node index.js` instead).
+                        "use_skill" => {
+                            limits.and_then(|l| l.default).unwrap_or(60_000)
+                        }
+                        "read_file" | "read" => {
+                            limits.and_then(|l| l.default).unwrap_or(3000)
+                        }
+                        _ => limits.and_then(|l| l.default).unwrap_or(3000),
+                    };
+
+                    let needs_compression = matches!(
                         tool_name.as_str(),
-                        "web_fetch" | "web_browser" | "browser" | "web_search"
+                        "web_fetch" | "web_browser" | "browser"
                     );
 
-                    // Structured responses (JSON / Atom XML / RSS / plain
-                    // markdown lists) are already useful as-is; sending them
-                    // through an LLM "extractor" just truncates and reformats
-                    // for no gain. Detect heuristically by the first
-                    // non-whitespace byte.
-                    let starts_structured = result_text
-                        .trim_start()
-                        .as_bytes()
-                        .first()
-                        .is_some_and(|b| matches!(b, b'{' | b'[' | b'<'));
-
-                    if is_web_tool
-                        && starts_structured
-                        && result_text.len() <= 50_000
-                    {
-                        // Structured web response (JSON / Atom / XML) under
-                        // 50KB: pass through verbatim so the agent reads the
-                        // raw structured data. Truncating to the generic 3KB
-                        // default in the non-web branch would clip useful
-                        // fields (e.g. multiple Stack Exchange questions).
-                        result_text.clone()
-                    } else if is_web_tool
-                        && !starts_structured
-                        && result_text.len() > WEB_COMPRESS_THRESHOLD
-                    {
+                    if needs_compression && result_text.chars().count() > max_chars {
                         let sk = ctx.session_key.clone();
                         let tn = tool_name.clone();
-                        match self.compress_tool_result_for_session(&sk, &tn, &result_text).await {
+                        match self
+                            .compress_tool_result_for_session(&sk, &tn, &result_text)
+                            .await
+                        {
                             Ok(summary) => {
                                 debug!(
                                     tool = %tn,
                                     orig = result_text.len(),
                                     compressed = summary.len(),
-                                    "tool result compressed for session"
+                                    "tool result compressed via flash model"
                                 );
-                                summary
+                                truncate_chars(&summary, max_chars)
                             }
                             Err(e) => {
-                                warn!(tool = %tn, error = %e, "tool result compression failed, truncating");
-                                let max = 3000usize;
-                                if result_text.len() > max {
-                                    let end = result_text
-                                        .char_indices()
-                                        .nth(max)
-                                        .map(|(i, _)| i)
-                                        .unwrap_or(result_text.len());
-                                    format!(
-                                        "{}\n[...truncated, {}/{} chars]",
-                                        &result_text[..end],
-                                        max,
-                                        result_text.len()
-                                    )
-                                } else {
-                                    result_text.clone()
-                                }
+                                warn!(tool = %tn, error = %e,
+                                    "tool result compression failed, truncating");
+                                truncate_chars(&result_text, max_chars)
                             }
                         }
+                    } else if result_text.chars().count() > max_chars {
+                        truncate_chars(&result_text, max_chars)
                     } else {
-                        // Non-web tools: keep existing per-tool limits.
-                        let limits_owned = self
-                            .live
-                            .ext
-                            .read()
-                            .await
-                            .tools
-                            .as_ref()
-                            .and_then(|t| t.session_result_limits.clone());
-                        let limits = limits_owned.as_ref();
-                        let max_chars = match tool_name.as_str() {
-                            "execute_command" | "exec" => {
-                                limits.and_then(|l| l.exec).unwrap_or(3000)
-                            }
-                            "read_file" | "read" => {
-                                limits.and_then(|l| l.default).unwrap_or(3000)
-                            }
-                            // use_skill returns SKILL.md, which is a contract
-                            // document the LLM MUST see in full. Truncating
-                            // it caused the agent to hallucinate CLI
-                            // invocations (e.g. flyai's SKILL.md says
-                            // `npm i -g @fly-ai/flyai-cli` on line 60 — past
-                            // the 3000-char cut — so the agent saw only
-                            // `runtime: node` in frontmatter and made up
-                            // `node index.js` instead).
-                            "use_skill" => {
-                                limits.and_then(|l| l.default).unwrap_or(60_000)
-                            }
-                            _ => limits.and_then(|l| l.default).unwrap_or(3000),
-                        };
-                        if result_text.len() > max_chars {
-                            let end = result_text
-                                .char_indices()
-                                .nth(max_chars)
-                                .map(|(i, _)| i)
-                                .unwrap_or(result_text.len());
-                            format!(
-                                "{}\n[...truncated, {}/{} chars]",
-                                &result_text[..end],
-                                max_chars,
-                                result_text.len()
-                            )
-                        } else {
-                            result_text.clone()
-                        }
+                        result_text.clone()
                     }
                 };
 
@@ -5208,6 +5687,18 @@ impl AgentRuntime {
             "session" => return self.tool_session_consolidated(ctx, args).await,
             "agent" | "subagents" => return self.tool_agent_consolidated(ctx, args).await,
             "channel" => return self.tool_channel_consolidated(args).await,
+
+            // A2A v1.0 INPUT_REQUIRED / AUTH_REQUIRED suspend-resume bridge.
+            // When the LLM calls this tool the runtime publishes
+            // TASK_STATE_INPUT_REQUIRED (or AUTH_REQUIRED), registers a
+            // resume handle on `state.suspended_tasks`, and awaits the
+            // client's next SendMessage on the same taskId — which the
+            // dispatcher routes through the resume short-path. The new
+            // text becomes this tool's return value, and the agent loop
+            // continues with that text as a fresh tool result. No-op on
+            // non-A2A turns: returns an error instead of hanging the loop.
+            "wait_input" => return self.tool_wait_input(ctx, args).await,
+            "wait_auth" => return self.tool_wait_input(ctx, inject_auth(args)).await,
 
             // --- Backward compat: old names map to consolidated handlers ---
             "memory_search" => {
@@ -5367,9 +5858,12 @@ impl AgentRuntime {
             }
             "read_file" | "read" => return self.tool_read(args).await,
             "write_file" | "write" => return self.tool_write(args).await,
-            "execute_command" | "exec" => return self.tool_exec(ctx, _id, args).await,
+            "edit_file" | "edit" => return self.tool_edit(args).await,
+            "shell" | "execute_command" | "exec" => return self.tool_exec(ctx, _id, args).await,
             "use_skill" => return self.tool_use_skill(args),
             "task" => return self.tool_task(ctx, args).await,
+            "task_finish" => return self.tool_task_finish(ctx, args).await,
+            "ask_user" => return self.tool_ask_user(ctx, args).await,
             "install_tool" | "tool_install" => return self.tool_install(args).await,
             "list_dir" => return self.tool_list_dir(args).await,
             "search_file" => return self.tool_search_file(args).await,
@@ -5396,7 +5890,7 @@ impl AgentRuntime {
             "web_fetch" => return self.tool_web_fetch(args).await,
             "web_download" => return self.tool_web_download(args).await,
             "web_browser" | "browser" => return self.tool_web_browser(ctx, args).await,
-            "computer_use" => return self.tool_computer_use(args).await,
+            "computer_use" => return self.tool_computer_use(ctx, args).await,
             "image_gen" | "image" => return self.tool_image(args).await,
             "video_gen" | "video" => return self.tool_video(args, ctx).await,
             "pdf" => return self.tool_pdf(args).await,
@@ -5543,6 +6037,11 @@ impl AgentRuntime {
                 peer_id: ctx.agent_id.clone(),
                 chat_id: String::new(),
                 reply_tx,
+                task_id: None,
+                context_id: None,
+                event_tx: None,
+                cancel_token: None,
+                input_request_tx: None,
                 extra_tools: vec![],
                 images: vec![],
                 files: vec![],
@@ -5578,7 +6077,7 @@ impl AgentRuntime {
         if let Some(ext) = self
             .config
             .agents
-            .external
+            .a2a
             .iter()
             .find(|e| e.id == agent_id || e.id == normalized_id)
         {
@@ -5671,6 +6170,45 @@ impl AgentRuntime {
         Ok(json!({"count": results.len(), "results": results}))
     }
 
+    /// A2A v1.0 INPUT_REQUIRED / AUTH_REQUIRED bridge tool.
+    ///
+    /// The agent calls this when it needs the client to supply more text
+    /// (e.g. a credential, a confirmation, a missing parameter) before it
+    /// can finish the turn. The runtime publishes a TASK_STATE_INPUT_REQUIRED
+    /// (or AUTH_REQUIRED if `auth=true`) status event with `prompt` as the
+    /// agent-role message, registers a one-shot resume handle on
+    /// `state.suspended_tasks`, and awaits the client's reply.
+    ///
+    /// Resume protocol: the client sends a fresh SendMessage / SendStreamingMessage
+    /// with the **same taskId** and the new text. The dispatcher detects the
+    /// existing `SuspendedTask` entry, pops it, and pushes the text into the
+    /// `resume_tx`. This tool then returns the text as its result and the
+    /// agent loop continues.
+    ///
+    /// Non-A2A turns (TurnContext default) have no `input_request_tx`, so
+    /// this returns an error — the LLM can recover with a plain reply.
+    pub(crate) async fn tool_wait_input(&self, ctx: &RunContext, args: Value) -> Result<Value> {
+        let prompt = args
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Please provide additional input to continue.");
+        let auth = args
+            .get("auth")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if ctx.turn_ctx.input_request_tx.is_none() {
+            return Ok(json!({
+                "error": "wait_input is only supported on A2A turns",
+            }));
+        }
+        match ctx.turn_ctx.request_input(prompt, auth).await {
+            Some(text) => Ok(json!({ "input": text })),
+            None => Err(anyhow!(
+                "resume channel dropped while awaiting input"
+            )),
+        }
+    }
+
     pub(crate) async fn tool_memory_get(&self, args: Value) -> Result<Value> {
         let id = args["id"].as_str().unwrap_or("").to_owned();
         let Some(ref mem) = self.memory else {
@@ -5690,7 +6228,7 @@ impl AgentRuntime {
     /// model would reach for `web_fetch`/`web_browser` even when a skill's
     /// description matched the task. Returns the skill's full SKILL.md so
     /// the LLM can derive the exact CLI invocation, then call
-    /// `execute_command` to run it.
+    /// `shell` to run it.
     /// Escalate the user's current request into a multi-turn background
     /// task. The LLM is the one judging when this is warranted (see the
     /// `task` ToolDef description). The original `looks_like_task`
@@ -5757,10 +6295,23 @@ impl AgentRuntime {
     }
 
     pub(crate) fn tool_use_skill(&self, args: Value) -> Result<Value> {
+        // Try "name" first, then fall back to common alternatives the model
+        // sometimes emits when it confuses the parameter name.
         let name = args
             .get("name")
+            .or_else(|| args.get("skill"))
+            .or_else(|| args.get("skill_name"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("use_skill: 'name' is required"))?;
+            .ok_or_else(|| {
+                let available: Vec<String> =
+                    self.skills.all().map(|s| s.name.clone()).collect();
+                anyhow!(
+                    "use_skill: 'name' is required. Available skills: {}. \
+                     Received args: {}",
+                    available.join(", "),
+                    args
+                )
+            })?;
         let Some(skill) = self.skills.get(name) else {
             let available: Vec<&str> = self.skills.all().map(|s| s.name.as_str()).collect();
             return Ok(serde_json::json!({
@@ -5778,7 +6329,7 @@ impl AgentRuntime {
             "dir": dir,
             "skill_md": skill_md,
             "next_step": "Read skill_md to find the exact CLI command and flags, \
-                          then call execute_command to run it. \
+                          then call shell to run it. \
                           Pass the user's actual question / parameters via the \
                           flags documented in skill_md."
         }))
@@ -6348,6 +6899,15 @@ fn inject_action(mut args: Value, action: &str) -> Value {
     args
 }
 
+/// Force `auth=true` on the wait-input args so the `wait_auth` alias
+/// routes to the AUTH_REQUIRED variant of the suspend-resume bridge.
+fn inject_auth(mut args: Value) -> Value {
+    if let Some(obj) = args.as_object_mut() {
+        obj.insert("auth".to_owned(), json!(true));
+    }
+    args
+}
+
 /// Inject a `channel` field into `args` if not already present.
 fn inject_channel(mut args: Value, channel: &str) -> Value {
     if let Some(obj) = args.as_object_mut() {
@@ -6607,7 +7167,7 @@ mod tests {
         let tools = build_tool_list(&skills, None, "test-agent", &[]);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         for expected in &[
-            "memory", "session", "agent", "channel", "read_file", "write_file", "execute_command",
+            "memory", "session", "agent", "channel", "read_file", "write_file", "shell",
         ] {
             assert!(
                 names.contains(expected),
@@ -6640,6 +7200,285 @@ mod tests {
         // "HEARTBEAT_OK" reply bug where cron jobs got the minimal prompt.
         assert!(!is_minimal_context_session("cron:morning-briefing"));
         assert!(!is_minimal_context_session("agent:main:telegram:direct:u1"));
+    }
+
+    // ------------------------------------------------------------------
+    // model_supports_image_input — schema-driven vision-capability lookup
+    // ------------------------------------------------------------------
+
+    fn build_config_with_models(
+        provider_name: &str,
+        models: Vec<crate::config::schema::ModelDef>,
+    ) -> crate::config::schema::Config {
+        use crate::config::schema::{
+            ApiFormat, Config, ModelsConfig, ProviderConfig,
+        };
+        let pc = ProviderConfig {
+            base_url: None,
+            api_key: None,
+            api: Some(ApiFormat::OpenAiCompletions),
+            models: Some(models),
+            enabled: Some(true),
+            user_agent: None,
+            prefix_id: None,
+        };
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(provider_name.to_owned(), pc);
+        Config {
+            models: Some(ModelsConfig {
+                mode: None,
+                providers,
+            }),
+            ..Config::default()
+        }
+    }
+
+    fn model_def(id: &str, inputs: Option<Vec<crate::config::schema::InputType>>) -> crate::config::schema::ModelDef {
+        crate::config::schema::ModelDef {
+            id: id.to_owned(),
+            name: None,
+            reasoning: None,
+            input: inputs,
+            cost: None,
+            context_window: None,
+            max_tokens: None,
+            enabled: None,
+        }
+    }
+
+    #[test]
+    fn model_supports_image_input_explicit_image() {
+        use crate::config::schema::InputType;
+        let cfg = build_config_with_models(
+            "kimi",
+            vec![model_def("kimi-for-coding", Some(vec![InputType::Text, InputType::Image]))],
+        );
+        // Both qualified and unqualified lookups resolve.
+        assert_eq!(model_supports_image_input(&cfg, "kimi/kimi-for-coding"), Some(true));
+        assert_eq!(model_supports_image_input(&cfg, "kimi-for-coding"), Some(true));
+    }
+
+    #[test]
+    fn model_supports_image_input_text_only() {
+        use crate::config::schema::InputType;
+        let cfg = build_config_with_models(
+            "deepseek",
+            vec![model_def("deepseek-chat", Some(vec![InputType::Text]))],
+        );
+        assert_eq!(model_supports_image_input(&cfg, "deepseek/deepseek-chat"), Some(false));
+    }
+
+    #[test]
+    fn model_supports_image_input_no_input_field_returns_none() {
+        let cfg = build_config_with_models(
+            "kimi",
+            vec![model_def("kimi-for-coding", None)],
+        );
+        // input field absent → caller should fall back to blocklist.
+        assert_eq!(model_supports_image_input(&cfg, "kimi/kimi-for-coding"), None);
+    }
+
+    #[test]
+    fn model_supports_image_input_unknown_model_returns_none() {
+        use crate::config::schema::InputType;
+        let cfg = build_config_with_models(
+            "kimi",
+            vec![model_def("kimi-for-coding", Some(vec![InputType::Image]))],
+        );
+        assert_eq!(model_supports_image_input(&cfg, "openai/gpt-4"), None);
+    }
+
+    // ------------------------------------------------------------------
+    // is_known_vision_model — built-in allow-list
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn is_known_vision_model_kimi_family() {
+        // kimi-for-coding ships vision tuning.
+        assert!(is_known_vision_model("kimi/kimi-for-coding"));
+        assert!(is_known_vision_model("kimi-for-coding"));
+        // K2.5+ series is multimodal; older K2.x (K2.0..=K2.4) is not.
+        assert!(is_known_vision_model("kimi/kimi-k2.5"));
+        assert!(is_known_vision_model("kimi/kimi-k2.6-preview"));
+        assert!(is_known_vision_model("kimi/kimi-k2.7"));
+        // Pre-2.5 must NOT match.
+        assert!(!is_known_vision_model("kimi/kimi-k2.0"));
+        assert!(!is_known_vision_model("kimi/kimi-k1"));
+    }
+
+    #[test]
+    fn is_known_vision_model_major_vlms() {
+        for name in [
+            // International
+            "openai/gpt-4o",
+            "openai/gpt-4-vision-preview",
+            "openai/gpt-5",
+            "anthropic/claude-3-opus",
+            "anthropic/claude-sonnet-4-5",
+            "anthropic/claude-4-7",
+            "google/gemini-1.5-pro",
+            "google/gemini-3-ultra",
+            "google/gemma-3-27b-it",
+            "google/gemma-4-9b",
+            "google/paligemma-3b-mix",
+            "meta/llama-3.2-90b-vision-instruct",
+            "meta/llama-4-scout-17b",
+            "mistral/pixtral-12b",
+            "mistral/mistral-small-3.1-24b",
+            "cohere/aya-vision-32b",
+            "xai/grok-3", "xai/grok-4-fast",
+
+            // Chinese — ByteDance / Alibaba / Moonshot / Zhipu / Baidu / 01 / Baichuan / DeepSeek / Tencent / MiniMax / StepFun
+            "doubao/doubao-seed-1.5-vision-pro",
+            "doubao/doubao-seed-1.6-vision-thinking",
+            // Doubao Seed 2+ — entire 2.x / 3.x / ... subtree is multimodal
+            "doubao/doubao-seed-2.0-pro",
+            "doubao/doubao-seed-2.0-lite",
+            "doubao/doubao-seed-2.0-code",
+            "doubao/doubao-seed-2.0-vision",
+            "doubao/doubao-seed-2.0-flash",
+            "doubao/doubao-seed-2.5-pro",       // future minor
+            "doubao/doubao-seed-3.0-pro",       // future major (auto-covered)
+            "doubao/doubao-seed-4-omni",
+            "doubao/doubao-vision",
+            "doubao/seedream",
+            "qwen/qwen-vl-plus",
+            "qwen/qwen2.5-vl-72b",
+            "qwen/qwen3-vl-30b",
+            "qwen/qwen3.5-instruct",
+            "qwen/qwen-3.6-pro",
+            "qwen/qvq-72b-preview",
+            "kimi/kimi-for-coding",
+            "kimi/kimi-k2.5",
+            "kimi/kimi-k2.6-preview",
+            "kimi/kimi-vl-thinking",
+            "zhipu/glm-4v-9b",
+            "zhipu/glm-4.5v",
+            "zhipu/cogagent-9b",
+            "baidu/ernie-4.5-vl-424b",
+            "baidu/ernie-5-pro",
+            "sensetime/sensenova-v6-pro",
+            "01-ai/yi-vl-34b",
+            "baichuan/baichuan-omni-1.5",
+            "deepseek/deepseek-vl2",
+            "deepseek/janus-pro-7b",
+            "tencent/hunyuan-vision",
+            "minimax/minimax-vl-01",
+            "stepfun/step-1o-vision-32k",
+            "stepfun/step-3",
+
+            // Open-source
+            "liuhaotian/llava-1.6-34b",
+            "opengvlab/internvl3-78b",
+            "openbmb/minicpm-v-2.6",
+            "microsoft/phi-3-vision-128k",
+            "microsoft/florence-2-large",
+            "huggingfaceh4/idefics3-8b",
+            "huggingfaceh4/smolvlm-instruct",
+            "nvidia/nvila-15b",
+
+            // GUI-agent VLMs
+            "bytedance/ui-tars-1.5-7b",
+            "bytedance/ui-tars-2",
+            "showui-2b",
+            "os-atlas-pro-7b",
+
+            // Universal suffix matchers
+            "anything-with-vision-suffix",
+            "weird-foo-omni",
+        ] {
+            assert!(is_known_vision_model(name), "should match: {name}");
+        }
+    }
+
+    #[test]
+    fn is_known_vision_model_text_only_returns_false() {
+        for name in [
+            // OpenAI text-only
+            "openai/gpt-3.5-turbo",
+            "openai/gpt-4",                 // bare GPT-4 base is text-only
+            "openai/text-davinci-003",
+            // Anthropic legacy
+            "anthropic/claude-2.1",
+            "anthropic/claude-instant-1",
+            // DeepSeek non-VL
+            "deepseek/deepseek-chat",
+            "deepseek/deepseek-reasoner",
+            "deepseek/deepseek-coder",
+            "deepseek/deepseek-v3",
+            // Doubao text-only
+            "doubao/doubao-seed-1.6",       // text variant; only -vision suffix is multimodal
+            "doubao/doubao-pro-256k",
+            "doubao/doubao-lite",
+            // Qwen text-only (pre-3.5)
+            "qwen/qwen-turbo",
+            "qwen/qwen-max",
+            "qwen/qwen-plus",
+            "qwen/qwen3.0",
+            "qwen/qwen3.4",
+            "qwen/qwen-3.4-instruct",
+            "qwen/qwen3-coder",             // coder is text-only
+            // Pre-3 Gemma
+            "google/gemma-2-9b",
+            "google/gemma-1-7b",
+            // Llama text-only
+            "meta/llama-3-70b",
+            "meta/llama-3.1-405b",
+            "meta/llama-3.2-3b",            // small Llama 3.2 are text
+            // Mistral text-only
+            "mistral/mistral-7b-instruct",
+            "mistral/mixtral-8x7b",
+            "mistral/codestral-22b",
+            "mistral/mistral-large-2411",
+            // Kimi pre-2.5
+            "kimi/kimi-k1",
+            "kimi/kimi-k2.0",
+            "kimi/kimi-k2.4",
+            "kimi/moonshot-v1-128k",        // base v1 is text without -vision
+            // Zhipu text-only (no v suffix)
+            "zhipu/glm-4-flash",
+            "zhipu/glm-4.5",
+            "zhipu/glm-5",                  // bare GLM-5 (the VL variant is glm-5v)
+            // Baidu text-only
+            "baidu/ernie-3.5-128k",
+            "baidu/ernie-4.0-turbo",
+            "baidu/ernie-speed",
+            // Yi text-only
+            "01-ai/yi-large",
+            "01-ai/yi-lightning",
+            // Baichuan text-only
+            "baichuan/baichuan2-13b",
+            "baichuan/baichuan4",
+            // Hunyuan text-only
+            "tencent/hunyuan-large",
+            "tencent/hunyuan-t1",
+            // MiniMax text-only — including base M2 / M2.5 / M2.7
+            // (despite "native multimodal" marketing, third-party
+            // testing confirms text-only input).
+            "minimax/abab6.5-chat",
+            "minimax/minimax-m1",
+            "minimax/minimax-m2",
+            "minimax/minimax-m2.5",
+            "minimax/minimax-m2.7",
+            "minimax/minimax-m3-base",
+            // StepFun text-only
+            "stepfun/step-1-128k",
+            "stepfun/step-2-mini",
+            // SmolLM (NOT SmolVLM)
+            "huggingfaceh4/smollm-1.7b",
+            "huggingfaceh4/smollm2-1.7b",
+            // MiniCPM bare (NOT minicpm-v)
+            "openbmb/minicpm-2b",
+            "openbmb/minicpm3-4b",
+            // Phi text-only
+            "microsoft/phi-3-mini-4k",
+            "microsoft/phi-4",              // bare phi-4 is text; phi-4-multimodal is vision
+            // Generic / unknown model — defaults to text-only.
+            "some-new-llm/v1",
+            "future-vendor/futurelm-2030",
+        ] {
+            assert!(!is_known_vision_model(name), "should NOT match (false positive): {name}");
+        }
     }
 }
 

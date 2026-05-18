@@ -14,6 +14,7 @@ use crate::{
         gemini::{self as gemini, GeminiProvider},
         openai::OpenAiProvider,
         registry::ProviderRegistry,
+        rsclaw::RsclawProvider,
     },
 };
 
@@ -22,10 +23,34 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
 
     if let Some(models_cfg) = &config.model.models {
         for (name, provider_cfg) in &models_cfg.providers {
+            // `load_json5` runs `expand_env_vars` at parse time, so a
+            // value like `"${RSCLAW_API_KEY}"` becomes the env var's
+            // actual contents — UNLESS the variable isn't set, in
+            // which case the placeholder is left verbatim with only a
+            // `debug!` notice. Without this filter, an unset env var
+            // would silently turn into `Authorization: Bearer ${RSCLAW_API_KEY}`
+            // on the wire and surface as a baffling "invalid api key"
+            // from the upstream worker. Treat unresolved placeholders
+            // as "no key configured" and fall through to the explicit
+            // env-var fallback below, while logging a warning so the
+            // user can see what happened.
             let api_key = provider_cfg
                 .api_key
                 .as_ref()
                 .and_then(|k| k.as_plain().map(str::to_owned))
+                .filter(|s| {
+                    if s.contains("${") && s.contains('}') {
+                        tracing::warn!(
+                            provider = %name,
+                            placeholder = %s,
+                            "provider apiKey is an unresolved ${{VAR}} placeholder \
+                             (env var not set); falling back to direct env lookup"
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                })
                 .or_else(|| std::env::var(format!("{}_API_KEY", name.to_uppercase())).ok());
 
             let base_url = provider_cfg.base_url.clone().or_else(|| {
@@ -59,6 +84,12 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                     "gemini" => ApiFormat::Gemini,
                     "doubao" | "bytedance" => ApiFormat::OpenAiResponses,
                     "ollama" => ApiFormat::Ollama,
+                    // Bare `rsclaw` name implies the stateful session
+                    // protocol — same shortcut as `anthropic`/`gemini`
+                    // above. Users who name their provider differently
+                    // (e.g. a self-hosted worker called `local-llm`)
+                    // must set `api: "rsclaw"` explicitly.
+                    "rsclaw" => ApiFormat::Rsclaw,
                     _ => ApiFormat::OpenAiCompletions,
                 }
             });
@@ -91,6 +122,29 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                     let url = base_url
                         .unwrap_or_else(|| crate::provider::openai::OPENAI_API_BASE.to_owned());
                     Arc::new(OpenAiProvider::responses_with_ua(url, key, user_agent))
+                }
+                (_, &crate::config::schema::ApiFormat::Rsclaw) => {
+                    // rsclaw stateful session protocol (kvCacheMode=2).
+                    // `baseUrl` should point at either rsclaw-server
+                    // (e.g. `https://api.rsclaw.ai/v1/agent`) or a
+                    // direct rsclaw-llm worker (e.g.
+                    // `http://localhost:9999`). `apiKey` is the bearer
+                    // token; falls back to RSCLAW_KEY env, then to
+                    // None (acceptable when targeting an unauth'd
+                    // local worker).
+                    let key = api_key
+                        .or_else(|| std::env::var("RSCLAW_KEY").ok())
+                        .or_else(|| std::env::var("RSCLAW_SERVER_KEY").ok())
+                        .filter(|s| !s.is_empty());
+                    let url = base_url.unwrap_or_else(|| {
+                        crate::provider::rsclaw::RSCLAW_DEFAULT_BASE.to_owned()
+                    });
+                    let provider = crate::provider::rsclaw::RsclawProvider::new(url, key);
+                    let provider = match provider_cfg.prefix_id.clone() {
+                        Some(pid) => provider.with_prefix_id(pid),
+                        None => provider,
+                    };
+                    Arc::new(provider)
                 }
                 _ => {
                     // OpenAI-compatible (covers openai-completions,
@@ -257,6 +311,56 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
         );
     }
 
+    // rsclaw-server — internal multi-provider gateway. Speaks OpenAI Chat
+    // Completions; clients send `Authorization: Bearer <client_key>` and
+    // upstream routing happens server-side.
+    //
+    //   RSCLAW_SERVER_KEY  — required, matches a `[[client_keys]]` entry
+    //                        in rsclaw-server's config.toml
+    //   RSCLAW_SERVER_URL  — optional override (default: http://localhost:8090/v1)
+    //
+    // `nonempty_env` (not `std::env::var(...).ok()`) so a placeholder
+    // `RSCLAW_SERVER_KEY=` in a dotenv template doesn't register the
+    // provider with an empty bearer (silent 401s upstream), and a blank
+    // `RSCLAW_SERVER_URL=` doesn't defeat the localhost default by
+    // returning `Ok("")` and falling through to register an
+    // unparseable empty base URL. Same rationale as the rsclaw block
+    // below.
+    if !registry.names().contains(&"rsclaw_server")
+        && let Some(key) = nonempty_env("RSCLAW_SERVER_KEY")
+    {
+        let url = nonempty_env("RSCLAW_SERVER_URL")
+            .unwrap_or_else(|| "http://localhost:8090/v1".to_string());
+        registry.register(
+            "rsclaw_server",
+            Arc::new(OpenAiProvider::with_base_url(url, Some(key))),
+        );
+    }
+
+    // rsclaw — kvCacheMode=2 incremental session protocol (rsclaw-protocol.md).
+    // Distinct from `rsclaw_server` above: that one speaks OpenAI Chat for
+    // mode 0/1 traffic; this one speaks the stateful session protocol and
+    // rejects requests with kv_cache_mode != 2.
+    //
+    //   RSCLAW_KEY  — bearer token (optional if rsclaw-server has auth disabled)
+    //   RSCLAW_URL  — full base URL including the `/v1/agent` mount
+    //                 (default: http://localhost:8090/v1/agent)
+    if !registry.names().contains(&"rsclaw") {
+        // `std::env::var(...).ok()` returns `Some("")` when an env var
+        // is *set but blank* (e.g. `RSCLAW_KEY=` in a dotenv file used
+        // as a placeholder/template). `Some("")` is truthy in
+        // `.or_else(...)`, so the fallback chain
+        // `RSCLAW_KEY` → `RSCLAW_SERVER_KEY` short-circuits on the
+        // empty earlier value and never reaches the populated later
+        // one — leaving the gateway with no bearer despite the user
+        // having set one. `nonempty_env` skips the empty-set case so
+        // the chain composes correctly.
+        let key = nonempty_env("RSCLAW_KEY").or_else(|| nonempty_env("RSCLAW_SERVER_KEY"));
+        let url = nonempty_env("RSCLAW_URL")
+            .unwrap_or_else(|| crate::provider::rsclaw::RSCLAW_DEFAULT_BASE.to_string());
+        registry.register("rsclaw", Arc::new(RsclawProvider::new(url, key)));
+    }
+
     // Wire up model aliases from agents.defaults.models.
     if let Some(models) = &config.agents.defaults.models {
         let mut aliases = HashMap::new();
@@ -277,4 +381,52 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
     }
 
     registry
+}
+
+/// Read an env var and treat both *unset* and *set-but-blank* as
+/// absent. Mirrors `std::env::var(name).ok()` for the absent case but
+/// adds whitespace-aware blank detection so callers can chain
+/// fallbacks (`A → B → C`) without an empty earlier value vetoing the
+/// rest. See the rsclaw block above for the concrete short-circuit
+/// scenario this prevents.
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nonempty_env_skips_unset_set_blank_and_whitespace_only() {
+        // Use unique names so parallel tests don't race each other.
+        // The point of the test is the *behaviour shape*, not the
+        // env-var lookup itself — exercise via SAFETY-ed set/remove.
+        let unset = "RSCLAW_TEST_NONEMPTY_UNSET_8d2f1c";
+        let blank = "RSCLAW_TEST_NONEMPTY_BLANK_8d2f1c";
+        let spaces = "RSCLAW_TEST_NONEMPTY_SPACES_8d2f1c";
+        let real = "RSCLAW_TEST_NONEMPTY_REAL_8d2f1c";
+        // SAFETY: env mutation is process-global. Names are unique so
+        // no other test in this crate observes them.
+        unsafe {
+            std::env::remove_var(unset);
+            std::env::set_var(blank, "");
+            std::env::set_var(spaces, "   \t\n");
+            std::env::set_var(real, "  sk-real  ");
+        }
+        assert_eq!(nonempty_env(unset), None, "unset");
+        assert_eq!(nonempty_env(blank), None, "set-blank");
+        assert_eq!(nonempty_env(spaces), None, "whitespace-only");
+        // Trimming is the *provider's* job (provider/rsclaw.rs), not
+        // ours — return the raw string so the caller can decide. We
+        // only filter on the trim *result* to detect blank.
+        assert_eq!(nonempty_env(real).as_deref(), Some("  sk-real  "));
+        unsafe {
+            std::env::remove_var(blank);
+            std::env::remove_var(spaces);
+            std::env::remove_var(real);
+        }
+    }
 }

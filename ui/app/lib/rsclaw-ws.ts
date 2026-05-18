@@ -22,6 +22,68 @@ type PendingReq = {
   reject: (reason: any) => void;
 };
 
+/**
+ * Payload of a `permission_request` frame, mirrors
+ * `crate::computer::permission::PermissionRequest`. Surfaced to the UI
+ * as a red-accented consent modal before any GUI agent loop touches the
+ * desktop.
+ */
+export type PermissionRequestPayload = {
+  request_id: string;
+  agent_id: string;
+  /** Display name of the app being controlled (may be empty). */
+  app: string;
+  /** Plain-language summary of what the agent is about to do. */
+  reason: string;
+  /** Estimated max action count (`max_loop`). */
+  estimated_steps: number;
+};
+
+/** Decision the user picks in the permission dialog. */
+export type PermissionDecision =
+  | "allow_once"
+  | "allow_session"
+  | "allow_always"
+  | "deny";
+
+/**
+ * Payload of a `computer_use_status` frame, mirrors
+ * `crate::computer::status::ComputerUseStatus`. The discriminator is
+ * `kind` (snake_case). Surfaced to the live status panel in the
+ * settings UI so the user can see what the GUI agent is doing.
+ */
+export type ComputerUseStatusPayload =
+  | {
+      kind: "started";
+      run_id: string;
+      agent_id: string;
+      app: string;
+      instruction: string;
+      max_steps: number;
+    }
+  | {
+      kind: "step";
+      run_id: string;
+      step_index: number;
+      action_summary: string;
+      thought: string;
+      result_ok: boolean;
+      result_message: string | null;
+    }
+  | {
+      kind: "finished";
+      run_id: string;
+      outcome_kind:
+        | "finished"
+        | "call_user"
+        | "max_loop"
+        | "user_abort"
+        | "permission_denied"
+        | "operator_error";
+      steps: number;
+      summary: string;
+    };
+
 /** Payload of a `restart.required` frame, mirrors src/events.rs RestartRequest. */
 export type RestartRequiredPayload = {
   at_ms: number;
@@ -51,6 +113,8 @@ class RsClawWsClient {
   private chatHandlers = new Map<string, { cb: ChatCallbacks; fullText: string }>();
   private notificationHandlers = new Set<(text: string, kind?: string) => void>();
   private restartHandlers = new Set<(payload: RestartRequiredPayload) => void>();
+  private permissionHandlers = new Set<(payload: PermissionRequestPayload) => void>();
+  private statusHandlers = new Set<(payload: ComputerUseStatusPayload) => void>();
   private connectHandlers = new Set<() => void>();
   private tokenRefresh: Promise<void> | null = null;
 
@@ -103,6 +167,48 @@ class RsClawWsClient {
   ): () => void {
     this.restartHandlers.add(handler);
     return () => this.restartHandlers.delete(handler);
+  }
+
+  /**
+   * Register a handler for `permission_request` event frames the gateway
+   * emits before driving the desktop with the GUI agent. The handler
+   * should mount a consent UI; the user's choice is sent back via
+   * `chat.permission_response`. Returns an unsubscribe function.
+   */
+  onPermissionRequest(
+    handler: (payload: PermissionRequestPayload) => void,
+  ): () => void {
+    this.permissionHandlers.add(handler);
+    return () => this.permissionHandlers.delete(handler);
+  }
+
+  /**
+   * Register a handler for `computer_use_status` event frames the
+   * gateway broadcasts as the GUI agent progresses through its loop.
+   * Returns an unsubscribe function.
+   */
+  onComputerUseStatus(
+    handler: (payload: ComputerUseStatusPayload) => void,
+  ): () => void {
+    this.statusHandlers.add(handler);
+    return () => this.statusHandlers.delete(handler);
+  }
+
+  /**
+   * Reply to a `PermissionRequest` with the user's decision. Returns
+   * the gateway's `{ resolved, requestId }` response.
+   */
+  permissionResponse(
+    requestId: string,
+    decision: PermissionDecision,
+    extra?: { agentId?: string; app?: string },
+  ): Promise<{ resolved: boolean; requestId: string }> {
+    return this.send("chat.permission_response", {
+      requestId,
+      decision,
+      agentId: extra?.agentId,
+      app: extra?.app,
+    });
   }
 
   /**
@@ -265,6 +371,18 @@ class RsClawWsClient {
     if (event === "restart.required") {
       const payload = (data.payload || data.data || {}) as RestartRequiredPayload;
       this.restartHandlers.forEach((h) => h(payload));
+      return;
+    }
+
+    if (event === "permission_request") {
+      const payload = (data.payload || data.data || {}) as PermissionRequestPayload;
+      this.permissionHandlers.forEach((h) => h(payload));
+      return;
+    }
+
+    if (event === "computer_use_status") {
+      const payload = (data.payload || data.data || {}) as ComputerUseStatusPayload;
+      this.statusHandlers.forEach((h) => h(payload));
       return;
     }
 

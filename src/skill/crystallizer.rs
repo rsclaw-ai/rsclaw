@@ -332,8 +332,11 @@ pub async fn distill_with_llm(
         temperature: Some(0.3),
         frequency_penalty: None,
         thinking_budget: None,
+        endpoint: Default::default(),
         kv_cache_mode: 0,
         session_key: None,
+        system_shared: None,
+        user_system: None,
     };
 
     let mut stream = provider
@@ -424,7 +427,7 @@ pub async fn crystallize_one(
     doc_id: &str,
     scope: &str,
     providers: &Arc<ProviderRegistry>,
-    flash_model: &str,
+    primary_model: &str,
     skills_dir: &Path,
 ) -> Result<Option<PathBuf>> {
     // 0. Master kill-switch.
@@ -459,11 +462,11 @@ pub async fn crystallize_one(
     let prompt = build_distill_prompt(&cluster);
 
     // 4. Resolve provider.
-    if flash_model.is_empty() {
-        tracing::debug!("crystallization: no flash model resolved, skipping");
+    if primary_model.is_empty() {
+        tracing::debug!("crystallization: no primary model resolved, skipping");
         return Ok(None);
     }
-    let (provider_name, model_id) = providers.resolve_model(flash_model);
+    let (provider_name, model_id) = providers.resolve_model(primary_model);
     let provider_arc = match providers.get(provider_name) {
         Ok(p) => p,
         Err(e) => {

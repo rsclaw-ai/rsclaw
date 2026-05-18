@@ -2,13 +2,25 @@
 //!
 //! Extracted from `runtime.rs` to reduce file size.
 
+use std::sync::LazyLock;
+
 use super::workspace::WorkspaceContext;
+use crate::plugin::PluginRegistry;
+use crate::plugin::wasm_runtime::WasmPlugin;
 use crate::skill::SkillRegistry;
+
+/// Cached output of [`build_shared_system_prefix`]. The shared prefix is
+/// byte-stable across the gateway lifetime (no dynamic inputs — only
+/// hardcoded literals + compile-time tool guidance constants), so the
+/// rsclaw kvCacheMode=2 hot path was rebuilding ~3KB of identical
+/// string per LLM iteration. Memoising keeps the first-call cost the
+/// same and turns subsequent calls into a clone of the cached String.
+static SHARED_SYSTEM_PREFIX: LazyLock<String> = LazyLock::new(build_shared_system_prefix_uncached);
 
 /// Read-only commands that are always allowed for any agent (regardless of
 /// allowedCommands).
 pub(crate) const READONLY_COMMANDS: &[&str] = &[
-    "/help", "/version", "/status", "/health", "/uptime", "/models", "/ctx", "/btw", "/clear",
+    "/help", "/version", "/status", "/health", "/uptime", "/models", "/btw", "/clear",
     "/compact", "/history", "/cron", "/abort", "/loop", "/task",
 ];
 
@@ -75,17 +87,8 @@ pub(crate) fn build_help_text_filtered(allowed: &str, lang: &str) -> String {
         h.push('\n');
     }
 
-    h.push_str(if zh { "背景上下文：\n" } else { "Background Context:\n" });
-    h.push_str(if zh { "  /ctx <文本>              添加持久上下文\n" } else { "  /ctx <text>              Add persistent context\n" });
-    h.push_str(if zh { "  /ctx --ttl <N> <文本>    添加上下文（N轮后过期）\n" } else { "  /ctx --ttl <N> <text>    Add context (expires in N turns)\n" });
-    if full { h.push_str(if zh { "  /ctx --global <文本>     添加全局上下文\n" } else { "  /ctx --global <text>     Add global context (all sessions)\n" }); }
-    h.push_str(if zh { "  /ctx --list              列出活跃上下文\n" } else { "  /ctx --list              List active context entries\n" });
-    h.push_str(if zh { "  /ctx --remove <id>       移除指定上下文\n" } else { "  /ctx --remove <id>       Remove entry by id\n" });
-    h.push_str(if zh { "  /ctx --clear             清除当前会话所有上下文\n" } else { "  /ctx --clear             Clear all context for this session\n" });
-    h.push('\n');
-
     h.push_str(if zh { "快速提问：\n" } else { "Side Query:\n" });
-    h.push_str(if zh { "  /btw <问题>              快速查询（不调用工具）\n" } else { "  /btw <question>          Quick query (no tools, ephemeral)\n" });
+    h.push_str(if zh { "  /btw <问题>              快速查询（不调用工具，旁路）\n" } else { "  /btw <question>          Quick query (no tools, ephemeral, bypass)\n" });
     h.push('\n');
 
     if full {
@@ -109,7 +112,6 @@ pub(crate) fn build_help_text_filtered(allowed: &str, lang: &str) -> String {
     h.push_str(if zh { "  /clear            清除会话\n" } else { "  /clear            Clear session\n" });
     h.push_str(if zh { "  /compact          压缩会话并保存记忆\n" } else { "  /compact          Compact session & save to memory\n" });
     h.push_str(if zh { "  /abort            终止当前任务\n" } else { "  /abort            Abort running task\n" });
-    if has("/reset") { h.push_str(if zh { "  /reset            重置会话\n" } else { "  /reset            Reset session\n" }); }
     h.push_str(if zh { "  /voice            语音回复模式\n" } else { "  /voice            Voice reply mode\n" });
     h.push_str(if zh { "  /text             文字回复模式\n" } else { "  /text             Text reply mode\n" });
     h.push_str(if zh { "  /history [n]      查看历史\n" } else { "  /history [n]      Show history\n" });
@@ -183,51 +185,40 @@ pub(crate) fn build_date_context() -> String {
 // System prompt builder
 // ---------------------------------------------------------------------------
 
-/// Build the base system prompt shared by main agent and sub agents.
+/// Build the **shared** system-prompt prefix.
 ///
-/// Contains: language directive, platform info, command safety rules.
-/// Date/time and other dynamic content is injected per-turn into the user
-/// message by the runtime, NOT here, to preserve KV cache prefix stability.
-pub(crate) fn build_base_system_prompt(config: &crate::config::schema::Config) -> Vec<String> {
+/// Byte-identical for every RsClaw client of the same RsClaw version,
+/// regardless of OS / language / installed skills / configured agents.
+/// Designed to sit at the very front of the system prompt so an
+/// upstream LLM gateway with kvCache=2 can pre-cache it once per
+/// version and dedupe it across all users — the client never has to
+/// resend these bytes.
+///
+/// Contains:
+/// - `<agent_loop>` (anti-hallucination + voice rules)
+/// - `[Output format rules]` + `[Data integrity rules]`
+/// - `## Tool Usage Guidelines` (file ops, completion discipline,
+///   delegation, GUI/desktop automation)
+/// - Tool guidance prompts from `EN_TOOL_*` constants (exec,
+///   web_search, web_fetch, web_browser, computer_use)
+/// - `## Self-Evolution & Skill Autonomy`
+///
+/// Everything that varies per machine (platform info, language,
+/// workspace, skills, plugins, agent persona) lives in
+/// [`build_user_system`].
+///
+/// Backed by [`SHARED_SYSTEM_PREFIX`] (a `LazyLock<String>`) — first
+/// call builds the prefix; every subsequent call clones the cached
+/// String. Returning `String` rather than `&'static str` keeps the
+/// existing `format!("{prefix}\n\n{suffix}")` and
+/// `effective_system.strip_prefix(&shared)` callers source-compatible.
+pub fn build_shared_system_prefix() -> String {
+    SHARED_SYSTEM_PREFIX.clone()
+}
+
+fn build_shared_system_prefix_uncached() -> String {
     let mut parts: Vec<String> = Vec::new();
 
-    // Language directive is stable (doesn't change per-turn).
-    if let Some(lang) = config.gateway.as_ref().and_then(|g| g.language.as_deref()) {
-        parts.push(format!(
-            "Default response language: {lang}. Always reply in {lang} unless the user explicitly uses another language."
-        ));
-    }
-
-    // Platform information so LLM generates correct shell commands.
-    let platform_info = if cfg!(target_os = "windows") {
-        "Platform: Windows. Shell: PowerShell. \
-         Use PowerShell commands: Get-ChildItem (or dir), Get-Content, Get-Date, Select-Object -Last N (tail). \
-         Pipes and filters work naturally: | Where-Object, | Select-Object, | Sort-Object. \
-         Paths: backslash or forward slash both work. \
-         Examples: Get-Date -Format 'yyyy-MM-dd'; Get-ChildItem | Select-Object -Last 5; Get-Content file.txt."
-    } else if cfg!(target_os = "macos") {
-        "Platform: macOS. Shell: bash/zsh. Standard Unix commands available (ls, cat, grep, tail, date)."
-    } else {
-        "Platform: Linux. Shell: bash/sh. Standard Unix commands available (ls, cat, grep, tail, date)."
-    };
-    parts.push(platform_info.to_string());
-
-    // Windows command safety rules (only on Windows builds).
-    if cfg!(target_os = "windows") {
-        parts.push(
-            "<windows_command_safety>\n\
-             Windows command safety rules (ALL mandatory):\n\
-             1. Do not wrap a command in an extra shell layer such as `cmd /c`, `powershell -Command`, or `pwsh -Command` unless strictly necessary.\n\
-             2. For destructive file operations, only use a fully specified absolute path.\n\
-             3. Never generate a command whose quoting, escaping, or trailing backslashes could cause the target path to be truncated or reinterpreted.\n\
-             4. Any destructive operation outside the workspace requires explicit user approval.\n\
-             5. If a destructive command fails, do NOT retry with workarounds or alternate commands. Stop, explain the failure, and ask the user.\n\
-             </windows_command_safety>"
-                .to_owned(),
-        );
-    }
-
-    // Agent loop guidance (helps small models understand the iteration pattern).
     parts.push(
         "<agent_loop>\n\
          You are operating in an agent loop:\n\
@@ -263,7 +254,44 @@ pub(crate) fn build_base_system_prompt(config: &crate::config::schema::Config) -
             .to_owned(),
     );
 
-    // Output formatting and data integrity rules (always included).
+    parts.push(
+        "## CAPABILITY PRIORITY (read before every action)\n\
+         \n\
+         For every user request, evaluate sources in this order and use \
+         the FIRST one that fits. Do not skip ahead.\n\n\
+         1. **Plugins** — installed runtime plugins (registered via the \
+         plugin registry). Highest priority. When the install has any \
+         plugins they appear in a later \"## Installed Plugins\" section; \
+         if no such section is present, the install has zero plugins.\n\
+         2. **Skills** — when installed, listed in a later \"## Installed Skills\" \
+         section (absent if zero are installed). Each skill description \
+         states the domains it covers (flights, stocks, weather, …). \
+         If ANY description matches the user's intent, you MUST use \
+         that skill — even if a built-in tool could also do the job.\n\
+         3. **Built-in tools** (web_fetch, web_browser, shell, \
+         read_file, …) — fallback ONLY when no plugin or skill applies.\n\n\
+         Common failure mode (avoid):\n\
+         > User asks about flights → you call web_fetch(ctrip.com) →\n\
+         > result is brittle / blocked / wrong data.\n\
+         > A flyai skill with `intents: [flight_search]` was sitting right\n\
+         > above and you ignored it.\n\n\
+         If you catch yourself reaching for web_fetch / web_browser /\n\
+         shell on a domain a plugin or skill description covers, STOP\n\
+         and use the plugin/skill instead.\n\n\
+         ### How to invoke an installed skill\n\
+         When a task matches a skill description listed under \"## Installed Skills\":\n\
+         1. Pick the skill whose description matches the user's intent.\n\
+         2. Call the `use_skill` function tool with `name=<slug>` — returns \
+         the full SKILL.md body.\n\
+         3. If SKILL.md mentions `references/<command>.md`, read_file that too.\n\
+         4. Then invoke the CLI with the exact flags from SKILL.md via \
+         `shell`.\n\n\
+         Prefer `use_skill` over manually `read_file`-ing SKILL.md so the \
+         discovery shows up cleanly in tool history. Guessing CLI flags from \
+         the description alone is the #1 failure mode."
+            .to_owned(),
+    );
+
     parts.push(
         "[Output format rules]\n\
          - Avoid Markdown headings (#, ##, ###) in chat replies.\n\
@@ -277,117 +305,170 @@ pub(crate) fn build_base_system_prompt(config: &crate::config::schema::Config) -
             .to_owned(),
     );
 
-    parts
+    parts.push(
+        "## Tool Usage Guidelines\n\
+         ### File Operations (use dedicated tools, NOT shell)\n\
+         - List directory: `list_dir`. Find files: `search_file`. Search contents: `search_content`.\n\
+         - Read file: `read_file`. Write/create file: `write_file`.\n\
+         - Documents (xlsx/docx/pdf/pptx): use `doc` tool.\n\
+         - Reserve `shell` for system commands with no dedicated tool.\n\
+         ### Completion Discipline\n\
+         - Have enough info to answer? STOP and reply immediately.\n\
+         - Do NOT repeat a tool call that already returned useful results.\n\
+         - One successful search/fetch is usually enough. Two is the maximum.\n\
+         ### Agent & Task Delegation\n\
+         Delegate work to sub-agents for parallelism, never block.\n\
+         - `agent` action=task for background sub-tasks. Specify `toolset` matching the task.\n\
+         - Independent tasks -> dispatch ALL at once in parallel.\n\
+         - Trivial tasks (simple answers, one read) -> do yourself.\n\
+         - Pipeline: dispatch parallel -> collect results -> dispatch dependent tasks -> synthesize.\n\
+         ### When to call the `task` tool (escalate to background)\n\
+         Default to answering the user directly in this turn. Only call `task` when ALL of:\n\
+         1. The work obviously needs many tool calls or many minutes (e.g. multi-file \
+         implementation, deep multi-source research, end-to-end deploys, long debugging).\n\
+         2. There is nothing useful you can answer right now in one turn.\n\
+         3. The user clearly wants the work done, not just discussed.\n\
+         Do NOT call `task` for: greetings ('你好', 'hi'), questions about your capabilities \
+         ('你能帮我做什么？', 'what can you do?'), single tool calls (one search, one file \
+         read, one calc), explanations, opinions, or anything you can finish in this turn. \
+         When in doubt, just answer — the user can type `/task <request>` to escalate manually.\n\
+         ### Other\n\
+         - Cron jobs: `cron` tool (action=list/add/remove).\n\
+         - Install tools (python, node, ffmpeg, chrome, etc.): `install_tool`. Do NOT download manually.\n\
+         - Memory: use `memory` to recall prior conversations. Search memory at session start if user references prior work.\n\
+         - Save corrected/complete info to memory immediately so it survives compaction.\n\
+         \n\
+         ### GUI / Desktop Automation (computer_use)\n\
+         For any GUI or desktop automation task (WeChat, Finder, Safari, etc.):\n\
+         - **ALWAYS prefer 'computer_use action=vlm_drive' with a natural-language instruction.**\n\
+           The configured VLM handles screenshot -> analysis -> execution internally.\n\
+           Example: computer_use action=vlm_drive instruction='Open WeChat and send a message to File Transfer'.\n\
+         - If an app-rule exists for the target app, call 'get_app_rule' FIRST to\n\
+           read its policy (trigger conditions, reply rules, pre-conditions).\n\
+           The app-rule tells you *what to do and when*; vlm_drive handles *how*.\n\
+           Use 'list_app_rules' to discover available rules.\n\
+         - Only fall back to manual 'screenshot' + individual 'click'/'type'/'key' calls\n\
+           if 'vlm_drive' is unavailable (not configured) or explicitly fails after retry.\n\
+         ### Screenshot routing\n\
+         - \"screenshot\" / \"截图\" / \"截屏\" with no URL → tell user to type \
+         `/ss` (desktop screencapture). Do NOT call web_browser.\n\
+         - \"screenshot of <url>\" / \"网页截图\" → tell user to type \
+         `/webshot <url>` (headless-Chrome web-page screenshot).\n\
+         - `web_browser action=screenshot` is ONLY for multi-step browser \
+         inspection AFTER you've already navigated. A blank-URL call \
+         captures a near-black Chrome new tab."
+            .to_owned(),
+    );
+
+    let tool_prompts = crate::agent::bootstrap::tool_prompts_for_system();
+    if !tool_prompts.is_empty() {
+        parts.push(tool_prompts);
+    }
+
+    parts.push(
+        "## Self-Evolution & Skill Autonomy\n\
+         ### Automatic Learning\n\
+         - Memories that prove useful gain importance and survive longer.\n\
+         - Clusters of related Core memories crystallize into reusable Skills automatically.\n\
+         - Periodic meditation deduplicates and cleans up stale memories.\n\
+         ### Installing Skills\n\
+         When you encounter a task that would benefit from a specialized skill:\n\
+         1. Search: use shell to run `rsclaw skills search <query>`\n\
+         2. Install: `rsclaw skills install <name>`\n\
+         3. The skill auto-matches and injects on future relevant requests.\n\
+         Proactively find and install skills you need — do NOT ask permission.\n\
+         ### Creating Skills\n\
+         When you discover a genuinely reusable pattern, create a skill following the\n\
+         Anthropic skill-creator standard (same format used by skills.sh):\n\
+         \n\
+         Directory layout:\n\
+           workspace/skills/<slug>/\n\
+             SKILL.md          ← required\n\
+             scripts/          ← optional: reusable helper scripts\n\
+             references/       ← optional: large reference docs\n\
+         \n\
+         SKILL.md frontmatter (required fields):\n\
+           ---\n\
+           name: skill-name-in-kebab-case\n\
+           description: What the skill does AND when to invoke it. Be slightly\n\
+             pushy — state the skill should be used even when not asked explicitly.\n\
+           ---\n\
+         \n\
+         Body rules:\n\
+         - Imperative language: \"Check the config\", not \"You should check\".\n\
+         - Explain WHY each step matters, not just what to do.\n\
+         - Include an Input/Output example where it helps.\n\
+         - Under 500 lines; reference scripts/ or references/ for heavy content.\n\
+         - Do NOT use ALL-CAPS MUST/NEVER; explain reasoning instead.\n\
+         \n\
+         After creating the skill: run `rsclaw skills list` to confirm it loaded.\n\
+         Record in memory to avoid duplicates. Inform the user.\n\
+         Only create skills for genuinely reusable patterns, not one-off tasks.\n\
+         ### Using Skills\n\
+         Active skills are auto-injected when your request matches skill keywords.\n\
+         Follow skill instructions carefully — they encode validated experience.\n\
+         If a skill's approach fails, fall back to general methods and update the skill."
+            .to_owned(),
+    );
+
+    parts.join("\n\n")
 }
 
-/// Build the full system prompt for the main agent (base + workspace + skills + tools).
-pub(crate) fn build_system_prompt(
+/// Build the **per-user** suffix that follows the shared prefix.
+///
+/// Contents vary by:
+/// - User's `gateway.language` config (response language directive)
+/// - Build-time `cfg!(target_os)` (platform info + Windows safety)
+/// - User's workspace dir + workspace file listing
+/// - Installed skills + their on-disk paths
+///
+/// Never goes into the shared kvCache prefix — sent fresh each turn.
+pub fn build_user_system(
     ws_ctx: &WorkspaceContext,
     skills: &SkillRegistry,
+    wasm_plugins: &[WasmPlugin],
+    shell_plugins: Option<&PluginRegistry>,
     config: &crate::config::schema::Config,
 ) -> String {
-    let mut parts = build_base_system_prompt(config);
+    let mut parts: Vec<String> = Vec::new();
 
-    // Tool usage guidance
-    {
+    if let Some(lang) = config.gateway.as_ref().and_then(|g| g.language.as_deref()) {
+        parts.push(format!(
+            "Default response language: {lang}. Always reply in {lang} unless the user explicitly uses another language."
+        ));
+    }
+
+    let platform_info = if cfg!(target_os = "windows") {
+        "Platform: Windows. Shell: PowerShell. \
+         Use PowerShell commands: Get-ChildItem (or dir), Get-Content, Get-Date, Select-Object -Last N (tail). \
+         Pipes and filters work naturally: | Where-Object, | Select-Object, | Sort-Object. \
+         Paths: backslash or forward slash both work. \
+         Examples: Get-Date -Format 'yyyy-MM-dd'; Get-ChildItem | Select-Object -Last 5; Get-Content file.txt."
+    } else if cfg!(target_os = "macos") {
+        "Platform: macOS. Shell: bash/zsh. Standard Unix commands available (ls, cat, grep, tail, date)."
+    } else {
+        "Platform: Linux. Shell: bash/sh. Standard Unix commands available (ls, cat, grep, tail, date)."
+    };
+    parts.push(platform_info.to_owned());
+
+    if cfg!(target_os = "windows") {
         parts.push(
-            "## Tool Usage Guidelines\n\
-             ### File Operations (use dedicated tools, NOT execute_command)\n\
-             - List directory: `list_dir`. Find files: `search_file`. Search contents: `search_content`.\n\
-             - Read file: `read_file`. Write/create file: `write_file`.\n\
-             - Documents (xlsx/docx/pdf/pptx): use `doc` tool.\n\
-             - Reserve `execute_command` for system commands with no dedicated tool.\n\
-             ### Completion Discipline\n\
-             - Have enough info to answer? STOP and reply immediately.\n\
-             - Do NOT repeat a tool call that already returned useful results.\n\
-             - One successful search/fetch is usually enough. Two is the maximum.\n\
-             ### Agent & Task Delegation\n\
-             Delegate work to sub-agents for parallelism, never block.\n\
-             - `agent` action=task for background sub-tasks. Specify `toolset` matching the task.\n\
-             - Independent tasks -> dispatch ALL at once in parallel.\n\
-             - Trivial tasks (simple answers, one read) -> do yourself.\n\
-             - Pipeline: dispatch parallel -> collect results -> dispatch dependent tasks -> synthesize.\n\
-             ### When to call the `task` tool (escalate to background)\n\
-             Default to answering the user directly in this turn. Only call `task` when ALL of:\n\
-             1. The work obviously needs many tool calls or many minutes (e.g. multi-file \
-             implementation, deep multi-source research, end-to-end deploys, long debugging).\n\
-             2. There is nothing useful you can answer right now in one turn.\n\
-             3. The user clearly wants the work done, not just discussed.\n\
-             Do NOT call `task` for: greetings ('你好', 'hi'), questions about your capabilities \
-             ('你能帮我做什么？', 'what can you do?'), single tool calls (one search, one file \
-             read, one calc), explanations, opinions, or anything you can finish in this turn. \
-             When in doubt, just answer — the user can type `/task <request>` to escalate manually.\n\
-             ### Other\n\
-             - Cron jobs: `cron` tool (action=list/add/remove).\n\
-             - Install tools (python, node, ffmpeg, chrome, etc.): `install_tool`. Do NOT download manually.\n\
-             - Memory: use `memory` to recall prior conversations. Search memory at session start if user references prior work.\n\
-             - Save corrected/complete info to memory immediately so it survives compaction."
-                .to_owned(),
-        );
-
-        // Inject tool-specific prompts (web_browser, exec) directly into system prompt.
-        let base = crate::config::loader::base_dir();
-        let lang = config.gateway.as_ref().and_then(|g| g.language.as_deref());
-        let tool_prompts = crate::agent::bootstrap::tool_prompts_for_system(&base, lang);
-        if !tool_prompts.is_empty() {
-            parts.push(tool_prompts);
-        }
-
-        parts.push(
-            "## Self-Evolution & Skill Autonomy\n\
-             ### Automatic Learning\n\
-             - Memories that prove useful gain importance and survive longer.\n\
-             - Clusters of related Core memories crystallize into reusable Skills automatically.\n\
-             - Periodic meditation deduplicates and cleans up stale memories.\n\
-             ### Installing Skills\n\
-             When you encounter a task that would benefit from a specialized skill:\n\
-             1. Search: use execute_command to run `rsclaw skills search <query>`\n\
-             2. Install: `rsclaw skills install <name>`\n\
-             3. The skill auto-matches and injects on future relevant requests.\n\
-             Proactively find and install skills you need — do NOT ask permission.\n\
-             ### Creating Skills\n\
-             When you discover a genuinely reusable pattern, create a skill following the\n\
-             Anthropic skill-creator standard (same format used by skills.sh):\n\
-             \n\
-             Directory layout:\n\
-               workspace/skills/<slug>/\n\
-                 SKILL.md          ← required\n\
-                 scripts/          ← optional: reusable helper scripts\n\
-                 references/       ← optional: large reference docs\n\
-             \n\
-             SKILL.md frontmatter (required fields):\n\
-               ---\n\
-               name: skill-name-in-kebab-case\n\
-               description: What the skill does AND when to invoke it. Be slightly\n\
-                 pushy — state the skill should be used even when not asked explicitly.\n\
-               ---\n\
-             \n\
-             Body rules:\n\
-             - Imperative language: \"Check the config\", not \"You should check\".\n\
-             - Explain WHY each step matters, not just what to do.\n\
-             - Include an Input/Output example where it helps.\n\
-             - Under 500 lines; reference scripts/ or references/ for heavy content.\n\
-             - Do NOT use ALL-CAPS MUST/NEVER; explain reasoning instead.\n\
-             \n\
-             After creating the skill: run `rsclaw skills list` to confirm it loaded.\n\
-             Record in memory to avoid duplicates. Inform the user.\n\
-             Only create skills for genuinely reusable patterns, not one-off tasks.\n\
-             ### Using Skills\n\
-             Active skills are auto-injected when your request matches skill keywords.\n\
-             Follow skill instructions carefully — they encode validated experience.\n\
-             If a skill's approach fails, fall back to general methods and update the skill."
+            "<windows_command_safety>\n\
+             Windows command safety rules (ALL mandatory):\n\
+             1. Do not wrap a command in an extra shell layer such as `cmd /c`, `powershell -Command`, or `pwsh -Command` unless strictly necessary.\n\
+             2. For destructive file operations, only use a fully specified absolute path.\n\
+             3. Never generate a command whose quoting, escaping, or trailing backslashes could cause the target path to be truncated or reinterpreted.\n\
+             4. Any destructive operation outside the workspace requires explicit user approval.\n\
+             5. If a destructive command fails, do NOT retry with workarounds or alternate commands. Stop, explain the failure, and ask the user.\n\
+             </windows_command_safety>"
                 .to_owned(),
         );
     }
 
-    // Workspace path anchor. Without this the agent has no idea which
-    // directory is "yours" and tends to globally search the rsclaw base
-    // dir (~/.rsclaw) when the user says "look at my .md files",
-    // sweeping up `tools/`, `skills/`, `models/`, `var/data/` etc.
     parts.push(format!(
         "## Workspace\n\
          Your workspace is `{ws}`. ALL relative paths in tool calls (read_file, \
-         write_file, list_dir, search_file, execute_command cwd) resolve against \
+         write_file, list_dir, search_file, shell cwd) resolve against \
          this directory. When the user says \"my files\" / \"my .md files\" / \
          \"the workspace\", they mean files inside this directory — NOT the \
          rsclaw base dir at `~/.rsclaw/` which contains internal state \
@@ -396,57 +477,103 @@ pub(crate) fn build_system_prompt(
         ws = ws_ctx.workspace_dir.display()
     ));
 
-    // Workspace files segment.
+    // KV-cache ordering rationale: append blocks from most-stable to most-volatile
+    // so the worker-side prefix match runs as deep as possible before hitting a
+    // changed byte. Plugins/skills only mutate on install/uninstall events, while
+    // ws_segment carries MEMORY.md / memory_today / memory_yesterday — content
+    // that rolls over daily. Putting plugins/skills BEFORE ws_segment keeps their
+    // KV slot hot across day-boundary memory churn.
+
+    // ## Installed Plugins — rendered via the existing helper. Sort
+    // happens inside that helper, byte-stable for given plugin set.
+    if let Some(plugins_block) = super::tools_builder::build_plugins_system(wasm_plugins, shell_plugins) {
+        parts.push(plugins_block);
+    }
+
+    // ## Installed Skills — pure enumeration, sorted by name.
+    //
+    // The generic "how to invoke a skill" guide lives in
+    // `build_shared_system_prefix` (under CAPABILITY PRIORITY → "How to
+    // invoke an installed skill"). Keeping it out of this per-user
+    // block keeps user_system bytes minimal and lets the shared base
+    // layer carry the invocation instructions to every client.
+    //
+    // SkillRegistry iterates a HashMap whose order is non-deterministic
+    // across gateway starts. Sorting by name produces a byte-stable
+    // payload so worker-side hashing of system+tools doesn't churn.
+    if !skills.is_empty() {
+        let mut skill_refs: Vec<_> = skills.all().collect();
+        skill_refs.sort_by(|a, b| a.name.cmp(&b.name));
+        let blocks: Vec<String> = skill_refs
+            .iter()
+            .map(|s| {
+                let desc = s.description.as_deref().unwrap_or("(no description)");
+                let one_line = desc.trim().replace('\n', " ");
+                format!(
+                    "<skill name=\"{}\" version=\"{}\" dir=\"{}\">\n{}\n</skill>",
+                    s.name,
+                    s.version.as_deref().unwrap_or(""),
+                    s.dir.display(),
+                    one_line,
+                )
+            })
+            .collect();
+        if !blocks.is_empty() {
+            parts.push(format!("## Installed Skills\n\n{}", blocks.join("\n\n")));
+        }
+    }
+
+    // ws_segment last — its memory_today / memory_yesterday blocks roll
+    // over daily. Keeping them at the very tail of user_system means a
+    // day-boundary KV miss only re-hydrates this trailing block, not the
+    // plugins/skills enumeration above it.
     let ws_segment = ws_ctx.to_prompt_segment();
     if !ws_segment.is_empty() {
         parts.push(ws_segment);
     }
 
-    // Available skills — name + description + on-disk path. The full SKILL.md
-    // (and any references/) stays on disk so the prompt budget isn't blown
-    // by every installed skill, but the LLM gets enough metadata to know
-    // when to invoke each one. Includes the explicit "read SKILL.md and
-    // references/ first" instruction so agents stop guessing CLI flags
-    // (e.g. flyai shipped --origin / --dep-date but agents kept inventing
-    // --depCity / --depDate from intuition).
-    if !skills.is_empty() {
-        let lines: Vec<_> = skills
-            .all()
-            .map(|s| {
-                let desc = s
-                    .description
-                    .as_deref()
-                    .map(|d| {
-                        // Compact to one line, cap so a verbose skill can't
-                        // monopolise the prompt.
-                        let oneline = d.replace('\n', " ");
-                        let trimmed = oneline.trim();
-                        if trimmed.chars().count() > 200 {
-                            let cut: String =
-                                trimmed.chars().take(200).collect();
-                            format!(" — {cut}…")
-                        } else if trimmed.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" — {trimmed}")
-                        }
-                    })
-                    .unwrap_or_default();
-                format!("- {}{desc}\n  dir: {}", s.name, s.dir.display())
-            })
-            .collect();
-        if !lines.is_empty() {
-            parts.push(format!(
-                "Available skills (read each skill's SKILL.md and any references/*.md \
-                 BEFORE invoking its CLI for the first time — exact flag names live \
-                 there, guessing them is the #1 failure mode):\n{}",
-                lines.join("\n")
-            ));
-        }
-    }
-
     parts.join("\n\n")
 }
+
+/// Build the full system prompt for the main agent.
+///
+/// Layout: `<shared prefix>\n\n<user suffix>`. The shared prefix is
+/// byte-identical across all RsClaw clients of the same version (see
+/// [`build_shared_system_prefix`]); the user suffix carries platform /
+/// language / workspace / skills (see [`build_user_system`]).
+pub(crate) fn build_system_prompt(
+    ws_ctx: &WorkspaceContext,
+    skills: &SkillRegistry,
+    wasm_plugins: &[WasmPlugin],
+    shell_plugins: Option<&PluginRegistry>,
+    config: &crate::config::schema::Config,
+) -> String {
+    let prefix = build_shared_system_prefix();
+    let suffix = build_user_system(ws_ctx, skills, wasm_plugins, shell_plugins, config);
+    if suffix.is_empty() {
+        prefix
+    } else {
+        format!("{prefix}\n\n{suffix}")
+    }
+}
+
+/// Names of tools compiled into the RsClaw binary — byte-stable across
+/// every client of the same version. The remainder (sub-agent `agent_<id>`
+/// tools, plugin tools, MCP tools, WASM tools) is per-machine.
+///
+/// Used by the rsclaw kvCacheMode=2 provider to split the tool list into
+/// `dynamic_prefix.tools` (the shared, cacheable subset) versus top-level
+/// `user_tools` (the per-client subset). Also dumped in the
+/// `RSCLAW_DUMP_PROMPT` debug payload.
+pub const BUILTIN_TOOL_NAMES: &[&str] = &[
+    "memory","use_skill","task","task_finish","read_file","write_file",
+    "edit_file","send_file","shell","agent","ask_user","install_tool",
+    "list_dir","search_file","search_content","web_search","web_fetch",
+    "web_download","web_browser","computer_use","image_gen","video_gen",
+    "pdf","text_to_voice","send_message","cron","session","gateway",
+    "opencode","claudecode","codex","channel","anycli","clarify","pairing",
+    "create_docx","create_pdf","create_xlsx","create_pptx","doc",
+];
 
 /// Build a minimal system prompt for internal sessions (heartbeat/cron/system).
 ///

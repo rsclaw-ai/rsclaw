@@ -57,6 +57,8 @@ pub fn minimal_config(port: u16) -> RuntimeConfig {
             bind_address: None,
             reload: ReloadMode::Hybrid,
             auth_token: None,
+            a2a_bearer_tokens: vec![],
+            a2a_api_keys: vec![],
             auth_token_configured: false,
             auth_token_is_plaintext: false,
             allow_tailscale: false,
@@ -70,7 +72,7 @@ pub fn minimal_config(port: u16) -> RuntimeConfig {
             defaults: Default::default(),
             list: vec![],
             bindings: vec![],
-            external: vec![],
+            a2a: vec![],
         },
         channel: ChannelRuntime {
             channels: Default::default(),
@@ -136,12 +138,35 @@ pub async fn start_server_with_handles(addr: SocketAddr) -> ServerHandles {
         .keep()
         .expect("keep device path");
 
+    // computer_use plumbing — production fills these in
+    // `gateway::startup::serve_with_runtime`. Tests don't drive a UI
+    // dialog, so the permission store starts in non-bypass mode (every
+    // request would prompt) and the broadcast channels exist purely so
+    // dependent handlers don't blow up if they touch the field.
+    let computer_permission = Arc::new(
+        rsclaw::computer::permission::RedbPermissionStore::new(
+            Arc::clone(&store.db),
+            false,
+        ),
+    );
+    let (computer_permission_tx, _) =
+        broadcast::channel::<rsclaw::computer::permission::PermissionRequest>(64);
+    let (computer_status_tx, _) =
+        broadcast::channel::<rsclaw::computer::status::ComputerUseStatus>(256);
+    let computer_runs: Arc<
+        tokio::sync::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    > = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+
     let state = AppState {
         config,
         live,
         agents,
         store,
         event_bus: event_tx,
+        computer_permission,
+        computer_permission_tx,
+        computer_status_tx,
+        computer_runs,
         devices: Arc::new(rsclaw::ws::DeviceStore::new(device_path)),
         ws_conns: Arc::new(rsclaw::ws::ConnRegistry::new()),
         feishu: Arc::new(tokio::sync::OnceCell::new()),
@@ -159,6 +184,23 @@ pub async fn start_server_with_handles(addr: SocketAddr) -> ServerHandles {
         restart_request_tx: restart_request_tx.clone(),
         pending_restart: Arc::clone(&pending_restart),
         shutdown: shutdown.clone(),
+        task_event_bus: rsclaw::a2a::event::TaskEventBus::new(),
+        task_cancels: Arc::new(dashmap::DashMap::new()),
+        suspended_tasks: Arc::new(dashmap::DashMap::new()),
+        task_store: {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let path = tmp.path().join("a2a-tasks.redb");
+            std::mem::forget(tmp);
+            Arc::new(rsclaw::a2a::store::TaskStore::open(&path).expect("a2a store"))
+        },
+        push_dispatcher: {
+            let bus = rsclaw::a2a::event::TaskEventBus::new();
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let path = tmp.path().join("a2a-tasks.redb");
+            std::mem::forget(tmp);
+            let store = Arc::new(rsclaw::a2a::store::TaskStore::open(&path).expect("a2a store"));
+            Arc::new(rsclaw::a2a::push::PushDispatcher::new(store, bus))
+        },
     };
 
     // Leak tempdir — store must stay live for the lifetime of the server task.

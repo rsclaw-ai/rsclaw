@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use super::registry::AgentRegistry;
 use crate::{
-    config::schema::ExternalAgentConfig,
+    config::schema::A2aPeerConfig,
     plugin::{PluginRegistry, WasmPlugin},
     provider::ToolDef,
     skill::SkillRegistry,
@@ -115,12 +115,18 @@ pub(crate) fn build_plugins_system(
     blocks.sort_by(|a, b| a.0.cmp(&b.0));
     let blocks_text: Vec<String> = blocks.into_iter().map(|(_, b)| b).collect();
 
+    // Priority ordering (plugins > skills > built-in tools) lives in
+    // the shared `CAPABILITY PRIORITY` section of
+    // `build_shared_system_prefix` so it ships unconditionally with the
+    // version baseline. Repeating it here would (a) duplicate ~30 tokens
+    // every time plugins are present and (b) make the rendered bytes
+    // diverge from the version-pinned baseline in a way that could
+    // disturb the rsclaw-llm static prefix cache assumptions.
     Some(format!(
         "## Installed Plugins\n\
          Plugins automate external services (e.g. image/video generation, \
          marketplace ops). When the user's task matches a plugin tool, prefer \
-         it over a generic browser-automation flow.\n\
-         Priority: plugins > skills > built-in tools.\n\n\
+         it over a generic browser-automation flow.\n\n\
          {}",
         blocks_text.join("\n\n"),
     ))
@@ -133,7 +139,7 @@ pub(crate) fn toolset_allowed_names(
     custom_tools: Option<&Vec<String>>,
 ) -> Option<std::collections::HashSet<String>> {
     const MINIMAL: &[&str] = &[
-        "execute_command",
+        "shell",
         "read_file",
         "write_file",
         "send_file",
@@ -159,7 +165,7 @@ pub(crate) fn toolset_allowed_names(
         "use_skill",
     ];
     const CODE: &[&str] = &[
-        "execute_command",
+        "shell",
         "read_file",
         "write_file",
         "list_dir",
@@ -169,7 +175,7 @@ pub(crate) fn toolset_allowed_names(
         "use_skill",
     ];
     const STANDARD: &[&str] = &[
-        "execute_command",
+        "shell",
         "read_file",
         "write_file",
         "list_dir",
@@ -220,11 +226,11 @@ pub(crate) fn toolset_allowed_names(
 ///
 /// Includes built-in tools, per-agent A2A tools, external agent tools,
 /// and skill-derived tools.
-pub(crate) fn build_tool_list(
+pub fn build_tool_list(
     skills: &SkillRegistry,
     agents: Option<&AgentRegistry>,
     caller_id: &str,
-    external_agents: &[ExternalAgentConfig],
+    a2a_peers: &[A2aPeerConfig],
 ) -> Vec<ToolDef> {
     let mut tools = Vec::new();
 
@@ -246,7 +252,7 @@ pub(crate) fn build_tool_list(
                 "id":     {"type": "string", "description": "Memory document ID (for get)"},
                 "text":   {"type": "string", "description": "Content to store (for put). Be specific and include context."},
                 "scope":  {"type": "string", "description": "Scope filter (optional)"},
-                "kind":   {"type": "string", "description": "Document kind: note (general), fact (verified info), remember (user explicitly asked to remember). Do NOT use kind=summary; session summaries are written automatically by /compact, /new, /reset."},
+                "kind":   {"type": "string", "description": "Document kind: note (general), fact (verified info), remember (user explicitly asked to remember). Do NOT use kind=summary; session summaries are written automatically by /compact and /new."},
                 "top_k":  {"type": "integer", "description": "Max results (for search, default 5)"}
             },
             "required": ["action"]
@@ -254,35 +260,41 @@ pub(crate) fn build_tool_list(
     });
     // `use_skill` — first-class entry point for installed skills. Listed
     // EARLY in the tool list so the LLM notices it before web_fetch /
-    // web_browser / execute_command. Only registered when at least one
+    // web_browser / shell. Only registered when at least one
     // skill is installed; otherwise it'd be dead surface area.
+    //
+    // Critical invariant: this description does NOT enumerate installed
+    // skill names. The skill list lives in `user_system` (rendered by
+    // `build_user_system` as "## Installed Skills"), which the worker
+    // treats as a per-session layer that does NOT participate in the
+    // base layer hash. Embedding skill names HERE — inside `tools` —
+    // would put them in the base-layer hash input and break cross-host
+    // cache reuse for clients with different skill sets installed.
     if skills.all().next().is_some() {
-        let skill_names: Vec<String> = skills.all().map(|s| s.name.clone()).collect();
-        let names_hint = if skill_names.is_empty() {
-            String::new()
-        } else {
-            format!(" Installed skill names: {}.", skill_names.join(", "))
-        };
         tools.push(ToolDef {
             name: "use_skill".to_owned(),
-            description: format!(
+            description:
                 "ACTIVATE an installed skill. Use this BEFORE web_fetch / web_browser / \
-                execute_command whenever the user's task matches any skill description \
+                shell whenever the user's task matches any skill description \
                 shown in the system prompt under '## Installed Skills' (flights, hotels, \
                 stocks, weather, finance data, etc.).\n\n\
                 Returns the full SKILL.md so you know the exact CLI command and flags. \
-                After calling use_skill you typically call execute_command with the CLI \
+                After calling use_skill you typically call shell with the CLI \
                 from skill_md.\n\n\
                 Common failure to avoid: defaulting to web_fetch on a domain a skill \
-                already covers. If a skill description matches, you MUST use_skill \
-                first.{names_hint}"
-            ),
+                already covers. If a skill description matches, you MUST use_skill first.\n\n\
+                Anti-loop guard: if you can already see the skill's content rendered in \
+                the current turn (e.g. injected via a system message or returned by a \
+                previous use_skill call), DO NOT call use_skill again — follow the \
+                instructions directly. Re-invoking on already-loaded content wastes a \
+                turn and burns context."
+                    .to_owned(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Exact skill name from the Installed Skills list (e.g. 'flyai', 'hithink-market-query'). Case-sensitive."
+                        "description": "Exact skill name from the '## Installed Skills' list in the system prompt (e.g. 'flyai', 'hithink-market-query'). Case-sensitive."
                     }
                 },
                 "required": ["name"]
@@ -326,13 +338,113 @@ pub(crate) fn build_tool_list(
             "required": ["task_text"]
         }),
     });
+    // task_finish — agent-declared structured outcome. Replaces fragile string-matching
+    // in the auto-continue supervisor by letting the agent self-report what it did.
+    tools.push(ToolDef {
+        name: "task_finish".to_owned(),
+        description: "Declare your task complete (or deliberately abandoned) and report a \
+            structured outcome to the orchestrator. Call this as your LAST tool of the turn \
+            when you believe the work is done — do not emit additional narrative text after \
+            it. Failing to call task_finish leaves the orchestrator guessing from your prose \
+            and can trigger a spurious auto-continue.\n\
+            \n\
+            When to call:\n\
+            - You finished the user's ask                → completion=full,    recommend=ship\n\
+            - You did a useful subset, more work obvious → completion=partial, recommend=continue, populate follow_up_tasks\n\
+            - You're blocked and need the user           → completion=partial|minimal, recommend=needs_human, populate blocked_on\n\
+            - Transient failure, retry might work        → recommend=retry\n\
+            - You give up                                → completion=failed,  recommend=abandon, explain in blocked_on\n\
+            \n\
+            Honesty contract (the orchestrator may verify):\n\
+            - verified=true REQUIRES verification_log with actual command + output excerpt.\n\
+              \"I read the code and it looks right\" is NOT verification.\n\
+            - accomplished entries must map to observable artifacts (file changed, command\n\
+              run, message sent). Vague claims like 'improved the code' are not allowed.\n\
+            - Asking the user a clarifying question is NOT completion=full — use\n\
+              recommend=needs_human and put the question in blocked_on.\n\
+            - completion=full with empty accomplished is rejected.\n\
+            \n\
+            This tool only RECORDS the outcome. Worker dispatch wiring is being built — \
+            for now the auto-continue supervisor still falls back to its string classifier \
+            if task_finish is omitted, but adopting it now ensures correct routing once \
+            wiring lands.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "completion": {
+                    "type": "string",
+                    "enum": ["full", "partial", "minimal", "failed"],
+                    "description": "How complete the work is. full=everything asked, partial=useful subset, minimal=almost nothing, failed=attempted but nothing landed."
+                },
+                "recommend": {
+                    "type": "string",
+                    "enum": ["ship", "continue", "needs_human", "retry", "abandon"],
+                    "description": "What the orchestrator should do next. ship=deliver to user; continue=auto-spawn follow_up_tasks; needs_human=surface blocked_on to user; retry=same task fresh attempt; abandon=stop."
+                },
+                "verified": {
+                    "type": "boolean",
+                    "description": "True only if you actually ran tests/build/lint/curl and saw success. Lying is the worst possible move — orchestrator may verify."
+                },
+                "verification_log": {
+                    "type": "string",
+                    "description": "REQUIRED when verified=true. Short excerpt of the command + its output (e.g. 'cargo test → 47 passed, 0 failed')."
+                },
+                "accomplished": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Concrete things you did. Each entry should map to an observable artifact, e.g. 'Added enum variant TaskOutcome::Structured in task_queue.rs:64', 'Ran rg \"old_pattern\" — 0 matches confirms rename complete'."
+                },
+                "skipped": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "what": {"type": "string"},
+                            "why":  {"type": "string"}
+                        },
+                        "required": ["what", "why"]
+                    },
+                    "description": "Things you deliberately skipped, with reasons. Explicit skips beat silent omissions."
+                },
+                "blocked_on": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Concrete unresolved blockers. When recommend=needs_human, each entry is surfaced verbatim to the user — phrase as questions or precise requests, not vague concerns."
+                },
+                "assumptions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Assumptions you made about ambiguous spec. Non-empty + completion<full triggers orchestrator to confirm with user."
+                },
+                "follow_up_tasks": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Self-contained next-task descriptions (each will be spawned as its own task if recommend=continue). NOT 'TODO comments' — must be actionable."
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Optional one-paragraph prose summary for the channel reply."
+                }
+            },
+            "required": ["completion", "recommend"]
+        }),
+    });
     tools.push(ToolDef {
         name: "read_file".to_owned(),
         description: "Read a file from the agent workspace.\n\
             Path is relative to workspace root.\n\
-            Supports text files, code, config, markdown, etc.\n\
+            Supports text files, code, config, markdown; .pdf / .docx / .xlsx / .pptx \
+            are auto-extracted to plain text.\n\
             Example: {\"path\":\"config.json\"} or {\"path\":\"src/main.py\"}\n\
-            For binary files (images, PDFs), use the dedicated tools instead.".to_owned(),
+            \n\
+            The whole file is read at once — there is no offset/limit yet. For very \
+            large files (logs, dumps), use `search_content` to grep for the relevant \
+            slice and read only the file(s) that match, or read after narrowing with \
+            `search_file`.\n\
+            \n\
+            If you just edited the file in this turn, you do not need to read it again — \
+            the prior `read_file` result still reflects what you wrote. Re-reading on \
+            every edit wastes a turn.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -343,7 +455,22 @@ pub(crate) fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "write_file".to_owned(),
-        description: "Write/create a file. Use this for ALL file creation and writing — do NOT use execute_command with notepad, echo, or any other editor/command to create files.\n\
+        description: "Write/create a file (full-overwrite). Use this for ALL file creation and full \
+            rewrites — do NOT use shell with notepad, echo, or any other editor/command to \
+            create files.\n\
+            \n\
+            PREFER `edit_file` for modifying an existing file — it does an exact-string \
+            replacement, sends a small diff, and is far cheaper than rewriting the whole file. \
+            Use `write_file` only when (a) the file does not yet exist, or (b) you are \
+            replacing the entire contents from scratch.\n\
+            \n\
+            If the file ALREADY exists, you must have read it (via `read_file`) in this \
+            session before overwriting — otherwise you risk silently destroying content \
+            that was added since you last looked.\n\
+            \n\
+            Do NOT create README.md, *.md documentation, or other narrative files unless \
+            the user explicitly asked for documentation. Default to working code only.\n\
+            \n\
             Creates parent directories as needed. Path is relative to workspace root.\n\
             Both 'path' and 'content' are required.\n\
             CRITICAL: When writing user-provided content, copy it EXACTLY character-by-character. \
@@ -357,6 +484,105 @@ pub(crate) fn build_tool_list(
                 "explanation": {"type": "string", "description": "Brief explanation of what you are creating and why, to help organize your thoughts before writing content."}
             },
             "required": ["path", "content"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "ask_user".to_owned(),
+        description: "Pose a structured multi-choice question to the user.\n\
+            \n\
+            When to use:\n\
+            - Multiple genuinely-viable approaches and the choice affects later work\n\
+            - User's instruction omits a key parameter with no safe default\n\
+            - Scope differs by an order of magnitude (small fix vs. big refactor)\n\
+            - Aesthetic / preference decisions with no right answer\n\
+            \n\
+            Do NOT use for:\n\
+            - 'Proceed?' / 'OK?' confirmations — just do the work the user asked for\n\
+            - Fake-choice asks where one option is obviously right from context\n\
+            - More than one ask_user in the same turn (collapse into one multi_select \
+              or wait for the user's reply before the next ask)\n\
+            \n\
+            How it works (important — this is FIRE-AND-FORGET, not blocking):\n\
+            - You call ask_user(question, options).\n\
+            - The tool returns a `formatted_text` string. Send EXACTLY that text as your \
+              reply to the user, then STOP this turn — do not continue working.\n\
+            - The user's answer arrives as a normal message on your next turn. Parse it: \
+              the number (\"1\", \"2\"), the option label, or free text (\"other\") are \
+              all valid responses.\n\
+            \n\
+            If you recommend one option, set `recommended_index` (0-based). The formatter \
+            marks it with '(Recommended)' so the user sees your steer.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "The full question. Be specific — vague questions waste the user's time."
+                },
+                "options": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label":       {"type": "string", "description": "Short option text (1-5 words)."},
+                            "description": {"type": "string", "description": "Optional one-sentence explanation of what choosing this means."}
+                        },
+                        "required": ["label"]
+                    },
+                    "description": "2-8 distinct choices. Always include enough that 'Other' (free-text) isn't needed for the common path."
+                },
+                "multi_select": {
+                    "type": "boolean",
+                    "description": "If true, user may pick multiple options (comma-separated). Default: false."
+                },
+                "recommended_index": {
+                    "type": "integer",
+                    "description": "0-based index of the option YOU recommend. The formatter appends '(Recommended)'."
+                },
+                "header": {
+                    "type": "string",
+                    "description": "Optional short tag (e.g. 'Library', 'Approach') shown before the question."
+                }
+            },
+            "required": ["question", "options"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "edit_file".to_owned(),
+        description: "Modify an existing file by exact-string replacement.\n\
+            \n\
+            PREFER edit_file over write_file for any modification of an existing file — \
+            it sends a small diff (old_string → new_string) instead of rewriting the whole \
+            file, dramatically cheaper in tokens and far less likely to lose content.\n\
+            \n\
+            Usage:\n\
+            - You must have called read_file on this path in the current session, so you \
+              can copy a verbatim substring (including exact whitespace) as old_string.\n\
+            - old_string must be UNIQUE in the file. If it appears more than once, either \
+              extend old_string with surrounding lines until it's unique, or set \
+              replace_all=true to replace every occurrence.\n\
+            - old_string must be NON-EMPTY. To create a new file, use write_file.\n\
+            - old_string and new_string must differ — identical strings are rejected.\n\
+            \n\
+            Common errors and how to fix them:\n\
+            - 'not found': you misremembered the substring (whitespace, casing, or it was\n\
+              edited earlier this turn). Re-read the file and copy verbatim.\n\
+            - 'matches N locations': add 2-4 lines of surrounding context to old_string to\n\
+              make it unique, OR pass replace_all=true if you really want every occurrence.\n\
+            \n\
+            Returns: { ok, path, replacements, bytes }. The 'replacements' field tells you\n\
+            how many sites were rewritten (1 for normal mode, N for replace_all).".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "path":        {"type": "string", "description": "Relative file path within the workspace. Example: 'src/main.rs'"},
+                "old_string":  {"type": "string", "description": "Exact substring to replace (verbatim, including whitespace). Must be unique unless replace_all=true."},
+                "new_string":  {"type": "string", "description": "Replacement text. May be empty (= deletion of old_string)."},
+                "replace_all": {"type": "boolean", "description": "If true, replace ALL occurrences of old_string. Default: false (requires uniqueness)."}
+            },
+            "required": ["path", "old_string", "new_string"]
         }),
     });
     tools.push(ToolDef {
@@ -374,33 +600,14 @@ pub(crate) fn build_tool_list(
         }),
     });
     tools.push(ToolDef {
-        name: "execute_command".to_owned(),
+        name: "shell".to_owned(),
         description: if cfg!(target_os = "windows") {
-            "Run a shell command (PowerShell) on Windows.\n\
-             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`, for HTTP/API requests use `web_fetch`. Only use exec for commands that have no dedicated tool.\n\
-             Use exec for: git operations, running scripts (node/python/cargo), system info (systeminfo, ipconfig, Get-Process), package management (npm/pip), process management (Start-Process, Stop-Process, taskkill).\n\
-             Do NOT use exec for HTTP requests (curl/wget/Invoke-WebRequest) or file downloads — use `web_fetch` / `web_download` instead.\n\
-             \n\
-             Tool selection: PowerShell for file/system ops; python for data processing (CSV/JSON/automation).\n\
-             Check tool availability first (`Get-Command python`, `Get-Command node`). Use `install_tool` for system tools.\n\
-             \n\
-             PowerShell patterns:\n\
-             - Pipes: Get-Process | Sort-Object CPU -Descending | Select-Object -First 10\n\
-             - Network connectivity check (not fetch): Test-NetConnection host -Port 80\n\
-             - Text: (Get-Content file) -replace 'old','new'\n\
-             - Dates: Get-Date -Format 'yyyy-MM-dd'; [DateTimeOffset]::Now.ToUnixTimeSeconds()\n\
-             Python patterns: `python -c \"import json; ...\"` for one-liners, write to $env:TEMP\\script.py for multi-line.\n\
-             \n\
-             Best practices: Do NOT wrap commands in extra cmd /c or powershell -Command layers. Use `| Select-Object -First 10` to limit output.\n\
-             Do NOT use exec for destructive operations on personal directories (Desktop, Downloads, Documents).\n\
-             Commands run in background by default (wait=false). Use wait=true only for short commands where you need the output immediately.\n\
-             If a command fails, do NOT retry with the same arguments. Try a different approach or ask the user."
-                .to_owned()
+            windows_shell_description()
         } else if cfg!(target_os = "macos") {
             "Run a shell command (bash/zsh) on macOS.\n\
-             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`, for HTTP/API requests use `web_fetch`. Only use exec for commands that have no dedicated tool.\n\
-             Use exec for: git operations, running scripts (node/python/cargo), system info (uname, df, top), package management (brew/npm/pip), process management (ps, kill).\n\
-             Do NOT use exec for HTTP requests (curl/wget) or file downloads — use `web_fetch` / `web_download` instead.\n\
+             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`, for HTTP/API requests use `web_fetch`. Only use shell for commands that have no dedicated tool.\n\
+             Use shell for: git operations, running scripts (node/python/cargo), system info (uname, df, top), package management (brew/npm/pip), process management (ps, kill).\n\
+             Do NOT use shell for HTTP requests (curl/wget) or file downloads — use `web_fetch` / `web_download` instead.\n\
              \n\
              Tool selection: bash for file/text/system ops; python3 for data processing (CSV/JSON/automation).\n\
              Check tool availability first (`which python3`, `which node`). Use `install_tool` for system tools.\n\
@@ -409,13 +616,30 @@ pub(crate) fn build_tool_list(
              Python patterns: `python3 -c \"import json; ...\"` for one-liners, write to /tmp/script.py for multi-line, `pip install` for packages.\n\
              \n\
              Best practices: pipe large output through head/tail, use wait=false for long tasks, never run destructive commands on personal dirs.\n\
-             If a command fails, do NOT retry with the same arguments. Try a different approach or ask the user."
+             If a command fails, do NOT retry with the same arguments. Try a different approach or ask the user.\n\
+             \n\
+             Multiple commands:\n\
+             - Independent → emit MULTIPLE shell tool calls in ONE message for parallelism.\n\
+             - Dependent → single shell call with shell-native chaining (`&&` on bash/zsh; on Windows PowerShell 5.1 use `; if ($?) { ... }` since 5.1 lacks `&&`).\n\
+             - Use `;` only when you don't care whether earlier commands succeed.\n\
+             - Do NOT use newlines to separate commands — use chaining or separate calls.\n\
+             \n\
+             Sleep is rarely the right answer:\n\
+             - Don't sleep between commands that can run back-to-back.\n\
+             - Don't sleep-poll a background task you started with `wait=false` — task results are delivered on your next turn automatically.\n\
+             - Don't sleep-retry a failing command — find the actual cause and change something.\n\
+             \n\
+             Git safety:\n\
+             - NEVER force-push to main / master.\n\
+             - NEVER `--no-verify`, `--no-gpg-sign`, or `-c commit.gpgsign=false` unless the user explicitly asks — fix the hook failure instead.\n\
+             - AVOID `git add -A` / `git add .` — stage specific files so you don't leak `.env`, credentials, or build artifacts.\n\
+             - Prefer NEW commits over `--amend`; amending after a pre-commit-hook failure can destroy work because the failed commit never landed."
                 .to_owned()
         } else {
             "Run a shell command (bash/sh) on Linux.\n\
-             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`, for HTTP/API requests use `web_fetch`. Only use exec for commands that have no dedicated tool.\n\
-             Use exec for: git operations, running scripts (node/python/cargo), system info (uname, df, top), package management (apt/npm/pip), process management (ps, kill).\n\
-             Do NOT use exec for HTTP requests (curl/wget) or file downloads — use `web_fetch` / `web_download` instead.\n\
+             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`, for HTTP/API requests use `web_fetch`. Only use shell for commands that have no dedicated tool.\n\
+             Use shell for: git operations, running scripts (node/python/cargo), system info (uname, df, top), package management (apt/npm/pip), process management (ps, kill).\n\
+             Do NOT use shell for HTTP requests (curl/wget) or file downloads — use `web_fetch` / `web_download` instead.\n\
              \n\
              Tool selection: bash for file/text/system ops; python3 for data processing (CSV/JSON/automation).\n\
              Check tool availability first (`which python3`, `which node`). Use `install_tool` for system tools.\n\
@@ -424,7 +648,24 @@ pub(crate) fn build_tool_list(
              Python patterns: `python3 -c \"import json; ...\"` for one-liners, write to /tmp/script.py for multi-line, `pip install` for packages.\n\
              \n\
              Best practices: pipe large output through head/tail, use wait=false for long tasks, never run destructive commands on personal dirs.\n\
-             If a command fails, do NOT retry with the same arguments. Try a different approach or ask the user."
+             If a command fails, do NOT retry with the same arguments. Try a different approach or ask the user.\n\
+             \n\
+             Multiple commands:\n\
+             - Independent → emit MULTIPLE shell tool calls in ONE message for parallelism.\n\
+             - Dependent → single shell call with shell-native chaining (`&&` on bash/zsh; on Windows PowerShell 5.1 use `; if ($?) { ... }` since 5.1 lacks `&&`).\n\
+             - Use `;` only when you don't care whether earlier commands succeed.\n\
+             - Do NOT use newlines to separate commands — use chaining or separate calls.\n\
+             \n\
+             Sleep is rarely the right answer:\n\
+             - Don't sleep between commands that can run back-to-back.\n\
+             - Don't sleep-poll a background task you started with `wait=false` — task results are delivered on your next turn automatically.\n\
+             - Don't sleep-retry a failing command — find the actual cause and change something.\n\
+             \n\
+             Git safety:\n\
+             - NEVER force-push to main / master.\n\
+             - NEVER `--no-verify`, `--no-gpg-sign`, or `-c commit.gpgsign=false` unless the user explicitly asks — fix the hook failure instead.\n\
+             - AVOID `git add -A` / `git add .` — stage specific files so you don't leak `.env`, credentials, or build artifacts.\n\
+             - Prefer NEW commits over `--amend`; amending after a pre-commit-hook failure can destroy work because the failed commit never landed."
                 .to_owned()
         },
         parameters: json!({
@@ -472,7 +713,27 @@ pub(crate) fn build_tool_list(
             Reason: GUI tasks depend on live state (frontmost window, mouse position, display\n\
             focus) and the current session's permission grants. Sub-agents start fresh with\n\
             no visual context and frequently fail on first attempts, creating loops. The\n\
-            main agent that already has the screenshot/context should complete these tasks.".to_owned(),
+            main agent that already has the screenshot/context should complete these tasks.\n\
+            \n\
+            DON'T PEEK / DON'T RACE (for action=task):\n\
+            - After dispatching a task agent, do NOT call action=list, action=send, or any\n\
+              other status probe in the same conversation just to check progress. You will\n\
+              be notified when the task completes — polling burns turns and pollutes context.\n\
+            - Do NOT predict, summarize, or fabricate the task's findings before the\n\
+              notification arrives. If the user asks mid-flight, say it's still running.\n\
+            - If you need the result before you can proceed, you delegated wrong — either\n\
+              do the work inline, or accept this turn ends here and resume in a later turn.\n\
+            \n\
+            WRITING THE TASK PROMPT (the single biggest quality lever):\n\
+            - Brief the task agent like a colleague who just walked in. It has zero context\n\
+              from this conversation — no idea what you've tried, what's been ruled out, or\n\
+              why the work matters.\n\
+            - Include: the goal, what you already know, what the agent should NOT do (so it\n\
+              doesn't duplicate your work), the exit criterion (\"report under 200 words\",\n\
+              \"return the diff\", \"give a yes/no with one sentence of evidence\").\n\
+            - For lookups, hand over the exact command. For investigations, hand over the\n\
+              question — prescribed steps die when the premise is wrong.\n\
+            - Terse one-line prompts produce shallow generic work. Spend the tokens up front.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -506,7 +767,7 @@ pub(crate) fn build_tool_list(
     tools.push(ToolDef {
         name: "list_dir".to_owned(),
         description: "List files and directories in a given path.\n\
-            Use this instead of execute_command with ls/dir.\n\
+            Use this instead of shell with ls/dir.\n\
             - Returns file names, sizes, and types.\n\
             - Does not display hidden/dot files by default.\n\
             - Use 'pattern' to filter by glob (e.g. '*.json').\n\
@@ -523,9 +784,10 @@ pub(crate) fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "search_file".to_owned(),
-        description: "Search for files by name pattern. Use this instead of execute_command with find.\n\
+        description: "Search for files by glob pattern. Use this instead of shell with find.\n\
             - Supports wildcard patterns for flexible matching.\n\
-            - Returns relative file paths.\n\
+            - Returns absolute file paths sorted by MOST-RECENTLY-MODIFIED first, so\n\
+              recently-touched files (the usually-relevant ones) bubble to the top.\n\
             - Prefer this over list_dir when you have a specific file pattern.\n\
             CRITICAL: 'pattern' must be returned before other parameters.".to_owned(),
         parameters: json!({
@@ -540,11 +802,18 @@ pub(crate) fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "search_content".to_owned(),
-        description: "Search file contents by regex or text pattern. Built on ripgrep.\n\
-            Use this instead of execute_command with grep/rg. This tool is faster and respects .gitignore.\n\
-            - Supports full regex syntax: 'log.*Error', 'function\\s+\\w+', 'TODO|FIXME'\n\
-            - Escape special chars for literal matches: 'functionCall\\('\n\
-            - Use 'include' to filter by file type: '*.py', '*.rs'\n\
+        description: "Search file contents by regex or literal pattern.\n\
+            Prefers ripgrep (`rg`) when installed — supports `output_mode` and `multiline`,\n\
+            respects .gitignore, fast. Falls back to `grep -rn` (Unix) / `Select-String`\n\
+            (Windows) when `rg` is absent; on the fallback path `output_mode` and\n\
+            `multiline` are silently ignored.\n\
+            - Use this instead of shell with grep/rg.\n\
+            - Full regex syntax: 'log.*Error', 'function\\s+\\w+', 'TODO|FIXME'.\n\
+            - Escape literal regex metacharacters: 'functionCall\\(', 'interface\\{\\}'.\n\
+            - `output_mode`: 'content' (default; lines with matches), 'files_with_matches'\n\
+              (file paths only — much cheaper for surveys), 'count' (per-file match count).\n\
+            - `multiline: true` enables patterns that span lines (e.g. 'struct\\s+\\w+\\{[\\s\\S]*?field').\n\
+            - Use 'include' glob to filter by file type: '*.py', '*.rs', '*.{ts,tsx}'.\n\
             CRITICAL: 'pattern' must be returned before other parameters.".to_owned(),
         parameters: json!({
             "type": "object",
@@ -553,7 +822,9 @@ pub(crate) fn build_tool_list(
                 "path":     {"type": "string", "description": "File or directory to search in. Defaults to workspace root."},
                 "include":  {"type": "string", "description": "File glob filter. Examples: '*.py', '*.{ts,tsx}', '*.rs'"},
                 "ignore_case": {"type": "boolean", "description": "If true, match case-insensitively. Default: false."},
-                "max_results": {"type": "integer", "description": "Maximum results (default: 20)"}
+                "max_results": {"type": "integer", "description": "Maximum results (default: 20)"},
+                "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"], "description": "Output detail level. 'files_with_matches' is much cheaper than 'content' when you only need to know WHICH files match. Default: 'content'. Requires ripgrep — ignored on fallback."},
+                "multiline":   {"type": "boolean", "description": "Enable cross-line pattern matching. Default: false. Requires ripgrep — ignored on fallback."}
             },
             "required": ["pattern"]
         }),
@@ -570,8 +841,17 @@ pub(crate) fn build_tool_list(
             - When unsure about facts — search BEFORE saying 'I don't know'\n\
             Tips:\n\
             - Be specific: include version numbers, dates, or exact terms\n\
-            - Use the current year (not past years) for latest docs\n\
-            - For Chinese content, search in Chinese for better results".to_owned(),
+            - Include the CURRENT year in queries when looking for latest docs / news\n\
+              (the model's training cutoff is older than \"now\"; queries written for\n\
+              last year's docs return last year's results).\n\
+            - For Chinese content, search in Chinese for better results\n\
+            \n\
+            After answering with web_search results, list your sources at the end as:\n\
+              Sources:\n\
+              - [Title](URL)\n\
+              - [Title](URL)\n\
+            so the user can verify the claim. Unsourced web-search-backed claims feel\n\
+            invented and erode trust.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -585,7 +865,7 @@ pub(crate) fn build_tool_list(
     tools.push(ToolDef {
         name: "web_fetch".to_owned(),
         description: "PREFERRED tool for HTTP requests — web pages, REST APIs, documentation, articles.\n\
-            Do NOT use execute_command with curl/wget/Invoke-WebRequest — use web_fetch instead.\n\
+            Do NOT use shell with curl/wget/Invoke-WebRequest — use web_fetch instead.\n\
             - URL must be fully-formed (https://...)\n\
             - HTTP auto-upgraded to HTTPS\n\
             - HTML pages are dehydrated to clean text/markdown\n\
@@ -603,10 +883,23 @@ pub(crate) fn build_tool_list(
               - headers: object — Authorization, X-API-Key, Cookie, custom Content-Type, etc.\n\
               - body: string (raw) OR object/array (auto JSON-serialized + Content-Type set)\n\
             \n\
-            FALL BACK to execute_command + curl only when you need:\n\
+            FALL BACK to shell + curl only when you need:\n\
               - File upload via multipart/form-data\n\
               - Streaming responses (SSE, chunked transfers consumed incrementally)\n\
-              - Sites behind interactive login (use web_browser when interaction is needed)".to_owned(),
+              - Sites behind interactive login (use web_browser when interaction is needed)\n\
+            \n\
+            GitHub URLs — prefer `gh` CLI via shell over web_fetch:\n\
+              - `gh pr view <num> --json title,body,state,...` returns structured JSON\n\
+              - `gh issue view <num> --json ...` same for issues\n\
+              - `gh api repos/<owner>/<repo>/...` for arbitrary GitHub API\n\
+              Web-fetching github.com HTML pages gives you a dehydrated UI rendering;\n\
+              `gh` returns the underlying data directly. Only fall back to web_fetch when\n\
+              `gh` is not installed or the target isn't an API/UI endpoint.\n\
+            \n\
+            Redirects: if the response indicates the URL redirected to a DIFFERENT host,\n\
+            issue a fresh web_fetch on the redirect URL — do not assume the original URL\n\
+            content was served. GET responses are cached for ~15 min keyed on the final\n\
+            URL, so re-fetching after a redirect is cheap.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -625,7 +918,7 @@ pub(crate) fn build_tool_list(
             - Supports resume for large files\n\
             - Use use_browser_cookies=true for authenticated downloads (e.g. after logging in via web_browser)\n\
             - Path is relative to workspace/downloads/ — just use filename like 'photo.jpg'\n\
-            - Do NOT use execute_command with curl/wget — always use this tool\n\
+            - Do NOT use shell with curl/wget — always use this tool\n\
             - After downloading, use send_file to deliver the file to the user".to_owned(),
         parameters: json!({
             "type": "object",
@@ -642,7 +935,7 @@ pub(crate) fn build_tool_list(
         name: "web_browser".to_owned(),
         description: "Control a web browser. Core workflow:\n\
             1. `open` — navigate to a URL\n\
-            2. `snapshot` — get page structure with interactive element refs (@e1, @e2...). Use `interactive: true` to only get actionable elements (saves tokens).\n\
+            2. `snapshot` — get page structure with interactive element refs (@e1, @e2...). Use `interactive: true` to only get actionable elements (saves tokens). Use `interactive: true, annotate: true` to also get a screenshot with colorful borders + numbered labels overlaid on each element — the model sees both structured text and visual markers for better grounding.\n\
             3. `click` ref=@e1 / `fill` ref=@e2 text='...' — interact using refs\n\
             4. Re-snapshot after any page change to get updated refs\n\
             Autocomplete inputs (Ctrip/Fliggy/Qunar city pickers, Google/Baidu search, flight/hotel/movie pickers, any input that pops a dropdown of suggestions): ALWAYS use `pick` ref=@eN query='武汉' in a single call — it focuses, types, waits for the popup, and clicks the first visible candidate. DO NOT build it yourself out of click+type+wait+screenshot loops; that wastes 5-7 iterations per field and the dropdown often dismisses before you re-screenshot. `pick` handles IME/React-controlled inputs that silently drop programmatic values.\n\
@@ -699,6 +992,7 @@ pub(crate) fn build_tool_list(
                 ]},
                 "url":        {"type": "string", "description": "URL for open/navigate"},
                 "interactive":{"type": "boolean", "description": "For snapshot: only return actionable elements (saves ~80% tokens). Default: false"},
+                "annotate":   {"type": "boolean", "description": "For snapshot: overlay colorful borders + numbered labels on interactive elements and return a screenshot alongside the structured text. Helps the model visually locate elements. Only works with interactive=true."},
                 "ref":        {"type": "string", "description": "Element ref like @e3 from snapshot"},
                 "from":       {"type": "string", "description": "Source element ref for drag"},
                 "to":         {"type": "string", "description": "Target element ref for drag"},
@@ -719,7 +1013,7 @@ pub(crate) fn build_tool_list(
                 "format":     {"type": "string", "enum": ["png", "jpeg"], "description": "Screenshot format"},
                 "quality":    {"type": "integer", "description": "JPEG quality (1-100)"},
                 "full_page":  {"type": "boolean", "description": "Capture full scrollable page"},
-                "annotate":   {"type": "boolean", "description": "Overlay numbered labels on interactive elements"},
+                "annotate":   {"type": "boolean", "description": "Overlay colorful borders + numbered labels on interactive elements and return a legend mapping numbers to refs. For snapshot+annotate, use snapshot action with annotate=true instead."},
                 "width":      {"type": "integer", "description": "Viewport width for set_viewport"},
                 "height":     {"type": "integer", "description": "Viewport height for set_viewport"},
                 "scale":      {"type": "number", "description": "Device scale factor for set_viewport"},
@@ -745,9 +1039,10 @@ pub(crate) fn build_tool_list(
             "required": ["action"]
         }),
     });
+
     tools.push(ToolDef {
         name: "computer_use".to_owned(),
-        description: "Control the computer desktop. ONLY use when the user EXPLICITLY asks to take a screenshot, click, type, or interact with the desktop. Do NOT call this tool just because the message mentions words like 'screenshot' or 'screen' in other contexts. Screenshots auto-resize, and mouse coordinates use the same physical-pixel space as the returned `original_width`/`original_height` (HiDPI is handled internally — multiply image-pixel coords by the returned `scale` and pass directly).".to_owned(),
+        description: "Control the computer desktop. ONLY use when the user EXPLICITLY asks to take a screenshot, click, type, or interact with the desktop. Do NOT call this tool just because the message mentions words like 'screenshot' or 'screen' in other contexts. Screenshots auto-resize, and mouse coordinates use the same physical-pixel space as the returned `original_width`/`original_height` (HiDPI is handled internally — multiply image-pixel coords by the returned `scale` and pass directly).\n\nCRITICAL — App-Rule Loading (MANDATORY):\nBefore controlling ANY desktop application (WeChat, Finder, Safari, etc.), you MUST first load the app-specific automation guide.\n1. Call `get_app_rule` with the app name (e.g. name='wechat').\n2. Read and follow the returned guide EXACTLY.\n3. Only then proceed with screenshot/click/type actions.\nNEVER guess coordinates or workflows — the app-rule contains version-specific steps you cannot infer.\n\nEND-TO-END AUTOMATION — vlm_drive action:\nFor complex multi-step desktop tasks (e.g. 'Open WeChat, find a group, send a message'), use the `vlm_drive` action with a natural-language instruction instead of scripting individual click/type steps. The configured VLM will drive the loop internally: screenshot -> analyze -> execute -> repeat. This is more robust than hand-coding coordinates.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -756,8 +1051,9 @@ pub(crate) fn build_tool_list(
                     "double_click", "triple_click", "right_click", "middle_click",
                     "drag", "scroll", "type", "key", "hold_key",
                     "cursor_position", "get_active_window", "ui_tree",
-                    "list_app_rules", "get_app_rule", "wait"
-                ], "description": "Action to perform. ui_tree returns the accessibility tree of the focused window (interactive elements with role/label/coordinates). list_app_rules/get_app_rule load per-app desktop automation playbooks from ~/.rsclaw/tools/computer_use/app-rules/."},
+                    "list_app_rules", "get_app_rule", "wait",
+                    "vlm_drive"
+                ], "description": "Action to perform. ui_tree returns the accessibility tree of the focused window (interactive elements with role/label/coordinates). list_app_rules/get_app_rule load per-app desktop automation playbooks from ~/.rsclaw/tools/computer_use/app-rules/. vlm_drive runs an end-to-end agent loop using the configured VLM — pass an instruction and it handles screenshot/analysis/execution internally."},
                 "x":         {"type": "number", "description": "X coordinate (mouse actions, drag start) in physical pixels"},
                 "y":         {"type": "number", "description": "Y coordinate (mouse actions, drag start) in physical pixels"},
                 "to_x":      {"type": "number", "description": "Drag destination X (physical pixels)"},
@@ -776,7 +1072,10 @@ pub(crate) fn build_tool_list(
                     "width":  {"type": "number"},
                     "height": {"type": "number"}
                 }, "required": ["x", "y", "width", "height"]},
-                "max_long_edge_px": {"type": "integer", "description": "Screenshot resize cap: longest edge of returned image. Default 1024 (XGA). Range 64-8192. Larger values = more detail + more tokens."}
+                "max_long_edge_px": {"type": "integer", "description": "Screenshot resize cap: longest edge of returned image. Default 1024 (XGA). Range 64-8192. Larger values = more detail + more tokens."},
+                "instruction": {"type": "string", "description": "NATURAL-LANGUAGE task instruction for the vlm_drive end-to-end agent loop. Example: 'Open WeChat, search for RsClaw研发群, and send a greeting message'. The configured VLM will drive screenshot->analyze->execute internally. ONLY used with action=vlm_drive."},
+                "max_steps": {"type": "integer", "description": "Maximum steps for the vlm_drive loop (default: 30). ONLY used with action=vlm_drive."},
+                "async": {"type": "boolean", "description": "Run vlm_drive in the background instead of blocking the current turn. STRONGLY RECOMMENDED for any task expected to take >30 seconds (WeChat group monitoring, video downloads, multi-step automations). With async=true the call returns a `task_id` immediately and you should reply to the user with an acknowledgement (e.g. '我已经开始处理'); the actual outcome arrives as a separate message when the task finishes. Without async (default false), the tool blocks for up to 4 minutes — suitable only for quick visual queries (e.g. 'screenshot and tell me what's on screen'). ONLY used with action=vlm_drive."}
             },
             "required": ["action"]
         }),
@@ -1026,6 +1325,35 @@ pub(crate) fn build_tool_list(
             "required": ["task"]
         }),
     });
+    // A2A v1.0 INPUT_REQUIRED / AUTH_REQUIRED suspend-resume bridge.
+    // Calling this on a non-A2A turn returns an error result (no hang);
+    // the LLM should fall back to a plain reply in that case.
+    tools.push(ToolDef {
+        name: "wait_input".to_owned(),
+        description:
+            "Pause the turn and wait for the calling A2A client to supply additional \
+             input (a missing parameter, a confirmation, etc.). Publishes a \
+             TASK_STATE_INPUT_REQUIRED (or TASK_STATE_AUTH_REQUIRED when \
+             auth=true) status event, suspends until the client re-sends with the \
+             same taskId, and returns the new text as `input`. Only meaningful on \
+             A2A turns — returns an error on other channels."
+                .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "Human-readable prompt the client should render."
+                },
+                "auth": {
+                    "type": "boolean",
+                    "description": "If true, publish AUTH_REQUIRED (for credentials / OAuth handoff) instead of INPUT_REQUIRED. Defaults to false."
+                }
+            },
+            "required": ["prompt"]
+        }),
+    });
+
     tools.push(ToolDef {
         name: "channel".to_owned(),
         description: "Perform channel-specific actions (send, reply, pin, delete messages). Channel is auto-detected from current session or can be specified explicitly: telegram, discord, slack, whatsapp, feishu, weixin, qq, dingtalk.".to_owned(),
@@ -1230,10 +1558,10 @@ pub(crate) fn build_tool_list(
 
     // External remote agent A2A tools (remote gateways).
     tracing::debug!(
-        count = external_agents.len(),
+        count = a2a_peers.len(),
         "build_tool_list: external agents"
     );
-    for ext in external_agents {
+    for ext in a2a_peers {
         if ext.id == caller_id {
             continue;
         }
@@ -1279,4 +1607,92 @@ pub(crate) fn build_tool_list(
     }
 
     tools
+}
+
+/// Build the Windows `shell` tool description with PowerShell-edition-aware
+/// language guidance (5.1 vs 7+). Detection is cached for the process
+/// lifetime via `platform::detect_powershell_edition`.
+///
+/// The 5.1 / 7+ branches differ sharply (`&&`, `??`, ternary, `2>&1`
+/// semantics, file encoding defaults). Steering the model with the right
+/// syntax up front avoids a class of parser-error retries.
+fn windows_shell_description() -> String {
+    use super::platform::{detect_powershell_edition, PowerShellEdition};
+
+    let edition_section = match detect_powershell_edition() {
+        Some(PowerShellEdition::Core) => "\
+             PowerShell edition detected: PowerShell 7+ (pwsh).\n\
+             - Pipeline chain operators `&&` and `||` ARE available and work like bash. Prefer `cmd1 && cmd2` over `cmd1; cmd2` when cmd2 should only run if cmd1 succeeds.\n\
+             - Ternary `$cond ? $a : $b`, null-coalescing `??`, and null-conditional `?.` ARE available.\n\
+             - Default file encoding is UTF-8 without BOM.\n\
+             \n",
+        Some(PowerShellEdition::Desktop) => "\
+             PowerShell edition detected: Windows PowerShell 5.1 (powershell.exe).\n\
+             - Pipeline chain operators `&&` and `||` are NOT available — they cause a parser error. To run B only if A succeeds: `A; if ($?) { B }`. To chain unconditionally: `A; B`.\n\
+             - Ternary (`?:`), null-coalescing (`??`), null-conditional (`?.`) operators are NOT available. Use `if/else` and explicit `$null -eq` checks.\n\
+             - Avoid `2>&1` on native executables. In 5.1, redirecting a native command's stderr inside PowerShell wraps each line in an ErrorRecord and sets `$?` to `$false` even when the exe returned exit code 0. stderr is already captured for you — don't redirect it.\n\
+             - Default file encoding is UTF-16 LE with BOM. When writing files other tools will read, pass `-Encoding utf8` to `Out-File`/`Set-Content`.\n\
+             - `ConvertFrom-Json` returns a PSCustomObject, not a hashtable. `-AsHashtable` is not available.\n\
+             \n",
+        None => "\
+             PowerShell edition not detected — assume Windows PowerShell 5.1 for compatibility.\n\
+             - Do NOT use `&&`, `||`, ternary `?:`, null-coalescing `??`, or null-conditional `?.`. These are PowerShell 7+ only and parser-error on 5.1.\n\
+             - To chain conditionally: `A; if ($?) { B }`. Unconditionally: `A; B`.\n\
+             - When writing files other tools will read, pass `-Encoding utf8` to `Out-File`/`Set-Content` (5.1 default is UTF-16 LE BOM).\n\
+             \n",
+    };
+
+    format!(
+        "Run a shell command (PowerShell) on Windows.\n\
+         IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`, for HTTP/API requests use `web_fetch`. Only use shell for commands that have no dedicated tool.\n\
+         Use shell for: git operations, running scripts (node/python/cargo), system info (systeminfo, ipconfig, Get-Process), package management (npm/pip), process management (Start-Process, Stop-Process, taskkill).\n\
+         Do NOT use shell for HTTP requests (curl/wget/Invoke-WebRequest) or file downloads — use `web_fetch` / `web_download` instead.\n\
+         \n\
+         {edition_section}\
+         PowerShell language notes (apply to all editions):\n\
+         - Variables prefix `$`; escape char is backtick `` ` `` (not `\\`).\n\
+         - Verb-Noun cmdlet naming: Get-ChildItem, Set-Location, New-Item, Remove-Item.\n\
+         - Env vars: read via `$env:NAME`, set via `$env:NAME = \"value\"` (NOT `Set-Variable`, NOT bash `export`).\n\
+         - Registry: use `HKLM:\\SOFTWARE\\...`, `HKCU:\\...` (PSDrive prefix), NOT raw `HKEY_LOCAL_MACHINE\\...`.\n\
+         - Call native exe with spaces in path via call operator: `& \"C:\\Program Files\\App\\app.exe\" arg1 arg2`.\n\
+         - For args containing `-` / `@` / other PS metachars: use `--%` stop-parsing token, e.g. `git log --% --format=%H`.\n\
+         - Multiline strings to native exes (commit messages, file content): use single-quoted here-string `@'...'@` — closing `'@` MUST be at column 0 (no leading whitespace) or you get a parse error.\n\
+         \n\
+         Interactive commands hang under -NonInteractive — NEVER use:\n\
+         - `Read-Host`, `Get-Credential`, `Out-GridView`, `$Host.UI.PromptForChoice`, `pause`\n\
+         - Destructive cmdlets that may prompt — add `-Confirm:$false` when you intend the action to proceed; `-Force` for read-only/hidden items.\n\
+         - `git rebase -i`, `git add -i`, or anything that opens an interactive editor.\n\
+         \n\
+         Tool selection: PowerShell for file/system ops; python for data processing (CSV/JSON/automation).\n\
+         Check tool availability first (`Get-Command python`, `Get-Command node`). Use `install_tool` for system tools.\n\
+         \n\
+         PowerShell patterns:\n\
+         - Pipes: Get-Process | Sort-Object CPU -Descending | Select-Object -First 10\n\
+         - Network connectivity check (not fetch): Test-NetConnection host -Port 80\n\
+         - Text: (Get-Content file) -replace 'old','new'\n\
+         - Dates: Get-Date -Format 'yyyy-MM-dd'; [DateTimeOffset]::Now.ToUnixTimeSeconds()\n\
+         Python patterns: `python -c \"import json; ...\"` for one-liners, write to $env:TEMP\\script.py for multi-line.\n\
+         \n\
+         Best practices: Do NOT wrap commands in extra cmd /c or powershell -Command layers. Use `| Select-Object -First 10` to limit output.\n\
+         Do NOT use shell for destructive operations on personal directories (Desktop, Downloads, Documents).\n\
+         Commands run in background by default (wait=false). Use wait=true only for short commands where you need the output immediately.\n\
+         If a command fails, do NOT retry with the same arguments. Try a different approach or ask the user.\n\
+         \n\
+         Multiple commands:\n\
+         - Independent → emit MULTIPLE shell tool calls in ONE message for parallelism.\n\
+         - Dependent → single shell call with edition-appropriate chaining (see edition section above).\n\
+         - Use `;` only when you don't care whether earlier commands succeed.\n\
+         - Do NOT use newlines to separate commands.\n\
+         \n\
+         Sleep is rarely the right answer:\n\
+         - Don't sleep between commands that can run back-to-back.\n\
+         - Don't sleep-poll a background task you started with `wait=false` — task results are delivered on your next turn automatically.\n\
+         - Don't sleep-retry a failing command — find the actual cause and change something.\n\
+         \n\
+         Git safety:\n\
+         - NEVER force-push to main / master.\n\
+         - NEVER `--no-verify`, `--no-gpg-sign`, or `-c commit.gpgsign=false` unless the user explicitly asks — fix the hook failure instead.\n\
+         - AVOID `git add -A` / `git add .` — stage specific files so you don't leak `.env`, credentials, or build artifacts.\n\
+         - Prefer NEW commits over `--amend`; amending after a pre-commit-hook failure can destroy work because the failed commit never landed."
+    )
 }

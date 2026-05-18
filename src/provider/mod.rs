@@ -11,13 +11,54 @@ pub mod gemini;
 pub mod model_defaults;
 pub mod openai;
 pub mod registry;
+pub mod rsclaw;
 
 use std::pin::Pin;
 
 use anyhow::Result;
 
 /// Default User-Agent for all LLM provider HTTP requests.
-pub(crate) const DEFAULT_USER_AGENT: &str = "rsclaw/1.0";
+pub(crate) const DEFAULT_USER_AGENT: &str = concat!("rsclaw/", env!("CARGO_PKG_VERSION"));
+
+/// Warn (at most once per `(provider, session_key)` pair across the
+/// process lifetime) when a non-`rsclaw` provider receives a request
+/// with `kv_cache_mode=2`. Mode 2 is the rsclaw-server stateful
+/// session protocol — every other provider treats the field as a no-op
+/// and silently degrades to mode 0, so an operator who configured
+/// `kvCacheMode: 2` against an OpenAI/Anthropic/Gemini-routed model
+/// would lose every benefit of the setting without seeing an error.
+/// Without this warning the misconfiguration is invisible.
+///
+/// Dedup is per-session so a long-running session doesn't re-warn on
+/// every iteration; the `provider` segment of the key keeps openai vs
+/// anthropic vs gemini distinct.
+pub(crate) fn warn_unsupported_kv_cache_mode_2(provider: &str, req: &LlmRequest) {
+    if req.kv_cache_mode < 2 {
+        return;
+    }
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let session = req.session_key.as_deref().unwrap_or("<no-session>");
+    let key = format!("{provider}:{session}");
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut guard = match seen.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if !guard.insert(key) {
+        return;
+    }
+    drop(guard);
+    tracing::warn!(
+        provider,
+        session = session,
+        "kv_cache_mode=2 requested but {} provider does not support it; \
+         degrading to mode 0 — route mode 2 traffic through the rsclaw \
+         provider (RSCLAW_KEY/RSCLAW_URL) for incremental session caching",
+        provider,
+    );
+}
 
 /// Build a `reqwest::Client` with the shared User-Agent header.
 pub(crate) fn http_client() -> reqwest::Client {
@@ -147,6 +188,9 @@ pub enum ContentPart {
         content: String,
         is_error: Option<bool>,
     },
+    Reasoning {
+        text: String,
+    },
 }
 
 /// A tool definition passed to the LLM.
@@ -157,8 +201,60 @@ pub struct ToolDef {
     pub parameters: serde_json::Value,
 }
 
+/// Which logical endpoint family a request belongs to.
+///
+/// The rsclaw-server fleet exposes three sibling endpoint families
+/// under `/v1/agent/*` — `sessions` for the primary agent loop,
+/// `fastshot` for cheap auxiliary calls (compression, query rewrite,
+/// personal-info extraction), and `vision` for VL grounding. Each is
+/// filtered to a different worker pool server-side
+/// (`sessions_enabled` / `fastshot_enabled` / `vision_enabled`), so
+/// auxiliary traffic never competes with the primary loop's KV-cache
+/// slots.
+///
+/// The client encodes this routing decision **explicitly** on the
+/// request rather than parsing it out of the model name. The agent
+/// runtime knows what kind of call it is making (primary turn vs
+/// flash compression vs vision describe); this enum captures that
+/// intent and the rsclaw provider maps it to the right URL prefix.
+///
+/// Non-rsclaw providers (OpenAI, Anthropic, Gemini, …) ignore this
+/// field — they have no equivalent server-side concept.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AgentEndpoint {
+    /// `/v1/agent/sessions/*` — main agent conversation traffic.
+    #[default]
+    Primary,
+    /// `/v1/agent/fastshot/*` — fastshot worker pool. Auto-selected
+    /// when caller sets this variant OR `model` matches the prefix
+    /// `rsclaw/rsclaw-flash-*` (e.g. `rsclaw-flash-v1`).
+    Flash,
+    /// `/v1/agent/vision/*` — VL grounding (image description,
+    /// computer_use screenshot reasoning). Auto-selected when
+    /// caller sets this variant OR `model` matches the prefix
+    /// `rsclaw/rsclaw-vision-*`.
+    Vision,
+}
+
+// Routing rule on the rsclaw provider (single source of truth).
+// Server enforces per-route model whitelists with 400 model_slot_mismatch
+// on violations, so canonical model names take priority over the endpoint
+// variant. The endpoint variant is only consulted for non-canonical models.
+//
+//   1. model rsclaw/rsclaw-flash-*                          → /v1/agent/fastshot
+//   2. model rsclaw/rsclaw-vision-*                         → /v1/agent/vision
+//   3. model rsclaw/rsclaw-agent-* + session_key=None       → /v1/agent/oneshot   (stateless agent call)
+//   4. model rsclaw/rsclaw-agent-* + session_key=Some       → /v1/agent/sessions  (kvCacheMode=2)
+//   5. non-canonical model + endpoint=Flash                  → /v1/agent/fastshot  (server may 400)
+//   6. non-canonical model + endpoint=Vision                 → /v1/agent/vision    (server may 400)
+//   7. endpoint=Primary + session_key=Some                   → /v1/agent/sessions  (kvCacheMode=2)
+//   8. endpoint=Primary + session_key=None                   → /v1/agent/oneshot
+//
+// Non-rsclaw providers (OpenAI/Anthropic/Gemini/…) ignore `endpoint` and
+// route purely by `model`.
+
 /// Full request to an LLM provider.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LlmRequest {
     pub model: String,
     pub messages: Vec<Message>,
@@ -169,10 +265,29 @@ pub struct LlmRequest {
     pub frequency_penalty: Option<f32>,
     /// If > 0, the provider should enable extended thinking with this budget.
     pub thinking_budget: Option<u32>,
+    /// Which rsclaw-server endpoint family this request targets.
+    /// Defaults to `Primary` so existing call sites need no change.
+    /// Non-rsclaw providers ignore this field.
+    pub endpoint: AgentEndpoint,
     /// KV cache mode: 0=off, 1=append-only (default), 2=incremental (cache_id + delta).
     pub kv_cache_mode: u8,
     /// Session key for cache_id tracking (used when kv_cache_mode=2).
     pub session_key: Option<String>,
+    /// (kvCacheMode=2 only) Pre-split shared system prefix —
+    /// byte-identical across all RsClaw clients of this version. The
+    /// rsclaw provider sends this as `dynamic_prefix.system` so the
+    /// upstream LRU dedupes the cacheable bytes across clients. When
+    /// `None`, the provider falls back to deriving everything from
+    /// `system` (loses cross-client cache reuse but stays correct).
+    /// Other providers ignore this field.
+    pub system_shared: Option<String>,
+    /// (kvCacheMode=2 only) Per-client `user_system` segment — workspace
+    /// MDs, language, skills, platform info. Sent as
+    /// `dynamic_prefix.user_system` and is the slot's per-session text
+    /// (worker's layer-2 KV cache between `base` and `session_tail`,
+    /// rsclaw-protocol §2.1.2 post-2026-05-16 rename). Other providers
+    /// ignore this field.
+    pub user_system: Option<String>,
 }
 
 /// Serialize an `f32` to a JSON number with 2 decimal places.
@@ -226,6 +341,44 @@ pub trait LlmProvider: Send + Sync {
     /// Stream a completion. The returned stream emits `StreamEvent`s until
     /// `StreamEvent::Done` or `StreamEvent::Error`.
     fn stream(&self, req: LlmRequest) -> BoxFuture<'_, Result<LlmStream>>;
+
+    /// In-place compact splice (rsclaw protocol §2.4 — kvCacheMode=2 only).
+    ///
+    /// Asks the provider to splice an existing server-side session:
+    /// preserve the first `keep_head_messages` messages' KV unchanged,
+    /// drop the middle KV pages, prefill `summary` in their place, and
+    /// preserve the last `keep_tail_messages` messages' KV unchanged.
+    /// `session_key` is the gateway-side stable key; the provider
+    /// resolves it to the wire `session_id` internally.
+    ///
+    /// `expected_msgs_count` is optimistic concurrency — the total
+    /// message count the gateway believes the session has right now.
+    /// Server returns 409 on mismatch and the caller MUST fall back to
+    /// the replay path.
+    ///
+    /// Returns the server-reported `msgs_count` after the splice. On any
+    /// `Err` callers MUST fall back to `/sessions/replay` (see
+    /// `agent/compaction.rs::compact_inner`).
+    ///
+    /// Default implementation: `Err`. Only rsclaw implements this — it's
+    /// kvCacheMode=2-specific and no stateless provider (anthropic /
+    /// openai / gemini / ollama) can support it. Adding a default impl
+    /// here keeps the trait small and lets callers branch on `Err`
+    /// instead of feature-detecting concrete provider types.
+    #[allow(unused_variables)]
+    fn compact_splice<'a>(
+        &'a self,
+        session_key: &'a str,
+        keep_head_messages: usize,
+        summary: &'a str,
+        keep_tail_messages: usize,
+        expected_msgs_count: Option<usize>,
+    ) -> BoxFuture<'a, Result<usize>> {
+        let name = self.name().to_owned();
+        Box::pin(async move {
+            anyhow::bail!("compact splice not supported by provider {name}")
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

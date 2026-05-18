@@ -42,7 +42,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
     },
     extract::Multipart,
-    routing::{get, patch, post},
+    routing::{delete, get, patch, post, put},
 };
 use futures::{Stream, StreamExt as _};
 use serde::{Deserialize, Serialize};
@@ -91,6 +91,31 @@ pub struct AppState {
     pub store: Arc<Store>,
     /// Broadcast channel for SSE: agent sends events here.
     pub event_bus: broadcast::Sender<AgentEvent>,
+    /// Shared computer_use permission store. Drivers register pending
+    /// requests via `register_pending_request`; the WS handler resolves
+    /// them via `resolve_pending_request` once the user clicks a button
+    /// in the Tauri permission dialog.
+    pub computer_permission: Arc<crate::computer::permission::RedbPermissionStore>,
+    /// Broadcast channel for `PermissionRequest` events. Subscribed by
+    /// the WS gateway (delivered to the desktop UI as `permission_request`
+    /// frames).
+    pub computer_permission_tx:
+        broadcast::Sender<crate::computer::permission::PermissionRequest>,
+    /// Broadcast channel for `ComputerUseStatus` events (Started/Step/
+    /// Finished). Same WS plumbing as `computer_permission_tx`; delivered
+    /// to the desktop UI as `computer_use_status` frames so the live
+    /// status panel can show what the GUI agent is doing right now.
+    pub computer_status_tx:
+        broadcast::Sender<crate::computer::status::ComputerUseStatus>,
+    /// Live registry of in-flight `computer_use` runs.
+    /// Maps `run_id` -> the driver's abort flag. Inserted when
+    /// `tool_vlm_drive` mints a run and removed on driver exit. The
+    /// `POST /computer-use/runs/{run_id}/abort` HTTP endpoint sets the
+    /// flag; the driver's loop checks it between steps and exits with
+    /// `DriverOutcome::UserAbort` -> `Finished { outcome_kind: "user_abort" }`,
+    /// which the overlay UI consumes to fade itself out.
+    pub computer_runs:
+        Arc<tokio::sync::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
     /// Device token store for WebSocket gateway auth.
     pub devices: Arc<crate::ws::DeviceStore>,
     /// Active WebSocket connections registry.
@@ -135,6 +160,19 @@ pub struct AppState {
     /// in-flight HTTP requests, task queue tasks, and channel handlers
     /// before re-exec.
     pub shutdown: crate::gateway::ShutdownCoordinator,
+    /// A2A v1.0 per-task event broadcast bus (fan-out for SSE subscribers
+    /// and the push notification dispatcher).
+    pub task_event_bus: crate::a2a::event::TaskEventBus,
+    /// Cancellation tokens for in-flight A2A tasks, keyed by task_id.
+    /// Inserted on SendMessage / SendStreamingMessage entry; fired by CancelTask.
+    pub task_cancels: Arc<dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
+    /// Tasks paused on TASK_STATE_INPUT_REQUIRED / AUTH_REQUIRED, keyed by task_id.
+    /// Resumed when the client sends another SendMessage with the matching taskId.
+    pub suspended_tasks: Arc<dashmap::DashMap<String, crate::a2a::event::SuspendedTask>>,
+    /// Persistent A2A task / push-config store (redb).
+    pub task_store: Arc<crate::a2a::store::TaskStore>,
+    /// Push notification dispatcher (subscribes to event bus, signs payloads).
+    pub push_dispatcher: Arc<crate::a2a::push::PushDispatcher>,
 }
 
 // AgentEvent is defined in crate::events to avoid circular deps with agent.
@@ -226,6 +264,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/config", get(get_config).put(save_config))
         .route("/cron", get(cron_list).post(cron_create))
         .route("/cron/reload", post(cron_reload))
+        .route("/cron/bulk_replace", put(cron_bulk_replace))
         .route("/cron/{id}", get(cron_get).put(cron_update).delete(cron_delete))
         .route("/cron/{id}/trigger", post(cron_trigger))
         .route("/cron/{id}/history", get(cron_history))
@@ -242,11 +281,39 @@ pub fn build_router(state: AppState) -> Router {
         .route("/workspace/files", get(list_workspace_files))
         .route("/workspace/files/{*path}", get(read_workspace_file).put(write_workspace_file))
         .route("/stream", get(stream_sse))
-        .route("/a2a", post(crate::a2a::server::a2a_rpc_handler))
-        .route("/tools/execute", post(execute_tool));
+        .route(
+            "/a2a",
+            post(crate::a2a::server::a2a_dispatch)
+                .layer(axum::middleware::from_fn(crate::a2a::version::a2a_version_layer))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::a2a::auth::a2a_auth_layer,
+                )),
+        )
+        .route("/tools/execute", post(execute_tool))
+        .route("/computer-use/permissions", get(computer_use_permissions_list))
+        .route(
+            "/computer-use/permissions/{agent_id}/{app}",
+            delete(computer_use_permissions_revoke),
+        )
+        .route(
+            "/computer-use/bypass",
+            get(computer_use_bypass_get).put(computer_use_bypass_set),
+        )
+        .route(
+            "/computer-use/runs/{run_id}/abort",
+            post(computer_use_run_abort),
+        );
 
     Router::new()
         .nest("/api/v1", api)
+        // Convenience alias: bare `/health` resolves to the same handler
+        // as `/api/v1/health`. Container orchestrators (Docker, k8s,
+        // generic uptime monitors) default to `/health`; aliasing avoids
+        // a misleading 401 in their logs when they probe an unmatched
+        // path. See auth_middleware's bypass list for the matching
+        // allowance.
+        .route("/health", get(health))
         .route("/hooks/feishu", post(feishu_webhook))
         .route("/hooks/wecom", get(wecom_verify).post(wecom_webhook))
         .route(
@@ -258,7 +325,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/hooks/{*path}", post(crate::hooks::handle_webhook))
         .route(
             "/.well-known/agent.json",
-            get(crate::a2a::server::agent_card_handler),
+            get(crate::a2a::server::agent_card_handler).layer(axum::middleware::from_fn(
+                crate::a2a::version::a2a_version_layer,
+            )),
         )
         // OpenAI-compatible endpoints — allow any OpenAI API client to connect.
         .route("/v1/chat/completions", post(openai_chat_completions))
@@ -319,8 +388,19 @@ async fn auth_middleware(
 ) -> Response {
     // Health, agent card discovery, WS, and internal reload endpoints are always open
     // (WS performs its own handshake-level auth).
+    //
+    // Both the bare `/health` and the namespaced `/api/v1/health` are
+    // listed: the bare path is the default for container orchestrators
+    // (Docker HEALTHCHECK, k8s probes, generic uptime monitors) and
+    // operator muscle memory; without the bypass the auth middleware
+    // would respond 401 BEFORE the request reached the routing layer,
+    // surfacing as a misleading "unauthorized" instead of the honest
+    // "path does not exist on this server". Both routes resolve to the
+    // same handler — see the top-level alias just below the `nest`
+    // call in `build_router`.
     let path = request.uri().path();
     if path == "/"
+        || path == "/health"
         || path == "/api/v1/health"
         || path == "/.well-known/agent.json"
         || path == "/ws"
@@ -330,6 +410,12 @@ async fn auth_middleware(
         || path == "/api/v1/shutdown"
         || path == "/api/v1/restart"
         || path == "/api/v1/restart-dismiss"
+        // A2A v1.0: bypass gateway-level auth so the protocol's own
+        // bearer/X-API-Key schemes (declared in Agent Card securitySchemes
+        // and enforced by `a2a_auth_layer`) are the authoritative gate.
+        // Otherwise the gateway token would override the A2A-advertised
+        // auth and any A2A v1.0 client following the spec would 401.
+        || path == "/api/v1/a2a"
     {
         return next.run(request).await;
     }
@@ -418,6 +504,11 @@ async fn send_message(
         peer_id: req.peer_id.unwrap_or_else(|| "api-client".to_string()),
         chat_id: String::new(),
         reply_tx,
+        task_id: None,
+        context_id: None,
+        event_tx: None,
+        cancel_token: None,
+        input_request_tx: None,
         extra_tools: vec![],
         images: file_images,
         files: file_files,
@@ -928,18 +1019,14 @@ async fn execute_tool(
     Json(serde_json::json!({"error": "use 'plugin.tool' format, e.g. 'jimeng.txt2img'"}))
 }
 
-async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let uptime_secs = state.started_at.elapsed().as_secs();
-    let hours = uptime_secs / 3600;
-    let mins = (uptime_secs % 3600) / 60;
-    let secs = uptime_secs % 60;
-    let port = state.live.gateway.read().await.port;
-    Json(serde_json::json!({
-        "status": "ok",
-        "version": option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
-        "port": port,
-        "uptime": format!("{:02}:{:02}:{:02}", hours, mins, secs),
-    }))
+async fn health(State(_state): State<AppState>) -> impl IntoResponse {
+    // Minimal unauthenticated health payload (R4 review I2).
+    // Previously leaked `version` + `port` to anyone reaching the
+    // bare `/health` alias — useful for CVE fingerprinting against
+    // a public-facing gateway, and the port is redundant since the
+    // caller already connected to it. Rich uptime / build info now
+    // lives only on the auth-gated `/api/v1/status` endpoint.
+    Json(serde_json::json!({"status": "ok"}))
 }
 
 async fn status(State(state): State<AppState>) -> impl IntoResponse {
@@ -1132,6 +1219,62 @@ async fn cron_reload(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+/// PUT /api/v1/cron/bulk_replace — atomically replace the entire cron
+/// job set with the supplied list. Used by the Tauri tray (see
+/// `ui/src-tauri/src/main.rs::save_cron_jobs`) so the UI never needs
+/// to write the cron.json5 file directly — preventing the 3-writer
+/// race where Tauri / ws cron.update / cron runner all hit the same
+/// file. Body shape: `{ "version": 1, "jobs": [...] }` (matches
+/// `cron.json5`).
+async fn cron_bulk_replace(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let jobs_array = match body.get("jobs").and_then(|v| v.as_array()) {
+        Some(arr) => arr.clone(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "missing `jobs` array"})),
+            )
+                .into_response();
+        }
+    };
+    let jobs: Vec<crate::cron::CronJob> = match jobs_array
+        .iter()
+        .map(|v| serde_json::from_value::<crate::cron::CronJob>(v.clone()))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(j) => j,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid cron job: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    // Serialize against concurrent cron.add / cron.update etc.
+    let _guard = crate::cron::CRON_FILE_LOCK.lock().await;
+
+    if let Err(e) = crate::cron::save_cron_jobs(&jobs) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("save failed: {e}")})),
+        )
+            .into_response();
+    }
+
+    // Notify CronRunner to reload (drops in-flight tasks for jobs
+    // whose schedule / enabled state changed).
+    if let Err(e) = state.cron_reload.send(()) {
+        tracing::warn!(err = %e, "cron: bulk_replace reload signal failed");
+    }
+
+    Json(serde_json::json!({ "replaced": jobs.len() })).into_response()
+}
+
 // ---------------------------------------------------------------------------
 // Cron CRUD API
 // ---------------------------------------------------------------------------
@@ -1177,9 +1320,13 @@ async fn cron_save_and_reload(
     // for other readers and caused jobs to silently disappear from the UI.
     let store = serde_json::json!({ "version": 1, "jobs": jobs });
     let json = serde_json::to_string_pretty(&store).map_err(|e| format!("serialize: {e}"))?;
-    tokio::fs::write(&path, json)
+    let tmp = format!("{}.tmp", path.display());
+    tokio::fs::write(&tmp, json)
         .await
-        .map_err(|e| format!("write jobs.json: {e}"))?;
+        .map_err(|e| format!("write jobs.json tmp: {e}"))?;
+    tokio::fs::rename(&tmp, &path)
+        .await
+        .map_err(|e| format!("rename jobs.json: {e}"))?;
     let _ = reload_tx.send(());
     Ok(())
 }
@@ -1411,6 +1558,11 @@ async fn cron_trigger(State(state): State<AppState>, Path(id): Path<String>) -> 
             peer_id: format!("cron:{id}"),
             chat_id: String::new(),
             reply_tx,
+            task_id: None,
+            context_id: None,
+            event_tx: None,
+            cancel_token: None,
+            input_request_tx: None,
             extra_tools: vec![],
             images: vec![],
             files: vec![],
@@ -1471,6 +1623,108 @@ async fn cron_trigger(State(state): State<AppState>, Path(id): Path<String>) -> 
     )
         .into_response()
 }
+
+// ---------------------------------------------------------------------------
+// Computer-use control endpoints (settings panel: bypass toggle +
+// saved permissions list / revoke).
+// ---------------------------------------------------------------------------
+
+/// GET /api/v1/computer-use/permissions — list every persisted
+/// "Always allow" grant for the settings UI.
+async fn computer_use_permissions_list(State(state): State<AppState>) -> Response {
+    match state.computer_permission.list_grants().await {
+        Ok(grants) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"grants": grants})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/v1/computer-use/permissions/:agent_id/:app — revoke one
+/// persisted grant. Idempotent: deleting a non-existent grant is
+/// reported as 200 with `revoked: false`.
+async fn computer_use_permissions_revoke(
+    State(state): State<AppState>,
+    Path((agent_id, app)): Path<(String, String)>,
+) -> Response {
+    use crate::computer::permission::PermissionStore as _;
+    match state.computer_permission.revoke(&agent_id, &app).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"revoked": true, "agent_id": agent_id, "app": app})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/v1/computer-use/bypass — read the current runtime value of
+/// the bypass switch.
+async fn computer_use_bypass_get(State(state): State<AppState>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "enabled": state.computer_permission.is_bypass_all(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct BypassToggleBody {
+    enabled: bool,
+}
+
+/// PUT /api/v1/computer-use/bypass — flip the bypass switch at runtime.
+/// Does NOT write to the config file; restart reloads the config-defined
+/// default.
+async fn computer_use_bypass_set(
+    State(state): State<AppState>,
+    Json(body): Json<BypassToggleBody>,
+) -> impl IntoResponse {
+    state.computer_permission.set_bypass_all(body.enabled);
+    Json(serde_json::json!({"enabled": body.enabled}))
+}
+
+/// POST /api/v1/computer-use/runs/:run_id/abort — flip the in-flight
+/// run's abort flag. The driver loop checks the flag between steps and
+/// exits with `DriverOutcome::UserAbort` -> emits a `Finished
+/// { outcome_kind: "user_abort" }` status event, which the desktop
+/// overlay consumes to fade itself out and restore the window.
+///
+/// Returns `{ aborted: true }` on hit, `{ aborted: false }` when the
+/// run_id is unknown (already finished, never started, or wrong id).
+/// Idempotent: aborting an already-aborted run still returns true on
+/// the first call and false on subsequent calls (registry entry is
+/// removed by the driver on exit).
+async fn computer_use_run_abort(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> impl IntoResponse {
+    let runs = state.computer_runs.read().await;
+    let aborted = match runs.get(&run_id) {
+        Some(flag) => {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            true
+        }
+        None => false,
+    };
+    drop(runs);
+    if aborted {
+        tracing::info!(run_id = %run_id, "computer_use: abort requested");
+    } else {
+        tracing::warn!(run_id = %run_id, "computer_use: abort target not found (already finished?)");
+    }
+    Json(serde_json::json!({"aborted": aborted, "runId": run_id}))
+}
+
+// ---------------------------------------------------------------------------
 
 /// GET /api/v1/cron/:id/history — get run history for a cron job.
 async fn cron_history(Path(id): Path<String>) -> impl IntoResponse {
@@ -1858,6 +2112,11 @@ async fn openai_chat_completions(
         peer_id,
         chat_id: String::new(),
         reply_tx,
+        task_id: None,
+        context_id: None,
+        event_tx: None,
+        cancel_token: None,
+        input_request_tx: None,
         extra_tools,
         images: file_images,
         files: file_files,

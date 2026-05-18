@@ -431,65 +431,43 @@ pub fn seed_workspace_with_lang(workspace: &Path, lang: Option<&str>) -> Result<
 // Tool prompt seeding
 // ---------------------------------------------------------------------------
 
-/// Returns tool prompts for system prompt injection.
-/// web_browser: short summary only (full guide in prompt.md, model reads on demand).
-/// Other tools: injected directly (they're short enough).
-pub fn tool_prompts_for_system(base_dir: &Path, _lang: Option<&str>) -> String {
-
-    let mut parts = Vec::new();
-
-    // Other tools: inject directly (short prompts, always English for LLM)
-    let short_tools: &[(&str, &str)] = &[
-        ("exec", EN_TOOL_EXEC),
-        ("web_search", EN_TOOL_WEB_SEARCH),
-        ("web_fetch", EN_TOOL_WEB_FETCH),
+/// Returns the per-tool guidance prompts injected into the shared
+/// system prompt prefix. Always returns the English `EN_TOOL_*`
+/// constants directly — disk customization (`tools/*/prompt.md`) is
+/// no longer honored, so the prefix is byte-identical across every
+/// RsClaw client of the same version (a hard requirement for the
+/// shared kvCacheMode=2 prefix on rsclaw-llm).
+///
+/// All five tool guides (including the longer web_browser one) are
+/// inlined into the prefix — the kvCache anchor amortises the cost
+/// of carrying them, so the previous lazy-load-via-read_file pattern
+/// for web_browser is no longer worth the extra round-trip.
+///
+/// Per CLAUDE.md, LLM-facing prompts are always English. Response
+/// language is steered by the per-user "Default response language: …"
+/// directive in the variable system suffix, not by translating tool
+/// guidance.
+pub fn tool_prompts_for_system() -> String {
+    let parts: &[&str] = &[
+        EN_TOOL_SHELL.trim(),
+        EN_TOOL_WEB_SEARCH.trim(),
+        EN_TOOL_WEB_FETCH.trim(),
+        EN_TOOL_WEB_BROWSER.trim(),
     ];
-    for (name, fallback) in short_tools {
-        let path = base_dir.join("tools").join(name).join("prompt.md");
-        let content = std::fs::read_to_string(&path)
-            .unwrap_or_else(|_| fallback.to_string());
-        if !content.trim().is_empty() {
-            parts.push(content.trim().to_owned());
-        }
-    }
-
     parts.join("\n\n")
 }
 
-/// Seed default tool prompt files under `base_dir/tools/`.
-/// Creates `tools/<name>/prompt.md` for each built-in tool guide.
-pub fn seed_tools(base_dir: &Path, lang: Option<&str>) -> Result<usize> {
-    let resolved = lang.map(crate::i18n::resolve_lang).unwrap_or("en");
-    let zh = resolved == "zh";
-
-    let tools: &[(&str, &str)] = if zh {
-        &[
-            ("web_browser", ZH_TOOL_WEB_BROWSER),
-            ("exec", ZH_TOOL_EXEC),
-            ("web_search", ZH_TOOL_WEB_SEARCH),
-            ("web_fetch", ZH_TOOL_WEB_FETCH),
-        ]
-    } else {
-        &[
-            ("web_browser", EN_TOOL_WEB_BROWSER),
-            ("exec", EN_TOOL_EXEC),
-            ("web_search", EN_TOOL_WEB_SEARCH),
-            ("web_fetch", EN_TOOL_WEB_FETCH),
-        ]
-    };
-
+/// Extract the bundled site-rules (web_browser) and app-rules
+/// (computer_use) trees under `base_dir/tools/`. Tool prompt files
+/// (`prompt.md`) are no longer seeded — the shared system prompt is
+/// fed directly from `EN_TOOL_*` constants instead, keeping the
+/// cacheable prefix byte-identical across every client.
+///
+/// The `lang` parameter is kept for caller compatibility but is now
+/// ignored; rule tree contents are language-agnostic data.
+pub fn seed_tools(base_dir: &Path, _lang: Option<&str>) -> Result<usize> {
     let tools_dir = base_dir.join("tools");
     let mut created = 0usize;
-    for (name, content) in tools {
-        let dir = tools_dir.join(name);
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join("prompt.md");
-        if !path.exists() {
-            std::fs::write(&path, content)?;
-            info!(file = %path.display(), "seeded tool prompt");
-            created += 1;
-        }
-    }
 
     // Site-rules — platform-wide DOM/URL knowledge for web_browser.
     // Embedded at compile time via `include_dir!`; extracted file-by-file
@@ -507,69 +485,6 @@ pub fn seed_tools(base_dir: &Path, lang: Option<&str>) -> Result<usize> {
 
     Ok(created)
 }
-
-// -- Tool prompts (Chinese) --------------------------------------------------
-
-const ZH_TOOL_WEB_BROWSER: &str = r#"# web_browser 使用指南
-
-## 基本流程（必须严格遵循）
-1. **先 open** — 必须先调用 `action: "open"` 打开目标 URL，等待页面加载
-2. **再 snapshot** — 调用 `action: "snapshot"` 获取页面元素列表和 ref 编号
-3. **再操作** — 用 snapshot 返回的 ref（如 @e1、@e10）执行 click、fill 等操作
-4. **操作后重新 snapshot** — 每次 click/fill 后重新 snapshot 获取最新的 ref
-5. **用 ref 点击，不要用 text** — 优先使用 `"ref": "@e10"` 而不是 `"text": "按钮名"`
-
-## 登录处理
-- 遇到登录页面时，优先查找扫码/二维码登录入口
-- 如果有二维码，用 `action: "screenshot"` 截图后用 `send_file` 发给用户，告知"请扫码登录"
-- 等待用户扫码完成（用 `action: "wait"` 或间隔几秒后 snapshot 检查页面是否变化）
-- 扫码成功后继续执行原来的任务
-- 如果没有扫码选项，再尝试手机号/验证码等其他登录方式
-
-## 表单/输入提交
-- contenteditable 输入框：先 click 聚焦 → 用 press Meta+a 全选 → press Backspace 清空 → 再 fill 或 type 输入内容
-- 提交方式：优先用 `action: "press"`, `key: "Enter"` 提交，如果 Enter 无效再用 ref 点击发送按钮
-- 等待结果：提交后用 `action: "wait"` 等待页面变化，至少等 15-20 秒
-
-## 提取页面数据
-- 提取图片URL（过滤 UI 小图标，只取 naturalWidth > 200 的大图）：
-  `action: "evaluate"`, `js: "(function(){var r=[];document.querySelectorAll('img').forEach(function(i){var s=i.src||i.dataset.src||'';if(s&&s.startsWith('http')&&i.naturalWidth>200)r.push(s);});document.querySelectorAll('*').forEach(function(e){var bg=getComputedStyle(e).backgroundImage;if(bg&&bg!=='none'&&e.offsetWidth>200){var m=bg.match(/url\\(\"?(https?[^\"\\)]+)/);if(m)r.push(m[1]);}});return JSON.stringify([...new Set(r)]);})()"`
-- 提取链接：`action: "evaluate"`, `js: "Array.from(document.querySelectorAll('a')).map(a=>({href:a.href,text:a.innerText}))"`
-- 下载图片/文件：用 `web_download` 下载（需要登录的资源加 use_browser_cookies=true），再用 send_file 发给用户
-- 截图：`action: "screenshot"` 截取当前页面
-- **重要**：生成图片/文件后，必须提取 URL → web_download 下载 → send_file 发给用户，不要只回复"已生成"
-
-## 禁止事项
-- 不要跳过 open 直接操作
-- 不要使用过期的 ref（页面变化后必须重新 snapshot）
-- 不要在 about:blank 页面上操作
-- 不要在提交后立即提取结果，必须等待页面加载完成
-- 不要只说"图片已生成"而不下载发送给用户
-- 绝对不要编造图片 URL
-"#;
-
-const ZH_TOOL_EXEC: &str = r#"# exec 使用指南
-
-- 只在用户明确要求时才执行命令
-- 执行前确认操作系统（macOS/Linux/Windows）
-- **不熟悉的 CLI 工具**：第一次用前先 `tool --help`（或 `tool subcommand --help`）看清楚 subcommand 名、flag 拼写和命名风格（kebab-case `--dep-date` vs camelCase `--depDate` 不同生态不一样，靠猜常错）
-- 命令失败时**不要重复同样的命令**：先看 stderr 里有没有 `tip:` / `Did you mean` 提示——返回结果里如果有 `hint` 字段就直接用它建议的版本；否则根据错误信息换一种方式
-- Windows 用 PowerShell，macOS/Linux 用 bash
-- 不要执行危险命令（rm -rf、格式化、关闭防火墙等）
-
-## 用户附件处理
-当用户消息包含 `[file:/绝对/路径/文件名]` 时，那就是文件本身。**直接用这个路径**，
-不要再 `ls` 找。路径里经常有**空格**（macOS 截图命名就是如此）。bash 里必须用
-单引号或双引号包起来：
-  对：`file '/Users/x/Desktop/Screenshot 2026.png'`
-  错：`file /Users/x/Desktop/Screenshot 2026.png`   （会被拆成 3 个参数）
-
-## Shell 重定向陷阱
-`2>&1` 和 `&>` 前面必须留空格。`foo.png2>&1` 会被 bash 解析成文件名 `foo.png2`
-加重定向——重定向把前一个 token 的最后一个字符吞了。
-  对：`cmd args 2>&1`
-  错：`cmd args2>&1`
-"#;
 
 // -- Tool prompts (English) --------------------------------------------------
 
@@ -601,13 +516,13 @@ const EN_TOOL_WEB_BROWSER: &str = r#"# web_browser Usage Guide
 - Just reply "done" without actually downloading and sending the generated content to user
 "#;
 
-const EN_TOOL_EXEC: &str = r#"# exec Usage Guide
+const EN_TOOL_SHELL: &str = r#"# shell Usage Guide
 
 ## Tool Mastery — Choose the Right Tool
 | Task | Best Tool |
 |------|-----------|
-| HTTP requests, REST APIs, fetching pages | **`web_fetch`** (NOT curl/wget/exec) |
-| File downloads (images/videos/binaries) | **`web_download`** (NOT curl/wget/exec) |
+| HTTP requests, REST APIs, fetching pages | **`web_fetch`** (NOT curl/wget/shell) |
+| File downloads (images/videos/binaries) | **`web_download`** (NOT curl/wget/shell) |
 | File/text ops, pipes, system info | bash/zsh (macOS/Linux) or PowerShell (Windows) |
 | Data processing (CSV/JSON local files) | Python (`python3 -c "..."` or write script) |
 | Package install | pip/npm, or `install_tool` for system tools |
@@ -658,44 +573,6 @@ eats the last character of the previous token. This is a classic trap.
 
 // -- web_search / web_fetch prompts -----------------------------------------
 
-const ZH_TOOL_WEB_SEARCH: &str = r#"# web_search 使用指南
-
-## 工具选择
-- 用户要求打开特定网站（如"打开淘宝"）→ 用 `web_browser`，不要先搜索
-- 通用问题或信息查找 → 用 `web_search`
-- 已知权威 URL → 用 `web_fetch` 直接抓取
-- 下载文件/图片/视频 → 用 `web_download`（支持续传、浏览器 cookie），不要用 curl/wget
-
-## 优先走结构化 API
-以下类型用 `web_fetch` 直接打接口，比搜索 SEO 结果准得多（JSON 会原样返回）。**不要用 curl/exec**：
-
-| 需求 | URL |
-|---|---|
-| 天气 | `https://wttr.in/城市?lang=zh&format=j1` |
-| IP 归属 | `https://ipinfo.io/8.8.8.8/json` |
-| 汇率 | `https://api.exchangerate.host/latest?base=USD&symbols=CNY` |
-| 维基摘要 | `https://zh.wikipedia.org/api/rest_v1/page/summary/主题` |
-| GitHub | `https://api.github.com/repos/owner/name` |
-
-有直接 API 就用，web_search 留给开放性、非结构化问题。
-
-## 查询关键词
-- 关键词**短、简**（2-5 个词），不要自然语言长问句
-- 国际话题用英文；国内话题用中文
-- 知道权威站点用 `site:` 过滤
-
-## 结果质量差时
-1. 换更短更简的关键词重搜
-2. 换直接 API
-3. 用 `web_fetch` 抓已知权威 URL
-4. 最后才 `web_browser`
-
-## 不要
-- 同样关键词重试失败的搜索
-- 打开浏览器访问 google.com / baidu.com
-- 把知乎/reddit 的 snippet 当权威事实
-"#;
-
 const EN_TOOL_WEB_SEARCH: &str = r#"# web_search Usage Guide
 
 ## Tool Selection
@@ -734,46 +611,10 @@ Use direct API first. web_search for open-ended or unstructured questions only.
 - Treat zhihu/reddit snippets as authoritative facts
 "#;
 
-const ZH_TOOL_WEB_FETCH: &str = r#"# web_fetch 使用指南
-
-- **任何 HTTP 请求都优先用 web_fetch**——网页、JSON API、REST、文档、文章
-- **绝对不要**用 `execute_command` + `curl`/`wget`/`Invoke-WebRequest` 抓 HTTP，一律走 web_fetch
-- HTML 页面自动转成干净的 markdown
-- JSON / 纯文本 / 非 HTML 响应**原样返回 body**——wttr.in、openweather、github、ipinfo 这种 REST API 直接传 URL
-- 静态内容用 web_fetch；需要交互（登录、点击）才用 web_browser
-- GET 失败或遇到验证码时会自动回退到浏览器抓取
-
-## 完整 HTTP 能力
-- `method`: GET（默认）、POST、PUT、PATCH、DELETE
-- `headers`: 对象，可传 Authorization、X-API-Key、Cookie、自定义 Content-Type
-- `body`: 字符串（按原样发送）或 对象/数组（自动 JSON 序列化 + 设 Content-Type）
-
-例：调一个鉴权 POST API
-```json
-{
-  "url": "https://api.example.com/v1/items",
-  "method": "POST",
-  "headers": {"Authorization": "Bearer abc123"},
-  "body": {"name": "foo", "qty": 3}
-}
-```
-
-## 什么时候才退到 curl/exec
-- multipart 文件上传
-- SSE / chunked 流式响应（边收边处理）
-- 需要交互式登录（改用 web_browser）
-
-## web_download
-- 下载文件/图片/视频用 `web_download`（支持续传、浏览器 cookie），不要用 curl/wget
-- path 是相对路径，基于 workspace/downloads/，直接传文件名如 `video.mp4`
-- 不要用 `~/`、`~/Downloads/` 或绝对路径
-- 下载后用 `send_file` 发给用户
-"#;
-
 const EN_TOOL_WEB_FETCH: &str = r#"# web_fetch Usage Guide
 
 - **PREFERRED for any HTTP request** — web pages, JSON APIs, REST endpoints, documentation, articles
-- **Do NOT** use `execute_command` with `curl`/`wget`/`Invoke-WebRequest` for HTTP — use web_fetch
+- **Do NOT** use `shell` with `curl`/`wget`/`Invoke-WebRequest` for HTTP — use web_fetch
 - HTML pages are auto-converted to clean text/markdown
 - JSON / plain-text / non-HTML responses are returned **as-is (raw body)** — works for wttr.in, openweather, github, ipinfo, etc.
 - Use web_fetch for static content; only use web_browser when interaction is needed (login, clicking, form filling)
@@ -805,3 +646,4 @@ Example — authenticated POST:
 - Do NOT use `~/`, `~/Downloads/`, or absolute paths.
 - After downloading, use `send_file` to send the file to the user.
 "#;
+

@@ -102,20 +102,20 @@ pub async fn crystallize_workflow(
     metrics: &TurnMetrics,
     signature: u64,
     providers: &Arc<ProviderRegistry>,
-    flash_model: &str,
+    primary_model: &str,
     skills_dir: &Path,
 ) -> Result<Option<PathBuf>> {
     if !crate::agent::evolution::evolution_config().enabled {
         return Ok(None);
     }
-    if flash_model.is_empty() {
-        tracing::debug!("workflow distill: no flash model resolved, skipping");
+    if primary_model.is_empty() {
+        tracing::debug!("workflow distill: no primary model resolved, skipping");
         return Ok(None);
     }
 
     let prompt = build_workflow_prompt(user_text, reply_text, metrics);
 
-    let (provider_name, model_id) = providers.resolve_model(flash_model);
+    let (provider_name, model_id) = providers.resolve_model(primary_model);
     let provider_arc = match providers.get(provider_name) {
         Ok(p) => p,
         Err(e) => {
@@ -185,14 +185,14 @@ mod tests {
         let mut m = TurnMetrics::new();
         m.record_tool("read_file", "{}".into(), "ok".into(), false);
         m.record_tool(
-            "execute_command",
+            "shell",
             r#"{"cmd":"ls"}"#.into(),
             "permission denied".into(),
             true,
         );
         let p = build_workflow_prompt("list files", "done", &m);
         assert!(p.contains("read_file"));
-        assert!(p.contains("execute_command"));
+        assert!(p.contains("shell"));
         assert!(p.contains("[ERROR]"));
         assert!(p.contains("[OK]"));
         assert!(p.contains("permission denied"));

@@ -193,7 +193,7 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
             println!();
             Ok(())
         }
-        GatewayCommand::Status => gateway_print_status(),
+        GatewayCommand::Status => gateway_print_status().await,
         GatewayCommand::Health => {
             let config = config::load_quiet().ok();
             let port = config.map(|c| c.gateway.port).unwrap_or(18888);
@@ -233,9 +233,14 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
         }
         GatewayCommand::UsageCost => {
             let config = config::load_quiet().ok();
-            let port = config.map(|c| c.gateway.port).unwrap_or(18888);
+            let port = config.as_ref().map(|c| c.gateway.port).unwrap_or(18888);
+            let auth_token = config.and_then(|c| c.gateway.auth_token).unwrap_or_default();
             let url = format!("http://127.0.0.1:{port}/api/v1/usage");
-            match reqwest::Client::new().get(&url).send().await {
+            let mut req = reqwest::Client::new().get(&url);
+            if !auth_token.is_empty() {
+                req = req.bearer_auth(&auth_token);
+            }
+            match req.send().await {
                 Ok(resp) if resp.status().is_success() => {
                     let body: serde_json::Value = resp.json().await.unwrap_or_default();
                     println!("{}", serde_json::to_string_pretty(&body)?);
@@ -252,6 +257,7 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
         GatewayCommand::Call { method, args } => {
             let config = std::sync::Arc::new(config::load_quiet()?);
             let port = config.gateway.port;
+            let auth_token = config.gateway.auth_token.clone().unwrap_or_default();
             let url = format!("http://127.0.0.1:{port}/api/v1/{method}");
             let body: serde_json::Value = if args.is_empty() {
                 serde_json::Value::Object(Default::default())
@@ -259,9 +265,11 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
                 serde_json::from_str(&args.join(" "))
                     .unwrap_or(serde_json::Value::String(args.join(" ")))
             };
-            let resp = reqwest::Client::new()
-                .post(&url)
-                .json(&body)
+            let mut req = reqwest::Client::new().post(&url).json(&body);
+            if !auth_token.is_empty() {
+                req = req.bearer_auth(&auth_token);
+            }
+            let resp = req
                 .send()
                 .await
                 .map_err(|e| anyhow::anyhow!("gateway unreachable at {url}: {e}"))?;
@@ -571,7 +579,7 @@ fn try_service_stop() -> bool {
     false
 }
 
-pub fn gateway_print_status() -> Result<()> {
+pub async fn gateway_print_status() -> Result<()> {
     let port = detect_port();
     let base = config::loader::base_dir();
     banner(&format!("rsclaw gateway {VERSION}"));
@@ -584,10 +592,25 @@ pub fn gateway_print_status() -> Result<()> {
             kv("Status:", &green(&format!("running (pid {pid})")));
             kv("URL:", &format!("http://127.0.0.1:{port}"));
 
-            // Try to get version from health endpoint
+            // Try to get version from the status endpoint. Attach the
+            // gateway auth token when configured — without it the call
+            // returns 401 and the gateway log fills with WARN
+            // "auth rejected: missing or invalid Bearer token path=/api/v1/status"
+            // every time someone runs `rsclaw status`. Uses async reqwest
+            // because gateway_print_status runs inside the tokio runtime
+            // (cmd_gateway is async) and reqwest::blocking would panic on
+            // its internal runtime drop.
             let url = format!("http://127.0.0.1:{port}/api/v1/status");
-            if let Ok(resp) = reqwest::blocking::get(&url)
-                && let Ok(body) = resp.json::<serde_json::Value>()
+            let auth_token = config::load()
+                .ok()
+                .and_then(|c| c.gateway.auth_token.clone())
+                .unwrap_or_default();
+            let mut req = reqwest::Client::new().get(&url);
+            if !auth_token.is_empty() {
+                req = req.bearer_auth(&auth_token);
+            }
+            if let Ok(resp) = req.send().await
+                && let Ok(body) = resp.json::<serde_json::Value>().await
             {
                 if let Some(v) = body.get("version").and_then(|v| v.as_str()) {
                     kv("Version:", v);

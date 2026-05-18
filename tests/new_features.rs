@@ -163,6 +163,7 @@ fn provider_config_has_user_agent_field() {
         models: None,
         enabled: Some(true),
         user_agent: Some("TestAgent/1.0".to_string()),
+        prefix_id: None,
     };
 
     assert_eq!(config.user_agent, Some("TestAgent/1.0".to_string()));

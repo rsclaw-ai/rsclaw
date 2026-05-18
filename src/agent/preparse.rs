@@ -194,7 +194,6 @@ impl PreParseEngine {
         add_direct(&mut commands, r"(?i)^/abort$", |_| "__ABORT__".into());
         add_direct(&mut commands, r"(?i)^/clear$", |_| "__CLEAR__".into());
         add_direct(&mut commands, r"(?i)^/compact$", |_| "__COMPACT__".into());
-        add_direct(&mut commands, r"(?i)^/reset$", |_| "__RESET__".into());
         add_direct(&mut commands, r"(?i)^/text$", |_| "__TEXT_MODE__".into());
         add_direct(&mut commands, r"(?i)^/voice$", |_| "__VOICE_MODE__".into());
         add_direct(&mut commands, r"(?i)^/history(?:\s+(\d+))?$", |caps| {
@@ -267,32 +266,6 @@ impl PreParseEngine {
             "message",
             ArgTemplate::Named(HashMap::new()),
         );
-
-        // --- Background context (/ctx, formerly /btw) ---
-        add_direct(&mut commands, r"(?i)^/ctx\s+--list$", |_| {
-            "__CTX_LIST__".into()
-        });
-        add_direct(&mut commands, r"(?i)^/ctx\s+--clear$", |_| {
-            "__CTX_CLEAR__".into()
-        });
-        add_direct(&mut commands, r"(?i)^/ctx\s+--remove\s+(\d+)$", |caps| {
-            format!("__CTX_REMOVE__:{}", &caps[1])
-        });
-        add_direct(
-            &mut commands,
-            r"(?i)^/ctx\s+--ttl\s+(\d+)\s+(.+)$",
-            |caps| format!("__CTX_TTL__:{}:{}", &caps[1], &caps[2]),
-        );
-        add_direct(&mut commands, r"(?i)^/ctx\s+--global\s+(.+)$", |caps| {
-            format!("__CTX_GLOBAL__:{}", &caps[1])
-        });
-        // Must be last /ctx pattern to avoid matching flags
-        add_direct(&mut commands, r"(?i)^/ctx\s+(.+)$", |caps| {
-            format!("__CTX_ADD__:{}", &caps[1])
-        });
-
-        // Bare /ctx with no args -> show usage
-        add_direct(&mut commands, r"(?i)^/ctx\s*$", |_| "__CTX_USAGE__".into());
 
         // --- Side-channel quick query (/btw) ---
         add_direct(&mut commands, r"(?i)^/btw\s+(.+)$", |caps| {

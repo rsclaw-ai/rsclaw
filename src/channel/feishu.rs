@@ -353,8 +353,19 @@ impl FeishuChannel {
             app_secret: app_secret.into(),
             brand: "feishu".to_owned(),
             chat_ids,
+            // connect_timeout: 10s — bail fast on stalled TCP/TLS to
+            // open.feishu.cn (DNS hiccup, IPv6 blackhole, captive proxy
+            // routing) instead of burning the full 30s envelope on a
+            // doomed handshake. The 30s overall timeout still applies
+            // once the connection is established.
+            // pool_idle_timeout: 60s — keep auth/im connections warm
+            // between the bursty token-refresh + send pattern so the
+            // next call doesn't pay TLS handshake again.
             client: crate::config::build_proxy_client()
                 .timeout(Duration::from_secs(30))
+                .connect_timeout(Duration::from_secs(10))
+                .pool_idle_timeout(Duration::from_secs(60))
+                .tcp_keepalive(Duration::from_secs(30))
                 .build()
                 .expect("reqwest client"),
             token_cache: RwLock::new(None),
@@ -387,28 +398,87 @@ impl FeishuChannel {
     }
 
     /// Request a new tenant access token from Feishu.
+    ///
+    /// Transient network failures (DNS hiccup, IPv6 blackhole, slow TLS
+    /// handshake on first request after sleep) are retried with
+    /// exponential backoff: 1s / 2s / 4s. Authentication failures
+    /// (HTTP error status or Feishu error code) fail fast — they won't
+    /// recover on retry and the pairing flow needs to surface the real
+    /// reason quickly. Without this, a single transient timeout would
+    /// drop the user's first DM into a 30s black hole and the pairing
+    /// code never arrives.
     async fn refresh_token(&self) -> Result<String> {
         let url = format!("{}/auth/v3/tenant_access_token/internal", self.api_base());
 
-        let resp = self
-            .client
-            .post(&url)
-            .json(&json!({
-                "app_id": self.app_id,
-                "app_secret": self.app_secret,
-            }))
-            .send()
-            .await
-            .context("feishu: request tenant_access_token")?;
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last_err: Option<anyhow::Error> = None;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("feishu: token request failed {status}: {body}");
+        for attempt in 0..MAX_ATTEMPTS {
+            if attempt > 0 {
+                let delay_ms = 1000u64 << (attempt - 1); // 1s, 2s, 4s
+                tracing::warn!(
+                    attempt,
+                    delay_ms,
+                    "feishu: tenant_access_token request failed, retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+
+            let resp = match self
+                .client
+                .post(&url)
+                .json(&json!({
+                    "app_id": self.app_id,
+                    "app_secret": self.app_secret,
+                }))
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    // Transport-level failure (timeout, DNS, TLS) — retry.
+                    last_err = Some(anyhow::Error::new(e).context("feishu: request tenant_access_token"));
+                    continue;
+                }
+            };
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                // 4xx is a permanent configuration error (bad app_id/secret
+                // or revoked credentials) — retrying won't help. 5xx may be
+                // a transient Feishu-side blip, so we still retry on those.
+                if status.is_client_error() {
+                    anyhow::bail!("feishu: token request failed {status}: {body}");
+                }
+                last_err = Some(anyhow::anyhow!(
+                    "feishu: token request failed {status}: {body}"
+                ));
+                continue;
+            }
+
+            let token_resp: FeishuTokenResponse = match resp
+                .json::<FeishuTokenResponse>()
+                .await
+                .context("feishu: parse token response")
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+
+            return self.finalize_token(token_resp).await;
         }
 
-        let token_resp: FeishuTokenResponse =
-            resp.json().await.context("feishu: parse token response")?;
+        // All retries exhausted.
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("feishu: token refresh failed after retries")))
+    }
+
+    /// Validate the token response and store it in the cache. Extracted
+    /// so the retry loop above stays focused on transport recovery.
+    async fn finalize_token(&self, token_resp: FeishuTokenResponse) -> Result<String> {
 
         if token_resp.code != 0 {
             anyhow::bail!(

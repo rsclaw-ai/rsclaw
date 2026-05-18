@@ -64,6 +64,7 @@ impl LlmProvider for GeminiProvider {
 
     fn stream(&self, req: LlmRequest) -> BoxFuture<'_, Result<LlmStream>> {
         Box::pin(async move {
+            super::warn_unsupported_kv_cache_mode_2(self.name(), &req);
             let body = build_request_body(&req)?;
             let url = format!(
                 "{}/models/{}:streamGenerateContent?alt=sse",
@@ -227,6 +228,9 @@ fn serialize_part(part: &ContentPart) -> Value {
                 "response": { "content": content },
             }
         }),
+        ContentPart::Reasoning { text } => json!({
+            "text": text,
+        }),
     }
 }
 
@@ -268,7 +272,7 @@ async fn parse_sse_chunk_buffered(
 
     let mut events = Vec::new();
     for line in complete_portion.lines() {
-        let data = if let Some(d) = line.strip_prefix("data: ") {
+        let data = if let Some(d) = line.strip_prefix("data:").map(|s| s.trim_start()) {
             d
         } else {
             continue;
@@ -347,15 +351,7 @@ mod tests {
     fn make_request() -> LlmRequest {
         LlmRequest {
             model: "gemini-2.0-flash".to_owned(),
-            messages: vec![],
-            tools: vec![],
-            system: None,
-            max_tokens: None,
-            temperature: None,
-            frequency_penalty: None,
-            thinking_budget: None,
-            kv_cache_mode: 0,
-            session_key: None,
+            ..Default::default()
         }
     }
 

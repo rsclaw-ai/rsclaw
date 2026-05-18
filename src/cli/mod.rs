@@ -35,6 +35,7 @@ pub mod setup;
 pub mod skills;
 pub mod system;
 pub mod tools;
+pub mod watch;
 pub mod webhooks;
 
 pub use acp::AcpCommand;
@@ -75,6 +76,7 @@ pub use setup::{ConfigureArgs, OnboardArgs, SetupArgs};
 pub use skills::SkillsCommand;
 pub use system::{HeartbeatCommand, SystemCommand};
 pub use tools::ToolsCommand;
+pub use watch::WatchArgs;
 pub use webhooks::WebhooksCommand;
 
 // ---------------------------------------------------------------------------
@@ -320,6 +322,51 @@ pub enum Command {
     /// Webhook helpers.
     #[command(subcommand)]
     Webhooks(WebhooksCommand),
+
+    /// Stream a file / SSE / shell source to stdout (same grammar as
+    /// the `/watch` chat slash command, but delivered to the terminal).
+    Watch(WatchArgs),
+
+    /// Debug utilities — prompt-spec dumps, internal state inspection.
+    #[command(subcommand)]
+    Debug(DebugCommand),
+}
+
+// ---------------------------------------------------------------------------
+// Debug command
+// ---------------------------------------------------------------------------
+
+/// Subcommands under `rsclaw debug …`.
+#[derive(Subcommand, Debug)]
+pub enum DebugCommand {
+    /// Dump the kvCache-aware system prompt + tool list as JSON.
+    ///
+    /// Splits into a shared (cacheable, byte-identical for every
+    /// RsClaw client of this version) half and a per-machine half.
+    /// Output suits being ingested by `rsclaw-llm` so it can pre-cache
+    /// the shared prefix once per RsClaw version and dedupe across
+    /// every client (kvCacheMode=2).
+    DumpPromptSpec(DumpPromptSpecArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct DumpPromptSpecArgs {
+    /// Agent id whose prompt + tool list to build. Defaults to the
+    /// agent flagged `default = true` in config (or `main`).
+    #[arg(long)]
+    pub agent: Option<String>,
+
+    /// Write JSON to this file instead of stdout. The directory must
+    /// exist; the file is overwritten.
+    #[arg(long, short = 'o')]
+    pub output: Option<std::path::PathBuf>,
+
+    /// Print only the cross-user-cacheable parts (`rsclaw_version`,
+    /// `shared_prefix`, `builtin_tools`). Use this for the
+    /// `rsclaw-llm` ingest pipeline where per-machine fields would be
+    /// noise.
+    #[arg(long)]
+    pub shared_only: bool,
 }
 
 #[derive(clap::Args, Debug)]

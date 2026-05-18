@@ -53,7 +53,7 @@ use crate::{
 };
 
 use super::preparse::{
-    btw_direct_call, is_fast_preparse, try_preparse_locally,
+    btw_direct_call, is_fast_preparse, try_preparse_locally, try_preparse_locally_with_account,
 };
 use super::startup::handle_pending_analysis;
 
@@ -124,6 +124,11 @@ pub(crate) fn start_channels(
                     peer_id,
                     chat_id: String::new(),
                     reply_tx,
+                    task_id: None,
+                    context_id: None,
+                    event_tx: None,
+                    cancel_token: None,
+                    input_request_tx: None,
                     extra_tools: vec![],
                     images: vec![],
                     files: vec![],
@@ -523,7 +528,7 @@ pub(crate) fn start_channels(
                                     peer_id: peer_id_s.clone(),
                                     dm_scope,
                                 });
-                                if let Some(mut reply) = try_preparse_locally(&text, &handle, "telegram", &peer_id_s).await {
+                                if let Some(mut reply) = try_preparse_locally(&text, &handle, "telegram", &peer_id_s, crate::gateway::preparse::PreparseOrigin::User).await {
                                     reply.target_id = chat_id_s;
                                     reply.is_group = is_group;
                                     if !reply.text.is_empty() || !reply.images.is_empty() {
@@ -543,6 +548,11 @@ pub(crate) fn start_channels(
                                     peer_id: peer_id_s,
                                     chat_id: String::new(),
                                     reply_tx,
+                                    task_id: None,
+                                    context_id: None,
+                                    event_tx: None,
+                                    cancel_token: None,
+                                    input_request_tx: None,
                                     extra_tools: vec![],
                                     images,
                                     files: file_attachments,

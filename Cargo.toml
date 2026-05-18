@@ -1,6 +1,6 @@
 [package]
 name = "rsclaw"
-version = "2026.5.2"
+version = "2026.5.15"
 edition = "2024"
 rust-version = "1.91"
 description = "AI Agent Engine Compatible with OpenClaw"
@@ -15,6 +15,9 @@ path = "src/main.rs"
 # Async runtime
 tokio        = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util   = { version = "0.7", features = ["rt"] }
+dashmap      = "6"
+eventsource-stream = "0.2"
 
 # Web framework
 axum         = { version = "0.8", features = ["ws", "multipart"] }
@@ -55,6 +58,13 @@ crossterm = "0.28"
 # Utilities
 uuid    = { version = "1", features = ["v4"] }
 regex   = "1"
+
+# jq interpreter for /watch --jq <expr> and built-in templates.
+# `sync` feature makes jaq_json::Val use Arc instead of Rc, so the
+# compiled filter can cross tokio task boundaries.
+jaq-core = "3"
+jaq-json = { version = "2", features = ["sync"] }
+jaq-std  = "3"
 chrono  = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 tracing = "0.1"
@@ -71,7 +81,6 @@ sha1          = "0.10"
 sha2          = "0.10"
 hmac          = "0.12"
 hex           = "0.4"
-dashmap = "6"
 dirs-next = "2"
 console = "0.16"
 tempfile  = "3"
@@ -99,6 +108,14 @@ silk-rs = "0.2"
 symphonia = { version = "0.5", features = ["mp3", "aac", "ogg", "flac", "wav", "pcm", "vorbis", "isomp4", "mkv"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 opus-decoder = "0.1"
+
+# Computer-use stack: native input synthesis + screenshot. Replaces our
+# previous shell-based path (cliclick / PowerShell / sips / screencapture)
+# with cross-platform native APIs — ~100x faster and removes the fork
+# overhead per action. See src/computer/operators/native.rs.
+enigo = "0.6"
+xcap = "0.6"
+display-info = "0.5"
 ogg = "0.9"
 lark-websocket-protobuf = "0.1"
 prost = "0.13"
@@ -145,6 +162,9 @@ overflow-checks = false
 # Reduce stack usage in debug builds
 [profile.dev]
 opt-level = 1
+# Trim DWARF: keep file:line for backtraces, drop variable/type info.
+# Cuts target/debug size ~40-60% without affecting panic location info.
+debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 0

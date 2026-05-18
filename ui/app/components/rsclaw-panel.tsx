@@ -504,7 +504,7 @@ function ConfigEditorPage() {
     { name: "Anthropic", key: "anthropic", enabled: false, apiKey: "", baseUrl: "" },
     { name: "OpenAI", key: "openai", enabled: false, apiKey: "", baseUrl: "" },
     { name: "DeepSeek", key: "deepseek", enabled: false, apiKey: "", baseUrl: "" },
-    { name: "Kimi", key: "kimi", enabled: false, apiKey: "", baseUrl: "", userAgent: "claude-code/0.1.0" },
+    { name: "Kimi", key: "kimi", enabled: false, apiKey: "", baseUrl: "", apiType: "openai", userAgent: "rsclaw/2026.5.5" },
     { name: "CodingPlan", key: "codingplan", enabled: false, apiKey: "", baseUrl: "" },
     { name: "Ollama", key: "ollama", enabled: true, apiKey: "", baseUrl: "http://localhost:11434" },
     { name: "Custom Provider", key: "custom", enabled: false, apiKey: "", baseUrl: "" },
@@ -589,8 +589,8 @@ function ConfigEditorPage() {
         enabled: enabled !== undefined ? enabled === "true" : (isCustomLike ? !!baseUrl : apiKey.length > 0),
         apiKey,
         baseUrl: baseUrl || "",
-        userAgent: userAgent || (pName === "kimi" ? "claude-code/0.1.0" : ""),
-        ...((isCustomLike || pName === "doubao") ? { apiType } : {}),
+        userAgent: userAgent || (pName === "kimi" ? "rsclaw/2026.5.5" : ""),
+        ...((isCustomLike || pName === "doubao" || pName === "kimi") ? { apiType } : {}),
       };
     });
     setProviders(newProviders);
@@ -725,6 +725,8 @@ function ConfigEditorPage() {
         if (prov.apiType) entry.api = prov.apiType;
       } else if (prov.key === "doubao") {
         entry.api = prov.apiType || "openai-responses";
+      } else if (prov.key === "kimi") {
+        entry.api = prov.apiType || "openai";
       }
       if (prov.userAgent) entry.userAgent = prov.userAgent;
       else delete entry.userAgent;
@@ -937,7 +939,7 @@ function ConfigEditorPage() {
               markDirty();
             }} />
           </div>
-          {(isCustomLike || prov.key === "doubao") && (
+          {(isCustomLike || prov.key === "doubao" || prov.key === "kimi") && (
             <div style={fieldRow}>
               <div style={fieldLabel}>API Type</div>
               <select
@@ -1000,7 +1002,7 @@ function ConfigEditorPage() {
           <div style={{ ...fieldRow, borderBottom: "none" }}>
             <div style={fieldLabel}>User-Agent</div>
             <input style={fieldInput} value={prov.userAgent || ""}
-              placeholder="e.g. claude-code/0.1.0"
+              placeholder="e.g. rsclaw/2026.5.5"
               onChange={(e) => {
                 const next = [...providers];
                 next[idx] = { ...next[idx], userAgent: e.target.value };
@@ -3618,11 +3620,23 @@ function TauriConfigPageInner() {
           apiModels = Array.from(families.values()).sort();
         }
         if (apiModels.length > 0) {
+          // Always surface MODELS[provId] presets at the top of the list,
+          // even when they aren't returned by the upstream /v1/models call
+          // (e.g. doubao's "rolling alias" ids like `doubao-seed-2.0-pro`
+          // never appear in the API \u2014 only dated snapshots do). Dedup by
+          // id so a preset that DOES appear upstream isn't duplicated, and
+          // cap the API tail at 30 so the picker stays manageable.
+          const presets = (MODELS[provId] || []).map((m) => ({ id: m.id, tag: zh ? m.tag : m.tagEn }));
+          const presetIds = new Set(presets.map((m) => m.id));
+          const apiEntries = apiModels
+            .filter((id) => !presetIds.has(id))
+            .slice(0, 30)
+            .map((id) => {
+              const fallback = (MODELS[provId] || []).find((fm) => fm.id === id);
+              return { id, tag: fallback ? (zh ? fallback.tag : fallback.tagEn) : "" };
+            });
           setProvTest((prev) => ({ ...prev, [provId]: "ok" }));
-          setProvModels((prev) => ({ ...prev, [provId]: apiModels.slice(0, 30).map((id) => {
-            const fallback = (MODELS[provId] || []).find((fm) => fm.id === id);
-            return { id, tag: fallback ? (zh ? fallback.tag : fallback.tagEn) : "" };
-          }) }));
+          setProvModels((prev) => ({ ...prev, [provId]: [...presets, ...apiEntries] }));
           toast.success(zh ? `${provId} \u8FDE\u63A5\u6210\u529F (${apiModels.length} \u4E2A\u6A21\u578B)` : `${provId} connected (${apiModels.length} models)`);
         } else {
           // API key works but no models returned
@@ -4214,7 +4228,7 @@ function TauriConfigPageInner() {
                             <input
                               style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none" }}
                               type="text"
-                              placeholder="claude-code/0.1.0"
+                              placeholder="rsclaw/2026.5.5"
                               value={getVal(`models.providers.${p.id}.userAgent`, "")}
                               onChange={(e) => {
                                 updateConfig(`models.providers.${p.id}.userAgent`, e.target.value);
@@ -4289,7 +4303,7 @@ function TauriConfigPageInner() {
                             <input
                               style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none" }}
                               type="text"
-                              placeholder="e.g. claude-code/0.1.0"
+                              placeholder="e.g. rsclaw/2026.5.5"
                               value={getVal(`models.providers.${p.id}.userAgent`, "")}
                               onChange={(e) => {
                                 updateConfig(`models.providers.${p.id}.userAgent`, e.target.value);
@@ -4344,7 +4358,7 @@ function TauriConfigPageInner() {
                             <input
                               style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none" }}
                               type="text"
-                              placeholder="e.g. claude-code/0.1.0"
+                              placeholder="e.g. rsclaw/2026.5.5"
                               value={getVal(`models.providers.${p.id}.userAgent`, "")}
                               onChange={(e) => {
                                 updateConfig(`models.providers.${p.id}.userAgent`, e.target.value);

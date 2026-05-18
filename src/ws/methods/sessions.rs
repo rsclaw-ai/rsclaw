@@ -157,6 +157,11 @@ pub async fn sessions_send(ctx: MethodCtx) -> MethodResult {
         peer_id: "ws-client".to_owned(),
         chat_id: String::new(),
         reply_tx,
+        task_id: None,
+        context_id: None,
+        event_tx: None,
+        cancel_token: None,
+        input_request_tx: None,
         extra_tools: vec![],
         images: vec![],
         files: vec![],
@@ -180,17 +185,40 @@ pub async fn sessions_send(ctx: MethodCtx) -> MethodResult {
                     if event.session_id != sk {
                         continue;
                     }
-                    tracing::debug!(session = %sk, done = event.done, delta_len = event.delta.len(), "ws relay: forwarding event");
+                    tracing::debug!(
+                        session = %sk,
+                        done = event.done,
+                        delta_len = event.delta.len(),
+                        has_question = event.question.is_some(),
+                        "ws relay: forwarding event"
+                    );
                     let seq = conn.write().await.next_seq();
-                    let payload = serde_json::json!({
-                        "sessionKey": sk,
-                        "message": {
-                            "role": "assistant",
-                            "content": event.delta,
-                            "done": event.done
-                        }
-                    });
-                    let frame = crate::ws::types::EventFrame::new("session.message", payload, seq);
+                    let (frame_type, payload) = if let Some(ref prompt) = event.question {
+                        // ask_user side-channel — structured prompt for L2 UI.
+                        // The agent's plain-text reply still arrives via the
+                        // normal session.message frames immediately after.
+                        (
+                            "session.ask_user",
+                            serde_json::json!({
+                                "sessionKey": sk,
+                                "agentId": event.agent_id,
+                                "prompt": prompt,
+                            }),
+                        )
+                    } else {
+                        (
+                            "session.message",
+                            serde_json::json!({
+                                "sessionKey": sk,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": event.delta,
+                                    "done": event.done
+                                }
+                            }),
+                        )
+                    };
+                    let frame = crate::ws::types::EventFrame::new(frame_type, payload, seq);
                     let json = serde_json::to_string(&frame).unwrap_or_default();
                     if event_tx.send(json).await.is_err() {
                         tracing::warn!(session = %sk, "ws relay: outbound channel closed");

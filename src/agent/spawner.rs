@@ -110,7 +110,6 @@ impl AgentSpawner {
             last_msg_tokens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             clear_signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             new_session_signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            reset_signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             memory: None,
             context_window,
         });
@@ -158,6 +157,7 @@ impl AgentSpawner {
                     images,
                     files,
                     chat_id,
+                    ..
                 } = msg;
                 let result = runtime
                     .run_turn(
@@ -169,10 +169,16 @@ impl AgentSpawner {
                         extra_tools,
                         images,
                         files,
+                        crate::agent::registry::TurnContext::default(),
                     )
                     .await;
                 let reply = result.unwrap_or_else(|e| {
                     tracing::error!(agent = %handle.id, "dynamic agent turn error: {e:#}");
+                    let outcome = if e.to_string().contains("canceled by A2A CancelTask") {
+                        crate::agent::registry::ReplyOutcome::Canceled
+                    } else {
+                        crate::agent::registry::ReplyOutcome::Error
+                    };
                     AgentReply {
                         text: format!("[error: {e}]"),
                         is_empty: false,
@@ -181,6 +187,7 @@ impl AgentSpawner {
                         files: vec![],
                         pending_analysis: None,
                         needs_outer_done_emit: false,
+                        outcome,
                     }
                 });
                 let _ = reply_tx.send(reply);

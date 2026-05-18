@@ -60,14 +60,10 @@ fn llm_request_fields_are_accessible() {
             role: Role::User,
             content: MessageContent::Text("hello".to_owned()),
         }],
-        tools: vec![],
         system: Some("You are helpful.".to_owned()),
         max_tokens: Some(1024),
         temperature: Some(0.5),
-        frequency_penalty: None,
-        thinking_budget: None,
-        kv_cache_mode: 0,
-        session_key: None,
+        ..Default::default()
     };
 
     assert_eq!(req.model, "claude-3-5-sonnet-20241022");
@@ -82,15 +78,7 @@ fn llm_request_fields_are_accessible() {
 fn llm_request_defaults_are_none() {
     let req = LlmRequest {
         model: "gpt-4o".to_owned(),
-        messages: vec![],
-        tools: vec![],
-        system: None,
-        max_tokens: None,
-        temperature: None,
-        frequency_penalty: None,
-        thinking_budget: None,
-        kv_cache_mode: 0,
-        session_key: None,
+        ..Default::default()
     };
 
     assert!(req.system.is_none());
@@ -195,7 +183,6 @@ fn llm_request_with_tools() {
     use rsclaw::provider::ToolDef;
     let req = LlmRequest {
         model: "gpt-4o".to_owned(),
-        messages: vec![],
         tools: vec![
             ToolDef {
                 name: "search".to_owned(),
@@ -208,13 +195,7 @@ fn llm_request_with_tools() {
                 parameters: serde_json::json!({"type": "object"}),
             },
         ],
-        system: None,
-        max_tokens: None,
-        temperature: None,
-        frequency_penalty: None,
-        thinking_budget: None,
-        kv_cache_mode: 0,
-        session_key: None,
+        ..Default::default()
     };
     assert_eq!(req.tools.len(), 2);
     assert_eq!(req.tools[0].name, "search");
@@ -225,15 +206,8 @@ fn llm_request_with_tools() {
 fn llm_request_with_thinking_budget() {
     let req = LlmRequest {
         model: "claude-3-5-sonnet".to_owned(),
-        messages: vec![],
-        tools: vec![],
-        system: None,
-        max_tokens: None,
-        temperature: None,
-        frequency_penalty: None,
         thinking_budget: Some(10000),
-        kv_cache_mode: 0,
-        session_key: None,
+        ..Default::default()
     };
     assert_eq!(req.thinking_budget, Some(10000));
 }
@@ -246,14 +220,11 @@ fn llm_request_clone_independence() {
             role: Role::User,
             content: MessageContent::Text("original".to_owned()),
         }],
-        tools: vec![],
         system: Some("system prompt".to_owned()),
         max_tokens: Some(100),
         temperature: Some(0.5),
-        frequency_penalty: None,
         thinking_budget: Some(5000),
-        kv_cache_mode: 0,
-        session_key: None,
+        ..Default::default()
     };
 
     let mut cloned = original.clone();

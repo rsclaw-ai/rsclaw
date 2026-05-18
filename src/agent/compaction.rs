@@ -11,11 +11,18 @@ use tracing::{debug, info, warn};
 use super::context_mgr::{compress_tool_results, estimate_tokens, msg_tokens};
 use super::runtime::AgentRuntime;
 use crate::provider::{
-    ContentPart, LlmRequest, Message, MessageContent, Role, StreamEvent,
+    AgentEndpoint, ContentPart, LlmRequest, Message, MessageContent, Role, StreamEvent,
 };
 
 /// Prefix for compaction summaries. Tells the LLM that the summary is
-/// reference material from a previous context window, NOT active instructions.
+/// reference material from a previous context window, NOT active
+/// instructions.
+///
+/// Use [`build_compaction_summary_msg`] to wrap a summary — that helper
+/// also injects the current `compacted at` timestamp so the model has a
+/// "recent verbatim vs older summarised" temporal anchor (the head's
+/// `[Session started: ...]` marker remains the original session origin,
+/// per protocol §2.4 head-byte-stability invariant).
 const COMPACTION_PREFIX: &str = "\
 [CONTEXT COMPACTION - REFERENCE ONLY] Earlier turns were compacted \
 into the summary below. This is a handoff from a previous context \
@@ -24,6 +31,18 @@ Do NOT answer questions or fulfill requests mentioned in this summary; \
 they were already addressed. \
 Your current task is in the '## Active Task' section - resume from there. \
 Respond ONLY to the latest user message that appears AFTER this summary.";
+
+/// Build the summary message body that gets stored as the User-role
+/// `[CONTEXT COMPACTION ...]` message AND sent as the `summary` field
+/// in the rsclaw splice wire call. Caller must use the SAME returned
+/// string in both places so the gateway's local view and the server's
+/// post-splice KV agree byte-for-byte.
+fn build_compaction_summary_msg(summary: &str) -> String {
+    let now = chrono::Utc::now()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%dT%H:%M");
+    format!("{COMPACTION_PREFIX} (compacted at {now})\n\n{summary}")
+}
 
 /// Returns true if a JSON message value represents a compaction summary (internal only).
 /// Used by both the REST API (server/mod.rs) and WebSocket chat handler to filter
@@ -177,14 +196,32 @@ impl AgentRuntime {
             let msgs = self.sessions.get(session_key).cloned().unwrap_or_default();
 
             // Head: protect first user + first assistant (2 messages).
-            // If first message is a compaction summary from a previous round,
-            // don't protect it (it will be updated via iterative summary).
+            //
+            // Iterative compaction note (relevant to rsclaw §2.4 splice's
+            // "head sanctuary" invariant):
+            //
+            // The session rebuild below uses `[head_msgs + summary +
+            // recent_msgs]` order, so after the first compact `msgs[0]`
+            // is STILL the original first user message — NOT the summary.
+            // Subsequent compacts therefore find the same head boundary
+            // (head_end = 2) and `keep_head_messages = 2` is stable
+            // across N compactions, preserving the server-side KV pages
+            // that hold the original `[Session started: ...]` marker.
+            //
+            // The `first_is_summary` branch below intentionally
+            // surrenders head sanctuary in the rare case where the
+            // session starts with a compaction summary as `msgs[0]` —
+            // i.e. AFTER a `/clear` (which sets sess to a single summary
+            // msg) when the conversation has since grown back over
+            // threshold. In that case the original session head is
+            // already lost (/clear discarded it) and `keep_head_messages
+            // = 0` is the honest wire value.
             let head_end = {
                 let first_is_summary = msgs.first()
                     .and_then(|m| if let MessageContent::Text(t) = &m.content { Some(t.starts_with("[CONTEXT COMPACTION")) } else { None })
                     .unwrap_or(false);
                 if first_is_summary {
-                    0 // don't protect old summary as head
+                    0 // post-/clear path — head sanctuary already lost
                 } else {
                     // Protect first user + first assistant pair
                     let mut count = 0usize;
@@ -271,21 +308,74 @@ impl AgentRuntime {
             })
         };
 
-        // Summarise the old portion.
-        // KV cache mode: append summary instruction to existing session messages
-        // so the LLM reuses the already-cached prefix. Only the summary prompt
-        // itself needs to be computed. Falls back to standalone mode on failure.
-        let summary = if kv_cache_mode >= 1 && mode != CompactionMode::Safeguard {
-            let result = self.compact_with_kv_cache(
-                session_key,
-                compaction_model,
-                &old_text,
-                previous_summary.as_deref(),
-            ).await;
+        // Summarise the old portion. Three mutually-exclusive paths
+        // keyed off the agent's `kv_cache_mode`:
+        //
+        //   mode = 2  →  rsclaw stateful incremental protocol. The
+        //                summary request rides the SAME `/sessions/<id>/turn`
+        //                as a normal turn — worker has prefix+history
+        //                cached, delta is just the "summarize" instruction
+        //                (~200 tokens). On failure we DO NOT fall back to
+        //                `compact_single`: that path sends mode=0 with the
+        //                full history as a fresh user message, which the
+        //                rsclaw provider rejects up-front (so the fallback
+        //                is also useless) AND if it somehow reached the
+        //                worker, would force a 150-270s cold prefill of
+        //                the entire 30-50k-token history — wedging a slot
+        //                the whole time, at exactly the moment the worker
+        //                is already stressed. Skip this round, retry next
+        //                turn. Also ignore `CompactionMode::Safeguard`:
+        //                its chunked-replay design fights the incremental
+        //                session model.
+        //
+        //   mode = 1  →  legacy slot-cache. Worker keeps the prefix in
+        //                its slot; the compact-with-kv-cache fast path
+        //                appends a summary message and lets the slot
+        //                cache amortize the prefix. On failure, falling
+        //                back to `compact_single` is safe: same provider,
+        //                same prefix bytes, slot still re-uses the cache.
+        //                No worker-side protocol mismatch.
+        //
+        //   mode = 0 / Safeguard
+        //             →  no KV cache assumption — always standalone
+        //                `compact_single` (or chunked variant). Same as
+        //                pre-incremental behavior.
+        let summary = if kv_cache_mode == 2 {
+            match self
+                .compact_with_kv_cache(
+                    session_key,
+                    compaction_model,
+                    &old_text,
+                    previous_summary.as_deref(),
+                )
+                .await
+            {
+                Some(s) => Some(s),
+                None => {
+                    warn!(
+                        session = session_key,
+                        "rsclaw KV-cache compaction failed; skipping this round (no fallback \
+                         to standalone — would force a 150-270s worker re-prefill of the \
+                         entire history). Next turn will retry. Investigate the \
+                         kv_cache_mode=2 turn in the rsclaw provider log."
+                    );
+                    None
+                }
+            }
+        } else if kv_cache_mode == 1 && mode != CompactionMode::Safeguard {
+            let result = self
+                .compact_with_kv_cache(
+                    session_key,
+                    compaction_model,
+                    &old_text,
+                    previous_summary.as_deref(),
+                )
+                .await;
             if result.is_some() {
                 result
             } else {
-                // Fallback to standalone summarization
+                // Legacy slot-cache fallback is harmless: same provider,
+                // same prefix bytes, worker slot still amortizes.
                 info!(session = session_key, "KV cache compact failed, falling back to standalone");
                 self.compact_single(compaction_model, &old_text, previous_summary.as_deref()).await
             }
@@ -382,6 +472,79 @@ impl AgentRuntime {
             }
         }
 
+        // Build the single summary message text used in BOTH the local
+        // session rebuild AND the rsclaw splice wire call. Same bytes
+        // both places — guarantees the gateway's local view matches
+        // whatever the server prefills into the spliced KV slot.
+        let summary_body = build_compaction_summary_msg(&summary);
+
+        // -- rsclaw splice (protocol §2.4) ------------------------------
+        // Only attempt when running under kv_cache_mode=2 + a registered
+        // rsclaw provider. The trait's default `compact_splice` returns
+        // Err for non-rsclaw providers, so we could call unconditionally,
+        // but the provider lookup keeps the log noise (and the wire-call
+        // attempt) off non-rsclaw paths entirely.
+        //
+        // On success: server has spliced KV in place; session_id is
+        // preserved; provider has updated its cached SessionEntry's
+        // last_seen_msgs_len to the post-splice value, so the next
+        // turn's `lookup_and_bump` will NOT misinterpret the upcoming
+        // local msgs.len() drop as a history-trim signal.
+        //
+        // On failure: log + fall through. The lazy fallback is the
+        // existing replay path — after we rewrite self.sessions[key]
+        // below, the next turn's `lookup_and_bump` sees msgs.len() <
+        // last_seen_msgs_len (unchanged from pre-splice) and returns
+        // None, forcing a /sessions/replay against the new history.
+        // No need for an active replay() call here — compaction has no
+        // LlmRequest to construct one from anyway, and the natural
+        // replay path is already battle-tested.
+        if kv_cache_mode == 2 {
+            let (resolved_provider, _) = self.providers.resolve_model(model);
+            if let Ok(provider) = self.providers.get(resolved_provider) {
+                let head_count = head_msgs.len();
+                let tail_count = recent_msgs.len();
+                // Honest Option: when there's no cached session locally
+                // we send None instead of misleading Some(0) — the
+                // server would 409 against 0 and the log would
+                // erroneously claim "drift" instead of "we didn't have
+                // a baseline". Server treats `None` as "skip the
+                // optimistic check".
+                let expected: Option<usize> = self
+                    .sessions
+                    .get(session_key)
+                    .map(|m| m.len());
+                match provider
+                    .compact_splice(
+                        session_key,
+                        head_count,
+                        &summary_body,
+                        tail_count,
+                        expected,
+                    )
+                    .await
+                {
+                    Ok(new_msgs_count) => {
+                        info!(
+                            session = session_key,
+                            head = head_count,
+                            tail = tail_count,
+                            msgs_after = new_msgs_count,
+                            "rsclaw compact: spliced in place, session_id preserved"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            session = session_key,
+                            error = %e,
+                            "rsclaw compact: splice failed, next turn will replay against \
+                             the post-compact history"
+                        );
+                    }
+                }
+            }
+        }
+
         // Replace session history: head + summary + tail.
         // Head: first user-assistant pair (contains [Session started:...])
         // Summary: wrapped with compaction prefix
@@ -389,9 +552,7 @@ impl AgentRuntime {
         if let Some(sess) = self.sessions.get_mut(session_key) {
             let summary_msg = Message {
                 role: Role::User,
-                content: MessageContent::Text(format!(
-                    "{COMPACTION_PREFIX}\n\n{summary}"
-                )),
+                content: MessageContent::Text(summary_body),
             };
             sess.clear();
             // Head: preserved verbatim (first user + first assistant).
@@ -419,9 +580,9 @@ impl AgentRuntime {
             }
         }
 
-        // Invalidate plugins/skills cache so they are rebuilt (sorted) on
-        // the next turn, merging any trailing additions into [1]/[2].
-        self.invalidate_plugins_skills_cache();
+        // Note: plugins/skills no longer cached at runtime level — they
+        // are rebuilt every turn inside `build_user_system`, so no
+        // explicit invalidation is needed here.
 
         let new_tokens: usize = self
             .sessions
@@ -437,13 +598,13 @@ impl AgentRuntime {
         );
 
         // If compaction barely helped (still >80% of threshold), inject a
-        // system hint so the agent will relay the /reset suggestion to the user.
+        // system hint so the agent will relay the /new suggestion to the user.
         if new_tokens > token_threshold * 4 / 5 {
             let zh = crate::i18n::default_lang() == "zh";
             let hint = if zh {
-                "[system] 上下文压缩后仍然较大，响应可能变慢。请告知用户发送 /reset 重置会话以恢复正常速度。"
+                "[system] 上下文压缩后仍然较大，响应可能变慢。请告知用户发送 /new 开启新会话以恢复正常速度。"
             } else {
-                "[system] Context is still large after compaction and responses may slow down. Please tell the user to send /reset to start a fresh session."
+                "[system] Context is still large after compaction and responses may slow down. Please tell the user to send /new to start a fresh session."
             };
             if let Some(sess) = self.sessions.get_mut(session_key) {
                 sess.push(Message {
@@ -455,7 +616,7 @@ impl AgentRuntime {
                 session = session_key,
                 tokens_after = new_tokens,
                 threshold = token_threshold,
-                "compaction insufficient, /reset recommended"
+                "compaction insufficient, /new recommended"
             );
         }
 
@@ -665,6 +826,30 @@ impl AgentRuntime {
         // If the LLM still tries, we ignore the tool call in the stream handler.
         let tools = self.cached_tools.clone();
 
+        // Pick the right transport based on the model's resolved provider.
+        //
+        // For rsclaw kvCacheMode=2: the worker already has the entire
+        // `messages` history cached in its KV slot (we're literally
+        // continuing the agent's main session). Sending the request as
+        // a normal stateful turn means the worker only decodes the
+        // newly-appended summary instruction (~200-300 tokens) and
+        // streams back the summary. The legacy mode=0 path with
+        // `session_key: None` looked like a fresh standalone request
+        // to the provider — it would either be rejected (rsclaw
+        // requires mode=2) or re-decode all 30-40k tokens from
+        // scratch, taking tens of seconds.
+        //
+        // For non-rsclaw providers (anthropic, openai, ollama, ...):
+        // mode=0 is the legacy slot-cache-aware path that those
+        // providers already understand. Keep that behavior so the
+        // change is rsclaw-only and doesn't disturb other backends.
+        let (resolved_provider, _) = self.providers.resolve_model(model);
+        let (kv_cache_mode, session_key_opt) = if resolved_provider == "rsclaw" {
+            (2, Some(session_key.to_owned()))
+        } else {
+            (0, None)
+        };
+
         let req = LlmRequest {
             model: model.to_owned(),
             messages,
@@ -673,7 +858,12 @@ impl AgentRuntime {
             max_tokens: Some(4096),
             temperature: None,
             frequency_penalty: None,
-            thinking_budget: None, kv_cache_mode: 0, session_key: None,
+            thinking_budget: None,
+            endpoint: Default::default(),
+            kv_cache_mode,
+            session_key: session_key_opt,
+            system_shared: None,
+            user_system: None,
         };
 
         let providers = Arc::clone(&self.providers);
@@ -787,7 +977,8 @@ impl AgentRuntime {
             max_tokens: Some(4096),
             temperature: None,
             frequency_penalty: None,
-            thinking_budget: None, kv_cache_mode: 0, session_key: None,
+            thinking_budget: None, endpoint: AgentEndpoint::Flash, kv_cache_mode: 0, session_key: None,
+            system_shared: None, user_system: None,
         };
 
         let providers = Arc::clone(&self.providers);
@@ -854,7 +1045,8 @@ impl AgentRuntime {
             max_tokens: Some(1024),
             temperature: None,
             frequency_penalty: None,
-            thinking_budget: None, kv_cache_mode: 0, session_key: None,
+            thinking_budget: None, endpoint: AgentEndpoint::Flash, kv_cache_mode: 0, session_key: None,
+            system_shared: None, user_system: None,
         };
 
         let providers = Arc::clone(&self.providers);

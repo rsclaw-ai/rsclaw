@@ -574,6 +574,91 @@ fn get_version() -> Result<String, String> {
     run_rsclaw_command(&["--version"])
 }
 
+/// HTML payload for the full-screen glow overlay. Inline so we don't
+/// need a separate static file or Next.js route — the overlay is a
+/// trivial CSS-animation page that doesn't share anything with the
+/// main UI bundle.
+const GLOW_OVERLAY_HTML: &str = r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>RsClaw Activity</title><style>
+html,body{margin:0;padding:0;width:100vw;height:100vh;background:transparent;overflow:hidden;pointer-events:none;-webkit-user-select:none;user-select:none}
+.glow{position:fixed;inset:0;pointer-events:none;background:radial-gradient(ellipse at center, transparent 55%, rgba(255,165,0,0) 65%, rgba(255,140,0,0.18) 80%, rgba(255,100,0,0.42) 100%);box-shadow:inset 0 0 200px 60px rgba(255,140,0,0.5),inset 0 0 80px 25px rgba(255,165,0,0.7);animation:pulse 2.4s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:0.65}50%{opacity:1}}
+</style></head><body><div class="glow"></div></body></html>"#;
+
+/// Open a borderless transparent click-through window covering the
+/// primary monitor with a pulsing orange glow on the edges. Used by
+/// the `computer_use` overlay so the user gets a screen-wide visual
+/// signal that an agent is driving the desktop, not just a glow on
+/// the (now-shrunken) main window. Idempotent: re-invoking when the
+/// window already exists is a no-op.
+#[tauri::command]
+async fn open_glow_overlay(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::{LogicalPosition, LogicalSize, WebviewUrl, WebviewWindowBuilder};
+
+    if app.get_webview_window("computer-use-glow").is_some() {
+        return Ok(());
+    }
+
+    let monitor = app
+        .primary_monitor()
+        .map_err(|e| format!("primary_monitor: {e}"))?
+        .ok_or_else(|| "no primary monitor".to_string())?;
+    let scale = monitor.scale_factor();
+    let size = monitor.size();
+    let pos = monitor.position();
+    let logical_w = size.width as f64 / scale;
+    let logical_h = size.height as f64 / scale;
+    let logical_x = pos.x as f64 / scale;
+    let logical_y = pos.y as f64 / scale;
+
+    use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+    let encoded = utf8_percent_encode(GLOW_OVERLAY_HTML, NON_ALPHANUMERIC).to_string();
+    let html_url = format!("data:text/html;charset=utf-8,{encoded}");
+    let parsed_url: url::Url = html_url
+        .parse()
+        .map_err(|e: url::ParseError| format!("parse data url: {e}"))?;
+    let webview_url = WebviewUrl::External(parsed_url);
+
+    let window = WebviewWindowBuilder::new(&app, "computer-use-glow", webview_url)
+        .title("RsClaw Activity Overlay")
+        .decorations(false)
+        .transparent(true)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .resizable(false)
+        .focused(false)
+        .visible(false) // shown after geometry is set so the user doesn't see a flicker
+        .inner_size(logical_w, logical_h)
+        .position(logical_x, logical_y)
+        .build()
+        .map_err(|e| format!("build glow window: {e}"))?;
+
+    // Ignore cursor events so the overlay is fully click-through.
+    window
+        .set_ignore_cursor_events(true)
+        .map_err(|e| format!("set_ignore_cursor_events: {e}"))?;
+    // Resize/reposition once visible to be sure the geometry stuck.
+    window
+        .set_size(LogicalSize::new(logical_w, logical_h))
+        .map_err(|e| format!("set_size: {e}"))?;
+    window
+        .set_position(LogicalPosition::new(logical_x, logical_y))
+        .map_err(|e| format!("set_position: {e}"))?;
+    window.show().map_err(|e| format!("show: {e}"))?;
+    Ok(())
+}
+
+/// Close the full-screen glow overlay window if open. No-op when the
+/// window doesn't exist.
+#[tauri::command]
+async fn close_glow_overlay(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("computer-use-glow") {
+        window
+            .close()
+            .map_err(|e| format!("close glow window: {e}"))?;
+    }
+    Ok(())
+}
+
 /// Scan OpenClaw data and return summary (agents, sessions, jsonl files).
 #[tauri::command]
 fn scan_openclaw(path: String) -> Result<serde_json::Value, String> {
@@ -757,27 +842,64 @@ fn channel_login_qr() -> Result<Option<String>, String> {
     Ok(Some(format!("data:image/png;base64,{}", b64)))
 }
 
-/// Write cron jobs to ~/.rsclaw/cron.json5
+/// Save cron jobs by calling the gateway's bulk_replace HTTP API.
+///
+/// **F2 — Tauri must NOT write `cron.json5` directly anymore.** The
+/// gateway is the sole writer; cron storage lives in redb and the
+/// file is just a best-effort export. Going through the API makes
+/// every UI mutation atomic with respect to the cron runner and the
+/// ws cron.* methods, eliminating the 3-writer race that caused
+/// "I disabled it but it keeps firing".
+///
+/// Falls back to the legacy direct-file path **only** when the
+/// gateway is offline (loopback connect refused). In that case we
+/// still write the file so the UI works in "cold edit" mode; the
+/// next gateway boot reconciles the file → redb anyway.
 #[tauri::command]
 fn save_cron_jobs(content: String) -> Result<(), String> {
-    let path = rsclaw_base_dir().join("cron.json5");
-    std::fs::write(&path, &content).map_err(|e| e.to_string())?;
-
-    // Notify running gateway to reload cron jobs (non-blocking, no deps).
     let port = get_gateway_port_number();
-    std::thread::spawn(move || {
-        use std::io::Write;
-        if let Ok(mut stream) = std::net::TcpStream::connect_timeout(
-            &format!("127.0.0.1:{port}").parse().unwrap(),
-            std::time::Duration::from_secs(3),
-        ) {
-            let _ = stream.write_all(
-                b"POST /api/v1/cron/reload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n",
-            );
-        }
-    });
+    let body = content.clone();
+    let body_len = body.len();
+    let request = format!(
+        "PUT /api/v1/cron/bulk_replace HTTP/1.1\r\n\
+         Host: 127.0.0.1\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {body_len}\r\n\
+         Connection: close\r\n\r\n{body}"
+    );
 
-    Ok(())
+    use std::io::{Read, Write};
+    let addr = format!("127.0.0.1:{port}").parse::<std::net::SocketAddr>()
+        .map_err(|e| format!("invalid addr: {e}"))?;
+    match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3)) {
+        Ok(mut stream) => {
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+            stream.write_all(request.as_bytes())
+                .map_err(|e| format!("send failed: {e}"))?;
+            let mut resp = Vec::with_capacity(512);
+            let _ = stream.read_to_end(&mut resp);
+            // Parse the HTTP status line to surface backend errors.
+            let resp_str = String::from_utf8_lossy(&resp);
+            if let Some(first_line) = resp_str.lines().next() {
+                if !first_line.contains(" 200 ") {
+                    // 4xx/5xx: extract the JSON body for a friendlier
+                    // toast in the UI. Body is after the empty line.
+                    let body_start = resp_str.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+                    let body = &resp_str[body_start..];
+                    return Err(format!("gateway rejected: {}", body.trim()));
+                }
+            }
+            Ok(())
+        }
+        Err(_) => {
+            // Gateway is offline — write the file directly so the user
+            // can still tweak jobs in cold mode. Next gateway boot
+            // imports via reconcile_file_to_redb_on_boot.
+            let path = rsclaw_base_dir().join("cron.json5");
+            std::fs::write(&path, &content).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+    }
 }
 
 /// Get gateway port number (default 18888)
@@ -816,15 +938,48 @@ fn http_shutdown_gateway() -> Result<(), String> {
     Ok(())
 }
 
-/// Read cron jobs from ~/.rsclaw/cron.json5
+/// Read cron jobs by calling the gateway's HTTP API (authoritative
+/// redb source). Falls back to reading `cron.json5` when the gateway
+/// is offline so the UI still shows something in cold-edit mode.
 #[tauri::command]
 fn get_cron_jobs() -> Result<serde_json::Value, String> {
+    let port = get_gateway_port_number();
+    let request = format!(
+        "GET /api/v1/cron HTTP/1.1\r\n\
+         Host: 127.0.0.1\r\n\
+         Connection: close\r\n\r\n"
+    );
+
+    use std::io::{Read, Write};
+    if let Ok(addr) = format!("127.0.0.1:{port}").parse::<std::net::SocketAddr>() {
+        if let Ok(mut stream) =
+            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2))
+        {
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+            if stream.write_all(request.as_bytes()).is_ok() {
+                let mut resp = Vec::with_capacity(8192);
+                let _ = stream.read_to_end(&mut resp);
+                let resp_str = String::from_utf8_lossy(&resp);
+                if resp_str.lines().next().map_or(false, |l| l.contains(" 200 ")) {
+                    if let Some(body_start) = resp_str.find("\r\n\r\n") {
+                        let body = &resp_str[body_start + 4..];
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
+                            return Ok(val);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Gateway unreachable — fall back to file (cold-edit mode).
     let path = rsclaw_base_dir().join("cron.json5");
     if !path.exists() {
         return Ok(serde_json::json!({ "jobs": [] }));
     }
     let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let val: serde_json::Value = json5::from_str(&raw).unwrap_or(serde_json::json!({ "jobs": [] }));
+    let val: serde_json::Value =
+        json5::from_str(&raw).unwrap_or(serde_json::json!({ "jobs": [] }));
     Ok(val)
 }
 
@@ -1387,6 +1542,8 @@ fn main() {
             open_path,
             save_attach_image,
             read_file_as_data_url,
+            open_glow_overlay,
+            close_glow_overlay,
         ])
         .setup(|app| {
             // Seed the bundled BGE embedding model into the standard rsclaw

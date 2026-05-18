@@ -37,6 +37,9 @@ pub async fn dispatch(ctx: MethodCtx) -> MethodResult {
         "chat.history" => methods::chat::chat_history(ctx).await,
         "chat.abort" => methods::chat::chat_abort(ctx).await,
         "chat.inject" => methods::chat::chat_inject(ctx).await,
+        "chat.permission_response" => {
+            methods::chat::chat_permission_response(ctx).await
+        }
 
         // agents
         "agents.list" => methods::agents::agents_list(ctx).await,
