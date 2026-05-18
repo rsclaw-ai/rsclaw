@@ -270,6 +270,12 @@ async fn spawn_streaming_task(
                 AgentEvent::Status { state, final_, .. } => {
                     let _ = persist_store.set_status(&persist_task_id, state);
                     if final_ {
+                        // Push config GC: terminal state means no more
+                        // webhooks will fire for this task — clear its
+                        // notification configs so they don't linger in
+                        // the store. (No-op if there were no configs.)
+                        let _ = persist_store
+                            .delete_push_configs_for_task(&persist_task_id);
                         break;
                     }
                 }

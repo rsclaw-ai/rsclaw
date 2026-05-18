@@ -191,4 +191,44 @@ impl TaskStore {
         txn.commit()?;
         Ok(removed)
     }
+
+    /// Delete every push notification config belonging to a task — called
+    /// when the task reaches a terminal state (Completed / Failed /
+    /// Canceled) so configs don't linger forever after delivery is done.
+    /// Returns the number of configs removed.
+    pub fn delete_push_configs_for_task(&self, task_id: &str) -> Result<usize> {
+        let prefix = format!("{task_id}:");
+        // Collect keys to delete in a read txn, then delete them in a
+        // write txn. redb doesn't allow holding a read iter while writing.
+        let keys: Vec<String> = {
+            let txn = self.db.begin_read()?;
+            let tbl = txn.open_table(PUSH_CONFIGS)?;
+            let mut out = Vec::new();
+            for entry in tbl.range(prefix.as_str()..)? {
+                let (k, _) = entry?;
+                let s = k.value();
+                if !s.starts_with(&prefix) {
+                    break;
+                }
+                out.push(s.to_owned());
+            }
+            out
+        };
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let txn = self.db.begin_write()?;
+        let n = {
+            let mut tbl = txn.open_table(PUSH_CONFIGS)?;
+            let mut count = 0;
+            for k in &keys {
+                if tbl.remove(k.as_str())?.is_some() {
+                    count += 1;
+                }
+            }
+            count
+        };
+        txn.commit()?;
+        Ok(n)
+    }
 }

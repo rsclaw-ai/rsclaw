@@ -242,10 +242,49 @@ async fn handle_send_message(
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    // Resume path: if the client is sending follow-up input to a paused task,
-    // route it to the suspended runtime and return the task's current state.
+    // Resume path: client is sending follow-up input to a paused task.
+    // Route the new text to the suspended runtime, then wait on the bus
+    // for the resumed turn to reach a terminal state (or re-suspend with
+    // another InputRequired). Without this wait, sync clients that don't
+    // open SSE never see the resumed turn's outcome.
     if let Some((_, suspended)) = state.suspended_tasks.remove(&task_id) {
+        // Subscribe BEFORE firing the resume so we don't race past the
+        // first events the bridged runtime emits.
+        let mut bus_rx = state.task_event_bus.subscribe(&task_id);
         let _ = suspended.resume_tx.send(text);
+
+        let timeout_secs: u64 = std::env::var("RSCLAW_A2A_RESUME_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &u64| n > 0)
+            .unwrap_or(600);
+
+        let wait = async {
+            loop {
+                match bus_rx.recv().await {
+                    Ok(crate::a2a::event::AgentEvent::Status { state: s, final_: true, .. }) => {
+                        return Some(s);
+                    }
+                    Ok(crate::a2a::event::AgentEvent::InputRequired { .. }) => {
+                        // Re-suspended — return the new pause state so the
+                        // client knows to send another resume.
+                        return Some(TaskState::InputRequired);
+                    }
+                    Ok(crate::a2a::event::AgentEvent::AuthRequired { .. }) => {
+                        return Some(TaskState::AuthRequired);
+                    }
+                    Ok(_) => continue, // intermediate Working / Artifact
+                    Err(_) => return None, // bus closed
+                }
+            }
+        };
+
+        let _final_state =
+            tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), wait).await;
+
+        // Always return the latest persisted snapshot — whether the wait
+        // resolved with a terminal state or timed out, the store is the
+        // source of truth at this point.
         let task = state
             .task_store
             .get(&task_id)
@@ -438,6 +477,7 @@ async fn handle_send_message(
                 let _ = state.task_store.attach_outcome_metadata(&task_id, outcome);
             }
             let _ = state.task_store.set_status(&task_id, TaskState::Completed);
+            let _ = state.task_store.delete_push_configs_for_task(&task_id);
             state.task_cancels.remove(&task_id);
 
             state.task_event_bus.publish(crate::a2a::event::AgentEvent::Artifact {
@@ -472,6 +512,7 @@ async fn handle_send_message(
                 let _ = state.task_store.attach_outcome_metadata(&task_id, outcome);
             }
             let _ = state.task_store.set_status(&task_id, TaskState::Failed);
+            let _ = state.task_store.delete_push_configs_for_task(&task_id);
             state.task_cancels.remove(&task_id);
             state.task_event_bus.publish(crate::a2a::event::AgentEvent::Status {
                 task_id: task_id.clone(),
@@ -619,6 +660,7 @@ async fn handle_cancel_task(
         Some((_, token)) => {
             token.cancel();
             let _ = state.task_store.set_status(&params.id, TaskState::Canceled);
+            let _ = state.task_store.delete_push_configs_for_task(&params.id);
             // Publish a terminal Canceled status so any SSE subscriber sees it.
             let ctx = state
                 .task_store
@@ -887,6 +929,7 @@ pub(crate) fn spawn_input_request_listener(
                     let _ = state_t
                         .task_store
                         .set_status(&task_id_t, TaskState::Failed);
+                    let _ = state_t.task_store.delete_push_configs_for_task(&task_id_t);
                     state_t.task_cancels.remove(&task_id_t);
                     state_t.task_event_bus.publish(
                         crate::a2a::event::AgentEvent::Status {
@@ -942,6 +985,7 @@ async fn resolve_agent_workspace(
 /// + broadcast channel don't leak.
 fn finalize_failed_task(state: &AppState, task_id: &str, context_id: &str) {
     let _ = state.task_store.set_status(task_id, TaskState::Failed);
+    let _ = state.task_store.delete_push_configs_for_task(task_id);
     state.task_cancels.remove(task_id);
     state
         .task_event_bus
