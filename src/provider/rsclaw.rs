@@ -2496,94 +2496,6 @@ struct PendingToolUse {
     partial_json: String,
 }
 
-/// Parse one OpenAI Chat Completions stream chunk and append events to
-/// `events`. Used on the rsclaw-server WS turn lane where the worker
-/// emits `{choices:[{delta:{content,reasoning_content,tool_calls},
-/// finish_reason}]}` and rsclaw-server passes it through verbatim
-/// wrapped in `data: ...`. Tool-call arguments arrive as deltas keyed
-/// by `tool_calls[].index` (same accumulation pattern as Anthropic's
-/// `input_json_delta`), so we reuse the same `PendingToolUse` map and
-/// flush on `finish_reason == "tool_calls"` (or defensively on `[DONE]`
-/// for impls that skip the finish_reason chunk).
-fn parse_openai_chunk_into(value: &Value, state: &mut SseState, events: &mut Vec<Result<StreamEvent>>) {
-    let Some(choice) = value
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|cs| cs.first())
-    else {
-        return;
-    };
-
-    if let Some(delta) = choice.get("delta") {
-        if let Some(s) = delta.get("content").and_then(Value::as_str)
-            && !s.is_empty()
-        {
-            events.push(Ok(StreamEvent::TextDelta(s.to_string())));
-        }
-        // DeepSeek-R1 / OpenAI-o-series reasoning lane. Field name is
-        // `reasoning_content` per the de-facto OAI-compat convention
-        // (not in OpenAI's official spec, but every reasoning model
-        // proxy uses this shape).
-        if let Some(s) = delta.get("reasoning_content").and_then(Value::as_str)
-            && !s.is_empty()
-        {
-            events.push(Ok(StreamEvent::ReasoningDelta(s.to_string())));
-        }
-        if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
-            for tc in tcs {
-                let index = tc.get("index").and_then(Value::as_u64).unwrap_or(0);
-                let entry = state.tools.entry(index).or_default();
-                if let Some(id) = tc.get("id").and_then(Value::as_str)
-                    && entry.id.is_empty()
-                {
-                    entry.id = id.to_string();
-                }
-                if let Some(func) = tc.get("function") {
-                    if let Some(name) = func.get("name").and_then(Value::as_str)
-                        && entry.name.is_empty()
-                    {
-                        entry.name = name.to_string();
-                    }
-                    if let Some(frag) = func.get("arguments").and_then(Value::as_str) {
-                        entry.partial_json.push_str(frag);
-                    }
-                }
-            }
-        }
-    }
-
-    // Final chunk for this choice — `finish_reason` is non-null. When
-    // the model used tools, flush them now (before [DONE] drops state).
-    // Other finish_reasons (stop, length, content_filter) need nothing
-    // here; the stream-level Done comes from [DONE].
-    if choice
-        .get("finish_reason")
-        .and_then(Value::as_str)
-        .is_some_and(|fr| fr == "tool_calls")
-    {
-        drain_pending_tool_calls(state, events);
-    }
-}
-
-/// Drain every accumulated `PendingToolUse` into a `StreamEvent::ToolCall`.
-/// Empty `partial_json` collapses to `{}` — matches the Anthropic-side
-/// `content_block_stop` policy a few branches below.
-fn drain_pending_tool_calls(state: &mut SseState, events: &mut Vec<Result<StreamEvent>>) {
-    let pending: Vec<PendingToolUse> = state.tools.drain().map(|(_, v)| v).collect();
-    for p in pending {
-        let input: Value = if p.partial_json.is_empty() {
-            Value::Object(Default::default())
-        } else {
-            serde_json::from_str(&p.partial_json).unwrap_or(Value::Object(Default::default()))
-        };
-        events.push(Ok(StreamEvent::ToolCall {
-            id: p.id,
-            name: p.name,
-            input,
-        }));
-    }
-}
-
 async fn parse_sse_chunk(
     chunk: Result<bytes::Bytes>,
     line_buffer: &Arc<tokio::sync::Mutex<String>>,
@@ -2655,21 +2567,12 @@ async fn parse_sse_chunk(
         let Some(payload) = line.strip_prefix("data:").map(|s| s.trim_start_matches(' ')) else {
             continue;
         };
-        // `data: [DONE]` is the terminator on the OAI-shape turn lane
-        // that rsclaw-server's WS-only fleet path emits (see
-        // rsclaw-server/src/backend/rsclaw_llm.rs — every worker `resp`
-        // gets wrapped + a `[DONE]` is appended at stream end). Anthropic
-        // shape uses `message_stop` and never sends `[DONE]`, so emitting
-        // Done here is safe in both modes — the Anthropic path already
-        // surfaced its terminal Done via `message_delta`, and the runtime
-        // tolerates a second Done as a no-op. Drain any pending tool
-        // calls first so accumulated `tool_calls[].function.arguments`
-        // partials get a final `ToolCall` emit before the stream closes
-        // (OpenAI streams send a finish_reason chunk THEN [DONE], but
-        // some impls skip finish_reason on success — defensive drain).
+        // No `data: [DONE]` sentinel on the native rsclaw protocol —
+        // spec §2.3.1 explicitly says message_stop is the terminator
+        // and only the `/v1/chat/completions` OAI translator emits
+        // [DONE]. Still defensive-skip if a misconfigured proxy injects
+        // one; pushing a parse error here would tank the turn.
         if payload == "[DONE]" {
-            drain_pending_tool_calls(&mut state, &mut events);
-            events.push(Ok(StreamEvent::Done { usage: None }));
             continue;
         }
         // Skip empty `data:` payloads silently. SSE keep-alives sometimes
@@ -2689,17 +2592,6 @@ async fn parse_sse_chunk(
                 continue;
             }
         };
-        // OpenAI Chat Completions chunk shape — the WS turn lane on
-        // rsclaw-server passes worker `resp` bodies through verbatim,
-        // and the worker emits OAI chunks. Detected via top-level
-        // `choices` array (Anthropic shape has no such field; it uses
-        // top-level `type` instead). Handle inline + `continue` so the
-        // `type`-keyed Anthropic match below doesn't also fire on the
-        // same payload.
-        if value.get("choices").is_some() {
-            parse_openai_chunk_into(&value, &mut state, &mut events);
-            continue;
-        }
         let kind = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
         match kind {
             // Block start: stash tool_use metadata so subsequent
@@ -3348,175 +3240,6 @@ mod tests {
             Some("x.rs"),
             "concatenated partial_json must parse cleanly; got {input:?}"
         );
-    }
-
-    // ---- OpenAI Chat Completions chunk shape (WS turn lane) ----
-
-    #[tokio::test]
-    async fn parse_sse_chunk_openai_text_delta_emits_text_event() {
-        // rsclaw-server's WS turn lane wraps worker chunks as OAI
-        // ChatCompletion deltas. Bare text content must surface as
-        // StreamEvent::TextDelta — earlier behavior dropped it because
-        // there's no top-level `type` field.
-        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
-        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let frame =
-            br#"data: {"choices":[{"delta":{"content":"Hello"}}]}
-"#;
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frame)), &buf, &rem).await;
-        let texts: Vec<String> = evs
-            .into_iter()
-            .filter_map(|e| match e {
-                Ok(StreamEvent::TextDelta(s)) => Some(s),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(texts, vec!["Hello".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn parse_sse_chunk_openai_reasoning_content_emits_reasoning_event() {
-        // DeepSeek-R1 / OAI-o-series stream reasoning via
-        // delta.reasoning_content (not in OpenAI's official spec but
-        // the de-facto convention for reasoning-capable models).
-        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
-        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let frame =
-            br#"data: {"choices":[{"delta":{"reasoning_content":"thinking..."}}]}
-"#;
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frame)), &buf, &rem).await;
-        let reasons: Vec<String> = evs
-            .into_iter()
-            .filter_map(|e| match e {
-                Ok(StreamEvent::ReasoningDelta(s)) => Some(s),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(reasons, vec!["thinking...".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn parse_sse_chunk_openai_done_emits_done_event() {
-        // [DONE] is the OAI-shape terminator — must surface as
-        // StreamEvent::Done so the runtime closes the turn instead of
-        // treating the stream as "successfully ended with no events"
-        // and reporting an empty model response.
-        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
-        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let frame = b"data: [DONE]\n";
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frame)), &buf, &rem).await;
-        assert!(
-            evs.iter()
-                .any(|e| matches!(e, Ok(StreamEvent::Done { usage: None }))),
-            "expected a Done event with no usage; got {evs:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn parse_sse_chunk_openai_full_stream_text_then_done() {
-        // End-to-end shape that rsclaw-server actually emits on the WS
-        // turn lane today: a few text deltas, then [DONE]. Must yield
-        // an in-order sequence of TextDeltas followed by a single Done.
-        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
-        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let state = Arc::new(tokio::sync::Mutex::new(SseState::default()));
-        let frames =
-            br#"data: {"choices":[{"delta":{"content":"Hel"}}]}
-data: {"choices":[{"delta":{"content":"lo"}}]}
-data: {"choices":[{"delta":{"content":" world"}}]}
-data: [DONE]
-"#;
-        let evs = parse_sse_chunk(
-            Ok(bytes::Bytes::copy_from_slice(frames)),
-            &buf,
-            &rem,
-            &state,
-        )
-        .await;
-        let labels: Vec<String> = evs
-            .iter()
-            .map(|e| match e {
-                Ok(StreamEvent::TextDelta(s)) => format!("text({s})"),
-                Ok(StreamEvent::Done { .. }) => "done".to_string(),
-                Ok(other) => format!("other({other:?})"),
-                Err(e) => format!("err({e})"),
-            })
-            .collect();
-        assert_eq!(
-            labels,
-            vec!["text(Hel)", "text(lo)", "text( world)", "done"]
-        );
-    }
-
-    #[tokio::test]
-    async fn parse_sse_chunk_openai_tool_call_accumulates_across_deltas() {
-        // OpenAI streams tool calls as `tool_calls[].function.arguments`
-        // partials keyed by `tool_calls[].index`, terminated by a chunk
-        // with `finish_reason: "tool_calls"`. Parser must accumulate the
-        // arguments fragments and emit one StreamEvent::ToolCall on the
-        // finish_reason chunk.
-        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
-        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let state = Arc::new(tokio::sync::Mutex::new(SseState::default()));
-        let frames = br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_42","function":{"name":"read_file","arguments":"{\"pat"}}]}}]}
-data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"h\":\"x.rs\"}"}}]}}]}
-data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
-"#;
-        let evs = parse_sse_chunk(
-            Ok(bytes::Bytes::copy_from_slice(frames)),
-            &buf,
-            &rem,
-            &state,
-        )
-        .await;
-        let calls: Vec<(String, String, Value)> = evs
-            .into_iter()
-            .filter_map(|e| match e {
-                Ok(StreamEvent::ToolCall { id, name, input }) => Some((id, name, input)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(calls.len(), 1, "expected one ToolCall, got {calls:?}");
-        let (id, name, input) = &calls[0];
-        assert_eq!(id, "call_42");
-        assert_eq!(name, "read_file");
-        assert_eq!(input.get("path").and_then(Value::as_str), Some("x.rs"));
-    }
-
-    #[tokio::test]
-    async fn parse_sse_chunk_openai_done_flushes_pending_tool_calls() {
-        // Some OAI-compat impls skip the finish_reason chunk and jump
-        // straight to [DONE] after streaming arguments. The [DONE]
-        // branch must defensively drain accumulated tool state so we
-        // don't lose the ToolCall.
-        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
-        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let state = Arc::new(tokio::sync::Mutex::new(SseState::default()));
-        let frames = br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"noop","arguments":"{}"}}]}}]}
-data: [DONE]
-"#;
-        let evs = parse_sse_chunk(
-            Ok(bytes::Bytes::copy_from_slice(frames)),
-            &buf,
-            &rem,
-            &state,
-        )
-        .await;
-        let mut saw_call = false;
-        let mut saw_done = false;
-        for e in &evs {
-            match e {
-                Ok(StreamEvent::ToolCall { id, name, .. }) => {
-                    assert_eq!(id, "c1");
-                    assert_eq!(name, "noop");
-                    saw_call = true;
-                }
-                Ok(StreamEvent::Done { .. }) => saw_done = true,
-                _ => {}
-            }
-        }
-        assert!(saw_call, "expected ToolCall flushed by [DONE]; got {evs:?}");
-        assert!(saw_done, "expected Done after [DONE]; got {evs:?}");
     }
 
     #[tokio::test]
