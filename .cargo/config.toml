@@ -1,3 +1,12 @@
+[alias]
+# Developer-local release — thin LTO + 16 codegen units. Builds much faster
+# than `--release` at a small runtime cost. Use for local dogfooding.
+brd = "build --profile release-dev"
+rrd = "run --profile release-dev --"
+
+# CI-grade release — catches release-only issues without fat LTO.
+brc = "build --profile ci"
+
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
 
