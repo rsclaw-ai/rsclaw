@@ -2,16 +2,28 @@
 //!
 //! Design: `docs/specs/2026-05-19-knowledge-base.md`
 //! ADR:    `docs/adr/0001-knowledge-base.md`
-//! Week 1 plan: `docs/plans/2026-05-19-kb-mvp-week1-foundation.md`
+//! Week plans: `docs/plans/2026-05-19-kb-mvp-week{1..4}-*.md`
+//! README:  `src/kb/README.md` (invariants 1–28)
 //!
 //! Layout:
 //!   model/         — KbDoc, KbChunk, KbEntity, LogicalSourceId, KbVisibility, …
-//!   content_store/ — atomic md/<kind>/<slug>--<lsid8>.md writer + readers
-//!   store/         — redb schema (13 tables) + accessors (Week 2+)
+//!   content_store/ — atomic md/<kind>/<slug>--<lsid8>--<md8>.md writer + readers
+//!   store/         — redb schema (13 tables) + per-table accessors
 //!   canonicalize/  — text/md/html/pdf → Markdown; url string canonicalization
 //!   chunker/       — markdown → KbChunk[] with deterministic chunk_id
-//!   ledger/        — IngestLedger + Outbox types (accessors Week 2+)
-//!   jobs/          — Job queue types (accessors Week 2+)
+//!   ledger/        — IngestLedger + Outbox types
+//!   jobs/          — Job queue types (state machine + fencing tokens)
+//!   embedder/      — KbEmbedder trait + StubEmbedder (BGE-M3 deferred)
+//!   pipeline/      — ingest_canonicalized: single-tx atomic ingest
+//!   worker/        — WorkerPool drains ChunkAndEmbed jobs (tokio)
+//!   index/         — HnswCache + TantivyIndex composite (CJK tokenizer,
+//!                    snapshot persistence)
+//!   search/        — filter + RRF + MMR + pipeline (visibility-safe)
+//!   tools/         — kb_search / kb_fetch / kb_list_docs / kb_similar /
+//!                    kb_search_entities (JSON-shaped MCP wrappers)
+//!   entities/      — regex entity extractor (URLs/emails/hashtags/mentions)
+//!   sync/          — KbSourceSyncer trait + ManualUpload + UrlSyncer
+//!   compactor/     — orphan file scan + ledger state advancement
 //!   util/          — redact() for PII-safe logging
 //!   paths.rs       — KbPaths resolves ~/.rsclaw/kb/{md,raw,db,idx,hnsw,state}/
 
