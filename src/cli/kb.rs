@@ -20,9 +20,14 @@ pub enum KbCommand {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
-    /// Remove a document by id (tombstone).
+    /// Remove a document by id, or all docs matching a tag.
     Rm {
-        doc_id: String,
+        /// Doc id to tombstone. Omit when using --tag.
+        doc_id: Option<String>,
+        /// Tombstone every Active doc with this tag (bulk delete).
+        #[arg(long)]
+        tag: Option<String>,
+        /// Skip the confirmation guard (required for tombstone).
         #[arg(long)]
         yes: bool,
     },

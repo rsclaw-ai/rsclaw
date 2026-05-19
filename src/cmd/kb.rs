@@ -17,7 +17,7 @@ pub async fn cmd_kb(cmd: KbCommand, kb_root: PathBuf) -> Result<()> {
     match cmd {
         KbCommand::Add { path_or_url, tags } => add(kb_root, path_or_url, tags).await,
         KbCommand::Ls { tag, source_kind, limit } => ls(kb_root, tag, source_kind, limit),
-        KbCommand::Rm { doc_id, yes } => rm(kb_root, doc_id, yes),
+        KbCommand::Rm { doc_id, tag, yes } => rm(kb_root, doc_id, tag, yes),
         KbCommand::Search { query, k } => search(kb_root, query, k),
         KbCommand::Show { id } => show(kb_root, id),
         KbCommand::Visibility { doc_id, visibility } => set_visibility(kb_root, doc_id, visibility),
@@ -137,12 +137,28 @@ fn ls(
     Ok(())
 }
 
-fn rm(kb_root: PathBuf, doc_id: String, yes: bool) -> Result<()> {
+fn rm(
+    kb_root: PathBuf,
+    doc_id: Option<String>,
+    tag: Option<String>,
+    yes: bool,
+) -> Result<()> {
     let h = open_kb(&kb_root)?;
     if !yes {
         eprintln!("Refusing to tombstone without --yes (this is a destructive operation).");
         return Ok(());
     }
+    match (doc_id, tag) {
+        (Some(id), None) => rm_by_id(&h, id),
+        (None, Some(tag)) => rm_by_tag(&h, &tag),
+        (Some(_), Some(_)) => {
+            anyhow::bail!("pass either doc_id or --tag, not both")
+        }
+        (None, None) => anyhow::bail!("pass either a doc_id or --tag <name>"),
+    }
+}
+
+fn rm_by_id(h: &Handles, doc_id: String) -> Result<()> {
     let rtx = h.store.begin_read()?;
     let mut d = docs::get(&rtx, &doc_id)?
         .ok_or_else(|| anyhow::anyhow!("doc not found: {doc_id}"))?;
@@ -152,6 +168,36 @@ fn rm(kb_root: PathBuf, doc_id: String, yes: bool) -> Result<()> {
     docs::put(&wtx, &d)?;
     wtx.commit()?;
     println!("tombstoned {doc_id}");
+    Ok(())
+}
+
+fn rm_by_tag(h: &Handles, tag: &str) -> Result<()> {
+    use crate::kb::store::codec::decode;
+    use redb::ReadableTable;
+    let rtx = h.store.begin_read()?;
+    let mut to_tombstone: Vec<crate::kb::model::KbDoc> = Vec::new();
+    {
+        let tbl = rtx.open_table(crate::kb::store::schema::KB_DOCS)?;
+        for entry in tbl.iter()? {
+            let (_, v) = entry?;
+            let d: crate::kb::model::KbDoc = decode(v.value())?;
+            if d.status == KbStatus::Active && d.tags.iter().any(|t| t == tag) {
+                to_tombstone.push(d);
+            }
+        }
+    }
+    drop(rtx);
+    if to_tombstone.is_empty() {
+        println!("no Active docs with tag={tag}");
+        return Ok(());
+    }
+    let wtx = h.store.begin_write()?;
+    for mut d in to_tombstone.iter().cloned() {
+        d.status = KbStatus::Tombstoned;
+        docs::put(&wtx, &d)?;
+    }
+    wtx.commit()?;
+    println!("tombstoned {} docs with tag={tag}", to_tombstone.len());
     Ok(())
 }
 
