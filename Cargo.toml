@@ -28,7 +28,11 @@ reqwest      = { version = "0.12", features = ["json", "stream", "multipart", "b
 rustls       = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
 
 # Storage
-redb         = "2"
+redb         = "4.1"
+# v2.6 kept as a one-shot fallback to upgrade existing v2 database files to
+# the v3 format. redb 3+ drops support for v2; we open with `redb 4.1` first
+# and only invoke this legacy crate when the open returns UpgradeRequired.
+redb_legacy  = { package = "redb", version = "2.6" }
 tantivy      = "0.22"
 
 # HNSW vector index for memory search (replaced LanceDB to cut ~500 deps)

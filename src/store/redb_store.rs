@@ -15,7 +15,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 #[allow(unused_imports)]
 use serde::{Serialize, de::DeserializeOwned};
 use tracing::debug;
@@ -105,6 +105,31 @@ impl std::fmt::Debug for RedbStore {
     }
 }
 
+/// Upgrade an existing redb file at `path` from the legacy v2 format to v3
+/// when needed. No-op when the file doesn't exist, is already v3, or any
+/// other error path — callers should still attempt their normal open
+/// afterwards and surface the real error.
+///
+/// redb 3+ dropped v2 file-format support, so users coming from earlier
+/// rsclaw builds (which shipped redb 2.x) would otherwise hit a hard open
+/// failure when the runtime opens its databases.
+pub(crate) fn upgrade_legacy_if_needed(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    if Database::open(path).is_ok() {
+        return Ok(());
+    }
+    tracing::warn!(path = %path.display(), "redb 4 open failed; attempting one-shot v2→v3 upgrade via bundled redb 2.6");
+    let mut legacy = redb_legacy::Database::open(path)
+        .with_context(|| format!("legacy open of {} for upgrade", path.display()))?;
+    let did_upgrade = legacy
+        .upgrade()
+        .with_context(|| format!("v2→v3 upgrade of {}", path.display()))?;
+    tracing::info!(path = %path.display(), did_upgrade, "redb file format upgrade complete");
+    Ok(())
+}
+
 impl RedbStore {
     /// Open (or create) the redb database at `path`.
     pub fn open(path: &Path, tier: MemoryTier) -> Result<Self> {
@@ -114,8 +139,10 @@ impl RedbStore {
             MemoryTier::High => 64 * 1024 * 1024,     // 64 MB
         };
 
-        let db = Database::builder()
-            .set_cache_size(cache_bytes)
+        upgrade_legacy_if_needed(path)?;
+        let mut builder = Database::builder();
+        builder.set_cache_size(cache_bytes);
+        let db = builder
             .create(path)
             .with_context(|| format!("open redb at {}", path.display()))?;
 
