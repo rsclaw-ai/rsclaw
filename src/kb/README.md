@@ -5,7 +5,7 @@ for the full design and `docs/adr/0001-knowledge-base.md` for the decision
 record. Week 1 plan: `docs/plans/2026-05-19-kb-mvp-week1-foundation.md`.
 Week 2 plan: `docs/plans/2026-05-19-kb-mvp-week2-pipeline.md`.
 
-## What's implemented (Weeks 1–3)
+## What's implemented (Weeks 1–4)
 
 **Week 1 (Foundation):**
 
@@ -68,16 +68,39 @@ Week 2 plan: `docs/plans/2026-05-19-kb-mvp-week2-pipeline.md`.
   find_by_surface scan + chunks_for_entity edges. Inverted index is a
   Week 4 optimisation once entity extraction emits non-trivial counts.
 
-## What's NOT in Weeks 1–3
+**Week 4 (Syncers + Compactor + CLI):**
+
+- **`KbSourceSyncer` trait** (`sync/mod.rs`) — generic interface for
+  source-specific ingest. Async via `async-trait`.
+- **`ManualUploadSyncer`** (`sync/manual.rs`) — file path → bytes →
+  `canonicalize_by_mime` → `ingest_canonicalized`. Used by
+  `rsclaw kb add <path>`.
+- **`UrlSyncer`** (`sync/url.rs`) — `reqwest::get` with
+  ETag/Last-Modified conditional headers; falls back to content-hash
+  dedupe via `seen_items`. Cursor persisted as
+  `etag:` / `lastmod:` / `contenthash:` in `SyncState`.
+- **`SyncRegistry`** (`sync/state.rs`) — load/save SyncState per
+  source_id wrapper around `store::seen::{get,put}_sync_state`.
+- **Compactor** (`compactor/mod.rs`) — orphan file scan with
+  grace-period guard + ledger advancement
+  `IndexingComplete → CleanupPending → Done`. Single
+  `run_compactor_tick` function, idempotent.
+- **CLI** (`src/cli/kb.rs` + `src/cmd/kb.rs`) — `rsclaw kb add | ls |
+  rm | search | show | visibility | compact | stats`. `kb add`
+  synchronously drains the worker pool so follow-up `kb search`
+  sees fresh chunks immediately.
+
+## What's NOT in Weeks 1–4
 
 - BGE-M3 embedder (real model) — Week 2.5 (self-contained behind `KbEmbedder` trait)
 - HNSW snapshot persistence — Week 3.5 (rebuild from redb on startup today)
 - CJK tokenizer for tantivy — Week 3.5 (whitespace + lowercase today)
-- Entity extraction — Week 4 (chunk-entity edges, `boost_entities`/`require_entities` activation)
-- URL fetch + HTML→Markdown (`UrlCanonicalizer`) — Week 4 (with `UrlSyncer`)
-- `ManualUploadSyncer` + `UrlSyncer` + CLI — Week 4
-- Compactor (orphan file cleanup, stale chunks, Failed-job triage) — Week 4
+- BGE-M3 real embedder — Week 2.5
+- Entity extraction — Week 4.5 (chunk-entity edges, `boost_entities`/`require_entities` activation)
+- Scheduled syncer ticks (cron integration) — Week 4.5
+- LocalFolderSyncer, MailSyncer, ChatSyncer — V2 (post-MVP)
 - `kb_explain` retrieval trace — V2 (post-MVP)
+- Tauri admin UI — V2 (post-MVP)
 
 ## Architecture invariants (verify after every code change)
 
@@ -180,6 +203,30 @@ Week 2 plan: `docs/plans/2026-05-19-kb-mvp-week2-pipeline.md`.
     field; the runtime constructs scope from auth context and passes
     it as a separate function argument to `tools::*::run`.
 
+### Added in Week 4
+
+19. **All syncers go through `ingest_canonicalized`** — `ManualUpload`
+    and `Url` syncers both terminate in `ingest_canonicalized(...)`,
+    so spec §J's atomicity contract holds for every ingest path. No
+    syncer ever writes to redb directly.
+20. **UrlSyncer conditional-get uses SyncState.cursor** — every
+    304 NOT_MODIFIED response counts as `docs_skipped`, never
+    `docs_added`. Covered by the `manual_syncer_dedupes_identical_bytes`
+    pattern (UrlSyncer integration deferred to Week 4.5 with a
+    `wiremock` dep).
+21. **Compactor never deletes files referenced by any KbDoc** —
+    `referenced_paths` unions over every doc's
+    `markdown_path` + `raw_path` plus every Pending/IndexingComplete
+    ledger entry's `new_paths`. The grace period (default 1h) guards
+    against in-flight ingest. Covered by
+    `kb::compactor::tests::referenced_file_preserved`.
+22. **CLI is a thin wrapper over the library surface** — every
+    `rsclaw kb` subcommand calls into Week 2–3's tool surface
+    (`ingest_canonicalized`, `kb_search`, `kb_list_docs`, `kb_fetch`)
+    or the new Week 4 syncer/compactor functions. `kb add` drains
+    the worker pool synchronously so an immediate `kb search` sees
+    fresh chunks.
+
 ## Quick start (Weeks 1–2)
 
 ```rust
@@ -242,9 +289,20 @@ pool.shutdown().await;
 ## Testing
 
 ```bash
-cargo test -p rsclaw --lib kb::          # unit tests (~190)
+cargo test -p rsclaw --lib kb::          # unit tests (~200)
 cargo test --test kb_week1_e2e           # Week 1 integration (6)
 cargo test --test kb_week2_pipeline      # Week 2 async e2e (1)
 cargo test --test kb_week2_recovery      # Week 2 crash recovery (2)
 cargo test --test kb_week3_search        # Week 3 retrieval e2e (1)
+cargo test --test kb_week4_syncers       # Week 4 syncer e2e (2)
+cargo test --test kb_week4_compactor     # Week 4 compactor integration (1)
+```
+
+End-to-end CLI smoke:
+
+```bash
+echo "# Hello\n\nThe quick brown fox." > /tmp/doc.md
+rsclaw --base-dir /tmp/kbdemo kb add /tmp/doc.md --tags demo
+rsclaw --base-dir /tmp/kbdemo kb search "brown fox"
+rsclaw --base-dir /tmp/kbdemo kb stats
 ```

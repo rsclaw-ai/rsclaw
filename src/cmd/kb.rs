@@ -6,6 +6,7 @@ use crate::kb::model::{CallerScope, KbStatus, KbVisibility};
 use crate::kb::store::{docs, KbStore};
 use crate::kb::sync::{KbSourceSyncer, ManualUploadSyncer, SyncContext, SyncReason, UrlSyncer};
 use crate::kb::tools::{kb_fetch, kb_list_docs, kb_search};
+use crate::kb::worker::{DefaultDispatcher, HandlerCtx, WorkerConfig, WorkerPool};
 use crate::kb::{KbEmbedder, KbIndex, KbPaths, StubEmbedder};
 use crate::kb::search::SearchCtx;
 use anyhow::{Context, Result};
@@ -73,6 +74,23 @@ async fn add(kb_root: PathBuf, path_or_url: String, tags: Vec<String>) -> Result
         "{}",
         serde_json::to_string_pretty(&outcome).unwrap_or_else(|_| format!("{outcome:?}"))
     );
+
+    // Drain pending ChunkAndEmbed jobs so a follow-up `kb search`
+    // sees the new chunks. In production the gateway daemon's worker
+    // pool handles this; for CLI-only mode we run a one-shot drain.
+    let hctx = HandlerCtx {
+        store: h.store.clone(),
+        paths: h.paths.clone(),
+        embedder: h.embedder.clone(),
+        index: h.index.clone(),
+    };
+    let cfg = WorkerConfig::default();
+    loop {
+        let did = WorkerPool::run_one_blocking(&hctx, &cfg, &DefaultDispatcher)?;
+        if !did {
+            break;
+        }
+    }
     Ok(())
 }
 
