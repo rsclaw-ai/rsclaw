@@ -1643,21 +1643,12 @@ export function OnboardingPage() {
     });
     return m;
   });
-  // Select first channel when entering step 3
-  const chsInitRef = useRef(false);
-  useEffect(() => {
-    if (step === 3 && !chsInitRef.current && CHANNELS.length > 0) {
-      chsInitRef.current = true;
-      const firstId = CHANNELS[0].id;
-      setChs((prev) => {
-        const c: Record<string, ChState> = {};
-        for (const [k, v] of Object.entries(prev)) {
-          c[k] = { ...v, enabled: k === firstId };
-        }
-        return c;
-      });
-    }
-  }, [step, CHANNELS]);
+  // Step 3 intentionally starts with no channel selected — the user
+  // picks one manually, and `toggleChannel` auto-starts QR for
+  // channels that support it. (Previously we auto-selected the first
+  // channel + auto-fired its QR, which forced users into WeChat by
+  // default and pinned a stale QR while they were still browsing the
+  // list.)
   const qrPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const qrTokenRef = useRef<string | null>(null);
 
@@ -2027,17 +2018,22 @@ export function OnboardingPage() {
       // Start login process in background (spawns rsclaw channels login <channel>)
       await tauriInvoke("channel_login_start", { channel: channelId });
 
-      // Poll for QR image + login completion
+      // Poll for QR image + login completion. The interval runs for
+      // as long as the channel is being authed — the only natural exit
+      // is `status === "done"` (or the parent component unmounting,
+      // which the cleanup effect below handles). We used to cap at
+      // 60 attempts (~120s); in practice users often navigate
+      // back / forth between steps and consumed the budget without
+      // ever scanning, leaving the UI stuck on "waiting".
       if (qrPollRef.current) clearInterval(qrPollRef.current);
-      let attempts = 0;
-      let qrFound = false;
+      let lastQrUri: string | null = null;
       qrPollRef.current = setInterval(async () => {
-        attempts++;
         try {
           // Check login status
           const status: string = await tauriInvoke("channel_login_status");
           if (status === "done") {
             if (qrPollRef.current) clearInterval(qrPollRef.current);
+            qrPollRef.current = null;
             // Read credentials written by sidecar into state
             let loginCreds: Record<string, string> = {};
             try {
@@ -2053,21 +2049,21 @@ export function OnboardingPage() {
             });
             return;
           }
-          // Check for QR image
-          if (!qrFound) {
-            const dataUri: string | null = await tauriInvoke("channel_login_qr");
-            if (dataUri) {
-              qrFound = true;
-              setChs((prev) => {
-                const c = { ...prev };
-                c[channelId] = { ...c[channelId], qrUrl: dataUri, qrStatus: "waiting" };
-                return c;
-              });
-            }
+          // Re-fetch the QR every iteration — the sidecar rotates the
+          // file when the server-side QR expires (typically 60–90s).
+          // Sticking with the first dataUri we saw means the rendered
+          // image goes stale and scans against it silently fail.
+          const dataUri: string | null = await tauriInvoke("channel_login_qr");
+          if (dataUri && dataUri !== lastQrUri) {
+            lastQrUri = dataUri;
+            setChs((prev) => {
+              const c = { ...prev };
+              c[channelId] = { ...c[channelId], qrUrl: dataUri, qrStatus: "waiting" };
+              return c;
+            });
           }
-        } catch {}
-        if (attempts > 60) {
-          if (qrPollRef.current) clearInterval(qrPollRef.current);
+        } catch {
+          /* transient — keep polling */
         }
       }, 2000);
     } catch {
