@@ -454,6 +454,39 @@ pub fn build_tool_list(
         }),
     });
     tools.push(ToolDef {
+        name: "read_session_archive".to_owned(),
+        description: "Search the FULL pre-compaction conversation history of the current session.\n\
+            \n\
+            When a session is compacted, you receive `[head + summary + recent]` in context, \
+            but every original message is still on disk (redb archive table, never deleted). \
+            Use this tool when the summary lacks specifics you need — e.g. the user asks \
+            about something discussed earlier and the summary doesn't have the verbatim detail.\n\
+            \n\
+            Modes:\n\
+              - mode=\"stat\"      — totals + seq range + generations, no content (CHEAP — check first)\n\
+              - mode=\"head:N\"    — first N archived messages (oldest)\n\
+              - mode=\"tail:N\"    — last N archived messages (newest)\n\
+              - mode=\"seq:A-B\"   — inclusive 1-indexed seq range, e.g. \"seq:120-140\"\n\
+              - mode=\"grep:PAT\"  — case-insensitive substring or alternation, e.g. \"grep:error|warn\" or \"grep:user paid\"\n\
+            \n\
+            Strategy: PREFER grep when you know a keyword — cheapest way to scan thousands of \
+            messages. Use stat first if the session is huge and you want to estimate cost. \
+            Use tail when the user says \"just earlier\" / \"刚刚\". Use seq:A-B for targeted \
+            scrolling around a known seq. Don't pull head/tail with large N; use grep.\n\
+            \n\
+            Large messages get nested through the artifact pipeline — if a result row has \
+            `tool_result_id`, call read_artifact for its full content. Grep results are \
+            capped at 50 hits per call; tighten the pattern if more.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "description": "stat | head:N | tail:N | seq:A-B | grep:PATTERN. Default `stat`."},
+                "session_key": {"type": "string", "description": "Optional — defaults to your current session. Pass another session_key only if you've been told to inspect someone else's history."},
+                "generation": {"type": "integer", "description": "Optional — restrict to a specific session generation (post-/clear). Omit for all."}
+            }
+        }),
+    });
+    tools.push(ToolDef {
         name: "read_artifact".to_owned(),
         description: "Read the full content of a tool_result artifact written by the runtime backstop.\n\
             \n\
@@ -463,11 +496,12 @@ pub fn build_tool_list(
             That id is your handle.\n\
             \n\
             Modes:\n\
+              - mode=\"stat\"        size + line count only, no content (CHEAP — check first if you don't know how big it is)\n\
               - mode=\"full\"        (default) entire artifact text\n\
               - mode=\"head:N\"      first N lines\n\
               - mode=\"tail:N\"      last N lines\n\
               - mode=\"lines:A-B\"   inclusive 1-indexed line range\n\
-              - mode=\"grep:PAT\"    case-insensitive regex over lines\n\
+              - mode=\"grep:PAT\"    case-insensitive regex over lines (substring works; alternation `a|b|c` works)\n\
             \n\
             Artifacts are session-scoped — an id from another session won't resolve. They \
             also expire after 7 days. If you only need to scan for a known substring, \

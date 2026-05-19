@@ -13,7 +13,7 @@ pub mod compact;
 pub mod store;
 pub mod text;
 
-pub use compact::{compact_value, PreviewBudget, ARTIFACT_THRESHOLD_CHARS};
+pub use compact::{compact_text, compact_value, PreviewBudget, ARTIFACT_THRESHOLD_CHARS};
 pub use store::{ArtifactId, ArtifactStore, ARTIFACT_SUBDIR};
 
 use std::sync::OnceLock;

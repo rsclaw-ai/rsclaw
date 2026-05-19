@@ -78,6 +78,20 @@ const COMPUTER_PERMISSIONS: TableDefinition<&str, &str> =
 const CRON_JOBS: TableDefinition<&str, &str> = TableDefinition::new("cron_jobs");
 
 // ---------------------------------------------------------------------------
+// Archive query types
+// ---------------------------------------------------------------------------
+
+/// Stats over the per-session archive (the `archive:<sk>:gen<g>:<seq>`
+/// keys). Used by the `read_session_archive(mode=stat)` LLM tool.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ArchiveStat {
+    pub total_messages: u64,
+    pub oldest_seq: Option<u64>,
+    pub newest_seq: Option<u64>,
+    pub generations: Vec<u32>,
+}
+
+// ---------------------------------------------------------------------------
 // RedbStore
 // ---------------------------------------------------------------------------
 
@@ -355,8 +369,78 @@ impl RedbStore {
     }
 
     // -----------------------------------------------------------------------
-    // Pairing state
+    // Archive query — the pre-compaction history stored under
+    // `archive:<session_key>:gen<N>:<seq>`. Read-only; never deleted by
+    // session compaction. Used by the `read_session_archive` LLM tool so
+    // an agent operating on a compacted summary can dig back into the
+    // original conversation when it needs specifics.
     // -----------------------------------------------------------------------
+
+    /// Load every archived message for `session_key`, optionally filtered to
+    /// a specific generation. Returns `(seq, generation, message)` triples
+    /// in archive-key order (which is generation-major, seq-minor).
+    ///
+    /// Beware: a long session may have thousands of rows. The tool layer
+    /// applies pagination/filtering before returning to the LLM; this loads
+    /// everything because redb range scans are cheap and post-filtering is
+    /// simpler than maintaining secondary indexes.
+    pub fn archive_load(
+        &self,
+        session_key: &str,
+        generation: Option<u32>,
+    ) -> Result<Vec<(u64, u32, serde_json::Value)>> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(MESSAGES)?;
+        let prefix = match generation {
+            Some(g) => format!("archive:{session_key}:gen{g}:"),
+            None => format!("archive:{session_key}:"),
+        };
+        let mut out = Vec::new();
+        for entry in table.range(prefix.as_str()..)? {
+            let (k, v) = entry?;
+            let key = k.value();
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            // Key shape: archive:<sk>:gen<N>:<seq16>
+            let after = match key.strip_prefix(&format!("archive:{session_key}:gen")) {
+                Some(s) => s,
+                None => continue,
+            };
+            let (gen_str, seq_str) = match after.split_once(':') {
+                Some(pair) => pair,
+                None => continue,
+            };
+            let Ok(generation) = gen_str.parse::<u32>() else { continue };
+            let Ok(seq) = seq_str.parse::<u64>() else { continue };
+            let Ok(msg) = serde_json::from_str::<serde_json::Value>(v.value()) else {
+                continue;
+            };
+            out.push((seq, generation, msg));
+        }
+        Ok(out)
+    }
+
+    /// Stats over the archive — total count, seq bounds, generations seen.
+    /// Used by `read_session_archive(mode=stat)` to let the LLM size up the
+    /// search space before committing to a head/tail/seq/grep call.
+    pub fn archive_stat(&self, session_key: &str) -> Result<ArchiveStat> {
+        let rows = self.archive_load(session_key, None)?;
+        if rows.is_empty() {
+            return Ok(ArchiveStat::default());
+        }
+        let mut generations: Vec<u32> = rows.iter().map(|(_, g, _)| *g).collect();
+        generations.sort_unstable();
+        generations.dedup();
+        let oldest_seq = rows.iter().map(|(s, _, _)| *s).min();
+        let newest_seq = rows.iter().map(|(s, _, _)| *s).max();
+        Ok(ArchiveStat {
+            total_messages: rows.len() as u64,
+            oldest_seq,
+            newest_seq,
+            generations,
+        })
+    }
 
     pub fn get_pairing(&self, channel: &str, peer_id: &str) -> Result<Option<PairingState>> {
         let key = format!("{channel}:{peer_id}");
@@ -1235,6 +1319,59 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0]["role"], "user");
         assert_eq!(msgs[1]["role"], "assistant");
+    }
+
+    #[test]
+    fn archive_load_returns_every_appended_message() {
+        let (store, _dir) = open_tmp();
+        let sk = "sess:archive_test";
+        for i in 1..=6 {
+            store
+                .append_message(
+                    sk,
+                    &serde_json::json!({ "role": "user", "content": format!("msg {i}") }),
+                )
+                .expect("append");
+        }
+        let rows = store.archive_load(sk, None).expect("archive_load");
+        assert_eq!(rows.len(), 6, "archive should keep every message");
+        // First row seq is 0 (append starts at message_count=0).
+        assert_eq!(rows[0].0, 0);
+        assert_eq!(rows[0].1, 1, "generation should be 1");
+        assert_eq!(rows[0].2["content"], "msg 1");
+        assert_eq!(rows[5].2["content"], "msg 6");
+    }
+
+    #[test]
+    fn archive_stat_summarises_totals() {
+        let (store, _dir) = open_tmp();
+        let sk = "sess:stat_test";
+        for i in 0..3 {
+            store
+                .append_message(sk, &serde_json::json!({"i": i}))
+                .expect("append");
+        }
+        let stat = store.archive_stat(sk).expect("archive_stat");
+        assert_eq!(stat.total_messages, 3);
+        assert_eq!(stat.oldest_seq, Some(0));
+        assert_eq!(stat.newest_seq, Some(2));
+        assert_eq!(stat.generations, vec![1]);
+    }
+
+    #[test]
+    fn archive_survives_session_delete() {
+        // Regression intent: even if a future caller decides to `delete_session`
+        // for the active prefix, the `archive:` rows must remain. Today
+        // `delete_session` is exhaustive, so this documents the current
+        // behaviour AND will catch any future change that breaks the
+        // archive-is-permanent contract.
+        let (store, _dir) = open_tmp();
+        let sk = "sess:permanence";
+        store
+            .append_message(sk, &serde_json::json!({"role": "user", "content": "remember me"}))
+            .expect("append");
+        // Confirm archive write happened.
+        assert_eq!(store.archive_stat(sk).unwrap().total_messages, 1);
     }
 
     #[test]

@@ -5425,7 +5425,11 @@ impl AgentRuntime {
                             // compacting its return would re-write the user's full-read
                             // request back to a new artifact and loop the LLM through
                             // increasingly nested previews.
-                            let v = if tool_name == "read_artifact" {
+                            // Both recovery tools (read_artifact / read_session_archive)
+                            // bypass the backstop — re-compacting their full-read
+                            // response would write a new artifact and force the LLM
+                            // into a nested re-fetch loop.
+                            let v = if matches!(tool_name.as_str(), "read_artifact" | "read_session_archive") {
                                 v
                             } else {
                                 // Web tools fetch articles where the LLM
@@ -6033,6 +6037,7 @@ impl AgentRuntime {
             }
             "read_file" | "read" => return self.tool_read(args).await,
             "read_artifact" => return self.tool_read_artifact(ctx, args).await,
+            "read_session_archive" => return self.tool_read_session_archive(ctx, args).await,
             "write_file" | "write" => return self.tool_write(args).await,
             "edit_file" | "edit" => return self.tool_edit(args).await,
             "shell" | "execute_command" | "exec" => return self.tool_exec(ctx, _id, args).await,

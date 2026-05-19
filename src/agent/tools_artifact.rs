@@ -23,6 +23,9 @@ use super::runtime::{AgentRuntime, RunContext};
 /// Factored out from the tool handler so unit tests can hit the parser
 /// without standing up a `RunContext`. Modes:
 /// - `full`         — entire text (returns `full` clone)
+/// - `stat`         — size summary only, no content (kept as `Ok("")` here;
+///                    the handler attaches structured fields to the
+///                    response Value)
 /// - `head:N`       — first N lines (N=0 → empty)
 /// - `tail:N`       — last N lines (N=0 → empty)
 /// - `lines:A-B`    — 1-indexed inclusive range, clamped to `[1, total]`
@@ -32,6 +35,11 @@ pub(crate) fn apply_mode(full: &str, mode: &str) -> Result<String> {
     let total = lines.len();
     if mode == "full" {
         return Ok(full.to_owned());
+    }
+    if mode == "stat" {
+        // Stat mode returns no content; the handler decorates the JSON
+        // response with line/char/byte counts instead.
+        return Ok(String::new());
     }
     if let Some(rest) = mode.strip_prefix("head:") {
         let n: usize = rest
@@ -110,13 +118,20 @@ impl AgentRuntime {
         let total_lines = full.lines().count();
         let selected = apply_mode(&full, mode)?;
 
-        Ok(json!({
+        let mut out = json!({
             "tool_result_id": id.as_str(),
             "mode": mode,
             "total_lines": total_lines,
             "returned_chars": selected.chars().count(),
             "content": selected,
-        }))
+        });
+        if mode == "stat" {
+            // Cheap size summary so the LLM can decide whether to commit
+            // to head/tail/lines/grep without paying for content.
+            out["byte_size"] = json!(full.len());
+            out["char_count"] = json!(full.chars().count());
+        }
+        Ok(out)
     }
 }
 
