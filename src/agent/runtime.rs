@@ -5420,16 +5420,51 @@ impl AgentRuntime {
                             // replaced with a head+tail preview + read_artifact hint.
                             // One enforcement point — no tool can leak a giant payload
                             // even if its handler forgot to compact.
-                            let v = crate::artifact::compact_value(
-                                crate::artifact::default_store(),
-                                &ctx.session_key,
-                                v,
-                            );
+                            //
+                            // Exception: `read_artifact` itself is the recovery path —
+                            // compacting its return would re-write the user's full-read
+                            // request back to a new artifact and loop the LLM through
+                            // increasingly nested previews.
+                            let v = if tool_name == "read_artifact" {
+                                v
+                            } else {
+                                crate::artifact::compact_value(
+                                    crate::artifact::default_store(),
+                                    &ctx.session_key,
+                                    v,
+                                )
+                            };
                             if let Some(s) = v.as_str() {
                                 (s.to_owned(), vec![])
                             } else {
                                 // Format structured tool results (exec, read, etc.) for better LLM comprehension
-                                (format_tool_result(&v), vec![])
+                                let mut text = format_tool_result(&v);
+                                // Surface the artifact envelope to the LLM —
+                                // format_tool_result is shape-specific (exec
+                                // returns stdout+stderr, read returns content,
+                                // …) and drops envelope metadata. Append an
+                                // explicit marker so the LLM sees the
+                                // tool_result_id even when the preview text's
+                                // inline hint sits buried mid-output.
+                                if v.get("_truncated").and_then(|x| x.as_bool()).unwrap_or(false) {
+                                    if let Some(id) = v.get("_tool_result_id").and_then(|x| x.as_str()) {
+                                        text.push_str(&format!(
+                                            "\n\n[truncated — call read_artifact(tool_result_id=\"{id}\") for full output]"
+                                        ));
+                                    } else if let Some(ids) = v.get("_tool_result_ids").and_then(|x| x.as_object()) {
+                                        let pairs: Vec<String> = ids
+                                            .iter()
+                                            .filter_map(|(k, v)| v.as_str().map(|s| format!("{k}={s}")))
+                                            .collect();
+                                        if !pairs.is_empty() {
+                                            text.push_str(&format!(
+                                                "\n\n[truncated — fields compacted: {}. Call read_artifact with the id of the field you need.]",
+                                                pairs.join(", ")
+                                            ));
+                                        }
+                                    }
+                                }
+                                (text, vec![])
                             }
                         }
                     }
@@ -6215,8 +6250,8 @@ impl AgentRuntime {
             let client = A2aClient::new();
             // Use remote agent ID if configured, otherwise omit (uses remote default).
             let remote_id = ext.remote_agent_id.as_deref().unwrap_or("");
-            let reply = client
-                .send_task(
+            let stream = client
+                .send_streaming_message(
                     &ext.url,
                     remote_id,
                     &text,
@@ -6225,7 +6260,120 @@ impl AgentRuntime {
                 )
                 .await
                 .map_err(|e| anyhow!("A2A remote `{agent_id}`: {e}"))?;
-            return Ok(Value::String(reply));
+            tokio::pin!(stream);
+
+            // Drain the SSE stream until the remote publishes a terminal
+            // status event.
+            //   - status-update with message text: forward to lead's channel
+            //     so streaming subscribers see sub-agent progress in real
+            //     time (e.g. "calling tool memory_search").
+            //   - artifact-update text parts: accumulate as the reply text
+            //     ultimately returned to the LLM.
+            //   - final=true: terminate; FAILED captures the error message,
+            //     CANCELED short-circuits with an error.
+            //
+            // Cancellation: if the lead's turn_ctx is cancelled, dropping the
+            // pinned SSE stream closes the HTTP connection; the remote's SSE
+            // handler observes the close and publishes a Canceled terminal
+            // event, propagating cancel down to the sub-agent.
+            let mut accumulated = String::new();
+            let mut last_msg = String::new();
+            let mut last_error: Option<String> = None;
+            loop {
+                let cancel_fut = async {
+                    match &ctx.turn_ctx.cancel_token {
+                        Some(t) => t.cancelled().await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    _ = cancel_fut => {
+                        return Err(anyhow!(
+                            "A2A remote `{agent_id}`: cancelled by client"
+                        ));
+                    }
+                    next = stream.next() => {
+                        let Some(event) = next else { break; };
+                        let event = event.map_err(|e| anyhow!(
+                            "A2A remote `{agent_id}` SSE: {e}"
+                        ))?;
+                        let kind = event
+                            .get("kind")
+                            .and_then(|k| k.as_str())
+                            .unwrap_or("");
+                        match kind {
+                            "status-update" => {
+                                let final_ = event
+                                    .get("final")
+                                    .and_then(|f| f.as_bool())
+                                    .unwrap_or(false);
+                                let state = event["status"]["state"]
+                                    .as_str()
+                                    .unwrap_or("");
+                                let msg_text = event["status"]["message"]
+                                    ["parts"][0]["text"]
+                                    .as_str()
+                                    .unwrap_or("");
+                                if !msg_text.is_empty() && msg_text != last_msg {
+                                    last_msg = msg_text.to_owned();
+                                    if let Some(ref bus) = self.event_bus {
+                                        let marker = format!(
+                                            "<rstool name=\"agent\">[{agent_id}] {msg_text}</rstool>"
+                                        );
+                                        let _ = bus.send(AgentEvent {
+                                            session_id: ctx.session_key.clone(),
+                                            agent_id: ctx.agent_id.clone(),
+                                            delta: marker,
+                                            done: false,
+                                            files: vec![],
+                                            images: vec![],
+                                            tool_log: vec![],
+                                            question: None,
+                                        });
+                                    }
+                                }
+                                if final_ {
+                                    if state == "TASK_STATE_FAILED"
+                                        && !msg_text.is_empty()
+                                    {
+                                        last_error = Some(msg_text.to_owned());
+                                    } else if state == "TASK_STATE_CANCELED" {
+                                        return Err(anyhow!(
+                                            "A2A remote `{agent_id}`: canceled"
+                                        ));
+                                    }
+                                    break;
+                                }
+                            }
+                            "artifact-update" => {
+                                if let Some(parts) = event["artifact"]["parts"]
+                                    .as_array()
+                                {
+                                    for part in parts {
+                                        if part["type"] == "text"
+                                            && let Some(t) = part["text"].as_str()
+                                        {
+                                            accumulated.push_str(t);
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            if let Some(err) = last_error {
+                return Err(anyhow!("A2A remote `{agent_id}`: {err}"));
+            }
+            if accumulated.is_empty() {
+                return Err(anyhow!(
+                    "A2A remote `{agent_id}`: no text artifact received"
+                ));
+            }
+            return Ok(Value::String(accumulated));
         }
 
         Err(anyhow!(
