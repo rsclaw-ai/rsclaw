@@ -15,7 +15,9 @@ use std::sync::Arc;
 
 pub async fn cmd_kb(cmd: KbCommand, kb_root: PathBuf) -> Result<()> {
     match cmd {
-        KbCommand::Add { path_or_url, tags } => add(kb_root, path_or_url, tags).await,
+        KbCommand::Add { path_or_url, tags, recursive, ext } => {
+            add(kb_root, path_or_url, tags, recursive, ext).await
+        }
         KbCommand::Ls { tag, source_kind, limit } => ls(kb_root, tag, source_kind, limit),
         KbCommand::Rm { doc_id, tag, yes } => rm(kb_root, doc_id, tag, yes),
         KbCommand::Search { query, k } => search(kb_root, query, k),
@@ -43,7 +45,13 @@ fn open_kb(kb_root: &PathBuf) -> Result<Handles> {
     Ok(Handles { store, paths, index, embedder })
 }
 
-async fn add(kb_root: PathBuf, path_or_url: String, tags: Vec<String>) -> Result<()> {
+async fn add(
+    kb_root: PathBuf,
+    path_or_url: String,
+    tags: Vec<String>,
+    recursive: bool,
+    ext: String,
+) -> Result<()> {
     let h = open_kb(&kb_root)?;
     let ctx = SyncContext {
         store: h.store.clone(),
@@ -51,34 +59,102 @@ async fn add(kb_root: PathBuf, path_or_url: String, tags: Vec<String>) -> Result
         index: h.index.clone(),
         embedder: h.embedder.clone(),
     };
-    let outcome = if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
+
+    let is_url =
+        path_or_url.starts_with("http://") || path_or_url.starts_with("https://");
+    if is_url {
         let syncer = UrlSyncer {
             url: path_or_url.clone(),
             tags,
         };
-        syncer
+        let outcome = syncer
             .sync(&ctx, SyncReason::Manual)
             .await
-            .map_err(|e| anyhow::anyhow!("url sync failed: {e}"))?
-    } else {
-        let syncer = ManualUploadSyncer {
-            source_id: format!("manual:{path_or_url}"),
-            file_path: PathBuf::from(&path_or_url),
-            tags,
-        };
-        syncer
-            .sync(&ctx, SyncReason::Manual)
-            .await
-            .map_err(|e| anyhow::anyhow!("manual sync failed: {e}"))?
-    };
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&outcome).unwrap_or_else(|_| format!("{outcome:?}"))
-    );
+            .map_err(|e| anyhow::anyhow!("url sync failed: {e}"))?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&outcome).unwrap_or_else(|_| format!("{outcome:?}"))
+        );
+        drain_worker(&h)?;
+        return Ok(());
+    }
 
-    // Drain pending ChunkAndEmbed jobs so a follow-up `kb search`
-    // sees the new chunks. In production the gateway daemon's worker
-    // pool handles this; for CLI-only mode we run a one-shot drain.
+    let path = PathBuf::from(&path_or_url);
+    let files = if recursive && path.is_dir() {
+        collect_files(&path, &ext)
+    } else {
+        vec![path.clone()]
+    };
+
+    let mut total = serde_json::Map::new();
+    total.insert("added".into(), serde_json::Value::Number(0u64.into()));
+    total.insert("skipped".into(), serde_json::Value::Number(0u64.into()));
+    let mut added = 0u64;
+    let mut skipped = 0u64;
+    for f in &files {
+        let syncer = ManualUploadSyncer {
+            source_id: format!("manual:{}", f.display()),
+            file_path: f.clone(),
+            tags: tags.clone(),
+        };
+        match syncer.sync(&ctx, SyncReason::Manual).await {
+            Ok(outcome) => {
+                added += outcome.docs_added as u64;
+                skipped += outcome.docs_skipped as u64;
+            }
+            Err(e) => {
+                eprintln!("skip {}: {e}", f.display());
+                skipped += 1;
+            }
+        }
+    }
+    drain_worker(&h)?;
+    total.insert("added".into(), serde_json::Value::Number(added.into()));
+    total.insert("skipped".into(), serde_json::Value::Number(skipped.into()));
+    total.insert(
+        "files_seen".into(),
+        serde_json::Value::Number((files.len() as u64).into()),
+    );
+    println!("{}", serde_json::Value::Object(total));
+    Ok(())
+}
+
+fn collect_files(root: &PathBuf, ext_csv: &str) -> Vec<PathBuf> {
+    let allowed: Vec<String> = ext_csv
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut out = Vec::new();
+    let mut stack: Vec<PathBuf> = vec![root.clone()];
+    while let Some(p) = stack.pop() {
+        let rd = match std::fs::read_dir(&p) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if let Ok(ft) = entry.file_type() {
+                if ft.is_dir() {
+                    stack.push(path);
+                } else if ft.is_file() {
+                    let ext = path
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    if allowed.iter().any(|a| a == &ext) {
+                        out.push(path);
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn drain_worker(h: &Handles) -> Result<()> {
     let hctx = HandlerCtx {
         store: h.store.clone(),
         paths: h.paths.clone(),

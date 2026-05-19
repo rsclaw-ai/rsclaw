@@ -4,12 +4,19 @@ use clap::Subcommand;
 
 #[derive(Subcommand, Debug)]
 pub enum KbCommand {
-    /// Add a document (file path or URL) to the knowledge base.
+    /// Add a document (file path, directory, or URL) to the knowledge base.
     Add {
-        /// File path or URL (http://, https://).
+        /// File path, directory, or URL (http://, https://).
         path_or_url: String,
         #[arg(long)]
         tags: Vec<String>,
+        /// When `path_or_url` is a directory, recursively ingest
+        /// every file matching `--ext` (default: md,txt,html,pdf).
+        #[arg(long)]
+        recursive: bool,
+        /// Comma-separated extensions to ingest in recursive mode.
+        #[arg(long, default_value = "md,txt,html,pdf")]
+        ext: String,
     },
     /// List documents.
     Ls {
