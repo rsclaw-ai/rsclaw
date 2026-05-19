@@ -80,6 +80,30 @@ async fn entities_extracted_and_queryable() -> Result<()> {
         email_hits.matches
     );
 
+    // entity_alignment + warnings: query containing a known
+    // canonical-id entity should report it in `entity_alignment`.
+    let alignment_out = kb_search::run(
+        &ctx,
+        kb_search::KbSearchInput {
+            query: "jane@example.com missing keyword".into(),
+            k: 5,
+            filter: Default::default(),
+            mode: "hybrid".into(),
+            diversity: "off".into(),
+            mmr_lambda: 0.5,
+            boost_entities: vec![],
+        },
+        &CallerScope::default(),
+    )?;
+    assert!(
+        alignment_out
+            .entity_alignment
+            .iter()
+            .any(|a| a.canonical_id.contains("email")),
+        "expected an email entity in alignment, got: {:?}",
+        alignment_out.entity_alignment
+    );
+
     let tag_hits = kb_search_entities::run(
         &ctx,
         kb_search_entities::KbSearchEntitiesInput {
