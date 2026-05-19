@@ -924,6 +924,17 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
+        // If a service manager (launchd/systemd) is supervising this process,
+        // ask it to restart us so the new instance picks up the supervisor's
+        // env, ulimits, log routing — instead of doing a naked re-exec that
+        // bypasses the manager. `try_service_self_restart` returns true only
+        // when it has confirmed delivery to the supervisor; on success it
+        // does NOT return (the supervisor SIGTERMs us as part of the kickstart).
+        if try_service_self_restart() {
+            info!("service-manager restart dispatched; exiting for supervisor takeover");
+            std::process::exit(0);
+        }
+
         let exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => {
@@ -986,6 +997,121 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         warn!("could not remove PID file on exit: {e}");
     }
     result
+}
+
+/// Best-effort: if this process is currently supervised by launchd (macOS)
+/// or systemd (Linux), dispatch the restart through the service manager
+/// rather than via naked `cmd.spawn()` from `current_exe`.
+///
+/// Why: a supervisor-managed restart respects the supervisor's env, ulimits,
+/// log routing, and respawn policy. A naked exec orphans the new process to
+/// PID 1 and loses anything the supervisor would have re-applied.
+///
+/// Detection is **runtime-only** (env vars set by the supervisor on the
+/// running process), distinct from `cmd::gateway::try_service_start` /
+/// `try_service_stop` which probe install-file presence.
+///
+/// Returns true when the supervisor command was dispatched successfully —
+/// caller should then `exit(0)` to let the supervisor finish the lifecycle.
+/// Returns false in all other cases (not supervised, supervisor command
+/// failed, or unsupported OS); caller falls back to native respawn.
+fn try_service_self_restart() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // launchd sets XPC_SERVICE_NAME (= job label) for managed processes.
+        // Absence means we're not under launchd → fall back to native respawn.
+        let Ok(label) = std::env::var("XPC_SERVICE_NAME") else {
+            return false;
+        };
+        info!(label = %label, "detected launchd supervision; kickstarting via launchctl");
+        // Try the user agent domain first (gui/<uid>/<label>), then the
+        // system daemon domain. `-k` kills the existing job before starting.
+        let uid = unsafe { libc::getuid() };
+        for target in [
+            format!("gui/{}/{}", uid, label),
+            format!("system/{}", label),
+        ] {
+            let status = std::process::Command::new("launchctl")
+                .args(["kickstart", "-k", &target])
+                .status();
+            if matches!(status, Ok(s) if s.success()) {
+                info!(target = %target, "launchctl kickstart dispatched");
+                return true;
+            }
+        }
+        warn!("launchctl kickstart failed for label {label}; falling back to native respawn");
+        false
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // systemd sets INVOCATION_ID for service units. Without it, no
+        // service supervision is in play.
+        if std::env::var("INVOCATION_ID").is_err() {
+            return false;
+        }
+        // Derive the unit name from /proc/self/cgroup — systemd encodes it
+        // in the cgroup path (e.g. `/system.slice/rsclaw.service`).
+        let unit = std::fs::read_to_string("/proc/self/cgroup")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find_map(|l| l.rsplit('/').next().filter(|t| t.ends_with(".service")))
+                    .map(str::to_owned)
+            });
+        let Some(unit) = unit else {
+            warn!("INVOCATION_ID set but unit name not found in /proc/self/cgroup; falling back");
+            return false;
+        };
+        info!(unit = %unit, "detected systemd supervision; restarting via systemctl");
+        // Try --user first; if it fails (not a user unit), retry system-wide.
+        for args in [
+            vec!["--user", "restart", unit.as_str()],
+            vec!["restart", unit.as_str()],
+        ] {
+            let status = std::process::Command::new("systemctl").args(&args).status();
+            if matches!(status, Ok(s) if s.success()) {
+                info!(unit = %unit, "systemctl restart dispatched");
+                return true;
+            }
+        }
+        warn!("systemctl restart failed for unit {unit}; falling back to native respawn");
+        false
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // The Service Control Manager runs services in session 0 with
+        // SESSIONNAME=Services. Absent or different means we're interactive.
+        let in_services_session = std::env::var("SESSIONNAME")
+            .map(|s| s.eq_ignore_ascii_case("Services"))
+            .unwrap_or(false);
+        if !in_services_session {
+            return false;
+        }
+        info!("detected Windows service supervision; signaling SCM via sc stop");
+        // Note: a service can't `sc restart` itself — stop is one-way and
+        // start runs in a detached SCM context. The actual restart is gated
+        // by the service's FailureActions policy. The installer should set
+        //   sc failure rsclaw reset=86400 actions=restart/5000
+        // so SCM auto-respawns us. If FailureActions isn't configured, this
+        // path stops us and leaves it to a human / monitoring system.
+        let status = std::process::Command::new("sc")
+            .args(["stop", "rsclaw"])
+            .status();
+        if matches!(status, Ok(s) if s.success()) {
+            info!("sc stop dispatched; SCM FailureActions will respawn if configured");
+            return true;
+        }
+        warn!("sc stop failed; falling back to native respawn");
+        false
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        // No supported service manager on this OS — caller will native-respawn.
+        false
+    }
 }
 
 

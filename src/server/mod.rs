@@ -285,7 +285,10 @@ pub fn build_router(state: AppState) -> Router {
             "/a2a",
             post(crate::a2a::server::a2a_dispatch)
                 .layer(axum::middleware::from_fn(crate::a2a::version::a2a_version_layer))
-                .layer(axum::middleware::from_fn(crate::a2a::auth::a2a_auth_layer)),
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::a2a::auth::a2a_auth_layer,
+                )),
         )
         .route("/tools/execute", post(execute_tool))
         .route("/computer-use/permissions", get(computer_use_permissions_list))

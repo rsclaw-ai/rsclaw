@@ -32,6 +32,7 @@ import {
 import { SideBar } from "./sidebar";
 import { ComputerUsePermissionDialog } from "./computer-use-permission";
 import { ComputerUseOverlay } from "./computer-use-overlay";
+import { AskUserModal } from "./ask-user-modal";
 import { useAppConfig } from "../store/config";
 import { AuthPage } from "./auth";
 import { getClientConfig } from "../config/client";
@@ -305,6 +306,13 @@ function Screen() {
             collapse / route changes the same way the permission
             dialog does. */}
         <ComputerUseOverlay />
+        {/* Non-destructive prompt the agent emits via `ask_user` when
+            it wants a structured choice from the human. Mounted at
+            the same level so it overlays the chat regardless of
+            sidebar / route state, but uses a brand-orange accent
+            rather than the permission dialog's red — this isn't a
+            security prompt and shouldn't look like one. */}
+        <AskUserModal />
       </>
     );
   };

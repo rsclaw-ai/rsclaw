@@ -41,6 +41,8 @@ fn minimal_config(port: u16) -> RuntimeConfig {
             bind_address: None,
             reload: ReloadMode::Hybrid,
             auth_token: None,
+            a2a_bearer_tokens: vec![],
+            a2a_api_keys: vec![],
             auth_token_configured: false,
             auth_token_is_plaintext: false,
             allow_tailscale: false,

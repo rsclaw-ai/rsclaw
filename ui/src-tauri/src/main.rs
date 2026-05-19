@@ -659,6 +659,213 @@ async fn close_glow_overlay(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// rsclaw.ai console webview
+// ---------------------------------------------------------------------------
+//
+// `api.rsclaw.ai/console` is the cloud account portal — sign-up, API key
+// creation, usage / quotas. We embed it as a child WebviewWindow and inject
+// an init script that exposes a narrowly-scoped channel back to the
+// desktop app (`window.__RSCLAW_DESKTOP__`). When the web side detects the
+// channel it can replace the normal "Copy key" CTA on the keys page with
+// "Install to RsClaw Desktop", which calls `installKey(...)`. We re-emit
+// that call as a Tauri event so the main-window TypeScript can do the
+// actual rsclaw.json5 mutation via the existing config write path.
+//
+// Security: the init script bails out unless `window.location.origin`
+// matches the configured base. If the user clicks a link to another
+// domain inside the webview, the next page load gets no channel — XSS
+// or arbitrary scripts on rsclaw.ai itself still get the channel, but
+// installing a fake key into the user's own config is the same outcome
+// they could already achieve by tricking the user into pasting it. The
+// damage is bounded.
+
+/// Base URL of the cloud console. Override at compile time via
+/// `RSCLAW_CONSOLE_URL` (used in QA against a staging deploy).
+const RSCLAW_CONSOLE_BASE: &str = match option_env!("RSCLAW_CONSOLE_URL") {
+    Some(v) => v,
+    None => "https://api.rsclaw.ai/console",
+};
+
+/// Best-effort device hostname used by the web side as the default
+/// label when creating a new API key. Falls back to platform name or a
+/// hardcoded "desktop" — none of these are correctness-critical, the
+/// user can rename the key on the web side anyway.
+fn device_hostname() -> String {
+    use std::process::Command;
+    let mut cmd = Command::new("hostname");
+    hide_window(&mut cmd);
+    if let Ok(out) = cmd.output() {
+        if out.status.success() {
+            if let Ok(s) = String::from_utf8(out.stdout) {
+                let trimmed = s.trim().to_string();
+                if !trimmed.is_empty() {
+                    return trimmed;
+                }
+            }
+        }
+    }
+    std::env::var("COMPUTERNAME") // Windows fallback if `hostname` cmd not on PATH
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            if cfg!(target_os = "macos") {
+                "macos".to_string()
+            } else if cfg!(target_os = "windows") {
+                "windows".to_string()
+            } else {
+                "linux".to_string()
+            }
+        })
+}
+
+/// Build the init script that runs in the rsclaw.ai webview before any
+/// page content loads. Captures the global `__TAURI__.core.invoke`,
+/// wraps it in a frozen `__RSCLAW_DESKTOP__` namespace, then deletes
+/// the broad `__TAURI__` global so the page can't call arbitrary
+/// commands. Only the two whitelisted commands are reachable.
+fn rsclaw_console_init_script(allowed_origin: &str) -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let platform = if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        "linux"
+    };
+    let hostname = device_hostname();
+    // Escape any double-quotes / backslashes that could appear in the
+    // hostname (rare but possible).
+    let hostname_js = hostname.replace('\\', "\\\\").replace('"', "\\\"");
+    let origin_js = allowed_origin.replace('\\', "\\\\").replace('"', "\\\"");
+    format!(
+        r#"
+(function() {{
+  try {{
+    // Only expose the channel when we're actually on the rsclaw.ai
+    // console. If the user navigates away (different origin) we don't
+    // want third-party pages getting it.
+    if (window.location.origin !== "{origin}") return;
+
+    var t = window.__TAURI__;
+    if (!t) return;
+    var invoke = (t.core && t.core.invoke) ? t.core.invoke.bind(t.core) : null;
+    if (!invoke) return;
+
+    Object.defineProperty(window, '__RSCLAW_DESKTOP__', {{
+      value: Object.freeze({{
+        version: "{version}",
+        platform: "{platform}",
+        hostname: "{hostname}",
+        installKey: function(data) {{
+          // Web team: call this with {{ name, key, tier? }} when the
+          // user clicks "Install to RsClaw Desktop" on the keys page.
+          return invoke('rsclaw_console_install_key', {{ data: data || {{}} }});
+        }},
+        close: function() {{
+          return invoke('close_rsclaw_console');
+        }}
+      }}),
+      writable: false,
+      configurable: false
+    }});
+
+    // Drop the broad surface so the page can't reach any other Tauri
+    // command. The two channels above are the entire contract.
+    try {{ delete window.__TAURI__; }} catch (_) {{}}
+  }} catch (e) {{
+    // Init failures shouldn't break the page — fall back to manual paste
+    // (the desktop UI still has a paste field).
+    console.warn('[rsclaw-desktop] init failed:', e);
+  }}
+}})();
+"#,
+        origin = origin_js,
+        version = version,
+        platform = platform,
+        hostname = hostname_js,
+    )
+}
+
+/// Open (or focus, if already open) the rsclaw.ai console webview.
+///
+/// `path` is appended to the configured `RSCLAW_CONSOLE_BASE` so callers
+/// can deep-link, e.g. `path = Some("/keys".into())` to land directly on
+/// the keys page. Defaults to the base URL when omitted.
+#[tauri::command]
+async fn open_rsclaw_console(
+    app: tauri::AppHandle,
+    path: Option<String>,
+) -> Result<(), String> {
+    use tauri::{WebviewUrl, WebviewWindowBuilder};
+
+    // Focus existing window instead of stacking.
+    if let Some(existing) = app.get_webview_window("rsclaw-console") {
+        existing.show().map_err(|e| format!("show: {e}"))?;
+        existing.set_focus().map_err(|e| format!("focus: {e}"))?;
+        return Ok(());
+    }
+
+    let suffix = path.unwrap_or_default();
+    let full_url = if suffix.is_empty() {
+        RSCLAW_CONSOLE_BASE.to_string()
+    } else if suffix.starts_with('/') {
+        format!("{}{}", RSCLAW_CONSOLE_BASE, suffix)
+    } else {
+        format!("{}/{}", RSCLAW_CONSOLE_BASE, suffix)
+    };
+
+    let parsed: url::Url = full_url
+        .parse()
+        .map_err(|e: url::ParseError| format!("parse console url: {e}"))?;
+    let origin = parsed.origin().ascii_serialization();
+    let webview_url = WebviewUrl::External(parsed);
+
+    let init_script = rsclaw_console_init_script(&origin);
+
+    WebviewWindowBuilder::new(&app, "rsclaw-console", webview_url)
+        .title("rsclaw console")
+        .inner_size(960.0, 760.0)
+        .min_inner_size(680.0, 520.0)
+        .center()
+        .resizable(true)
+        .focused(true)
+        .initialization_script(&init_script)
+        .build()
+        .map_err(|e| format!("build console window: {e}"))?;
+
+    Ok(())
+}
+
+/// Close the rsclaw.ai console webview if open. No-op otherwise.
+/// Called by the web side after a successful key install (via the
+/// injected `__RSCLAW_DESKTOP__.close()`) or directly by the desktop
+/// UI when the user cancels.
+#[tauri::command]
+async fn close_rsclaw_console(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("rsclaw-console") {
+        window
+            .close()
+            .map_err(|e| format!("close console window: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Webview-side entry point invoked by `window.__RSCLAW_DESKTOP__.installKey`.
+/// We don't do the rsclaw.json5 mutation here — main-window TypeScript
+/// owns that path (read → merge → `write_config`). This command's only
+/// job is to re-emit the payload as a Tauri event so the main window's
+/// listener fires regardless of which webview the call originated in.
+#[tauri::command]
+async fn rsclaw_console_install_key(
+    app: tauri::AppHandle,
+    data: serde_json::Value,
+) -> Result<(), String> {
+    app.emit("rsclaw:console-install-key", data)
+        .map_err(|e| format!("emit install-key event: {e}"))?;
+    Ok(())
+}
+
 /// Scan OpenClaw data and return summary (agents, sessions, jsonl files).
 #[tauri::command]
 fn scan_openclaw(path: String) -> Result<serde_json::Value, String> {
@@ -1544,6 +1751,9 @@ fn main() {
             read_file_as_data_url,
             open_glow_overlay,
             close_glow_overlay,
+            open_rsclaw_console,
+            close_rsclaw_console,
+            rsclaw_console_install_key,
         ])
         .setup(|app| {
             // Seed the bundled BGE embedding model into the standard rsclaw

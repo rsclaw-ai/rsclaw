@@ -762,6 +762,8 @@ mod tests {
                 bind_address: None,
                 reload: ReloadMode::Hybrid,
                 auth_token: None,
+            a2a_bearer_tokens: vec![],
+            a2a_api_keys: vec![],
                 allow_tailscale: false,
                 channel_health_check_minutes: 5,
                 channel_stale_event_threshold_minutes: 30,

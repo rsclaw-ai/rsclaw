@@ -163,15 +163,32 @@ panic = "abort"
 debug-assertions = false
 overflow-checks = false
 
-# Reduce stack usage in debug builds
 [profile.dev]
-opt-level = 1
+opt-level = 0
+incremental = true
 # Trim DWARF: keep file:line for backtraces, drop variable/type info.
 # Cuts target/debug size ~40-60% without affecting panic location info.
 debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 0
+
+# Developer-local release — parallel codegen, thin LTO. Builds much faster
+# than `release` at a small runtime cost. Use for local dogfooding.
+# Run: cargo build --profile release-dev
+[profile.release-dev]
+inherits = "release"
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+strip = "symbols"
+
+# CI builds — catches release-only issues without paying for fat LTO.
+# Use: cargo build --profile ci
+[profile.ci]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
 
 [dev-dependencies]
 tokio-test = "0.4"

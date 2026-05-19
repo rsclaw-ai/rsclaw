@@ -37,6 +37,13 @@ pub struct GatewayRuntime {
     pub bind_address: Option<String>,
     pub reload: ReloadMode,
     pub auth_token: Option<String>,
+    /// Accepted Bearer tokens for `/api/v1/a2a`, resolved from
+    /// `gateway.a2aAuth.tokens` + env `RSCLAW_A2A_BEARER_TOKENS`.
+    /// Empty Vec = no config tokens (env may still apply at request time).
+    pub a2a_bearer_tokens: Vec<String>,
+    /// Accepted `X-API-Key` values for `/api/v1/a2a`, resolved from
+    /// `gateway.a2aAuth.apiKeys` + env `RSCLAW_A2A_API_KEYS`.
+    pub a2a_api_keys: Vec<String>,
     /// True when `gateway.auth.token` is present in config (Plain or
     /// SecretRef). Used by the validator to avoid a false "no auth token"
     /// warning when the token is a SecretRef that couldn't be resolved at
@@ -164,6 +171,28 @@ impl IntoRuntime for Config {
             .or_else(|| std::env::var("RSCLAW_AUTH_TOKEN").ok())
             .or_else(|| std::env::var("OPENCLAW_GATEWAY_TOKEN").ok());
 
+        // A2A inbound auth — resolve config-listed tokens/keys, then merge
+        // env-set lists for back-compat with the original env-only design.
+        // Empty in both => middleware passes through (dev mode).
+        let resolve_list = |list: Option<&Vec<SecretOrString>>| -> Vec<String> {
+            list.map(|v| v.iter().filter_map(|s| s.resolve_early()).collect())
+                .unwrap_or_default()
+        };
+        let env_split = |name: &str| -> Vec<String> {
+            std::env::var(name)
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+        let mut a2a_bearer_tokens =
+            resolve_list(gw.a2a_auth.as_ref().and_then(|a| a.tokens.as_ref()));
+        a2a_bearer_tokens.extend(env_split("RSCLAW_A2A_BEARER_TOKENS"));
+        let mut a2a_api_keys =
+            resolve_list(gw.a2a_auth.as_ref().and_then(|a| a.api_keys.as_ref()));
+        a2a_api_keys.extend(env_split("RSCLAW_A2A_API_KEYS"));
+
         Ok(RuntimeConfig {
             gateway: GatewayRuntime {
                 port: gw.port.unwrap_or(18888),
@@ -172,6 +201,8 @@ impl IntoRuntime for Config {
                 bind_address: gw.bind_address.clone(),
                 reload: gw.reload.unwrap_or(ReloadMode::Hybrid),
                 auth_token,
+                a2a_bearer_tokens,
+                a2a_api_keys,
                 auth_token_configured,
                 auth_token_is_plaintext,
                 allow_tailscale: gw

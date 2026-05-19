@@ -47,6 +47,21 @@ rsclaw start
 
 完全支持所有 OpenClaw 配置字段，未知字段静默忽略以保持前向兼容。
 
+### 从 A2A 早期 beta 升级
+
+如果你的 `rsclaw.json5` 里有 `agents.external: [...]`，A2A v1.0 上线时把它改名为 `agents.a2a: [...]`。字段结构没动，只换了 key + 结构体名：
+
+```json5
+agents: {
+  // 旧：
+  // external: [{ id: "remote-analyst", url: "https://…", auth_token: "${TOKEN}" }],
+  // 新：
+  a2a: [{ id: "remote-analyst", url: "https://…", auth_token: "${TOKEN}" }],
+}
+```
+
+没保留兼容 alias —— gateway 启动时会拒绝未知键（`external` 现在就是未知）。Rust 结构体也跟着改名了：`ExternalAgentConfig` → `A2aPeerConfig`。
+
 ---
 
 ## RsClaw vs OpenClaw
@@ -777,6 +792,58 @@ assert expected == request.headers["X-A2A-Signature"]
 **取消语义：**
 
 `CancelTask` 触发 cancel_token，runtime 在 agent 主循环每次迭代顶部 + 每次工具调度前自检 → 中断颗粒度是"工具之间"。一个 30s 阻塞工具会跑完才退出；但 dispatcher 端会立即发 `TASK_STATE_CANCELED` final 事件并关 SSE，client 不会被那个长工具阻塞观测。
+
+**把 A2A 端点暴露到公网：**
+
+gateway 默认监听 `127.0.0.1:18888`，远端 peer 进不来。按你的网络挑一条：
+
+**🇨🇳 国内 — `frp` + 国内 VPS（推荐）**
+
+Cloudflare 的边缘节点在国内访问质量看 ISP 看运气，长连接（A2A 的 SSE 流）受影响最大。买个国内轻量服务器（阿里云/腾讯云/华为云，约 5-10 元/月），跑 [frp](https://github.com/fatedier/frp)：
+
+VPS 端 `frps.toml`：
+
+```toml
+bindPort = 7000
+auth.token = "your-frp-secret"
+
+[[httpsVhost]]
+type = "https"
+listenPort = 443
+customDomains = ["a2a.example.cn"]
+```
+
+agent 本地 `frpc.toml`：
+
+```toml
+serverAddr = "your-vps-ip"
+serverPort = 7000
+auth.token = "your-frp-secret"
+
+[[proxies]]
+name = "rsclaw-a2a"
+type = "https"
+localIP = "127.0.0.1"
+localPort = 18888
+customDomains = ["a2a.example.cn"]
+```
+
+远端 peer 把 `agents.a2a[].url` 配成 `https://a2a.example.cn`。**必须** 设 `RSCLAW_A2A_BEARER_TOKENS` —— frp 隧道默认开放，没鉴权等于公网裸跑。
+
+`nps` 是 `frp` 的图形化分支，配置麻烦的话可以用它。[樱花穿透 Sakura Frp](https://www.natfrp.com/) 有免费层但带宽有限。
+
+**🌍 国外 — Cloudflare Tunnel**
+
+```bash
+brew install cloudflared
+cloudflared tunnel --url http://127.0.0.1:18888    # 拿到 https://<random>.trycloudflare.com
+```
+
+生产用 named tunnel 绑自有域名。同样必须设 `RSCLAW_A2A_BEARER_TOKENS`。
+
+**🏗️ 自托管多租户 — [`rsclaw-tunnel`](https://github.com/rsclaw-ai/rsclaw-tunnel)**
+
+一个 server 托管多个 agent + JSON-RPC 方法级限速 + 边缘鉴权 + 数据完全自控的场景。早期开发中，不是给个人用户取代 Cloudflare 用的——只有当你需要"协议感知 + 多租户"这类现成隧道不提供的能力时再考虑。
 
 ### 定时任务
 
