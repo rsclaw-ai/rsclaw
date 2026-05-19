@@ -1430,13 +1430,15 @@ impl RsclawProvider {
         let byte_stream = resp.bytes_stream();
         let line_buffer = Arc::new(tokio::sync::Mutex::new(String::new()));
         let utf8_remainder = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let block_state = Arc::new(tokio::sync::Mutex::new(SseState::default()));
         let event_stream = byte_stream
             .map_err(|e| anyhow::anyhow!("stream read error: {e}"))
             .then(move |chunk| {
                 let line_buffer = line_buffer.clone();
                 let utf8_remainder = utf8_remainder.clone();
+                let block_state = block_state.clone();
                 async move {
-                    parse_sse_chunk(chunk, &line_buffer, &utf8_remainder).await
+                    parse_sse_chunk(chunk, &line_buffer, &utf8_remainder, &block_state).await
                 }
             })
             .flat_map(futures::stream::iter);
@@ -2532,10 +2534,46 @@ fn serialize_replay_history(messages: &[&Message]) -> Vec<Value> {
 // server may add new types (e.g. `cache_hit_summary`) without breaking
 // old clients.
 
+/// Per-stream state for the v1 native protocol. Frames are
+/// block-oriented (Anthropic Messages-style):
+///
+///     block_start{index, block:{type,id?,name?}}
+///     block_delta{index, delta}     (zero or more, may interleave by index)
+///     block_stop{index}
+///
+/// `blocks` tracks open builders keyed by the `index` field so deltas
+/// for interleaved parallel blocks (e.g. one `text` and one `tool_call`
+/// open simultaneously) route to the right accumulator.
+#[derive(Debug, Default)]
+struct SseState {
+    blocks: std::collections::HashMap<u64, BlockBuilder>,
+}
+
+#[derive(Debug)]
+struct BlockBuilder {
+    kind: BlockKind,
+    /// Accumulates partial JSON for `tool_call` blocks. Text/thinking
+    /// blocks emit incrementally on every `block_delta` for UI
+    /// streaming, so `buf` stays empty for them — saves memory on
+    /// long answers and lets `block_stop` distinguish the two paths
+    /// purely by `kind`.
+    buf: String,
+    tool_id: String,
+    tool_name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockKind {
+    Text,
+    Thinking,
+    ToolCall,
+}
+
 async fn parse_sse_chunk(
     chunk: Result<bytes::Bytes>,
     line_buffer: &Arc<tokio::sync::Mutex<String>>,
     utf8_remainder: &Arc<tokio::sync::Mutex<Vec<u8>>>,
+    block_state: &Arc<tokio::sync::Mutex<SseState>>,
 ) -> Vec<Result<StreamEvent>> {
     let mut events: Vec<Result<StreamEvent>> = Vec::new();
     let bytes = match chunk {
@@ -2601,11 +2639,12 @@ async fn parse_sse_chunk(
         let Some(payload) = line.strip_prefix("data:").map(|s| s.trim_start_matches(' ')) else {
             continue;
         };
-        // No `data: [DONE]` sentinel on the native rsclaw protocol —
-        // spec §2.3.1 explicitly says message_stop is the terminator
-        // and only the `/v1/chat/completions` OAI translator emits
-        // [DONE]. Still defensive-skip if a misconfigured proxy injects
-        // one; pushing a parse error here would tank the turn.
+        // v1 native protocol emits a trailing `[DONE]` sentinel after
+        // the final `done` event (mirrors OAI translator convention so
+        // generic SSE clients have a deterministic close signal). The
+        // authoritative terminator is `done`, which already pushed a
+        // `StreamEvent::Done` upstream. `[DONE]` itself carries no
+        // payload — drop it silently rather than surface a parse error.
         if payload == "[DONE]" {
             continue;
         }
@@ -2627,55 +2666,126 @@ async fn parse_sse_chunk(
             }
         };
         let kind = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let mut state = block_state.lock().await;
         match kind {
-            // Text fragment. Worker emits one per generated token on
-            // both the session-turn lane and the fastshot lanes.
-            "delta" => {
-                if let Some(s) = value.get("content").and_then(Value::as_str)
-                    && !s.is_empty()
-                {
-                    events.push(Ok(StreamEvent::TextDelta(s.to_string())));
+            // Stream prelude — carries cache stats / model / session
+            // metadata for telemetry. No StreamEvent emission; clients
+            // should tap this for observability if they care.
+            "start" => {}
+            // Server-side keepalive. SSE-comment translators may also
+            // arrive here. Reset any keepalive timer the caller tracks;
+            // no StreamEvent.
+            "ping" => {}
+            // Open a new content block. `index` is the routing key;
+            // future deltas with the same index land in this builder.
+            // Unknown `block.type` is skipped (forward-compat: server
+            // may add e.g. `image` blocks later — old clients ignore).
+            "block_start" => {
+                let Some(index) = value.get("index").and_then(Value::as_u64) else {
+                    continue;
+                };
+                let block = value.get("block");
+                let block_type = block
+                    .and_then(|b| b.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let kind = match block_type {
+                    "text" => BlockKind::Text,
+                    "thinking" => BlockKind::Thinking,
+                    "tool_call" => BlockKind::ToolCall,
+                    _ => continue,
+                };
+                let (tool_id, tool_name) = if kind == BlockKind::ToolCall {
+                    (
+                        block
+                            .and_then(|b| b.get("id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        block
+                            .and_then(|b| b.get("name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                    )
+                } else {
+                    (String::new(), String::new())
+                };
+                state.blocks.insert(
+                    index,
+                    BlockBuilder {
+                        kind,
+                        buf: String::new(),
+                        tool_id,
+                        tool_name,
+                    },
+                );
+            }
+            // Streaming content for an open block. Text/thinking emit
+            // each delta IMMEDIATELY so the UI streams character-by-
+            // character; tool_call deltas accumulate (partial JSON
+            // shards) until block_stop, where the whole input parses
+            // atomically. A delta arriving for an unknown index is
+            // dropped silently (forward-compat with reordered or
+            // dropped block_start frames).
+            "block_delta" => {
+                let Some(index) = value.get("index").and_then(Value::as_u64) else {
+                    continue;
+                };
+                let Some(delta) = value.get("delta").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(b) = state.blocks.get_mut(&index) else {
+                    continue;
+                };
+                match b.kind {
+                    BlockKind::Text => {
+                        if !delta.is_empty() {
+                            events.push(Ok(StreamEvent::TextDelta(delta.to_string())));
+                        }
+                    }
+                    BlockKind::Thinking => {
+                        if !delta.is_empty() {
+                            events.push(Ok(StreamEvent::ReasoningDelta(delta.to_string())));
+                        }
+                    }
+                    BlockKind::ToolCall => {
+                        b.buf.push_str(delta);
+                    }
                 }
             }
-            // Reasoning fragment. Only emitted by reasoning-enabled
-            // models (DeepSeek-R1, o-series, Qwen3-thinking, etc.);
-            // others never send it. Same `content` field as `delta`.
-            "thinking" => {
-                if let Some(s) = value.get("content").and_then(Value::as_str)
-                    && !s.is_empty()
+            // Close a block. For tool_call: parse the accumulated buf
+            // as JSON and emit a single ToolCall event. Malformed JSON
+            // collapses to an empty object so downstream `.as_object()`
+            // consumers never have to match Null; the empty-args path
+            // is the runtime's existing "tool with no args" branch.
+            // Text/thinking already emitted incrementally — block_stop
+            // is just a no-op cleanup for them.
+            "block_stop" => {
+                let Some(index) = value.get("index").and_then(Value::as_u64) else {
+                    continue;
+                };
+                if let Some(b) = state.blocks.remove(&index)
+                    && b.kind == BlockKind::ToolCall
                 {
-                    events.push(Ok(StreamEvent::ReasoningDelta(s.to_string())));
+                    let input: Value = if b.buf.is_empty() {
+                        Value::Object(Default::default())
+                    } else {
+                        serde_json::from_str(&b.buf)
+                            .unwrap_or_else(|_| Value::Object(Default::default()))
+                    };
+                    events.push(Ok(StreamEvent::ToolCall {
+                        id: b.tool_id,
+                        name: b.tool_name,
+                        input,
+                    }));
                 }
-            }
-            // Whole tool call in one frame — id, name, and input
-            // arrive together. No accumulation across deltas (the
-            // server flattens worker-side streaming before forwarding).
-            // Per §4.2 default `input` to {} if absent or non-object so
-            // downstream `.as_object()` consumers don't have to match Null.
-            "tool_call" => {
-                let id = value
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let name = value
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let input = value
-                    .get("input")
-                    .cloned()
-                    .filter(Value::is_object)
-                    .unwrap_or(Value::Object(Default::default()));
-                events.push(Ok(StreamEvent::ToolCall { id, name, input }));
             }
             // Terminal frame — carries `finish_reason` (we don't
             // propagate it; runtime treats Done as "stream complete")
-            // and `usage` with worker token counts. The server
-            // forwards the worker's usage object verbatim; different
-            // lanes use different field names so be defensive
-            // (docs/client-server-integration.md §4.3).
+            // and `usage` with worker token counts. Field-name drift
+            // across lanes documented in client-server-integration.md
+            // §4.3 (input_tokens / prompt_tokens / input — try each).
             "done" => {
                 let usage = value
                     .get("usage")
@@ -2689,9 +2799,9 @@ async fn parse_sse_chunk(
                     });
                 events.push(Ok(StreamEvent::Done { usage }));
             }
-            // Mid-stream error frame per §4.2: `{type:"error",
-            // error:{code, message}}`. Empty fields collapse to a
-            // generic message rather than a confusing "[]: " prefix.
+            // Mid-stream error frame: `{type:"error", error:{code, message}}`.
+            // Empty fields collapse to a generic message rather than a
+            // confusing "[]: " prefix.
             "error" => {
                 let err = value.get("error");
                 let code = err
@@ -2710,11 +2820,12 @@ async fn parse_sse_chunk(
                 };
                 events.push(Ok(StreamEvent::Error(msg)));
             }
-            // Unknown types: forward-compat per §4.2 — server may add
-            // new types (e.g. `cache_hit_summary`) and old clients
+            // Unknown types: forward-compat — server may add new
+            // frame types (e.g. `cache_hit_summary`) and old clients
             // should ignore them rather than fail the turn.
             _ => {}
         }
+        drop(state);
     }
     events
 }
@@ -2936,26 +3047,60 @@ mod tests {
         chunk: Result<bytes::Bytes>,
         buf: &Arc<tokio::sync::Mutex<String>>,
         rem: &Arc<tokio::sync::Mutex<Vec<u8>>>,
+        state: &Arc<tokio::sync::Mutex<SseState>>,
     ) -> Vec<Result<StreamEvent>> {
-        parse_sse_chunk(chunk, buf, rem).await
+        parse_sse_chunk(chunk, buf, rem, state).await
+    }
+
+    /// Convenience: create a fresh block state for a single-call test.
+    fn new_state() -> Arc<tokio::sync::Mutex<SseState>> {
+        Arc::new(tokio::sync::Mutex::new(SseState::default()))
     }
 
     #[tokio::test]
     async fn parse_sse_chunk_recovers_split_utf8() {
-        // SSE delta line carrying "你好"
-        // (U+4F60 = E4 BD A0, U+597D = E5 A5 BD), with the byte split
-        // landing in the middle of the first character.
-        let line_full = b"data: {\"type\":\"delta\",\"content\":\"\xe4\xbd\xa0\xe5\xa5\xbd\"}\n";
-        let split = 20;
-        let (a, b) = line_full.split_at(split);
-        let (b, c) = b.split_at(line_full.len() / 2 - split);
+        // v1 block_delta line carrying "你好" (U+4F60 = E4 BD A0, U+597D
+        // = E5 A5 BD). Open the block first, then split the delta
+        // line so chunk boundaries land mid-CJK — UTF-8 stitching
+        // must preserve the codepoints verbatim, no U+FFFD leak.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        // Prime the parser with block_start so subsequent block_delta
+        // frames have somewhere to route.
+        let _ = parse_sse_test(
+            Ok(bytes::Bytes::from_static(
+                b"data: {\"type\":\"block_start\",\"index\":0,\"block\":{\"type\":\"text\"}}\n",
+            )),
+            &buf,
+            &rem,
+            &state,
+        )
+        .await;
+
+        let line_full = b"data: {\"type\":\"block_delta\",\"index\":0,\"delta\":\"\xe4\xbd\xa0\xe5\xa5\xbd\"}\n";
+        // 51 bytes prefix before the CJK bytes; split inside the
+        // first codepoint at byte 52 (E4 BD ...| A0 ...).
+        let split = 52;
+        let (a, b) = line_full.split_at(split);
+        let (b, c) = b.split_at(2);
 
         for piece in [a, b, c] {
-            let _ = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(piece)), &buf, &rem).await;
+            let _ = parse_sse_test(
+                Ok(bytes::Bytes::copy_from_slice(piece)),
+                &buf,
+                &rem,
+                &state,
+            )
+            .await;
         }
-        let evs = parse_sse_test(Ok(bytes::Bytes::from_static(b"")), &buf, &rem).await;
+        let evs = parse_sse_test(
+            Ok(bytes::Bytes::from_static(b"")),
+            &buf,
+            &rem,
+            &state,
+        )
+        .await;
 
         let texts: Vec<_> = evs
             .into_iter()
@@ -2964,9 +3109,8 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // Either fully delivered now or already delivered in an earlier piece.
         let all_text: String = texts.into_iter().collect();
-        // The final newline-terminated event must produce 你好 verbatim, no U+FFFD.
+        // Final newline-terminated frame must produce 你好 verbatim.
         assert!(
             !all_text.contains('\u{FFFD}'),
             "expected no replacement char, got {all_text:?}"
@@ -2983,9 +3127,10 @@ mod tests {
         // the stream stalls forever on a single bad byte.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
 
         // Chunk 1: just an invalid byte. error_len() = Some(1).
-        let evs = parse_sse_test(Ok(bytes::Bytes::from_static(b"\xff")), &buf, &rem).await;
+        let evs = parse_sse_test(Ok(bytes::Bytes::from_static(b"\xff")), &buf, &rem, &state).await;
         assert!(
             evs.iter().all(|e| e.is_ok()),
             "stray 0xFF must not surface as Err — got {evs:?}"
@@ -3003,10 +3148,11 @@ mod tests {
         // emit it normally — no contamination from the prior bad byte.
         let evs = parse_sse_test(
             Ok(bytes::Bytes::from_static(
-                b"data: {\"type\":\"delta\",\"content\":\"hi\"}\n",
+                b"data: {\"type\":\"block_start\",\"index\":0,\"block\":{\"type\":\"text\"}}\ndata: {\"type\":\"block_delta\",\"index\":0,\"delta\":\"hi\"}\ndata: {\"type\":\"block_stop\",\"index\":0}\n",
             )),
             &buf,
             &rem,
+            &state,
         )
         .await;
         let texts: Vec<_> = evs
@@ -3032,8 +3178,9 @@ mod tests {
         // streams. Post-fix the remainder stays empty after each call.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
         for _ in 0..50 {
-            let _ = parse_sse_test(Ok(bytes::Bytes::from_static(b"\xff")), &buf, &rem).await;
+            let _ = parse_sse_test(Ok(bytes::Bytes::from_static(b"\xff")), &buf, &rem, &state).await;
         }
         let r = rem.lock().await;
         assert!(
@@ -3052,8 +3199,9 @@ mod tests {
         // event and assert: only the real text delta fires, no Err.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = b"data:\ndata: {\"type\":\"delta\",\"content\":\"hi\"}\n";
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let state = new_state();
+        let line = b"data:\ndata: {\"type\":\"block_start\",\"index\":0,\"block\":{\"type\":\"text\"}}\ndata: {\"type\":\"block_delta\",\"index\":0,\"delta\":\"hi\"}\ndata: {\"type\":\"block_stop\",\"index\":0}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         let mut texts: Vec<String> = Vec::new();
         for e in evs {
             match e {
@@ -3072,8 +3220,9 @@ mod tests {
         // Verify the same: no Err, no spurious event.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
         let line = b"data:    \n";
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         for e in evs {
             if let Err(err) = e {
                 panic!("whitespace-only data: must not surface as Err — got {err}");
@@ -3089,8 +3238,11 @@ mod tests {
         // `data:{...}` without a space. Both forms must parse.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = b"data:{\"type\":\"delta\",\"content\":\"hi\"}\n";
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let state = new_state();
+        // SSE spec allows the space after `data:` to be omitted; both
+        // forms must parse. v1 frames split across three lines here.
+        let line = b"data:{\"type\":\"block_start\",\"index\":0,\"block\":{\"type\":\"text\"}}\ndata:{\"type\":\"block_delta\",\"index\":0,\"delta\":\"hi\"}\ndata:{\"type\":\"block_stop\",\"index\":0}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         let texts: Vec<_> = evs
             .into_iter()
             .filter_map(|e| match e {
@@ -3107,8 +3259,9 @@ mod tests {
         // generated token on every native lane.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = b"data: {\"type\":\"delta\",\"content\":\"hello\"}\n";
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let state = new_state();
+        let line = b"data: {\"type\":\"block_start\",\"index\":0,\"block\":{\"type\":\"text\"}}\ndata: {\"type\":\"block_delta\",\"index\":0,\"delta\":\"hello\"}\ndata: {\"type\":\"block_stop\",\"index\":0}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         let texts: Vec<String> = evs
             .into_iter()
             .filter_map(|e| match e {
@@ -3126,8 +3279,9 @@ mod tests {
         // separately from user-visible TextDelta.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = b"data: {\"type\":\"thinking\",\"content\":\"step 1: parse\"}\n";
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let state = new_state();
+        let line = b"data: {\"type\":\"block_start\",\"index\":0,\"block\":{\"type\":\"thinking\"}}\ndata: {\"type\":\"block_delta\",\"index\":0,\"delta\":\"step 1: parse\"}\ndata: {\"type\":\"block_stop\",\"index\":0}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         let reasonings: Vec<String> = evs
             .into_iter()
             .filter_map(|e| match e {
@@ -3140,15 +3294,17 @@ mod tests {
 
     #[tokio::test]
     async fn parse_sse_chunk_native_tool_call_emits_whole_frame() {
-        // Native tool_call arrives complete in ONE frame — no
-        // accumulation across deltas (unlike Anthropic's
-        // input_json_delta streaming). id, name, input all materialise
-        // together.
+        // v1 tool_call block: id+name on `block_start`; input as one
+        // or more `block_delta` JSON shards; `block_stop` triggers
+        // a single `ToolCall` emission with the parsed input.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = br#"data: {"type":"tool_call","id":"call_42","name":"read_file","input":{"path":"x.rs"}}
+        let state = new_state();
+        let line = br#"data: {"type":"block_start","index":0,"block":{"type":"tool_call","id":"call_42","name":"read_file"}}
+data: {"type":"block_delta","index":0,"delta":"{\"path\":\"x.rs\"}"}
+data: {"type":"block_stop","index":0}
 "#;
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         let (id, name, input) = evs
             .into_iter()
             .find_map(|e| match e {
@@ -3163,13 +3319,15 @@ mod tests {
 
     #[tokio::test]
     async fn parse_sse_chunk_native_tool_call_missing_input_defaults_empty_object() {
-        // §4.2 says: emit ToolCall with input = {} when the worker
-        // omits or sends a non-object input. Downstream consumers
-        // call `.as_object()` directly without a Null match.
+        // A tool_call block that gets `block_stop` without any
+        // `block_delta` (worker had no input args) must emit
+        // ToolCall with input = {}. Downstream consumers call
+        // `.as_object()` directly without a Null match.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = b"data: {\"type\":\"tool_call\",\"id\":\"c\",\"name\":\"get_time\"}\n";
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let state = new_state();
+        let line = b"data: {\"type\":\"block_start\",\"index\":0,\"block\":{\"type\":\"tool_call\",\"id\":\"c\",\"name\":\"get_time\"}}\ndata: {\"type\":\"block_stop\",\"index\":0}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         let input = evs
             .into_iter()
             .find_map(|e| match e {
@@ -3187,8 +3345,9 @@ mod tests {
     async fn parse_sse_chunk_native_done_emits_done_with_usage() {
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
         let line = b"data: {\"type\":\"done\",\"finish_reason\":\"end_turn\",\"usage\":{\"input_tokens\":11,\"output_tokens\":22}}\n";
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         let mut saw_done = false;
         for e in evs {
             if let Ok(StreamEvent::Done { usage }) = e {
@@ -3206,8 +3365,9 @@ mod tests {
         // Server may omit usage on early termination — Done must still fire.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
         let line = b"data: {\"type\":\"done\",\"finish_reason\":\"end_turn\"}\n";
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         let mut saw_done = false;
         for e in evs {
             if let Ok(StreamEvent::Done { usage }) = e {
@@ -3227,8 +3387,9 @@ mod tests {
         // usage object.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
         let line = b"data: {\"type\":\"done\",\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":13}}\n";
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         let u = evs
             .into_iter()
             .find_map(|e| match e {
@@ -3247,8 +3408,9 @@ mod tests {
         // we DID get is preserved.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
         let line = b"data: {\"type\":\"done\",\"usage\":{\"input_tokens\":17}}\n";
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         let usage = evs
             .into_iter()
             .find_map(|e| match e {
@@ -3268,8 +3430,9 @@ mod tests {
         // mask buggy worker builds that drop the field.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
         let line = b"data: {\"type\":\"done\",\"usage\":null}\n";
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         let mut saw_done = false;
         for e in evs {
             if let Ok(StreamEvent::Done { usage }) = e {
@@ -3285,8 +3448,9 @@ mod tests {
         // Malformed `"usage": [1,2]` must NOT yield Some(TokenUsage{0,0}).
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
         let line = b"data: {\"type\":\"done\",\"usage\":[1,2,3]}\n";
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         let mut saw_done = false;
         for e in evs {
             if let Ok(StreamEvent::Done { usage }) = e {
@@ -3303,9 +3467,10 @@ mod tests {
         // Both fields must survive into StreamEvent::Error.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
         let line = br#"data: {"type":"error","error":{"code":"slot_evicted","message":"slot was reclaimed mid-decode"}}
 "#;
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         let msg = evs
             .into_iter()
             .find_map(|e| match e {
@@ -3321,9 +3486,10 @@ mod tests {
     async fn parse_sse_chunk_native_error_code_missing_keeps_message() {
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
         let line = br#"data: {"type":"error","error":{"message":"upstream hung up"}}
 "#;
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         let msg = evs
             .into_iter()
             .find_map(|e| match e {
@@ -3339,9 +3505,10 @@ mod tests {
     async fn parse_sse_chunk_native_error_message_missing_keeps_code() {
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
         let line = br#"data: {"type":"error","error":{"code":"version_drift"}}
 "#;
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         let msg = evs
             .into_iter()
             .find_map(|e| match e {
@@ -3357,8 +3524,9 @@ mod tests {
     async fn parse_sse_chunk_native_error_uses_default_when_both_missing() {
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
         let line = b"data: {\"type\":\"error\",\"error\":{}}\n";
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         let msg = evs
             .into_iter()
             .find_map(|e| match e {
@@ -3375,10 +3543,13 @@ mod tests {
         // `cache_hit_summary` frames) must be silently ignored.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
         let frames = br#"data: {"type":"cache_hit_summary","hits":42}
-data: {"type":"delta","content":"hi"}
+data: {"type":"block_start","index":0,"block":{"type":"text"}}
+data: {"type":"block_delta","index":0,"delta":"hi"}
+data: {"type":"block_stop","index":0}
 "#;
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frames)), &buf, &rem).await;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frames)), &buf, &rem, &state).await;
         let texts: Vec<String> = evs
             .into_iter()
             .filter_map(|e| match e {
@@ -3387,6 +3558,202 @@ data: {"type":"delta","content":"hi"}
             })
             .collect();
         assert_eq!(texts, vec!["hi".to_string()]);
+    }
+
+    // ----- v1 protocol: block-oriented streaming -----
+
+    #[tokio::test]
+    async fn parse_v1_text_emits_incremental_text_deltas() {
+        // Two block_delta frames inside one text block must each
+        // emit a TextDelta in order (UI streams character-by-
+        // character; we don't wait for block_stop).
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let frames = br#"data: {"type":"start"}
+data: {"type":"block_start","index":0,"block":{"type":"text"}}
+data: {"type":"block_delta","index":0,"delta":"Hel"}
+data: {"type":"block_delta","index":0,"delta":"lo"}
+data: {"type":"block_stop","index":0}
+data: {"type":"done","finish_reason":"stop","usage":{"input_tokens":1,"output_tokens":2}}
+data: [DONE]
+"#;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frames)), &buf, &rem, &state).await;
+        let mut texts = Vec::new();
+        let mut got_done = false;
+        for e in evs {
+            match e.unwrap() {
+                StreamEvent::TextDelta(s) => texts.push(s),
+                StreamEvent::Done { usage } => {
+                    got_done = true;
+                    let u = usage.expect("usage present");
+                    assert_eq!(u.input, 1);
+                    assert_eq!(u.output, 2);
+                }
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        assert_eq!(texts, vec!["Hel".to_string(), "lo".to_string()]);
+        assert!(got_done, "Done event missing");
+    }
+
+    #[tokio::test]
+    async fn parse_v1_tool_call_streams_args_then_emits_one_toolcall() {
+        // Tool input arrives as partial JSON shards across multiple
+        // block_delta frames. The parser accumulates and emits a
+        // single ToolCall on block_stop with the parsed input.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let frames = br#"data: {"type":"block_start","index":0,"block":{"type":"tool_call","id":"c1","name":"write_file"}}
+data: {"type":"block_delta","index":0,"delta":"{\"path\":\"a.txt\","}
+data: {"type":"block_delta","index":0,"delta":"\"content\":\"hello\"}"}
+data: {"type":"block_stop","index":0}
+data: {"type":"done"}
+data: [DONE]
+"#;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frames)), &buf, &rem, &state).await;
+        // Exactly one ToolCall, no intermediate TextDelta events.
+        let mut tool_calls = Vec::new();
+        for e in &evs {
+            if let Ok(StreamEvent::TextDelta(_)) = e {
+                panic!("tool_call deltas must NOT emit TextDelta");
+            }
+            if let Ok(StreamEvent::ToolCall { id, name, input }) = e {
+                tool_calls.push((id.clone(), name.clone(), input.clone()));
+            }
+        }
+        assert_eq!(tool_calls.len(), 1, "expected exactly one ToolCall");
+        let (id, name, input) = tool_calls.into_iter().next().unwrap();
+        assert_eq!(id, "c1");
+        assert_eq!(name, "write_file");
+        assert_eq!(input.get("path").and_then(Value::as_str), Some("a.txt"));
+        assert_eq!(input.get("content").and_then(Value::as_str), Some("hello"));
+    }
+
+    #[tokio::test]
+    async fn parse_v1_parallel_blocks_by_index() {
+        // Text block (index=0) and tool_call block (index=1) opened
+        // simultaneously with interleaved deltas. Each delta must
+        // route to the right builder by index — no cross-talk.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let frames = br#"data: {"type":"block_start","index":0,"block":{"type":"text"}}
+data: {"type":"block_start","index":1,"block":{"type":"tool_call","id":"t1","name":"shell"}}
+data: {"type":"block_delta","index":0,"delta":"Running... "}
+data: {"type":"block_delta","index":1,"delta":"{\"cmd\":\""}
+data: {"type":"block_delta","index":0,"delta":"please wait"}
+data: {"type":"block_delta","index":1,"delta":"ls\"}"}
+data: {"type":"block_stop","index":1}
+data: {"type":"block_stop","index":0}
+"#;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frames)), &buf, &rem, &state).await;
+        let mut texts = Vec::new();
+        let mut tool_calls = Vec::new();
+        for e in evs {
+            match e.unwrap() {
+                StreamEvent::TextDelta(s) => texts.push(s),
+                StreamEvent::ToolCall { id, name, input } => tool_calls.push((id, name, input)),
+                _ => {}
+            }
+        }
+        assert_eq!(texts, vec!["Running... ".to_string(), "please wait".to_string()]);
+        assert_eq!(tool_calls.len(), 1);
+        let (id, name, input) = tool_calls.into_iter().next().unwrap();
+        assert_eq!(id, "t1");
+        assert_eq!(name, "shell");
+        assert_eq!(input.get("cmd").and_then(Value::as_str), Some("ls"));
+    }
+
+    #[tokio::test]
+    async fn parse_v1_start_and_ping_emit_nothing() {
+        // `start` carries telemetry metadata; `ping` is a keepalive.
+        // Neither should surface as a StreamEvent.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let frames = br#"data: {"type":"start","model":"foo","session_id":"s1"}
+data: {"type":"ping"}
+data: {"type":"ping"}
+"#;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frames)), &buf, &rem, &state).await;
+        for e in evs {
+            match e {
+                Ok(ev) => panic!("start/ping must not emit events; got {ev:?}"),
+                Err(err) => panic!("start/ping must not surface as Err; got {err}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_v1_done_sentinel_is_silently_consumed() {
+        // The trailing `data: [DONE]` after `done` carries no
+        // payload; parser must not surface it as a parse error.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let frames = br#"data: {"type":"done"}
+data: [DONE]
+"#;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frames)), &buf, &rem, &state).await;
+        let dones: Vec<_> = evs
+            .iter()
+            .filter_map(|e| match e {
+                Ok(StreamEvent::Done { .. }) => Some(()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dones.len(), 1, "expected exactly one Done event");
+        for e in &evs {
+            if let Err(err) = e {
+                panic!("[DONE] sentinel must not surface as Err; got {err}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_v1_block_delta_for_unopened_index_dropped_silently() {
+        // A block_delta arriving without a matching block_start (e.g.
+        // dropped frame, server bug) must NOT emit an event and must
+        // NOT panic. Forward-compat behavior.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let frames = br#"data: {"type":"block_delta","index":99,"delta":"orphan"}
+data: {"type":"block_stop","index":99}
+"#;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frames)), &buf, &rem, &state).await;
+        for e in evs {
+            match e {
+                Ok(ev) => panic!("orphan delta must not emit; got {ev:?}"),
+                Err(err) => panic!("orphan delta must not surface as Err; got {err}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_v1_tool_call_malformed_json_falls_back_to_empty_object() {
+        // Malformed tool_call input must not panic / surface as Err —
+        // the parser falls back to {} so downstream consumers don't
+        // crash. Matches the runtime's "no-args" branch behavior.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let frames = br#"data: {"type":"block_start","index":0,"block":{"type":"tool_call","id":"c","name":"foo"}}
+data: {"type":"block_delta","index":0,"delta":"{not valid json"}
+data: {"type":"block_stop","index":0}
+"#;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frames)), &buf, &rem, &state).await;
+        let input = evs
+            .into_iter()
+            .find_map(|e| match e {
+                Ok(StreamEvent::ToolCall { input, .. }) => Some(input),
+                _ => None,
+            })
+            .expect("expected one ToolCall event");
+        assert!(input.is_object());
+        assert_eq!(input.as_object().unwrap().len(), 0);
     }
 
     #[test]
