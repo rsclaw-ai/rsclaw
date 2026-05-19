@@ -90,3 +90,20 @@ pub fn build_runtime(_tier: MemoryTier) -> Result<tokio::runtime::Runtime> {
         .thread_stack_size(8 * 1024 * 1024) // 8MB stack per thread
         .build()?)
 }
+
+/// Run a function on a thread with a larger stack size.
+/// This is needed for the main thread because the default stack size on Windows
+/// is ~1MB which can overflow in debug builds with large async state machines.
+pub fn run_with_large_stack<F, T>(f: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    // 8MB stack for the main execution thread
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap()
+}
