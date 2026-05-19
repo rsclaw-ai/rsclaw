@@ -24,3 +24,28 @@ pub mod chunker;
 pub mod ledger;
 pub mod jobs;
 pub mod util;
+
+// Public façade — re-export the surface most callers need so they
+// can `use rsclaw::kb::{stage_doc, chunk_markdown, ...}` without
+// reaching into submodules. Submodules stay `pub` for advanced
+// callers that need finer control.
+
+pub use paths::KbPaths;
+pub use model::{
+    chunk_id, hamming64, simhash64, CallerScope, ChunkStatus, EntityKind, KbChunk, KbDoc,
+    KbEntity, KbEntityIndex, KbLocator, KbSource, KbSourceKind, KbStatus, KbVisibility,
+    LogicalSourceId, MailSource, VersionPointer,
+};
+pub use content_store::{
+    compose_doc_file, parse_doc_file, read_doc_body, read_doc_range, stage_doc,
+    verify_doc_sha, FrontMatter, StageInput, StagedDoc,
+};
+pub use canonicalize::{
+    canonicalize_by_mime, canonicalize_url, detect_mime, CanonicalMetadata, CanonicalizeInput,
+    CanonicalizedSource,
+};
+pub use chunker::{chunk_markdown, ChunkerInput, LocatorKind};
+pub use store::open_db;
+pub use ledger::{IngestLedgerEntry, LedgerOp, LedgerStatus};
+pub use jobs::{ClaimToken, Job, JobKind, JobStatus};
+pub use util::redact;
