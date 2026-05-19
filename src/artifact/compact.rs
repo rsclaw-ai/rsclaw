@@ -75,13 +75,18 @@ fn char_cap(s: &str, max: usize, id: &str) -> String {
     if s.chars().count() <= max {
         return s.to_owned();
     }
-    let head_n = max * 7 / 10;
-    let tail_n = max - head_n;
+    // Marker is fixed-template; reserve its chars from the budget so the
+    // returned string respects `max` (was ~80 chars over before).
+    let marker = format!(
+        "\n... output truncated — call read_artifact(tool_result_id=\"{id}\") for full output ...\n"
+    );
+    let marker_len = marker.chars().count();
+    let body = max.saturating_sub(marker_len);
+    let head_n = body * 7 / 10;
+    let tail_n = body - head_n;
     let head: String = s.chars().take(head_n).collect();
     let tail: String = s.chars().rev().take(tail_n).collect::<String>().chars().rev().collect();
-    format!(
-        "{head}\n... output truncated — call read_artifact(tool_result_id=\"{id}\") for full output ...\n{tail}"
-    )
+    format!("{head}{marker}{tail}")
 }
 
 /// Compact a JSON tool_result `Value`. Walks the value, replacing any large
@@ -97,14 +102,17 @@ pub fn compact_value(store: &ArtifactStore, session_key: &str, mut value: Value)
     if let Value::Object(map) = &mut value {
         let heavy_keys = ["stdout", "stderr", "text", "content", "messages_text", "output"];
         let mut any_compacted = false;
-        let mut total_raw: usize = 0;
+        let mut compacted_raw: usize = 0;
         let mut artifact_ids: Vec<(String, String)> = Vec::new();
         for k in heavy_keys.iter() {
             if let Some(field) = map.get(*k) {
                 if let Some(s) = field.as_str() {
                     let raw = s.chars().count();
-                    total_raw += raw;
                     if raw > ARTIFACT_THRESHOLD_CHARS {
+                        // `_raw_chars` only counts fields that crossed the
+                        // threshold — a 5KB stdout + a 10-char text shouldn't
+                        // report 5010 raw chars when only stdout was written.
+                        compacted_raw += raw;
                         let (preview, id) = compact_text(store, session_key, s);
                         if let Some(id) = id {
                             artifact_ids.push((k.to_string(), id));
@@ -136,7 +144,7 @@ pub fn compact_value(store: &ArtifactStore, session_key: &str, mut value: Value)
             map.insert("_truncated".to_string(), Value::Bool(true));
             map.insert(
                 "_raw_chars".to_string(),
-                Value::Number(serde_json::Number::from(total_raw)),
+                Value::Number(serde_json::Number::from(compacted_raw)),
             );
             map.insert(
                 "_hint".to_string(),

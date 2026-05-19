@@ -1,8 +1,8 @@
 //! Line-based text utilities used by the artifact preview pipeline.
 //!
-//! ANSI escape stripping, line normalisation, adjacent dedup, head/tail
-//! summarisation, simple pluralisation. Char-count approximation (not
-//! grapheme-aware) — good enough for line-based summarisation.
+//! ANSI escape stripping, line normalisation, head/tail summarisation.
+//! Char-count approximation (not grapheme-aware) — good enough for
+//! line-based summarisation.
 
 use std::sync::LazyLock;
 
@@ -41,28 +41,6 @@ pub fn normalize_lines(text: &str) -> Vec<String> {
         .collect()
 }
 
-pub fn trim_empty_edges(lines: &[String]) -> Vec<String> {
-    let mut start = 0;
-    let mut end = lines.len();
-    while start < end && lines[start].trim().is_empty() {
-        start += 1;
-    }
-    while end > start && lines[end - 1].trim().is_empty() {
-        end -= 1;
-    }
-    lines[start..end].to_vec()
-}
-
-pub fn dedupe_adjacent(lines: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::with_capacity(lines.len());
-    for line in lines {
-        if out.last().map(|s| s.as_str()) != Some(line.as_str()) {
-            out.push(line.clone());
-        }
-    }
-    out
-}
-
 /// Keep first `head` and last `tail` lines, with a single omission marker
 /// in between. Returns the input unchanged when nothing would be omitted.
 pub fn head_tail(lines: &[String], head: u32, tail: u32) -> Vec<String> {
@@ -80,42 +58,6 @@ pub fn head_tail(lines: &[String], head: u32, tail: u32) -> Vec<String> {
     out.push(format!("... {omitted} lines omitted ..."));
     out.extend_from_slice(&lines[lines.len() - tail..]);
     out
-}
-
-// ---- Pluralisation ----------------------------------------------------------
-
-/// English pluralisation matching upstream behaviour (count + noun) with
-/// `passed/failed/skipped` suffix exemption.
-pub fn pluralize(count: u32, noun: &str) -> String {
-    if noun.ends_with("passed") || noun.ends_with("failed") || noun.ends_with("skipped") {
-        return format!("{count} {noun}");
-    }
-    if count == 1 {
-        return format!("{count} {noun}");
-    }
-    let ends_with_sxz = noun
-        .chars()
-        .last()
-        .map(|c| matches!(c, 's' | 'x' | 'z'))
-        .unwrap_or(false);
-    let ends_with_sh_or_ch = noun.ends_with("sh") || noun.ends_with("ch");
-    if ends_with_sxz || ends_with_sh_or_ch {
-        return format!("{count} {noun}es");
-    }
-    if noun.ends_with('y') {
-        let prev = noun.chars().rev().nth(1);
-        let prev_is_consonant = prev.map(|c| !matches!(c, 'a' | 'e' | 'i' | 'o' | 'u')).unwrap_or(false);
-        if prev_is_consonant {
-            return format!("{count} {}ies", &noun[..noun.len() - 1]);
-        }
-    }
-    format!("{count} {noun}s")
-}
-
-// ---- Char count -------------------------------------------------------------
-
-pub fn count_text_chars(text: &str) -> usize {
-    text.chars().count()
 }
 
 // ---- Tests ------------------------------------------------------------------
@@ -137,12 +79,6 @@ mod tests {
     }
 
     #[test]
-    fn dedupe_keeps_first() {
-        let v = dedupe_adjacent(&["a", "a", "b", "b", "a"].iter().map(|s| s.to_string()).collect::<Vec<_>>());
-        assert_eq!(v, vec!["a", "b", "a"]);
-    }
-
-    #[test]
     fn head_tail_omits() {
         let lines: Vec<String> = (1..=10).map(|i| i.to_string()).collect();
         let out = head_tail(&lines, 2, 2);
@@ -154,15 +90,5 @@ mod tests {
         let lines: Vec<String> = (1..=4).map(|i| i.to_string()).collect();
         let out = head_tail(&lines, 2, 2);
         assert_eq!(out, lines);
-    }
-
-    #[test]
-    fn pluralize_basics() {
-        assert_eq!(pluralize(1, "file"), "1 file");
-        assert_eq!(pluralize(3, "file"), "3 files");
-        assert_eq!(pluralize(2, "match"), "2 matches");
-        assert_eq!(pluralize(2, "error"), "2 errors");
-        assert_eq!(pluralize(2, "entry"), "2 entries");
-        assert_eq!(pluralize(2, "passed"), "2 passed");
     }
 }

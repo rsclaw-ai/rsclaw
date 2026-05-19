@@ -30,16 +30,13 @@ pub struct ArtifactId(pub String);
 
 impl ArtifactId {
     pub fn new() -> Self {
-        // 32-bit randomness is enough — collisions within a session are
-        // recoverable (write overwrites). Avoid pulling uuid into this hot path.
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
-        let pid = std::process::id();
-        let mix = nanos.wrapping_mul(pid.wrapping_add(2654435761));
-        Self(format!("tr_{:08x}", mix))
+        // UUID v4 gives 122 bits of randomness — orders of magnitude beyond
+        // what any single session could collide on. Earlier nanosec-mix was
+        // collision-prone under parallel dispatch (multiple tools writing
+        // within the same microsecond on macOS), causing silent data loss
+        // when `File::create` truncated the previous artifact.
+        let s = uuid::Uuid::new_v4().simple().to_string();
+        Self(format!("tr_{}", &s[..12]))
     }
 
     pub fn as_str(&self) -> &str {
@@ -242,6 +239,34 @@ mod tests {
         assert_eq!(store.read("sess/../escape", &id).unwrap(), "x");
         // The dir is under the root, not above it.
         assert!(store.session_dir("sess/../escape").starts_with(tmp.path()));
+    }
+
+    #[test]
+    fn concurrent_writes_get_distinct_ids() {
+        // Regression: original `subsec_nanos`-based id collided under parallel
+        // dispatch (same microsecond → same id → File::create truncated the
+        // earlier write → silent data loss). Verify 100 threads writing the
+        // same session all produce distinct, intact artifacts.
+        let tmp = tempdir().unwrap();
+        let store = ArtifactStore::at(tmp.path().to_path_buf());
+        let store = std::sync::Arc::new(store);
+        let mut handles = Vec::with_capacity(100);
+        for i in 0..100 {
+            let s = std::sync::Arc::clone(&store);
+            handles.push(std::thread::spawn(move || {
+                let payload = format!("payload-{i:03}");
+                let id = s.write("sess-par", &payload).unwrap();
+                (id, payload)
+            }));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for h in handles {
+            let (id, payload) = h.join().unwrap();
+            assert!(seen.insert(id.0.clone()), "duplicate id {}", id.0);
+            let got = store.read("sess-par", &id).unwrap();
+            assert_eq!(got, payload, "artifact {} corrupted", id.0);
+        }
+        assert_eq!(seen.len(), 100);
     }
 
     #[test]
