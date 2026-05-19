@@ -87,6 +87,11 @@ pub(crate) const DEFAULT_TIMEOUT_SECONDS: u64 = 1800;
 /// Max consecutive tool parse errors before aborting the turn.
 /// Prevents infinite retry loops when model output gets corrupted.
 const MAX_PARSE_ERRORS: usize = 10;
+/// Per-tool wall-clock ceiling inside a single turn's parallel dispatch.
+/// One wedged sub-agent / hung HTTP call no longer holds the whole batch
+/// hostage — it is reported as a tool error after this many seconds.
+/// Generous because legitimate exec/image-gen tools may run minutes.
+const TOOL_DISPATCH_TIMEOUT_SECS: u64 = 600;
 /// Token string that suppresses any reply to the channel.
 const NO_REPLY_TOKEN: &str = "NO_REPLY";
 /// Default max file size before first confirmation (bytes): 50 MB.
@@ -4995,7 +5000,31 @@ impl AgentRuntime {
                 });
             }
 
-            // Execute each tool and push results.
+            // Three-phase tool dispatch:
+            //   Phase 1 (serial): preflight — parse-error skip, loop
+            //     detection, last_tool_key bookkeeping, max_iterations
+            //     upgrade. Anything that may early-return BEFORE side
+            //     effects must happen here.
+            //   Phase 2a (serial): pre-dispatch side effects — live_status,
+            //     before_tool_call hook, A2A progress emit, cancel check.
+            //     Deferred from Phase 1 so a Phase-1 early-return doesn't
+            //     leave dangling before_tool_call hooks without a matching
+            //     after_tool_call.
+            //   Phase 2b (parallel): join_all(dispatch_tool) with per-tool
+            //     timeout — one stuck sub-agent / wedged HTTP call no
+            //     longer blocks every other tool in the same turn.
+            //   Phase 3 (serial, in LLM emit order): after_tool_call hook,
+            //     metrics, full_trace, loop_detector, image/file extraction,
+            //     event-bus emit, session compression, turn_scratchpad push.
+            struct PendingDispatch {
+                tool_id: String,
+                tool_name: String,
+                tool_input: Value,
+                tool_input_str: String,
+            }
+            let mut to_dispatch: Vec<PendingDispatch> = Vec::new();
+
+            // ---- Phase 1: serial preflight ----
             for (tool_id, tool_name, tool_input) in tool_calls {
                 // Skip tools with parse errors — do not execute, return error directly.
                 // This prevents infinite retry loops when model output gets truncated.
@@ -5041,8 +5070,6 @@ impl AgentRuntime {
                     turn_scratchpad.push(tool_msg);
                     continue;
                 }
-
-                info!(tool = %tool_name, "dispatching tool call");
 
                 // Detect consecutive identical tool calls (same name + same args).
                 let call_key = crate::agent::loop_detection::hash_tool_call(&tool_name, &tool_input);
@@ -5102,39 +5129,66 @@ impl AgentRuntime {
                     max_iterations = max_iterations.max(configured_complex);
                 }
 
-                // Update live status: tool call starting.
+                let tool_input_str = tool_input.to_string();
+                to_dispatch.push(PendingDispatch {
+                    tool_id,
+                    tool_name,
+                    tool_input,
+                    tool_input_str,
+                });
+            }
+
+            // ---- Phase 2a: serial pre-dispatch side effects ----
+            for p in &to_dispatch {
+                info!(tool = %p.tool_name, "dispatching tool call");
                 if let Ok(mut status) = self.live_status.try_write() {
                     status.state = "tool_call".to_owned();
-                    status.tool_history.push(tool_name.clone());
+                    status.tool_history.push(p.tool_name.clone());
                 }
-
                 self.fire_hook(
                     "before_tool_call",
                     json!({
                         "agent_id": self.handle.id,
-                        "tool": tool_name,
-                        "input": tool_input,
+                        "tool": p.tool_name,
+                        "input": p.tool_input,
                     }),
                 )
                 .await;
-
-                let tool_input_str = tool_input.to_string();
-                // Clone for the per-turn metrics record (after dispatch
-                // moves the value).
-                let tool_input_for_metrics = tool_input.clone();
-                // A2A progress signal: publish "calling tool X" before
-                // dispatch so the client / push subscribers can render
-                // tool-level progress. No-op for non-A2A turns. Cancel
-                // check too — a long-running prior tool may have
-                // observed the token between iterations.
                 ctx.turn_ctx
-                    .emit_working(&format!("calling tool {tool_name}"));
+                    .emit_working(&format!("calling tool {}", p.tool_name));
                 if ctx.turn_ctx.is_cancelled() {
                     return Err(anyhow!("canceled by A2A CancelTask"));
                 }
-                let result = self
-                    .dispatch_tool(ctx, &tool_id, &tool_name, tool_input)
-                    .await;
+            }
+
+            // ---- Phase 2b: parallel dispatch with per-tool timeout ----
+            // dispatch_tool takes (&self, &RunContext) — both immutable —
+            // so concurrent calls are safe. Per-tool timeout caps a hung
+            // sub-agent / wedged HTTP call; without it, max(t1,t2,t3) is
+            // unbounded once any one tool wedges.
+            let dispatch_futures = to_dispatch.iter().map(|p| {
+                let fut = self.dispatch_tool(ctx, &p.tool_id, &p.tool_name, p.tool_input.clone());
+                time::timeout(Duration::from_secs(TOOL_DISPATCH_TIMEOUT_SECS), fut)
+            });
+            let timed_results = futures::future::join_all(dispatch_futures).await;
+
+            // ---- Phase 3: serial post-processing in LLM emit order ----
+            for (pending, timed_result) in to_dispatch.into_iter().zip(timed_results.into_iter()) {
+                let PendingDispatch {
+                    tool_id,
+                    tool_name,
+                    tool_input: tool_input_for_metrics,
+                    tool_input_str,
+                } = pending;
+
+                let result: Result<Value> = match timed_result {
+                    Ok(inner) => inner,
+                    Err(_elapsed) => Err(anyhow!(
+                        "tool '{}' timed out after {}s",
+                        tool_name,
+                        TOOL_DISPATCH_TIMEOUT_SECS
+                    )),
+                };
 
                 self.fire_hook(
                     "after_tool_call",
@@ -5269,11 +5323,23 @@ impl AgentRuntime {
                                 ),
                                 vec![img.to_owned()],
                             )
-                        } else if v.is_string() {
-                            (v.as_str().unwrap_or("").to_owned(), vec![])
                         } else {
-                            // Format structured tool results (exec, read, etc.) for better LLM comprehension
-                            (format_tool_result(&v), vec![])
+                            // Runtime backstop: every tool's output funnels through here.
+                            // Oversized payloads get written to the artifact store and
+                            // replaced with a head+tail preview + read_artifact hint.
+                            // One enforcement point — no tool can leak a giant payload
+                            // even if its handler forgot to compact.
+                            let v = crate::artifact::compact_value(
+                                crate::artifact::default_store(),
+                                &ctx.session_key,
+                                v,
+                            );
+                            if let Some(s) = v.as_str() {
+                                (s.to_owned(), vec![])
+                            } else {
+                                // Format structured tool results (exec, read, etc.) for better LLM comprehension
+                                (format_tool_result(&v), vec![])
+                            }
                         }
                     }
                     Err(e) => {
@@ -5857,6 +5923,7 @@ impl AgentRuntime {
                 }));
             }
             "read_file" | "read" => return self.tool_read(args).await,
+            "read_artifact" => return self.tool_read_artifact(ctx, args).await,
             "write_file" | "write" => return self.tool_write(args).await,
             "edit_file" | "edit" => return self.tool_edit(args).await,
             "shell" | "execute_command" | "exec" => return self.tool_exec(ctx, _id, args).await,
