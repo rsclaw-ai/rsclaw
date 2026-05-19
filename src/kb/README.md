@@ -286,6 +286,16 @@ Week 2 plan: `docs/plans/2026-05-19-kb-mvp-week2-pipeline.md`.
     sidecar so restore is symmetric. Covered by
     `kb::index::hnsw::tests::snapshot_roundtrip_preserves_search`
     and `snapshot_empty_cache_writes_meta_only`.
+27. **Tombstoned docs resurrect on same-content re-ingest** — spec
+    §6 keeps Tombstoned docs for 30 days. Re-adding the same file
+    within that window flips status back to Active rather than
+    silently NOOP-returning the hidden doc. Both the read-only
+    fast path and the wtx-scoped re-check honour this. Covered by
+    `kb::pipeline::ingest::tests::tombstoned_doc_resurrects_on_reingest`.
+28. **CLI smoke tests** — `tests/kb_cli_smoke.rs` invokes the
+    compiled `rsclaw` binary via `CARGO_BIN_EXE_rsclaw`. Eight
+    tests covering the full `kb` subcommand surface guard against
+    arg-parsing and output-format regressions.
 
 ## Quick start (Weeks 1–2)
 
@@ -356,7 +366,8 @@ cargo test --test kb_week2_recovery      # Week 2 crash recovery (2)
 cargo test --test kb_week3_search        # Week 3 retrieval e2e (1)
 cargo test --test kb_week4_syncers       # Week 4 syncer e2e (2)
 cargo test --test kb_week4_compactor     # Week 4 compactor integration (1)
-cargo test --test kb_entities_e2e        # Week 5 entity extraction (1)
+cargo test --test kb_entities_e2e        # Week 5 entity extraction (2)
+cargo test --test kb_cli_smoke           # CLI smoke (8)
 ```
 
 End-to-end CLI smoke:
