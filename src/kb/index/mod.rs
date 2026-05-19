@@ -94,22 +94,27 @@ mod tests {
             },
         )
         .unwrap();
-        let pre_index = Arc::new(KbIndex::open(&paths).unwrap());
-        let ctx = HandlerCtx {
-            store: store.clone(),
-            paths: paths.clone(),
-            embedder,
-            index: pre_index,
-        };
-        WorkerPool::run_one_blocking(
-            &ctx,
-            &WorkerConfig {
-                worker_id: "w".into(),
-                ..WorkerConfig::default()
-            },
-            &DefaultDispatcher,
-        )
-        .unwrap();
+        // Scope the worker's KbIndex so its tantivy lock is released
+        // before we open a fresh one for the rebuild check (tantivy
+        // takes an exclusive directory lock per process).
+        {
+            let pre_index = Arc::new(KbIndex::open(&paths).unwrap());
+            let ctx = HandlerCtx {
+                store: store.clone(),
+                paths: paths.clone(),
+                embedder,
+                index: pre_index,
+            };
+            WorkerPool::run_one_blocking(
+                &ctx,
+                &WorkerConfig {
+                    worker_id: "w".into(),
+                    ..WorkerConfig::default()
+                },
+                &DefaultDispatcher,
+            )
+            .unwrap();
+        }
 
         // Now rebuild a fresh KbIndex from redb.
         let idx = KbIndex::open_and_rebuild(&paths, &store).unwrap();

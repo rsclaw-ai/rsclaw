@@ -5,7 +5,7 @@ for the full design and `docs/adr/0001-knowledge-base.md` for the decision
 record. Week 1 plan: `docs/plans/2026-05-19-kb-mvp-week1-foundation.md`.
 Week 2 plan: `docs/plans/2026-05-19-kb-mvp-week2-pipeline.md`.
 
-## What's implemented (Weeks 1–2)
+## What's implemented (Weeks 1–3)
 
 **Week 1 (Foundation):**
 
@@ -42,16 +42,42 @@ Week 2 plan: `docs/plans/2026-05-19-kb-mvp-week2-pipeline.md`.
 - **Crash recovery** — stalled-claim reclaim path tested; process
   restart resumes the queue.
 
-## What's NOT in Weeks 1–2
+**Week 3 (Retrieval):**
+
+- **HnswCache** (`index/hnsw.rs`) — `RwLock<Hnsw<f32, DistCosine>>`
+  with rebuild from redb on startup. Append-only `insert` (re-inserting
+  an id orphans the old vertex; compactor reaps via rebuild).
+- **TantivyIndex** (`index/tantivy.rs`) — BM25 with `chunk_id`-keyed
+  delete-then-add upsert + `delete_all_documents` for full rebuild.
+- **KbIndex composite** (`index/mod.rs`) — single handle wraps both
+  layers; `upsert_chunk` + `commit` are the worker write path.
+- **Worker integration** — `ChunkAndEmbed` handler writes to both
+  indexes after the redb commit lands; failures propagate so the
+  worker retries (chunks are already durable in redb).
+- **Filter** (`search/filter.rs`) — visibility + status + version +
+  tags + source_kind + doc_ids. Single source of truth for "can this
+  caller see this hit".
+- **RRF + MMR** (`search/rrf.rs`, `search/mmr.rs`) — pure-function
+  fusion + diversity selector.
+- **Pipeline** (`search/pipeline.rs`) — `SearchCtx::search` composes
+  dense + sparse → filter → fuse → MMR → lazy text fetch.
+- **Tools** (`tools/`) — `kb_search`, `kb_fetch`, `kb_list_docs`,
+  `kb_similar`, `kb_search_entities`. JSON-shaped IO; `CallerScope`
+  is a separate function arg (runtime-injected, agent cannot supply).
+- **Entity store** (`store/entities.rs`) — put_entity + get_entity +
+  find_by_surface scan + chunks_for_entity edges. Inverted index is a
+  Week 4 optimisation once entity extraction emits non-trivial counts.
+
+## What's NOT in Weeks 1–3
 
 - BGE-M3 embedder (real model) — Week 2.5 (self-contained behind `KbEmbedder` trait)
-- Tantivy `add_document` — Week 3
-- HNSW `insert` + ArcSwap cache — Week 3
-- Hybrid retrieval (RRF + MMR) / `kb_search` tool — Week 3
-- Visibility filter wiring into retrieval — Week 3
+- HNSW snapshot persistence — Week 3.5 (rebuild from redb on startup today)
+- CJK tokenizer for tantivy — Week 3.5 (whitespace + lowercase today)
+- Entity extraction — Week 4 (chunk-entity edges, `boost_entities`/`require_entities` activation)
 - URL fetch + HTML→Markdown (`UrlCanonicalizer`) — Week 4 (with `UrlSyncer`)
 - `ManualUploadSyncer` + `UrlSyncer` + CLI — Week 4
-- Compactor (orphan file cleanup + ledger advancement past `IndexingComplete`) — Week 4
+- Compactor (orphan file cleanup, stale chunks, Failed-job triage) — Week 4
+- `kb_explain` retrieval trace — V2 (post-MVP)
 
 ## Architecture invariants (verify after every code change)
 
@@ -133,6 +159,27 @@ Week 2 plan: `docs/plans/2026-05-19-kb-mvp-week2-pipeline.md`.
     until they return. Covered by
     `kb::worker::pool::tests::shutdown_exits_within_poll_idle_plus_margin`.
 
+### Added in Week 3
+
+15. **Visibility filter runs on every retrieval call** — every
+    `tools/kb_*` entry point goes through `search::filter::keep_doc` +
+    `is_latest_version`. There is no caller-supplied bypass. Covered
+    by
+    `kb::search::pipeline::tests::search_filter_by_visibility_hides_private`.
+16. **HNSW + tantivy are caches over redb** — losing either is a
+    rebuild, not data loss. `KbIndex::open_and_rebuild` reconstructs
+    both from `kb_chunks` on startup. Covered by
+    `kb::index::hnsw::tests::rebuild_then_search_returns_hits` and
+    `kb::index::tests::open_and_rebuild_recovers_both_layers`.
+17. **Tantivy upsert deletes-by-term before add** — re-running
+    `chunk_embed` on the same chunk_id replaces the indexed text
+    rather than producing a duplicate match. Covered by
+    `kb::index::tantivy::tests::upsert_replaces_previous`.
+18. **CallerScope is injected by the runtime, not by tool input** —
+    `kb_search::KbSearchInput` deliberately has no `caller_scope`
+    field; the runtime constructs scope from auth context and passes
+    it as a separate function argument to `tools::*::run`.
+
 ## Quick start (Weeks 1–2)
 
 ```rust
@@ -195,8 +242,9 @@ pool.shutdown().await;
 ## Testing
 
 ```bash
-cargo test -p rsclaw --lib kb::          # unit tests (~160)
-cargo test --test kb_week1_e2e           # integration tests (6)
-cargo test --test kb_week2_pipeline      # async e2e (1)
-cargo test --test kb_week2_recovery      # crash recovery (2)
+cargo test -p rsclaw --lib kb::          # unit tests (~190)
+cargo test --test kb_week1_e2e           # Week 1 integration (6)
+cargo test --test kb_week2_pipeline      # Week 2 async e2e (1)
+cargo test --test kb_week2_recovery      # Week 2 crash recovery (2)
+cargo test --test kb_week3_search        # Week 3 retrieval e2e (1)
 ```
