@@ -111,14 +111,21 @@ Week 2 plan: `docs/plans/2026-05-19-kb-mvp-week2-pipeline.md`.
   Active doc with that tag; `kb export <doc_id> --to <path>` writes
   the canonical markdown body to disk; `kb stats` now reports
   per-status doc counts + `kb_entities` / `kb_entity_index` /
-  `disk_bytes`.
+  `disk_bytes`; `kb add --recursive <dir>` ingests a directory
+  tree with an `--ext` filter (default `md,txt,html,pdf`).
+- **HNSW snapshot persistence** (`index/hnsw.rs::{snapshot,restore}`)
+  — `kb compact` dumps `<paths.root>/hnsw/snapshot.*` via
+  `hnsw_rs::file_dump` plus a JSON sidecar with the `id_to_chunk`
+  map. `KbIndex::open_and_rebuild` tries `restore()` first, falling
+  back to `rebuild()` from redb. Eliminates startup cost on
+  re-open of large stores.
 
 ## What's NOT in Weeks 1–4
 
 - BGE-M3 embedder (real model) — Week 2.5 (self-contained behind `KbEmbedder` trait)
-- HNSW snapshot persistence — Week 6 (rebuild from redb on startup today)
 - BGE-M3 real embedder — Week 6 (StubEmbedder today)
-- Scheduled syncer ticks (cron integration) — Week 6
+- Scheduled syncer ticks (cron integration) — Week 6 (manual
+  `kb add <url>` re-runs conditional GET via SyncState today)
 - LocalFolderSyncer, MailSyncer, ChatSyncer — V2 (post-MVP)
 - `kb_explain` retrieval trace — V2 (post-MVP)
 - Tauri admin UI — V2 (post-MVP)
@@ -270,7 +277,15 @@ Week 2 plan: `docs/plans/2026-05-19-kb-mvp-week2-pipeline.md`.
     either a `doc_id` or `--tag <name>` for bulk tombstone;
     `show` resolves doc_ids to a chunk list and chunk_ids to a
     single-chunk fetch with neighbors. `stats` reports per-status
-    doc counts and on-disk bytes.
+    doc counts and on-disk bytes. `add --recursive <dir>` ingests
+    a directory tree.
+26. **HNSW snapshot survives process restart** — `kb compact`
+    dumps the dense layer to `hnsw/snapshot.*`. Subsequent
+    `KbIndex::open_and_rebuild` calls restore in-place rather than
+    re-inserting every chunk. Empty caches still write a meta
+    sidecar so restore is symmetric. Covered by
+    `kb::index::hnsw::tests::snapshot_roundtrip_preserves_search`
+    and `snapshot_empty_cache_writes_meta_only`.
 
 ## Quick start (Weeks 1–2)
 
