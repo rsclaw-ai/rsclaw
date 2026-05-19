@@ -2,55 +2,56 @@
 
 User-managed RAG knowledge base. See `docs/specs/2026-05-19-knowledge-base.md`
 for the full design and `docs/adr/0001-knowledge-base.md` for the decision
-record. Week 1 implementation plan lives at
-`docs/plans/2026-05-19-kb-mvp-week1-foundation.md`.
+record. Week 1 plan: `docs/plans/2026-05-19-kb-mvp-week1-foundation.md`.
+Week 2 plan: `docs/plans/2026-05-19-kb-mvp-week2-pipeline.md`.
 
-## What's implemented (Week 1)
+## What's implemented (Weeks 1–2)
 
-- **Types** (`model/`): KbDoc / KbChunk (with `logical_source_id` for
-  idempotency) / KbEntity / KbEntityIndex / LogicalSourceId / KbLocator /
-  KbVisibility / CallerScope / VersionPointer / SimHash-64.
-- **Content store** (`content_store/`): atomic no-clobber markdown
-  writes (via `tempfile::NamedTempFile::persist_noclobber`) under
-  `~/.rsclaw/kb/md/<kind>/<slug>--<lsid8>.md` with YAML front-matter.
-  The `--<lsid8>` suffix is the first 8 hex chars of
-  `sha256(logical_source_id)`, making re-ingest idempotent and
-  same-slug-different-source ingests collision-free.
-  `stage_doc` verifies body-sha on write_if_new=false collisions and
-  errors loudly rather than silently returning a dangling SHA.
-  Optional raw bytes go under `~/.rsclaw/kb/raw/<doc_id>.<ext>`;
-  `read_doc_range` gives lazy chunk-body retrieval.
-- **redb schema** (`store/`): all 13 tables defined and openable
-  (`kb_docs` / `kb_doc_latest_version` / `kb_chunks` /
-  `kb_chunk_by_logical` / `kb_entities` / `kb_entity_index` /
-  `kb_seen_items` / `kb_sync_state` / `kb_ledger` / `kb_jobs_by_id` /
-  `kb_jobs_by_dedupe_active` / `kb_jobs_by_status_priority` /
-  `kb_job_claims`).
-- **Ledger/Jobs types** (`ledger/`, `jobs/`): structs and enums for
-  the IngestLedger + Outbox pattern; accessors come in Week 2.
-- **Canonicalizers** (`canonicalize/`): markdown, plain text, HTML
-  (via lol-html), PDF text layer (no OCR), URL **identity**
-  canonicalization (tracker stripping, param sorting — string only;
-  HTTP fetch + HTML→Markdown is Week 2).
-- **Chunker** (`chunker/`): paragraph splitter with `heading_path`
-  injection into `indexed_text`; chunk_ids derived from
-  `logical_source_id` for re-ingest idempotency; SimHash-64 near-dup
-  dedup.
-- **Façade** (`mod.rs`): re-exports the surface most callers need
-  (`stage_doc`, `chunk_markdown`, `canonicalize_by_mime`, `KbPaths`,
-  …).
+**Week 1 (Foundation):**
 
-## What's NOT in Week 1
+- Types, content store, canonicalizers, chunker, redb schema, file IO primitives.
 
-- redb accessors (read/write of KbDoc / KbChunk / Ledger / Jobs) → Week 2
-- Embedder (BGE-M3 local) → Week 2
-- Worker pool + chunk+embed pipeline → Week 2
-- URL fetch + HTML→Markdown (`UrlCanonicalizer`) → Week 2
-- Tantivy `add_document` + HNSW `insert` → Week 3
-- Hybrid retrieval (RRF + MMR) / `kb_search` tool → Week 3
-- Visibility filter wiring into retrieval → Week 3
-- `ManualUploadSyncer` + `UrlSyncer` + CLI → Week 4
-- Compactor → Week 4
+**Week 2 (Persistence + Pipeline):**
+
+- **redb accessors** (`store/docs`, `store/chunks`, `store/seen`,
+  `store/ledger`, `store/jobs`) — composable inside a single
+  `WriteTransaction` so the pipeline can write doc + ledger + job +
+  seen atomically. Each table has `*_in_wtx` reader variants for the
+  race-safe NOOP re-check inside the ingest pipeline.
+- **`KbStore` facade** — owns the `redb::Database`, exposes
+  `begin_write` / `begin_read`.
+- **`KbEmbedder` trait + `StubEmbedder`** — deterministic 1024-dim
+  vectors for tests; real BGE-M3 embedder lands as a self-contained
+  follow-up behind the same trait.
+- **`ingest_canonicalized()`** — single-tx atomic pipeline. Fast-path
+  NOOP read, file staging, then one `WriteTransaction` does the race-safe
+  NOOP re-check + version compute + 5-table write + commit. Returns
+  `doc_id` synchronously.
+- **`WorkerPool`** — single tokio task that claims `Ready` jobs from
+  `kb_jobs_by_status_priority`, dispatches to `JobHandler`, marks
+  `Done` / `Failed` / requeues. `reclaim_stale` interleaved every
+  `reclaim_interval` for expired claims. `mark_done` / `mark_failed`
+  verify the claim's fencing token so zombie workers can't clobber
+  the new claimant's state. Requires multi-threaded tokio runtime
+  (uses `tokio::task::block_in_place`).
+- **`ChunkAndEmbed` handler** — reads staged markdown, runs the
+  Week 1 chunker, embeds via `KbEmbedder`, writes chunks + advances
+  ledger to `IndexingComplete`. Idempotent on rerun (deterministic
+  `chunk_id`); drops stale chunks from prior `doc_version`s before
+  inserting the new set.
+- **Crash recovery** — stalled-claim reclaim path tested; process
+  restart resumes the queue.
+
+## What's NOT in Weeks 1–2
+
+- BGE-M3 embedder (real model) — Week 2.5 (self-contained behind `KbEmbedder` trait)
+- Tantivy `add_document` — Week 3
+- HNSW `insert` + ArcSwap cache — Week 3
+- Hybrid retrieval (RRF + MMR) / `kb_search` tool — Week 3
+- Visibility filter wiring into retrieval — Week 3
+- URL fetch + HTML→Markdown (`UrlCanonicalizer`) — Week 4 (with `UrlSyncer`)
+- `ManualUploadSyncer` + `UrlSyncer` + CLI — Week 4
+- Compactor (orphan file cleanup + ledger advancement past `IndexingComplete`) — Week 4
 
 ## Architecture invariants (verify after every code change)
 
@@ -85,19 +86,72 @@ record. Week 1 implementation plan lives at
 7. **PII in logs goes through `util::redact`**: source ids and
    content previews emit only `redact(s)` (first 8 hex of sha256).
 
-## Quick start (Week 1 only)
+### Added in Week 2
+
+8. **All ingest writes happen in one redb tx** — `ingest_canonicalized`
+   commits `KbDoc` + `VersionPointer` + `IngestLedgerEntry` + `Job` +
+   `SeenItems` together. Splitting any of these into separate txs
+   reintroduces the Outbox bug: a doc visible to readers but no job
+   queued for chunking. Covered by
+   `kb::pipeline::ingest::tests::fresh_ingest_writes_all_tables`.
+9. **NOOP re-check + version compute happen INSIDE the wtx** — these
+   reads use `*_in_wtx` accessor variants so a concurrent ingest with
+   the same `(lsid, raw_sha)` cannot pass NOOP-miss in both threads and
+   produce duplicate docs. redb's single-writer guarantee plus the
+   in-wtx re-check is the correctness hinge. Covered by
+   `kb::pipeline::ingest::tests::concurrent_ingest_same_bytes_produces_one_doc`.
+10. **`ChunkAndEmbed` handler is idempotent** — re-running on the same
+    `doc_id` produces identical chunks (deterministic `chunk_id`) and
+    identical vectors. Re-runs after the ledger already advanced are
+    safe no-ops, not errors. Covered by
+    `kb::worker::handlers::chunk_embed::tests::idempotent_rerun_produces_same_chunks`
+    and `rerun_after_ledger_advanced_does_not_error`.
+11. **Job dedupe is keyed on `JobKind::dedupe_key()`, not job_id** —
+    enqueueing the same logical work twice while a job is `Ready` or
+    `Running` returns the existing `job_id` without writing a duplicate.
+    Covered by `kb::store::jobs::tests::enqueue_dedupes_active_jobs`.
+12. **`mark_done` / `mark_failed` verify the claim's fencing token** —
+    a zombie worker whose claim was reclaimed cannot transition the
+    job and clobber the new claimant. Covered by
+    `kb::store::jobs::tests::mark_done_with_wrong_token_errors` and
+    `mark_done_after_reclaim_errors`.
+13. **Stalled claims auto-reclaim** — workers that crash mid-job leave
+    a claim with `expires_at` in the past; the next `reclaim_stale`
+    sweep resets the job to `Ready` and another worker re-runs it.
+    Covered by
+    `tests/kb_week2_recovery.rs::stalled_claim_is_reclaimed_and_rerun`.
+14. **`WorkerPool::shutdown()` exits in bounded time** — the AtomicBool
+    is checked at the top of each loop iteration and on every wake
+    from the idle sleep. Long-running handlers delay shutdown only
+    until they return. Covered by
+    `kb::worker::pool::tests::shutdown_exits_within_poll_idle_plus_margin`.
+
+## Quick start (Weeks 1–2)
 
 ```rust
 use rsclaw::kb::{
-    canonicalize_by_mime, chunk_markdown, detect_mime, stage_doc,
-    CanonicalizeInput, ChunkerInput, FrontMatter, KbPaths, LocatorKind,
-    StageInput,
+    canonicalize_by_mime, detect_mime, ingest_canonicalized,
+    CanonicalizeInput, HandlerCtx, IngestInput, KbEmbedder, KbPaths, KbStore,
+    StubEmbedder, WorkerConfig, WorkerPool,
 };
-use ulid::Ulid;
+use std::sync::Arc;
 
-let paths = KbPaths::new("/path/to/.rsclaw/kb");
+# async fn demo() -> anyhow::Result<()> {
+let tmp = tempfile::TempDir::new()?;
+let store = Arc::new(KbStore::open(&tmp.path().join("kb.redb"))?);
+let paths = Arc::new(KbPaths::new(tmp.path().join("kb")));
 paths.ensure_layout()?;
+let embedder: Arc<dyn KbEmbedder> = Arc::new(StubEmbedder::default());
 
+// Start the worker pool (requires multi-threaded tokio runtime).
+let ctx = HandlerCtx {
+    store: store.clone(),
+    paths: paths.clone(),
+    embedder,
+};
+let pool = WorkerPool::start(ctx, WorkerConfig::default());
+
+// Ingest a doc.
 let bytes = std::fs::read("manual.md")?;
 let mime = detect_mime(&bytes, Some("manual.md"));
 let canon = canonicalize_by_mime(CanonicalizeInput {
@@ -108,43 +162,34 @@ let canon = canonicalize_by_mime(CanonicalizeInput {
 })?
 .unwrap();
 
-let doc_id = Ulid::new().to_string();
-let _staged = stage_doc(&paths, StageInput {
-    doc_id: &doc_id,
-    kind: canon.metadata.source_kind,
-    slug: "manual.md",
-    logical_source_id: canon.metadata.logical_source_id.as_str(),
-    front: FrontMatter {
-        title: canon.metadata.title.clone(),
-        source_kind: canon.metadata.source_kind.as_str().to_string(),
-        logical_source_id: canon.metadata.logical_source_id.as_str().to_string(),
-        created_at: chrono::Utc::now().to_rfc3339(),
-        tags: canon.metadata.tags.clone(),
-        meta: canon.metadata.extra.clone(),
+let out = ingest_canonicalized(
+    &store,
+    IngestInput {
+        canon: &canon,
+        raw_bytes: &bytes,
+        raw_ext: "md",
+        visibility: None,
+        owner_user_id: None,
+        seen_key: None,
+        source: None,
+        paths: &paths,
     },
-    body: &canon.markdown,
-    raw: Some((&bytes, "md")),
-    keep_raw: true,
-})?;
+)?;
+println!("doc_id: {}", out.doc_id);
 
-let chunks = chunk_markdown(ChunkerInput {
-    logical_source_id: &canon.metadata.logical_source_id,
-    doc_id: &doc_id,
-    doc_version: 1,
-    markdown_body: &canon.markdown,
-    default_locator_kind: LocatorKind::MdSection,
-});
+// Worker pool picks up the ChunkAndEmbed job asynchronously and
+// writes chunks + vectors into kb_chunks. See
+// `tests/kb_week2_pipeline.rs` for the full async wait pattern.
 
-// Week 1 stops here — DB writes, embedding, FTS indexing, retrieval
-// land in Week 2/3.
+pool.shutdown().await;
+# Ok(()) }
 ```
-
-See `tests/kb_week1_e2e.rs` for the full file → canonicalize → stage
-→ chunk flow over `.md`, `.html`, `.txt` fixtures.
 
 ## Testing
 
 ```bash
-cargo test -p rsclaw --lib kb::          # unit tests (~115)
+cargo test -p rsclaw --lib kb::          # unit tests (~160)
 cargo test --test kb_week1_e2e           # integration tests (6)
+cargo test --test kb_week2_pipeline      # async e2e (1)
+cargo test --test kb_week2_recovery      # crash recovery (2)
 ```
