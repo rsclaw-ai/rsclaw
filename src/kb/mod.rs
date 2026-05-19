@@ -52,3 +52,4 @@ pub use store::{open_db, KbStore};
 pub use ledger::{IngestLedgerEntry, LedgerOp, LedgerStatus};
 pub use jobs::{ClaimToken, Job, JobKind, JobStatus};
 pub use util::redact;
+pub use embedder::{KbEmbedder, StubEmbedder};
