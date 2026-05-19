@@ -16,7 +16,7 @@ use super::runtime::{AgentRuntime, RunContext, expand_tilde};
 use super::web_parsers::{
     extract_html_title, html_dehydrate_to_text, is_captcha_page, lang_to_bing_mkt,
     parse_baidu_results, parse_bing_html_results, parse_ddg_results, parse_sogou_results,
-    search_engine_url, truncate_chars, urlencoding,
+    search_engine_url, truncate_chars, truncate_chars_middle, urlencoding,
 };
 
 use crate::config::loader::{applicable_site_rules, applicable_site_rules_body};
@@ -734,7 +734,7 @@ impl AgentRuntime {
         // inherently non-idempotent.
         if is_get && body_value.is_none() && headers.is_empty() {
             if let Some((cached_title, cached_md)) = FETCH_CACHE.get(&fetch_url).await {
-                let text = truncate_chars(&cached_md, max_length);
+                let text = truncate_chars_middle(&cached_md, max_length);
                 let text = self.maybe_summarize(&text, prompt).await;
                 return Ok(json!({
                     "url": url,
@@ -820,7 +820,7 @@ impl AgentRuntime {
                 tracing::warn!(url = %fetch_url, error = %e, "web_fetch: HTTP failed, trying browser fallback");
                 match self.browser_get_article(&fetch_url).await {
                     Ok((t, md)) if !md.is_empty() => {
-                        let text = truncate_chars(&md, max_length);
+                        let text = truncate_chars_middle(&md, max_length);
                         let text = self.maybe_summarize(&text, prompt).await;
                         FETCH_CACHE.insert(fetch_url, (t.clone(), md)).await;
                         return Ok(json!({
@@ -921,7 +921,7 @@ impl AgentRuntime {
             FETCH_CACHE.insert(fetch_url, (final_title.clone(), final_md.clone())).await;
         }
 
-        let text = truncate_chars(&final_md, max_length);
+        let text = truncate_chars_middle(&final_md, max_length);
         let text = self.maybe_summarize(&text, prompt).await;
 
         // Surface site-rules for this host in the response so the agent
@@ -1547,7 +1547,7 @@ impl AgentRuntime {
         match self.browser_get_article(url).await {
             Ok((title, text)) if !text.is_empty() => json!({
                 "title": title,
-                "text": truncate_chars(&text, 8000),
+                "text": truncate_chars_middle(&text, 8000),
                 "url": url,
             }),
             Ok(_) => json!({ "error": "browser returned empty content", "url": url }),

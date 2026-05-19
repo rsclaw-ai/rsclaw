@@ -302,6 +302,129 @@ pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
     }
 }
 
+const MIDDLE_MARKER: &str = "\n\n...(middle omitted)...\n\n";
+
+/// Middle-truncate `s` to ~`max` chars, keeping 80% head + 20% tail.
+///
+/// Web pages follow inverted-pyramid structure (lede first, footer/related
+/// last) so head-biased middle-cut preserves more signal than tail-drop.
+/// Each side retreats to the nearest sentence-end punctuation to avoid
+/// cutting mid-sentence (retreat capped at 15% of that side).
+///
+/// Falls back to [`truncate_chars`] when `max` is too small for a meaningful
+/// middle cut.
+pub(crate) fn truncate_chars_middle(s: &str, max: usize) -> String {
+    let total = s.chars().count();
+    if total <= max {
+        return s.to_owned();
+    }
+    let marker_len = MIDDLE_MARKER.chars().count();
+    if max <= marker_len + 40 {
+        return truncate_chars(s, max);
+    }
+    let body = max - marker_len;
+    let head_n = body * 8 / 10;
+    let tail_n = body - head_n;
+
+    let head_end = s.char_indices().nth(head_n).map(|(i, _)| i).unwrap_or(s.len());
+    let tail_start = s
+        .char_indices()
+        .nth(total - tail_n)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+
+    let head_raw = &s[..head_end];
+    let tail_raw = &s[tail_start..];
+
+    let head = trim_to_sentence_end(head_raw);
+    let tail = trim_to_sentence_start(tail_raw);
+
+    format!("{head}{MIDDLE_MARKER}{tail}")
+}
+
+fn is_sentence_end(c: char) -> bool {
+    matches!(c, '.' | '。' | '!' | '?' | '！' | '？' | '\n')
+}
+
+/// Retreat head to the last sentence-end punctuation, capped at 15% loss.
+fn trim_to_sentence_end(s: &str) -> &str {
+    if s.is_empty() {
+        return s;
+    }
+    let min_keep = s.len() * 85 / 100;
+    // char_indices().rev() gives byte-start of each char from the end; we
+    // need byte-start + char's utf-8 width to slice past multi-byte puncts
+    // like '。' cleanly (otherwise &s[..=i] cuts mid-char).
+    for (i, c) in s.char_indices().rev() {
+        if is_sentence_end(c) {
+            return if i >= min_keep {
+                &s[..i + c.len_utf8()]
+            } else {
+                s
+            };
+        }
+    }
+    s
+}
+
+/// Skip tail forward to the first sentence-end punctuation, capped at 15% loss.
+fn trim_to_sentence_start(s: &str) -> &str {
+    if s.is_empty() {
+        return s;
+    }
+    let max_skip = s.len() * 15 / 100;
+    for (i, c) in s.char_indices() {
+        if is_sentence_end(c) {
+            return if i <= max_skip {
+                s.get(i + c.len_utf8()..)
+                    .map(|t| t.trim_start())
+                    .unwrap_or(s)
+            } else {
+                s
+            };
+        }
+    }
+    s
+}
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::*;
+
+    #[test]
+    fn passthrough_short() {
+        assert_eq!(truncate_chars_middle("hello world", 100), "hello world");
+    }
+
+    #[test]
+    fn small_budget_falls_back_to_tail() {
+        let s = "a".repeat(200);
+        let out = truncate_chars_middle(&s, 30);
+        assert!(out.ends_with("...(truncated)"));
+    }
+
+    #[test]
+    fn middle_cut_preserves_both_ends() {
+        let head = "HEAD ".repeat(200); // 1000 chars
+        let tail = "TAIL ".repeat(200); // 1000 chars
+        let mid = "x".repeat(2000);
+        let s = format!("{head}{mid}{tail}");
+        let out = truncate_chars_middle(&s, 600);
+        assert!(out.starts_with("HEAD "), "out={out}");
+        assert!(out.contains("middle omitted"));
+        assert!(out.trim_end().ends_with("TAIL"), "out={out}");
+    }
+
+    #[test]
+    fn utf8_safe_with_chinese() {
+        // 1000 chinese chars
+        let s = "测试内容。".repeat(200);
+        let out = truncate_chars_middle(&s, 400);
+        assert!(out.chars().count() <= 420);
+        assert!(out.contains("middle omitted"));
+    }
+}
+
 /// Extract `<title>` content from HTML.
 pub(crate) fn extract_html_title(html: &str) -> String {
     TITLE_RE.captures(html)
