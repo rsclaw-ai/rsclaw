@@ -45,6 +45,21 @@ interface host-runtime {
     log: func(level: string, msg: string);
     sleep: func(ms: u32);
     read-file: func(path: string) -> result<string, string>;
+    /// Write `contents` to `path`. The path is sandboxed to the plugin
+    /// workspace or var/plugins/<name>/ directory; writes outside these
+    /// dirs are rejected. Parent directories are created automatically.
+    write-file: func(path: string, contents: string) -> result<string, string>;
+    /// Ensure a directory and all its parents exist (mkdir -p).
+    /// The path is sandboxed the same way as write-file.
+    ensure-dir: func(path: string) -> result<string, string>;
+    /// Execute a SQL statement that does not return rows (CREATE, INSERT,
+    /// UPDATE, DELETE, etc.). `params` are bound positionally (?1, ?2, ...)
+    /// to prevent SQL injection. Returns JSON {"rows_affected": N,
+    /// "last_insert_rowid": M}. Each plugin gets its own isolated SQLite DB.
+    sql-execute: func(sql: string, params: list<string>) -> result<string, string>;
+    /// Execute a SQL query that returns rows (SELECT). `params` are bound
+    /// positionally. Returns a JSON array of objects, one per row.
+    sql-query: func(sql: string, params: list<string>) -> result<string, string>;
     /// Send a progress/notification message to the user during long operations.
     notify: func(message: string) -> result<string, string>;
 
@@ -102,6 +117,57 @@ interface host-media {
     extract-keyframes: func(video-path: string, count: u32) -> result<list<string>, string>;
 }
 
+interface host-desktop {
+    /// Activate an application by bundle-id (macOS), exe name (Windows), or WM_CLASS (Linux).
+    desktop-activate-app: func(bundle-id: string) -> result<string, string>;
+
+    /// List all windows of the target app. Returns JSON array:
+    /// [{"idx":1,"title":"...","x":0,"y":0,"w":900,"h":600}]
+    desktop-list-windows: func(bundle-id: string) -> result<string, string>;
+
+    /// Close a specific window by its index (from list-windows).
+    desktop-close-window: func(bundle-id: string, window-idx: u32) -> result<string, string>;
+
+    /// Get the main window bounds (x, y, w, h) as JSON.
+    /// Prefers title=="Weixin", falls back to largest window.
+    desktop-get-main-window: func(bundle-id: string) -> result<string, string>;
+
+    /// Screenshot the app's main window. Returns data:image/png;base64,... data URI.
+    desktop-screenshot-window: func(bundle-id: string) -> result<string, string>;
+
+    /// Screenshot a screen region. Returns data URI.
+    desktop-screenshot-region: func(x: u32, y: u32, w: u32, h: u32) -> result<string, string>;
+
+    /// Mouse left-click at absolute screen coordinates (x, y).
+    desktop-mouse-click: func(x: u32, y: u32) -> result<string, string>;
+
+    /// Drag from (x1, y1) to (x2, y2).
+    desktop-mouse-drag: func(x1: u32, y1: u32, x2: u32, y2: u32) -> result<string, string>;
+
+    /// Scroll the mouse wheel. Positive clicks = down, negative = up.
+    desktop-mouse-scroll: func(clicks: s32) -> result<string, string>;
+
+    /// Press a key with optional modifiers.
+    /// key: key name (e.g. "Return", "Escape", "v", "k").
+    /// modifiers: list of "command", "control", "shift", "option" / "alt".
+    desktop-key-press: func(key: string, modifiers: list<string>) -> result<string, string>;
+
+    /// Set the system clipboard text.
+    desktop-clipboard-set: func(text: string) -> result<string, string>;
+
+    /// Get the system clipboard text.
+    desktop-clipboard-get: func() -> result<string, string>;
+}
+
+interface host-vlm {
+    /// Parse an image with a vision-language model.
+    /// image-data-uri must be data:image/png;base64,... format.
+    /// prompt is the task description sent to the VLM.
+    /// Returns the VLM's raw text output.
+    vlm-parse: func(image-data-uri: string, prompt: string, max-tokens: u32)
+        -> result<string, string>;
+}
+
 interface plugin-api {
     handle-tool: func(tool-name: string, args-json: string) -> result<string, string>;
 }
@@ -111,5 +177,15 @@ world jimeng-plugin {
     import host-runtime;
     import host-storage;
     import host-media;
+    import host-desktop;
+    import host-vlm;
+    export plugin-api;
+}
+
+world wechat-plugin {
+    import host-desktop;
+    import host-vlm;
+    import host-runtime;
+    import host-storage;
     export plugin-api;
 }

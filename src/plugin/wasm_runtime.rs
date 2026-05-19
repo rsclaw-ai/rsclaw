@@ -17,6 +17,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -50,6 +51,7 @@ use crate::browser::BrowserSession;
 
 bindgen!({
     path: "src/plugin/wit/world.wit",
+    world: "jimeng-plugin",
     async: true,
     trappable_imports: true,
 });
@@ -121,12 +123,15 @@ struct HostState {
     /// CDN download rules from the calling plugin's manifest. Consulted by
     /// `browser_download` to attach a Referer when the URL matches.
     cdn_rules: Vec<crate::plugin::manifest::CdnDownloadRule>,
+    /// Plugin name — used to scope per-plugin resources (SQLite DB path, etc.).
+    plugin_name: String,
 }
 
 fn new_host_state(
     browser: Arc<Mutex<Option<BrowserSession>>>,
     notify_ctx: Option<WasmNotifyCtx>,
     cdn_rules: Vec<crate::plugin::manifest::CdnDownloadRule>,
+    plugin_name: String,
 ) -> HostState {
     HostState {
         browser,
@@ -137,6 +142,7 @@ fn new_host_state(
             .build(),
         notify_ctx,
         cdn_rules,
+        plugin_name,
     }
 }
 
@@ -147,8 +153,9 @@ fn new_sandboxed_store(
     browser: Arc<Mutex<Option<BrowserSession>>>,
     notify_ctx: Option<WasmNotifyCtx>,
     cdn_rules: Vec<crate::plugin::manifest::CdnDownloadRule>,
+    plugin_name: String,
 ) -> Store<HostState> {
-    let mut store = Store::new(engine, new_host_state(browser, notify_ctx, cdn_rules));
+    let mut store = Store::new(engine, new_host_state(browser, notify_ctx, cdn_rules, plugin_name));
     store.limiter(|s| &mut s.limits);
     store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
     store
@@ -182,6 +189,22 @@ fn canonicalize_plugin_path(input: &str) -> Result<PathBuf, String> {
         ));
     }
     Ok(canonical)
+}
+
+/// Same as `canonicalize_plugin_path` but also permits paths under
+/// `~/.rsclaw/var/plugins/` so plugins can persist databases and config.
+fn canonicalize_writable_path(input: &str) -> Result<PathBuf, String> {
+    let base = crate::config::loader::base_dir();
+    let workspace = base.join("workspace");
+    let plugins_var = base.join("var").join("plugins");
+    let canonical = crate::agent::runtime::canonicalize_external_path(input, &workspace);
+    if canonical.starts_with(&workspace) || canonical.starts_with(&plugins_var) {
+        return Ok(canonical);
+    }
+    Err(format!(
+        "writable path '{}' resolves outside allowed dirs (workspace or var/plugins)",
+        input
+    ))
 }
 
 impl rsclaw::plugin::host_browser::Host for HostState {
@@ -492,6 +515,141 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
             Err(e) => Ok(Err(format!("failed to read {}: {e}", canonical.display()))),
         }
     }
+
+    async fn write_file(&mut self, path: String, contents: String) -> Result<Result<String, String>> {
+        let canonical = match canonicalize_writable_path(&path) {
+            Ok(p) => p,
+            Err(e) => return Ok(Err(e)),
+        };
+        if let Some(parent) = canonical.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                return Ok(Err(format!("failed to create parent dirs for {}: {e}", canonical.display())));
+            }
+        }
+        match tokio::fs::write(&canonical, contents).await {
+            Ok(()) => Ok(Ok(canonical.to_string_lossy().into_owned())),
+            Err(e) => Ok(Err(format!("failed to write {}: {e}", canonical.display()))),
+        }
+    }
+
+    async fn ensure_dir(&mut self, path: String) -> Result<Result<String, String>> {
+        let canonical = match canonicalize_writable_path(&path) {
+            Ok(p) => p,
+            Err(e) => return Ok(Err(e)),
+        };
+        match tokio::fs::metadata(&canonical).await {
+            Ok(meta) if meta.is_file() => {
+                return Ok(Err(format!(
+                    "ensure_dir: path exists and is a file, not a directory: {}",
+                    canonical.display()
+                )));
+            }
+            Ok(_) => return Ok(Ok(canonical.to_string_lossy().into_owned())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match tokio::fs::create_dir_all(&canonical).await {
+                    Ok(()) => Ok(Ok(canonical.to_string_lossy().into_owned())),
+                    Err(e) => Ok(Err(format!(
+                        "failed to create dir {}: {e}",
+                        canonical.display()
+                    ))),
+                }
+            }
+            Err(e) => Ok(Err(format!(
+                "failed to stat {}: {e}",
+                canonical.display()
+            ))),
+        }
+    }
+
+    async fn sql_execute(
+        &mut self,
+        sql: String,
+        params: Vec<String>,
+    ) -> Result<Result<String, String>> {
+        let db_path = plugin_db_path(&self.plugin_name);
+        if let Some(parent) = db_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return Ok(Err(format!("sql_execute: create_dir: {e}")));
+            }
+        }
+        let result = tokio::task::spawn_blocking(move || {
+            let conn = rusqlite::Connection::open(&db_path)?;
+            let mut stmt = conn.prepare(&sql)?;
+            let params_ref: Vec<&dyn rusqlite::ToSql> =
+                params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+            let rows_affected = stmt.execute(params_ref.as_slice())?;
+            let last_id = conn.last_insert_rowid();
+            Ok::<_, rusqlite::Error>(json!({
+                "rows_affected": rows_affected,
+                "last_insert_rowid": last_id,
+            }).to_string())
+        })
+        .await;
+        match result {
+            Ok(Ok(json)) => Ok(Ok(json)),
+            Ok(Err(e)) => Ok(Err(format!("sql_execute error: {e}"))),
+            Err(e) => Ok(Err(format!("sql_execute panic: {e}"))),
+        }
+    }
+
+    async fn sql_query(
+        &mut self,
+        sql: String,
+        params: Vec<String>,
+    ) -> Result<Result<String, String>> {
+        let db_path = plugin_db_path(&self.plugin_name);
+        if let Some(parent) = db_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return Ok(Err(format!("sql_query: create_dir: {e}")));
+            }
+        }
+        let result = tokio::task::spawn_blocking(move || {
+            let conn = rusqlite::Connection::open(&db_path)?;
+            let mut stmt = conn.prepare(&sql)?;
+            let params_ref: Vec<&dyn rusqlite::ToSql> =
+                params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+            let column_names: Vec<String> = stmt
+                .column_names()
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect();
+            let rows = stmt.query_map(params_ref.as_slice(), |row| {
+                let mut obj = serde_json::Map::new();
+                for (i, name) in column_names.iter().enumerate() {
+                    let val: serde_json::Value = match row.get_ref(i)? {
+                        rusqlite::types::ValueRef::Null => serde_json::Value::Null,
+                        rusqlite::types::ValueRef::Integer(v) => json!(v),
+                        rusqlite::types::ValueRef::Real(v) => json!(v),
+                        rusqlite::types::ValueRef::Text(v) => json!(String::from_utf8_lossy(v)),
+                        rusqlite::types::ValueRef::Blob(v) => json!(base64::engine::general_purpose::STANDARD.encode(v)),
+                    };
+                    obj.insert(name.clone(), val);
+                }
+                Ok(serde_json::Value::Object(obj))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            serde_json::to_string(&out)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+        })
+        .await;
+        match result {
+            Ok(Ok(json)) => Ok(Ok(json)),
+            Ok(Err(e)) => Ok(Err(format!("sql_query error: {e}"))),
+            Err(e) => Ok(Err(format!("sql_query panic: {e}"))),
+        }
+    }
+}
+
+/// Return the SQLite database path for a given plugin name.
+fn plugin_db_path(plugin_name: &str) -> PathBuf {
+    crate::config::loader::base_dir()
+        .join("var")
+        .join("plugins")
+        .join(plugin_name)
+        .join("plugin.db")
 }
 
 impl rsclaw::plugin::host_storage::Host for HostState {
@@ -851,6 +1009,7 @@ impl WasmPlugin {
             Arc::clone(&self.browser),
             notify_ctx,
             self.browser_cdn_rules.clone(),
+            self.name.clone(),
         );
 
         let instance = self
