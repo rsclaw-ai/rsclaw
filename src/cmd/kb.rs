@@ -23,6 +23,7 @@ pub async fn cmd_kb(cmd: KbCommand, kb_root: PathBuf) -> Result<()> {
         KbCommand::Visibility { doc_id, visibility } => set_visibility(kb_root, doc_id, visibility),
         KbCommand::Compact => compact(kb_root),
         KbCommand::Stats => stats(kb_root),
+        KbCommand::Export { doc_id, to } => export(kb_root, doc_id, to),
     }
 }
 
@@ -325,25 +326,97 @@ fn compact(kb_root: PathBuf) -> Result<()> {
 }
 
 fn stats(kb_root: PathBuf) -> Result<()> {
+    use crate::kb::store::codec::decode;
     use redb::ReadableTable;
     let h = open_kb(&kb_root)?;
     let rtx = h.store.begin_read()?;
     let mut counts = serde_json::Map::new();
+    // Per-status doc breakdown.
+    let docs_tbl = rtx.open_table(crate::kb::store::schema::KB_DOCS)?;
+    let mut active = 0u64;
+    let mut tombstoned = 0u64;
+    for entry in docs_tbl.iter()? {
+        let (_, v) = entry?;
+        let d: crate::kb::model::KbDoc = decode(v.value())?;
+        match d.status {
+            crate::kb::model::KbStatus::Active => active += 1,
+            crate::kb::model::KbStatus::Tombstoned => tombstoned += 1,
+            _ => {}
+        }
+    }
+    counts.insert("docs_active".into(), serde_json::Value::Number(active.into()));
+    counts.insert(
+        "docs_tombstoned".into(),
+        serde_json::Value::Number(tombstoned.into()),
+    );
+    // Other table sizes.
     for (name, td) in [
-        ("kb_docs", crate::kb::store::schema::KB_DOCS),
         ("kb_chunks", crate::kb::store::schema::KB_CHUNKS),
         ("kb_ledger", crate::kb::store::schema::KB_LEDGER),
         ("kb_jobs_by_id", crate::kb::store::schema::KB_JOBS_BY_ID),
         ("kb_seen_items", crate::kb::store::schema::KB_SEEN_ITEMS),
+        ("kb_entities", crate::kb::store::schema::KB_ENTITIES),
+        (
+            "kb_entity_index",
+            crate::kb::store::schema::KB_ENTITY_INDEX,
+        ),
     ] {
         let tbl = rtx.open_table(td)?;
         let n = tbl.iter()?.count();
         counts.insert(name.into(), serde_json::Value::Number(n.into()));
     }
-    println!(
-        "{}",
-        serde_json::Value::Object(counts)
+    // Disk usage: sum of md/ + raw/ + kb.redb + idx/ tree.
+    let disk_bytes = total_size(&kb_root);
+    counts.insert(
+        "disk_bytes".into(),
+        serde_json::Value::Number(disk_bytes.into()),
     );
+    println!("{}", serde_json::Value::Object(counts));
+    Ok(())
+}
+
+fn total_size(root: &PathBuf) -> u64 {
+    let mut total = 0u64;
+    let mut stack: Vec<PathBuf> = vec![root.clone()];
+    while let Some(p) = stack.pop() {
+        let read = match std::fs::read_dir(&p) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            if let Ok(ft) = entry.file_type() {
+                if ft.is_dir() {
+                    stack.push(path);
+                } else if ft.is_file() {
+                    if let Ok(meta) = path.metadata() {
+                        total += meta.len();
+                    }
+                }
+            }
+        }
+    }
+    total
+}
+
+fn export(kb_root: PathBuf, doc_id: String, to: PathBuf) -> Result<()> {
+    let h = open_kb(&kb_root)?;
+    let rtx = h.store.begin_read()?;
+    let doc = docs::get(&rtx, &doc_id)?
+        .ok_or_else(|| anyhow::anyhow!("doc not found: {doc_id}"))?;
+    if !doc.visible_to(&CallerScope::default()) {
+        anyhow::bail!("doc not visible to current scope");
+    }
+    let abs = h.paths.root.join(&doc.markdown_path);
+    let body = crate::kb::content_store::read::read_doc_body(&abs)
+        .with_context(|| format!("read {}", abs.display()))?;
+    if let Some(parent) = to.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+        }
+    }
+    std::fs::write(&to, &body).with_context(|| format!("write {}", to.display()))?;
+    println!("wrote {} ({} bytes) → {}", doc.title, body.len(), to.display());
     Ok(())
 }
 

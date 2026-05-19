@@ -44,4 +44,10 @@ pub enum KbCommand {
     Compact,
     /// Show kb stats (doc/chunk counts, disk usage).
     Stats,
+    /// Export a doc's markdown body to a path.
+    Export {
+        doc_id: String,
+        #[arg(long)]
+        to: std::path::PathBuf,
+    },
 }
