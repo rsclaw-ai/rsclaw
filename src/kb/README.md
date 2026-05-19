@@ -119,13 +119,23 @@ Week 2 plan: `docs/plans/2026-05-19-kb-mvp-week2-pipeline.md`.
   map. `KbIndex::open_and_rebuild` tries `restore()` first, falling
   back to `rebuild()` from redb. Eliminates startup cost on
   re-open of large stores.
+- **`kb sync-all`** — refresh every Active URL doc whose
+  `SyncState.last_sync_at` is older than `--interval-min`
+  (default 20). Supports `--max` cap and `--dry-run`. Acts as a
+  manual scheduler tick until gateway-resident syncer ticks ship.
+- **`kb search --json`** + `entity_alignment` + `warnings` in
+  every kb_search response — the same regex extractor that runs
+  on chunk text runs on the query so the agent can spot
+  cross-entity hallucinations (`query mentions [伊利] but none
+  of the chunks containing it appear in results`).
 
 ## What's NOT in Weeks 1–4
 
 - BGE-M3 embedder (real model) — Week 2.5 (self-contained behind `KbEmbedder` trait)
 - BGE-M3 real embedder — Week 6 (StubEmbedder today)
-- Scheduled syncer ticks (cron integration) — Week 6 (manual
-  `kb add <url>` re-runs conditional GET via SyncState today)
+- Gateway-resident scheduler for syncer ticks — Week 6 (today:
+  manual `kb add <url>` and `kb sync-all` both work; user/cron
+  drives the cadence)
 - LocalFolderSyncer, MailSyncer, ChatSyncer — V2 (post-MVP)
 - `kb_explain` retrieval trace — V2 (post-MVP)
 - Tauri admin UI — V2 (post-MVP)
