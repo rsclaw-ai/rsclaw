@@ -279,6 +279,60 @@ pub fn find_by_logical_and_hash(
     }
 }
 
+// --- WriteTransaction read variants ---
+// Mirror the rtx readers but use `wtx.open_table()` so the ingest
+// pipeline can do its NOOP re-check, version compute, and old_paths
+// lookup inside the same write transaction (race-safe — redb is
+// single-writer once `begin_write()` returns). redb's
+// WriteTransaction tables implement `ReadableTable`, so the read
+// logic is identical to the rtx variants.
+
+pub fn get_in_wtx(wtx: &WriteTransaction, doc_id: &str) -> Result<Option<KbDoc>> {
+    let tbl = wtx.open_table(KB_DOCS)?;
+    match tbl.get(doc_id)? {
+        Some(v) => Ok(Some(decode(v.value())?)),
+        None => Ok(None),
+    }
+}
+
+pub fn latest_version_in_wtx(
+    wtx: &WriteTransaction,
+    logical_source_id: &str,
+) -> Result<Option<VersionPointer>> {
+    let tbl = wtx.open_table(KB_DOC_LATEST_VERSION)?;
+    match tbl.get(logical_source_id)? {
+        Some(v) => Ok(Some(decode(v.value())?)),
+        None => Ok(None),
+    }
+}
+
+pub fn next_version_for_in_wtx(
+    wtx: &WriteTransaction,
+    logical_source_id: &str,
+) -> Result<u32> {
+    Ok(latest_version_in_wtx(wtx, logical_source_id)?
+        .map(|p| p.version + 1)
+        .unwrap_or(1))
+}
+
+pub fn find_by_logical_and_hash_in_wtx(
+    wtx: &WriteTransaction,
+    logical_source_id: &str,
+    expected_raw_sha: &str,
+) -> Result<Option<String>> {
+    let Some(ptr) = latest_version_in_wtx(wtx, logical_source_id)? else {
+        return Ok(None);
+    };
+    let Some(doc) = get_in_wtx(wtx, &ptr.doc_id)? else {
+        return Ok(None);
+    };
+    if doc.raw_sha256 == expected_raw_sha {
+        Ok(Some(doc.id))
+    } else {
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,6 +418,33 @@ mod tests {
         assert_eq!(find_by_logical_and_hash(&rtx, "lsid", "rawA").unwrap().as_deref(), Some("d1"));
         assert!(find_by_logical_and_hash(&rtx, "lsid", "rawB").unwrap().is_none());
         assert!(find_by_logical_and_hash(&rtx, "other", "rawA").unwrap().is_none());
+    }
+
+    #[test]
+    fn wtx_read_variants_see_committed_state() {
+        // The `_in_wtx` accessors are the race-safety hinge for the
+        // ingest NOOP re-check. They must observe data committed by a
+        // prior wtx exactly the same way an rtx does.
+        let tmp = TempDir::new().unwrap();
+        let db = open_db(&tmp.path().join("kb.redb")).unwrap();
+        {
+            let wtx = db.begin_write().unwrap();
+            put(&wtx, &sample("d1", "lsid", "rawA", 1)).unwrap();
+            set_latest_version(
+                &wtx,
+                "lsid",
+                &VersionPointer { doc_id: "d1".into(), version: 1 },
+            ).unwrap();
+            wtx.commit().unwrap();
+        }
+        let wtx = db.begin_write().unwrap();
+        assert_eq!(get_in_wtx(&wtx, "d1").unwrap().unwrap().raw_sha256, "rawA");
+        assert_eq!(next_version_for_in_wtx(&wtx, "lsid").unwrap(), 2);
+        assert_eq!(
+            find_by_logical_and_hash_in_wtx(&wtx, "lsid", "rawA").unwrap().as_deref(),
+            Some("d1"),
+        );
+        assert!(find_by_logical_and_hash_in_wtx(&wtx, "lsid", "rawB").unwrap().is_none());
     }
 }
 ```
@@ -471,6 +552,71 @@ fn compose_logical_key(logical_source_id: &str, chunk_id: &str) -> String {
     format!("{logical_source_id}\0{chunk_id}")
 }
 
+/// Remove all chunks for `logical_source_id` whose `doc_version <
+/// keep_from_version`. Used by the ChunkAndEmbed handler when a new
+/// doc version supersedes the prior one — same-version re-runs are
+/// idempotent because chunk_ids are deterministic, but a v(N-1)→vN
+/// transition would otherwise leak vN-1's chunks. Returns the count
+/// of chunks removed. Runs inside the caller's wtx so cleanup +
+/// new-version inserts are atomic.
+pub fn delete_for_doc_version_below(
+    wtx: &WriteTransaction,
+    logical_source_id: &str,
+    keep_from_version: u32,
+) -> Result<usize> {
+    // 1. Collect target ids (read-only scan via the by_logical index).
+    let ids = chunk_ids_for_logical_in_wtx(wtx, logical_source_id)?;
+    // 2. Decide which ids belong to older versions.
+    let mut to_remove = Vec::new();
+    {
+        let tbl = wtx.open_table(KB_CHUNKS)?;
+        for id in &ids {
+            if let Some(v) = tbl.get(id.as_str())? {
+                let c: KbChunk = decode(v.value())?;
+                if c.doc_version < keep_from_version {
+                    to_remove.push(id.clone());
+                }
+            }
+        }
+    }
+    // 3. Remove from both kb_chunks and the by_logical index.
+    let mut removed = 0;
+    {
+        let mut tbl = wtx.open_table(KB_CHUNKS)?;
+        for id in &to_remove {
+            if tbl.remove(id.as_str())?.is_some() {
+                removed += 1;
+            }
+        }
+    }
+    {
+        let mut idx = wtx.open_table(KB_CHUNK_BY_LOGICAL)?;
+        for id in &to_remove {
+            let key = compose_logical_key(logical_source_id, id);
+            idx.remove(key.as_str())?;
+        }
+    }
+    Ok(removed)
+}
+
+fn chunk_ids_for_logical_in_wtx(
+    wtx: &WriteTransaction,
+    logical_source_id: &str,
+) -> Result<Vec<String>> {
+    let prefix = format!("{logical_source_id}\0");
+    let end = format!("{logical_source_id}\u{1}");
+    let idx = wtx.open_table(KB_CHUNK_BY_LOGICAL)?;
+    let mut out = Vec::new();
+    for entry in idx.range(prefix.as_str()..end.as_str())? {
+        let (k, _) = entry?;
+        let key = k.value();
+        if let Some(pos) = key.bytes().position(|b| b == SEP) {
+            out.push(key[pos + 1..].to_string());
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,6 +714,38 @@ mod tests {
         }
         let rtx = db.begin_read().unwrap();
         assert_eq!(chunks_for_logical(&rtx, lsid.as_str()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delete_for_doc_version_below_removes_older_only() {
+        let tmp = TempDir::new().unwrap();
+        let db = open_db(&tmp.path().join("kb.redb")).unwrap();
+        let lsid = LogicalSourceId::for_file("abc");
+        // Two chunks with different seqs/bodies so chunk_ids differ.
+        let mut v1 = sample(&lsid, 0, "v1-body");
+        v1.doc_version = 1;
+        let mut v2 = sample(&lsid, 1, "v2-body");
+        v2.doc_version = 2;
+        {
+            let wtx = db.begin_write().unwrap();
+            put(&wtx, &v1).unwrap();
+            put(&wtx, &v2).unwrap();
+            wtx.commit().unwrap();
+        }
+        let removed = {
+            let wtx = db.begin_write().unwrap();
+            let n = delete_for_doc_version_below(&wtx, lsid.as_str(), 2).unwrap();
+            wtx.commit().unwrap();
+            n
+        };
+        assert_eq!(removed, 1);
+        let rtx = db.begin_read().unwrap();
+        let remaining = chunks_for_logical(&rtx, lsid.as_str()).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].doc_version, 2);
+        // by_logical index entry for v1 is also gone.
+        let ids = chunk_ids_for_logical(&rtx, lsid.as_str()).unwrap();
+        assert_eq!(ids.len(), 1);
     }
 }
 ```
@@ -858,6 +1036,41 @@ pub fn update_status(
     Ok(())
 }
 
+/// Find the (single) Pending ledger entry for a given `doc_id`. Each
+/// ingest creates exactly one ledger row per doc_id, so at most one
+/// Pending row exists per doc. Returns `None` if no Pending row (e.g.
+/// already advanced to IndexingComplete on a prior successful run).
+/// Linear scan — Week 2 ledger is small; if it becomes hot, add a
+/// `kb_ledger_by_doc` secondary index in Week 3+.
+pub fn find_pending_by_doc(
+    rtx: &ReadTransaction,
+    doc_id: &str,
+) -> Result<Option<IngestLedgerEntry>> {
+    for entry in list_by_status(rtx, LedgerStatus::Pending)? {
+        if entry.doc_id == doc_id {
+            return Ok(Some(entry));
+        }
+    }
+    Ok(None)
+}
+
+/// wtx variant of `find_pending_by_doc`. Used by the ChunkAndEmbed
+/// handler so the ledger lookup + status update are atomic.
+pub fn find_pending_by_doc_in_wtx(
+    wtx: &WriteTransaction,
+    doc_id: &str,
+) -> Result<Option<IngestLedgerEntry>> {
+    let tbl = wtx.open_table(KB_LEDGER)?;
+    for entry in tbl.iter()? {
+        let (_, v) = entry?;
+        let e: IngestLedgerEntry = decode(v.value())?;
+        if e.status == LedgerStatus::Pending && e.doc_id == doc_id {
+            return Ok(Some(e));
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -936,6 +1149,27 @@ mod tests {
         let db = open_db(&tmp.path().join("kb.redb")).unwrap();
         let wtx = db.begin_write().unwrap();
         assert!(update_status(&wtx, "nope", LedgerStatus::Done, 0).is_err());
+    }
+
+    #[test]
+    fn find_pending_by_doc_returns_only_pending() {
+        let tmp = TempDir::new().unwrap();
+        let db = open_db(&tmp.path().join("kb.redb")).unwrap();
+        {
+            let wtx = db.begin_write().unwrap();
+            let mut p = sample("L1", LedgerStatus::Pending);
+            p.doc_id = "doc-a".into();
+            put(&wtx, &p).unwrap();
+            let mut d = sample("L2", LedgerStatus::IndexingComplete);
+            d.doc_id = "doc-b".into();
+            put(&wtx, &d).unwrap();
+            wtx.commit().unwrap();
+        }
+        let rtx = db.begin_read().unwrap();
+        assert_eq!(find_pending_by_doc(&rtx, "doc-a").unwrap().unwrap().id, "L1");
+        // doc-b's row is IndexingComplete, not Pending → None
+        assert!(find_pending_by_doc(&rtx, "doc-b").unwrap().is_none());
+        assert!(find_pending_by_doc(&rtx, "missing").unwrap().is_none());
     }
 }
 ```
@@ -1078,11 +1312,14 @@ pub fn claim_next(
     Ok(Some((new_job, token)))
 }
 
-/// Mark a job Done. Removes it from `kb_jobs_by_dedupe_active`,
-/// removes the claim token, and updates the priority index to reflect
-/// the new status. The job row stays in `kb_jobs_by_id` for audit /
-/// retry history.
-pub fn mark_done(wtx: &WriteTransaction, job_id: &str) -> Result<()> {
+/// Mark a job Done. Verifies `token` matches the active ClaimToken so
+/// a stalled-then-reclaimed worker can't clobber the new claimant's
+/// state. Errors with a "stale claim" message on mismatch — the
+/// caller (worker pool) treats this as "I'm a zombie, stop". Removes
+/// the dedupe entry + claim token; the job row stays in
+/// `kb_jobs_by_id` for audit / retry history.
+pub fn mark_done(wtx: &WriteTransaction, job_id: &str, token: &str) -> Result<()> {
+    verify_claim_token(wtx, job_id, token)?;
     let (mut job, old_key) = read_and_old_key(wtx, job_id)?;
     let dedupe_key = job.kind.dedupe_key();
     job.status = JobStatus::Done;
@@ -1098,10 +1335,16 @@ pub fn mark_done(wtx: &WriteTransaction, job_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Mark a job Failed. Same shape as mark_done — removes from
-/// dedupe + claims, but keeps the row for visibility (UI can list
-/// Failed for human triage).
-pub fn mark_failed(wtx: &WriteTransaction, job_id: &str, error: &str) -> Result<()> {
+/// Mark a job Failed. Same fencing semantics as `mark_done` — token
+/// must match the active claim. Keeps the row for visibility (UI can
+/// list Failed for human triage).
+pub fn mark_failed(
+    wtx: &WriteTransaction,
+    job_id: &str,
+    token: &str,
+    error: &str,
+) -> Result<()> {
+    verify_claim_token(wtx, job_id, token)?;
     let (mut job, old_key) = read_and_old_key(wtx, job_id)?;
     let dedupe_key = job.kind.dedupe_key();
     job.status = JobStatus::Failed;
@@ -1115,6 +1358,26 @@ pub fn mark_failed(wtx: &WriteTransaction, job_id: &str, error: &str) -> Result<
     {
         let mut claims = wtx.open_table(KB_JOB_CLAIMS)?;
         claims.remove(job_id)?;
+    }
+    Ok(())
+}
+
+/// Read the active claim token and confirm it matches `expected`. If
+/// the claim was removed (reclaim_stale put the job back to Ready) or
+/// a different worker now holds the claim, this errors with a "stale
+/// claim" message. Pure read using the wtx's view of KB_JOB_CLAIMS.
+fn verify_claim_token(wtx: &WriteTransaction, job_id: &str, expected: &str) -> Result<()> {
+    let claims = wtx.open_table(KB_JOB_CLAIMS)?;
+    let Some(v) = claims.get(job_id)? else {
+        return Err(anyhow::anyhow!(
+            "stale claim: no active claim for job {job_id} (reclaim_stale may have requeued it)"
+        ));
+    };
+    let active: ClaimToken = decode(v.value())?;
+    if active.token != expected {
+        return Err(anyhow::anyhow!(
+            "stale claim: token mismatch for job {job_id} (held by a different worker)"
+        ));
     }
     Ok(())
 }
@@ -1290,14 +1553,15 @@ mod tests {
             enqueue(&wtx, &job).unwrap();
             wtx.commit().unwrap();
         }
-        {
+        let token = {
             let wtx = db.begin_write().unwrap();
-            claim_next(&wtx, "w", 0, 60_000).unwrap();
+            let (_j, t) = claim_next(&wtx, "w", 0, 60_000).unwrap().unwrap();
             wtx.commit().unwrap();
-        }
+            t.token
+        };
         {
             let wtx = db.begin_write().unwrap();
-            mark_done(&wtx, &job_id).unwrap();
+            mark_done(&wtx, &job_id, &token).unwrap();
             wtx.commit().unwrap();
         }
         let rtx = db.begin_read().unwrap();
@@ -1324,14 +1588,15 @@ mod tests {
             enqueue(&wtx, &job).unwrap();
             wtx.commit().unwrap();
         }
-        {
+        let token = {
             let wtx = db.begin_write().unwrap();
-            claim_next(&wtx, "w", 0, 60_000).unwrap();
+            let (_j, t) = claim_next(&wtx, "w", 0, 60_000).unwrap().unwrap();
             wtx.commit().unwrap();
-        }
+            t.token
+        };
         {
             let wtx = db.begin_write().unwrap();
-            mark_failed(&wtx, &job_id, "boom").unwrap();
+            mark_failed(&wtx, &job_id, &token, "boom").unwrap();
             wtx.commit().unwrap();
         }
         let rtx = db.begin_read().unwrap();
@@ -1339,6 +1604,70 @@ mod tests {
         assert_eq!(j.status, JobStatus::Failed);
         assert_eq!(j.attempts, 1);
         assert_eq!(j.last_error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn mark_done_with_wrong_token_errors() {
+        // Fencing-token semantics: a worker that lost its claim (e.g.
+        // because reclaim_stale moved the job to another worker)
+        // cannot call mark_done and clobber the new claimant's state.
+        let (_tmp, db) = fresh();
+        let job = Job::new(JobKind::RebuildHnsw);
+        let job_id = job.id.clone();
+        {
+            let wtx = db.begin_write().unwrap();
+            enqueue(&wtx, &job).unwrap();
+            wtx.commit().unwrap();
+        }
+        let real_token = {
+            let wtx = db.begin_write().unwrap();
+            let (_j, t) = claim_next(&wtx, "w1", 0, 60_000).unwrap().unwrap();
+            wtx.commit().unwrap();
+            t.token
+        };
+        {
+            let wtx = db.begin_write().unwrap();
+            // Wrong token → error, no transition.
+            assert!(mark_done(&wtx, &job_id, "not-the-real-token").is_err());
+            wtx.commit().unwrap();
+        }
+        let rtx = db.begin_read().unwrap();
+        assert_eq!(get(&rtx, &job_id).unwrap().unwrap().status, JobStatus::Running);
+        drop(rtx);
+        // Right token → success.
+        {
+            let wtx = db.begin_write().unwrap();
+            mark_done(&wtx, &job_id, &real_token).unwrap();
+            wtx.commit().unwrap();
+        }
+    }
+
+    #[test]
+    fn mark_done_after_reclaim_errors() {
+        // Zombie path: a worker holds an expired token, the job has
+        // been reclaimed and re-Ready. The zombie's mark_done must
+        // fail (no active claim under that job_id).
+        let (_tmp, db) = fresh();
+        let job = Job::new(JobKind::RebuildHnsw);
+        let job_id = job.id.clone();
+        {
+            let wtx = db.begin_write().unwrap();
+            enqueue(&wtx, &job).unwrap();
+            wtx.commit().unwrap();
+        }
+        let stale_token = {
+            let wtx = db.begin_write().unwrap();
+            let (_j, t) = claim_next(&wtx, "zombie", 100, 50).unwrap().unwrap();
+            wtx.commit().unwrap();
+            t.token
+        };
+        {
+            let wtx = db.begin_write().unwrap();
+            assert_eq!(reclaim_stale(&wtx, 200).unwrap().len(), 1);
+            wtx.commit().unwrap();
+        }
+        let wtx = db.begin_write().unwrap();
+        assert!(mark_done(&wtx, &job_id, &stale_token).is_err());
     }
 
     #[test]
@@ -1417,7 +1746,7 @@ pub mod jobs;
 ```bash
 cargo test -p rsclaw --lib kb::store::jobs
 git add src/kb/store/
-git commit -m "feat(kb): store::jobs queue ops (enqueue/claim_next/mark_done/mark_failed/reclaim_stale/requeue)"
+git commit -m "feat(kb): store::jobs queue ops with fencing-token mark_done/mark_failed + reclaim_stale + requeue"
 ```
 
 ---
@@ -1755,14 +2084,16 @@ pub fn ingest_canonicalized(store: &KbStore, input: IngestInput<'_>) -> Result<I
     let lsid_str = input.canon.metadata.logical_source_id.as_str().to_string();
     let now_ms = chrono::Utc::now().timestamp_millis();
 
-    // 1. NOOP short-circuit: identical lsid + raw_sha → return existing doc_id
+    // 1. NOOP fast-path (read-only). Avoids the file-staging I/O when
+    //    the doc already exists. NOT race-safe on its own — the
+    //    wtx-scoped re-check in step 3 handles concurrent inserts.
     {
         let rtx = store.begin_read()?;
         if let Some(existing_doc_id) = docs::find_by_logical_and_hash(&rtx, &lsid_str, &raw_sha)? {
             if let Some(existing) = docs::get(&rtx, &existing_doc_id)? {
                 tracing::info!(
                     doc = %crate::kb::redact(&existing_doc_id),
-                    "kb ingest: noop"
+                    "kb ingest: noop (fast path)"
                 );
                 return Ok(IngestOutput {
                     doc_id: existing_doc_id,
@@ -1773,9 +2104,10 @@ pub fn ingest_canonicalized(store: &KbStore, input: IngestInput<'_>) -> Result<I
         }
     }
 
-    // 2. Stage markdown + raw bytes on disk (before opening the tx).
-    //    If the tx later fails, these files become orphans → Week 4
-    //    compactor cleans them.
+    // 2. Stage markdown + raw bytes BEFORE opening the wtx. If the
+    //    wtx-scoped NOOP re-check trips (a concurrent ingest beat us)
+    //    or the tx fails to commit, the staged files become orphans
+    //    — Week 4 compactor's grace-period scan reclaims them.
     let doc_id = ulid::Ulid::new().to_string();
     let slug = slugify(&input.canon.metadata.title);
     let staged = stage_doc(
@@ -1799,12 +2131,37 @@ pub fn ingest_canonicalized(store: &KbStore, input: IngestInput<'_>) -> Result<I
         },
     )?;
 
-    // 3. Compute version + old_paths (if this is an Update).
-    let rtx = store.begin_read()?;
-    let next_version = docs::next_version_for(&rtx, &lsid_str)?;
+    // 3. Single write tx. NOOP re-check + version compute + old_paths
+    //    + all five record writes happen atomically. redb is
+    //    single-writer once `begin_write()` returns, so any
+    //    concurrent ingest is fully serialised behind us.
+    let wtx = store.begin_write()?;
+
+    // 3a. Race-safe NOOP re-check using the wtx's view.
+    if let Some(existing_doc_id) =
+        docs::find_by_logical_and_hash_in_wtx(&wtx, &lsid_str, &raw_sha)?
+    {
+        if let Some(existing) = docs::get_in_wtx(&wtx, &existing_doc_id)? {
+            // Abort wtx by dropping it without commit — staged files
+            // become orphans for the Week 4 compactor.
+            drop(wtx);
+            tracing::info!(
+                doc = %crate::kb::redact(&existing_doc_id),
+                "kb ingest: noop (lost race; staged files left for compactor)"
+            );
+            return Ok(IngestOutput {
+                doc_id: existing_doc_id,
+                noop: true,
+                markdown_rel_path: existing.markdown_path,
+            });
+        }
+    }
+
+    // 3b. Version + old_paths read INSIDE wtx — race-safe.
+    let next_version = docs::next_version_for_in_wtx(&wtx, &lsid_str)?;
     let old_paths = if next_version > 1 {
-        let ptr = docs::latest_version(&rtx, &lsid_str)?.unwrap();
-        match docs::get(&rtx, &ptr.doc_id)? {
+        let ptr = docs::latest_version_in_wtx(&wtx, &lsid_str)?.unwrap();
+        match docs::get_in_wtx(&wtx, &ptr.doc_id)? {
             Some(prev) => {
                 let mut p = vec![prev.markdown_path];
                 if let Some(raw) = prev.raw_path {
@@ -1817,9 +2174,8 @@ pub fn ingest_canonicalized(store: &KbStore, input: IngestInput<'_>) -> Result<I
     } else {
         vec![]
     };
-    drop(rtx);
 
-    // 4. Build the records.
+    // 3c. Build the records.
     let source = input
         .source
         .clone()
@@ -1871,22 +2227,19 @@ pub fn ingest_canonicalized(store: &KbStore, input: IngestInput<'_>) -> Result<I
         doc_version: next_version,
     });
 
-    // 5. Single write tx: persist all five records together.
-    {
-        let wtx = store.begin_write()?;
-        docs::put(&wtx, &doc)?;
-        docs::set_latest_version(
-            &wtx,
-            &lsid_str,
-            &VersionPointer { doc_id: doc_id.clone(), version: next_version },
-        )?;
-        ledger::put(&wtx, &ledger_entry)?;
-        jobs::enqueue(&wtx, &job)?;
-        if let Some((source_id, item_id)) = input.seen_key {
-            seen::mark_seen(&wtx, source_id, item_id, &raw_sha, now_ms)?;
-        }
-        wtx.commit()?;
+    // 3d. Persist all five records together.
+    docs::put(&wtx, &doc)?;
+    docs::set_latest_version(
+        &wtx,
+        &lsid_str,
+        &VersionPointer { doc_id: doc_id.clone(), version: next_version },
+    )?;
+    ledger::put(&wtx, &ledger_entry)?;
+    jobs::enqueue(&wtx, &job)?;
+    if let Some((source_id, item_id)) = input.seen_key {
+        seen::mark_seen(&wtx, source_id, item_id, &raw_sha, now_ms)?;
     }
+    wtx.commit()?;
 
     tracing::info!(
         doc = %crate::kb::redact(&doc_id),
@@ -1929,6 +2282,17 @@ mod tests {
         })
         .unwrap()
         .unwrap()
+    }
+
+    fn fixture_arc() -> (TempDir, std::sync::Arc<KbStore>, std::sync::Arc<KbPaths>) {
+        // Arc-shared fixture for the threaded race test. Mirrors
+        // `fixture()` but returns Arcs so two threads can hold the
+        // same store + paths.
+        let tmp = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(KbStore::open(&tmp.path().join("kb.redb")).unwrap());
+        let paths = std::sync::Arc::new(KbPaths::new(tmp.path().join("kb")));
+        paths.ensure_layout().unwrap();
+        (tmp, store, paths)
     }
 
     #[test]
@@ -2061,6 +2425,67 @@ mod tests {
         let ledgers = ledger_store::list_by_status(&rtx, LedgerStatus::Pending).unwrap();
         let lb = ledgers.iter().find(|e| e.doc_id == b.doc_id).unwrap();
         assert!(lb.old_paths.contains(&doc_a.markdown_path));
+    }
+
+    #[test]
+    fn concurrent_ingest_same_bytes_produces_one_doc() {
+        // Two real threads ingest the same (lsid, raw_sha) at once.
+        // The fast-path NOOP read may miss in BOTH threads (since
+        // neither has committed yet), so both proceed to begin_write.
+        // redb serialises wtxes: thread B's wtx-scoped re-check trips
+        // and returns NOOP — same doc_id, same single job enqueued.
+        let (_tmp, store, paths) = fixture_arc();
+        let raw_bytes = std::sync::Arc::new(b"# Concurrent\n\nshared body.".to_vec());
+
+        let mk_canon = || canonicalize_by_mime(CanonicalizeInput {
+            bytes: raw_bytes.as_slice(),
+            mime: "text/markdown",
+            hint_title: Some("concurrent"),
+            logical_source_id_seed: None,
+        }).unwrap().unwrap();
+
+        let h1 = {
+            let store = store.clone();
+            let paths = paths.clone();
+            let raw = raw_bytes.clone();
+            std::thread::spawn(move || {
+                let c = mk_canon();
+                ingest_canonicalized(
+                    &store,
+                    IngestInput {
+                        canon: &c, raw_bytes: &raw, raw_ext: "md",
+                        visibility: None, owner_user_id: None, seen_key: None,
+                        source: None, paths: &paths,
+                    },
+                ).unwrap()
+            })
+        };
+        let h2 = {
+            let store = store.clone();
+            let paths = paths.clone();
+            let raw = raw_bytes.clone();
+            std::thread::spawn(move || {
+                let c = mk_canon();
+                ingest_canonicalized(
+                    &store,
+                    IngestInput {
+                        canon: &c, raw_bytes: &raw, raw_ext: "md",
+                        visibility: None, owner_user_id: None, seen_key: None,
+                        source: None, paths: &paths,
+                    },
+                ).unwrap()
+            })
+        };
+        let a = h1.join().unwrap();
+        let b = h2.join().unwrap();
+
+        // Both calls returned the same doc_id, and at least one was a noop.
+        assert_eq!(a.doc_id, b.doc_id);
+        assert!(a.noop || b.noop, "expected one of the racing ingests to noop");
+        // Exactly one ChunkAndEmbed job is queued.
+        let rtx = store.begin_read().unwrap();
+        let ready = jobs_store::list_by_status(&rtx, JobStatus::Ready).unwrap();
+        assert_eq!(ready.len(), 1, "race produced duplicate jobs");
     }
 }
 ```
@@ -2207,17 +2632,51 @@ pub fn run(ctx: &HandlerCtx, doc_id: &str, doc_version: u32) -> Result<()> {
         })
         .collect();
 
-    // 4. Persist chunks + advance ledger in one tx.
+    // 4. Persist chunks + advance ledger in one tx. Cleanup +
+    //    inserts + ledger-advance run atomically so a v(N-1)→vN
+    //    transition never leaves the chunk table in a mixed state.
     {
         let wtx = ctx.store.begin_write()?;
+
+        // 4a. Drop chunks from prior doc_versions of the same logical
+        //     source. Same-version reruns are no-ops because chunk_ids
+        //     are deterministic; cross-version drops here keep
+        //     retrieval clean.
+        let removed = chunks::delete_for_doc_version_below(
+            &wtx,
+            &doc.logical_source_id,
+            doc.version,
+        )?;
+        if removed > 0 {
+            tracing::info!(
+                doc = %crate::kb::redact(doc_id),
+                old_chunks = removed,
+                "kb worker: removed stale chunks from prior version"
+            );
+        }
+
+        // 4b. Insert new-version chunks.
         for c in &chunks_with_vec {
             chunks::put(&wtx, c)?;
         }
-        // Find the ledger entry for this doc (latest Pending for this doc_id).
-        if let Some(ledger_id) = find_ledger_for_doc(&ctx.store, &doc.id)? {
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            ledger::update_status(&wtx, &ledger_id, LedgerStatus::IndexingComplete, now_ms)?;
+
+        // 4c. Advance the ledger using the wtx's view:
+        //   Pending         → IndexingComplete (normal path)
+        //   non-Pending     → already advanced (idempotent rerun) — log + continue
+        //   missing         → row was reclaimed; chunks landed so still ok
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        match ledger::find_pending_by_doc_in_wtx(&wtx, &doc.id)? {
+            Some(entry) => {
+                ledger::update_status(&wtx, &entry.id, LedgerStatus::IndexingComplete, now_ms)?;
+            }
+            None => {
+                tracing::debug!(
+                    doc = %crate::kb::redact(&doc.id),
+                    "kb worker: no Pending ledger row for doc — treating as idempotent rerun"
+                );
+            }
         }
+
         wtx.commit()?;
     }
 
@@ -2227,16 +2686,6 @@ pub fn run(ctx: &HandlerCtx, doc_id: &str, doc_version: u32) -> Result<()> {
         "kb worker: chunk_embed complete"
     );
     Ok(())
-}
-
-fn find_ledger_for_doc(store: &crate::kb::store::KbStore, doc_id: &str) -> Result<Option<String>> {
-    let rtx = store.begin_read()?;
-    for entry in ledger::list_by_status(&rtx, LedgerStatus::Pending)? {
-        if entry.doc_id == doc_id {
-            return Ok(Some(entry.id));
-        }
-    }
-    Ok(None)
 }
 
 #[cfg(test)]
@@ -2333,6 +2782,85 @@ mod tests {
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].doc_id, doc_id);
     }
+
+    #[test]
+    fn rerun_after_ledger_advanced_does_not_error() {
+        // Crash-before-mark_done scenario: handler ran, chunks +
+        // ledger landed, mark_done crashed → reclaim → rerun. The
+        // ledger row is already IndexingComplete; handler must not
+        // error trying to advance a non-Pending row.
+        let (_tmp, ctx, doc_id) = fixture();
+        let doc = {
+            let rtx = ctx.store.begin_read().unwrap();
+            docs::get(&rtx, &doc_id).unwrap().unwrap()
+        };
+        run(&ctx, &doc_id, doc.version).unwrap();
+        // Second run sees the ledger already advanced — must succeed.
+        run(&ctx, &doc_id, doc.version).unwrap();
+        let rtx = ctx.store.begin_read().unwrap();
+        let done = ledger::list_by_status(&rtx, LedgerStatus::IndexingComplete).unwrap();
+        // Still exactly one IndexingComplete row, not two.
+        assert_eq!(done.len(), 1);
+    }
+
+    #[test]
+    fn new_version_drops_old_chunks() {
+        // v1 indexed → v2 ingested (same lsid, different bytes) →
+        // handler runs for v2 → v1 chunks gone, only v2 chunks remain.
+        use crate::kb::canonicalize::CanonicalizeInput;
+        use crate::kb::model::LogicalSourceId;
+
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(KbStore::open(&tmp.path().join("kb.redb")).unwrap());
+        let paths = Arc::new(KbPaths::new(tmp.path().join("kb")));
+        paths.ensure_layout().unwrap();
+        let embedder: Arc<dyn KbEmbedder> = Arc::new(StubEmbedder::default());
+        let ctx = HandlerCtx { store: store.clone(), paths: paths.clone(), embedder };
+
+        let lsid = LogicalSourceId("file:custom:rotate".into());
+        let mk = |bytes: &[u8]| {
+            crate::kb::canonicalize::canonicalize_by_mime(CanonicalizeInput {
+                bytes,
+                mime: "text/markdown",
+                hint_title: Some("rotate"),
+                logical_source_id_seed: Some(lsid.clone()),
+            }).unwrap().unwrap()
+        };
+
+        let v1 = mk(b"# v1\n\nfirst body very different.");
+        let v1_out = ingest_canonicalized(
+            &store,
+            IngestInput {
+                canon: &v1, raw_bytes: b"# v1\n\nfirst body very different.",
+                raw_ext: "md", visibility: None, owner_user_id: None, seen_key: None,
+                source: None, paths: &paths,
+            },
+        ).unwrap();
+        run(&ctx, &v1_out.doc_id, 1).unwrap();
+        let v1_chunks_before = {
+            let rtx = store.begin_read().unwrap();
+            chunks::chunks_for_logical(&rtx, &lsid.0).unwrap()
+        };
+        assert!(!v1_chunks_before.is_empty(), "v1 should have chunks before v2 lands");
+
+        let v2 = mk(b"# v2\n\nentirely different body content here.");
+        let v2_out = ingest_canonicalized(
+            &store,
+            IngestInput {
+                canon: &v2, raw_bytes: b"# v2\n\nentirely different body content here.",
+                raw_ext: "md", visibility: None, owner_user_id: None, seen_key: None,
+                source: None, paths: &paths,
+            },
+        ).unwrap();
+        run(&ctx, &v2_out.doc_id, 2).unwrap();
+
+        let rtx = store.begin_read().unwrap();
+        let chunks_after = chunks::chunks_for_logical(&rtx, &lsid.0).unwrap();
+        // Only v2 chunks remain.
+        for c in &chunks_after {
+            assert_eq!(c.doc_version, 2, "expected only v2 chunks, saw v{}", c.doc_version);
+        }
+    }
 }
 ```
 
@@ -2407,12 +2935,19 @@ pub struct WorkerPool {
 
 impl WorkerPool {
     /// Start with `DefaultDispatcher`.
+    ///
+    /// **Runtime requirement:** must be called from a multi-threaded
+    /// tokio runtime (e.g. `#[tokio::main]` default flavor or
+    /// `Runtime::new()` with `enable_all()`). `run_main` wraps the
+    /// synchronous handler call with `tokio::task::block_in_place`,
+    /// which panics on a single-threaded runtime.
     pub fn start(ctx: HandlerCtx, cfg: WorkerConfig) -> Self {
         Self::start_with_handler(ctx, cfg, Arc::new(DefaultDispatcher))
     }
 
     /// Start with a custom job handler. Tests use this with handlers
-    /// that fail deterministically to exercise the retry path.
+    /// that fail deterministically to exercise the retry path. Same
+    /// multi-threaded runtime requirement as `start`.
     pub fn start_with_handler(
         ctx: HandlerCtx,
         cfg: WorkerConfig,
@@ -2424,15 +2959,19 @@ impl WorkerPool {
     }
 
     /// Signal shutdown and wait for the background task to drain its
-    /// current job (if any) and exit.
+    /// current job (if any) and exit. Logs a JoinError if the task
+    /// panicked instead of silently swallowing.
     pub async fn shutdown(self) {
         self.shutdown.store(true, Ordering::Release);
-        let _ = self.main.await;
+        if let Err(e) = self.main.await {
+            tracing::error!("kb worker pool exited with error: {e:#}");
+        }
     }
 
     /// Test helper: run exactly one job synchronously. Returns true if
     /// a job was claimed and processed. Used in tests so we don't have
-    /// to poll-and-wait.
+    /// to poll-and-wait. Passes the claim token to mark_done /
+    /// mark_failed so the fencing check is exercised end-to-end.
     pub fn run_one_blocking(
         ctx: &HandlerCtx,
         cfg: &WorkerConfig,
@@ -2445,21 +2984,29 @@ impl WorkerPool {
             wtx.commit()?;
             claim
         };
-        let Some((job, _token)) = claimed else {
+        let Some((job, token)) = claimed else {
             return Ok(false);
         };
         match handler.handle(ctx, &job.kind) {
             Ok(()) => {
                 let wtx = ctx.store.begin_write()?;
-                jobs::mark_done(&wtx, &job.id)?;
+                // If verification fails here (e.g. a parallel reclaim
+                // requeued the job mid-handler), we want the error to
+                // surface so the worker logs it and moves on rather
+                // than silently double-committing.
+                jobs::mark_done(&wtx, &job.id, &token.token)?;
                 wtx.commit()?;
                 Ok(true)
             }
             Err(e) => {
                 let wtx = ctx.store.begin_write()?;
                 if job.attempts + 1 >= cfg.max_attempts {
-                    jobs::mark_failed(&wtx, &job.id, &format!("{e:#}"))?;
+                    jobs::mark_failed(&wtx, &job.id, &token.token, &format!("{e:#}"))?;
                 } else {
+                    // requeue does NOT need a token check: putting a
+                    // job back to Ready is non-destructive (the next
+                    // claimant gets a fresh token), and the lossy path
+                    // is preferable to refusing to retry.
                     jobs::requeue(&wtx, &job.id)?;
                 }
                 wtx.commit()?;
@@ -2485,7 +3032,13 @@ async fn run_main(
             next_reclaim = Instant::now() + cfg.reclaim_interval;
         }
 
-        let did_work = match WorkerPool::run_one_blocking(&ctx, &cfg, handler.as_ref()) {
+        // `run_one_blocking` does sync redb I/O + handler work.
+        // Wrap in block_in_place so a single tokio worker thread
+        // isn't held hostage by a slow handler. Requires
+        // multi-threaded runtime (see `WorkerPool::start` docs).
+        let did_work = match tokio::task::block_in_place(|| {
+            WorkerPool::run_one_blocking(&ctx, &cfg, handler.as_ref())
+        }) {
             Ok(b) => b,
             Err(e) => {
                 tracing::error!("kb worker main loop error: {e:#}");
@@ -2609,6 +3162,31 @@ mod tests {
         let rtx = ctx.store.begin_read().unwrap();
         let failed = jobs_store::list_by_status(&rtx, JobStatus::Failed).unwrap();
         assert_eq!(failed.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_exits_within_poll_idle_plus_margin() {
+        // The point of the single-task redesign is correct shutdown
+        // observation. Drain the seeded job so the worker is idle,
+        // start the pool, signal shutdown, and assert it returns in
+        // bounded time — under poll_idle + scheduling overhead.
+        let (_tmp, ctx, mut cfg, _doc_id, _lsid) = fixture();
+        cfg.poll_idle = Duration::from_millis(50);
+        {
+            let handler = DefaultDispatcher;
+            WorkerPool::run_one_blocking(&ctx, &cfg, &handler).unwrap();
+        }
+        let pool = WorkerPool::start(ctx, cfg);
+        // Let the worker observe an empty queue and enter idle sleep.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let start = std::time::Instant::now();
+        pool.shutdown().await;
+        let elapsed = start.elapsed();
+        // poll_idle (50ms) + 10ms sleep granularity + scheduling slack.
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "shutdown took {elapsed:?}, expected < 200ms"
+        );
     }
 }
 ```
@@ -3076,3 +3654,56 @@ These mirror the ones still listed in the spec / ADR Open Questions section. Add
 - [ ] All redb accessors take `&WriteTransaction` (writes) or `&ReadTransaction` (reads) — never both, never neither.
 - [ ] Worker pool's `shutdown()` actually drops the background tasks; tests verify by running `run_one_blocking` after shutdown returns nothing.
 - [ ] Spec §J flow steps 1–11 each map to a concrete task or are explicitly deferred to Week 3/4.
+
+---
+
+## Plan-fix sweep — P0/P1 review findings applied
+
+Same review rhythm as Week 1 (`0d46638` + `2a9944d`). Findings from the
+post-write plan review, fixed inline before execution starts:
+
+### P0 (correctness bugs the plan would have produced)
+1. **T10 NOOP/version race** — original plan did `find_by_logical_and_hash`,
+   `next_version_for`, and `old_paths` lookup in a `ReadTransaction` *outside*
+   the wtx. Two concurrent ingests with the same `(lsid, raw_sha)` could each
+   pass NOOP-miss + compute the same `next_version` + each commit a duplicate
+   doc, racing on the version pointer. Fix: added `*_in_wtx` reader variants
+   to T3 (`docs::get_in_wtx`, `latest_version_in_wtx`, `next_version_for_in_wtx`,
+   `find_by_logical_and_hash_in_wtx`) and reordered T10 so the NOOP re-check,
+   version compute, and old_paths read all happen inside the wtx. Added a
+   threaded test (`concurrent_ingest_same_bytes_produces_one_doc`) that drives
+   the race and asserts exactly one doc + one job.
+2. **T7 ClaimToken not verified** — spec §J + `types.rs:98` comment promised
+   `mark_done verifies`, but the impl took `&str` job_id and ignored the
+   token. Fix: changed `mark_done` and `mark_failed` signatures to take
+   `token: &str`; added a `verify_claim_token` helper that errors on
+   "stale claim". Updated T7 tests + T12 `run_one_blocking` to thread the
+   token through. Added `mark_done_with_wrong_token_errors` and
+   `mark_done_after_reclaim_errors` to cover the fencing semantics.
+3. **T11 `find_ledger_for_doc` O(n) scan + silent rerun bug** — moved the
+   lookup helper into T6 (`ledger::find_pending_by_doc` + `_in_wtx` variant);
+   gave T11 an explicit `Pending → IndexingComplete | already-advanced |
+   missing` decision tree so a crash-before-mark_done rerun no longer
+   silently no-ops. Added `rerun_after_ledger_advanced_does_not_error` test.
+
+### P1 (correctness gaps in second-order paths)
+4. **T12 shutdown untested** — the whole point of the 1-task redesign was
+   correct shutdown observation. Added
+   `shutdown_exits_within_poll_idle_plus_margin` (`multi_thread` flavor)
+   that drains the queue, starts the pool, signals shutdown, and asserts
+   exit < 200ms.
+5. **T12 sync handler blocks single-threaded runtime** — wrapped the
+   `run_one_blocking` call inside `run_main` with `tokio::task::block_in_place`
+   and documented the multi-threaded runtime requirement on
+   `WorkerPool::start` / `start_with_handler`. Also added JoinError logging
+   in `shutdown()` so a panicked worker is no longer silent.
+6. **T11 stale-version chunks leak** — added
+   `chunks::delete_for_doc_version_below` (T4) and called it from the T11
+   handler before inserting new-version chunks. Added
+   `delete_for_doc_version_below_removes_older_only` (T4) +
+   `new_version_drops_old_chunks` (T11) tests.
+
+P2 findings (logging `last_error` from `reclaim_stale`, missing recovery
+matrix scenarios d/e in T13, unenforced `KbSource::Doc { path: "(manual)" }`
+placeholder) are NOT applied here. They are non-blocking and tracked for
+inline cleanup during execution.
