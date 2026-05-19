@@ -8,7 +8,7 @@ use crate::kb::paths::KbPaths;
 use crate::kb::search::filter::{is_latest_version, keep_doc, SearchFilter};
 use crate::kb::search::mmr::{mmr_select, MmrCandidate};
 use crate::kb::search::rrf::rrf_fuse;
-use crate::kb::store::{chunks, docs, KbStore};
+use crate::kb::store::{chunks, docs, entities, KbStore};
 use anyhow::Result;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -125,15 +125,56 @@ impl SearchCtx {
         }
 
         // 4. Fuse.
-        let fused = match req.mode {
+        let mut fused = match req.mode {
             SearchMode::Dense => kept_dense,
             SearchMode::Bm25 => kept_sparse,
             _ => rrf_fuse(&[&kept_dense, &kept_sparse]),
         };
 
-        // 5. boost_entities (placeholder — Week 4 entity extraction
-        //    fills chunk-entity edges; until then this is a no-op).
-        let _ = req.boost_entities;
+        // 5a. require_entities: drop fused hits whose chunk_id is
+        //     not in EVERY required entity's chunk set.
+        //     (Entity edges are populated by the chunk_embed handler's
+        //     regex extractor — `KbEntityIndex` rows keyed
+        //     `entity_id\0chunk_id`.)
+        if !req.filter.require_entities.is_empty() {
+            let mut required_sets: Vec<std::collections::HashSet<String>> = Vec::new();
+            for eid in &req.filter.require_entities {
+                let set: std::collections::HashSet<String> = entities::chunks_for_entity(&rtx, eid)?
+                    .into_iter()
+                    .map(|e| e.chunk_id)
+                    .collect();
+                required_sets.push(set);
+            }
+            fused.retain(|(cid, _)| required_sets.iter().all(|s| s.contains(cid)));
+        }
+
+        // 5b. boost_entities: multiply each fused hit's score by
+        //     `BOOST_FACTOR` for every boost entity it mentions.
+        //     Bounded so adding more boost entities has diminishing
+        //     impact (1.0 + Σ min(boost_factor, ...)). Re-sort.
+        const BOOST_FACTOR: f32 = 0.2;
+        if !req.boost_entities.is_empty() {
+            let mut boost_sets: Vec<std::collections::HashSet<String>> = Vec::new();
+            for eid in &req.boost_entities {
+                let set: std::collections::HashSet<String> = entities::chunks_for_entity(&rtx, eid)?
+                    .into_iter()
+                    .map(|e| e.chunk_id)
+                    .collect();
+                boost_sets.push(set);
+            }
+            for (cid, score) in fused.iter_mut() {
+                let bonus: f32 = boost_sets
+                    .iter()
+                    .map(|s| if s.contains(cid) { BOOST_FACTOR } else { 0.0 })
+                    .sum();
+                *score *= 1.0 + bonus;
+            }
+            fused.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.0.cmp(&b.0))
+            });
+        }
 
         // 6. MMR.
         let final_ids: Vec<(String, f32)> = match req.diversity {

@@ -2,8 +2,10 @@
 //! worker drains → kb_search_entities returns the extracted mentions.
 
 use anyhow::Result;
+use rsclaw::kb::entities::extract::canonical_id;
+use rsclaw::kb::model::EntityKind;
 use rsclaw::kb::sync::{KbSourceSyncer, ManualUploadSyncer, SyncContext, SyncReason};
-use rsclaw::kb::tools::kb_search_entities;
+use rsclaw::kb::tools::{kb_search, kb_search_entities};
 use rsclaw::kb::worker::{DefaultDispatcher, HandlerCtx, WorkerConfig, WorkerPool};
 use rsclaw::kb::{CallerScope, KbEmbedder, KbIndex, KbPaths, KbStore, StubEmbedder};
 use rsclaw::kb::search::SearchCtx;
@@ -92,5 +94,93 @@ async fn entities_extracted_and_queryable() -> Result<()> {
         "expected CJK hashtag entity, got: {:?}",
         tag_hits.matches
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn require_entities_filters_to_chunks_with_mention() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let store = Arc::new(KbStore::open(&tmp.path().join("kb.redb"))?);
+    let paths = Arc::new(KbPaths::new(tmp.path().join("kb")));
+    paths.ensure_layout()?;
+    let embedder: Arc<dyn KbEmbedder> = Arc::new(StubEmbedder::default());
+    let index = Arc::new(KbIndex::open(&paths)?);
+
+    // Two docs: one mentions @alice, one doesn't.
+    let f1 = tmp.path().join("a.md");
+    std::fs::write(&f1, "# A\n\nMessage from @alice about the project.")?;
+    let f2 = tmp.path().join("b.md");
+    std::fs::write(&f2, "# B\n\nAnnouncement about the project status.")?;
+
+    let hctx = HandlerCtx {
+        store: store.clone(),
+        paths: paths.clone(),
+        embedder: embedder.clone(),
+        index: index.clone(),
+    };
+    for path in [f1, f2] {
+        let syncer = ManualUploadSyncer {
+            source_id: format!("test:{}", path.display()),
+            file_path: path,
+            tags: vec![],
+        };
+        let sctx = SyncContext {
+            store: store.clone(),
+            paths: paths.clone(),
+            index: index.clone(),
+            embedder: embedder.clone(),
+        };
+        syncer.sync(&sctx, SyncReason::Manual).await.unwrap();
+        WorkerPool::run_one_blocking(&hctx, &WorkerConfig::default(), &DefaultDispatcher)?;
+    }
+
+    let ctx = SearchCtx { store, index, paths, embedder };
+    let alice_id = canonical_id(EntityKind::Person, "alice");
+
+    // Baseline: no require_entities → both docs match "project".
+    let baseline = kb_search::run(
+        &ctx,
+        kb_search::KbSearchInput {
+            query: "project".into(),
+            k: 10,
+            filter: Default::default(),
+            mode: "hybrid".into(),
+            diversity: "off".into(),
+            mmr_lambda: 0.5,
+            boost_entities: vec![],
+        },
+        &CallerScope::default(),
+    )?;
+    let baseline_docs: std::collections::HashSet<String> =
+        baseline.results.iter().map(|h| h.doc_title.clone()).collect();
+    assert!(baseline_docs.len() >= 2, "expected ≥2 docs in baseline, got {baseline_docs:?}");
+
+    // With require_entities=alice → only doc A matches.
+    let filtered = kb_search::run(
+        &ctx,
+        kb_search::KbSearchInput {
+            query: "project".into(),
+            k: 10,
+            filter: kb_search::KbSearchFilter {
+                entity_ids: vec![alice_id],
+                ..Default::default()
+            },
+            mode: "hybrid".into(),
+            diversity: "off".into(),
+            mmr_lambda: 0.5,
+            boost_entities: vec![],
+        },
+        &CallerScope::default(),
+    )?;
+    assert!(
+        !filtered.results.is_empty(),
+        "expected at least one hit for @alice + 'project'"
+    );
+    for hit in &filtered.results {
+        assert!(
+            hit.doc_title.contains('A') || hit.text.contains("@alice"),
+            "filter leaked a non-@alice doc: {hit:?}"
+        );
+    }
     Ok(())
 }
