@@ -1310,6 +1310,56 @@ pub enum PairingState {
 mod tests {
     use super::*;
 
+    /// Create a v2-format redb file via the bundled `redb_legacy` (2.6.x default
+    /// is v2), then verify `upgrade_legacy_if_needed` migrates it in place and
+    /// the original data survives a round-trip through redb 4.
+    #[test]
+    fn upgrades_v2_database_to_v3_preserving_data() {
+        const LEGACY_TABLE: redb_legacy::TableDefinition<&str, &str> =
+            redb_legacy::TableDefinition::new("session_meta");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("legacy.redb");
+
+        // 1. Write a v2 database with one row.
+        {
+            let db = redb_legacy::Database::create(&path).expect("create v2");
+            let txn = db.begin_write().expect("begin write");
+            {
+                let mut tbl = txn.open_table(LEGACY_TABLE).expect("open table");
+                tbl.insert("hello", "world").expect("insert");
+            }
+            txn.commit().expect("commit");
+        }
+        // Sanity: redb 4 must refuse the v2 file before upgrade.
+        assert!(
+            Database::open(&path).is_err(),
+            "redb 4 should reject v2 file before upgrade"
+        );
+
+        // 2. Run the migration helper.
+        upgrade_legacy_if_needed(&path).expect("upgrade");
+
+        // 3. Re-open with redb 4 and confirm the row survived.
+        {
+            let db = Database::open(&path).expect("open after upgrade");
+            let read = db.begin_read().expect("begin read");
+            let tbl = read.open_table(SESSION_META).expect("open table v3");
+            let got = tbl.get("hello").expect("get").expect("present");
+            assert_eq!(got.value(), "world");
+        }
+
+        // 4. Second call is a no-op (file is already v3) — must succeed cleanly.
+        upgrade_legacy_if_needed(&path).expect("second upgrade no-op");
+    }
+
+    /// Upgrade helper must be a no-op when the file does not exist (fresh
+    /// install path) and not panic.
+    #[test]
+    fn upgrade_helper_noop_on_missing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        upgrade_legacy_if_needed(&dir.path().join("does-not-exist.redb")).expect("noop");
+    }
+
     fn open_tmp() -> (RedbStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let store =
