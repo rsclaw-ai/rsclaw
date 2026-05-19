@@ -312,7 +312,14 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/computer-use/runs/{run_id}/abort",
             post(computer_use_run_abort),
-        );
+        )
+        // Memory management — read-only browse + stats. Each request
+        // opens `MemoryStore::open_readonly` to avoid touching the
+        // agent runtime's live store. Mutating endpoints (delete,
+        // pin/unpin, importance bump) need shared-state coordination
+        // and land in a follow-up.
+        .route("/memory/docs", get(memory_list_docs))
+        .route("/memory/stats", get(memory_stats));
 
     Router::new()
         .nest("/api/v1", api)
@@ -3415,4 +3422,224 @@ async fn delete_file(Path(file_id): Path<String>) -> impl IntoResponse {
         "object": "file",
         "deleted": true,
     })).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Memory management API
+// ---------------------------------------------------------------------------
+//
+// Read-only browse endpoints for the desktop's Memory page. Both
+// handlers open `MemoryStore` in read-only mode for the duration of
+// the request — the agent runtime keeps its own write-capable
+// instance and we don't share state. redb allows multiple readers
+// alongside one writer, so this is safe.
+
+#[derive(Debug, Deserialize)]
+struct MemoryListParams {
+    /// Semantic search query. When set, returns the top-K matches
+    /// instead of iterating active docs.
+    q: Option<String>,
+    /// Filter by exact `scope` (agent id or "global").
+    scope: Option<String>,
+    /// Filter by exact `kind` ("note" | "fact" | "summary" | "session" | ...).
+    kind: Option<String>,
+    /// Max results (defaults to 200, hard cap 1000).
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryDocOut {
+    id: String,
+    scope: String,
+    kind: String,
+    text: String,
+    abstract_text: Option<String>,
+    overview_text: Option<String>,
+    tags: Vec<String>,
+    tier: String,
+    importance: f32,
+    pinned: bool,
+    created_at: i64,
+    accessed_at: i64,
+    access_count: i64,
+    /// Weibull stretched-exponential decay score (0..1). Computed
+    /// on read since it depends on `now()`.
+    relevance_score: f32,
+}
+
+impl From<&crate::agent::memory::MemoryDoc> for MemoryDocOut {
+    fn from(d: &crate::agent::memory::MemoryDoc) -> Self {
+        let tier = match d.tier {
+            crate::agent::memory::MemDocTier::Core => "core",
+            crate::agent::memory::MemDocTier::Working => "working",
+            crate::agent::memory::MemDocTier::Peripheral => "peripheral",
+        }
+        .to_string();
+        Self {
+            id: d.id.clone(),
+            scope: d.scope.clone(),
+            kind: d.kind.clone(),
+            text: d.text.clone(),
+            abstract_text: d.abstract_text.clone(),
+            overview_text: d.overview_text.clone(),
+            tags: d.tags.clone(),
+            tier,
+            importance: d.importance,
+            pinned: d.pinned,
+            created_at: d.created_at,
+            accessed_at: d.accessed_at,
+            access_count: d.access_count,
+            relevance_score: d.relevance_score(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryListResponse {
+    docs: Vec<MemoryDocOut>,
+    /// Total before `limit` is applied (so the UI can show "X of Y").
+    total: usize,
+}
+
+/// Locate the BGE model directory and pick the first one that has a
+/// `config.json`. Mirrors the discovery logic in `cmd/memory.rs` so
+/// the HTTP and CLI paths behave identically.
+fn memory_model_dir() -> std::path::PathBuf {
+    let base = crate::config::loader::base_dir();
+    let zh = base.join("models/bge-small-zh");
+    let en = base.join("models/bge-small-en");
+    if zh.join("config.json").exists() {
+        zh
+    } else {
+        en
+    }
+}
+
+async fn memory_list_docs(
+    State(state): State<AppState>,
+    Query(params): Query<MemoryListParams>,
+) -> impl IntoResponse {
+    let base = crate::config::loader::base_dir();
+    let data_dir = base.join("var/data");
+    let model_dir = memory_model_dir();
+    let search_cfg = state.config.raw.memory_search.as_ref();
+    let limit = params.limit.unwrap_or(200).min(1000);
+
+    let mut store = match crate::agent::memory::MemoryStore::open_readonly(
+        &data_dir,
+        Some(&model_dir),
+        search_cfg,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            // Most common cause: memory db not yet seeded. Return
+            // an empty list rather than 500 so the UI can show "no
+            // memories yet" gracefully.
+            warn!(error = %e, "memory_list: open_readonly failed");
+            return Json(MemoryListResponse {
+                docs: vec![],
+                total: 0,
+            })
+            .into_response();
+        }
+    };
+
+    let docs: Vec<crate::agent::memory::MemoryDoc> =
+        if let Some(q) = params.q.as_deref().filter(|s| !s.trim().is_empty()) {
+            match store.search(q, None, limit).await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(error = %e, query = %q, "memory_list: search failed");
+                    vec![]
+                }
+            }
+        } else {
+            store.list_active()
+        };
+
+    let filtered: Vec<&crate::agent::memory::MemoryDoc> = docs
+        .iter()
+        .filter(|d| params.scope.as_ref().is_none_or(|s| &d.scope == s))
+        .filter(|d| params.kind.as_ref().is_none_or(|k| &d.kind == k))
+        .collect();
+
+    let total = filtered.len();
+    let truncated: Vec<MemoryDocOut> = filtered.iter().take(limit).map(|d| (*d).into()).collect();
+
+    Json(MemoryListResponse {
+        docs: truncated,
+        total,
+    })
+    .into_response()
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryStatsResponse {
+    /// Total active docs (post-tombstone filter).
+    total: usize,
+    /// Counts by tier ("core" / "working" / "peripheral").
+    by_tier: std::collections::HashMap<String, usize>,
+    /// Counts by `kind` field ("note" / "fact" / "summary" / "session" / ...).
+    by_kind: std::collections::HashMap<String, usize>,
+    /// Counts by `scope` field (agent id or "global").
+    by_scope: std::collections::HashMap<String, usize>,
+    /// Number of pinned docs.
+    pinned: usize,
+}
+
+async fn memory_stats(State(state): State<AppState>) -> impl IntoResponse {
+    let base = crate::config::loader::base_dir();
+    let data_dir = base.join("var/data");
+    let model_dir = memory_model_dir();
+    let search_cfg = state.config.raw.memory_search.as_ref();
+
+    let store = match crate::agent::memory::MemoryStore::open_readonly(
+        &data_dir,
+        Some(&model_dir),
+        search_cfg,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(_) => {
+            return Json(MemoryStatsResponse {
+                total: 0,
+                by_tier: Default::default(),
+                by_kind: Default::default(),
+                by_scope: Default::default(),
+                pinned: 0,
+            })
+            .into_response();
+        }
+    };
+
+    let docs = store.list_active();
+    let mut by_tier: std::collections::HashMap<String, usize> = Default::default();
+    let mut by_kind: std::collections::HashMap<String, usize> = Default::default();
+    let mut by_scope: std::collections::HashMap<String, usize> = Default::default();
+    let mut pinned = 0usize;
+    for d in &docs {
+        let tier = match d.tier {
+            crate::agent::memory::MemDocTier::Core => "core",
+            crate::agent::memory::MemDocTier::Working => "working",
+            crate::agent::memory::MemDocTier::Peripheral => "peripheral",
+        };
+        *by_tier.entry(tier.to_string()).or_default() += 1;
+        *by_kind.entry(d.kind.clone()).or_default() += 1;
+        *by_scope.entry(d.scope.clone()).or_default() += 1;
+        if d.pinned {
+            pinned += 1;
+        }
+    }
+
+    Json(MemoryStatsResponse {
+        total: docs.len(),
+        by_tier,
+        by_kind,
+        by_scope,
+        pinned,
+    })
+    .into_response()
 }

@@ -777,10 +777,9 @@ export function SideBar(props: { className?: string }) {
               { tab: "cron", icon: "\u23F0", label: getLang() === "cn" ? "\u5B9A\u65F6\u4EFB\u52A1" : "Cron" },
               { tab: "skills", icon: "\uD83D\uDD27", label: getLang() === "cn" ? "\u6280\u80FD\u7BA1\u7406" : "Skills" },
               { tab: "doctor", icon: "\uD83D\uDEE1\uFE0F", label: getLang() === "cn" ? "\u5B89\u5168\u68C0\u67E5" : "Doctor" },
-              // Placeholder slots \u2014 UI only, backend not wired yet.
-              // Click shows a "coming soon" toast instead of navigating
-              // so the user doesn't land on a blank tab.
-              { tab: "memory", icon: "\uD83E\uDDE0", label: Locale.RsClawPanel.Sidebar.Memory, comingSoon: true },
+              { tab: "memory", icon: "\uD83E\uDDE0", label: Locale.RsClawPanel.Sidebar.Memory },
+              // Knowledge still a placeholder \u2014 backend collections
+              // layer not wired yet. Click shows a coming-soon toast.
               { tab: "knowledge", icon: "\uD83D\uDCDA", label: Locale.RsClawPanel.Sidebar.Knowledge, comingSoon: true },
             ].map((item) => (
               <button
