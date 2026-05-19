@@ -238,27 +238,58 @@ memory 系统的衰减、importance、tier transition 等机制对知识库场�
 
 **A. Jobs queue：redb 显式索引表 ✅ (已 confirm)**
 - 待验证：高并发 worker 抢任务的实测延迟（目标 < 5ms p99）
+- 🟢 **已落地**：4 表设计 + 单写事务 + fencing claim_token；单 worker 在 redb 单写者下足以满足 v1 throughput（多 worker 待 v1.x 压测后再决）
 
 **B. logical_source_id schema 边界**
 - URL canonicalize：除了 utm/fbclid/gclid 还要剥哪些 tracker？
 - Chat bucket window：5min idle vs 6h 固定？
 - 邮件无 Message-ID 极少见场景的 fallback 策略
+- 🟡 **部分**：URL canonicalize 已 ship 通用 tracker stripping + 参数排序；Chat / Mail 不在 v1 范围
 
 **C. recency_policy 默认表（v2）**
 - 按 source_kind vs 按 tag vs 按用户全局策略
+- 🔵 **V2**
 
 **D. HistoryProvider 首发 channel**
 - Feishu / Slack / Telegram / Matrix 哪个先？倾向 Feishu
+- 🔵 **V2**
 
 **E. PermissionScope 多 agent 跨问行为**
 - A 调 B 时 A 看不见的 B 是否应静默 mask（倾向）vs 显式拒绝
+- 🟢 **已落地**：retrieval pipeline 的 `keep_doc` 默认静默 mask（`doc.visible_to(scope)` 不通过 → chunk 被 skip，不在结果中暴露存在性）
 
 **F. URL canonicalization 测试套件**
 - v1 MVP 需要覆盖：Google 搜索结果、知乎、GitHub、b 站、微博、wikipedia
+- 🟡 **部分**：Week 1 e2e 覆盖 `?utm_source=…&b=2&a=1` → 排序 + tracker 剥除；fixture-driven 多站测试套件未 ship
 
 **G. HNSW snapshot 周期 + 重启重建阈值**
 - snapshot 每 1h vs 每 N 个新 chunk
 - 启动 snapshot 落后多少 chunks 直接重建
+- 🟢 **已落地**：`kb compact` 触发 `hnsw_rs::file_dump` + JSON sidecar；`KbIndex::open_and_rebuild` 先尝试 restore，失败/缺文件 fall back rebuild。自动周期 snapshot 留给 gateway-resident scheduler（v1.x）
+
+## Status
+
+**v1.0 MVP ✅ shipped** (Weeks 1–5, branch `worktree-feat+knowledge-base`):
+
+- 13 redb tables + per-table accessors
+- `ingest_canonicalized` atomic single-tx pipeline with race-safe NOOP re-check
+- `WorkerPool` with fencing-token transitions + bounded shutdown
+- `KbIndex` composite (HNSW + tantivy) with snapshot persistence + CJK tokenizer
+- 5 MCP tools: `kb_search`, `kb_fetch`, `kb_list_docs`, `kb_similar`, `kb_search_entities`
+- Hybrid retrieval: dense + sparse → RRF → MMR → lazy text fetch
+- Visibility filter (`Global / Agent / Channel / Private`) at retrieval boundary
+- `ManualUploadSyncer` + `UrlSyncer` (conditional GET via ETag/Last-Modified)
+- Compactor (orphan scan + ledger advancement)
+- Regex entity extraction + `require_entities` / `boost_entities` filters
+- CLI: `rsclaw kb add | ls | rm | search | show | visibility | compact | stats | export | sync-all`
+- Test surface: 215 unit + 25 integration, 0 ignored, 0 failed
+
+**Deferred to v1.x:**
+
+- BGE-M3 real embedder (today: `StubEmbedder`)
+- Gateway-resident syncer scheduler (today: `kb sync-all` CLI tick)
+
+**V2 (post-MVP):** see "V2 增项" above.
 
 ## References
 
