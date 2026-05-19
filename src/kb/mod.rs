@@ -25,6 +25,7 @@ pub mod ledger;
 pub mod jobs;
 pub mod compactor;
 pub mod embedder;
+pub mod entities;
 pub mod index;
 pub mod pipeline;
 pub mod search;

@@ -4,9 +4,10 @@
 
 use crate::kb::chunker::{chunk_markdown, ChunkerInput, LocatorKind};
 use crate::kb::content_store::read::read_doc_body;
+use crate::kb::entities::extract::{canonical_id, extract_entities};
 use crate::kb::ledger::LedgerStatus;
-use crate::kb::model::{KbChunk, LogicalSourceId};
-use crate::kb::store::{chunks, docs, ledger};
+use crate::kb::model::{KbChunk, KbEntity, KbEntityIndex, LogicalSourceId};
+use crate::kb::store::{chunks, docs, entities, ledger};
 use crate::kb::worker::handlers::HandlerCtx;
 use anyhow::{Context, Result};
 
@@ -62,6 +63,7 @@ pub fn run(ctx: &HandlerCtx, doc_id: &str, doc_version: u32) -> Result<()> {
     // 4. Persist chunks + advance ledger in one tx.
     {
         let wtx = ctx.store.begin_write()?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
 
         // 4a. Drop chunks from prior doc_versions.
         let removed = chunks::delete_for_doc_version_below(
@@ -77,13 +79,35 @@ pub fn run(ctx: &HandlerCtx, doc_id: &str, doc_version: u32) -> Result<()> {
             );
         }
 
-        // 4b. Insert new chunks.
+        // 4b. Insert new chunks + per-chunk entity edges (regex
+        //     extractor; v2 NER lands behind the same call site).
         for c in &chunks_with_vec {
             chunks::put(&wtx, c)?;
+            for mention in extract_entities(&c.indexed_text) {
+                let canonical = canonical_id(mention.kind, &mention.surface);
+                entities::put_entity(
+                    &wtx,
+                    &KbEntity {
+                        canonical_id: canonical.clone(),
+                        surface_forms: vec![mention.surface.clone()],
+                        kind: mention.kind,
+                        created_at: now_ms,
+                    },
+                )?;
+                entities::put_index(
+                    &wtx,
+                    &KbEntityIndex {
+                        entity_id: canonical,
+                        chunk_id: c.id.clone(),
+                        doc_id: c.doc_id.clone(),
+                        mention_count: 1,
+                        score: 1.0,
+                    },
+                )?;
+            }
         }
 
         // 4c. Advance the ledger.
-        let now_ms = chrono::Utc::now().timestamp_millis();
         match ledger::find_pending_by_doc_in_wtx(&wtx, &doc.id)? {
             Some(entry) => {
                 ledger::update_status(&wtx, &entry.id, LedgerStatus::IndexingComplete, now_ms)?;
