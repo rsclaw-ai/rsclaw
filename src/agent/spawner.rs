@@ -143,6 +143,9 @@ impl AgentSpawner {
             None, // notification_tx not available for dynamically spawned agents
         );
 
+        // Capture for i18n lookup on the error reply path inside the
+        // spawned task.
+        let config_for_task = Arc::clone(&self.config);
         tokio::spawn(async move {
             info!(agent_id = %handle.id, "dynamic agent spawned");
             while let Some(msg) = rx.recv().await {
@@ -179,8 +182,23 @@ impl AgentSpawner {
                     } else {
                         crate::agent::registry::ReplyOutcome::Error
                     };
+                    // i18n the user-facing text. Raw anyhow Error stays
+                    // in the ERROR log above; the chat channel sees a
+                    // friendly localized message. Mirrors the same
+                    // pattern in gateway::startup::spawn_agent_tasks.
+                    let i18n_lang = config_for_task
+                        .raw
+                        .gateway
+                        .as_ref()
+                        .and_then(|g| g.language.as_deref())
+                        .map(crate::i18n::resolve_lang)
+                        .unwrap_or("en");
+                    let user_text = match outcome {
+                        crate::agent::registry::ReplyOutcome::Canceled => "[canceled]".to_owned(),
+                        _ => crate::i18n::t("backend_unavailable", i18n_lang),
+                    };
                     AgentReply {
-                        text: format!("[error: {e}]"),
+                        text: user_text,
                         is_empty: false,
                         tool_calls: None,
                         images: vec![],

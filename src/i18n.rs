@@ -68,6 +68,23 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "ru" => "Очередь сопряжения заполнена. Повторите попытку позже.",
     );
 
+    // Surfaced when reply.outcome == ReplyOutcome::Error. Channels swap
+    // the raw `[error: ...]` reply text with this friendly message
+    // before sending to the end user. The original error stays in the
+    // gateway log at ERROR level for operator debugging.
+    msg!("backend_unavailable",
+        "en" => "\u{26A0}\u{FE0F} Service temporarily unavailable. Please retry shortly.",
+        "zh" => "\u{26A0}\u{FE0F} 服务暂时不可用，请稍后重试。",
+        "fr" => "\u{26A0}\u{FE0F} Service temporairement indisponible. R\u{00E9}essayez sous peu.",
+        "de" => "\u{26A0}\u{FE0F} Dienst vor\u{00FC}bergehend nicht verf\u{00FC}gbar. Bitte sp\u{00E4}ter erneut versuchen.",
+        "th" => "\u{26A0}\u{FE0F} \u{0E1A}\u{0E23}\u{0E34}\u{0E01}\u{0E32}\u{0E23}\u{0E44}\u{0E21}\u{0E48}\u{0E1E}\u{0E23}\u{0E49}\u{0E2D}\u{0E21}\u{0E43}\u{0E0A}\u{0E49}\u{0E07}\u{0E32}\u{0E19}\u{0E0A}\u{0E31}\u{0E48}\u{0E27}\u{0E04}\u{0E23}\u{0E32}\u{0E27} \u{0E42}\u{0E1B}\u{0E23}\u{0E14}\u{0E25}\u{0E2D}\u{0E07}\u{0E43}\u{0E2B}\u{0E21}\u{0E48}",
+        "vi" => "\u{26A0}\u{FE0F} Dich vu tam thoi khong kha dung. Vui long thu lai sau.",
+        "ja" => "\u{26A0}\u{FE0F} \u{30B5}\u{30FC}\u{30D3}\u{30B9}\u{306F}\u{4E00}\u{6642}\u{7684}\u{306B}\u{5229}\u{7528}\u{3067}\u{304D}\u{307E}\u{305B}\u{3093}\u{3002}\u{3057}\u{3070}\u{3089}\u{304F}\u{3057}\u{3066}\u{304B}\u{3089}\u{518D}\u{8A66}\u{884C}\u{3057}\u{3066}\u{304F}\u{3060}\u{3055}\u{3044}\u{3002}",
+        "es" => "\u{26A0}\u{FE0F} Servicio temporalmente no disponible. Vuelve a intentarlo en breve.",
+        "ko" => "\u{26A0}\u{FE0F} \u{C11C}\u{BE44}\u{C2A4}\u{B97C} \u{C77C}\u{C2DC}\u{C801}\u{C73C}\u{B85C} \u{C0AC}\u{C6A9}\u{D560} \u{C218} \u{C5C6}\u{C2B5}\u{B2C8}\u{B2E4}. \u{C7A0}\u{C2DC} \u{D6C4} \u{B2E4}\u{C2DC} \u{C2DC}\u{B3C4}\u{D574} \u{C8FC}\u{C138}\u{C694}.",
+        "ru" => "\u{26A0}\u{FE0F} \u{0421}\u{0435}\u{0440}\u{0432}\u{0438}\u{0441} \u{0432}\u{0440}\u{0435}\u{043C}\u{0435}\u{043D}\u{043D}\u{043E} \u{043D}\u{0435}\u{0434}\u{043E}\u{0441}\u{0442}\u{0443}\u{043F}\u{0435}\u{043D}. \u{041F}\u{043E}\u{0432}\u{0442}\u{043E}\u{0440}\u{0438}\u{0442}\u{0435} \u{043F}\u{043E}\u{043F}\u{044B}\u{0442}\u{043A}\u{0443} \u{043F}\u{043E}\u{0437}\u{0436}\u{0435}.",
+    );
+
     msg!("file_saved",
         "en" => "Saved {count} file(s) to uploads/",
         "zh" => "已保存 {count} 个文件到 uploads/",

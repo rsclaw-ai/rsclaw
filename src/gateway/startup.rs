@@ -1273,6 +1273,7 @@ fn spawn_agent_tasks(
         runtime.computer_runs = Some(Arc::clone(&computer_runs));
 
         let event_tx_task = event_tx.clone();
+        let config_for_task = Arc::clone(&config);
         tokio::spawn(async move {
             info!(agent_id = %handle.id, "agent runtime task started");
             while let Some(msg) = rx.recv().await {
@@ -1331,8 +1332,27 @@ fn spawn_agent_tasks(
                     } else {
                         crate::agent::registry::ReplyOutcome::Error
                     };
+                    // User-facing text: don't leak the raw anyhow Error
+                    // (HTTP status codes, internal IDs, JSON error bodies)
+                    // to the chat channel — that material is operator-
+                    // debug-only and lives in the ERROR log above. The
+                    // end user sees an i18n'd "service unavailable" line
+                    // for real LLM / transport errors; the original
+                    // outcome tag (Error / Canceled) survives so A2A
+                    // consumers still key off the terminal status.
+                    let i18n_lang = config_for_task
+                        .raw
+                        .gateway
+                        .as_ref()
+                        .and_then(|g| g.language.as_deref())
+                        .map(crate::i18n::resolve_lang)
+                        .unwrap_or("en");
+                    let user_text = match outcome {
+                        crate::agent::registry::ReplyOutcome::Canceled => "[canceled]".to_owned(),
+                        _ => crate::i18n::t("backend_unavailable", i18n_lang),
+                    };
                     AgentReply {
-                        text: format!("[error: {e}]"),
+                        text: user_text,
                         is_empty: false,
                         tool_calls: None,
                         images: vec![],
