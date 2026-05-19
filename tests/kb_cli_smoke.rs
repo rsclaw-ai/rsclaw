@@ -271,6 +271,76 @@ fn kb_add_recursive_ingests_directory() {
     assert!(summary.contains("\"files_seen\":2"), "summary: {summary}");
 }
 
+#[test]
+fn kb_sync_all_dry_run_reports_zero_for_file_only_kb() {
+    let tmp = TempDir::new().unwrap();
+    let base = tmp.path().join("base");
+    let fixture = tmp.path().join("local.md");
+    std::fs::write(&fixture, "# Local\n\nbody.").unwrap();
+    run(rsclaw().args([
+        "--base-dir",
+        base.to_str().unwrap(),
+        "kb",
+        "add",
+        fixture.to_str().unwrap(),
+    ]));
+    let (stdout, _stderr, code) = run(rsclaw().args([
+        "--base-dir",
+        base.to_str().unwrap(),
+        "kb",
+        "sync-all",
+        "--dry-run",
+    ]));
+    assert_eq!(code, 0);
+    let last = stdout.lines().last().unwrap_or_default();
+    assert!(
+        last.contains("\"dry_run\":true") && last.contains("\"candidates\":0"),
+        "sync-all dry-run: {last}"
+    );
+}
+
+#[test]
+fn kb_search_json_emits_full_output_struct() {
+    let tmp = TempDir::new().unwrap();
+    let base = tmp.path().join("base");
+    let fixture = tmp.path().join("j.md");
+    std::fs::write(
+        &fixture,
+        "# JSON\n\nThe yellow dwarf star is in the Milky Way.",
+    )
+    .unwrap();
+    run(rsclaw().args([
+        "--base-dir",
+        base.to_str().unwrap(),
+        "kb",
+        "add",
+        fixture.to_str().unwrap(),
+    ]));
+    let (stdout, _stderr, code) = run(rsclaw().args([
+        "--base-dir",
+        base.to_str().unwrap(),
+        "kb",
+        "search",
+        "yellow dwarf",
+        "--json",
+    ]));
+    assert_eq!(code, 0);
+    // Drop the "profile:" prefix line, parse the rest as JSON.
+    let json_body = stdout
+        .lines()
+        .skip_while(|l| !l.trim_start().starts_with('{'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&json_body).expect(&format!("invalid JSON: {json_body}"));
+    assert!(parsed.get("results").is_some(), "missing results: {parsed}");
+    assert!(
+        parsed.get("entity_alignment").is_some(),
+        "missing entity_alignment: {parsed}"
+    );
+    assert!(parsed.get("warnings").is_some(), "missing warnings: {parsed}");
+}
+
 // Bare-bones sanity: invoking the binary at all returns help.
 #[test]
 fn rsclaw_prints_help_with_no_args() {

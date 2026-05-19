@@ -43,6 +43,9 @@ pub enum KbCommand {
         query: String,
         #[arg(short, long, default_value_t = 8)]
         k: usize,
+        /// Emit the full KbSearchOutput as JSON (machine consumption).
+        #[arg(long)]
+        json: bool,
     },
     /// Show a chunk or doc by id.
     Show { id: String },

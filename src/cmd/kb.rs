@@ -20,7 +20,7 @@ pub async fn cmd_kb(cmd: KbCommand, kb_root: PathBuf) -> Result<()> {
         }
         KbCommand::Ls { tag, source_kind, limit } => ls(kb_root, tag, source_kind, limit),
         KbCommand::Rm { doc_id, tag, yes } => rm(kb_root, doc_id, tag, yes),
-        KbCommand::Search { query, k } => search(kb_root, query, k),
+        KbCommand::Search { query, k, json } => search(kb_root, query, k, json),
         KbCommand::Show { id } => show(kb_root, id),
         KbCommand::Visibility { doc_id, visibility } => set_visibility(kb_root, doc_id, visibility),
         KbCommand::Compact => compact(kb_root),
@@ -280,7 +280,7 @@ fn rm_by_tag(h: &Handles, tag: &str) -> Result<()> {
     Ok(())
 }
 
-fn search(kb_root: PathBuf, query: String, k: usize) -> Result<()> {
+fn search(kb_root: PathBuf, query: String, k: usize, json: bool) -> Result<()> {
     let h = open_kb(&kb_root)?;
     let ctx = search_ctx(&h);
     let out = kb_search::run(
@@ -296,8 +296,20 @@ fn search(kb_root: PathBuf, query: String, k: usize) -> Result<()> {
         },
         &CallerScope::default(),
     )?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&out).unwrap_or_else(|_| format!("{out:?}"))
+        );
+        return Ok(());
+    }
     if out.results.is_empty() {
         println!("(no hits)");
+        if !out.warnings.is_empty() {
+            for w in &out.warnings {
+                eprintln!("warning: {w}");
+            }
+        }
         return Ok(());
     }
     for (i, hit) in out.results.iter().enumerate() {
@@ -311,6 +323,9 @@ fn search(kb_root: PathBuf, query: String, k: usize) -> Result<()> {
         let snippet: String = hit.text.chars().take(160).collect();
         println!("    {snippet}");
         println!("    chunk_id={}", hit.chunk_id);
+    }
+    for w in &out.warnings {
+        eprintln!("warning: {w}");
     }
     Ok(())
 }
