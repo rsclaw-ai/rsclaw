@@ -70,7 +70,7 @@ src/kb/
     version.rs        # KbDocVersion + latest_version helpers
   content_store/
     mod.rs            # stage_doc / read_doc_body / read_doc_range public API
-    atomic.rs         # tempfile + fsync + rename + parent fsync
+    atomic.rs         # write_if_new (NamedTempFile + persist_noclobber) + parent fsync
     paths.rs          # markdown_rel_path / raw_rel_path / slugify
     compose.rs        # YAML front-matter + body composition
     read.rs           # parse front-matter, read body, verify SHA
@@ -210,7 +210,10 @@ pub struct KbDoc {
     pub title: String,
     pub mime: String,
     pub raw_sha256: String,               // sha256 of 原始 bytes
-    pub markdown_path: String,            // 相对 kb_root: "md/doc/<slug>.md"
+    pub markdown_path: String,            // 相对 kb_root: "md/<kind>/<slug>--<lsid8>.md"
+                                          // lsid8 = sha256(logical_source_id)[..8]
+                                          // 重 ingest 同一 logical source → 同路径（幂等）
+                                          // 同 slug 不同 logical source → 不同路径（防碰撞）
     pub markdown_sha256: String,          // sha256 of body bytes only
     pub raw_path: Option<String>,
     pub created_at: i64,
@@ -476,8 +479,11 @@ pub enum LedgerStatus {
    - 命中且 raw_sha256 一致 → 返回现有 doc_id（NOOP，不动 ledger）
    - 否则继续
 
-3. stage_doc(canonical, raw): 写 md/<kind>/<slug>.md + raw/<doc_id>.<ext>
-   (原子写：tempfile + fsync + rename，永不覆盖已存在文件)
+3. stage_doc(canonical, raw): 写 md/<kind>/<slug>--<lsid8>.md + raw/<doc_id>.<ext>
+   - 路径 lsid8 = sha256(logical_source_id)[..8]，保证同 logical source 落同一路径
+   - 原子写：NamedTempFile + persist_noclobber (Unix link-based, 真正 no-clobber)
+   - write_if_new 返回 false（路径已存在）→ 读现有 body，校验 sha 与 new body 一致；
+     不一致 → 报错（捕获非确定性 canonicalizer / lsid8 碰撞），不静默覆盖
 
 4. 准备 KbDoc { id: ulid, version: next, markdown_path, raw_path, ... }
 5. 准备 IngestLedgerEntry { op: Create|Update, new_paths, old_paths, status: Pending }
