@@ -46,7 +46,7 @@ static MENTION_RE: Lazy<Regex> = Lazy::new(|| {
 pub fn extract_entities(text: &str) -> Vec<ExtractedMention> {
     let mut out: Vec<ExtractedMention> = Vec::new();
     let mut seen: HashSet<(EntityKind, String)> = HashSet::new();
-    let mut push = |kind: EntityKind, surface: String, out: &mut Vec<ExtractedMention>,
+    let push = |kind: EntityKind, surface: String, out: &mut Vec<ExtractedMention>,
                     seen: &mut HashSet<(EntityKind, String)>| {
         if out.len() >= MAX_MENTIONS_PER_CHUNK {
             return;

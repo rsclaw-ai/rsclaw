@@ -39,19 +39,28 @@ pub fn ingest_canonicalized(store: &KbStore, input: IngestInput<'_>) -> Result<I
     let now_ms = chrono::Utc::now().timestamp_millis();
 
     // 1. NOOP fast-path (read-only).
+    //
+    // Active doc with same content → return doc_id as a NOOP.
+    // Tombstoned doc with same content → fall through to the wtx
+    // path so we can un-tombstone (re-add of a deleted file is a
+    // user-meaningful "restore"). Spec §6 retains Tombstoned docs
+    // for 30 days; until then they should resurrect on re-add.
     {
         let rtx = store.begin_read()?;
         if let Some(existing_doc_id) = docs::find_by_logical_and_hash(&rtx, &lsid_str, &raw_sha)? {
             if let Some(existing) = docs::get(&rtx, &existing_doc_id)? {
-                tracing::info!(
-                    doc = %crate::kb::redact(&existing_doc_id),
-                    "kb ingest: noop (fast path)"
-                );
-                return Ok(IngestOutput {
-                    doc_id: existing_doc_id,
-                    noop: true,
-                    markdown_rel_path: existing.markdown_path,
-                });
+                if existing.status == KbStatus::Active {
+                    tracing::info!(
+                        doc = %crate::kb::redact(&existing_doc_id),
+                        "kb ingest: noop (fast path)"
+                    );
+                    return Ok(IngestOutput {
+                        doc_id: existing_doc_id,
+                        noop: true,
+                        markdown_rel_path: existing.markdown_path,
+                    });
+                }
+                // Tombstoned: fall through; the wtx path resurrects below.
             }
         }
     }
@@ -84,19 +93,40 @@ pub fn ingest_canonicalized(store: &KbStore, input: IngestInput<'_>) -> Result<I
     let wtx = store.begin_write()?;
 
     // 3a. Race-safe NOOP re-check using the wtx's view.
+    //
+    // Same status semantics as the fast-path: Active → NOOP;
+    // Tombstoned → resurrect (flip status + bump updated_at) and
+    // commit so the user can keep using the doc.
     if let Some(existing_doc_id) =
         docs::find_by_logical_and_hash_in_wtx(&wtx, &lsid_str, &raw_sha)?
     {
-        if let Some(existing) = docs::get_in_wtx(&wtx, &existing_doc_id)? {
-            drop(wtx);
+        if let Some(mut existing) = docs::get_in_wtx(&wtx, &existing_doc_id)? {
+            if existing.status == KbStatus::Active {
+                drop(wtx);
+                tracing::info!(
+                    doc = %crate::kb::redact(&existing_doc_id),
+                    "kb ingest: noop (lost race; staged files left for compactor)"
+                );
+                return Ok(IngestOutput {
+                    doc_id: existing_doc_id,
+                    noop: true,
+                    markdown_rel_path: existing.markdown_path,
+                });
+            }
+            // Tombstoned with same content → resurrect.
+            let markdown_path = existing.markdown_path.clone();
+            existing.status = KbStatus::Active;
+            existing.updated_at = now_ms;
+            docs::put(&wtx, &existing)?;
+            wtx.commit()?;
             tracing::info!(
                 doc = %crate::kb::redact(&existing_doc_id),
-                "kb ingest: noop (lost race; staged files left for compactor)"
+                "kb ingest: resurrected tombstoned doc"
             );
             return Ok(IngestOutput {
                 doc_id: existing_doc_id,
-                noop: true,
-                markdown_rel_path: existing.markdown_path,
+                noop: false,
+                markdown_rel_path: markdown_path,
             });
         }
     }
@@ -387,6 +417,57 @@ mod tests {
         let ledgers = ledger_store::list_by_status(&rtx, LedgerStatus::Pending).unwrap();
         let lb = ledgers.iter().find(|e| e.doc_id == b.doc_id).unwrap();
         assert!(lb.old_paths.contains(&doc_a.markdown_path));
+    }
+
+    #[test]
+    fn tombstoned_doc_resurrects_on_reingest() {
+        let (_tmp, store, paths) = fixture();
+        let c = canon("# Restore me\n\noriginal body.");
+        let raw = b"# Restore me\n\noriginal body.";
+        let first = ingest_canonicalized(
+            &store,
+            IngestInput {
+                canon: &c,
+                raw_bytes: raw,
+                raw_ext: "md",
+                visibility: None,
+                owner_user_id: None,
+                seen_key: None,
+                source: None,
+                paths: &paths,
+            },
+        )
+        .unwrap();
+        // Tombstone the doc.
+        {
+            let rtx = store.begin_read().unwrap();
+            let mut d = docs::get(&rtx, &first.doc_id).unwrap().unwrap();
+            drop(rtx);
+            d.status = crate::kb::model::KbStatus::Tombstoned;
+            let wtx = store.begin_write().unwrap();
+            docs::put(&wtx, &d).unwrap();
+            wtx.commit().unwrap();
+        }
+        // Re-add same content → resurrected (status flips to Active).
+        let second = ingest_canonicalized(
+            &store,
+            IngestInput {
+                canon: &c,
+                raw_bytes: raw,
+                raw_ext: "md",
+                visibility: None,
+                owner_user_id: None,
+                seen_key: None,
+                source: None,
+                paths: &paths,
+            },
+        )
+        .unwrap();
+        assert_eq!(first.doc_id, second.doc_id, "should re-use same doc_id");
+        assert!(!second.noop, "resurrection isn't a NOOP");
+        let rtx = store.begin_read().unwrap();
+        let d = docs::get(&rtx, &second.doc_id).unwrap().unwrap();
+        assert_eq!(d.status, crate::kb::model::KbStatus::Active);
     }
 
     #[test]
