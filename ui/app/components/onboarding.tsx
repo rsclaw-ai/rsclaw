@@ -2098,7 +2098,11 @@ export function OnboardingPage() {
         providers[id] = { api: "ollama", baseUrl: ps.baseUrl || ps.apiKey };
       } else if (ps.apiKey) {
         const entry: Record<string, any> = { apiKey: ps.apiKey };
-        if (ps.baseUrl) entry.baseUrl = ps.baseUrl;
+        // RsClaw uses the gateway-compiled-in managed fleet URL
+        // (`RSCLAW_DEFAULT_BASE` in providers.rs). Writing a baseUrl
+        // here is redundant and clutters the config; users with a
+        // self-hosted worker can add it back manually.
+        if (ps.baseUrl && id !== "rsclaw") entry.baseUrl = ps.baseUrl;
         if (ps.userAgent) entry.userAgent = ps.userAgent;
         // Standard providers that opt into the api_type field (e.g. doubao
         // for CodingPlan) save the user's selection. Default to "openai"
@@ -2106,12 +2110,6 @@ export function OnboardingPage() {
         // silently drop and the gateway would have to autodetect.
         if (id === "doubao") entry.api = ps.apiType || "openai-responses";
         if (id === "kimi") entry.api = ps.apiType || "openai";
-        // RsClaw: the bare provider name `rsclaw` auto-resolves to
-        // ApiFormat::Rsclaw + the managed fleet baseUrl in
-        // gateway/providers.rs (build_providers, RSCLAW_DEFAULT_BASE
-        // fallback). No `api` / `baseUrl` keys needed unless the user
-        // pointed at a self-hosted worker — `ps.baseUrl` above is
-        // already preserved when set.
         providers[id] = entry;
       } else {
         providers[id] = {};

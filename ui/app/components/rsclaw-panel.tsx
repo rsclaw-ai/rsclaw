@@ -627,6 +627,72 @@ function ConfigEditorPage() {
     if (ltl) setMemoryLongTermLimit(parseInt(ltl, 10) || 100);
   }, [extractVal]);
 
+  // Belt-and-suspenders refresh: every time the user toggles into
+  // the raw JSON5 mode, re-read the file from disk. Cheap,
+  // idempotent, and covers the case where an external write (chip
+  // install, file edit in another editor, etc.) happened while the
+  // event listener below was unsubscribed.
+  useEffect(() => {
+    if (!rawMode) return;
+    if (!isTauri) return;
+    if (dirty) return; // don't blow away the user's unsaved edits
+    let cancelled = false;
+    (async () => {
+      try {
+        const raw = (await tauriInvokeV2("read_config_file")) as string;
+        if (!cancelled && raw) {
+          setRawConfig(raw);
+          parseConfig(raw);
+        }
+      } catch {
+        /* tolerate */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [rawMode, dirty, parseConfig]);
+
+  // External-write watcher: when the sidebar chip / onboarding card
+  // writes the rsclaw key to `rsclaw.json5` via the Tauri install
+  // event, this panel's cached `rawConfig` state goes stale. Listen
+  // for the same event and re-read so the user sees the fresh file
+  // when they switch over to the Config tab. (Tauri-only — the HTTP
+  // path doesn't have this race because there's no separate writer.)
+  useEffect(() => {
+    if (!isTauri) return;
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    (async () => {
+      try {
+        const { listen } = await import("@tauri-apps/api/event");
+        console.info("[config-panel] subscribed to rsclaw:console-install-key");
+        const fn = await listen("rsclaw:console-install-key", async () => {
+          console.info("[config-panel] install event received, reloading config");
+          if (cancelled) return;
+          try {
+            const raw = (await tauriInvokeV2("read_config_file")) as string;
+            if (!cancelled && raw) {
+              setRawConfig(raw);
+              parseConfig(raw);
+              console.info("[config-panel] rawConfig updated, len=", raw.length);
+            }
+          } catch (e) {
+            console.warn("[config-panel] reload failed:", e);
+          }
+        });
+        if (cancelled) fn();
+        else unlisten = fn;
+      } catch (e) {
+        console.warn("[config-panel] listener setup failed:", e);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [parseConfig]);
+
   useEffect(() => {
     (async () => {
       try {

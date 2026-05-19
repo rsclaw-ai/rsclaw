@@ -109,6 +109,7 @@ import {
   UNFINISHED_INPUT,
 } from "../constant";
 import { Avatar } from "./emoji";
+import { UserMdBanner } from "./user-md-banner";
 import { ChatCommandPrefix, useChatCommand, useCommand } from "../command";
 import { prettyObject } from "../utils/format";
 // ExportMessageModal removed
@@ -2153,6 +2154,10 @@ function _Chat() {
           />
         </div>
         <div className={styles["chat-main"]}>
+          {/* First-run nudge for personalising USER.md. Hidden once
+              the agent has filled in the file, or once the user has
+              dismissed the banner. See user-md-banner.tsx. */}
+          <UserMdBanner />
           <div className={styles["chat-body-container"]}>
             <Virtuoso
               ref={virtuosoRef}

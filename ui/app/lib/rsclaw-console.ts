@@ -174,6 +174,15 @@ export async function applyInstalledKey(
         /* missing config → start from empty */
       }
       const merged = deepMerge(existing, patch);
+      // RsClaw's baseUrl is hardcoded in the gateway
+      // (`RSCLAW_DEFAULT_BASE`). Strip any baseUrl that landed in
+      // the config from an earlier flow so we don't carry stale
+      // redirects across reinstalls. Self-hosted workers must
+      // re-add baseUrl manually — by design, the desktop UI never
+      // writes it.
+      if (merged?.models?.providers?.rsclaw) {
+        delete merged.models.providers.rsclaw.baseUrl;
+      }
       await invoke("write_config", { content: JSON.stringify(merged, null, 2) });
 
       // Refresh in-memory auth token if a gateway is already running.
@@ -205,6 +214,9 @@ export async function applyInstalledKey(
       /* empty config */
     }
     const merged = deepMerge(existing, patch);
+    if (merged?.models?.providers?.rsclaw) {
+      delete merged.models.providers.rsclaw.baseUrl;
+    }
     await saveConfig({ raw: JSON.stringify(merged, null, 2) });
     return { ok: true };
   } catch (e) {
@@ -221,4 +233,82 @@ export async function applyInstalledKey(
 export function isLikelyRsclawKey(s: string): boolean {
   const t = s.trim();
   return t.startsWith("sk-rsclaw-") && t.length >= 20;
+}
+
+/**
+ * Snapshot of the rsclaw.ai account as recorded in `rsclaw.json5`.
+ * All fields are optional — only `connected` is guaranteed. We don't
+ * fetch live account info from the server here (no polling, by
+ * design); name/tier are whatever the web side last sent via
+ * `installKey({name, tier})` and the desktop persisted under
+ * `_name` / `_tier` in the provider config.
+ */
+export type RsclawAccountState = {
+  connected: boolean;
+  /** Key display name (e.g. "rsclaw-macos"). */
+  name?: string;
+  /** Plan label (e.g. "free", "pro"). */
+  tier?: string;
+};
+
+/** Read the current account state from `rsclaw.json5`. */
+export async function readAccountState(): Promise<RsclawAccountState> {
+  try {
+    let raw = "";
+    if (isTauri) {
+      raw = (await invoke("read_config_file")) as string;
+    } else {
+      const cfg = await getConfig();
+      raw = cfg.raw || "";
+    }
+    const parsed = JSON5.parse(raw || "{}");
+    const rsclaw = parsed?.models?.providers?.rsclaw;
+    if (!rsclaw || typeof rsclaw.apiKey !== "string" || !rsclaw.apiKey.trim()) {
+      return { connected: false };
+    }
+    return {
+      connected: true,
+      name: typeof rsclaw._name === "string" ? rsclaw._name : undefined,
+      tier: typeof rsclaw._tier === "string" ? rsclaw._tier : undefined,
+    };
+  } catch {
+    return { connected: false };
+  }
+}
+
+/**
+ * Disconnect the rsclaw.ai account by stripping the apiKey (and the
+ * `_name` / `_tier` metadata) from `rsclaw.json5`. The provider entry
+ * itself is left in place — the user might reconnect later, and
+ * other config under `providers.rsclaw` shouldn't be wiped.
+ */
+export async function disconnectAccount(): Promise<{
+  ok: boolean;
+  error?: string;
+}> {
+  try {
+    let raw = "";
+    if (isTauri) {
+      raw = (await invoke("read_config_file")) as string;
+    } else {
+      const cfg = await getConfig();
+      raw = cfg.raw || "";
+    }
+    const parsed = JSON5.parse(raw || "{}");
+    if (parsed?.models?.providers?.rsclaw) {
+      const r = parsed.models.providers.rsclaw;
+      delete r.apiKey;
+      delete r._name;
+      delete r._tier;
+    }
+    const next = JSON.stringify(parsed, null, 2);
+    if (isTauri) {
+      await invoke("write_config", { content: next });
+    } else {
+      await saveConfig({ raw: next });
+    }
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
 }
