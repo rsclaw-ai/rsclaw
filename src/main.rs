@@ -34,7 +34,7 @@ use cli::{AcpCommand, Cli, Command};
 use cmd::{
     cmd_agent_turn, cmd_agents, cmd_anycli, cmd_browser, cmd_approvals, cmd_backup, cmd_channels, cmd_completion,
     cmd_config, cmd_configure, cmd_cron, cmd_daemon, cmd_dashboard, cmd_debug, cmd_devices, cmd_directory,
-    cmd_dns, cmd_docs, cmd_doctor, cmd_gateway, cmd_health, cmd_hooks, cmd_logs, cmd_memory,
+    cmd_dns, cmd_docs, cmd_doctor, cmd_env, cmd_gateway, cmd_health, cmd_hooks, cmd_logs, cmd_memory,
     cmd_message, cmd_migrate, cmd_models, cmd_onboard, cmd_plugins, cmd_qr, cmd_reset, cmd_sandbox,
     cmd_secrets, cmd_security, cmd_sessions, cmd_setup, cmd_skills, cmd_status, cmd_system,
     cmd_tools, cmd_tray, cmd_tui, cmd_uninstall, cmd_update, cmd_watch, cmd_webhooks,
@@ -165,6 +165,7 @@ async fn run() -> Result<()> {
         Command::Configure(args) => cmd_configure(args).await,
         Command::Config(sub) => cmd_config(sub).await,
         Command::Doctor(args) => cmd_doctor(args).await,
+        Command::Env(sub) => cmd_env(sub).await,
         Command::Gateway(sub) => cmd_gateway(sub).await,
         Command::Start => cmd_gateway(cli::GatewayCommand::Start).await,
         Command::Stop => cmd_gateway(cli::GatewayCommand::Stop).await,
