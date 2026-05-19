@@ -26,32 +26,68 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
             // `load_json5` runs `expand_env_vars` at parse time, so a
             // value like `"${RSCLAW_API_KEY}"` becomes the env var's
             // actual contents — UNLESS the variable isn't set, in
-            // which case the placeholder is left verbatim with only a
-            // `debug!` notice. Without this filter, an unset env var
-            // would silently turn into `Authorization: Bearer ${RSCLAW_API_KEY}`
-            // on the wire and surface as a baffling "invalid api key"
-            // from the upstream worker. Treat unresolved placeholders
-            // as "no key configured" and fall through to the explicit
-            // env-var fallback below, while logging a warning so the
-            // user can see what happened.
+            // which case the placeholder is left verbatim. Without
+            // this filter, an unset env var would silently turn into
+            // `Authorization: Bearer ${RSCLAW_API_KEY}` on the wire and
+            // surface as a baffling "invalid api key" upstream. We
+            // also remember WHETHER the user explicitly set `apiKey:`
+            // — that determines whether the post-fallback empty state
+            // is "they wanted a key and we couldn't find it" (disable
+            // the provider) versus "they're targeting an unauth'd
+            // local endpoint" (let it through, current behaviour).
+            let user_specified_key = provider_cfg.api_key.is_some();
+            let mut unresolved_placeholder: Option<String> = None;
             let api_key = provider_cfg
                 .api_key
                 .as_ref()
                 .and_then(|k| k.as_plain().map(str::to_owned))
                 .filter(|s| {
                     if s.contains("${") && s.contains('}') {
-                        tracing::warn!(
-                            provider = %name,
-                            placeholder = %s,
-                            "provider apiKey is an unresolved ${{VAR}} placeholder \
-                             (env var not set); falling back to direct env lookup"
-                        );
+                        unresolved_placeholder = Some(s.clone());
                         false
                     } else {
                         true
                     }
                 })
                 .or_else(|| std::env::var(format!("{}_API_KEY", name.to_uppercase())).ok());
+
+            // Hard-fail providers that REQUIRE a bearer (anthropic /
+            // openai / gemini / etc. anything not explicitly opt-in to
+            // running without auth). Detection: user wrote
+            // `apiKey: "${VAR}"`, var was unset, and the `{NAME}_API_KEY`
+            // env fallback also yielded nothing. Marking disabled at
+            // registry level is louder than registering with an empty
+            // key (current behaviour); failed routing returns the
+            // disable reason instead of a request-time 401.
+            if user_specified_key && api_key.as_deref().is_none_or(str::is_empty) {
+                let hint = match &unresolved_placeholder {
+                    Some(s) if s.contains("${") => {
+                        let var_name = s
+                            .trim_start_matches("${")
+                            .trim_end_matches('}')
+                            .to_owned();
+                        format!(
+                            "set {var_name} in your shell (then `rsclaw env sync`) \
+                             or edit {}/.env directly",
+                            std::env::var("RSCLAW_BASE_DIR")
+                                .unwrap_or_else(|_| "~/.rsclaw".to_owned())
+                        )
+                    }
+                    _ => format!(
+                        "configure `models.providers.{name}.apiKey` with a real value \
+                         or set {}_API_KEY in env",
+                        name.to_uppercase()
+                    ),
+                };
+                let reason = format!("apiKey unresolved — {hint}");
+                tracing::error!(
+                    provider = %name,
+                    placeholder = ?unresolved_placeholder.as_deref(),
+                    "provider disabled — apiKey unresolved",
+                );
+                registry.disable(name.clone(), reason);
+                continue;
+            }
 
             let base_url = provider_cfg.base_url.clone().or_else(|| {
                 // Fall back to well-known base URLs for named providers.

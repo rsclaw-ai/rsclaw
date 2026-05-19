@@ -1104,6 +1104,26 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
         { "--".to_string() }
     };
 
+    // Disabled providers — Phase 3 surface. Empty list when every
+    // configured provider booted cleanly; non-empty when one or more
+    // had unresolved Secret fields. Operators see the reason here
+    // without grep'ing logs. All agents share the same ProviderRegistry
+    // Arc, so any agent (the first one) is sufficient.
+    let (providers_active, providers_disabled): (Vec<String>, Vec<serde_json::Value>) =
+        match state.agents.all().first() {
+            Some(agent) => {
+                let regs = &agent.providers;
+                let active: Vec<String> = regs.names().into_iter().map(str::to_owned).collect();
+                let disabled: Vec<serde_json::Value> = regs
+                    .disabled_list()
+                    .into_iter()
+                    .map(|(name, reason)| serde_json::json!({"name": name, "reason": reason}))
+                    .collect();
+                (active, disabled)
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+
     Json(serde_json::json!({
         "version": option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
         "agents": state.agents.len(),
@@ -1112,6 +1132,10 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
         "memory": memory,
         "sessions": sessions,
         "channels": channels,
+        "providers": {
+            "active": providers_active,
+            "disabled": providers_disabled,
+        },
     }))
 }
 
