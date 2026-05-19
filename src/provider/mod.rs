@@ -318,10 +318,19 @@ pub enum StreamEvent {
     Error(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TokenUsage {
     pub input: u32,
     pub output: u32,
+    /// Input tokens written to the prompt cache this turn.
+    /// Mirrors Anthropic's `usage.cache_creation_input_tokens`.
+    /// Zero when the provider doesn't report it.
+    pub cache_creation: u32,
+    /// Input tokens served from the prompt cache this turn (the
+    /// "savings"). Mirrors Anthropic's `usage.cache_read_input_tokens`
+    /// and OpenAI's `usage.prompt_tokens_details.cached_tokens`.
+    /// Zero when the provider doesn't report it.
+    pub cache_read: u32,
 }
 
 /// Boxed streaming response.

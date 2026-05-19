@@ -505,6 +505,14 @@ fn parse_event(data: &str) -> Option<StreamEvent> {
             let usage = v["usage"].as_object().map(|u| TokenUsage {
                 input: u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
                 output: u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
+                cache_creation: u
+                    .get("cache_creation_input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as u32,
+                cache_read: u
+                    .get("cache_read_input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as u32,
             });
             if v["delta"]["stop_reason"].is_string() {
                 Some(StreamEvent::Done { usage })

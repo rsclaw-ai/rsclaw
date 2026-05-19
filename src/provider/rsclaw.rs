@@ -2212,6 +2212,14 @@ async fn parse_oneshot_sse_chunk(
                             u,
                             &["output_tokens", "completion_tokens", "output"],
                         ),
+                        cache_creation: extract_usage_count(
+                            u,
+                            &["cache_creation_input_tokens", "cache_creation_tokens"],
+                        ),
+                        cache_read: extract_usage_count(
+                            u,
+                            &["cache_read_input_tokens", "cached_tokens", "cache_read_tokens"],
+                        ),
                     });
                 events.push(Ok(StreamEvent::Done { usage }));
             }
@@ -2795,6 +2803,17 @@ async fn parse_sse_chunk(
                         output: extract_usage_count(
                             u,
                             &["output_tokens", "completion_tokens", "output"],
+                        ),
+                        // Cache stats: Anthropic-style names primary, OpenAI's
+                        // single `cached_tokens` accepted as a fallback for
+                        // cache_read (OAI doesn't distinguish creation vs read).
+                        cache_creation: extract_usage_count(
+                            u,
+                            &["cache_creation_input_tokens", "cache_creation_tokens"],
+                        ),
+                        cache_read: extract_usage_count(
+                            u,
+                            &["cache_read_input_tokens", "cached_tokens", "cache_read_tokens"],
                         ),
                     });
                 events.push(Ok(StreamEvent::Done { usage }));
@@ -3730,6 +3749,73 @@ data: {"type":"block_stop","index":99}
                 Err(err) => panic!("orphan delta must not surface as Err; got {err}"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn parse_v1_done_extracts_cache_stats() {
+        // v1 done.usage carries cache breakdown:
+        //   cache_creation_input_tokens — tokens written to cache this turn
+        //   cache_read_input_tokens     — tokens served from cache (savings)
+        // Both default to 0 when absent. OAI's `cached_tokens` is accepted
+        // as an alias for cache_read (one-counter providers).
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let line = b"data: {\"type\":\"done\",\"usage\":{\"input_tokens\":120,\"output_tokens\":40,\"cache_creation_input_tokens\":50,\"cache_read_input_tokens\":70}}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
+        let usage = evs
+            .into_iter()
+            .find_map(|e| match e {
+                Ok(StreamEvent::Done { usage }) => usage,
+                _ => None,
+            })
+            .expect("Done with usage");
+        assert_eq!(usage.input, 120);
+        assert_eq!(usage.output, 40);
+        assert_eq!(usage.cache_creation, 50);
+        assert_eq!(usage.cache_read, 70);
+    }
+
+    #[tokio::test]
+    async fn parse_v1_done_cached_tokens_alias_maps_to_cache_read() {
+        // OAI compat: `cached_tokens` (single counter) populates
+        // cache_read so dashboards have a uniform field to read.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let line = b"data: {\"type\":\"done\",\"usage\":{\"input_tokens\":80,\"output_tokens\":20,\"cached_tokens\":60}}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
+        let usage = evs
+            .into_iter()
+            .find_map(|e| match e {
+                Ok(StreamEvent::Done { usage }) => usage,
+                _ => None,
+            })
+            .expect("Done with usage");
+        assert_eq!(usage.cache_creation, 0);
+        assert_eq!(usage.cache_read, 60);
+    }
+
+    #[tokio::test]
+    async fn parse_v1_done_without_cache_fields_defaults_to_zero() {
+        // Old-shape usage (no cache fields) must still parse cleanly;
+        // both cache counters default to 0 — same as "no cache activity".
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let line = b"data: {\"type\":\"done\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
+        let usage = evs
+            .into_iter()
+            .find_map(|e| match e {
+                Ok(StreamEvent::Done { usage }) => usage,
+                _ => None,
+            })
+            .expect("Done with usage");
+        assert_eq!(usage.input, 10);
+        assert_eq!(usage.output, 5);
+        assert_eq!(usage.cache_creation, 0);
+        assert_eq!(usage.cache_read, 0);
     }
 
     #[tokio::test]

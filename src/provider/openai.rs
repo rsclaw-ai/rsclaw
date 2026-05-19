@@ -1382,6 +1382,14 @@ fn parse_event(data: &str) -> Vec<StreamEvent> {
                 .get("completion_tokens")
                 .and_then(Value::as_u64)
                 .unwrap_or(0) as u32,
+            // OpenAI has no separate creation counter; reads land in
+            // prompt_tokens_details.cached_tokens.
+            cache_creation: 0,
+            cache_read: u
+                .get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32,
         });
         events.push(StreamEvent::Done { usage });
     }
@@ -1750,6 +1758,12 @@ fn parse_responses_event(data: &str, event_type: Option<&str>) -> Option<StreamE
                         .get("output_tokens")
                         .and_then(Value::as_u64)
                         .unwrap_or(0) as u32,
+                    cache_creation: 0,
+                    cache_read: u
+                        .get("input_tokens_details")
+                        .and_then(|d| d.get("cached_tokens"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as u32,
                 });
             Some(StreamEvent::Done { usage })
         }
@@ -1802,6 +1816,12 @@ fn parse_completions_fallback(v: &Value) -> Option<StreamEvent> {
                 .unwrap_or(0) as u32,
             output: u
                 .get("completion_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32,
+            cache_creation: 0,
+            cache_read: u
+                .get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
                 .and_then(Value::as_u64)
                 .unwrap_or(0) as u32,
         });
