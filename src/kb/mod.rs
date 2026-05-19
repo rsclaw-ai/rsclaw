@@ -24,7 +24,10 @@ pub mod chunker;
 pub mod ledger;
 pub mod jobs;
 pub mod embedder;
+pub mod index;
 pub mod pipeline;
+pub mod search;
+pub mod tools;
 pub mod worker;
 pub mod util;
 
