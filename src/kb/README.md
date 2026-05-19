@@ -307,13 +307,49 @@ Week 2 plan: `docs/plans/2026-05-19-kb-mvp-week2-pipeline.md`.
     tests covering the full `kb` subcommand surface guard against
     arg-parsing and output-format regressions.
 
-## Quick start (Weeks 1–2)
+## Quick start
+
+### CLI (everyday flow)
+
+```bash
+# Add a file (synchronously chunks + indexes in CLI-only mode)
+rsclaw kb add ~/Documents/manual.md --tags personal
+
+# Add a directory recursively
+rsclaw kb add ~/Documents/notes --recursive --ext md,txt --tags wiki
+
+# Add a URL (conditional GET via ETag/Last-Modified on re-run)
+rsclaw kb add https://example.com/changelog.html --tags changelog
+
+# Search (hybrid: HNSW + tantivy BM25 + RRF + MMR)
+rsclaw kb search "brown fox" -k 5
+rsclaw kb search "brown fox" --json | jq
+
+# List + filter
+rsclaw kb ls --tag wiki --limit 20
+rsclaw kb show <doc_id>           # metadata + chunk list
+rsclaw kb show <chunk_id>         # single chunk + neighbors
+rsclaw kb visibility <doc_id> private
+
+# Maintenance
+rsclaw kb compact                  # orphan-file scan + HNSW snapshot
+rsclaw kb sync-all --dry-run       # refresh stale URL docs
+rsclaw kb stats                    # per-status counts + disk_bytes
+rsclaw kb export <doc_id> --to ./out.md
+
+# Delete (tombstone — kept 30 days for recovery)
+rsclaw kb rm <doc_id> --yes
+rsclaw kb rm --tag stale --yes     # bulk by tag
+# Re-add the same file within 30 days resurrects the doc.
+```
+
+### Rust API (embedders + tests)
 
 ```rust
 use rsclaw::kb::{
     canonicalize_by_mime, detect_mime, ingest_canonicalized,
-    CanonicalizeInput, HandlerCtx, IngestInput, KbEmbedder, KbPaths, KbStore,
-    StubEmbedder, WorkerConfig, WorkerPool,
+    CanonicalizeInput, HandlerCtx, IngestInput, KbEmbedder, KbIndex,
+    KbPaths, KbStore, StubEmbedder, WorkerConfig, WorkerPool,
 };
 use std::sync::Arc;
 
@@ -323,12 +359,14 @@ let store = Arc::new(KbStore::open(&tmp.path().join("kb.redb"))?);
 let paths = Arc::new(KbPaths::new(tmp.path().join("kb")));
 paths.ensure_layout()?;
 let embedder: Arc<dyn KbEmbedder> = Arc::new(StubEmbedder::default());
+let index = Arc::new(KbIndex::open(&paths)?);
 
 // Start the worker pool (requires multi-threaded tokio runtime).
 let ctx = HandlerCtx {
     store: store.clone(),
     paths: paths.clone(),
-    embedder,
+    embedder: embedder.clone(),
+    index: index.clone(),
 };
 let pool = WorkerPool::start(ctx, WorkerConfig::default());
 
