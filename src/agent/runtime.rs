@@ -5161,16 +5161,107 @@ impl AgentRuntime {
                 }
             }
 
-            // ---- Phase 2b: parallel dispatch with per-tool timeout ----
-            // dispatch_tool takes (&self, &RunContext) — both immutable —
-            // so concurrent calls are safe. Per-tool timeout caps a hung
-            // sub-agent / wedged HTTP call; without it, max(t1,t2,t3) is
-            // unbounded once any one tool wedges.
-            let dispatch_futures = to_dispatch.iter().map(|p| {
-                let fut = self.dispatch_tool(ctx, &p.tool_id, &p.tool_name, p.tool_input.clone());
-                time::timeout(Duration::from_secs(TOOL_DISPATCH_TIMEOUT_SECS), fut)
-            });
-            let timed_results = futures::future::join_all(dispatch_futures).await;
+            // ---- Phase 2b: parallel dispatch + real-time per-tool emit ----
+            // FuturesUnordered (instead of join_all) lets the user see
+            // each tool's result the instant it completes — no longer
+            // batched at max(t1,t2,t3). dispatch_tool is (&self, &ctx)
+            // immutable, so concurrent calls are safe. Per-tool timeout
+            // caps a hung sub-agent / wedged HTTP call.
+            //
+            // The `<rstool>` channel emit that previously lived in Phase 3
+            // now fires here inside each future's tail, so streaming
+            // channel subscribers (desktop WS, etc.) get per-tool cards
+            // as they finish rather than all at the slowest's latency.
+            let dispatch_stream: futures::stream::FuturesUnordered<_> = to_dispatch
+                .iter()
+                .enumerate()
+                .map(|(idx, p)| {
+                    let bus = self.event_bus.clone();
+                    let session_id = ctx.session_key.clone();
+                    let agent_id = ctx.agent_id.clone();
+                    let tool_name = p.tool_name.clone();
+                    let tool_input_str = p.tool_input_str.clone();
+                    let fut = self
+                        .dispatch_tool(ctx, &p.tool_id, &p.tool_name, p.tool_input.clone());
+                    async move {
+                        let timed = time::timeout(
+                            Duration::from_secs(TOOL_DISPATCH_TIMEOUT_SECS),
+                            fut,
+                        )
+                        .await;
+                        if let Some(bus) = bus {
+                            let preview = match &timed {
+                                Ok(Ok(v)) => {
+                                    let raw = if v.is_string() {
+                                        v.as_str().unwrap_or("").to_owned()
+                                    } else {
+                                        v.to_string()
+                                    };
+                                    if raw.chars().count() > 4000 {
+                                        let truncated: String =
+                                            raw.chars().take(2000).collect();
+                                        format!("{truncated}…(truncated)")
+                                    } else {
+                                        raw
+                                    }
+                                }
+                                Ok(Err(e)) => format!("[error: {e:#}]"),
+                                Err(_) => format!(
+                                    "[timeout after {TOOL_DISPATCH_TIMEOUT_SECS}s]"
+                                ),
+                            };
+                            // Exec tools: prepend `$ command` so the UI's
+                            // card header shows what was run (parity with
+                            // the old Phase-3 emit).
+                            let display_out = if matches!(
+                                tool_name.as_str(),
+                                "shell" | "execute_command" | "exec"
+                            ) {
+                                serde_json::from_str::<serde_json::Value>(&tool_input_str)
+                                    .ok()
+                                    .and_then(|a| {
+                                        a.get("command")
+                                            .and_then(|c| c.as_str())
+                                            .map(|cmd| format!("$ {cmd}\n{preview}"))
+                                    })
+                                    .unwrap_or(preview)
+                            } else {
+                                preview
+                            };
+                            let marker = format!(
+                                "<rstool name=\"{tool_name}\">{display_out}</rstool>"
+                            );
+                            let _ = bus.send(AgentEvent {
+                                session_id,
+                                agent_id,
+                                delta: marker,
+                                done: false,
+                                files: vec![],
+                                images: vec![],
+                                tool_log: vec![],
+                                question: None,
+                            });
+                        }
+                        (idx, timed)
+                    }
+                })
+                .collect();
+
+            // Drain in completion order so the emit above fires real-time,
+            // then re-index by emit position so Phase 3 can iterate the LLM's
+            // original tool_call order (matters for scratchpad / loop
+            // detector / metrics determinism).
+            let mut timed_results: Vec<Option<_>> =
+                (0..to_dispatch.len()).map(|_| None).collect();
+            {
+                use futures::StreamExt as _;
+                let mut stream = dispatch_stream;
+                while let Some((idx, r)) = stream.next().await {
+                    timed_results[idx] = Some(r);
+                }
+            }
+            let timed_results: Vec<_> =
+                timed_results.into_iter().map(|o| o.expect("every dispatch future yields exactly one result")).collect();
 
             // ---- Phase 3: serial post-processing in LLM emit order ----
             for (pending, timed_result) in to_dispatch.into_iter().zip(timed_results.into_iter()) {
@@ -5366,7 +5457,10 @@ impl AgentRuntime {
                 tool_images.extend(result_images);
 
                 // Record tool call for frontend display (truncated to 4000 chars).
-                // Also emit immediately so the desktop chat shows results in real time.
+                // The companion `<rstool>` channel emit moved to Phase 2b so
+                // streaming subscribers see per-tool cards in real time; this
+                // block only builds `tool_log` for the final AgentReply
+                // (rendered by non-streaming channels like Feishu/WeChat).
                 {
                     let args_str = tool_input_str;
                     let out_str = if result_text.len() > 4000 {
@@ -5375,38 +5469,7 @@ impl AgentRuntime {
                     } else {
                         result_text.clone()
                     };
-                    tool_log.push((tool_name.clone(), args_str.clone(), out_str.clone()));
-                    if let Some(ref bus) = self.event_bus {
-                        // Prepend `$ command` line for exec tools so the
-                        // desktop UI can show a command preview in the header.
-                        let display_out = if matches!(tool_name.as_str(), "shell" | "execute_command" | "exec") {
-                            if let Ok(a) = serde_json::from_str::<serde_json::Value>(&args_str) {
-                                if let Some(cmd) = a.get("command").and_then(|c| c.as_str()) {
-                                    format!("$ {cmd}\n{out_str}")
-                                } else {
-                                    out_str.clone()
-                                }
-                            } else {
-                                out_str.clone()
-                            }
-                        } else {
-                            out_str.clone()
-                        };
-                        let marker = format!(
-                            "<rstool name=\"{}\">{}</rstool>",
-                            tool_name, display_out
-                        );
-                        let _ = bus.send(AgentEvent {
-                            session_id: ctx.session_key.clone(),
-                            agent_id: ctx.agent_id.clone(),
-                            delta: marker,
-                            done: false,
-                            files: vec![],
-                            images: vec![],
-                            tool_log: vec![],
-                            question: None,
-                        });
-                    }
+                    tool_log.push((tool_name.clone(), args_str, out_str));
                 }
 
                 // Auto-send files: any tool returning __send_file=true queues the
