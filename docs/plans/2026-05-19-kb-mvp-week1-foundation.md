@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the foundation layer of the rsclaw Knowledge Base — model types (with `logical_source_id` + `KbVisibility`), on-disk content store, redb schema covering all 12 tables (incl. `kb_ledger`, `kb_jobs_*`, `kb_seen_items`, `kb_doc_latest_version`), source canonicalizers (text / md / html / text-layer PDF), URL canonicalization, and the chunker (deterministic chunk_id from `logical_source_id`). By end of Week 1, the system can canonicalize a file/URL into Markdown, stage it on disk, compute its `logical_source_id`, and produce chunks — **but no DB writes, no embedding, no FTS indexing, no retrieval**. Those are Week 2/3.
+**Goal:** Build the foundation layer of the rsclaw Knowledge Base — model types (with `logical_source_id` + `KbVisibility`), on-disk content store, redb schema covering all 13 tables (incl. `kb_ledger`, `kb_jobs_*`, `kb_seen_items`, `kb_doc_latest_version`, `kb_sync_state`), source canonicalizers (text / md / html / text-layer PDF), URL **identity** canonicalization (string-only normalization for use as a `logical_source_id` seed), and the chunker (deterministic chunk_id from `logical_source_id`). By end of Week 1, the system can canonicalize a **file** into Markdown, stage it on disk, compute its `logical_source_id`, and produce chunks — **but no HTTP fetch, no URL body → Markdown, no DB writes, no embedding, no FTS indexing, no retrieval**. URL body fetch + HTML→Markdown (UrlCanonicalizer) lands in Week 2 alongside the embedder and worker pool, where the HTTP client is already wired and the UrlSyncer scope is on deck. DB / embed / FTS / retrieval are Week 2/3.
 
 **Architecture:** New `src/kb/` module on top of existing `redb` / `tantivy` / `hnsw_rs` deps. **No SQL pretense** — jobs queue and seen_items are modeled as redb-native KV tables with explicit indices. **logical_source_id is the idempotency key**: same content from same source produces same chunk_ids no matter how many times re-ingested.
 
@@ -21,12 +21,12 @@ cargo test -p rsclaw --lib kb::
 cargo test --test kb_week1_e2e
 ```
 
-…and have the full integration test pass: given a sample `.md` / `.html` / `.txt` / `.pdf` file or a URL, the system:
+…and have the full integration test pass: given a sample `.md` / `.html` / `.txt` / `.pdf` **file**, the system:
 
 1. Detects mime
 2. Canonicalizes → CanonicalizedSource { markdown, metadata }
-3. Computes `logical_source_id` (`file:sha256:...` or `url:<normalized>`)
-4. Stages `.md` file to `~/.rsclaw/kb/md/<kind>/<slug>.md` (atomic write, body + YAML front-matter)
+3. Computes `logical_source_id` for files (`file:sha256:...`); the `canonicalize_url(...)` helper produces `url:<normalized>` strings for callers that already have a URL, but **no HTTP fetch happens this week**
+4. Stages `.md` file to `~/.rsclaw/kb/md/<kind>/<slug>--<lsid8>.md` (atomic no-clobber write via `persist_noclobber`, body + YAML front-matter; the `--<lsid8>` suffix is the first 8 hex chars of `sha256(logical_source_id)`, so re-ingesting the same source lands at the same path and different sources with the same slug get different paths)
 5. Stages raw bytes to `~/.rsclaw/kb/raw/<doc_id>.<ext>` if `keep_raw=true`
 6. Chunks the canonical markdown into ≤512-token chunks with `heading_path` prefix and SimHash
 7. Produces deterministic chunk_ids that are **identical across runs**
@@ -800,12 +800,23 @@ impl KbVisibility {
         }
     }
 
-    pub fn visible_to(&self, scope: &CallerScope) -> bool {
+    /// Check visibility against a caller scope. `owner_user_id` is the
+    /// doc's `owner_user_id` field — REQUIRED for `Private` to match
+    /// (otherwise Private docs would leak to any authenticated caller,
+    /// violating spec §K). For non-Private variants, `owner_user_id`
+    /// is ignored.
+    ///
+    /// Prefer `KbDoc::visible_to(scope)` from retrieval code so the
+    /// owner argument is always paired with the visibility correctly.
+    pub fn visible_to(&self, scope: &CallerScope, owner_user_id: Option<&str>) -> bool {
         match self {
             Self::Global => true,
-            Self::Agent { agent_id } => scope.agent_id.as_ref() == Some(agent_id),
-            Self::Channel { channel_id } => scope.channel_id.as_ref() == Some(channel_id),
-            Self::Private => scope.user_id.is_some(),  // any authenticated caller
+            Self::Agent { agent_id } => scope.agent_id.as_deref() == Some(agent_id.as_str()),
+            Self::Channel { channel_id } => scope.channel_id.as_deref() == Some(channel_id.as_str()),
+            Self::Private => match (owner_user_id, scope.user_id.as_deref()) {
+                (Some(owner), Some(caller)) => owner == caller,
+                _ => false,
+            },
         }
     }
 }
@@ -841,6 +852,16 @@ pub struct KbDoc {
     pub meta: serde_json::Value,
 }
 
+impl KbDoc {
+    /// Check whether `scope` can see this doc. Pairs `visibility` with
+    /// `owner_user_id` so `Private` is matched correctly. Retrieval
+    /// code MUST use this instead of calling `KbVisibility::visible_to`
+    /// directly — passing the wrong owner is the most likely scope-leak.
+    pub fn visible_to(&self, scope: &CallerScope) -> bool {
+        self.visibility.visible_to(scope, self.owner_user_id.as_deref())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -854,33 +875,60 @@ mod tests {
 
     #[test]
     fn visibility_global_visible_to_anyone() {
-        assert!(KbVisibility::Global.visible_to(&CallerScope::default()));
+        assert!(KbVisibility::Global.visible_to(&CallerScope::default(), None));
     }
 
     #[test]
     fn visibility_agent_filters_by_agent_id() {
         let v = KbVisibility::Agent { agent_id: "a1".into() };
-        assert!(v.visible_to(&CallerScope { agent_id: Some("a1".into()), ..Default::default() }));
-        assert!(!v.visible_to(&CallerScope { agent_id: Some("a2".into()), ..Default::default() }));
-        assert!(!v.visible_to(&CallerScope::default()));
+        assert!(v.visible_to(&CallerScope { agent_id: Some("a1".into()), ..Default::default() }, None));
+        assert!(!v.visible_to(&CallerScope { agent_id: Some("a2".into()), ..Default::default() }, None));
+        assert!(!v.visible_to(&CallerScope::default(), None));
     }
 
     #[test]
     fn visibility_channel_filters_by_channel_id() {
         let v = KbVisibility::Channel { channel_id: "c1".into() };
-        assert!(v.visible_to(&CallerScope { channel_id: Some("c1".into()), ..Default::default() }));
-        assert!(!v.visible_to(&CallerScope { channel_id: Some("c2".into()), ..Default::default() }));
+        assert!(v.visible_to(&CallerScope { channel_id: Some("c1".into()), ..Default::default() }, None));
+        assert!(!v.visible_to(&CallerScope { channel_id: Some("c2".into()), ..Default::default() }, None));
     }
 
     #[test]
-    fn visibility_private_requires_user_id() {
-        assert!(KbVisibility::Private.visible_to(&CallerScope { user_id: Some("u1".into()), ..Default::default() }));
-        assert!(!KbVisibility::Private.visible_to(&CallerScope::default()));
+    fn visibility_private_requires_matching_owner() {
+        // owner=u1, caller=u1 → allowed
+        assert!(KbVisibility::Private.visible_to(
+            &CallerScope { user_id: Some("u1".into()), ..Default::default() },
+            Some("u1"),
+        ));
+        // owner=u1, caller=u2 → DENIED (regression test for the bug
+        // where Private leaked to any authenticated caller)
+        assert!(!KbVisibility::Private.visible_to(
+            &CallerScope { user_id: Some("u2".into()), ..Default::default() },
+            Some("u1"),
+        ));
+        // No caller user_id → denied
+        assert!(!KbVisibility::Private.visible_to(
+            &CallerScope::default(),
+            Some("u1"),
+        ));
+        // No owner → denied (defensive: a Private doc with no owner is unreachable)
+        assert!(!KbVisibility::Private.visible_to(
+            &CallerScope { user_id: Some("u1".into()), ..Default::default() },
+            None,
+        ));
     }
 
     #[test]
-    fn doc_serde_roundtrip() {
-        let d = KbDoc {
+    fn kbdoc_visible_to_pairs_owner_with_visibility() {
+        let mut d = sample_doc();
+        d.visibility = KbVisibility::Private;
+        d.owner_user_id = Some("u1".into());
+        assert!(d.visible_to(&CallerScope { user_id: Some("u1".into()), ..Default::default() }));
+        assert!(!d.visible_to(&CallerScope { user_id: Some("u2".into()), ..Default::default() }));
+    }
+
+    fn sample_doc() -> KbDoc {
+        KbDoc {
             id: "01HXY".into(),
             logical_source_id: "file:sha256:abc".into(),
             source: KbSource::Doc { path: "/tmp/x".into() },
@@ -888,7 +936,7 @@ mod tests {
             title: "T".into(),
             mime: "text/markdown".into(),
             raw_sha256: "abc".into(),
-            markdown_path: "md/doc/x.md".into(),
+            markdown_path: "md/doc/x--12345678.md".into(),
             markdown_sha256: "def".into(),
             raw_path: None,
             owner_user_id: None,
@@ -897,7 +945,12 @@ mod tests {
             visibility: KbVisibility::Global,
             tags: vec![],
             meta: serde_json::Value::Null,
-        };
+        }
+    }
+
+    #[test]
+    fn doc_serde_roundtrip() {
+        let d = sample_doc();
         let s = serde_json::to_string(&d).unwrap();
         let back: KbDoc = serde_json::from_str(&s).unwrap();
         assert_eq!(d, back);
@@ -1073,7 +1126,7 @@ mod tests {
             doc_id: "D1".into(),
             logical_source_id: "file:sha256:abc".into(),
             op: LedgerOp::Create,
-            new_paths: vec!["md/doc/x.md".into()],
+            new_paths: vec!["md/doc/x--12345678.md".into()],
             old_paths: vec![],
             status: LedgerStatus::Pending,
             error: None,
@@ -1217,7 +1270,7 @@ git commit -m "feat(kb): IngestLedgerEntry + Job/JobKind types (Week 2 will add 
 
 ---
 
-## Task 10: `store/schema.rs` — ALL redb tables
+## Task 10: `store/schema.rs` — ALL 13 redb tables
 
 **Files:** `src/kb/store/schema.rs`, `src/kb/store/mod.rs`
 
@@ -1277,7 +1330,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn open_creates_all_12_tables() {
+    fn open_creates_all_13_tables() {
         let tmp = TempDir::new().unwrap();
         let db = open_db(&tmp.path().join("kb.redb")).unwrap();
         let rtx = db.begin_read().unwrap();
@@ -1318,7 +1371,7 @@ pub use schema::open_db;
 ```bash
 cargo test -p rsclaw --lib kb::store::schema
 git add src/kb/store/
-git commit -m "feat(kb): redb schema covering all 12 KB tables (Week 2/3 add accessors)"
+git commit -m "feat(kb): redb schema covering all 13 KB tables (Week 2/3 add accessors)"
 ```
 
 ---
@@ -1333,35 +1386,43 @@ git commit -m "feat(kb): redb schema covering all 12 KB tables (Week 2/3 add acc
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::Path;
+use tempfile::NamedTempFile;
 
-/// Atomic file write that refuses to overwrite. Returns Ok(false) if
-/// file already exists (caller treats as no-op).
+/// Atomic, no-clobber file write. Returns Ok(true) if the file was
+/// created, Ok(false) if a file already existed at `path`. Truly atomic:
+/// uses `NamedTempFile::persist_noclobber`, which goes through
+/// `link(2)` + `unlink(2)` on Unix (so a concurrent racing writer cannot
+/// overwrite) and the equivalent no-replace move on Windows.
+///
+/// Why this is necessary: a naive `if path.exists() { return Ok(false) }`
+/// + `rename(tmp, path)` is a TOCTOU race AND `rename(2)` on Unix
+/// overwrites the destination — so two concurrent ingests of the same
+/// path could each see `!exists()` and then clobber each other.
 pub fn write_if_new(path: &Path, bytes: &[u8]) -> Result<bool> {
-    if path.exists() { return Ok(false); }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("mkdir -p {}", parent.display()))?;
-    }
-    let tmp = path.with_extension(format!(
-        "{}.tmp.{}",
-        path.extension().and_then(|e| e.to_str()).unwrap_or("kb"),
-        ulid::Ulid::new()
-    ));
-    {
-        let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    #[cfg(unix)]
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
+    let parent = path.parent()
+        .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("mkdir -p {}", parent.display()))?;
+
+    let mut tmp = NamedTempFile::new_in(parent)
+        .with_context(|| format!("create tempfile in {}", parent.display()))?;
+    tmp.as_file_mut().write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+
+    match tmp.persist_noclobber(path) {
+        Ok(_) => {
+            #[cfg(unix)]
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();  // best-effort fsync of dir entry
+            }
+            Ok(true)
         }
+        Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(anyhow::Error::from(e.error)
+            .context(format!("persist_noclobber → {}", path.display()))),
     }
-    Ok(true)
 }
 
 pub fn overwrite_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -1423,6 +1484,32 @@ mod tests {
     }
 
     #[test]
+    fn write_if_new_concurrent_no_clobber() {
+        // Regression: TOCTOU race where two threads each see !exists() and
+        // then rename(tmp, path) over each other. With persist_noclobber,
+        // exactly one wins and the other gets Ok(false); the file always
+        // holds the winner's bytes.
+        use std::sync::Arc;
+        use std::thread;
+
+        for _ in 0..20 {  // run repeatedly to flush the race
+            let tmp = TempDir::new().unwrap();
+            let p = Arc::new(tmp.path().join("race.md"));
+            let p1 = p.clone();
+            let p2 = p.clone();
+            let h1 = thread::spawn(move || write_if_new(&p1, b"first").unwrap());
+            let h2 = thread::spawn(move || write_if_new(&p2, b"second").unwrap());
+            let r1 = h1.join().unwrap();
+            let r2 = h2.join().unwrap();
+            // Exactly one of the two writes must have succeeded.
+            assert_ne!(r1, r2, "both calls reported the same result");
+            assert!(r1 || r2);
+            let body = std::fs::read(&*p).unwrap();
+            assert!(body == b"first" || body == b"second");
+        }
+    }
+
+    #[test]
     fn overwrite_replaces() {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path().join("x.md");
@@ -1462,6 +1549,7 @@ git commit -m "feat(kb): atomic write_if_new + overwrite_atomic + sha256_hex"
 
 ```rust
 use crate::kb::model::KbSourceKind;
+use sha2::Digest;
 
 pub fn slugify(title: &str) -> String {
     let mut out = String::with_capacity(title.len());
@@ -1487,8 +1575,39 @@ fn is_cjk(c: char) -> bool {
        || (0xAC00..=0xD7AF).contains(&cp)
 }
 
-pub fn markdown_rel_path(kind: KbSourceKind, slug: &str) -> String {
-    format!("md/{}/{}.md", kind.as_str(), slug)
+/// Stable, collision-resistant path for a doc's canonical markdown.
+///
+/// Layout: `md/<kind>/<slug>--<lsid8>.md` where `lsid8` is the first
+/// 8 hex chars of `sha256(logical_source_id)`. The hash suffix is
+/// load-bearing:
+///   - Re-ingesting the same source → same `lsid8` → same path →
+///     `write_if_new` correctly returns `false` and stage_doc reuses
+///     the existing file.
+///   - Two different sources that slugify to the same prefix (e.g.
+///     `蒙牛 报告.md` from two different folders) → different
+///     `logical_source_id` → different `lsid8` → distinct files,
+///     no collision.
+///
+/// 8 hex chars = 32 bits = ~4B distinct paths per slug; the
+/// birthday-collision risk is ~1 in 2^16 at ~65k same-slug docs,
+/// which is acceptable for v1 (and stage_doc still verifies body
+/// equality on `false` returns, so a collision surfaces as a hard
+/// error, not silent data loss).
+pub fn markdown_rel_path(kind: KbSourceKind, slug: &str, logical_source_id: &str) -> String {
+    let lsid8 = lsid_hash8(logical_source_id);
+    format!("md/{}/{}--{lsid8}.md", kind.as_str(), slug)
+}
+
+pub fn lsid_hash8(logical_source_id: &str) -> String {
+    let mut h = sha2::Sha256::new();
+    h.update(logical_source_id.as_bytes());
+    let d = h.finalize();
+    let mut s = String::with_capacity(8);
+    for b in d.iter().take(4) {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 pub fn raw_rel_path(doc_id: &str, ext: &str) -> String {
@@ -1517,9 +1636,44 @@ mod tests {
     }
 
     #[test]
-    fn markdown_rel_per_kind() {
-        assert_eq!(markdown_rel_path(KbSourceKind::Doc, "蒙牛"), "md/doc/蒙牛.md");
-        assert_eq!(markdown_rel_path(KbSourceKind::Url, "x"), "md/url/x.md");
+    fn markdown_rel_per_kind_carries_lsid_suffix() {
+        let p = markdown_rel_path(KbSourceKind::Doc, "蒙牛", "file:sha256:abc");
+        assert!(p.starts_with("md/doc/蒙牛--"), "got {p}");
+        assert!(p.ends_with(".md"), "got {p}");
+        // slug + "--" + 8 hex chars + ".md"
+        let suffix = p.trim_start_matches("md/doc/蒙牛--").trim_end_matches(".md");
+        assert_eq!(suffix.len(), 8, "lsid suffix must be 8 hex chars, got {suffix}");
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()), "got {suffix}");
+
+        let q = markdown_rel_path(KbSourceKind::Url, "x", "url:https://example.com/p");
+        assert!(q.starts_with("md/url/x--") && q.ends_with(".md"), "got {q}");
+    }
+
+    #[test]
+    fn markdown_rel_same_lsid_same_path_idempotent() {
+        // Re-ingesting the same source MUST produce the same path so
+        // write_if_new can correctly say "already on disk".
+        let a = markdown_rel_path(KbSourceKind::Doc, "report", "file:sha256:abc");
+        let b = markdown_rel_path(KbSourceKind::Doc, "report", "file:sha256:abc");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn markdown_rel_different_lsid_different_path_no_collision() {
+        // Regression: previously `md/doc/<slug>.md` would collide on slug
+        // alone, causing the second ingest to either silently overwrite
+        // or (with write_if_new) hold a dangling pointer to the first
+        // doc's bytes.
+        let a = markdown_rel_path(KbSourceKind::Doc, "report", "file:sha256:abc");
+        let b = markdown_rel_path(KbSourceKind::Doc, "report", "file:sha256:def");
+        assert_ne!(a, b, "same slug + different lsid must map to different paths");
+    }
+
+    #[test]
+    fn lsid_hash8_is_8_hex_chars() {
+        let h = lsid_hash8("file:sha256:abc");
+        assert_eq!(h.len(), 8);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -1781,7 +1935,10 @@ git commit -m "feat(kb): read_doc_body + read_doc_range + verify_doc_sha"
 - [ ] **Step 1: Write impl + tests**
 
 ```rust
-//! On-disk content store. Files at `md/<kind>/<slug>.md` (atomic) and
+//! On-disk content store. Files at `md/<kind>/<slug>--<lsid8>.md`
+//! (atomic, no-clobber; the `--<lsid8>` suffix is the first 8 hex
+//! chars of `sha256(logical_source_id)` so re-ingest is idempotent
+//! and same-slug different-source ingests don't collide) and
 //! optional raw at `raw/<doc_id>.<ext>`. DB stores relative paths +
 //! sha256 + byte_offset only.
 
@@ -1792,7 +1949,7 @@ pub mod read;
 
 use crate::kb::model::KbSourceKind;
 use crate::kb::paths::KbPaths;
-use anyhow::Result;
+use anyhow::{Context, Result};
 pub use compose::{compose_doc_file, parse_doc_file, FrontMatter, Parsed};
 pub use read::{read_doc_body, read_doc_range, verify_doc_sha};
 
@@ -1810,6 +1967,10 @@ pub struct StageInput<'a> {
     pub doc_id: &'a str,
     pub kind: KbSourceKind,
     pub slug: &'a str,
+    /// REQUIRED — seeds the path suffix so re-ingest of the same source
+    /// lands at the same file and different sources with the same slug
+    /// get different files. See `paths::markdown_rel_path` for why.
+    pub logical_source_id: &'a str,
     pub front: FrontMatter,
     pub body: &'a str,
     pub raw: Option<(&'a [u8], &'a str)>,  // (bytes, ext)
@@ -1817,12 +1978,41 @@ pub struct StageInput<'a> {
 }
 
 pub fn stage_doc(paths: &KbPaths, input: StageInput<'_>) -> Result<StagedDoc> {
-    let md_rel = paths::markdown_rel_path(input.kind, input.slug);
+    let md_rel = paths::markdown_rel_path(input.kind, input.slug, input.logical_source_id);
     let md_abs = paths.root.join(&md_rel);
     let composed = compose_doc_file(&input.front, input.body)?;
-    atomic::write_if_new(&md_abs, composed.as_bytes())?;
     let parsed = parse_doc_file(&composed)?;
-    let md_sha = atomic::sha256_hex(parsed.body.as_bytes());
+    let new_body_sha = atomic::sha256_hex(parsed.body.as_bytes());
+
+    let wrote = atomic::write_if_new(&md_abs, composed.as_bytes())?;
+    let md_sha = if wrote {
+        new_body_sha
+    } else {
+        // Path already on disk — must be a re-ingest of the same
+        // logical_source_id (the only way to land at this path). Verify
+        // the existing body matches what we'd have written; if it
+        // doesn't, that's either (a) a 32-bit lsid_hash8 collision or
+        // (b) a non-deterministic canonicalizer — both worth surfacing
+        // immediately instead of silently returning a sha that doesn't
+        // match the bytes on disk (the original bug).
+        let existing = std::fs::read(&md_abs)
+            .with_context(|| format!("read existing {}", md_abs.display()))?;
+        let existing_str = std::str::from_utf8(&existing)
+            .with_context(|| format!("existing {} not utf8", md_abs.display()))?;
+        let existing_parsed = parse_doc_file(existing_str)?;
+        let existing_sha = atomic::sha256_hex(existing_parsed.body.as_bytes());
+        if existing_sha != new_body_sha {
+            return Err(anyhow::anyhow!(
+                "stage_doc collision at {}: existing body sha {} ≠ new body sha {} \
+                 (logical_source_id={}, doc_id={}). Two different sources hashed to \
+                 the same lsid8 path suffix, OR the canonicalizer is non-deterministic. \
+                 Refusing to silently overwrite.",
+                md_abs.display(), existing_sha, new_body_sha,
+                input.logical_source_id, input.doc_id,
+            ));
+        }
+        existing_sha
+    };
 
     let raw_rel = if input.keep_raw {
         if let Some((bytes, ext)) = input.raw {
@@ -1864,10 +2054,12 @@ mod tests {
         p.ensure_layout().unwrap();
         let s = stage_doc(&p, StageInput {
             doc_id: "01HXY", kind: KbSourceKind::Doc, slug: "test",
+            logical_source_id: "file:sha256:aaaa",
             front: fm(), body: "# Hi",
             raw: Some((b"raw", "pdf")), keep_raw: true,
         }).unwrap();
-        assert_eq!(s.markdown_rel_path, "md/doc/test.md");
+        assert!(s.markdown_rel_path.starts_with("md/doc/test--"));
+        assert!(s.markdown_rel_path.ends_with(".md"));
         assert_eq!(s.raw_rel_path.as_deref(), Some("raw/01HXY.pdf"));
     }
 
@@ -1878,6 +2070,7 @@ mod tests {
         p.ensure_layout().unwrap();
         let s = stage_doc(&p, StageInput {
             doc_id: "01H", kind: KbSourceKind::Doc, slug: "n",
+            logical_source_id: "file:sha256:bbbb",
             front: fm(), body: "x",
             raw: Some((b"r", "txt")), keep_raw: false,
         }).unwrap();
@@ -1891,10 +2084,84 @@ mod tests {
         p.ensure_layout().unwrap();
         let s = stage_doc(&p, StageInput {
             doc_id: "01H", kind: KbSourceKind::Doc, slug: "r",
+            logical_source_id: "file:sha256:cccc",
             front: fm(), body: "0123456789",
             raw: None, keep_raw: false,
         }).unwrap();
         assert_eq!(read_doc_range(&p.root.join(&s.markdown_rel_path), 3, 7).unwrap(), "3456");
+    }
+
+    #[test]
+    fn stage_reingest_same_lsid_returns_consistent_sha() {
+        // Re-ingesting the same logical source must land at the same
+        // path, and the returned sha must match the bytes actually
+        // on disk (regression: previously returned the new body's
+        // sha while the file held the original body).
+        let tmp = TempDir::new().unwrap();
+        let p = KbPaths::new(tmp.path());
+        p.ensure_layout().unwrap();
+        let s1 = stage_doc(&p, StageInput {
+            doc_id: "01H", kind: KbSourceKind::Doc, slug: "report",
+            logical_source_id: "file:sha256:dddd",
+            front: fm(), body: "hello world", raw: None, keep_raw: false,
+        }).unwrap();
+        let s2 = stage_doc(&p, StageInput {
+            doc_id: "01H", kind: KbSourceKind::Doc, slug: "report",
+            logical_source_id: "file:sha256:dddd",
+            front: fm(), body: "hello world", raw: None, keep_raw: false,
+        }).unwrap();
+        assert_eq!(s1.markdown_rel_path, s2.markdown_rel_path);
+        assert_eq!(s1.markdown_sha256, s2.markdown_sha256);
+        // sha on disk equals returned sha
+        let on_disk = std::fs::read(p.root.join(&s1.markdown_rel_path)).unwrap();
+        let parsed = parse_doc_file(std::str::from_utf8(&on_disk).unwrap()).unwrap();
+        assert_eq!(atomic::sha256_hex(parsed.body.as_bytes()), s1.markdown_sha256);
+    }
+
+    #[test]
+    fn stage_collision_with_divergent_body_errors() {
+        // If two stage_doc calls land at the same path (same lsid)
+        // but with different bodies, the second MUST error rather
+        // than silently return a sha that doesn't match disk. This
+        // catches non-deterministic canonicalizers and 32-bit
+        // lsid_hash8 collisions.
+        let tmp = TempDir::new().unwrap();
+        let p = KbPaths::new(tmp.path());
+        p.ensure_layout().unwrap();
+        stage_doc(&p, StageInput {
+            doc_id: "01H", kind: KbSourceKind::Doc, slug: "x",
+            logical_source_id: "file:sha256:eeee",
+            front: fm(), body: "first body", raw: None, keep_raw: false,
+        }).unwrap();
+        let err = stage_doc(&p, StageInput {
+            doc_id: "01H", kind: KbSourceKind::Doc, slug: "x",
+            logical_source_id: "file:sha256:eeee",
+            front: fm(), body: "second body different", raw: None, keep_raw: false,
+        }).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("collision"), "want collision error, got: {msg}");
+    }
+
+    #[test]
+    fn stage_different_lsid_same_slug_no_collision() {
+        // Two different sources with the same slugified title must
+        // produce two distinct files.
+        let tmp = TempDir::new().unwrap();
+        let p = KbPaths::new(tmp.path());
+        p.ensure_layout().unwrap();
+        let a = stage_doc(&p, StageInput {
+            doc_id: "01A", kind: KbSourceKind::Doc, slug: "report",
+            logical_source_id: "file:sha256:1111",
+            front: fm(), body: "body A", raw: None, keep_raw: false,
+        }).unwrap();
+        let b = stage_doc(&p, StageInput {
+            doc_id: "01B", kind: KbSourceKind::Doc, slug: "report",
+            logical_source_id: "file:sha256:2222",
+            front: fm(), body: "body B", raw: None, keep_raw: false,
+        }).unwrap();
+        assert_ne!(a.markdown_rel_path, b.markdown_rel_path);
+        assert!(p.root.join(&a.markdown_rel_path).exists());
+        assert!(p.root.join(&b.markdown_rel_path).exists());
     }
 }
 ```
@@ -1909,9 +2176,11 @@ git commit -m "feat(kb): content_store::stage_doc public API"
 
 ---
 
-## Task 16: `canonicalize/url_canon.rs` — URL canonicalization
+## Task 16: `canonicalize/url_canon.rs` — URL **identity** canonicalization (string only)
 
 **Files:** `src/kb/canonicalize/url_canon.rs`, `src/kb/canonicalize/mod.rs` stub
+
+> **Scope note:** Week 1 only produces a normalized URL **string** for use as a `logical_source_id` seed. There is no HTTP fetch and no URL→Markdown canonicalizer here. The full `UrlCanonicalizer` (fetch HTML, run it through `HtmlCanonicalizer`, handle redirects/timeouts/content-type) lands in Week 2 alongside the embedder, worker pool, and `UrlSyncer`. This keeps Week 1 free of any HTTP surface.
 
 - [ ] **Step 1: Write impl + tests**
 
@@ -3080,6 +3349,7 @@ fn pipeline(paths: &KbPaths, src_path: &Path) -> Result<(String, usize)> {
         doc_id: &doc_id,
         kind: canon.metadata.source_kind,
         slug: name,
+        logical_source_id: canon.metadata.logical_source_id.as_str(),
         front: FrontMatter {
             title: canon.metadata.title.clone(),
             source_kind: canon.metadata.source_kind.as_str().to_string(),
@@ -3228,11 +3498,14 @@ for the full design.
 - **Types** (`model/`): KbDoc / KbChunk (with `logical_source_id` for
   idempotency) / KbEntity / KbEntityIndex / LogicalSourceId / KbLocator /
   KbVisibility / CallerScope / VersionPointer / SimHash-64.
-- **Content store** (`content_store/`): atomic markdown writes under
-  `~/.rsclaw/kb/md/<kind>/<slug>.md` with YAML front-matter; optional
-  raw bytes under `~/.rsclaw/kb/raw/<doc_id>.<ext>`; `read_doc_range`
-  for lazy chunk-body retrieval.
-- **redb schema** (`store/`): all 12 tables defined and openable
+- **Content store** (`content_store/`): atomic no-clobber markdown writes
+  (via `persist_noclobber`) under `~/.rsclaw/kb/md/<kind>/<slug>--<lsid8>.md`
+  with YAML front-matter; the `--<lsid8>` suffix is the first 8 hex chars
+  of `sha256(logical_source_id)`, making re-ingest idempotent and
+  same-slug different-source ingests collision-free; optional raw bytes
+  under `~/.rsclaw/kb/raw/<doc_id>.<ext>`; `read_doc_range` for lazy
+  chunk-body retrieval.
+- **redb schema** (`store/`): all 13 tables defined and openable
   (kb_docs / kb_doc_latest_version / kb_chunks / kb_chunk_by_logical /
   kb_entities / kb_entity_index / kb_seen_items / kb_sync_state /
   kb_ledger / kb_jobs_by_id / kb_jobs_by_dedupe_active /
@@ -3240,8 +3513,9 @@ for the full design.
 - **Ledger/Jobs types** (`ledger/`, `jobs/`): structs and enums for the
   IngestLedger + Outbox pattern; accessors come in Week 2.
 - **Canonicalizers** (`canonicalize/`): markdown, plain text, HTML
-  (via lol-html), PDF text layer (no OCR), URL canonicalization
-  (tracker stripping, param sorting).
+  (via lol-html), PDF text layer (no OCR), URL **identity** canonicalization
+  (tracker stripping, param sorting — string only; HTTP fetch + HTML→Markdown
+  is Week 2).
 - **Chunker** (`chunker/`): paragraph-based splitter with
   `heading_path` injection into `indexed_text`; chunk_ids derived from
   `logical_source_id` for re-ingest idempotency; SimHash near-dup
