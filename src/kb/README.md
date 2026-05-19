@@ -103,16 +103,22 @@ Week 2 plan: `docs/plans/2026-05-19-kb-mvp-week2-pipeline.md`.
   `indexed_text`. The worker handler upserts `KbEntity` +
   `KbEntityIndex` edges per chunk, activating
   `kb_search_entities`. CJK hashtags supported.
+- **`require_entities` + `boost_entities` in search pipeline** —
+  intersect/multiply on the fused result set against entity edges.
+  Covered by `tests/kb_entities_e2e.rs::require_entities_filters_to_chunks_with_mention`.
+- **CLI completeness for spec §5 v1** — `kb show <doc_id>` lists
+  the doc's chunks; `kb rm --tag <name>` bulk-tombstones every
+  Active doc with that tag; `kb export <doc_id> --to <path>` writes
+  the canonical markdown body to disk; `kb stats` now reports
+  per-status doc counts + `kb_entities` / `kb_entity_index` /
+  `disk_bytes`.
 
 ## What's NOT in Weeks 1–4
 
 - BGE-M3 embedder (real model) — Week 2.5 (self-contained behind `KbEmbedder` trait)
-- HNSW snapshot persistence — Week 5.5 (rebuild from redb on startup today)
-- BGE-M3 real embedder — Week 2.5 (StubEmbedder today)
-- Entity boosting in retrieval — Week 5.5 (`boost_entities` /
-  `require_entities` filters currently no-op; entity edges now exist
-  so a Week 5.5 task wires them into the search pipeline)
-- Scheduled syncer ticks (cron integration) — Week 5.5
+- HNSW snapshot persistence — Week 6 (rebuild from redb on startup today)
+- BGE-M3 real embedder — Week 6 (StubEmbedder today)
+- Scheduled syncer ticks (cron integration) — Week 6
 - LocalFolderSyncer, MailSyncer, ChatSyncer — V2 (post-MVP)
 - `kb_explain` retrieval trace — V2 (post-MVP)
 - Tauri admin UI — V2 (post-MVP)
@@ -255,9 +261,16 @@ Week 2 plan: `docs/plans/2026-05-19-kb-mvp-week2-pipeline.md`.
     extractor (`entities/extract.rs`) runs inside the same
     `wtx` as the chunk insert, so `KbEntityIndex` rows are
     consistent with chunks. `kb_search_entities` returns these
-    edges; `boost_entities` / `require_entities` filters can be
-    wired in Week 5.5 without re-ingest. Covered by
-    `tests/kb_entities_e2e.rs::entities_extracted_and_queryable`.
+    edges; `require_entities` / `boost_entities` filters in
+    `search::pipeline` are wired against them. Covered by
+    `tests/kb_entities_e2e.rs::entities_extracted_and_queryable`
+    and `require_entities_filters_to_chunks_with_mention`.
+25. **CLI fully covers spec §5 v1** — `add | ls | rm | search |
+    show | visibility | compact | stats | export`. `rm` accepts
+    either a `doc_id` or `--tag <name>` for bulk tombstone;
+    `show` resolves doc_ids to a chunk list and chunk_ids to a
+    single-chunk fetch with neighbors. `stats` reports per-status
+    doc counts and on-disk bytes.
 
 ## Quick start (Weeks 1–2)
 
