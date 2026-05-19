@@ -16,9 +16,13 @@
 //! from redb reaps the orphans.
 
 use crate::kb::store::KbStore;
-use anyhow::Result;
+use anyhow::{Context, Result};
+use hnsw_rs::api::AnnT;
+use hnsw_rs::hnswio::HnswIo;
 use hnsw_rs::prelude::{DistCosine, Hnsw};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::RwLock;
 
 const DIMENSION: usize = 1024;
@@ -27,6 +31,17 @@ const EF_CONSTRUCTION: usize = 200;
 const MAX_NB_LAYER: usize = 16;
 const EF_SEARCH: usize = 64;
 const INITIAL_CAPACITY: usize = 10_000;
+
+/// Basename used for hnsw_rs's two-file snapshot (`.hnsw.graph` +
+/// `.hnsw.data`). Lives alongside the JSON meta sidecar at
+/// `<dir>/<SNAPSHOT_NAME>.meta.json`.
+const SNAPSHOT_NAME: &str = "snapshot";
+
+#[derive(Serialize, Deserialize)]
+struct HnswMeta {
+    dimension: usize,
+    id_to_chunk: Vec<String>,
+}
 
 pub struct HnswCache {
     inner: RwLock<HnswInner>,
@@ -153,6 +168,101 @@ impl HnswCache {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Snapshot the current state to `<dir>/snapshot.hnsw.{graph,data}`
+    /// + a `snapshot.meta.json` sidecar carrying the `id_to_chunk` map.
+    /// Caller is responsible for ensuring `dir` exists. Empty caches
+    /// still write a meta file so restore is symmetric.
+    pub fn snapshot(&self, dir: &Path) -> Result<()> {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("create_dir_all {}", dir.display()))?;
+        let inner = self.inner.read().unwrap();
+        // hnsw_rs's `file_dump` panics if there are zero data points,
+        // so skip it for the empty case — we still write meta so
+        // `restore` can detect an intentional empty snapshot.
+        if !inner.id_to_chunk.is_empty() {
+            inner
+                .hnsw
+                .file_dump(dir, SNAPSHOT_NAME)
+                .map_err(|e| anyhow::anyhow!("hnsw file_dump: {e}"))?;
+        }
+        let meta = HnswMeta {
+            dimension: DIMENSION,
+            id_to_chunk: inner.id_to_chunk.clone(),
+        };
+        let meta_path = dir.join(format!("{SNAPSHOT_NAME}.meta.json"));
+        std::fs::write(&meta_path, serde_json::to_vec(&meta)?)
+            .with_context(|| format!("write {}", meta_path.display()))?;
+        tracing::info!(
+            n = inner.id_to_chunk.len(),
+            dir = %dir.display(),
+            "kb hnsw: snapshot written"
+        );
+        Ok(())
+    }
+
+    /// Try to load a previously-written snapshot. Returns `Ok(true)`
+    /// on success, `Ok(false)` when no snapshot exists (caller should
+    /// fall back to `rebuild`). Errors when the snapshot is present
+    /// but corrupt or has a different dimension.
+    pub fn restore(&self, dir: &Path) -> Result<bool> {
+        let meta_path = dir.join(format!("{SNAPSHOT_NAME}.meta.json"));
+        let graph_path = dir.join(format!("{SNAPSHOT_NAME}.hnsw.graph"));
+        let data_path = dir.join(format!("{SNAPSHOT_NAME}.hnsw.data"));
+        if !meta_path.exists() {
+            return Ok(false);
+        }
+        let meta_bytes = std::fs::read(&meta_path)
+            .with_context(|| format!("read {}", meta_path.display()))?;
+        let meta: HnswMeta = serde_json::from_slice(&meta_bytes)
+            .with_context(|| format!("decode {}", meta_path.display()))?;
+        if meta.dimension != DIMENSION {
+            return Err(anyhow::anyhow!(
+                "snapshot dim={} does not match runtime dim={DIMENSION}",
+                meta.dimension
+            ));
+        }
+        let n = meta.id_to_chunk.len();
+        if n == 0 {
+            // Empty snapshot: clear inner state, skip hnsw load.
+            let mut inner = self.inner.write().unwrap();
+            *inner = HnswInner::empty();
+            tracing::info!(dir = %dir.display(), "kb hnsw: restored empty snapshot");
+            return Ok(true);
+        }
+        if !graph_path.exists() || !data_path.exists() {
+            return Err(anyhow::anyhow!(
+                "snapshot meta present but graph/data files missing in {}",
+                dir.display()
+            ));
+        }
+        // hnsw_rs's `load_hnsw` returns `Hnsw<'b, T, D>` borrowed from
+        // the `HnswIo` instance. To store the loaded handle in our
+        // `'static`-bounded `HnswInner`, we `Box::leak` the HnswIo so
+        // the mmap'd backing data outlives any subsequent search.
+        // This is a one-shot startup cost; a later `rebuild()`
+        // replaces the inner hnsw with a freshly-constructed one and
+        // the leaked HnswIo simply remains as unused mmap pages
+        // (kernel will reclaim them when the file is unmapped on
+        // process exit). Acceptable trade for wait-free restores.
+        let reloader_box: Box<HnswIo> = Box::new(HnswIo::new(dir, SNAPSHOT_NAME));
+        let reloader: &'static mut HnswIo = Box::leak(reloader_box);
+        let hnsw: Hnsw<'static, f32, DistCosine> = reloader
+            .load_hnsw::<f32, DistCosine>()
+            .map_err(|e| anyhow::anyhow!("hnsw load: {e}"))?;
+        let mut chunk_to_id = HashMap::with_capacity(n);
+        for (i, id) in meta.id_to_chunk.iter().enumerate() {
+            chunk_to_id.insert(id.clone(), i);
+        }
+        let new_inner = HnswInner {
+            hnsw,
+            id_to_chunk: meta.id_to_chunk,
+            chunk_to_id,
+        };
+        *self.inner.write().unwrap() = new_inner;
+        tracing::info!(n, dir = %dir.display(), "kb hnsw: snapshot restored");
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -245,5 +355,51 @@ mod tests {
         let hits = cache.search(&v2, 1);
         assert!(!hits.is_empty());
         assert_eq!(hits[0].0, "c1");
+    }
+
+    #[test]
+    fn snapshot_roundtrip_preserves_search() {
+        let dir = TempDir::new().unwrap();
+        let dump_dir = dir.path().join("snap");
+        let cache = HnswCache::empty();
+        // Build a few orthogonal vectors so search has signal.
+        let mut v_alpha = vec![0.0_f32; DIMENSION];
+        v_alpha[0] = 1.0;
+        let mut v_beta = vec![0.0_f32; DIMENSION];
+        v_beta[1] = 1.0;
+        cache.insert("alpha", &v_alpha).unwrap();
+        cache.insert("beta", &v_beta).unwrap();
+        cache.snapshot(&dump_dir).unwrap();
+
+        // Restore into a fresh cache; search must still find alpha first.
+        let restored = HnswCache::empty();
+        assert!(restored.restore(&dump_dir).unwrap());
+        assert_eq!(restored.len(), 2);
+        let hits = restored.search(&v_alpha, 1);
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].0, "alpha");
+    }
+
+    #[test]
+    fn restore_returns_false_when_no_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let cache = HnswCache::empty();
+        assert!(!cache.restore(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn snapshot_empty_cache_writes_meta_only() {
+        let dir = TempDir::new().unwrap();
+        let dump_dir = dir.path().join("empty");
+        let cache = HnswCache::empty();
+        cache.snapshot(&dump_dir).unwrap();
+        assert!(dump_dir.join("snapshot.meta.json").exists());
+        // The hnsw_rs files MUST NOT be written for empty caches
+        // (file_dump panics if there's no data).
+        assert!(!dump_dir.join("snapshot.hnsw.graph").exists());
+        // Restoring round-trips to an empty cache.
+        let restored = HnswCache::empty();
+        assert!(restored.restore(&dump_dir).unwrap());
+        assert_eq!(restored.len(), 0);
     }
 }

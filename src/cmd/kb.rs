@@ -360,12 +360,23 @@ fn compact(kb_root: PathBuf) -> Result<()> {
     let h = open_kb(&kb_root)?;
     let now = chrono::Utc::now().timestamp_millis();
     let stats = run_compactor_tick(&h.store, &h.paths, now)?;
+    // Spec §6 pairs the compactor tick with an HNSW snapshot dump.
+    // Errors here are non-fatal — snapshot is a performance
+    // optimisation; the next startup just rebuilds from redb.
+    let snapshot_status = match h.index.snapshot_hnsw(&h.paths) {
+        Ok(()) => "ok",
+        Err(e) => {
+            tracing::warn!("kb snapshot dump failed: {e:#}");
+            "failed"
+        }
+    };
     println!(
         "{}",
         serde_json::json!({
             "orphans_deleted": stats.orphans_deleted,
             "ledger_advanced_to_cleanup": stats.ledger_advanced_to_cleanup,
             "ledger_advanced_to_done": stats.ledger_advanced_to_done,
+            "hnsw_snapshot": snapshot_status,
         })
     );
     Ok(())

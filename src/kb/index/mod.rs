@@ -32,11 +32,26 @@ impl KbIndex {
         })
     }
 
-    /// Open + rebuild from redb. Use at startup.
+    /// Open + populate the dense layer. Tries the on-disk HNSW
+    /// snapshot first (cheap, no embedder work); falls back to a
+    /// full rebuild from redb (cost: O(N log N) hnsw inserts).
+    /// Tantivy is always rebuilt from redb — it's already a persistent
+    /// on-disk index so the upsert path is cheap.
     pub fn open_and_rebuild(paths: &KbPaths, store: &KbStore) -> Result<Self> {
         let idx = Self::open(paths)?;
-        rebuild::from_redb(&idx, store)?;
+        let snapshot_dir = paths.root.join("hnsw");
+        let restored = idx.hnsw.restore(&snapshot_dir).unwrap_or(false);
+        if !restored {
+            idx.hnsw.rebuild(store)?;
+        }
+        idx.tantivy.rebuild(store)?;
         Ok(idx)
+    }
+
+    /// Write a snapshot of the HNSW state under `<paths.root>/hnsw/`.
+    /// Cheap to call; idempotent.
+    pub fn snapshot_hnsw(&self, paths: &KbPaths) -> Result<()> {
+        self.hnsw.snapshot(&paths.root.join("hnsw"))
     }
 
     /// Upsert a chunk into both indexes. Caller wraps multiple upserts
