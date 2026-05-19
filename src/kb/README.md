@@ -49,6 +49,9 @@ Week 2 plan: `docs/plans/2026-05-19-kb-mvp-week2-pipeline.md`.
   an id orphans the old vertex; compactor reaps via rebuild).
 - **TantivyIndex** (`index/tantivy.rs`) — BM25 with `chunk_id`-keyed
   delete-then-add upsert + `delete_all_documents` for full rebuild.
+  Uses the `JiebaTokenizer` (`index/cjk.rs`) so Chinese queries
+  match against jieba-segmented tokens; ASCII queries round-trip
+  identically.
 - **KbIndex composite** (`index/mod.rs`) — single handle wraps both
   layers; `upsert_chunk` + `commit` are the worker write path.
 - **Worker integration** — `ChunkAndEmbed` handler writes to both
@@ -90,17 +93,30 @@ Week 2 plan: `docs/plans/2026-05-19-kb-mvp-week2-pipeline.md`.
   synchronously drains the worker pool so follow-up `kb search`
   sees fresh chunks immediately.
 
+**Week 5 (Polish):**
+
+- **CJK tokenizer** (`index/cjk.rs`) — `JiebaTokenizer` registered
+  as tantivy's `cjk` analyzer. The schema applies it to
+  `indexed_text` so Chinese BM25 queries actually match.
+- **Regex entity extractor** (`entities/extract.rs`) — pulls URLs /
+  emails / hashtags / @-mentions out of each chunk's
+  `indexed_text`. The worker handler upserts `KbEntity` +
+  `KbEntityIndex` edges per chunk, activating
+  `kb_search_entities`. CJK hashtags supported.
+
 ## What's NOT in Weeks 1–4
 
 - BGE-M3 embedder (real model) — Week 2.5 (self-contained behind `KbEmbedder` trait)
-- HNSW snapshot persistence — Week 3.5 (rebuild from redb on startup today)
-- CJK tokenizer for tantivy — Week 3.5 (whitespace + lowercase today)
-- BGE-M3 real embedder — Week 2.5
-- Entity extraction — Week 4.5 (chunk-entity edges, `boost_entities`/`require_entities` activation)
-- Scheduled syncer ticks (cron integration) — Week 4.5
+- HNSW snapshot persistence — Week 5.5 (rebuild from redb on startup today)
+- BGE-M3 real embedder — Week 2.5 (StubEmbedder today)
+- Entity boosting in retrieval — Week 5.5 (`boost_entities` /
+  `require_entities` filters currently no-op; entity edges now exist
+  so a Week 5.5 task wires them into the search pipeline)
+- Scheduled syncer ticks (cron integration) — Week 5.5
 - LocalFolderSyncer, MailSyncer, ChatSyncer — V2 (post-MVP)
 - `kb_explain` retrieval trace — V2 (post-MVP)
 - Tauri admin UI — V2 (post-MVP)
+- ML-based NER (replaces regex extractor) — V2 (post-MVP)
 
 ## Architecture invariants (verify after every code change)
 
@@ -227,6 +243,22 @@ Week 2 plan: `docs/plans/2026-05-19-kb-mvp-week2-pipeline.md`.
     the worker pool synchronously so an immediate `kb search` sees
     fresh chunks.
 
+### Added in Week 5 (Polish)
+
+23. **CJK BM25 search works** — `JiebaTokenizer` is registered as
+    tantivy's `cjk` analyzer and applied to the `indexed_text`
+    field's `TextOptions`. The default whitespace+lowercase
+    analyzer reduced Chinese sentences to a single un-searchable
+    token; jieba splits them into searchable terms. Covered by
+    `kb::index::tantivy::tests::chinese_query_matches_chinese_doc`.
+24. **Entity edges land on every chunk write** — the regex
+    extractor (`entities/extract.rs`) runs inside the same
+    `wtx` as the chunk insert, so `KbEntityIndex` rows are
+    consistent with chunks. `kb_search_entities` returns these
+    edges; `boost_entities` / `require_entities` filters can be
+    wired in Week 5.5 without re-ingest. Covered by
+    `tests/kb_entities_e2e.rs::entities_extracted_and_queryable`.
+
 ## Quick start (Weeks 1–2)
 
 ```rust
@@ -296,6 +328,7 @@ cargo test --test kb_week2_recovery      # Week 2 crash recovery (2)
 cargo test --test kb_week3_search        # Week 3 retrieval e2e (1)
 cargo test --test kb_week4_syncers       # Week 4 syncer e2e (2)
 cargo test --test kb_week4_compactor     # Week 4 compactor integration (1)
+cargo test --test kb_entities_e2e        # Week 5 entity extraction (1)
 ```
 
 End-to-end CLI smoke:
