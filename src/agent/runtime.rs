@@ -5428,10 +5428,21 @@ impl AgentRuntime {
                             let v = if tool_name == "read_artifact" {
                                 v
                             } else {
+                                // Web tools fetch articles where the LLM
+                                // usually wants the lede + structure in
+                                // one shot; a wider preview saves a
+                                // follow-up read_artifact call.
+                                let budget = match tool_name.as_str() {
+                                    "web_fetch" | "web_browser" | "web_search" => {
+                                        crate::artifact::PreviewBudget::WEB
+                                    }
+                                    _ => crate::artifact::PreviewBudget::DEFAULT,
+                                };
                                 crate::artifact::compact_value(
                                     crate::artifact::default_store(),
                                     &ctx.session_key,
                                     v,
+                                    budget,
                                 )
                             };
                             if let Some(s) = v.as_str() {

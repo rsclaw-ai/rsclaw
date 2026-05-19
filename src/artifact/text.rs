@@ -49,7 +49,10 @@ pub fn head_tail(lines: &[String], head: u32, tail: u32) -> Vec<String> {
     if head == 0 && tail == 0 {
         return lines.to_vec();
     }
-    if lines.len() <= head + tail {
+    // Require at least 3 omitted lines before we bother with a marker.
+    // Smaller savings produce noise like `... 1 lines omitted ...` whose
+    // text overhead is longer than the row it replaced.
+    if lines.len() <= head + tail + 3 {
         return lines.to_vec();
     }
     let omitted = lines.len() - head - tail;
