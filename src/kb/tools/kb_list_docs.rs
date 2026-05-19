@@ -6,7 +6,6 @@ use crate::kb::search::SearchCtx;
 use crate::kb::store::codec::decode;
 use crate::kb::store::schema::KB_DOCS;
 use anyhow::Result;
-use redb::ReadableTable;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]

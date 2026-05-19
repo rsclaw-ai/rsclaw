@@ -2448,3 +2448,65 @@ git commit -m "docs(kb): README — Week 3 scope + invariants 15–18 + retrieva
 - [ ] Visibility filter is wired through `kb_search`, `kb_fetch`, `kb_list_docs`, `kb_similar` — every retrieval entry point.
 - [ ] `HandlerCtx` gains `index: Arc<KbIndex>` and existing Week 2 tests are updated to construct it.
 - [ ] Spec §3 / §K / §L points each map to a concrete task or are explicitly deferred.
+
+---
+
+## Execution-time fix sweep — eight more findings, all fixed
+
+These surfaced *during* Week 3 execution and were fixed inline at the
+failure point. Plan + code are consistent; the final test suite is
+192 unit + 10 integration, 0 ignored, 0 failed.
+
+1. **T2 entity model mismatch** — plan assumed Week 1 `KbEntity` had
+   `id`/`canonical_name`/`aliases`/`description` and a `Place` variant.
+   Week 1 actually ships `canonical_id`/`surface_forms`/`kind`/`created_at`
+   and no `Place`. Rewrote `store::entities` against the real model:
+   linear `find_by_surface` scan over `surface_forms`, `chunks_for_entity`
+   over the entity→chunk index. Inverted-index optimisation is a Week 4
+   follow-up.
+
+2. **T3 `HnswCache::insert` placeholder didn't compile** — plan body
+   left a `i_must_keep_compiler_happy_about_v_id` token + ad-hoc TODO.
+   Replaced the whole module with a `RwLock<HnswInner>` design:
+   append-only `insert` (re-inserts orphan the old vertex; rebuild
+   from redb reaps), `search` reads under shared lock, `rebuild`
+   constructs a fresh hnsw + swaps under exclusive lock. ArcSwap is a
+   Week 3.5 optimisation once we have a hot-read benchmark.
+
+3. **T7/T11/T13 `KbSourceKind::from_str`** — Week 1 actually exposes
+   `KbSourceKind::parse(&str) -> Result<Self, String>`. All tool
+   wrappers updated to use `parse(...).ok()`.
+
+4. **T10 `KbLocator` variant fields** — plan named the wrong fields:
+   - `MdSection { line, .. }` → actual `MdSection { heading_path }`
+   - `UrlAnchor { anchor, .. }` → actual `UrlAnchor { fragment }`
+   Fixed by using the existing `KbLocator::human()` method from Week 1
+   instead of writing a parallel renderer in the pipeline.
+
+5. **T10 `KbSource::Url { url }`** — actual variant has
+   `Url { url, fetched_at }`. Fixed `render_source` to destructure
+   with `Url { url, .. }`.
+
+6. **T11 manual `Serialize` impls** — plan hand-wrote `Serialize` for
+   `RetrievalHit` and `Citation`. Replaced with `#[derive(Serialize)]`;
+   `KbLocator` already derives `Serialize` so nesting works.
+
+7. **T15 entity field mismatch** — plan's `EntityMatch` used
+   `canonical_name`/`aliases` which don't exist on Week 1 `KbEntity`.
+   Use first `surface_forms` as the display name, rest as aliases.
+
+8. **T5 test tantivy `LockBusy`** — `open_and_rebuild_recovers_both_layers`
+   opened two `KbIndex` instances on the same `idx/tantivy/` path
+   simultaneously (the worker's pre-index + the post-rebuild check).
+   Tantivy holds a per-process exclusive directory lock. Fixed by
+   scoping the worker's index in a block so the lock is released
+   before the rebuild check opens its own.
+
+Smoke after sweep:
+
+```bash
+$ cargo test -p rsclaw --lib kb::
+test result: ok. 192 passed; 0 failed; 0 ignored
+$ cargo test --test kb_week1_e2e --test kb_week2_pipeline --test kb_week2_recovery --test kb_week3_search
+all pass (6 + 1 + 2 + 1 = 10 integration tests)
+```
