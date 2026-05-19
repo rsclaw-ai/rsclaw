@@ -23,6 +23,9 @@ pub mod canonicalize;
 pub mod chunker;
 pub mod ledger;
 pub mod jobs;
+pub mod embedder;
+pub mod pipeline;
+pub mod worker;
 pub mod util;
 
 // Public façade — re-export the surface most callers need so they
