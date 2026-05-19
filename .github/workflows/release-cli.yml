@@ -27,10 +27,10 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-22.04
+            os: ubuntu-24.04
             archive: tar.gz
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-22.04-arm
+            os: ubuntu-24.04-arm
             archive: tar.gz
           - target: x86_64-apple-darwin
             os: macos-14
@@ -61,7 +61,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libwayland-dev libpipewire-0.3-dev libegl-dev libxkbcommon-dev
+          sudo apt-get install -y protobuf-compiler libwayland-dev libpipewire-0.3-dev libegl-dev libxkbcommon-dev libgbm-dev
 
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
