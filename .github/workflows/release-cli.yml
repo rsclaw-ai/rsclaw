@@ -61,7 +61,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libwayland-dev libpipewire-0.3-dev
+          sudo apt-get install -y protobuf-compiler libwayland-dev libpipewire-0.3-dev libegl-dev libxkbcommon-dev
 
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
