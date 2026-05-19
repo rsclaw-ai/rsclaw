@@ -22,9 +22,11 @@
 //! service-managed launch (launchd / systemd) where there's no shell
 //! env to inherit from.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use anyhow::Result;
 use regex::Regex;
@@ -88,7 +90,30 @@ pub fn reconcile(raw_config: &str, base_dir: &Path) -> Result<()> {
         }
     }
 
-    let file_changed = !updated.is_empty() || !added.is_empty();
+    // Fallback: vars that are STILL unresolved (not in shell snapshot
+    // and not in .env) — try sourcing the user's login shell rc to
+    // pick them up. Common when launchd/systemd starts gateway with
+    // an empty env and the user has only ever exported the var in
+    // their ~/.zshrc (never written to .env). One-shot per process —
+    // self-restart children skip via _RSCLAW_ENV_INHERITED marker.
+    let still_missing: Vec<String> = needed
+        .iter()
+        .filter(|v| std::env::var_os(v.as_str()).is_none())
+        .cloned()
+        .collect();
+    let mut recovered_from_rc: BTreeMap<String, String> = BTreeMap::new();
+    if !still_missing.is_empty() {
+        if let Some(found) = shell_rc_fallback(&still_missing) {
+            for (k, v) in &found {
+                // SAFETY: same single-threaded boot phase as above.
+                unsafe { std::env::set_var(k, v) };
+                file.insert(k.clone(), v.clone());
+                recovered_from_rc.insert(k.clone(), v.clone());
+            }
+        }
+    }
+
+    let file_changed = !updated.is_empty() || !added.is_empty() || !recovered_from_rc.is_empty();
     if file_changed {
         env_file::write(&env_path, &file)?;
         if !added.is_empty() {
@@ -105,9 +130,182 @@ pub fn reconcile(raw_config: &str, base_dir: &Path) -> Result<()> {
                 ".env: updated vars from shell (rotation)"
             );
         }
+        if !recovered_from_rc.is_empty() {
+            tracing::info!(
+                vars = ?recovered_from_rc.keys().collect::<Vec<_>>(),
+                path = %env_path.display(),
+                ".env: recovered vars by sourcing shell rc files"
+            );
+        }
     }
 
     Ok(())
+}
+
+/// Spawn the user's login shell with `-lic 'env'` to source their
+/// rc/profile files and capture the resulting env. Only used as a
+/// last-resort fallback when a config-referenced var is missing from
+/// both the shell snapshot and `.env`. Filters output to just the
+/// `wanted` list — we don't want to leak unrelated shell-only vars
+/// (PROMPT_COMMAND, PS1, HISTFILE, …) into .env.
+///
+/// Returns `None` when:
+///   - on Windows (no POSIX rc-file convention here)
+///   - `_RSCLAW_ENV_INHERITED=1` is already set (we're a self-restart
+///     child of a process that already ran this)
+///   - `RSCLAW_NO_SHELL_SOURCE=1` is set (operator opt-out)
+///   - we couldn't determine the login shell or it doesn't exist
+///   - the shell timed out, returned non-zero, or wrote no env output
+fn shell_rc_fallback(wanted: &[String]) -> Option<BTreeMap<String, String>> {
+    if cfg!(windows) {
+        return None;
+    }
+    if std::env::var_os("_RSCLAW_ENV_INHERITED").is_some() {
+        return None;
+    }
+    if std::env::var_os("RSCLAW_NO_SHELL_SOURCE").is_some() {
+        return None;
+    }
+
+    let shell = resolve_login_shell()?;
+    tracing::debug!(
+        shell = %shell,
+        vars = ?wanted,
+        "env reconcile: sourcing shell rc to recover missing vars"
+    );
+
+    // `$SHELL -lic 'env'` — login + interactive flags trigger the full
+    // rc/profile chain on bash/zsh; fish honours `-l -c` similarly and
+    // ships `env` on PATH. The `-i` flag is the load-bearing one for
+    // bash/zsh: `.bashrc` / `.zshrc` are sourced only for interactive
+    // shells.
+    let mut cmd = Command::new(&shell);
+    cmd.args(["-lic", "env"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    let output = match run_with_timeout(cmd, Duration::from_secs(5)) {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(
+                shell = %shell,
+                error = %e,
+                "env reconcile: shell rc source failed"
+            );
+            // Set the marker anyway so a flaky shell doesn't cause us
+            // to retry every config load.
+            unsafe { std::env::set_var("_RSCLAW_ENV_INHERITED", "1") };
+            return None;
+        }
+    };
+    if !output.status.success() {
+        tracing::warn!(
+            shell = %shell,
+            exit = ?output.status.code(),
+            "env reconcile: shell rc source exited non-zero"
+        );
+        unsafe { std::env::set_var("_RSCLAW_ENV_INHERITED", "1") };
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let want: std::collections::HashSet<&str> = wanted.iter().map(String::as_str).collect();
+    let mut found = BTreeMap::new();
+    for line in stdout.lines() {
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        if want.contains(k) {
+            found.insert(k.to_owned(), v.to_owned());
+        }
+    }
+
+    // Always mark — even an empty result means "we tried and
+    // shouldn't retry on hot-reload".
+    unsafe { std::env::set_var("_RSCLAW_ENV_INHERITED", "1") };
+
+    if found.is_empty() { None } else { Some(found) }
+}
+
+/// Find the user's login shell. `$SHELL` is the fast path; falls back
+/// to `getent passwd` (Linux) or `dscl . -read /Users/<user>` (macOS)
+/// for the launchd / systemd case where the supervisor doesn't pass
+/// `$SHELL` through.
+fn resolve_login_shell() -> Option<String> {
+    if let Ok(s) = std::env::var("SHELL") {
+        if !s.is_empty() && Path::new(&s).exists() {
+            return Some(s);
+        }
+    }
+    let user = std::env::var("USER").or_else(|_| std::env::var("LOGNAME")).ok()?;
+
+    #[cfg(target_os = "macos")]
+    {
+        let out = Command::new("dscl")
+            .args([".", "-read", &format!("/Users/{user}"), "UserShell"])
+            .output()
+            .ok()?;
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            // dscl prints "UserShell: /bin/zsh"
+            if let Some((_, v)) = s.split_once(':') {
+                let shell = v.trim().to_owned();
+                if Path::new(&shell).exists() {
+                    return Some(shell);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let out = Command::new("getent")
+            .args(["passwd", &user])
+            .output()
+            .ok()?;
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            // getent prints "user:x:uid:gid:gecos:/home/user:/bin/bash"
+            let shell = s.trim().rsplit(':').next()?.to_owned();
+            if Path::new(&shell).exists() {
+                return Some(shell);
+            }
+        }
+    }
+
+    None
+}
+
+/// Run a child to completion or kill it on timeout. Designed for the
+/// shell-rc fallback path where a hung shell would otherwise wedge
+/// gateway startup forever.
+fn run_with_timeout(mut cmd: Command, dur: Duration) -> Result<std::process::Output> {
+    let child = cmd.spawn()?;
+    let pid = child.id();
+
+    // Move the child into a worker thread that waits for it. The
+    // worker sends the output back through a channel. Meanwhile the
+    // caller waits on the channel with a timeout — if the timeout
+    // fires before the worker sends, we SIGTERM the child by PID.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+
+    match rx.recv_timeout(dur) {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => {
+            #[cfg(unix)]
+            // SAFETY: libc::kill on a PID we just spawned; sending
+            // SIGTERM is benign even if the child has already exited.
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
+            anyhow::bail!("shell command timed out after {dur:?}")
+        }
+    }
 }
 
 /// `${VAR}` placeholder regex — matches the same shape as
