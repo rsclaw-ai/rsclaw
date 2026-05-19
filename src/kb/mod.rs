@@ -54,3 +54,4 @@ pub use jobs::{ClaimToken, Job, JobKind, JobStatus};
 pub use util::redact;
 pub use embedder::{KbEmbedder, StubEmbedder};
 pub use pipeline::{ingest_canonicalized, IngestInput, IngestOutput};
+pub use worker::{DefaultDispatcher, HandlerCtx, JobHandler, WorkerConfig, WorkerPool};
