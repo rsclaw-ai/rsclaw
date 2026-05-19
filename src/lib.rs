@@ -77,6 +77,7 @@ pub mod gateway;
 pub mod heartbeat;
 pub mod hooks;
 pub mod i18n;
+pub mod kb;
 pub mod mcp;
 pub mod migrate;
 pub mod plugin;
