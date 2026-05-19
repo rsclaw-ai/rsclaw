@@ -221,8 +221,6 @@ mod tests {
         assert_eq!(done.len(), 1);
     }
 
-    // ISSUE #3: blocked on stage_doc version-aware path support.
-    #[ignore = "blocked on stage_doc version-aware path support (issue #3)"]
     #[test]
     fn new_version_drops_old_chunks() {
         use crate::kb::canonicalize::CanonicalizeInput;

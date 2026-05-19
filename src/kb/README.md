@@ -72,11 +72,18 @@ Week 2 plan: `docs/plans/2026-05-19-kb-mvp-week2-pipeline.md`.
    `rename(2)` overwrites. Covered by
    `kb::content_store::atomic::tests::write_if_new_concurrent_no_clobber`
    (20-iteration thread race).
-4. **`stage_doc` errors on divergent body at the same path**: a
-   `write_if_new=false` with a different body means either (a) a
-   32-bit `lsid_hash8` collision or (b) a non-deterministic
-   canonicalizer — both must surface immediately, not silently. Covered
-   by `kb::content_store::tests::stage_collision_with_divergent_body_errors`.
+4. **Markdown paths are content-addressed**: layout is
+   `md/<kind>/<slug>--<lsid8>--<md8>.md` where `lsid8` =
+   `sha256(logical_source_id)[:8]` and `md8` =
+   `sha256(body)[:8]`. Same lsid + same content → same path
+   (idempotent re-ingest). Same lsid + new content (v2 ingest under a
+   stable seed) → different path; both versions coexist until the
+   Week 4 compactor reaps the old file. `stage_doc` still errors on
+   any body mismatch at a same-path hit (full 64-bit suffix
+   collision, ~2^-32). Covered by
+   `kb::content_store::paths::tests::markdown_rel_same_lsid_different_body_different_path`
+   and
+   `kb::content_store::tests::stage_same_lsid_different_body_lands_at_different_paths`.
 5. **Files are stage-only**: nothing in `canonicalize/` or
    `content_store/` deletes files. Deletion happens via the compactor
    + ledger reconciliation in Week 4.

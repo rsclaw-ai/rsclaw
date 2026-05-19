@@ -324,14 +324,6 @@ mod tests {
         assert_eq!(jobs_store::list_by_status(&rtx, JobStatus::Ready).unwrap().len(), 1);
     }
 
-    // ISSUE #3 in fix-sweep TODO: Week 1's stage_doc treats
-    // `{slug}--{lsid8}.md` as a stable address keyed off the
-    // logical_source_id and refuses to overwrite with different
-    // body bytes — collision detection. This v2 scenario (same
-    // lsid_seed, new content) needs stage_doc to support
-    // version-aware paths (e.g. `--v{N}` suffix) before this test
-    // can pass. Ignoring until the stage_doc fix lands.
-    #[ignore = "blocked on stage_doc version-aware path support (issue #3)"]
     #[test]
     fn reingest_different_bytes_bumps_version() {
         let (_tmp, store, paths) = fixture();

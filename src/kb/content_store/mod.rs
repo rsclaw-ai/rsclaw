@@ -42,23 +42,25 @@ pub struct StageInput<'a> {
 }
 
 pub fn stage_doc(paths: &KbPaths, input: StageInput<'_>) -> Result<StagedDoc> {
-    let md_rel = paths::markdown_rel_path(input.kind, input.slug, input.logical_source_id);
-    let md_abs = paths.root.join(&md_rel);
+    // Compose first so we can derive body_sha and use it in the path.
+    // The path is now content-addressed (`--<lsid8>--<md8>.md`) so a
+    // v2 ingest under the same `logical_source_id` but new content
+    // lands at a distinct file instead of colliding with v1.
     let composed = compose_doc_file(&input.front, input.body)?;
     let parsed = parse_doc_file(&composed)?;
     let new_body_sha = atomic::sha256_hex(parsed.body.as_bytes());
+    let md_rel =
+        paths::markdown_rel_path(input.kind, input.slug, input.logical_source_id, &new_body_sha);
+    let md_abs = paths.root.join(&md_rel);
 
     let wrote = atomic::write_if_new(&md_abs, composed.as_bytes())?;
     let md_sha = if wrote {
         new_body_sha
     } else {
-        // Path already on disk — must be a re-ingest of the same
-        // logical_source_id (the only way to land at this path).
-        // Verify the existing body matches what we'd have written; if
-        // it doesn't, that's either (a) a 32-bit lsid_hash8 collision
-        // or (b) a non-deterministic canonicalizer — both worth
-        // surfacing immediately instead of silently returning a sha
-        // that doesn't match the bytes on disk (the original bug).
+        // Path already on disk — same lsid8 AND same md8 means the
+        // body bytes should be identical. Verify and surface a hard
+        // error on any divergence (would imply a full 64-bit suffix
+        // collision or a non-deterministic canonicalizer).
         let existing = std::fs::read(&md_abs)
             .with_context(|| format!("read existing {}", md_abs.display()))?;
         let existing_str = std::str::from_utf8(&existing)
@@ -68,8 +70,8 @@ pub fn stage_doc(paths: &KbPaths, input: StageInput<'_>) -> Result<StagedDoc> {
         if existing_sha != new_body_sha {
             return Err(anyhow::anyhow!(
                 "stage_doc collision at {}: existing body sha {} ≠ new body sha {} \
-                 (logical_source_id={}, doc_id={}). Two different sources hashed to \
-                 the same lsid8 path suffix, OR the canonicalizer is non-deterministic. \
+                 (logical_source_id={}, doc_id={}). Full 64-bit lsid8+md8 suffix \
+                 collision (~2^-32 chance) or non-deterministic canonicalizer. \
                  Refusing to silently overwrite.",
                 md_abs.display(),
                 existing_sha,
@@ -235,19 +237,20 @@ mod tests {
     }
 
     #[test]
-    fn stage_collision_with_divergent_body_errors() {
-        // If two stage_doc calls land at the same path (same lsid)
-        // but with different bodies, the second MUST error rather
-        // than silently return a sha that doesn't match disk. This
-        // catches non-deterministic canonicalizers and 32-bit
-        // lsid_hash8 collisions.
+    fn stage_same_lsid_different_body_lands_at_different_paths() {
+        // With content-addressed paths (`--<lsid8>--<md8>.md`), the
+        // same lsid with different bodies maps to different files —
+        // this is the v2 ingest scenario where a URL/file source has
+        // a stable identity but mutable content. Both versions
+        // coexist; the compactor reclaims the old file once
+        // retrieval moves to the new version.
         let tmp = TempDir::new().unwrap();
         let p = KbPaths::new(tmp.path());
         p.ensure_layout().unwrap();
-        stage_doc(
+        let v1 = stage_doc(
             &p,
             StageInput {
-                doc_id: "01H",
+                doc_id: "01A",
                 kind: KbSourceKind::Doc,
                 slug: "x",
                 logical_source_id: "file:sha256:eeee",
@@ -258,10 +261,10 @@ mod tests {
             },
         )
         .unwrap();
-        let err = stage_doc(
+        let v2 = stage_doc(
             &p,
             StageInput {
-                doc_id: "01H",
+                doc_id: "01B",
                 kind: KbSourceKind::Doc,
                 slug: "x",
                 logical_source_id: "file:sha256:eeee",
@@ -271,9 +274,15 @@ mod tests {
                 keep_raw: false,
             },
         )
-        .unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("collision"), "want collision error, got: {msg}");
+        .unwrap();
+        assert_ne!(
+            v1.markdown_rel_path, v2.markdown_rel_path,
+            "v1 and v2 must land at different paths"
+        );
+        assert_ne!(v1.markdown_sha256, v2.markdown_sha256);
+        // Both files exist on disk.
+        assert!(p.root.join(&v1.markdown_rel_path).exists());
+        assert!(p.root.join(&v2.markdown_rel_path).exists());
     }
 
     #[test]

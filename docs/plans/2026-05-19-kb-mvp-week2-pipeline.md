@@ -813,10 +813,16 @@ pub fn mark_seen(
 ) -> Result<()> {
     let key = compose_seen_key(source_id, item_id);
     let mut tbl = wtx.open_table(KB_SEEN_ITEMS)?;
-    let existing = tbl.get(key.as_str())?;
+    // Decode existing inside a scope so the AccessGuard is dropped
+    // before the mutable `insert` borrow below — otherwise the
+    // immutable borrow from `tbl.get()` overlaps the mutable
+    // `tbl.insert()` and the borrow checker rejects.
+    let existing: Option<SeenRecord> = match tbl.get(key.as_str())? {
+        Some(v) => Some(decode(v.value())?),
+        None => None,
+    };
     let rec = match existing {
-        Some(v) => {
-            let mut r: SeenRecord = decode(v.value())?;
+        Some(mut r) => {
             r.last_seen_at = now_ms;
             r.raw_sha256 = raw_sha256.into();
             r
@@ -3401,7 +3407,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn end_to_end_ingest_then_worker_drains_async() -> Result<()> {
     let tmp = TempDir::new()?;
     let store = Arc::new(KbStore::open(&tmp.path().join("kb.redb"))?);
@@ -3707,3 +3713,41 @@ P2 findings (logging `last_error` from `reclaim_stale`, missing recovery
 matrix scenarios d/e in T13, unenforced `KbSource::Doc { path: "(manual)" }`
 placeholder) are NOT applied here. They are non-blocking and tracked for
 inline cleanup during execution.
+
+---
+
+## Execution-time fix sweep — three more findings, all fixed
+
+These surfaced *during* Week 2 execution and were either fixed inline at
+the failure point or batched into a unified sweep at the end. Plan +
+code are now consistent; tests pass end-to-end with 0 ignored.
+
+1. **T5 `mark_seen` borrow-checker** — the original plan code did
+   `let existing = tbl.get(...)?` then `tbl.insert(...)` in the same
+   scope; the immutable `AccessGuard` overlapped the mutable
+   `insert` borrow and the compiler rejected. Fixed by decoding the
+   existing record into an owned `Option<SeenRecord>` first so the
+   guard drops before `insert`. Plan code updated in-place.
+
+2. **T14 e2e tokio runtime flavor** — original plan used
+   `#[tokio::test]` (single-threaded default) but `WorkerPool` uses
+   `tokio::task::block_in_place`, which panics on a single-threaded
+   runtime. Changed to
+   `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]`.
+
+3. **stage_doc content-addressed path** — the original
+   `paths::markdown_rel_path` produced `md/<kind>/<slug>--<lsid8>.md`,
+   which made the v2 ingest scenario (stable `logical_source_id_seed`
+   + new content) collide on the existing file. The
+   `reingest_different_bytes_bumps_version` (T10) and
+   `new_version_drops_old_chunks` (T11) tests were both blocked. Fix:
+   extended `markdown_rel_path` to take `body_sha256_hex` and
+   produce `md/<kind>/<slug>--<lsid8>--<md8>.md` — different content
+   under the same lsid now lands at a different file. `stage_doc`
+   composes first to derive `body_sha`, then derives the path. Both
+   versions coexist on disk until Week 4's compactor reaps the old
+   file. Week 1's existing tests (`reingest_same_source_lands_at_same_path`,
+   etc.) still pass because identical content still maps to the same
+   path. The collision-error test in `content_store/mod.rs` was
+   updated to verify the new "different body → different path"
+   semantic.
