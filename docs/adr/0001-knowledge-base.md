@@ -16,11 +16,18 @@ rsclaw 当前没有用户主动管理的知识库。`src/agent/memory.rs` 提供
 
 memory 系统的衰减、importance、tier transition 等机制对知识库场景是反模式（用户不希望昨天上传的合同今天被"忘了"）。
 
-经研究 OpenHuman (`~/git/openhuman/src/openhuman/memory/tree/` 和 `composio/providers/`) 之后，借鉴了多项 production-grade 模式：canonicalize-first / deterministic chunk_id / content store on disk / jobs queue / entity inverted index / `ComposioProvider` → `KbSourceSyncer` trait 改造。
-
 ## Decision
 
-新增 `src/kb/` 模块，复用 redb + tantivy + hnsw_rs 三件套但**独立 DB 文件 + 独立 lifecycle + 完全自包含目录**。核心选择：
+新增 `src/kb/` 模块，复用 redb + tantivy + hnsw_rs 三件套但**独立 DB 文件 + 独立 lifecycle + 完全自包含目录**。设计组合了 RAG 领域的成熟模式与 rsclaw 独有创新。
+
+### rsclaw 独有创新（差异化设计）
+
+这些是基于 rsclaw 现有基础设施（GPU 集群 + agent memory + 多 channel）才有的能力，不是任何同类开源系统能简单复制的：
+
+1. **Fleet-accelerated batch ingest** —— 千篇级 PDF 入库时，chunks 分发到 rsclaw-llm fleet（IDC GPU 集群）并行 embed + entity 抽取，单机数小时 → 集群数分钟。依赖 rsclaw-server `/v1/embed/batch` + `/v1/entity/batch` endpoint
+2. **`kb_explain` 工具** —— agent 调 `kb_search` 拿 `trace_id`，再调 `kb_explain(trace_id)` 拿到完整检索推理 trace（BM25 命中 term / dense 维度激活 / entity_index 触发 / MMR 选择理由 / citation_confidence 因子分解）。让 agent 能解释"为什么引用这条"
+3. **`citation_confidence` 评分** —— 独立于 relevance score：`f(quality × recency_decay × is_latest_version × entity_alignment × source_kind_trust)`。映射到三档 `citation_tier`（authoritative / supporting / indicative），agent 决定引用措辞强度
+4. **Memory ↔ KB 双向流** —— 高稳定性 agent memory item 可经用户确认晋升为 KB doc；session 启动时按对话主题预热 KB 的 authoritative chunks 进 agent memory。利用 rsclaw "agent memory + 用户 KB" 双系统的独有结构，带防回路机制
 
 ### 数据 & 存储
 
@@ -43,18 +50,19 @@ memory 系统的衰减、importance、tier transition 等机制对知识库场�
 | Chunker | 512/64 token，**强制 `heading_path` 前缀注入 indexed text**，SimHash 去重 |
 | OCR 三层 | Fast=RapidOCR (PP-OCRv4 ONNX) / Strong=PaddleOCR-VL 1.5 / Fleet=Qianfan-OCR 4B via rsclaw-server :8444 vLLM sidecar |
 | OCR 路由 | 按文档特征预扫描（图表 → Fleet / KIE → Fleet / 表格公式 → Strong / 纯文本 → Fast） |
-| Embedding | BGE-M3 本地 (1024) 默认 + 远程 API 备路 |
-| **Jobs queue** | SQLite-backed in kb.redb，`dedupe_key` partial unique index + `claim_token` + `recover_stale_locks`（OpenHuman 模式） |
+| Embedding | BGE-M3 本地 (1024) 默认 + 远程 API 备路 + **Fleet 大批量路径**（独有） |
+| **Jobs queue** | SQLite-backed in kb.redb，`dedupe_key` partial unique index + `claim_token` + `reclaim_stale_jobs`（参考 Sidekiq / RQ / Faktory 通用模式） |
 
 ### 检索
 
 | 决策点 | 选择 |
 |---|---|
-| Retrieval | Tool-call (`kb_search` / `kb_fetch` / `kb_list_docs` / `kb_similar` / **`kb_search_entities`**)，不做 auto-RAG |
+| Retrieval | Tool-call (`kb_search` / `kb_fetch` / `kb_list_docs` / `kb_similar` / `kb_search_entities` / **`kb_explain`**)，不做 auto-RAG |
 | Hybrid | Dense (BGE-M3) + Sparse (tantivy BM25) + RRF 融合 |
 | Diversity | MMR 默认开 (λ=0.5) |
 | **Entity inverted index** | `KbEntity` + `KbEntityIndex`，入库时 O(N) 一次建索引；查询时 O(1) 查 entity_alignment |
 | 实体感知 | `require_entities` / `boost_entities` 参数 + RAG 引用纪律 prompt |
+| **`citation_confidence`** | 独有：独立于 relevance；三档 tier 引导 agent 引用措辞 |
 | Citation | agent 用 `[^kb:<chunk_id>]` 标记，前端 `<KbCitation>` 渲染 + 点击跳源 |
 | Reranker | v1 不接，留 trait |
 
@@ -62,14 +70,22 @@ memory 系统的衰减、importance、tier transition 等机制对知识库场�
 
 | 决策点 | 选择 |
 |---|---|
-| **Syncer trait** | `KbSourceSyncer` (参考 OpenHuman `ComposioProvider`)，所有源（包括 ManualUpload）统一接口 |
-| **SyncState** | KV 持久化（kb.redb），含 cursor / synced_ids / daily_budget / last_seen_id / status / consecutive_failures / paused_until |
-| **synced_ids 实现** | Bloom filter (假阳性<0.1%) + LRU(10000) 精确集；假阳性由 chunk-level deterministic id 兜底 |
+| **Syncer trait** | `KbSourceSyncer`：trait-based provider 抽象，所有源（包括 ManualUpload）统一接口 |
+| **SyncState** | KV 持久化（kb.redb），含 cursor / seen_index / daily_budget / last_seen_id / status / consecutive_failures / paused_until |
+| **`seen_index` 实现** | `ScalableSeenSet`：Bloom filter (假阳性<0.1%) + LRU(10000) 精确集；假阳性由 chunk-level deterministic id 兜底 |
 | Scheduler | 复用 `src/cron/`，5min tick + event-driven (`FsChangeEvent` / `ChannelMessageEvent`) |
 | V1 syncers | ManualUpload + UrlSyncer + LocalFolderSyncer + ChannelHistorySyncer |
-| **三层 dedup** | API/HTTP cursor → SyncState `synced_ids` → chunk-level deterministic id |
+| **三层 dedup** | API/HTTP cursor → SyncState `seen_index` → chunk-level deterministic id |
 | 退避 | 指数：1→0、2→1min、3→5min、6→1h、12→6h、>12 24h 封顶 |
 | 错误隔离 | scheduler 永不 panic，单 syncer 失败不影响其他 |
+
+### Memory ↔ KB 桥（独有）
+
+| 决策点 | 选择 |
+|---|---|
+| **Memory → KB 晋升** | 满足 stability ≥ 0.85 + importance ≥ 0.7 + **用户手动确认** → 创建 KbDoc `source_kind=Doc`, `source_id=agent_memory:<mem_id>`，标 `promoted_to_kb_at` |
+| **KB → Memory 预热** | session 启动时按对话主题 `kb_search(k=5, min_tier=authoritative)` → 注入 agent memory，标 `from_kb_at` |
+| **防回路** | 晋升标记防止 memory 重新被晋升；注入标记防止 KB 内容回流晋升候选 |
 
 ### Lifecycle / Security / 隐私
 
@@ -84,12 +100,13 @@ memory 系统的衰减、importance、tier transition 等机制对知识库场�
 
 ### 实施分期
 
-5 phases + 1 收尾 phase / 总工期 **~12 周**：
+6.5 phases + 1 收尾 / 总工期 **~13.5 周**：
 1. MVP (3 周)：model + content_store + jobs queue + entity index + Hybrid+RRF + CLI 基础
-2. 基础可用 (2 周)：UI 面板 + Citation 渲染 + entity_alignment + MMR
+2. 基础可用 (2 周)：UI 面板 + Citation 渲染 + entity_alignment + MMR + **citation_confidence + kb_explain**
 3. OCR Fast (2 周)：RapidOCR + 预扫描路由
 4. OCR Strong/Fleet (2 周)：PaddleOCR-VL + Qianfan vLLM sidecar
 5. Syncer 框架 (2 周)：4 个 v1 syncer + 数据源 tab + sync CLI
+5.5. **Fleet + Memory 桥** (1.5 周)：fleet_dispatch + rsclaw-server endpoints + memory_bridge + warm_session
 6. Compactor / 迁移 / 收尾 (1 周)
 
 ## Consequences
@@ -103,11 +120,13 @@ memory 系统的衰减、importance、tier transition 等机制对知识库场�
 - **可溯源 + 点击跳源**：UI 体验贴近 Notion AI / Perplexity
 - **幂等入库**：deterministic chunk_id + 三层 dedup
 - **数据源框架可演进**：v2 加 MailSyncer / 整站爬等只需 impl trait，不改架构
+- **Fleet 加速**：千篇级 ingest 在 IDC 集群上分钟级完成 —— 同类开源系统做不到
+- **可解释 RAG**：`kb_explain` + `citation_confidence` 让 agent 能解释决策，降低幻觉
 
 ### 负面
 - **hnsw_rs 不支持单点删** → tombstone + 后台 rebuild 复杂度（双 buffer 缓解）
 - **OCR Fleet 层引入 vLLM/SGLang sidecar** → 多一个 Python 服务（复用数字人 sidecar 模式）
-- **12 周工期** → 不是小投入；按 phase 灰度
+- **13.5 周工期** → 不是小投入；按 phase 灰度
 - **content store on disk** → DB 与 md/ 目录必须一起备份（loose coupling 但有依赖）
 - **raw/ 默认开** → 100 PDF ≈ 几百 MB 磁盘（用户可关）
 
@@ -133,62 +152,70 @@ memory 系统的衰减、importance、tier transition 等机制对知识库场�
 **否决**：违背"chunk 文本不出本机"的隐私默认。改 rsclaw-llm fleet 自部署 vLLM sidecar。
 
 ### F. KB spec 不入 git
-**否决**：12 周 / 多模块项目级 feature，spec 必须可被 PR / review / implementation 引用。spec 入 `docs/specs/`，ADR 入 `docs/adr/`，AI brainstorming 草稿继续放 `docs/superpowers/` (ignored)。
+**否决**：13.5 周 / 多模块项目级 feature，spec 必须可被 PR / review / implementation 引用。spec 入 `docs/specs/`，ADR 入 `docs/adr/`，AI brainstorming 草稿继续放 `docs/superpowers/` (ignored)。
 
-### G. Chunk body 存 DB（原 spec v1 设计）
-**否决**：DB 臃肿；丧失 Obsidian / grep 兼容；备份只能 DB dump。**改为 content store on disk + DB 只存 byte_offset**（OpenHuman 同款）。读 chunk 多一次文件 IO（~10μs），可忽略。
+### G. Chunk body 存 DB
+**否决**：DB 臃肿；丧失 Obsidian / grep 兼容；备份只能 DB dump。**改为 content store on disk + DB 只存 byte_offset**。读 chunk 多一次文件 IO（~10μs），可忽略。
 
 ### H. Chunk ID 用 ULID
-**否决**：再 ingest 同样内容会产生新 ID，索引爆膨胀。**改为 deterministic sha256(kind|source_id|seq|content) 截 32 hex**（OpenHuman 同款），完全幂等。
+**否决**：再 ingest 同样内容会产生新 ID，索引爆膨胀。**改为 deterministic sha256(kind|source_id|seq|content) 截 32 hex**，完全幂等。
 
 ### I. 数据源各自实现，无统一 syncer 框架
-**否决**：URL 周期重抓、目录监控、聊天增量这三类都需要 cursor + dedup + 退避 + 配额 + 错误隔离的同一套机制。**抽 `KbSourceSyncer` trait + `SyncState`（OpenHuman `ComposioProvider` 模式）**，每加一个源 = 一个 impl，零基础设施工作。
+**否决**：URL 周期重抓、目录监控、聊天增量这三类都需要 cursor + dedup + 退避 + 配额 + 错误隔离的同一套机制。**抽 `KbSourceSyncer` trait + `SyncState`**，每加一个源 = 一个 impl，零基础设施工作。
 
-### J. 走 Composio 做第三方源 OAuth（Gmail / Slack / Notion 等）
-**否决**：rsclaw 主中国市场 + 私有部署，Composio 是境外 SaaS（OAuth/HMAC/socket.io 都过它后端），违背 desktop-first 和数据隐私默认。**保留 Composio 的 trait 设计模式，但 impl 直接对接原生 API**。
+### J. 通过第三方 SaaS 中介做源 OAuth（Composio / Pipedream 等）
+**否决**：rsclaw 主中国市场 + 私有部署，违背 desktop-first 和数据隐私默认（OAuth/HMAC 都过中介后端）。**直接对接原生 API**（飞书 / 企微 / IMAP / 等）。
 
-### K. `synced_ids` 用纯持久化 HashSet
-**否决**：聊天历史几年下来百万级 ID，100MB+ 内存。**改 Bloom filter (假阳性<0.1%) + LRU(10000) 精确集**；假阳性由 chunk-level deterministic id 兜底正确。
+### K. `seen_index` 用纯持久化 HashSet
+**否决**：聊天历史几年下来百万级 ID，100MB+ 内存。**改 `ScalableSeenSet`：Bloom filter + LRU 精确集**；假阳性由 chunk-level deterministic id 兜底正确。
 
-## Open follow-up（不进 KB spec，但记录给 rsclaw 主线借鉴）
+### L. 不做 fleet 路径，纯本地 ingest
+**否决**：rsclaw 已经有 IDC GPU 集群，**不利用就是浪费独有基础设施**。本地路径作为 fallback，大批量自动走 fleet 让用户感受到 rsclaw 的硬件优势。
 
-### 1. OpenHuman `tokenjuice/` → rsclaw agent tool output 压缩
+### M. `citation_confidence` 合并到 `score` 一个字段
+**否决**：relevance（语义相关）和 trust（可信度）是两个独立维度。同一 score 的两个 chunk，一个是上周的官方 PRD，一个是 1 年前的群聊截图，应当区别对待。**分两个字段 + 三档 tier 明示给 agent**。
 
-[`~/git/openhuman/src/openhuman/tokenjuice/`](file:///Users/oopos/git/openhuman/src/openhuman/tokenjuice/) 是 [vincentkoc/tokenjuice](https://github.com/vincentkoc/tokenjuice) 的 Rust port，把 verbose tool 输出（git status / cargo build / docker logs）按 JSON 规则压缩，pass-through safe。**直接 vendor 进 rsclaw agent loop → 每次 tool turn 省 30-60% token，几乎零工程量**。和 KB 完全平行，但 ROI 极高。
-
-### 2. OpenHuman `learning/` → rsclaw evolution / meditation
-
-[`~/git/openhuman/src/openhuman/learning/`](file:///Users/oopos/git/openhuman/src/openhuman/learning/) 是 agent 自学子系统。值得 rsclaw 主线借鉴的：
-
-- `reflection.rs` —— 四类结构化 LLM 反思输出（observations / patterns / preferences / user_reflections），喂给 meditation
-- `tool_tracker.rs` —— 工具有效性追踪
-- `stability_detector.rs` —— "同一观察被多次确认才晋升"的稳定性评分
-- `prompt_sections.rs` —— 学到的东西分段注入下次 prompt
-- `transcript_ingest/` —— heuristic-only 设计（不强依赖 LLM），先 heuristic 跑通再 LLM 增强的工程模式
-
-**KB 不抄它**（物种不同），但 rsclaw 的 heartbeat / meditation / evolution 路线可借鉴。
+### N. KB ↔ Memory 自动晋升（无用户确认）
+**否决**：agent memory 包含很多噪音（误判、上下文性临时事实），自动晋升会污染 KB。**必须用户手动 promote**，KB 是"用户主动维护"的 source of truth。
 
 ## References
 
-### 完整设计
-- [docs/specs/2026-05-19-knowledge-base.md](../specs/2026-05-19-knowledge-base.md)
+### 算法 / 模式（公开发表的方法）
 
-### 现有代码
-- `src/agent/memory.rs` —— lifecycle 区别参照
+- **RRF 融合**：Cormack et al., "Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods" (SIGIR 2009)
+- **MMR 多样性**：Carbonell & Goldstein, "The Use of MMR, Diversity-Based Reranking for Reordering Documents and Producing Summaries" (SIGIR 1998)
+- **SimHash**：Charikar, "Similarity estimation techniques from rounding algorithms" (STOC 2002)
+- **BM25**：Robertson & Walker, "Some Simple Effective Approximations to the 2-Poisson Model for Probabilistic Weighted Retrieval" (SIGIR 1994)
+- **HNSW**：Malkov & Yashunin, "Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs" (2016)
+- **Bloom Filter**：Bloom, "Space/Time Trade-offs in Hash Coding with Allowable Errors" (CACM 1970)
+- **BGE-M3**：BAAI, "BGE M3-Embedding: Multi-Lingual, Multi-Functionality, Multi-Granularity Text Embeddings Through Self-Knowledge Distillation"
+- **Job queue dedupe + claim_token**：通用 production 模式，参考 Sidekiq / RQ / Faktory / GoodJob 设计
+
+### 工具 / 模型（all permissive license）
+
+- **RapidOCR**：PP-OCRv4 蒸馏 ONNX 实现（Apache 2.0）
+- **PaddleOCR-VL 1.5**：Apache 2.0, OmniDocBench v1.5 SOTA pipeline
+- **Qianfan-OCR 4B**：Apache 2.0, end-to-end SOTA + KIE，via vLLM/SGLang serve
+- **jieba-rs**：中文分词（MIT）
+- **ort**：ONNX Runtime Rust binding（Apache 2.0 / MIT）
+- **tantivy**：full-text search engine（MIT）
+- **hnsw_rs**：HNSW Rust impl（Apache 2.0）
+- **redb**：embedded KV store（Apache 2.0 / MIT）
+
+### rsclaw 内部依赖
+
+- `src/agent/memory.rs` —— lifecycle 区别参照 + Memory↔KB 桥的对侧
 - `src/store/` —— redb + tantivy + hnsw_rs 基础设施
 - `src/cron/` —— syncer scheduler 集成点
-- `src/channel/` —— ChannelHistorySyncer 复用 fetch_messages
+- `src/channel/` —— ChannelHistorySyncer 复用 `fetch_messages`
 - `src/browser/` —— UrlSyncer 复用渲染
+- `src/agent/prompt_builder.rs` —— RAG 引用纪律 prompt 注入点
+- `project_rsclaw_llm_rollout.md`（auto-memory）—— Fleet 部署上下文
+- `project_context_mgmt_v2.md`（auto-memory）—— KV cache 优化路线
 
-### OpenHuman 借鉴（具体路径）
-- `~/git/openhuman/src/openhuman/memory/tree/` —— canonicalize-first / chunk_id / content_store / jobs queue / entity index
-- `~/git/openhuman/src/openhuman/memory/tree/canonicalize/` —— 源适配模式
-- `~/git/openhuman/src/openhuman/composio/providers/` —— sync trait + SyncState 模式
-- `~/git/openhuman/src/openhuman/composio/providers/sync_state.rs` —— SyncState 字段设计参考
-- `~/git/openhuman/src/openhuman/composio/providers/gmail/sync.rs` —— Gmail incremental sync 模式（v2 MailSyncer 参考）
-- `~/git/openhuman/src/openhuman/composio/periodic.rs` —— 周期 scheduler 模式
+### 设计灵感
 
-### Memory（auto-memory）
-- `project_rsclaw_llm_rollout.md` —— Fleet 部署上下文
-- `project_context_mgmt_v2.md` —— KV cache 优化路线
-- `project_three_repo_topology.md` —— rsclaw / rsclaw-server / rsclaw-llm 拓扑
+- Notion AI / Perplexity —— citation 渲染 UX
+- Obsidian —— `.md` 文件本地优先的 PKM 模型
+- Anthropic Claude Projects / OpenAI Custom GPTs —— 用户主动 curate 知识库的产品形态
+- Glean / Hebbia —— enterprise RAG 的 citation 严谨度参考

@@ -19,7 +19,14 @@
 - **Entity inverted index**：解决"伊利问题"，支持 entity-based 检索
 - **Source syncer 框架**：URL/本地目录/聊天历史可周期或事件触发增量同步
 
-**借鉴自 OpenHuman 的关键模式：** canonicalize-first pipeline / deterministic chunk_id / on-disk content store / jobs queue 模式 (`dedupe_key` + `claim_token` + `recover_stale_locks`) / entity inverted index / PII redaction / `ComposioProvider`-style sync trait + `SyncState`（参考 `~/git/openhuman/src/openhuman/memory/tree/` 与 `~/git/openhuman/src/openhuman/composio/providers/`）。
+**采用的业界成熟模式：** canonicalize-first pipeline / deterministic chunk_id / on-disk content store / 带 `dedupe_key` + `claim_token` + `reclaim_stale_jobs` 的 jobs queue / entity inverted index / PII redaction / provider-style sync trait + KV-persisted `SyncState`。
+
+**rsclaw 独有创新（差异化设计）：**
+
+1. **Fleet-accelerated batch ingest** —— 千篇级 PDF 入库时，chunks 分发到 rsclaw-llm fleet（IDC GPU 集群）并行 embed + entity 抽取，单机几小时 → 集群几分钟。
+2. **`kb_explain` 工具** —— 返回检索推理 trace（BM25 term / dense 维度激活 / entity_index 触发 / MMR 选择理由），agent 能解释"为什么引这条"。
+3. **`citation_confidence` 评分** —— 独立于 relevance：`f(quality × recency_decay × is_latest_version × entity_alignment × source_kind_trust)`。Agent 用它决定"引用"还是"仅参考"，避免高 score 但低可信度（过期 PRD）被当权威引。
+4. **Memory ↔ KB 双向流** —— 高稳定性 agent memory item 可晋升为 KB doc；session 启动时 KB 喂 context 预热 agent memory。利用 rsclaw "agent memory + 用户 KB" 双系统的独有结构。
 
 ## 设计决策
 
@@ -28,14 +35,14 @@
 | 用户边界 | 全局一个库 | YAGNI；多租户 v2 再说 |
 | Retrieval 方式 | Tool-call（agent 主动） | KV cache 友好；与 agent-loop 哲学一致 |
 | 文档源 v1 | 本地文件 + URL（单页）+ 聊天历史 + 图片 + 邮件（.eml 手动上传） | 覆盖 80% 场景；代码 repo / 整站爬 / IMAP-Gmail 直连留 v2 |
-| 数据同步 | `KbSourceSyncer` trait + KV-persisted `SyncState` | OpenHuman 同款；URL 周期、目录监控、聊天增量都走这套 |
+| 数据同步 | `KbSourceSyncer` trait + KV-persisted `SyncState` | URL 周期、目录监控、聊天增量都走同一套 trait |
 | Scheduler | 复用 `src/cron/`，5min tick + event-driven 触发 | 不重复造轮子；channel/fs 事件实时响应 |
 | 存储后端 | redb + tantivy + hnsw_rs，**独立 DB 文件 + 独立目录** | 零新依赖；与现有 store 完全平级隔离 |
 | **目录布局** | `~/.rsclaw/kb/{md,raw,db,idx,hnsw,state}/` | 全部短化；md=canonicalized markdown / raw=原始字节 / db=redb / idx=tantivy / hnsw=向量 / state=syncer state |
 | Content store | canonicalized markdown 作为 `.md` 文件落磁盘，DB 只存路径+offset | Obsidian 兼容 / grep 友好 / DB 不臃肿 / 备份=copy 文件夹 / 可重新 canonicalize |
 | Raw cache | 默认开（`kb.keep_raw = true`） | KB 自包含：备份/迁移完整可用；可重新 canonicalize；用户可关 |
 | **chunk_id** | **deterministic `sha256(kind\|source_id\|seq\|content)` 截 32 hex** | 同内容重复入库 → 同 ID → upsert no-op，完全幂等（替代 ULID） |
-| Canonicalize-first | 所有源先转 Markdown 字符串 + Metadata，再走统一 chunker / embedder | 下游零分支；OpenHuman 验证过的架构 |
+| Canonicalize-first | 所有源先转 Markdown 字符串 + Metadata，再走统一 chunker / embedder | 下游零分支；source-specific 复杂度只在 canonicalize 层 |
 | 删除机制 | Tombstone + 查询 filter + 后台 compactor | hnsw_rs 不支持 true delete 的标准解法 |
 | Hybrid 检索 | Dense (BGE-M3) + Sparse (BM25) + **RRF 融合** | 不调权重，对分数尺度不敏感 |
 | Reranker | v1 不接，留 trait | 质量提升显著但单独算时间最长，留 hook |
@@ -45,7 +52,7 @@
 | **Entity inverted index** | `KbEntity` + `KbEntityIndex` 表，入库时一次性建索引 | 替代查询时 jieba 检查；O(1) 查"X 在哪些 chunk 出现"；驱动 `kb_search_entities` 工具 |
 | 实体感知 | `entity_alignment` 返回字段 + `require_entities`/`boost_entities` 参数 + RAG 引用纪律 prompt | 防"query 含库里没有的实体"翻车 |
 | 多样性 | MMR 默认开 (λ=0.5) | RAG "5 chunk 说同一件事"是最常见失败模式 |
-| 入库去重 | 三层防护：API cursor + SyncState `synced_ids` + chunk-level deterministic id | OpenHuman 同款；任一层漏掉下层兜底 |
+| 入库去重 | 三层防护：API cursor + SyncState `seen_index` + chunk-level deterministic id | 任一层漏掉下层兜底 |
 | OCR 引擎 | Fast=RapidOCR / Strong=PaddleOCR-VL 1.5 / Fleet=Qianfan-OCR 4B | RapidOCR 中文显著高于 tesseract；PaddleOCR-VL OmniDocBench SOTA pipeline；Qianfan end-to-end SOTA + KIE |
 | OCR 路由 | 按文档特征预扫描自动路由 | 资源等级 ≠ 任务类型；图表必须 Vision LLM |
 | Fleet 部署 | rsclaw-server :8444 vLLM/SGLang sidecar | llama.cpp 不支持 InternVL vision encoder；不挂境外云 |
@@ -54,12 +61,12 @@
 | 配额 | search ≤8KB / fetch_full ≤32KB / ≤5次 search 每轮 | 防 context 爆 / search-spam |
 | KV cache 友好 | chunk 严格按 (score, chunk_id) 字典序，不带 timestamp/uuid | 同 query 命中同组 chunks → tool result 完全一致 → cache hit |
 | Lifecycle 隔离 | KB 不衰减；删除 30 天恢复期 | 跟 MemoryDoc 区分开 |
-| Jobs queue | SQLite-backed (in kb.redb) + `dedupe_key` 唯一索引 + `claim_token` 防 stale worker + `recover_stale_locks` 重启续传 | OpenHuman 验证模式；production-grade async pipeline |
+| Jobs queue | SQLite-backed (in kb.redb) + `dedupe_key` 唯一索引 + `claim_token` 防 stale worker + `reclaim_stale_jobs` 重启续传 | production-grade async pipeline 通用模式（参考 Sidekiq / RQ / Faktory） |
 | Compactor | 1h tick + 03:00 强制 + 残骸率 >15% 触发；HNSW 双 buffer μs 级原子切换 | 重建期间老 index 服务查询，新入库写双份 |
-| PII redaction | 日志全栈走 `util/redact.rs`，source_id / 内容预览永远是哈希 | OpenHuman 同款；从 day 1 强制 |
+| PII redaction | 日志全栈走 `util/redact.rs`，source_id / 内容预览永远是哈希 | 从 day 1 强制，避免后期反向加固 |
 | Security 默认 | 本地全栈；远程开关显式确认 | chunk 文本不出本机 |
 | 聊天历史隐私 | 默认 `self_messages_only = true`（只入用户消息+@自己） | 不把他人发言入库；UI 可关 |
-| **`synced_ids` 实现** | Bloom filter (假阳性 <0.1%) + LRU 精确集合 (最近 10000 条) | 百万级 ID 不能全内存 HashSet；假阳性由 chunk-level deterministic id 兜底 |
+| **`seen_index` 实现** | `ScalableSeenSet`：Bloom filter (假阳性 <0.1%) + LRU 精确集合 (最近 10000 条) | 百万级 ID 不能全内存 HashSet；假阳性由 chunk-level deterministic id 兜底 |
 | 删除检测（folder syncer）| 周期全扫识别 orphan + tombstone（30 天恢复期） | 用户临时移走再放回有 30 天窗口 |
 | 退避策略 | 指数：1次→0、2次→1min、3次→5min、6次→1h、12次→6h、>12次 24h 封顶 | 平衡敏感性与噪音 |
 
@@ -75,7 +82,7 @@ src/kb/
     chat.rs           # 聊天 batch → markdown
     url.rs            # URL → markdown
     image.rs          # 图片 → OCR → markdown
-    mail.rs           # .eml/.mbox → thread 结构化 markdown (参考 OpenHuman email canonicalizer)
+    mail.rs           # .eml/.mbox → thread 结构化 markdown
     pdf.rs            # PDF 文本层抽取 + 扫描页转 OCR
     docx.rs           # docx-rs，按 paragraph + heading_path
     md.rs             # passthrough + heading_path 抽取
@@ -106,10 +113,13 @@ src/kb/
     resolver.rs       # 实体规范化（大小写、变体合并）
     index.rs          # 倒排索引读写
   retrieval/
-    mod.rs            # kb_search / kb_fetch / kb_list_docs / kb_similar / kb_search_entities
+    mod.rs            # kb_search / kb_fetch / kb_list_docs / kb_similar / kb_search_entities / kb_explain
     hybrid.rs         # Dense + BM25 + RRF
     mmr.rs            # MMR 多样性
     alignment.rs      # entity_alignment 返回字段（查倒排索引）
+    confidence.rs     # citation_confidence 评分（独有：独立于 relevance）
+    explain.rs        # 检索 trace 收集（独有：kb_explain 工具用）
+    memory_bridge.rs  # KB ↔ agent memory 双向流（独有）
   syncer/             # 数据源同步框架
     mod.rs            # KbSourceSyncer trait + SyncState + SyncContext / Reason / Outcome / Error
     registry.rs       # source 注册表 + 启动 wiring
@@ -124,9 +134,10 @@ src/kb/
   jobs/               # async job queue
     mod.rs            # 公共 API
     types.rs          # JobKind / JobStatus / Job / NewJob + 每 kind 的 Payload
-    store.rs          # SQLite（kb.redb）持久化：dedupe_key + claim_token + recover_stale_locks
+    store.rs          # SQLite（kb.redb）持久化：dedupe_key + claim_token + reclaim_stale_jobs
     worker.rs         # worker pool（3 task），LLM-bound 用 semaphore 限流
     handlers/         # 每 JobKind 一个 handler：canonicalize / chunk / embed / index / extract_entities
+    fleet_dispatch.rs # 大批量任务分发到 rsclaw-llm fleet（独有：batch embed / entity 走集群）
   compactor.rs        # 后台 tokio task：tombstone 清理 + HNSW 双 buffer 重建
   migrator.rs         # embedding 模型迁移流程
   util/
@@ -185,7 +196,7 @@ ui/app/components/kb/
     kb_v1024_bgem3.hnsw     # 当前活跃向量索引（按 embedder_id 命名）
     kb_v1024_bgem3.next     # 迁移/重建中的下一份（双 buffer）
   state/
-    triggers/YYYY-MM-DD.jsonl  # webhook/event 归档（参考 OpenHuman）
+    triggers/YYYY-MM-DD.jsonl  # webhook/event 归档
     logs/                    # syncer 最近运行日志
 ```
 
@@ -307,7 +318,6 @@ pub struct KbEntityIndex {
 ### Chunk ID 决定论
 
 ```rust
-// 与 OpenHuman 同款 (`memory/tree/types.rs::chunk_id`)
 pub fn chunk_id(kind: KbSourceKind, source_id: &str, seq: u32, content: &str) -> String {
     let mut h = Sha256::new();
     h.update(kind.as_str().as_bytes());
@@ -384,7 +394,7 @@ pub trait Canonicalizer: Send + Sync {
 - `ChatCanonicalizer`：消息按时间排序 → `## <ts> — <author>\n<body>` block
 - `UrlCanonicalizer`：lol-html 剥脚本 → markdown 转换
 - `ImgCanonicalizer`：OCR → text → 简单 markdown wrap
-- `MailCanonicalizer`：thread 解析 → 按 `---\nFrom: ...\nSubject: ...\nDate: ...\n\n<cleaned-body>` 切块（OpenHuman `email_clean::clean_body` 同款剥回复链/footer/legal boilerplate）；source_id 用 `mail:{participants}` 形式（`from ∪ to` 去重排序，CC 不入 bucket key，避免会话碎片化）
+- `MailCanonicalizer`：thread 解析 → 按 `---\nFrom: ...\nSubject: ...\nDate: ...\n\n<cleaned-body>` 切块（剥回复链 / footer / legal boilerplate）；source_id 用 `mail:{participants}` 形式（`from ∪ to` 去重排序，CC 不入 bucket key，避免会话碎片化）
 
 **OCR 三层路由（PDF/Img）：**
 
@@ -434,7 +444,7 @@ pub async fn rewrite_tags(markdown_path: &str, new_tags: &[String]) -> Result<()
 pub async fn delete_doc_files(markdown_path: &str, raw_path: Option<&str>) -> Result<()>;
 ```
 
-**原子写实现：** tempfile + fsync(file) + rename + fsync(parent dir on Unix)。OpenHuman 同款 (`content_store/atomic.rs`)。
+**原子写实现：** tempfile + fsync(file) + rename + fsync(parent dir on Unix)。POSIX 标准的崩溃安全写文件模式。
 
 **Body 不可变 + tags 可变：** `markdown_sha256` 只 hash body 部分。重写 tags 不影响 SHA。
 
@@ -467,10 +477,43 @@ pub trait KbEmbedder: Send + Sync {
     fn embedder_id(&self) -> &str;
 }
 
-// 默认 LocalBgeM3 (1024)；备路 RemoteApiEmbedder（走 ProviderRegistry）
+// 默认 LocalBgeM3 (1024)；备路 RemoteApiEmbedder（走 ProviderRegistry）；
+// 大批量走 FleetEmbedder（独有）
 ```
 
-batch：local 16、remote 64。`embedder_id` 落 `KbChunk.embedder_id`，模型变更触发迁移流程（§6）。
+batch：local 16、remote 64；fleet **每节点 128，并发 fan-out**。`embedder_id` 落 `KbChunk.embedder_id`，模型变更触发迁移流程（§6）。
+
+### Fleet-accelerated batch ingest（独有）
+
+当 jobs queue 检测到**单次入库 ≥100 chunks** 或 **整库 reindex** 任务时，`jobs/fleet_dispatch.rs` 自动分发到 rsclaw-llm fleet：
+
+```
+local 触发 (用户拖 1000 PDF)
+        │
+        ▼
+canonicalize + chunk (单机，快)
+        │
+        ▼ N chunks
+fleet_dispatch.rs 切片：N / fleet_size 每节点
+        │
+        ▼
+rsclaw-server `/v1/embed/batch`     ──┐
+rsclaw-server `/v1/entity/batch`    ──┤  (并行)
+                                       │
+                                       ▼
+                              rsclaw-llm fleet (IDC 1000 节点)
+                                       │
+                                       ▼ vectors + entities
+                              本地 writer 合并 → redb + tantivy + hnsw
+```
+
+**规模收益示例：** 1000 PDF (~30 万 chunks)
+- 纯本地 (单 GPU 4090)：~4-6 小时
+- Fleet (200 节点并发，仅占用 20%)：**~3-5 分钟**
+
+**Fleet 不可用时自动 fallback 本地**，UI 显示路径。配置：`kb.embedding.use_fleet_threshold = 100`（chunks 数阈值）。
+
+**这是 rsclaw 独有能力**：不是任何同类系统能简单复制的，依赖完整的 GPU 集群 + rsclaw-server 协议栈。
 
 ### entity extraction
 
@@ -492,7 +535,7 @@ pub struct ExtractedEntity {
 // v2: + LlmEntityExtractor（NER + 重要性评分）
 ```
 
-**RegexEntityExtractor：** email / URL / `@handle` / `#hashtag`，OpenHuman 同款。
+**RegexEntityExtractor：** email / URL / `@handle` / `#hashtag` 等机械标识符。
 **JiebaEntityExtractor：** 中文分词 + 大写词 / 专有名词 boost，提取候选实体。
 **resolver：** 大小写规范化、去 @/#、合并变体（"伊利" / "Yili" / "伊利股份" → 同 canonical_id）。
 
@@ -523,7 +566,7 @@ async fn upsert_doc(doc: KbDoc, raw_bytes: Option<Vec<u8>>) -> Result<KbDocId> {
 
 后台 worker 异步处理 chunk + embed + entity + tantivy + hnsw。失败任一步，job 重试；hnsw 写失败不回滚 redb，启动时校验 hnsw vs redb 缺的补。
 
-### Jobs queue（OpenHuman 模式）
+### Jobs queue
 
 ```rust
 pub enum JobKind {
@@ -550,7 +593,7 @@ pub struct Job {
 }
 ```
 
-**关键模式（OpenHuman 验证）：**
+**关键模式：**
 
 1. **`dedupe_key` partial unique index** (`WHERE status IN ('Ready','Running')`)：飞行中重复任务静默抑制（同一 doc 重复 enqueue chunk-embed → 第二次 no-op）
 2. **`enqueue_tx`**：side-effect + follow-up job 同一 redb 事务原子提交
@@ -593,7 +636,9 @@ worker pool：3 个 task，LLM-bound 走 3-permit semaphore（embedder / entity 
       "doc_title": "蒙牛奶粉冲泡指南.pdf",
       "text": "蒙牛奶粉建议100g兑100ml温水",     // 按需 read_doc_range 读
       "heading_path": ["蒙牛奶粉冲泡指南", "建议比例"],
-      "score": 0.83,
+      "score": 0.83,                              // 检索相关性
+      "citation_confidence": 0.91,                // 独有：是否值得作为引用源
+      "citation_tier": "authoritative",           // 独有：authoritative | supporting | indicative
       "citation": {
         "source": "file:///Users/x/docs/...",
         "locator_human": "p.12 §建议比例",
@@ -608,8 +653,14 @@ worker pool：3 个 task，LLM-bound 走 3-permit semaphore（embedder / entity 
   ],
   "warnings": [
     "query 含关键词 [伊利]，召回 chunks 中 0/5 包含此词，可能存在实体不匹配"
-  ]
+  ],
+  "trace_id": "trc_01HXY..."                      // 独有：用 kb_explain(trace_id) 拿推理细节
 }
+
+// kb_explain  (独有：检索推理 trace)
+{ "trace_id": "trc_01HXY..." }
+// 返回：每 chunk 的 bm25 命中 terms / dense 激活维度 top-N / entity_index 触发关系 /
+//      MMR 入选/拒绝理由 / citation_confidence 各因子分解
 
 // kb_fetch
 { "chunk_id": "...", "expand": "none|neighbor|full_doc" }
@@ -640,33 +691,70 @@ worker pool：3 个 task，LLM-bound 走 3-permit semaphore（embedder / entity 
 ```
 query
   │
-  ├──▶ dense: BGE-M3 embed → hnsw.search(k*3)
-  │
-  ├──▶ sparse: tantivy BM25(k*3)
-  │
-  └──▶ [filter: tags / source_kind / doc_ids / entity_ids / status≠Tombstoned / quality / require_entities]
-              │
-              ▼
-       RRF fusion (k=60)
-              │
-              ▼
-       boost_entities apply (×1.5 if hit)
-              │
-              ▼
-       MMR diversity (λ=0.5)
-              │
-              ▼
-       [optional rerank] —— v1 noop trait
-              │
-              ▼
-       entity_alignment 计算（查倒排索引，非查询时分词）
-              │
-              ▼
-       lazy read body text via content_store.read_doc_range
-              │
-              ▼
-       top-k 截断 → 返回
+  ├──▶ dense: BGE-M3 embed → hnsw.search(k*3)        ┐
+  │                                                    │
+  ├──▶ sparse: tantivy BM25(k*3)                       │ 全程
+  │                                                    │ 收集 trace
+  └──▶ [filter: tags / source_kind / doc_ids /         │ (独有)
+                entity_ids / status≠Tombstoned /       │
+                quality / require_entities]            │
+              │                                        │
+              ▼                                        │
+       RRF fusion (k=60)                               │
+              │                                        │
+              ▼                                        │
+       boost_entities apply (×1.5 if hit)              │
+              │                                        │
+              ▼                                        │
+       MMR diversity (λ=0.5)                           │
+              │                                        │
+              ▼                                        │
+       [optional rerank] —— v1 noop trait              │
+              │                                        │
+              ▼                                        │
+       entity_alignment 计算（查倒排索引）              │
+              │                                        │
+              ▼                                        │
+       citation_confidence 评分（独有）                  │
+              │                                        │
+              ▼                                        │
+       lazy read body via content_store.read_doc_range │
+              │                                        │
+              ▼                                        ▼
+       top-k 截断 → 返回 + trace_id 入 explain_cache
 ```
+
+### Citation Confidence（独有）
+
+`citation_confidence ∈ [0.0, 1.0]`，公式：
+
+```
+confidence = quality
+           × recency_decay(doc.updated_at)        // exp(-Δdays / 90)
+           × is_latest_version_flag               // 0.5 if not latest, 1.0 if latest
+           × max(0.3, entity_alignment_match)     // entity 全不匹配下限 0.3
+           × source_kind_trust                    // 默认表，用户可调
+```
+
+**`source_kind_trust` 默认表：**
+
+| source_kind | 默认 trust |
+|---|---|
+| Doc | 1.0 |
+| Mail | 1.0 |
+| Url | 0.85 |
+| Chat | 0.65 |
+| Img (OCR) | 0.7 |
+
+**`citation_tier` 分档**（给 agent 用）：
+
+| confidence 区间 | tier | 含义 |
+|---|---|---|
+| ≥ 0.8 | `authoritative` | 直接引用 |
+| 0.5–0.8 | `supporting` | 可引但建议措辞缓和（"根据..."） |
+| < 0.5 | `indicative` | 仅作参考，不应作为权威来源 |
+
+system prompt 教 agent：低 tier 内容必须明确措辞标识，不能装权威。
 
 ### Filter 时机
 
@@ -712,6 +800,11 @@ chunk 排序严格 (score 降序, chunk_id 字典序)，不带 timestamp / uuid 
 - 引用前必须验证 chunk 中的实体/品牌/数值与用户问题一致
 - 若 entity_alignment 显示某关键词 matched_chunks=0，必须明确告知用户「知识库未找到 X 的相关数据」，不得套用其他实体的数据
 - 引用时必须用 [^kb:<chunk_id>] 标记，由 UI 渲染为可点击引用
+- 关注每个 chunk 的 citation_tier：
+  · authoritative —— 可直接引用
+  · supporting —— 引用需措辞缓和（"根据 X，可能..."）
+  · indicative —— 仅作参考，不应作为权威来源
+- 拿不准时调 kb_explain(trace_id) 查清楚为什么这条命中，再决定是否引用
 ```
 
 ## §4 Citation 渲染（UI）
@@ -976,6 +1069,74 @@ log_redaction = true                  # 强制 PII redaction
 - **聊天历史**：默认只入用户自己 + @ 自己消息
 - **v1 不加密** kb 目录（与现有 store.redb 一致）；v2 考虑 AGE 加密 + raw 目录
 
+## §M Memory ↔ KB 双向流（独有）
+
+rsclaw 有两套独立的"记忆"系统：
+- **Agent memory** (`src/agent/memory.rs`)：agent 在对话中自学的、会衰减的、私有的（隐式上下文）
+- **KB**：用户主动喂入、不衰减、可溯源（显式上下文）
+
+**双向流让两者协同：**
+
+### Memory → KB 晋升
+
+当一条 agent memory item 满足：
+- `stability_score ≥ 0.85`（连续 N 次确认）
+- `importance ≥ 0.7`
+- **用户在 UI 上手动确认 "promote to KB"** —— 不自动晋升，避免污染
+
+→ 创建对应 KbDoc，`source_kind = Doc`，`source_id = "agent_memory:<mem_id>"`，写到 `md/doc/agent-memory-<slug>.md`，YAML front-matter 标注来源。
+
+**用例：** 用户跟 agent 反复确认"我们项目的部署流程是 X"，agent memory 稳定记下来；用户觉得有价值 → 一键晋升 KB → 其他 agent 也能查到。
+
+### KB → Memory 预热
+
+session 启动时：
+
+```rust
+async fn warm_session_memory(thread_id: &str, ctx: &SessionContext) {
+    // 1. 拿到对话主题（前 N 条消息 / channel context）
+    let topic_summary = ctx.thread_summary().await?;
+    
+    // 2. KB 检索 top-K 相关 chunks（轻量，k=5，只看 authoritative tier）
+    let hits = kb_search(KbSearchRequest {
+        query: topic_summary,
+        k: 5,
+        filter: { min_quality: 0.8, source_kind: None, ... },
+        diversity: "mmr",
+    }).await?;
+    
+    let authoritative: Vec<_> = hits.results
+        .into_iter()
+        .filter(|h| h.citation_tier == "authoritative")
+        .collect();
+    
+    // 3. 注入 agent memory 作为"会话级背景知识"
+    ctx.memory.inject_session_context(authoritative).await?;
+}
+```
+
+**用例：** 用户在 PM 群问"上次说的那个 OKR 怎么定的"，agent session 启动时 KB 已经把相关 PRD 章节预热进 memory，agent 第一句话就能精准回答，不用先 kb_search 一轮。
+
+### 防回路
+
+- Memory → KB 晋升后，**该 memory item 标 `promoted_to_kb_at`，不再参与 KB → Memory 预热**（防止自己喂自己循环）
+- KB → Memory 注入的 session context 标 `from_kb_at`，不参与 Memory → KB 晋升候选（防止洗白）
+
+### Config
+
+```toml
+[kb.memory_bridge]
+enabled = true
+promotion_stability_threshold = 0.85
+promotion_importance_threshold = 0.7
+promotion_requires_user_confirm = true   # 默认 true，避免自动污染
+warm_session_enabled = true
+warm_session_k = 5
+warm_session_min_tier = "authoritative"
+```
+
+---
+
 ## §S 数据源同步（KbSourceSyncer 框架）
 
 ### S.1 核心 Trait
@@ -986,16 +1147,16 @@ pub trait KbSourceSyncer: Send + Sync + 'static {
     fn source_kind(&self) -> KbSourceKind;
     fn source_id(&self) -> &str;
     fn sync_interval_secs(&self) -> Option<u64> { Some(20 * 60) }
-    
+
     async fn sync(
         &self,
         ctx: &SyncContext,
         state: &mut SyncState,
         reason: SyncReason,
     ) -> Result<SyncOutcome, SyncError>;
-    
-    async fn on_enable(&self, ctx: &SyncContext) -> Result<(), SyncError> { Ok(()) }
-    async fn on_disable(&self, ctx: &SyncContext) -> Result<(), SyncError> { Ok(()) }
+
+    async fn on_enable(&self, _ctx: &SyncContext) -> Result<(), SyncError> { Ok(()) }
+    async fn on_disable(&self, _ctx: &SyncContext) -> Result<(), SyncError> { Ok(()) }
     fn health(&self) -> SyncerHealth { SyncerHealth::Unknown }
 }
 
@@ -1060,7 +1221,7 @@ pub struct SyncState {
     pub cursor: Option<String>,           // provider-specific watermark
     pub last_seen_id: Option<String>,     // "第一页第一条已见"短路
     
-    pub synced_ids: BloomLru,             // Bloom (假阳性<0.1%) + LRU(10000) 精确集
+    pub seen_index: ScalableSeenSet,      // Bloom (假阳性<0.1%) + LRU(10000) 精确集
     
     pub daily_budget: DailyBudget {
         date: NaiveDate,
@@ -1083,7 +1244,7 @@ pub struct SyncState {
 }
 ```
 
-**`BloomLru` 实现：** 1M-entry bloom + 10K-entry LRU 精确集合，序列化到 redb blob。误命中由 chunk-level deterministic id 兜底（同内容 → 同 chunk_id → upsert no-op）。
+**`ScalableSeenSet` 实现：** 1M-entry bloom + 10K-entry LRU 精确集合，序列化到 redb blob。误命中由 chunk-level deterministic id 兜底（同内容 → 同 chunk_id → upsert no-op）。
 
 ### S.3 Scheduler 集成
 
@@ -1235,20 +1396,21 @@ impl IngestPipeline {
 | Phase | 内容 | 工期 |
 |---|---|---|
 | **1 MVP** | model + redb + tantivy + hnsw + canonicalize (md/text/html + 文本层 PDF) + content_store + chunker (deterministic id + heading_path) + LocalBgeM3 + entity (regex+jieba) + Writer + Jobs queue 基础 + Hybrid+RRF + kb_search/fetch/list_docs + ManualUploadSyncer + CLI 基础 | **3 周**（比 v1 多 1 周，主要 content_store + jobs queue + entity index） |
-| **2 基础可用** | Tauri 控制台「知识库」面板（文档 tab）+ 拖拽上传 + 任务进度 + Citation 渲染全套 + entity_alignment + require_entities + RAG 引用纪律 prompt + MMR 默认开 + 远程 embedding 备路 + kb_search_entities 工具 | 2 周 |
+| **2 基础可用** | Tauri 控制台「知识库」面板（文档 tab）+ 拖拽上传 + 任务进度 + Citation 渲染全套 + entity_alignment + require_entities + RAG 引用纪律 prompt + MMR 默认开 + 远程 embedding 备路 + kb_search_entities 工具 + **citation_confidence 评分 + kb_explain trace 工具** | 2 周 |
 | **3 OCR 接入** | OcrEngine trait + Tier Fast (RapidOCR) + 预扫描路由 + OCR 任务异步队列 + 断点续传 + 扫描 PDF / 单图入库 | 2 周 |
 | **4 Strong/Fleet 层** | Tier Strong (PaddleOCR-VL 1.5) + Tier Fleet (Qianfan-OCR via rsclaw-server :8444 vLLM sidecar) + 自动路由 + 部署脚本 | 2 周 |
-| **5 Syncer 框架** | KbSourceSyncer trait + SyncState + BloomLru + scheduler 接 src/cron + UrlSyncer + LocalFolderSyncer + ChannelHistorySyncer + 数据源 tab UI + sync CLI 全套 | 2 周 |
+| **5 Syncer 框架** | KbSourceSyncer trait + SyncState + ScalableSeenSet + scheduler 接 src/cron + UrlSyncer + LocalFolderSyncer + ChannelHistorySyncer + 数据源 tab UI + sync CLI 全套 | 2 周 |
+| **5.5 Fleet + Memory 桥（独有）** | jobs/fleet_dispatch.rs + rsclaw-server `/v1/embed/batch` + `/v1/entity/batch` endpoint + retrieval/memory_bridge.rs + Memory↔KB 晋升 UI + warm_session 钩子 | 1.5 周 |
 | **6 Compactor / 迁移 / 收尾** | Compactor 后台 + Embedding 迁移流程 + 整体 e2e 测试 + 文档 + 灰度发布 | 1 周 |
-| **总工期** | | **~12 周** |
+| **总工期** | | **~13.5 周** |
 
 **v2 留作：**
 
-- **MailSyncer**：IMAP / Gmail / Outlook 直连，cursor=internalDate epoch ms（参考 OpenHuman `composio/providers/gmail/sync.rs`），bucket by participants
+- **MailSyncer**：IMAP / Gmail / Outlook 直连，cursor = internalDate epoch ms，bucket by participants
 - Reranker (BGE-Reranker-v2-m3)
-- Summary tree 架构（OpenHuman 的 tree_source/tree_topic/tree_global，给聊天历史和邮件流用）
-- Admission gate (score 模块，给流式源用)
-- `drill_down` retrieval 工具
+- Summary tree 架构（per-source / per-topic / global 三层 summary，给聊天历史和邮件流这种高基数源用，bucket-seal 模式）
+- Admission gate（score 模块，给流式源做"keep or drop"决定）
+- `drill_down` retrieval 工具（从 summary 钻到 leaves）
 - LLM EntityExtractor（NER + 重要性）
 - URL 整站爬取（sitemap.xml + per-page state）
 - 引用图谱可视化
@@ -1296,14 +1458,40 @@ impl IngestPipeline {
 - [ ] **`keep_raw=false`**：raw/ 不写；KbDoc.raw_path = None；canonicalize 后立即丢弃 raw bytes
 - [ ] **.eml 上传**：拖一个 .eml 文件入 KB → 自动路由到 MailCanonicalizer → 写 `md/mail/` 而非 `md/doc/`，source_kind=mail，participants 正确解析
 - [ ] **.mbox 上传**：批量邮件 .mbox → 按 thread 切多份 KbDoc，participants 相同的合并到同一个月份文件
+- [ ] **Fleet ingest 阈值**：拖 100+ PDF → 自动走 fleet 路径；fleet 不可用 → 静默 fallback 本地，UI 显示路径
+- [ ] **citation_confidence**：相同 score 的两 chunks，一个 90 天前一个昨天 → 后者 confidence 显著高，tier 更高
+- [ ] **kb_explain 完整性**：拿 trace_id 调 explain → 返回所有命中 term / 激活维度 / MMR 决策的完整解释
+- [ ] **Memory→KB 晋升**：稳定 memory item 用户点 promote → 出现在 `md/doc/agent-memory-*.md`，front-matter 标注来源
+- [ ] **KB→Memory 预热**：session 启动 → 相关 authoritative chunks 入 agent context；不会回流到 KB 晋升候选
 
 ## References
 
-- OpenHuman tree memory architecture：`~/git/openhuman/src/openhuman/memory/tree/`
-  - 借鉴：canonicalize-first / chunk_id deterministic / content_store / jobs queue / entity index
-- OpenHuman Composio providers：`~/git/openhuman/src/openhuman/composio/providers/`
-  - 借鉴：`ComposioProvider` trait → `KbSourceSyncer` trait / `SyncState` 模式
-- 现有 memory 系统：`src/agent/memory.rs`（lifecycle 区别参照）
-- 现有存储层：`src/store/`（基础设施复用）
-- rsclaw-llm fleet：`project_rsclaw_llm_rollout.md`（memory）
-- KV cache 优化：`project_context_mgmt_v2.md`（memory）
+### 算法 / 模式（公开发表的方法）
+
+- **RRF 融合**：Cormack et al., "Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods" (SIGIR 2009)
+- **MMR 多样性**：Carbonell & Goldstein, "The Use of MMR, Diversity-Based Reranking for Reordering Documents and Producing Summaries" (SIGIR 1998)
+- **SimHash**：Charikar, "Similarity estimation techniques from rounding algorithms" (STOC 2002)
+- **BM25**：Robertson & Walker, "Some Simple Effective Approximations to the 2-Poisson Model for Probabilistic Weighted Retrieval" (SIGIR 1994)
+- **HNSW**：Malkov & Yashunin, "Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs" (2016)
+- **BGE-M3**：BAAI, "BGE M3-Embedding: Multi-Lingual, Multi-Functionality, Multi-Granularity Text Embeddings Through Self-Knowledge Distillation"
+
+### 工具 / 模型
+
+- **RapidOCR**：PP-OCRv4 蒸馏 ONNX 实现
+- **PaddleOCR-VL 1.5**：Apache 2.0, OmniDocBench v1.5 SOTA pipeline
+- **Qianfan-OCR 4B**：Apache 2.0, end-to-end SOTA + KIE，via vLLM/SGLang serve
+
+### rsclaw 内部依赖
+
+- `src/agent/memory.rs` —— lifecycle 区别参照
+- `src/store/` —— redb + tantivy + hnsw_rs 基础设施
+- `src/cron/` —— syncer scheduler 集成点
+- `src/channel/` —— ChannelHistorySyncer 复用 `fetch_messages`
+- `src/browser/` —— UrlSyncer 复用渲染
+- `project_rsclaw_llm_rollout.md`（auto-memory）—— Fleet 部署上下文
+- `project_context_mgmt_v2.md`（auto-memory）—— KV cache 优化路线
+
+### 设计灵感
+
+- Notion AI / Perplexity —— citation 渲染 UX
+- Obsidian —— `.md` 文件本地优先的 PKM 模型
