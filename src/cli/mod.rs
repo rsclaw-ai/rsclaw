@@ -20,6 +20,7 @@ pub mod dns;
 pub mod doctor;
 pub mod gateway;
 pub mod hooks;
+pub mod kb;
 pub mod memory;
 pub mod message;
 pub mod migrate;
@@ -55,6 +56,7 @@ pub use dns::DnsCommand;
 pub use doctor::DoctorArgs;
 pub use gateway::{GatewayCommand, GatewayRunArgs};
 pub use hooks::HooksCommand;
+pub use kb::KbCommand;
 pub use memory::{MemoryCommand, MemoryIndexArgs, MemorySearchArgs, MemoryStatusArgs};
 pub use message::MessageCommand;
 pub use migrate::MigrateArgs;
@@ -185,6 +187,10 @@ pub enum Command {
     /// Plugin management.
     #[command(subcommand)]
     Plugins(PluginsCommand),
+
+    /// Knowledge-base management.
+    #[command(subcommand)]
+    Kb(KbCommand),
 
     /// Memory management.
     #[command(subcommand)]
