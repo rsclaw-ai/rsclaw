@@ -65,6 +65,7 @@
 pub mod a2a;
 pub mod acp;
 pub mod agent;
+pub mod artifact;
 pub mod browser;
 pub mod channel;
 pub mod cli;

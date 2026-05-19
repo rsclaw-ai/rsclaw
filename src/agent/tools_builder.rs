@@ -454,6 +454,34 @@ pub fn build_tool_list(
         }),
     });
     tools.push(ToolDef {
+        name: "read_artifact".to_owned(),
+        description: "Read the full content of a tool_result artifact written by the runtime backstop.\n\
+            \n\
+            When any tool produces output larger than ~4 KB, the runtime writes the full \
+            payload to disk and shows you only a head+tail preview in the tool_result. The \
+            preview ends with `... N lines omitted — call read_artifact(tool_result_id=\"tr_xxxxxxxx\") ...`. \
+            That id is your handle.\n\
+            \n\
+            Modes:\n\
+              - mode=\"full\"        (default) entire artifact text\n\
+              - mode=\"head:N\"      first N lines\n\
+              - mode=\"tail:N\"      last N lines\n\
+              - mode=\"lines:A-B\"   inclusive 1-indexed line range\n\
+              - mode=\"grep:PAT\"    case-insensitive regex over lines\n\
+            \n\
+            Artifacts are session-scoped — an id from another session won't resolve. They \
+            also expire after 7 days. If you only need to scan for a known substring, \
+            `mode=\"grep:...\"` is much cheaper than `full`.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "tool_result_id": {"type": "string", "description": "Artifact id of the form `tr_xxxxxxxx` returned in a prior compacted tool_result."},
+                "mode": {"type": "string", "description": "full | head:N | tail:N | lines:A-B | grep:PATTERN. Default `full`."}
+            },
+            "required": ["tool_result_id"]
+        }),
+    });
+    tools.push(ToolDef {
         name: "write_file".to_owned(),
         description: "Write/create a file (full-overwrite). Use this for ALL file creation and full \
             rewrites — do NOT use shell with notepad, echo, or any other editor/command to \

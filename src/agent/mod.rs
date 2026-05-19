@@ -33,6 +33,7 @@ pub mod sft_exporter;
 pub mod trace_capture;
 pub mod tools_acp;
 pub mod tools_agent;
+pub mod tools_artifact;
 pub mod tools_builder;
 pub mod tools_computer;
 pub mod tools_cron;
