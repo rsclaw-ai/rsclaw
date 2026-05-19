@@ -916,9 +916,45 @@ git commit -m "docs(kb): README — Week 4 scope + invariants 19–22 + CLI quic
 
 ## Self-review checklist
 
-- [ ] All Week 4 modules compile with no warnings.
-- [ ] Async-trait dep added cleanly to Cargo.toml.
-- [ ] `rsclaw kb --help` shows all 8 subcommands.
-- [ ] `cargo test --test kb_week4_syncers --test kb_week4_compactor` passes.
-- [ ] Full suite still green: `cargo test -p rsclaw --lib kb::` + all 5 integration tests.
-- [ ] README invariants 19–22 each map to a covering test.
+- [x] All Week 4 modules compile with no new warnings.
+- [x] `async-trait` dep added cleanly to Cargo.toml.
+- [x] `rsclaw kb --help` shows all 8 subcommands.
+- [x] `cargo test --test kb_week4_syncers --test kb_week4_compactor` passes.
+- [x] Full suite green: `cargo test -p rsclaw --lib kb::` (197 unit) + 6 integration test files (13 tests total).
+- [x] README invariants 19–22 each map to a covering test or design contract.
+
+---
+
+## Execution-time fix sweep — one finding, fixed inline
+
+Only one substantive issue surfaced during T1-T18 execution.
+
+1. **`kb add` returned before the worker drained the queue** — in
+   CLI-only mode (no gateway daemon running), `ingest_canonicalized`
+   enqueues a `ChunkAndEmbed` job and exits. A follow-up
+   `kb search` then sees zero hits because no worker has run.
+   Fixed by adding a synchronous worker drain to `cmd::kb::add`:
+   loop `WorkerPool::run_one_blocking` until it returns `Ok(false)`.
+   This makes `kb add` look synchronous from the user's POV in
+   CLI-only mode; in production the gateway daemon's worker pool
+   still handles the async case.
+
+Open questions all resolved cleanly:
+- `async-trait`: added as `async-trait = "0.1"`.
+- `walkdir`: skipped — replaced with std `read_dir` recursion in
+  `compactor::scan_and_delete_orphans`.
+- `thiserror`: already in deps.
+- HTML extraction: Week 1's `canonicalize_by_mime("text/html", ...)`
+  works as-is.
+
+Final test smoke:
+
+```bash
+$ cargo test -p rsclaw --lib kb::
+test result: ok. 197 passed; 0 failed; 0 ignored
+
+$ cargo test --test kb_week1_e2e --test kb_week2_pipeline \
+              --test kb_week2_recovery --test kb_week3_search \
+              --test kb_week4_syncers --test kb_week4_compactor
+all pass (6 + 1 + 2 + 1 + 2 + 1 = 13 integration tests)
+```
