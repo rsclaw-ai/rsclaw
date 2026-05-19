@@ -26,6 +26,9 @@ pub async fn cmd_kb(cmd: KbCommand, kb_root: PathBuf) -> Result<()> {
         KbCommand::Compact => compact(kb_root),
         KbCommand::Stats => stats(kb_root),
         KbCommand::Export { doc_id, to } => export(kb_root, doc_id, to),
+        KbCommand::SyncAll { interval_min, max, dry_run } => {
+            sync_all(kb_root, interval_min, max, dry_run).await
+        }
     }
 }
 
@@ -530,6 +533,106 @@ fn total_size(root: &PathBuf) -> u64 {
         }
     }
     total
+}
+
+/// Re-sync every Active URL-sourced doc whose SyncState is older
+/// than `interval_min` minutes. Cap concurrency at `max`. Spec §S's
+/// long-term plan is a gateway-resident background task; until that
+/// lands users (or their cron job) can call this CLI directly.
+async fn sync_all(
+    kb_root: PathBuf,
+    interval_min: u64,
+    max: usize,
+    dry_run: bool,
+) -> Result<()> {
+    use crate::kb::canonicalize::canonicalize_url;
+    use crate::kb::store::codec::decode;
+    use crate::kb::store::schema::KB_DOCS;
+    use crate::kb::store::seen::get_sync_state;
+    use crate::kb::sync::{KbSourceSyncer, SyncContext, SyncReason, UrlSyncer};
+    use redb::ReadableTable;
+
+    let h = open_kb(&kb_root)?;
+    let cutoff_ms = chrono::Utc::now().timestamp_millis() - (interval_min as i64) * 60_000;
+
+    // 1. Collect candidate URLs from Active URL docs.
+    let mut candidates: Vec<(String, Vec<String>)> = Vec::new(); // (url, tags)
+    {
+        let rtx = h.store.begin_read()?;
+        let tbl = rtx.open_table(KB_DOCS)?;
+        for entry in tbl.iter()? {
+            let (_, v) = entry?;
+            let d: crate::kb::model::KbDoc = decode(v.value())?;
+            if d.status != crate::kb::model::KbStatus::Active {
+                continue;
+            }
+            let url = match &d.source {
+                crate::kb::model::KbSource::Url { url, .. } => url.clone(),
+                _ => continue,
+            };
+            let canonical = canonicalize_url(&url).unwrap_or(url);
+            let last = get_sync_state(&rtx, &canonical)
+                .ok()
+                .flatten()
+                .map(|s| s.last_sync_at)
+                .unwrap_or(0);
+            if last < cutoff_ms {
+                candidates.push((canonical, d.tags.clone()));
+            }
+        }
+    }
+    // De-dup canonical URLs (the same URL can back multiple versions).
+    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    candidates.dedup_by(|a, b| a.0 == b.0);
+    let total_candidates = candidates.len();
+    let to_run: Vec<_> = candidates.into_iter().take(max).collect();
+
+    if dry_run {
+        println!(
+            "{}",
+            serde_json::json!({
+                "dry_run": true,
+                "candidates": total_candidates,
+                "would_run": to_run.iter().map(|(u, _)| u).collect::<Vec<_>>(),
+            })
+        );
+        return Ok(());
+    }
+
+    let ctx = SyncContext {
+        store: h.store.clone(),
+        paths: h.paths.clone(),
+        index: h.index.clone(),
+        embedder: h.embedder.clone(),
+    };
+    let mut added = 0u64;
+    let mut skipped = 0u64;
+    let mut errored: Vec<String> = Vec::new();
+    for (url, tags) in &to_run {
+        let syncer = UrlSyncer {
+            url: url.clone(),
+            tags: tags.clone(),
+        };
+        match syncer.sync(&ctx, SyncReason::Periodic).await {
+            Ok(o) => {
+                added += o.docs_added as u64;
+                skipped += o.docs_skipped as u64;
+            }
+            Err(e) => errored.push(format!("{url}: {e}")),
+        }
+    }
+    drain_worker(&h)?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "candidates": total_candidates,
+            "ran": to_run.len(),
+            "added": added,
+            "skipped": skipped,
+            "errors": errored,
+        })
+    );
+    Ok(())
 }
 
 fn export(kb_root: PathBuf, doc_id: String, to: PathBuf) -> Result<()> {

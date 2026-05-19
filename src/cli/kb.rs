@@ -62,4 +62,16 @@ pub enum KbCommand {
         #[arg(long)]
         to: std::path::PathBuf,
     },
+    /// Re-sync all URL-sourced Active docs whose last sync is stale.
+    SyncAll {
+        /// Skip docs whose last_sync_at is newer than this many minutes ago.
+        #[arg(long, default_value_t = 20)]
+        interval_min: u64,
+        /// Cap the number of URLs synced this tick (rate-limit guard).
+        #[arg(long, default_value_t = 50)]
+        max: usize,
+        /// Print what would run without doing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
