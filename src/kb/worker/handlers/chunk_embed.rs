@@ -99,10 +99,17 @@ pub fn run(ctx: &HandlerCtx, doc_id: &str, doc_version: u32) -> Result<()> {
         wtx.commit()?;
     }
 
+    // 5. Update indexes (caches over redb; failures propagate so the
+    //    worker retries the job — chunks are already durable in redb).
+    for c in &chunks_with_vec {
+        ctx.index.upsert_chunk(c)?;
+    }
+    ctx.index.commit()?;
+
     tracing::info!(
         doc = %crate::kb::redact(doc_id),
         n_chunks = chunks_with_vec.len(),
-        "kb worker: chunk_embed complete"
+        "kb worker: chunk_embed + index update complete"
     );
     Ok(())
 }
@@ -124,6 +131,7 @@ mod tests {
         let paths = Arc::new(KbPaths::new(tmp.path().join("kb")));
         paths.ensure_layout().unwrap();
         let embedder: Arc<dyn KbEmbedder> = Arc::new(StubEmbedder::default());
+        let index = Arc::new(crate::kb::index::KbIndex::open(&paths).unwrap());
 
         let bytes = b"# Hi\n\nbody one.\n\nbody two.";
         let canon = canonicalize_by_mime(CanonicalizeInput {
@@ -148,7 +156,7 @@ mod tests {
             },
         )
         .unwrap();
-        let ctx = HandlerCtx { store, paths, embedder };
+        let ctx = HandlerCtx { store, paths, embedder, index };
         (tmp, ctx, out.doc_id)
     }
 
@@ -231,7 +239,8 @@ mod tests {
         let paths = Arc::new(KbPaths::new(tmp.path().join("kb")));
         paths.ensure_layout().unwrap();
         let embedder: Arc<dyn KbEmbedder> = Arc::new(StubEmbedder::default());
-        let ctx = HandlerCtx { store: store.clone(), paths: paths.clone(), embedder };
+        let index = Arc::new(crate::kb::index::KbIndex::open(&paths).unwrap());
+        let ctx = HandlerCtx { store: store.clone(), paths: paths.clone(), embedder, index };
 
         let lsid = LogicalSourceId("file:custom:rotate".into());
         let mk = |bytes: &[u8]| {

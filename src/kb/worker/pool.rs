@@ -195,7 +195,8 @@ mod tests {
         )
         .unwrap();
 
-        let ctx = HandlerCtx { store, paths, embedder };
+        let index = Arc::new(crate::kb::index::KbIndex::open(&paths).unwrap());
+        let ctx = HandlerCtx { store, paths, embedder, index };
         let cfg = WorkerConfig { worker_id: "w-test".into(), ..WorkerConfig::default() };
         (tmp, ctx, cfg, out.doc_id, lsid)
     }

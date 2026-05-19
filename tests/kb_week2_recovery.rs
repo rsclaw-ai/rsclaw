@@ -42,7 +42,8 @@ fn pipeline_fixture() -> (TempDir, HandlerCtx, WorkerConfig, String, String) {
         },
     )
     .unwrap();
-    let ctx = HandlerCtx { store, paths, embedder };
+    let index = Arc::new(rsclaw::kb::KbIndex::open(&paths).unwrap());
+    let ctx = HandlerCtx { store, paths, embedder, index };
     let cfg = WorkerConfig {
         worker_id: "w-recovery".into(),
         claim_ttl_ms: 50,
@@ -117,8 +118,10 @@ fn ingest_survives_process_restart() -> Result<()> {
 
     let store = Arc::new(KbStore::open(&db_path)?);
     let paths = Arc::new(KbPaths::new(&kb_root));
+    paths.ensure_layout()?;
     let embedder: Arc<dyn KbEmbedder> = Arc::new(StubEmbedder::default());
-    let ctx = HandlerCtx { store: store.clone(), paths, embedder };
+    let index = Arc::new(rsclaw::kb::KbIndex::open(&paths)?);
+    let ctx = HandlerCtx { store: store.clone(), paths, embedder, index };
     let cfg = WorkerConfig::default();
     let handler = DefaultDispatcher;
     assert!(WorkerPool::run_one_blocking(&ctx, &cfg, &handler)?);

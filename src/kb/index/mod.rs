@@ -94,10 +94,12 @@ mod tests {
             },
         )
         .unwrap();
+        let pre_index = Arc::new(KbIndex::open(&paths).unwrap());
         let ctx = HandlerCtx {
             store: store.clone(),
             paths: paths.clone(),
             embedder,
+            index: pre_index,
         };
         WorkerPool::run_one_blocking(
             &ctx,

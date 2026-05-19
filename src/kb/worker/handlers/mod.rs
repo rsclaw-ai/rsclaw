@@ -1,6 +1,7 @@
 pub mod chunk_embed;
 
 use crate::kb::embedder::KbEmbedder;
+use crate::kb::index::KbIndex;
 use crate::kb::jobs::JobKind;
 use crate::kb::paths::KbPaths;
 use crate::kb::store::KbStore;
@@ -18,6 +19,7 @@ pub struct HandlerCtx {
     pub store: Arc<KbStore>,
     pub paths: Arc<KbPaths>,
     pub embedder: Arc<dyn KbEmbedder>,
+    pub index: Arc<KbIndex>,
 }
 
 /// Default dispatcher: matches on `JobKind` and delegates.

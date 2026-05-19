@@ -22,10 +22,12 @@ async fn end_to_end_ingest_then_worker_drains_async() -> Result<()> {
     paths.ensure_layout()?;
     let embedder: Arc<dyn KbEmbedder> = Arc::new(StubEmbedder::default());
 
+    let index = Arc::new(rsclaw::kb::KbIndex::open(&paths)?);
     let ctx = HandlerCtx {
         store: store.clone(),
         paths: paths.clone(),
         embedder,
+        index,
     };
     let cfg = WorkerConfig {
         worker_id: "w-e2e".into(),
