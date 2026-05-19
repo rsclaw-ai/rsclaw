@@ -763,6 +763,7 @@ mod tests {
                 auth_token: None,
             a2a_bearer_tokens: vec![],
             a2a_api_keys: vec![],
+            a2a_max_body_bytes: 100 * 1024 * 1024,
                 allow_tailscale: false,
                 channel_health_check_minutes: 5,
                 channel_stale_event_threshold_minutes: 30,

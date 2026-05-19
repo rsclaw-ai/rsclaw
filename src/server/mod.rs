@@ -283,7 +283,16 @@ pub fn build_router(state: AppState) -> Router {
         .route("/stream", get(stream_sse))
         .route(
             "/a2a",
+            // axum's stock Json<T> body limit is 2 MiB which 413s any
+            // realistic file attachment. Honour gateway.a2a.maxBodyMb
+            // (default 100 MiB resolved in runtime.rs). The
+            // DefaultBodyLimit::max layer must wrap the route directly
+            // (before the middlewares) so axum's body-aware extractors
+            // see the larger limit.
             post(crate::a2a::server::a2a_dispatch)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    state.config.gateway.a2a_max_body_bytes.min(usize::MAX as u64) as usize,
+                ))
                 .layer(axum::middleware::from_fn(crate::a2a::version::a2a_version_layer))
                 .layer(axum::middleware::from_fn_with_state(
                     state.clone(),
