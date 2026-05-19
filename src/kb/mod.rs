@@ -48,7 +48,7 @@ pub use canonicalize::{
     CanonicalizedSource,
 };
 pub use chunker::{chunk_markdown, ChunkerInput, LocatorKind};
-pub use store::open_db;
+pub use store::{open_db, KbStore};
 pub use ledger::{IngestLedgerEntry, LedgerOp, LedgerStatus};
 pub use jobs::{ClaimToken, Job, JobKind, JobStatus};
 pub use util::redact;
