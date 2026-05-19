@@ -2,6 +2,7 @@
 //! markdown body on disk (`md/*.md` referenced by `KbChunk.byte_offset`);
 //! tantivy holds an inverted index keyed on `chunk_id`.
 
+use crate::kb::index::cjk::JiebaTokenizer;
 use crate::kb::store::KbStore;
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -9,8 +10,12 @@ use std::sync::Mutex;
 use tantivy::collector::TopDocs;
 use tantivy::directory::MmapDirectory;
 use tantivy::query::QueryParser;
-use tantivy::schema::{Field, Schema, Value, STORED, STRING, TEXT};
+use tantivy::schema::{
+    Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, STORED, STRING,
+};
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
+
+const CJK_TOKENIZER: &str = "cjk";
 
 const WRITER_HEAP_BYTES: usize = 50_000_000;
 
@@ -38,7 +43,14 @@ impl TantivyIndex {
         let mut sb = Schema::builder();
         let chunk_id = sb.add_text_field("chunk_id", STRING | STORED);
         let doc_id = sb.add_text_field("doc_id", STRING | STORED);
-        let indexed_text = sb.add_text_field("indexed_text", TEXT | STORED);
+        // indexed_text uses the jieba-backed CJK tokenizer so Chinese
+        // queries can match into the BM25 index. Registered below.
+        let text_opts = TextOptions::default().set_stored().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer(CJK_TOKENIZER)
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+        );
+        let indexed_text = sb.add_text_field("indexed_text", text_opts);
         let schema_obj = sb.build();
 
         let index = if Index::exists(&dir)? {
@@ -47,6 +59,11 @@ impl TantivyIndex {
             Index::create_in_dir(path, schema_obj.clone())
                 .with_context(|| "create tantivy")?
         };
+        // Register the CJK tokenizer on every open (not persisted in
+        // the index metadata; must re-register after each restart).
+        index
+            .tokenizers()
+            .register(CJK_TOKENIZER, JiebaTokenizer::new());
         let writer: IndexWriter = index.writer(WRITER_HEAP_BYTES)?;
         let reader = index
             .reader_builder()
@@ -193,5 +210,23 @@ mod tests {
         let (_tmp, idx) = fresh();
         let hits = idx.search("anything", 5).unwrap();
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn chinese_query_matches_chinese_doc() {
+        // The default whitespace analyzer can't split CJK; jieba does.
+        let (_tmp, idx) = fresh();
+        idx.upsert("c1", "d1", "蒙牛奶粉冲泡指南：建议比例 1:7").unwrap();
+        idx.upsert("c2", "d1", "伊利酸奶发酵过程详解").unwrap();
+        idx.commit().unwrap();
+        let hits = idx.search("蒙牛", 5).unwrap();
+        assert_eq!(hits.len(), 1, "expected 1 hit for 蒙牛, got {hits:?}");
+        assert_eq!(hits[0].0, "c1");
+        let hits = idx.search("奶粉", 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "c1");
+        let hits = idx.search("酸奶", 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "c2");
     }
 }

@@ -2,10 +2,12 @@
 //! Both layers are caches over redb; rebuild from redb is the
 //! canonical recovery path.
 
+pub mod cjk;
 pub mod hnsw;
 pub mod rebuild;
 pub mod tantivy;
 
+pub use cjk::JiebaTokenizer;
 pub use hnsw::HnswCache;
 pub use tantivy::TantivyIndex;
 
