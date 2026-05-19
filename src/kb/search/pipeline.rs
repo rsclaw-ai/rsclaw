@@ -10,6 +10,7 @@ use crate::kb::search::mmr::{mmr_select, MmrCandidate};
 use crate::kb::search::rrf::rrf_fuse;
 use crate::kb::store::{chunks, docs, KbStore};
 use anyhow::Result;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -38,7 +39,7 @@ pub enum Diversity {
     Mmr,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RetrievalHit {
     pub chunk_id: String,
     pub doc_id: String,
@@ -50,7 +51,7 @@ pub struct RetrievalHit {
     pub entities: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Citation {
     pub source: String,
     pub locator_human: String,
