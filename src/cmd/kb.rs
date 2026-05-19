@@ -192,8 +192,65 @@ fn search(kb_root: PathBuf, query: String, k: usize) -> Result<()> {
 fn show(kb_root: PathBuf, id: String) -> Result<()> {
     let h = open_kb(&kb_root)?;
     let ctx = search_ctx(&h);
+
+    // Resolve id: try chunk_id first (32 hex chars from Week 1's
+    // deterministic chunker), else treat as doc_id and list its
+    // chunks. Falls back to "not found" if neither resolves.
+    let is_chunk_id = id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit());
+    if is_chunk_id {
+        return show_chunk(&ctx, id);
+    }
+
+    // Treat as doc_id: print doc metadata + every chunk's heading
+    // path + first snippet (180 chars).
+    let rtx = h.store.clone().begin_read()?;
+    let doc = match crate::kb::store::docs::get(&rtx, &id)? {
+        Some(d) => d,
+        None => {
+            // Last chance: maybe it really was a chunk_id with an
+            // unconventional length. Try kb_fetch anyway.
+            drop(rtx);
+            return show_chunk(&ctx, id);
+        }
+    };
+    if !doc.visible_to(&CallerScope::default()) {
+        eprintln!("doc not visible to current scope");
+        return Ok(());
+    }
+    println!("doc_id:    {}", doc.id);
+    println!("title:     {}", doc.title);
+    println!("source:    {:?}", doc.source);
+    println!("kind:      {}", doc.source_kind.as_str());
+    println!("version:   {}", doc.version);
+    println!("status:    {:?}", doc.status);
+    if !doc.tags.is_empty() {
+        println!("tags:      {}", doc.tags.join(", "));
+    }
+    let chunks_list =
+        crate::kb::store::chunks::chunks_for_logical(&rtx, &doc.logical_source_id)?;
+    let mut chunks_this_version: Vec<_> = chunks_list
+        .into_iter()
+        .filter(|c| c.doc_id == doc.id)
+        .collect();
+    chunks_this_version.sort_by_key(|c| c.seq);
+    println!("chunks:    {}", chunks_this_version.len());
+    println!("---");
+    for c in &chunks_this_version {
+        let head = if c.heading_path.is_empty() {
+            String::from("(root)")
+        } else {
+            c.heading_path.join(" > ")
+        };
+        let snippet: String = c.indexed_text.chars().take(180).collect();
+        println!("[{}]  §{}", c.id, head);
+        println!("    {snippet}");
+    }
+    Ok(())
+}
+
+fn show_chunk(ctx: &SearchCtx, id: String) -> Result<()> {
     let out = kb_fetch::run(
-        &ctx,
+        ctx,
         kb_fetch::KbFetchInput {
             chunk_id: id,
             expand: "neighbor".into(),
