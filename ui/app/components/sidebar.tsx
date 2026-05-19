@@ -787,7 +787,7 @@ export function SideBar(props: { className?: string }) {
                 className={styles["sidebar-quick-btn"]}
                 onClick={() => {
                   if (item.comingSoon) {
-                    toast.success(
+                    toast.info(
                       item.label,
                       Locale.RsClawPanel.Sidebar.ComingSoon,
                     );

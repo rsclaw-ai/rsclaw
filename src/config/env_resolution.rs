@@ -279,7 +279,7 @@ fn resolve_login_shell() -> Option<String> {
 
 /// Run a child to completion or kill it on timeout. Designed for the
 /// shell-rc fallback path where a hung shell would otherwise wedge
-/// gateway startup forever.
+/// gateway startup forever — and the worker thread waiting on it.
 fn run_with_timeout(mut cmd: Command, dur: Duration) -> Result<std::process::Output> {
     let child = cmd.spawn()?;
     let pid = child.id();
@@ -287,7 +287,10 @@ fn run_with_timeout(mut cmd: Command, dur: Duration) -> Result<std::process::Out
     // Move the child into a worker thread that waits for it. The
     // worker sends the output back through a channel. Meanwhile the
     // caller waits on the channel with a timeout — if the timeout
-    // fires before the worker sends, we SIGTERM the child by PID.
+    // fires before the worker sends, we SIGTERM the child by PID,
+    // then SIGKILL after a short grace if it's still alive. Without
+    // the SIGKILL escalation a `.zshrc` wedged on a network call
+    // would leak the worker thread for the rest of the process.
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(child.wait_with_output());
@@ -298,10 +301,23 @@ fn run_with_timeout(mut cmd: Command, dur: Duration) -> Result<std::process::Out
         Ok(Err(e)) => Err(e.into()),
         Err(_) => {
             #[cfg(unix)]
-            // SAFETY: libc::kill on a PID we just spawned; sending
-            // SIGTERM is benign even if the child has already exited.
             unsafe {
+                // SAFETY: libc::kill on a PID we just spawned; sending
+                // SIGTERM is benign even if the child has already exited
+                // (kill returns ESRCH, which we ignore).
                 libc::kill(pid as i32, libc::SIGTERM);
+                // Grace window for graceful shutdown — then escalate to
+                // SIGKILL so the worker thread can unblock from
+                // wait_with_output() and not leak for the rest of the
+                // process lifetime.
+                const SIGKILL_GRACE: Duration = Duration::from_millis(500);
+                if rx.recv_timeout(SIGKILL_GRACE).is_err() {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                    // Final short window to reap; if even SIGKILL
+                    // doesn't free the worker, the thread is leaked
+                    // but at most one process is involved per boot.
+                    let _ = rx.recv_timeout(Duration::from_millis(500));
+                }
             }
             anyhow::bail!("shell command timed out after {dur:?}")
         }
@@ -314,11 +330,11 @@ static PLACEHOLDER_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| 
     Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}").expect("valid regex")
 });
 
-/// `{source:"env",id:"VAR"}` SecretRef regex. Operates on raw JSON5
-/// text because we need the var list BEFORE the config is parsed
-/// (chicken-and-egg: parsing fills in ${VAR} from process env, but
-/// we need to populate process env first). Tolerant of whitespace and
-/// either single or double quotes around values; not a full parser.
+/// `{source:"env",id:"VAR"}` SecretRef regex — used only as a fallback
+/// when JSON5 parsing fails. The primary scan goes via parsed Value
+/// tree to avoid matching SecretRef-looking syntax inside string
+/// literals (e.g. a tool description that mentions `{source:'env',
+/// id:'PATH'}` would otherwise persist `PATH` into `.env`).
 static SECRETREF_ENV_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
     Regex::new(
         r#""?source"?\s*:\s*"env"\s*,[^}]*?"?id"?\s*:\s*["']([A-Za-z_][A-Za-z0-9_]*)["']"#,
@@ -326,16 +342,153 @@ static SECRETREF_ENV_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|
     .expect("valid regex")
 });
 
+/// Sentinel-wrapped placeholder used to make the raw config parseable as
+/// JSON5 before any `${VAR}` substitution has happened. We replace
+/// `${VAR}` → `"__RSCLAW_PH_VAR__"` so the parser never chokes on a bare
+/// placeholder (e.g. `port: ${PORT}`), then strip the sentinel back
+/// when walking the resulting Value tree.
+const PLACEHOLDER_SENTINEL_PREFIX: &str = "__RSCLAW_PH_";
+const PLACEHOLDER_SENTINEL_SUFFIX: &str = "__";
+
+/// Strip JSON5 line/block comments without otherwise touching the text.
+/// Used only by the fallback regex scan; the primary path parses JSON5
+/// directly which already ignores comments.
+fn strip_json5_comments(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0;
+    let mut in_string: Option<u8> = None;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = in_string {
+            // Inside a string: pass through, watch for the matching close
+            // quote, treat `\` as a 2-char escape so `\"` doesn't end the
+            // string. JSON5 does not allow unescaped newlines inside
+            // single-line strings; we don't try to be cleverer than that.
+            out.push(c as char);
+            if c == b'\\' && i + 1 < bytes.len() {
+                out.push(bytes[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            if c == q {
+                in_string = None;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'/' && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'/' => {
+                    // Line comment — skip to next \n (keep the \n).
+                    i += 2;
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                b'*' => {
+                    // Block comment — skip to closing `*/`.
+                    i += 2;
+                    while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i = (i + 2).min(bytes.len());
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if c == b'"' || c == b'\'' {
+            in_string = Some(c);
+        }
+        out.push(c as char);
+        i += 1;
+    }
+    out
+}
+
+/// Walk a parsed JSON5 Value tree and collect:
+/// - `id` strings from `{source: "env", id: "X"}` SecretRef objects;
+/// - `${VAR}` placeholders embedded in any string value.
+fn walk_value_for_refs(v: &serde_json::Value, out: &mut BTreeSet<String>) {
+    use serde_json::Value;
+    match v {
+        Value::Object(m) => {
+            let is_env_ref = matches!(m.get("source"), Some(Value::String(s)) if s == "env");
+            if is_env_ref {
+                if let Some(Value::String(raw_id)) = m.get("id") {
+                    // `id` may itself be a `${VAR}` placeholder that the
+                    // sentinel pass turned into `__RSCLAW_PH_VAR__`. In
+                    // that case the placeholder's name is captured
+                    // separately via PLACEHOLDER_RE on the raw text —
+                    // don't double-add it here.
+                    let id = raw_id.as_str();
+                    let is_sentinel = id.starts_with(PLACEHOLDER_SENTINEL_PREFIX)
+                        && id.ends_with(PLACEHOLDER_SENTINEL_SUFFIX);
+                    if !is_sentinel
+                        && !id.is_empty()
+                        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && id.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                    {
+                        out.insert(id.to_owned());
+                    }
+                }
+            }
+            for v in m.values() {
+                walk_value_for_refs(v, out);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr {
+                walk_value_for_refs(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Scan raw config text for both `${VAR}` placeholders and `{source:
 /// "env", id: "X"}` SecretRef nodes. Returns the union of referenced
 /// var names.
+///
+/// Primary strategy: substitute `${VAR}` placeholders with a sentinel
+/// string so the raw text always parses as JSON5, then walk the Value
+/// tree. This anchors SecretRef detection to actual JSON5 structure so
+/// matching syntax buried inside string literals (e.g. a tool
+/// description) does not get hoisted into `.env`.
+///
+/// Fallback: if JSON5 parsing still fails, fall back to a
+/// comment-stripped raw-regex scan. Better to over-set a couple of env
+/// vars than to silently miss a real reference.
 pub fn scan_var_refs(raw: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
+    // `${VAR}` placeholders are always collected from the raw text;
+    // they live inside strings and are unambiguous.
     for caps in PLACEHOLDER_RE.captures_iter(raw) {
         out.insert(caps[1].to_owned());
     }
-    for caps in SECRETREF_ENV_RE.captures_iter(raw) {
-        out.insert(caps[1].to_owned());
+    // For SecretRef detection: substitute placeholders → sentinel
+    // string, parse JSON5, walk the tree.
+    let sentinel = PLACEHOLDER_RE.replace_all(raw, |caps: &regex::Captures<'_>| {
+        format!(
+            "\"{prefix}{name}{suffix}\"",
+            prefix = PLACEHOLDER_SENTINEL_PREFIX,
+            name = &caps[1],
+            suffix = PLACEHOLDER_SENTINEL_SUFFIX,
+        )
+    });
+    match json5::from_str::<serde_json::Value>(&sentinel) {
+        Ok(v) => walk_value_for_refs(&v, &mut out),
+        Err(_) => {
+            // Fallback: comment-stripped regex scan. Less precise but
+            // preserves the old behaviour for configs that won't parse
+            // (rare; usually means a hand-edited syntax error).
+            let stripped = strip_json5_comments(raw);
+            for caps in SECRETREF_ENV_RE.captures_iter(&stripped) {
+                out.insert(caps[1].to_owned());
+            }
+        }
     }
     out
 }
@@ -378,5 +531,57 @@ mod tests {
         let got = scan_var_refs(raw);
         assert!(got.contains("FROM_PLACEHOLDER"));
         assert!(got.contains("FROM_REF"));
+    }
+
+    #[test]
+    fn secretref_inside_string_literal_ignored() {
+        // A tool description that mentions SecretRef syntax inside a
+        // STRING VALUE must NOT cause `PATH` to be persisted to `.env`.
+        let raw = r#"{
+            tools: [{
+                name: "explain_secret_ref",
+                description: "Pass {source:'env', id:'PATH'} to fetch process PATH at runtime."
+            }],
+            apiKey: {source: "env", id: "REAL_KEY"}
+        }"#;
+        let got = scan_var_refs(raw);
+        assert!(got.contains("REAL_KEY"), "real ref missing: {got:?}");
+        assert!(!got.contains("PATH"), "false positive captured: {got:?}");
+    }
+
+    #[test]
+    fn secretref_inside_line_comment_ignored() {
+        let raw = r#"{
+            // example: apiKey: {source: "env", id: "EXAMPLE_KEY"}
+            apiKey: {source: "env", id: "REAL_KEY"}
+        }"#;
+        let got = scan_var_refs(raw);
+        assert!(got.contains("REAL_KEY"));
+        assert!(!got.contains("EXAMPLE_KEY"), "comment captured: {got:?}");
+    }
+
+    #[test]
+    fn secretref_inside_block_comment_ignored() {
+        let raw = r#"{
+            /* legacy: {source: "env", id: "OLD_KEY"} */
+            apiKey: {source: "env", id: "REAL_KEY"}
+        }"#;
+        let got = scan_var_refs(raw);
+        assert!(got.contains("REAL_KEY"));
+        assert!(!got.contains("OLD_KEY"), "block comment captured: {got:?}");
+    }
+
+    #[test]
+    fn placeholder_outside_string_still_captured() {
+        // `port: ${PORT}` (placeholder appears bare; not valid JSON5).
+        // Sentinel pass makes it parseable; PLACEHOLDER_RE still finds
+        // PORT on the raw text.
+        let raw = r#"{
+            port: ${PORT},
+            apiKey: "${MY_KEY}"
+        }"#;
+        let got = scan_var_refs(raw);
+        assert!(got.contains("PORT"), "got {got:?}");
+        assert!(got.contains("MY_KEY"), "got {got:?}");
     }
 }

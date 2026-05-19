@@ -481,7 +481,6 @@ pub fn build_tool_list(
             "type": "object",
             "properties": {
                 "mode": {"type": "string", "description": "stat | head:N | tail:N | seq:A-B | grep:PATTERN. Default `stat`."},
-                "session_key": {"type": "string", "description": "Optional — defaults to your current session. Pass another session_key only if you've been told to inspect someone else's history."},
                 "generation": {"type": "integer", "description": "Optional — restrict to a specific session generation (post-/clear). Omit for all."}
             }
         }),

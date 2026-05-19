@@ -93,14 +93,14 @@ export function RsclawProviderCard() {
 
     let cancelled = false;
     let unsub: (() => void) | undefined;
-    onKeyInstalled(async (data) => {
+    // sidebar-account-chip is always mounted and owns the persist of
+    // `rsclaw:console-install-key` payloads via applyInstalledKey().
+    // This card only needs to re-read the resulting state — racing a
+    // second applyInstalledKey here would cause concurrent read→merge
+    // →write on rsclaw.json5 (last-write-wins, but wasteful).
+    onKeyInstalled(async () => {
       if (cancelled) return;
-      // Same belt-and-suspenders write as the sidebar chip — when an
-      // install event fires while this card is mounted, persist the
-      // key here too. No double-write risk: onboarding card and
-      // sidebar chip aren't mounted simultaneously with this panel.
-      await applyInstalledKey(data);
-      if (!cancelled) await refresh();
+      await refresh();
     })
       .then((fn) => {
         if (cancelled) fn();
@@ -290,12 +290,13 @@ function ManualKeyRow(props: {
   saveLabel: string;
   busy: boolean;
 }) {
+  const [reveal, setReveal] = useState(false);
   return (
     <div style={manualRowStyle}>
       <div style={manualLabelStyle}>{props.label}</div>
       <div style={{ display: "flex", gap: 6 }}>
         <input
-          type="text"
+          type={reveal ? "text" : "password"}
           placeholder={props.placeholder}
           value={props.value}
           onChange={(e) => props.onChange(e.target.value)}
@@ -304,7 +305,17 @@ function ManualKeyRow(props: {
           }}
           style={manualInputStyle}
           spellCheck={false}
+          autoComplete="off"
         />
+        <button
+          type="button"
+          onClick={() => setReveal((v) => !v)}
+          disabled={!props.value}
+          style={revealBtnStyle}
+          title={reveal ? "hide" : "show"}
+        >
+          {reveal ? "🙈" : "👁"}
+        </button>
         <button
           type="button"
           onClick={props.onSave}
@@ -399,6 +410,18 @@ const primaryBtnStyle: React.CSSProperties = {
   borderRadius: 7,
   cursor: "pointer",
   fontFamily: "inherit",
+};
+
+const revealBtnStyle: React.CSSProperties = {
+  padding: "7px 10px",
+  fontSize: 13,
+  color: "#eceaf4",
+  background: "rgba(255,255,255,0.04)",
+  border: "1px solid rgba(255,255,255,0.10)",
+  borderRadius: 7,
+  cursor: "pointer",
+  fontFamily: "inherit",
+  lineHeight: 1,
 };
 
 const dangerBtnStyle: React.CSSProperties = {

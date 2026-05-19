@@ -10,7 +10,7 @@
 use serde_json::{json, Value};
 
 use crate::artifact::store::ArtifactStore;
-use crate::artifact::text::{head_tail, normalize_lines, strip_ansi};
+use crate::artifact::text::{head_tail_with_marker, normalize_lines, strip_ansi};
 
 /// Tool output below this many chars is returned verbatim — compaction noise
 /// (envelope fields, omission marker) costs more than the savings.
@@ -81,22 +81,24 @@ pub fn compact_text(
         }
     };
     let lines = normalize_lines(&strip_ansi(text));
-    let total = lines.len();
-    let kept = head_tail(&lines, budget.head_lines, budget.tail_lines);
-    let preview = kept.join("\n");
-
-    // Replace the line-omission marker with one that points at the artifact id.
-    let omitted = total
-        .saturating_sub(budget.head_lines as usize)
-        .saturating_sub(budget.tail_lines as usize);
-    let preview = preview.replacen(
-        &format!("... {omitted} lines omitted ..."),
-        &format!(
-            "... {omitted} lines omitted — call read_artifact(tool_result_id=\"{}\") for full output ...",
-            id.as_str()
-        ),
-        1,
+    // Build the preview with the artifact-aware marker in one pass.
+    // Previously this called head_tail() and then `replacen`'d the
+    // generic marker — fragile, because content lines that happened
+    // to match the literal `"... N lines omitted ..."` (or that got
+    // mangled by strip_ansi) made the replacement silently no-op and
+    // the LLM never saw the read_artifact handle.
+    let id_str = id.as_str().to_owned();
+    let kept = head_tail_with_marker(
+        &lines,
+        budget.head_lines,
+        budget.tail_lines,
+        |omitted| {
+            format!(
+                "... {omitted} lines omitted — call read_artifact(tool_result_id=\"{id_str}\") for full output ..."
+            )
+        },
     );
+    let preview = kept.join("\n");
 
     // Char-cap fallback. Two cases this protects against:
     //   1. input is one giant line (minified JSON, base64) — line-based

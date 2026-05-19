@@ -288,6 +288,8 @@ fn stream_event_done_with_usage() {
         usage: Some(TokenUsage {
             input: 100,
             output: 50,
+            cache_creation: 0,
+            cache_read: 0,
         }),
     };
     match event {

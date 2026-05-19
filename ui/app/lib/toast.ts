@@ -3,7 +3,7 @@
 //        toast.error("保存失败", "网关未运行");
 //        toast.success("已保存");
 
-type ToastType = "error" | "warn" | "success";
+type ToastType = "error" | "warn" | "success" | "info";
 
 interface ToastItem {
   id: string;
@@ -58,6 +58,9 @@ export const toast = {
   },
   success(title: string, desc?: string) {
     add("success", title, desc);
+  },
+  info(title: string, desc?: string) {
+    add("info", title, desc);
   },
   // Convenience: show error from a caught exception with translation.
   fromError(title: string, err: unknown) {

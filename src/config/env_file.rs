@@ -39,7 +39,11 @@ pub fn read(path: &Path) -> Result<BTreeMap<String, String>> {
             tracing::warn!(line_num = i + 1, line, "malformed line in .env, skipping");
             continue;
         };
+        // Tolerate `export FOO=bar` — copy-pasting `env | grep FOO` or
+        // lines straight from a shell script into `.env` is a common
+        // workflow and the `export` prefix is meaningless here.
         let k = k.trim();
+        let k = k.strip_prefix("export ").map(str::trim).unwrap_or(k);
         if !is_valid_key(k) {
             tracing::warn!(
                 line_num = i + 1,
@@ -152,6 +156,24 @@ mod tests {
         assert_eq!(got.get("GOOD").map(String::as_str), Some("ok"));
         assert_eq!(got.get("FOO").map(String::as_str), Some("bar"));
         assert_eq!(got.len(), 2, "expected only valid keys");
+    }
+
+    #[test]
+    fn read_accepts_export_prefix() {
+        // Lines copy-pasted from a shell script (or `env | grep ... |
+        // sed 's/^/export /'`) keep working without manual cleanup.
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let path = tmp.path().join(".env");
+        std::fs::write(
+            &path,
+            "export OPENAI_KEY=sk-abc\nexport FOO=bar\nBAREKEY=baz\n",
+        )
+        .expect("write");
+        let got = read(&path).expect("read");
+        assert_eq!(got.get("OPENAI_KEY").map(String::as_str), Some("sk-abc"));
+        assert_eq!(got.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(got.get("BAREKEY").map(String::as_str), Some("baz"));
+        assert_eq!(got.len(), 3);
     }
 
     #[test]

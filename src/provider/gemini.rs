@@ -328,12 +328,12 @@ fn parse_event(data: &str) -> Option<StreamEvent> {
     // Finish reason.
     if candidate.get("finishReason").is_some() {
         let usage = v.get("usageMetadata").map(|u| TokenUsage {
-            input: u["promptTokenCount"].as_u64().unwrap_or(0) as u32,
-            output: u["candidatesTokenCount"].as_u64().unwrap_or(0) as u32,
+            input: u["promptTokenCount"].as_u64().unwrap_or(0),
+            output: u["candidatesTokenCount"].as_u64().unwrap_or(0),
             // Gemini reports cache reads via `cachedContentTokenCount`;
             // no separate creation counter (cache is implicit).
             cache_creation: 0,
-            cache_read: u["cachedContentTokenCount"].as_u64().unwrap_or(0) as u32,
+            cache_read: u["cachedContentTokenCount"].as_u64().unwrap_or(0),
         });
         return Some(StreamEvent::Done { usage });
     }

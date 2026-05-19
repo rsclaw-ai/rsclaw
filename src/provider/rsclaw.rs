@@ -1371,18 +1371,27 @@ impl RsclawProvider {
         // the body stream is allowed to take as long as it needs.
         // Connection liveness during streaming is covered by the
         // client-level `tcp_keepalive(30s)` configured above.
-        // Retry transient backend errors (502 / 503 / 504 / 429) with
-        // bounded backoff. rsclaw-llm fleet exhibits brief unavailability
-        // windows during worker WS reattach, dynamic-LRU pressure, and
-        // queue saturation — observed lengths are typically << 5s. Without
-        // retry, those windows surface as cryptic 502/503 leaks to end
-        // users. We don't retry forever: 3 attempts at 500ms / 2s / 5s
-        // cover the common case while still failing fast on a truly down
-        // backend.
-        const RETRY_BACKOFFS: [Duration; 3] = [
+        // Retry policy for `/sessions/<id>/turn`:
+        //
+        // `POST /turn` is NOT idempotent — its body contains
+        // `tool_results` that the server appends to the session log on
+        // success. A blind retry on 502/504 risks double-appending if
+        // the upstream reached the worker but failed to flush headers.
+        // 429 surfaces a real rate-limit signal the caller should see.
+        //
+        // Per docs/client-server-integration.md §4.4: "Treat 503 on
+        // /turn as retryable with backoff" — only 503 means the
+        // server-side auto-replay attempted recovery and gave up
+        // BEFORE the worker advanced state. We narrow retry to that
+        // single status.
+        //
+        // 503s with a specific `session_diverged` / `version_drift` /
+        // `backend_unavailable` (pinned-node) body code go through
+        // `is_session_evicted` above and return SessionNotFound so the
+        // caller can drive a clean `/sessions/replay` recovery.
+        const RETRY_BACKOFFS: [Duration; 2] = [
             Duration::from_millis(500),
             Duration::from_secs(2),
-            Duration::from_secs(5),
         ];
         let mut attempt: usize = 0;
         let resp = loop {
@@ -1412,13 +1421,13 @@ impl RsclawProvider {
             if is_session_evicted(status, &body_text) {
                 return Ok(TurnOutcome::SessionNotFound);
             }
-            if is_transient_backend_error(status) && attempt < RETRY_BACKOFFS.len() {
+            if status == StatusCode::SERVICE_UNAVAILABLE && attempt < RETRY_BACKOFFS.len() {
                 let delay = RETRY_BACKOFFS[attempt];
                 tracing::warn!(
                     status = %status,
                     attempt = attempt + 1,
                     delay_ms = delay.as_millis() as u64,
-                    "rsclaw turn: transient backend error, retrying"
+                    "rsclaw turn: 503 from upstream after server-side auto-replay; retrying"
                 );
                 tokio::time::sleep(delay).await;
                 attempt += 1;
@@ -2852,39 +2861,13 @@ async fn parse_sse_chunk(
 /// Pull a usage count from a worker `usage` object, trying field
 /// names in order and defaulting missing to 0. Lane-specific name
 /// drift is documented in client-server-integration.md §4.3.
-fn extract_usage_count(u: &serde_json::Map<String, Value>, names: &[&str]) -> u32 {
+fn extract_usage_count(u: &serde_json::Map<String, Value>, names: &[&str]) -> u64 {
     for name in names {
         if let Some(n) = u.get(*name).and_then(Value::as_u64) {
-            return n as u32;
+            return n;
         }
     }
     0
-}
-
-/// True when the status alone (no body code required) is a transient
-/// upstream signal that retrying after a short backoff is likely to
-/// succeed:
-/// - `502 Bad Gateway` — rsclaw-server can't reach its worker right
-///   now (WS detach, self-loopback 404). Often clears in 1-2s.
-/// - `503 Service Unavailable` — generic backend pressure (dynamic
-///   prefix LRU full, no_backend_available). 1-5s window typical.
-/// - `504 Gateway Timeout` — request queued past the server's wait
-///   budget. Retrying gives it a fresh slot.
-/// - `429 Too Many Requests` — explicit rate limit. Backoff is the
-///   correct response.
-///
-/// This is intentionally body-blind: we don't want to special-case
-/// every error code variant the server might add. The cost of a
-/// spurious retry on a non-transient 5xx is bounded by the backoff
-/// schedule; the benefit is a smoother UX during real transients.
-fn is_transient_backend_error(status: StatusCode) -> bool {
-    matches!(
-        status,
-        StatusCode::BAD_GATEWAY              // 502
-            | StatusCode::SERVICE_UNAVAILABLE // 503
-            | StatusCode::GATEWAY_TIMEOUT     // 504
-            | StatusCode::TOO_MANY_REQUESTS   // 429
-    )
 }
 
 /// True when the (status, body) pair is a documented session-eviction
@@ -3906,36 +3889,6 @@ data: {"type":"block_stop","index":0}
     fn is_session_evicted_recognizes_session_not_found() {
         let body = r#"{"error":{"code":"session_not_found","detail":"slot evicted"}}"#;
         assert!(is_session_evicted(StatusCode::NOT_FOUND, body));
-    }
-
-    #[test]
-    fn is_transient_backend_error_covers_5xx_and_429() {
-        for s in [
-            StatusCode::BAD_GATEWAY,
-            StatusCode::SERVICE_UNAVAILABLE,
-            StatusCode::GATEWAY_TIMEOUT,
-            StatusCode::TOO_MANY_REQUESTS,
-        ] {
-            assert!(is_transient_backend_error(s), "expected transient: {s}");
-        }
-    }
-
-    #[test]
-    fn is_transient_backend_error_rejects_4xx_client_and_2xx() {
-        // 4xx (other than 429) are client problems; retrying won't help.
-        // 2xx is success — never reached by the retry branch but assert
-        // anyway to lock down the contract.
-        for s in [
-            StatusCode::BAD_REQUEST,
-            StatusCode::UNAUTHORIZED,
-            StatusCode::FORBIDDEN,
-            StatusCode::NOT_FOUND,
-            StatusCode::CONFLICT,
-            StatusCode::PAYLOAD_TOO_LARGE,
-            StatusCode::OK,
-        ] {
-            assert!(!is_transient_backend_error(s), "expected non-transient: {s}");
-        }
     }
 
     #[test]

@@ -418,6 +418,10 @@ impl RedbStore {
             };
             out.push((seq, generation, msg));
         }
+        // Keys range in lexicographic order, so `gen10` sorts between `gen1`
+        // and `gen2`. Re-sort by (generation, seq) so head/tail/seq modes see
+        // chronological order even after the 10th /clear.
+        out.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
         Ok(out)
     }
 
@@ -1340,6 +1344,42 @@ mod tests {
         assert_eq!(rows[0].1, 1, "generation should be 1");
         assert_eq!(rows[0].2["content"], "msg 1");
         assert_eq!(rows[5].2["content"], "msg 6");
+    }
+
+    #[test]
+    fn archive_load_orders_cross_generation_numerically() {
+        // Regression: keys are `archive:<sk>:gen<N>:<seq>`. Lexicographic
+        // range scan sorts `gen10` BEFORE `gen2` — head/tail used to
+        // return chronologically-wrong messages once a session had been
+        // /clear'd more than 9 times. archive_load post-sorts by
+        // (generation, seq) to keep head/tail meaningful.
+        let (store, _dir) = open_tmp();
+        let sk = "sess:gen_order";
+        // Build 11 generations with one message each.
+        for _ in 0..11 {
+            store
+                .append_message(sk, &serde_json::json!({ "role": "user", "content": "msg" }))
+                .expect("append");
+            store.new_generation(sk).expect("new_generation");
+        }
+        // One more message in gen 12 so we test the bigger range.
+        store
+            .append_message(sk, &serde_json::json!({ "role": "user", "content": "final" }))
+            .expect("append");
+
+        let rows = store.archive_load(sk, None).expect("archive_load");
+        // Generations must be monotonically non-decreasing.
+        for win in rows.windows(2) {
+            assert!(
+                win[0].1 <= win[1].1,
+                "generations out of order: {} then {}",
+                win[0].1,
+                win[1].1,
+            );
+        }
+        // First row is generation 1; last row is generation 12.
+        assert_eq!(rows.first().map(|r| r.1), Some(1));
+        assert_eq!(rows.last().map(|r| r.1), Some(12));
     }
 
     #[test]

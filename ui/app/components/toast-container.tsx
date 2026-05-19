@@ -7,6 +7,7 @@ const COLORS: Record<string, { border: string; line: string }> = {
   error: { border: "rgba(217,95,95,0.25)", line: "#d95f5f" },
   warn: { border: "rgba(249,115,22,0.25)", line: "#f97316" },
   success: { border: "rgba(45,212,160,0.25)", line: "#2dd4a0" },
+  info: { border: "rgba(125,140,170,0.25)", line: "#7d8caa" },
 };
 
 export function ToastContainer() {

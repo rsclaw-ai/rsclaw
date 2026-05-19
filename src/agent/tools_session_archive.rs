@@ -174,11 +174,10 @@ impl AgentRuntime {
         ctx: &RunContext,
         args: Value,
     ) -> Result<Value> {
-        let session_key = args["session_key"]
-            .as_str()
-            .or_else(|| args["sessionKey"].as_str())
-            .unwrap_or(&ctx.session_key)
-            .to_string();
+        // Always operate on the caller's own session — never let the LLM
+        // pass `session_key` to read a peer's archive. The argument is
+        // intentionally absent from the tool schema.
+        let session_key = ctx.session_key.clone();
         let mode = args["mode"].as_str().unwrap_or("stat");
         let generation = args["generation"].as_u64().map(|g| g as u32);
 

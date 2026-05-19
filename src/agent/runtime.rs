@@ -5192,10 +5192,23 @@ impl AgentRuntime {
                         if let Some(bus) = bus {
                             let preview = match &timed {
                                 Ok(Ok(v)) => {
+                                    // Render through `format_tool_result` so
+                                    // shape-specific tools (exec, read,
+                                    // web_search, …) emit clean text instead
+                                    // of raw JSON. Then collapse any oversize
+                                    // string fields (image data URLs, full
+                                    // HTML, base64 blobs) so the UI card
+                                    // doesn't carry raw payload —
+                                    // `compact_value` runs in Phase 3 against
+                                    // the same value and produces the canonical
+                                    // artifact, so duplicating that write here
+                                    // would burn disk; we just squash for the
+                                    // streaming preview.
                                     let raw = if v.is_string() {
                                         v.as_str().unwrap_or("").to_owned()
                                     } else {
-                                        v.to_string()
+                                        let squashed = squash_large_strings(v, 1_000);
+                                        format_tool_result(&squashed)
                                     };
                                     if raw.chars().count() > 4000 {
                                         let truncated: String =
@@ -6068,7 +6081,7 @@ impl AgentRuntime {
                 }
                 return self.tool_web_search(args).await;
             }
-            "web_fetch" => return self.tool_web_fetch(args).await,
+            "web_fetch" => return self.tool_web_fetch(ctx, args).await,
             "web_download" => return self.tool_web_download(args).await,
             "web_browser" | "browser" => return self.tool_web_browser(ctx, args).await,
             "computer_use" => return self.tool_computer_use(ctx, args).await,
@@ -6967,6 +6980,36 @@ fn is_likely_text_file(lower: &str) -> bool {
 
 
 /// Format a tool call result as human-readable markdown.
+/// Walk a `Value` and replace any string longer than `max_chars` with a
+/// `[N chars]` placeholder. Used by Phase 2b's streaming preview so a
+/// tool that returns a giant base64 image / full-page HTML doesn't dump
+/// the raw payload into the UI bus marker. Non-mutating: returns a
+/// fresh `Value`.
+fn squash_large_strings(val: &serde_json::Value, max_chars: usize) -> serde_json::Value {
+    use serde_json::Value;
+    match val {
+        Value::String(s) => {
+            let chars = s.chars().count();
+            if chars > max_chars {
+                Value::String(format!("[{chars} chars elided]"))
+            } else {
+                Value::String(s.clone())
+            }
+        }
+        Value::Array(arr) => Value::Array(
+            arr.iter().map(|v| squash_large_strings(v, max_chars)).collect(),
+        ),
+        Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                out.insert(k.clone(), squash_large_strings(v, max_chars));
+            }
+            Value::Object(out)
+        }
+        _ => val.clone(),
+    }
+}
+
 fn format_tool_result(val: &serde_json::Value) -> String {
     // exec tool: { exit_code, stdout, stderr }
     if val.get("stdout").is_some() || val.get("stderr").is_some() {

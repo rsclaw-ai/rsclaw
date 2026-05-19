@@ -44,6 +44,26 @@ pub fn normalize_lines(text: &str) -> Vec<String> {
 /// Keep first `head` and last `tail` lines, with a single omission marker
 /// in between. Returns the input unchanged when nothing would be omitted.
 pub fn head_tail(lines: &[String], head: u32, tail: u32) -> Vec<String> {
+    head_tail_with_marker(lines, head, tail, |omitted| {
+        format!("... {omitted} lines omitted ...")
+    })
+}
+
+/// Like [`head_tail`] but lets the caller construct the omission marker
+/// from the line count. Used by the artifact compaction path which
+/// embeds a `read_artifact(tool_result_id=…)` call site into the marker
+/// — building the marker here, with the omitted-line count in hand, is
+/// race-free and avoids the previous `replacen` post-pass that
+/// silently no-op'd if the source content contained the same literal.
+pub fn head_tail_with_marker<F>(
+    lines: &[String],
+    head: u32,
+    tail: u32,
+    marker: F,
+) -> Vec<String>
+where
+    F: FnOnce(usize) -> String,
+{
     let head = head as usize;
     let tail = tail as usize;
     if head == 0 && tail == 0 {
@@ -58,7 +78,7 @@ pub fn head_tail(lines: &[String], head: u32, tail: u32) -> Vec<String> {
     let omitted = lines.len() - head - tail;
     let mut out = Vec::with_capacity(head + 1 + tail);
     out.extend_from_slice(&lines[..head]);
-    out.push(format!("... {omitted} lines omitted ..."));
+    out.push(marker(omitted));
     out.extend_from_slice(&lines[lines.len() - tail..]);
     out
 }

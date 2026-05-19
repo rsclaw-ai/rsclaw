@@ -5,8 +5,6 @@
 //! load; these commands let operators inspect / force-sync without
 //! restarting.
 
-use std::collections::BTreeMap;
-
 use anyhow::Result;
 
 use crate::cli::{EnvCommand, EnvSyncArgs};
@@ -32,7 +30,7 @@ async fn env_sync(args: EnvSyncArgs) -> Result<()> {
     let mut file = env_file::read(&env_path)?;
 
     let mut added: Vec<String> = Vec::new();
-    let mut updated: Vec<(String, String, String)> = Vec::new(); // (name, old, new)
+    let mut updated: Vec<String> = Vec::new();
     let mut still_missing: Vec<String> = Vec::new();
     let mut overwritten_blanks: Vec<String> = Vec::new();
 
@@ -40,7 +38,7 @@ async fn env_sync(args: EnvSyncArgs) -> Result<()> {
         match (shell.get(var), file.get(var)) {
             (Some(s), Some(f)) if s != f => {
                 if args.force || !s.is_empty() {
-                    updated.push((var.clone(), redact(f), redact(s)));
+                    updated.push(var.clone());
                     if !args.dry_run {
                         file.insert(var.clone(), s.clone());
                     }
@@ -81,7 +79,7 @@ async fn env_sync(args: EnvSyncArgs) -> Result<()> {
     }
     if !updated.is_empty() {
         println!("\n  updated ({}, shell wins):", updated.len());
-        for (n, _old, _new) in &updated {
+        for n in &updated {
             println!("    ~ {n}");
         }
     }
@@ -163,16 +161,5 @@ async fn env_list() -> Result<()> {
         );
     }
 
-    // Drop unused binding so clippy doesn't complain about
-    // `let _ = file;` style.
-    let _ = BTreeMap::<String, String>::new();
     Ok(())
-}
-
-fn redact(s: &str) -> String {
-    if s.len() <= 8 {
-        "***".to_owned()
-    } else {
-        format!("{}...{}", &s[..4], &s[s.len() - 4..])
-    }
 }

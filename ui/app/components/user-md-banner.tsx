@@ -16,7 +16,7 @@
  * never reappears for users who said no, even on fresh USER.md.
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { useChatStore } from "../store";
 import { isUserMdDefault, readUserMd } from "../lib/user-md";
@@ -78,16 +78,26 @@ export function UserMdBanner() {
     return () => window.removeEventListener("focus", onFocus);
   }, [check, dismissed]);
 
-  // Subscribe to chat-store updates so we re-check after each turn
-  // ends — the agent's call to `write_workspace_file` happens
-  // inside a tool turn, and the file write itself isn't an event
-  // we'd otherwise observe. Cheap: just a string compare.
+  // Re-check after each turn FINISHES — the agent's call to
+  // `write_workspace_file` happens inside a tool turn and the file
+  // write itself isn't an event we'd otherwise observe.
+  //
+  // Narrow signal: fire only on the streaming=true → false transition
+  // of the last assistant message. The previous version subscribed
+  // on every store change and re-read the disk on every message add
+  // (user msg + assistant start), doubling disk reads per turn and
+  // firing during keystrokes that touched any other store field.
+  const lastStreamingRef = useRef<boolean | undefined>(undefined);
   useEffect(() => {
     if (dismissed) return;
-    const unsub = useChatStore.subscribe((state, prev) => {
+    const unsub = useChatStore.subscribe((state) => {
       const cur = state.currentSession?.();
-      const old = prev.currentSession?.();
-      if (cur && old && cur.messages.length !== old.messages.length) {
+      const last = cur?.messages[cur.messages.length - 1];
+      const streaming = last?.streaming;
+      const prev = lastStreamingRef.current;
+      lastStreamingRef.current = streaming;
+      // Edge: streaming flipped from true → false (turn just ended).
+      if (prev === true && streaming !== true) {
         void check();
       }
     });

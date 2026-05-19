@@ -110,7 +110,16 @@ impl ArtifactStore {
 
         let id = ArtifactId::new();
         let path = dir.join(format!("{}.txt", id.as_str()));
-        let mut f = fs::File::create(&path)
+        // create_new — fail loud on collision instead of silently
+        // truncating an existing artifact. With a 122-bit random id,
+        // a real collision is astronomically unlikely; surfacing it
+        // as an error protects against restored-backup overlap and
+        // RNG-seeded test paths that would otherwise corrupt
+        // write-once semantics.
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
             .with_context(|| format!("create artifact {}", path.display()))?;
         f.write_all(text.as_bytes())
             .with_context(|| format!("write artifact {}", path.display()))?;

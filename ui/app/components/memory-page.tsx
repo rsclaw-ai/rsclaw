@@ -172,30 +172,32 @@ export function MemoryPage() {
 
       {/* Secondary filters */}
       <div style={filterRowStyle}>
-        <select
-          value={kindFilter}
-          onChange={(e) => setKindFilter(e.target.value)}
-          style={selectStyle}
-        >
-          <option value="">{zh ? "全部类型" : "All kinds"}</option>
-          {kindOptions.map((k) => (
-            <option key={k} value={k}>
-              {k} ({stats?.by_kind[k] || 0})
-            </option>
-          ))}
-        </select>
-        <select
-          value={scopeFilter}
-          onChange={(e) => setScopeFilter(e.target.value)}
-          style={selectStyle}
-        >
-          <option value="">{zh ? "全部 scope" : "All scopes"}</option>
-          {scopeOptions.map((s) => (
-            <option key={s} value={s}>
-              {s} ({stats?.by_scope[s] || 0})
-            </option>
-          ))}
-        </select>
+        <div style={filterControlsStyle}>
+          <select
+            value={kindFilter}
+            onChange={(e) => setKindFilter(e.target.value)}
+            style={selectStyle}
+          >
+            <option value="">{zh ? "全部类型" : "All kinds"}</option>
+            {kindOptions.map((k) => (
+              <option key={k} value={k}>
+                {k} ({stats?.by_kind[k] || 0})
+              </option>
+            ))}
+          </select>
+          <select
+            value={scopeFilter}
+            onChange={(e) => setScopeFilter(e.target.value)}
+            style={selectStyle}
+          >
+            <option value="">{zh ? "全部 scope" : "All scopes"}</option>
+            {scopeOptions.map((s) => (
+              <option key={s} value={s}>
+                {s} ({stats?.by_scope[s] || 0})
+              </option>
+            ))}
+          </select>
+        </div>
         <span style={countLabelStyle}>
           {zh ? "显示" : "Showing"} {visibleDocs.length}
           {tierFilter !== "all" ? ` / ${docs.length}` : ""} {zh ? "条，共" : "of"} {total}
@@ -391,6 +393,14 @@ const clearTierBtnStyle: React.CSSProperties = {
 const filterRowStyle: React.CSSProperties = {
   display: "flex",
   alignItems: "center",
+  justifyContent: "space-between",
+  gap: 10,
+  flexWrap: "wrap",
+};
+
+const filterControlsStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
   gap: 10,
   flexWrap: "wrap",
 };
@@ -410,7 +420,7 @@ const countLabelStyle: React.CSSProperties = {
   fontSize: 11,
   color: "#6b6877",
   fontFamily: "inherit",
-  marginLeft: "auto",
+  whiteSpace: "nowrap",
 };
 
 const errorStyle: React.CSSProperties = {
