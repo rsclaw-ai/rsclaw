@@ -114,7 +114,7 @@ opus-decoder = "0.1"
 # with cross-platform native APIs — ~100x faster and removes the fork
 # overhead per action. See src/computer/operators/native.rs.
 enigo = "0.6"
-xcap = "0.6"
+xcap = "0.9"
 display-info = "0.5"
 ogg = "0.9"
 lark-websocket-protobuf = "0.1"
