@@ -1,6 +1,6 @@
-//! Frozen baseline for the `rsclaw/2026.5.15` wire prefix.
+//! Frozen baseline for the `rsclaw/2026.5.18` wire prefix.
 //!
-//! `tests/fixtures/baseline-2026.5.15.json` captures the byte-exact
+//! `tests/fixtures/baseline-2026.5.18.json` captures the byte-exact
 //! `shared_prefix` + `builtin_tools` array the gateway sends as
 //! `dynamic_prefix.system` + `dynamic_prefix.tools` for this version.
 //! These are the two fields that participate in the worker-side base
@@ -19,13 +19,13 @@
 //!          cargo build --release --bin rsclaw
 //!          target/release/rsclaw debug dump-prompt-spec --json
 //!              | jq '{rsclaw_version, shared_prefix, builtin_tools}'
-//!              > tests/fixtures/baseline-2026.5.15.json
+//!              > tests/fixtures/baseline-2026.5.18.json
 //!      and re-add the `_doc` header that lives at the top of the
 //!      fixture (preserved for human readers).
 //!
 //! Coordination with rsclaw-llm:
 //!   The SHA-256s of the two byte-exact fields ARE the canonical
-//!   identifier the worker should use when ingesting `rsclaw/2026.5.15`
+//!   identifier the worker should use when ingesting `rsclaw/2026.5.18`
 //!   into its static prefix registry. If this test passes locally and
 //!   the worker's pre-registered KV doesn't hit on traffic from this
 //!   gateway, the worker registry is stale — re-ingest from the
@@ -40,7 +40,7 @@ use rsclaw::skill::SkillRegistry;
 use rsclaw::skill::manifest::SkillManifest;
 use serde_json::Value;
 
-const FIXTURE_PATH: &str = "tests/fixtures/baseline-2026.5.15.json";
+const FIXTURE_PATH: &str = "tests/fixtures/baseline-2026.5.18.json";
 
 fn load_baseline() -> Value {
     let bytes = std::fs::read(FIXTURE_PATH).unwrap_or_else(|e| {
@@ -75,7 +75,7 @@ fn baseline_skill_registry() -> SkillRegistry {
 
 /// Regenerate the fixture from the live code using the same controlled
 /// setup the byte-stable tests run. Ignored by default — opt in with
-///   cargo test --test baseline_2026_5_15 -- --ignored regenerate_fixture
+///   cargo test --test baseline_2026_5_18 -- --ignored regenerate_fixture
 /// after intentional builtin-tool or shared-prefix changes.
 #[test]
 #[ignore]
@@ -97,7 +97,7 @@ fn regenerate_fixture() {
         })
         .collect();
     let fixture = serde_json::json!({
-        "rsclaw_version": "2026.5.15",
+        "rsclaw_version": "2026.5.18",
         "shared_prefix": build_shared_system_prefix(),
         "builtin_tools": builtin_json,
     });
@@ -117,8 +117,8 @@ fn baseline_rsclaw_version_pinned() {
         .as_str()
         .expect("fixture rsclaw_version is a string");
     assert_eq!(
-        pinned, "2026.5.15",
-        "baseline-2026.5.15.json file is wired to a different version. \
+        pinned, "2026.5.18",
+        "baseline-2026.5.18.json file is wired to a different version. \
          Either rename the fixture or update the test."
     );
 }
@@ -135,7 +135,7 @@ fn baseline_shared_prefix_byte_stable() {
     assert_eq!(
         actual.len(),
         expected.len(),
-        "shared_prefix LENGTH drifted from 2026.5.15 baseline (actual={}, expected={}). \
+        "shared_prefix LENGTH drifted from 2026.5.18 baseline (actual={}, expected={}). \
          If intentional, regenerate the fixture per the module-level docstring.",
         actual.len(),
         expected.len(),
@@ -148,7 +148,7 @@ fn baseline_shared_prefix_byte_stable() {
         let preview_actual: String = actual.chars().skip(n.saturating_sub(40)).take(120).collect();
         let preview_expected: String = expected.chars().skip(n.saturating_sub(40)).take(120).collect();
         panic!(
-            "shared_prefix bytes drifted from 2026.5.15 baseline at offset {n}.\n\
+            "shared_prefix bytes drifted from 2026.5.18 baseline at offset {n}.\n\
              actual   :  …{preview_actual}…\n\
              expected :  …{preview_expected}…\n\
              Regenerate the fixture per the module-level docstring if the change is intentional."
@@ -210,7 +210,7 @@ fn baseline_builtin_tools_byte_stable() {
 
         if actual_names != expected_names {
             panic!(
-                "builtin_tools NAME LIST drifted from 2026.5.15 baseline.\n\
+                "builtin_tools NAME LIST drifted from 2026.5.18 baseline.\n\
                  actual   : {actual_names:?}\n\
                  expected : {expected_names:?}\n\
                  Regenerate the fixture per the module-level docstring if the change is intentional."
@@ -226,7 +226,7 @@ fn baseline_builtin_tools_byte_stable() {
             }
         }
         panic!(
-            "builtin_tools CONTENT drifted from 2026.5.15 baseline (names matched, \
+            "builtin_tools CONTENT drifted from 2026.5.18 baseline (names matched, \
              but at least one tool's body diverged): {diff_names:?}.\n\
              Regenerate the fixture per the module-level docstring if the change is intentional."
         );
@@ -235,7 +235,7 @@ fn baseline_builtin_tools_byte_stable() {
     assert_eq!(
         builtin.len(),
         40,
-        "Expected 40 builtin tools in the 2026.5.15 baseline; got {}. \
+        "Expected 40 builtin tools in the 2026.5.18 baseline; got {}. \
          If a builtin tool was added or removed intentionally, regenerate the fixture \
          and bump this count.",
         builtin.len()

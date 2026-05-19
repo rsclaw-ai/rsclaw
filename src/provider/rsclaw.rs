@@ -65,7 +65,7 @@ pub const RSCLAW_DEFAULT_BASE: &str = "https://api.rsclaw.ai/v1/agent";
 /// `tests/fixtures/baseline-<ver>.json`) actually changes, and
 /// coordinate with rsclaw-llm to re-ingest the new fixture under
 /// the new identifier.
-pub const RSCLAW_DEFAULT_PREFIX_ID: &str = "rsclaw/2026.5.15";
+pub const RSCLAW_DEFAULT_PREFIX_ID: &str = "rsclaw/2026.5.18";
 
 /// Well-known model names served by the managed rsclaw fleet (see
 /// `GET /v1/agent/models`). Used by `agent::runtime` to auto-resolve
@@ -1371,19 +1371,45 @@ impl RsclawProvider {
         // the body stream is allowed to take as long as it needs.
         // Connection liveness during streaming is covered by the
         // client-level `tcp_keepalive(30s)` configured above.
-        let send_fut = self.send_following_redirects(&path, &body, None);
-        let resp = match tokio::time::timeout(TURN_HEADERS_TIMEOUT, send_fut).await {
-            Ok(r) => r?,
-            Err(_) => anyhow::bail!(
-                "rsclaw turn: timed out waiting for response headers after {}s ({}{})",
-                TURN_HEADERS_TIMEOUT.as_secs(),
-                self.base_url,
-                path,
-            ),
-        };
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+        // Retry policy for `/sessions/<id>/turn`:
+        //
+        // `POST /turn` is NOT idempotent — its body contains
+        // `tool_results` that the server appends to the session log on
+        // success. A blind retry on 502/504 risks double-appending if
+        // the upstream reached the worker but failed to flush headers.
+        // 429 surfaces a real rate-limit signal the caller should see.
+        //
+        // Per docs/client-server-integration.md §4.4: "Treat 503 on
+        // /turn as retryable with backoff" — only 503 means the
+        // server-side auto-replay attempted recovery and gave up
+        // BEFORE the worker advanced state. We narrow retry to that
+        // single status.
+        //
+        // 503s with a specific `session_diverged` / `version_drift` /
+        // `backend_unavailable` (pinned-node) body code go through
+        // `is_session_evicted` above and return SessionNotFound so the
+        // caller can drive a clean `/sessions/replay` recovery.
+        const RETRY_BACKOFFS: [Duration; 2] = [
+            Duration::from_millis(500),
+            Duration::from_secs(2),
+        ];
+        let mut attempt: usize = 0;
+        let resp = loop {
+            let send_fut = self.send_following_redirects(&path, &body, None);
+            let resp = match tokio::time::timeout(TURN_HEADERS_TIMEOUT, send_fut).await {
+                Ok(r) => r?,
+                Err(_) => anyhow::bail!(
+                    "rsclaw turn: timed out waiting for response headers after {}s ({}{})",
+                    TURN_HEADERS_TIMEOUT.as_secs(),
+                    self.base_url,
+                    path,
+                ),
+            };
+            let status = resp.status();
+            if status.is_success() {
+                break resp;
+            }
+            let body_text = resp.text().await.unwrap_or_default();
             // 404 session_not_found (slot evicted), 409 version_drift
             // (pinned node upgraded past our rsclaw_version) and 503
             // backend_unavailable (pinned node gone via heartbeat
@@ -1392,29 +1418,36 @@ impl RsclawProvider {
             // a misrouted request hitting a CDN/proxy 404 page — should
             // bail with the upstream body so operators can see the real
             // error instead of looping forever in replay.
-            if is_session_evicted(status, &body) {
+            if is_session_evicted(status, &body_text) {
                 return Ok(TurnOutcome::SessionNotFound);
             }
-            anyhow::bail!("rsclaw turn failed {status}: {body}");
-        }
+            if status == StatusCode::SERVICE_UNAVAILABLE && attempt < RETRY_BACKOFFS.len() {
+                let delay = RETRY_BACKOFFS[attempt];
+                tracing::warn!(
+                    status = %status,
+                    attempt = attempt + 1,
+                    delay_ms = delay.as_millis() as u64,
+                    "rsclaw turn: 503 from upstream after server-side auto-replay; retrying"
+                );
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+                continue;
+            }
+            anyhow::bail!("rsclaw turn failed {status}: {body_text}");
+        };
 
         let byte_stream = resp.bytes_stream();
         let line_buffer = Arc::new(tokio::sync::Mutex::new(String::new()));
         let utf8_remainder = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        // sse_state lives for the duration of this stream — tracks
-        // in-progress `tool_use` blocks so their input JSON can be
-        // accumulated across `content_block_delta` frames before
-        // emitting a fully-formed `StreamEvent::ToolCall` on the
-        // matching `content_block_stop`.
-        let sse_state = Arc::new(tokio::sync::Mutex::new(SseState::default()));
+        let block_state = Arc::new(tokio::sync::Mutex::new(SseState::default()));
         let event_stream = byte_stream
             .map_err(|e| anyhow::anyhow!("stream read error: {e}"))
             .then(move |chunk| {
                 let line_buffer = line_buffer.clone();
                 let utf8_remainder = utf8_remainder.clone();
-                let sse_state = sse_state.clone();
+                let block_state = block_state.clone();
                 async move {
-                    parse_sse_chunk(chunk, &line_buffer, &utf8_remainder, &sse_state).await
+                    parse_sse_chunk(chunk, &line_buffer, &utf8_remainder, &block_state).await
                 }
             })
             .flat_map(futures::stream::iter);
@@ -2179,20 +2212,69 @@ async fn parse_oneshot_sse_chunk(
                 }
             }
             "done" => {
-                let usage = val.get("usage").and_then(|u| {
-                    let input = u.get("input_tokens").and_then(Value::as_u64)? as u32;
-                    let output = u.get("output_tokens").and_then(Value::as_u64)? as u32;
-                    Some(TokenUsage { input, output })
-                });
+                let usage = val
+                    .get("usage")
+                    .and_then(Value::as_object)
+                    .map(|u| TokenUsage {
+                        input: extract_usage_count(u, &["input_tokens", "prompt_tokens", "input"]),
+                        output: extract_usage_count(
+                            u,
+                            &["output_tokens", "completion_tokens", "output"],
+                        ),
+                        cache_creation: extract_usage_count(
+                            u,
+                            &["cache_creation_input_tokens", "cache_creation_tokens"],
+                        ),
+                        cache_read: extract_usage_count(
+                            u,
+                            &["cache_read_input_tokens", "cached_tokens", "cache_read_tokens"],
+                        ),
+                    });
                 events.push(Ok(StreamEvent::Done { usage }));
             }
             "error" => {
-                let msg = val
-                    .get("error")
+                // Per §4.2 the error payload is `{code, message}`.
+                let err = val.get("error");
+                let code = err
+                    .and_then(|e| e.get("code"))
                     .and_then(Value::as_str)
-                    .unwrap_or("unknown fastshot error")
-                    .to_owned();
+                    .unwrap_or("");
+                let detail = err
+                    .and_then(|e| e.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let msg = match (code.is_empty(), detail.is_empty()) {
+                    (false, false) => format!("rsclaw stream error [{code}]: {detail}"),
+                    (false, true) => format!("rsclaw stream error [{code}]"),
+                    (true, false) => format!("rsclaw stream error: {detail}"),
+                    (true, true) => "rsclaw stream error".to_string(),
+                };
                 events.push(Ok(StreamEvent::Error(msg)));
+            }
+            "thinking" => {
+                if let Some(s) = val.get("content").and_then(Value::as_str)
+                    && !s.is_empty()
+                {
+                    events.push(Ok(StreamEvent::ReasoningDelta(s.to_string())));
+                }
+            }
+            "tool_call" => {
+                let id = val
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let name = val
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let input = val
+                    .get("input")
+                    .cloned()
+                    .filter(Value::is_object)
+                    .unwrap_or(Value::Object(Default::default()));
+                events.push(Ok(StreamEvent::ToolCall { id, name, input }));
             }
             other => {
                 tracing::debug!(ty = other, payload, "rsclaw fastshot: unknown event type");
@@ -2451,56 +2533,64 @@ fn serialize_replay_history(messages: &[&Message]) -> Vec<Value> {
 }
 
 // ---------------------------------------------------------------------------
-// SSE parsing — protocol §2.3.1 Anthropic Messages event shape
+// SSE parsing — rsclaw-native event shape (docs/client-server-integration.md §4.2)
 // ---------------------------------------------------------------------------
 //
-// The wire format mirrors Anthropic's SDK accumulator pattern so clients
-// written against `/v1/messages` can plug in with near-zero translation
-// (rsclaw-server's own `/v1/messages` bridge is a thin passthrough).
+// Five top-level frame types share a flat `{type, ...}` shape across every
+// rsclaw-server lane that speaks this provider (`/v1/agent/sessions/*/turn`,
+// `/v1/agent/fastshot`, `/v1/agent/oneshot`, `/v1/agent/vision`):
 //
-// Event sequence for a text-only turn:
-//   message_start
-//   content_block_start { content_block: { type: "text", text: "" } }
-//   content_block_delta { delta: { type: "text_delta", text: "..." } }
-//   ... one delta per generated token ...
-//   content_block_stop
-//   message_delta { delta: { stop_reason }, usage, timing }
-//   message_stop
+//   data: {"type":"delta","content":"Hello"}
+//   data: {"type":"thinking","content":"reasoning fragment..."}    (reasoning models)
+//   data: {"type":"tool_call","id":"...","name":"...","input":{...}} (whole frame, not accumulated)
+//   data: {"type":"done","finish_reason":"...","usage":{...}}
+//   data: {"type":"error","error":{"code":"...","message":"..."}}
+//   data: [DONE]                                                   (SSE framing sentinel)
 //
-// v1.7 will add `thinking_delta` blocks (StreamEvent::ReasoningDelta) and
-// `tool_use` blocks with `input_json_delta` streaming. To keep the worker
-// rollout decoupled, this parser recognises those event shapes now and
-// emits the matching `StreamEvent` variants — if a worker speaking v1.6
-// never produces them, no harm; if a v1.7 worker shows up they Just Work.
+// Forward-compat rule: unknown `type` values are silently ignored — the
+// server may add new types (e.g. `cache_hit_summary`) without breaking
+// old clients.
 
-/// State carried across multiple SSE chunks for a single stream. Tracks
-/// in-progress `tool_use` content blocks: Anthropic streams the input
-/// JSON one `partial_json` chunk per delta and only emits the complete
-/// id/name on the `content_block_start`. We must accumulate until the
-/// matching `content_block_stop` before we can emit a fully-formed
-/// `StreamEvent::ToolCall`.
+/// Per-stream state for the v1 native protocol. Frames are
+/// block-oriented (Anthropic Messages-style):
+///
+///     block_start{index, block:{type,id?,name?}}
+///     block_delta{index, delta}     (zero or more, may interleave by index)
+///     block_stop{index}
+///
+/// `blocks` tracks open builders keyed by the `index` field so deltas
+/// for interleaved parallel blocks (e.g. one `text` and one `tool_call`
+/// open simultaneously) route to the right accumulator.
 #[derive(Debug, Default)]
 struct SseState {
-    /// `index` (from `content_block_*` events) → pending tool_use info.
-    /// HashMap rather than Vec because the protocol reserves the right
-    /// to interleave content blocks at different indices.
-    tools: HashMap<u64, PendingToolUse>,
+    blocks: std::collections::HashMap<u64, BlockBuilder>,
 }
 
-#[derive(Debug, Default)]
-struct PendingToolUse {
-    id: String,
-    name: String,
-    /// Concatenation of every `input_json_delta.partial_json` chunk seen
-    /// so far. Parsed once on `content_block_stop`.
-    partial_json: String,
+#[derive(Debug)]
+struct BlockBuilder {
+    kind: BlockKind,
+    /// Accumulates partial JSON for `tool_call` blocks. Text/thinking
+    /// blocks emit incrementally on every `block_delta` for UI
+    /// streaming, so `buf` stays empty for them — saves memory on
+    /// long answers and lets `block_stop` distinguish the two paths
+    /// purely by `kind`.
+    buf: String,
+    tool_id: String,
+    tool_name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockKind {
+    Text,
+    Thinking,
+    ToolCall,
 }
 
 async fn parse_sse_chunk(
     chunk: Result<bytes::Bytes>,
     line_buffer: &Arc<tokio::sync::Mutex<String>>,
     utf8_remainder: &Arc<tokio::sync::Mutex<Vec<u8>>>,
-    sse_state: &Arc<tokio::sync::Mutex<SseState>>,
+    block_state: &Arc<tokio::sync::Mutex<SseState>>,
 ) -> Vec<Result<StreamEvent>> {
     let mut events: Vec<Result<StreamEvent>> = Vec::new();
     let bytes = match chunk {
@@ -2552,7 +2642,6 @@ async fn parse_sse_chunk(
     };
     drop(remainder);
 
-    let mut state = sse_state.lock().await;
     let mut buf = line_buffer.lock().await;
     buf.push_str(&decoded);
     while let Some(idx) = buf.find('\n') {
@@ -2567,11 +2656,12 @@ async fn parse_sse_chunk(
         let Some(payload) = line.strip_prefix("data:").map(|s| s.trim_start_matches(' ')) else {
             continue;
         };
-        // No `data: [DONE]` sentinel on the native rsclaw protocol —
-        // spec §2.3.1 explicitly says message_stop is the terminator
-        // and only the `/v1/chat/completions` OAI translator emits
-        // [DONE]. Still defensive-skip if a misconfigured proxy injects
-        // one; pushing a parse error here would tank the turn.
+        // v1 native protocol emits a trailing `[DONE]` sentinel after
+        // the final `done` event (mirrors OAI translator convention so
+        // generic SSE clients have a deterministic close signal). The
+        // authoritative terminator is `done`, which already pushed a
+        // `StreamEvent::Done` upstream. `[DONE]` itself carries no
+        // payload — drop it silently rather than surface a parse error.
         if payload == "[DONE]" {
             continue;
         }
@@ -2593,145 +2683,157 @@ async fn parse_sse_chunk(
             }
         };
         let kind = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let mut state = block_state.lock().await;
         match kind {
-            // Block start: stash tool_use metadata so subsequent
-            // `input_json_delta`s know which pending block to append to.
-            // Text-block starts carry no useful payload (block starts
-            // empty and every codepoint arrives via content_block_delta);
-            // we don't synthesise a StreamEvent for them.
-            "content_block_start" => {
-                let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
-                let block = value.get("content_block");
+            // Stream prelude — carries cache stats / model / session
+            // metadata for telemetry. No StreamEvent emission; clients
+            // should tap this for observability if they care.
+            "start" => {}
+            // Server-side keepalive. SSE-comment translators may also
+            // arrive here. Reset any keepalive timer the caller tracks;
+            // no StreamEvent.
+            "ping" => {}
+            // Open a new content block. `index` is the routing key;
+            // future deltas with the same index land in this builder.
+            // Unknown `block.type` is skipped (forward-compat: server
+            // may add e.g. `image` blocks later — old clients ignore).
+            "block_start" => {
+                let Some(index) = value.get("index").and_then(Value::as_u64) else {
+                    continue;
+                };
+                let block = value.get("block");
                 let block_type = block
                     .and_then(|b| b.get("type"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                if block_type == "tool_use" {
-                    let id = block
-                        .and_then(|b| b.get("id"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let name = block
-                        .and_then(|b| b.get("name"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    state.tools.insert(
-                        index,
-                        PendingToolUse {
-                            id,
-                            name,
-                            partial_json: String::new(),
-                        },
-                    );
+                let kind = match block_type {
+                    "text" => BlockKind::Text,
+                    "thinking" => BlockKind::Thinking,
+                    "tool_call" => BlockKind::ToolCall,
+                    _ => continue,
+                };
+                let (tool_id, tool_name) = if kind == BlockKind::ToolCall {
+                    (
+                        block
+                            .and_then(|b| b.get("id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        block
+                            .and_then(|b| b.get("name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                    )
+                } else {
+                    (String::new(), String::new())
+                };
+                state.blocks.insert(
+                    index,
+                    BlockBuilder {
+                        kind,
+                        buf: String::new(),
+                        tool_id,
+                        tool_name,
+                    },
+                );
+            }
+            // Streaming content for an open block. Text/thinking emit
+            // each delta IMMEDIATELY so the UI streams character-by-
+            // character; tool_call deltas accumulate (partial JSON
+            // shards) until block_stop, where the whole input parses
+            // atomically. A delta arriving for an unknown index is
+            // dropped silently (forward-compat with reordered or
+            // dropped block_start frames).
+            "block_delta" => {
+                let Some(index) = value.get("index").and_then(Value::as_u64) else {
+                    continue;
+                };
+                let Some(delta) = value.get("delta").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(b) = state.blocks.get_mut(&index) else {
+                    continue;
+                };
+                match b.kind {
+                    BlockKind::Text => {
+                        if !delta.is_empty() {
+                            events.push(Ok(StreamEvent::TextDelta(delta.to_string())));
+                        }
+                    }
+                    BlockKind::Thinking => {
+                        if !delta.is_empty() {
+                            events.push(Ok(StreamEvent::ReasoningDelta(delta.to_string())));
+                        }
+                    }
+                    BlockKind::ToolCall => {
+                        b.buf.push_str(delta);
+                    }
                 }
             }
-            // The token-by-token content stream. The inner `delta.type`
-            // discriminates text vs thinking vs tool_use input chunks.
-            "content_block_delta" => {
-                let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
-                let delta = value.get("delta");
-                let delta_type = delta
-                    .and_then(|d| d.get("type"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                match delta_type {
-                    "text_delta" => {
-                        let s = delta
-                            .and_then(|d| d.get("text"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        if !s.is_empty() {
-                            events.push(Ok(StreamEvent::TextDelta(s.to_string())));
-                        }
-                    }
-                    "thinking_delta" => {
-                        let s = delta
-                            .and_then(|d| d.get("thinking"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        if !s.is_empty() {
-                            events.push(Ok(StreamEvent::ReasoningDelta(s.to_string())));
-                        }
-                    }
-                    "input_json_delta" => {
-                        // Append to the pending tool's accumulating
-                        // JSON. If no pending block exists at this
-                        // index, drop silently — server bug or
-                        // out-of-order frames shouldn't tank the turn.
-                        if let Some(pending) = state.tools.get_mut(&index) {
-                            let frag = delta
-                                .and_then(|d| d.get("partial_json"))
-                                .and_then(Value::as_str)
-                                .unwrap_or("");
-                            pending.partial_json.push_str(frag);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            // Block end: emit a fully-formed ToolCall once we have
-            // the complete input JSON. Text blocks just close — their
-            // content already streamed via content_block_delta.
-            "content_block_stop" => {
-                let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
-                if let Some(pending) = state.tools.remove(&index) {
-                    // Empty partial_json means the worker emitted a
-                    // tool_use with no arguments — represent as an
-                    // empty object, matching the other providers'
-                    // null-vs-empty-object policy.
-                    let input: Value = if pending.partial_json.is_empty() {
+            // Close a block. For tool_call: parse the accumulated buf
+            // as JSON and emit a single ToolCall event. Malformed JSON
+            // collapses to an empty object so downstream `.as_object()`
+            // consumers never have to match Null; the empty-args path
+            // is the runtime's existing "tool with no args" branch.
+            // Text/thinking already emitted incrementally — block_stop
+            // is just a no-op cleanup for them.
+            "block_stop" => {
+                let Some(index) = value.get("index").and_then(Value::as_u64) else {
+                    continue;
+                };
+                if let Some(b) = state.blocks.remove(&index)
+                    && b.kind == BlockKind::ToolCall
+                {
+                    let input: Value = if b.buf.is_empty() {
                         Value::Object(Default::default())
                     } else {
-                        match serde_json::from_str(&pending.partial_json) {
-                            Ok(v) => v,
-                            Err(_) => Value::Object(Default::default()),
-                        }
+                        serde_json::from_str(&b.buf)
+                            .unwrap_or_else(|_| Value::Object(Default::default()))
                     };
                     events.push(Ok(StreamEvent::ToolCall {
-                        id: pending.id,
-                        name: pending.name,
+                        id: b.tool_id,
+                        name: b.tool_name,
                         input,
                     }));
                 }
             }
-            // Final usage + stop_reason. We don't propagate
-            // `stop_reason` separately — the runtime treats Done as
-            // "stream complete," and stop_reason variants we'd care
-            // about (max_tokens, end_turn) are already implicit in the
-            // text accumulated above.
-            "message_delta" => {
-                // Per protocol §2.3 the `usage` field on `message_delta`
-                // carries the terminal counts. As with the legacy
-                // `done` event, defaulting missing fields to 0 (rather
-                // than dropping the entire TokenUsage on a single
-                // missing field) keeps partial-usage workers usable.
-                // `as_object` filter is load-bearing: `"usage": null`
-                // must collapse to None, not Some(zeros).
+            // Terminal frame — carries `finish_reason` (we don't
+            // propagate it; runtime treats Done as "stream complete")
+            // and `usage` with worker token counts. Field-name drift
+            // across lanes documented in client-server-integration.md
+            // §4.3 (input_tokens / prompt_tokens / input — try each).
+            "done" => {
                 let usage = value
                     .get("usage")
                     .and_then(Value::as_object)
                     .map(|u| TokenUsage {
-                        input: u
-                            .get("input_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0) as u32,
-                        output: u
-                            .get("output_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0) as u32,
+                        input: extract_usage_count(u, &["input_tokens", "prompt_tokens", "input"]),
+                        output: extract_usage_count(
+                            u,
+                            &["output_tokens", "completion_tokens", "output"],
+                        ),
+                        // Cache stats: Anthropic-style names primary, OpenAI's
+                        // single `cached_tokens` accepted as a fallback for
+                        // cache_read (OAI doesn't distinguish creation vs read).
+                        cache_creation: extract_usage_count(
+                            u,
+                            &["cache_creation_input_tokens", "cache_creation_tokens"],
+                        ),
+                        cache_read: extract_usage_count(
+                            u,
+                            &["cache_read_input_tokens", "cached_tokens", "cache_read_tokens"],
+                        ),
                     });
                 events.push(Ok(StreamEvent::Done { usage }));
             }
-            // Mid-stream error frame per spec §2.3.1. Anthropic shape
-            // is `{type:"error", error:{type:"...", message:"..."}}`
-            // — pull the error sub-object's fields, fall through to a
-            // generic message if either is missing.
+            // Mid-stream error frame: `{type:"error", error:{code, message}}`.
+            // Empty fields collapse to a generic message rather than a
+            // confusing "[]: " prefix.
             "error" => {
                 let err = value.get("error");
                 let code = err
-                    .and_then(|e| e.get("type"))
+                    .and_then(|e| e.get("code"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 let detail = err
@@ -2746,20 +2848,26 @@ async fn parse_sse_chunk(
                 };
                 events.push(Ok(StreamEvent::Error(msg)));
             }
-            // Terminal frame — clients should close after this. No
-            // StreamEvent emitted; the runtime drains the stream after
-            // Done from message_delta and a trailing message_stop is
-            // just acknowledgement.
-            "message_stop" => {}
-            // `message_start` and any unknown event types fall through
-            // — message_start carries only diagnostic info (session_id,
-            // cached_tokens count) that the runtime doesn't surface,
-            // and forward-compat means unknown shapes should be ignored
-            // rather than producing errors that tank the whole turn.
+            // Unknown types: forward-compat — server may add new
+            // frame types (e.g. `cache_hit_summary`) and old clients
+            // should ignore them rather than fail the turn.
             _ => {}
         }
+        drop(state);
     }
     events
+}
+
+/// Pull a usage count from a worker `usage` object, trying field
+/// names in order and defaulting missing to 0. Lane-specific name
+/// drift is documented in client-server-integration.md §4.3.
+fn extract_usage_count(u: &serde_json::Map<String, Value>, names: &[&str]) -> u64 {
+    for name in names {
+        if let Some(n) = u.get(*name).and_then(Value::as_u64) {
+            return n;
+        }
+    }
+    0
 }
 
 /// True when the (status, body) pair is a documented session-eviction
@@ -2935,35 +3043,66 @@ mod tests {
         );
     }
 
-    /// Test wrapper: most tests don't care about per-stream tool_use
-    /// state (they exercise one event in isolation), so mint a fresh
-    /// `SseState` per call. Multi-call tests construct their own state
-    /// to keep it shared across chunks.
+    /// Thin shim mirroring `parse_sse_chunk`'s signature so tests don't
+    /// have to repeat the lock-wrap boilerplate.
     async fn parse_sse_test(
         chunk: Result<bytes::Bytes>,
         buf: &Arc<tokio::sync::Mutex<String>>,
         rem: &Arc<tokio::sync::Mutex<Vec<u8>>>,
+        state: &Arc<tokio::sync::Mutex<SseState>>,
     ) -> Vec<Result<StreamEvent>> {
-        let state = Arc::new(tokio::sync::Mutex::new(SseState::default()));
-        parse_sse_chunk(chunk, buf, rem, &state).await
+        parse_sse_chunk(chunk, buf, rem, state).await
+    }
+
+    /// Convenience: create a fresh block state for a single-call test.
+    fn new_state() -> Arc<tokio::sync::Mutex<SseState>> {
+        Arc::new(tokio::sync::Mutex::new(SseState::default()))
     }
 
     #[tokio::test]
     async fn parse_sse_chunk_recovers_split_utf8() {
-        // SSE content_block_delta line carrying "你好"
-        // (U+4F60 = E4 BD A0, U+597D = E5 A5 BD), with the byte split
-        // landing in the middle of the first character.
-        let line_full = b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"\xe4\xbd\xa0\xe5\xa5\xbd\"}}\n";
-        let split = 30;
-        let (a, b) = line_full.split_at(split);
-        let (b, c) = b.split_at(line_full.len() / 2 - split);
+        // v1 block_delta line carrying "你好" (U+4F60 = E4 BD A0, U+597D
+        // = E5 A5 BD). Open the block first, then split the delta
+        // line so chunk boundaries land mid-CJK — UTF-8 stitching
+        // must preserve the codepoints verbatim, no U+FFFD leak.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        // Prime the parser with block_start so subsequent block_delta
+        // frames have somewhere to route.
+        let _ = parse_sse_test(
+            Ok(bytes::Bytes::from_static(
+                b"data: {\"type\":\"block_start\",\"index\":0,\"block\":{\"type\":\"text\"}}\n",
+            )),
+            &buf,
+            &rem,
+            &state,
+        )
+        .await;
+
+        let line_full = b"data: {\"type\":\"block_delta\",\"index\":0,\"delta\":\"\xe4\xbd\xa0\xe5\xa5\xbd\"}\n";
+        // 51 bytes prefix before the CJK bytes; split inside the
+        // first codepoint at byte 52 (E4 BD ...| A0 ...).
+        let split = 52;
+        let (a, b) = line_full.split_at(split);
+        let (b, c) = b.split_at(2);
 
         for piece in [a, b, c] {
-            let _ = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(piece)), &buf, &rem).await;
+            let _ = parse_sse_test(
+                Ok(bytes::Bytes::copy_from_slice(piece)),
+                &buf,
+                &rem,
+                &state,
+            )
+            .await;
         }
-        let evs = parse_sse_test(Ok(bytes::Bytes::from_static(b"")), &buf, &rem).await;
+        let evs = parse_sse_test(
+            Ok(bytes::Bytes::from_static(b"")),
+            &buf,
+            &rem,
+            &state,
+        )
+        .await;
 
         let texts: Vec<_> = evs
             .into_iter()
@@ -2972,9 +3111,8 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // Either fully delivered now or already delivered in an earlier piece.
         let all_text: String = texts.into_iter().collect();
-        // The final newline-terminated event must produce 你好 verbatim, no U+FFFD.
+        // Final newline-terminated frame must produce 你好 verbatim.
         assert!(
             !all_text.contains('\u{FFFD}'),
             "expected no replacement char, got {all_text:?}"
@@ -2991,9 +3129,10 @@ mod tests {
         // the stream stalls forever on a single bad byte.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
 
         // Chunk 1: just an invalid byte. error_len() = Some(1).
-        let evs = parse_sse_test(Ok(bytes::Bytes::from_static(b"\xff")), &buf, &rem).await;
+        let evs = parse_sse_test(Ok(bytes::Bytes::from_static(b"\xff")), &buf, &rem, &state).await;
         assert!(
             evs.iter().all(|e| e.is_ok()),
             "stray 0xFF must not surface as Err — got {evs:?}"
@@ -3011,10 +3150,11 @@ mod tests {
         // emit it normally — no contamination from the prior bad byte.
         let evs = parse_sse_test(
             Ok(bytes::Bytes::from_static(
-                b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n",
+                b"data: {\"type\":\"block_start\",\"index\":0,\"block\":{\"type\":\"text\"}}\ndata: {\"type\":\"block_delta\",\"index\":0,\"delta\":\"hi\"}\ndata: {\"type\":\"block_stop\",\"index\":0}\n",
             )),
             &buf,
             &rem,
+            &state,
         )
         .await;
         let texts: Vec<_> = evs
@@ -3040,8 +3180,9 @@ mod tests {
         // streams. Post-fix the remainder stays empty after each call.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
         for _ in 0..50 {
-            let _ = parse_sse_test(Ok(bytes::Bytes::from_static(b"\xff")), &buf, &rem).await;
+            let _ = parse_sse_test(Ok(bytes::Bytes::from_static(b"\xff")), &buf, &rem, &state).await;
         }
         let r = rem.lock().await;
         assert!(
@@ -3060,8 +3201,9 @@ mod tests {
         // event and assert: only the real text delta fires, no Err.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = b"data:\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n";
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let state = new_state();
+        let line = b"data:\ndata: {\"type\":\"block_start\",\"index\":0,\"block\":{\"type\":\"text\"}}\ndata: {\"type\":\"block_delta\",\"index\":0,\"delta\":\"hi\"}\ndata: {\"type\":\"block_stop\",\"index\":0}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         let mut texts: Vec<String> = Vec::new();
         for e in evs {
             match e {
@@ -3080,8 +3222,9 @@ mod tests {
         // Verify the same: no Err, no spurious event.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
         let line = b"data:    \n";
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         for e in evs {
             if let Err(err) = e {
                 panic!("whitespace-only data: must not surface as Err — got {err}");
@@ -3097,8 +3240,11 @@ mod tests {
         // `data:{...}` without a space. Both forms must parse.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = b"data:{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n";
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let state = new_state();
+        // SSE spec allows the space after `data:` to be omitted; both
+        // forms must parse. v1 frames split across three lines here.
+        let line = b"data:{\"type\":\"block_start\",\"index\":0,\"block\":{\"type\":\"text\"}}\ndata:{\"type\":\"block_delta\",\"index\":0,\"delta\":\"hi\"}\ndata:{\"type\":\"block_stop\",\"index\":0}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         let texts: Vec<_> = evs
             .into_iter()
             .filter_map(|e| match e {
@@ -3110,30 +3256,120 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parse_sse_chunk_emits_done_with_usage() {
+    async fn parse_sse_chunk_native_delta_emits_text() {
+        // Happy-path text fragment. Worker emits one of these per
+        // generated token on every native lane.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = b"data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"input_tokens\":17,\"output_tokens\":42}}\n";
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let state = new_state();
+        let line = b"data: {\"type\":\"block_start\",\"index\":0,\"block\":{\"type\":\"text\"}}\ndata: {\"type\":\"block_delta\",\"index\":0,\"delta\":\"hello\"}\ndata: {\"type\":\"block_stop\",\"index\":0}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
+        let texts: Vec<String> = evs
+            .into_iter()
+            .filter_map(|e| match e {
+                Ok(StreamEvent::TextDelta(s)) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["hello".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_native_thinking_emits_reasoning() {
+        // Reasoning-model lane: `{type:"thinking",content:"..."}`
+        // maps to ReasoningDelta so the agent runtime can stash it
+        // separately from user-visible TextDelta.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let line = b"data: {\"type\":\"block_start\",\"index\":0,\"block\":{\"type\":\"thinking\"}}\ndata: {\"type\":\"block_delta\",\"index\":0,\"delta\":\"step 1: parse\"}\ndata: {\"type\":\"block_stop\",\"index\":0}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
+        let reasonings: Vec<String> = evs
+            .into_iter()
+            .filter_map(|e| match e {
+                Ok(StreamEvent::ReasoningDelta(s)) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasonings, vec!["step 1: parse".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_native_tool_call_emits_whole_frame() {
+        // v1 tool_call block: id+name on `block_start`; input as one
+        // or more `block_delta` JSON shards; `block_stop` triggers
+        // a single `ToolCall` emission with the parsed input.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let line = br#"data: {"type":"block_start","index":0,"block":{"type":"tool_call","id":"call_42","name":"read_file"}}
+data: {"type":"block_delta","index":0,"delta":"{\"path\":\"x.rs\"}"}
+data: {"type":"block_stop","index":0}
+"#;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
+        let (id, name, input) = evs
+            .into_iter()
+            .find_map(|e| match e {
+                Ok(StreamEvent::ToolCall { id, name, input }) => Some((id, name, input)),
+                _ => None,
+            })
+            .expect("expected one ToolCall event");
+        assert_eq!(id, "call_42");
+        assert_eq!(name, "read_file");
+        assert_eq!(input.get("path").and_then(Value::as_str), Some("x.rs"));
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_native_tool_call_missing_input_defaults_empty_object() {
+        // A tool_call block that gets `block_stop` without any
+        // `block_delta` (worker had no input args) must emit
+        // ToolCall with input = {}. Downstream consumers call
+        // `.as_object()` directly without a Null match.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let line = b"data: {\"type\":\"block_start\",\"index\":0,\"block\":{\"type\":\"tool_call\",\"id\":\"c\",\"name\":\"get_time\"}}\ndata: {\"type\":\"block_stop\",\"index\":0}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
+        let input = evs
+            .into_iter()
+            .find_map(|e| match e {
+                Ok(StreamEvent::ToolCall { input, .. }) => Some(input),
+                _ => None,
+            })
+            .expect("expected one ToolCall event");
+        assert!(
+            input.as_object().is_some_and(|m| m.is_empty()),
+            "missing input must default to empty object, got {input:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_native_done_emits_done_with_usage() {
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let line = b"data: {\"type\":\"done\",\"finish_reason\":\"end_turn\",\"usage\":{\"input_tokens\":11,\"output_tokens\":22}}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         let mut saw_done = false;
         for e in evs {
             if let Ok(StreamEvent::Done { usage }) = e {
                 let u = usage.expect("usage should be populated");
-                assert_eq!(u.input, 17);
-                assert_eq!(u.output, 42);
+                assert_eq!(u.input, 11);
+                assert_eq!(u.output, 22);
                 saw_done = true;
             }
         }
-        assert!(saw_done, "expected one Done event");
+        assert!(saw_done, "expected Done from native done frame");
     }
 
     #[tokio::test]
-    async fn parse_sse_chunk_emits_done_without_usage() {
+    async fn parse_sse_chunk_native_done_without_usage() {
         // Server may omit usage on early termination — Done must still fire.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = b"data: {\"type\":\"message_delta\",\"delta\":{}}\n";
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let state = new_state();
+        let line = b"data: {\"type\":\"done\",\"finish_reason\":\"end_turn\"}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         let mut saw_done = false;
         for e in evs {
             if let Ok(StreamEvent::Done { usage }) = e {
@@ -3145,131 +3381,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parse_sse_chunk_tool_use_empty_input_yields_empty_object() {
-        // Anthropic shape: tool_use needs start + (optional deltas) +
-        // stop. With NO input_json_delta between (tool with zero args),
-        // the parser MUST still emit a ToolCall with input = {} —
-        // anthropic/gemini/openai providers all default to an empty
-        // object so runtime consumers can call `.as_object()` without
-        // first matching Null. The three frames share state.
+    async fn parse_sse_chunk_native_done_usage_field_name_fallback() {
+        // §4.3: lanes differ on usage field names. Each side must try
+        //   input_tokens || prompt_tokens || input
+        //   output_tokens || completion_tokens || output
+        // and default missing to 0 rather than dropping the whole
+        // usage object.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let state = Arc::new(tokio::sync::Mutex::new(SseState::default()));
-        let start = br#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_xyz","name":"get_time","input":{}}}
-"#;
-        let stop = br#"data: {"type":"content_block_stop","index":0}
-"#;
-        let _ = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(start)), &buf, &rem, &state).await;
-        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(stop)), &buf, &rem, &state).await;
-        let (id, name, input) = evs
+        let state = new_state();
+        let line = b"data: {\"type\":\"done\",\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":13}}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
+        let u = evs
             .into_iter()
             .find_map(|e| match e {
-                Ok(StreamEvent::ToolCall { id, name, input }) => Some((id, name, input)),
+                Ok(StreamEvent::Done { usage }) => usage,
                 _ => None,
             })
-            .expect("expected one ToolCall event");
-        assert_eq!(id, "toolu_xyz");
-        assert_eq!(name, "get_time");
-        assert!(
-            input.as_object().is_some_and(|m| m.is_empty()),
-            "expected empty object, got {input:?}"
-        );
+            .expect("expected Done with usage");
+        assert_eq!(u.input, 7);
+        assert_eq!(u.output, 13);
     }
 
     #[tokio::test]
-    async fn parse_sse_chunk_tool_use_malformed_partial_json_falls_back_to_empty_object() {
-        // If a buggy worker streams partial_json that doesn't parse as
-        // a complete JSON object on content_block_stop, fall back to
-        // {} rather than tanking the whole stream. Downstream
-        // consumers rely on the input always being an object.
+    async fn parse_sse_chunk_native_done_partial_usage_keeps_present_side() {
+        // Pre-fix the `?` short-circuit nuked the entire TokenUsage on
+        // a single missing field. Default each side to 0 so the half
+        // we DID get is preserved.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let state = Arc::new(tokio::sync::Mutex::new(SseState::default()));
-        let start = br#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"n","input":{}}}
-"#;
-        let delta = br#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"truncat"}}
-"#;
-        let stop = br#"data: {"type":"content_block_stop","index":0}
-"#;
-        let _ = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(start)), &buf, &rem, &state).await;
-        let _ = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(delta)), &buf, &rem, &state).await;
-        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(stop)), &buf, &rem, &state).await;
-        let input = evs
-            .into_iter()
-            .find_map(|e| match e {
-                Ok(StreamEvent::ToolCall { input, .. }) => Some(input),
-                _ => None,
-            })
-            .expect("expected one ToolCall event");
-        assert!(
-            input.as_object().is_some_and(|m| m.is_empty()),
-            "malformed partial JSON should fall back to {{}}, got {input:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn parse_sse_chunk_tool_use_assembles_partial_json_across_deltas() {
-        // The happy path: input arrives across multiple input_json_delta
-        // frames. Parser concatenates all `partial_json` fragments and
-        // serde-parses on content_block_stop to emit a complete input.
-        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
-        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let state = Arc::new(tokio::sync::Mutex::new(SseState::default()));
-        let start = br#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"read_file","input":{}}}
-"#;
-        let d1 = br#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}
-"#;
-        let d2 = br#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"x.rs\"}"}}
-"#;
-        let stop = br#"data: {"type":"content_block_stop","index":0}
-"#;
-        let _ = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(start)), &buf, &rem, &state).await;
-        let _ = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(d1)), &buf, &rem, &state).await;
-        let _ = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(d2)), &buf, &rem, &state).await;
-        let evs = parse_sse_chunk(Ok(bytes::Bytes::copy_from_slice(stop)), &buf, &rem, &state).await;
-        let (name, input) = evs
-            .into_iter()
-            .find_map(|e| match e {
-                Ok(StreamEvent::ToolCall { name, input, .. }) => Some((name, input)),
-                _ => None,
-            })
-            .expect("expected one ToolCall event");
-        assert_eq!(name, "read_file");
-        assert_eq!(
-            input.get("path").and_then(Value::as_str),
-            Some("x.rs"),
-            "concatenated partial_json must parse cleanly; got {input:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn parse_sse_chunk_ignores_message_start_and_message_stop() {
-        // message_start carries diagnostic info the runtime doesn't
-        // surface; message_stop is the terminal frame. Neither should
-        // produce a StreamEvent — they're just protocol structure.
-        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
-        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let frames = br#"data: {"type":"message_start","session_id":"rs_w7_x","input_tokens":10,"cached_tokens":20,"n_tokens_at_start":30}
-data: {"type":"message_stop"}
-"#;
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frames)), &buf, &rem).await;
-        assert!(
-            evs.is_empty(),
-            "message_start / message_stop should produce no StreamEvents; got {evs:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn parse_sse_chunk_done_preserves_partial_usage() {
-        // Server may legitimately ship usage with one of the two token
-        // counts missing (e.g. early-termination or a buggy proxy that
-        // strips fields). Old parser used `?` to short-circuit, which
-        // nuked the entire TokenUsage on any missing field. Defaulting
-        // each side to 0 keeps the half we DID get.
-        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
-        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = b"data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"input_tokens\":17}}\n";
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let state = new_state();
+        let line = b"data: {\"type\":\"done\",\"usage\":{\"input_tokens\":17}}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         let usage = evs
             .into_iter()
             .find_map(|e| match e {
@@ -3283,24 +3426,19 @@ data: {"type":"message_stop"}
     }
 
     #[tokio::test]
-    async fn parse_sse_chunk_done_treats_null_usage_as_absent() {
-        // `"usage": null` must collapse to `None`, identical to the
-        // field being missing. The pre-fix code emitted
-        // `Some(TokenUsage{0,0})` for null usage, which downstream
-        // cost-tracking recorded as a real zero-token turn — a phantom
-        // accounting entry that diluted average usage stats and faked
-        // a successful "free" turn from a buggy / older server build.
+    async fn parse_sse_chunk_native_done_null_usage_is_none() {
+        // `"usage": null` must collapse to None, not Some(0,0) — a
+        // phantom zero-token turn would dilute accounting averages and
+        // mask buggy worker builds that drop the field.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = b"data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":null}\n";
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let state = new_state();
+        let line = b"data: {\"type\":\"done\",\"usage\":null}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         let mut saw_done = false;
         for e in evs {
             if let Ok(StreamEvent::Done { usage }) = e {
-                assert!(
-                    usage.is_none(),
-                    "null usage must collapse to None, got {usage:?}"
-                );
+                assert!(usage.is_none(), "null usage must collapse to None, got {usage:?}");
                 saw_done = true;
             }
         }
@@ -3308,16 +3446,13 @@ data: {"type":"message_stop"}
     }
 
     #[tokio::test]
-    async fn parse_sse_chunk_done_treats_non_object_usage_as_absent() {
-        // Defensive: a malformed server that ships `"usage": [1,2]` or
-        // `"usage": "0"` (wrong JSON type) must NOT yield a phantom
-        // Some(TokenUsage{0,0}). Fall back to None and let downstream
-        // accounting record the turn as "usage unknown" instead of
-        // "usage was zero".
+    async fn parse_sse_chunk_native_done_non_object_usage_is_none() {
+        // Malformed `"usage": [1,2]` must NOT yield Some(TokenUsage{0,0}).
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = b"data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":[1,2,3]}\n";
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let state = new_state();
+        let line = b"data: {\"type\":\"done\",\"usage\":[1,2,3]}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         let mut saw_done = false;
         for e in evs {
             if let Ok(StreamEvent::Done { usage }) = e {
@@ -3329,38 +3464,15 @@ data: {"type":"message_stop"}
     }
 
     #[tokio::test]
-    async fn parse_sse_chunk_error_preserves_code_and_detail() {
-        // Protocol §2.3: error frame is `{type:"error", code, detail}`.
-        // Both fields must survive into StreamEvent::Error so callers
-        // can branch on code (e.g. slot_evicted → replay) and humans
-        // see the detail in tail logs.
+    async fn parse_sse_chunk_native_error_preserves_code_and_message() {
+        // §4.2: error frame is `{type:"error", error:{code, message}}`.
+        // Both fields must survive into StreamEvent::Error.
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = br#"data: {"type":"error","error":{"type":"slot_evicted","message":"slot was reclaimed mid-decode"}}
+        let state = new_state();
+        let line = br#"data: {"type":"error","error":{"code":"slot_evicted","message":"slot was reclaimed mid-decode"}}
 "#;
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
-        let mut msgs = Vec::new();
-        for e in evs {
-            if let Ok(StreamEvent::Error(m)) = e {
-                msgs.push(m);
-            }
-        }
-        assert_eq!(msgs.len(), 1, "expected exactly one Error event");
-        assert!(msgs[0].contains("slot_evicted"), "missing code: {}", msgs[0]);
-        assert!(
-            msgs[0].contains("slot was reclaimed mid-decode"),
-            "missing detail: {}",
-            msgs[0]
-        );
-    }
-
-    #[tokio::test]
-    async fn parse_sse_chunk_error_falls_back_when_code_missing() {
-        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
-        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = br#"data: {"type":"error","error":{"message":"upstream hung up"}}
-"#;
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         let msg = evs
             .into_iter()
             .find_map(|e| match e {
@@ -3368,17 +3480,37 @@ data: {"type":"message_stop"}
                 _ => None,
             })
             .expect("expected one Error event");
-        assert!(msg.contains("upstream hung up"), "missing detail: {msg}");
+        assert!(msg.contains("slot_evicted"), "missing code: {msg}");
+        assert!(msg.contains("slot was reclaimed mid-decode"), "missing message: {msg}");
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_native_error_code_missing_keeps_message() {
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let line = br#"data: {"type":"error","error":{"message":"upstream hung up"}}
+"#;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
+        let msg = evs
+            .into_iter()
+            .find_map(|e| match e {
+                Ok(StreamEvent::Error(m)) => Some(m),
+                _ => None,
+            })
+            .expect("expected one Error event");
+        assert!(msg.contains("upstream hung up"), "missing message: {msg}");
         assert!(!msg.contains("[]"), "empty-code marker leaked: {msg}");
     }
 
     #[tokio::test]
-    async fn parse_sse_chunk_error_falls_back_when_detail_missing() {
+    async fn parse_sse_chunk_native_error_message_missing_keeps_code() {
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-        let line = br#"data: {"type":"error","error":{"type":"version_drift"}}
+        let state = new_state();
+        let line = br#"data: {"type":"error","error":{"code":"version_drift"}}
 "#;
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         let msg = evs
             .into_iter()
             .find_map(|e| match e {
@@ -3387,15 +3519,16 @@ data: {"type":"message_stop"}
             })
             .expect("expected one Error event");
         assert!(msg.contains("version_drift"), "missing code: {msg}");
-        assert!(!msg.ends_with(": "), "trailing empty-detail leaked: {msg}");
+        assert!(!msg.ends_with(": "), "trailing empty-message leaked: {msg}");
     }
 
     #[tokio::test]
-    async fn parse_sse_chunk_error_uses_default_when_both_missing() {
+    async fn parse_sse_chunk_native_error_uses_default_when_both_missing() {
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
         let line = b"data: {\"type\":\"error\",\"error\":{}}\n";
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem).await;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         let msg = evs
             .into_iter()
             .find_map(|e| match e {
@@ -3404,6 +3537,292 @@ data: {"type":"message_stop"}
             })
             .expect("expected one Error event");
         assert_eq!(msg, "rsclaw stream error");
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_unknown_type_ignored_for_forward_compat() {
+        // §4.2 forward-compat rule: unknown types (e.g. future
+        // `cache_hit_summary` frames) must be silently ignored.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let frames = br#"data: {"type":"cache_hit_summary","hits":42}
+data: {"type":"block_start","index":0,"block":{"type":"text"}}
+data: {"type":"block_delta","index":0,"delta":"hi"}
+data: {"type":"block_stop","index":0}
+"#;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frames)), &buf, &rem, &state).await;
+        let texts: Vec<String> = evs
+            .into_iter()
+            .filter_map(|e| match e {
+                Ok(StreamEvent::TextDelta(s)) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["hi".to_string()]);
+    }
+
+    // ----- v1 protocol: block-oriented streaming -----
+
+    #[tokio::test]
+    async fn parse_v1_text_emits_incremental_text_deltas() {
+        // Two block_delta frames inside one text block must each
+        // emit a TextDelta in order (UI streams character-by-
+        // character; we don't wait for block_stop).
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let frames = br#"data: {"type":"start"}
+data: {"type":"block_start","index":0,"block":{"type":"text"}}
+data: {"type":"block_delta","index":0,"delta":"Hel"}
+data: {"type":"block_delta","index":0,"delta":"lo"}
+data: {"type":"block_stop","index":0}
+data: {"type":"done","finish_reason":"stop","usage":{"input_tokens":1,"output_tokens":2}}
+data: [DONE]
+"#;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frames)), &buf, &rem, &state).await;
+        let mut texts = Vec::new();
+        let mut got_done = false;
+        for e in evs {
+            match e.unwrap() {
+                StreamEvent::TextDelta(s) => texts.push(s),
+                StreamEvent::Done { usage } => {
+                    got_done = true;
+                    let u = usage.expect("usage present");
+                    assert_eq!(u.input, 1);
+                    assert_eq!(u.output, 2);
+                }
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        assert_eq!(texts, vec!["Hel".to_string(), "lo".to_string()]);
+        assert!(got_done, "Done event missing");
+    }
+
+    #[tokio::test]
+    async fn parse_v1_tool_call_streams_args_then_emits_one_toolcall() {
+        // Tool input arrives as partial JSON shards across multiple
+        // block_delta frames. The parser accumulates and emits a
+        // single ToolCall on block_stop with the parsed input.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let frames = br#"data: {"type":"block_start","index":0,"block":{"type":"tool_call","id":"c1","name":"write_file"}}
+data: {"type":"block_delta","index":0,"delta":"{\"path\":\"a.txt\","}
+data: {"type":"block_delta","index":0,"delta":"\"content\":\"hello\"}"}
+data: {"type":"block_stop","index":0}
+data: {"type":"done"}
+data: [DONE]
+"#;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frames)), &buf, &rem, &state).await;
+        // Exactly one ToolCall, no intermediate TextDelta events.
+        let mut tool_calls = Vec::new();
+        for e in &evs {
+            if let Ok(StreamEvent::TextDelta(_)) = e {
+                panic!("tool_call deltas must NOT emit TextDelta");
+            }
+            if let Ok(StreamEvent::ToolCall { id, name, input }) = e {
+                tool_calls.push((id.clone(), name.clone(), input.clone()));
+            }
+        }
+        assert_eq!(tool_calls.len(), 1, "expected exactly one ToolCall");
+        let (id, name, input) = tool_calls.into_iter().next().unwrap();
+        assert_eq!(id, "c1");
+        assert_eq!(name, "write_file");
+        assert_eq!(input.get("path").and_then(Value::as_str), Some("a.txt"));
+        assert_eq!(input.get("content").and_then(Value::as_str), Some("hello"));
+    }
+
+    #[tokio::test]
+    async fn parse_v1_parallel_blocks_by_index() {
+        // Text block (index=0) and tool_call block (index=1) opened
+        // simultaneously with interleaved deltas. Each delta must
+        // route to the right builder by index — no cross-talk.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let frames = br#"data: {"type":"block_start","index":0,"block":{"type":"text"}}
+data: {"type":"block_start","index":1,"block":{"type":"tool_call","id":"t1","name":"shell"}}
+data: {"type":"block_delta","index":0,"delta":"Running... "}
+data: {"type":"block_delta","index":1,"delta":"{\"cmd\":\""}
+data: {"type":"block_delta","index":0,"delta":"please wait"}
+data: {"type":"block_delta","index":1,"delta":"ls\"}"}
+data: {"type":"block_stop","index":1}
+data: {"type":"block_stop","index":0}
+"#;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frames)), &buf, &rem, &state).await;
+        let mut texts = Vec::new();
+        let mut tool_calls = Vec::new();
+        for e in evs {
+            match e.unwrap() {
+                StreamEvent::TextDelta(s) => texts.push(s),
+                StreamEvent::ToolCall { id, name, input } => tool_calls.push((id, name, input)),
+                _ => {}
+            }
+        }
+        assert_eq!(texts, vec!["Running... ".to_string(), "please wait".to_string()]);
+        assert_eq!(tool_calls.len(), 1);
+        let (id, name, input) = tool_calls.into_iter().next().unwrap();
+        assert_eq!(id, "t1");
+        assert_eq!(name, "shell");
+        assert_eq!(input.get("cmd").and_then(Value::as_str), Some("ls"));
+    }
+
+    #[tokio::test]
+    async fn parse_v1_start_and_ping_emit_nothing() {
+        // `start` carries telemetry metadata; `ping` is a keepalive.
+        // Neither should surface as a StreamEvent.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let frames = br#"data: {"type":"start","model":"foo","session_id":"s1"}
+data: {"type":"ping"}
+data: {"type":"ping"}
+"#;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frames)), &buf, &rem, &state).await;
+        for e in evs {
+            match e {
+                Ok(ev) => panic!("start/ping must not emit events; got {ev:?}"),
+                Err(err) => panic!("start/ping must not surface as Err; got {err}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_v1_done_sentinel_is_silently_consumed() {
+        // The trailing `data: [DONE]` after `done` carries no
+        // payload; parser must not surface it as a parse error.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let frames = br#"data: {"type":"done"}
+data: [DONE]
+"#;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frames)), &buf, &rem, &state).await;
+        let dones: Vec<_> = evs
+            .iter()
+            .filter_map(|e| match e {
+                Ok(StreamEvent::Done { .. }) => Some(()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dones.len(), 1, "expected exactly one Done event");
+        for e in &evs {
+            if let Err(err) = e {
+                panic!("[DONE] sentinel must not surface as Err; got {err}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_v1_block_delta_for_unopened_index_dropped_silently() {
+        // A block_delta arriving without a matching block_start (e.g.
+        // dropped frame, server bug) must NOT emit an event and must
+        // NOT panic. Forward-compat behavior.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let frames = br#"data: {"type":"block_delta","index":99,"delta":"orphan"}
+data: {"type":"block_stop","index":99}
+"#;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frames)), &buf, &rem, &state).await;
+        for e in evs {
+            match e {
+                Ok(ev) => panic!("orphan delta must not emit; got {ev:?}"),
+                Err(err) => panic!("orphan delta must not surface as Err; got {err}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_v1_done_extracts_cache_stats() {
+        // v1 done.usage carries cache breakdown:
+        //   cache_creation_input_tokens — tokens written to cache this turn
+        //   cache_read_input_tokens     — tokens served from cache (savings)
+        // Both default to 0 when absent. OAI's `cached_tokens` is accepted
+        // as an alias for cache_read (one-counter providers).
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let line = b"data: {\"type\":\"done\",\"usage\":{\"input_tokens\":120,\"output_tokens\":40,\"cache_creation_input_tokens\":50,\"cache_read_input_tokens\":70}}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
+        let usage = evs
+            .into_iter()
+            .find_map(|e| match e {
+                Ok(StreamEvent::Done { usage }) => usage,
+                _ => None,
+            })
+            .expect("Done with usage");
+        assert_eq!(usage.input, 120);
+        assert_eq!(usage.output, 40);
+        assert_eq!(usage.cache_creation, 50);
+        assert_eq!(usage.cache_read, 70);
+    }
+
+    #[tokio::test]
+    async fn parse_v1_done_cached_tokens_alias_maps_to_cache_read() {
+        // OAI compat: `cached_tokens` (single counter) populates
+        // cache_read so dashboards have a uniform field to read.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let line = b"data: {\"type\":\"done\",\"usage\":{\"input_tokens\":80,\"output_tokens\":20,\"cached_tokens\":60}}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
+        let usage = evs
+            .into_iter()
+            .find_map(|e| match e {
+                Ok(StreamEvent::Done { usage }) => usage,
+                _ => None,
+            })
+            .expect("Done with usage");
+        assert_eq!(usage.cache_creation, 0);
+        assert_eq!(usage.cache_read, 60);
+    }
+
+    #[tokio::test]
+    async fn parse_v1_done_without_cache_fields_defaults_to_zero() {
+        // Old-shape usage (no cache fields) must still parse cleanly;
+        // both cache counters default to 0 — same as "no cache activity".
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let line = b"data: {\"type\":\"done\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
+        let usage = evs
+            .into_iter()
+            .find_map(|e| match e {
+                Ok(StreamEvent::Done { usage }) => usage,
+                _ => None,
+            })
+            .expect("Done with usage");
+        assert_eq!(usage.input, 10);
+        assert_eq!(usage.output, 5);
+        assert_eq!(usage.cache_creation, 0);
+        assert_eq!(usage.cache_read, 0);
+    }
+
+    #[tokio::test]
+    async fn parse_v1_tool_call_malformed_json_falls_back_to_empty_object() {
+        // Malformed tool_call input must not panic / surface as Err —
+        // the parser falls back to {} so downstream consumers don't
+        // crash. Matches the runtime's "no-args" branch behavior.
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let frames = br#"data: {"type":"block_start","index":0,"block":{"type":"tool_call","id":"c","name":"foo"}}
+data: {"type":"block_delta","index":0,"delta":"{not valid json"}
+data: {"type":"block_stop","index":0}
+"#;
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frames)), &buf, &rem, &state).await;
+        let input = evs
+            .into_iter()
+            .find_map(|e| match e {
+                Ok(StreamEvent::ToolCall { input, .. }) => Some(input),
+                _ => None,
+            })
+            .expect("expected one ToolCall event");
+        assert!(input.is_object());
+        assert_eq!(input.as_object().unwrap().len(), 0);
     }
 
     #[test]
@@ -3669,11 +4088,11 @@ data: {"type":"message_stop"}
         let mut req = req_with(vec![], 2, Some("k"));
         req.model = "qwen3-235b".into();
         let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
-        assert_eq!(split.prefix_id, "rsclaw/2026.5.15");
+        assert_eq!(split.prefix_id, "rsclaw/2026.5.18");
 
         req.model = "myorg/qwen3-235b".into();
         let split2 = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
-        assert_eq!(split2.prefix_id, "rsclaw/2026.5.15");
+        assert_eq!(split2.prefix_id, "rsclaw/2026.5.18");
     }
 
     #[test]
@@ -3808,7 +4227,7 @@ data: {"type":"message_stop"}
             options: Some(split.options.clone()),
         };
         let v = serde_json::to_value(&body).unwrap();
-        assert_eq!(v["prefix_id"], "rsclaw/2026.5.15");
+        assert_eq!(v["prefix_id"], "rsclaw/2026.5.18");
         assert_eq!(v["dynamic_prefix"]["system"], "<sys>");
         assert_eq!(v["dynamic_prefix"]["user_system"], "<suf>");
         assert_eq!(v["dynamic_prefix"]["tools"][0]["name"], "memory");
@@ -4095,20 +4514,20 @@ data: {"type":"message_stop"}
             "k",
             SessionEntry {
                 session_id: "rs_w7_abc".into(),
-                prefix_id: "rsclaw/2026.5.15".into(),
+                prefix_id: "rsclaw/2026.5.18".into(),
                 last_seen_msgs_len: 12,
             },
         );
         // Same len → cached entry returned, last_seen unchanged.
-        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.15", 12).is_some());
+        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.18", 12).is_some());
         // Growth → bumped, returned.
-        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.15", 14).is_some());
+        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.18", 14).is_some());
         // Shrink (compaction trimmed history) → None, caller re-hydrates.
-        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.15", 8).is_none());
+        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.18", 8).is_none());
         // Version drift → None even if len matches.
         assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.6", 14).is_none());
         // Missing key → None.
-        assert!(provider.lookup_and_bump("missing", "rsclaw/2026.5.15", 14).is_none());
+        assert!(provider.lookup_and_bump("missing", "rsclaw/2026.5.18", 14).is_none());
     }
 
     #[test]
@@ -4605,10 +5024,10 @@ data: {"type":"message_stop"}
         // `prefix_id`. New servers send this name natively.
         let body = r#"{
             "session_id": "rs_w7_8a3c1f2b",
-            "prefix_id": "rsclaw/2026.5.15"
+            "prefix_id": "rsclaw/2026.5.18"
         }"#;
         let resp: CreateSessionResp = serde_json::from_str(body).expect("create shape parses");
-        assert_eq!(resp.prefix_id.as_deref(), Some("rsclaw/2026.5.15"));
+        assert_eq!(resp.prefix_id.as_deref(), Some("rsclaw/2026.5.18"));
     }
 
     #[test]
@@ -4669,9 +5088,9 @@ data: {"type":"message_stop"}
     fn create_session_resp_parses_populated_prefix_id() {
         // Round-trip the happy path so the Option<String> change
         // doesn't accidentally start coercing real values to None.
-        let body = r#"{"session_id":"rs_a_b","prefix_id":"rsclaw/2026.5.15"}"#;
+        let body = r#"{"session_id":"rs_a_b","prefix_id":"rsclaw/2026.5.18"}"#;
         let resp: CreateSessionResp = serde_json::from_str(body).expect("string field must parse");
-        assert_eq!(resp.prefix_id.as_deref(), Some("rsclaw/2026.5.15"));
+        assert_eq!(resp.prefix_id.as_deref(), Some("rsclaw/2026.5.18"));
     }
 
     // -- 8-rule dispatch precedence (R1 C3) -----------------------------

@@ -87,6 +87,11 @@ pub(crate) const DEFAULT_TIMEOUT_SECONDS: u64 = 1800;
 /// Max consecutive tool parse errors before aborting the turn.
 /// Prevents infinite retry loops when model output gets corrupted.
 const MAX_PARSE_ERRORS: usize = 10;
+/// Per-tool wall-clock ceiling inside a single turn's parallel dispatch.
+/// One wedged sub-agent / hung HTTP call no longer holds the whole batch
+/// hostage — it is reported as a tool error after this many seconds.
+/// Generous because legitimate exec/image-gen tools may run minutes.
+const TOOL_DISPATCH_TIMEOUT_SECS: u64 = 600;
 /// Token string that suppresses any reply to the channel.
 const NO_REPLY_TOKEN: &str = "NO_REPLY";
 /// Default max file size before first confirmation (bytes): 50 MB.
@@ -4995,7 +5000,31 @@ impl AgentRuntime {
                 });
             }
 
-            // Execute each tool and push results.
+            // Three-phase tool dispatch:
+            //   Phase 1 (serial): preflight — parse-error skip, loop
+            //     detection, last_tool_key bookkeeping, max_iterations
+            //     upgrade. Anything that may early-return BEFORE side
+            //     effects must happen here.
+            //   Phase 2a (serial): pre-dispatch side effects — live_status,
+            //     before_tool_call hook, A2A progress emit, cancel check.
+            //     Deferred from Phase 1 so a Phase-1 early-return doesn't
+            //     leave dangling before_tool_call hooks without a matching
+            //     after_tool_call.
+            //   Phase 2b (parallel): join_all(dispatch_tool) with per-tool
+            //     timeout — one stuck sub-agent / wedged HTTP call no
+            //     longer blocks every other tool in the same turn.
+            //   Phase 3 (serial, in LLM emit order): after_tool_call hook,
+            //     metrics, full_trace, loop_detector, image/file extraction,
+            //     event-bus emit, session compression, turn_scratchpad push.
+            struct PendingDispatch {
+                tool_id: String,
+                tool_name: String,
+                tool_input: Value,
+                tool_input_str: String,
+            }
+            let mut to_dispatch: Vec<PendingDispatch> = Vec::new();
+
+            // ---- Phase 1: serial preflight ----
             for (tool_id, tool_name, tool_input) in tool_calls {
                 // Skip tools with parse errors — do not execute, return error directly.
                 // This prevents infinite retry loops when model output gets truncated.
@@ -5041,8 +5070,6 @@ impl AgentRuntime {
                     turn_scratchpad.push(tool_msg);
                     continue;
                 }
-
-                info!(tool = %tool_name, "dispatching tool call");
 
                 // Detect consecutive identical tool calls (same name + same args).
                 let call_key = crate::agent::loop_detection::hash_tool_call(&tool_name, &tool_input);
@@ -5102,39 +5129,170 @@ impl AgentRuntime {
                     max_iterations = max_iterations.max(configured_complex);
                 }
 
-                // Update live status: tool call starting.
+                let tool_input_str = tool_input.to_string();
+                to_dispatch.push(PendingDispatch {
+                    tool_id,
+                    tool_name,
+                    tool_input,
+                    tool_input_str,
+                });
+            }
+
+            // ---- Phase 2a: serial pre-dispatch side effects ----
+            for p in &to_dispatch {
+                info!(tool = %p.tool_name, "dispatching tool call");
                 if let Ok(mut status) = self.live_status.try_write() {
                     status.state = "tool_call".to_owned();
-                    status.tool_history.push(tool_name.clone());
+                    status.tool_history.push(p.tool_name.clone());
                 }
-
                 self.fire_hook(
                     "before_tool_call",
                     json!({
                         "agent_id": self.handle.id,
-                        "tool": tool_name,
-                        "input": tool_input,
+                        "tool": p.tool_name,
+                        "input": p.tool_input,
                     }),
                 )
                 .await;
-
-                let tool_input_str = tool_input.to_string();
-                // Clone for the per-turn metrics record (after dispatch
-                // moves the value).
-                let tool_input_for_metrics = tool_input.clone();
-                // A2A progress signal: publish "calling tool X" before
-                // dispatch so the client / push subscribers can render
-                // tool-level progress. No-op for non-A2A turns. Cancel
-                // check too — a long-running prior tool may have
-                // observed the token between iterations.
                 ctx.turn_ctx
-                    .emit_working(&format!("calling tool {tool_name}"));
+                    .emit_working(&format!("calling tool {}", p.tool_name));
                 if ctx.turn_ctx.is_cancelled() {
                     return Err(anyhow!("canceled by A2A CancelTask"));
                 }
-                let result = self
-                    .dispatch_tool(ctx, &tool_id, &tool_name, tool_input)
-                    .await;
+            }
+
+            // ---- Phase 2b: parallel dispatch + real-time per-tool emit ----
+            // FuturesUnordered (instead of join_all) lets the user see
+            // each tool's result the instant it completes — no longer
+            // batched at max(t1,t2,t3). dispatch_tool is (&self, &ctx)
+            // immutable, so concurrent calls are safe. Per-tool timeout
+            // caps a hung sub-agent / wedged HTTP call.
+            //
+            // The `<rstool>` channel emit that previously lived in Phase 3
+            // now fires here inside each future's tail, so streaming
+            // channel subscribers (desktop WS, etc.) get per-tool cards
+            // as they finish rather than all at the slowest's latency.
+            let dispatch_stream: futures::stream::FuturesUnordered<_> = to_dispatch
+                .iter()
+                .enumerate()
+                .map(|(idx, p)| {
+                    let bus = self.event_bus.clone();
+                    let session_id = ctx.session_key.clone();
+                    let agent_id = ctx.agent_id.clone();
+                    let tool_name = p.tool_name.clone();
+                    let tool_input_str = p.tool_input_str.clone();
+                    let fut = self
+                        .dispatch_tool(ctx, &p.tool_id, &p.tool_name, p.tool_input.clone());
+                    async move {
+                        let timed = time::timeout(
+                            Duration::from_secs(TOOL_DISPATCH_TIMEOUT_SECS),
+                            fut,
+                        )
+                        .await;
+                        if let Some(bus) = bus {
+                            let preview = match &timed {
+                                Ok(Ok(v)) => {
+                                    // Render through `format_tool_result` so
+                                    // shape-specific tools (exec, read,
+                                    // web_search, …) emit clean text instead
+                                    // of raw JSON. Then collapse any oversize
+                                    // string fields (image data URLs, full
+                                    // HTML, base64 blobs) so the UI card
+                                    // doesn't carry raw payload —
+                                    // `compact_value` runs in Phase 3 against
+                                    // the same value and produces the canonical
+                                    // artifact, so duplicating that write here
+                                    // would burn disk; we just squash for the
+                                    // streaming preview.
+                                    let raw = if v.is_string() {
+                                        v.as_str().unwrap_or("").to_owned()
+                                    } else {
+                                        let squashed = squash_large_strings(v, 1_000);
+                                        format_tool_result(&squashed)
+                                    };
+                                    if raw.chars().count() > 4000 {
+                                        let truncated: String =
+                                            raw.chars().take(2000).collect();
+                                        format!("{truncated}…(truncated)")
+                                    } else {
+                                        raw
+                                    }
+                                }
+                                Ok(Err(e)) => format!("[error: {e:#}]"),
+                                Err(_) => format!(
+                                    "[timeout after {TOOL_DISPATCH_TIMEOUT_SECS}s]"
+                                ),
+                            };
+                            // Exec tools: prepend `$ command` so the UI's
+                            // card header shows what was run (parity with
+                            // the old Phase-3 emit).
+                            let display_out = if matches!(
+                                tool_name.as_str(),
+                                "shell" | "execute_command" | "exec"
+                            ) {
+                                serde_json::from_str::<serde_json::Value>(&tool_input_str)
+                                    .ok()
+                                    .and_then(|a| {
+                                        a.get("command")
+                                            .and_then(|c| c.as_str())
+                                            .map(|cmd| format!("$ {cmd}\n{preview}"))
+                                    })
+                                    .unwrap_or(preview)
+                            } else {
+                                preview
+                            };
+                            let marker = format!(
+                                "<rstool name=\"{tool_name}\">{display_out}</rstool>"
+                            );
+                            let _ = bus.send(AgentEvent {
+                                session_id,
+                                agent_id,
+                                delta: marker,
+                                done: false,
+                                files: vec![],
+                                images: vec![],
+                                tool_log: vec![],
+                                question: None,
+                            });
+                        }
+                        (idx, timed)
+                    }
+                })
+                .collect();
+
+            // Drain in completion order so the emit above fires real-time,
+            // then re-index by emit position so Phase 3 can iterate the LLM's
+            // original tool_call order (matters for scratchpad / loop
+            // detector / metrics determinism).
+            let mut timed_results: Vec<Option<_>> =
+                (0..to_dispatch.len()).map(|_| None).collect();
+            {
+                use futures::StreamExt as _;
+                let mut stream = dispatch_stream;
+                while let Some((idx, r)) = stream.next().await {
+                    timed_results[idx] = Some(r);
+                }
+            }
+            let timed_results: Vec<_> =
+                timed_results.into_iter().map(|o| o.expect("every dispatch future yields exactly one result")).collect();
+
+            // ---- Phase 3: serial post-processing in LLM emit order ----
+            for (pending, timed_result) in to_dispatch.into_iter().zip(timed_results.into_iter()) {
+                let PendingDispatch {
+                    tool_id,
+                    tool_name,
+                    tool_input: tool_input_for_metrics,
+                    tool_input_str,
+                } = pending;
+
+                let result: Result<Value> = match timed_result {
+                    Ok(inner) => inner,
+                    Err(_elapsed) => Err(anyhow!(
+                        "tool '{}' timed out after {}s",
+                        tool_name,
+                        TOOL_DISPATCH_TIMEOUT_SECS
+                    )),
+                };
 
                 self.fire_hook(
                     "after_tool_call",
@@ -5269,11 +5427,73 @@ impl AgentRuntime {
                                 ),
                                 vec![img.to_owned()],
                             )
-                        } else if v.is_string() {
-                            (v.as_str().unwrap_or("").to_owned(), vec![])
                         } else {
-                            // Format structured tool results (exec, read, etc.) for better LLM comprehension
-                            (format_tool_result(&v), vec![])
+                            // Runtime backstop: every tool's output funnels through here.
+                            // Oversized payloads get written to the artifact store and
+                            // replaced with a head+tail preview + read_artifact hint.
+                            // One enforcement point — no tool can leak a giant payload
+                            // even if its handler forgot to compact.
+                            //
+                            // Exception: `read_artifact` itself is the recovery path —
+                            // compacting its return would re-write the user's full-read
+                            // request back to a new artifact and loop the LLM through
+                            // increasingly nested previews.
+                            // Both recovery tools (read_artifact / read_session_archive)
+                            // bypass the backstop — re-compacting their full-read
+                            // response would write a new artifact and force the LLM
+                            // into a nested re-fetch loop.
+                            let v = if matches!(tool_name.as_str(), "read_artifact" | "read_session_archive") {
+                                v
+                            } else {
+                                // Web tools fetch articles where the LLM
+                                // usually wants the lede + structure in
+                                // one shot; a wider preview saves a
+                                // follow-up read_artifact call.
+                                let budget = match tool_name.as_str() {
+                                    "web_fetch" | "web_browser" | "web_search" => {
+                                        crate::artifact::PreviewBudget::WEB
+                                    }
+                                    _ => crate::artifact::PreviewBudget::DEFAULT,
+                                };
+                                crate::artifact::compact_value(
+                                    crate::artifact::default_store(),
+                                    &ctx.session_key,
+                                    v,
+                                    budget,
+                                )
+                            };
+                            if let Some(s) = v.as_str() {
+                                (s.to_owned(), vec![])
+                            } else {
+                                // Format structured tool results (exec, read, etc.) for better LLM comprehension
+                                let mut text = format_tool_result(&v);
+                                // Surface the artifact envelope to the LLM —
+                                // format_tool_result is shape-specific (exec
+                                // returns stdout+stderr, read returns content,
+                                // …) and drops envelope metadata. Append an
+                                // explicit marker so the LLM sees the
+                                // tool_result_id even when the preview text's
+                                // inline hint sits buried mid-output.
+                                if v.get("_truncated").and_then(|x| x.as_bool()).unwrap_or(false) {
+                                    if let Some(id) = v.get("_tool_result_id").and_then(|x| x.as_str()) {
+                                        text.push_str(&format!(
+                                            "\n\n[truncated — call read_artifact(tool_result_id=\"{id}\") for full output]"
+                                        ));
+                                    } else if let Some(ids) = v.get("_tool_result_ids").and_then(|x| x.as_object()) {
+                                        let pairs: Vec<String> = ids
+                                            .iter()
+                                            .filter_map(|(k, v)| v.as_str().map(|s| format!("{k}={s}")))
+                                            .collect();
+                                        if !pairs.is_empty() {
+                                            text.push_str(&format!(
+                                                "\n\n[truncated — fields compacted: {}. Call read_artifact with the id of the field you need.]",
+                                                pairs.join(", ")
+                                            ));
+                                        }
+                                    }
+                                }
+                                (text, vec![])
+                            }
                         }
                     }
                     Err(e) => {
@@ -5300,7 +5520,10 @@ impl AgentRuntime {
                 tool_images.extend(result_images);
 
                 // Record tool call for frontend display (truncated to 4000 chars).
-                // Also emit immediately so the desktop chat shows results in real time.
+                // The companion `<rstool>` channel emit moved to Phase 2b so
+                // streaming subscribers see per-tool cards in real time; this
+                // block only builds `tool_log` for the final AgentReply
+                // (rendered by non-streaming channels like Feishu/WeChat).
                 {
                     let args_str = tool_input_str;
                     let out_str = if result_text.len() > 4000 {
@@ -5309,38 +5532,7 @@ impl AgentRuntime {
                     } else {
                         result_text.clone()
                     };
-                    tool_log.push((tool_name.clone(), args_str.clone(), out_str.clone()));
-                    if let Some(ref bus) = self.event_bus {
-                        // Prepend `$ command` line for exec tools so the
-                        // desktop UI can show a command preview in the header.
-                        let display_out = if matches!(tool_name.as_str(), "shell" | "execute_command" | "exec") {
-                            if let Ok(a) = serde_json::from_str::<serde_json::Value>(&args_str) {
-                                if let Some(cmd) = a.get("command").and_then(|c| c.as_str()) {
-                                    format!("$ {cmd}\n{out_str}")
-                                } else {
-                                    out_str.clone()
-                                }
-                            } else {
-                                out_str.clone()
-                            }
-                        } else {
-                            out_str.clone()
-                        };
-                        let marker = format!(
-                            "<rstool name=\"{}\">{}</rstool>",
-                            tool_name, display_out
-                        );
-                        let _ = bus.send(AgentEvent {
-                            session_id: ctx.session_key.clone(),
-                            agent_id: ctx.agent_id.clone(),
-                            delta: marker,
-                            done: false,
-                            files: vec![],
-                            images: vec![],
-                            tool_log: vec![],
-                            question: None,
-                        });
-                    }
+                    tool_log.push((tool_name.clone(), args_str, out_str));
                 }
 
                 // Auto-send files: any tool returning __send_file=true queues the
@@ -5857,6 +6049,8 @@ impl AgentRuntime {
                 }));
             }
             "read_file" | "read" => return self.tool_read(args).await,
+            "read_artifact" => return self.tool_read_artifact(ctx, args).await,
+            "read_session_archive" => return self.tool_read_session_archive(ctx, args).await,
             "write_file" | "write" => return self.tool_write(args).await,
             "edit_file" | "edit" => return self.tool_edit(args).await,
             "shell" | "execute_command" | "exec" => return self.tool_exec(ctx, _id, args).await,
@@ -5887,7 +6081,7 @@ impl AgentRuntime {
                 }
                 return self.tool_web_search(args).await;
             }
-            "web_fetch" => return self.tool_web_fetch(args).await,
+            "web_fetch" => return self.tool_web_fetch(ctx, args).await,
             "web_download" => return self.tool_web_download(args).await,
             "web_browser" | "browser" => return self.tool_web_browser(ctx, args).await,
             "computer_use" => return self.tool_computer_use(ctx, args).await,
@@ -6085,8 +6279,8 @@ impl AgentRuntime {
             let client = A2aClient::new();
             // Use remote agent ID if configured, otherwise omit (uses remote default).
             let remote_id = ext.remote_agent_id.as_deref().unwrap_or("");
-            let reply = client
-                .send_task(
+            let stream = client
+                .send_streaming_message(
                     &ext.url,
                     remote_id,
                     &text,
@@ -6095,7 +6289,120 @@ impl AgentRuntime {
                 )
                 .await
                 .map_err(|e| anyhow!("A2A remote `{agent_id}`: {e}"))?;
-            return Ok(Value::String(reply));
+            tokio::pin!(stream);
+
+            // Drain the SSE stream until the remote publishes a terminal
+            // status event.
+            //   - status-update with message text: forward to lead's channel
+            //     so streaming subscribers see sub-agent progress in real
+            //     time (e.g. "calling tool memory_search").
+            //   - artifact-update text parts: accumulate as the reply text
+            //     ultimately returned to the LLM.
+            //   - final=true: terminate; FAILED captures the error message,
+            //     CANCELED short-circuits with an error.
+            //
+            // Cancellation: if the lead's turn_ctx is cancelled, dropping the
+            // pinned SSE stream closes the HTTP connection; the remote's SSE
+            // handler observes the close and publishes a Canceled terminal
+            // event, propagating cancel down to the sub-agent.
+            let mut accumulated = String::new();
+            let mut last_msg = String::new();
+            let mut last_error: Option<String> = None;
+            loop {
+                let cancel_fut = async {
+                    match &ctx.turn_ctx.cancel_token {
+                        Some(t) => t.cancelled().await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    _ = cancel_fut => {
+                        return Err(anyhow!(
+                            "A2A remote `{agent_id}`: cancelled by client"
+                        ));
+                    }
+                    next = stream.next() => {
+                        let Some(event) = next else { break; };
+                        let event = event.map_err(|e| anyhow!(
+                            "A2A remote `{agent_id}` SSE: {e}"
+                        ))?;
+                        let kind = event
+                            .get("kind")
+                            .and_then(|k| k.as_str())
+                            .unwrap_or("");
+                        match kind {
+                            "status-update" => {
+                                let final_ = event
+                                    .get("final")
+                                    .and_then(|f| f.as_bool())
+                                    .unwrap_or(false);
+                                let state = event["status"]["state"]
+                                    .as_str()
+                                    .unwrap_or("");
+                                let msg_text = event["status"]["message"]
+                                    ["parts"][0]["text"]
+                                    .as_str()
+                                    .unwrap_or("");
+                                if !msg_text.is_empty() && msg_text != last_msg {
+                                    last_msg = msg_text.to_owned();
+                                    if let Some(ref bus) = self.event_bus {
+                                        let marker = format!(
+                                            "<rstool name=\"agent\">[{agent_id}] {msg_text}</rstool>"
+                                        );
+                                        let _ = bus.send(AgentEvent {
+                                            session_id: ctx.session_key.clone(),
+                                            agent_id: ctx.agent_id.clone(),
+                                            delta: marker,
+                                            done: false,
+                                            files: vec![],
+                                            images: vec![],
+                                            tool_log: vec![],
+                                            question: None,
+                                        });
+                                    }
+                                }
+                                if final_ {
+                                    if state == "TASK_STATE_FAILED"
+                                        && !msg_text.is_empty()
+                                    {
+                                        last_error = Some(msg_text.to_owned());
+                                    } else if state == "TASK_STATE_CANCELED" {
+                                        return Err(anyhow!(
+                                            "A2A remote `{agent_id}`: canceled"
+                                        ));
+                                    }
+                                    break;
+                                }
+                            }
+                            "artifact-update" => {
+                                if let Some(parts) = event["artifact"]["parts"]
+                                    .as_array()
+                                {
+                                    for part in parts {
+                                        if part["type"] == "text"
+                                            && let Some(t) = part["text"].as_str()
+                                        {
+                                            accumulated.push_str(t);
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            if let Some(err) = last_error {
+                return Err(anyhow!("A2A remote `{agent_id}`: {err}"));
+            }
+            if accumulated.is_empty() {
+                return Err(anyhow!(
+                    "A2A remote `{agent_id}`: no text artifact received"
+                ));
+            }
+            return Ok(Value::String(accumulated));
         }
 
         Err(anyhow!(
@@ -6673,6 +6980,36 @@ fn is_likely_text_file(lower: &str) -> bool {
 
 
 /// Format a tool call result as human-readable markdown.
+/// Walk a `Value` and replace any string longer than `max_chars` with a
+/// `[N chars]` placeholder. Used by Phase 2b's streaming preview so a
+/// tool that returns a giant base64 image / full-page HTML doesn't dump
+/// the raw payload into the UI bus marker. Non-mutating: returns a
+/// fresh `Value`.
+fn squash_large_strings(val: &serde_json::Value, max_chars: usize) -> serde_json::Value {
+    use serde_json::Value;
+    match val {
+        Value::String(s) => {
+            let chars = s.chars().count();
+            if chars > max_chars {
+                Value::String(format!("[{chars} chars elided]"))
+            } else {
+                Value::String(s.clone())
+            }
+        }
+        Value::Array(arr) => Value::Array(
+            arr.iter().map(|v| squash_large_strings(v, max_chars)).collect(),
+        ),
+        Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                out.insert(k.clone(), squash_large_strings(v, max_chars));
+            }
+            Value::Object(out)
+        }
+        _ => val.clone(),
+    }
+}
+
 fn format_tool_result(val: &serde_json::Value) -> String {
     // exec tool: { exit_code, stdout, stderr }
     if val.get("stdout").is_some() || val.get("stderr").is_some() {

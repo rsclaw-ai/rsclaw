@@ -9,6 +9,15 @@ const cn = {
   Error: {
     Unauthorized: `获取访问密钥失败，请检查配置文件 rsclaw.json5 或到[设置](/#/settings)重新运行引导程序。`,
   },
+  AskUser: {
+    Recommended: "推荐",
+    Send: "发送",
+    Cancel: "取消",
+    Other: "其他",
+    OtherPlaceholder: "输入你的回答…",
+    EscHint: "按 Esc 取消",
+    MultiSelectHint: "可多选",
+  },
   Auth: {
     Return: "返回",
     Title: "需要密码",
@@ -930,8 +939,13 @@ const cn = {
       ServiceTitle: "网关状态",
       Config: "配置管理",
       ConfigTitle: "配置管理",
-      Agents: "多智能体",
-      AgentsTitle: "多智能体管理",
+      Agents: "智能体管理",
+      AgentsTitle: "智能体管理",
+      Memory: "记忆管理",
+      MemoryTitle: "记忆管理",
+      Knowledge: "知识库管理",
+      KnowledgeTitle: "知识库管理",
+      ComingSoon: "即将上线",
     },
 
     Nav: {

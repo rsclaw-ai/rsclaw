@@ -52,6 +52,9 @@ impl HostMethodRegistry {
             "browser_download" => self.host_browser_download(params).await,
             "sleep" => self.host_sleep(params).await,
             "storage_allocate_artifact" => self.host_storage_allocate_artifact(params).await,
+            "extract_audio" => self.host_extract_audio(params).await,
+            "transcribe" => self.host_transcribe(params).await,
+            "extract_keyframes" => self.host_extract_keyframes(params).await,
             other => bail!("unknown host method: {other}"),
         }
     }
@@ -353,6 +356,130 @@ impl HostMethodRegistry {
                 }
             }
             Err(e) => Err(anyhow::anyhow!("{e}")),
+        }
+    }
+
+    // ---- Media methods ----
+
+    /// Extract audio from a video/audio file using ffmpeg.
+    /// Params: `{ "input_path": "<path>" }`. Mirrors wasm `extract_audio`.
+    async fn host_extract_audio(&self, params: Value) -> Result<Value> {
+        let input_path = params["input_path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("extract_audio: `input_path` required"))?;
+
+        let ffmpeg_bin = match crate::agent::platform::detect_ffmpeg() {
+            Some(p) => p,
+            None => return Ok(json!({"error": "ffmpeg not found. Run: rsclaw tools install ffmpeg"})),
+        };
+
+        let out_path = match crate::plugin::wasm_runtime::allocate_dl_paths("audio.wav", 1) {
+            Ok(mut p) => p.pop().unwrap_or_default(),
+            Err(e) => return Ok(json!({"error": e})),
+        };
+
+        let output = tokio::process::Command::new(&ffmpeg_bin)
+            .args([
+                "-y", "-i", input_path,
+                "-vn", "-acodec", "pcm_s16le",
+                "-ar", "16000", "-ac", "1",
+                &out_path,
+            ])
+            .output()
+            .await;
+
+        match output {
+            Ok(o) if o.status.success() => Ok(json!({"path": out_path})),
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                Ok(json!({"error": format!("ffmpeg failed: {stderr}")}))
+            }
+            Err(e) => Ok(json!({"error": format!("ffmpeg spawn error: {e}")})),
+        }
+    }
+
+    /// Transcribe audio to text using the host's STT engine.
+    /// Params: `{ "audio_path": "<path>", "language": "zh-CN" }`. Mirrors wasm `transcribe`.
+    async fn host_transcribe(&self, params: Value) -> Result<Value> {
+        let audio_path = params["audio_path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("transcribe: `audio_path` required"))?;
+        let _language = params["language"].as_str().unwrap_or("zh-CN");
+
+        let bytes = match tokio::fs::read(audio_path).await {
+            Ok(b) => b,
+            Err(e) => return Ok(json!({"error": format!("read audio file failed: {e}")})),
+        };
+
+        let mime = if audio_path.to_lowercase().ends_with(".wav") {
+            "audio/wav"
+        } else {
+            "audio/mpeg"
+        };
+
+        let client = reqwest::Client::new();
+        match crate::channel::transcription::transcribe_audio(&client, &bytes, audio_path, mime).await {
+            Ok(text) => Ok(json!({"text": text})),
+            Err(e) => Ok(json!({"error": format!("transcription failed: {e:#}")})),
+        }
+    }
+
+    /// Extract keyframes from a video file using ffmpeg.
+    /// Params: `{ "video_path": "<path>", "count": 5 }`. Mirrors wasm `extract_keyframes`.
+    async fn host_extract_keyframes(&self, params: Value) -> Result<Value> {
+        let video_path = params["video_path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("extract_keyframes: `video_path` required"))?;
+        let count = params["count"].as_u64().unwrap_or(5).max(1).min(20) as usize;
+
+        let ffmpeg_bin = match crate::agent::platform::detect_ffmpeg() {
+            Some(p) => p,
+            None => return Ok(json!({"error": "ffmpeg not found. Run: rsclaw tools install ffmpeg"})),
+        };
+
+        let out_paths = match crate::plugin::wasm_runtime::allocate_dl_paths("frame.png", count) {
+            Ok(p) => p,
+            Err(e) => return Ok(json!({"error": e})),
+        };
+
+        // Get video duration.
+        let duration_secs: f64 = {
+            let probe = tokio::process::Command::new(&ffmpeg_bin)
+                .args(["-v", "error", "-show_entries", "format=duration",
+                       "-of", "default=noprint_wrappers=1:nokey=1", video_path])
+                .output()
+                .await;
+            match probe {
+                Ok(o) if o.status.success() => {
+                    String::from_utf8_lossy(&o.stdout).trim().parse().unwrap_or(0.0)
+                }
+                _ => 0.0,
+            }
+        };
+
+        if duration_secs <= 0.0 {
+            return Ok(json!({"error": "could not determine video duration"}));
+        }
+
+        let interval = duration_secs / count as f64;
+        let out_pattern = out_paths[0].replace(".png", "_%03d.png");
+
+        let output = tokio::process::Command::new(&ffmpeg_bin)
+            .args([
+                "-y", "-i", video_path,
+                "-vf", &format!("fps=1/{interval},scale=480:-1"),
+                &out_pattern,
+            ])
+            .output()
+            .await;
+
+        match output {
+            Ok(o) if o.status.success() => Ok(json!({"paths": out_paths})),
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                Ok(json!({"error": format!("ffmpeg failed: {stderr}")}))
+            }
+            Err(e) => Ok(json!({"error": format!("ffmpeg spawn error: {e}")})),
         }
     }
 }

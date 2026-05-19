@@ -28,6 +28,8 @@ import dynamic from "next/dynamic";
 import { showConfirm } from "./ui-lib";
 import clsx from "clsx";
 import { isTauri, invoke as tauriInvokeV2 } from "../utils/tauri";
+import { SidebarAccountChip } from "./sidebar-account-chip";
+import { toast } from "../lib/toast";
 import { getAgents, getHealth } from "../lib/rsclaw-api";
 import { useRestartBanner } from "../hooks/useRestartBanner";
 
@@ -679,14 +681,55 @@ export function SideBarBody(props: {
 
 export function SideBarTail(props: {
   primaryAction?: React.ReactNode;
+  /**
+   * Optional middle slot that absorbs the empty space between
+   * `primaryAction` (anchored left) and `secondaryAction` (anchored
+   * right). Used for the cloud-account chip — placing it here means
+   * the chip doesn't add a new row to the sidebar footer.
+   */
+  centerAction?: React.ReactNode;
   secondaryAction?: React.ReactNode;
 }) {
-  const { primaryAction, secondaryAction } = props;
+  const { primaryAction, centerAction, secondaryAction } = props;
 
   return (
-    <div className={styles["sidebar-tail"]}>
-      <div className={styles["sidebar-actions"]}>{primaryAction}</div>
-      <div className={styles["sidebar-actions"]}>{secondaryAction}</div>
+    <div
+      className={styles["sidebar-tail"]}
+      // `.sidebar-tail` has no `align-items` in its SCSS — flex
+      // default is `stretch`, which lets each slot grow to its own
+      // content height and end up visually misaligned next to a
+      // center-action chip that's shorter than the icon buttons.
+      // Lock everything to the same vertical centerline here.
+      style={{ alignItems: "center" }}
+    >
+      <div
+        className={styles["sidebar-actions"]}
+        style={{ alignItems: "center" }}
+      >
+        {primaryAction}
+      </div>
+      {centerAction && (
+        <div
+          className={styles["sidebar-actions"]}
+          style={{
+            flex: 1,
+            minWidth: 0,
+            alignItems: "center",
+            // Center the chip horizontally in the available gap so
+            // it doesn't crowd either of the action buttons.
+            justifyContent: "center",
+            padding: "0 8px",
+          }}
+        >
+          {centerAction}
+        </div>
+      )}
+      <div
+        className={styles["sidebar-actions"]}
+        style={{ alignItems: "center" }}
+      >
+        {secondaryAction}
+      </div>
     </div>
   );
 }
@@ -734,12 +777,29 @@ export function SideBar(props: { className?: string }) {
               { tab: "cron", icon: "\u23F0", label: getLang() === "cn" ? "\u5B9A\u65F6\u4EFB\u52A1" : "Cron" },
               { tab: "skills", icon: "\uD83D\uDD27", label: getLang() === "cn" ? "\u6280\u80FD\u7BA1\u7406" : "Skills" },
               { tab: "doctor", icon: "\uD83D\uDEE1\uFE0F", label: getLang() === "cn" ? "\u5B89\u5168\u68C0\u67E5" : "Doctor" },
+              { tab: "memory", icon: "\uD83E\uDDE0", label: Locale.RsClawPanel.Sidebar.Memory },
+              // Knowledge still a placeholder \u2014 backend collections
+              // layer not wired yet. Click shows a coming-soon toast.
+              { tab: "knowledge", icon: "\uD83D\uDCDA", label: Locale.RsClawPanel.Sidebar.Knowledge, comingSoon: true },
             ].map((item) => (
               <button
                 key={item.tab}
                 className={styles["sidebar-quick-btn"]}
-                onClick={() => navigate(Path.RsClawPanel + "?tab=" + item.tab)}
-                title={item.label}
+                onClick={() => {
+                  if (item.comingSoon) {
+                    toast.info(
+                      item.label,
+                      Locale.RsClawPanel.Sidebar.ComingSoon,
+                    );
+                    return;
+                  }
+                  navigate(Path.RsClawPanel + "?tab=" + item.tab);
+                }}
+                title={
+                  item.comingSoon
+                    ? `${item.label} \u00B7 ${Locale.RsClawPanel.Sidebar.ComingSoon}`
+                    : item.label
+                }
               >
                 <span>{item.icon}</span>
                 <span>{item.label}</span>
@@ -781,10 +841,15 @@ export function SideBar(props: { className?: string }) {
             </div>
           </>
         }
+        centerAction={<SidebarAccountChip narrow={shouldNarrow} />}
         secondaryAction={
           <IconButton
             icon={<AddIcon />}
-            text={shouldNarrow ? undefined : Locale.Home.NewChat}
+            // Icon-only — the "新建会话 / New Chat" text used to take
+            // ~120px on the right and crowded the account chip into a
+            // single dot. The AddIcon + aria label is enough.
+            aria={Locale.Home.NewChat}
+            title={Locale.Home.NewChat}
             onClick={() => setShowNewChat(true)}
             shadow
           />

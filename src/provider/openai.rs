@@ -1377,11 +1377,19 @@ fn parse_event(data: &str) -> Vec<StreamEvent> {
     // must precede it.
     if choice["finish_reason"].is_string() {
         let usage = v["usage"].as_object().map(|u| TokenUsage {
-            input: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
+            input: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
             output: u
                 .get("completion_tokens")
                 .and_then(Value::as_u64)
-                .unwrap_or(0) as u32,
+                .unwrap_or(0),
+            // OpenAI has no separate creation counter; reads land in
+            // prompt_tokens_details.cached_tokens.
+            cache_creation: 0,
+            cache_read: u
+                .get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
         });
         events.push(StreamEvent::Done { usage });
     }
@@ -1745,11 +1753,17 @@ fn parse_responses_event(data: &str, event_type: Option<&str>) -> Option<StreamE
                     input: u
                         .get("input_tokens")
                         .and_then(Value::as_u64)
-                        .unwrap_or(0) as u32,
+                        .unwrap_or(0),
                     output: u
                         .get("output_tokens")
                         .and_then(Value::as_u64)
-                        .unwrap_or(0) as u32,
+                        .unwrap_or(0),
+                    cache_creation: 0,
+                    cache_read: u
+                        .get("input_tokens_details")
+                        .and_then(|d| d.get("cached_tokens"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
                 });
             Some(StreamEvent::Done { usage })
         }
@@ -1799,11 +1813,17 @@ fn parse_completions_fallback(v: &Value) -> Option<StreamEvent> {
             input: u
                 .get("prompt_tokens")
                 .and_then(Value::as_u64)
-                .unwrap_or(0) as u32,
+                .unwrap_or(0),
             output: u
                 .get("completion_tokens")
                 .and_then(Value::as_u64)
-                .unwrap_or(0) as u32,
+                .unwrap_or(0),
+            cache_creation: 0,
+            cache_read: u
+                .get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
         });
         return Some(StreamEvent::Done { usage });
     }

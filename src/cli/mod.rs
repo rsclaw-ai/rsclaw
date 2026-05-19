@@ -18,6 +18,7 @@ pub mod devices;
 pub mod directory;
 pub mod dns;
 pub mod doctor;
+pub mod env;
 pub mod gateway;
 pub mod hooks;
 pub mod memory;
@@ -53,6 +54,7 @@ pub use devices::DevicesCommand;
 pub use directory::DirectoryCommand;
 pub use dns::DnsCommand;
 pub use doctor::DoctorArgs;
+pub use env::{EnvCommand, EnvSyncArgs};
 pub use gateway::{GatewayCommand, GatewayRunArgs};
 pub use hooks::HooksCommand;
 pub use memory::{MemoryCommand, MemoryIndexArgs, MemorySearchArgs, MemoryStatusArgs};
@@ -149,6 +151,10 @@ pub enum Command {
 
     /// Diagnose and optionally fix configuration issues.
     Doctor(DoctorArgs),
+
+    /// Manage the auto-managed `.env` file (sync from shell, list refs).
+    #[command(subcommand)]
+    Env(EnvCommand),
 
     /// Gateway lifecycle sub-commands.
     #[command(subcommand)]

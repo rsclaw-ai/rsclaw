@@ -85,6 +85,23 @@ interface host-storage {
     allocate-artifact-group: func(filename: string, count: u32) -> result<list<string>, string>;
 }
 
+interface host-media {
+    /// Extract audio track from a local video or audio file using ffmpeg.
+    /// Converts to 16kHz mono WAV (compatible with most STT engines).
+    /// Input can be video (mp4/webm/mov/...) or audio (mp3/wav/...).
+    extract-audio: func(input-path: string) -> result<string, string>;
+
+    /// Transcribe audio to text using the host's configured STT engine.
+    /// Provider priority: sherpa-onnx (local) → whisper.cpp → OpenAI API.
+    /// `language` is a BCP-47 code (zh-CN, en-US, ja-JP, etc).
+    transcribe: func(audio-path: string, language: string) -> result<string, string>;
+
+    /// Extract keyframes from a local video file using ffmpeg.
+    /// Spreads `count` frames evenly across the video duration.
+    /// Returns a list of PNG image file paths.
+    extract-keyframes: func(video-path: string, count: u32) -> result<list<string>, string>;
+}
+
 interface plugin-api {
     handle-tool: func(tool-name: string, args-json: string) -> result<string, string>;
 }
@@ -93,5 +110,6 @@ world jimeng-plugin {
     import host-browser;
     import host-runtime;
     import host-storage;
+    import host-media;
     export plugin-api;
 }

@@ -102,7 +102,7 @@ pub struct GatewayConfig {
     /// for back-compat — env-set lists are merged into the accepted set.
     /// When everything is empty, the middleware passes through (dev mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub a2a_auth: Option<GatewayA2aAuth>,
+    pub a2a: Option<GatewayA2a>,
     pub control_ui: Option<ControlUiConfig>,
     pub reload: Option<ReloadMode>,
     pub push: Option<PushConfig>,
@@ -179,19 +179,23 @@ pub struct GatewayAuth {
     pub allow_local: Option<bool>,
 }
 
-/// A2A inbound credentials configured in the gateway block. JSON5 key
-/// `gateway.a2aAuth`. Both fields are optional Vecs of `SecretOrString` so
-/// they support plain strings, `${VAR}` expansion, and `{ source: "env",
-/// id: "..." }` refs.
+/// A2A inbound configuration in the gateway block. JSON5 key
+/// `gateway.a2a`. Auth lists support plain strings, `${VAR}` expansion,
+/// and `{ source: "env", id: "..." }` refs.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct GatewayA2aAuth {
+pub struct GatewayA2a {
     /// Accepted Bearer tokens for `/api/v1/a2a`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tokens: Option<Vec<SecretOrString>>,
+    pub auth_tokens: Option<Vec<SecretOrString>>,
     /// Accepted `X-API-Key` values for `/api/v1/a2a`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_keys: Option<Vec<SecretOrString>>,
+    /// Max body size in megabytes for `/api/v1/a2a` requests. Default
+    /// 100 MB. axum's built-in default is 2 MB which immediately
+    /// 413's any non-trivial file attachment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_body_mb: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

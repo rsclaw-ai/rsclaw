@@ -255,6 +255,36 @@ fn build_shared_system_prefix_uncached() -> String {
     );
 
     parts.push(
+        "<context_recovery>\n\
+         The runtime auto-compacts large outputs to keep context bounded — you have two recovery tools.\n\
+         \n\
+         **Tool-result artifact** (one-shot tool output > ~4 KB):\n\
+         Tool results that crossed the size budget come back with `_truncated: true`, a head+tail\n\
+         preview, and a `tool_result_id` (the inline marker `... call read_artifact(...) ...` carries it).\n\
+         Full payload is on disk. Fetch with `read_artifact(tool_result_id=\"tr_xxx\", mode=...)`.\n\
+         \n\
+         **Session archive** (the conversation itself, after `/compact` or auto-compaction):\n\
+         Older turns get summarised, but every original message is preserved in the redb archive.\n\
+         When the compaction summary lacks a specific you need (verbatim quote, exact path, the user's\n\
+         earlier wording), call `read_session_archive(mode=...)`. Modes mirror read_artifact.\n\
+         \n\
+         **Strategy — pick the cheapest mode that answers the question:**\n\
+           - `mode=stat` first if you don't know the size — cheap, returns total_lines/byte_size.\n\
+           - `mode=grep:KEYWORD` when you know a substring — scans 10000 lines in 1 response.\n\
+             Alternation works: `grep:error|fail|timeout`.\n\
+           - `mode=tail:N` for \"just now\" / \"刚刚\" style queries.\n\
+           - `mode=head:N` for openings, prefaces, the user's original ask.\n\
+           - `mode=lines:A-B` / `mode=seq:A-B` for exact ranges when you have line/seq numbers.\n\
+           - `mode=full` is the most expensive — use only when you genuinely need everything.\n\
+         \n\
+         Every response already returns `total_lines` (read_artifact) or `total_archived`\n\
+         (read_session_archive) — never call `wc -l` (Linux) or `Measure-Object` (Windows) to count;\n\
+         the size is already in the JSON.\n\
+         </context_recovery>"
+            .to_owned(),
+    );
+
+    parts.push(
         "## CAPABILITY PRIORITY (read before every action)\n\
          \n\
          For every user request, evaluate sources in this order and use \
@@ -307,6 +337,8 @@ fn build_shared_system_prefix_uncached() -> String {
 
     parts.push(
         "## Tool Usage Guidelines\n\
+         ### Permission errors\n\
+         If a tool returns \"Permission denied\" with an \"Allowed:\" list, pick a tool from that list and continue. Do NOT retry the denied tool. If nothing on the list can complete the task, tell the user honestly what's missing.\n\
          ### File Operations (use dedicated tools, NOT shell)\n\
          - List directory: `list_dir`. Find files: `search_file`. Search contents: `search_content`.\n\
          - Read file: `read_file`. Write/create file: `write_file`.\n\

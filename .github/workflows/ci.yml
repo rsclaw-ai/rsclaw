@@ -21,8 +21,8 @@ jobs:
         with:
           toolchain: "1.91"
       - uses: Swatinem/rust-cache@v2
-      - name: Install protoc
-        run: sudo apt-get install -y protobuf-compiler
+      - name: Install system deps
+        run: sudo apt-get install -y protobuf-compiler libwayland-dev libpipewire-0.3-dev
       - name: Increase swap for linker
         run: |
           sudo swapoff -a
@@ -43,8 +43,8 @@ jobs:
         with:
           toolchain: "1.91"
       - uses: Swatinem/rust-cache@v2
-      - name: Install protoc
-        run: sudo apt-get install -y protobuf-compiler
+      - name: Install system deps
+        run: sudo apt-get install -y protobuf-compiler libwayland-dev libpipewire-0.3-dev
       - name: Increase swap for linker
         run: |
           sudo swapoff -a
@@ -67,6 +67,6 @@ jobs:
           toolchain: "1.91"
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Install protoc
-        run: sudo apt-get install -y protobuf-compiler
+      - name: Install system deps
+        run: sudo apt-get install -y protobuf-compiler libwayland-dev libpipewire-0.3-dev
       - run: cargo clippy --all-targets

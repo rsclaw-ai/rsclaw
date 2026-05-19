@@ -1339,6 +1339,19 @@ impl MemoryStore {
         Ok(self.docs.iter().filter(|d| !d.id.is_empty()).count())
     }
 
+    /// Snapshot of all currently-active docs (excludes tombstoned
+    /// slots where the id was cleared after a delete). Cheap — clones
+    /// the in-memory vec; no I/O. Used by the HTTP API for the
+    /// desktop's Memory management page to list everything without a
+    /// semantic-search query.
+    pub fn list_active(&self) -> Vec<MemoryDoc> {
+        self.docs
+            .iter()
+            .filter(|d| !d.id.is_empty())
+            .cloned()
+            .collect()
+    }
+
     pub fn embed_dim(&self) -> i32 {
         self.embed_dim
     }

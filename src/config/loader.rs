@@ -62,7 +62,18 @@ pub fn load_json5(path: &Path) -> Result<Config> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config: {}", path.display()))?;
 
-    // 1. Expand env vars before any parsing.
+    // 1a. Bootstrap env: snapshot shell, load .env, reconcile.
+    // Must run BEFORE expand_env_vars so process env reflects the
+    // final resolved state. Best-effort — a write/read failure on
+    // .env logs but does not abort gateway startup; downstream
+    // expand_env_vars will warn on any var that remains unresolved.
+    if std::env::var_os("RSCLAW_NO_ENV_SYNC").is_none() {
+        if let Err(e) = super::env_resolution::reconcile(&raw, base_dir) {
+            tracing::warn!(error = %e, "env reconcile failed (continuing with current process env)");
+        }
+    }
+
+    // 1b. Expand env vars before any parsing.
     let expanded = expand_env_vars(&raw);
 
     // 2. Parse into a generic JSON value so we can handle $include.

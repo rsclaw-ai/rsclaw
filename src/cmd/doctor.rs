@@ -280,6 +280,62 @@ pub async fn cmd_doctor(args: DoctorArgs) -> Result<()> {
         }
     }
 
+    // -- env vars referenced in config ----------------------------------------
+    println!();
+    println!("  {} env vars referenced in rsclaw.json5", bold("Env:"));
+    if let Some(cfg_path) = config::loader::detect_config_path() {
+        match std::fs::read_to_string(&cfg_path) {
+            Ok(raw) => {
+                let needed = config::env_resolution::scan_var_refs(&raw);
+                if needed.is_empty() {
+                    println!("  {} no ${{VAR}} or env SecretRef references", dim("[--]"));
+                } else {
+                    let env_path = config::loader::base_dir().join(".env");
+                    let file_vars = config::env_file::read(&env_path).unwrap_or_default();
+                    let mut missing: Vec<&String> = Vec::new();
+                    let mut drift: Vec<&String> = Vec::new();
+                    for var in &needed {
+                        let in_shell = std::env::var(var).is_ok();
+                        let file_v = file_vars.get(var);
+                        let shell_v = std::env::var(var).ok();
+                        match (in_shell, file_v.is_some()) {
+                            (false, false) => missing.push(var),
+                            (true, true) if shell_v.as_deref() != file_v.map(String::as_str) => {
+                                drift.push(var);
+                            }
+                            _ => passed += 1,
+                        }
+                    }
+                    if !missing.is_empty() {
+                        for v in &missing {
+                            issues.push(Issue::warn(format!(
+                                "env var '{v}' referenced in config but not set anywhere (provider will be disabled)"
+                            )));
+                        }
+                    }
+                    if !drift.is_empty() {
+                        for v in &drift {
+                            issues.push(Issue::warn(format!(
+                                "env var '{v}' has different values in shell vs .env (next gateway start will sync shell -> .env)"
+                            )));
+                        }
+                    }
+                    println!(
+                        "  {} {} var(s) referenced -- {} ok, {} missing, {} drift",
+                        dim("[--]"),
+                        needed.len(),
+                        passed.min(needed.len()),
+                        missing.len(),
+                        drift.len(),
+                    );
+                }
+            }
+            Err(e) => {
+                println!("  {} could not read config: {e}", yellow("[!!]"));
+            }
+        }
+    }
+
     // -- Summary & apply fixes ------------------------------------------------
     let fixable_count = issues.iter().filter(|i| i.fix_fn.is_some()).count();
     let issue_count = issues.len();
