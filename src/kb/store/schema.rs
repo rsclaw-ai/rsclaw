@@ -66,6 +66,7 @@ pub fn open_db(path: &std::path::Path) -> anyhow::Result<redb::Database> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use redb::ReadableDatabase;
     use tempfile::TempDir;
 
     #[test]

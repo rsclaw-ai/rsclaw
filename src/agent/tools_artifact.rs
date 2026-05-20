@@ -23,9 +23,7 @@ use super::runtime::{AgentRuntime, RunContext};
 /// Factored out from the tool handler so unit tests can hit the parser
 /// without standing up a `RunContext`. Modes:
 /// - `full`         — entire text (returns `full` clone)
-/// - `stat`         — size summary only, no content (kept as `Ok("")` here;
-///                    the handler attaches structured fields to the
-///                    response Value)
+/// - `stat`         — size summary only, no content (kept as `Ok("")` here; the handler attaches structured fields to the response Value)
 /// - `head:N`       — first N lines (N=0 → empty)
 /// - `tail:N`       — last N lines (N=0 → empty)
 /// - `lines:A-B`    — 1-indexed inclusive range, clamped to `[1, total]`

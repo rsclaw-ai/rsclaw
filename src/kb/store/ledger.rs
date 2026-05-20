@@ -91,6 +91,7 @@ pub fn find_pending_by_doc_in_wtx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use redb::ReadableDatabase;
     use crate::kb::ledger::{LedgerOp, LedgerStatus};
     use crate::kb::store::open_db;
     use tempfile::TempDir;

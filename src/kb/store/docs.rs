@@ -136,6 +136,7 @@ pub fn find_by_logical_and_hash_in_wtx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use redb::ReadableDatabase;
     use crate::kb::model::{KbSource, KbSourceKind, KbStatus, KbVisibility};
     use crate::kb::store::open_db;
     use tempfile::TempDir;

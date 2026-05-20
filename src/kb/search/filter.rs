@@ -54,6 +54,7 @@ pub fn is_latest_version(rtx: &ReadTransaction, doc: &KbDoc) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use redb::ReadableDatabase;
     use crate::kb::model::{KbSource, KbSourceKind, KbStatus, KbVisibility, VersionPointer};
     use crate::kb::store::open_db;
     use serde_json::Value;

@@ -138,6 +138,7 @@ fn chunk_ids_for_logical_in_wtx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use redb::ReadableDatabase;
     use crate::kb::model::{chunk_id, ChunkStatus, KbLocator, LogicalSourceId};
     use crate::kb::store::open_db;
     use tempfile::TempDir;

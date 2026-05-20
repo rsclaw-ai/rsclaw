@@ -15,7 +15,7 @@ pub use schema::open_db;
 pub use seen::{SeenRecord, SyncState};
 
 use anyhow::Result;
-use redb::{Database, ReadTransaction, WriteTransaction};
+use redb::{Database, ReadTransaction, ReadableDatabase, WriteTransaction};
 use std::path::Path;
 
 pub struct KbStore {

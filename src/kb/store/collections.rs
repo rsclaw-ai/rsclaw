@@ -74,6 +74,7 @@ pub fn delete(wtx: &WriteTransaction, id: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use redb::ReadableDatabase;
     use crate::kb::store::schema::open_db;
     use tempfile::TempDir;
 

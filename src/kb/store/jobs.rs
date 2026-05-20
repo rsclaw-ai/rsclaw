@@ -274,6 +274,7 @@ fn job_id_from_priority_key(key: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use redb::ReadableDatabase;
     use crate::kb::jobs::{Job, JobKind};
     use crate::kb::store::open_db;
     use tempfile::TempDir;

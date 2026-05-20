@@ -98,6 +98,7 @@ fn compose_idx_key(entity_id: &str, chunk_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use redb::ReadableDatabase;
     use crate::kb::store::open_db;
     use tempfile::TempDir;
 

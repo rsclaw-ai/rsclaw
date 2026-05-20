@@ -92,6 +92,7 @@ pub fn get_sync_state(rtx: &ReadTransaction, source_id: &str) -> Result<Option<S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use redb::ReadableDatabase;
     use crate::kb::store::open_db;
     use tempfile::TempDir;
 
