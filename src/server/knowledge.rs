@@ -20,17 +20,19 @@ use futures::{Stream, StreamExt as _};
 use std::convert::Infallible;
 use std::time::Duration;
 
+use std::sync::Arc;
+
 use crate::kb::model::KbCollection;
 use crate::kb::service::DocInfo;
-use crate::kb::KnowledgeError;
-use crate::server::AppState;
+use crate::kb::{KnowledgeError, KnowledgeService};
 
 /// Max upload size (JSON body or multipart file). Mirrors the spec's
 /// `knowledge.maxDocMb` default; could be made configurable later.
 const MAX_DOC_BYTES: usize = 50 * 1024 * 1024;
 
-/// Routes nested under `/api/v1/knowledge`.
-pub fn routes() -> Router<AppState> {
+/// Routes nested under `/api/v1/knowledge`. State is the `KnowledgeService`
+/// alone (not the full `AppState`), so the handlers are testable in isolation.
+pub fn routes() -> Router<Arc<KnowledgeService>> {
     Router::new()
         .route("/collections", get(list_collections).post(create_collection))
         .route(
@@ -131,8 +133,8 @@ struct PatchCollectionReq {
 
 // --- handlers -------------------------------------------------------------
 
-async fn list_collections(State(st): State<AppState>) -> Response {
-    match st.knowledge.list_collections() {
+async fn list_collections(State(svc): State<Arc<KnowledgeService>>) -> Response {
+    match svc.list_collections() {
         Ok(cols) => {
             let dtos: Vec<CollectionDto> = cols.into_iter().map(Into::into).collect();
             Json(serde_json::json!({ "collections": dtos })).into_response()
@@ -142,7 +144,7 @@ async fn list_collections(State(st): State<AppState>) -> Response {
 }
 
 async fn create_collection(
-    State(st): State<AppState>,
+    State(svc): State<Arc<KnowledgeService>>,
     Json(req): Json<CreateCollectionReq>,
 ) -> Response {
     let name = req.name.trim();
@@ -160,24 +162,21 @@ async fn create_collection(
         )
             .into_response();
     }
-    match st
-        .knowledge
-        .create_collection(name, req.description, req.embed_model)
-    {
+    match svc.create_collection(name, req.description, req.embed_model) {
         Ok(c) => (StatusCode::CREATED, Json(CollectionDto::from(c))).into_response(),
         Err(e) => err_response(e),
     }
 }
 
-async fn get_collection(State(st): State<AppState>, Path(id): Path<String>) -> Response {
-    match st.knowledge.get_collection(&id) {
+async fn get_collection(State(svc): State<Arc<KnowledgeService>>, Path(id): Path<String>) -> Response {
+    match svc.get_collection(&id) {
         Ok(c) => Json(CollectionDto::from(c)).into_response(),
         Err(e) => err_response(e),
     }
 }
 
 async fn patch_collection(
-    State(st): State<AppState>,
+    State(svc): State<Arc<KnowledgeService>>,
     Path(id): Path<String>,
     Json(req): Json<PatchCollectionReq>,
 ) -> Response {
@@ -185,14 +184,14 @@ async fn patch_collection(
     // (JSON can't distinguish absent from null here, so an explicit clear is
     // a P2 refinement; for now omitting it keeps the existing value.)
     let desc = req.description.map(Some);
-    match st.knowledge.update_collection(&id, req.name, desc) {
+    match svc.update_collection(&id, req.name, desc) {
         Ok(c) => Json(CollectionDto::from(c)).into_response(),
         Err(e) => err_response(e),
     }
 }
 
-async fn delete_collection(State(st): State<AppState>, Path(id): Path<String>) -> Response {
-    match st.knowledge.delete_collection(&id) {
+async fn delete_collection(State(svc): State<Arc<KnowledgeService>>, Path(id): Path<String>) -> Response {
+    match svc.delete_collection(&id) {
         Ok(deleted_docs) => {
             Json(serde_json::json!({ "deletedDocs": deleted_docs })).into_response()
         }
@@ -257,7 +256,7 @@ fn bad_request(code: &str) -> Response {
 /// for text/markdown, or `multipart/form-data` (title field + file field) for
 /// binary files (pdf/docx/xlsx/pptx) — the backend canonicalizes either way.
 /// Returns 202; indexing runs in the background.
-async fn upload_doc(State(st): State<AppState>, Path(cid): Path<String>, req: Request) -> Response {
+async fn upload_doc(State(svc): State<Arc<KnowledgeService>>, Path(cid): Path<String>, req: Request) -> Response {
     let ct = req
         .headers()
         .get(header::CONTENT_TYPE)
@@ -266,7 +265,7 @@ async fn upload_doc(State(st): State<AppState>, Path(cid): Path<String>, req: Re
         .to_ascii_lowercase();
 
     if ct.starts_with("multipart/form-data") {
-        upload_multipart(st, cid, req).await
+        upload_multipart(svc, cid, req).await
     } else {
         // Treat everything else as JSON.
         let body = match to_bytes(req.into_body(), MAX_DOC_BYTES).await {
@@ -281,7 +280,7 @@ async fn upload_doc(State(st): State<AppState>, Path(cid): Path<String>, req: Re
             return bad_request("empty_content");
         }
         ingest_and_respond(
-            &st,
+            &svc,
             &cid,
             parsed.title.trim(),
             parsed.text.as_bytes(),
@@ -290,8 +289,8 @@ async fn upload_doc(State(st): State<AppState>, Path(cid): Path<String>, req: Re
     }
 }
 
-async fn upload_multipart(st: AppState, cid: String, req: Request) -> Response {
-    let mut mp = match Multipart::from_request(req, &st).await {
+async fn upload_multipart(svc: Arc<KnowledgeService>, cid: String, req: Request) -> Response {
+    let mut mp = match Multipart::from_request(req, &svc).await {
         Ok(m) => m,
         Err(_) => return bad_request("invalid_multipart"),
     };
@@ -319,12 +318,12 @@ async fn upload_multipart(st: AppState, cid: String, req: Request) -> Response {
         .filter(|t| !t.trim().is_empty())
         .or(file_name)
         .unwrap_or_default();
-    ingest_and_respond(&st, &cid, title.trim(), &bytes, None)
+    ingest_and_respond(&svc, &cid, title.trim(), &bytes, None)
 }
 
 /// Validate + ingest + 202. Shared by the JSON and multipart paths.
 fn ingest_and_respond(
-    st: &AppState,
+    svc: &KnowledgeService,
     cid: &str,
     title: &str,
     bytes: &[u8],
@@ -336,7 +335,7 @@ fn ingest_and_respond(
     if bytes.is_empty() {
         return bad_request("empty_content");
     }
-    match st.knowledge.ingest(cid, title, bytes, mime) {
+    match svc.ingest(cid, title, bytes, mime) {
         Ok((id, _noop)) => (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({
@@ -348,8 +347,8 @@ fn ingest_and_respond(
     }
 }
 
-async fn list_docs(State(st): State<AppState>, Path(cid): Path<String>) -> Response {
-    match st.knowledge.list_docs(&cid) {
+async fn list_docs(State(svc): State<Arc<KnowledgeService>>, Path(cid): Path<String>) -> Response {
+    match svc.list_docs(&cid) {
         Ok(docs) => {
             let dtos: Vec<DocDto> = docs.into_iter().map(Into::into).collect();
             Json(serde_json::json!({ "docs": dtos, "nextCursor": serde_json::Value::Null }))
@@ -359,18 +358,18 @@ async fn list_docs(State(st): State<AppState>, Path(cid): Path<String>) -> Respo
     }
 }
 
-async fn get_doc(State(st): State<AppState>, Path((cid, did)): Path<(String, String)>) -> Response {
-    match st.knowledge.get_doc(&cid, &did) {
+async fn get_doc(State(svc): State<Arc<KnowledgeService>>, Path((cid, did)): Path<(String, String)>) -> Response {
+    match svc.get_doc(&cid, &did) {
         Ok(d) => Json(DocDto::from(d)).into_response(),
         Err(e) => err_response(e),
     }
 }
 
 async fn get_doc_content(
-    State(st): State<AppState>,
+    State(svc): State<Arc<KnowledgeService>>,
     Path((cid, did)): Path<(String, String)>,
 ) -> Response {
-    match st.knowledge.doc_content(&cid, &did) {
+    match svc.doc_content(&cid, &did) {
         Ok((mime, body)) => (
             [(header::CONTENT_TYPE, format!("{mime}; charset=utf-8"))],
             body,
@@ -381,20 +380,20 @@ async fn get_doc_content(
 }
 
 async fn delete_doc(
-    State(st): State<AppState>,
+    State(svc): State<Arc<KnowledgeService>>,
     Path((cid, did)): Path<(String, String)>,
 ) -> Response {
-    match st.knowledge.delete_doc(&cid, &did) {
+    match svc.delete_doc(&cid, &did) {
         Ok(()) => Json(serde_json::json!({ "deleted": true })).into_response(),
         Err(e) => err_response(e),
     }
 }
 
 async fn reindex_doc(
-    State(st): State<AppState>,
+    State(svc): State<Arc<KnowledgeService>>,
     Path((cid, did)): Path<(String, String)>,
 ) -> Response {
-    match st.knowledge.reindex_doc(&cid, &did) {
+    match svc.reindex_doc(&cid, &did) {
         Ok(()) => (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({ "status": "indexing" })),
@@ -416,7 +415,7 @@ struct SearchReq {
     score_threshold: Option<f32>,
 }
 
-async fn search(State(st): State<AppState>, Json(req): Json<SearchReq>) -> Response {
+async fn search(State(svc): State<Arc<KnowledgeService>>, Json(req): Json<SearchReq>) -> Response {
     let query = req.query.trim();
     if query.is_empty() || query.chars().count() > 512 {
         return bad_request("invalid_query");
@@ -424,10 +423,7 @@ async fn search(State(st): State<AppState>, Json(req): Json<SearchReq>) -> Respo
     let top_k = req.top_k.unwrap_or(10).clamp(1, 50);
     let threshold = req.score_threshold.unwrap_or(0.0);
     let t0 = std::time::Instant::now();
-    match st
-        .knowledge
-        .search(query, &req.collection_ids, top_k, threshold)
-    {
+    match svc.search(query, &req.collection_ids, top_k, threshold) {
         Ok(hits) => {
             let dtos: Vec<_> = hits
                 .into_iter()
@@ -449,8 +445,8 @@ async fn search(State(st): State<AppState>, Json(req): Json<SearchReq>) -> Respo
     }
 }
 
-async fn stats(State(st): State<AppState>) -> Response {
-    match st.knowledge.stats() {
+async fn stats(State(svc): State<Arc<KnowledgeService>>) -> Response {
+    match svc.stats() {
         Ok(s) => Json(serde_json::json!({
             "collectionCount": s.collection_count,
             "docCount": s.doc_count,
@@ -465,8 +461,8 @@ async fn stats(State(st): State<AppState>) -> Response {
 /// SSE stream of `knowledge.doc.status_changed` events, so the UI can react to
 /// async indexing finishing without polling. Each event's data is the JSON
 /// `{ type, docId, status }`.
-async fn events(State(st): State<AppState>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let rx = st.knowledge.subscribe();
+async fn events(State(svc): State<Arc<KnowledgeService>>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let rx = svc.subscribe();
     let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|msg| async move {
         let data = msg.ok()?;
         Some(Ok(Event::default().data(data)))
@@ -478,8 +474,153 @@ async fn events(State(st): State<AppState>) -> Sse<impl Stream<Item = Result<Eve
     )
 }
 
-async fn embedders(State(st): State<AppState>) -> Response {
-    let list = st.knowledge.embedders();
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use tempfile::TempDir;
+    use tower::ServiceExt; // oneshot
+
+    type App = Router;
+
+    fn app() -> (TempDir, Arc<KnowledgeService>, App) {
+        let tmp = TempDir::new().unwrap();
+        let svc = Arc::new(KnowledgeService::open(tmp.path().join("kb")).unwrap());
+        let app = routes().with_state(svc.clone());
+        (tmp, svc, app)
+    }
+
+    async fn send(
+        app: &App,
+        method: &str,
+        uri: &str,
+        json: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        let body = match json {
+            Some(v) => {
+                builder = builder.header("content-type", "application/json");
+                Body::from(v.to_string())
+            }
+            None => Body::empty(),
+        };
+        let resp = app.clone().oneshot(builder.body(body).unwrap()).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let val = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, val)
+    }
+
+    #[tokio::test]
+    async fn full_collection_doc_search_flow_over_http() {
+        let (_t, svc, app) = app();
+
+        // create
+        let (st, body) = send(
+            &app,
+            "POST",
+            "/collections",
+            Some(serde_json::json!({ "name": "手册" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+        let cid = body["id"].as_str().unwrap().to_string();
+
+        // duplicate name → 409
+        let (st, body) = send(
+            &app,
+            "POST",
+            "/collections",
+            Some(serde_json::json!({ "name": "手册" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "duplicate_name");
+
+        // list
+        let (st, body) = send(&app, "GET", "/collections", None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body["collections"].as_array().unwrap().len(), 1);
+
+        // upload doc (202)
+        let (st, body) = send(
+            &app,
+            "POST",
+            &format!("/collections/{cid}/docs"),
+            Some(serde_json::json!({
+                "title": "a.md",
+                "text": "# A\n\nquantum entanglement links two particles.",
+                "mime": "text/markdown"
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        let doc_id = body["id"].as_str().unwrap().to_string();
+
+        // drive the (otherwise background) indexing
+        while svc.drain_once().unwrap() {}
+
+        // list docs → ready
+        let (st, body) = send(&app, "GET", &format!("/collections/{cid}/docs"), None).await;
+        assert_eq!(st, StatusCode::OK);
+        let docs = body["docs"].as_array().unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0]["status"], "ready");
+
+        // content
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/collections/{cid}/docs/{doc_id}/content"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("two particles"));
+
+        // search
+        let (st, body) = send(
+            &app,
+            "POST",
+            "/search",
+            Some(serde_json::json!({ "query": "two particles", "collectionIds": [cid] })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(!body["hits"].as_array().unwrap().is_empty());
+
+        // stats
+        let (st, body) = send(&app, "GET", "/stats", None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body["docCount"], 1);
+        assert_eq!(body["collectionCount"], 1);
+
+        // delete collection (cascades)
+        let (st, body) = send(&app, "DELETE", &format!("/collections/{cid}"), None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body["deletedDocs"], 1);
+
+        // gone → 404
+        let (st, _) = send(&app, "GET", &format!("/collections/{cid}"), None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn unknown_collection_404() {
+        let (_t, _svc, app) = app();
+        let (st, body) = send(&app, "GET", "/collections/col_nope", None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "collection_not_found");
+    }
+}
+
+async fn embedders(State(svc): State<Arc<KnowledgeService>>) -> Response {
+    let list = svc.embedders();
     let default = list.iter().find(|e| e.is_default).map(|e| e.id.clone());
     let available: Vec<_> = list
         .iter()

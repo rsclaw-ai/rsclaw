@@ -248,7 +248,10 @@ struct PatchAgentRequest {
 
 pub fn build_router(state: AppState) -> Router {
     let api = Router::new()
-        .nest("/knowledge", knowledge::routes())
+        .nest(
+            "/knowledge",
+            knowledge::routes().with_state(state.knowledge.clone()),
+        )
         .route("/message", post(send_message))
         .route("/sessions", get(list_sessions))
         .route("/sessions/{id}", get(get_session).delete(delete_session))
