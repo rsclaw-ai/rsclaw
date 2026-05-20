@@ -105,28 +105,69 @@ impl std::fmt::Debug for RedbStore {
     }
 }
 
-/// Upgrade an existing redb file at `path` from the legacy v2 format to v3
-/// when needed. No-op when the file doesn't exist, is already v3, or any
-/// other error path — callers should still attempt their normal open
-/// afterwards and surface the real error.
+/// Upgrade an existing redb file at `path` from the legacy v1/v2 format to v3
+/// when needed. Caller is expected to perform its normal `Database::create`
+/// / `Database::open` immediately afterwards.
 ///
-/// redb 3+ dropped v2 file-format support, so users coming from earlier
+/// redb 3+ dropped v1/v2 file-format support, so users coming from earlier
 /// rsclaw builds (which shipped redb 2.x) would otherwise hit a hard open
-/// failure when the runtime opens its databases.
+/// failure on first launch.
+///
+/// Behavior:
+/// * Missing file → no-op (fresh install).
+/// * Already v3 → no-op.
+/// * v1/v2 file (`DatabaseError::UpgradeRequired`) → write a `.v2.bak` copy
+///   next to the file (only if no backup exists yet, never overwriting), then
+///   run the one-shot `Database::upgrade()` via the bundled `redb 2.6` crate.
+/// * Any other open failure (permission denied, lock conflict, real
+///   corruption, …) → return `Ok(())` so the caller's own `Database::open`
+///   surfaces the true root cause rather than being masked by a confusing
+///   "legacy upgrade failed" wrapper.
 pub(crate) fn upgrade_legacy_if_needed(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    if Database::open(path).is_ok() {
-        return Ok(());
+    match Database::open(path) {
+        Ok(_db) => Ok(()),
+        Err(redb::DatabaseError::UpgradeRequired(legacy_version)) => {
+            backup_and_upgrade(path, legacy_version)
+        }
+        Err(_) => Ok(()),
     }
-    tracing::warn!(path = %path.display(), "redb 4 open failed; attempting one-shot v2→v3 upgrade via bundled redb 2.6");
+}
+
+fn backup_and_upgrade(path: &Path, legacy_version: u8) -> Result<()> {
+    let backup = path.with_extension("redb.v2.bak");
+    if backup.exists() {
+        tracing::info!(
+            backup = %backup.display(),
+            "pre-upgrade backup already exists; not overwriting"
+        );
+    } else {
+        std::fs::copy(path, &backup)
+            .with_context(|| format!("write backup to {}", backup.display()))?;
+        tracing::info!(
+            backup = %backup.display(),
+            original = %path.display(),
+            "wrote pre-upgrade backup",
+        );
+    }
+
+    tracing::info!(
+        path = %path.display(),
+        from_version = legacy_version,
+        "upgrading redb file format to v3 (one-time)",
+    );
     let mut legacy = redb_legacy::Database::open(path)
         .with_context(|| format!("legacy open of {} for upgrade", path.display()))?;
     let did_upgrade = legacy
         .upgrade()
         .with_context(|| format!("v2→v3 upgrade of {}", path.display()))?;
-    tracing::info!(path = %path.display(), did_upgrade, "redb file format upgrade complete");
+    tracing::info!(
+        path = %path.display(),
+        did_upgrade,
+        "redb file format upgrade complete",
+    );
     Ok(())
 }
 
@@ -1310,46 +1351,117 @@ pub enum PairingState {
 mod tests {
     use super::*;
 
-    /// Create a v2-format redb file via the bundled `redb_legacy` (2.6.x default
-    /// is v2), then verify `upgrade_legacy_if_needed` migrates it in place and
-    /// the original data survives a round-trip through redb 4.
+    // Two table names used only by the upgrade tests below. Decoupled from the
+    // production schema so renaming a real table doesn't silently change the
+    // fixture's contents.
+    const T_A: redb_legacy::TableDefinition<&str, &str> =
+        redb_legacy::TableDefinition::new("_upgrade_test_a");
+    const T_B: redb_legacy::TableDefinition<&str, u64> =
+        redb_legacy::TableDefinition::new("_upgrade_test_b");
+    const T_A_V3: TableDefinition<&str, &str> = TableDefinition::new("_upgrade_test_a");
+    const T_B_V3: TableDefinition<&str, u64> = TableDefinition::new("_upgrade_test_b");
+
+    /// Write a v2 redb file at `path` containing two tables with a few rows
+    /// each. Returns the original file bytes so callers can compare against a
+    /// backup later.
+    fn write_v2_fixture(path: &std::path::Path) -> Vec<u8> {
+        let db = redb_legacy::Database::create(path).expect("create v2");
+        let txn = db.begin_write().expect("begin write");
+        {
+            let mut a = txn.open_table(T_A).expect("open T_A");
+            a.insert("hello", "world").expect("insert a1");
+            a.insert("foo", "bar").expect("insert a2");
+            let mut b = txn.open_table(T_B).expect("open T_B");
+            b.insert("count", 42u64).expect("insert b1");
+            b.insert("year", 2026u64).expect("insert b2");
+        }
+        txn.commit().expect("commit");
+        drop(db); // release file lock before reading bytes
+        std::fs::read(path).expect("read v2 bytes")
+    }
+
+    /// End-to-end migration: v2 fixture → upgrade → redb 4 read back, plus
+    /// backup creation and idempotency.
     #[test]
-    fn upgrades_v2_database_to_v3_preserving_data() {
-        const LEGACY_TABLE: redb_legacy::TableDefinition<&str, &str> =
-            redb_legacy::TableDefinition::new("session_meta");
+    fn upgrades_v2_database_to_v3_preserving_data_and_writes_backup() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("legacy.redb");
+        let original_bytes = write_v2_fixture(&path);
 
-        // 1. Write a v2 database with one row.
-        {
-            let db = redb_legacy::Database::create(&path).expect("create v2");
-            let txn = db.begin_write().expect("begin write");
-            {
-                let mut tbl = txn.open_table(LEGACY_TABLE).expect("open table");
-                tbl.insert("hello", "world").expect("insert");
-            }
-            txn.commit().expect("commit");
+        // Sanity: redb 4 rejects the v2 file with the specific error we key on.
+        match Database::open(&path) {
+            Err(redb::DatabaseError::UpgradeRequired(_)) => {}
+            other => panic!("expected UpgradeRequired before upgrade, got {other:?}"),
         }
-        // Sanity: redb 4 must refuse the v2 file before upgrade.
-        assert!(
-            Database::open(&path).is_err(),
-            "redb 4 should reject v2 file before upgrade"
-        );
 
-        // 2. Run the migration helper.
+        // First migration run.
         upgrade_legacy_if_needed(&path).expect("upgrade");
 
-        // 3. Re-open with redb 4 and confirm the row survived.
+        // Backup exists with the original v2 bytes intact.
+        let backup = path.with_extension("redb.v2.bak");
+        assert!(backup.exists(), "backup file should exist at {backup:?}");
+        let backup_bytes = std::fs::read(&backup).expect("read backup");
+        assert_eq!(
+            backup_bytes, original_bytes,
+            "backup must be byte-identical to the original v2 file"
+        );
+
+        // Both tables and all rows survived.
         {
             let db = Database::open(&path).expect("open after upgrade");
             let read = db.begin_read().expect("begin read");
-            let tbl = read.open_table(SESSION_META).expect("open table v3");
-            let got = tbl.get("hello").expect("get").expect("present");
-            assert_eq!(got.value(), "world");
+            let a = read.open_table(T_A_V3).expect("open T_A v3");
+            assert_eq!(a.get("hello").unwrap().unwrap().value(), "world");
+            assert_eq!(a.get("foo").unwrap().unwrap().value(), "bar");
+            let b = read.open_table(T_B_V3).expect("open T_B v3");
+            assert_eq!(b.get("count").unwrap().unwrap().value(), 42u64);
+            assert_eq!(b.get("year").unwrap().unwrap().value(), 2026u64);
         }
 
-        // 4. Second call is a no-op (file is already v3) — must succeed cleanly.
+        // Second run is a no-op on the already-v3 file.
         upgrade_legacy_if_needed(&path).expect("second upgrade no-op");
+    }
+
+    /// Once a backup exists from a prior upgrade attempt, the helper must not
+    /// overwrite it (preserves the earliest known-good copy).
+    #[test]
+    fn upgrade_does_not_overwrite_existing_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("legacy.redb");
+        write_v2_fixture(&path);
+        let backup = path.with_extension("redb.v2.bak");
+        std::fs::write(&backup, b"sentinel-do-not-overwrite").expect("seed backup");
+
+        upgrade_legacy_if_needed(&path).expect("upgrade");
+
+        assert_eq!(
+            std::fs::read(&backup).expect("read backup"),
+            b"sentinel-do-not-overwrite",
+            "existing backup must be preserved verbatim"
+        );
+    }
+
+    /// A truly corrupt or unrelated file must NOT be funnelled into the legacy
+    /// upgrade path — the helper should silently return Ok so the caller's own
+    /// `Database::create` surfaces the real error.
+    #[test]
+    fn corrupted_file_is_not_mistaken_for_legacy_v2() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("garbage.redb");
+        std::fs::write(&path, b"this is not a redb file at all").expect("seed garbage");
+
+        // Helper must succeed (no-op) — we don't try to upgrade unknown files.
+        upgrade_legacy_if_needed(&path).expect("noop on garbage");
+
+        // No backup created — we only backup when we're about to mutate.
+        assert!(
+            !path.with_extension("redb.v2.bak").exists(),
+            "no backup should be written for non-legacy files",
+        );
+
+        // Caller's open still fails — error is the genuine corruption, not a
+        // confusing "legacy upgrade failed" wrapper.
+        assert!(Database::create(&path).is_err());
     }
 
     /// Upgrade helper must be a no-op when the file does not exist (fresh
