@@ -745,6 +745,10 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         suspended_tasks: Arc::new(dashmap::DashMap::new()),
         task_store: a2a_task_store,
         push_dispatcher: a2a_push_dispatcher,
+        knowledge: Arc::new(
+            crate::kb::KnowledgeService::open(base_dir.join("kb"))
+                .expect("open knowledge base store"),
+        ),
     };
     crate::ws::tick::start_tick_loop(Arc::clone(&state.ws_conns));
 

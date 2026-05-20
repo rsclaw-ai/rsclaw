@@ -4,6 +4,7 @@
 pub mod schema;
 pub mod codec;
 pub mod docs;
+pub mod collections;
 pub mod chunks;
 pub mod seen;
 pub mod ledger;

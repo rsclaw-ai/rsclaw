@@ -9,6 +9,12 @@ use redb::TableDefinition;
 
 // Core data
 pub const KB_DOCS: TableDefinition<&str, &[u8]> = TableDefinition::new("kb_docs");
+/// Collection metadata (id → KbCollection). Desktop "知识库/合集" veneer.
+pub const KB_COLLECTIONS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("kb_collections");
+/// Collection name → id, for uniqueness checks and name lookup.
+pub const KB_COLLECTION_BY_NAME: TableDefinition<&str, &str> =
+    TableDefinition::new("kb_collection_by_name");
 pub const KB_DOC_LATEST_VERSION: TableDefinition<&str, &[u8]> =
     TableDefinition::new("kb_doc_latest_version");
 pub const KB_CHUNKS: TableDefinition<&str, &[u8]> = TableDefinition::new("kb_chunks");
@@ -39,6 +45,8 @@ pub fn open_db(path: &std::path::Path) -> anyhow::Result<redb::Database> {
     let wtx = db.begin_write()?;
     // Open all tables to ensure they exist.
     let _ = wtx.open_table(KB_DOCS)?;
+    let _ = wtx.open_table(KB_COLLECTIONS)?;
+    let _ = wtx.open_table(KB_COLLECTION_BY_NAME)?;
     let _ = wtx.open_table(KB_DOC_LATEST_VERSION)?;
     let _ = wtx.open_table(KB_CHUNKS)?;
     let _ = wtx.open_table(KB_CHUNK_BY_LOGICAL)?;
