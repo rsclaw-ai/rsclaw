@@ -27,6 +27,10 @@ pub struct KbSearchInput {
     pub mmr_lambda: f32,
     #[serde(default)]
     pub boost_entities: Vec<String>,
+    /// Optional asymmetric-embedding query instruction (Qwen3); applied to the
+    /// dense query only, not BM25. Default unset = symmetric.
+    #[serde(default)]
+    pub query_instruction: Option<String>,
 }
 
 fn default_k() -> usize { 8 }
@@ -91,6 +95,7 @@ pub fn run(ctx: &SearchCtx, input: KbSearchInput, scope: &CallerScope) -> Result
         diversity,
         mmr_lambda: input.mmr_lambda,
         boost_entities: input.boost_entities,
+        query_instruction: input.query_instruction,
     };
     let results = ctx.search(&req, scope)?;
 

@@ -321,6 +321,9 @@ pub struct MemoryStore {
     /// progress — startup should kick off a background migration so search
     /// becomes available without blocking gateway boot.
     pending_migration: usize,
+    /// Asymmetric query instruction (`memorySearch.queryInstruction`), applied
+    /// to search queries only. None = symmetric (current behaviour).
+    query_instruction: Option<String>,
 }
 
 impl MemoryStore {
@@ -445,6 +448,7 @@ impl MemoryStore {
             embed_dim,
             swap: None,
             pending_migration: skipped,
+            query_instruction: search_cfg.and_then(|c| c.query_instruction.clone()),
         };
 
         Ok(store)
@@ -639,7 +643,8 @@ impl MemoryStore {
             return Ok(vec![]);
         }
 
-        let q_vec = self.embedder.embed(query);
+        let q_text = crate::embed::format_query(self.query_instruction.as_deref(), query);
+        let q_vec = self.embedder.embed(&q_text);
         // Search more than top_k to account for filtered/deleted docs.
         let ef_search = (top_k * 4).max(32);
         let neighbours = self.hnsw.search(&q_vec, top_k + 10, ef_search);

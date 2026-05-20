@@ -103,6 +103,9 @@ pub struct KnowledgeService {
     /// Broadcasts `knowledge.doc.status_changed` JSON events to SSE
     /// subscribers (`GET /api/v1/knowledge/events`).
     events: broadcast::Sender<String>,
+    /// Asymmetric query instruction from `memorySearch.queryInstruction`
+    /// (default None = symmetric). Applied to search queries' dense side.
+    query_instruction: Option<String>,
 }
 
 impl KnowledgeService {
@@ -116,7 +119,11 @@ impl KnowledgeService {
         let dim = embedder.dimension();
         let index = Arc::new(KbIndex::open_and_rebuild_with_dim(&paths, &store, dim)?);
         let (events, _) = broadcast::channel(256);
-        Ok(Self { store, paths, index, embedder, kb_root, events })
+        let query_instruction = crate::config::load()
+            .ok()
+            .and_then(|c| c.raw.memory_search.clone())
+            .and_then(|m| m.query_instruction);
+        Ok(Self { store, paths, index, embedder, kb_root, events, query_instruction })
     }
 
     /// Subscribe to `knowledge.doc.status_changed` events (for SSE).
@@ -338,6 +345,7 @@ impl KnowledgeService {
                 diversity: "mmr".into(),
                 mmr_lambda: 0.5,
                 boost_entities: vec![],
+                query_instruction: self.query_instruction.clone(),
             },
             &CallerScope::default(),
         )?;

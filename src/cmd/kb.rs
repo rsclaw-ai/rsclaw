@@ -302,6 +302,7 @@ fn search(kb_root: PathBuf, query: String, k: usize, json: bool) -> Result<()> {
             diversity: "mmr".into(),
             mmr_lambda: 0.5,
             boost_entities: vec![],
+            query_instruction: None,
         },
         &CallerScope::default(),
     )?;

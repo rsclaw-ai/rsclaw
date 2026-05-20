@@ -1933,6 +1933,11 @@ pub struct MemorySearchConfig {
     pub api_key: Option<SecretOrString>,
     /// Local model settings
     pub local: Option<LocalEmbeddingConfig>,
+    /// Optional query instruction for asymmetric embedding models (Qwen3-
+    /// Embedding). When set, retrieval *queries* (not stored docs) are wrapped
+    /// as `Instruct: {this}\nQuery: {q}`, which materially improves recall.
+    /// Default unset = symmetric embedding (current behaviour).
+    pub query_instruction: Option<String>,
     /// Experimental flags
     pub experimental: Option<Value>,
 }

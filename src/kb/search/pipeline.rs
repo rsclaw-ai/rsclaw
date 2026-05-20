@@ -23,6 +23,9 @@ pub struct SearchRequest {
     pub diversity: Diversity,
     pub mmr_lambda: f32,
     pub boost_entities: Vec<String>,
+    /// Asymmetric-embedding query instruction (Qwen3), applied to the dense
+    /// query only. `None` = symmetric (the query is embedded as-is).
+    pub query_instruction: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,7 +76,11 @@ impl SearchCtx {
         let dense = match req.mode {
             SearchMode::Bm25 => Vec::new(),
             _ => {
-                let qv = self.embedder.embed_batch(&[req.query.clone()])?;
+                // Dense side applies the asymmetric query instruction if set;
+                // BM25 (below) always uses the raw query.
+                let dense_query =
+                    crate::embed::format_query(req.query_instruction.as_deref(), &req.query);
+                let qv = self.embedder.embed_batch(&[dense_query])?;
                 self.index.hnsw.search(&qv[0], recall_k)
             }
         };
@@ -321,6 +328,7 @@ mod tests {
             diversity: Diversity::Mmr,
             mmr_lambda: 0.5,
             boost_entities: vec![],
+            query_instruction: None,
         };
         let hits = ctx.search(&req, &CallerScope::default()).unwrap();
         assert!(!hits.is_empty(), "expected at least one hit");
@@ -343,6 +351,7 @@ mod tests {
             diversity: Diversity::Mmr,
             mmr_lambda: 0.5,
             boost_entities: vec![],
+            query_instruction: None,
         };
         let first: Vec<String> = ctx
             .search(&req, &CallerScope::default())
@@ -395,6 +404,7 @@ mod tests {
             diversity: Diversity::Off,
             mmr_lambda: 0.5,
             boost_entities: vec![],
+            query_instruction: None,
         };
         let scope_other = CallerScope { user_id: Some("u2".into()), ..Default::default() };
         let hits = ctx.search(&req, &scope_other).unwrap();
