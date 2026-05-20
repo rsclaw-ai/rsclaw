@@ -9,7 +9,7 @@
 //! so swapping models just works as long as the snapshot is rebuilt.
 
 use super::KbEmbedder;
-use crate::agent::memory::{Embedder as MemEmbedder, LocalBgeEmbedder};
+use crate::embed::{Embedder as MemEmbedder, LocalBgeEmbedder};
 use anyhow::{Context, Result};
 use std::path::Path;
 

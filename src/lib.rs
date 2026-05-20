@@ -72,6 +72,7 @@ pub mod cmd;
 pub mod computer;
 pub mod config;
 pub mod cron;
+pub mod embed;
 pub mod events;
 pub mod gateway;
 pub mod heartbeat;
