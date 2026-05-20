@@ -10,11 +10,16 @@
 use crate::kb::canonicalize::{canonicalize_by_mime, detect_mime, CanonicalizeInput};
 use crate::kb::content_store::read::read_doc_body;
 use crate::kb::embedder::resolve_embedder;
-use crate::kb::model::{collection_tag, ChunkStatus, KbChunk, KbCollection, KbDoc, KbStatus};
+use crate::kb::model::{
+    collection_tag, CallerScope, ChunkStatus, KbChunk, KbCollection, KbDoc, KbStatus,
+    COLLECTION_TAG_PREFIX,
+};
 use crate::kb::pipeline::{ingest_canonicalized, IngestInput};
 use crate::kb::store::codec::decode;
 use crate::kb::store::schema::{KB_CHUNKS, KB_DOCS};
 use crate::kb::store::{collections, docs};
+use crate::kb::search::SearchCtx;
+use crate::kb::tools::kb_search::{self, KbSearchFilter, KbSearchInput};
 use crate::kb::worker::{DefaultDispatcher, HandlerCtx, WorkerConfig, WorkerPool};
 use crate::kb::{KbEmbedder, KbIndex, KbPaths, KbStore};
 use redb::ReadableTable;
@@ -58,6 +63,33 @@ impl DocInfo {
             "indexing"
         }
     }
+}
+
+/// One semantic search result.
+pub struct SearchHit {
+    pub doc_id: String,
+    pub collection_id: Option<String>,
+    pub collection_name: Option<String>,
+    pub source_title: String,
+    pub chunk_text: String,
+    pub score: f32,
+}
+
+/// Aggregate knowledge-base stats.
+pub struct KbStats {
+    pub collection_count: usize,
+    pub doc_count: usize,
+    pub chunk_count: usize,
+    pub bytes: u64,
+}
+
+/// An embedder the user can select for a collection.
+pub struct EmbedderInfo {
+    pub id: String,
+    pub label: String,
+    pub dim: usize,
+    pub downloaded: bool,
+    pub is_default: bool,
 }
 
 pub struct KnowledgeService {
@@ -219,6 +251,125 @@ impl KnowledgeService {
         docs::put(&wtx, &d)?;
         wtx.commit().map_err(anyhow::Error::from)?;
         Ok(())
+    }
+
+    /// Semantic search over one or more collections (empty = all). Hits below
+    /// `score_threshold` are dropped. Reuses the KB hybrid search pipeline.
+    pub fn search(
+        &self,
+        query: &str,
+        collection_ids: &[String],
+        top_k: usize,
+        score_threshold: f32,
+    ) -> KResult<Vec<SearchHit>> {
+        let ctx = self.search_ctx();
+        let tags: Vec<String> = collection_ids.iter().map(|id| collection_tag(id)).collect();
+        let out = kb_search::run(
+            &ctx,
+            KbSearchInput {
+                query: query.to_string(),
+                k: top_k,
+                filter: KbSearchFilter { tags, ..Default::default() },
+                mode: "hybrid".into(),
+                diversity: "mmr".into(),
+                mmr_lambda: 0.5,
+                boost_entities: vec![],
+            },
+            &CallerScope::default(),
+        )?;
+        let rtx = self.store.begin_read()?;
+        let names: HashMap<String, String> = collections::list(&rtx)?
+            .into_iter()
+            .map(|c| (c.id, c.name))
+            .collect();
+        let mut hits = Vec::new();
+        for r in out.results {
+            if r.score < score_threshold {
+                continue;
+            }
+            let cid = docs::get(&rtx, &r.doc_id)?.and_then(|d| {
+                d.tags
+                    .iter()
+                    .find_map(|t| t.strip_prefix(COLLECTION_TAG_PREFIX).map(|s| s.to_string()))
+            });
+            let cname = cid.as_ref().and_then(|id| names.get(id).cloned());
+            hits.push(SearchHit {
+                doc_id: r.doc_id,
+                collection_id: cid,
+                collection_name: cname,
+                source_title: r.doc_title,
+                chunk_text: r.text,
+                score: r.score,
+            });
+        }
+        Ok(hits)
+    }
+
+    /// Aggregate stats across all collections/docs/chunks.
+    pub fn stats(&self) -> KResult<KbStats> {
+        let rtx = self.store.begin_read()?;
+        let collection_count = collections::list(&rtx)?.len();
+        let chunk_count: usize = self.chunk_counts(&rtx)?.values().sum();
+        let docs = self.all_active_docs(&rtx)?;
+        let bytes: u64 = docs
+            .iter()
+            .map(|d| {
+                std::fs::metadata(self.paths.root.join(&d.markdown_path))
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+            })
+            .sum();
+        Ok(KbStats {
+            collection_count,
+            doc_count: docs.len(),
+            chunk_count,
+            bytes,
+        })
+    }
+
+    /// Embedders the UI can offer. The active one is marked default; local BGE
+    /// models count as "downloaded" when present under `<base>/models/`.
+    pub fn embedders(&self) -> Vec<EmbedderInfo> {
+        let base = self.kb_root.parent().unwrap_or(&self.kb_root);
+        let models = base.join("models");
+        let active = self.embedder.embedder_id().to_string();
+        [
+            ("bge-small-zh", "BGE-Small-ZH", 512usize),
+            ("bge-base-zh", "BGE-Base-ZH", 768),
+            ("bge-small-en", "BGE-Small-EN", 384),
+            ("Qwen3-Embedding-0.6B", "Qwen3-Embedding-0.6B (remote)", 1024),
+        ]
+        .iter()
+        .map(|(id, label, dim)| EmbedderInfo {
+            id: id.to_string(),
+            label: label.to_string(),
+            dim: *dim,
+            downloaded: models.join(id).join("model.safetensors").exists(),
+            is_default: active.contains(id),
+        })
+        .collect()
+    }
+
+    fn search_ctx(&self) -> SearchCtx {
+        SearchCtx {
+            store: self.store.clone(),
+            index: self.index.clone(),
+            paths: self.paths.clone(),
+            embedder: self.embedder.clone(),
+        }
+    }
+
+    fn all_active_docs(&self, rtx: &redb::ReadTransaction) -> anyhow::Result<Vec<KbDoc>> {
+        let mut out = Vec::new();
+        let tbl = rtx.open_table(KB_DOCS)?;
+        for entry in tbl.iter()? {
+            let (_, v) = entry?;
+            let d: KbDoc = decode(v.value())?;
+            if d.status == KbStatus::Active {
+                out.push(d);
+            }
+        }
+        Ok(out)
     }
 
     /// Fetch a doc that is Active AND tagged into the given collection, else
@@ -445,6 +596,24 @@ mod tests {
             s.get_doc(&c.id, &doc_id),
             Err(KnowledgeError::DocNotFound)
         ));
+    }
+
+    #[test]
+    fn search_and_stats_after_ingest() {
+        let (_t, s) = svc();
+        let c = s.create_collection("kb", None, None).unwrap();
+        s.ingest(&c.id, "a.md", b"# A\n\nquantum entanglement links two particles.", Some("text/markdown")).unwrap();
+        s.ingest(&c.id, "b.md", b"# B\n\nthe capital of France is Paris.", Some("text/markdown")).unwrap();
+        while s.drain_once().unwrap() {}
+        // BM25 side of the hybrid search matches the lexical term regardless of
+        // the (stub) embedder, so the doc is findable.
+        let hits = s.search("two particles", &[c.id.clone()], 5, 0.0).unwrap();
+        assert!(!hits.is_empty(), "expected a hit for 'two particles'");
+        assert_eq!(hits[0].collection_id.as_deref(), Some(c.id.as_str()));
+        let st = s.stats().unwrap();
+        assert_eq!(st.collection_count, 1);
+        assert_eq!(st.doc_count, 2);
+        assert!(st.chunk_count >= 2);
     }
 
     #[test]

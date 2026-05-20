@@ -11,7 +11,7 @@ use axum::{
     extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Request, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +41,9 @@ pub fn routes() -> Router<AppState> {
             get(get_doc).delete(delete_doc),
         )
         .route("/collections/{id}/docs/{doc_id}/content", get(get_doc_content))
+        .route("/search", post(search))
+        .route("/stats", get(stats))
+        .route("/embedders", get(embedders))
         // Allow large document uploads (default axum limit is 2MB).
         .layer(DefaultBodyLimit::max(MAX_DOC_BYTES))
 }
@@ -377,4 +380,76 @@ async fn delete_doc(
         Ok(()) => Json(serde_json::json!({ "deleted": true })).into_response(),
         Err(e) => err_response(e),
     }
+}
+
+// --- search / stats / embedders ------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchReq {
+    query: String,
+    #[serde(default)]
+    collection_ids: Vec<String>,
+    top_k: Option<usize>,
+    score_threshold: Option<f32>,
+}
+
+async fn search(State(st): State<AppState>, Json(req): Json<SearchReq>) -> Response {
+    let query = req.query.trim();
+    if query.is_empty() || query.chars().count() > 512 {
+        return bad_request("invalid_query");
+    }
+    let top_k = req.top_k.unwrap_or(10).clamp(1, 50);
+    let threshold = req.score_threshold.unwrap_or(0.0);
+    let t0 = std::time::Instant::now();
+    match st
+        .knowledge
+        .search(query, &req.collection_ids, top_k, threshold)
+    {
+        Ok(hits) => {
+            let dtos: Vec<_> = hits
+                .into_iter()
+                .map(|h| {
+                    serde_json::json!({
+                        "docId": h.doc_id,
+                        "collectionId": h.collection_id,
+                        "collectionName": h.collection_name,
+                        "sourceTitle": h.source_title,
+                        "chunkText": h.chunk_text,
+                        "score": h.score,
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({ "hits": dtos, "queryMs": t0.elapsed().as_millis() as u64 }))
+                .into_response()
+        }
+        Err(e) => err_response(e),
+    }
+}
+
+async fn stats(State(st): State<AppState>) -> Response {
+    match st.knowledge.stats() {
+        Ok(s) => Json(serde_json::json!({
+            "collectionCount": s.collection_count,
+            "docCount": s.doc_count,
+            "chunkCount": s.chunk_count,
+            "bytes": s.bytes,
+        }))
+        .into_response(),
+        Err(e) => err_response(e),
+    }
+}
+
+async fn embedders(State(st): State<AppState>) -> Response {
+    let list = st.knowledge.embedders();
+    let default = list.iter().find(|e| e.is_default).map(|e| e.id.clone());
+    let available: Vec<_> = list
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "id": e.id, "label": e.label, "dim": e.dim, "downloaded": e.downloaded
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "default": default, "available": available })).into_response()
 }
