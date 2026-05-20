@@ -2,7 +2,11 @@
 
 use super::*;
 use crate::kb::canonicalize::{
-    html::HtmlCanonicalizer, md::MdCanonicalizer, pdf::PdfCanonicalizer, text::TextCanonicalizer,
+    html::HtmlCanonicalizer, md::MdCanonicalizer,
+    ooxml::{
+        DocxCanonicalizer, PptxCanonicalizer, XlsxCanonicalizer, DOCX_MIME, PPTX_MIME, XLSX_MIME,
+    },
+    pdf::PdfCanonicalizer, text::TextCanonicalizer,
 };
 
 /// Detect MIME from byte magic + filename hint. Conservative: returns
@@ -19,6 +23,12 @@ pub fn detect_mime(bytes: &[u8], filename_hint: Option<&str>) -> String {
             "html" | "htm" => return "text/html".into(),
             "pdf" => return "application/pdf".into(),
             "txt" | "log" => return "text/plain".into(),
+            "csv" => return "text/csv".into(),
+            // OOXML are all zip (PK) by magic; the extension is what
+            // distinguishes Word / Excel / PowerPoint.
+            "docx" => return DOCX_MIME.into(),
+            "xlsx" => return XLSX_MIME.into(),
+            "pptx" => return PPTX_MIME.into(),
             _ => {}
         }
     }
@@ -41,6 +51,9 @@ pub fn canonicalize_by_mime(
         &HtmlCanonicalizer,
         &PdfCanonicalizer,
         &TextCanonicalizer,
+        &DocxCanonicalizer,
+        &XlsxCanonicalizer,
+        &PptxCanonicalizer,
     ];
     for c in registered {
         if c.supports_mime(input.mime) {
@@ -64,6 +77,10 @@ mod tests {
         assert_eq!(detect_mime(b"# x", Some("a.md")), "text/markdown");
         assert_eq!(detect_mime(b"<", Some("a.html")), "text/html");
         assert_eq!(detect_mime(b"x", Some("a.txt")), "text/plain");
+        // OOXML: binary zip bytes, routed purely by extension.
+        assert_eq!(detect_mime(b"PK\x03\x04", Some("report.docx")), DOCX_MIME);
+        assert_eq!(detect_mime(b"PK\x03\x04", Some("sheet.xlsx")), XLSX_MIME);
+        assert_eq!(detect_mime(b"PK\x03\x04", Some("deck.pptx")), PPTX_MIME);
     }
 
     #[test]
