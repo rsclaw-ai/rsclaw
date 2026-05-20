@@ -8,13 +8,14 @@
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::kb::model::KbCollection;
+use crate::kb::service::DocInfo;
 use crate::kb::KnowledgeError;
 use crate::server::AppState;
 
@@ -26,6 +27,15 @@ pub fn routes() -> Router<AppState> {
             "/collections/{id}",
             get(get_collection).patch(patch_collection).delete(delete_collection),
         )
+        .route(
+            "/collections/{id}/docs",
+            get(list_docs).post(upload_doc),
+        )
+        .route(
+            "/collections/{id}/docs/{doc_id}",
+            get(get_doc).delete(delete_doc),
+        )
+        .route("/collections/{id}/docs/{doc_id}/content", get(get_doc_content))
 }
 
 // --- error mapping --------------------------------------------------------
@@ -35,6 +45,7 @@ pub fn routes() -> Router<AppState> {
 fn err_response(e: KnowledgeError) -> Response {
     let (status, code) = match e {
         KnowledgeError::CollectionNotFound => (StatusCode::NOT_FOUND, "collection_not_found"),
+        KnowledgeError::DocNotFound => (StatusCode::NOT_FOUND, "doc_not_found"),
         KnowledgeError::DuplicateName => (StatusCode::CONFLICT, "duplicate_name"),
         KnowledgeError::Internal(ref err) => {
             tracing::warn!("knowledge internal error: {err:#}");
@@ -167,6 +178,132 @@ async fn delete_collection(State(st): State<AppState>, Path(id): Path<String>) -
     match st.knowledge.delete_collection(&id) {
         // Doc/chunk cascade counts land in P2; report 0 for now.
         Ok(()) => Json(serde_json::json!({ "deletedDocs": 0, "deletedChunks": 0 })).into_response(),
+        Err(e) => err_response(e),
+    }
+}
+
+// --- documents ------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DocDto {
+    id: String,
+    title: String,
+    source: &'static str,
+    mime: String,
+    bytes: u64,
+    chunk_count: usize,
+    status: String,
+    /// RFC3339 when the doc became `ready`; null while still indexing.
+    indexed_at: Option<String>,
+    created_at: String,
+}
+
+impl From<DocInfo> for DocDto {
+    fn from(d: DocInfo) -> Self {
+        let status = d.status().to_string();
+        let indexed_at = (status == "ready").then(|| ms_to_rfc3339(d.updated_at));
+        DocDto {
+            id: d.id,
+            title: d.title,
+            source: "uploaded",
+            mime: d.mime,
+            bytes: d.bytes,
+            chunk_count: d.chunk_count,
+            status,
+            indexed_at,
+            created_at: ms_to_rfc3339(d.created_at),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadJsonReq {
+    title: String,
+    text: String,
+    mime: Option<String>,
+    #[allow(dead_code)]
+    source: Option<String>,
+}
+
+fn bad_request(code: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": code })),
+    )
+        .into_response()
+}
+
+/// Upload a text/markdown document as JSON. Binary files (pdf/docx/...) use
+/// the multipart path (added next); the backend canonicalizes either way.
+/// Returns 202 — indexing runs in the background.
+async fn upload_doc(
+    State(st): State<AppState>,
+    Path(cid): Path<String>,
+    Json(req): Json<UploadJsonReq>,
+) -> Response {
+    let title = req.title.trim().to_string();
+    if title.is_empty() {
+        return bad_request("title_required");
+    }
+    if req.text.is_empty() {
+        return bad_request("empty_content");
+    }
+    let bytes = req.text.len();
+    match st
+        .knowledge
+        .ingest(&cid, &title, req.text.as_bytes(), req.mime.as_deref())
+    {
+        Ok((id, _noop)) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "id": id, "title": title, "status": "pending", "bytes": bytes
+            })),
+        )
+            .into_response(),
+        Err(e) => err_response(e),
+    }
+}
+
+async fn list_docs(State(st): State<AppState>, Path(cid): Path<String>) -> Response {
+    match st.knowledge.list_docs(&cid) {
+        Ok(docs) => {
+            let dtos: Vec<DocDto> = docs.into_iter().map(Into::into).collect();
+            Json(serde_json::json!({ "docs": dtos, "nextCursor": serde_json::Value::Null }))
+                .into_response()
+        }
+        Err(e) => err_response(e),
+    }
+}
+
+async fn get_doc(State(st): State<AppState>, Path((cid, did)): Path<(String, String)>) -> Response {
+    match st.knowledge.get_doc(&cid, &did) {
+        Ok(d) => Json(DocDto::from(d)).into_response(),
+        Err(e) => err_response(e),
+    }
+}
+
+async fn get_doc_content(
+    State(st): State<AppState>,
+    Path((cid, did)): Path<(String, String)>,
+) -> Response {
+    match st.knowledge.doc_content(&cid, &did) {
+        Ok((mime, body)) => (
+            [(header::CONTENT_TYPE, format!("{mime}; charset=utf-8"))],
+            body,
+        )
+            .into_response(),
+        Err(e) => err_response(e),
+    }
+}
+
+async fn delete_doc(
+    State(st): State<AppState>,
+    Path((cid, did)): Path<(String, String)>,
+) -> Response {
+    match st.knowledge.delete_doc(&cid, &did) {
+        Ok(()) => Json(serde_json::json!({ "deleted": true })).into_response(),
         Err(e) => err_response(e),
     }
 }

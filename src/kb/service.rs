@@ -8,12 +8,17 @@
 //! service in P2/P3.
 
 use crate::kb::canonicalize::{canonicalize_by_mime, detect_mime, CanonicalizeInput};
+use crate::kb::content_store::read::read_doc_body;
 use crate::kb::embedder::resolve_embedder;
-use crate::kb::model::{collection_tag, KbCollection};
+use crate::kb::model::{collection_tag, ChunkStatus, KbChunk, KbCollection, KbDoc, KbStatus};
 use crate::kb::pipeline::{ingest_canonicalized, IngestInput};
-use crate::kb::store::collections;
+use crate::kb::store::codec::decode;
+use crate::kb::store::schema::{KB_CHUNKS, KB_DOCS};
+use crate::kb::store::{collections, docs};
 use crate::kb::worker::{DefaultDispatcher, HandlerCtx, WorkerConfig, WorkerPool};
 use crate::kb::{KbEmbedder, KbIndex, KbPaths, KbStore};
+use redb::ReadableTable;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,11 +30,35 @@ pub enum KnowledgeError {
     CollectionNotFound,
     #[error("duplicate_name")]
     DuplicateName,
+    #[error("doc_not_found")]
+    DocNotFound,
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
 
 pub type KResult<T> = Result<T, KnowledgeError>;
+
+/// A document's API-facing summary. `status()` derives indexing state: a doc
+/// is `ready` once its chunks are embedded+indexed, else `indexing`.
+pub struct DocInfo {
+    pub id: String,
+    pub title: String,
+    pub mime: String,
+    pub bytes: u64,
+    pub chunk_count: usize,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl DocInfo {
+    pub fn status(&self) -> &'static str {
+        if self.chunk_count > 0 {
+            "ready"
+        } else {
+            "indexing"
+        }
+    }
+}
 
 pub struct KnowledgeService {
     store: Arc<KbStore>,
@@ -132,6 +161,106 @@ impl KnowledgeService {
             },
         )?;
         Ok((out.doc_id, out.noop))
+    }
+
+    /// Active documents in a collection, newest first, with chunk counts.
+    pub fn list_docs(&self, collection_id: &str) -> KResult<Vec<DocInfo>> {
+        self.get_collection(collection_id)?;
+        let tag = collection_tag(collection_id);
+        let rtx = self.store.begin_read()?;
+        let counts = self.chunk_counts(&rtx)?;
+        let docs = self.collect_active_docs(&rtx, &tag)?;
+        let mut out: Vec<DocInfo> = docs.into_iter().map(|d| self.doc_info(d, &counts)).collect();
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(out)
+    }
+
+    fn collect_active_docs(
+        &self,
+        rtx: &redb::ReadTransaction,
+        tag: &str,
+    ) -> anyhow::Result<Vec<KbDoc>> {
+        let mut out = Vec::new();
+        let tbl = rtx.open_table(KB_DOCS)?;
+        for entry in tbl.iter()? {
+            let (_, v) = entry?;
+            let d: KbDoc = decode(v.value())?;
+            if d.status == KbStatus::Active && d.tags.iter().any(|t| t == tag) {
+                out.push(d);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn get_doc(&self, collection_id: &str, doc_id: &str) -> KResult<DocInfo> {
+        let rtx = self.store.begin_read()?;
+        let d = self.active_doc_in_collection(&rtx, collection_id, doc_id)?;
+        let counts = self.chunk_counts(&rtx)?;
+        Ok(self.doc_info(d, &counts))
+    }
+
+    /// `(mime, body)` of a document's canonical markdown, for display/editing.
+    pub fn doc_content(&self, collection_id: &str, doc_id: &str) -> KResult<(String, String)> {
+        let rtx = self.store.begin_read()?;
+        let d = self.active_doc_in_collection(&rtx, collection_id, doc_id)?;
+        drop(rtx);
+        let abs = self.paths.root.join(&d.markdown_path);
+        let body = read_doc_body(&abs)?;
+        Ok((d.mime, body))
+    }
+
+    /// Tombstone a document; the compactor reaps its chunks/vectors later.
+    pub fn delete_doc(&self, collection_id: &str, doc_id: &str) -> KResult<()> {
+        let rtx = self.store.begin_read()?;
+        let mut d = self.active_doc_in_collection(&rtx, collection_id, doc_id)?;
+        drop(rtx);
+        d.status = KbStatus::Tombstoned;
+        let wtx = self.store.begin_write()?;
+        docs::put(&wtx, &d)?;
+        wtx.commit().map_err(anyhow::Error::from)?;
+        Ok(())
+    }
+
+    /// Fetch a doc that is Active AND tagged into the given collection, else
+    /// `DocNotFound` (also hides docs that belong to a different collection).
+    fn active_doc_in_collection(
+        &self,
+        rtx: &redb::ReadTransaction,
+        collection_id: &str,
+        doc_id: &str,
+    ) -> KResult<KbDoc> {
+        let tag = collection_tag(collection_id);
+        docs::get(rtx, doc_id)?
+            .filter(|d| d.status == KbStatus::Active && d.tags.iter().any(|t| t == &tag))
+            .ok_or(KnowledgeError::DocNotFound)
+    }
+
+    fn chunk_counts(&self, rtx: &redb::ReadTransaction) -> anyhow::Result<HashMap<String, usize>> {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        let tbl = rtx.open_table(KB_CHUNKS)?;
+        for entry in tbl.iter()? {
+            let (_, v) = entry?;
+            let c: KbChunk = decode(v.value())?;
+            if c.status == ChunkStatus::Active {
+                *counts.entry(c.doc_id).or_default() += 1;
+            }
+        }
+        Ok(counts)
+    }
+
+    fn doc_info(&self, d: KbDoc, counts: &HashMap<String, usize>) -> DocInfo {
+        let bytes = std::fs::metadata(self.paths.root.join(&d.markdown_path))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        DocInfo {
+            chunk_count: counts.get(&d.id).copied().unwrap_or(0),
+            id: d.id,
+            title: d.title,
+            mime: d.mime,
+            bytes,
+            created_at: d.created_at,
+            updated_at: d.updated_at,
+        }
     }
 
     /// All collections, newest first.
@@ -288,6 +417,34 @@ mod tests {
             }
         }
         assert!(drained >= 1, "expected the embed job to be drained");
+    }
+
+    #[test]
+    fn doc_lifecycle_list_content_delete() {
+        let (_t, s) = svc();
+        let c = s.create_collection("kb", None, None).unwrap();
+        let (doc_id, _) = s
+            .ingest(
+                &c.id,
+                "note.md",
+                b"# Title\n\nhello world body text for the knowledge base.",
+                Some("text/markdown"),
+            )
+            .unwrap();
+        while s.drain_once().unwrap() {}
+        let listed = s.list_docs(&c.id).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, doc_id);
+        assert_eq!(listed[0].status(), "ready");
+        let (mime, body) = s.doc_content(&c.id, &doc_id).unwrap();
+        assert_eq!(mime, "text/markdown");
+        assert!(body.contains("hello world"), "body was: {body}");
+        s.delete_doc(&c.id, &doc_id).unwrap();
+        assert!(s.list_docs(&c.id).unwrap().is_empty());
+        assert!(matches!(
+            s.get_doc(&c.id, &doc_id),
+            Err(KnowledgeError::DocNotFound)
+        ));
     }
 
     #[test]
