@@ -415,7 +415,8 @@ cargo test --test kb_week3_search        # Week 3 retrieval e2e (1)
 cargo test --test kb_week4_syncers       # Week 4 syncer e2e (2)
 cargo test --test kb_week4_compactor     # Week 4 compactor integration (1)
 cargo test --test kb_entities_e2e        # Week 5 entity extraction (2)
-cargo test --test kb_cli_smoke           # CLI smoke (8)
+cargo test --test kb_cli_smoke           # CLI smoke (10)
+cargo test --test kb_tools_e2e           # kb_fetch/similar/list_docs (7)
 ```
 
 End-to-end CLI smoke:
