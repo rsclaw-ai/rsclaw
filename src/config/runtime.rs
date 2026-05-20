@@ -38,12 +38,17 @@ pub struct GatewayRuntime {
     pub reload: ReloadMode,
     pub auth_token: Option<String>,
     /// Accepted Bearer tokens for `/api/v1/a2a`, resolved from
-    /// `gateway.a2aAuth.tokens` + env `RSCLAW_A2A_BEARER_TOKENS`.
+    /// `gateway.a2a.authTokens` + env `RSCLAW_A2A_BEARER_TOKENS`.
     /// Empty Vec = no config tokens (env may still apply at request time).
     pub a2a_bearer_tokens: Vec<String>,
     /// Accepted `X-API-Key` values for `/api/v1/a2a`, resolved from
-    /// `gateway.a2aAuth.apiKeys` + env `RSCLAW_A2A_API_KEYS`.
+    /// `gateway.a2a.apiKeys` + env `RSCLAW_A2A_API_KEYS`.
     pub a2a_api_keys: Vec<String>,
+    /// Max body size in bytes for `/api/v1/a2a`. Resolved from
+    /// `gateway.a2a.maxBodyMb` × 1 MiB. Default 100 MiB. Wired as
+    /// `DefaultBodyLimit::max(...)` on the route — axum's stock 2 MiB
+    /// is too small for realistic file attachments.
+    pub a2a_max_body_bytes: u64,
     /// True when `gateway.auth.token` is present in config (Plain or
     /// SecretRef). Used by the validator to avoid a false "no auth token"
     /// warning when the token is a SecretRef that couldn't be resolved at
@@ -187,11 +192,18 @@ impl IntoRuntime for Config {
                 .collect()
         };
         let mut a2a_bearer_tokens =
-            resolve_list(gw.a2a_auth.as_ref().and_then(|a| a.tokens.as_ref()));
+            resolve_list(gw.a2a.as_ref().and_then(|a| a.auth_tokens.as_ref()));
         a2a_bearer_tokens.extend(env_split("RSCLAW_A2A_BEARER_TOKENS"));
         let mut a2a_api_keys =
-            resolve_list(gw.a2a_auth.as_ref().and_then(|a| a.api_keys.as_ref()));
+            resolve_list(gw.a2a.as_ref().and_then(|a| a.api_keys.as_ref()));
         a2a_api_keys.extend(env_split("RSCLAW_A2A_API_KEYS"));
+        let a2a_max_body_bytes: u64 = gw
+            .a2a
+            .as_ref()
+            .and_then(|a| a.max_body_mb)
+            .unwrap_or(100) as u64
+            * 1024
+            * 1024;
 
         Ok(RuntimeConfig {
             gateway: GatewayRuntime {
@@ -203,6 +215,7 @@ impl IntoRuntime for Config {
                 auth_token,
                 a2a_bearer_tokens,
                 a2a_api_keys,
+                a2a_max_body_bytes,
                 auth_token_configured,
                 auth_token_is_plaintext,
                 allow_tailscale: gw

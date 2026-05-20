@@ -617,7 +617,13 @@ $synth.Speak('{}')
     // -------------------------------------------------------------------
 
     pub(crate) async fn tool_memory_consolidated(&self, ctx: &RunContext, args: Value) -> Result<Value> {
-        let action = args["action"].as_str().unwrap_or("search");
+        // Trim whitespace/newlines: the rsclaw v1 block protocol shards
+        // tool_call input JSON across deltas and occasionally introduces
+        // leading/trailing whitespace inside string values (seen in
+        // production as e.g. `{"action": "\nsearch\n"}`). A bare match
+        // against "search" then fails and the user gets a confusing
+        // "unknown action 'search\n'" error.
+        let action = args["action"].as_str().unwrap_or("search").trim();
         match action {
             "search" => self.tool_memory_search(args).await,
             "get" => self.tool_memory_get(args).await,

@@ -10,6 +10,15 @@ const en: LocaleType = {
   Error: {
     Unauthorized: `Auth token not found. Check rsclaw.json5 or re-run the [setup wizard](/#/settings).`,
   },
+  AskUser: {
+    Recommended: "Recommended",
+    Send: "Send",
+    Cancel: "Cancel",
+    Other: "Other",
+    OtherPlaceholder: "Type your answer…",
+    EscHint: "Esc to cancel",
+    MultiSelectHint: "Pick one or more",
+  },
   Auth: {
     Return: "Return",
     Title: "Need Access Code",
@@ -942,6 +951,11 @@ const en: LocaleType = {
       ConfigTitle: "Configuration",
       Agents: "Agents",
       AgentsTitle: "Agent Manager",
+      Memory: "Memory",
+      MemoryTitle: "Memory",
+      Knowledge: "Knowledge",
+      KnowledgeTitle: "Knowledge Base",
+      ComingSoon: "Coming soon",
     },
 
     Nav: {

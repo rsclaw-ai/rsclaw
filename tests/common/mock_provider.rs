@@ -338,7 +338,7 @@ pub fn assert_stream_done(events: &[StreamEvent]) {
 }
 
 /// Assert token usage on the Done event.
-pub fn assert_usage(events: &[StreamEvent], expected_input: u32, expected_output: u32) {
+pub fn assert_usage(events: &[StreamEvent], expected_input: u64, expected_output: u64) {
     for event in events {
         if let StreamEvent::Done {
             usage: Some(usage), ..

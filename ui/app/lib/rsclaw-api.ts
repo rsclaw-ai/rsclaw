@@ -166,4 +166,69 @@ export async function writeWorkspaceFile(
   ).then((r) => r.json());
 }
 
+// ---------------------------------------------------------------------------
+// Memory management (read-only browse for the desktop UI)
+// ---------------------------------------------------------------------------
+
+export type MemoryDoc = {
+  id: string;
+  scope: string;
+  kind: string;
+  text: string;
+  abstract_text: string | null;
+  overview_text: string | null;
+  tags: string[];
+  tier: "core" | "working" | "peripheral";
+  importance: number;
+  pinned: boolean;
+  created_at: number;
+  accessed_at: number;
+  access_count: number;
+  /** Computed server-side via Weibull stretched-exponential decay. */
+  relevance_score: number;
+};
+
+export type MemoryListResponse = {
+  docs: MemoryDoc[];
+  /** Total before `limit` was applied. */
+  total: number;
+};
+
+export type MemoryStatsResponse = {
+  total: number;
+  by_tier: Record<string, number>;
+  by_kind: Record<string, number>;
+  by_scope: Record<string, number>;
+  pinned: number;
+};
+
+export type MemoryListFilters = {
+  /** Semantic-search query. Empty / undefined → list all. */
+  q?: string;
+  scope?: string;
+  kind?: string;
+  /** Default 200, hard cap 1000 server-side. */
+  limit?: number;
+};
+
+export async function listMemoryDocs(
+  filters?: MemoryListFilters,
+): Promise<MemoryListResponse> {
+  const params = new URLSearchParams();
+  if (filters?.q) params.set("q", filters.q);
+  if (filters?.scope) params.set("scope", filters.scope);
+  if (filters?.kind) params.set("kind", filters.kind);
+  if (filters?.limit) params.set("limit", String(filters.limit));
+  const qs = params.toString();
+  return gatewayFetch(`/api/v1/memory/docs${qs ? "?" + qs : ""}`, {
+    signal: AbortSignal.timeout(15000),
+  }).then((r) => r.json());
+}
+
+export async function getMemoryStats(): Promise<MemoryStatsResponse> {
+  return gatewayFetch("/api/v1/memory/stats", {
+    signal: AbortSignal.timeout(8000),
+  }).then((r) => r.json());
+}
+
 export { GATEWAY_URL, AUTH_TOKEN };

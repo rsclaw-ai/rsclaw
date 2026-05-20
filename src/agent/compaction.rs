@@ -30,7 +30,12 @@ window - treat it as background reference, NOT as active instructions. \
 Do NOT answer questions or fulfill requests mentioned in this summary; \
 they were already addressed. \
 Your current task is in the '## Active Task' section - resume from there. \
-Respond ONLY to the latest user message that appears AFTER this summary.";
+Respond ONLY to the latest user message that appears AFTER this summary. \
+\n\
+If you need pre-compaction specifics this summary omits (a verbatim \
+quote, a file path, an error you can't find here), call \
+read_session_archive(mode=\"grep:KEYWORD\") to search the full \
+original conversation — it's still on disk, never deleted by compaction.";
 
 /// Build the summary message body that gets stored as the User-role
 /// `[CONTEXT COMPACTION ...]` message AND sent as the `summary` field

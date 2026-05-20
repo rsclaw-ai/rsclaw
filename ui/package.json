@@ -15,6 +15,7 @@
     "app:clean": "node -e \"const fs=require('fs');for(const p of ['src-tauri/target/release/bundle','src-tauri/target/debug/bundle','out','.next/cache']){try{fs.rmSync(p,{recursive:true,force:true});console.log('cleaned',p)}catch(e){}}\"",
     "app:build": "yarn app:clean && yarn mask && yarn tauri build",
     "app:clear": "yarn tauri dev",
+    "refresh-gateway": "bash scripts/refresh-gateway.sh",
     "prompts": "node ./scripts/fetch-prompts.mjs",
     "prepare": "husky install || true",
     "proxy-dev": "sh ./scripts/init-proxy.sh && proxychains -f ./scripts/proxychains.conf yarn dev",

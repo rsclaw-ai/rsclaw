@@ -26,6 +26,8 @@ import {
   API_TYPE_NEEDS_KEY,
 } from "../lib/provider-defaults";
 import { isTauri, invoke as tauriInvokeV2 } from "../utils/tauri";
+import { RsclawRecommendedCard } from "./onboarding-rsclaw-card";
+import type { InstalledKeyData } from "../lib/rsclaw-console";
 
 // ── i18n translations for the wizard ──
 
@@ -784,7 +786,7 @@ export interface ProviderDef {
 
 // All providers (unordered lookup table)
 export const ALL_PROVIDERS: Record<string, ProviderDef> = {
-  rsclaw:      { id: "rsclaw",      name: "RsClaw",             tag: "\u63A8\u8350 \u00B7 kvCache=2", tagEn: "Recommended \u00B7 kvCache=2", keyLabel: "RsClaw API Key", keyPlaceholder: "sk-...", hasBaseUrl: true, defaultBaseUrl: "https://api.rsclaw.ai/v1/agent" },
+  rsclaw:      { id: "rsclaw",      name: "RsClaw",             tag: "\u589E\u91CF\u534F\u8BAE \u00B7 \u4E1A\u5185\u9996\u53D1", tagEn: "Incremental \u00B7 Industry-first", keyLabel: "RsClaw API Key", keyPlaceholder: "sk-...", hasBaseUrl: true, defaultBaseUrl: "https://api.rsclaw.ai/v1/agent" },
   qwen:        { id: "qwen",        name: "Qwen (\u5343\u95EE)", tag: "\u56FD\u5185\u76F4\u8FDE",      tagEn: "China direct",      keyLabel: "DashScope API Key",   keyPlaceholder: "sk-..." },
   doubao:      { id: "doubao",      name: "Doubao (\u8C46\u5305)", tag: "\u5B57\u8282\u8DF3\u52A8",     tagEn: "ByteDance",         keyLabel: "ARK API Key",         keyPlaceholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", hasBaseUrl: true, defaultBaseUrl: "https://ark.cn-beijing.volces.com/api/v3" },
   minimax:     { id: "minimax",     name: "MiniMax",            tag: "\u56FD\u5185",                  tagEn: "China",             keyLabel: "MiniMax API Key",     keyPlaceholder: "eyJ..." },
@@ -1641,21 +1643,12 @@ export function OnboardingPage() {
     });
     return m;
   });
-  // Select first channel when entering step 3
-  const chsInitRef = useRef(false);
-  useEffect(() => {
-    if (step === 3 && !chsInitRef.current && CHANNELS.length > 0) {
-      chsInitRef.current = true;
-      const firstId = CHANNELS[0].id;
-      setChs((prev) => {
-        const c: Record<string, ChState> = {};
-        for (const [k, v] of Object.entries(prev)) {
-          c[k] = { ...v, enabled: k === firstId };
-        }
-        return c;
-      });
-    }
-  }, [step, CHANNELS]);
+  // Step 3 intentionally starts with no channel selected — the user
+  // picks one manually, and `toggleChannel` auto-starts QR for
+  // channels that support it. (Previously we auto-selected the first
+  // channel + auto-fired its QR, which forced users into WeChat by
+  // default and pinned a stale QR while they were still browsing the
+  // list.)
   const qrPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const qrTokenRef = useRef<string | null>(null);
 
@@ -1870,6 +1863,32 @@ export function OnboardingPage() {
       return p;
     });
 
+    // rsclaw short-circuit: the cloud agent endpoint doesn't expose an
+    // OpenAI-compatible `/models` listing, and we're often clicking
+    // this button before the local gateway has started (onboarding
+    // step 2 runs pre-launch). Trust the key, use the hardcoded model
+    // list — if it's actually invalid the user finds out at the
+    // gateway-start step's health check.
+    if (id === "rsclaw") {
+      const fallback = MODELS["rsclaw"] || [];
+      const defaultModel =
+        fallback.find((m) => m.rec)?.id || fallback[0]?.id || "rsclaw-agent-v1";
+      setProvs((prev) => {
+        const p = { ...prev };
+        p[id] = {
+          ...p[id],
+          testStatus: "success",
+          inputState: "ok",
+          testError: "",
+          modelsLoading: false,
+          models: fallback,
+          selectedModel: p[id].selectedModel || defaultModel,
+        };
+        return p;
+      });
+      return;
+    }
+
     try {
       // Test provider API directly (Tauri) or via gateway (browser)
       const provDef = PROVIDERS.find((p) => p.id === id);
@@ -1999,17 +2018,22 @@ export function OnboardingPage() {
       // Start login process in background (spawns rsclaw channels login <channel>)
       await tauriInvoke("channel_login_start", { channel: channelId });
 
-      // Poll for QR image + login completion
+      // Poll for QR image + login completion. The interval runs for
+      // as long as the channel is being authed — the only natural exit
+      // is `status === "done"` (or the parent component unmounting,
+      // which the cleanup effect below handles). We used to cap at
+      // 60 attempts (~120s); in practice users often navigate
+      // back / forth between steps and consumed the budget without
+      // ever scanning, leaving the UI stuck on "waiting".
       if (qrPollRef.current) clearInterval(qrPollRef.current);
-      let attempts = 0;
-      let qrFound = false;
+      let lastQrUri: string | null = null;
       qrPollRef.current = setInterval(async () => {
-        attempts++;
         try {
           // Check login status
           const status: string = await tauriInvoke("channel_login_status");
           if (status === "done") {
             if (qrPollRef.current) clearInterval(qrPollRef.current);
+            qrPollRef.current = null;
             // Read credentials written by sidecar into state
             let loginCreds: Record<string, string> = {};
             try {
@@ -2025,21 +2049,21 @@ export function OnboardingPage() {
             });
             return;
           }
-          // Check for QR image
-          if (!qrFound) {
-            const dataUri: string | null = await tauriInvoke("channel_login_qr");
-            if (dataUri) {
-              qrFound = true;
-              setChs((prev) => {
-                const c = { ...prev };
-                c[channelId] = { ...c[channelId], qrUrl: dataUri, qrStatus: "waiting" };
-                return c;
-              });
-            }
+          // Re-fetch the QR every iteration — the sidecar rotates the
+          // file when the server-side QR expires (typically 60–90s).
+          // Sticking with the first dataUri we saw means the rendered
+          // image goes stale and scans against it silently fail.
+          const dataUri: string | null = await tauriInvoke("channel_login_qr");
+          if (dataUri && dataUri !== lastQrUri) {
+            lastQrUri = dataUri;
+            setChs((prev) => {
+              const c = { ...prev };
+              c[channelId] = { ...c[channelId], qrUrl: dataUri, qrStatus: "waiting" };
+              return c;
+            });
           }
-        } catch {}
-        if (attempts > 60) {
-          if (qrPollRef.current) clearInterval(qrPollRef.current);
+        } catch {
+          /* transient — keep polling */
         }
       }, 2000);
     } catch {
@@ -2074,7 +2098,11 @@ export function OnboardingPage() {
         providers[id] = { api: "ollama", baseUrl: ps.baseUrl || ps.apiKey };
       } else if (ps.apiKey) {
         const entry: Record<string, any> = { apiKey: ps.apiKey };
-        if (ps.baseUrl) entry.baseUrl = ps.baseUrl;
+        // RsClaw uses the gateway-compiled-in managed fleet URL
+        // (`RSCLAW_DEFAULT_BASE` in providers.rs). Writing a baseUrl
+        // here is redundant and clutters the config; users with a
+        // self-hosted worker can add it back manually.
+        if (ps.baseUrl && id !== "rsclaw") entry.baseUrl = ps.baseUrl;
         if (ps.userAgent) entry.userAgent = ps.userAgent;
         // Standard providers that opt into the api_type field (e.g. doubao
         // for CodingPlan) save the user's selection. Default to "openai"
@@ -2082,12 +2110,6 @@ export function OnboardingPage() {
         // silently drop and the gateway would have to autodetect.
         if (id === "doubao") entry.api = ps.apiType || "openai-responses";
         if (id === "kimi") entry.api = ps.apiType || "openai";
-        // RsClaw: the bare provider name `rsclaw` auto-resolves to
-        // ApiFormat::Rsclaw + the managed fleet baseUrl in
-        // gateway/providers.rs (build_providers, RSCLAW_DEFAULT_BASE
-        // fallback). No `api` / `baseUrl` keys needed unless the user
-        // pointed at a self-hosted worker — `ps.baseUrl` above is
-        // already preserved when set.
         providers[id] = entry;
       } else {
         providers[id] = {};
@@ -2522,6 +2544,51 @@ export function OnboardingPage() {
             <div style={S.card}>
               <div style={S.cardTitle}>{t.step2Title}</div>
               <div style={S.cardSub}>{t.step2Sub}</div>
+
+              {/* Recommended provider card — sits above the regular
+                  list so it visually leads the choice. On install the
+                  callback flips `provs.rsclaw` to selected + apiKey-set
+                  so the rest of step 2 (model picker, test button)
+                  picks it up without the user re-entering anything. */}
+              <RsclawRecommendedCard
+                zh={isZh}
+                onInstalled={(data: InstalledKeyData) => {
+                  // Auto-callback path: web side handed back a valid
+                  // key, gateway-side ownership is implied. Synthesize
+                  // a "tested successfully" state so `canNextStep2`
+                  // flips immediately — no need for the user to click
+                  // 获取模型 (which would fail anyway, see below).
+                  const rsclawModels = MODELS["rsclaw"] || [];
+                  const defaultModel =
+                    rsclawModels.find((m) => m.rec)?.id ||
+                    rsclawModels[0]?.id ||
+                    "rsclaw-agent-v1";
+                  setProvs((prev) => {
+                    const next: Record<string, ProvState> = {};
+                    for (const [k, v] of Object.entries(prev)) {
+                      next[k] = {
+                        ...v,
+                        // Deselect all others so the active provider
+                        // dropdown below jumps straight to rsclaw.
+                        selected: k === "rsclaw",
+                      };
+                    }
+                    const existing = next["rsclaw"] || ({} as ProvState);
+                    next["rsclaw"] = {
+                      ...existing,
+                      selected: true,
+                      apiKey: data.key,
+                      testStatus: "success",
+                      inputState: "ok",
+                      testError: "",
+                      modelsLoading: false,
+                      models: rsclawModels,
+                      selectedModel: defaultModel,
+                    };
+                    return next;
+                  });
+                }}
+              />
 
               {/* List selector */}
               <div style={{ border: "1px solid rgba(255,255,255,0.055)", borderRadius: 10, maxHeight: 155, overflowY: "auto", background: "#141618", marginBottom: 0 }}>

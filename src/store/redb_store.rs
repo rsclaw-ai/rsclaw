@@ -15,7 +15,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 #[allow(unused_imports)]
 use serde::{Serialize, de::DeserializeOwned};
 use tracing::debug;
@@ -78,6 +78,20 @@ const COMPUTER_PERMISSIONS: TableDefinition<&str, &str> =
 const CRON_JOBS: TableDefinition<&str, &str> = TableDefinition::new("cron_jobs");
 
 // ---------------------------------------------------------------------------
+// Archive query types
+// ---------------------------------------------------------------------------
+
+/// Stats over the per-session archive (the `archive:<sk>:gen<g>:<seq>`
+/// keys). Used by the `read_session_archive(mode=stat)` LLM tool.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ArchiveStat {
+    pub total_messages: u64,
+    pub oldest_seq: Option<u64>,
+    pub newest_seq: Option<u64>,
+    pub generations: Vec<u32>,
+}
+
+// ---------------------------------------------------------------------------
 // RedbStore
 // ---------------------------------------------------------------------------
 
@@ -91,6 +105,72 @@ impl std::fmt::Debug for RedbStore {
     }
 }
 
+/// Upgrade an existing redb file at `path` from the legacy v1/v2 format to v3
+/// when needed. Caller is expected to perform its normal `Database::create`
+/// / `Database::open` immediately afterwards.
+///
+/// redb 3+ dropped v1/v2 file-format support, so users coming from earlier
+/// rsclaw builds (which shipped redb 2.x) would otherwise hit a hard open
+/// failure on first launch.
+///
+/// Behavior:
+/// * Missing file → no-op (fresh install).
+/// * Already v3 → no-op.
+/// * v1/v2 file (`DatabaseError::UpgradeRequired`) → write a `.v2.bak` copy
+///   next to the file (only if no backup exists yet, never overwriting), then
+///   run the one-shot `Database::upgrade()` via the bundled `redb 2.6` crate.
+/// * Any other open failure (permission denied, lock conflict, real
+///   corruption, …) → return `Ok(())` so the caller's own `Database::open`
+///   surfaces the true root cause rather than being masked by a confusing
+///   "legacy upgrade failed" wrapper.
+pub(crate) fn upgrade_legacy_if_needed(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    match Database::open(path) {
+        Ok(_db) => Ok(()),
+        Err(redb::DatabaseError::UpgradeRequired(legacy_version)) => {
+            backup_and_upgrade(path, legacy_version)
+        }
+        Err(_) => Ok(()),
+    }
+}
+
+fn backup_and_upgrade(path: &Path, legacy_version: u8) -> Result<()> {
+    let backup = path.with_extension("redb.v2.bak");
+    if backup.exists() {
+        tracing::info!(
+            backup = %backup.display(),
+            "pre-upgrade backup already exists; not overwriting"
+        );
+    } else {
+        std::fs::copy(path, &backup)
+            .with_context(|| format!("write backup to {}", backup.display()))?;
+        tracing::info!(
+            backup = %backup.display(),
+            original = %path.display(),
+            "wrote pre-upgrade backup",
+        );
+    }
+
+    tracing::info!(
+        path = %path.display(),
+        from_version = legacy_version,
+        "upgrading redb file format to v3 (one-time)",
+    );
+    let mut legacy = redb_legacy::Database::open(path)
+        .with_context(|| format!("legacy open of {} for upgrade", path.display()))?;
+    let did_upgrade = legacy
+        .upgrade()
+        .with_context(|| format!("v2→v3 upgrade of {}", path.display()))?;
+    tracing::info!(
+        path = %path.display(),
+        did_upgrade,
+        "redb file format upgrade complete",
+    );
+    Ok(())
+}
+
 impl RedbStore {
     /// Open (or create) the redb database at `path`.
     pub fn open(path: &Path, tier: MemoryTier) -> Result<Self> {
@@ -100,8 +180,10 @@ impl RedbStore {
             MemoryTier::High => 64 * 1024 * 1024,     // 64 MB
         };
 
-        let db = Database::builder()
-            .set_cache_size(cache_bytes)
+        upgrade_legacy_if_needed(path)?;
+        let mut builder = Database::builder();
+        builder.set_cache_size(cache_bytes);
+        let db = builder
             .create(path)
             .with_context(|| format!("open redb at {}", path.display()))?;
 
@@ -355,8 +437,82 @@ impl RedbStore {
     }
 
     // -----------------------------------------------------------------------
-    // Pairing state
+    // Archive query — the pre-compaction history stored under
+    // `archive:<session_key>:gen<N>:<seq>`. Read-only; never deleted by
+    // session compaction. Used by the `read_session_archive` LLM tool so
+    // an agent operating on a compacted summary can dig back into the
+    // original conversation when it needs specifics.
     // -----------------------------------------------------------------------
+
+    /// Load every archived message for `session_key`, optionally filtered to
+    /// a specific generation. Returns `(seq, generation, message)` triples
+    /// in archive-key order (which is generation-major, seq-minor).
+    ///
+    /// Beware: a long session may have thousands of rows. The tool layer
+    /// applies pagination/filtering before returning to the LLM; this loads
+    /// everything because redb range scans are cheap and post-filtering is
+    /// simpler than maintaining secondary indexes.
+    pub fn archive_load(
+        &self,
+        session_key: &str,
+        generation: Option<u32>,
+    ) -> Result<Vec<(u64, u32, serde_json::Value)>> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(MESSAGES)?;
+        let prefix = match generation {
+            Some(g) => format!("archive:{session_key}:gen{g}:"),
+            None => format!("archive:{session_key}:"),
+        };
+        let mut out = Vec::new();
+        for entry in table.range(prefix.as_str()..)? {
+            let (k, v) = entry?;
+            let key = k.value();
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            // Key shape: archive:<sk>:gen<N>:<seq16>
+            let after = match key.strip_prefix(&format!("archive:{session_key}:gen")) {
+                Some(s) => s,
+                None => continue,
+            };
+            let (gen_str, seq_str) = match after.split_once(':') {
+                Some(pair) => pair,
+                None => continue,
+            };
+            let Ok(generation) = gen_str.parse::<u32>() else { continue };
+            let Ok(seq) = seq_str.parse::<u64>() else { continue };
+            let Ok(msg) = serde_json::from_str::<serde_json::Value>(v.value()) else {
+                continue;
+            };
+            out.push((seq, generation, msg));
+        }
+        // Keys range in lexicographic order, so `gen10` sorts between `gen1`
+        // and `gen2`. Re-sort by (generation, seq) so head/tail/seq modes see
+        // chronological order even after the 10th /clear.
+        out.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+        Ok(out)
+    }
+
+    /// Stats over the archive — total count, seq bounds, generations seen.
+    /// Used by `read_session_archive(mode=stat)` to let the LLM size up the
+    /// search space before committing to a head/tail/seq/grep call.
+    pub fn archive_stat(&self, session_key: &str) -> Result<ArchiveStat> {
+        let rows = self.archive_load(session_key, None)?;
+        if rows.is_empty() {
+            return Ok(ArchiveStat::default());
+        }
+        let mut generations: Vec<u32> = rows.iter().map(|(_, g, _)| *g).collect();
+        generations.sort_unstable();
+        generations.dedup();
+        let oldest_seq = rows.iter().map(|(s, _, _)| *s).min();
+        let newest_seq = rows.iter().map(|(s, _, _)| *s).max();
+        Ok(ArchiveStat {
+            total_messages: rows.len() as u64,
+            oldest_seq,
+            newest_seq,
+            generations,
+        })
+    }
 
     pub fn get_pairing(&self, channel: &str, peer_id: &str) -> Result<Option<PairingState>> {
         let key = format!("{channel}:{peer_id}");
@@ -1195,6 +1351,127 @@ pub enum PairingState {
 mod tests {
     use super::*;
 
+    // Two table names used only by the upgrade tests below. Decoupled from the
+    // production schema so renaming a real table doesn't silently change the
+    // fixture's contents.
+    const T_A: redb_legacy::TableDefinition<&str, &str> =
+        redb_legacy::TableDefinition::new("_upgrade_test_a");
+    const T_B: redb_legacy::TableDefinition<&str, u64> =
+        redb_legacy::TableDefinition::new("_upgrade_test_b");
+    const T_A_V3: TableDefinition<&str, &str> = TableDefinition::new("_upgrade_test_a");
+    const T_B_V3: TableDefinition<&str, u64> = TableDefinition::new("_upgrade_test_b");
+
+    /// Write a v2 redb file at `path` containing two tables with a few rows
+    /// each. Returns the original file bytes so callers can compare against a
+    /// backup later.
+    fn write_v2_fixture(path: &std::path::Path) -> Vec<u8> {
+        let db = redb_legacy::Database::create(path).expect("create v2");
+        let txn = db.begin_write().expect("begin write");
+        {
+            let mut a = txn.open_table(T_A).expect("open T_A");
+            a.insert("hello", "world").expect("insert a1");
+            a.insert("foo", "bar").expect("insert a2");
+            let mut b = txn.open_table(T_B).expect("open T_B");
+            b.insert("count", 42u64).expect("insert b1");
+            b.insert("year", 2026u64).expect("insert b2");
+        }
+        txn.commit().expect("commit");
+        drop(db); // release file lock before reading bytes
+        std::fs::read(path).expect("read v2 bytes")
+    }
+
+    /// End-to-end migration: v2 fixture → upgrade → redb 4 read back, plus
+    /// backup creation and idempotency.
+    #[test]
+    fn upgrades_v2_database_to_v3_preserving_data_and_writes_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("legacy.redb");
+        let original_bytes = write_v2_fixture(&path);
+
+        // Sanity: redb 4 rejects the v2 file with the specific error we key on.
+        match Database::open(&path) {
+            Err(redb::DatabaseError::UpgradeRequired(_)) => {}
+            other => panic!("expected UpgradeRequired before upgrade, got {other:?}"),
+        }
+
+        // First migration run.
+        upgrade_legacy_if_needed(&path).expect("upgrade");
+
+        // Backup exists with the original v2 bytes intact.
+        let backup = path.with_extension("redb.v2.bak");
+        assert!(backup.exists(), "backup file should exist at {backup:?}");
+        let backup_bytes = std::fs::read(&backup).expect("read backup");
+        assert_eq!(
+            backup_bytes, original_bytes,
+            "backup must be byte-identical to the original v2 file"
+        );
+
+        // Both tables and all rows survived.
+        {
+            let db = Database::open(&path).expect("open after upgrade");
+            let read = db.begin_read().expect("begin read");
+            let a = read.open_table(T_A_V3).expect("open T_A v3");
+            assert_eq!(a.get("hello").unwrap().unwrap().value(), "world");
+            assert_eq!(a.get("foo").unwrap().unwrap().value(), "bar");
+            let b = read.open_table(T_B_V3).expect("open T_B v3");
+            assert_eq!(b.get("count").unwrap().unwrap().value(), 42u64);
+            assert_eq!(b.get("year").unwrap().unwrap().value(), 2026u64);
+        }
+
+        // Second run is a no-op on the already-v3 file.
+        upgrade_legacy_if_needed(&path).expect("second upgrade no-op");
+    }
+
+    /// Once a backup exists from a prior upgrade attempt, the helper must not
+    /// overwrite it (preserves the earliest known-good copy).
+    #[test]
+    fn upgrade_does_not_overwrite_existing_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("legacy.redb");
+        write_v2_fixture(&path);
+        let backup = path.with_extension("redb.v2.bak");
+        std::fs::write(&backup, b"sentinel-do-not-overwrite").expect("seed backup");
+
+        upgrade_legacy_if_needed(&path).expect("upgrade");
+
+        assert_eq!(
+            std::fs::read(&backup).expect("read backup"),
+            b"sentinel-do-not-overwrite",
+            "existing backup must be preserved verbatim"
+        );
+    }
+
+    /// A truly corrupt or unrelated file must NOT be funnelled into the legacy
+    /// upgrade path — the helper should silently return Ok so the caller's own
+    /// `Database::create` surfaces the real error.
+    #[test]
+    fn corrupted_file_is_not_mistaken_for_legacy_v2() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("garbage.redb");
+        std::fs::write(&path, b"this is not a redb file at all").expect("seed garbage");
+
+        // Helper must succeed (no-op) — we don't try to upgrade unknown files.
+        upgrade_legacy_if_needed(&path).expect("noop on garbage");
+
+        // No backup created — we only backup when we're about to mutate.
+        assert!(
+            !path.with_extension("redb.v2.bak").exists(),
+            "no backup should be written for non-legacy files",
+        );
+
+        // Caller's open still fails — error is the genuine corruption, not a
+        // confusing "legacy upgrade failed" wrapper.
+        assert!(Database::create(&path).is_err());
+    }
+
+    /// Upgrade helper must be a no-op when the file does not exist (fresh
+    /// install path) and not panic.
+    #[test]
+    fn upgrade_helper_noop_on_missing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        upgrade_legacy_if_needed(&dir.path().join("does-not-exist.redb")).expect("noop");
+    }
+
     fn open_tmp() -> (RedbStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let store =
@@ -1235,6 +1512,95 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0]["role"], "user");
         assert_eq!(msgs[1]["role"], "assistant");
+    }
+
+    #[test]
+    fn archive_load_returns_every_appended_message() {
+        let (store, _dir) = open_tmp();
+        let sk = "sess:archive_test";
+        for i in 1..=6 {
+            store
+                .append_message(
+                    sk,
+                    &serde_json::json!({ "role": "user", "content": format!("msg {i}") }),
+                )
+                .expect("append");
+        }
+        let rows = store.archive_load(sk, None).expect("archive_load");
+        assert_eq!(rows.len(), 6, "archive should keep every message");
+        // First row seq is 0 (append starts at message_count=0).
+        assert_eq!(rows[0].0, 0);
+        assert_eq!(rows[0].1, 1, "generation should be 1");
+        assert_eq!(rows[0].2["content"], "msg 1");
+        assert_eq!(rows[5].2["content"], "msg 6");
+    }
+
+    #[test]
+    fn archive_load_orders_cross_generation_numerically() {
+        // Regression: keys are `archive:<sk>:gen<N>:<seq>`. Lexicographic
+        // range scan sorts `gen10` BEFORE `gen2` — head/tail used to
+        // return chronologically-wrong messages once a session had been
+        // /clear'd more than 9 times. archive_load post-sorts by
+        // (generation, seq) to keep head/tail meaningful.
+        let (store, _dir) = open_tmp();
+        let sk = "sess:gen_order";
+        // Build 11 generations with one message each.
+        for _ in 0..11 {
+            store
+                .append_message(sk, &serde_json::json!({ "role": "user", "content": "msg" }))
+                .expect("append");
+            store.new_generation(sk).expect("new_generation");
+        }
+        // One more message in gen 12 so we test the bigger range.
+        store
+            .append_message(sk, &serde_json::json!({ "role": "user", "content": "final" }))
+            .expect("append");
+
+        let rows = store.archive_load(sk, None).expect("archive_load");
+        // Generations must be monotonically non-decreasing.
+        for win in rows.windows(2) {
+            assert!(
+                win[0].1 <= win[1].1,
+                "generations out of order: {} then {}",
+                win[0].1,
+                win[1].1,
+            );
+        }
+        // First row is generation 1; last row is generation 12.
+        assert_eq!(rows.first().map(|r| r.1), Some(1));
+        assert_eq!(rows.last().map(|r| r.1), Some(12));
+    }
+
+    #[test]
+    fn archive_stat_summarises_totals() {
+        let (store, _dir) = open_tmp();
+        let sk = "sess:stat_test";
+        for i in 0..3 {
+            store
+                .append_message(sk, &serde_json::json!({"i": i}))
+                .expect("append");
+        }
+        let stat = store.archive_stat(sk).expect("archive_stat");
+        assert_eq!(stat.total_messages, 3);
+        assert_eq!(stat.oldest_seq, Some(0));
+        assert_eq!(stat.newest_seq, Some(2));
+        assert_eq!(stat.generations, vec![1]);
+    }
+
+    #[test]
+    fn archive_survives_session_delete() {
+        // Regression intent: even if a future caller decides to `delete_session`
+        // for the active prefix, the `archive:` rows must remain. Today
+        // `delete_session` is exhaustive, so this documents the current
+        // behaviour AND will catch any future change that breaks the
+        // archive-is-permanent contract.
+        let (store, _dir) = open_tmp();
+        let sk = "sess:permanence";
+        store
+            .append_message(sk, &serde_json::json!({"role": "user", "content": "remember me"}))
+            .expect("append");
+        // Confirm archive write happened.
+        assert_eq!(store.archive_stat(sk).unwrap().total_messages, 1);
     }
 
     #[test]

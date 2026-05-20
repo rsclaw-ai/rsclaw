@@ -1,6 +1,6 @@
 [package]
 name = "rsclaw"
-version = "2026.5.15"
+version = "2026.5.18"
 edition = "2024"
 rust-version = "1.91"
 description = "AI Agent Engine Compatible with OpenClaw"
@@ -28,7 +28,11 @@ reqwest      = { version = "0.12", features = ["json", "stream", "multipart", "b
 rustls       = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
 
 # Storage
-redb         = "2"
+redb         = "4.1"
+# v2.6 kept as a one-shot fallback to upgrade existing v2 database files to
+# the v3 format. redb 3+ drops support for v2; we open with `redb 4.1` first
+# and only invoke this legacy crate when the open returns UpgradeRequired.
+redb_legacy  = { package = "redb", version = "2.6" }
 tantivy      = "0.22"
 
 # HNSW vector index for memory search (replaced LanceDB to cut ~500 deps)
@@ -115,7 +119,7 @@ opus-decoder = "0.1"
 # with cross-platform native APIs — ~100x faster and removes the fork
 # overhead per action. See src/computer/operators/native.rs.
 enigo = "0.6"
-xcap = "0.6"
+xcap = "0.9"
 display-info = "0.5"
 ogg = "0.9"
 lark-websocket-protobuf = "0.1"
@@ -172,15 +176,32 @@ panic = "abort"
 debug-assertions = false
 overflow-checks = false
 
-# Reduce stack usage in debug builds
 [profile.dev]
-opt-level = 1
+opt-level = 0
+incremental = true
 # Trim DWARF: keep file:line for backtraces, drop variable/type info.
 # Cuts target/debug size ~40-60% without affecting panic location info.
 debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 0
+
+# Developer-local release — parallel codegen, thin LTO. Builds much faster
+# than `release` at a small runtime cost. Use for local dogfooding.
+# Run: cargo build --profile release-dev
+[profile.release-dev]
+inherits = "release"
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+strip = "symbols"
+
+# CI builds — catches release-only issues without paying for fat LTO.
+# Use: cargo build --profile ci
+[profile.ci]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
 
 [dev-dependencies]
 tokio-test = "0.4"

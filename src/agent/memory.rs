@@ -15,6 +15,7 @@ use std::{path::Path, sync::Arc};
 
 use anyhow::{anyhow, Context, Result};
 use hnsw_rs::{hnsw::Hnsw, prelude::DistCosine};
+use redb::ReadableDatabase;
 use tracing::{debug, info, warn};
 
 use crate::{MemoryTier, config::schema::MemorySearchConfig};
@@ -337,6 +338,7 @@ impl MemoryStore {
         let mem_dir = data_dir.join("memory");
         std::fs::create_dir_all(&mem_dir)?;
         let db_path = mem_dir.join("memory.redb");
+        crate::store::upgrade_legacy_if_needed(&db_path)?;
         let db = redb::Database::create(&db_path).context("open memory redb")?;
         Self::open_with_db(db, model_dir, search_cfg).await
     }
@@ -351,6 +353,7 @@ impl MemoryStore {
         if !db_path.exists() {
             anyhow::bail!("memory database not found at {}", db_path.display());
         }
+        crate::store::upgrade_legacy_if_needed(&db_path)?;
         let db = redb::Database::open(&db_path).context("open memory redb (readonly)")?;
         Self::open_with_db(db, model_dir, search_cfg).await
     }
@@ -901,6 +904,19 @@ impl MemoryStore {
 
     pub async fn count(&self) -> Result<usize> {
         Ok(self.docs.iter().filter(|d| !d.id.is_empty()).count())
+    }
+
+    /// Snapshot of all currently-active docs (excludes tombstoned
+    /// slots where the id was cleared after a delete). Cheap — clones
+    /// the in-memory vec; no I/O. Used by the HTTP API for the
+    /// desktop's Memory management page to list everything without a
+    /// semantic-search query.
+    pub fn list_active(&self) -> Vec<MemoryDoc> {
+        self.docs
+            .iter()
+            .filter(|d| !d.id.is_empty())
+            .cloned()
+            .collect()
     }
 
     pub fn embed_dim(&self) -> i32 {

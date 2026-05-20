@@ -509,6 +509,124 @@ impl rsclaw::plugin::host_storage::Host for HostState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// host-media trait implementation
+// ---------------------------------------------------------------------------
+
+impl rsclaw::plugin::host_media::Host for HostState {
+    async fn extract_audio(&mut self, input_path: String) -> Result<Result<String, String>> {
+        let ffmpeg_bin = match crate::agent::platform::detect_ffmpeg() {
+            Some(p) => p,
+            None => return Ok(Err("ffmpeg not found. Run: rsclaw tools install ffmpeg".to_string())),
+        };
+
+        let out_path = match allocate_dl_paths("audio.wav", 1) {
+            Ok(mut p) => p.pop().unwrap_or_default(),
+            Err(e) => return Ok(Err(e)),
+        };
+
+        let output = tokio::process::Command::new(&ffmpeg_bin)
+            .args([
+                "-y",
+                "-i",
+                &input_path,
+                "-vn",
+                "-acodec",
+                "pcm_s16le",
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                &out_path,
+            ])
+            .output()
+            .await;
+
+        match output {
+            Ok(o) if o.status.success() => Ok(Ok(out_path)),
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                Ok(Err(format!("ffmpeg failed: {stderr}")))
+            }
+            Err(e) => Ok(Err(format!("ffmpeg spawn error: {e}"))),
+        }
+    }
+
+    async fn transcribe(&mut self, audio_path: String, _language: String) -> Result<Result<String, String>> {
+        let bytes = match tokio::fs::read(&audio_path).await {
+            Ok(b) => b,
+            Err(e) => return Ok(Err(format!("read audio file failed: {e}"))),
+        };
+
+        let mime = if audio_path.to_lowercase().ends_with(".wav") {
+            "audio/wav"
+        } else {
+            "audio/mpeg"
+        };
+
+        let client = reqwest::Client::new();
+        match crate::channel::transcription::transcribe_audio(&client, &bytes, &audio_path, mime).await {
+            Ok(text) => Ok(Ok(text)),
+            Err(e) => Ok(Err(format!("transcription failed: {e:#}"))),
+        }
+    }
+
+    async fn extract_keyframes(&mut self, video_path: String, count: u32) -> Result<Result<Vec<String>, String>> {
+        let ffmpeg_bin = match crate::agent::platform::detect_ffmpeg() {
+            Some(p) => p,
+            None => return Ok(Err("ffmpeg not found. Run: rsclaw tools install ffmpeg".to_string())),
+        };
+
+        let count = count.max(1).min(20) as usize;
+        let out_paths = match allocate_dl_paths("frame.png", count) {
+            Ok(p) => p,
+            Err(e) => return Ok(Err(e)),
+        };
+
+        // Get video duration via ffprobe
+        let duration_secs: f64 = {
+            let probe = tokio::process::Command::new(&ffmpeg_bin)
+                .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", &video_path])
+                .output()
+                .await;
+            match probe {
+                Ok(o) if o.status.success() => {
+                    String::from_utf8_lossy(&o.stdout).trim().parse().unwrap_or(0.0)
+                }
+                _ => 0.0,
+            }
+        };
+
+        if duration_secs <= 0.0 {
+            return Ok(Err("could not determine video duration".to_string()));
+        }
+
+        let interval = duration_secs / count as f64;
+        let out_pattern = out_paths[0].replace(".png", "_%03d.png");
+
+        let output = tokio::process::Command::new(&ffmpeg_bin)
+            .args([
+                "-y",
+                "-i",
+                &video_path,
+                "-vf",
+                &format!("fps=1/{interval},scale=480:-1"),
+                &out_pattern,
+            ])
+            .output()
+            .await;
+
+        match output {
+            Ok(o) if o.status.success() => Ok(Ok(out_paths)),
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                Ok(Err(format!("ffmpeg failed: {stderr}")))
+            }
+            Err(e) => Ok(Err(format!("ffmpeg spawn error: {e}"))),
+        }
+    }
+}
+
 /// Build `count` canonical download paths, all sharing the same
 /// `dl_<kind>_<TS><abc>` base. For `count > 1` each path gets a `_N`
 /// (1-based) index suffix; for `count == 1` no suffix is appended.
@@ -622,6 +740,7 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostState>> {
     rsclaw::plugin::host_browser::add_to_linker(&mut linker, |state: &mut HostState| state)?;
     rsclaw::plugin::host_runtime::add_to_linker(&mut linker, |state: &mut HostState| state)?;
     rsclaw::plugin::host_storage::add_to_linker(&mut linker, |state: &mut HostState| state)?;
+    rsclaw::plugin::host_media::add_to_linker(&mut linker, |state: &mut HostState| state)?;
     Ok(linker)
 }
 

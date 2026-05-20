@@ -4,6 +4,8 @@ import JSON5 from "json5";
 import { useEffect, useState, useCallback, useRef } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import { ErrorBoundary } from "./error";
+import { MemoryPage } from "./memory-page";
+import { RsclawProviderCard } from "./rsclaw-provider-card";
 import { Popover } from "./ui-lib";
 import { toast } from "../lib/toast";
 import { EmojiAvatar, AvatarPicker } from "./emoji";
@@ -88,7 +90,7 @@ interface LogEntry {
   msg: string;
 }
 
-type PanelPage = "status" | "config" | "agents" | "cron" | "skills" | "workspace" | "doctor" | "pairing" | "wizard";
+type PanelPage = "status" | "config" | "agents" | "cron" | "skills" | "workspace" | "doctor" | "pairing" | "wizard" | "memory";
 
 // ── Toggle Component ────────────────────────────────────
 function Toggle(props: {
@@ -463,938 +465,6 @@ function StatusPage() {
           </div>
         </div>
       )}
-    </div>
-  );
-}
-
-// ══════════════════════════════════════════════════════════
-// ── Config Editor Page ───────────────────────────────────
-// ══════════════════════════════════════════════════════════
-function ConfigEditorPage() {
-  type TabKey = "gateway" | "models" | "channels" | "tools";
-  const tabs: { key: TabKey; label: string }[] = [
-    { key: "gateway", label: getLang() === "cn" ? "\u7F51\u5173" : "Gateway" },
-    { key: "models", label: getLang() === "cn" ? "\u6A21\u578B\u63D0\u4F9B\u5546" : "Models" },
-    { key: "channels", label: getLang() === "cn" ? "\u6D88\u606F\u901A\u9053" : "Channels" },
-    { key: "tools", label: getLang() === "cn" ? "\u5DE5\u5177 & \u529F\u80FD" : "Tools" },
-  ];
-
-  const [activeTab, setActiveTab] = useState<TabKey>("gateway");
-  const [rawMode, setRawMode] = useState(() => isTauri);
-  const [rawConfig, setRawConfig] = useState("");
-  const [configPath, setConfigPath] = useState("");
-  const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [dirty, setDirty] = useState(false);
-
-  // Parsed config fields - Gateway
-  const [port, setPort] = useState(18889);
-  const [bind, setBind] = useState("127.0.0.1");
-  const [language, setLanguage] = useState("zh-CN");
-  const [authToken, setAuthToken] = useState("");
-  const [agentModel, setAgentModel] = useState("");
-  const [agentMaxTokens, setAgentMaxTokens] = useState(0);
-
-  // Parsed config fields - Models
-  const [providers, setProviders] = useState<{
-    name: string; key: string; enabled: boolean; apiKey: string; baseUrl: string; apiType?: ApiType; userAgent?: string;
-  }[]>([
-    { name: "Doubao (\u8C46\u5305)", key: "doubao", enabled: false, apiKey: "", baseUrl: "", apiType: "openai-responses" },
-    { name: "Qwen (\u5343\u95EE)", key: "qwen", enabled: false, apiKey: "", baseUrl: "" },
-    { name: "Anthropic", key: "anthropic", enabled: false, apiKey: "", baseUrl: "" },
-    { name: "OpenAI", key: "openai", enabled: false, apiKey: "", baseUrl: "" },
-    { name: "DeepSeek", key: "deepseek", enabled: false, apiKey: "", baseUrl: "" },
-    { name: "Kimi", key: "kimi", enabled: false, apiKey: "", baseUrl: "", apiType: "openai", userAgent: "rsclaw/2026.5.5" },
-    { name: "CodingPlan", key: "codingplan", enabled: false, apiKey: "", baseUrl: "" },
-    { name: "Ollama", key: "ollama", enabled: true, apiKey: "", baseUrl: "http://localhost:11434" },
-    { name: "Custom Provider", key: "custom", enabled: false, apiKey: "", baseUrl: "" },
-  ]);
-
-  // Parsed config fields - Channels
-  const [channels, setChannels] = useState<{
-    type: string; enabled: boolean; status: string;
-  }[]>([]);
-
-  // Parsed config fields - Tools
-  const [execSandbox, setExecSandbox] = useState(true);
-  const [uploadMaxSize, setUploadMaxSize] = useState(10);
-  const [webSearchProvider, setWebSearchProvider] = useState("none");
-  const [memoryShortTermLimit, setMemoryShortTermLimit] = useState(20);
-  const [memoryLongTermLimit, setMemoryLongTermLimit] = useState(100);
-
-  // Simple JSON5 parser helper - extract value for a key from raw text
-  const extractVal = useCallback((raw: string, key: string): string | undefined => {
-    // Match key: value or "key": value patterns in json5
-    const patterns = [
-      new RegExp(`["']?${key}["']?\\s*:\\s*"([^"]*)"`, "m"),
-      new RegExp(`["']?${key}["']?\\s*:\\s*'([^']*)'`, "m"),
-      new RegExp(`["']?${key}["']?\\s*:\\s*([\\d.]+)`, "m"),
-      new RegExp(`["']?${key}["']?\\s*:\\s*(true|false)`, "m"),
-    ];
-    for (const p of patterns) {
-      const m = raw.match(p);
-      if (m) return m[1];
-    }
-    return undefined;
-  }, []);
-
-  const parseConfig = useCallback((raw: string) => {
-    // Gateway fields
-    const p = extractVal(raw, "port");
-    if (p) setPort(parseInt(p, 10) || 18889);
-    const b = extractVal(raw, "bind");
-    if (b) setBind(b);
-    const l = extractVal(raw, "language");
-    if (l) {
-      setLanguage(l);
-    } else {
-      // Config has no `language` field — the dropdown still shows the
-      // useState default ("zh-CN") which gives the user a false sense
-      // that it's persisted. Mark dirty so the next save writes the
-      // default value, and the tray menu (which reads gateway.language
-      // from rsclaw.json5) starts following it.
-      setDirty(true);
-    }
-    const at = extractVal(raw, "authToken");
-    if (at) { setAuthToken(at); setApiAuthToken(at); }
-
-    // Agent defaults
-    const am = extractVal(raw, "model");
-    if (am) setAgentModel(am);
-    const amt = extractVal(raw, "maxTokens");
-    if (amt) setAgentMaxTokens(parseInt(amt, 10) || 4096);
-
-    // Models - try to detect provider blocks
-    const providerNames = ["doubao", "qwen", "anthropic", "openai", "deepseek", "kimi", "codingplan", "ollama", "custom"];
-    const displayNames: Record<string, string> = {
-      doubao: "Doubao (\u8C46\u5305)", qwen: "Qwen (\u5343\u95EE)", anthropic: "Anthropic", openai: "OpenAI", deepseek: "DeepSeek", kimi: "Kimi", codingplan: "CodingPlan", ollama: "Ollama", custom: "Custom Provider",
-    };
-    const newProviders = providerNames.map((pName) => {
-      // Look for a block like anthropic: { ... }
-      const blockRe = new RegExp(`["']?${pName}["']?\\s*:\\s*\\{([^}]*)\\}`, "ms");
-      const blockMatch = raw.match(blockRe);
-      const block = blockMatch ? blockMatch[1] : "";
-      const apiKey = extractVal(block, "apiKey") || "";
-      const baseUrl = extractVal(block, "baseUrl") || extractVal(block, "base_url") || "";
-      const userAgent = extractVal(block, "userAgent") || extractVal(block, "user_agent") || "";
-      const enabled = extractVal(block, "enabled");
-      const apiField = extractVal(block, "api") || extractVal(block, "api_type");
-      const apiType: ApiType | undefined = (apiField === "anthropic" || apiField === "gemini" || apiField === "ollama" || apiField === "openai" || apiField === "openai-responses")
-        ? (apiField as ApiType)
-        : undefined;
-      const isCustomLike = pName === "custom" || pName === "codingplan";
-      return {
-        name: displayNames[pName] || pName,
-        key: pName,
-        enabled: enabled !== undefined ? enabled === "true" : (isCustomLike ? !!baseUrl : apiKey.length > 0),
-        apiKey,
-        baseUrl: baseUrl || "",
-        userAgent: userAgent || (pName === "kimi" ? "rsclaw/2026.5.5" : ""),
-        ...((isCustomLike || pName === "doubao" || pName === "kimi") ? { apiType } : {}),
-      };
-    });
-    setProviders(newProviders);
-
-    // Channels - detect channel blocks
-    const channelTypes = ["wechat", "wecom", "telegram", "slack", "dingtalk", "feishu", "http", "terminal"];
-    const detectedChannels: { type: string; enabled: boolean; status: string }[] = [];
-    for (const ct of channelTypes) {
-      const re = new RegExp(`["']?${ct}["']?\\s*:\\s*\\{`, "m");
-      if (raw.match(re)) {
-        const blockRe = new RegExp(`["']?${ct}["']?\\s*:\\s*\\{([^}]*)\\}`, "ms");
-        const bm = raw.match(blockRe);
-        const block = bm ? bm[1] : "";
-        const en = extractVal(block, "enabled");
-        detectedChannels.push({
-          type: ct,
-          enabled: en !== undefined ? en === "true" : true,
-          status: en === "false" ? "disabled" : "configured",
-        });
-      }
-    }
-    setChannels(detectedChannels);
-
-    // Tools
-    const es = extractVal(raw, "sandbox");
-    if (es !== undefined) setExecSandbox(es === "true");
-    const ums = extractVal(raw, "maxUploadSize");
-    if (ums) setUploadMaxSize(parseInt(ums, 10) || 10);
-    const wsp = extractVal(raw, "webSearchProvider") || extractVal(raw, "searchProvider");
-    if (wsp) setWebSearchProvider(wsp);
-    const stl = extractVal(raw, "shortTermLimit");
-    if (stl) setMemoryShortTermLimit(parseInt(stl, 10) || 20);
-    const ltl = extractVal(raw, "longTermLimit");
-    if (ltl) setMemoryLongTermLimit(parseInt(ltl, 10) || 100);
-  }, [extractVal]);
-
-  useEffect(() => {
-    (async () => {
-      try {
-        const data = await getConfig();
-        if (data.raw) {
-          setRawConfig(data.raw);
-          setConfigPath(data.path || "");
-          parseConfig(data.raw);
-        } else {
-          throw new Error("no raw config");
-        }
-      } catch {
-        // Fallback: read config file directly via Tauri
-        try {
-          const tauriInvoke = isTauri ? tauriInvokeV2 : null;
-          if (tauriInvoke) {
-            const cp: string = await tauriInvoke("get_config_path");
-            const home = cp || "~/.rsclaw";
-            const configFile = home + "/rsclaw.json5";
-            // Use rsclaw config get to read raw content
-            const raw: string = await tauriInvoke("read_config_file");
-            if (raw) {
-              setRawConfig(raw);
-              setConfigPath(configFile);
-              parseConfig(raw);
-            } else {
-              setRawConfig("// Failed to load config");
-            }
-          } else {
-            setRawConfig("// Failed to load config (gateway auth required)");
-          }
-        } catch {
-          setRawConfig("// Failed to load config");
-        }
-      } finally {
-        setLoading(false);
-      }
-    })();
-  }, [parseConfig]);
-
-  // Rebuild raw config from structured fields is complex for json5.
-  // Instead, we do targeted find-replace on the raw text for known keys.
-  const applyFieldToRaw = useCallback((raw: string, key: string, value: string | number | boolean): string => {
-    const strVal = typeof value === "string" ? `"${value}"` : String(value);
-    // Try to find and replace existing key
-    const patterns = [
-      new RegExp(`(["']?${key}["']?\\s*:\\s*)"[^"]*"`, "m"),
-      new RegExp(`(["']?${key}["']?\\s*:\\s*)'[^']*'`, "m"),
-      new RegExp(`(["']?${key}["']?\\s*:\\s*)[\\d.]+`, "m"),
-      new RegExp(`(["']?${key}["']?\\s*:\\s*)(?:true|false)`, "m"),
-    ];
-    for (const p of patterns) {
-      if (raw.match(p)) {
-        return raw.replace(p, `$1${strVal}`);
-      }
-    }
-    return raw; // key not found, leave unchanged
-  }, []);
-
-  const buildRawFromFields = useCallback(() => {
-    // Parse existing config (JSON5-safe), overlay structured fields, re-serialize.
-    let cfg: any = {};
-    try { cfg = JSON5.parse(rawConfig); } catch { cfg = {}; }
-
-    // Gateway fields
-    if (!cfg.gateway) cfg.gateway = {};
-    cfg.gateway.port = port;
-    cfg.gateway.bind = bind;
-    cfg.gateway.language = language;
-    if (authToken) {
-      if (!cfg.gateway.auth) cfg.gateway.auth = {};
-      cfg.gateway.auth.token = authToken;
-    }
-
-    // Providers
-    if (!cfg.models) cfg.models = {};
-    if (!cfg.models.providers) cfg.models.providers = {};
-    for (const prov of providers) {
-      const isCustomLike = prov.key === "custom" || prov.key === "codingplan";
-      if (!prov.enabled) {
-        // Remove disabled provider
-        delete cfg.models.providers[prov.key];
-        continue;
-      }
-      const entry: any = cfg.models.providers[prov.key] || {};
-      if (prov.apiKey) entry.apiKey = prov.apiKey;
-      else delete entry.apiKey;
-      if (prov.baseUrl) entry.baseUrl = prov.baseUrl;
-      else if (isCustomLike || prov.key === "ollama") delete entry.baseUrl;
-      // Doubao opts into the api_type field too (CodingPlan offering).
-      // For doubao, default to "openai" when the user enables it without
-      // touching the API Type dropdown — the dropdown's "-- Select --"
-      // placeholder used to silently skip the save, leaving gateway to
-      // autodetect a wrong protocol later.
-      if (isCustomLike) {
-        if (prov.apiType) entry.api = prov.apiType;
-      } else if (prov.key === "doubao") {
-        entry.api = prov.apiType || "openai-responses";
-      } else if (prov.key === "kimi") {
-        entry.api = prov.apiType || "openai";
-      }
-      if (prov.userAgent) entry.userAgent = prov.userAgent;
-      else delete entry.userAgent;
-      cfg.models.providers[prov.key] = entry;
-    }
-
-    return JSON.stringify(cfg, null, 2);
-  }, [rawConfig, port, bind, language, authToken, providers]);
-
-  const handleSave = async () => {
-    setSaving(true);
-    try {
-      const finalRaw = rawMode ? rawConfig : buildRawFromFields();
-      const result = await saveConfig({ raw: finalRaw });
-      if (result.error) {
-        toast.error(Locale.RsClawPanel.Config.SaveFailed, result.error);
-      } else {
-        setDirty(false);
-        setRawConfig(finalRaw);
-        toast.success(Locale.RsClawPanel.Config.SaveSuccess);
-        try { await reloadConfig(); } catch {}
-      }
-    } catch (e) {
-      toast.fromError(Locale.RsClawPanel.Config.SaveFailed, e);
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const markDirty = () => { if (!dirty) setDirty(true); };
-
-  if (loading) return <div className={styles["empty-state"]}>{Locale.RsClawPanel.Config.Loading}</div>;
-
-  // Safety: if raw config couldn't be loaded or starts with error comment
-  if (!rawConfig || rawConfig.startsWith("//")) {
-    return (
-      <div style={{ padding: 20 }}>
-        <div style={{ fontSize: 14, color: "#d95f5f", marginBottom: 12 }}>{rawConfig || "No config loaded"}</div>
-        <div style={{ fontSize: 12, color: "#888" }}>
-          {getLang() === "cn" ? "\u65E0\u6CD5\u52A0\u8F7D\u914D\u7F6E\uFF0C\u8BF7\u786E\u8BA4\u7F51\u5173\u5DF2\u542F\u52A8\u5E76\u4E14 auth token \u6B63\u786E\u3002" : "Cannot load config. Ensure gateway is running and auth token is correct."}
-        </div>
-      </div>
-    );
-  }
-
-
-  // ---- Inline style constants ----
-  const sectionCard: React.CSSProperties = {
-    background: "var(--white)", borderRadius: "12px", border: "1px solid var(--border-in-light)",
-    padding: "20px", marginBottom: "16px",
-  };
-  const sectionTitle: React.CSSProperties = {
-    fontSize: "14px", fontWeight: 600, color: "var(--black)", marginBottom: "16px",
-    paddingBottom: "10px", borderBottom: "1px solid var(--border-in-light)",
-  };
-  const fieldRow: React.CSSProperties = {
-    display: "flex", alignItems: "center", justifyContent: "space-between",
-    padding: "10px 0", borderBottom: "1px solid rgba(0,0,0,0.04)",
-  };
-  const fieldLabel: React.CSSProperties = {
-    fontSize: "13px", color: "var(--black)", fontWeight: 500, minWidth: "140px",
-  };
-  const fieldSub: React.CSSProperties = {
-    fontSize: "11px", color: "#999", marginTop: "2px",
-  };
-  const fieldInput: React.CSSProperties = {
-    padding: "6px 10px", borderRadius: "6px", border: "1px solid var(--border-in-light)",
-    fontSize: "13px", background: "var(--white)", outline: "none", width: "220px",
-  };
-  const fieldSelect: React.CSSProperties = { ...fieldInput, width: "230px" };
-  const toggleTrack = (on: boolean): React.CSSProperties => ({
-    width: "40px", height: "22px", borderRadius: "11px", cursor: "pointer",
-    background: on ? "#f0a500" : "#ccc", position: "relative", transition: "background 0.2s",
-    display: "inline-block", flexShrink: 0,
-  });
-  const toggleThumb = (on: boolean): React.CSSProperties => ({
-    width: "18px", height: "18px", borderRadius: "50%", background: "#fff",
-    position: "absolute", top: "2px", left: on ? "20px" : "2px", transition: "left 0.2s",
-    boxShadow: "0 1px 3px rgba(0,0,0,0.2)",
-  });
-  const providerCard: React.CSSProperties = {
-    border: "1px solid var(--border-in-light)", borderRadius: "10px", padding: "16px",
-    marginBottom: "12px", background: "var(--white)",
-  };
-  const providerHeader: React.CSSProperties = {
-    display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "12px",
-  };
-  const providerName: React.CSSProperties = { fontSize: "14px", fontWeight: 600 };
-  const channelRow: React.CSSProperties = {
-    display: "flex", alignItems: "center", justifyContent: "space-between",
-    padding: "12px 16px", borderRadius: "8px", border: "1px solid var(--border-in-light)",
-    marginBottom: "8px", background: "var(--white)",
-  };
-  const statusPill = (status: string): React.CSSProperties => ({
-    padding: "2px 10px", borderRadius: "10px", fontSize: "11px", fontWeight: 500,
-    background: status === "configured" ? "rgba(45,212,160,0.12)" : status === "pending" ? "rgba(240,165,0,0.12)" : "rgba(0,0,0,0.06)",
-    color: status === "configured" ? "#2dd4a0" : status === "pending" ? "#f0a500" : "#999",
-  });
-  const sliderContainer: React.CSSProperties = {
-    display: "flex", alignItems: "center", gap: "10px", width: "220px",
-  };
-
-  // Toggle component
-  const Toggle = ({ on, onToggle }: { on: boolean; onToggle: () => void }) => (
-    <div style={toggleTrack(on)} onClick={onToggle}>
-      <div style={toggleThumb(on)} />
-    </div>
-  );
-
-  // ---- Tab content renderers ----
-  const renderGateway = () => (
-    <div>
-      <div style={sectionCard}>
-        <div style={sectionTitle}>{Locale.RsClawPanel.Config.Gateway}</div>
-        <div style={fieldRow}>
-          <div>
-            <div style={fieldLabel}>{Locale.RsClawPanel.Config.Port}</div>
-            <div style={fieldSub}>HTTP API port</div>
-          </div>
-          <input style={fieldInput} type="number" value={port}
-            onChange={(e) => { setPort(parseInt(e.target.value, 10) || 18889); markDirty(); }} />
-        </div>
-        <div style={fieldRow}>
-          <div>
-            <div style={fieldLabel}>{Locale.RsClawPanel.Config.Bind}</div>
-            <div style={fieldSub}>{Locale.RsClawPanel.Config.BindLoopback} / {Locale.RsClawPanel.Config.BindAll}</div>
-          </div>
-          <select style={fieldSelect} value={bind}
-            onChange={(e) => { setBind(e.target.value); markDirty(); }}>
-            <option value="127.0.0.1">{Locale.RsClawPanel.Config.BindLoopback}</option>
-            <option value="0.0.0.0">{Locale.RsClawPanel.Config.BindAll}</option>
-          </select>
-        </div>
-        <div style={fieldRow}>
-          <div>
-            <div style={fieldLabel}>{Locale.RsClawPanel.Config.Language}</div>
-          </div>
-          <select style={fieldSelect} value={language}
-            onChange={(e) => { setLanguage(e.target.value); markDirty(); }}>
-            <option value="zh-CN">zh-CN</option>
-            <option value="en">en</option>
-            <option value="ja">ja</option>
-          </select>
-        </div>
-        <div style={{ ...fieldRow, borderBottom: "none" }}>
-          <div>
-            <div style={fieldLabel}>Auth Token</div>
-            <div style={fieldSub}>API authentication token</div>
-          </div>
-          <input style={fieldInput} type="password" value={authToken} placeholder="(not set)"
-            onChange={(e) => { setAuthToken(e.target.value); setApiAuthToken(e.target.value); markDirty(); }} />
-        </div>
-      </div>
-      <div style={sectionCard}>
-        <div style={sectionTitle}>Agent Defaults</div>
-        <div style={fieldRow}>
-          <div>
-            <div style={fieldLabel}>Default Model</div>
-          </div>
-          <input style={fieldInput} value={agentModel} placeholder="e.g. claude-sonnet-4-20250514"
-            onChange={(e) => { setAgentModel(e.target.value); markDirty(); }} />
-        </div>
-        <div style={{ ...fieldRow, borderBottom: "none" }}>
-          <div>
-            <div style={fieldLabel}>Max Tokens <span style={{ color: "#666", fontWeight: 400 }}>(0 = auto)</span></div>
-          </div>
-          <input style={fieldInput} type="number" value={agentMaxTokens}
-            onChange={(e) => { setAgentMaxTokens(parseInt(e.target.value, 10) || 0); markDirty(); }} />
-        </div>
-      </div>
-    </div>
-  );
-
-  const renderModels = () => (
-    <div>
-      {providers.map((prov, idx) => {
-        const isCustomLike = prov.key === "custom" || prov.key === "codingplan";
-        const curApiType: ApiType | undefined = prov.apiType;
-        const hideKey = prov.key === "ollama";
-        const keyOptional = isCustomLike && curApiType && !API_TYPE_NEEDS_KEY[curApiType];
-        const isZh = getLang() === "cn";
-        // Determine configuration status
-        const hasCredentials = prov.apiKey.length > 0 || (["ollama", "custom", "codingplan"].includes(prov.key) && prov.baseUrl.length > 0);
-        const badgeLabel = prov.enabled
-          ? (hasCredentials ? (isZh ? "已配置" : "Configured") : (isZh ? "待配置" : "Pending"))
-          : (isZh ? "关闭" : "OFF");
-        const badgeBg = prov.enabled
-          ? (hasCredentials ? "rgba(45,212,160,0.12)" : "rgba(240,165,0,0.12)")
-          : "rgba(0,0,0,0.06)";
-        const badgeColor = prov.enabled
-          ? (hasCredentials ? "#2dd4a0" : "#f0a500")
-          : "#999";
-        return (
-        <div key={prov.key} style={providerCard}>
-          <div style={providerHeader}>
-            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-              <span style={providerName}>{prov.name}</span>
-              <span style={{
-                padding: "2px 8px", borderRadius: "8px", fontSize: "11px",
-                background: badgeBg,
-                color: badgeColor,
-              }}>
-                {badgeLabel}
-              </span>
-            </div>
-            <Toggle on={prov.enabled} onToggle={() => {
-              const next = [...providers];
-              next[idx] = { ...next[idx], enabled: !next[idx].enabled };
-              setProviders(next);
-              markDirty();
-            }} />
-          </div>
-          {(isCustomLike || prov.key === "doubao" || prov.key === "kimi") && (
-            <div style={fieldRow}>
-              <div style={fieldLabel}>API Type</div>
-              <select
-                style={{ ...fieldInput, cursor: "pointer" }}
-                value={curApiType || ""}
-                onChange={(e) => {
-                  const val = e.target.value;
-                  if (!val) return;
-                  const at = val as ApiType;
-                  const next = [...providers];
-                  // For custom-like providers, switching api_type wipes the
-                  // base URL (each api_type has its own default). For doubao,
-                  // keep the existing base URL — only the auth/format changes.
-                  const baseUrlReset = isCustomLike ? "" : next[idx].baseUrl;
-                  next[idx] = { ...next[idx], apiType: at, baseUrl: baseUrlReset };
-                  setProviders(next);
-                  markDirty();
-                }}
-              >
-                {!curApiType && <option value="">-- Select --</option>}
-                {(Object.keys(API_TYPE_LABELS) as ApiType[]).map((at) => (
-                  <option key={at} value={at}>{API_TYPE_LABELS[at]}</option>
-                ))}
-              </select>
-            </div>
-          )}
-          {!hideKey && (
-          <div style={fieldRow}>
-              <div style={fieldLabel}>API Key{keyOptional ? <span style={{ color: "#999", fontWeight: 400 }}> (optional)</span> : null}</div>
-              <input style={fieldInput} type="password" value={prov.apiKey}
-                placeholder={keyOptional ? "(optional)" : "sk-..."}
-                onChange={(e) => {
-                  const next = [...providers];
-                  next[idx] = { ...next[idx], apiKey: e.target.value };
-                  setProviders(next);
-                  markDirty();
-                }} />
-            </div>
-          )}
-          {(isCustomLike || prov.key === "doubao" || prov.key === "ollama" || prov.key === "kimi") && (
-          <div style={fieldRow}>
-            <div style={fieldLabel}>API URL</div>
-            <input style={fieldInput} value={prov.baseUrl}
-              placeholder={
-                isCustomLike ? "https://your-api-server.com/v1" :
-                prov.key === "kimi" ? "https://api.moonshot.cn/v1" :
-                prov.key === "doubao" ? "https://ark.cn-beijing.volces.com/api/v3" :
-                prov.key === "ollama" ? "http://localhost:11434" :
-                "(default)"
-              }
-              onChange={(e) => {
-                const next = [...providers];
-                next[idx] = { ...next[idx], baseUrl: e.target.value };
-                setProviders(next);
-                markDirty();
-              }} />
-          </div>
-          )}
-          {(isCustomLike || prov.key === "kimi") && (
-          <div style={{ ...fieldRow, borderBottom: "none" }}>
-            <div style={fieldLabel}>User-Agent</div>
-            <input style={fieldInput} value={prov.userAgent || ""}
-              placeholder="e.g. rsclaw/2026.5.5"
-              onChange={(e) => {
-                const next = [...providers];
-                next[idx] = { ...next[idx], userAgent: e.target.value };
-                setProviders(next);
-                markDirty();
-              }} />
-          </div>
-          )}
-        </div>
-        );
-      })}
-    </div>
-  );
-
-  // All 13 channels with their credential fields
-  const zh = getLang() === "cn";
-  const ALL_CHANNELS_DEF = [
-    { id: "wechat", icon: "\u5FAE", name: zh ? "\u5FAE\u4FE1" : "WeChat", fields: [
-      { key: "botId", label: "Bot ID", type: "text", placeholder: "xxx@im.bot" },
-      { key: "botToken", label: "Bot Token", type: "password", placeholder: "${WECHAT_BOT_TOKEN}" },
-    ]},
-    { id: "wecom", icon: "WC", name: zh ? "\u4F01\u4E1A\u5FAE\u4FE1" : "WeCom", fields: [
-      { key: "botId", label: "Bot ID", type: "text", placeholder: "" },
-      { key: "secret", label: "Secret", type: "password", placeholder: "${WECOM_SECRET}" },
-    ]},
-    { id: "feishu", icon: "\u98DE", name: zh ? "\u98DE\u4E66" : "Feishu", fields: [
-      { key: "appId", label: "App ID", type: "text", placeholder: "cli_xxx" },
-      { key: "appSecret", label: "App Secret", type: "password", placeholder: "${FEISHU_APP_SECRET}" },
-      { key: "brand", label: "Brand", type: "select", options: ["feishu", "lark"] },
-    ]},
-    { id: "dingtalk", icon: "DT", name: zh ? "\u9489\u9489" : "DingTalk", fields: [
-      { key: "appKey", label: "App Key", type: "text", placeholder: "" },
-      { key: "appSecret", label: "App Secret", type: "password", placeholder: "${DINGTALK_APP_SECRET}" },
-    ]},
-    { id: "telegram", icon: "Tg", name: "Telegram", fields: [
-      { key: "botToken", label: "Bot Token", type: "password", placeholder: "${TELEGRAM_BOT_TOKEN}" },
-    ]},
-    { id: "discord", icon: "Dc", name: "Discord", fields: [
-      { key: "token", label: "Bot Token", type: "password", placeholder: "${DISCORD_BOT_TOKEN}" },
-    ]},
-    { id: "slack", icon: "Sl", name: "Slack", fields: [
-      { key: "botToken", label: "Bot Token", type: "password", placeholder: "${SLACK_BOT_TOKEN}" },
-      { key: "appToken", label: "App Token", type: "password", placeholder: "${SLACK_APP_TOKEN}" },
-    ]},
-    { id: "whatsapp", icon: "WA", name: "WhatsApp", fields: [
-      { key: "phoneNumberId", label: "Phone Number ID", type: "text", placeholder: "" },
-      { key: "accessToken", label: "Access Token", type: "password", placeholder: "${WHATSAPP_TOKEN}" },
-    ]},
-    { id: "qq", icon: "QQ", name: "QQ", fields: [
-      { key: "appId", label: "App ID", type: "text", placeholder: "" },
-      { key: "appSecret", label: "App Secret", type: "password", placeholder: "${QQ_APP_SECRET}" },
-    ]},
-    { id: "line", icon: "Li", name: "LINE", fields: [
-      { key: "channelSecret", label: "Channel Secret", type: "password", placeholder: "${LINE_CHANNEL_SECRET}" },
-      { key: "channelAccessToken", label: "Access Token", type: "password", placeholder: "${LINE_ACCESS_TOKEN}" },
-    ]},
-    { id: "zalo", icon: "Za", name: "Zalo", fields: [
-      { key: "appId", label: "App ID", type: "text", placeholder: "" },
-      { key: "accessToken", label: "Access Token", type: "password", placeholder: "${ZALO_ACCESS_TOKEN}" },
-    ]},
-    { id: "matrix", icon: "Mx", name: "Matrix", fields: [
-      { key: "homeserver", label: "Homeserver", type: "text", placeholder: "https://matrix.org" },
-      { key: "userId", label: "User ID", type: "text", placeholder: "@bot:matrix.org" },
-      { key: "accessToken", label: "Access Token", type: "password", placeholder: "${MATRIX_ACCESS_TOKEN}" },
-    ]},
-    { id: "signal", icon: "Sg", name: "Signal", fields: [
-      { key: "phoneNumber", label: "Phone Number", type: "text", placeholder: "+1234567890" },
-    ]},
-  ];
-
-  const POLICY_OPTIONS = ["pairing", "open", "allowlist", "disabled"];
-
-  // Channel config state: { [channelId]: { enabled, expanded, fields: {key: value}, dmPolicy, groupPolicy } }
-  const [channelConfigs, setChannelConfigs] = useState<Record<string, {
-    enabled: boolean; expanded: boolean; fields: Record<string, string>; dmPolicy: string; groupPolicy: string;
-  }>>(() => {
-    const init: any = {};
-    ALL_CHANNELS_DEF.forEach((ch) => {
-      // Check if channel exists in parsed config
-      const existing = channels.find((c) => c.type === ch.id);
-      init[ch.id] = {
-        enabled: !!existing?.enabled,
-        expanded: false,
-        fields: {},
-        dmPolicy: "pairing",
-        groupPolicy: "allowlist",
-      };
-    });
-    return init;
-  });
-
-  // Sync from parsed config on load
-  useEffect(() => {
-    if (!rawConfig) return;
-    const next = { ...channelConfigs };
-    ALL_CHANNELS_DEF.forEach((chDef) => {
-      // Try to extract channel block from raw config
-      const blockRe = new RegExp(`["']?${chDef.id}["']?\\s*:\\s*\\{([^}]*)\\}`, "ms");
-      const m = rawConfig.match(blockRe);
-      if (m) {
-        next[chDef.id].enabled = true;
-        const block = m[1];
-        chDef.fields.forEach((f) => {
-          const valRe = new RegExp(`["']?${f.key}["']?\\s*:\\s*["']([^"']*)["']`);
-          const vm = block.match(valRe);
-          if (vm) next[chDef.id].fields[f.key] = vm[1];
-        });
-        const dmRe = /["']?dmPolicy["']?\s*:\s*["']([^"']*)["']/;
-        const dm = block.match(dmRe);
-        if (dm) next[chDef.id].dmPolicy = dm[1];
-        const gpRe = /["']?groupPolicy["']?\s*:\s*["']([^"']*)["']/;
-        const gp = block.match(gpRe);
-        if (gp) next[chDef.id].groupPolicy = gp[1];
-      }
-    });
-    setChannelConfigs(next);
-  }, [rawConfig]);
-
-  const updateChannelField = (chId: string, key: string, value: string) => {
-    setChannelConfigs((prev) => ({
-      ...prev,
-      [chId]: { ...prev[chId], fields: { ...prev[chId].fields, [key]: value } },
-    }));
-    markDirty();
-  };
-
-  const toggleChannelEnabled = (chId: string) => {
-    setChannelConfigs((prev) => ({
-      ...prev,
-      [chId]: { ...prev[chId], enabled: !prev[chId].enabled },
-    }));
-    markDirty();
-  };
-
-  const toggleChannelExpanded = (chId: string) => {
-    setChannelConfigs((prev) => ({
-      ...prev,
-      [chId]: { ...prev[chId], expanded: !prev[chId].expanded },
-    }));
-  };
-
-  const chIconStyle = (on: boolean) => ({
-    width: 32, height: 32, borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "center",
-    fontSize: 11, fontWeight: 700, flexShrink: 0 as const,
-    background: on ? "rgba(249,115,22,0.15)" : "#1a1c20",
-    color: on ? "#f97316" : "#2e2c3a",
-    border: `1px solid ${on ? "rgba(249,115,22,0.25)" : "#252830"}`,
-  });
-
-  const renderChannels = () => (
-    <div>
-      <div style={{ fontSize: 11, color: "#2a2836", marginBottom: 12 }}>
-        {zh ? "\u70B9\u51FB\u901A\u9053\u53F3\u4FA7\u5F00\u5173\u542F\u7528\uFF0C\u5C55\u5F00\u586B\u5199\u51ED\u8BC1\uFF0C\u4FDD\u5B58\u540E\u751F\u6548\u3002" : "Toggle channels on, expand to fill credentials, save to apply."}
-      </div>
-      <div style={sectionCard}>
-        {ALL_CHANNELS_DEF.map((chDef) => {
-          const cc = channelConfigs[chDef.id] || { enabled: false, expanded: false, fields: {}, dmPolicy: "pairing", groupPolicy: "allowlist" };
-          return (
-            <div key={chDef.id} style={{ borderBottom: "1px solid #111315" }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "11px 14px", cursor: "pointer" }}
-                onClick={() => toggleChannelExpanded(chDef.id)}>
-                <div style={chIconStyle(cc.enabled)}>{chDef.icon}</div>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 12, fontWeight: 500, color: cc.enabled ? "#c8c6d4" : "#6a6878" }}>{chDef.name}</div>
-                  <div style={{ fontSize: 10, color: "#252530", fontFamily: "'JetBrains Mono', monospace", marginTop: 1 }}>
-                    {cc.enabled && Object.values(cc.fields).some(Boolean) ? chDef.id + " \u00B7 " + cc.dmPolicy : (zh ? "\u672A\u914D\u7F6E" : "Not configured")}
-                  </div>
-                </div>
-                <span style={statusPill(cc.enabled ? (Object.values(cc.fields).some(Boolean) ? "configured" : "pending") : "disabled")}>
-                  {cc.enabled
-                    ? (Object.values(cc.fields).some(Boolean) ? (zh ? "\u5DF2\u914D\u7F6E" : "Configured") : (zh ? "\u5F85\u914D\u7F6E" : "Pending"))
-                    : (zh ? "\u672A\u542F\u7528" : "disabled")}
-                </span>
-                <div onClick={(e) => e.stopPropagation()}>
-                  <Toggle on={cc.enabled} onToggle={() => toggleChannelEnabled(chDef.id)} />
-                </div>
-                <span style={{ fontSize: 10, color: "#3e3c4a", transition: "transform 0.15s", transform: cc.expanded ? "rotate(90deg)" : "none" }}>{"\u25B6"}</span>
-              </div>
-              {cc.expanded && (
-                <div style={{ padding: "0 14px 14px 56px", display: "flex", flexDirection: "column", gap: 8 }}>
-                  {chDef.fields.map((f) => (
-                    <div key={f.key}>
-                      <div style={{ fontSize: 10, color: "#35323f", marginBottom: 4, fontFamily: "'JetBrains Mono', monospace" }}>{f.label}</div>
-                      {f.type === "select" ? (
-                        <select style={fieldSelect} value={cc.fields[f.key] || f.options?.[0] || ""}
-                          onChange={(e) => updateChannelField(chDef.id, f.key, e.target.value)}>
-                          {f.options?.map((o) => <option key={o} value={o}>{o}</option>)}
-                        </select>
-                      ) : (
-                        <input style={fieldInput} type={f.type} value={cc.fields[f.key] || ""}
-                          placeholder={f.placeholder}
-                          onChange={(e) => updateChannelField(chDef.id, f.key, e.target.value)} />
-                      )}
-                    </div>
-                  ))}
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <div style={{ flex: 1 }}>
-                      <div style={{ fontSize: 10, color: "#35323f", marginBottom: 4 }}>dmPolicy</div>
-                      <select style={fieldSelect} value={cc.dmPolicy}
-                        onChange={(e) => { setChannelConfigs((p) => ({ ...p, [chDef.id]: { ...p[chDef.id], dmPolicy: e.target.value } })); markDirty(); }}>
-                        {POLICY_OPTIONS.map((o) => <option key={o} value={o}>{o}</option>)}
-                      </select>
-                    </div>
-                    <div style={{ flex: 1 }}>
-                      <div style={{ fontSize: 10, color: "#35323f", marginBottom: 4 }}>groupPolicy</div>
-                      <select style={fieldSelect} value={cc.groupPolicy}
-                        onChange={(e) => { setChannelConfigs((p) => ({ ...p, [chDef.id]: { ...p[chDef.id], groupPolicy: e.target.value } })); markDirty(); }}>
-                        {POLICY_OPTIONS.map((o) => <option key={o} value={o}>{o}</option>)}
-                      </select>
-                    </div>
-                  </div>
-                </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-
-  const renderTools = () => (
-    <div>
-      <div style={sectionCard}>
-        <div style={sectionTitle}>{getLang() === "cn" ? "\u6267\u884C\u5DE5\u5177" : "Exec Tool"}</div>
-        <div style={{ ...fieldRow, borderBottom: "none" }}>
-          <div>
-            <div style={fieldLabel}>{getLang() === "cn" ? "\u6C99\u7BB1\u6A21\u5F0F" : "Sandbox Mode"}</div>
-            <div style={fieldSub}>{getLang() === "cn" ? "\u9650\u5236\u4EE3\u7801\u6267\u884C\u73AF\u5883" : "Restrict code execution environment"}</div>
-          </div>
-          <Toggle on={execSandbox} onToggle={() => { setExecSandbox(!execSandbox); markDirty(); }} />
-        </div>
-      </div>
-      <div style={sectionCard}>
-        <div style={sectionTitle}>{getLang() === "cn" ? "\u4E0A\u4F20\u9650\u5236" : "Upload Limits"}</div>
-        <div style={{ ...fieldRow, borderBottom: "none" }}>
-          <div>
-            <div style={fieldLabel}>{getLang() === "cn" ? "\u6700\u5927\u4E0A\u4F20\u5927\u5C0F (MB)" : "Max Upload Size (MB)"}</div>
-          </div>
-          <input style={fieldInput} type="number" value={uploadMaxSize}
-            onChange={(e) => { setUploadMaxSize(parseInt(e.target.value, 10) || 10); markDirty(); }} />
-        </div>
-      </div>
-      <div style={sectionCard}>
-        <div style={sectionTitle}>{getLang() === "cn" ? "\u7F51\u7EDC\u641C\u7D22" : "Web Search"}</div>
-        <div style={{ ...fieldRow, borderBottom: "none" }}>
-          <div>
-            <div style={fieldLabel}>{getLang() === "cn" ? "\u641C\u7D22\u63D0\u4F9B\u5546" : "Search Provider"}</div>
-          </div>
-          <select style={fieldSelect} value={webSearchProvider}
-            onChange={(e) => { setWebSearchProvider(e.target.value); markDirty(); }}>
-            <option value="none">{getLang() === "cn" ? "\u5173\u95ED" : "None"}</option>
-            <option value="tavily">Tavily</option>
-            <option value="searxng">SearXNG</option>
-            <option value="bing">Bing</option>
-          </select>
-        </div>
-      </div>
-      <div style={sectionCard}>
-        <div style={sectionTitle}>{getLang() === "cn" ? "\u8BB0\u5FC6\u7BA1\u7406" : "Memory"}</div>
-        <div style={fieldRow}>
-          <div>
-            <div style={fieldLabel}>{getLang() === "cn" ? "\u77ED\u671F\u8BB0\u5FC6\u4E0A\u9650" : "Short-term Limit"}</div>
-          </div>
-          <div style={sliderContainer}>
-            <input type="range" min={5} max={50} value={memoryShortTermLimit}
-              style={{ flex: 1, accentColor: "#f0a500" }}
-              onChange={(e) => { setMemoryShortTermLimit(parseInt(e.target.value, 10)); markDirty(); }} />
-            <span style={{ fontSize: "13px", fontWeight: 500, minWidth: "30px", textAlign: "right" }}>{memoryShortTermLimit}</span>
-          </div>
-        </div>
-        <div style={{ ...fieldRow, borderBottom: "none" }}>
-          <div>
-            <div style={fieldLabel}>{getLang() === "cn" ? "\u957F\u671F\u8BB0\u5FC6\u4E0A\u9650" : "Long-term Limit"}</div>
-          </div>
-          <div style={sliderContainer}>
-            <input type="range" min={10} max={500} value={memoryLongTermLimit}
-              style={{ flex: 1, accentColor: "#f0a500" }}
-              onChange={(e) => { setMemoryLongTermLimit(parseInt(e.target.value, 10)); markDirty(); }} />
-            <span style={{ fontSize: "13px", fontWeight: 500, minWidth: "30px", textAlign: "right" }}>{memoryLongTermLimit}</span>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-
-  const renderRawEditor = () => (
-    <div>
-      <div className={styles["ws-editor"]} style={{ height: "calc(100vh - 48px - 200px)" }}>
-        <textarea
-          className={styles["ws-textarea"]}
-          value={rawConfig}
-          onChange={(e) => { setRawConfig(e.target.value); setDirty(true); }}
-          spellCheck={false}
-        />
-      </div>
-      <div className={styles["note"] + " " + styles["info"]} style={{ marginTop: "12px" }}>
-        <span>i</span>
-        <span>{Locale.RsClawPanel.Config.ReloadNote}</span>
-      </div>
-    </div>
-  );
-
-  // Debug: catch render errors
-  try {
-    // test all locale keys to find undefined ones
-    const _test = [
-      Locale.RsClawPanel.Config.PageTitle,
-      Locale.RsClawPanel.Config.Gateway,
-      Locale.RsClawPanel.Config.Port,
-      Locale.RsClawPanel.Config.Bind,
-      Locale.RsClawPanel.Config.BindLoopback,
-      Locale.RsClawPanel.Config.BindAll,
-      Locale.RsClawPanel.Config.Language,
-      Locale.RsClawPanel.Config.SaveAndReload,
-      Locale.RsClawPanel.Config.Saving,
-      Locale.RsClawPanel.Config.ReloadNote,
-    ];
-    const missing = _test.findIndex(v => v === undefined);
-    if (missing >= 0) console.error("[Config] Missing locale key at index", missing);
-  } catch (e) {
-    return <div style={{padding:20,color:"#d95f5f"}}>Config render error: {String(e)}</div>;
-  }
-
-  return (
-    <div>
-      <div className={styles["page-header"]}>
-        <div>
-          <div className={styles["page-title"]}>{Locale.RsClawPanel.Config.PageTitle}</div>
-          <div className={styles["page-sub"]}>{configPath}</div>
-        </div>
-      </div>
-
-      {/* Tab bar + action buttons */}
-      <div style={{
-        display: "flex", alignItems: "center", justifyContent: "space-between",
-        borderBottom: "1px solid var(--border-in-light)", marginBottom: "16px", paddingBottom: "0",
-      }}>
-        <div style={{ display: "flex", gap: "0" }}>
-          {!rawMode && tabs.map((tab) => (
-            <button key={tab.key}
-              onClick={() => setActiveTab(tab.key)}
-              style={{
-                padding: "10px 18px", fontSize: "13px", fontWeight: activeTab === tab.key ? 600 : 400,
-                color: activeTab === tab.key ? "#f0a500" : "var(--black)",
-                background: "transparent", border: "none", cursor: "pointer",
-                borderBottom: activeTab === tab.key ? "2px solid #f0a500" : "2px solid transparent",
-                transition: "all 0.15s", marginBottom: "-1px",
-              }}>
-              {tab.label}
-            </button>
-          ))}
-          {rawMode && (
-            <div style={{ padding: "10px 18px", fontSize: "13px", fontWeight: 600, color: "#f0a500" }}>
-              {getLang() === "cn" ? "\u539F\u59CB JSON5" : "Raw JSON5"}
-            </div>
-          )}
-        </div>
-        <div style={{ display: "flex", gap: "8px", paddingBottom: "8px" }}>
-          <button
-            className={styles["btn"]}
-            onClick={() => {
-              if (rawMode) {
-                // Switching back to structured - re-parse
-                parseConfig(rawConfig);
-              }
-              setRawMode(!rawMode);
-            }}
-            style={{ fontSize: "12px" }}
-          >
-            {rawMode
-              ? (getLang() === "cn" ? "\u8FD4\u56DE\u7ED3\u6784\u5316\u7F16\u8F91" : "Back to Structured")
-              : (getLang() === "cn" ? "\u67E5\u770B\u539F\u59CB JSON5" : "View Raw JSON5")}
-          </button>
-          <button
-            className={`${styles["btn"]} ${styles["primary"]}`}
-            onClick={handleSave}
-            disabled={saving || !dirty}
-            style={{ fontSize: "12px" }}
-          >
-            {saving ? Locale.RsClawPanel.Config.Saving : Locale.RsClawPanel.Config.SaveAndReload}
-          </button>
-        </div>
-      </div>
-
-      {/* Tab content */}
-      <div style={{ overflowY: "auto", maxHeight: "calc(100vh - 48px - 200px)", paddingRight: "4px" }}>
-        {rawMode ? renderRawEditor()
-          : activeTab === "gateway" ? renderGateway()
-          : activeTab === "models" ? renderModels()
-          : activeTab === "channels" ? renderChannels()
-          : renderTools()}
-      </div>
     </div>
   );
 }
@@ -3365,6 +2435,65 @@ function TauriConfigPageInner() {
     })();
   }, []);
 
+  // ── External-write watcher ──
+  // The sidebar account chip / onboarding card writes to rsclaw.json5
+  // via the install event. Our cached `raw` state goes stale unless we
+  // re-read on the same event. Belt-and-suspenders: also re-read every
+  // time the user enters the raw JSON5 tab (covers external editors,
+  // missed events, etc.). Both paths skip when `dirty` so we never
+  // blow away unsaved local edits.
+  useEffect(() => {
+    if (!isTauri) return;
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    (async () => {
+      try {
+        const { listen } = await import("@tauri-apps/api/event");
+        const fn = await listen("rsclaw:console-install-key", async () => {
+          if (cancelled || dirty) return;
+          try {
+            const content = (await tauriInvokeV2("read_config_file")) as string;
+            if (!cancelled && content) {
+              setRaw(content);
+              try { setConfig(JSON5.parse(content)); setParseError(""); } catch {}
+            }
+          } catch {
+            /* swallow */
+          }
+        });
+        if (cancelled) fn();
+        else unlisten = fn;
+      } catch {
+        /* event subscription unavailable */
+      }
+    })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [dirty]);
+
+  useEffect(() => {
+    if (activeTab !== "raw") return;
+    if (!isTauri) return;
+    if (dirty) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const content = (await tauriInvokeV2("read_config_file")) as string;
+        if (!cancelled && content) {
+          setRaw(content);
+          try { setConfig(JSON5.parse(content)); setParseError(""); } catch {}
+        }
+      } catch {
+        /* tolerate */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, dirty]);
+
   // ── Auto-detect configured providers on load ──
   useEffect(() => {
     if (!config?.models?.providers) return;
@@ -3497,7 +2626,13 @@ function TauriConfigPageInner() {
 
   // ── Ordered providers / channels ──
   const provOrder = zh ? PROV_ORDER_ZH : PROV_ORDER_EN;
-  const provList = provOrder.map((id) => ALL_PROVIDERS[id]).filter(Boolean);
+  // rsclaw lives in its own card above this list (account-managed,
+  // not BYOK). Drop it from the regular grid so the user doesn't see
+  // it twice.
+  const provList = provOrder
+    .filter((id) => id !== "rsclaw")
+    .map((id) => ALL_PROVIDERS[id])
+    .filter(Boolean);
   const chOrder = zh ? CH_ORDER_ZH : CH_ORDER_EN;
   const chList = chOrder.map((id) => ALL_CHANNELS[id]).filter(Boolean);
 
@@ -3575,6 +2710,28 @@ function TauriConfigPageInner() {
     }
     setProvTest((prev) => ({ ...prev, [provId]: "testing" }));
     setProvErr((prev) => ({ ...prev, [provId]: "" }));
+
+    // rsclaw short-circuit — same rationale as the onboarding flow:
+    // the cloud agent endpoint doesn't expose an OpenAI-compatible
+    // `/models` listing, so the Tauri `test_provider` command bails
+    // out with "unknown provider". Trust the key, use the hardcoded
+    // MODELS["rsclaw"] preset list. Real validation happens at the
+    // gateway-start health check.
+    if (provId === "rsclaw") {
+      const presets = (MODELS["rsclaw"] || []).map((m) => ({
+        id: m.id,
+        tag: zh ? m.tag : m.tagEn,
+      }));
+      setProvTest((prev) => ({ ...prev, [provId]: "ok" }));
+      setProvModels((prev) => ({ ...prev, [provId]: presets }));
+      toast.success(
+        zh
+          ? `rsclaw 已就绪 (${presets.length} 个模型)`
+          : `rsclaw ready (${presets.length} models)`,
+      );
+      return;
+    }
+
     try {
       const tauriInvoke = isTauri ? tauriInvokeV2 : null;
       let res: any;
@@ -4153,6 +3310,14 @@ function TauriConfigPageInner() {
 
           {secHead(zh ? "LLM \u63D0\u4F9B\u5546" : "LLM PROVIDERS")}
           <div style={{ fontSize: 11, color: V.t3, marginBottom: 12 }}>{zh ? "\u9009\u4E2D\u63D0\u4F9B\u5546\u586B\u5165 Key\uFF0C\u6D4B\u8BD5\u8FDE\u63A5\u6210\u529F\u540E\u4ECE API \u83B7\u53D6\u53EF\u7528\u6A21\u578B\u5217\u8868\uFF0C\u9009\u62E9\u9ED8\u8BA4\u6A21\u578B\u3002" : "Enter API Key per provider, test connection, then select a default model."}</div>
+
+          {/* rsclaw account card \u2014 sits above the regular BYOK
+              provider grid. Different visual treatment because
+              rsclaw is cloud-managed (account-based) rather than
+              bring-your-own-key. The card handles its own state from
+              rsclaw.json5 + install events; the panel doesn't need
+              to thread anything through. */}
+          <RsclawProviderCard />
 
           {/* Provider cards */}
           <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 24 }}>
@@ -5795,7 +4960,7 @@ function getTabFromLocation(search?: string): PanelPage {
   const qs = search || (typeof window !== "undefined" ? window.location.hash.split("?")[1] || "" : "");
   const params = new URLSearchParams(qs);
   const tab = params.get("tab");
-  if (["config", "agents", "cron", "skills", "status", "workspace", "doctor", "pairing", "wizard"].includes(tab || "")) {
+  if (["config", "agents", "cron", "skills", "status", "workspace", "doctor", "pairing", "wizard", "memory"].includes(tab || "")) {
     return tab as PanelPage;
   }
   return "status";
@@ -5854,13 +5019,14 @@ export function RsClawPanel() {
         <div className={styles["panel-body"]}>
           <div className={styles["rsp-content"]} style={{ flex: 1 }}>
             {activePage === "status" && <StatusPage />}
-            {activePage === "config" && <ErrorBoundary>{isTauri ? <TauriConfigPage /> : <ConfigEditorPage />}</ErrorBoundary>}
+            {activePage === "config" && <ErrorBoundary><TauriConfigPage /></ErrorBoundary>}
             {activePage === "agents" && <AgentManagerPage />}
             {activePage === "cron" && <CronTaskPage />}
             {activePage === "skills" && <SkillsPage />}
             {activePage === "workspace" && <WorkspacePage />}
             {activePage === "doctor" && <DoctorPage />}
             {activePage === "pairing" && <PairingPage />}
+            {activePage === "memory" && <MemoryPage />}
           </div>
         </div>
       </div>

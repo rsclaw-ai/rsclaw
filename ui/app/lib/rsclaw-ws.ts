@@ -84,6 +84,51 @@ export type ComputerUseStatusPayload =
       summary: string;
     };
 
+/**
+ * One option in an `AskUserPrompt`. Field names match the on-wire
+ * snake_case shape — no rename needed on the backend.
+ */
+export type AskUserOption = {
+  /** Display label, 1–5 words. */
+  label: string;
+  /** Optional one-line elaboration shown beneath the label. */
+  description?: string;
+};
+
+/**
+ * Payload of an `ask_user` frame (either nested inside a `chat` frame as
+ * `p.type === "ask_user"` or as a standalone `session.ask_user` frame).
+ * Mirrors `crate::events::AskUserPrompt`. Surfaced to the UI as a
+ * non-destructive modal so the agent can collect a structured choice
+ * mid-turn.
+ */
+export type AskUserPrompt = {
+  question: string;
+  options: AskUserOption[];
+  /** Default false — single-select. */
+  multi_select?: boolean;
+  /** 0-based index of the agent-recommended option. */
+  recommended_index?: number;
+  /** Optional short label rendered as a chip before the question. */
+  header?: string;
+};
+
+/**
+ * Envelope wrapping an `AskUserPrompt` with the routing fields the UI
+ * needs to know which chat the question belongs to. Both relay paths
+ * (`chat` payload with `p.type === "ask_user"` and the standalone
+ * `session.ask_user` frame) get normalised into this shape before the
+ * handler set is fanned out.
+ */
+export type AskUserPayload = {
+  /** Always present from at least one relay path. */
+  sessionKey: string;
+  /** Only set when the relay path is `chat` (HTTP-initiated). */
+  runId?: string;
+  agentId?: string;
+  prompt: AskUserPrompt;
+};
+
 /** Payload of a `restart.required` frame, mirrors src/events.rs RestartRequest. */
 export type RestartRequiredPayload = {
   at_ms: number;
@@ -115,6 +160,7 @@ class RsClawWsClient {
   private restartHandlers = new Set<(payload: RestartRequiredPayload) => void>();
   private permissionHandlers = new Set<(payload: PermissionRequestPayload) => void>();
   private statusHandlers = new Set<(payload: ComputerUseStatusPayload) => void>();
+  private askUserHandlers = new Set<(payload: AskUserPayload) => void>();
   private connectHandlers = new Set<() => void>();
   private tokenRefresh: Promise<void> | null = null;
 
@@ -192,6 +238,26 @@ class RsClawWsClient {
   ): () => void {
     this.statusHandlers.add(handler);
     return () => this.statusHandlers.delete(handler);
+  }
+
+  /**
+   * Register a handler for `ask_user` prompts the agent emits when it
+   * wants a structured choice from the user mid-turn. Both the
+   * `chat`-payload relay (`p.type === "ask_user"`) and the standalone
+   * `session.ask_user` frame are normalised into one `AskUserPayload`
+   * before being fanned out here. Returns an unsubscribe function.
+   *
+   * Note: the agent will ALSO stream a numbered-options fallback as
+   * regular text-delta frames around this event. Suppressing that
+   * fallback in the transcript is up to the consumer — by default it
+   * remains visible so the question is still in history if the modal
+   * is cancelled.
+   */
+  onAskUser(
+    handler: (payload: AskUserPayload) => void,
+  ): () => void {
+    this.askUserHandlers.add(handler);
+    return () => this.askUserHandlers.delete(handler);
   }
 
   /**
@@ -386,9 +452,47 @@ class RsClawWsClient {
       return;
     }
 
+    // Standalone session-scoped relay (WS-initiated chats subscribing
+    // to a session). Frame shape: { type: "session.ask_user", data: {
+    // sessionKey, agentId, prompt } }.
+    if (event === "session.ask_user") {
+      const d = data.payload || data.data || {};
+      const prompt = (d.prompt || {}) as AskUserPrompt;
+      if (!prompt.question) return;
+      this.askUserHandlers.forEach((h) =>
+        h({
+          sessionKey: d.sessionKey || d.session_key || "",
+          agentId: d.agentId || d.agent_id,
+          prompt,
+        }),
+      );
+      return;
+    }
+
     if (event === "chat") {
       const p = data.payload || {};
       const runId: string = p.runId || "";
+
+      // `ask_user` rides on the chat envelope but is independent of
+      // any `runId`-keyed streaming handler — it's a sideband prompt
+      // the modal subscribes to globally. Fan out to ask-user
+      // handlers regardless of whether a chat callback is registered
+      // for this runId.
+      if (p.type === "ask_user") {
+        const prompt = (p.prompt || {}) as AskUserPrompt;
+        if (prompt.question) {
+          this.askUserHandlers.forEach((h) =>
+            h({
+              sessionKey: p.sessionKey || p.session_key || "",
+              runId,
+              agentId: p.agentId || p.agent_id,
+              prompt,
+            }),
+          );
+        }
+        return;
+      }
+
       const entry = this.chatHandlers.get(runId);
       if (!entry) return;
 

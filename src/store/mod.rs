@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 pub use redb_store::RedbStore;
+pub(crate) use redb_store::upgrade_legacy_if_needed;
 pub use search::SearchIndex;
 use tracing::info;
 
