@@ -3501,50 +3501,36 @@ struct MemoryListResponse {
     total: usize,
 }
 
-/// Locate the BGE model directory and pick the first one that has a
-/// `config.json`. Mirrors the discovery logic in `cmd/memory.rs` so
-/// the HTTP and CLI paths behave identically.
-fn memory_model_dir() -> std::path::PathBuf {
-    let base = crate::config::loader::base_dir();
-    let zh = base.join("models/bge-small-zh");
-    let en = base.join("models/bge-small-en");
-    if zh.join("config.json").exists() {
-        zh
-    } else {
-        en
-    }
+
+/// The gateway already holds the memory store open with redb's exclusive
+/// write lock. A second `MemoryStore::open_readonly` on the same file fails
+/// ("open memory redb (readonly)"), so HTTP handlers must reuse the live
+/// store from the agent handle instead of opening their own.
+fn live_memory_store(
+    state: &AppState,
+) -> Option<std::sync::Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>> {
+    state
+        .agents
+        .default_agent()
+        .ok()
+        .and_then(|h| h.memory.clone())
 }
 
 async fn memory_list_docs(
     State(state): State<AppState>,
     Query(params): Query<MemoryListParams>,
 ) -> impl IntoResponse {
-    let base = crate::config::loader::base_dir();
-    let data_dir = base.join("var/data");
-    let model_dir = memory_model_dir();
-    let search_cfg = state.config.raw.memory_search.as_ref();
     let limit = params.limit.unwrap_or(200).min(1000);
 
-    let mut store = match crate::agent::memory::MemoryStore::open_readonly(
-        &data_dir,
-        Some(&model_dir),
-        search_cfg,
-    )
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            // Most common cause: memory db not yet seeded. Return
-            // an empty list rather than 500 so the UI can show "no
-            // memories yet" gracefully.
-            warn!(error = %e, "memory_list: open_readonly failed");
-            return Json(MemoryListResponse {
-                docs: vec![],
-                total: 0,
-            })
-            .into_response();
-        }
+    let Some(mem) = live_memory_store(&state) else {
+        // Memory disabled or no agent — show "no memories yet" gracefully.
+        return Json(MemoryListResponse {
+            docs: vec![],
+            total: 0,
+        })
+        .into_response();
     };
+    let mut store = mem.lock().await;
 
     let docs: Vec<crate::agent::memory::MemoryDoc> =
         if let Some(q) = params.q.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -3558,6 +3544,7 @@ async fn memory_list_docs(
         } else {
             store.list_active()
         };
+    drop(store);
 
     let filtered: Vec<&crate::agent::memory::MemoryDoc> = docs
         .iter()
@@ -3590,30 +3577,17 @@ struct MemoryStatsResponse {
 }
 
 async fn memory_stats(State(state): State<AppState>) -> impl IntoResponse {
-    let base = crate::config::loader::base_dir();
-    let data_dir = base.join("var/data");
-    let model_dir = memory_model_dir();
-    let search_cfg = state.config.raw.memory_search.as_ref();
-
-    let store = match crate::agent::memory::MemoryStore::open_readonly(
-        &data_dir,
-        Some(&model_dir),
-        search_cfg,
-    )
-    .await
-    {
-        Ok(s) => s,
-        Err(_) => {
-            return Json(MemoryStatsResponse {
-                total: 0,
-                by_tier: Default::default(),
-                by_kind: Default::default(),
-                by_scope: Default::default(),
-                pinned: 0,
-            })
-            .into_response();
-        }
+    let Some(mem) = live_memory_store(&state) else {
+        return Json(MemoryStatsResponse {
+            total: 0,
+            by_tier: Default::default(),
+            by_kind: Default::default(),
+            by_scope: Default::default(),
+            pinned: 0,
+        })
+        .into_response();
     };
+    let store = mem.lock().await;
 
     let docs = store.list_active();
     let mut by_tier: std::collections::HashMap<String, usize> = Default::default();
