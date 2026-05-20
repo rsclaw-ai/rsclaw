@@ -303,9 +303,27 @@ Week 2 plan: `docs/plans/2026-05-19-kb-mvp-week2-pipeline.md`.
     fast path and the wtx-scoped re-check honour this. Covered by
     `kb::pipeline::ingest::tests::tombstoned_doc_resurrects_on_reingest`.
 28. **CLI smoke tests** — `tests/kb_cli_smoke.rs` invokes the
-    compiled `rsclaw` binary via `CARGO_BIN_EXE_rsclaw`. Eight
+    compiled `rsclaw` binary via `CARGO_BIN_EXE_rsclaw`. Ten
     tests covering the full `kb` subcommand surface guard against
     arg-parsing and output-format regressions.
+29. **Retrieval output is byte-deterministic** — `search::pipeline`
+    sorts the post-MMR result by `(score desc, chunk_id asc)` so
+    the wire bytes are stable across calls with the same inputs.
+    Spec §3 "KV cache 友好": identical search inputs must produce
+    identical agent context across turns or the cache fragments.
+30. **HNSW snapshot has a schema_version** — `HnswMeta.schema_version`
+    bumps on format changes. Restore errors instead of panicking
+    on mismatch; the operator can delete the `hnsw/` directory
+    to force a rebuild from redb (cache, not source of truth).
+31. **`reclaim_stale` leaves an audit trail** — every job reset
+    from Running→Ready gets `last_error =
+    "claim_token_expired"` inside the same wtx. Operators reading
+    `kb_jobs_by_id` see exactly why each job came back.
+32. **`UrlSyncer` classifies HTTP failures** — 401/403 →
+    `AuthFailed`, 429 (with Retry-After parsed) → `RateLimited`,
+    other 4xx → `Permanent` (no point retrying), 5xx →
+    `Network` (transient). `SyncError` variants are usable
+    end-to-end now.
 
 ## Quick start
 
