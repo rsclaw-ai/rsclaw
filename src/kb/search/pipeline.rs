@@ -313,6 +313,41 @@ mod tests {
     }
 
     #[test]
+    fn search_output_is_deterministic_across_calls() {
+        // Spec §3 KV-cache friendliness: same inputs MUST produce
+        // the same chunk_id sequence on the wire. MMR's greedy
+        // picker can tie on score; the post-MMR `(score desc,
+        // chunk_id asc)` sort makes the tiebreak stable.
+        let (_tmp, ctx) = ctx_with_ingested(
+            "# A\n\npara one.\n\npara two.\n\npara three.\n\npara four.\n\npara five.",
+        );
+        let req = SearchRequest {
+            query: "para".into(),
+            k: 3,
+            filter: SearchFilter::default(),
+            mode: SearchMode::Hybrid,
+            diversity: Diversity::Mmr,
+            mmr_lambda: 0.5,
+            boost_entities: vec![],
+        };
+        let first: Vec<String> = ctx
+            .search(&req, &CallerScope::default())
+            .unwrap()
+            .into_iter()
+            .map(|h| h.chunk_id)
+            .collect();
+        for _ in 0..3 {
+            let again: Vec<String> = ctx
+                .search(&req, &CallerScope::default())
+                .unwrap()
+                .into_iter()
+                .map(|h| h.chunk_id)
+                .collect();
+            assert_eq!(first, again, "search order not stable across calls");
+        }
+    }
+
+    #[test]
     fn search_filter_by_visibility_hides_private() {
         let (_tmp, ctx) = ctx_with_ingested("# Secret\n\nclassified info goes here.");
         // Re-tag the existing doc as Private + owner u1.

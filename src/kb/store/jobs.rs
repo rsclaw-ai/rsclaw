@@ -464,6 +464,8 @@ mod tests {
         let j = get(&rtx, &job_id).unwrap().unwrap();
         assert_eq!(j.status, JobStatus::Ready);
         assert_eq!(j.attempts, 1);
+        // Audit trail: reclaim must annotate why the job came back.
+        assert_eq!(j.last_error.as_deref(), Some("claim_token_expired"));
     }
 
     #[test]

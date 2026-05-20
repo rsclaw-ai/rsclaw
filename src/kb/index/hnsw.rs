@@ -407,6 +407,31 @@ mod tests {
     }
 
     #[test]
+    fn restore_rejects_incompatible_schema_version() {
+        let dir = TempDir::new().unwrap();
+        let dump_dir = dir.path().join("snap");
+        std::fs::create_dir_all(&dump_dir).unwrap();
+        // Hand-write a meta file claiming an unknown future version.
+        let bad_meta = serde_json::json!({
+            "schema_version": 999,
+            "dimension": DIMENSION,
+            "id_to_chunk": ["c1"],
+        });
+        std::fs::write(
+            dump_dir.join("snapshot.meta.json"),
+            serde_json::to_vec(&bad_meta).unwrap(),
+        )
+        .unwrap();
+        let cache = HnswCache::empty();
+        let err = cache.restore(&dump_dir).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("schema_version"),
+            "expected schema_version mismatch error, got: {msg}"
+        );
+    }
+
+    #[test]
     fn snapshot_empty_cache_writes_meta_only() {
         let dir = TempDir::new().unwrap();
         let dump_dir = dir.path().join("empty");
