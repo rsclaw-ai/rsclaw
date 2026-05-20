@@ -43,9 +43,41 @@ fn open_kb(kb_root: &PathBuf) -> Result<Handles> {
     let paths = Arc::new(KbPaths::new(kb_root));
     paths.ensure_layout().context("ensure_layout")?;
     let store = Arc::new(KbStore::open(&kb_root.join("kb.redb")).context("open kb.redb")?);
-    let index = Arc::new(KbIndex::open_and_rebuild(&paths, &store).context("open index")?);
-    let embedder: Arc<dyn KbEmbedder> = Arc::new(StubEmbedder::default());
+
+    // Pick the embedder. Default: local BGE (bge-small-zh) if a model
+    // dir exists under `<base_dir>/models/`. base_dir is kb_root's
+    // parent (kb_root = <base_dir>/kb). Falls back to StubEmbedder
+    // when no model is present, so the CLI works out-of-the-box on a
+    // fresh install before `rsclaw models download`.
+    let embedder = resolve_embedder(kb_root);
+    let dim = embedder.dimension();
+    let index =
+        Arc::new(KbIndex::open_and_rebuild_with_dim(&paths, &store, dim).context("open index")?);
     Ok(Handles { store, paths, index, embedder })
+}
+
+/// Resolve the KB embedder: prefer a local BGE model, else stub.
+/// Probes `<base_dir>/models/{bge-small-zh,bge-base-zh,bge-small-en}`.
+fn resolve_embedder(kb_root: &PathBuf) -> Arc<dyn KbEmbedder> {
+    let base_dir = kb_root.parent().unwrap_or(kb_root.as_path());
+    let models_dir = base_dir.join("models");
+    for name in ["bge-small-zh", "bge-base-zh", "bge-small-en"] {
+        let dir = models_dir.join(name);
+        if dir.join("model.safetensors").exists() {
+            match crate::kb::embedder::LocalKbEmbedder::load(&dir) {
+                Ok(e) => {
+                    let dim = crate::kb::embedder::KbEmbedder::dimension(&e);
+                    tracing::info!(model = name, dim, "kb: using local BGE embedder");
+                    return Arc::new(e);
+                }
+                Err(e) => {
+                    tracing::warn!(model = name, "kb: BGE load failed, trying next: {e:#}");
+                }
+            }
+        }
+    }
+    tracing::info!("kb: no local BGE model found, using StubEmbedder (1024-dim)");
+    Arc::new(StubEmbedder::default())
 }
 
 async fn add(
