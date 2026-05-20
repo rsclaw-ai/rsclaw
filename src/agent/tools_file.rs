@@ -817,6 +817,21 @@ impl super::runtime::AgentRuntime {
                 cmd.env("PATH", all.join(if cfg!(windows) { ";" } else { ":" }));
             }
         }
+        // Ensure the workspace exists before chdir. A dynamically-spawned
+        // sub-agent's workspace (e.g. ~/.rsclaw/workspace/task-xxx) is only
+        // recorded in the agent entry at spawn time, not created on disk —
+        // and Command::current_dir on a missing directory fails the spawn
+        // with ENOENT ("exec `ls`: No such file or directory (os error 2)")
+        // even though the command itself is perfectly valid.
+        if !workspace.exists() {
+            if let Err(e) = std::fs::create_dir_all(&workspace) {
+                tracing::warn!(
+                    workspace = %workspace.display(),
+                    error = %e,
+                    "exec: failed to create workspace dir; falling back to base_dir"
+                );
+            }
+        }
         cmd.args(&shell_args)
             .arg(command)
             .current_dir(&workspace)
