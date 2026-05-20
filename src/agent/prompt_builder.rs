@@ -605,6 +605,17 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "pdf","text_to_voice","send_message","cron","session","gateway",
     "opencode","claudecode","codex","channel","anycli","clarify","pairing",
     "create_docx","create_pdf","create_xlsx","create_pptx","doc",
+    // Context-recovery tools: static, byte-identical for every client of
+    // this prefix version, so they belong in the cacheable builtin prefix.
+    // Previously misclassified as user_tools, which under prefix_id mode
+    // (dynamic_prefix omitted) meant they were NEVER sent to the model —
+    // so the model could never call read_session_archive despite the
+    // summary/system-prompt telling it to.
+    "read_session_archive","read_artifact",
+    // A2A-only tool, but unconditionally registered in build_tool_list and
+    // byte-identical across clients — same builtin class. Errors gracefully
+    // if called on a non-A2A turn.
+    "wait_input",
 ];
 
 /// Build a minimal system prompt for internal sessions (heartbeat/cron/system).

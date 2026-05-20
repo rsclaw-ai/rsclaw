@@ -260,8 +260,13 @@ pub fn build_tool_list(
     });
     // `use_skill` — first-class entry point for installed skills. Listed
     // EARLY in the tool list so the LLM notices it before web_fetch /
-    // web_browser / shell. Only registered when at least one
-    // skill is installed; otherwise it'd be dead surface area.
+    // web_browser / shell. Registered UNCONDITIONALLY (even with zero
+    // skills installed) so the cacheable base-layer prefix — and the
+    // exported baseline that seeds the rsclaw-server prefix slot — is
+    // DETERMINISTIC regardless of the generating host's skill set. With no
+    // skills installed the model just has nothing valid to pass; that's
+    // cheaper than a baseline whose tool set silently depends on whether
+    // the dump machine happened to have a skill on disk.
     //
     // Critical invariant: this description does NOT enumerate installed
     // skill names. The skill list lives in `user_system` (rendered by
@@ -270,37 +275,35 @@ pub fn build_tool_list(
     // base layer hash. Embedding skill names HERE — inside `tools` —
     // would put them in the base-layer hash input and break cross-host
     // cache reuse for clients with different skill sets installed.
-    if skills.all().next().is_some() {
-        tools.push(ToolDef {
-            name: "use_skill".to_owned(),
-            description:
-                "ACTIVATE an installed skill. Use this BEFORE web_fetch / web_browser / \
-                shell whenever the user's task matches any skill description \
-                shown in the system prompt under '## Installed Skills' (flights, hotels, \
-                stocks, weather, finance data, etc.).\n\n\
-                Returns the full SKILL.md so you know the exact CLI command and flags. \
-                After calling use_skill you typically call shell with the CLI \
-                from skill_md.\n\n\
-                Common failure to avoid: defaulting to web_fetch on a domain a skill \
-                already covers. If a skill description matches, you MUST use_skill first.\n\n\
-                Anti-loop guard: if you can already see the skill's content rendered in \
-                the current turn (e.g. injected via a system message or returned by a \
-                previous use_skill call), DO NOT call use_skill again — follow the \
-                instructions directly. Re-invoking on already-loaded content wastes a \
-                turn and burns context."
-                    .to_owned(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Exact skill name from the '## Installed Skills' list in the system prompt (e.g. 'flyai', 'hithink-market-query'). Case-sensitive."
-                    }
-                },
-                "required": ["name"]
-            }),
-        });
-    }
+    tools.push(ToolDef {
+        name: "use_skill".to_owned(),
+        description:
+            "ACTIVATE an installed skill. Use this BEFORE web_fetch / web_browser / \
+            shell whenever the user's task matches any skill description \
+            shown in the system prompt under '## Installed Skills' (flights, hotels, \
+            stocks, weather, finance data, etc.).\n\n\
+            Returns the full SKILL.md so you know the exact CLI command and flags. \
+            After calling use_skill you typically call shell with the CLI \
+            from skill_md.\n\n\
+            Common failure to avoid: defaulting to web_fetch on a domain a skill \
+            already covers. If a skill description matches, you MUST use_skill first.\n\n\
+            Anti-loop guard: if you can already see the skill's content rendered in \
+            the current turn (e.g. injected via a system message or returned by a \
+            previous use_skill call), DO NOT call use_skill again — follow the \
+            instructions directly. Re-invoking on already-loaded content wastes a \
+            turn and burns context."
+                .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Exact skill name from the '## Installed Skills' list in the system prompt (e.g. 'flyai', 'hithink-market-query'). Case-sensitive."
+                }
+            },
+            "required": ["name"]
+        }),
+    });
     // `task` — escalate the current chat into a multi-turn background task.
     // The LLM decides when sustained work is warranted (implementation
     // spanning many tool calls, multi-file refactor, deep research). For

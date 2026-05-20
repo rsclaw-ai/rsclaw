@@ -24,15 +24,12 @@ use crate::skill::loader::load_skills;
 ///
 /// Keep in sync with the list in `runtime.rs::dump_prompt_spec`. If a
 /// new built-in tool is added, both lists must grow together.
-const BUILTIN_TOOLS: &[&str] = &[
-    "memory", "use_skill", "task", "read_file", "write_file", "send_file",
-    "shell", "agent", "install_tool", "list_dir", "search_file",
-    "search_content", "web_search", "web_fetch", "web_download", "web_browser",
-    "computer_use", "image_gen", "video_gen", "pdf", "text_to_voice",
-    "send_message", "cron", "session", "gateway", "opencode", "claudecode",
-    "codex", "channel", "anycli", "clarify", "pairing",
-    "create_docx", "create_pdf", "create_xlsx", "create_pptx", "doc",
-];
+// Single source of truth for the builtin/user split: reuse the runtime's
+// classification list (prompt_builder::BUILTIN_TOOL_NAMES) instead of a
+// local copy. A local duplicate had silently drifted (was missing
+// task_finish/edit_file/ask_user), which would have produced a baseline
+// export that didn't match what the gateway actually classifies as builtin.
+use crate::agent::prompt_builder::BUILTIN_TOOL_NAMES as BUILTIN_TOOLS;
 
 pub async fn cmd_debug(sub: DebugCommand) -> Result<()> {
     match sub {
