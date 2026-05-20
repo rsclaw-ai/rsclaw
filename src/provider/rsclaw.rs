@@ -3828,6 +3828,7 @@ data: {"type":"block_stop","index":0}
     }
 
     #[tokio::test]
+    #[allow(clippy::never_loop)] // assert-empty: loop body diverges by design
     async fn parse_v1_start_and_ping_emit_nothing() {
         // `start` carries telemetry metadata; `ping` is a keepalive.
         // Neither should surface as a StreamEvent.
@@ -3874,6 +3875,7 @@ data: [DONE]
     }
 
     #[tokio::test]
+    #[allow(clippy::never_loop)] // assert-empty: loop body diverges by design
     async fn parse_v1_block_delta_for_unopened_index_dropped_silently() {
         // A block_delta arriving without a matching block_start (e.g.
         // dropped frame, server bug) must NOT emit an event and must

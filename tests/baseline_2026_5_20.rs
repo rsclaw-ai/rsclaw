@@ -224,11 +224,10 @@ fn baseline_builtin_tools_byte_stable() {
 
         let mut diff_names = Vec::new();
         for (a, e) in actual_arr.iter().zip(expected.iter()) {
-            if a != e {
-                if let Some(n) = a.get("name").and_then(|n| n.as_str()) {
+            if a != e
+                && let Some(n) = a.get("name").and_then(|n| n.as_str()) {
                     diff_names.push(n.to_owned());
                 }
-            }
         }
         panic!(
             "builtin_tools CONTENT drifted from 2026.5.20 baseline (names matched, \

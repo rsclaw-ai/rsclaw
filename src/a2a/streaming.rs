@@ -21,7 +21,7 @@ use crate::{
     a2a::{
         event::AgentEvent,
         types::{
-            A2aArtifact, A2aMessage, A2aPart, A2aTask, A2aTaskStatus, JsonRpcRequest,
+            A2aArtifact, A2aMessage, A2aTask, A2aTaskStatus, JsonRpcRequest,
             SendMessageParams, TaskState,
         },
     },

@@ -12,9 +12,7 @@
 //! - `head:N`       — first N messages (oldest)
 //! - `tail:N`       — last N messages (newest)
 //! - `seq:A-B`      — 1-indexed inclusive seq range
-//! - `grep:PAT`     — case-insensitive regex over each message's text
-//!                    (substring works since literal patterns are valid
-//!                    regex; alternation like `error|fail|warn` works)
+//! - `grep:PAT`     — case-insensitive regex over each message's text (substring works since literal patterns are valid regex; alternation like `error|fail|warn` works)
 //!
 //! Large messages (> ARTIFACT_THRESHOLD_CHARS) get nested through the
 //! artifact pipeline: each oversized hit is written to its own artifact

@@ -1,0 +1,1 @@
+Plain text fixture for Week 1 e2e.

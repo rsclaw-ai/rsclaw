@@ -713,6 +713,22 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         a2a_bus.clone(),
     ));
 
+    // User-managed RAG knowledge base. Open once; spawn the async indexing
+    // worker that drains embed jobs in the background. A failure here (corrupt
+    // store, bad permissions, full disk) disables KB but must not abort the
+    // gateway — every other channel and provider stays up.
+    let knowledge_svc = match crate::kb::KnowledgeService::open(base_dir.join("kb")) {
+        Ok(svc) => {
+            let svc = Arc::new(svc);
+            svc.spawn_worker();
+            Some(svc)
+        }
+        Err(e) => {
+            tracing::error!("knowledge base disabled: failed to open store: {e:#}");
+            None
+        }
+    };
+
     let state = AppState {
         config: Arc::clone(&config),
         live: Arc::clone(&live),
@@ -745,6 +761,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         suspended_tasks: Arc::new(dashmap::DashMap::new()),
         task_store: a2a_task_store,
         push_dispatcher: a2a_push_dispatcher,
+        knowledge: knowledge_svc,
     };
     crate::ws::tick::start_tick_loop(Arc::clone(&state.ws_conns));
 

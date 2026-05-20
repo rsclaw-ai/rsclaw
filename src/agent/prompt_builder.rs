@@ -216,6 +216,10 @@ pub fn build_shared_system_prefix() -> String {
     SHARED_SYSTEM_PREFIX.clone()
 }
 
+// Pre-existing (not part of the KB work): the sequential `parts.push(..)`
+// blocks below read more clearly than one giant `vec![..]` literal. Suppress
+// the clippy lint locally rather than restructure unrelated prompt code.
+#[allow(clippy::vec_init_then_push)]
 fn build_shared_system_prefix_uncached() -> String {
     let mut parts: Vec<String> = Vec::new();
 

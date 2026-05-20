@@ -59,6 +59,8 @@ use crate::{
     ws::types::EventFrame,
 };
 
+mod knowledge;
+
 // ---------------------------------------------------------------------------
 // Timing-safe token comparison
 // ---------------------------------------------------------------------------
@@ -173,6 +175,11 @@ pub struct AppState {
     pub task_store: Arc<crate::a2a::store::TaskStore>,
     /// Push notification dispatcher (subscribes to event bus, signs payloads).
     pub push_dispatcher: Arc<crate::a2a::push::PushDispatcher>,
+    /// User-managed RAG knowledge base (desktop `/api/v1/knowledge/*`).
+    /// Collections are a tag veneer over the single KB store. `None` when
+    /// the KB store failed to open — the gateway still serves everything
+    /// else and the `/knowledge` routes are simply not mounted.
+    pub knowledge: Option<Arc<crate::kb::KnowledgeService>>,
 }
 
 // AgentEvent is defined in crate::events to avoid circular deps with agent.
@@ -242,7 +249,7 @@ struct PatchAgentRequest {
 // ---------------------------------------------------------------------------
 
 pub fn build_router(state: AppState) -> Router {
-    let api = Router::new()
+    let mut api = Router::new()
         .route("/message", post(send_message))
         .route("/sessions", get(list_sessions))
         .route("/sessions/{id}", get(get_session).delete(delete_session))
@@ -320,6 +327,13 @@ pub fn build_router(state: AppState) -> Router {
         // and land in a follow-up.
         .route("/memory/docs", get(memory_list_docs))
         .route("/memory/stats", get(memory_stats));
+
+    // Mount the knowledge base routes only when the store opened. A KB
+    // open failure leaves `knowledge` None; the rest of the API still serves.
+    if let Some(k) = state.knowledge.clone() {
+        let max_doc_bytes = k.max_doc_bytes();
+        api = api.nest("/knowledge", knowledge::routes(max_doc_bytes).with_state(k));
+    }
 
     Router::new()
         .nest("/api/v1", api)

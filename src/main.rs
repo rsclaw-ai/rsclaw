@@ -34,7 +34,8 @@ use cli::{AcpCommand, Cli, Command};
 use cmd::{
     cmd_agent_turn, cmd_agents, cmd_anycli, cmd_browser, cmd_approvals, cmd_backup, cmd_channels, cmd_completion,
     cmd_config, cmd_configure, cmd_cron, cmd_daemon, cmd_dashboard, cmd_debug, cmd_devices, cmd_directory,
-    cmd_dns, cmd_docs, cmd_doctor, cmd_env, cmd_gateway, cmd_health, cmd_hooks, cmd_logs, cmd_memory,
+    cmd_dns, cmd_docs, cmd_doctor, cmd_env, cmd_gateway, cmd_health, cmd_hooks, cmd_kb, cmd_logs,
+    cmd_memory,
     cmd_message, cmd_migrate, cmd_models, cmd_onboard, cmd_plugins, cmd_qr, cmd_reset, cmd_sandbox,
     cmd_secrets, cmd_security, cmd_sessions, cmd_setup, cmd_skills, cmd_status, cmd_system,
     cmd_tools, cmd_tray, cmd_tui, cmd_uninstall, cmd_update, cmd_watch, cmd_webhooks,
@@ -176,6 +177,7 @@ async fn run() -> Result<()> {
         Command::Skills(sub) => cmd_skills(sub).await,
         Command::Plugins(sub) => cmd_plugins(sub).await,
         Command::Message(sub) => cmd_message(sub).await,
+        Command::Kb(sub) => cmd_kb(sub, base_dir.join("kb")).await,
         Command::Memory(sub) => cmd_memory(sub).await,
         Command::Migrate(args) => cmd_migrate(args).await,
         Command::Sessions(sub) => cmd_sessions(sub).await,
