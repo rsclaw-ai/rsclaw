@@ -475,22 +475,16 @@ impl HeartbeatRunner {
 
     /// Send a heartbeat message to the agent and wait for reply.
     async fn send_heartbeat(&self, agent_id: &str, state_key: &str, content: &str) -> Result<()> {
-        // Reject state_key values that would collide with reserved
-        // session_key namespaces. `format!("heartbeat:{state_key}")`
-        // produces the session_key the runtime stores against; the
-        // is_internal_session / is_minimal_context_session checks
-        // only look at the FIRST ":"-delimited token. If a state_key
-        // ever contained ":" (e.g. "heartbeat:cron:foo" from a
-        // mis-handled cron channel), a user-channel session matching
-        // that literal prefix could be classified as internal and
-        // silently lose all tools. R2 review I4.
-        if state_key.contains(':') {
-            bail!(
-                "heartbeat state_key must not contain ':' (got {state_key:?}); \
-                 the colon would collide with the heartbeat:* namespace prefix"
-            );
-        }
-
+        // No state_key validation here. The R2 I4 reviewer worried that
+        // `:` in state_key would break is_internal_session — but that
+        // check is a literal `starts_with("heartbeat:")` (first-segment
+        // prefix match), so any number of additional `:` segments past
+        // the prefix are routed correctly. Session keys throughout this
+        // codebase routinely chain multiple `:` segments (e.g.
+        // `agent:main:feishu:direct:ou_xxx`), so banning `:` here was
+        // both unnecessary and broke heartbeat permanently — the
+        // adjacent agent_loop builds `state_key = "{agent_id}:{file}"`,
+        // which the old validator then rejected at every tick.
         let handle = self.registry.get(agent_id)
             .map_err(|e| anyhow!("agent not found: {e:#}"))?;
 
