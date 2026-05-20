@@ -24,10 +24,11 @@ use crate::kb::tools::kb_search::{self, KbSearchFilter, KbSearchInput};
 use crate::kb::worker::{DefaultDispatcher, HandlerCtx, WorkerConfig, WorkerPool};
 use crate::kb::{KbEmbedder, KbIndex, KbPaths, KbStore};
 use redb::ReadableTable;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::broadcast;
 
 /// Service-level errors the HTTP layer maps to status codes + error envelope.
 #[derive(Debug, thiserror::Error)]
@@ -99,6 +100,9 @@ pub struct KnowledgeService {
     index: Arc<KbIndex>,
     embedder: Arc<dyn KbEmbedder>,
     kb_root: PathBuf,
+    /// Broadcasts `knowledge.doc.status_changed` JSON events to SSE
+    /// subscribers (`GET /api/v1/knowledge/events`).
+    events: broadcast::Sender<String>,
 }
 
 impl KnowledgeService {
@@ -111,7 +115,43 @@ impl KnowledgeService {
         let embedder = resolve_embedder(&kb_root);
         let dim = embedder.dimension();
         let index = Arc::new(KbIndex::open_and_rebuild_with_dim(&paths, &store, dim)?);
-        Ok(Self { store, paths, index, embedder, kb_root })
+        let (events, _) = broadcast::channel(256);
+        Ok(Self { store, paths, index, embedder, kb_root, events })
+    }
+
+    /// Subscribe to `knowledge.doc.status_changed` events (for SSE).
+    pub fn subscribe(&self) -> broadcast::Receiver<String> {
+        self.events.subscribe()
+    }
+
+    /// Emit a `status_changed=ready` event for each doc that has newly gained
+    /// its first indexed chunk since `emitted` was last updated. `emitted`
+    /// tracks already-announced docs to avoid duplicates.
+    fn emit_ready_transitions(&self, emitted: &mut HashSet<String>) {
+        if let Ok(ready) = self.ready_doc_ids() {
+            for id in ready {
+                if emitted.insert(id.clone()) {
+                    let payload = serde_json::json!({
+                        "type": "knowledge.doc.status_changed",
+                        "docId": id,
+                        "status": "ready",
+                    })
+                    .to_string();
+                    let _ = self.events.send(payload);
+                }
+            }
+        }
+    }
+
+    /// Active doc ids that currently have ≥1 indexed chunk (i.e. `ready`).
+    fn ready_doc_ids(&self) -> anyhow::Result<HashSet<String>> {
+        let rtx = self.store.begin_read()?;
+        Ok(self
+            .chunk_counts(&rtx)?
+            .into_iter()
+            .filter(|(_, n)| *n > 0)
+            .map(|(id, _)| id)
+            .collect())
     }
 
     pub fn kb_root(&self) -> &Path {
@@ -140,13 +180,20 @@ impl KnowledgeService {
         let this = Arc::clone(self);
         std::thread::Builder::new()
             .name("kb-knowledge-worker".into())
-            .spawn(move || loop {
-                match this.drain_once() {
-                    Ok(true) => {} // did work; immediately look for the next job
-                    Ok(false) => std::thread::sleep(Duration::from_millis(500)),
-                    Err(e) => {
-                        tracing::warn!("kb knowledge worker: {e:#}");
-                        std::thread::sleep(Duration::from_secs(2));
+            .spawn(move || {
+                // Seed with already-ready docs so we don't replay a burst of
+                // status events for the existing corpus on startup.
+                let mut emitted: HashSet<String> = this.ready_doc_ids().unwrap_or_default();
+                loop {
+                    match this.drain_once() {
+                        // A job finished — emit status_changed=ready for any doc
+                        // that just gained its first indexed chunk.
+                        Ok(true) => this.emit_ready_transitions(&mut emitted),
+                        Ok(false) => std::thread::sleep(Duration::from_millis(500)),
+                        Err(e) => {
+                            tracing::warn!("kb knowledge worker: {e:#}");
+                            std::thread::sleep(Duration::from_secs(2));
+                        }
                     }
                 }
             })
@@ -638,6 +685,25 @@ mod tests {
         assert_eq!(st.collection_count, 1);
         assert_eq!(st.doc_count, 2);
         assert!(st.chunk_count >= 2);
+    }
+
+    #[test]
+    fn sse_emits_status_changed_when_doc_becomes_ready() {
+        let (_t, s) = svc();
+        let c = s.create_collection("kb", None, None).unwrap();
+        let mut rx = s.subscribe();
+        let (doc_id, _) = s
+            .ingest(&c.id, "a.md", b"# A\n\nhello indexed body", Some("text/markdown"))
+            .unwrap();
+        while s.drain_once().unwrap() {}
+        let mut emitted = HashSet::new();
+        s.emit_ready_transitions(&mut emitted);
+        let msg = rx.try_recv().expect("expected an SSE status event");
+        assert!(msg.contains("knowledge.doc.status_changed"), "got: {msg}");
+        assert!(msg.contains(&doc_id), "got: {msg}");
+        // idempotent: no duplicate for the same doc
+        s.emit_ready_transitions(&mut emitted);
+        assert!(rx.try_recv().is_err(), "should not re-emit for the same doc");
     }
 
     #[test]

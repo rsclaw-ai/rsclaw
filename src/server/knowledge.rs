@@ -15,6 +15,11 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use axum::response::sse::{Event, KeepAlive, Sse};
+use futures::{Stream, StreamExt as _};
+use std::convert::Infallible;
+use std::time::Duration;
+
 use crate::kb::model::KbCollection;
 use crate::kb::service::DocInfo;
 use crate::kb::KnowledgeError;
@@ -45,6 +50,7 @@ pub fn routes() -> Router<AppState> {
         .route("/search", post(search))
         .route("/stats", get(stats))
         .route("/embedders", get(embedders))
+        .route("/events", get(events))
         // Allow large document uploads (default axum limit is 2MB).
         .layer(DefaultBodyLimit::max(MAX_DOC_BYTES))
 }
@@ -454,6 +460,22 @@ async fn stats(State(st): State<AppState>) -> Response {
         .into_response(),
         Err(e) => err_response(e),
     }
+}
+
+/// SSE stream of `knowledge.doc.status_changed` events, so the UI can react to
+/// async indexing finishing without polling. Each event's data is the JSON
+/// `{ type, docId, status }`.
+async fn events(State(st): State<AppState>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let rx = st.knowledge.subscribe();
+    let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|msg| async move {
+        let data = msg.ok()?;
+        Some(Ok(Event::default().data(data)))
+    });
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("ping"),
+    )
 }
 
 async fn embedders(State(st): State<AppState>) -> Response {
