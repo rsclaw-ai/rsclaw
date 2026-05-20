@@ -187,8 +187,9 @@ async fn patch_collection(
 
 async fn delete_collection(State(st): State<AppState>, Path(id): Path<String>) -> Response {
     match st.knowledge.delete_collection(&id) {
-        // Doc/chunk cascade counts land in P2; report 0 for now.
-        Ok(()) => Json(serde_json::json!({ "deletedDocs": 0, "deletedChunks": 0 })).into_response(),
+        Ok(deleted_docs) => {
+            Json(serde_json::json!({ "deletedDocs": deleted_docs })).into_response()
+        }
         Err(e) => err_response(e),
     }
 }

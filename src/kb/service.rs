@@ -506,15 +506,22 @@ impl KnowledgeService {
         Ok(c)
     }
 
-    pub fn delete_collection(&self, id: &str) -> KResult<()> {
+    /// Delete a collection and tombstone all of its documents (the compactor
+    /// reaps their chunks/vectors later). Returns the number of docs removed.
+    pub fn delete_collection(&self, id: &str) -> KResult<usize> {
         self.get_collection(id)?; // 404 if absent
+        let tag = collection_tag(id);
+        let rtx = self.store.begin_read()?;
+        let docs_to_remove = self.collect_active_docs(&rtx, &tag)?;
+        drop(rtx);
         let wtx = self.store.begin_write()?;
+        for mut d in docs_to_remove.iter().cloned() {
+            d.status = KbStatus::Tombstoned;
+            docs::put(&wtx, &d)?;
+        }
         collections::delete(&wtx, id)?;
         wtx.commit().map_err(anyhow::Error::from)?;
-        // TODO(P2): cascade — remove docs tagged `collection_tag(id)` plus
-        // their chunks/vectors, alongside the doc remove path.
-        let _ = collection_tag(id);
-        Ok(())
+        Ok(docs_to_remove.len())
     }
 }
 
@@ -631,6 +638,21 @@ mod tests {
         assert_eq!(st.collection_count, 1);
         assert_eq!(st.doc_count, 2);
         assert!(st.chunk_count >= 2);
+    }
+
+    #[test]
+    fn delete_collection_cascades_docs() {
+        let (_t, s) = svc();
+        let c = s.create_collection("kb", None, None).unwrap();
+        s.ingest(&c.id, "a.md", b"# A\n\nbody one here", Some("text/markdown")).unwrap();
+        s.ingest(&c.id, "b.md", b"# B\n\nbody two here", Some("text/markdown")).unwrap();
+        while s.drain_once().unwrap() {}
+        let removed = s.delete_collection(&c.id).unwrap();
+        assert_eq!(removed, 2);
+        assert!(matches!(
+            s.get_collection(&c.id),
+            Err(KnowledgeError::CollectionNotFound)
+        ));
     }
 
     #[test]
