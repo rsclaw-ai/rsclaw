@@ -1106,8 +1106,9 @@ pub fn vision_unavailable_message(reason: &str) -> String {
 impl AgentRuntime {
 
     /// Estimate fixed context overhead: system prompt + tools tokens.
-    /// Used for pre-flight context budget check before LLM call.
-    fn estimate_fixed_overhead(&self) -> usize {
+    /// Used for pre-flight context budget check before LLM call, and by
+    /// the compaction module's estimate fallback.
+    pub(crate) fn estimate_fixed_overhead(&self) -> usize {
         // Estimate system prompt from last known size (more accurate than guessing).
         let sys_tokens = self.handle.last_sys_tokens.load(Ordering::Relaxed);
         let tools_tokens = self.handle.last_tools_tokens.load(Ordering::Relaxed);

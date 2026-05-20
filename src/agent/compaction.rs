@@ -101,33 +101,64 @@ impl AgentRuntime {
         let cfg = self.live.agents.read().await.defaults.compaction.clone()
             .unwrap_or_default();
 
-        // Compaction trigger: token threshold ONLY.
-        // Turn count and time-based triggers were removed because they
-        // unnecessarily discard context and break KV cache in the new
-        // append-only architecture.
-        let context_tokens = self.live.agents.read().await.defaults.context_tokens.unwrap_or(64_000) as usize;
-        let kv_cache_mode = self.live.agents.read().await.defaults.kv_cache_mode.unwrap_or(1);
-        // kvCacheMode >= 1: append-only mode, compact at 80% to leave headroom
-        // for token estimation inaccuracy (10-15%). Mode 0: legacy 50% threshold.
-        let default_threshold = if kv_cache_mode >= 1 {
-            (context_tokens * 4 / 5).max(16_000) // 80% — safe margin for estimation error
+        // Compaction trigger: token threshold against the FULL prompt size
+        // (system + tools + message history), not message history alone.
+        //
+        // Previously this compared `sum(msg_tokens)` against an 80%-of-context
+        // threshold — but msg_tokens excludes the ~24K of system prompt + tool
+        // definitions that every request also carries. On a 64K context with
+        // 6K system + 17.5K tools, the backend rejects at ~40K msg_tokens, yet
+        // the old check didn't fire until 51K msg_tokens — so the model 413'd
+        // before compaction ever ran. Compare against `total` instead.
+        // Per-agent context window wins (agent.model.contextTokens), then
+        // the global default, then 64K. handle.context_window already
+        // resolved that chain at construction (0 = unset → use default).
+        let context_tokens = if self.handle.context_window > 0 {
+            self.handle.context_window
         } else {
-            (context_tokens / 2).max(16_000)      // 50% — same as hermes, save tokens/cost
+            self.live.agents.read().await.defaults.context_tokens.unwrap_or(64_000) as usize
         };
-        // reserveTokensFloor is the MINIMUM tokens to keep free for replies.
-        // Trigger compaction when used tokens exceed (contextTokens - reserveFloor).
-        // NOT a direct threshold — it's how much headroom to leave.
+        // Used later to pick the splice strategy (mode 2 = rsclaw stateful).
+        let kv_cache_mode = self.live.agents.read().await.defaults.kv_cache_mode.unwrap_or(1);
+
+        // Headroom to leave below the context window for: the model's reply,
+        // the next user message, and token-estimation drift. `reserveTokensFloor`
+        // (if configured) is authoritative; otherwise reserve 5% + a fixed
+        // margin for the next inbound message.
+        const NEXT_MSG_MARGIN: usize = 4_000;
+        let reply_reserve = (context_tokens / 20).max(2_000);
         let token_threshold = if let Some(floor) = cfg.reserve_tokens_floor {
             context_tokens.saturating_sub(floor as usize).max(16_000)
         } else {
-            default_threshold
+            context_tokens
+                .saturating_sub(reply_reserve)
+                .saturating_sub(NEXT_MSG_MARGIN)
+                .max(16_000)
         };
 
-        let total_tokens: usize = self
-            .sessions
-            .get(session_key)
-            .map(|msgs| msgs.iter().map(msg_tokens).sum())
-            .unwrap_or(0);
+        // Prefer the server-measured prompt size (input_tokens from the last
+        // turn's usage, stored as `SessionTokens.total`) — it's exact, vs the
+        // chars/4 heuristic which drifts 10-30% on CJK / code. Falls back to
+        // the estimate (msg_tokens sum + fixed sys/tools overhead) when usage
+        // wasn't reported (e.g. first turn, or a provider that omits usage).
+        let real_total = self
+            .handle
+            .session_tokens
+            .read()
+            .ok()
+            .and_then(|m| m.get(session_key).map(|t| t.total))
+            .filter(|&t| t > 0);
+        let total_tokens: usize = real_total.unwrap_or_else(|| {
+            let msgs: usize = self
+                .sessions
+                .get(session_key)
+                .map(|msgs| msgs.iter().map(msg_tokens).sum())
+                .unwrap_or(0);
+            // Add the fixed system+tools overhead so the estimate is
+            // comparable to `total` (a full-prompt number).
+            let overhead = self.estimate_fixed_overhead();
+            msgs + overhead
+        });
 
         let turns = self
             .compaction_state
