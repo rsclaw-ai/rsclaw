@@ -7,7 +7,8 @@
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    body::to_bytes,
+    extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Request, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
@@ -18,6 +19,10 @@ use crate::kb::model::KbCollection;
 use crate::kb::service::DocInfo;
 use crate::kb::KnowledgeError;
 use crate::server::AppState;
+
+/// Max upload size (JSON body or multipart file). Mirrors the spec's
+/// `knowledge.maxDocMb` default; could be made configurable later.
+const MAX_DOC_BYTES: usize = 50 * 1024 * 1024;
 
 /// Routes nested under `/api/v1/knowledge`.
 pub fn routes() -> Router<AppState> {
@@ -36,6 +41,8 @@ pub fn routes() -> Router<AppState> {
             get(get_doc).delete(delete_doc),
         )
         .route("/collections/{id}/docs/{doc_id}/content", get(get_doc_content))
+        // Allow large document uploads (default axum limit is 2MB).
+        .layer(DefaultBodyLimit::max(MAX_DOC_BYTES))
 }
 
 // --- error mapping --------------------------------------------------------
@@ -235,30 +242,94 @@ fn bad_request(code: &str) -> Response {
         .into_response()
 }
 
-/// Upload a text/markdown document as JSON. Binary files (pdf/docx/...) use
-/// the multipart path (added next); the backend canonicalizes either way.
-/// Returns 202 — indexing runs in the background.
-async fn upload_doc(
-    State(st): State<AppState>,
-    Path(cid): Path<String>,
-    Json(req): Json<UploadJsonReq>,
+/// Upload a document. Accepts either `application/json` ({title, text, mime?})
+/// for text/markdown, or `multipart/form-data` (title field + file field) for
+/// binary files (pdf/docx/xlsx/pptx) — the backend canonicalizes either way.
+/// Returns 202; indexing runs in the background.
+async fn upload_doc(State(st): State<AppState>, Path(cid): Path<String>, req: Request) -> Response {
+    let ct = req
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if ct.starts_with("multipart/form-data") {
+        upload_multipart(st, cid, req).await
+    } else {
+        // Treat everything else as JSON.
+        let body = match to_bytes(req.into_body(), MAX_DOC_BYTES).await {
+            Ok(b) => b,
+            Err(_) => return bad_request("body_too_large"),
+        };
+        let parsed: UploadJsonReq = match serde_json::from_slice(&body) {
+            Ok(p) => p,
+            Err(_) => return bad_request("invalid_json"),
+        };
+        if parsed.text.is_empty() {
+            return bad_request("empty_content");
+        }
+        ingest_and_respond(
+            &st,
+            &cid,
+            parsed.title.trim(),
+            parsed.text.as_bytes(),
+            parsed.mime.as_deref(),
+        )
+    }
+}
+
+async fn upload_multipart(st: AppState, cid: String, req: Request) -> Response {
+    let mut mp = match Multipart::from_request(req, &st).await {
+        Ok(m) => m,
+        Err(_) => return bad_request("invalid_multipart"),
+    };
+    let mut title: Option<String> = None;
+    let mut file_name: Option<String> = None;
+    let mut bytes: Option<Vec<u8>> = None;
+    while let Ok(Some(field)) = mp.next_field().await {
+        match field.name().unwrap_or("") {
+            "title" => title = field.text().await.ok(),
+            "file" => {
+                file_name = field.file_name().map(|s| s.to_string());
+                bytes = field.bytes().await.ok().map(|b| b.to_vec());
+            }
+            _ => {}
+        }
+    }
+    let bytes = match bytes {
+        Some(b) if !b.is_empty() => b,
+        _ => return bad_request("empty_content"),
+    };
+    // Title precedence: explicit `title` field, else the uploaded filename.
+    // The filename also drives MIME detection (OOXML magic is just zip), so we
+    // pass mime=None and let `ingest` detect from the title/extension.
+    let title = title
+        .filter(|t| !t.trim().is_empty())
+        .or(file_name)
+        .unwrap_or_default();
+    ingest_and_respond(&st, &cid, title.trim(), &bytes, None)
+}
+
+/// Validate + ingest + 202. Shared by the JSON and multipart paths.
+fn ingest_and_respond(
+    st: &AppState,
+    cid: &str,
+    title: &str,
+    bytes: &[u8],
+    mime: Option<&str>,
 ) -> Response {
-    let title = req.title.trim().to_string();
     if title.is_empty() {
         return bad_request("title_required");
     }
-    if req.text.is_empty() {
+    if bytes.is_empty() {
         return bad_request("empty_content");
     }
-    let bytes = req.text.len();
-    match st
-        .knowledge
-        .ingest(&cid, &title, req.text.as_bytes(), req.mime.as_deref())
-    {
+    match st.knowledge.ingest(cid, title, bytes, mime) {
         Ok((id, _noop)) => (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({
-                "id": id, "title": title, "status": "pending", "bytes": bytes
+                "id": id, "title": title, "status": "pending", "bytes": bytes.len()
             })),
         )
             .into_response(),
