@@ -3990,9 +3990,20 @@ impl AgentRuntime {
             // production as a 75s turn after a 27K-token threshold trip).
             // Defer to the server in that mode; it splices locally without
             // breaking incremental cache hits.
-            let kv_cache_mode = self.live.agents.read().await.defaults.kv_cache_mode.unwrap_or(1);
+            //
+            // Mirror the auto-force at line ~4277: when the resolved
+            // provider is `rsclaw`, the provider IS the kvCacheMode=2
+            // protocol, so treat it as mode 2 even if agents.defaults
+            // didn't set kv_cache_mode (default is 1).
+            let configured_kv_mode = self.live.agents.read().await.defaults.kv_cache_mode.unwrap_or(1);
+            let (resolved_provider, _) = self.providers.resolve_model(model);
+            let effective_kv_mode = if resolved_provider == "rsclaw" {
+                2
+            } else {
+                configured_kv_mode
+            };
             let scratchpad_tokens: usize = turn_scratchpad.iter().map(msg_tokens).sum();
-            if kv_cache_mode < 2
+            if effective_kv_mode < 2
                 && let Some(sess) = self.sessions.get_mut(&ctx.session_key)
             {
                 apply_context_budget_trim(
