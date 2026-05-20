@@ -2554,9 +2554,11 @@ fn serialize_replay_history(messages: &[&Message]) -> Vec<Value> {
 /// Per-stream state for the v1 native protocol. Frames are
 /// block-oriented (Anthropic Messages-style):
 ///
-///     block_start{index, block:{type,id?,name?}}
-///     block_delta{index, delta}     (zero or more, may interleave by index)
-///     block_stop{index}
+/// ```text
+/// block_start{index, block:{type,id?,name?}}
+/// block_delta{index, delta}     (zero or more, may interleave by index)
+/// block_stop{index}
+/// ```
 ///
 /// `blocks` tracks open builders keyed by the `index` field so deltas
 /// for interleaved parallel blocks (e.g. one `text` and one `tool_call`
