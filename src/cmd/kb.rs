@@ -56,9 +56,47 @@ fn open_kb(kb_root: &PathBuf) -> Result<Handles> {
     Ok(Handles { store, paths, index, embedder })
 }
 
-/// Resolve the KB embedder: prefer a local BGE model, else stub.
-/// Probes `<base_dir>/models/{bge-small-zh,bge-base-zh,bge-small-en}`.
+/// Resolve the KB embedder. Precedence:
+///   1. Remote OpenAI-compatible (`memorySearch.provider = "openai"`) —
+///      reuse the shared embedding config so KB and memory hit the same
+///      GPU-fleet `/v1/embeddings` (e.g. Qwen3-Embedding).
+///   2. Local BGE model under `<base_dir>/models/{bge-small-zh,bge-base-zh,
+///      bge-small-en}`.
+///   3. StubEmbedder (deterministic) so a fresh install works out of the box.
 fn resolve_embedder(kb_root: &PathBuf) -> Arc<dyn KbEmbedder> {
+    if let Some(cfg) = crate::config::load()
+        .ok()
+        .and_then(|c| c.raw.memory_search.clone())
+    {
+        if cfg.provider.as_deref() == Some("openai") {
+            let model = cfg
+                .model
+                .clone()
+                .unwrap_or_else(|| crate::embed::OPENAI_DEFAULT_MODEL.to_owned());
+            let api_key = cfg
+                .api_key
+                .as_ref()
+                .and_then(|s| s.resolve_early())
+                .or_else(|| std::env::var("OPENAI_API_KEY").ok());
+            let dim = cfg
+                .dimensions
+                .unwrap_or_else(|| crate::embed::openai_model_dim(&model)) as usize;
+            let base_url = cfg
+                .base_url
+                .clone()
+                .unwrap_or_else(|| crate::embed::OPENAI_DEFAULT_BASE_URL.to_owned());
+            tracing::info!(
+                model = %model,
+                dim,
+                base_url = %base_url,
+                "kb: using remote OpenAI-compatible embedder"
+            );
+            return Arc::new(crate::kb::embedder::LocalKbEmbedder::remote_openai(
+                base_url, model, api_key, dim,
+            ));
+        }
+    }
+
     let base_dir = kb_root.parent().unwrap_or(kb_root.as_path());
     let models_dir = base_dir.join("models");
     for name in ["bge-small-zh", "bge-base-zh", "bge-small-en"] {
