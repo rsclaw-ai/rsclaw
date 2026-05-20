@@ -7,11 +7,16 @@
 //! embedder. P1 covers collection metadata CRUD; docs + search grow the
 //! service in P2/P3.
 
+use crate::kb::canonicalize::{canonicalize_by_mime, detect_mime, CanonicalizeInput};
+use crate::kb::embedder::resolve_embedder;
 use crate::kb::model::{collection_tag, KbCollection};
+use crate::kb::pipeline::{ingest_canonicalized, IngestInput};
 use crate::kb::store::collections;
-use crate::kb::{KbPaths, KbStore};
+use crate::kb::worker::{DefaultDispatcher, HandlerCtx, WorkerConfig, WorkerPool};
+use crate::kb::{KbEmbedder, KbIndex, KbPaths, KbStore};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Service-level errors the HTTP layer maps to status codes + error envelope.
 #[derive(Debug, thiserror::Error)]
@@ -28,16 +33,23 @@ pub type KResult<T> = Result<T, KnowledgeError>;
 
 pub struct KnowledgeService {
     store: Arc<KbStore>,
+    paths: Arc<KbPaths>,
+    index: Arc<KbIndex>,
+    embedder: Arc<dyn KbEmbedder>,
     kb_root: PathBuf,
 }
 
 impl KnowledgeService {
-    /// Open (or create) the KB store under `kb_root` (e.g. `<base>/kb`).
+    /// Open (or create) the KB under `kb_root` (e.g. `<base>/kb`): store,
+    /// HNSW + full-text index, and the resolved embedder.
     pub fn open(kb_root: PathBuf) -> anyhow::Result<Self> {
-        let paths = KbPaths::new(&kb_root);
+        let paths = Arc::new(KbPaths::new(&kb_root));
         paths.ensure_layout()?;
         let store = Arc::new(KbStore::open(&kb_root.join("kb.redb"))?);
-        Ok(Self { store, kb_root })
+        let embedder = resolve_embedder(&kb_root);
+        let dim = embedder.dimension();
+        let index = Arc::new(KbIndex::open_and_rebuild_with_dim(&paths, &store, dim)?);
+        Ok(Self { store, paths, index, embedder, kb_root })
     }
 
     pub fn kb_root(&self) -> &Path {
@@ -45,6 +57,81 @@ impl KnowledgeService {
     }
     pub fn store(&self) -> &Arc<KbStore> {
         &self.store
+    }
+
+    /// Process one queued KB job (chunk + embed + index). Returns whether a
+    /// job was claimed. Used by the background worker and tests.
+    pub fn drain_once(&self) -> anyhow::Result<bool> {
+        let ctx = HandlerCtx {
+            store: self.store.clone(),
+            paths: self.paths.clone(),
+            embedder: self.embedder.clone(),
+            index: self.index.clone(),
+        };
+        WorkerPool::run_one_blocking(&ctx, &WorkerConfig::default(), &DefaultDispatcher)
+    }
+
+    /// Spawn a background thread that drains KB jobs forever, so document
+    /// indexing runs asynchronously after upload. Idempotent per service
+    /// instance is the caller's responsibility (call once at startup).
+    pub fn spawn_worker(self: &Arc<Self>) {
+        let this = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("kb-knowledge-worker".into())
+            .spawn(move || loop {
+                match this.drain_once() {
+                    Ok(true) => {} // did work; immediately look for the next job
+                    Ok(false) => std::thread::sleep(Duration::from_millis(500)),
+                    Err(e) => {
+                        tracing::warn!("kb knowledge worker: {e:#}");
+                        std::thread::sleep(Duration::from_secs(2));
+                    }
+                }
+            })
+            .expect("spawn kb knowledge worker thread");
+    }
+
+    /// Ingest a document into a collection. Stores + tags it and enqueues the
+    /// embed job (drained by the background worker). Returns `(doc_id, noop)`;
+    /// `noop` means identical content was already present. `mime` overrides
+    /// MIME detection (the JSON upload path passes it explicitly).
+    pub fn ingest(
+        &self,
+        collection_id: &str,
+        title: &str,
+        bytes: &[u8],
+        mime: Option<&str>,
+    ) -> KResult<(String, bool)> {
+        self.get_collection(collection_id)?; // 404 if the collection is gone
+        let detected = mime
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| detect_mime(bytes, Some(title)));
+        let ext = title.rsplit('.').next().filter(|e| *e != title).unwrap_or("");
+        let mut canon = canonicalize_by_mime(CanonicalizeInput {
+            bytes,
+            mime: &detected,
+            hint_title: Some(title),
+            logical_source_id_seed: None,
+        })?
+        .ok_or_else(|| {
+            KnowledgeError::Internal(anyhow::anyhow!("unsupported or empty content (mime={detected})"))
+        })?;
+        canon.metadata.tags.push(collection_tag(collection_id));
+        let lsid = canon.metadata.logical_source_id.as_str().to_string();
+        let out = ingest_canonicalized(
+            &self.store,
+            IngestInput {
+                canon: &canon,
+                raw_bytes: bytes,
+                raw_ext: ext,
+                visibility: None,
+                owner_user_id: None,
+                seen_key: Some(("knowledge", &lsid)),
+                source: None,
+                paths: &self.paths,
+            },
+        )?;
+        Ok((out.doc_id, out.noop))
     }
 
     /// All collections, newest first.
@@ -176,6 +263,40 @@ mod tests {
         // old name is now reusable
         s.create_collection("旧名", None, None).unwrap();
         assert_eq!(s.get_collection(&c.id).unwrap().name, "新名");
+    }
+
+    #[test]
+    fn ingest_enqueues_and_worker_drains() {
+        let (_t, s) = svc();
+        let c = s.create_collection("kb", None, None).unwrap();
+        let (doc_id, noop) = s
+            .ingest(
+                &c.id,
+                "note.md",
+                b"# Title\n\nquantum entanglement is a phenomenon of two particles.",
+                Some("text/markdown"),
+            )
+            .unwrap();
+        assert!(!noop);
+        assert!(doc_id.starts_with("doc_") || !doc_id.is_empty());
+        // Drain the enqueued embed job(s).
+        let mut drained = 0;
+        while s.drain_once().unwrap() {
+            drained += 1;
+            if drained > 50 {
+                break;
+            }
+        }
+        assert!(drained >= 1, "expected the embed job to be drained");
+    }
+
+    #[test]
+    fn ingest_into_missing_collection_404s() {
+        let (_t, s) = svc();
+        assert!(matches!(
+            s.ingest("col_nope", "x.md", b"hi", Some("text/markdown")),
+            Err(KnowledgeError::CollectionNotFound)
+        ));
     }
 
     #[test]
