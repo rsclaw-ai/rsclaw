@@ -23,6 +23,9 @@ use tracing::warn;
 pub const DEFAULT_EMBED_DIM: i32 = 384;
 /// Default OpenAI-compatible embedding model name.
 pub const OPENAI_DEFAULT_MODEL: &str = "text-embedding-3-small";
+/// Default OpenAI-compatible API root. Override to point at a GPU fleet
+/// serving `/v1/embeddings` (vLLM / SGLang / TEI / infinity).
+pub const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 /// Default Ollama embedding model.
 pub const OLLAMA_DEFAULT_MODEL: &str = "nomic-embed-text";
 /// Default Ollama REST base URL.
@@ -262,23 +265,36 @@ pub struct OpenAiEmbedder {
     api_key: String,
     model: String,
     dim: i32,
+    /// API root, e.g. `https://api.openai.com/v1` or a GPU fleet's
+    /// OpenAI-compatible endpoint. `/embeddings` is appended at request time.
+    base_url: String,
 }
 
 impl OpenAiEmbedder {
-    pub fn new(api_key: String, model: Option<String>, base_url: Option<String>) -> Self {
+    /// `base_url` points at any OpenAI-compatible API root (defaults to
+    /// OpenAI's). `dim_override` sets the output dimension for models
+    /// `openai_model_dim` doesn't know (e.g. Qwen3-Embedding = 1024);
+    /// when `None`, the dimension is derived from the model name.
+    pub fn new(
+        api_key: String,
+        model: Option<String>,
+        base_url: Option<String>,
+        dim_override: Option<i32>,
+    ) -> Self {
         let model = model.unwrap_or_else(|| OPENAI_DEFAULT_MODEL.to_owned());
-        let dim = openai_model_dim(&model);
-        let _ = base_url;
+        let dim = dim_override.unwrap_or_else(|| openai_model_dim(&model));
+        let base_url = base_url.unwrap_or_else(|| OPENAI_DEFAULT_BASE_URL.to_owned());
         Self {
             client: reqwest::Client::new(),
             api_key,
             model,
             dim,
+            base_url,
         }
     }
 
     fn embed_blocking(&self, text: &str) -> Result<Vec<f32>> {
-        let url = "https://api.openai.com/v1/embeddings";
+        let url = format!("{}/embeddings", self.base_url.trim_end_matches('/'));
         let body = serde_json::json!({
             "model": self.model,
             "input": text,
@@ -289,7 +305,7 @@ impl OpenAiEmbedder {
             Ok(handle) => tokio::task::block_in_place(|| {
                 handle.block_on(async {
                     self.client
-                        .post(url)
+                        .post(url.as_str())
                         .header("Authorization", format!("Bearer {}", self.api_key))
                         .json(&body)
                         .send()
@@ -305,7 +321,7 @@ impl OpenAiEmbedder {
                 tmp_rt
                     .block_on(async {
                         self.client
-                            .post(url)
+                            .post(url.as_str())
                             .header("Authorization", format!("Bearer {}", self.api_key))
                             .json(&body)
                             .send()
@@ -348,10 +364,17 @@ impl Embedder for OpenAiEmbedder {
     }
 }
 
-fn openai_model_dim(model: &str) -> i32 {
+/// Best-effort output dimension for a known OpenAI-compatible model name.
+/// Callers should prefer an explicit `memorySearch.dimensions` when the
+/// model isn't in this table.
+pub fn openai_model_dim(model: &str) -> i32 {
     match model {
         "text-embedding-3-large" => 3072,
         "text-embedding-3-small" | "text-embedding-ada-002" => 1536,
+        // Qwen3-Embedding family (served on the GPU fleet). Set
+        // `memorySearch.dimensions` explicitly to be safe; this is a
+        // best-effort default for the common 0.6B/4B 1024-dim case.
+        m if m.starts_with("Qwen3-Embedding") || m.starts_with("qwen3-embedding") => 1024,
         _ => 1536,
     }
 }

@@ -1919,6 +1919,12 @@ pub struct MemorySearchConfig {
     pub provider: Option<String>,
     /// Embedding model name, e.g. "text-embedding-3-small"
     pub model: Option<String>,
+    /// Output vector dimension. Required for OpenAI-compatible models that
+    /// `openai_model_dim` doesn't recognize (e.g. Qwen3-Embedding = 1024 on
+    /// the GPU fleet). When unset, the dimension is inferred from the model
+    /// name. Must match the model's actual output dim or the HNSW index will
+    /// reject vectors.
+    pub dimensions: Option<i32>,
     /// What to index: ["memory", "sessions"]
     pub sources: Option<Vec<String>>,
     /// Custom base URL for the embedding API

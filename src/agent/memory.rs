@@ -32,7 +32,8 @@ const HNSW_EF_CONSTRUCTION: usize = 200;
 // existing `crate::agent::memory::EmbedderBackend` paths still resolve.
 pub use crate::embed::{
     Embedder, EmbedderBackend, FnvEmbedder, LocalBgeEmbedder, OllamaEmbedder, OpenAiEmbedder,
-    DEFAULT_EMBED_DIM, OLLAMA_DEFAULT_MODEL, OLLAMA_DEFAULT_URL, OPENAI_DEFAULT_MODEL,
+    DEFAULT_EMBED_DIM, OLLAMA_DEFAULT_MODEL, OLLAMA_DEFAULT_URL, OPENAI_DEFAULT_BASE_URL,
+    OPENAI_DEFAULT_MODEL,
 };
 
 // redb table for memory docs metadata.
@@ -1098,12 +1099,14 @@ fn choose_embedder(
                 Some(key) => {
                     let model = cfg.and_then(|c| c.model.clone());
                     let base_url = cfg.and_then(|c| c.base_url.clone());
+                    let dims = cfg.and_then(|c| c.dimensions);
                     info!(
                         model = model.as_deref().unwrap_or(OPENAI_DEFAULT_MODEL),
+                        base_url = base_url.as_deref().unwrap_or(OPENAI_DEFAULT_BASE_URL),
                         "using OpenAI embedding provider"
                     );
                     Arc::new(EmbedderBackend::OpenAi(OpenAiEmbedder::new(
-                        key, model, base_url,
+                        key, model, base_url, dims,
                     )))
                 }
                 None => {

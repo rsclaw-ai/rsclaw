@@ -50,7 +50,12 @@ impl LocalKbEmbedder {
         api_key: Option<String>,
         dim: usize,
     ) -> Self {
-        let inner = OpenAiEmbedder::new(api_key.unwrap_or_default(), Some(model.clone()), Some(base_url));
+        let inner = OpenAiEmbedder::new(
+            api_key.unwrap_or_default(),
+            Some(model.clone()),
+            Some(base_url),
+            Some(dim as i32),
+        );
         Self {
             backend: EmbedderBackend::OpenAi(inner),
             dim,
