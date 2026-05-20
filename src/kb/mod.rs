@@ -69,7 +69,7 @@ pub use chunker::{chunk_markdown, ChunkerInput, LocatorKind};
 pub use store::{open_db, KbStore};
 pub use ledger::{IngestLedgerEntry, LedgerOp, LedgerStatus};
 pub use jobs::{ClaimToken, Job, JobKind, JobStatus};
-pub use util::redact;
+pub use util::{redact, RAG_DISCIPLINE_PROMPT};
 pub use embedder::{KbEmbedder, StubEmbedder};
 pub use pipeline::{ingest_canonicalized, IngestInput, IngestOutput};
 pub use worker::{DefaultDispatcher, HandlerCtx, JobHandler, WorkerConfig, WorkerPool};
