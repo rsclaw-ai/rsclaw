@@ -1,51 +1,67 @@
-//! Local BGE embedder for the KB — a thin adapter over the candle
-//! BGE loader already shipped for memory search
-//! (`crate::agent::memory::LocalBgeEmbedder`). Reuses the same model
-//! files under `<base_dir>/models/bge-small-{zh,en}/` so the KB and
-//! memory don't each ship their own copy.
+//! Adapter from the shared `crate::embed` backends to the KB's
+//! `KbEmbedder` trait. One adapter wraps any `EmbedderBackend`
+//! (Local BGE / OpenAi-compatible REST / Ollama), so the KB gets all
+//! of them — including the remote-API path (point an OpenAi backend
+//! at a GPU fleet serving Qwen3-Embedding).
 //!
-//! bge-small-zh-v1.5 → hidden_size 512; bge-small-en-v1.5 → 384. The
-//! KB's HNSW dimension is taken from `dimension()` at index-open time,
-//! so swapping models just works as long as the snapshot is rebuilt.
+//! The shared `Embedder` trait is single-text (`embed(&str)`); KB's
+//! `KbEmbedder` is batch (`embed_batch(&[String])`). This adapter
+//! maps the batch over the single-text backend. True server-side
+//! batching is a follow-up (the OpenAi `/v1/embeddings` endpoint
+//! accepts an array, so a batched remote path is a clean upgrade).
 
 use super::KbEmbedder;
-use crate::embed::{Embedder as MemEmbedder, LocalBgeEmbedder};
+use crate::embed::{Embedder, EmbedderBackend, LocalBgeEmbedder, OpenAiEmbedder};
 use anyhow::{Context, Result};
 use std::path::Path;
 
 pub struct LocalKbEmbedder {
-    inner: LocalBgeEmbedder,
+    backend: EmbedderBackend,
     dim: usize,
     id: String,
 }
 
 impl LocalKbEmbedder {
-    /// Load a BGE model directory (`config.json` + `model.safetensors`
-    /// + `tokenizer.json`). The `id` is derived from the dir name so
-    /// `KbChunk.embedder_id` records which model produced each vector.
+    /// Load a local BGE model directory (`config.json` +
+    /// `model.safetensors` + `tokenizer.json`). `id` is derived from
+    /// the dir name so `KbChunk.embedder_id` records the model.
     pub fn load(model_dir: &Path) -> Result<Self> {
         let inner = LocalBgeEmbedder::load(model_dir)
             .with_context(|| format!("load BGE model from {}", model_dir.display()))?;
-        let dim = inner.dimension() as usize;
+        let dim = Embedder::dimension(&inner) as usize;
         let name = model_dir
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("bge");
         Ok(Self {
-            inner,
+            backend: EmbedderBackend::Local(inner),
             dim,
             id: format!("local-{name}-{dim}"),
         })
+    }
+
+    /// Remote OpenAI-compatible embedder. Point `base_url` at any
+    /// `/v1/embeddings` server — e.g. a GPU fleet running
+    /// Qwen3-Embedding via vLLM / SGLang / TEI / infinity. `dim` is
+    /// the model's output dimension (must match the KB's HNSW dim).
+    pub fn remote_openai(
+        base_url: String,
+        model: String,
+        api_key: Option<String>,
+        dim: usize,
+    ) -> Self {
+        let inner = OpenAiEmbedder::new(api_key.unwrap_or_default(), Some(model.clone()), Some(base_url));
+        Self {
+            backend: EmbedderBackend::OpenAi(inner),
+            dim,
+            id: format!("remote-{model}-{dim}"),
+        }
     }
 }
 
 impl KbEmbedder for LocalKbEmbedder {
     fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        // LocalBgeEmbedder embeds one text at a time (candle BERT
-        // forward per call). Batching is a Week 6 optimisation; for
-        // now map sequentially. Output is already L2-normalised by
-        // the inner embedder so cosine == dot.
-        Ok(texts.iter().map(|t| self.inner.embed(t)).collect())
+        Ok(texts.iter().map(|t| self.backend.embed(t)).collect())
     }
 
     fn dimension(&self) -> usize {
