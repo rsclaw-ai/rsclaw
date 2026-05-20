@@ -1066,14 +1066,18 @@ impl RsclawProvider {
     }
 
     async fn open(&self, split: &SplitRequest<'_>) -> Result<CreateSessionResp> {
-        let body = CreateSessionReq {
-            prefix_id: &split.prefix_id,
-            model: &split.model,
-            dynamic_prefix: DynamicPrefixWire {
+        let (prefix_id, dynamic_prefix) = prefix_fields(
+            &split.prefix_id,
+            DynamicPrefixWire {
                 system: split.dynamic_system,
                 tools: &split.dynamic_tools,
                 user_system: split.dynamic_user_system,
             },
+        );
+        let body = CreateSessionReq {
+            prefix_id,
+            model: &split.model,
+            dynamic_prefix,
             options: Some(split.options.clone()),
         };
         // 180s caps the worst-case prefix-decode time for a fresh
@@ -1129,14 +1133,18 @@ impl RsclawProvider {
             &user_system_owned
         };
         let history: Vec<Value> = serialize_replay_history(&filtered);
-        let body = ReplayReq {
-            prefix_id: &split.prefix_id,
-            model: &split.model,
-            dynamic_prefix: DynamicPrefixWire {
+        let (prefix_id, dynamic_prefix) = prefix_fields(
+            &split.prefix_id,
+            DynamicPrefixWire {
                 system: split.dynamic_system,
                 tools: &split.dynamic_tools,
                 user_system,
             },
+        );
+        let body = ReplayReq {
+            prefix_id,
+            model: &split.model,
+            dynamic_prefix,
             history,
             options: Some(split.options.clone()),
         };
@@ -1495,10 +1503,14 @@ struct DynamicPrefixWire<'a> {
 
 #[derive(Debug, Serialize)]
 struct CreateSessionReq<'a> {
-    /// Protocol §2.1.1 — namespaced `<ns>/<ver>`. rsclaw-server still
-    /// accepts the legacy `rsclaw_version` field name as an alias, but
-    /// we always send the post-rename name on new traffic.
-    prefix_id: &'a str,
+    /// Protocol §2.1.1 — namespaced `<ns>/<ver>`. Mutually exclusive with
+    /// `dynamic_prefix`: a non-empty `prefix_id` forks the session from the
+    /// worker's static registry slot, so `dynamic_prefix` is omitted. When
+    /// `prefix_id` is empty the worker falls back to the dynamic-LRU keyed
+    /// by hash(system+tools) — then `dynamic_prefix` is sent and `prefix_id`
+    /// is omitted. See `prefix_fields`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefix_id: Option<&'a str>,
     /// Bare model id (no `rsclaw/` namespace prefix) — required since
     /// 2026-05 to route the request to the correct model slot on the
     /// worker. The session retains this binding for its lifetime, so
@@ -1506,26 +1518,46 @@ struct CreateSessionReq<'a> {
     /// needs to repeat it. Strip the `rsclaw/` namespace before
     /// sending because the server records the bare id.
     model: &'a str,
-    /// Hybrid mode (§2.1.3) — always sent. When `prefix_id` hits the
-    /// static registry the worker forks from there; otherwise the
-    /// dynamic-LRU keyed by hash of `system + tools` is used.
-    dynamic_prefix: DynamicPrefixWire<'a>,
+    /// Sent only when `prefix_id` is empty (dynamic-LRU mode). Omitted
+    /// when `prefix_id` is present (static-registry fork).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dynamic_prefix: Option<DynamicPrefixWire<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<TurnOptions>,
 }
 
 #[derive(Debug, Serialize)]
 struct ReplayReq<'a> {
-    prefix_id: &'a str,
+    /// Same mutual-exclusion contract as `CreateSessionReq`: present
+    /// only when non-empty, in which case `dynamic_prefix` is omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefix_id: Option<&'a str>,
     /// Same bare model id contract as `CreateSessionReq` — replay
     /// rebuilds the session from scratch, so the model binding must be
     /// declared again. Worker returns
     /// `missing_model` 400 if omitted.
     model: &'a str,
-    dynamic_prefix: DynamicPrefixWire<'a>,
+    /// Sent only when `prefix_id` is empty. See `CreateSessionReq`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dynamic_prefix: Option<DynamicPrefixWire<'a>>,
     history: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<TurnOptions>,
+}
+
+/// Split the `(prefix_id, dynamic_prefix)` pair into the mutually-exclusive
+/// wire form: a non-empty `prefix_id` forks from the worker's static
+/// registry (dynamic_prefix omitted); an empty `prefix_id` selects the
+/// dynamic-LRU path (prefix_id omitted, dynamic_prefix carried).
+fn prefix_fields<'a>(
+    prefix_id: &'a str,
+    dynamic: DynamicPrefixWire<'a>,
+) -> (Option<&'a str>, Option<DynamicPrefixWire<'a>>) {
+    if prefix_id.is_empty() {
+        (None, Some(dynamic))
+    } else {
+        (Some(prefix_id), None)
+    }
 }
 
 /// Wire body for `POST /v1/agent/sessions/<id>/compact` per protocol §2.4.
@@ -4200,15 +4232,10 @@ data: {"type":"block_stop","index":0}
     }
 
     #[test]
-    fn create_session_req_serialises_post_rename_shape() {
-        // Matches the wire body rsclaw-server's backend/rsclaw_llm.rs
-        // tests assert: `prefix_id` + `dynamic_prefix{system,tools,
-        // user_system}` + `options`, and explicitly NO top-level
-        // `user_tools` / `rsclaw_version` / `user_suffix` /
-        // `user_system` / `plugins_system` / `skills_system`. The
-        // `user_suffix` legacy name (and `user_system` accidentally
-        // promoted to top-level) is asserted absent so a refactor that
-        // re-emits either at top-level gets caught by the test.
+    fn create_session_req_with_prefix_id_omits_dynamic_prefix() {
+        // Non-empty prefix_id → static-registry fork: send `prefix_id`,
+        // OMIT `dynamic_prefix` entirely. Also assert the legacy / pre-rename
+        // field names never leak at top-level.
         let mut req = req_with(vec![], 2, Some("k"));
         req.system_shared = Some("<sys>".into());
         req.user_system = Some("<suf>".into());
@@ -4218,27 +4245,70 @@ data: {"type":"block_stop","index":0}
             parameters: json!({"type":"object"}),
         });
         let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
-        let body = CreateSessionReq {
-            prefix_id: &split.prefix_id,
-            model: &split.model,
-            dynamic_prefix: DynamicPrefixWire {
+        let (prefix_id, dynamic_prefix) = prefix_fields(
+            &split.prefix_id,
+            DynamicPrefixWire {
                 system: split.dynamic_system,
                 tools: &split.dynamic_tools,
                 user_system: split.dynamic_user_system,
             },
+        );
+        let body = CreateSessionReq {
+            prefix_id,
+            model: &split.model,
+            dynamic_prefix,
             options: Some(split.options.clone()),
         };
         let v = serde_json::to_value(&body).unwrap();
         assert_eq!(v["prefix_id"], "rsclaw/2026.5.18");
-        assert_eq!(v["dynamic_prefix"]["system"], "<sys>");
-        assert_eq!(v["dynamic_prefix"]["user_system"], "<suf>");
-        assert_eq!(v["dynamic_prefix"]["tools"][0]["name"], "memory");
+        assert!(
+            v.get("dynamic_prefix").is_none(),
+            "non-empty prefix_id must OMIT dynamic_prefix (mutually exclusive)"
+        );
         assert!(v.get("user_tools").is_none(), "post-rename body must omit top-level user_tools");
         assert!(v.get("rsclaw_version").is_none(), "rsclaw_version is the pre-rename name; never send");
         assert!(v.get("user_suffix").is_none(), "user_suffix is the legacy name; never send (top-level or otherwise)");
         assert!(v.get("user_system").is_none(), "user_system lives inside dynamic_prefix, never at top-level");
         assert!(v.get("plugins_system").is_none(), "pre-rename field; folded into dynamic_prefix.system");
         assert!(v.get("skills_system").is_none(), "pre-rename field; folded into dynamic_prefix.system");
+    }
+
+    #[test]
+    fn create_session_req_empty_prefix_id_sends_dynamic_prefix() {
+        // Empty prefix_id → dynamic-LRU mode: OMIT `prefix_id`, send the
+        // full `dynamic_prefix{system,tools,user_system}`.
+        let mut req = req_with(vec![], 2, Some("k"));
+        req.system_shared = Some("<sys>".into());
+        req.user_system = Some("<suf>".into());
+        req.tools.push(ToolDef {
+            name: "memory".into(),
+            description: "memory tool".into(),
+            parameters: json!({"type":"object"}),
+        });
+        // Empty prefix_id forces the dynamic-LRU path.
+        let split = split_request(&req, "").unwrap();
+        let (prefix_id, dynamic_prefix) = prefix_fields(
+            &split.prefix_id,
+            DynamicPrefixWire {
+                system: split.dynamic_system,
+                tools: &split.dynamic_tools,
+                user_system: split.dynamic_user_system,
+            },
+        );
+        let body = CreateSessionReq {
+            prefix_id,
+            model: &split.model,
+            dynamic_prefix,
+            options: Some(split.options.clone()),
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert!(
+            v.get("prefix_id").is_none(),
+            "empty prefix_id must be OMITTED (mutually exclusive with dynamic_prefix)"
+        );
+        assert_eq!(v["dynamic_prefix"]["system"], "<sys>");
+        assert_eq!(v["dynamic_prefix"]["user_system"], "<suf>");
+        assert_eq!(v["dynamic_prefix"]["tools"][0]["name"], "memory");
     }
 
     #[test]
