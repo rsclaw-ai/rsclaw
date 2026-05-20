@@ -10,6 +10,7 @@
 use crate::kb::canonicalize::{canonicalize_by_mime, detect_mime, CanonicalizeInput};
 use crate::kb::content_store::read::read_doc_body;
 use crate::kb::embedder::resolve_embedder;
+use crate::kb::jobs::{Job, JobKind};
 use crate::kb::model::{
     collection_tag, CallerScope, ChunkStatus, KbChunk, KbCollection, KbDoc, KbStatus,
     COLLECTION_TAG_PREFIX,
@@ -239,6 +240,22 @@ impl KnowledgeService {
         let abs = self.paths.root.join(&d.markdown_path);
         let body = read_doc_body(&abs)?;
         Ok((d.mime, body))
+    }
+
+    /// Re-enqueue a chunk+embed job for an existing document (e.g. after an
+    /// embedder change). The background worker re-indexes it.
+    pub fn reindex_doc(&self, collection_id: &str, doc_id: &str) -> KResult<()> {
+        let rtx = self.store.begin_read()?;
+        let d = self.active_doc_in_collection(&rtx, collection_id, doc_id)?;
+        drop(rtx);
+        let job = Job::new(JobKind::ChunkAndEmbed {
+            doc_id: d.id.clone(),
+            doc_version: d.version,
+        });
+        let wtx = self.store.begin_write()?;
+        crate::kb::store::jobs::enqueue(&wtx, &job)?;
+        wtx.commit().map_err(anyhow::Error::from)?;
+        Ok(())
     }
 
     /// Tombstone a document; the compactor reaps its chunks/vectors later.
@@ -614,6 +631,21 @@ mod tests {
         assert_eq!(st.collection_count, 1);
         assert_eq!(st.doc_count, 2);
         assert!(st.chunk_count >= 2);
+    }
+
+    #[test]
+    fn reindex_enqueues_drainable_job() {
+        let (_t, s) = svc();
+        let c = s.create_collection("kb", None, None).unwrap();
+        let (doc_id, _) = s
+            .ingest(&c.id, "a.md", b"# A\n\nhello particles here", Some("text/markdown"))
+            .unwrap();
+        while s.drain_once().unwrap() {}
+        s.reindex_doc(&c.id, &doc_id).unwrap();
+        assert!(
+            s.drain_once().unwrap(),
+            "reindex should enqueue a drainable job"
+        );
     }
 
     #[test]

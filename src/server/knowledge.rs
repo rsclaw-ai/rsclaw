@@ -41,6 +41,7 @@ pub fn routes() -> Router<AppState> {
             get(get_doc).delete(delete_doc),
         )
         .route("/collections/{id}/docs/{doc_id}/content", get(get_doc_content))
+        .route("/collections/{id}/docs/{doc_id}/reindex", post(reindex_doc))
         .route("/search", post(search))
         .route("/stats", get(stats))
         .route("/embedders", get(embedders))
@@ -378,6 +379,20 @@ async fn delete_doc(
 ) -> Response {
     match st.knowledge.delete_doc(&cid, &did) {
         Ok(()) => Json(serde_json::json!({ "deleted": true })).into_response(),
+        Err(e) => err_response(e),
+    }
+}
+
+async fn reindex_doc(
+    State(st): State<AppState>,
+    Path((cid, did)): Path<(String, String)>,
+) -> Response {
+    match st.knowledge.reindex_doc(&cid, &did) {
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "status": "indexing" })),
+        )
+            .into_response(),
         Err(e) => err_response(e),
     }
 }
