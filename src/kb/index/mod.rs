@@ -21,24 +21,40 @@ pub struct KbIndex {
 }
 
 impl KbIndex {
-    /// Open both layers. Tantivy lives on disk under `<paths.root>/idx/tantivy/`;
-    /// hnsw starts empty and must be populated via `rebuild::from_redb`
-    /// or per-chunk `upsert_chunk`.
+    /// Open both layers at `DEFAULT_DIMENSION` (1024 — stub embedder).
+    /// Existing callers + tests use this. Real-embedder callers use
+    /// `open_with_dim`.
     pub fn open(paths: &KbPaths) -> Result<Self> {
+        Self::open_with_dim(paths, hnsw::DEFAULT_DIMENSION)
+    }
+
+    /// Open both layers at the active embedder's vector dimension.
+    /// `dim` MUST equal `embedder.dimension()` or chunk inserts /
+    /// query searches will be rejected by the dim check.
+    pub fn open_with_dim(paths: &KbPaths, dim: usize) -> Result<Self> {
         let tantivy = TantivyIndex::open_or_create(&paths.root.join("idx/tantivy"))?;
         Ok(Self {
-            hnsw: HnswCache::empty(),
+            hnsw: HnswCache::new(dim),
             tantivy,
         })
     }
 
-    /// Open + populate the dense layer. Tries the on-disk HNSW
-    /// snapshot first (cheap, no embedder work); falls back to a
-    /// full rebuild from redb (cost: O(N log N) hnsw inserts).
-    /// Tantivy is always rebuilt from redb — it's already a persistent
-    /// on-disk index so the upsert path is cheap.
+    /// Open + populate the dense layer at `DEFAULT_DIMENSION`.
     pub fn open_and_rebuild(paths: &KbPaths, store: &KbStore) -> Result<Self> {
-        let idx = Self::open(paths)?;
+        Self::open_and_rebuild_with_dim(paths, store, hnsw::DEFAULT_DIMENSION)
+    }
+
+    /// Open + populate the dense layer at `dim`. Tries the on-disk
+    /// HNSW snapshot first (cheap, no embedder work); falls back to a
+    /// full rebuild from redb. A snapshot whose dimension doesn't
+    /// match `dim` (e.g. embedder changed) fails restore and triggers
+    /// a clean rebuild. Tantivy is always rebuilt from redb.
+    pub fn open_and_rebuild_with_dim(
+        paths: &KbPaths,
+        store: &KbStore,
+        dim: usize,
+    ) -> Result<Self> {
+        let idx = Self::open_with_dim(paths, dim)?;
         let snapshot_dir = paths.root.join("hnsw");
         let restored = idx.hnsw.restore(&snapshot_dir).unwrap_or(false);
         if !restored {

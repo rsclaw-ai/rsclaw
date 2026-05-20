@@ -1,15 +1,22 @@
-//! Embedder trait + deterministic stub used in Week 2.
+//! Embedder trait + backends.
 //!
-//! The real BGE-M3 embedder (candle-based, ~2GB weights) is a
-//! self-contained follow-up that swaps in behind `KbEmbedder` once
-//! the pipeline + worker pool are proven correct. Until then,
-//! `StubEmbedder` returns sha256-derived deterministic vectors so
-//! handler idempotency tests are easy to write.
+//! - `StubEmbedder`: deterministic sha256 vectors (1024-dim), used by
+//!   tests so idempotency is trivial to assert.
+//! - `LocalKbEmbedder` (`local`): candle BGE adapter reusing the
+//!   model loader already shipped for memory search
+//!   (`crate::agent::memory::LocalBgeEmbedder`). Default in production
+//!   when a model is present (bge-small-zh = 512-dim).
+//!
+//! Remote (OpenAI-compatible `/v1/embeddings` against the GPU fleet
+//! running Qwen3-Embedding) is the next backend — same trait, just an
+//! HTTP client.
 
+pub mod local;
 pub mod stub;
 
 use anyhow::Result;
 
+pub use local::LocalKbEmbedder;
 pub use stub::StubEmbedder;
 
 pub trait KbEmbedder: Send + Sync {

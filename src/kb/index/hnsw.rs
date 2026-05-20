@@ -25,7 +25,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::RwLock;
 
-const DIMENSION: usize = 1024;
+/// Default vector dimension when none is supplied (matches
+/// `StubEmbedder`). Real embedders pass their own: bge-small-zh=512,
+/// bge-base-zh=768, bge-m3 / Qwen3-Embedding-0.6B / remote=1024.
+pub const DEFAULT_DIMENSION: usize = 1024;
 const M: usize = 16;
 const EF_CONSTRUCTION: usize = 200;
 const MAX_NB_LAYER: usize = 16;
@@ -56,6 +59,10 @@ fn default_schema_version() -> u32 {
 
 pub struct HnswCache {
     inner: RwLock<HnswInner>,
+    /// Vector dimension this cache accepts. Set at construction from
+    /// the active embedder; all insert / search / restore paths
+    /// validate against it.
+    dimension: usize,
 }
 
 struct HnswInner {
@@ -81,11 +88,24 @@ impl HnswInner {
 }
 
 impl HnswCache {
-    /// Empty cache. Use `rebuild` to populate from redb.
-    pub fn empty() -> Self {
+    /// Empty cache at the given vector dimension. Use `rebuild` to
+    /// populate from redb.
+    pub fn new(dimension: usize) -> Self {
         Self {
             inner: RwLock::new(HnswInner::empty()),
+            dimension,
         }
+    }
+
+    /// Empty cache at `DEFAULT_DIMENSION` (1024). Back-compat shim for
+    /// stub-embedder callers + existing tests.
+    pub fn empty() -> Self {
+        Self::new(DEFAULT_DIMENSION)
+    }
+
+    /// The vector dimension this cache was built for.
+    pub fn dim(&self) -> usize {
+        self.dimension
     }
 
     /// Cosine similarity search; returns `(chunk_id, score)` pairs
@@ -93,7 +113,7 @@ impl HnswCache {
     /// so higher = more similar.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(String, f32)> {
         let inner = self.inner.read().unwrap();
-        if inner.id_to_chunk.is_empty() || query.len() != DIMENSION {
+        if inner.id_to_chunk.is_empty() || query.len() != self.dimension {
             return Vec::new();
         }
         let raw = inner.hnsw.search(query, k, EF_SEARCH);
@@ -110,9 +130,10 @@ impl HnswCache {
     /// Append-only insert. Re-inserting the same chunk_id orphans the
     /// old vertex; `chunk_to_id` is updated to point at the new id.
     pub fn insert(&self, chunk_id: &str, vector: &[f32]) -> Result<()> {
-        if vector.len() != DIMENSION {
+        if vector.len() != self.dimension {
             return Err(anyhow::anyhow!(
-                "hnsw insert: expected dim={DIMENSION}, got {}",
+                "hnsw insert: expected dim={}, got {}",
+                self.dimension,
                 vector.len()
             ));
         }
@@ -141,7 +162,7 @@ impl HnswCache {
             for entry in tbl.iter()? {
                 let (_, v) = entry?;
                 let c: KbChunk = decode(v.value())?;
-                if c.vector.len() != DIMENSION {
+                if c.vector.len() != self.dimension {
                     continue;
                 }
                 let seq = id_to_chunk.len();
@@ -199,7 +220,7 @@ impl HnswCache {
         }
         let meta = HnswMeta {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
-            dimension: DIMENSION,
+            dimension: self.dimension,
             id_to_chunk: inner.id_to_chunk.clone(),
         };
         let meta_path = dir.join(format!("{SNAPSHOT_NAME}.meta.json"));
@@ -235,10 +256,11 @@ impl HnswCache {
                 meta.schema_version
             ));
         }
-        if meta.dimension != DIMENSION {
+        if meta.dimension != self.dimension {
             return Err(anyhow::anyhow!(
-                "snapshot dim={} does not match runtime dim={DIMENSION}",
-                meta.dimension
+                "snapshot dim={} does not match runtime dim={}",
+                meta.dimension,
+                self.dimension
             ));
         }
         let n = meta.id_to_chunk.len();
@@ -343,7 +365,7 @@ mod tests {
         let cache = HnswCache::empty();
         cache.rebuild(&store).unwrap();
         assert!(cache.len() > 0, "expected chunks to be loaded");
-        let q = vec![0.0_f32; DIMENSION];
+        let q = vec![0.0_f32; DEFAULT_DIMENSION];
         let hits = cache.search(&q, 5);
         assert!(!hits.is_empty(), "expected hits, got empty");
     }
@@ -351,7 +373,7 @@ mod tests {
     #[test]
     fn search_on_empty_returns_empty() {
         let cache = HnswCache::empty();
-        assert!(cache.search(&vec![0.0; DIMENSION], 5).is_empty());
+        assert!(cache.search(&vec![0.0; DEFAULT_DIMENSION], 5).is_empty());
     }
 
     #[test]
@@ -366,8 +388,8 @@ mod tests {
         // search for the new vector return the chunk_id (the old
         // vertex becomes orphaned but doesn't surface).
         let cache = HnswCache::empty();
-        let v1 = vec![1.0_f32; DIMENSION];
-        let mut v2 = vec![0.0_f32; DIMENSION];
+        let v1 = vec![1.0_f32; DEFAULT_DIMENSION];
+        let mut v2 = vec![0.0_f32; DEFAULT_DIMENSION];
         v2[0] = 1.0; // pretty different
         cache.insert("c1", &v1).unwrap();
         cache.insert("c1", &v2).unwrap();
@@ -382,9 +404,9 @@ mod tests {
         let dump_dir = dir.path().join("snap");
         let cache = HnswCache::empty();
         // Build a few orthogonal vectors so search has signal.
-        let mut v_alpha = vec![0.0_f32; DIMENSION];
+        let mut v_alpha = vec![0.0_f32; DEFAULT_DIMENSION];
         v_alpha[0] = 1.0;
-        let mut v_beta = vec![0.0_f32; DIMENSION];
+        let mut v_beta = vec![0.0_f32; DEFAULT_DIMENSION];
         v_beta[1] = 1.0;
         cache.insert("alpha", &v_alpha).unwrap();
         cache.insert("beta", &v_beta).unwrap();
@@ -414,7 +436,7 @@ mod tests {
         // Hand-write a meta file claiming an unknown future version.
         let bad_meta = serde_json::json!({
             "schema_version": 999,
-            "dimension": DIMENSION,
+            "dimension": DEFAULT_DIMENSION,
             "id_to_chunk": ["c1"],
         });
         std::fs::write(

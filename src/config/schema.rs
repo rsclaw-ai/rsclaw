@@ -37,6 +37,7 @@ pub struct Config {
     pub secrets: Option<SecretsConfig>,
     pub memory_search: Option<MemorySearchConfig>,
     pub memory: Option<MemoryTopConfig>,
+    pub kb: Option<KbConfig>,
     pub mcp: Option<McpConfig>,
     /// Per-registry overrides keyed by registry name (`iwencai`, `clawhub`,
     /// `skillhub`, ...). Lets users put `apiKey`/`baseUrl` for paid skill
@@ -1940,6 +1941,33 @@ pub struct LocalEmbeddingConfig {
     pub model_download_url: Option<String>,
     /// Model repo name on HuggingFace (default: "BAAI/bge-small-zh-v1.5")
     pub model_repo: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// kb (Knowledge Base — RAG over local docs)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KbConfig {
+    /// Embedder backend: "stub" (deterministic sha256 vectors, 1024-dim,
+    /// default for tests) or "local" (candle BGE model from
+    /// `embedder_model_path`). Future: "openai" / "ollama".
+    pub embedder: Option<String>,
+    /// Directory holding the local BGE model (`config.json`,
+    /// `model.safetensors`, `tokenizer.json`). Default:
+    /// `<base_dir>/models/bge-small-zh`. The model's `hidden_size`
+    /// determines the vector dimension (bge-small-zh = 512).
+    pub embedder_model_path: Option<String>,
+    /// Persist the original raw bytes under `raw/<doc_id>.<ext>`
+    /// (default true; users can disable to save disk).
+    pub keep_raw: Option<bool>,
+    /// Compactor grace period (seconds) before an orphan file is
+    /// reaped. Default 3600 (1h).
+    pub compactor_grace_secs: Option<i64>,
+    /// Tombstone retention (days) before physical deletion.
+    /// Default 30.
+    pub tombstone_retention_days: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
