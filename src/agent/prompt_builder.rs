@@ -470,18 +470,28 @@ pub fn build_user_system(
         ));
     }
 
-    let platform_info = if cfg!(target_os = "windows") {
-        "Platform: Windows. Shell: PowerShell. \
-         Use PowerShell commands: Get-ChildItem (or dir), Get-Content, Get-Date, Select-Object -Last N (tail). \
-         Pipes and filters work naturally: | Where-Object, | Select-Object, | Sort-Object. \
-         Paths: backslash or forward slash both work. \
-         Examples: Get-Date -Format 'yyyy-MM-dd'; Get-ChildItem | Select-Object -Last 5; Get-Content file.txt."
+    // Per-session OS / shell guidance. This reflects the CLIENT's actual
+    // OS and lives in user_system (NOT the cached `shell` tool description,
+    // which is OS-agnostic), so a Windows client never inherits a macOS-
+    // baked prefix's shell conventions. On Windows this includes runtime
+    // PowerShell-edition detection — inherently per-machine, must not enter
+    // the base-layer hash.
+    let platform_info: String = if cfg!(target_os = "windows") {
+        super::tools_builder::windows_shell_guidance()
     } else if cfg!(target_os = "macos") {
-        "Platform: macOS. Shell: bash/zsh. Standard Unix commands available (ls, cat, grep, tail, date)."
+        "Platform: macOS. Shell: bash/zsh. Package manager: brew (npm/pip for \
+         language deps). Standard Unix commands available (ls, cat, grep, tail, date).\n\
+         Chain dependent commands with `&&`; use `;` only when you don't care whether \
+         earlier commands succeed."
+            .to_owned()
     } else {
-        "Platform: Linux. Shell: bash/sh. Standard Unix commands available (ls, cat, grep, tail, date)."
+        "Platform: Linux. Shell: bash/sh. Package manager: apt (or the distro's; npm/pip \
+         for language deps). Standard Unix commands available (ls, cat, grep, tail, date).\n\
+         Chain dependent commands with `&&`; use `;` only when you don't care whether \
+         earlier commands succeed."
+            .to_owned()
     };
-    parts.push(platform_info.to_owned());
+    parts.push(platform_info);
 
     if cfg!(target_os = "windows") {
         parts.push(

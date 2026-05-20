@@ -65,7 +65,7 @@ pub const RSCLAW_DEFAULT_BASE: &str = "https://api.rsclaw.ai/v1/agent";
 /// `tests/fixtures/baseline-<ver>.json`) actually changes, and
 /// coordinate with rsclaw-llm to re-ingest the new fixture under
 /// the new identifier.
-pub const RSCLAW_DEFAULT_PREFIX_ID: &str = "rsclaw/2026.5.18";
+pub const RSCLAW_DEFAULT_PREFIX_ID: &str = "rsclaw/2026.5.20";
 
 /// Default HTTP timeout (seconds) for the `/sessions/<id>/compact` splice
 /// call. The server holds the per-session lock and dispatches the splice
@@ -4247,11 +4247,11 @@ data: {"type":"block_stop","index":0}
         let mut req = req_with(vec![], 2, Some("k"));
         req.model = "qwen3-235b".into();
         let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
-        assert_eq!(split.prefix_id, "rsclaw/2026.5.18");
+        assert_eq!(split.prefix_id, "rsclaw/2026.5.20");
 
         req.model = "myorg/qwen3-235b".into();
         let split2 = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
-        assert_eq!(split2.prefix_id, "rsclaw/2026.5.18");
+        assert_eq!(split2.prefix_id, "rsclaw/2026.5.20");
     }
 
     #[test]
@@ -4385,7 +4385,7 @@ data: {"type":"block_stop","index":0}
             options: Some(split.options.clone()),
         };
         let v = serde_json::to_value(&body).unwrap();
-        assert_eq!(v["prefix_id"], "rsclaw/2026.5.18");
+        assert_eq!(v["prefix_id"], "rsclaw/2026.5.20");
         assert!(
             v.get("dynamic_prefix").is_none(),
             "non-empty prefix_id must OMIT dynamic_prefix (mutually exclusive)"
@@ -4711,20 +4711,20 @@ data: {"type":"block_stop","index":0}
             "k",
             SessionEntry {
                 session_id: "rs_w7_abc".into(),
-                prefix_id: "rsclaw/2026.5.18".into(),
+                prefix_id: "rsclaw/2026.5.20".into(),
                 last_seen_msgs_len: 12,
             },
         );
         // Same len → cached entry returned, last_seen unchanged.
-        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.18", 12).is_some());
+        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.20", 12).is_some());
         // Growth → bumped, returned.
-        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.18", 14).is_some());
+        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.20", 14).is_some());
         // Shrink (compaction trimmed history) → None, caller re-hydrates.
-        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.18", 8).is_none());
+        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.20", 8).is_none());
         // Version drift → None even if len matches.
         assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.6", 14).is_none());
         // Missing key → None.
-        assert!(provider.lookup_and_bump("missing", "rsclaw/2026.5.18", 14).is_none());
+        assert!(provider.lookup_and_bump("missing", "rsclaw/2026.5.20", 14).is_none());
     }
 
     #[test]
@@ -5221,10 +5221,10 @@ data: {"type":"block_stop","index":0}
         // `prefix_id`. New servers send this name natively.
         let body = r#"{
             "session_id": "rs_w7_8a3c1f2b",
-            "prefix_id": "rsclaw/2026.5.18"
+            "prefix_id": "rsclaw/2026.5.20"
         }"#;
         let resp: CreateSessionResp = serde_json::from_str(body).expect("create shape parses");
-        assert_eq!(resp.prefix_id.as_deref(), Some("rsclaw/2026.5.18"));
+        assert_eq!(resp.prefix_id.as_deref(), Some("rsclaw/2026.5.20"));
     }
 
     #[test]
@@ -5285,9 +5285,9 @@ data: {"type":"block_stop","index":0}
     fn create_session_resp_parses_populated_prefix_id() {
         // Round-trip the happy path so the Option<String> change
         // doesn't accidentally start coercing real values to None.
-        let body = r#"{"session_id":"rs_a_b","prefix_id":"rsclaw/2026.5.18"}"#;
+        let body = r#"{"session_id":"rs_a_b","prefix_id":"rsclaw/2026.5.20"}"#;
         let resp: CreateSessionResp = serde_json::from_str(body).expect("string field must parse");
-        assert_eq!(resp.prefix_id.as_deref(), Some("rsclaw/2026.5.18"));
+        assert_eq!(resp.prefix_id.as_deref(), Some("rsclaw/2026.5.20"));
     }
 
     // -- 8-rule dispatch precedence (R1 C3) -----------------------------

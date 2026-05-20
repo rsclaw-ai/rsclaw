@@ -665,27 +665,29 @@ pub fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "shell".to_owned(),
-        description: if cfg!(target_os = "windows") {
-            windows_shell_description()
-        } else if cfg!(target_os = "macos") {
-            "Run a shell command (bash/zsh) on macOS.\n\
+        // OS-AGNOSTIC by design: this description is hashed into the
+        // cacheable base-layer prefix, so it must be byte-identical across
+        // macOS / Linux / Windows clients. The actual OS, shell, package
+        // manager, and shell-specific syntax (chaining/quoting/encoding,
+        // PowerShell edition quirks) live in the per-session `user_system`
+        // "Platform" section (see prompt_builder::build_user_system), which
+        // reflects the CLIENT's real OS and never enters the base hash.
+        description: "Run a shell command. Your OS, shell, package manager, and \
+             shell-specific syntax (command chaining, quoting, encoding) are described in \
+             the system prompt's \"Platform\" section — follow those.\n\
              IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`, for HTTP/API requests use `web_fetch`. Only use shell for commands that have no dedicated tool.\n\
-             Use shell for: git operations, running scripts (node/python/cargo), system info (uname, df, top), package management (brew/npm/pip), process management (ps, kill).\n\
+             Use shell for: git operations, running scripts (node/python/cargo), system info, package management, process management.\n\
              Do NOT use shell for HTTP requests (curl/wget) or file downloads — use `web_fetch` / `web_download` instead.\n\
              \n\
-             Tool selection: bash for file/text/system ops; python3 for data processing (CSV/JSON/automation).\n\
-             Check tool availability first (`which python3`, `which node`). Use `install_tool` for system tools.\n\
+             Tool selection: shell for file/text/system ops; python for data processing (CSV/JSON/automation).\n\
+             Check tool availability first (e.g. `which python3` / `Get-Command python`). Use `install_tool` for system tools.\n\
              \n\
-             Bash patterns: `| head -n 20` to limit output, `date +%s` for timestamps, `find . -name '*.py' -mtime -7`.\n\
-             Python patterns: `python3 -c \"import json; ...\"` for one-liners, write to /tmp/script.py for multi-line, `pip install` for packages.\n\
-             \n\
-             Best practices: pipe large output through head/tail, use wait=false for long tasks, never run destructive commands on personal dirs.\n\
+             Best practices: pipe large output through a head/limit, use wait=false for long tasks, never run destructive commands on personal dirs.\n\
              If a command fails, do NOT retry with the same arguments. Try a different approach or ask the user.\n\
              \n\
              Multiple commands:\n\
              - Independent → emit MULTIPLE shell tool calls in ONE message for parallelism.\n\
-             - Dependent → single shell call with shell-native chaining (`&&` on bash/zsh; on Windows PowerShell 5.1 use `; if ($?) { ... }` since 5.1 lacks `&&`).\n\
-             - Use `;` only when you don't care whether earlier commands succeed.\n\
+             - Dependent → a single shell call chained with the OS-appropriate operator (see the Platform section).\n\
              - Do NOT use newlines to separate commands — use chaining or separate calls.\n\
              \n\
              Sleep is rarely the right answer:\n\
@@ -698,40 +700,7 @@ pub fn build_tool_list(
              - NEVER `--no-verify`, `--no-gpg-sign`, or `-c commit.gpgsign=false` unless the user explicitly asks — fix the hook failure instead.\n\
              - AVOID `git add -A` / `git add .` — stage specific files so you don't leak `.env`, credentials, or build artifacts.\n\
              - Prefer NEW commits over `--amend`; amending after a pre-commit-hook failure can destroy work because the failed commit never landed."
-                .to_owned()
-        } else {
-            "Run a shell command (bash/sh) on Linux.\n\
-             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`, for HTTP/API requests use `web_fetch`. Only use shell for commands that have no dedicated tool.\n\
-             Use shell for: git operations, running scripts (node/python/cargo), system info (uname, df, top), package management (apt/npm/pip), process management (ps, kill).\n\
-             Do NOT use shell for HTTP requests (curl/wget) or file downloads — use `web_fetch` / `web_download` instead.\n\
-             \n\
-             Tool selection: bash for file/text/system ops; python3 for data processing (CSV/JSON/automation).\n\
-             Check tool availability first (`which python3`, `which node`). Use `install_tool` for system tools.\n\
-             \n\
-             Bash patterns: `| head -n 20` to limit output, `date +%s` for timestamps, `find . -name '*.py' -mtime -7`.\n\
-             Python patterns: `python3 -c \"import json; ...\"` for one-liners, write to /tmp/script.py for multi-line, `pip install` for packages.\n\
-             \n\
-             Best practices: pipe large output through head/tail, use wait=false for long tasks, never run destructive commands on personal dirs.\n\
-             If a command fails, do NOT retry with the same arguments. Try a different approach or ask the user.\n\
-             \n\
-             Multiple commands:\n\
-             - Independent → emit MULTIPLE shell tool calls in ONE message for parallelism.\n\
-             - Dependent → single shell call with shell-native chaining (`&&` on bash/zsh; on Windows PowerShell 5.1 use `; if ($?) { ... }` since 5.1 lacks `&&`).\n\
-             - Use `;` only when you don't care whether earlier commands succeed.\n\
-             - Do NOT use newlines to separate commands — use chaining or separate calls.\n\
-             \n\
-             Sleep is rarely the right answer:\n\
-             - Don't sleep between commands that can run back-to-back.\n\
-             - Don't sleep-poll a background task you started with `wait=false` — task results are delivered on your next turn automatically.\n\
-             - Don't sleep-retry a failing command — find the actual cause and change something.\n\
-             \n\
-             Git safety:\n\
-             - NEVER force-push to main / master.\n\
-             - NEVER `--no-verify`, `--no-gpg-sign`, or `-c commit.gpgsign=false` unless the user explicitly asks — fix the hook failure instead.\n\
-             - AVOID `git add -A` / `git add .` — stage specific files so you don't leak `.env`, credentials, or build artifacts.\n\
-             - Prefer NEW commits over `--amend`; amending after a pre-commit-hook failure can destroy work because the failed commit never landed."
-                .to_owned()
-        },
+            .to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -1680,7 +1649,13 @@ pub fn build_tool_list(
 /// The 5.1 / 7+ branches differ sharply (`&&`, `??`, ternary, `2>&1`
 /// semantics, file encoding defaults). Steering the model with the right
 /// syntax up front avoids a class of parser-error retries.
-fn windows_shell_description() -> String {
+/// Windows shell guidance for the per-session `user_system` "Platform"
+/// section (NOT the cached `shell` tool description — that's OS-agnostic).
+/// Lives here next to the shell tool for cohesion, but is consumed by
+/// `prompt_builder::build_user_system`. Reflects the actual host's
+/// PowerShell edition via runtime detection, so it must stay in the
+/// per-session layer that never enters the base-layer prefix hash.
+pub(crate) fn windows_shell_guidance() -> String {
     use super::platform::{detect_powershell_edition, PowerShellEdition};
 
     let edition_section = match detect_powershell_edition() {
@@ -1707,7 +1682,7 @@ fn windows_shell_description() -> String {
     };
 
     format!(
-        "Run a shell command (PowerShell) on Windows.\n\
+        "Platform: Windows. Shell: PowerShell. Package manager: winget/scoop/choco (npm/pip for language deps).\n\
          IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`, for HTTP/API requests use `web_fetch`. Only use shell for commands that have no dedicated tool.\n\
          Use shell for: git operations, running scripts (node/python/cargo), system info (systeminfo, ipconfig, Get-Process), package management (npm/pip), process management (Start-Process, Stop-Process, taskkill).\n\
          Do NOT use shell for HTTP requests (curl/wget/Invoke-WebRequest) or file downloads — use `web_fetch` / `web_download` instead.\n\
