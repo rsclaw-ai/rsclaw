@@ -3982,8 +3982,19 @@ impl AgentRuntime {
             // persistent session fits within the context window.  The scratchpad
             // (current-turn working buffer) is NOT trimmed but its token cost is
             // subtracted from the available budget so session is trimmed enough.
+            //
+            // kvCacheMode >= 2 (rsclaw-server's stateful incremental protocol)
+            // owns the cache server-side. Client-side trimming would delete
+            // msgs the server still has cached, invalidating the prefix and
+            // forcing a cold recompute on the next turn (observed in
+            // production as a 75s turn after a 27K-token threshold trip).
+            // Defer to the server in that mode; it splices locally without
+            // breaking incremental cache hits.
+            let kv_cache_mode = self.live.agents.read().await.defaults.kv_cache_mode.unwrap_or(1);
             let scratchpad_tokens: usize = turn_scratchpad.iter().map(msg_tokens).sum();
-            if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
+            if kv_cache_mode < 2
+                && let Some(sess) = self.sessions.get_mut(&ctx.session_key)
+            {
                 apply_context_budget_trim(
                     sess,
                     context_tokens,
