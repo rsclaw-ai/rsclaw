@@ -251,7 +251,7 @@ Week 2 plan: `docs/plans/2026-05-19-kb-mvp-week2-pipeline.md`.
 20. **UrlSyncer conditional-get uses SyncState.cursor** — every
     304 NOT_MODIFIED response counts as `docs_skipped`, never
     `docs_added`. Covered by the `manual_syncer_dedupes_identical_bytes`
-    pattern (UrlSyncer integration deferred to Week 4.5 with a
+    pattern (UrlSyncer integration deferred to Week 6 with a
     `wiremock` dep).
 21. **Compactor never deletes files referenced by any KbDoc** —
     `referenced_paths` unions over every doc's
