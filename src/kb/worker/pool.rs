@@ -82,7 +82,24 @@ impl WorkerPool {
         let Some((job, token)) = claimed else {
             return Ok(false);
         };
-        match handler.handle(ctx, &job.kind) {
+        // Isolate handler panics: a panic (e.g. a tokenizer edge case)
+        // must not unwind out of the worker loop and kill it. Convert it
+        // to an Err so the requeue / mark_failed path below applies the
+        // same attempt accounting as a normal failure.
+        let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handler.handle(ctx, &job.kind)
+        })) {
+            Ok(r) => r,
+            Err(panic) => {
+                let msg = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                Err(anyhow::anyhow!("handler panicked: {msg}"))
+            }
+        };
+        match outcome {
             Ok(()) => {
                 let wtx = ctx.store.begin_write()?;
                 jobs::mark_done(&wtx, &job.id, &token.token)?;
@@ -112,7 +129,7 @@ async fn run_main(
     let mut next_reclaim = Instant::now() + cfg.reclaim_interval;
     while !shutdown.load(Ordering::Acquire) {
         if Instant::now() >= next_reclaim {
-            run_reclaim_once(&ctx.store);
+            run_reclaim_once(&ctx.store, cfg.max_attempts);
             next_reclaim = Instant::now() + cfg.reclaim_interval;
         }
 
@@ -137,11 +154,11 @@ async fn run_main(
     }
 }
 
-fn run_reclaim_once(store: &KbStore) {
+fn run_reclaim_once(store: &KbStore, max_attempts: u32) {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let res = (|| -> Result<usize> {
         let wtx = store.begin_write()?;
-        let n = jobs::reclaim_stale(&wtx, now_ms)?.len();
+        let n = jobs::reclaim_stale(&wtx, now_ms, max_attempts)?.len();
         wtx.commit()?;
         Ok(n)
     })();
@@ -242,6 +259,30 @@ mod tests {
         let rtx = ctx.store.begin_read().unwrap();
         let failed = jobs_store::list_by_status(&rtx, JobStatus::Failed).unwrap();
         assert_eq!(failed.len(), 1);
+    }
+
+    #[test]
+    fn handler_panic_is_isolated_and_fails_job() {
+        // A panicking handler must not unwind out of run_one_blocking; it is
+        // converted to a failure and accounted like any other error.
+        let (_tmp, ctx, mut cfg, _doc_id, _lsid) = fixture();
+        cfg.max_attempts = 1;
+        struct Panics;
+        impl JobHandler for Panics {
+            fn handle(&self, _: &HandlerCtx, _: &crate::kb::jobs::JobKind) -> Result<()> {
+                panic!("boom from handler");
+            }
+        }
+        // Returns Ok(true) (a job was processed) rather than propagating.
+        assert!(WorkerPool::run_one_blocking(&ctx, &cfg, &Panics).unwrap());
+        let rtx = ctx.store.begin_read().unwrap();
+        let failed = jobs::list_by_status(&rtx, JobStatus::Failed).unwrap();
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0]
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("handler panicked"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

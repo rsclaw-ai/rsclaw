@@ -6,9 +6,7 @@
 //! Backends (all behind the `Embedder` trait, hot-swappable):
 //!   - `FnvEmbedder`     — deterministic hash projection, no model.
 //!   - `LocalBgeEmbedder`— candle BGE (BERT) from a model dir.
-//!   - `OpenAiEmbedder`  — OpenAI-compatible `/v1/embeddings` REST.
-//!                         Point `base_url` at a GPU fleet running
-//!                         Qwen3-Embedding for remote acceleration.
+//!   - `OpenAiEmbedder`  — OpenAI-compatible `/v1/embeddings` REST; point `base_url` at a GPU fleet running Qwen3-Embedding for remote acceleration.
 //!   - `OllamaEmbedder`  — Ollama local REST API.
 //!
 //! `agent::memory` re-exports these names for backward compatibility,

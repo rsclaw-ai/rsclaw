@@ -69,6 +69,7 @@ async fn e2e_kb_search_ranks_relevant_chunks_top() -> Result<()> {
             diversity: "mmr".into(),
             mmr_lambda: 0.5,
             boost_entities: vec![],
+            query_instruction: None,
         },
         &CallerScope::default(),
     )?;

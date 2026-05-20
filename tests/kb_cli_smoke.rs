@@ -332,7 +332,7 @@ fn kb_search_json_emits_full_output_struct() {
         .collect::<Vec<_>>()
         .join("\n");
     let parsed: serde_json::Value =
-        serde_json::from_str(&json_body).expect(&format!("invalid JSON: {json_body}"));
+        serde_json::from_str(&json_body).unwrap_or_else(|_| panic!("invalid JSON: {json_body}"));
     assert!(parsed.get("results").is_some(), "missing results: {parsed}");
     assert!(
         parsed.get("entity_alignment").is_some(),

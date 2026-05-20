@@ -92,6 +92,7 @@ async fn entities_extracted_and_queryable() -> Result<()> {
             diversity: "off".into(),
             mmr_lambda: 0.5,
             boost_entities: vec![],
+            query_instruction: None,
         },
         &CallerScope::default(),
     )?;
@@ -172,6 +173,7 @@ async fn require_entities_filters_to_chunks_with_mention() -> Result<()> {
             diversity: "off".into(),
             mmr_lambda: 0.5,
             boost_entities: vec![],
+            query_instruction: None,
         },
         &CallerScope::default(),
     )?;
@@ -193,6 +195,7 @@ async fn require_entities_filters_to_chunks_with_mention() -> Result<()> {
             diversity: "off".into(),
             mmr_lambda: 0.5,
             boost_entities: vec![],
+            query_instruction: None,
         },
         &CallerScope::default(),
     )?;

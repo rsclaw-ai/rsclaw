@@ -714,12 +714,20 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     ));
 
     // User-managed RAG knowledge base. Open once; spawn the async indexing
-    // worker that drains embed jobs in the background.
-    let knowledge_svc = Arc::new(
-        crate::kb::KnowledgeService::open(base_dir.join("kb"))
-            .expect("open knowledge base store"),
-    );
-    knowledge_svc.spawn_worker();
+    // worker that drains embed jobs in the background. A failure here (corrupt
+    // store, bad permissions, full disk) disables KB but must not abort the
+    // gateway — every other channel and provider stays up.
+    let knowledge_svc = match crate::kb::KnowledgeService::open(base_dir.join("kb")) {
+        Ok(svc) => {
+            let svc = Arc::new(svc);
+            svc.spawn_worker();
+            Some(svc)
+        }
+        Err(e) => {
+            tracing::error!("knowledge base disabled: failed to open store: {e:#}");
+            None
+        }
+    };
 
     let state = AppState {
         config: Arc::clone(&config),

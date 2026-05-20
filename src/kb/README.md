@@ -212,9 +212,12 @@ Week 2 plan: `docs/plans/2026-05-19-kb-mvp-week2-pipeline.md`.
     `mark_done_after_reclaim_errors`.
 13. **Stalled claims auto-reclaim** — workers that crash mid-job leave
     a claim with `expires_at` in the past; the next `reclaim_stale`
-    sweep resets the job to `Ready` and another worker re-runs it.
-    Covered by
-    `tests/kb_week2_recovery.rs::stalled_claim_is_reclaimed_and_rerun`.
+    sweep resets the job to `Ready` (or fails it once `max_attempts` is
+    hit) and another worker re-runs it. Both the `WorkerPool` (tokio,
+    CLI/tests) and the gateway's `KnowledgeService::spawn_worker`
+    (std::thread, sweeps every 30s) drive this. Covered by
+    `tests/kb_week2_recovery.rs::stalled_claim_is_reclaimed_and_rerun`
+    and `kb::store::jobs::tests::reclaim_stale_fails_job_past_max_attempts`.
 14. **`WorkerPool::shutdown()` exits in bounded time** — the AtomicBool
     is checked at the top of each loop iteration and on every wake
     from the idle sleep. Long-running handlers delay shutdown only

@@ -1979,6 +1979,9 @@ pub struct KbConfig {
     /// Tombstone retention (days) before physical deletion.
     /// Default 30.
     pub tombstone_retention_days: Option<i64>,
+    /// Max accepted document size (MB) for the `/api/v1/knowledge` upload
+    /// endpoints (JSON body or multipart file). Default 50.
+    pub max_doc_mb: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------

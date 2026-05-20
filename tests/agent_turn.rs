@@ -202,6 +202,7 @@ async fn start_echo_server(addr: SocketAddr) {
             let store = Arc::new(rsclaw::a2a::store::TaskStore::open(&path).expect("a2a store"));
             Arc::new(rsclaw::a2a::push::PushDispatcher::new(store, bus))
         },
+        knowledge: None,
     };
 
     // Leak the tempdir so the store stays valid for the server's lifetime.

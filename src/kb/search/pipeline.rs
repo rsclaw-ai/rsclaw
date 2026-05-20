@@ -81,7 +81,12 @@ impl SearchCtx {
                 let dense_query =
                     crate::embed::format_query(req.query_instruction.as_deref(), &req.query);
                 let qv = self.embedder.embed_batch(&[dense_query])?;
-                self.index.hnsw.search(&qv[0], recall_k)
+                match qv.first() {
+                    Some(qvec) => self.index.hnsw.search(qvec, recall_k),
+                    // Embedder returned no vector — skip dense recall rather
+                    // than panic; sparse recall still runs in Auto/Hybrid.
+                    None => Vec::new(),
+                }
             }
         };
 

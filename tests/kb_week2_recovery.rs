@@ -64,7 +64,7 @@ fn stalled_claim_is_reclaimed_and_rerun() -> Result<()> {
     std::thread::sleep(std::time::Duration::from_millis(100));
     let reclaimed = {
         let wtx = ctx.store.begin_write()?;
-        let r = jobs_store::reclaim_stale(&wtx, 300)?;
+        let r = jobs_store::reclaim_stale(&wtx, 300, 5)?;
         wtx.commit()?;
         r
     };

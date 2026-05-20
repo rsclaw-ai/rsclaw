@@ -42,8 +42,7 @@ fn is_cjk(c: char) -> bool {
 ///
 /// Layout: `md/<kind>/<slug>--<lsid8>--<md8>.md` where:
 ///   - `lsid8` = first 8 hex chars of `sha256(logical_source_id)`.
-///   - `md8`  = first 8 hex chars of `body_sha256` (the canonical
-///              markdown body, post-canonicalize).
+///   - `md8`  = first 8 hex chars of `body_sha256` (the canonical markdown body, post-canonicalize).
 ///
 /// Path semantics:
 ///   - Re-ingesting the same source with the same content → same

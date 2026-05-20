@@ -26,13 +26,10 @@ use crate::kb::model::KbCollection;
 use crate::kb::service::DocInfo;
 use crate::kb::{KnowledgeError, KnowledgeService};
 
-/// Max upload size (JSON body or multipart file). Mirrors the spec's
-/// `knowledge.maxDocMb` default; could be made configurable later.
-const MAX_DOC_BYTES: usize = 50 * 1024 * 1024;
-
 /// Routes nested under `/api/v1/knowledge`. State is the `KnowledgeService`
 /// alone (not the full `AppState`), so the handlers are testable in isolation.
-pub fn routes() -> Router<Arc<KnowledgeService>> {
+/// `max_doc_bytes` (from `kb.maxDocMb`) caps the request body size.
+pub fn routes(max_doc_bytes: usize) -> Router<Arc<KnowledgeService>> {
     Router::new()
         .route("/collections", get(list_collections).post(create_collection))
         .route(
@@ -54,7 +51,7 @@ pub fn routes() -> Router<Arc<KnowledgeService>> {
         .route("/embedders", get(embedders))
         .route("/events", get(events))
         // Allow large document uploads (default axum limit is 2MB).
-        .layer(DefaultBodyLimit::max(MAX_DOC_BYTES))
+        .layer(DefaultBodyLimit::max(max_doc_bytes))
 }
 
 // --- error mapping --------------------------------------------------------
@@ -268,7 +265,7 @@ async fn upload_doc(State(svc): State<Arc<KnowledgeService>>, Path(cid): Path<St
         upload_multipart(svc, cid, req).await
     } else {
         // Treat everything else as JSON.
-        let body = match to_bytes(req.into_body(), MAX_DOC_BYTES).await {
+        let body = match to_bytes(req.into_body(), svc.max_doc_bytes()).await {
             Ok(b) => b,
             Err(_) => return bad_request("body_too_large"),
         };
@@ -474,6 +471,20 @@ async fn events(State(svc): State<Arc<KnowledgeService>>) -> Sse<impl Stream<Ite
     )
 }
 
+async fn embedders(State(svc): State<Arc<KnowledgeService>>) -> Response {
+    let list = svc.embedders();
+    let default = list.iter().find(|e| e.is_default).map(|e| e.id.clone());
+    let available: Vec<_> = list
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "id": e.id, "label": e.label, "dim": e.dim, "downloaded": e.downloaded
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "default": default, "available": available })).into_response()
+}
+
 #[cfg(test)]
 mod http_tests {
     use super::*;
@@ -487,7 +498,7 @@ mod http_tests {
     fn app() -> (TempDir, Arc<KnowledgeService>, App) {
         let tmp = TempDir::new().unwrap();
         let svc = Arc::new(KnowledgeService::open(tmp.path().join("kb")).unwrap());
-        let app = routes().with_state(svc.clone());
+        let app = routes(svc.max_doc_bytes()).with_state(svc.clone());
         (tmp, svc, app)
     }
 
@@ -617,18 +628,4 @@ mod http_tests {
         assert_eq!(st, StatusCode::NOT_FOUND);
         assert_eq!(body["error"], "collection_not_found");
     }
-}
-
-async fn embedders(State(svc): State<Arc<KnowledgeService>>) -> Response {
-    let list = svc.embedders();
-    let default = list.iter().find(|e| e.is_default).map(|e| e.id.clone());
-    let available: Vec<_> = list
-        .iter()
-        .map(|e| {
-            serde_json::json!({
-                "id": e.id, "label": e.label, "dim": e.dim, "downloaded": e.downloaded
-            })
-        })
-        .collect();
-    Json(serde_json::json!({ "default": default, "available": available })).into_response()
 }

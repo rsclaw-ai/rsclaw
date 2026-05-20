@@ -53,7 +53,12 @@ pub fn run_compactor_tick(
             for rel in &entry.old_paths {
                 let abs = paths.root.join(rel);
                 if abs.exists() {
-                    let _ = std::fs::remove_file(&abs);
+                    if let Err(e) = std::fs::remove_file(&abs) {
+                        tracing::warn!(
+                            path = %abs.display(),
+                            "kb compactor: failed to remove superseded file: {e}"
+                        );
+                    }
                 }
             }
             let wtx = store.begin_write()?;

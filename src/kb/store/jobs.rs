@@ -167,10 +167,17 @@ pub fn requeue(wtx: &WriteTransaction, job_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Find Running jobs whose claim token has expired, reset to Ready.
-/// Annotates `last_error = "claim_token_expired"` on each reclaimed
-/// job so operators have an audit trail.
-pub fn reclaim_stale(wtx: &WriteTransaction, now_ms: i64) -> Result<Vec<String>> {
+/// Find Running jobs whose claim token has expired and recover them.
+/// A job under `max_attempts` is reset to Ready (annotated
+/// `last_error = "claim_token_expired"`); a job that has exhausted its
+/// attempts is marked Failed instead of requeued, so a worker that keeps
+/// dying mid-job can't requeue it forever. Either way the claim is
+/// released and the audit trail records why. Returns the affected job ids.
+pub fn reclaim_stale(
+    wtx: &WriteTransaction,
+    now_ms: i64,
+    max_attempts: u32,
+) -> Result<Vec<String>> {
     let mut to_reclaim = Vec::new();
     {
         let claims = wtx.open_table(KB_JOB_CLAIMS)?;
@@ -183,14 +190,22 @@ pub fn reclaim_stale(wtx: &WriteTransaction, now_ms: i64) -> Result<Vec<String>>
         }
     }
     for id in &to_reclaim {
-        requeue(wtx, id)?;
-        // Annotate the requeued job so operators can see why it came
-        // back to Ready. requeue() already wrote the new status; we
-        // do a follow-up read+write to set last_error. Single wtx so
-        // atomicity holds.
         let (mut job, old_key) = read_and_old_key(wtx, id)?;
-        job.last_error = Some("claim_token_expired".into());
-        write_status_transition(wtx, &job, &old_key)?;
+        job.attempts += 1;
+        if job.attempts >= max_attempts {
+            job.status = JobStatus::Failed;
+            job.last_error = Some("claim_token_expired (max attempts exceeded)".into());
+            write_status_transition(wtx, &job, &old_key)?;
+            let dedupe_key = job.kind.dedupe_key();
+            let mut dedupe = wtx.open_table(KB_JOBS_BY_DEDUPE_ACTIVE)?;
+            dedupe.remove(dedupe_key.as_str())?;
+        } else {
+            job.status = JobStatus::Ready;
+            job.last_error = Some("claim_token_expired".into());
+            write_status_transition(wtx, &job, &old_key)?;
+        }
+        let mut claims = wtx.open_table(KB_JOB_CLAIMS)?;
+        claims.remove(id.as_str())?;
     }
     Ok(to_reclaim)
 }
@@ -431,7 +446,7 @@ mod tests {
         };
         {
             let wtx = db.begin_write().unwrap();
-            assert_eq!(reclaim_stale(&wtx, 200).unwrap().len(), 1);
+            assert_eq!(reclaim_stale(&wtx, 200, 5).unwrap().len(), 1);
             wtx.commit().unwrap();
         }
         let wtx = db.begin_write().unwrap();
@@ -455,7 +470,7 @@ mod tests {
         }
         let reclaimed = {
             let wtx = db.begin_write().unwrap();
-            let ids = reclaim_stale(&wtx, 200).unwrap();
+            let ids = reclaim_stale(&wtx, 200, 5).unwrap();
             wtx.commit().unwrap();
             ids
         };
@@ -469,6 +484,45 @@ mod tests {
     }
 
     #[test]
+    fn reclaim_stale_fails_job_past_max_attempts() {
+        let (_tmp, db) = fresh();
+        let job = Job::new(JobKind::RebuildHnsw);
+        let job_id = job.id.clone();
+        {
+            let wtx = db.begin_write().unwrap();
+            enqueue(&wtx, &job).unwrap();
+            wtx.commit().unwrap();
+        }
+        // claim with a short TTL so it is immediately stale
+        {
+            let wtx = db.begin_write().unwrap();
+            claim_next(&wtx, "zombie", 100, 50).unwrap();
+            wtx.commit().unwrap();
+        }
+        // max_attempts=1: the first reclaim pushes attempts to 1 == max,
+        // so the job is failed out instead of requeued forever.
+        {
+            let wtx = db.begin_write().unwrap();
+            assert_eq!(reclaim_stale(&wtx, 200, 1).unwrap().len(), 1);
+            wtx.commit().unwrap();
+        }
+        let rtx = db.begin_read().unwrap();
+        let j = get(&rtx, &job_id).unwrap().unwrap();
+        assert_eq!(j.status, JobStatus::Failed);
+        assert_eq!(j.attempts, 1);
+        assert_eq!(
+            j.last_error.as_deref(),
+            Some("claim_token_expired (max attempts exceeded)")
+        );
+        drop(rtx);
+        // dedupe key freed → an identical job can be enqueued fresh.
+        let again = Job::new(JobKind::RebuildHnsw);
+        let again_id = again.id.clone();
+        let wtx = db.begin_write().unwrap();
+        assert_eq!(enqueue(&wtx, &again).unwrap(), again_id);
+    }
+
+    #[test]
     fn reclaim_stale_skips_fresh_claims() {
         let (_tmp, db) = fresh();
         let job = Job::new(JobKind::RebuildHnsw);
@@ -479,7 +533,7 @@ mod tests {
             wtx.commit().unwrap();
         }
         let wtx = db.begin_write().unwrap();
-        assert!(reclaim_stale(&wtx, 200).unwrap().is_empty());
+        assert!(reclaim_stale(&wtx, 200, 5).unwrap().is_empty());
     }
 
     #[test]

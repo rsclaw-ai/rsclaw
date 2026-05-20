@@ -93,7 +93,7 @@ mod tests {
         let v = e.embed_batch(&inputs).unwrap();
         assert_eq!(v.len(), 5);
         for (i, t) in inputs.iter().enumerate() {
-            let single = e.embed_batch(&[t.clone()]).unwrap();
+            let single = e.embed_batch(std::slice::from_ref(t)).unwrap();
             assert_eq!(v[i], single[0]);
         }
     }

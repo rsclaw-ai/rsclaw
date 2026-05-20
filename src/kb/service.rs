@@ -106,7 +106,12 @@ pub struct KnowledgeService {
     /// Asymmetric query instruction from `memorySearch.queryInstruction`
     /// (default None = symmetric). Applied to search queries' dense side.
     query_instruction: Option<String>,
+    /// Max accepted upload size in bytes (`kb.maxDocMb`, default 50 MB).
+    max_doc_bytes: usize,
 }
+
+/// Default max upload size when `kb.maxDocMb` is unset (50 MB).
+const DEFAULT_MAX_DOC_BYTES: usize = 50 * 1024 * 1024;
 
 impl KnowledgeService {
     /// Open (or create) the KB under `kb_root` (e.g. `<base>/kb`): store,
@@ -119,11 +124,34 @@ impl KnowledgeService {
         let dim = embedder.dimension();
         let index = Arc::new(KbIndex::open_and_rebuild_with_dim(&paths, &store, dim)?);
         let (events, _) = broadcast::channel(256);
-        let query_instruction = crate::config::load()
-            .ok()
+        let cfg = crate::config::load().ok();
+        let query_instruction = cfg
+            .as_ref()
             .and_then(|c| c.raw.memory_search.clone())
             .and_then(|m| m.query_instruction);
-        Ok(Self { store, paths, index, embedder, kb_root, events, query_instruction })
+        // kb.maxDocMb → bytes; default 50 MB, clamp negatives/zero to default.
+        let max_doc_bytes = cfg
+            .as_ref()
+            .and_then(|c| c.raw.kb.as_ref())
+            .and_then(|k| k.max_doc_mb)
+            .filter(|mb| *mb > 0)
+            .map(|mb| mb as usize * 1024 * 1024)
+            .unwrap_or(DEFAULT_MAX_DOC_BYTES);
+        Ok(Self {
+            store,
+            paths,
+            index,
+            embedder,
+            kb_root,
+            events,
+            query_instruction,
+            max_doc_bytes,
+        })
+    }
+
+    /// Max accepted upload size in bytes (`kb.maxDocMb`, default 50 MB).
+    pub fn max_doc_bytes(&self) -> usize {
+        self.max_doc_bytes
     }
 
     /// Subscribe to `knowledge.doc.status_changed` events (for SSE).
@@ -180,6 +208,19 @@ impl KnowledgeService {
         WorkerPool::run_one_blocking(&ctx, &WorkerConfig::default(), &DefaultDispatcher)
     }
 
+    /// Requeue jobs whose claiming worker died mid-flight (claim TTL
+    /// expired). Run periodically by the background worker so a crash or
+    /// restart can't strand a `Running` job — and its dedupe key —
+    /// forever. Returns how many jobs were reclaimed.
+    pub fn reclaim_stale(&self) -> anyhow::Result<usize> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let max_attempts = WorkerConfig::default().max_attempts;
+        let wtx = self.store.begin_write()?;
+        let n = crate::kb::store::jobs::reclaim_stale(&wtx, now_ms, max_attempts)?.len();
+        wtx.commit()?;
+        Ok(n)
+    }
+
     /// Spawn a background thread that drains KB jobs forever, so document
     /// indexing runs asynchronously after upload. Idempotent per service
     /// instance is the caller's responsibility (call once at startup).
@@ -191,7 +232,21 @@ impl KnowledgeService {
                 // Seed with already-ready docs so we don't replay a burst of
                 // status events for the existing corpus on startup.
                 let mut emitted: HashSet<String> = this.ready_doc_ids().unwrap_or_default();
+                // Recover jobs stranded by a crash/restart mid-claim. The
+                // claim TTL is 60s; check a bit more often than that.
+                let reclaim_every = Duration::from_secs(30);
+                let mut next_reclaim = std::time::Instant::now() + reclaim_every;
                 loop {
+                    if std::time::Instant::now() >= next_reclaim {
+                        match this.reclaim_stale() {
+                            Ok(n) if n > 0 => {
+                                tracing::info!("kb knowledge worker: reclaimed {n} stale jobs")
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!("kb knowledge worker reclaim: {e:#}"),
+                        }
+                        next_reclaim = std::time::Instant::now() + reclaim_every;
+                    }
                     match this.drain_once() {
                         // A job finished — emit status_changed=ready for any doc
                         // that just gained its first indexed chunk.
@@ -686,7 +741,7 @@ mod tests {
         while s.drain_once().unwrap() {}
         // BM25 side of the hybrid search matches the lexical term regardless of
         // the (stub) embedder, so the doc is findable.
-        let hits = s.search("two particles", &[c.id.clone()], 5, 0.0).unwrap();
+        let hits = s.search("two particles", std::slice::from_ref(&c.id), 5, 0.0).unwrap();
         assert!(!hits.is_empty(), "expected a hit for 'two particles'");
         assert_eq!(hits[0].collection_id.as_deref(), Some(c.id.as_str()));
         let st = s.stats().unwrap();

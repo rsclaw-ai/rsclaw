@@ -16,10 +16,12 @@
 //!   2. If the change was INTENTIONAL (you bumped the gateway version
 //!      or added/restructured a builtin tool on purpose): regenerate
 //!      the fixture with
-//!          cargo build --release --bin rsclaw
-//!          target/release/rsclaw debug dump-prompt-spec --json
-//!              | jq '{rsclaw_version, shared_prefix, builtin_tools}'
-//!              > tests/fixtures/baseline-2026.5.15.json
+//!      ```text
+//!      cargo build --release --bin rsclaw
+//!      target/release/rsclaw debug dump-prompt-spec --json
+//!        | jq '{rsclaw_version, shared_prefix, builtin_tools}'
+//!        > tests/fixtures/baseline-2026.5.15.json
+//!      ```
 //!      and re-add the `_doc` header that lives at the top of the
 //!      fixture (preserved for human readers).
 //!
@@ -219,11 +221,10 @@ fn baseline_builtin_tools_byte_stable() {
 
         let mut diff_names = Vec::new();
         for (a, e) in actual_arr.iter().zip(expected.iter()) {
-            if a != e {
-                if let Some(n) = a.get("name").and_then(|n| n.as_str()) {
+            if a != e
+                && let Some(n) = a.get("name").and_then(|n| n.as_str()) {
                     diff_names.push(n.to_owned());
                 }
-            }
         }
         panic!(
             "builtin_tools CONTENT drifted from 2026.5.15 baseline (names matched, \

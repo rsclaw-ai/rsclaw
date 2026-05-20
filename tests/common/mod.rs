@@ -201,6 +201,7 @@ pub async fn start_server_with_handles(addr: SocketAddr) -> ServerHandles {
             let store = Arc::new(rsclaw::a2a::store::TaskStore::open(&path).expect("a2a store"));
             Arc::new(rsclaw::a2a::push::PushDispatcher::new(store, bus))
         },
+        knowledge: None,
     };
 
     // Leak tempdir — store must stay live for the lifetime of the server task.
