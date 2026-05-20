@@ -7581,6 +7581,7 @@ mod tests {
             enabled: Some(true),
             user_agent: None,
             prefix_id: None,
+            compact_timeout_secs: None,
         };
         let mut providers = std::collections::HashMap::new();
         providers.insert(provider_name.to_owned(), pc);

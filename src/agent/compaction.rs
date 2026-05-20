@@ -49,6 +49,54 @@ fn build_compaction_summary_msg(summary: &str) -> String {
     format!("{COMPACTION_PREFIX} (compacted at {now})\n\n{summary}")
 }
 
+/// Convert a local (OpenAI-style) message slice into the rsclaw server's
+/// flat slot count.
+///
+/// The server stores a flat `[user, assistant, user, assistant, …]` log
+/// (`docs/client-server-integration.md` §6.3.2): each `POST /turn` input is
+/// ONE `user` slot — and a turn's `tool_results` bundle into a single
+/// `user` slot regardless of how many tools ran — and each assistant reply
+/// is ONE `assistant` slot. Our local history keeps tool results as
+/// separate `Role::Tool` messages (and `Role::Assistant` carries its
+/// `ToolUse` blocks inline), so `Vec<Message>::len()` is a DIFFERENT
+/// granularity than the server's slot count and must not be sent as
+/// `expected_msgs_count` / `keep_head_messages` / `keep_tail_messages`.
+///
+/// Mapping that mirrors the server's bundling:
+///   - `Role::User`      → 1 slot
+///   - `Role::Assistant` → 1 slot
+///   - a maximal contiguous run of `Role::Tool` → 1 slot (the bundled
+///     `tool_results` turn)
+///   - `Role::System`    → 0 (it lives in the prefix, never a message slot)
+///
+/// Self-consistency: after a splice the local history is rebuilt as
+/// `head + summary(1 user) + tail`, so `count_server_slots` of the new
+/// history equals `keep_head + 1 + keep_tail`, which is exactly the
+/// server's reported post-splice `msgs_count` — the basis stays aligned
+/// across repeated compactions with no extra bookkeeping.
+fn count_server_slots(msgs: &[Message]) -> usize {
+    let mut slots = 0usize;
+    let mut in_tool_run = false;
+    for m in msgs {
+        match m.role {
+            Role::User | Role::Assistant => {
+                slots += 1;
+                in_tool_run = false;
+            }
+            Role::Tool => {
+                if !in_tool_run {
+                    slots += 1;
+                    in_tool_run = true;
+                }
+            }
+            Role::System => {
+                in_tool_run = false;
+            }
+        }
+    }
+    slots
+}
+
 /// Returns true if a JSON message value represents a compaction summary (internal only).
 /// Used by both the REST API (server/mod.rs) and WebSocket chat handler to filter
 /// compaction messages from user-visible history.
@@ -557,8 +605,13 @@ impl AgentRuntime {
         if kv_cache_mode == 2 {
             let (resolved_provider, _) = self.providers.resolve_model(model);
             if let Ok(provider) = self.providers.get(resolved_provider) {
-                let head_count = head_msgs.len();
-                let tail_count = recent_msgs.len();
+                // keep_head/keep_tail/expected MUST be in the server's
+                // flat-slot unit, not local Vec<Message> length — see
+                // count_server_slots. head is the first user+assistant
+                // (2 slots, or 0 post-/clear); tail is the kept recent
+                // window collapsed to server slots.
+                let head_count = count_server_slots(&head_msgs);
+                let tail_count = count_server_slots(&recent_msgs);
                 // Honest Option: when there's no cached session locally
                 // we send None instead of misleading Some(0) — the
                 // server would 409 against 0 and the log would
@@ -568,7 +621,7 @@ impl AgentRuntime {
                 let expected: Option<usize> = self
                     .sessions
                     .get(session_key)
-                    .map(|m| m.len());
+                    .map(|m| count_server_slots(m));
                 match provider
                     .compact_splice(
                         session_key,
@@ -1248,4 +1301,90 @@ fn parse_entities_from_summary(summary: &str) -> Vec<crate::agent::context_mgr::
     }
 
     entities
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(role: Role, text: &str) -> Message {
+        Message {
+            role,
+            content: MessageContent::Text(text.to_owned()),
+        }
+    }
+
+    #[test]
+    fn count_server_slots_plain_turns() {
+        // [user, assistant, user, assistant] → 4 server slots, one per
+        // /turn input + one per assistant reply.
+        let msgs = vec![
+            msg(Role::User, "hi"),
+            msg(Role::Assistant, "hello"),
+            msg(Role::User, "bye"),
+            msg(Role::Assistant, "later"),
+        ];
+        assert_eq!(count_server_slots(&msgs), 4);
+    }
+
+    #[test]
+    fn count_server_slots_bundles_tool_run() {
+        // One tool round: user, assistant(tool_calls), tool, tool, assistant.
+        // The server bundles the two tool_results into a SINGLE user slot
+        // (the tool_results /turn), so 5 local messages → 4 server slots:
+        // [user, assistant, user(bundled), assistant].
+        let msgs = vec![
+            msg(Role::User, "q"),
+            msg(Role::Assistant, "calling tools"),
+            msg(Role::Tool, "result-a"),
+            msg(Role::Tool, "result-b"),
+            msg(Role::Assistant, "final"),
+        ];
+        assert_eq!(count_server_slots(&msgs), 4);
+    }
+
+    #[test]
+    fn count_server_slots_two_tool_rounds() {
+        // user, assistant(tc), [tool], assistant(tc), [tool], assistant
+        // → server: user, asst, user, asst, user, asst = 6 slots.
+        let msgs = vec![
+            msg(Role::User, "q"),
+            msg(Role::Assistant, "tc1"),
+            msg(Role::Tool, "r1"),
+            msg(Role::Assistant, "tc2"),
+            msg(Role::Tool, "r2"),
+            msg(Role::Assistant, "final"),
+        ];
+        assert_eq!(count_server_slots(&msgs), 6);
+    }
+
+    #[test]
+    fn count_server_slots_skips_system() {
+        // A leading system message lives in the prefix, not a message slot.
+        let msgs = vec![
+            msg(Role::System, "you are concise"),
+            msg(Role::User, "hi"),
+            msg(Role::Assistant, "hello"),
+        ];
+        assert_eq!(count_server_slots(&msgs), 2);
+    }
+
+    #[test]
+    fn count_server_slots_post_splice_self_consistent() {
+        // After a splice the local history is head(2) + summary(1 user) +
+        // tail. count_server_slots of that rebuild must equal
+        // keep_head + 1 + keep_tail so the basis stays aligned with the
+        // server's reported msgs_count across repeated compactions.
+        let keep_head = 2;
+        let keep_tail = 4;
+        let mut rebuilt = vec![msg(Role::User, "first"), msg(Role::Assistant, "first-reply")];
+        rebuilt.push(msg(Role::User, "[CONTEXT COMPACTION] summary"));
+        rebuilt.extend(vec![
+            msg(Role::User, "t1"),
+            msg(Role::Assistant, "t1r"),
+            msg(Role::User, "t2"),
+            msg(Role::Assistant, "t2r"),
+        ]);
+        assert_eq!(count_server_slots(&rebuilt), keep_head + 1 + keep_tail);
+    }
 }

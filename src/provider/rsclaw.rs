@@ -67,6 +67,13 @@ pub const RSCLAW_DEFAULT_BASE: &str = "https://api.rsclaw.ai/v1/agent";
 /// the new identifier.
 pub const RSCLAW_DEFAULT_PREFIX_ID: &str = "rsclaw/2026.5.18";
 
+/// Default HTTP timeout (seconds) for the `/sessions/<id>/compact` splice
+/// call. The server holds the per-session lock and dispatches the splice
+/// to a worker, and a large `keep_tail` can take a while to redecode, so
+/// this must be ≥ the server's splice ceiling. Overridable per provider via
+/// config `compactTimeoutSecs`.
+pub const RSCLAW_DEFAULT_COMPACT_TIMEOUT_SECS: u64 = 180;
+
 /// Well-known model names served by the managed rsclaw fleet (see
 /// `GET /v1/agent/models`). Used by `agent::runtime` to auto-resolve
 /// `flash` and `vision` when the user only configured a `rsclaw/*`
@@ -151,6 +158,11 @@ pub struct RsclawProvider {
     /// so threading model or per-request data into this field would
     /// only fragment the cache.
     prefix_id: String,
+    /// HTTP timeout for the `/sessions/<id>/compact` splice POST. Defaults
+    /// to [`RSCLAW_DEFAULT_COMPACT_TIMEOUT_SECS`]; overridable via the
+    /// per-provider config `compactTimeoutSecs` so it can be aligned with
+    /// the server's splice ceiling without a rebuild.
+    compact_timeout: Duration,
     sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
     /// Cache of 308 redirects, keyed by *origin* (scheme + host + port)
     /// of the requested URL. Lets a single LB call amortise across the
@@ -341,9 +353,22 @@ impl RsclawProvider {
             base_url,
             bearer,
             prefix_id: RSCLAW_DEFAULT_PREFIX_ID.to_owned(),
+            compact_timeout: Duration::from_secs(RSCLAW_DEFAULT_COMPACT_TIMEOUT_SECS),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             redirect_cache: Arc::new(Mutex::new(RedirectCache::default())),
         }
+    }
+
+    /// Override the `/compact` splice HTTP timeout (seconds). Used by the
+    /// provider builder in `gateway::providers` when the config carries an
+    /// explicit `compactTimeoutSecs`. A zero/absent value is ignored so a
+    /// misconfigured `0` can't disable the timeout entirely (which would
+    /// let a wedged splice hang the compaction path forever).
+    pub fn with_compact_timeout_secs(mut self, secs: u64) -> Self {
+        if secs > 0 {
+            self.compact_timeout = Duration::from_secs(secs);
+        }
+        self
     }
 
     /// Override the default `prefix_id` sent on the wire. Used by the
@@ -815,21 +840,82 @@ impl LlmProvider for RsclawProvider {
                     })?
             };
 
-            let resp = self
-                .compact_splice_inner(
-                    &session_id,
-                    keep_head_messages,
-                    summary,
-                    keep_tail_messages,
-                    expected_msgs_count,
-                )
-                .await?;
+            // Bounded optimistic-concurrency retry (protocol §6.3.1).
+            // A non-atomic turn (server appends the user slot before
+            // dispatch and does not roll it back on failure) or genuine
+            // concurrency can leave the server's slot count ahead of
+            // ours. On 409 the server returns its authoritative `current`;
+            // the extra slots are the most recent, so we keep them
+            // verbatim by growing the tail. The dropped middle is
+            // unchanged, so the already-computed `summary` stays valid —
+            // no re-summarize needed. Falls back to replay (bail) only on
+            // the genuinely unrecoverable shapes.
+            const MAX_SPLICE_ATTEMPTS: usize = 3;
+            let mut expected = expected_msgs_count;
+            let mut keep_tail = keep_tail_messages;
+            let mut attempt = 0usize;
+            let resp = loop {
+                attempt += 1;
+                match self
+                    .compact_splice_inner(
+                        &session_id,
+                        keep_head_messages,
+                        summary,
+                        keep_tail,
+                        expected,
+                    )
+                    .await?
+                {
+                    SpliceOutcome::Done(r) => break r,
+                    SpliceOutcome::CountMismatch { current } => {
+                        let prev = expected.unwrap_or(current);
+                        if current < prev {
+                            // Local history is AHEAD of the server — should
+                            // not happen with correct slot counting. Don't
+                            // shrink the tail (would drop messages the
+                            // summary doesn't cover); fall back to replay.
+                            anyhow::bail!(
+                                "rsclaw compact splice: server count {current} < local \
+                                 {prev}; falling back to replay rather than dropping \
+                                 unsummarized messages"
+                            );
+                        }
+                        keep_tail += current - prev;
+                        expected = Some(current);
+                        if keep_head_messages + keep_tail >= current {
+                            anyhow::bail!(
+                                "rsclaw compact splice: realigned keep ranges (head \
+                                 {keep_head_messages} + tail {keep_tail}) leave no middle \
+                                 to drop against server count {current}; falling back to \
+                                 replay"
+                            );
+                        }
+                        if attempt >= MAX_SPLICE_ATTEMPTS {
+                            anyhow::bail!(
+                                "rsclaw compact splice: still 409 msg_count_mismatch \
+                                 after {attempt} attempts (count drifting under \
+                                 concurrent load); falling back to replay"
+                            );
+                        }
+                        tracing::info!(
+                            session_key,
+                            current,
+                            new_keep_tail = keep_tail,
+                            attempt,
+                            "rsclaw compact splice: 409 msg_count_mismatch — realigned \
+                             expected to server count and retrying"
+                        );
+                    }
+                }
+            };
 
             // Optimistically update last_seen_msgs_len with the
             // gateway-local computation (head + summary(1) + tail).
+            // `keep_tail` may have grown across 409 retries, so recompute
+            // from the final value rather than the original argument.
             // The server's resp.msgs_count is also tracked but kept as
             // a sanity cross-check at log level.
-            let local_msgs_count = keep_head_messages + 1 + keep_tail_messages;
+            let local_msgs_count = keep_head_messages + 1 + keep_tail;
             if resp.msgs_count != local_msgs_count {
                 tracing::warn!(
                     session_key,
@@ -1213,7 +1299,7 @@ impl RsclawProvider {
         summary: &str,
         keep_tail_messages: usize,
         expected_msgs_count: Option<usize>,
-    ) -> Result<CompactSpliceResp> {
+    ) -> Result<SpliceOutcome> {
         let path = format!("/sessions/{}/compact", session_id);
         let body = CompactSpliceReq {
             keep_head_messages,
@@ -1222,16 +1308,32 @@ impl RsclawProvider {
             expected_msgs_count,
         };
         let resp = self
-            .send_following_redirects(&path, &body, Some(Duration::from_secs(180)))
+            .send_following_redirects(&path, &body, Some(self.compact_timeout))
             .await?;
         let status = resp.status();
+        // 409 msg_count_mismatch is optimistic-concurrency, NOT a hard
+        // failure — the server hands back its authoritative `current`
+        // slot count so the caller can re-align and retry (protocol
+        // §6.3.1). Surface it as a typed outcome instead of bailing, so
+        // the wrapper's retry loop can resolve it without falling back to
+        // a full replay.
+        if status.as_u16() == 409 {
+            let text = resp.text().await.unwrap_or_default();
+            let parsed: CompactSplice409 = serde_json::from_str(&text)
+                .with_context(|| format!("rsclaw compact: parse 409 body: {text}"))?;
+            return Ok(SpliceOutcome::CountMismatch {
+                current: parsed.error.current,
+            });
+        }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("rsclaw compact splice failed {status}: {body}");
         }
-        resp.json::<CompactSpliceResp>()
+        let resp = resp
+            .json::<CompactSpliceResp>()
             .await
-            .context("rsclaw compact: parse response")
+            .context("rsclaw compact: parse response")?;
+        Ok(SpliceOutcome::Done(resp))
     }
 
     /// Dispatch a one-shot stateless request to `/fastshot`, `/vision`,
@@ -1594,6 +1696,29 @@ struct CompactSpliceResp {
     session_id: String,
     msgs_count: usize,
     tokens_count: usize,
+}
+
+/// Outcome of a single `/compact` POST. Splits the success path from the
+/// `409 msg_count_mismatch` optimistic-concurrency signal so the wrapper
+/// can retry the latter (protocol §6.3.1) instead of treating it as a
+/// hard failure that forces a full replay.
+enum SpliceOutcome {
+    Done(CompactSpliceResp),
+    CountMismatch { current: usize },
+}
+
+/// Body of a `409 msg_count_mismatch` from `/compact`:
+/// `{"error":{"code":"msg_count_mismatch","detail":"expected 20, got 21","current":21}}`.
+/// `current` is the server's authoritative post-turn slot count; the client
+/// re-aligns `expected_msgs_count` to it and retries.
+#[derive(Debug, Deserialize)]
+struct CompactSplice409 {
+    error: CompactSplice409Error,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompactSplice409Error {
+    current: usize,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -5548,6 +5673,85 @@ data: {"type":"block_stop","index":0}
         assert_eq!(
             entry.prefix_id, RSCLAW_DEFAULT_PREFIX_ID,
             "prefix_id must be unchanged"
+        );
+    }
+
+    #[test]
+    fn compact_splice_409_body_parses() {
+        let body = r#"{"error":{"code":"msg_count_mismatch","detail":"expected 50, got 52","current":52}}"#;
+        let parsed: CompactSplice409 =
+            serde_json::from_str(body).expect("409 body must parse");
+        assert_eq!(parsed.error.current, 52);
+    }
+
+    #[tokio::test]
+    async fn compact_splice_retries_on_409_then_succeeds() {
+        // Protocol §6.3.1: 409 msg_count_mismatch is optimistic-concurrency,
+        // NOT fatal. The client must read `current`, re-align, and retry —
+        // a non-atomic turn leaves the server's slot count ahead of ours.
+        // First POST 409s (server has 52, we sent 50); the client grows the
+        // tail by the delta (2) and retries, which succeeds. No replay
+        // fallback, session_id preserved.
+        use crate::provider::LlmProvider;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let session_id = "rs_w7_retry";
+        let compact_path = format!("/sessions/{}/compact", session_id);
+
+        // First call: 409 with the server's authoritative current=52.
+        Mock::given(method("POST"))
+            .and(path(compact_path.clone()))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "error": {
+                    "code": "msg_count_mismatch",
+                    "detail": "expected 50, got 52",
+                    "current": 52
+                }
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // Second call (after realign): success. keep_tail grew 10→12, so
+        // server reports head(2)+summary(1)+tail(12)=15.
+        Mock::given(method("POST"))
+            .and(path(compact_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": session_id,
+                "msgs_count": 15,
+                "tokens_count": 9000,
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let provider = RsclawProvider::new(mock_server.uri(), None);
+        {
+            let mut map = provider.lock_sessions();
+            map.insert(
+                "retry-key".to_owned(),
+                SessionEntry {
+                    session_id: session_id.to_owned(),
+                    prefix_id: RSCLAW_DEFAULT_PREFIX_ID.to_owned(),
+                    last_seen_msgs_len: 50,
+                },
+            );
+        }
+
+        let result = provider
+            .compact_splice("retry-key", 2, "<summary>", 10, Some(50))
+            .await
+            .expect("splice should succeed after one 409 retry");
+        assert_eq!(result, 15, "returns server msgs_count from the retried call");
+
+        let map = provider.lock_sessions();
+        let entry = map.get("retry-key").expect("entry preserved");
+        assert_eq!(
+            entry.last_seen_msgs_len, 15,
+            "last_seen recomputed from the GROWN tail: head(2)+summary(1)+tail(12)"
         );
     }
 }

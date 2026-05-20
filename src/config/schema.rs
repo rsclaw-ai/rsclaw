@@ -734,6 +734,15 @@ pub struct ProviderConfig {
     /// when omitted. Ignored for non-rsclaw `api` formats.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_id: Option<String>,
+    /// HTTP timeout (seconds) for the `rsclaw` `/sessions/<id>/compact`
+    /// splice call. The server holds the per-session lock and dispatches
+    /// the splice to a worker; a large tail can take a while, so this must
+    /// be ≥ the server's splice ceiling or the client times out before the
+    /// splice returns. Defaults to
+    /// `provider::rsclaw::RSCLAW_DEFAULT_COMPACT_TIMEOUT_SECS` (180) when
+    /// omitted. Ignored for non-rsclaw `api` formats.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

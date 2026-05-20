@@ -180,6 +180,10 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                         Some(pid) => provider.with_prefix_id(pid),
                         None => provider,
                     };
+                    let provider = match provider_cfg.compact_timeout_secs {
+                        Some(secs) => provider.with_compact_timeout_secs(secs),
+                        None => provider,
+                    };
                     Arc::new(provider)
                 }
                 _ => {
