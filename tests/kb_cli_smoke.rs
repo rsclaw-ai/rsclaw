@@ -341,6 +341,74 @@ fn kb_search_json_emits_full_output_struct() {
     assert!(parsed.get("warnings").is_some(), "missing warnings: {parsed}");
 }
 
+#[test]
+fn kb_visibility_private_hides_doc_from_default_scope() {
+    let tmp = TempDir::new().unwrap();
+    let base = tmp.path().join("base");
+    let fixture = tmp.path().join("v.md");
+    std::fs::write(&fixture, "# Secret\n\nclassified yellow dwarf data.").unwrap();
+    run(rsclaw().args([
+        "--base-dir",
+        base.to_str().unwrap(),
+        "kb",
+        "add",
+        fixture.to_str().unwrap(),
+    ]));
+    // Default scope can see Global docs.
+    let (before, _, _) = run(rsclaw().args([
+        "--base-dir",
+        base.to_str().unwrap(),
+        "kb",
+        "search",
+        "yellow dwarf",
+    ]));
+    assert!(
+        before.contains("classified") || before.contains("Secret"),
+        "doc should be visible as Global before visibility flip: {before}"
+    );
+
+    let (ls_stdout, _, _) = run(rsclaw().args([
+        "--base-dir",
+        base.to_str().unwrap(),
+        "kb",
+        "ls",
+    ]));
+    let doc_id = ls_stdout
+        .lines()
+        .find_map(|l| {
+            let first = l.split_whitespace().next()?;
+            if first.len() == 26 && first.chars().all(|c| c.is_ascii_alphanumeric()) {
+                Some(first.to_string())
+            } else {
+                None
+            }
+        })
+        .expect("doc_id not in ls");
+
+    let (_, _, code) = run(rsclaw().args([
+        "--base-dir",
+        base.to_str().unwrap(),
+        "kb",
+        "visibility",
+        &doc_id,
+        "private",
+    ]));
+    assert_eq!(code, 0);
+
+    // After visibility=private, default scope (no user_id) sees nothing.
+    let (after, _, _) = run(rsclaw().args([
+        "--base-dir",
+        base.to_str().unwrap(),
+        "kb",
+        "search",
+        "yellow dwarf",
+    ]));
+    assert!(
+        after.contains("(no hits)"),
+        "private doc must be hidden from default scope: {after}"
+    );
+}
+
 // Bare-bones sanity: invoking the binary at all returns help.
 #[test]
 fn rsclaw_prints_help_with_no_args() {
