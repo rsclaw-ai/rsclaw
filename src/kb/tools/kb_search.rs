@@ -109,7 +109,16 @@ pub fn run(ctx: &SearchCtx, input: KbSearchInput, scope: &CallerScope) -> Result
             results.iter().map(|h| h.chunk_id.as_str()).collect();
         for m in query_mentions {
             let cid = canonical_id(m.kind, &m.surface);
-            let chunk_edges = entities::chunks_for_entity(&rtx, &cid).unwrap_or_default();
+            let chunk_edges = match entities::chunks_for_entity(&rtx, &cid) {
+                Ok(edges) => edges,
+                Err(e) => {
+                    tracing::warn!(
+                        entity = %cid,
+                        "kb_search: entity_alignment lookup failed: {e}"
+                    );
+                    Vec::new()
+                }
+            };
             let total = chunk_edges.len();
             let matched = chunk_edges
                 .iter()

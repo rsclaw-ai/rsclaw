@@ -212,7 +212,21 @@ impl SearchCtx {
                 None => continue,
             };
             let abs = self.paths.root.join(&d.markdown_path);
-            let text = read_doc_range(&abs, c.byte_offset.0, c.byte_offset.1).unwrap_or_default();
+            // Body-read failures degrade to empty text rather than
+            // erroring the whole search, but log them — usually means
+            // the file was reaped by the compactor in a race, which
+            // should be rare and worth knowing about.
+            let text = match read_doc_range(&abs, c.byte_offset.0, c.byte_offset.1) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(
+                        chunk = %crate::kb::redact(&chunk_id),
+                        path = %abs.display(),
+                        "kb search: chunk body read failed: {e}"
+                    );
+                    String::new()
+                }
+            };
             hits.push(RetrievalHit {
                 chunk_id,
                 doc_id: d.id.clone(),
