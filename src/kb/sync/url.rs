@@ -56,16 +56,40 @@ impl KbSourceSyncer for UrlSyncer {
             .send()
             .await
             .map_err(|e| SyncError::Network(format!("get {canonical_url}: {e}")))?;
-        if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_MODIFIED {
             return Ok(SyncOutcome {
                 docs_skipped: 1,
                 ..Default::default()
             });
         }
-        if !resp.status().is_success() {
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            || status == reqwest::StatusCode::FORBIDDEN
+        {
+            return Err(SyncError::AuthFailed(format!(
+                "status {status} for {canonical_url}"
+            )));
+        }
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry_after_secs = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(60);
+            return Err(SyncError::RateLimited { retry_after_secs });
+        }
+        if status.is_client_error() {
+            // 4xx other than 401/403/429 — permanent (bad request,
+            // not found, gone). Periodic retry won't help.
+            return Err(SyncError::Permanent(format!(
+                "client error {status} for {canonical_url}"
+            )));
+        }
+        if !status.is_success() {
+            // 5xx — transient; cron-style retry should make progress.
             return Err(SyncError::Network(format!(
-                "status {} for {canonical_url}",
-                resp.status()
+                "server error {status} for {canonical_url}"
             )));
         }
         let etag = resp

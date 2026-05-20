@@ -177,7 +177,7 @@ impl SearchCtx {
         }
 
         // 6. MMR.
-        let final_ids: Vec<(String, f32)> = match req.diversity {
+        let mut final_ids: Vec<(String, f32)> = match req.diversity {
             Diversity::Off => fused.into_iter().take(req.k).collect(),
             Diversity::Mmr => {
                 let candidates: Vec<MmrCandidate> = fused
@@ -193,6 +193,16 @@ impl SearchCtx {
                 mmr_select(candidates, req.k, req.mmr_lambda)
             }
         };
+        // Spec §3 KV-cache friendliness: stable order across calls.
+        // RRF already breaks ties deterministically; MMR's greedy
+        // picker can produce equal-score ties — apply (score desc,
+        // chunk_id asc) one more time so the same inputs always
+        // produce the same on-the-wire byte sequence.
+        final_ids.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
 
         // 7. Lazy text fetch + build hits.
         let mut hits = Vec::with_capacity(final_ids.len());

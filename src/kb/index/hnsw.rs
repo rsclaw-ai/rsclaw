@@ -37,10 +37,21 @@ const INITIAL_CAPACITY: usize = 10_000;
 /// `<dir>/<SNAPSHOT_NAME>.meta.json`.
 const SNAPSHOT_NAME: &str = "snapshot";
 
+/// Bumped on incompatible snapshot format changes. v1 = the layout
+/// shipped at KB MVP. Future versions can fall back to rebuild from
+/// redb on mismatch rather than panicking.
+const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Serialize, Deserialize)]
 struct HnswMeta {
+    #[serde(default = "default_schema_version")]
+    schema_version: u32,
     dimension: usize,
     id_to_chunk: Vec<String>,
+}
+
+fn default_schema_version() -> u32 {
+    SNAPSHOT_SCHEMA_VERSION
 }
 
 pub struct HnswCache {
@@ -187,6 +198,7 @@ impl HnswCache {
                 .map_err(|e| anyhow::anyhow!("hnsw file_dump: {e}"))?;
         }
         let meta = HnswMeta {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
             dimension: DIMENSION,
             id_to_chunk: inner.id_to_chunk.clone(),
         };
@@ -216,6 +228,13 @@ impl HnswCache {
             .with_context(|| format!("read {}", meta_path.display()))?;
         let meta: HnswMeta = serde_json::from_slice(&meta_bytes)
             .with_context(|| format!("decode {}", meta_path.display()))?;
+        if meta.schema_version != SNAPSHOT_SCHEMA_VERSION {
+            return Err(anyhow::anyhow!(
+                "snapshot schema_version={} is incompatible with runtime version={SNAPSHOT_SCHEMA_VERSION} \
+                 — delete the hnsw/ directory to force a rebuild from redb",
+                meta.schema_version
+            ));
+        }
         if meta.dimension != DIMENSION {
             return Err(anyhow::anyhow!(
                 "snapshot dim={} does not match runtime dim={DIMENSION}",

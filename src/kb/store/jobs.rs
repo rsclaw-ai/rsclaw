@@ -168,6 +168,8 @@ pub fn requeue(wtx: &WriteTransaction, job_id: &str) -> Result<()> {
 }
 
 /// Find Running jobs whose claim token has expired, reset to Ready.
+/// Annotates `last_error = "claim_token_expired"` on each reclaimed
+/// job so operators have an audit trail.
 pub fn reclaim_stale(wtx: &WriteTransaction, now_ms: i64) -> Result<Vec<String>> {
     let mut to_reclaim = Vec::new();
     {
@@ -182,6 +184,13 @@ pub fn reclaim_stale(wtx: &WriteTransaction, now_ms: i64) -> Result<Vec<String>>
     }
     for id in &to_reclaim {
         requeue(wtx, id)?;
+        // Annotate the requeued job so operators can see why it came
+        // back to Ready. requeue() already wrote the new status; we
+        // do a follow-up read+write to set last_error. Single wtx so
+        // atomicity holds.
+        let (mut job, old_key) = read_and_old_key(wtx, id)?;
+        job.last_error = Some("claim_token_expired".into());
+        write_status_transition(wtx, &job, &old_key)?;
     }
     Ok(to_reclaim)
 }

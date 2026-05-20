@@ -71,4 +71,11 @@ pub trait KbSourceSyncer: Send + Sync {
         ctx: &SyncContext,
         reason: SyncReason,
     ) -> Result<SyncOutcome, SyncError>;
+    /// Called once when a syncer is enabled / registered. Default
+    /// impl is a no-op; concrete syncers can use this for any
+    /// one-shot setup (e.g. fetching feed metadata, registering a
+    /// webhook) before the first periodic tick.
+    async fn on_enable(&self, _ctx: &SyncContext) -> Result<(), SyncError> {
+        Ok(())
+    }
 }
