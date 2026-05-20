@@ -133,16 +133,22 @@ pub fn ingest_canonicalized(store: &KbStore, input: IngestInput<'_>) -> Result<I
 
     // 3b. Version + old_paths INSIDE wtx.
     let next_version = docs::next_version_for_in_wtx(&wtx, &lsid_str)?;
+    // When next_version > 1 there should be a latest_version pointer
+    // by construction (that's how next_version_for derives N+1), but
+    // we treat a missing pointer as a recoverable race rather than
+    // panicking — empty old_paths is harmless for the ledger.
     let old_paths = if next_version > 1 {
-        let ptr = docs::latest_version_in_wtx(&wtx, &lsid_str)?.unwrap();
-        match docs::get_in_wtx(&wtx, &ptr.doc_id)? {
-            Some(prev) => {
-                let mut p = vec![prev.markdown_path];
-                if let Some(raw) = prev.raw_path {
-                    p.push(raw);
+        match docs::latest_version_in_wtx(&wtx, &lsid_str)? {
+            Some(ptr) => match docs::get_in_wtx(&wtx, &ptr.doc_id)? {
+                Some(prev) => {
+                    let mut p = vec![prev.markdown_path];
+                    if let Some(raw) = prev.raw_path {
+                        p.push(raw);
+                    }
+                    p
                 }
-                p
-            }
+                None => vec![],
+            },
             None => vec![],
         }
     } else {
