@@ -119,7 +119,26 @@ impl AgentRuntime {
             self.live.agents.read().await.defaults.context_tokens.unwrap_or(64_000) as usize
         };
         // Used later to pick the splice strategy (mode 2 = rsclaw stateful).
-        let kv_cache_mode = self.live.agents.read().await.defaults.kv_cache_mode.unwrap_or(1);
+        //
+        // Mirror the auto-force at runtime.rs (~4277): the actual turn LLM
+        // calls force kv_cache_mode=2 whenever the resolved provider is
+        // `rsclaw`, regardless of agents.defaults.kv_cache_mode (which is
+        // unset → 1 by default). Compaction MUST use the same effective
+        // mode, otherwise the `kv_cache_mode == 2` splice path below is
+        // skipped: the session gets rewritten locally but the server is
+        // never told, so the next turn's lookup sees msgs.len() drop,
+        // forces a /sessions/replay, opens a NEW server session_id, and
+        // cold-prefills the entire post-compact history (~50s/turn,
+        // observed as rs_w4_* session churn in the worker log). With the
+        // effective mode the splice preserves session_id and the cache.
+        let configured_kv_mode =
+            self.live.agents.read().await.defaults.kv_cache_mode.unwrap_or(1);
+        let (resolved_provider, _) = self.providers.resolve_model(model);
+        let kv_cache_mode = if resolved_provider == "rsclaw" {
+            2
+        } else {
+            configured_kv_mode
+        };
 
         // Headroom to leave below the context window for: the model's reply,
         // the next user message, and token-estimation drift. `reserveTokensFloor`
