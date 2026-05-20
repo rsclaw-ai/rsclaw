@@ -496,3 +496,40 @@ fn ollama_model_dim(model: &str) -> i32 {
     }
 }
 
+/// Build the text to embed for a retrieval *query*. With no instruction
+/// (or an empty one) the query is embedded as-is, preserving symmetric
+/// behaviour. When an instruction is set, wrap it in the Qwen3-Embedding
+/// query format (`Instruct: {task}\nQuery: {query}`), which materially
+/// improves asymmetric retrieval quality. Document embeddings never use this.
+pub fn format_query(instruction: Option<&str>, query: &str) -> String {
+    match instruction {
+        Some(task) if !task.is_empty() => format!("Instruct: {task}\nQuery: {query}"),
+        _ => query.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod query_instruction_tests {
+    use super::*;
+
+    #[test]
+    fn none_returns_query_unchanged() {
+        assert_eq!(format_query(None, "梯度下降"), "梯度下降");
+    }
+
+    #[test]
+    fn some_wraps_in_qwen3_instruct_format() {
+        assert_eq!(
+            format_query(Some("Given a query, retrieve relevant passages"), "梯度下降"),
+            "Instruct: Given a query, retrieve relevant passages\nQuery: 梯度下降"
+        );
+    }
+
+    #[test]
+    fn empty_instruction_string_is_treated_as_no_instruction() {
+        // A configured-but-empty instruction must not produce a malformed
+        // "Instruct: \nQuery: ..." prefix that pollutes the embedding.
+        assert_eq!(format_query(Some(""), "梯度下降"), "梯度下降");
+    }
+}
+
