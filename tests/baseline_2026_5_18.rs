@@ -156,6 +156,12 @@ fn baseline_shared_prefix_byte_stable() {
     }
 }
 
+// Gated to macOS because the `shell` tool's description is target-OS-specific
+// (different package-manager + shell hints for macOS vs Linux vs Windows), and
+// the fixture is regenerated on macOS by `regenerate_fixture` above. Running
+// this check on a Linux CI runner would always diff on the `shell` tool body.
+// Verifying on a single canonical OS is enough to catch unintentional drift.
+#[cfg(target_os = "macos")]
 #[test]
 fn baseline_builtin_tools_byte_stable() {
     let fixture = load_baseline();
