@@ -8,7 +8,12 @@ use rsclaw::computer::parser::{parse_vlm_response, CoordFormat};
 use rsclaw::computer::prompt::{build_system_prompt, PromptInputs};
 use rsclaw::computer::app_rules::AppRuleSet;
 
+// xcap::Monitor::all needs a real display (X11/Wayland/Quartz). GitHub
+// Actions Linux runners are headless and fail with "Connection closed,
+// error during parsing display string". Run manually with
+// `cargo test --test computer_e2e -- --ignored` on a desktop machine.
 #[tokio::test]
+#[ignore]
 async fn native_operator_screenshot_works() {
     let op = NativeOperator::new();
     let snap = op.screenshot().await.expect("xcap screenshot");
