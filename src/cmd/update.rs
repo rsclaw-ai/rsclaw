@@ -22,6 +22,22 @@ pub async fn cmd_update(sub: UpdateCommand) -> Result<()> {
     Ok(())
 }
 
+/// Compare two dot-separated numeric versions (CalVer "2026.5.20"), segment
+/// by segment as integers. String comparison is wrong for CalVer
+/// ("2026.5.9" would sort after "2026.5.10"), and a plain `==` check treats a
+/// published version that is *older* than the local build as "different,
+/// therefore an update" — which silently downgrades dev builds. Non-numeric
+/// segments (e.g. a "dev" build) parse as 0, so they never read as newer and a
+/// dev build still updates to a real release.
+fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let parse = |s: &str| {
+        s.split('.')
+            .map(|p| p.parse::<u64>().unwrap_or(0))
+            .collect::<Vec<u64>>()
+    };
+    parse(a).cmp(&parse(b))
+}
+
 const RSCLAW_VERSION_URL: &str = "https://app.rsclaw.ai/api/version";
 
 /// Apply GITHUB_PROXY env to a URL: proxy + "/" + url
@@ -125,7 +141,10 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
         return Ok(());
     }
 
-    if latest_version == current {
+    // Only update when the published version is strictly newer. Equal means
+    // up to date; older means this is a local/dev build ahead of the last
+    // release — never downgrade it.
+    if version_cmp(&latest_version, current) != std::cmp::Ordering::Greater {
         if quiet {
             println!(
                 "{}",
@@ -510,11 +529,12 @@ async fn update_status() -> Result<()> {
         Some(tag) => {
             let latest = tag.trim_start_matches('v');
             kv("Latest:", latest);
-            if latest == option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev") {
-                println!("  {} up to date", green("[ok]"));
-            } else {
+            let current = option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev");
+            if version_cmp(latest, current) == std::cmp::Ordering::Greater {
                 println!("  {} update available: {latest}", yellow("[!]"));
                 println!("  Run: rsclaw update");
+            } else {
+                println!("  {} up to date", green("[ok]"));
             }
         }
         None => {
@@ -523,4 +543,37 @@ async fn update_status() -> Result<()> {
     }
     println!();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::version_cmp;
+    use std::cmp::Ordering;
+
+    #[test]
+    fn newer_release_is_greater() {
+        assert_eq!(version_cmp("2026.5.20", "2026.5.18"), Ordering::Greater);
+    }
+
+    #[test]
+    fn segments_compare_numerically_not_lexically() {
+        // String comparison would rank "9" after "10"; numeric must not.
+        assert_eq!(version_cmp("2026.5.10", "2026.5.9"), Ordering::Greater);
+    }
+
+    #[test]
+    fn equal_versions_are_equal() {
+        assert_eq!(version_cmp("2026.5.18", "2026.5.18"), Ordering::Equal);
+    }
+
+    #[test]
+    fn local_build_ahead_of_release_is_less_so_no_downgrade() {
+        // The reported bug: latest (release) older than current (local build).
+        assert_eq!(version_cmp("2026.5.18", "2026.5.20"), Ordering::Less);
+    }
+
+    #[test]
+    fn dev_build_is_behind_any_release() {
+        assert_eq!(version_cmp("dev", "2026.5.18"), Ordering::Less);
+    }
 }
