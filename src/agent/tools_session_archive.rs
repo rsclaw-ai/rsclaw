@@ -109,6 +109,11 @@ pub(crate) fn apply_archive_mode(
     rows: &[(u64, u32, Value)],
     mode: &str,
 ) -> Result<(Vec<(u64, u32, Value)>, Option<String>)> {
+    // Defensive trim: the rsclaw v1 tool-call protocol can leak a trailing
+    // newline into string args, which would make `mode == "stat"` fail and
+    // turn `grep:foo` into the regex `foo\n` (matching nothing). The handler
+    // also trims, but trimming here keeps the pure parser robust for any caller.
+    let mode = mode.trim();
     let total = rows.len();
     if mode == "stat" {
         return Ok((Vec::new(), Some("stat".to_string())));
@@ -176,7 +181,14 @@ impl AgentRuntime {
         // pass `session_key` to read a peer's archive. The argument is
         // intentionally absent from the tool schema.
         let session_key = ctx.session_key.clone();
-        let mode = args["mode"].as_str().unwrap_or("stat");
+        // Trim the mode arg: the rsclaw v1 tool-call protocol leaks a
+        // trailing newline into string arguments (same hazard fixed for the
+        // computer `action` arg in 289d5c4). Without this, `mode="stat\n"`
+        // fails the exact-match in apply_archive_mode ("unknown mode") and
+        // `grep:rsclaw\n` compiles to a regex requiring a literal newline
+        // after the keyword — so every archive lookup silently returns empty
+        // even though the data is present.
+        let mode = args["mode"].as_str().unwrap_or("stat").trim();
         let generation = args["generation"].as_u64().map(|g| g as u32);
 
         let rows = self
@@ -260,6 +272,27 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].0, 1);
         assert_eq!(out[1].0, 2);
+    }
+
+    // Regression: the rsclaw v1 tool-call protocol leaks a trailing newline
+    // into string args. Before trimming, `mode="stat\n"` errored "unknown
+    // mode" and `grep:weather\n` compiled to a regex requiring a literal
+    // newline after the keyword — so archive lookups silently returned empty
+    // even with matching data present.
+    #[test]
+    fn mode_arg_tolerates_trailing_newline() {
+        // stat with trailing newline → treated as stat (not "unknown mode").
+        let (_, summary) = apply_archive_mode(&sample(), "stat\n").unwrap();
+        assert_eq!(summary.as_deref(), Some("stat"));
+
+        // grep with trailing newline still matches the keyword.
+        let (out, _) = apply_archive_mode(&sample(), "grep:weather\n").unwrap();
+        assert_eq!(out.len(), 1, "grep:weather should match the Beijing-weather row");
+        assert_eq!(out[0].0, 3);
+
+        // head/seq with surrounding whitespace parse cleanly.
+        let (out, _) = apply_archive_mode(&sample(), " head:2 ").unwrap();
+        assert_eq!(out.len(), 2);
     }
 
     #[test]
