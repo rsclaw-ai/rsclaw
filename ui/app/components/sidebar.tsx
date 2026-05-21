@@ -305,21 +305,54 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
   React.useEffect(() => {
     const check = () => {
       getHealth()
-        .then(() => { setStatus("online"); autoStarted.current = false; })
+        .then(() => {
+          setStatus("online");
+          autoStarted.current = false;
+          failCount.current = 0;
+        })
         .catch(() => {
           if (starting) return; // don't overwrite "starting" state
-          setStatus("offline");
-          // Auto-start on first offline detection (unless user manually stopped)
+
           const tauriInvoke = isTauri ? tauriInvokeV2 : null;
-          if (tauriInvoke && !getUserStopped() && !autoStarted.current) {
+          const userStopped = getUserStopped();
+
+          if (userStopped) {
+            // Only path that legitimately shows "offline": the user
+            // explicitly stopped via tray / button. They expect to see
+            // the gateway off and the Start button.
+            setStatus("offline");
+            return;
+          }
+
+          // Not user-stopped — they didn't ask for this. Don't scare
+          // them with "offline" when the gateway might just be slow to
+          // boot, restarting, or briefly unreachable across a wake-from-
+          // sleep / window-restore. Stay on "checking" (or kick into
+          // "starting" if we're about to auto-start).
+          if (tauriInvoke && !autoStarted.current) {
             autoStarted.current = true;
             doStart();
+            // doStart() already sets status="starting"; nothing else to do.
+            return;
           }
+
+          setStatus("checking");
         });
     };
     check();
-    const timer = setInterval(check, 10000);
-    return () => clearInterval(timer);
+    const timer = setInterval(check, 5000);
+
+    // Re-check immediately when the window comes back from background
+    // (restoring from tray, switching workspace, waking from sleep).
+    // Without this the user can stare at a stale state for up to 10s
+    // before the next interval tick fires.
+    const onFocus = () => check();
+    window.addEventListener("focus", onFocus);
+
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener("focus", onFocus);
+    };
   }, []);
 
   // Auto-restart: when a `restart.required` event arrives and the gateway is

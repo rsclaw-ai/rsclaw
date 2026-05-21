@@ -24,11 +24,18 @@ export async function gatewayFetch(
   path: string,
   options?: RequestInit,
 ): Promise<Response> {
+  // Resolve URL + token through the accessors so localStorage fallbacks
+  // and Tauri-set runtime values always win over module-init env defaults.
+  // The closure-cached `GATEWAY_URL` / `AUTH_TOKEN` were the source of a
+  // "stuck offline" bug: env (.env.local) pinned URL to a stale port and
+  // requests kept hitting it even after Tauri called setGatewayUrl().
+  const url = getGatewayUrl();
+  const token = getAuthToken();
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
-    ...(AUTH_TOKEN ? { Authorization: `Bearer ${AUTH_TOKEN}` } : {}),
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
   };
-  return fetch(`${GATEWAY_URL}${path}`, {
+  return fetch(`${url}${path}`, {
     ...options,
     headers: { ...headers, ...(options?.headers as Record<string, string>) },
   });
@@ -59,6 +66,23 @@ export async function saveConfig(config: any) {
 
 export async function reloadConfig() {
   return gatewayFetch("/api/v1/config/reload", { method: "POST" }).then((r) =>
+    r.json(),
+  );
+}
+
+/**
+ * Graceful re-exec of the gateway binary. Backend does flag-and-flush:
+ * sets the shutdown flag, returns `{ restarting: true }` immediately,
+ * then axum's `with_graceful_shutdown` drains in-flight requests before
+ * the listener releases the port and a replacement process binds.
+ *
+ * Loopback-only — backend rejects with 403 from non-127.0.0.1 peers.
+ * Use after operations that change live state the gateway caches in-
+ * memory (e.g. installing a plugin: its WASM/manifest needs to be
+ * registered into PluginRegistry, which only happens at boot).
+ */
+export async function restartGateway() {
+  return gatewayFetch("/api/v1/restart", { method: "POST" }).then((r) =>
     r.json(),
   );
 }
