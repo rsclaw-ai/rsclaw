@@ -8,7 +8,7 @@
 //! `{"id":1,"error":"message"}\n`
 //!
 //! Lifecycle:
-//!   - `ShellBridgePlugin::spawn()` — start the subprocess
+//!   - `JsPlugin::spawn()` — start the subprocess
 //!   - `call(method, params)`       — send a request, wait for response
 //!   - `Drop`                       — kill the subprocess (RAII)
 //!
@@ -41,11 +41,11 @@ use super::manifest::PluginManifest;
 const DEFAULT_CALL_TIMEOUT_SECS: u64 = 30;
 
 // ---------------------------------------------------------------------------
-// ShellBridgePlugin
+// JsPlugin
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-pub struct ShellBridgePlugin {
+pub struct JsPlugin {
     pub name: String,
     stdin: Arc<Mutex<ChildStdin>>,
     child: Arc<Mutex<Child>>,
@@ -58,7 +58,7 @@ pub struct ShellBridgePlugin {
     reader_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
-impl ShellBridgePlugin {
+impl JsPlugin {
     /// Spawn the plugin subprocess and start the reader task that demuxes
     /// incoming lines into pending-request fulfillment or host method dispatch.
     pub async fn spawn(
@@ -323,10 +323,11 @@ async fn handle_incoming(
 // Runtime resolver
 // ---------------------------------------------------------------------------
 
-/// Resolve the shell-plugin runtime binary path (node/bun/deno).
+/// Resolve the JS-runtime binary path (node/bun/deno).
 ///
-/// Priority: ~/.rsclaw/tools/node/ > system PATH.
-/// Preference order: `bun` > `node` > `deno` (if the manifest doesn't specify).
+/// Priority: ~/.rsclaw/tools/ (bundled, installed via `rsclaw tools install`) >
+/// system PATH. node installs to `tools/node/bin/node`; bun/deno extract as a
+/// single binary to `tools/<rt>/<rt>`.
 fn resolve_runtime(runtime: &str) -> Result<String> {
     let candidates = match runtime {
         "bun" => vec!["bun"],
@@ -335,11 +336,17 @@ fn resolve_runtime(runtime: &str) -> Result<String> {
         other => vec![other],
     };
 
-    // 1. Check ~/.rsclaw/tools/node/ first
-    let tools_dir = crate::config::loader::base_dir().join("tools/node/bin");
-    if tools_dir.exists() {
-        for candidate in &candidates {
-            let bin = tools_dir.join(candidate);
+    let base = crate::config::loader::base_dir();
+
+    // 1. Check ~/.rsclaw/tools/ first. node lands in tools/node/bin/<rt>;
+    //    bun/deno extract as a bare binary to tools/<rt>/<rt> (or tools/<rt>/bin/).
+    for candidate in &candidates {
+        let probes = [
+            base.join(format!("tools/node/bin/{candidate}")),
+            base.join(format!("tools/{candidate}/{candidate}")),
+            base.join(format!("tools/{candidate}/bin/{candidate}")),
+        ];
+        for bin in probes {
             if bin.exists() {
                 return Ok(bin.to_string_lossy().to_string());
             }
@@ -347,10 +354,13 @@ fn resolve_runtime(runtime: &str) -> Result<String> {
     }
     #[cfg(target_os = "windows")]
     {
-        let tools_dir_win = crate::config::loader::base_dir().join("tools/node");
-        if tools_dir_win.exists() {
-            for candidate in &candidates {
-                let bin = tools_dir_win.join(format!("{candidate}.exe"));
+        for candidate in &candidates {
+            let probes = [
+                base.join(format!("tools/node/{candidate}.exe")),
+                base.join(format!("tools/{candidate}/{candidate}.exe")),
+                base.join(format!("tools/{candidate}/bin/{candidate}.exe")),
+            ];
+            for bin in probes {
                 if bin.exists() {
                     return Ok(bin.to_string_lossy().to_string());
                 }
@@ -366,8 +376,8 @@ fn resolve_runtime(runtime: &str) -> Result<String> {
     }
 
     bail!(
-        "no suitable shell-plugin runtime found for `{runtime}`. \
-         Run `rsclaw tools install node`, download from https://gitfast.io, or install node/bun/deno manually."
+        "no suitable JS-runtime found for `{runtime}`. \
+         Run `rsclaw tools install {runtime}`, download from https://gitfast.io, or install node/bun/deno manually."
     )
 }
 
@@ -375,10 +385,10 @@ fn resolve_runtime(runtime: &str) -> Result<String> {
 // Plugin trait adapter
 // ---------------------------------------------------------------------------
 
-/// `Plugin` wraps a `ShellBridgePlugin` and implements both `MemorySlot`
+/// `Plugin` wraps a `JsPlugin` and implements both `MemorySlot`
 /// and a generic `call()` interface used by the hook system.
 pub struct Plugin {
-    inner: ShellBridgePlugin,
+    inner: JsPlugin,
     pub manifest: PluginManifest,
 }
 
@@ -387,7 +397,7 @@ impl Plugin {
         manifest: PluginManifest,
         host_dispatch: Arc<crate::plugin::host_methods::HostMethodRegistry>,
     ) -> Result<Self> {
-        let inner = ShellBridgePlugin::spawn(&manifest, host_dispatch).await?;
+        let inner = JsPlugin::spawn(&manifest, host_dispatch).await?;
         Ok(Self { inner, manifest })
     }
 

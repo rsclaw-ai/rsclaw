@@ -51,6 +51,15 @@ const TOOLS: &[ToolDef] = &[
         optional: false,
     },
     ToolDef {
+        // Optional faster JS runtime for plugins with `runtime: "bun"`. node is
+        // the default; bun is opt-in (no Windows-ARM64 build upstream).
+        name: "bun",
+        display: "Bun (fast JS plugin runtime; node alternative)",
+        detect_cmd: &["bun"],
+        local_bin: "bun",
+        optional: true,
+    },
+    ToolDef {
         name: "python",
         display: "Python 3 (skill/plugin runtime)",
         detect_cmd: &["python3", "python"],
