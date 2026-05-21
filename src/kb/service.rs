@@ -10,7 +10,7 @@
 use crate::kb::canonicalize::{canonicalize_by_mime, detect_mime, CanonicalizeInput};
 use crate::kb::content_store::read::read_doc_body;
 use crate::kb::embedder::resolve_embedder;
-use crate::kb::jobs::{Job, JobKind};
+use crate::kb::jobs::{Job, JobKind, JobStatus};
 use crate::kb::model::{
     collection_tag, CallerScope, ChunkStatus, KbChunk, KbCollection, KbDoc, KbStatus,
     COLLECTION_TAG_PREFIX,
@@ -46,21 +46,29 @@ pub enum KnowledgeError {
 pub type KResult<T> = Result<T, KnowledgeError>;
 
 /// A document's API-facing summary. `status()` derives indexing state: a doc
-/// is `ready` once its chunks are embedded+indexed, else `indexing`.
+/// is `ready` once its chunks are embedded+indexed; `failed` if its indexing
+/// job exhausted retries with no chunks produced; else still `indexing`.
 pub struct DocInfo {
     pub id: String,
     pub title: String,
     pub mime: String,
     pub bytes: u64,
     pub chunk_count: usize,
+    /// The current-version ChunkAndEmbed job is in `Failed` state and no
+    /// chunks were produced — indexing permanently failed for this doc.
+    pub failed: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
 
 impl DocInfo {
+    /// `ready` (has chunks) > `failed` (index job exhausted, no chunks) >
+    /// `indexing` (still in flight).
     pub fn status(&self) -> &'static str {
         if self.chunk_count > 0 {
             "ready"
+        } else if self.failed {
+            "failed"
         } else {
             "indexing"
         }
@@ -335,8 +343,12 @@ impl KnowledgeService {
         let tag = collection_tag(collection_id);
         let rtx = self.store.begin_read()?;
         let counts = self.chunk_counts(&rtx)?;
+        let failed_jobs = self.failed_index_jobs(&rtx)?;
         let docs = self.collect_active_docs(&rtx, &tag)?;
-        let mut out: Vec<DocInfo> = docs.into_iter().map(|d| self.doc_info(d, &counts)).collect();
+        let mut out: Vec<DocInfo> = docs
+            .into_iter()
+            .map(|d| self.doc_info(d, &counts, &failed_jobs))
+            .collect();
         out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         Ok(out)
     }
@@ -362,7 +374,8 @@ impl KnowledgeService {
         let rtx = self.store.begin_read()?;
         let d = self.active_doc_in_collection(&rtx, collection_id, doc_id)?;
         let counts = self.chunk_counts(&rtx)?;
-        Ok(self.doc_info(d, &counts))
+        let failed_jobs = self.failed_index_jobs(&rtx)?;
+        Ok(self.doc_info(d, &counts, &failed_jobs))
     }
 
     /// `(mime, body)` of a document's canonical markdown, for display/editing.
@@ -550,12 +563,39 @@ impl KnowledgeService {
         Ok(counts)
     }
 
-    fn doc_info(&self, d: KbDoc, counts: &HashMap<String, usize>) -> DocInfo {
+    /// `(doc_id, doc_version)` of every `ChunkAndEmbed` job currently in
+    /// `Failed` state — i.e. indexing that exhausted its retries. Used to
+    /// surface a `failed` doc status instead of an indefinite `indexing`.
+    fn failed_index_jobs(
+        &self,
+        rtx: &redb::ReadTransaction,
+    ) -> anyhow::Result<HashSet<(String, u32)>> {
+        let mut out = HashSet::new();
+        for job in crate::kb::store::jobs::list_by_status(rtx, JobStatus::Failed)? {
+            if let JobKind::ChunkAndEmbed { doc_id, doc_version } = job.kind {
+                out.insert((doc_id, doc_version));
+            }
+        }
+        Ok(out)
+    }
+
+    fn doc_info(
+        &self,
+        d: KbDoc,
+        counts: &HashMap<String, usize>,
+        failed_jobs: &HashSet<(String, u32)>,
+    ) -> DocInfo {
         let bytes = std::fs::metadata(self.paths.root.join(&d.markdown_path))
             .map(|m| m.len())
             .unwrap_or(0);
+        let chunk_count = counts.get(&d.id).copied().unwrap_or(0);
+        // Only treat as failed when no chunks landed AND this doc's current
+        // version has a Failed indexing job (a stale failed job for an older
+        // version must not mask a freshly re-ingested, still-indexing doc).
+        let failed = chunk_count == 0 && failed_jobs.contains(&(d.id.clone(), d.version));
         DocInfo {
-            chunk_count: counts.get(&d.id).copied().unwrap_or(0),
+            chunk_count,
+            failed,
             id: d.id,
             title: d.title,
             mime: d.mime,
@@ -681,6 +721,32 @@ mod tests {
         assert!(c.id.starts_with("col_"));
         assert_eq!(s.get_collection(&c.id).unwrap().name, "产品手册");
         assert_eq!(s.list_collections().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn doc_status_failed_when_index_job_exhausted() {
+        let (_t, s) = svc();
+        let c = s.create_collection("kb", None, None).unwrap();
+        let (doc_id, _) = s
+            .ingest(&c.id, "a.md", b"# A\n\nbody one here", Some("text/markdown"))
+            .unwrap();
+        // Before the worker runs: still indexing.
+        assert_eq!(s.get_doc(&c.id, &doc_id).unwrap().status(), "indexing");
+        // Simulate the worker giving up: claim the enqueued ChunkAndEmbed job
+        // and mark it Failed (what run_one_blocking does at max_attempts).
+        {
+            use crate::kb::store::jobs;
+            let now = chrono::Utc::now().timestamp_millis();
+            let wtx = s.store().begin_write().unwrap();
+            let (job, token) = jobs::claim_next(&wtx, "test", now, 60_000).unwrap().unwrap();
+            jobs::mark_failed(&wtx, &job.id, &token.token, "boom").unwrap();
+            wtx.commit().unwrap();
+        }
+        // Now surfaced as failed (no chunks + Failed job for this version).
+        assert_eq!(s.get_doc(&c.id, &doc_id).unwrap().status(), "failed");
+        let docs = s.list_docs(&c.id).unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].status(), "failed");
     }
 
     #[test]
