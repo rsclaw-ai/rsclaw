@@ -9,10 +9,13 @@ use crate::cli::ToolsCommand;
 // Mirror URL (Chinese users) / upstream fallback
 // ---------------------------------------------------------------------------
 
-/// Manifest endpoint — schema-2 JSON: `{schema, updated_at, tools:{name:{version,
-/// platforms:{platform:{url,sha256}}}}}`. All download metadata is explicit (no
-/// built-in per-tool URL conventions).
-const MANIFEST_URL: &str = "https://gitfast.org/tools/manifest.json";
+/// Tools manifest — schema-2 JSON: `{schema, updated_at, tools:{name:{version,
+/// platforms:{platform:{url,sha256}}}}}`. All download metadata is explicit.
+const MANIFEST_URL: &str = "https://hub.rsclaw.ai/tools/manifest.json";
+
+/// Signed hub meta — its `sha256.tools` (covered by the ed25519 signature) pins
+/// the tools manifest. The install path verifies the manifest against it.
+const META_URL: &str = "https://hub.rsclaw.ai/meta.json";
 
 // ---------------------------------------------------------------------------
 // Tool definitions
@@ -396,17 +399,40 @@ pub async fn cmd_install(name: &str, force: bool) -> Result<()> {
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
 
-    let manifest: serde_json::Value = match client.get(MANIFEST_URL).send().await {
-        Ok(resp) if resp.status().is_success() => resp.json().await?,
+    // Fetch as text so we can verify its hash against the signed meta.
+    let manifest_txt = match client.get(MANIFEST_URL).send().await {
+        Ok(resp) if resp.status().is_success() => resp.text().await?,
         Ok(resp) => bail!("manifest fetch failed: HTTP {}", resp.status()),
         Err(e) => {
-            err_msg(&format!("Cannot reach mirror: {e}"));
+            err_msg(&format!("Cannot reach hub: {e}"));
             println!();
             println!("  Please download manually from: {}", bold("https://gitfast.io"));
             println!("  Then extract to: {}", bold(&tools_dir().display().to_string()));
             return Ok(());
         }
     };
+
+    // Trust anchor (fail-closed): fetch the signed meta, verify its ed25519
+    // signature against the pinned key, then confirm this manifest matches the
+    // signed `sha256.tools`. A compromised hub can't forge the signature.
+    {
+        let meta_txt = client
+            .get(META_URL)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| anyhow::anyhow!("fetch signed meta.json: {e}"))?
+            .text()
+            .await?;
+        let (_, _, tools_sha) = crate::skill::sig::verify_signed_meta(&meta_txt)?;
+        use sha2::{Digest, Sha256};
+        let got = format!("{:x}", Sha256::digest(manifest_txt.as_bytes()));
+        if tools_sha.is_empty() || got != tools_sha {
+            bail!("tools manifest sha256 != signed meta.sha256.tools — refusing");
+        }
+    }
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_txt)
+        .map_err(|e| anyhow::anyhow!("parse tools manifest: {e}"))?;
 
     let dir = tools_dir();
     std::fs::create_dir_all(&dir)?;

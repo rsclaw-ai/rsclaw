@@ -17,7 +17,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-const ALLOWLIST_BASE: &str = "https://api.rsclaw.ai/v1/hub/allowlist";
+/// Hub root. Layout: `/meta.json` (signed), `/skills/manifest.json`,
+/// `/plugins/manifest.json`, `/tools/manifest.json`.
+const HUB_BASE: &str = "https://hub.rsclaw.ai";
 
 /// One audited entry. `sha256` pins the audited SKILL.md (same convention as
 /// the clawhub lockfile); empty means "not content-pinned yet" → slug-gate only.
@@ -75,6 +77,9 @@ struct Meta {
     version: String,
     #[serde(default)]
     sha256: MetaSha,
+    /// ed25519 signature (base64) over the canonical payload — see sig.rs.
+    #[serde(default)]
+    sig: String,
 }
 #[derive(Deserialize, Default)]
 struct MetaSha {
@@ -82,6 +87,8 @@ struct MetaSha {
     skills: String,
     #[serde(default)]
     plugins: String,
+    #[serde(default)]
+    tools: String,
 }
 
 static CURRENT: LazyLock<RwLock<Arc<Allowlist>>> =
@@ -133,8 +140,19 @@ pub fn load_cached() -> (usize, usize) {
     counts
 }
 
-/// Verify each list against `meta.sha256`. (Signature verification is a
-/// follow-up — see the plan; HTTPS + this hash-pin is the floor.)
+/// Verify the hub's ed25519 signature on `meta.json` against the pinned public
+/// key. Fail-closed (empty/invalid sig → error). This is the trust anchor: a
+/// compromised hub can't forge a signature, so the meta hashes (and thus the
+/// lists they pin) are authentic.
+fn verify_meta_signature(meta: &str) -> Result<()> {
+    let m: Meta = serde_json::from_str(meta).context("parse allowlist meta.json")?;
+    crate::skill::sig::verify_meta_sig(
+        &m.version, &m.sha256.skills, &m.sha256.plugins, &m.sha256.tools, &m.sig,
+    )
+}
+
+/// Verify each list against `meta.sha256` (the signed hashes — see
+/// `verify_meta_signature`, which must pass first).
 fn verify_against_meta(meta: &str, skills: &str, plugins: &str) -> Result<()> {
     let m: Meta = serde_json::from_str(meta).context("parse allowlist meta.json")?;
     if !m.sha256.skills.is_empty() && sha256_hex(skills.as_bytes()) != m.sha256.skills {
@@ -154,7 +172,7 @@ pub async fn refresh() -> Result<()> {
         .timeout(Duration::from_secs(15))
         .build()?;
     let fetch = |path: &'static str| {
-        let url = format!("{ALLOWLIST_BASE}/{path}");
+        let url = format!("{HUB_BASE}/{path}");
         let c = client.clone();
         async move {
             c.get(&url)
@@ -166,9 +184,11 @@ pub async fn refresh() -> Result<()> {
                 .map_err(anyhow::Error::from)
         }
     };
-    let meta_txt = fetch("meta.json").await.context("fetch allowlist meta.json")?;
-    let skills_txt = fetch("skills.json").await.context("fetch allowlist skills.json")?;
-    let plugins_txt = fetch("plugins.json").await.context("fetch allowlist plugins.json")?;
+    let meta_txt = fetch("meta.json").await.context("fetch hub meta.json")?;
+    let skills_txt = fetch("skills/manifest.json").await.context("fetch hub skills/manifest.json")?;
+    let plugins_txt = fetch("plugins/manifest.json").await.context("fetch hub plugins/manifest.json")?;
+    // Trust anchor first: the meta signature, then the lists match the signed hashes.
+    verify_meta_signature(&meta_txt)?;
     verify_against_meta(&meta_txt, &skills_txt, &plugins_txt)?;
 
     let d = cache_dir();
@@ -245,6 +265,25 @@ mod tests {
         assert!(verify_against_meta(&good, skills, "{}").is_ok());
         let bad = r#"{"version":"v1","sha256":{"skills":"deadbeef"}}"#;
         assert!(verify_against_meta(bad, skills, "{}").is_err());
+    }
+
+    #[test]
+    fn meta_signature_verified_and_tamper_rejected() {
+        // Golden vector signed by hub-rsclaw-dist.py (same key as HUB_PUBKEY):
+        // payload version=2026-01-01.000000 skills=AAAA plugins=BBBB tools=CCCC.
+        const SIG: &str = "DGm3uiJwAeYeyi1km20QNFk8rrUD33QgAJYhgcuPlgF3JOXTUViZBDtkhys5D6wTfSvdBpgyAc7zWRuLdBCiCg==";
+        let good = format!(
+            r#"{{"version":"2026-01-01.000000","sha256":{{"skills":"AAAA","plugins":"BBBB","tools":"CCCC"}},"sig":"{SIG}"}}"#
+        );
+        assert!(verify_meta_signature(&good).is_ok());
+        // Tamper a hash → signature no longer matches.
+        let bad = format!(
+            r#"{{"version":"2026-01-01.000000","sha256":{{"skills":"XXXX","plugins":"BBBB","tools":"CCCC"}},"sig":"{SIG}"}}"#
+        );
+        assert!(verify_meta_signature(&bad).is_err());
+        // No signature → fail-closed.
+        let nosig = r#"{"version":"2026-01-01.000000","sha256":{"skills":"AAAA","plugins":"BBBB","tools":"CCCC"}}"#;
+        assert!(verify_meta_signature(nosig).is_err());
     }
 
     #[test]

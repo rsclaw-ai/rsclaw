@@ -53,6 +53,22 @@ pub fn verify_meta_sig(
         .context("hub meta signature verification failed")
 }
 
+/// Parse a hub `meta.json`, verify its signature against the pinned key, and
+/// return the verified `(skills, plugins, tools)` sha256 hashes. Fail-closed.
+pub fn verify_signed_meta(meta_json: &str) -> Result<(String, String, String)> {
+    let v: serde_json::Value = serde_json::from_str(meta_json).context("parse meta.json")?;
+    let s = |p: &str| v.pointer(p).and_then(|x| x.as_str()).unwrap_or("");
+    let (version, skills, plugins, tools, sig) = (
+        s("/version"),
+        s("/sha256/skills"),
+        s("/sha256/plugins"),
+        s("/sha256/tools"),
+        s("/sig"),
+    );
+    verify_meta_sig(version, skills, plugins, tools, sig)?;
+    Ok((skills.to_owned(), plugins.to_owned(), tools.to_owned()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
