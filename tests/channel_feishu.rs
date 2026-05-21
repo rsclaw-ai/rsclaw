@@ -6,7 +6,7 @@ use rsclaw::channel::feishu::FeishuChannel;
 use rsclaw::channel::{Channel, OutboundMessage};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
-    matchers::{method, path},
+    matchers::{body_string_contains, method, path},
 };
 
 fn init_crypto() {
@@ -153,6 +153,132 @@ async fn send_chunked_4000() {
         .await;
 
     assert!(result.is_ok(), "chunked send should succeed: {:?}", result.err());
+}
+
+/// A transient 5xx on the send endpoint is retried and then succeeds —
+/// the message is not dropped on a single transport-level blip.
+#[tokio::test]
+async fn send_retries_transient_5xx_then_succeeds() {
+    init_crypto();
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/auth/v3/tenant_access_token/internal"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 0, "msg": "ok", "tenant_access_token": "t-tok", "expire": 7200
+        })))
+        .mount(&server)
+        .await;
+
+    // First send attempt returns 503 (served at most once, highest priority);
+    // the retry falls through to the 200 mock.
+    Mock::given(method("POST"))
+        .and(path("/im/v1/messages"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/im/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 0, "msg": "ok", "data": { "message_id": "om_ok" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let ch = make_channel(&server.uri());
+    let result = ch
+        .send(OutboundMessage {
+            target_id: "oc_chat_1".to_owned(),
+            is_group: false,
+            text: "retry me".to_owned(),
+            reply_to: None,
+            images: vec![],
+            ..Default::default()
+        })
+        .await;
+
+    assert!(result.is_ok(), "send should recover after one 5xx: {:?}", result.err());
+}
+
+/// Every send carries a `uuid` so a post-commit reset retry is deduped by
+/// Feishu rather than delivered twice.
+#[tokio::test]
+async fn send_includes_uuid_for_idempotency() {
+    init_crypto();
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/auth/v3/tenant_access_token/internal"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 0, "msg": "ok", "tenant_access_token": "t-tok", "expire": 7200
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/im/v1/messages"))
+        .and(body_string_contains("\"uuid\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 0, "msg": "ok", "data": { "message_id": "om_ok" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let ch = make_channel(&server.uri());
+    let result = ch
+        .send(OutboundMessage {
+            target_id: "oc_chat_2".to_owned(),
+            is_group: false,
+            text: "dedupe me".to_owned(),
+            reply_to: None,
+            images: vec![],
+            ..Default::default()
+        })
+        .await;
+
+    assert!(result.is_ok(), "send with uuid should match and succeed: {:?}", result.err());
+}
+
+/// A 4xx is a permanent error (bad token / recipient) — fail fast, do not
+/// retry. The `.expect(1)` asserts exactly one send attempt was made.
+#[tokio::test]
+async fn send_4xx_fails_fast_without_retry() {
+    init_crypto();
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/auth/v3/tenant_access_token/internal"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code": 0, "msg": "ok", "tenant_access_token": "t-tok", "expire": 7200
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/im/v1/messages"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let ch = make_channel(&server.uri());
+    let result = ch
+        .send(OutboundMessage {
+            target_id: "oc_chat_3".to_owned(),
+            is_group: false,
+            text: "doomed".to_owned(),
+            reply_to: None,
+            images: vec![],
+            ..Default::default()
+        })
+        .await;
+
+    assert!(result.is_err(), "4xx should fail");
 }
 
 /// Verify the api_base_override is honoured (not hitting real Feishu).

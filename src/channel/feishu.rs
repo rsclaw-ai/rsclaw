@@ -24,6 +24,7 @@ use tracing::{debug, info, warn};
 use super::{Channel, OutboundMessage};
 use crate::channel::{
     chunker::{ChunkConfig, chunk_text, platform_chunk_limit},
+    retry::{SendRetry, send_with_retry},
     transcription::transcribe_audio,
 };
 
@@ -524,22 +525,23 @@ impl FeishuChannel {
         let card_str =
             serde_json::to_string(&card_payload["card"]).context("feishu: serialize card")?;
 
+        // Idempotency: one uuid per chunk, held constant across retries so a
+        // post-commit connection reset cannot double-send. Feishu dedupes
+        // identical uuids for 1h (<=50 chars).
+        let uuid = uuid::Uuid::new_v4().to_string();
         let body = json!({
             "receive_id": target_id,
             "msg_type": "interactive",
             "content": card_str,
+            "uuid": uuid,
         });
 
         info!(target_id, text_preview = %text.chars().take(100).collect::<String>(), "feishu: send_text_chunk sending");
 
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
-            .await
-            .context("feishu: send message")?;
+        let resp = send_with_retry("feishu", &SendRetry::default(), || {
+            self.client.post(&url).bearer_auth(&token).json(&body)
+        })
+        .await?;
 
         let status = resp.status();
         info!(target_id, status = %status.as_u16(), "feishu: send_text_chunk response");
@@ -571,17 +573,18 @@ impl FeishuChannel {
         let card_str =
             serde_json::to_string(&card_payload["card"]).context("feishu: serialize card")?;
 
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&token)
-            .json(&json!({
-                "msg_type": "interactive",
-                "content": card_str,
-            }))
-            .send()
-            .await
-            .context("feishu: reply message")?;
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let body = json!({
+            "msg_type": "interactive",
+            "content": card_str,
+            "uuid": uuid,
+        });
+
+        let resp = send_with_retry("feishu", &SendRetry::default(), || {
+            self.client.post(&url).bearer_auth(&token).json(&body)
+        })
+        .await
+        .context("feishu: reply message")?;
 
         let status = resp.status();
         if !status.is_success() {
