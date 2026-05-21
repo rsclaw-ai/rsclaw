@@ -35,18 +35,32 @@ pub struct A2aIdentity {
 
 /// Snapshot of accepted A2A credentials, materialised once per request.
 struct Accepted {
+    /// `gateway.auth.token` — the gateway operator master key. It matches
+    /// unconditionally to the privileged `gateway-auth` identity, even when its
+    /// value ALSO appears as an a2a client secret: the operator always wins, so
+    /// the master token's privilege never depends on config overlap.
+    operator_token: Option<String>,
     principals: Vec<A2aPrincipal>,
 }
 
 impl Accepted {
     fn is_empty(&self) -> bool {
-        self.principals.is_empty()
+        self.operator_token.is_none() && self.principals.is_empty()
     }
 
-    /// Constant-time match of a presented secret against every principal. We
-    /// scan ALL principals (no early break) so the response time doesn't leak
-    /// how many credentials are configured or where a match landed.
+    /// Resolve a presented secret to its identity. The operator master key is
+    /// checked first and always resolves to `gateway-auth` (admin). Otherwise
+    /// we scan ALL principals with no early break, so timing doesn't leak how
+    /// many credentials exist or where a match landed.
     fn match_secret(&self, presented: &str) -> Option<A2aIdentity> {
+        if let Some(t) = &self.operator_token
+            && constant_time_eq(t, presented)
+        {
+            return Some(A2aIdentity {
+                id: "gateway-auth".to_owned(),
+                scopes: Vec::new(),
+            });
+        }
         let mut matched: Option<&A2aPrincipal> = None;
         for p in &self.principals {
             if constant_time_eq(&p.secret, presented) {
@@ -61,21 +75,14 @@ impl Accepted {
 }
 
 /// Build the per-request accepted-credentials set from live state. Principals
-/// are resolved at startup; `gateway.auth.token` is merged live as the
-/// `gateway-auth` principal so a single configured token unifies all auth.
+/// are resolved at startup; `gateway.auth.token` is kept separate as the
+/// operator master key so it always authenticates as `gateway-auth`.
 async fn collect_accepted(state: &AppState) -> Accepted {
     let gw = state.live.gateway.read().await;
-    let mut principals = gw.a2a_principals.clone();
-    if let Some(unified) = gw.auth_token.as_ref() {
-        if !principals.iter().any(|p| &p.secret == unified) {
-            principals.push(A2aPrincipal {
-                id: "gateway-auth".to_owned(),
-                secret: unified.clone(),
-                scopes: Vec::new(),
-            });
-        }
+    Accepted {
+        operator_token: gw.auth_token.clone(),
+        principals: gw.a2a_principals.clone(),
     }
-    Accepted { principals }
 }
 
 pub async fn a2a_auth_layer(
@@ -112,9 +119,10 @@ pub async fn a2a_auth_layer(
 mod tests {
     use super::*;
 
-    /// Build an `Accepted` from `(id, secret)` pairs.
+    /// Build an `Accepted` from `(id, secret)` pairs (no operator token).
     fn accepted(pairs: &[(&str, &str)]) -> Accepted {
         Accepted {
+            operator_token: None,
             principals: pairs
                 .iter()
                 .map(|(id, secret)| A2aPrincipal {
@@ -130,6 +138,40 @@ mod tests {
     fn empty_accepted_is_dev_passthrough_marker() {
         assert!(accepted(&[]).is_empty());
         assert!(!accepted(&[("a", "x")]).is_empty());
+        // An operator token alone keeps the endpoint guarded.
+        assert!(
+            !Accepted {
+                operator_token: Some("t".to_owned()),
+                principals: vec![],
+            }
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn operator_token_always_wins_even_on_secret_collision() {
+        // gateway.auth.token shares its value with the "alice" client secret.
+        // Presenting it must resolve to the privileged gateway-auth admin, not
+        // to the colliding scoped principal — option A, deterministic.
+        let a = Accepted {
+            operator_token: Some("master".to_owned()),
+            principals: vec![A2aPrincipal {
+                id: "alice".to_owned(),
+                secret: "master".to_owned(),
+                scopes: Vec::new(),
+            }],
+        };
+        assert_eq!(a.match_secret("master").unwrap().id, "gateway-auth");
+        // A distinct client secret still resolves to its own principal.
+        let a2 = Accepted {
+            operator_token: Some("master".to_owned()),
+            principals: vec![A2aPrincipal {
+                id: "alice".to_owned(),
+                secret: "sk-alice".to_owned(),
+                scopes: Vec::new(),
+            }],
+        };
+        assert_eq!(a2.match_secret("sk-alice").unwrap().id, "alice");
     }
 
     #[test]
