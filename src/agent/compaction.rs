@@ -675,6 +675,11 @@ impl AgentRuntime {
         self.compaction_state
             .insert(session_key.to_owned(), (std::time::Instant::now(), 0));
 
+        // Compaction is a natural refresh point: pick up any skills installed
+        // (skill_install) since the last load. Cache-safe — only re-prefills
+        // the per-session user_system layer, and only if the set changed.
+        self.reload_skills();
+
         // Persist compacted session to redb (survives restarts).
         if let Some(sess) = self.sessions.get(session_key) {
             if let Err(e) = self.store.db.delete_session(session_key) {

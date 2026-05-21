@@ -151,7 +151,7 @@ pub(crate) fn toolset_allowed_names(
         "memory",
         "clarify",
         "anycli",
-        "use_skill",
+        "skill_use",
     ];
     const WEB: &[&str] = &[
         "web_search",
@@ -162,7 +162,7 @@ pub(crate) fn toolset_allowed_names(
         "list_dir",
         "search_file",
         "memory",
-        "use_skill",
+        "skill_use",
     ];
     const CODE: &[&str] = &[
         "shell",
@@ -172,7 +172,7 @@ pub(crate) fn toolset_allowed_names(
         "search_file",
         "search_content",
         "memory",
-        "use_skill",
+        "skill_use",
     ];
     const STANDARD: &[&str] = &[
         "shell",
@@ -192,7 +192,11 @@ pub(crate) fn toolset_allowed_names(
         "computer_use",
         "clarify",
         "anycli",
-        "use_skill",
+        "skill_use",
+        "skill_list",
+        "skill_search",
+        "skill_install",
+        "skill_remove",
         "task",
     ];
 
@@ -276,30 +280,80 @@ pub fn build_tool_list(
     // would put them in the base-layer hash input and break cross-host
     // cache reuse for clients with different skill sets installed.
     tools.push(ToolDef {
-        name: "use_skill".to_owned(),
+        name: "skill_use".to_owned(),
         description:
             "ACTIVATE an installed skill. Use this BEFORE web_fetch / web_browser / \
             shell whenever the user's task matches any skill description \
             shown in the system prompt under '## Installed Skills' (flights, hotels, \
             stocks, weather, finance data, etc.).\n\n\
             Returns the full SKILL.md so you know the exact CLI command and flags. \
-            After calling use_skill you typically call shell with the CLI \
+            After calling skill_use you typically call shell with the CLI \
             from skill_md.\n\n\
             Common failure to avoid: defaulting to web_fetch on a domain a skill \
-            already covers. If a skill description matches, you MUST use_skill first.\n\n\
+            already covers. If a skill description matches, you MUST skill_use first. \
+            If NO installed skill matches but one likely exists (e.g. restaurants → \
+            meituan, stocks → hithink), `skill_search` for it, `skill_install` it, \
+            then skill_use it.\n\n\
             Anti-loop guard: if you can already see the skill's content rendered in \
-            the current turn (e.g. injected via a system message or returned by a \
-            previous use_skill call), DO NOT call use_skill again — follow the \
-            instructions directly. Re-invoking on already-loaded content wastes a \
-            turn and burns context."
+            the current turn (returned by a previous skill_use call), DO NOT call \
+            skill_use again — follow the instructions directly."
                 .to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "Exact skill name from the '## Installed Skills' list in the system prompt (e.g. 'flyai', 'hithink-market-query'). Case-sensitive."
+                    "description": "Exact skill name from the '## Installed Skills' list (e.g. 'flyai', 'hithink-market-query'). Case-sensitive."
                 }
+            },
+            "required": ["name"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "skill_list".to_owned(),
+        description: "List the skills currently installed locally (name + description). \
+            Use to see what's available before reaching for skill_search/web."
+            .to_owned(),
+        parameters: json!({ "type": "object", "properties": {} }),
+    });
+    tools.push(ToolDef {
+        name: "skill_search".to_owned(),
+        description: "Search the remote skill registries for an installable skill when no \
+            installed skill matches the task and web tools won't cut it (e.g. \
+            'restaurant'→meituan, 'stock quote'→hithink). Returns candidate slugs; \
+            install one with skill_install then activate with skill_use."
+            .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "What capability you need, e.g. 'restaurant booking', 'stock market data'."}
+            },
+            "required": ["query"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "skill_install".to_owned(),
+        description: "Install a skill by slug (from skill_search results) into the local \
+            skills store. Usable immediately via skill_use. Only install skills the \
+            user's task clearly needs."
+            .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Skill slug to install (from skill_search)."}
+            },
+            "required": ["name"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "skill_remove".to_owned(),
+        description: "Uninstall a locally-installed skill by name. Use only when the user \
+            asks to remove it."
+            .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Installed skill name to remove."}
             },
             "required": ["name"]
         }),

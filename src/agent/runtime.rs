@@ -1548,7 +1548,10 @@ impl AgentRuntime {
                 }
                 self.sessions.insert(key, vec![msg]);
             }
-            // /clear does NOT invalidate plugins/skills cache (same conversation continues).
+            // Refresh installed skills from disk (picks up skill_install/remove
+            // since last load). Only invalidates the prompt cache if the set
+            // actually changed — see reload_skills.
+            self.reload_skills();
         }
 
         // /new — start a fresh conversation with new archive generation.
@@ -1574,6 +1577,7 @@ impl AgentRuntime {
                     Err(e) => tracing::warn!("failed to start new generation: {e:#}"),
                 }
             }
+            self.reload_skills();
         }
 
         // Reclaim idle browser session (kills Chrome process) to free memory.
@@ -3452,6 +3456,30 @@ impl AgentRuntime {
     }
 
     /// Resolve a session key through the alias table.
+    /// Reload installed skills from disk and invalidate the cached system
+    /// prompt so newly-installed (or removed) skills appear in the per-session
+    /// "## Installed Skills" list. Cache-safe: skills live in user_system, not
+    /// the base-layer hash, so this only re-prefills that per-session layer —
+    /// and only when the byte-stable prompt actually changed. Called at the
+    /// natural refresh points (compact / clear / new).
+    pub(crate) fn reload_skills(&mut self) {
+        let dir = crate::config::loader::base_dir().join("skills");
+        match crate::skill::load_skills(&dir, None, None) {
+            Ok(reg) => {
+                let before = self.skills.all().count();
+                self.skills = Arc::new(reg);
+                let after = self.skills.all().count();
+                if before != after {
+                    // Skill set changed → drop the cached prompt so the next
+                    // turn rebuilds user_system with the new skill list.
+                    self.cached_system_prompt = None;
+                    tracing::info!(before, after, "reloaded skills (set changed)");
+                }
+            }
+            Err(e) => tracing::warn!("reload_skills failed: {e:#}"),
+        }
+    }
+
     /// If the key has an alias, returns the canonical (old) key so all data
     /// stays under one key. Otherwise returns the key unchanged.
     fn resolve_session_key<'a>(&'a self, session_key: &'a str) -> &'a str {
@@ -5801,7 +5829,7 @@ impl AgentRuntime {
                         // @fly-ai/flyai-cli` on line 60 — past the 3000-char
                         // cut — so the agent saw only `runtime: node` in
                         // frontmatter and made up `node index.js` instead).
-                        "use_skill" => {
+                        "skill_use" | "use_skill" => {
                             limits.and_then(|l| l.default).unwrap_or(60_000)
                         }
                         "read_file" | "read" => {
@@ -6087,7 +6115,11 @@ impl AgentRuntime {
             "write_file" | "write" => return self.tool_write(args).await,
             "edit_file" | "edit" => return self.tool_edit(args).await,
             "shell" | "execute_command" | "exec" => return self.tool_exec(ctx, _id, args).await,
-            "use_skill" => return self.tool_use_skill(args),
+            "skill_use" | "use_skill" => return self.tool_use_skill(args),
+            "skill_list" => return self.tool_skill_list(),
+            "skill_search" => return self.tool_skill_search(args).await,
+            "skill_install" => return self.tool_skill_install(args).await,
+            "skill_remove" => return self.tool_skill_remove(args).await,
             "task" => return self.tool_task(ctx, args).await,
             "task_finish" => return self.tool_task_finish(ctx, args).await,
             "ask_user" => return self.tool_ask_user(ctx, args).await,
@@ -6706,20 +6738,31 @@ impl AgentRuntime {
                     args
                 )
             })?;
-        let Some(skill) = self.skills.get(name) else {
-            let available: Vec<&str> = self.skills.all().map(|s| s.name.as_str()).collect();
-            return Ok(serde_json::json!({
-                "error": format!("skill '{name}' not installed"),
-                "available": available,
-            }));
+        // Resolve the skill dir: prefer the live registry, else fall back to
+        // the skills dir on disk so a freshly `skill_install`ed skill is usable
+        // the SAME turn (before the next compact/clear/new reload folds it into
+        // the registry + system prompt).
+        let skill_dir = if let Some(skill) = self.skills.get(name) {
+            skill.dir.clone()
+        } else {
+            let disk = crate::config::loader::base_dir().join("skills").join(name);
+            if disk.join("SKILL.md").is_file() {
+                disk
+            } else {
+                let available: Vec<&str> = self.skills.all().map(|s| s.name.as_str()).collect();
+                return Ok(serde_json::json!({
+                    "error": format!("skill '{name}' not installed"),
+                    "available": available,
+                }));
+            }
         };
-        let dir = skill.dir.display().to_string();
-        let skill_md_path = skill.dir.join("SKILL.md");
+        let dir = skill_dir.display().to_string();
+        let skill_md_path = skill_dir.join("SKILL.md");
         let skill_md = std::fs::read_to_string(&skill_md_path).unwrap_or_else(|e| {
             format!("(failed to read SKILL.md: {e}; check {})", skill_md_path.display())
         });
         Ok(serde_json::json!({
-            "name": skill.name,
+            "name": name,
             "dir": dir,
             "skill_md": skill_md,
             "next_step": "Read skill_md to find the exact CLI command and flags, \
@@ -6727,6 +6770,107 @@ impl AgentRuntime {
                           Pass the user's actual question / parameters via the \
                           flags documented in skill_md."
         }))
+    }
+
+    /// `skill_list` — list locally-installed skills (name + description).
+    pub(crate) fn tool_skill_list(&self) -> Result<Value> {
+        let skills: Vec<Value> = self
+            .skills
+            .all()
+            .map(|s| {
+                json!({
+                    "name": s.name,
+                    "description": s.description.clone().unwrap_or_default(),
+                })
+            })
+            .collect();
+        Ok(json!({ "count": skills.len(), "skills": skills }))
+    }
+
+    /// `skill_search` — search the remote skill registries (clawhub / skillhub /
+    /// iwencai). Returns candidate slugs the model can `skill_install`.
+    pub(crate) async fn tool_skill_search(&self, args: Value) -> Result<Value> {
+        let query = args["query"]
+            .as_str()
+            .or_else(|| args["q"].as_str())
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        if query.is_empty() {
+            return Ok(json!({ "error": "query is required" }));
+        }
+        let client = crate::skill::clawhub::ClawhubClient::new();
+        let results = match client.search_with_fallback(&query).await {
+            Ok(r) => r,
+            Err(e) => return Ok(json!({ "error": format!("skill search failed: {e}") })),
+        };
+        let out: Vec<Value> = results
+            .into_iter()
+            .take(20)
+            .map(|r| {
+                json!({
+                    "slug": r.slug,
+                    "description": r.description,
+                    "installs": r.installs,
+                    "registry": r.registry,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "count": out.len(),
+            "results": out,
+            "hint": "To use one: skill_install(name=\"<slug>\") then skill_use(name=\"<slug>\").",
+        }))
+    }
+
+    /// `skill_install` — install a skill from a registry into the global skills
+    /// dir. Usable the same turn via `skill_use` (disk fallback); it folds into
+    /// the system-prompt skill list on the next compaction/clear/new reload.
+    pub(crate) async fn tool_skill_install(&self, args: Value) -> Result<Value> {
+        let name = args["name"]
+            .as_str()
+            .or_else(|| args["slug"].as_str())
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        if name.is_empty() {
+            return Ok(json!({ "error": "name is required" }));
+        }
+        let dir = crate::config::loader::base_dir().join("skills");
+        let client = crate::skill::clawhub::ClawhubClient::new();
+        match client.install_with_fallback(&name, &dir).await {
+            Ok(locked) => Ok(json!({
+                "installed": name,
+                "version": locked.version,
+                "dir": locked.install_dir.display().to_string(),
+                "next_step": "Usable now: skill_use(name=\"...\") to read its SKILL.md, then run the CLI it documents via shell.",
+            })),
+            Err(e) => Ok(json!({ "error": format!("install failed: {e}"), "name": name })),
+        }
+    }
+
+    /// `skill_remove` — uninstall a locally-installed skill (delete its dir).
+    pub(crate) async fn tool_skill_remove(&self, args: Value) -> Result<Value> {
+        let name = args["name"]
+            .as_str()
+            .or_else(|| args["slug"].as_str())
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        if name.is_empty() {
+            return Ok(json!({ "error": "name is required" }));
+        }
+        let dir = crate::config::loader::base_dir().join("skills").join(&name);
+        if !dir.is_dir() {
+            return Ok(json!({ "error": format!("skill '{name}' not installed") }));
+        }
+        match std::fs::remove_dir_all(&dir) {
+            Ok(_) => Ok(json!({
+                "removed": name,
+                "note": "Removed from disk. Drops from the system-prompt skill list on the next compaction/clear/new reload.",
+            })),
+            Err(e) => Ok(json!({ "error": format!("remove failed: {e}") })),
+        }
     }
 
     pub(crate) async fn tool_memory_put(&self, ctx: &RunContext, args: Value) -> Result<Value> {

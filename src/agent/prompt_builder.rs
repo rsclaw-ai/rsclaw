@@ -374,6 +374,7 @@ fn build_shared_system_prefix_uncached() -> String {
          - Memory: use `memory` to recall prior conversations. Search memory at session start if user references prior work.\n\
          - Save corrected/complete info to memory immediately so it survives compaction.\n\
          - Knowledge base: when the user asks about THEIR own material (uploaded docs, PDFs, URLs, files), use `knowledge_base` to search it and CITE the returned source_title. Prefer it over `web_search` for the user's material; if it returns nothing, say so — never fabricate a citation. (`memory` = what you learned; `knowledge_base` = the user's authoritative corpus.)\n\
+         - Skills: prefer an installed skill (see '## Installed Skills') via `skill_use` over raw web/shell. If none matches and web tools can't solve it, `skill_search` for one (restaurants→meituan, stock/finance→hithink, etc.), `skill_install` it, then `skill_use`. `skill_list` shows what's installed; `skill_remove` uninstalls.\n\
          \n\
          ### GUI / Desktop Automation (computer_use)\n\
          For any GUI or desktop automation task (WeChat, Finder, Safari, etc.):\n\
@@ -613,7 +614,7 @@ pub(crate) fn build_system_prompt(
 /// `user_tools` (the per-client subset). Also dumped in the
 /// `RSCLAW_DUMP_PROMPT` debug payload.
 pub const BUILTIN_TOOL_NAMES: &[&str] = &[
-    "memory","use_skill","task","task_finish","read_file","write_file",
+    "memory","skill_use","task","task_finish","read_file","write_file",
     "edit_file","send_file","shell","agent","ask_user","install_tool",
     "list_dir","search_file","search_content","web_search","web_fetch",
     "web_download","web_browser","computer_use","image_gen","video_gen",
@@ -631,6 +632,8 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     // byte-identical across clients — same builtin class. Errors gracefully
     // if called on a non-A2A turn.
     "wait_input",
+    // Self-service skill management (discover → install → use → remove).
+    "skill_list","skill_search","skill_install","skill_remove",
 ];
 
 /// Build a minimal system prompt for internal sessions (heartbeat/cron/system).
