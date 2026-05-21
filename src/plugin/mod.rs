@@ -123,6 +123,8 @@ pub async fn load_all_plugins(
     config: Option<&PluginsConfig>,
     wasm_browser: Arc<tokio::sync::Mutex<Option<crate::browser::BrowserSession>>>,
     notify_tx: Option<tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>>,
+    providers: Option<Arc<crate::provider::registry::ProviderRegistry>>,
+    vision_model: Option<String>,
 ) -> Result<PluginRegistry> {
     let manifests = scan_plugins(plugins_dir)?;
     let mut registry = PluginRegistry::new();
@@ -170,7 +172,15 @@ pub async fn load_all_plugins(
         if manifest.is_wasm() {
             // WASM runtime
             let engine = wasm_engine.as_ref().expect("wasm engine initialized");
-            match load_wasm_plugin(&manifest, engine, Arc::clone(&wasm_browser)).await {
+            match load_wasm_plugin(
+                &manifest,
+                engine,
+                Arc::clone(&wasm_browser),
+                providers.clone(),
+                vision_model.clone(),
+            )
+            .await
+            {
                 Ok(plugin) => {
                     info!(
                         plugin = %plugin.name,

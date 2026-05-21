@@ -89,6 +89,10 @@ pub struct WasmPlugin {
     min_call_interval: Duration,
     /// Last `call_tool` start time, used to compute the throttle delay.
     last_call: Mutex<Option<Instant>>,
+    /// Optional provider registry for host-vlm interface.
+    providers: Option<Arc<crate::provider::registry::ProviderRegistry>>,
+    /// Default vision model name for host-vlm interface.
+    vision_model: Option<String>,
 }
 
 /// A tool definition extracted from a WASM plugin's manifest.
@@ -125,6 +129,12 @@ struct HostState {
     cdn_rules: Vec<crate::plugin::manifest::CdnDownloadRule>,
     /// Plugin name — used to scope per-plugin resources (SQLite DB path, etc.).
     plugin_name: String,
+    /// Desktop session for host-desktop interface (input synthesis, screenshots).
+    desktop: Box<dyn crate::desktop::DesktopSession>,
+    /// Optional provider registry for host-vlm interface.
+    providers: Option<Arc<crate::provider::registry::ProviderRegistry>>,
+    /// Default vision model name for host-vlm interface.
+    vision_model: Option<String>,
 }
 
 fn new_host_state(
@@ -132,6 +142,8 @@ fn new_host_state(
     notify_ctx: Option<WasmNotifyCtx>,
     cdn_rules: Vec<crate::plugin::manifest::CdnDownloadRule>,
     plugin_name: String,
+    providers: Option<Arc<crate::provider::registry::ProviderRegistry>>,
+    vision_model: Option<String>,
 ) -> HostState {
     HostState {
         browser,
@@ -143,6 +155,9 @@ fn new_host_state(
         notify_ctx,
         cdn_rules,
         plugin_name,
+        desktop: crate::desktop::create_session(),
+        providers,
+        vision_model,
     }
 }
 
@@ -154,8 +169,13 @@ fn new_sandboxed_store(
     notify_ctx: Option<WasmNotifyCtx>,
     cdn_rules: Vec<crate::plugin::manifest::CdnDownloadRule>,
     plugin_name: String,
+    providers: Option<Arc<crate::provider::registry::ProviderRegistry>>,
+    vision_model: Option<String>,
 ) -> Store<HostState> {
-    let mut store = Store::new(engine, new_host_state(browser, notify_ctx, cdn_rules, plugin_name));
+    let mut store = Store::new(
+        engine,
+        new_host_state(browser, notify_ctx, cdn_rules, plugin_name, providers, vision_model),
+    );
     store.limiter(|s| &mut s.limits);
     store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
     store
@@ -886,6 +906,226 @@ impl HostState {
 }
 
 // ---------------------------------------------------------------------------
+// host-desktop trait implementation
+// ---------------------------------------------------------------------------
+
+impl rsclaw::plugin::host_desktop::Host for HostState {
+    async fn desktop_activate_app(
+        &mut self,
+        bundle_id: String,
+    ) -> wasmtime::Result<Result<String, String>> {
+        Ok(self.desktop.activate_app(&bundle_id).await)
+    }
+
+    async fn desktop_list_windows(
+        &mut self,
+        bundle_id: String,
+    ) -> wasmtime::Result<Result<String, String>> {
+        Ok(self.desktop.list_windows(&bundle_id).await)
+    }
+
+    async fn desktop_close_window(
+        &mut self,
+        bundle_id: String,
+        window_idx: u32,
+    ) -> wasmtime::Result<Result<String, String>> {
+        Ok(self.desktop.close_window(&bundle_id, window_idx).await)
+    }
+
+    async fn desktop_get_main_window(
+        &mut self,
+        bundle_id: String,
+    ) -> wasmtime::Result<Result<String, String>> {
+        Ok(self.desktop.get_main_window(&bundle_id).await)
+    }
+
+    async fn desktop_screenshot_window(
+        &mut self,
+        bundle_id: String,
+    ) -> wasmtime::Result<Result<String, String>> {
+        Ok(self.desktop.screenshot_window(&bundle_id).await)
+    }
+
+    async fn desktop_screenshot_region(
+        &mut self,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> wasmtime::Result<Result<String, String>> {
+        Ok(self.desktop.screenshot_region(x, y, w, h).await)
+    }
+
+    async fn desktop_mouse_move(
+        &mut self,
+        x: u32,
+        y: u32,
+    ) -> wasmtime::Result<Result<String, String>> {
+        Ok(self.desktop.mouse_move(x, y).await)
+    }
+
+    async fn desktop_mouse_click(
+        &mut self,
+        x: u32,
+        y: u32,
+    ) -> wasmtime::Result<Result<String, String>> {
+        Ok(self.desktop.mouse_click(x, y).await)
+    }
+
+    async fn desktop_mouse_double_click(
+        &mut self,
+        x: u32,
+        y: u32,
+    ) -> wasmtime::Result<Result<String, String>> {
+        Ok(self.desktop.mouse_double_click(x, y).await)
+    }
+
+    async fn desktop_mouse_drag(
+        &mut self,
+        x1: u32,
+        y1: u32,
+        x2: u32,
+        y2: u32,
+    ) -> wasmtime::Result<Result<String, String>> {
+        Ok(self.desktop.mouse_drag(x1, y1, x2, y2).await)
+    }
+
+    async fn desktop_mouse_scroll(
+        &mut self,
+        clicks: i32,
+    ) -> wasmtime::Result<Result<String, String>> {
+        Ok(self.desktop.mouse_scroll(clicks).await)
+    }
+
+    async fn desktop_key_press(
+        &mut self,
+        key: String,
+        modifiers: Vec<String>,
+    ) -> wasmtime::Result<Result<String, String>> {
+        Ok(self.desktop.key_press(&key, &modifiers).await)
+    }
+
+    async fn desktop_clipboard_set(
+        &mut self,
+        text: String,
+    ) -> wasmtime::Result<Result<String, String>> {
+        Ok(self.desktop.clipboard_set(&text).await)
+    }
+
+    async fn desktop_clipboard_get(&mut self) -> wasmtime::Result<Result<String, String>> {
+        Ok(self.desktop.clipboard_get().await)
+    }
+
+    async fn desktop_clipboard_set_file(
+        &mut self,
+        file_path: String,
+    ) -> wasmtime::Result<Result<String, String>> {
+        Ok(self.desktop.clipboard_set_file(&file_path).await)
+    }
+
+    async fn desktop_clipboard_get_image(
+        &mut self,
+    ) -> wasmtime::Result<Result<String, String>> {
+        Ok(self.desktop.clipboard_get_image().await)
+    }
+
+    async fn desktop_mouse_right_click(
+        &mut self,
+        x: u32,
+        y: u32,
+    ) -> wasmtime::Result<Result<String, String>> {
+        Ok(self.desktop.mouse_right_click(x, y).await)
+    }
+
+    async fn desktop_file_dialog_open(
+        &mut self,
+        title: String,
+        filters: Vec<String>,
+    ) -> wasmtime::Result<Result<String, String>> {
+        Ok(self.desktop.file_dialog_open(&title, &filters).await)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// host-vlm trait implementation
+// ---------------------------------------------------------------------------
+
+impl rsclaw::plugin::host_vlm::Host for HostState {
+    async fn vlm_parse(
+        &mut self,
+        image_data_uri: String,
+        prompt: String,
+        max_tokens: u32,
+    ) -> wasmtime::Result<Result<String, String>> {
+        let Some(providers) = self.providers.as_ref() else {
+            return Ok(Err("vlm_parse: no provider registry configured".to_string()));
+        };
+        let Some(vision_model) = self.vision_model.as_ref() else {
+            return Ok(Err("vlm_parse: no vision model configured".to_string()));
+        };
+
+        let (provider_name, model_id) = providers.resolve_model(vision_model);
+        let provider = match providers.get(provider_name) {
+            Ok(p) => p,
+            Err(e) => return Ok(Err(format!("vlm_parse: provider {provider_name} not found: {e}"))),
+        };
+
+        let messages = vec![crate::provider::Message {
+            role: crate::provider::Role::User,
+            content: crate::provider::MessageContent::Parts(vec![
+                crate::provider::ContentPart::Text { text: prompt },
+                crate::provider::ContentPart::Image { url: image_data_uri },
+            ]),
+        }];
+
+        let req = crate::provider::LlmRequest {
+            model: format!("{provider_name}/{model_id}"),
+            messages,
+            tools: Vec::new(),
+            system: None,
+            max_tokens: Some(max_tokens),
+            temperature: Some(0.0),
+            frequency_penalty: None,
+            thinking_budget: None,
+            endpoint: crate::provider::AgentEndpoint::Vision,
+            kv_cache_mode: 0,
+            session_key: None,
+            system_shared: None,
+            user_system: None,
+        };
+
+        match provider.stream(req).await {
+            Ok(mut stream) => {
+                let mut text = String::new();
+                let mut reasoning = String::new();
+                use futures::StreamExt;
+                while let Some(event) = stream.next().await {
+                    match event {
+                        Ok(crate::provider::StreamEvent::TextDelta(d)) => text.push_str(&d),
+                        Ok(crate::provider::StreamEvent::ReasoningDelta(d)) => reasoning.push_str(&d),
+                        Ok(crate::provider::StreamEvent::Done { .. }) => break,
+                        Ok(crate::provider::StreamEvent::ToolCall { .. }) => {}
+                        Ok(crate::provider::StreamEvent::Error(e)) => {
+                            return Ok(Err(format!("vlm_parse stream error: {e}")));
+                        }
+                        Err(e) => {
+                            return Ok(Err(format!("vlm_parse stream error: {e}")));
+                        }
+                    }
+                }
+                let result = if text.trim().is_empty() {
+                    reasoning
+                } else {
+                    text
+                };
+                Ok(Ok(result))
+            }
+            Err(e) => Ok(Err(format!("vlm_parse provider error: {e}"))),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Loading
 // ---------------------------------------------------------------------------
 
@@ -899,6 +1139,8 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostState>> {
     rsclaw::plugin::host_runtime::add_to_linker(&mut linker, |state: &mut HostState| state)?;
     rsclaw::plugin::host_storage::add_to_linker(&mut linker, |state: &mut HostState| state)?;
     rsclaw::plugin::host_media::add_to_linker(&mut linker, |state: &mut HostState| state)?;
+    rsclaw::plugin::host_desktop::add_to_linker(&mut linker, |state: &mut HostState| state)?;
+    rsclaw::plugin::host_vlm::add_to_linker(&mut linker, |state: &mut HostState| state)?;
     Ok(linker)
 }
 
@@ -912,6 +1154,8 @@ pub async fn load_wasm_plugin(
     manifest: &super::manifest::PluginManifest,
     engine: &Engine,
     browser: Arc<Mutex<Option<BrowserSession>>>,
+    providers: Option<Arc<crate::provider::registry::ProviderRegistry>>,
+    vision_model: Option<String>,
 ) -> Result<WasmPlugin> {
     let path = manifest.entry_path();
     let wasm_bytes = std::fs::read(&path)
@@ -945,6 +1189,8 @@ pub async fn load_wasm_plugin(
         browser_cdn_rules: manifest.browser_cdn.download_rules.clone(),
         min_call_interval: Duration::from_millis(u64::from(manifest.min_call_interval_ms)),
         last_call: Mutex::new(None),
+        providers,
+        vision_model,
     })
 }
 
@@ -1010,6 +1256,8 @@ impl WasmPlugin {
             notify_ctx,
             self.browser_cdn_rules.clone(),
             self.name.clone(),
+            self.providers.clone(),
+            self.vision_model.clone(),
         );
 
         let instance = self

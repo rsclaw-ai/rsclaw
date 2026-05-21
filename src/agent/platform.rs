@@ -107,6 +107,7 @@ pub(crate) fn detect_chrome() -> Option<String> {
     {
         let app_paths = [
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
             "/Applications/Chromium.app/Contents/MacOS/Chromium",
         ];
         for p in &app_paths {
@@ -143,6 +144,8 @@ pub(crate) fn detect_chrome() -> Option<String> {
         let candidates = [
             r"C:\Program Files\Google\Chrome\Application\chrome.exe",
             r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
         ];
         for path in &candidates {
             if std::path::Path::new(path).exists() {

@@ -227,11 +227,22 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     let plugins_dir = base_dir.join("plugins");
     let wasm_browser: Arc<tokio::sync::Mutex<Option<crate::browser::BrowserSession>>> =
         Arc::new(tokio::sync::Mutex::new(None));
+    // Resolve default vision model for host-vlm interface.
+    let vision_model = config
+        .raw
+        .agents
+        .as_ref()
+        .and_then(|a| a.defaults.as_ref())
+        .and_then(|d| d.model.as_ref())
+        .and_then(|m| m.vision.clone());
+
     let mut plugin_registry = load_all_plugins(
         &plugins_dir,
         config.ext.plugins.as_ref(),
         Arc::clone(&wasm_browser),
         Some(notification_tx.clone()),
+        Some(Arc::clone(&providers)),
+        vision_model,
     )
     .await
     .unwrap_or_else(|e| {

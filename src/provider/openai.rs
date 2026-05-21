@@ -698,8 +698,12 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
         .map(|m| serialize_message(m, thinking_enabled))
         .collect();
 
+    // Strip provider prefix (e.g. "doubao/doubao-seed-2.0-lite" →
+    // "doubao-seed-2.0-lite") — downstream APIs expect the bare model id.
+    let bare_model = req.model.rsplit_once('/').map(|(_, m)| m).unwrap_or(&req.model);
+
     let mut body = json!({
-        "model":      req.model,
+        "model":      bare_model,
         "stream":     true,
         "messages":   messages,
     });
@@ -714,19 +718,26 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
     let model_lower = req.model.to_lowercase();
     let is_minimax = model_lower.contains("minimax");
 
+    // Vision endpoint (VLM calls) typically do not support thinking/reasoning
+    // params — Doubao coding/v3 rejects them with "UnsupportedModel: coding
+    // plan feature" when present on a vision request.
+    let is_vision = req.endpoint == super::AgentEndpoint::Vision;
+
     // MiniMax does not support thinking/reasoning params — skip entirely.
     if is_minimax {
         body["reasoning_split"] = json!(true);
-    } else {
+    } else if !is_vision {
         match req.thinking_budget {
             Some(budget) if budget > 0 => {
                 body["enable_thinking"] = json!(true);
+                body["thinking"] = json!({"type": "disabled"});
                 body["thinking_budget"] = json!(budget);
                 body["chat_template_kwargs"] = json!({"enable_thinking": true});
             }
             _ => {
                 // Disable thinking for models that support it (DashScope, llama.cpp).
                 body["enable_thinking"] = json!(false);
+                body["thinking"] = json!({"type": "disabled"});
                 body["chat_template_kwargs"] = json!({"enable_thinking": false});
             }
         }

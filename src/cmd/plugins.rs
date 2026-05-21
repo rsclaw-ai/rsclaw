@@ -282,7 +282,7 @@ async fn install_wasm_file(src: &std::path::Path) -> Result<()> {
     };
 
     let browser = std::sync::Arc::new(tokio::sync::Mutex::new(None));
-    let wasm_plugin = crate::plugin::load_wasm_plugin(&tmp_manifest, &engine, browser).await;
+    let wasm_plugin = crate::plugin::load_wasm_plugin(&tmp_manifest, &engine, browser, None, None).await;
 
     let (name, version, description, tools_count) = match wasm_plugin {
         Ok(ref wp) => (

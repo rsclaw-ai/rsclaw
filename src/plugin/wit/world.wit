@@ -138,8 +138,14 @@ interface host-desktop {
     /// Screenshot a screen region. Returns data URI.
     desktop-screenshot-region: func(x: u32, y: u32, w: u32, h: u32) -> result<string, string>;
 
+    /// Move the mouse cursor to absolute screen coordinates (x, y) without clicking.
+    desktop-mouse-move: func(x: u32, y: u32) -> result<string, string>;
+
     /// Mouse left-click at absolute screen coordinates (x, y).
     desktop-mouse-click: func(x: u32, y: u32) -> result<string, string>;
+
+    /// Mouse double-click at absolute screen coordinates (x, y).
+    desktop-mouse-double-click: func(x: u32, y: u32) -> result<string, string>;
 
     /// Drag from (x1, y1) to (x2, y2).
     desktop-mouse-drag: func(x1: u32, y1: u32, x2: u32, y2: u32) -> result<string, string>;
@@ -157,6 +163,19 @@ interface host-desktop {
 
     /// Get the system clipboard text.
     desktop-clipboard-get: func() -> result<string, string>;
+
+    /// Set the system clipboard to a file reference (for paste-as-file).
+    desktop-clipboard-set-file: func(file-path: string) -> result<string, string>;
+
+    /// Get image data from the system clipboard (PNG, returns data URI).
+    /// Returns empty/error if no image is on the clipboard.
+    desktop-clipboard-get-image: func() -> result<string, string>;
+
+    /// Mouse right-click at absolute screen coordinates (x, y).
+    desktop-mouse-right-click: func(x: u32, y: u32) -> result<string, string>;
+
+    /// Open a native file dialog. Returns the selected file path or error.
+    desktop-file-dialog-open: func(title: string, filters: list<string>) -> result<string, string>;
 }
 
 interface host-vlm {
@@ -179,13 +198,5 @@ world jimeng-plugin {
     import host-media;
     import host-desktop;
     import host-vlm;
-    export plugin-api;
-}
-
-world wechat-plugin {
-    import host-desktop;
-    import host-vlm;
-    import host-runtime;
-    import host-storage;
     export plugin-api;
 }
