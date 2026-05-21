@@ -90,6 +90,27 @@ Responses:
   `body_too_large`, `invalid_multipart`
 - `404 collection_not_found`
 
+### `POST /collections/{id}/docs/from-url` — ingest by URL (server-side fetch)
+Body: `{ "url": "https://..." }`
+The gateway fetches the URL server-side (no browser CORS), canonicalizes
+(HTML→markdown etc.), ingests, and records `KbSource::Url` provenance so the
+doc can be re-synced later. The fetch happens during the request (≤30s);
+embedding/indexing then runs in the background like other uploads.
+
+- `202 { "status": "pending"|"skipped", "docsAdded": N, "docsSkipped": N }`
+  — `skipped` when the URL was unchanged (ETag/304) or content-deduped.
+- `400` codes: `url_required`, `invalid_url` (bad/non-http(s) scheme),
+  `url_not_allowed` (SSRF guard: loopback/private/link-local/localhost),
+  `url_unresolved` (DNS failure)
+- `404 collection_not_found`
+- `429 {"error":"url_rate_limited"}` — target returned 429
+- `502 {"error":"url_fetch_failed"}` — network error / target 4xx-5xx /
+  `url_auth_failed` (target 401/403)
+- `422 {"error":"url_unprocessable"}` — fetched but could not canonicalize
+
+> SSRF: only globally-routable http(s) targets are accepted. Validation is at
+> request time (DNS-rebinding TOCTOU not yet pinned through the connector).
+
 ### `GET /collections/{id}/docs/{doc_id}`
 → `200 DocDto` | `404 doc_not_found` / `collection_not_found`
 
@@ -167,6 +188,7 @@ without polling.
 | PATCH | `/collections/{id}` | update name/description |
 | DELETE | `/collections/{id}` | delete (cascades to docs) |
 | GET | `/collections/{id}/docs` | list docs |
+| POST | `/collections/{id}/docs/from-url` | ingest by URL (server-side fetch), 202 |
 | POST | `/collections/{id}/docs` | upload (JSON or multipart), 202 |
 | GET | `/collections/{id}/docs/{doc_id}` | get doc metadata |
 | GET | `/collections/{id}/docs/{doc_id}/content` | raw body |
