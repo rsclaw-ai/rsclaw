@@ -790,19 +790,31 @@ $synth.Speak('{}')
         // fallback (L1: every channel works).
         let mut options: Vec<crate::events::AskUserOption> = Vec::with_capacity(raw_options.len());
         for (idx, opt) in raw_options.iter().enumerate() {
-            let label = opt["label"]
-                .as_str()
-                .ok_or_else(|| anyhow!("ask_user: option[{idx}].label required"))?
-                .trim()
-                .to_owned();
+            // Accept either a {"label","description"} object (the schema's
+            // canonical shape) OR a bare string. Qwen-style local models emit a
+            // plain string list ["A","B"] for simple choices instead of objects;
+            // a bare string becomes its own label so the agent doesn't dead-loop
+            // on "option[i].label required".
+            let (label, description) = if let Some(s) = opt.as_str() {
+                (s.trim().to_owned(), None)
+            } else {
+                let label = opt["label"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!(
+                        "ask_user: option[{idx}] must be a string or an object with a `label`"
+                    ))?
+                    .trim()
+                    .to_owned();
+                let description = opt["description"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+                (label, description)
+            };
             if label.is_empty() {
                 bail!("ask_user: option[{idx}].label must be non-empty");
             }
-            let description = opt["description"]
-                .as_str()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned);
             options.push(crate::events::AskUserOption { label, description });
         }
 

@@ -679,7 +679,7 @@ pub fn build_tool_list(
                         },
                         "required": ["label"]
                     },
-                    "description": "2-8 distinct choices. Always include enough that 'Other' (free-text) isn't needed for the common path."
+                    "description": "2-8 distinct choices. Each entry is a {label, description} object, OR a bare string (the string becomes the label). Always include enough that 'Other' (free-text) isn't needed for the common path."
                 },
                 "multi_select": {
                     "type": "boolean",
