@@ -158,16 +158,33 @@ fn backup_and_upgrade(path: &Path, legacy_version: u8) -> Result<()> {
         from_version = legacy_version,
         "upgrading redb file format to v3 (one-time)",
     );
-    let mut legacy = redb_legacy::Database::open(path)
-        .with_context(|| format!("legacy open of {} for upgrade", path.display()))?;
-    let did_upgrade = legacy
-        .upgrade()
-        .with_context(|| format!("v2→v3 upgrade of {}", path.display()))?;
-    tracing::info!(
-        path = %path.display(),
-        did_upgrade,
-        "redb file format upgrade complete",
-    );
+    // redb 2.6's opener can hit `unreachable!()` and PANIC (not just return
+    // Err) on a file that isn't a clean v1/v2 — e.g. a half-migrated file, or
+    // one written by a newer redb that 4.1 still flags `UpgradeRequired`.
+    // Without this guard that panic crashes the gateway on boot (and, with a
+    // supervisor restarting it, boot-loops). catch_unwind turns it into a
+    // recoverable error: we log and return Ok so the caller's own open surfaces
+    // the real state — and ephemeral stores (a2a tasks) can self-heal.
+    let upgraded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<bool> {
+        let mut legacy = redb_legacy::Database::open(path)
+            .with_context(|| format!("legacy open of {} for upgrade", path.display()))?;
+        legacy
+            .upgrade()
+            .with_context(|| format!("v2→v3 upgrade of {}", path.display()))
+    }));
+    match upgraded {
+        Ok(Ok(did_upgrade)) => {
+            tracing::info!(path = %path.display(), did_upgrade, "redb file format upgrade complete");
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(path = %path.display(), error = %e,
+                "legacy redb upgrade failed; leaving file for caller's open to handle");
+        }
+        Err(_) => {
+            tracing::warn!(path = %path.display(),
+                "legacy redb opener panicked (file is not a clean v1/v2); leaving file for caller's open to handle");
+        }
+    }
     Ok(())
 }
 

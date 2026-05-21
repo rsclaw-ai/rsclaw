@@ -25,7 +25,32 @@ impl TaskStore {
             std::fs::create_dir_all(parent).context("create a2a store dir")?;
         }
         crate::store::upgrade_legacy_if_needed(path)?;
-        let db = Database::create(path).context("open a2a task redb")?;
+        // A2A tasks are ephemeral (completed-task records + push configs). If
+        // the existing file can't be opened by the current redb — e.g. a
+        // half-migrated format the legacy upgrader couldn't fix — move it aside
+        // and recreate fresh rather than crashing the gateway on boot. The bad
+        // file is preserved as `.broken-<ts>` for recovery, never deleted.
+        let db = match Database::create(path) {
+            Ok(db) => db,
+            Err(e) => {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let aside = path.with_extension(format!("redb.broken-{ts}"));
+                tracing::error!(
+                    path = %path.display(),
+                    moved_to = %aside.display(),
+                    error = %e,
+                    "a2a task store unopenable; moving aside and recreating (task history reset)"
+                );
+                if path.exists() {
+                    std::fs::rename(path, &aside)
+                        .context("move aside unopenable a2a task store")?;
+                }
+                Database::create(path).context("recreate a2a task redb")?
+            }
+        };
         let txn = db.begin_write()?;
         {
             let _ = txn.open_table(TASKS)?;
