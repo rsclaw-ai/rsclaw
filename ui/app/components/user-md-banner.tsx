@@ -16,13 +16,42 @@
  * never reappears for users who said no, even on fresh USER.md.
  */
 
+import JSON5 from "json5";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { useChatStore } from "../store";
 import { isUserMdDefault, readUserMd } from "../lib/user-md";
 import { getLang } from "../locales";
+import { invoke, isTauri } from "../utils/tauri";
 
 const DISMISS_KEY = "rsclaw-user-md-banner-dismissed";
+
+// Resolve a workable agentId when the current session has none. The
+// default empty session created on first launch has no agentId until
+// the user explicitly picks an agent — without a fallback the banner
+// stays hidden forever for first-run users. Cached at module scope so
+// we don't re-read rsclaw.json5 on every focus tick.
+let cachedDefaultAgentId: string | null = null;
+let defaultAgentIdInflight: Promise<string | null> | null = null;
+async function resolveDefaultAgentId(): Promise<string | null> {
+  if (cachedDefaultAgentId !== null) return cachedDefaultAgentId;
+  if (!isTauri) return null;
+  if (defaultAgentIdInflight) return defaultAgentIdInflight;
+  defaultAgentIdInflight = (async () => {
+    try {
+      const raw = (await invoke("read_config_file")) as string;
+      const cfg = JSON5.parse(raw || "{}") as any;
+      const first = cfg?.agents?.list?.[0]?.id;
+      cachedDefaultAgentId = typeof first === "string" && first ? first : "";
+    } catch {
+      cachedDefaultAgentId = "";
+    }
+    return cachedDefaultAgentId;
+  })();
+  const result = await defaultAgentIdInflight;
+  defaultAgentIdInflight = null;
+  return result;
+}
 
 export function UserMdBanner() {
   const session = useChatStore((s) => s.currentSession());
@@ -59,11 +88,18 @@ export function UserMdBanner() {
   // changes — switching agents means a different workspace + a
   // different USER.md state.
   const check = useCallback(async () => {
-    if (!agentId) {
+    let id = agentId;
+    if (!id) {
+      // Default empty session (first launch) has no agentId. Fall back
+      // to the first agent declared in rsclaw.json5 so the banner can
+      // still nudge the user even before they pick an agent.
+      id = (await resolveDefaultAgentId()) || "";
+    }
+    if (!id) {
       setNeedsSetup(false);
       return;
     }
-    const content = await readUserMd(agentId);
+    const content = await readUserMd(id);
     setNeedsSetup(isUserMdDefault(content));
   }, [agentId]);
 
