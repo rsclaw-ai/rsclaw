@@ -154,6 +154,10 @@ export function KnowledgePage() {
   const [docsLoading, setDocsLoading] = useState(false);
 
   const [query, setQuery] = useState("");
+  // What the user actually submitted (vs. what's typed in the box).
+  // Used to gate the HitsPane: typing alone shouldn't replace the doc
+  // list with a stale "no matches" — only an actual search does.
+  const [lastQuery, setLastQuery] = useState("");
   const [searchScope, setSearchScope] = useState<"current" | "all">("all");
   const [searching, setSearching] = useState(false);
   const [hits, setHits] = useState<KbSearchHit[]>([]);
@@ -357,13 +361,22 @@ export function KnowledgePage() {
     const q = query.trim();
     if (!q) {
       setHits([]);
+      setLastQuery("");
       return;
     }
     if (q.length > 512) {
       toast.error(zh ? "查询过长（最多 512 字符）" : "Query too long (max 512 chars)");
       return;
     }
-    setSearching(true);
+    // Lock in the submitted query so HitsPane shows results-or-empty
+    // for THIS query, not whatever the user is still typing.
+    setLastQuery(q);
+    // Delayed-spinner pattern: only flip to "搜索中..." if the fetch
+    // hasn't returned within 200ms. Fast queries (warm cache, small
+    // corpus) skip the loading state entirely so the button text
+    // doesn't flash. Mirrors Material/Suspense guidance — anything
+    // under ~200ms should feel instant.
+    const spinnerTimer = setTimeout(() => setSearching(true), 200);
     try {
       // "current" scope only applies when a collection is actually
       // selected — otherwise fall through to global search so the user
@@ -375,11 +388,19 @@ export function KnowledgePage() {
       const r = await search({ query: q, topK: 20, ...scoped });
       setHits(r.hits);
       setQueryMs(r.queryMs);
+      // Explicit feedback on zero hits — the centered empty-state in
+      // HitsPane covers the spot, but a quick toast surfaces it even
+      // when the user's eyes are still on the input box.
+      if ((r.hits || []).length === 0) {
+        toast.info(zh ? `「${q}」无匹配结果` : `No matches for "${q}"`);
+      }
     } catch (e: any) {
       toast.fromError(zh ? "搜索失败" : "Search failed", e);
       setHits([]);
+    } finally {
+      clearTimeout(spinnerTimer);
+      setSearching(false);
     }
-    setSearching(false);
   }, [query, searchScope, activeCollectionId, zh]);
 
   // ── Upload entries ───────────────────────────────────────────────
@@ -451,7 +472,10 @@ export function KnowledgePage() {
 
   // ── Ready state ──────────────────────────────────────────────────
   const activeCol = collections.find((c) => c.id === activeCollectionId);
-  const showingHits = query.trim().length > 0;
+  // HitsPane is gated by what was last SUBMITTED, not what's typed.
+  // So typing into the search box doesn't replace the doc list until
+  // the user actually presses Enter / Search.
+  const showingHits = lastQuery.length > 0;
 
   return (
     <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", position: "relative" }}>
@@ -491,7 +515,7 @@ export function KnowledgePage() {
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === "Enter") void runSearch();
-              if (e.key === "Escape") setQuery("");
+              if (e.key === "Escape") { setQuery(""); setLastQuery(""); setHits([]); }
             }}
             placeholder={zh ? "语义搜索（Enter 提交，Esc 清空）..." : "Semantic search (Enter, Esc to clear)..."}
             style={{ ...fInput, flex: 1, padding: "9px 14px", fontSize: 12 }}
@@ -520,12 +544,23 @@ export function KnowledgePage() {
               onClick={() => setSearchScope("all")}
             />
           </div>
-          {showingHits && (
-            <button onClick={() => setQuery("")} style={btnSubtle}>
-              {zh ? "清空" : "Clear"}
-            </button>
-          )}
-          <button onClick={() => void runSearch()} disabled={searching || !query.trim()} style={btnPrimary}>
+          {/* Keep Clear always mounted (disabled when nothing to clear)
+              and pin both buttons to a fixed minWidth so the input's
+              `flex: 1` neighbour can't reflow left-right every time
+              `searching` or `showingHits` flips. Without this the row
+              jitters horizontally each render. */}
+          <button
+            onClick={() => { setQuery(""); setLastQuery(""); setHits([]); }}
+            disabled={!showingHits}
+            style={{ ...btnSubtle, minWidth: 64, visibility: showingHits ? "visible" : "hidden" }}
+          >
+            {zh ? "清空" : "Clear"}
+          </button>
+          <button
+            onClick={() => void runSearch()}
+            disabled={searching || !query.trim()}
+            style={{ ...btnPrimary, minWidth: 96 }}
+          >
             {searching ? (zh ? "搜索中..." : "Searching...") : zh ? "搜索" : "Search"}
           </button>
         </div>
@@ -642,6 +677,14 @@ export function KnowledgePage() {
             <HitsPane
               hits={hits}
               zh={zh}
+              // Use the SUBMITTED query, not the current input — otherwise
+              // typing into the box after a search swaps the "no matches
+              // for X" message to a stale word while the hits below still
+              // reflect the previous submission.
+              query={lastQuery}
+              searching={searching}
+              scopedToCollection={searchScope === "current" && !!activeCollectionId ? activeCol?.name ?? null : null}
+              onClearScope={() => setSearchScope("all")}
               onPick={async (h) => {
                 if (!h.collectionId) {
                   toast.error(zh ? "该命中无所属知识库，无法打开" : "Hit has no collection — cannot open");
@@ -658,6 +701,7 @@ export function KnowledgePage() {
                   // Clear query so closing the modal returns to doc list,
                   // not the still-active hits view.
                   setQuery("");
+                  setLastQuery("");
                   setHits([]);
                 } catch (e: any) {
                   toast.fromError(zh ? "打开文档失败" : "Failed to open doc", e);
@@ -720,7 +764,18 @@ export function KnowledgePage() {
                     </button>
                   }
                   items={[
-                    { label: zh ? "选择文件" : "Pick files", onClick: () => fileInputRef.current?.click() },
+                    {
+                      label: zh ? "选择文件" : "Pick files",
+                      // Defer the native file picker by one tick so React
+                      // finishes committing the menu's close render before
+                      // we open the NSOpenPanel. Without this, WKWebView
+                      // can crash on the synchronous click() while the
+                      // menu sub-tree is unmounting — confirmed crash
+                      // reproducer.
+                      onClick: () => {
+                        setTimeout(() => fileInputRef.current?.click(), 0);
+                      },
+                    },
                     { label: zh ? "粘贴文本" : "Paste text", onClick: () => setShowPasteText(true) },
                     { label: zh ? "URL 抓取" : "Fetch URL", onClick: () => setShowFetchUrl(true) },
                   ]}
@@ -765,8 +820,25 @@ export function KnowledgePage() {
                   ref={fileInputRef}
                   type="file"
                   multiple
-                  accept=".md,.txt,.json,.pdf,.docx,.xlsx,.pptx,text/markdown,text/plain,application/json,application/pdf"
-                  style={{ display: "none" }}
+                  // Mirror the backend's accepted set (multipart in
+                  // /api/v1/knowledge/.../docs): pdf/docx/xlsx/pptx
+                  // binaries + plain/markdown/csv/html/json + email
+                  // archives (.eml / .mbox). MIME types listed alongside
+                  // extensions for stricter browsers.
+                  accept=".md,.markdown,.txt,.csv,.html,.htm,.json,.pdf,.docx,.xlsx,.pptx,.eml,.mbox,text/markdown,text/plain,text/csv,text/html,application/json,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.openxmlformats-officedocument.presentationml.presentation,message/rfc822,application/mbox"
+                  // Don't use display:none — WKWebView occasionally
+                  // refuses to dispatch click() on a fully-removed input.
+                  // Render off-screen + pointer-events:none so it
+                  // accepts programmatic clicks while staying invisible.
+                  style={{
+                    position: "absolute",
+                    left: -10000,
+                    top: -10000,
+                    width: 1,
+                    height: 1,
+                    opacity: 0,
+                    pointerEvents: "none",
+                  }}
                   onChange={(e) => {
                     void handleFilePick(e.target.files);
                     if (e.target) e.target.value = "";
@@ -1020,16 +1092,88 @@ function StatPill({ label, value }: { label: string; value: string }) {
 function HitsPane({
   hits,
   zh,
+  query,
+  searching,
+  scopedToCollection,
+  onClearScope,
   onPick,
 }: {
   hits: KbSearchHit[];
   zh: boolean;
+  query: string;
+  searching: boolean;
+  scopedToCollection: string | null;
+  onClearScope: () => void;
   onPick: (h: KbSearchHit) => void;
 }) {
   if (hits.length === 0) {
+    // While the request is in flight, show a placeholder rather than
+    // "No matches" — otherwise an in-progress search briefly reads as
+    // a failed one. Once the response lands we either populate hits or
+    // surface the empty branch below.
+    if (searching) {
+      return (
+        <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: V2.t3, fontSize: 12 }}>
+          {zh ? "搜索中…" : "Searching…"}
+        </div>
+      );
+    }
     return (
-      <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: V2.t3, fontSize: 12 }}>
-        {zh ? "没有匹配结果" : "No matches"}
+      <div
+        style={{
+          flex: 1,
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: 14,
+          padding: 40,
+          textAlign: "center",
+        }}
+      >
+        <div style={{ fontSize: 44, opacity: 0.6 }}>🔍</div>
+        <div style={{ fontSize: 15, fontWeight: 600, color: V2.t0 }}>
+          {zh ? "没有匹配结果" : "No matches"}
+        </div>
+        <div style={{ fontSize: 12, color: V2.t1, lineHeight: 1.6, maxWidth: 360 }}>
+          {zh ? "未找到与「" : "Nothing matched "}
+          <span style={{ color: V2.t0, fontFamily: V2.mono }}>{query}</span>
+          {zh ? "」相关的文档片段。" : "."}
+          {scopedToCollection && (
+            <>
+              <br />
+              {zh ? "当前限于知识库" : "Currently scoped to"}{" "}
+              <span style={{ color: V2.or, fontFamily: V2.mono }}>{scopedToCollection}</span>
+              {zh ? "。" : "."}
+            </>
+          )}
+        </div>
+        <div style={{ fontSize: 11, color: V2.t2, lineHeight: 1.55, maxWidth: 360 }}>
+          {zh
+            ? "可尝试：换个关键词 / 用同义词 / 更短的短语"
+            : "Try: different keywords, synonyms, or a shorter phrase"}
+          {scopedToCollection && (
+            <>
+              <br />
+              {zh ? "或" : "or"}{" "}
+              <button
+                onClick={onClearScope}
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  color: V2.green,
+                  fontSize: 11,
+                  cursor: "pointer",
+                  padding: 0,
+                  textDecoration: "underline",
+                  fontFamily: "inherit",
+                }}
+              >
+                {zh ? "扩到全部知识库再试" : "broaden to all collections"}
+              </button>
+            </>
+          )}
+        </div>
       </div>
     );
   }
@@ -1048,14 +1192,16 @@ function HitsPane({
             cursor: "pointer",
           }}
         >
+          {/* No score badge — backend returns a raw RRF fusion score
+              (typically 0.005–0.05), not a normalized 0-1 similarity.
+              Rendering it as % was misleading ("0.8%" looked like
+              "barely relevant" when it actually meant "ranked first").
+              Order in the list already conveys priority. */}
           <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
             <div style={{ fontSize: 12, fontWeight: 600, color: V2.t0, flex: 1 }}>{h.sourceTitle}</div>
             {h.collectionName && (
               <div style={{ fontSize: 10, color: V2.t2, fontFamily: V2.mono }}>{h.collectionName}</div>
             )}
-            <div style={{ fontSize: 10, fontFamily: V2.mono, color: V2.green }}>
-              {(h.score * 100).toFixed(1)}%
-            </div>
           </div>
           <div
             style={{
