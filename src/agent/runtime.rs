@@ -4154,7 +4154,7 @@ impl AgentRuntime {
             }
             let effective_system = system_prompt.to_owned();
 
-            // Resolve max_tokens with priority: config > built-in defaults > 8192
+            // Resolve max_tokens with priority: config > built-in defaults > 15000
             let (provider_name, model_id) =
                 crate::provider::registry::ProviderRegistry::parse_model(&model);
             let configured_max_tokens = {
@@ -4182,7 +4182,7 @@ impl AgentRuntime {
                     .and_then(|m| m.max_tokens)
                     .map(|v| v as u32);
 
-                from_agent.or(from_defaults).or(from_provider).or(Some(30_000))
+                from_agent.or(from_defaults).or(from_provider).or(Some(15_000))
             };
 
             if let Some(configured) = configured_max_tokens {
