@@ -6,7 +6,7 @@ use super::style::*;
 use crate::cli::ToolsCommand;
 
 // ---------------------------------------------------------------------------
-// Mirror URL (Chinese users) / upstream fallback
+// Hub endpoints
 // ---------------------------------------------------------------------------
 
 /// Tools manifest — schema-2 JSON: `{schema, updated_at, tools:{name:{version,
