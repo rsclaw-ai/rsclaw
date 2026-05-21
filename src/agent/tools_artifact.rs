@@ -29,6 +29,9 @@ use super::runtime::{AgentRuntime, RunContext};
 /// - `lines:A-B`    — 1-indexed inclusive range, clamped to `[1, total]`
 /// - `grep:PATTERN` — case-insensitive regex over lines
 pub(crate) fn apply_mode(full: &str, mode: &str) -> Result<String> {
+    // Defensive trim against the v1 tool-call protocol's trailing-newline
+    // leak (see read_session_archive::apply_archive_mode for the same guard).
+    let mode = mode.trim();
     let lines: Vec<&str> = full.lines().collect();
     let total = lines.len();
     if mode == "full" {
@@ -96,13 +99,18 @@ impl AgentRuntime {
         ctx: &RunContext,
         args: Value,
     ) -> Result<Value> {
+        // Trim string args: the rsclaw v1 tool-call protocol leaks a trailing
+        // newline into them (same root cause as read_session_archive `mode`
+        // and the computer `action` arg). Untrimmed, `tool_result_id="tr_x\n"`
+        // fails to resolve and `mode="grep:x\n"` matches nothing.
         let id_str = args["tool_result_id"]
             .as_str()
             .or_else(|| args["id"].as_str())
+            .map(str::trim)
             .ok_or_else(|| anyhow!("read_artifact: `tool_result_id` required"))?;
         let id = ArtifactId::parse(id_str)?;
 
-        let mode = args["mode"].as_str().unwrap_or("full");
+        let mode = args["mode"].as_str().unwrap_or("full").trim();
         let store = default_store();
         let full = store.read(&ctx.session_key, &id).map_err(|e| {
             anyhow!(
@@ -144,6 +152,15 @@ mod tests {
     #[test]
     fn full_returns_everything() {
         assert_eq!(apply_mode(&sample(), "full").unwrap(), sample());
+    }
+
+    // Regression: v1 tool-call protocol leaks a trailing newline into the
+    // mode arg; untrimmed it broke exact-match and grep regexes.
+    #[test]
+    fn mode_tolerates_trailing_newline() {
+        assert_eq!(apply_mode(&sample(), "full\n").unwrap(), sample());
+        assert_eq!(apply_mode(&sample(), "head:2\n").unwrap(), "line1\nline2");
+        assert_eq!(apply_mode(&sample(), "grep:line3\n").unwrap(), "line3");
     }
 
     #[test]
