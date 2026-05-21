@@ -309,14 +309,20 @@ async fn upload_multipart(svc: Arc<KnowledgeService>, cid: String, req: Request)
         Some(b) if !b.is_empty() => b,
         _ => return bad_request("empty_content"),
     };
-    // Title precedence: explicit `title` field, else the uploaded filename.
-    // The filename also drives MIME detection (OOXML magic is just zip), so we
-    // pass mime=None and let `ingest` detect from the title/extension.
+    // MIME detection MUST key off the real uploaded filename, not the title:
+    // a custom `title` field has no extension, and OOXML / .eml / .mbox are
+    // distinguished by extension (their magic is just zip / ASCII). Detecting
+    // from the title would mis-route them (docx → octet-stream error, .eml →
+    // plain text). Detect from the filename here and pass it explicitly.
+    let mime = file_name
+        .as_deref()
+        .map(|f| crate::kb::canonicalize::detect_mime(&bytes, Some(f)));
+    // Title precedence for DISPLAY only: explicit `title` field, else filename.
     let title = title
         .filter(|t| !t.trim().is_empty())
         .or(file_name)
         .unwrap_or_default();
-    ingest_and_respond(&svc, &cid, title.trim(), &bytes, None)
+    ingest_and_respond(&svc, &cid, title.trim(), &bytes, mime.as_deref())
 }
 
 /// Validate + ingest + 202. Shared by the JSON and multipart paths.
