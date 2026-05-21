@@ -10,6 +10,7 @@
 //!   - `ClawhubClient`  — download/install skills from clawhub.ai
 //!   - `LockFile`       — `.clawhub/lock.json` read/write
 
+pub mod allowlist;
 pub mod clawhub;
 pub mod crystallizer;
 pub mod loader;

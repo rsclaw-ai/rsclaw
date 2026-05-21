@@ -136,6 +136,17 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     );
     info!("{} skill(s) loaded", skills.len());
 
+    // Auto-install allowlist (security gate for the skill_install tool): load
+    // the local cache now so the gate has data immediately, then refresh from
+    // the hub in the background. Fail-closed — no cache + failed fetch = empty.
+    let (al_s, al_p) = crate::skill::allowlist::load_cached();
+    info!(skills = al_s, plugins = al_p, "allowlist: loaded from cache");
+    tokio::spawn(async {
+        if let Err(e) = crate::skill::allowlist::refresh().await {
+            warn!("allowlist refresh failed (keeping cache; fail-closed): {e:#}");
+        }
+    });
+
     // 5. Build agent registry with live receivers.
     let (registry, receivers) =
         AgentRegistry::from_config_with_receivers(&config, Arc::clone(&providers));

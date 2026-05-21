@@ -6836,15 +6836,36 @@ impl AgentRuntime {
         if name.is_empty() {
             return Ok(json!({ "error": "name is required" }));
         }
+        // Security gate: the agent may AUTO-install only audited, content-pinned
+        // skills (allowlist). Off-list installs are blocked here and must go
+        // through the human-initiated CLI (`rsclaw skills install`).
+        let Some(entry) = crate::skill::allowlist::snapshot().lookup_skill(&name) else {
+            return Ok(json!({
+                "error": format!("'{name}' is not on the audited auto-install allowlist"),
+                "guidance": "This skill is not pre-audited, so it cannot be auto-installed. \
+                    Tell the user; if they trust it they can install it themselves with \
+                    `rsclaw skills install <slug>`.",
+            }));
+        };
         let dir = crate::config::loader::base_dir().join("skills");
         let client = crate::skill::clawhub::ClawhubClient::new();
         match client.install_with_fallback(&name, &dir).await {
-            Ok(locked) => Ok(json!({
-                "installed": name,
-                "version": locked.version,
-                "dir": locked.install_dir.display().to_string(),
-                "next_step": "Usable now: skill_use(name=\"...\") to read its SKILL.md, then run the CLI it documents via shell.",
-            })),
+            Ok(locked) => {
+                // Content pin: the downloaded SKILL.md must match the audited
+                // hash, so a registry can't swap content under an audited slug.
+                if let Err(e) =
+                    crate::skill::allowlist::verify_skill_content(&locked.install_dir, &entry)
+                {
+                    let _ = std::fs::remove_dir_all(&locked.install_dir);
+                    return Ok(json!({ "error": e.to_string(), "name": name }));
+                }
+                Ok(json!({
+                    "installed": name,
+                    "version": locked.version,
+                    "dir": locked.install_dir.display().to_string(),
+                    "next_step": "Usable now: skill_use(name=\"...\") to read its SKILL.md, then run the CLI it documents via shell.",
+                }))
+            }
             Err(e) => Ok(json!({ "error": format!("install failed: {e}"), "name": name })),
         }
     }
