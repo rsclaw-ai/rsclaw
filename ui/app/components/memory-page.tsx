@@ -54,6 +54,9 @@ export function MemoryPage() {
   const [tierFilter, setTierFilter] = useState<TierFilter>("all");
   const [kindFilter, setKindFilter] = useState<string>("");
   const [scopeFilter, setScopeFilter] = useState<string>("");
+  // Client-side pinned toggle. Server doesn't expose a `pinned` filter
+  // on /memory/docs yet, so we apply it locally over the fetched list.
+  const [pinnedOnly, setPinnedOnly] = useState(false);
 
   // Debounce search input — the semantic search has to embed the
   // query and run an HNSW scan, no point firing on every keystroke.
@@ -97,12 +100,15 @@ export function MemoryPage() {
     void load();
   }, [load]);
 
-  // Client-side tier filter (the server filter only supports kind /
-  // scope; tier is a small enum we can cut down in-memory cheaply).
+  // Client-side tier + pinned filter (the server filter only supports
+  // kind / scope; the rest is a small enum + boolean we can cut down
+  // in-memory cheaply).
   const visibleDocs = useMemo(() => {
-    if (tierFilter === "all") return docs;
-    return docs.filter((d) => d.tier === tierFilter);
-  }, [docs, tierFilter]);
+    let out = docs;
+    if (tierFilter !== "all") out = out.filter((d) => d.tier === tierFilter);
+    if (pinnedOnly) out = out.filter((d) => d.pinned);
+    return out;
+  }, [docs, tierFilter, pinnedOnly]);
 
   const kindOptions = useMemo(() => {
     if (!stats) return [];
@@ -135,35 +141,56 @@ export function MemoryPage() {
       {/* Stats row */}
       {stats && (
         <div style={statsRowStyle}>
-          <StatPill label={zh ? "总计" : "Total"} value={stats.total} accent="#a8a6b2" />
+          <StatPill
+            label={zh ? "总计" : "Total"}
+            value={stats.total}
+            accent="#a8a6b2"
+            tooltip={zh ? "全部记忆条目（含永久）。点击清除当前筛选" : "All memory docs (incl. permanent). Click to clear filters."}
+            // "Total" doubles as a clear-all-filters affordance — clicking
+            // wipes tier + pinned in one go (kind/scope live in their own
+            // dropdowns and aren't touched).
+            onClick={() => { setTierFilter("all"); setPinnedOnly(false); }}
+            active={tierFilter === "all" && !pinnedOnly}
+          />
           <StatPill
             label={zh ? "核心" : "Core"}
             value={stats.by_tier.core || 0}
             accent={TIER_COLOR.core}
-            onClick={() => setTierFilter("core")}
+            tooltip={zh ? "核心层：高频访问 / 高重要度，衰减最慢。系统自动按 importance + access_count + 时间评分" : "Core tier: high-frequency / high-importance, slowest decay. Auto-classified by importance × access_count × age."}
+            onClick={() => setTierFilter(tierFilter === "core" ? "all" : "core")}
             active={tierFilter === "core"}
           />
           <StatPill
             label={zh ? "工作" : "Working"}
             value={stats.by_tier.working || 0}
             accent={TIER_COLOR.working}
-            onClick={() => setTierFilter("working")}
+            tooltip={zh ? "工作层：近期活跃但尚未沉淀的记忆，标准衰减速度" : "Working tier: recently active but not yet consolidated. Standard decay rate."}
+            onClick={() => setTierFilter(tierFilter === "working" ? "all" : "working")}
             active={tierFilter === "working"}
           />
           <StatPill
             label={zh ? "外围" : "Peripheral"}
             value={stats.by_tier.peripheral || 0}
             accent={TIER_COLOR.peripheral}
-            onClick={() => setTierFilter("peripheral")}
+            tooltip={zh ? "外围层：低频 / 低重要度，衰减最快，可能被清理" : "Peripheral tier: low-frequency / low-importance, fastest decay, candidate for cleanup."}
+            onClick={() => setTierFilter(tierFilter === "peripheral" ? "all" : "peripheral")}
             active={tierFilter === "peripheral"}
           />
           <StatPill
-            label={zh ? "已固定" : "Pinned"}
+            label={zh ? "永久 📌" : "Permanent 📌"}
             value={stats.pinned}
             accent="#f97316"
+            tooltip={zh
+              ? "永久记忆：关键事实（电话/姓名/订单号等）永不衰减、永远锁在核心层。横切维度，会与核心/工作/外围重叠计数。"
+              : "Permanent: critical facts (names, phone numbers, IDs, etc.) — never decay, locked in Core tier. Orthogonal to tier; counted alongside Core/Working/Peripheral."}
+            onClick={() => setPinnedOnly((v) => !v)}
+            active={pinnedOnly}
           />
-          {tierFilter !== "all" && (
-            <button onClick={() => setTierFilter("all")} style={clearTierBtnStyle}>
+          {(tierFilter !== "all" || pinnedOnly) && (
+            <button
+              onClick={() => { setTierFilter("all"); setPinnedOnly(false); }}
+              style={clearTierBtnStyle}
+            >
               {zh ? "清除筛选 ×" : "Clear ×"}
             </button>
           )}
@@ -295,18 +322,21 @@ function StatPill({
   accent,
   onClick,
   active,
+  tooltip,
 }: {
   label: string;
   value: number;
   accent: string;
   onClick?: () => void;
   active?: boolean;
+  tooltip?: string;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
       disabled={!onClick}
+      title={tooltip}
       style={{
         ...statPillStyle,
         cursor: onClick ? "pointer" : "default",
