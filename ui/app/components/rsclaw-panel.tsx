@@ -4800,23 +4800,10 @@ function CronTaskPage() {
 
 interface SkillInfo { name: string; description?: string; version?: string; author?: string; tools?: { name: string; description?: string }[]; path?: string; icon?: string; }
 
-const RECOMMENDED_SKILLS: { name: string; icon: string; ver: string; author: string; desc: { cn: string; en: string }; tools: string[]; downloads?: string; stars?: string }[] = [
-  { name: "self-improving-agent", icon: "\uD83E\uDDE0", ver: "v3.0.13", author: "@pskoett", desc: { cn: "\u6355\u83B7\u5B66\u4E60\u3001\u9519\u8BEF\u548C\u4FEE\u6B63\uFF0C\u5B9E\u73B0\u6301\u7EED\u6539\u8FDB", en: "Captures learnings, errors, and corrections for continuous improvement" }, tools: [], downloads: "345k", stars: "2.9k" },
-  { name: "ontology", icon: "\uD83D\uDD17", ver: "v1.0.4", author: "@oswalpalash", desc: { cn: "\u7ED3\u6784\u5316\u667A\u80FD\u4F53\u8BB0\u5FC6\u77E5\u8BC6\u56FE\u8C31", en: "Typed knowledge graph for structured agent memory and composable skills" }, tools: [], downloads: "150k", stars: "472" },
-  { name: "Self-Improving-Proactive-Agent", icon: "\u2728", ver: "v1.2.16", author: "@ivangdavila", desc: { cn: "\u81EA\u53CD\u601D+\u81EA\u6279\u8BC4+\u81EA\u5B66\u4E60+\u81EA\u7EC4\u7EC7\u8BB0\u5FC6", en: "Self-reflection, self-criticism, self-learning, self-organizing memory" }, tools: [], downloads: "144k", stars: "866" },
-  { name: "AdMapix", icon: "\uD83D\uDCCA", ver: "v1.0.28", author: "@fly0pants", desc: { cn: "\u5E7F\u544A\u60C5\u62A5\u4E0E\u5E94\u7528\u5206\u6790\u52A9\u624B", en: "Ad intelligence & app analytics assistant" }, tools: [], downloads: "78.9k", stars: "212" },
-  { name: "nano-banana-pro", icon: "\uD83C\uDF4C", ver: "v1.0.1", author: "@steipete", desc: { cn: "Gemini 3 Pro \u56FE\u50CF\u751F\u6210/\u7F16\u8F91\uFF0C\u652F\u6301 1K/2K/4K", en: "Generate/edit images with Nano Banana Pro (Gemini 3 Pro Image)" }, tools: [], downloads: "77.5k", stars: "308" },
-  { name: "obsidian", icon: "\uD83D\uDCDD", ver: "v1.0.0", author: "@steipete", desc: { cn: "Obsidian \u77E5\u8BC6\u5E93\u64CD\u4F5C\u4E0E\u81EA\u52A8\u5316", en: "Work with Obsidian vaults and automate via obsidian-cli" }, tools: [], downloads: "73.1k", stars: "297" },
-  { name: "baidu-search", icon: "\uD83D\uDD0D", ver: "v1.1.3", author: "@ide-rea", desc: { cn: "\u767E\u5EA6 AI \u641C\u7D22\u5F15\u64CE", en: "Search the web using Baidu AI Search Engine" }, tools: [], downloads: "71.5k", stars: "188" },
-  { name: "Agent-Browser", icon: "\uD83C\uDF10", ver: "v0.1.0", author: "@matrixy", desc: { cn: "\u65E0\u5934\u6D4F\u89C8\u5668\u81EA\u52A8\u5316 CLI\uFF0C\u4F18\u5316 AI \u4EA4\u4E92", en: "Headless browser automation CLI optimized for AI agents" }, tools: [], downloads: "67k", stars: "236" },
-  { name: "api-gateway", icon: "\uD83D\uDD0C", ver: "v1.0.76", author: "@byungkyu", desc: { cn: "\u8FDE\u63A5 100+ API\uFF08Google, Microsoft, GitHub, Notion, Slack \u7B49\uFF09", en: "Connect to 100+ APIs with managed OAuth" }, tools: [], downloads: "61.9k", stars: "303" },
-  { name: "mcporter", icon: "\uD83D\uDEE0\uFE0F", ver: "v1.0.0", author: "@steipete", desc: { cn: "MCP \u670D\u52A1\u5668/\u5DE5\u5177\u7BA1\u7406 CLI", en: "List, configure, auth, and call MCP servers/tools directly" }, tools: [], downloads: "51.3k", stars: "156" },
-  { name: "free-ride", icon: "\uD83C\uDD93", ver: "v1.0.8", author: "@shaivpidadi", desc: { cn: "\u514D\u8D39 AI \u6A21\u578B\u7BA1\u7406\uFF0C\u81EA\u52A8\u6392\u540D\u548C fallback", en: "Manages free AI models from OpenRouter with auto-ranking and fallbacks" }, tools: [], downloads: "50.9k", stars: "363" },
-  { name: "prismfy-search", icon: "\uD83D\uDD0E", ver: "v1.1.0", author: "@uroboros1205", desc: { cn: "10 \u5F15\u64CE\u7F51\u7EDC\u641C\u7D22\uFF08Google, Reddit, GitHub, arXiv \u7B49\uFF09", en: "Search across 10 engines: Google, Reddit, GitHub, arXiv, Hacker News" }, tools: [], downloads: "49.3k", stars: "16" },
-  { name: "word-docx", icon: "\uD83D\uDCC4", ver: "v1.0.2", author: "@ivangdavila", desc: { cn: "Word/DOCX \u6587\u6863\u521B\u5EFA\u3001\u68C0\u67E5\u548C\u7F16\u8F91", en: "Create, inspect, and edit Microsoft Word documents and DOCX files" }, tools: [], downloads: "48.2k", stars: "222" },
-  { name: "excel-xlsx", icon: "\uD83D\uDCCA", ver: "v1.0.2", author: "@ivangdavila", desc: { cn: "Excel/XLSX \u5DE5\u4F5C\u7C3F\u521B\u5EFA\u3001\u68C0\u67E5\u548C\u7F16\u8F91", en: "Create, inspect, and edit Microsoft Excel workbooks and XLSX files" }, tools: [], downloads: "42.9k", stars: "173" },
-  { name: "imap-smtp-email", icon: "\uD83D\uDCE7", ver: "v0.0.10", author: "community", desc: { cn: "IMAP/SMTP \u90AE\u4EF6\u6536\u53D1", en: "Email via IMAP/SMTP" }, tools: [], downloads: "40k", stars: "" },
-];
+// Recommended skills list was previously hardcoded here (16 entries
+// curated from clawhub). It's been removed pending a real marketplace
+// endpoint (`GET /api/v1/marketplace?kind=skill`) \u2014 UI now shows only
+// the installed list + clawhub search results.
 
 function SkillsTab() {
   const zh = getLang() === "cn";
@@ -4889,7 +4876,6 @@ function SkillsTab() {
 
   const V2 = { bg2: "#141618", bg3: "#1a1c22", bg4: "#1f2126", bg5: "#252830", bd: "rgba(255,255,255,.055)", bd2: "rgba(255,255,255,.09)", t0: "#eceaf4", t1: "#9896a4", t2: "#7e7c8c", t3: "#5a5868", or: "#f97316", olo: "rgba(249,115,22,.09)", obrd: "rgba(249,115,22,.2)", green: "#2dd4a0", glo: "rgba(45,212,160,.07)", gbrd: "rgba(45,212,160,.18)", red: "#d95f5f", rlo: "rgba(217,95,95,.08)", rbrd: "rgba(217,95,95,.18)", mono: "'JetBrains Mono', monospace" };
   const isInstalled = (name: string) => installed.some((s) => s.name === name);
-  const filtered = RECOMMENDED_SKILLS.filter((s) => !search || s.name.includes(search.toLowerCase()));
 
   return (
     <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
@@ -4967,36 +4953,16 @@ function SkillsTab() {
         )}
         {searching && <div style={{ textAlign: "center", color: V2.t3, padding: 20 }}>...</div>}
 
-        {/* Recommended */}
-        <div style={{ fontSize: 11, fontWeight: 600, color: V2.t2, letterSpacing: 0.5, textTransform: "uppercase", marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
-          {zh ? "\u63A8\u8350\u5B89\u88C5" : "Recommended"} <span style={{ fontSize: 9, padding: "1px 7px", borderRadius: 3, background: V2.bg4, color: V2.t2 }}>{filtered.length}</span>
-        </div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, maxHeight: 420, overflowY: "auto" }}>
-          {filtered.map((rec) => (
-            <div key={rec.name} style={{ background: V2.bg2, border: `1px solid ${V2.bd}`, borderRadius: 11, padding: "14px 16px", display: "flex", flexDirection: "column", gap: 10, transition: "border-color .13s" }}>
-              <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
-                <div style={{ width: 36, height: 36, borderRadius: 9, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, flexShrink: 0, background: V2.bg3, border: `1px solid ${V2.bd}` }}>{rec.icon}</div>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 13, fontWeight: 600, color: V2.t0 }}>{rec.name}</div>
-                  <div style={{ fontSize: 10, fontFamily: V2.mono, color: V2.t3, marginTop: 1 }}>{rec.ver} {"\u00B7"} {rec.author}{rec.downloads ? ` \u00B7 ${rec.downloads}` : ""}{rec.stars ? ` \u2605 ${rec.stars}` : ""}</div>
-                </div>
-                {isInstalled(rec.name) && <div style={{ fontSize: 10, color: V2.green, fontFamily: V2.mono, display: "flex", alignItems: "center", gap: 4 }}>{"●"} {zh ? "\u5DF2\u5B89\u88C5" : "Installed"}</div>}
-              </div>
-              <div style={{ fontSize: 11, color: V2.t2, lineHeight: 1.55 }}>{zh ? rec.desc.cn : rec.desc.en}</div>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-                  {rec.tools.map((t) => <span key={t} style={{ fontSize: 9, padding: "1px 6px", borderRadius: 3, background: V2.bg4, color: V2.t2, fontFamily: V2.mono }}>{t}</span>)}
-                </div>
-                {isInstalled(rec.name)
-                  ? <span style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${V2.bd2}`, color: V2.t2, fontSize: 11 }}>{"\u2713"}</span>
-                  : <button onClick={() => doInstall(rec.name)} disabled={installing === rec.name}
-                      style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${installing === rec.name ? V2.obrd : V2.gbrd}`, background: installing === rec.name ? V2.olo : V2.glo, color: installing === rec.name ? V2.or : V2.green, fontSize: 11, fontWeight: 600, cursor: installing === rec.name ? "not-allowed" : "pointer" }}>
-                      {installing === rec.name ? (zh ? "\u5B89\u88C5\u4E2D..." : "Installing...") : (zh ? "\u5B89\u88C5" : "Install")}
-                    </button>}
-              </div>
-            </div>
-          ))}
-        </div>
+        {/* Recommended block removed \u2014 pending GET /api/v1/marketplace?kind=skill
+            on the backend. Empty-state hint replaces the old 16-entry hardcoded
+            list so users still know how to discover new skills. */}
+        {searchResults.length === 0 && !searching && (
+          <div style={{ fontSize: 11, color: V2.t3, padding: "20px 0", textAlign: "center", lineHeight: 1.6 }}>
+            {zh
+              ? "\u63A8\u8350\u5217\u8868\u672A\u5C31\u7EEA\uFF08\u7B49\u5F85\u540E\u7AEF marketplace \u63A5\u53E3\uFF09\u3002\u53EF\u5728\u4E0A\u65B9\u641C\u7D22\u6D4F\u89C8 clawhub\u3002"
+              : "Recommendations not wired yet (pending backend marketplace endpoint). Use the search box above to browse clawhub."}
+          </div>
+        )}
       </div>
 
       {/* Detail modal */}
@@ -5051,10 +5017,10 @@ interface PluginInfo {
 
 type PluginRuntime = "wasm" | "shell";
 
-const RECOMMENDED_PLUGINS: { name: string; runtime: PluginRuntime; icon: string; ver: string; author: string; desc: { cn: string; en: string }; spec: string }[] = [
-  { name: "qrcode", runtime: "wasm", icon: "📱", ver: "v1.0.0", author: "@rsclaw", desc: { cn: "二维码生成/识别示例（WASM）", en: "QR code generator/decoder example (WASM)" }, spec: "https://github.com/rsclaw/plugin-qrcode/releases/latest/download/qrcode.wasm" },
-  { name: "browser-tools", runtime: "shell", icon: "🌐", ver: "v0.2.0", author: "@rsclaw", desc: { cn: "浏览器自动化 (Node shell-bridge)", en: "Browser automation via Node shell-bridge" }, spec: "https://github.com/rsclaw/plugin-browser-tools/releases/latest/download/browser-tools.zip" },
-];
+// Recommended plugins list was previously hardcoded here (2 entries).
+// Removed pending a real marketplace endpoint
+// (`GET /api/v1/marketplace?kind=plugin`) — UI now relies on the
+// URL/path install input + drag-drop only.
 
 function PluginsTab() {
   const zh = getLang() === "cn";
@@ -5149,7 +5115,6 @@ function PluginsTab() {
 
   const isInstalled = (name: string) => installed.some((p) => p.name === name);
   const installedFiltered = installed.filter((p) => p.runtime === runtime);
-  const recommendedFiltered = RECOMMENDED_PLUGINS.filter((p) => p.runtime === runtime);
 
   const subTabBtn = (key: PluginRuntime, label: string) => (
     <button key={key} onClick={() => setRuntime(key)}
@@ -5221,37 +5186,14 @@ function PluginsTab() {
           </div>
         )}
 
-        {/* Recommended */}
-        <div style={{ fontSize: 11, fontWeight: 600, color: V2.t2, letterSpacing: 0.5, textTransform: "uppercase", marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
-          {zh ? "推荐安装" : "Recommended"} <span style={{ fontSize: 9, padding: "1px 7px", borderRadius: 3, background: V2.bg4, color: V2.t2 }}>{recommendedFiltered.length}</span>
+        {/* Recommended block removed — pending GET /api/v1/marketplace?kind=plugin
+            on the backend. Until then, install by URL/path (input above) or
+            drag a .wasm/.zip into the window. */}
+        <div style={{ fontSize: 11, color: V2.t3, padding: "20px 0", textAlign: "center", lineHeight: 1.6 }}>
+          {zh
+            ? "推荐列表未就绪（等待后端 marketplace 接口）。可通过上方 URL/路径 输入框或拖拽 .wasm/.zip 安装。"
+            : "Recommendations not wired yet (pending backend marketplace endpoint). Use the URL/path input above or drag a .wasm/.zip into the window."}
         </div>
-        {recommendedFiltered.length === 0 ? (
-          <div style={{ fontSize: 11, color: V2.t3, padding: "16px 0" }}>{zh ? "暂无推荐" : "No recommendations yet"}</div>
-        ) : (
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-            {recommendedFiltered.map((rec) => (
-              <div key={rec.name} style={{ background: V2.bg2, border: `1px solid ${V2.bd}`, borderRadius: 11, padding: "14px 16px", display: "flex", flexDirection: "column", gap: 10 }}>
-                <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
-                  <div style={{ width: 36, height: 36, borderRadius: 9, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, flexShrink: 0, background: V2.bg3, border: `1px solid ${V2.bd}` }}>{rec.icon}</div>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontSize: 13, fontWeight: 600, color: V2.t0 }}>{rec.name}</div>
-                    <div style={{ fontSize: 10, fontFamily: V2.mono, color: V2.t3, marginTop: 1 }}>{rec.ver} {"·"} {rec.author}</div>
-                  </div>
-                  {isInstalled(rec.name) && <div style={{ fontSize: 10, color: V2.green, fontFamily: V2.mono, display: "flex", alignItems: "center", gap: 4 }}>{"●"} {zh ? "已安装" : "Installed"}</div>}
-                </div>
-                <div style={{ fontSize: 11, color: V2.t2, lineHeight: 1.55 }}>{zh ? rec.desc.cn : rec.desc.en}</div>
-                <div style={{ display: "flex", justifyContent: "flex-end" }}>
-                  {isInstalled(rec.name)
-                    ? <span style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${V2.bd2}`, color: V2.t2, fontSize: 11 }}>{"✓"}</span>
-                    : <button onClick={() => doInstall(rec.spec)} disabled={installing === rec.spec}
-                        style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${installing === rec.spec ? V2.obrd : V2.gbrd}`, background: installing === rec.spec ? V2.olo : V2.glo, color: installing === rec.spec ? V2.or : V2.green, fontSize: 11, fontWeight: 600, cursor: installing === rec.spec ? "not-allowed" : "pointer" }}>
-                        {installing === rec.spec ? (zh ? "安装中..." : "Installing...") : (zh ? "安装" : "Install")}
-                      </button>}
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
       </div>
 
       {/* Drag-drop overlay highlight */}
