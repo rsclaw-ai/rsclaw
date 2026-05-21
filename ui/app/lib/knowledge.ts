@@ -48,6 +48,29 @@ export interface KbDoc {
   createdAt: string;
 }
 
+/**
+ * Server's 202 envelope for `POST …/docs` (JSON or multipart). Carries
+ * only enough to identify the doc — `mime/chunkCount/indexedAt/createdAt`
+ * land later via SSE / refetch. Don't treat this as a `KbDoc`.
+ */
+export interface KbUploadAccepted {
+  id: string;
+  title: string;
+  status: string;
+  bytes: number;
+}
+
+/**
+ * Response shape for `POST …/docs/from-url`. UrlSyncer's job-level
+ * envelope — no per-doc id is returned (one URL may dedupe to an existing
+ * doc, hence `docsSkipped`). Use SSE / listDocs() to surface the result.
+ */
+export interface KbUrlIngestAccepted {
+  status: "pending" | "skipped";
+  docsAdded: number;
+  docsSkipped: number;
+}
+
 export interface KbSearchHit {
   docId: string;
   collectionId: string | null;
@@ -188,10 +211,16 @@ export async function getDocContent(collectionId: string, docId: string): Promis
   return res.text();
 }
 
+/**
+ * Upload via JSON. Server returns 202 with a partial envelope (id/title/
+ * status/bytes) — NOT a full KbDoc. mime/chunkCount/indexedAt/createdAt
+ * fill in later via SSE or a follow-up listDocs() call. Treat this as
+ * fire-and-refresh: don't drop the return value into a KbDoc-shaped slot.
+ */
 export async function uploadDocJson(
   collectionId: string,
   input: { title: string; text: string; mime?: string },
-): Promise<KbDoc> {
+): Promise<KbUploadAccepted> {
   const res = await gatewayFetch(
     `/api/v1/knowledge/collections/${encodeURIComponent(collectionId)}/docs`,
     {
@@ -199,19 +228,20 @@ export async function uploadDocJson(
       body: JSON.stringify(input),
     },
   );
-  return ok<KbDoc>(res);
+  return ok<KbUploadAccepted>(res);
 }
 
 /**
- * Multipart upload. We DON'T go through gatewayFetch because that helper
- * always sets `Content-Type: application/json` — multipart needs the
- * browser to set the Content-Type with its own random boundary.
+ * Multipart upload. Same 202 / partial-envelope semantics as uploadDocJson;
+ * see KbUploadAccepted. We DON'T go through gatewayFetch because that
+ * helper always sets `Content-Type: application/json` — multipart needs
+ * the browser to set the Content-Type with its own random boundary.
  */
 export async function uploadDocFile(
   collectionId: string,
   file: File,
   title?: string,
-): Promise<KbDoc> {
+): Promise<KbUploadAccepted> {
   const fd = new FormData();
   if (title) fd.append("title", title);
   fd.append("file", file);
@@ -224,18 +254,22 @@ export async function uploadDocFile(
       body: fd,
     },
   );
-  return ok<KbDoc>(res);
+  return ok<KbUploadAccepted>(res);
 }
 
 /**
  * Hand a URL to the backend's UrlSyncer. Same async path as multipart/JSON
  * uploads — returns 202 immediately and the doc indexes in the background.
  * Backend derives the title from the URL/page; no title field accepted.
+ *
+ * Caveat: this is a JOB envelope, NOT a doc handle — there's no `id`,
+ * because a single URL may dedupe to an existing doc (hence docsSkipped).
+ * Callers MUST refresh via listDocs()/SSE to learn the resulting doc.
  */
 export async function uploadDocFromUrl(
   collectionId: string,
   url: string,
-): Promise<KbDoc> {
+): Promise<KbUrlIngestAccepted> {
   const res = await gatewayFetch(
     `/api/v1/knowledge/collections/${encodeURIComponent(collectionId)}/docs/from-url`,
     {
@@ -243,7 +277,7 @@ export async function uploadDocFromUrl(
       body: JSON.stringify({ url }),
     },
   );
-  return ok<KbDoc>(res);
+  return ok<KbUrlIngestAccepted>(res);
 }
 
 export async function deleteDoc(

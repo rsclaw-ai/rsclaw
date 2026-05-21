@@ -89,6 +89,22 @@ const fInput: React.CSSProperties = {
 // /api/v1/config) fails. Matches the backend's own default.
 const DEFAULT_maxDocBytes = 50 * 1024 * 1024;
 
+// Threshold for treating an "indexing" doc as probably-stuck.
+//
+// Backend's DocInfo::status() only returns "ready" (≥1 chunk) or
+// "indexing" (no chunks yet). A doc whose embed/chunk job dies leaves
+// it stuck at "indexing" forever — there's no "failed" state on the
+// wire today (KbDocStatus union has it in anticipation, but the backend
+// never emits it). 5 min is generous: most docs index in seconds and
+// even a 50MB PDF finishes inside this window on a warm BGE.
+const STUCK_INDEXING_MS = 5 * 60 * 1000;
+
+function isDocStuck(d: KbDoc, now = Date.now()): boolean {
+  if (d.status !== "indexing") return false;
+  const created = new Date(d.createdAt).getTime();
+  return Number.isFinite(created) && now - created > STUCK_INDEXING_MS;
+}
+
 const fmtBytes = (n: number): string => {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
@@ -235,7 +251,24 @@ export function KnowledgePage() {
         /* surface disconnect to status icon later */
       },
     );
-    return off;
+    // Heartbeat: every 30s, if any doc is still "indexing", refetch the
+    // collection. Two birds: (a) stuck detection (isDocStuck) re-evaluates
+    // automatically once the createdAt threshold tips over; (b) catches
+    // missed SSE events on flaky networks. Skip when there's nothing
+    // indexing so we don't churn against the backend.
+    const tick = setInterval(() => {
+      if (!activeCollectionId) return;
+      setDocs((prev) => {
+        if (prev.some((d) => d.status === "indexing")) {
+          void refreshDocs(activeCollectionId);
+        }
+        return prev;
+      });
+    }, 30_000);
+    return () => {
+      off();
+      clearInterval(tick);
+    };
   }, [bootState, activeCollectionId, refreshDocs, refreshStats]);
 
   // ── Drag-drop file upload ────────────────────────────────────────
@@ -750,44 +783,83 @@ export function KnowledgePage() {
                     {zh ? "尚无文档。可拖拽文件到窗口，或使用上方按钮上传。" : "No docs yet. Drag files into the window or use the buttons above."}
                   </div>
                 ) : (
-                  docs.map((d) => (
-                    <div
-                      key={d.id}
-                      onClick={() => setDetailDoc(d)}
-                      style={{
-                        padding: "10px 12px",
-                        margin: "4px 0",
-                        background: V2.bg3,
-                        border: `1px solid ${V2.bd}`,
-                        borderRadius: 9,
-                        cursor: "pointer",
-                        display: "flex",
-                        gap: 12,
-                        alignItems: "center",
-                      }}
-                    >
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontSize: 12, fontWeight: 600, color: V2.t0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                          {d.title}
-                        </div>
-                        <div style={{ fontSize: 10, color: V2.t3, fontFamily: V2.mono, marginTop: 2 }}>
-                          {d.mime} · {fmtBytes(d.bytes)} · {d.chunkCount} chunks
-                        </div>
-                      </div>
+                  docs.map((d) => {
+                    const stuck = isDocStuck(d);
+                    return (
                       <div
+                        key={d.id}
+                        onClick={() => setDetailDoc(d)}
                         style={{
-                          fontSize: 10,
-                          fontFamily: V2.mono,
-                          color: statusColor(d.status),
+                          padding: "10px 12px",
+                          margin: "4px 0",
+                          background: V2.bg3,
+                          border: `1px solid ${stuck ? V2.obrd : V2.bd}`,
+                          borderRadius: 9,
+                          cursor: "pointer",
                           display: "flex",
+                          gap: 12,
                           alignItems: "center",
-                          gap: 4,
                         }}
                       >
-                        ● {d.status}
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: 12, fontWeight: 600, color: V2.t0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                            {d.title}
+                          </div>
+                          <div style={{ fontSize: 10, color: V2.t3, fontFamily: V2.mono, marginTop: 2 }}>
+                            {d.mime} · {fmtBytes(d.bytes)} · {d.chunkCount} chunks
+                          </div>
+                        </div>
+                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          <div
+                            title={
+                              stuck
+                                ? zh
+                                  ? "已超过 5 分钟仍在索引，可能失败。点击右侧 ↻ 重试。"
+                                  : "Still indexing after 5 minutes — likely stuck. Click ↻ to retry."
+                                : undefined
+                            }
+                            style={{
+                              fontSize: 10,
+                              fontFamily: V2.mono,
+                              color: stuck ? V2.or : statusColor(d.status),
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 4,
+                            }}
+                          >
+                            ● {stuck ? (zh ? "indexing · 慢" : "indexing · slow") : d.status}
+                          </div>
+                          {stuck && activeCollectionId && (
+                            <button
+                              onClick={async (e) => {
+                                e.stopPropagation();
+                                try {
+                                  await reindexDoc(activeCollectionId, d.id);
+                                  toast.success(zh ? "已重新入队" : "Reindex queued");
+                                  await refreshDocs(activeCollectionId);
+                                } catch (err: any) {
+                                  toast.fromError(zh ? "重试失败" : "Retry failed", err);
+                                }
+                              }}
+                              title={zh ? "重试索引" : "Retry indexing"}
+                              style={{
+                                padding: "2px 8px",
+                                borderRadius: 6,
+                                border: `1px solid ${V2.obrd}`,
+                                background: V2.olo,
+                                color: V2.or,
+                                fontSize: 11,
+                                cursor: "pointer",
+                                fontFamily: V2.mono,
+                              }}
+                            >
+                              ↻
+                            </button>
+                          )}
+                        </div>
                       </div>
-                    </div>
-                  ))
+                    );
+                  })
                 )}
               </div>
             </>
@@ -858,8 +930,17 @@ export function KnowledgePage() {
           onClose={() => setShowFetchUrl(false)}
           onSubmit={async (url) => {
             try {
-              await uploadDocFromUrl(activeCollectionId, url);
+              const r = await uploadDocFromUrl(activeCollectionId, url);
               setShowFetchUrl(false);
+              // Surface dedup: backend returns status="skipped" or
+              // docsAdded=0/docsSkipped>0 when the URL canonicalizes to a
+              // doc already in this collection. Toast so users don't
+              // assume their click did nothing.
+              if (r.status === "skipped" || (r.docsAdded === 0 && r.docsSkipped > 0)) {
+                toast.info(zh ? "URL 已存在于知识库，跳过" : "URL already in KB, skipped");
+              } else {
+                toast.success(zh ? "已入队抓取" : "Queued for ingestion");
+              }
               await refreshDocs(activeCollectionId);
               await refreshStats();
             } catch (e: any) {
