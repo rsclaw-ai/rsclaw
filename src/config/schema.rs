@@ -1971,17 +1971,27 @@ pub struct LocalEmbeddingConfig {
 // kb (Knowledge Base — RAG over local docs)
 // ---------------------------------------------------------------------------
 
+/// Embedding-provider configuration. KB's `kb.embed` and the memory subsystem's
+/// `memorySearch` share this exact shape, so a KB-specific embedder is
+/// configured identically to memory (local BGE or remote OpenAI-compatible).
+pub type EmbedConfig = MemorySearchConfig;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KbConfig {
-    /// Embedder backend: "stub" (deterministic sha256 vectors, 1024-dim,
-    /// default for tests) or "local" (candle BGE model from
-    /// `embedder_model_path`). Future: "openai" / "ollama".
+    /// Per-KB embedder override. Same shape as `memorySearch` (local or
+    /// remote). When unset, KB falls back to the shared `memorySearch` config,
+    /// then to a local-model-dir scan, then to the deterministic stub. Set this
+    /// to point KB at a different embedder than memory — e.g. KB on the remote
+    /// GPU-fleet Qwen3 while memory stays on a fast local BGE. Changing it on a
+    /// populated KB requires a reindex (KB does not auto-migrate like memory).
+    pub embed: Option<EmbedConfig>,
+    /// DEPRECATED (unused): superseded by `embed`. Kept only so existing
+    /// configs that still set it continue to parse (deny_unknown_fields). No
+    /// code reads it — embedder selection goes through `embed` / `memorySearch`.
     pub embedder: Option<String>,
-    /// Directory holding the local BGE model (`config.json`,
-    /// `model.safetensors`, `tokenizer.json`). Default:
-    /// `<base_dir>/models/bge-small-zh`. The model's `hidden_size`
-    /// determines the vector dimension (bge-small-zh = 512).
+    /// DEPRECATED (unused): superseded by `embed.local`. Kept for parse
+    /// compatibility only; no code reads it.
     pub embedder_model_path: Option<String>,
     /// Persist the original raw bytes under `raw/<doc_id>.<ext>`
     /// (default true; users can disable to save disk).

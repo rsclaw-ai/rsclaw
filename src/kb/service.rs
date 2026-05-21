@@ -133,9 +133,10 @@ impl KnowledgeService {
         let index = Arc::new(KbIndex::open_and_rebuild_with_dim(&paths, &store, dim)?);
         let (events, _) = broadcast::channel(256);
         let cfg = crate::config::load().ok();
-        let query_instruction = cfg
-            .as_ref()
-            .and_then(|c| c.raw.memory_search.clone())
+        // queryInstruction comes from the SAME effective embed config the
+        // embedder was resolved from (`kb.embed` override, else `memorySearch`),
+        // so a KB-specific asymmetric model uses its own instruction.
+        let query_instruction = crate::kb::embedder::effective_embed_config()
             .and_then(|m| m.query_instruction);
         // kb.maxDocMb → bytes; default 50 MB, clamp negatives/zero to default.
         let max_doc_bytes = cfg

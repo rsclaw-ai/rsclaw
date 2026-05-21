@@ -26,45 +26,71 @@ pub trait KbEmbedder: Send + Sync {
 }
 
 /// Resolve the KB embedder for a `kb_root`. Precedence:
-///   1. Remote OpenAI-compatible (`memorySearch.provider = "openai"`) — reuse
-///      the shared embedding config so KB and memory hit the same GPU-fleet
-///      `/v1/embeddings` (e.g. Qwen3-Embedding).
-///   2. Local BGE model under `<base_dir>/models/{bge-small-zh,bge-base-zh,
-///      bge-small-en}`.
+///   1. Effective embed config — `kb.embed` if set, else the shared
+///      `memorySearch`. When its `provider = "openai"`, use a remote
+///      OpenAI-compatible embedder (e.g. the GPU-fleet Qwen3-Embedding).
+///      A `kb.embed` override lets KB use a different embedder than memory.
+///   2. Local BGE model — the `embed.local.modelRepo` dir if set, then the
+///      defaults under `<base_dir>/models/{bge-small-zh,bge-base-zh,bge-small-en}`.
 ///   3. StubEmbedder (deterministic) so a fresh install works out of the box.
+///
+/// `kb.embed` reuses `memorySearch`'s exact shape (local or remote); a
+/// `provider` KB has no adapter for (e.g. "ollama") logs a warning and falls
+/// through to the local-model scan rather than failing.
 ///
 /// Shared by the `rsclaw kb` CLI and the gateway `KnowledgeService`.
 pub fn resolve_embedder(kb_root: &std::path::Path) -> std::sync::Arc<dyn KbEmbedder> {
     use std::sync::Arc;
-    if let Some(cfg) = crate::config::load()
-        .ok()
-        .and_then(|c| c.raw.memory_search.clone())
-    {
-        if cfg.provider.as_deref() == Some("openai") {
-            let model = cfg
-                .model
-                .clone()
-                .unwrap_or_else(|| crate::embed::OPENAI_DEFAULT_MODEL.to_owned());
-            let api_key = cfg
-                .api_key
-                .as_ref()
-                .and_then(|s| s.resolve_early())
-                .or_else(|| std::env::var("OPENAI_API_KEY").ok());
-            let dim = cfg
-                .dimensions
-                .unwrap_or_else(|| crate::embed::openai_model_dim(&model)) as usize;
-            let base_url = cfg
-                .base_url
-                .clone()
-                .unwrap_or_else(|| crate::embed::OPENAI_DEFAULT_BASE_URL.to_owned());
-            tracing::info!(model = %model, dim, base_url = %base_url, "kb: using remote OpenAI-compatible embedder");
-            return Arc::new(LocalKbEmbedder::remote_openai(base_url, model, api_key, dim));
+    let embed_cfg = effective_embed_config();
+
+    if let Some(cfg) = embed_cfg.as_ref() {
+        match cfg.provider.as_deref() {
+            Some("openai") => {
+                let model = cfg
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| crate::embed::OPENAI_DEFAULT_MODEL.to_owned());
+                let api_key = cfg
+                    .api_key
+                    .as_ref()
+                    .and_then(|s| s.resolve_early())
+                    .or_else(|| std::env::var("OPENAI_API_KEY").ok());
+                let dim = cfg
+                    .dimensions
+                    .unwrap_or_else(|| crate::embed::openai_model_dim(&model))
+                    as usize;
+                let base_url = cfg
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| crate::embed::OPENAI_DEFAULT_BASE_URL.to_owned());
+                tracing::info!(model = %model, dim, base_url = %base_url, "kb: using remote OpenAI-compatible embedder");
+                return Arc::new(LocalKbEmbedder::remote_openai(base_url, model, api_key, dim));
+            }
+            // "local"/unset → fall through to the local-model scan below.
+            None | Some("local") => {}
+            Some(other) => {
+                tracing::warn!(
+                    provider = other,
+                    "kb: no embedder adapter for this provider; falling back to local BGE scan"
+                );
+            }
         }
     }
 
+    // Local BGE: honor an explicit `embed.local.modelRepo` dir first, then the
+    // built-in defaults. `modelRepo` is e.g. "BAAI/bge-small-zh-v1.5"; the dir
+    // name is its last path segment.
     let base_dir = kb_root.parent().unwrap_or(kb_root);
     let models_dir = base_dir.join("models");
-    for name in ["bge-small-zh", "bge-base-zh", "bge-small-en"] {
+    let preferred = embed_cfg
+        .as_ref()
+        .and_then(|c| c.local.as_ref())
+        .and_then(|l| l.model_repo.as_deref())
+        .and_then(|repo| repo.rsplit('/').next())
+        .map(str::to_owned);
+    let defaults = ["bge-small-zh", "bge-base-zh", "bge-small-en"];
+    let candidates = preferred.iter().map(String::as_str).chain(defaults);
+    for name in candidates {
         let dir = models_dir.join(name);
         if dir.join("model.safetensors").exists() {
             match LocalKbEmbedder::load(&dir) {
@@ -81,4 +107,16 @@ pub fn resolve_embedder(kb_root: &std::path::Path) -> std::sync::Arc<dyn KbEmbed
     }
     tracing::info!("kb: no local BGE model found, using StubEmbedder (1024-dim)");
     Arc::new(StubEmbedder::default())
+}
+
+/// The embed config KB should use: `kb.embed` override if present, else the
+/// shared `memorySearch`. Centralized so embedder selection and the asymmetric
+/// `queryInstruction` (in `KnowledgeService`) read the same source.
+pub fn effective_embed_config() -> Option<crate::config::schema::EmbedConfig> {
+    let cfg = crate::config::load().ok()?;
+    cfg.raw
+        .kb
+        .as_ref()
+        .and_then(|k| k.embed.clone())
+        .or_else(|| cfg.raw.memory_search.clone())
 }
