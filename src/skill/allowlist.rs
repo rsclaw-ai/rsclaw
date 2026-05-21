@@ -191,8 +191,22 @@ pub async fn refresh() -> Result<()> {
 /// NOTE: pins SKILL.md (the audited contract + CLI the agent runs), matching the
 /// existing clawhub lockfile hash. Hashing `scripts/` too is a hardening
 /// follow-up tracked in the allowlist plan.
-pub fn verify_skill_content(install_dir: &Path, entry: &AllowEntry) -> Result<()> {
+pub fn verify_skill_content(
+    install_dir: &Path,
+    entry: &AllowEntry,
+    require_pin: bool,
+) -> Result<()> {
     if entry.sha256.is_empty() {
+        // Fail-closed on the agent auto-install path: an un-pinned entry is not
+        // "audited, content-pinned", so the agent must not install it. Only the
+        // human CLI path (require_pin = false) may proceed without a hash.
+        if require_pin {
+            anyhow::bail!(
+                "allowlist entry '{}' has no sha256 content pin — agent auto-install \
+                 requires a pinned hash; install it via the CLI instead",
+                entry.slug
+            );
+        }
         return Ok(());
     }
     let md = install_dir.join("SKILL.md");
@@ -234,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_sha_skips_content_check() {
+    fn empty_sha_enforcement_depends_on_require_pin() {
         let e = AllowEntry {
             slug: "x".into(),
             url: String::new(),
@@ -244,7 +258,11 @@ mod tests {
             publisher: String::new(),
             audited_at: String::new(),
         };
-        // No sha256 → passes regardless of dir contents.
-        assert!(verify_skill_content(std::path::Path::new("/nonexistent"), &e).is_ok());
+        let dir = std::path::Path::new("/nonexistent");
+        // Human CLI path (require_pin = false): no sha256 → skip, legacy behavior.
+        assert!(verify_skill_content(dir, &e, false).is_ok());
+        // Agent auto-install path (require_pin = true): an un-pinned entry must
+        // be rejected — the agent may only install content-pinned skills.
+        assert!(verify_skill_content(dir, &e, true).is_err());
     }
 }

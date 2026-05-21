@@ -6736,6 +6736,9 @@ impl AgentRuntime {
         // the registry + system prompt).
         let skill_dir = if let Some(skill) = self.skills.get(name) {
             skill.dir.clone()
+        } else if !crate::skill::valid_slug(name) {
+            // Disk fallback joins `name` onto the skills root — reject traversal.
+            return Ok(serde_json::json!({ "error": format!("invalid skill name: {name:?}") }));
         } else {
             let disk = crate::config::loader::base_dir().join("skills").join(name);
             if disk.join("SKILL.md").is_file() {
@@ -6828,6 +6831,9 @@ impl AgentRuntime {
         if name.is_empty() {
             return Ok(json!({ "error": "name is required" }));
         }
+        if !crate::skill::valid_slug(&name) {
+            return Ok(json!({ "error": format!("invalid skill name: {name:?}") }));
+        }
         // Security gate: the agent may AUTO-install only audited, content-pinned
         // skills (allowlist). Off-list installs are blocked here and must go
         // through the human-initiated CLI (`rsclaw skills install`).
@@ -6851,7 +6857,7 @@ impl AgentRuntime {
                 // Content pin: the downloaded SKILL.md must match the audited
                 // hash, so a registry can't swap content under an audited slug.
                 if let Err(e) =
-                    crate::skill::allowlist::verify_skill_content(&locked.install_dir, &entry)
+                    crate::skill::allowlist::verify_skill_content(&locked.install_dir, &entry, true)
                 {
                     let _ = std::fs::remove_dir_all(&locked.install_dir);
                     return Ok(json!({ "error": e.to_string(), "name": name }));
@@ -6877,6 +6883,12 @@ impl AgentRuntime {
             .to_owned();
         if name.is_empty() {
             return Ok(json!({ "error": "name is required" }));
+        }
+        // Path-traversal guard: `name` is model-controlled and joined onto the
+        // skills root, then `remove_dir_all`'d. Without this, name = "../../.ssh"
+        // would delete a directory outside skills. Reject anything non-slug.
+        if !crate::skill::valid_slug(&name) {
+            return Ok(json!({ "error": format!("invalid skill name: {name:?}") }));
         }
         let dir = crate::config::loader::base_dir().join("skills").join(&name);
         if !dir.is_dir() {

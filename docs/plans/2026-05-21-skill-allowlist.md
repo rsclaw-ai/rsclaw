@@ -122,3 +122,52 @@ Same `plugins.json` shape + `lookup_plugin`, wired into a future `plugin_install
 - The audited-list CONTENT + the hub server endpoints (rsclaw-server / hub side).
 - Signature key distribution (decide: pin a public key in the binary vs config).
 - Plugin hot-add runtime (separate backlog).
+
+## Follow-up: off-list consent flow (DEFERRED — 2026-05-21)
+
+Idea: when `skill_install` hits an off-list slug, instead of a flat refusal, ask
+the user to confirm and install on "yes".
+
+**Blocker found (investigated 2026-05-21): there is NO cross-channel blocking-wait
+primitive.**
+- `ask_user` (tools_misc.rs) / `clarify` — emit a prompt + END the turn; the
+  "wait" is implicit (next inbound message resumes). Cross-channel, NON-blocking.
+- `wait_input` (runtime.rs) — TRUE blocking via a oneshot resume channel, but
+  `input_request_tx` is only set on **A2A turns**; feishu/wechat/CLI get
+  "wait_input is only supported on A2A turns".
+
+So "block inside skill_install until a real cross-channel yes" is not feasible
+today. Two real options when we pick this up:
+- **A. ask_user non-blocking pattern**: off-list install returns `consent_required`
+  + emits an ask_user event → turn ends → user replies yes → model RE-issues
+  skill_install with a consent token. Works cross-channel now, no new primitive.
+  Must guard against a forged "yes" in history auto-approving.
+- **B. generalize `wait_input`** into a real cross-channel blocking primitive
+  (oneshot + timeout + per-channel resume routing). Cleanest UX, but collides
+  with the in-flight channel refactor.
+
+Decision: defer until the channel layer stabilizes, then prefer B (fall back to A).
+
+## Security hardening (shipped 2026-05-21)
+
+Fixes from a P1 review of the install path:
+- **Zip Slip** (`extract_zip`, clawhub.rs): entries were `dest.join`'d with no
+  sanitization → `pkg/../../.ssh/...` escaped the skills dir. Now rejects any
+  non-`Normal`/`CurDir` path component + confirms the resolved path stays under
+  `dest`. (tar path was already safe via the `tar` crate's `unpack`.)
+- **Path traversal in `skill_use`/`skill_remove`/`skill_install`** (runtime.rs):
+  model-controlled `name` joined onto the skills root; `skill_remove("../../.ssh")`
+  would `remove_dir_all` outside it. Now gated by `skill::valid_slug`
+  (`^[a-z0-9][a-z0-9._-]{0,127}$`).
+- **Content-pin fail-open**: `verify_skill_content` no-op'd on empty `sha256`.
+  Added `require_pin`; the agent auto-install path passes `true` → un-pinned
+  entries are rejected (human CLI path stays permissive).
+
+Remaining follow-ups:
+- [ ] Extract to a staging/temp dir, verify the WHOLE package (not just SKILL.md),
+      then atomic-move into `skills/` — so a malicious payload never lands on disk
+      before verification (the plan's gate flow already specifies this; the current
+      impl extracts in place then verifies).
+- [ ] Hash `scripts/` too, not only SKILL.md (allowlist.rs `verify_skill_content`).
+- [ ] Consider rejecting empty `meta.sha256.{skills,plugins}` (list-level
+      integrity is also fail-open on empty, allowlist.rs `verify_against_meta`).
