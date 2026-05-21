@@ -12,6 +12,7 @@
 
 pub mod allowlist;
 pub mod clawhub;
+pub mod sig;
 pub mod crystallizer;
 pub mod loader;
 pub mod manifest;
