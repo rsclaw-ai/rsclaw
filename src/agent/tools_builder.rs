@@ -867,17 +867,23 @@ pub fn build_tool_list(
     });
 
     // Tool installer (structured alternative to exec rsclaw tools install).
-    tools.push(ToolDef {
-        name: "install_tool".to_owned(),
-        description: "Install a tool/runtime. Available: python, node, ffmpeg, chrome, opencode, claude-code, sherpa-onnx.".to_owned(),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "enum": ["python", "node", "ffmpeg", "chrome", "opencode", "claude-code", "sherpa-onnx"], "description": "Tool name to install"}
-            },
-            "required": ["name"]
-        }),
-    });
+    // enum/description derive from the available-tools list (cached manifest ∪
+    // compiled-in baseline) so a new tool needs no edit here.
+    {
+        let cache = crate::cmd::tools::load_manifest_cache_pub(&crate::cmd::tools::tools_dir_pub());
+        let available = crate::cmd::tools::available_tools(cache.as_ref());
+        tools.push(ToolDef {
+            name: "install_tool".to_owned(),
+            description: format!("Install a tool/runtime. Available: {}.", available.join(", ")),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "enum": available, "description": "Tool name to install"}
+                },
+                "required": ["name"]
+            }),
+        });
+    }
 
     // File operation tools (structured alternatives to exec ls/find/grep).
     // These help small models avoid digit-loss and dead-loop issues.

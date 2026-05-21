@@ -9,9 +9,9 @@ use crate::cli::ToolsCommand;
 // Mirror URL (Chinese users) / upstream fallback
 // ---------------------------------------------------------------------------
 
-const MIRROR_BASE: &str = "https://gitfast.org/tools";
-
-/// Manifest endpoint — returns JSON with versions and download URLs.
+/// Manifest endpoint — schema-2 JSON: `{schema, updated_at, tools:{name:{version,
+/// platforms:{platform:{url,sha256}}}}}`. All download metadata is explicit (no
+/// built-in per-tool URL conventions).
 const MANIFEST_URL: &str = "https://gitfast.org/tools/manifest.json";
 
 // ---------------------------------------------------------------------------
@@ -95,6 +95,120 @@ const TOOLS: &[ToolDef] = &[
 
 fn tools_dir() -> PathBuf {
     crate::config::loader::base_dir().join("tools")
+}
+
+// ---------------------------------------------------------------------------
+// Manifest cache + installed-version markers (manifest-driven tools list)
+// ---------------------------------------------------------------------------
+
+/// Path of the cached copy of the remote tools manifest.
+fn manifest_cache_path(tools_dir: &std::path::Path) -> PathBuf {
+    tools_dir.join(".manifest.json")
+}
+
+/// Persist a fetched manifest so the available-tools list survives offline.
+fn write_manifest_cache(tools_dir: &std::path::Path, manifest: &serde_json::Value) -> Result<()> {
+    std::fs::create_dir_all(tools_dir)?;
+    std::fs::write(manifest_cache_path(tools_dir), serde_json::to_vec_pretty(manifest)?)?;
+    Ok(())
+}
+
+/// Load the cached manifest. Returns None when absent or corrupt (fail-open).
+fn load_manifest_cache(tools_dir: &std::path::Path) -> Option<serde_json::Value> {
+    let bytes = std::fs::read(manifest_cache_path(tools_dir)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Write the installed-version marker for a tool (tools_dir/<subdir>/.version).
+/// `subdir` is the tool's `local_bin` so the marker sits alongside the binary.
+fn write_version_marker(tools_dir: &std::path::Path, subdir: &str, version: &str) -> Result<()> {
+    let dir = tools_dir.join(subdir);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join(".version"), version.trim().as_bytes())?;
+    Ok(())
+}
+
+/// Read the installed version of a tool, if a marker exists.
+fn installed_version(tools_dir: &std::path::Path, subdir: &str) -> Option<String> {
+    let s = std::fs::read_to_string(tools_dir.join(subdir).join(".version")).ok()?;
+    let s = s.trim();
+    if s.is_empty() { None } else { Some(s.to_owned()) }
+}
+
+/// Version string for a tool from a manifest, if present.
+fn manifest_tool_version(manifest: &serde_json::Value, tool: &str) -> Option<String> {
+    manifest.get("tools")?.get(tool)?.get("version")?.as_str().map(|s| s.to_owned())
+}
+
+/// All installable tool names: cached-manifest keys ∪ compiled-in baseline.
+/// Sorted + de-duped for byte-stable downstream rendering. `None` cache →
+/// baseline only (offline / fetch failed).
+pub(crate) fn available_tools(cache: Option<&serde_json::Value>) -> Vec<String> {
+    let mut names: Vec<String> = TOOLS.iter().map(|d| d.name.to_owned()).collect();
+    // schema 2: installable tools live under `.tools` (keyed by name).
+    if let Some(obj) = cache
+        .and_then(|v| v.get("tools"))
+        .and_then(|v| v.as_object())
+    {
+        names.extend(obj.keys().cloned());
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Installed tools (those whose local_bin exists) paired with their marker
+/// version (None when the marker is missing — e.g. installed by an older build).
+pub(crate) fn installed_tools(tools_dir: &std::path::Path) -> Vec<(String, Option<String>)> {
+    // Marker + presence both key off `local_bin` (the install subdir) so the
+    // marker sits alongside the binary. name == local_bin for current tools.
+    let mut out: Vec<(String, Option<String>)> = TOOLS
+        .iter()
+        .filter(|d| tools_dir.join(d.local_bin).exists())
+        .map(|d| (d.name.to_owned(), installed_version(tools_dir, d.local_bin)))
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// First-startup fetch only runs when there is no cache yet (NOT an
+/// auto-update poll — later startups always skip).
+fn should_fetch_manifest(tools_dir: &std::path::Path) -> bool {
+    !manifest_cache_path(tools_dir).exists()
+}
+
+/// One-shot: if no cached manifest exists, GET it once and cache it.
+/// Fail-open — any error leaves the cache absent (readers use the baseline).
+pub async fn fetch_manifest_if_missing() {
+    let dir = tools_dir();
+    if !should_fetch_manifest(&dir) {
+        return;
+    }
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    match client.get(MANIFEST_URL).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(m) = resp.json::<serde_json::Value>().await {
+                let _ = write_manifest_cache(&dir, &m);
+            }
+        }
+        _ => { /* fail-open: leave cache absent */ }
+    }
+}
+
+/// Public accessor for the tools dir (used by the agent prompt/tool builders).
+pub fn tools_dir_pub() -> PathBuf {
+    tools_dir()
+}
+
+/// Public accessor for the cached manifest (used by the agent prompt/tool builders).
+pub fn load_manifest_cache_pub(tools_dir: &std::path::Path) -> Option<serde_json::Value> {
+    load_manifest_cache(tools_dir)
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +410,8 @@ pub async fn cmd_install(name: &str, force: bool) -> Result<()> {
 
     let dir = tools_dir();
     std::fs::create_dir_all(&dir)?;
+    // Refresh the local cache so the available-tools list survives offline.
+    let _ = write_manifest_cache(&dir, &manifest);
 
     let platform = detect_platform();
     println!("Platform: {}", bold(platform));
@@ -362,8 +478,18 @@ pub async fn cmd_install(name: &str, force: bool) -> Result<()> {
         let dest_dir = dir.join(def.local_bin);
         std::fs::create_dir_all(&dest_dir)?;
 
-        match download_and_extract(&client, &url, &dest_dir).await {
+        // Content-pin the download against tools.{tool}.platforms.{platform}.sha256
+        // when present (signed via the hub meta). Absent → unverified (legacy).
+        let expected_sha = tool_platform(&manifest, def.name, platform)
+            .and_then(|p| p.get("sha256"))
+            .and_then(|v| v.as_str());
+
+        match download_and_extract(&client, &url, &dest_dir, expected_sha).await {
             Ok(()) => {
+                // Record the installed version (marker alongside the binary).
+                if let Some(v) = manifest_tool_version(&manifest, def.name) {
+                    let _ = write_version_marker(&dir, def.local_bin, &v);
+                }
                 ok(&format!("{} installed to {}", def.name, dest_dir.display()));
             }
             Err(e) => {
@@ -397,115 +523,38 @@ fn detect_platform() -> &'static str {
 // Resolve download URL from manifest
 // ---------------------------------------------------------------------------
 
+/// The `{url, sha256}` entry for a tool+platform in the schema-2 manifest
+/// (`tools.<tool>.platforms.<platform>`). All download metadata is explicit in
+/// the (signed) manifest — no built-in per-tool URL conventions.
+fn tool_platform<'a>(
+    manifest: &'a serde_json::Value,
+    tool: &str,
+    platform: &str,
+) -> Option<&'a serde_json::Value> {
+    manifest.get("tools")?.get(tool)?.get("platforms")?.get(platform)
+}
+
 fn resolve_download_url(
     manifest: &serde_json::Value,
     tool: &str,
     platform: &str,
 ) -> Option<String> {
-    // Try manifest.{tool}.downloads.{platform}
-    if let Some(url) = manifest
-        .get(tool)
-        .and_then(|t| t.get("downloads"))
-        .and_then(|d| d.get(platform))
-        .and_then(|v| v.as_str())
-    {
-        return Some(url.to_owned());
-    }
-
-    // Fallback: construct URL from mirror base + tool conventions
-    // manifest keys use underscores (sherpa_onnx), tool names use hyphens (sherpa-onnx)
-    let manifest_key = tool.replace('-', "_");
-    let section = manifest.get(&manifest_key).or_else(|| manifest.get(tool))?;
-
-    match tool {
-        "chrome" => {
-            let ver = section.get("version")?.as_str()?;
-            let filename = match platform {
-                "linux-x64" => "chrome-linux64.zip",
-                "mac-x64" => "chrome-mac-x64.zip",
-                "mac-arm64" => "chrome-mac-arm64.zip",
-                "win-x64" => "chrome-win64.zip",
-                _ => return None,
-            };
-            Some(format!("{MIRROR_BASE}/chrome/{ver}/{filename}"))
-        }
-        "ffmpeg" => {
-            let filename = match platform {
-                "linux-x64" => "ffmpeg-linux-x64.tar.xz",
-                "linux-arm64" => "ffmpeg-linux-arm64.tar.xz",
-                "win-x64" => "ffmpeg-win-x64.zip",
-                "mac-x64" | "mac-arm64" => "ffmpeg-mac-x64.zip",
-                _ => return None,
-            };
-            Some(format!("{MIRROR_BASE}/ffmpeg/{filename}"))
-        }
-        "node" => {
-            let ver = section.get("version")?.as_str()?;
-            let filename = match platform {
-                "linux-x64" => format!("node-linux-x64.tar.xz"),
-                "linux-arm64" => format!("node-linux-arm64.tar.xz"),
-                "mac-x64" => format!("node-mac-x64.tar.gz"),
-                "mac-arm64" => format!("node-mac-arm64.tar.gz"),
-                "win-x64" => format!("node-win-x64.zip"),
-                _ => return None,
-            };
-            Some(format!("{MIRROR_BASE}/node/{ver}/{filename}"))
-        }
-        // bun is fully manifest-driven: the mirror writes explicit
-        // `bun.downloads.{platform}` URLs (handled by the first branch above),
-        // so there is no built-in convention arm here.
-        "python" => {
-            let ver = section.get("version")?.as_str()?;
-            let filename = match platform {
-                "linux-x64" => "python-linux-x64.tar.gz",
-                "linux-arm64" => "python-linux-arm64.tar.gz",
-                "mac-x64" => "python-mac-x64.tar.gz",
-                "mac-arm64" => "python-mac-arm64.tar.gz",
-                "win-x64" => "python-win-x64.tar.gz",
-                _ => return None,
-            };
-            Some(format!("{MIRROR_BASE}/python/{ver}/{filename}"))
-        }
-        "sherpa-onnx" => {
-            // Use the `-shared` variants (NOT `-shared-lib`). The `-lib`
-            // suffix is library-only (just .dylib/.so) and lacks the
-            // sherpa-onnx-offline / sherpa-onnx-offline-tts CLI binaries
-            // that TTS / STT actually invoke. The `-shared` archives ship
-            // bin/ alongside lib/ — that's the one we want.
-            //
-            // linux-aarch64 names the CPU build `-shared-cpu` (there are
-            // also `-shared-gpu-*` GPU variants we skip). Windows packages
-            // the runtime config in the suffix; `-shared-MT-Release` is
-            // the standard release build.
-            let ver = section.get("version")?.as_str()?;
-            let filename = match platform {
-                "linux-x64" => format!("sherpa-onnx-v{ver}-linux-x64-shared.tar.bz2"),
-                "linux-arm64" => format!("sherpa-onnx-v{ver}-linux-aarch64-shared-cpu.tar.bz2"),
-                "mac-x64" => format!("sherpa-onnx-v{ver}-osx-x64-shared.tar.bz2"),
-                "mac-arm64" => format!("sherpa-onnx-v{ver}-osx-arm64-shared.tar.bz2"),
-                "win-x64" => format!("sherpa-onnx-v{ver}-win-x64-shared-MT-Release.tar.bz2"),
-                _ => return None,
-            };
-            Some(format!("{MIRROR_BASE}/sherpa-onnx/{ver}/{filename}"))
-        }
-        "opencode" => {
-            let ver = section.get("version")?.as_str()?;
-            let filename = match platform {
-                "linux-x64" => "opencode-linux-x64.tar.gz",
-                "linux-arm64" => "opencode-linux-arm64.tar.gz",
-                "mac-x64" => "opencode-mac-x64.tar.gz",
-                "mac-arm64" => "opencode-mac-arm64.tar.gz",
-                _ => return None, // no Windows binary available
-            };
-            Some(format!("{MIRROR_BASE}/opencode/{ver}/{filename}"))
-        }
-        _ => None,
-    }
+    tool_platform(manifest, tool, platform)?
+        .get("url")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 // ---------------------------------------------------------------------------
 // Download and extract archive
 // ---------------------------------------------------------------------------
+
+/// sha256 hex of a file (content-pin verification of downloads).
+fn sha256_file_hex(path: &std::path::Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let data = std::fs::read(path)?;
+    Ok(format!("{:x}", Sha256::digest(&data)))
+}
 
 /// Download an archive and extract to dest. Public so `cmd/models.rs` can reuse.
 pub async fn download_and_extract_public(
@@ -513,18 +562,29 @@ pub async fn download_and_extract_public(
     url: &str,
     dest: &std::path::Path,
 ) -> Result<()> {
-    download_and_extract(client, url, dest).await
+    download_and_extract(client, url, dest, None).await
 }
 
 async fn download_and_extract(
     client: &reqwest::Client,
     url: &str,
     dest: &std::path::Path,
+    expected_sha256: Option<&str>,
 ) -> Result<()> {
     let tmp_dir = tempfile::tempdir()?;
     let filename = url.rsplit('/').next().unwrap_or("download");
     let tmp_path = tmp_dir.path().join(filename);
     download_resumable(client, url, &tmp_path, filename).await?;
+
+    // Content-pin: verify the downloaded archive against the manifest hash
+    // BEFORE extracting/running it. Absent hash → skip (back-compat). The tmp
+    // dir auto-deletes on drop, so a mismatch leaves nothing on disk.
+    if let Some(exp) = expected_sha256 {
+        let got = sha256_file_hex(&tmp_path)?;
+        if !got.eq_ignore_ascii_case(exp) {
+            bail!("sha256 mismatch for {filename}: expected {exp}, got {got} — refusing");
+        }
+    }
 
     if url.ends_with(".zip") {
         extract_zip(&tmp_path, dest)?;
@@ -851,4 +911,31 @@ fn extract_tar<R: std::io::Read>(reader: R, dest: &std::path::Path) -> Result<()
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn manifest_cache_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = json!({"bun": {"version": "1.3.14"}});
+        write_manifest_cache(tmp.path(), &m).unwrap();
+        assert_eq!(load_manifest_cache(tmp.path()), Some(m));
+    }
+
+    #[test]
+    fn manifest_cache_missing_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(load_manifest_cache(tmp.path()), None);
+    }
+
+    #[test]
+    fn manifest_cache_corrupt_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".manifest.json"), b"{ not json").unwrap();
+        assert_eq!(load_manifest_cache(tmp.path()), None);
+    }
 }

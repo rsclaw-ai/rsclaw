@@ -370,7 +370,7 @@ fn build_shared_system_prefix_uncached() -> String {
          When in doubt, just answer — the user can type `/task <request>` to escalate manually.\n\
          ### Other\n\
          - Cron jobs: `cron` tool (action=list/add/remove).\n\
-         - Install tools (python, node, ffmpeg, chrome, etc.): `install_tool`. Do NOT download manually.\n\
+         - Install a system tool/runtime: `install_tool` (its enum lists what's available). Do NOT download manually.\n\
          - Memory: use `memory` to recall prior conversations. Search memory at session start if user references prior work.\n\
          - Save corrected/complete info to memory immediately so it survives compaction.\n\
          - Knowledge base: when the user asks about THEIR own material (uploaded docs, PDFs, URLs, files), use `knowledge_base` to search it and CITE the returned source_title. Prefer it over `web_search` for the user's material; if it returns nothing, say so — never fabricate a citation. (`memory` = what you learned; `knowledge_base` = the user's authoritative corpus.)\n\
@@ -569,6 +569,21 @@ pub fn build_user_system(
         if !blocks.is_empty() {
             parts.push(format!("## Installed Skills\n\n{}", blocks.join("\n\n")));
         }
+    }
+
+    // ## Installed Tools — per-machine binary runtimes (node/bun/ffmpeg/…) and
+    // their versions. Volatile (changes on install), so it lives here in
+    // user_system, not the cached prefix. So the agent knows what it can run.
+    let installed_tools = crate::cmd::tools::installed_tools(&crate::cmd::tools::tools_dir_pub());
+    if !installed_tools.is_empty() {
+        let lines: Vec<String> = installed_tools
+            .iter()
+            .map(|(name, ver)| match ver {
+                Some(v) => format!("- {name} {v}"),
+                None => format!("- {name} (version unknown)"),
+            })
+            .collect();
+        parts.push(format!("## Installed Tools\n\n{}", lines.join("\n")));
     }
 
     // ws_segment last — its memory_today / memory_yesterday blocks roll

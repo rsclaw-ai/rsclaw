@@ -146,6 +146,11 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             warn!("allowlist refresh failed (keeping cache; fail-closed): {e:#}");
         }
     });
+    // First-startup-only fetch of the tools manifest (fail-open to the
+    // compiled-in baseline). NOT an auto-update poll — later startups skip.
+    tokio::spawn(async {
+        crate::cmd::tools::fetch_manifest_if_missing().await;
+    });
 
     // 5. Build agent registry with live receivers.
     let (registry, receivers) =
