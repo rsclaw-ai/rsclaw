@@ -22,6 +22,7 @@ import {
   getConfig,
   saveConfig,
   reloadConfig,
+  restartGateway,
   getLogs,
   getAgents,
   saveAgent,
@@ -4812,7 +4813,7 @@ function SkillsTab() {
   const [installing, setInstalling] = useState<string | null>(null);
   const [detailSkill, setDetailSkill] = useState<SkillInfo | null>(null);
   const [search, setSearch] = useState("");
-  const [searchResults, setSearchResults] = useState<{ name: string; version?: string; description?: string }[]>([]);
+  const [searchResults, setSearchResults] = useState<{ name: string; version?: string; description?: string; registry?: string; installs?: string; stars?: string }[]>([]);
   const [searching, setSearching] = useState(false);
 
   const fetchSkills = useCallback(async () => {
@@ -4935,7 +4936,11 @@ function SkillsTab() {
                 <div key={sr.name} style={{ background: V2.bg2, border: `1px solid ${V2.bd}`, borderRadius: 11, padding: "14px 16px", display: "flex", flexDirection: "column", gap: 10 }}>
                   <div>
                     <div style={{ fontSize: 13, fontWeight: 600, color: V2.t0 }}>{sr.name}</div>
-                    <div style={{ fontSize: 10, fontFamily: V2.mono, color: V2.t3, marginTop: 1 }}>{sr.version}</div>
+                    <div style={{ fontSize: 10, fontFamily: V2.mono, color: V2.t3, marginTop: 1 }}>
+                      {sr.registry || sr.version || ""}
+                      {sr.installs && sr.installs !== "-" ? ` · ${sr.installs} installs` : ""}
+                      {sr.stars && sr.stars !== "-" ? ` · ★ ${sr.stars}` : ""}
+                    </div>
                   </div>
                   {sr.description && <div style={{ fontSize: 11, color: V2.t2, lineHeight: 1.55 }}>{sr.description}</div>}
                   <div style={{ display: "flex", justifyContent: "flex-end" }}>
@@ -5006,7 +5011,7 @@ interface PluginInfo {
   name: string;
   version?: string;
   description?: string;
-  runtime: "wasm" | "shell";
+  runtime: "wasm" | "js";
   runtimeRaw?: string;
   entry?: string;
   tools?: string[];
@@ -5015,7 +5020,10 @@ interface PluginInfo {
   icon?: string;
 }
 
-type PluginRuntime = "wasm" | "shell";
+// Runtime bucket exposed to the UI. JS today covers node/bun/deno
+// (subprocess JSON-RPC bridge). Future non-JS subprocess runtimes
+// (python/go binary/…) would need their own bucket here.
+type PluginRuntime = "wasm" | "js";
 
 // Recommended plugins list was previously hardcoded here (2 entries).
 // Removed pending a real marketplace endpoint
@@ -5058,9 +5066,29 @@ function PluginsTab() {
       if (tauriInvoke) { await tauriInvoke("install_plugin", { spec: trimmed }); }
       else { await gatewayFetch("/api/v1/plugins/install", { method: "POST", body: JSON.stringify({ spec: trimmed }) }); }
       await fetchPlugins();
-      try { await reloadConfig(); } catch {}
       setInstallSpec("");
-      toast.success(zh ? `${trimmed} 安装完成` : `${trimmed} installed`);
+      // Plugin manifests are only registered into PluginRegistry /
+      // WasmPlugin slot at gateway boot. reloadConfig() doesn't pick
+      // up new manifest files — only a full re-exec does. POST /restart
+      // is a graceful drain: in-flight requests finish, the listener
+      // releases the port, then the same binary re-execs and rebinds.
+      // User-visible: ~1-2s of "checking..." in the sidebar status dot.
+      let restarting = false;
+      try {
+        await restartGateway();
+        restarting = true;
+      } catch {
+        // Endpoint is loopback-only — non-Tauri / remote UI would 403.
+        // Fall back to the in-process reload so at least the channel
+        // and provider registries refresh. Plugin won't go live until
+        // the next manual restart.
+        try { await reloadConfig(); } catch {}
+      }
+      toast.success(
+        zh
+          ? `${trimmed} ${restarting ? "已安装，网关重启中…" : "已安装"}`
+          : `${trimmed} ${restarting ? "installed, gateway restarting…" : "installed"}`,
+      );
     } catch (e: any) {
       const msg = typeof e === "string" ? e : e?.message || "";
       toast.fromError(zh ? "安装失败" : "Install failed", msg);
@@ -5074,8 +5102,21 @@ function PluginsTab() {
       if (tauriInvoke) { await tauriInvoke("uninstall_plugin", { name }); }
       else { await gatewayFetch(`/api/v1/plugins/${encodeURIComponent(name)}`, { method: "DELETE" }); }
       await fetchPlugins(); setDetail(null);
-      try { await reloadConfig(); } catch {}
-      toast.success(zh ? `${name} 已卸载` : `${name} uninstalled`);
+      // Mirror install path — the gateway still has the plugin loaded
+      // in PluginRegistry until restart. reloadConfig() doesn't unload
+      // a WASM module; only re-exec does.
+      let restarting = false;
+      try {
+        await restartGateway();
+        restarting = true;
+      } catch {
+        try { await reloadConfig(); } catch {}
+      }
+      toast.success(
+        zh
+          ? `${name} ${restarting ? "已卸载，网关重启中…" : "已卸载"}`
+          : `${name} ${restarting ? "uninstalled, gateway restarting…" : "uninstalled"}`,
+      );
     } catch (e: any) {
       const msg = typeof e === "string" ? e : e?.message || "";
       toast.fromError(zh ? "卸载失败" : "Uninstall failed", msg);
@@ -5132,7 +5173,7 @@ function PluginsTab() {
         <div style={{ fontSize: 11, color: V2.t3, fontFamily: V2.mono }}>~/.rsclaw/plugins/</div>
         <div style={{ display: "flex", gap: 6 }}>
           {subTabBtn("wasm", "WASM")}
-          {subTabBtn("shell", "Shell")}
+          {subTabBtn("js", "JS")}
         </div>
       </div>
 
@@ -5143,6 +5184,29 @@ function PluginsTab() {
             onKeyDown={(e) => { if (e.key === "Enter") doInstall(installSpec); }}
             placeholder={zh ? "URL / 本地路径 (.wasm / .zip / 目录)..." : "URL / local path (.wasm / .zip / directory)..."}
             style={{ flex: 1, background: V2.bg2, border: `1px solid ${V2.bd}`, borderRadius: 9, padding: "9px 14px", color: V2.t0, fontSize: 12, outline: "none" }} />
+          {/* Native file picker (Tauri only). Filters to .wasm / .zip so the
+              user can't accidentally hand the CLI a directory of garbage —
+              for .git repos / arbitrary dirs they can still type the path. */}
+          {isTauri && (
+            <button
+              onClick={async () => {
+                try {
+                  const { open } = await import("@tauri-apps/plugin-dialog");
+                  const selected = await open({
+                    multiple: false,
+                    filters: [{ name: zh ? "插件文件" : "Plugin file", extensions: ["wasm", "zip"] }],
+                  });
+                  if (typeof selected === "string" && selected) setInstallSpec(selected);
+                } catch (e: any) {
+                  toast.fromError(zh ? "打开文件失败" : "File picker failed", e);
+                }
+              }}
+              title={zh ? "选择 .wasm / .zip 文件" : "Pick a .wasm / .zip file"}
+              style={{ padding: "0 14px", borderRadius: 9, border: `1px solid ${V2.bd2}`, background: V2.bg4, color: V2.t1, fontSize: 12, cursor: "pointer", whiteSpace: "nowrap" }}
+            >
+              📂 {zh ? "选择" : "Browse"}
+            </button>
+          )}
           <button onClick={() => doInstall(installSpec)} disabled={!installSpec.trim() || !!installing}
             style={{ padding: "0 16px", borderRadius: 9, border: `1px solid ${V2.gbrd}`, background: installing ? V2.olo : V2.glo, color: installing ? V2.or : V2.green, fontSize: 11, fontWeight: 600, cursor: installing ? "not-allowed" : "pointer", fontFamily: V2.mono }}>
             {installing ? (zh ? "安装中..." : "Installing...") : (zh ? "安装" : "Install")}
@@ -5159,15 +5223,15 @@ function PluginsTab() {
         {loading ? <div style={{ color: V2.t3, padding: 20, textAlign: "center" }}>...</div>
         : installedFiltered.length === 0 ? (
           <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 10, padding: "30px 0", color: V2.t3, marginBottom: 24 }}>
-            <div style={{ fontSize: 32, opacity: 0.4 }}>{runtime === "wasm" ? "🧩" : "🐚"}</div>
-            <div style={{ fontSize: 12 }}>{zh ? `尚未安装 ${runtime === "wasm" ? "WASM" : "Shell"} 插件` : `No ${runtime === "wasm" ? "WASM" : "Shell"} plugins installed`}</div>
+            <div style={{ fontSize: 32, opacity: 0.4 }}>{runtime === "wasm" ? "🧩" : "⚙️"}</div>
+            <div style={{ fontSize: 12 }}>{zh ? `尚未安装 ${runtime === "wasm" ? "WASM" : "JS"} 插件` : `No ${runtime === "wasm" ? "WASM" : "JS"} plugins installed`}</div>
           </div>
         ) : (
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 24 }}>
             {installedFiltered.map((plugin) => (
               <div key={plugin.name} onClick={() => setDetail(plugin)} style={{ background: V2.bg2, border: `1px solid rgba(45,212,160,.15)`, borderRadius: 11, padding: "14px 16px", cursor: "pointer", display: "flex", flexDirection: "column", gap: 10 }}>
                 <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
-                  <div style={{ width: 36, height: 36, borderRadius: 9, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, flexShrink: 0, background: V2.bg3, border: `1px solid ${V2.bd}` }}>{plugin.icon || (plugin.runtime === "wasm" ? "🧩" : "🐚")}</div>
+                  <div style={{ width: 36, height: 36, borderRadius: 9, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, flexShrink: 0, background: V2.bg3, border: `1px solid ${V2.bd}` }}>{plugin.icon || (plugin.runtime === "wasm" ? "🧩" : "⚙️")}</div>
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ fontSize: 13, fontWeight: 600, color: V2.t0 }}>{plugin.name}</div>
                     <div style={{ fontSize: 10, fontFamily: V2.mono, color: V2.t3, marginTop: 1 }}>{plugin.version || "-"} {plugin.runtimeRaw && plugin.runtimeRaw !== plugin.runtime ? `· ${plugin.runtimeRaw}` : ""}</div>
@@ -5175,10 +5239,10 @@ function PluginsTab() {
                   <div style={{ fontSize: 10, color: V2.green, fontFamily: V2.mono, display: "flex", alignItems: "center", gap: 4 }}>{"●"} {zh ? "已安装" : "Installed"}</div>
                 </div>
                 {plugin.description && <div style={{ fontSize: 11, color: V2.t2, lineHeight: 1.55 }}>{plugin.description}</div>}
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                  <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-                    {plugin.tools?.map((t) => <span key={t} style={{ fontSize: 9, padding: "1px 6px", borderRadius: 3, background: V2.bg4, color: V2.t2, fontFamily: V2.mono }}>{t}</span>)}
-                  </div>
+                {/* Tools chips intentionally omitted from the card — keep the
+                    summary compact. Full tool list still surfaces in the
+                    detail modal (clicking the card). */}
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end" }}>
                   <button onClick={(e) => { e.stopPropagation(); doUninstall(plugin.name); }} style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${V2.rbrd}`, background: V2.rlo, color: V2.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "卸载" : "Uninstall"}</button>
                 </div>
               </div>
@@ -5213,7 +5277,15 @@ function PluginsTab() {
               <button onClick={() => setDetail(null)} style={{ width: 26, height: 26, borderRadius: "50%", border: `1px solid ${V2.bd2}`, background: "transparent", color: V2.t2, fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}>{"✕"}</button>
             </div>
             <div style={{ padding: "18px 22px" }}>
-              <div style={{ fontSize: 10, fontFamily: V2.mono, color: V2.t3, marginBottom: 12 }}>{detail.version || "-"} {"·"} {detail.runtimeRaw || detail.runtime}</div>
+              <div style={{ fontSize: 10, fontFamily: V2.mono, color: V2.t3, marginBottom: 6 }}>{detail.version || "-"} {"·"} {detail.runtimeRaw || detail.runtime}</div>
+              {/* Execution-model hint — clarifies the security profile. WASM
+                  is sandboxed; native runs as a host subprocess with the
+                  user's full FS/network perms. */}
+              <div style={{ fontSize: 10, color: V2.t2, marginBottom: 12, lineHeight: 1.5 }}>
+                {detail.runtime === "wasm"
+                  ? (zh ? "wasmtime 沙箱内运行，受限文件/网络访问" : "Sandboxed in wasmtime; restricted FS/network access")
+                  : (zh ? "JS 子进程运行 (node/bun/deno)，具备完整文件/网络权限" : "Runs as a JS subprocess (node/bun/deno) with full FS/network access")}
+              </div>
               {detail.description && <div style={{ fontSize: 12, color: V2.t1, lineHeight: 1.6, marginBottom: 12 }}>{detail.description}</div>}
               {detail.tools && detail.tools.length > 0 && (
                 <div style={{ marginBottom: 12 }}>

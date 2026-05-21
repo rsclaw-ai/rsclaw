@@ -1291,26 +1291,68 @@ fn install_skill(name: String) -> Result<String, String> {
     run_rsclaw_command(&["skills", "install", &name])
 }
 
-/// Search skills online via sidecar, parse table output
+/// Search skills online via sidecar, parse the human-readable table.
+///
+/// The CLI prints two formats depending on whether the registry returns
+/// install/star stats:
+///   - 3 cols: `NAME              REGISTRY  DESCRIPTION`
+///   - 5 cols: `NAME  INSTALLS  STARS  REGISTRY  DESCRIPTION`
+/// and trails the table with a blank line + footer hint
+/// (`Install with: rsclaw skills install <name>`). We detect the format
+/// from the header row and stop at the first blank line after results so
+/// the footer doesn't get scraped into a fake skill entry.
 #[tauri::command]
 fn search_skills(query: String) -> Result<serde_json::Value, String> {
     let raw = run_rsclaw_command(&["skills", "search", &query])?;
     let mut results = Vec::new();
-    for line in raw.lines().skip(1) {
+    let mut has_stats: Option<bool> = None;
+    let mut seen_any_result = false;
+    for line in raw.lines() {
         let stripped = strip_ansi(line);
-        let parts: Vec<&str> = stripped.splitn(3, |c: char| c.is_whitespace()).filter(|s| !s.is_empty()).collect();
-        if parts.len() >= 2 {
-            let name = parts[0].trim();
-            let version = parts[1].trim();
-            let desc = if parts.len() >= 3 { parts[2].trim() } else { "" };
-            if !name.is_empty() && name != "NAME" {
-                results.push(serde_json::json!({
-                    "name": name,
-                    "version": version,
-                    "description": desc,
-                }));
-            }
+        let trimmed = stripped.trim();
+
+        // Empty line after the result rows terminates the table — the
+        // footer ("Install with: rsclaw skills install <name>") lives
+        // below it and must not be parsed as a result.
+        if trimmed.is_empty() {
+            if seen_any_result { break; }
+            continue;
         }
+
+        // First non-empty line is the header. Use it to fix column count.
+        if has_stats.is_none() {
+            let cols: Vec<&str> = trimmed.split_whitespace().collect();
+            // Stats header: "NAME INSTALLS STARS REGISTRY DESCRIPTION"
+            has_stats = Some(cols.len() >= 5 && cols[1] == "INSTALLS");
+            // The header itself is not a result; skip it.
+            if cols.first().copied() == Some("NAME") { continue; }
+        }
+
+        let stats_mode = has_stats.unwrap_or(false);
+        let need = if stats_mode { 5 } else { 3 };
+        let parts: Vec<&str> = trimmed.splitn(need, |c: char| c.is_whitespace()).filter(|s| !s.is_empty()).collect();
+        if parts.len() < need { continue; }
+
+        let name = parts[0].trim();
+        if name.is_empty() || name == "NAME" { continue; }
+
+        let (installs, stars, registry, desc) = if stats_mode {
+            (parts[1].trim(), parts[2].trim(), parts[3].trim(), parts[4].trim())
+        } else {
+            ("", "", parts[1].trim(), parts[2].trim())
+        };
+
+        seen_any_result = true;
+        results.push(serde_json::json!({
+            "name": name,
+            // No version in the CLI output — leave blank rather than
+            // misclaim. UI can show `registry` instead.
+            "version": "",
+            "registry": registry,
+            "installs": installs,
+            "stars": stars,
+            "description": desc,
+        }));
     }
     Ok(serde_json::json!({ "results": results }))
 }
@@ -1337,7 +1379,12 @@ fn uninstall_skill(name: String) -> Result<String, String> {
 
 /// List installed plugins by reading ~/.rsclaw/plugins/<name>/{plugin.json5,openclaw.plugin.json}
 /// Returns `{ plugins: [{ name, version, description, runtime, entry, tools, channels, path }] }`.
-/// `runtime` is normalized into `"wasm" | "shell"` for the UI (anything non-wasm = shell-bridge).
+/// `runtime` is normalized into `"wasm" | "js"` for the UI. JS covers
+/// node/bun/deno (shell-bridge subprocess speaking JSON-RPC over stdio).
+/// Future non-JS subprocess runtimes (python/go binary/etc.) will need
+/// a new bucket; for now they fall back to "js" too — the manifest's
+/// actual runtime hint is passed through verbatim in `runtimeRaw` so
+/// the detail modal can show the precise interpreter.
 #[tauri::command]
 fn get_plugins() -> Result<serde_json::Value, String> {
     let plugins_dir = rsclaw_base_dir().join("plugins");
@@ -1368,7 +1415,7 @@ fn get_plugins() -> Result<serde_json::Value, String> {
                     .or_else(|| val.get("id").and_then(|v| v.as_str()))
                     .unwrap_or(&dir_name).to_string();
                 let runtime_raw = val.get("runtime").and_then(|v| v.as_str()).unwrap_or("node");
-                let runtime = if runtime_raw == "wasm" { "wasm" } else { "shell" };
+                let runtime = if runtime_raw == "wasm" { "wasm" } else { "js" };
                 let tools: Vec<String> = val.get("tools").and_then(|v| v.as_array())
                     .map(|arr| arr.iter().filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(|s| s.to_string())).collect())
                     .unwrap_or_default();
