@@ -7349,7 +7349,7 @@ dependencies = [
 
 [[package]]
 name = "rsclaw"
-version = "2026.5.18"
+version = "2026.5.20"
 dependencies = [
  "aes",
  "anycli",
