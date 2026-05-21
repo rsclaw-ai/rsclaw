@@ -5,6 +5,7 @@ import { useEffect, useState, useCallback, useRef } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import { ErrorBoundary } from "./error";
 import { MemoryPage } from "./memory-page";
+import { KnowledgePage } from "./knowledge-page";
 import { RsclawProviderCard } from "./rsclaw-provider-card";
 import { Popover } from "./ui-lib";
 import { toast } from "../lib/toast";
@@ -90,7 +91,7 @@ interface LogEntry {
   msg: string;
 }
 
-type PanelPage = "status" | "config" | "agents" | "cron" | "skills-plugins" | "workspace" | "doctor" | "pairing" | "wizard" | "memory";
+type PanelPage = "status" | "config" | "agents" | "cron" | "skills-plugins" | "workspace" | "doctor" | "pairing" | "wizard" | "memory" | "knowledge";
 
 // ── Toggle Component ────────────────────────────────────
 function Toggle(props: {
@@ -5454,7 +5455,7 @@ function getTabFromLocation(search?: string): PanelPage {
   const qs = search || (typeof window !== "undefined" ? window.location.hash.split("?")[1] || "" : "");
   const params = new URLSearchParams(qs);
   const tab = params.get("tab");
-  if (["config", "agents", "cron", "skills-plugins", "status", "workspace", "doctor", "pairing", "wizard", "memory"].includes(tab || "")) {
+  if (["config", "agents", "cron", "skills-plugins", "status", "workspace", "doctor", "pairing", "wizard", "memory", "knowledge"].includes(tab || "")) {
     return tab as PanelPage;
   }
   // Back-compat: bookmarked `?tab=skills` URLs redirect into the new combined page.
@@ -5525,6 +5526,7 @@ export function RsClawPanel() {
             {activePage === "doctor" && <DoctorPage />}
             {activePage === "pairing" && <PairingPage />}
             {activePage === "memory" && <MemoryPage />}
+            {activePage === "knowledge" && <ErrorBoundary><KnowledgePage /></ErrorBoundary>}
           </div>
         </div>
       </div>

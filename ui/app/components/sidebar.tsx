@@ -778,28 +778,15 @@ export function SideBar(props: { className?: string }) {
               { tab: "skills-plugins", icon: "\uD83D\uDD27", label: getLang() === "cn" ? "\u6280\u80FD\u63D2\u4EF6" : "Skills & Plugins" },
               { tab: "doctor", icon: "\uD83D\uDEE1\uFE0F", label: getLang() === "cn" ? "\u5B89\u5168\u68C0\u67E5" : "Doctor" },
               { tab: "memory", icon: "\uD83E\uDDE0", label: Locale.RsClawPanel.Sidebar.Memory },
-              // Knowledge still a placeholder \u2014 backend collections
-              // layer not wired yet. Click shows a coming-soon toast.
-              { tab: "knowledge", icon: "\uD83D\uDCDA", label: Locale.RsClawPanel.Sidebar.Knowledge, comingSoon: true },
+              { tab: "knowledge", icon: "\uD83D\uDCDA", label: Locale.RsClawPanel.Sidebar.Knowledge },
             ].map((item) => (
               <button
                 key={item.tab}
                 className={styles["sidebar-quick-btn"]}
                 onClick={() => {
-                  if (item.comingSoon) {
-                    toast.info(
-                      item.label,
-                      Locale.RsClawPanel.Sidebar.ComingSoon,
-                    );
-                    return;
-                  }
                   navigate(Path.RsClawPanel + "?tab=" + item.tab);
                 }}
-                title={
-                  item.comingSoon
-                    ? `${item.label} \u00B7 ${Locale.RsClawPanel.Sidebar.ComingSoon}`
-                    : item.label
-                }
+                title={item.label}
               >
                 <span>{item.icon}</span>
                 <span>{item.label}</span>
