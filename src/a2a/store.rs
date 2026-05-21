@@ -10,6 +10,10 @@ use super::types::{A2aArtifact, A2aMessage, A2aTask, PushNotificationConfig, Tas
 const TASKS: TableDefinition<&str, &str> = TableDefinition::new("a2a_tasks");
 /// Push configs keyed by "{task_id}:{config_id}".
 const PUSH_CONFIGS: TableDefinition<&str, &str> = TableDefinition::new("a2a_push_configs");
+/// Task owner index: task_id -> A2A principal id that created it. Kept out of
+/// the `A2aTask` wire type so the owning principal never leaks in responses;
+/// used only server-side to enforce per-caller access (A2A spec §7.5).
+const TASK_OWNERS: TableDefinition<&str, &str> = TableDefinition::new("a2a_task_owners");
 
 pub struct TaskStore {
     db: Database,
@@ -26,6 +30,7 @@ impl TaskStore {
         {
             let _ = txn.open_table(TASKS)?;
             let _ = txn.open_table(PUSH_CONFIGS)?;
+            let _ = txn.open_table(TASK_OWNERS)?;
         }
         txn.commit()?;
         Ok(Self { db })
@@ -34,6 +39,25 @@ impl TaskStore {
     // -----------------------------------------------------------------------
     // Tasks
     // -----------------------------------------------------------------------
+
+    /// Record the principal that owns `task_id` (A2A §7.5 access control).
+    pub fn put_owner(&self, task_id: &str, principal: &str) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut tbl = txn.open_table(TASK_OWNERS)?;
+            tbl.insert(task_id, principal)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// The principal that owns `task_id`, if recorded. `None` for tasks created
+    /// before ownership tracking or while auth was disabled (dev mode).
+    pub fn get_owner(&self, task_id: &str) -> Result<Option<String>> {
+        let txn = self.db.begin_read()?;
+        let tbl = txn.open_table(TASK_OWNERS)?;
+        Ok(tbl.get(task_id)?.map(|v| v.value().to_owned()))
+    }
 
     pub fn put(&self, task: &A2aTask) -> Result<()> {
         let json = serde_json::to_string(task)?;

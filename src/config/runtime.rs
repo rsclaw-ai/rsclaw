@@ -27,6 +27,17 @@ use super::schema::{
 // Sub-structs
 // ---------------------------------------------------------------------------
 
+/// A resolved, accepted A2A inbound credential: the `secret` that authenticates
+/// as principal `id`, carrying optional `scopes` for future per-method
+/// authorization (A2A §7.5). Anonymous (legacy / env) credentials get a
+/// synthetic id like `legacy:bearer:0`.
+#[derive(Debug, Clone)]
+pub struct A2aPrincipal {
+    pub id: String,
+    pub secret: String,
+    pub scopes: Vec<String>,
+}
+
 /// Network / auth / channel-health knobs.  Swappable without restart.
 #[derive(Debug, Clone)]
 pub struct GatewayRuntime {
@@ -37,13 +48,13 @@ pub struct GatewayRuntime {
     pub bind_address: Option<String>,
     pub reload: ReloadMode,
     pub auth_token: Option<String>,
-    /// Accepted Bearer tokens for `/api/v1/a2a`, resolved from
-    /// `gateway.a2a.authTokens` + env `RSCLAW_A2A_BEARER_TOKENS`.
-    /// Empty Vec = no config tokens (env may still apply at request time).
-    pub a2a_bearer_tokens: Vec<String>,
-    /// Accepted `X-API-Key` values for `/api/v1/a2a`, resolved from
-    /// `gateway.a2a.apiKeys` + env `RSCLAW_A2A_API_KEYS`.
-    pub a2a_api_keys: Vec<String>,
+    /// Accepted A2A inbound credentials for `/api/v1/a2a`, each carrying the
+    /// principal `id` it authenticates as. Resolved from `gateway.a2a.clients`
+    /// plus the deprecated `authTokens`/`apiKeys` (as anonymous principals) and
+    /// the env lists `RSCLAW_A2A_BEARER_TOKENS` / `RSCLAW_A2A_API_KEYS`. A
+    /// secret matches on either the Bearer or X-API-Key header. Empty Vec =
+    /// the middleware passes through (dev mode).
+    pub a2a_principals: Vec<A2aPrincipal>,
     /// Max body size in bytes for `/api/v1/a2a`. Resolved from
     /// `gateway.a2a.maxBodyMb` × 1 MiB. Default 100 MiB. Wired as
     /// `DefaultBodyLimit::max(...)` on the route — axum's stock 2 MiB
@@ -191,12 +202,41 @@ impl IntoRuntime for Config {
                 .filter(|s| !s.is_empty())
                 .collect()
         };
-        let mut a2a_bearer_tokens =
-            resolve_list(gw.a2a.as_ref().and_then(|a| a.auth_tokens.as_ref()));
-        a2a_bearer_tokens.extend(env_split("RSCLAW_A2A_BEARER_TOKENS"));
-        let mut a2a_api_keys =
-            resolve_list(gw.a2a.as_ref().and_then(|a| a.api_keys.as_ref()));
-        a2a_api_keys.extend(env_split("RSCLAW_A2A_API_KEYS"));
+        // Unified A2A credential pool. Named `clients` resolve to their own id;
+        // the deprecated authTokens/apiKeys and env lists become anonymous
+        // principals. A secret is accepted on either header at request time —
+        // transport is the caller's choice, not a config axis.
+        let mut a2a_principals: Vec<A2aPrincipal> = Vec::new();
+        if let Some(clients) = gw.a2a.as_ref().and_then(|a| a.clients.as_ref()) {
+            for c in clients {
+                if let Some(secret) = c.secret.resolve_early() {
+                    a2a_principals.push(A2aPrincipal {
+                        id: c.id.clone(),
+                        secret,
+                        scopes: c.scopes.clone().unwrap_or_default(),
+                    });
+                }
+            }
+        }
+        let anon = |secret: String, kind: &str, n: usize| A2aPrincipal {
+            id: format!("legacy:{kind}:{n}"),
+            secret,
+            scopes: Vec::new(),
+        };
+        for (n, s) in resolve_list(gw.a2a.as_ref().and_then(|a| a.auth_tokens.as_ref()))
+            .into_iter()
+            .chain(env_split("RSCLAW_A2A_BEARER_TOKENS"))
+            .enumerate()
+        {
+            a2a_principals.push(anon(s, "bearer", n));
+        }
+        for (n, s) in resolve_list(gw.a2a.as_ref().and_then(|a| a.api_keys.as_ref()))
+            .into_iter()
+            .chain(env_split("RSCLAW_A2A_API_KEYS"))
+            .enumerate()
+        {
+            a2a_principals.push(anon(s, "apikey", n));
+        }
         let a2a_max_body_bytes: u64 = gw
             .a2a
             .as_ref()
@@ -213,8 +253,7 @@ impl IntoRuntime for Config {
                 bind_address: gw.bind_address.clone(),
                 reload: gw.reload.unwrap_or(ReloadMode::Hybrid),
                 auth_token,
-                a2a_bearer_tokens,
-                a2a_api_keys,
+                a2a_principals,
                 a2a_max_body_bytes,
                 auth_token_configured,
                 auth_token_is_plaintext,

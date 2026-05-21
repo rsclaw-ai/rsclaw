@@ -121,33 +121,60 @@ pub fn build_agent_card(state: &AppState, _extended: bool) -> AgentCard {
 // JSON-RPC dispatch — POST /api/v1/a2a (non-streaming methods)
 // ---------------------------------------------------------------------------
 
+/// A2A §7.5 access control: a caller may touch a task only if it owns it.
+/// A `None` caller (auth disabled / dev pass-through) is unscoped; the unified
+/// `gateway-auth` operator token sees everything; a task with no recorded owner
+/// (legacy or dev-created) is unscoped. Fails closed on a store error.
+pub(crate) fn caller_owns(
+    store: &crate::a2a::store::TaskStore,
+    caller: &Option<crate::a2a::auth::A2aIdentity>,
+    task_id: &str,
+) -> bool {
+    match caller {
+        None => true,
+        Some(c) if c.id == "gateway-auth" => true,
+        Some(c) => match store.get_owner(task_id) {
+            Ok(Some(owner)) => owner == c.id,
+            Ok(None) => true,
+            Err(_) => false,
+        },
+    }
+}
+
 pub async fn a2a_rpc_handler(
     State(state): State<AppState>,
+    caller: Option<axum::Extension<crate::a2a::auth::A2aIdentity>>,
     Json(req): Json<JsonRpcRequest>,
 ) -> impl IntoResponse {
-    a2a_rpc_handler_inner(state, req).await
+    a2a_rpc_handler_inner(state, caller.map(|e| e.0), req).await
 }
 
 /// Top-level dispatcher. Streaming methods route to `crate::a2a::streaming`
 /// and return an SSE stream; everything else returns a JSON-RPC response.
 pub async fn a2a_dispatch(
     State(state): State<AppState>,
+    caller: Option<axum::Extension<crate::a2a::auth::A2aIdentity>>,
     Json(req): Json<JsonRpcRequest>,
 ) -> axum::response::Response {
+    let caller = caller.map(|e| e.0);
     match req.method.as_str() {
         "SendStreamingMessage" | "SubscribeToTask" => {
-            crate::a2a::streaming::handle_streaming_rpc(state, req)
+            crate::a2a::streaming::handle_streaming_rpc(state, caller, req)
                 .await
                 .into_response()
         }
-        _ => a2a_rpc_handler_inner(state, req).await.into_response(),
+        _ => a2a_rpc_handler_inner(state, caller, req).await.into_response(),
     }
 }
 
-pub async fn a2a_rpc_handler_inner(state: AppState, req: JsonRpcRequest) -> Json<JsonRpcResponse> {
+pub async fn a2a_rpc_handler_inner(
+    state: AppState,
+    caller: Option<crate::a2a::auth::A2aIdentity>,
+    req: JsonRpcRequest,
+) -> Json<JsonRpcResponse> {
     let id = req.id.clone();
     match req.method.as_str() {
-        "SendMessage" => handle_send_message(state, id, req.params).await,
+        "SendMessage" => handle_send_message(state, caller, id, req.params).await,
         "GetExtendedAgentCard" => Json(JsonRpcResponse::ok(
             id,
             serde_json::to_value(build_agent_card(&state, true)).unwrap_or(Value::Null),
@@ -157,18 +184,20 @@ pub async fn a2a_rpc_handler_inner(state: AppState, req: JsonRpcRequest) -> Json
             -32601,
             "use Accept: text/event-stream for streaming methods",
         )),
-        "GetTask" => handle_get_task(state, id, req.params).await,
-        "ListTasks" => handle_list_tasks(state, id, req.params).await,
-        "CancelTask" => handle_cancel_task(state, id, req.params).await,
+        "GetTask" => handle_get_task(state, caller, id, req.params).await,
+        "ListTasks" => handle_list_tasks(state, caller, id, req.params).await,
+        "CancelTask" => handle_cancel_task(state, caller, id, req.params).await,
         "CreateTaskPushNotificationConfig" => {
-            handle_create_push_config(state, id, req.params).await
+            handle_create_push_config(state, caller, id, req.params).await
         }
-        "GetTaskPushNotificationConfig" => handle_get_push_config(state, id, req.params).await,
+        "GetTaskPushNotificationConfig" => {
+            handle_get_push_config(state, caller, id, req.params).await
+        }
         "ListTaskPushNotificationConfigs" => {
-            handle_list_push_configs(state, id, req.params).await
+            handle_list_push_configs(state, caller, id, req.params).await
         }
         "DeleteTaskPushNotificationConfig" => {
-            handle_delete_push_config(state, id, req.params).await
+            handle_delete_push_config(state, caller, id, req.params).await
         }
         other => Json(JsonRpcResponse::err(
             id,
@@ -180,6 +209,7 @@ pub async fn a2a_rpc_handler_inner(state: AppState, req: JsonRpcRequest) -> Json
 
 async fn handle_send_message(
     state: AppState,
+    caller: Option<crate::a2a::auth::A2aIdentity>,
     id: Value,
     params: Value,
 ) -> Json<JsonRpcResponse> {
@@ -331,6 +361,11 @@ async fn handle_send_message(
     };
     if let Err(e) = state.task_store.put(&initial_task) {
         info!(err = %e, "failed to persist initial task");
+    }
+    // §7.5: record the creating principal so only it (or the operator token)
+    // can later read/cancel/configure this task.
+    if let Some(c) = caller.as_ref() {
+        let _ = state.task_store.put_owner(&task_id, &c.id);
     }
 
     // Register a cancellation token so CancelTask can stop the in-flight turn.
@@ -563,7 +598,12 @@ struct GetTaskParams {
     history_length: Option<usize>,
 }
 
-async fn handle_get_task(state: AppState, id: Value, params: Value) -> Json<JsonRpcResponse> {
+async fn handle_get_task(
+    state: AppState,
+    caller: Option<crate::a2a::auth::A2aIdentity>,
+    id: Value,
+    params: Value,
+) -> Json<JsonRpcResponse> {
     let params: GetTaskParams = match serde_json::from_value(params) {
         Ok(p) => p,
         Err(e) => {
@@ -574,7 +614,7 @@ async fn handle_get_task(state: AppState, id: Value, params: Value) -> Json<Json
         }
     };
     match state.task_store.get(&params.id) {
-        Ok(Some(mut task)) => {
+        Ok(Some(mut task)) if caller_owns(&state.task_store, &caller, &params.id) => {
             if let Some(n) = params.history_length
                 && task.history.len() > n
             {
@@ -586,7 +626,9 @@ async fn handle_get_task(state: AppState, id: Value, params: Value) -> Json<Json
                 serde_json::to_value(task).unwrap_or(Value::Null),
             ))
         }
-        Ok(None) => Json(JsonRpcResponse::err_struct(
+        // §7.5: a task that exists but isn't owned by the caller returns the
+        // SAME error as a missing task — never reveal that it exists.
+        Ok(_) => Json(JsonRpcResponse::err_struct(
             id,
             a2a_errors::not_found(format!("tasks/{}", params.id)),
         )),
@@ -606,7 +648,12 @@ struct ListTasksParams {
     page_token: Option<String>,
 }
 
-async fn handle_list_tasks(state: AppState, id: Value, params: Value) -> Json<JsonRpcResponse> {
+async fn handle_list_tasks(
+    state: AppState,
+    caller: Option<crate::a2a::auth::A2aIdentity>,
+    id: Value,
+    params: Value,
+) -> Json<JsonRpcResponse> {
     let params: ListTasksParams = serde_json::from_value(params).unwrap_or(ListTasksParams {
         page_size: None,
         page_token: None,
@@ -619,11 +666,17 @@ async fn handle_list_tasks(state: AppState, id: Value, params: Value) -> Json<Js
     let limit = params.page_size.unwrap_or(50).min(500);
     match state.task_store.list(offset, limit) {
         Ok(tasks) => {
+            // Page-token advances on the pre-filter count so paging still
+            // progresses; §7.5 filtering may yield fewer than `limit` rows.
             let next_token = if tasks.len() == limit {
                 Some((offset + limit).to_string())
             } else {
                 None
             };
+            let tasks: Vec<_> = tasks
+                .into_iter()
+                .filter(|t| caller_owns(&state.task_store, &caller, &t.id))
+                .collect();
             Json(JsonRpcResponse::ok(
                 id,
                 json!({ "tasks": tasks, "nextPageToken": next_token }),
@@ -644,6 +697,7 @@ struct CancelTaskParams {
 
 async fn handle_cancel_task(
     state: AppState,
+    caller: Option<crate::a2a::auth::A2aIdentity>,
     id: Value,
     params: Value,
 ) -> Json<JsonRpcResponse> {
@@ -656,6 +710,13 @@ async fn handle_cancel_task(
             ));
         }
     };
+    // §7.5: a non-owner cancelling sees the same not-found as a missing task.
+    if !caller_owns(&state.task_store, &caller, &params.id) {
+        return Json(JsonRpcResponse::err_struct(
+            id,
+            a2a_errors::not_found(format!("tasks/{}", params.id)),
+        ));
+    }
     match state.task_cancels.remove(&params.id) {
         Some((_, token)) => {
             token.cancel();
@@ -727,6 +788,7 @@ struct CreatePushConfigParams {
 
 async fn handle_create_push_config(
     state: AppState,
+    caller: Option<crate::a2a::auth::A2aIdentity>,
     id: Value,
     params: Value,
 ) -> Json<JsonRpcResponse> {
@@ -739,6 +801,12 @@ async fn handle_create_push_config(
             ));
         }
     };
+    if !caller_owns(&state.task_store, &caller, &params.task_id) {
+        return Json(JsonRpcResponse::err_struct(
+            id,
+            a2a_errors::not_found(format!("tasks/{}", params.task_id)),
+        ));
+    }
     params.push_notification_config.task_id = params.task_id.clone();
     if params.push_notification_config.id.is_empty() {
         params.push_notification_config.id = Uuid::new_v4().to_string();
@@ -764,6 +832,7 @@ struct GetPushConfigParams {
 
 async fn handle_get_push_config(
     state: AppState,
+    caller: Option<crate::a2a::auth::A2aIdentity>,
     id: Value,
     params: Value,
 ) -> Json<JsonRpcResponse> {
@@ -776,6 +845,15 @@ async fn handle_get_push_config(
             ));
         }
     };
+    if !caller_owns(&state.task_store, &caller, &params.task_id) {
+        return Json(JsonRpcResponse::err_struct(
+            id,
+            a2a_errors::not_found(format!(
+                "tasks/{}/pushNotificationConfigs/{}",
+                params.task_id, params.push_notification_config_id
+            )),
+        ));
+    }
     match state
         .task_store
         .get_push_config(&params.task_id, &params.push_notification_config_id)
@@ -806,6 +884,7 @@ struct ListPushConfigsParams {
 
 async fn handle_list_push_configs(
     state: AppState,
+    caller: Option<crate::a2a::auth::A2aIdentity>,
     id: Value,
     params: Value,
 ) -> Json<JsonRpcResponse> {
@@ -818,6 +897,12 @@ async fn handle_list_push_configs(
             ));
         }
     };
+    if !caller_owns(&state.task_store, &caller, &params.task_id) {
+        return Json(JsonRpcResponse::err_struct(
+            id,
+            a2a_errors::not_found(format!("tasks/{}", params.task_id)),
+        ));
+    }
     match state.task_store.list_push_configs(&params.task_id) {
         Ok(configs) => Json(JsonRpcResponse::ok(id, json!({ "configs": configs }))),
         Err(e) => Json(JsonRpcResponse::err_struct(
@@ -836,6 +921,7 @@ struct DeletePushConfigParams {
 
 async fn handle_delete_push_config(
     state: AppState,
+    caller: Option<crate::a2a::auth::A2aIdentity>,
     id: Value,
     params: Value,
 ) -> Json<JsonRpcResponse> {
@@ -848,6 +934,15 @@ async fn handle_delete_push_config(
             ));
         }
     };
+    if !caller_owns(&state.task_store, &caller, &params.task_id) {
+        return Json(JsonRpcResponse::err_struct(
+            id,
+            a2a_errors::not_found(format!(
+                "tasks/{}/pushNotificationConfigs/{}",
+                params.task_id, params.push_notification_config_id
+            )),
+        ));
+    }
     match state
         .task_store
         .delete_push_config(&params.task_id, &params.push_notification_config_id)
@@ -997,4 +1092,35 @@ fn finalize_failed_task(state: &AppState, task_id: &str, context_id: &str) {
             final_: true,
         });
     state.task_event_bus.close(task_id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::a2a::auth::A2aIdentity;
+    use crate::a2a::store::TaskStore;
+
+    fn ident(id: &str) -> Option<A2aIdentity> {
+        Some(A2aIdentity {
+            id: id.to_owned(),
+            scopes: vec![],
+        })
+    }
+
+    #[test]
+    fn caller_owns_enforces_section_7_5_access() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = TaskStore::open(&tmp.path().join("tasks.redb")).unwrap();
+        store.put_owner("task-1", "alice").unwrap();
+
+        // Owner can access; a different principal cannot (→ caller gets the
+        // same not-found as a missing task at the handler layer).
+        assert!(caller_owns(&store, &ident("alice"), "task-1"));
+        assert!(!caller_owns(&store, &ident("bob"), "task-1"));
+        // The operator token and dev/no-auth mode are unscoped.
+        assert!(caller_owns(&store, &ident("gateway-auth"), "task-1"));
+        assert!(caller_owns(&store, &None::<A2aIdentity>, "task-1"));
+        // A task with no recorded owner (legacy / dev-created) is unscoped.
+        assert!(caller_owns(&store, &ident("bob"), "no-such-task"));
+    }
 }

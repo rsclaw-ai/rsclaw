@@ -6336,13 +6336,15 @@ impl AgentRuntime {
             let client = A2aClient::new();
             // Use remote agent ID if configured, otherwise omit (uses remote default).
             let remote_id = ext.remote_agent_id.as_deref().unwrap_or("");
+            // Resolve the peer token (plain / ${ENV} / secret-ref) at call time.
+            let peer_token = ext.auth_token.as_ref().and_then(|s| s.resolve_early());
             let stream = client
                 .send_streaming_message(
                     &ext.url,
                     remote_id,
                     &text,
                     &ctx.session_key,
-                    ext.auth_token.as_deref(),
+                    peer_token.as_deref(),
                 )
                 .await
                 .map_err(|e| anyhow!("A2A remote `{agent_id}`: {e}"))?;

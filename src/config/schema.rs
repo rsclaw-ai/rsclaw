@@ -183,13 +183,37 @@ pub struct GatewayAuth {
 /// A2A inbound configuration in the gateway block. JSON5 key
 /// `gateway.a2a`. Auth lists support plain strings, `${VAR}` expansion,
 /// and `{ source: "env", id: "..." }` refs.
+/// One named A2A client credential. The `secret` is accepted on EITHER the
+/// `Authorization: Bearer` or `X-API-Key` header — transport is the caller's
+/// choice, not a server config axis. Once the secret matches, the request is
+/// attributed to `id` (the principal). `scopes` is reserved for per-method
+/// authorization (A2A spec §7.5) and is not enforced yet.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct A2aClient {
+    /// Logical identity this credential authenticates as (e.g. "partner-acme").
+    pub id: String,
+    /// Accepted secret: plain string, `${ENV}`, or a secret ref.
+    pub secret: SecretOrString,
+    /// Reserved for per-method authorization (A2A §7.5); unenforced today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<Vec<String>>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayA2a {
-    /// Accepted Bearer tokens for `/api/v1/a2a`.
+    /// Named A2A client credentials for `/api/v1/a2a`. Each secret is accepted
+    /// on either the Bearer or X-API-Key header and resolves to its `id` as the
+    /// request principal. Prefer this over `authTokens`/`apiKeys`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clients: Option<Vec<A2aClient>>,
+    /// DEPRECATED: prefer `clients`. Accepted Bearer tokens for `/api/v1/a2a`;
+    /// each becomes an anonymous principal. Kept for config compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_tokens: Option<Vec<SecretOrString>>,
-    /// Accepted `X-API-Key` values for `/api/v1/a2a`.
+    /// DEPRECATED: prefer `clients`. Accepted `X-API-Key` values; each becomes
+    /// an anonymous principal. Kept for config compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_keys: Option<Vec<SecretOrString>>,
     /// Max body size in megabytes for `/api/v1/a2a` requests. Default
@@ -266,9 +290,11 @@ pub struct A2aPeerConfig {
     pub id: String,
     /// Base URL of the remote rsclaw/OpenClaw gateway, e.g. "http://host:18888".
     pub url: String,
-    /// Optional bearer token for the remote gateway.
+    /// Optional bearer token presented to the remote gateway. Plain string,
+    /// `${ENV}`, or a secret ref — so partner credentials need not sit in
+    /// plaintext config (parity with `gateway.a2a` secrets).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth_token: Option<String>,
+    pub auth_token: Option<SecretOrString>,
     /// Remote agent ID to target. If omitted, uses the remote gateway's default agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_agent_id: Option<String>,

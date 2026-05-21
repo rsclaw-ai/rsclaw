@@ -33,11 +33,12 @@ use crate::{
 /// `SendStreamingMessage` or `SubscribeToTask`.
 pub async fn handle_streaming_rpc(
     state: AppState,
+    caller: Option<crate::a2a::auth::A2aIdentity>,
     req: JsonRpcRequest,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let req_id = req.id.clone();
     let (task_id, rx) = match req.method.as_str() {
-        "SendStreamingMessage" => spawn_streaming_task(state.clone(), req.params).await,
+        "SendStreamingMessage" => spawn_streaming_task(state.clone(), caller, req.params).await,
         "SubscribeToTask" => {
             let tid = req
                 .params
@@ -45,11 +46,15 @@ pub async fn handle_streaming_rpc(
                 .and_then(|v| v.as_str())
                 .map(str::to_owned)
                 .unwrap_or_default();
-            // Empty id or unknown task: emit a synthetic Failed and close so
-            // the SSE doesn't hang waiting on a channel that will never
-            // receive a publish. Existing tasks still in flight have a live
-            // sender, so subscribing returns events as expected.
-            if tid.is_empty() || state.task_store.get(&tid).ok().flatten().is_none() {
+            // Empty id, unknown task, OR a task the caller doesn't own: emit a
+            // synthetic Failed and close. §7.5 — a non-owner gets the SAME
+            // "task not found" outcome as a genuinely missing task, so task
+            // existence never leaks. Existing in-flight tasks owned by the
+            // caller have a live sender, so subscribing returns events.
+            if tid.is_empty()
+                || state.task_store.get(&tid).ok().flatten().is_none()
+                || !crate::a2a::server::caller_owns(&state.task_store, &caller, &tid)
+            {
                 let rx = state.task_event_bus.subscribe(&tid);
                 state.task_event_bus.publish(AgentEvent::Status {
                     task_id: tid.clone(),
@@ -119,6 +124,7 @@ pub async fn handle_streaming_rpc(
 /// observes the full Submitted → Working → Completed sequence.
 async fn spawn_streaming_task(
     state: AppState,
+    caller: Option<crate::a2a::auth::A2aIdentity>,
     params: Value,
 ) -> (String, tokio::sync::broadcast::Receiver<AgentEvent>) {
     let params: SendMessageParams = match serde_json::from_value(params) {
@@ -150,6 +156,12 @@ async fn spawn_streaming_task(
         .task_id
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    // §7.5: stamp the creating principal so only it (or the operator token)
+    // can later read / cancel / subscribe to this streaming task.
+    if let Some(c) = caller.as_ref() {
+        let _ = state.task_store.put_owner(&task_id, &c.id);
+    }
 
     // CRITICAL: subscribe BEFORE any publish so the SSE consumer sees
     // Submitted/Working frames. broadcast channels don't replay history.
