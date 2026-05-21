@@ -90,7 +90,7 @@ interface LogEntry {
   msg: string;
 }
 
-type PanelPage = "status" | "config" | "agents" | "cron" | "skills" | "workspace" | "doctor" | "pairing" | "wizard" | "memory";
+type PanelPage = "status" | "config" | "agents" | "cron" | "skills-plugins" | "workspace" | "doctor" | "pairing" | "wizard" | "memory";
 
 // ── Toggle Component ────────────────────────────────────
 function Toggle(props: {
@@ -2382,7 +2382,7 @@ function TauriConfigPageInner() {
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [parseError, setParseError] = useState("");
-  const [activeTab, setActiveTab] = useState<"gateway"|"models"|"channels"|"tools"|"raw">("gateway");
+  const [activeTab, setActiveTab] = useState<"gateway"|"models"|"channels"|"tools"|"a2a"|"raw">("gateway");
 
   // Provider state: open cards, test status, fetched model lists, selected model
   const [openProvs, setOpenProvs] = useState<Set<string>>(new Set());
@@ -2839,6 +2839,7 @@ function TauriConfigPageInner() {
     { key: "models", label: zh ? "\u6A21\u578B\u63D0\u4F9B\u5546" : "Models" },
     { key: "channels", label: zh ? "\u6D88\u606F\u901A\u9053" : "Channels" },
     { key: "tools", label: zh ? "\u5DE5\u5177 & \u529F\u80FD" : "Tools" },
+    { key: "a2a", label: "A2A" },
     { key: "raw", label: "JSON5" },
   ];
 
@@ -4046,6 +4047,196 @@ function TauriConfigPageInner() {
           </div>
         </div>)}
 
+        {/* ══ A2A TAB ══ */}
+        {/* gateway.a2a = inbound auth for /api/v1/a2a (this instance accepts).
+            agents.a2a   = outbound peers exposed as agent_<id> tools.
+            authTokens / apiKeys allow plain strings or { source:"env", id:"NAME" }
+            refs. We edit strings as <input type=password>; object refs render
+            read-only with a "convert to string" affordance so we never silently
+            drop a user-authored env binding. */}
+        {activeTab === "a2a" && (() => {
+          // Normalize a single auth entry into { kind, display, raw }. We round-trip
+          // env-ref objects through `raw` so save preserves them untouched.
+          const describeSecret = (v: any): { kind: "string" | "envRef" | "other"; display: string; isEnv: boolean } => {
+            if (typeof v === "string") return { kind: "string", display: v, isEnv: false };
+            if (v && typeof v === "object" && v.source === "env" && typeof v.id === "string") {
+              return { kind: "envRef", display: `\${${v.id}}`, isEnv: true };
+            }
+            return { kind: "other", display: JSON.stringify(v), isEnv: false };
+          };
+
+          const renderSecretList = (path: string, labelCN: string, labelEN: string, hint: string, placeholder: string) => {
+            const list: any[] = getVal(path, []) as any[];
+            const arr = Array.isArray(list) ? list : [];
+            const setAt = (i: number, v: any) => updateConfig(path, arr.map((x, idx) => idx === i ? v : x));
+            const removeAt = (i: number) => updateConfig(path, arr.filter((_, idx) => idx !== i));
+            const append = () => updateConfig(path, [...arr, ""]);
+            return (
+              <div style={fcard}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "11px 15px", background: V.bg3, borderBottom: `1px solid ${V.bd}` }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? labelCN : labelEN}</div>
+                    <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>{path}</div>
+                  </div>
+                  <button onClick={append} style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${V.gbrd}`, background: V.glo, color: V.green, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
+                    {zh ? "+ 添加" : "+ Add"}
+                  </button>
+                </div>
+                {arr.length === 0 ? (
+                  <div style={{ ...fieldRow, borderBottom: "none", color: V.t3, fontSize: 11 }}>{hint}</div>
+                ) : arr.map((entry, i) => {
+                  const desc = describeSecret(entry);
+                  const isLast = i === arr.length - 1;
+                  if (desc.kind === "string") {
+                    return (
+                      <div key={i} style={{ ...fieldRow, borderBottom: isLast ? "none" : "1px solid rgba(255,255,255,.03)" }}>
+                        <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, width: 22 }}>{`[${i}]`}</div>
+                        <input style={{ ...fInput, flex: 1, minWidth: 200 }} type="password" value={entry} placeholder={placeholder} onChange={(e) => setAt(i, e.target.value)} />
+                        <button onClick={() => removeAt(i)} style={{ padding: "5px 10px", borderRadius: 7, border: `1px solid ${V.rbrd}`, background: V.rlo, color: V.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "删除" : "Remove"}</button>
+                      </div>
+                    );
+                  }
+                  // envRef or other: render the literal display; the user can convert to a string to edit.
+                  return (
+                    <div key={i} style={{ ...fieldRow, borderBottom: isLast ? "none" : "1px solid rgba(255,255,255,.03)" }}>
+                      <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, width: 22 }}>{`[${i}]`}</div>
+                      <div style={{ flex: 1, fontFamily: V.mono, fontSize: 11, color: V.t2, padding: "7px 10px", background: V.bg4, border: `1px dashed ${V.bd2}`, borderRadius: 7 }}>{desc.display}</div>
+                      <button onClick={() => setAt(i, desc.isEnv ? desc.display : "")} style={{ padding: "5px 10px", borderRadius: 7, border: `1px solid ${V.bd2}`, background: V.bg4, color: V.t2, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "转为字符串" : "To string"}</button>
+                      <button onClick={() => removeAt(i)} style={{ padding: "5px 10px", borderRadius: 7, border: `1px solid ${V.rbrd}`, background: V.rlo, color: V.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "删除" : "Remove"}</button>
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          };
+
+          // ── Peers (agents.a2a[]) ──
+          const peers: any[] = getVal("agents.a2a", []) as any[];
+          const peerArr = Array.isArray(peers) ? peers : [];
+          const setPeerField = (i: number, field: string, value: any) => {
+            const next = peerArr.map((p, idx) => idx === i ? { ...p, [field]: value } : p);
+            updateConfig("agents.a2a", next);
+          };
+          const deletePeerField = (i: number, field: string) => {
+            const next = peerArr.map((p, idx) => {
+              if (idx !== i) return p;
+              const copy: any = { ...p };
+              delete copy[field];
+              return copy;
+            });
+            updateConfig("agents.a2a", next);
+          };
+          const removePeer = (i: number) => updateConfig("agents.a2a", peerArr.filter((_, idx) => idx !== i));
+          const addPeer = () => {
+            // Generate a fresh `id` slot — a1/a2/a3... — skipping any in use.
+            const existing = new Set(peerArr.map((p) => p?.id).filter(Boolean));
+            let next = 1;
+            while (existing.has(`a${next}`)) next++;
+            updateConfig("agents.a2a", [...peerArr, { id: `a${next}`, url: "" }]);
+          };
+
+          return (<div style={{ animation: "fi .15s ease" }}>
+            <div style={{ padding: "0 0 14px", fontSize: 11, color: V.t2, lineHeight: 1.55 }}>
+              {zh
+                ? "A2A（Agent-to-Agent）允许此 rsclaw 实例与其它实例互相调用。入站凭据用于接受其它实例的请求；出站对端会以 agent_<id> 工具暴露给本地智能体。"
+                : "A2A (Agent-to-Agent) lets this rsclaw instance call and be called by other rsclaw instances. Inbound credentials authenticate incoming requests; outbound peers are exposed to the local agent as agent_<id> tools."}
+            </div>
+
+            {/* ── Inbound ── */}
+            {secHead(zh ? "入站（gateway.a2a）" : "INBOUND (gateway.a2a)")}
+            {renderSecretList(
+              "gateway.a2a.authTokens",
+              "Bearer Tokens",
+              "Bearer Tokens",
+              zh ? "尚未设置；/api/v1/a2a 将拒绝所有 Bearer 请求（除非匹配 gateway.auth.token）" : "Not set; /api/v1/a2a will reject Bearer requests (unless matching gateway.auth.token).",
+              "${RSCLAW_A2A_BEARER}"
+            )}
+            {renderSecretList(
+              "gateway.a2a.apiKeys",
+              "API Keys (X-API-Key)",
+              "API Keys (X-API-Key)",
+              zh ? "尚未设置；/api/v1/a2a 不会接受 X-API-Key 请求" : "Not set; /api/v1/a2a will reject X-API-Key requests.",
+              "${RSCLAW_A2A_APIKEY}"
+            )}
+            <div style={fcard}>
+              <div style={{ ...fieldRow, borderBottom: "none" }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "最大请求体" : "Max Body Size"} <span style={{ color: V.t3, fontWeight: 400 }}>(MB)</span></div>
+                  <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>gateway.a2a.maxBodyMb</div>
+                  <div style={{ fontSize: 10, color: V.t3, marginTop: 2, lineHeight: 1.5 }}>{zh ? "默认 100MB。低于客户端发送的附件大小会触发 413。" : "Default 100MB. Setting it below incoming attachment size triggers 413."}</div>
+                </div>
+                <input style={{ ...fInput, minWidth: 100 }} type="number" min={1} max={1024}
+                  value={getVal("gateway.a2a.maxBodyMb", 100)}
+                  onChange={(e) => updateConfig("gateway.a2a.maxBodyMb", parseInt(e.target.value) || 100)} />
+              </div>
+            </div>
+
+            {/* ── Outbound peers ── */}
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12, marginTop: 22 }}>
+              <div style={{ fontSize: 11, fontWeight: 600, color: V.t1, letterSpacing: 0.4, textTransform: "uppercase" as const }}>{zh ? "出站对端（agents.a2a）" : "OUTBOUND PEERS (agents.a2a)"}</div>
+              <div style={{ flex: 1, height: 1, background: V.bd }} />
+              <button onClick={addPeer} style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${V.gbrd}`, background: V.glo, color: V.green, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
+                {zh ? "+ 添加对端" : "+ Add Peer"}
+              </button>
+            </div>
+
+            {peerArr.length === 0 ? (
+              <div style={{ ...fcard, padding: "26px 16px", textAlign: "center", color: V.t3, fontSize: 12 }}>
+                {zh ? "尚未配置任何 A2A 对端。点击右上 “+ 添加对端” 注册第一个。" : "No A2A peers configured yet. Click “+ Add Peer” to register the first one."}
+              </div>
+            ) : peerArr.map((peer, i) => {
+              const authVal = peer?.authToken;
+              const authIsString = typeof authVal === "string" || authVal === undefined || authVal === null;
+              return (
+                <div key={`peer-${i}`} style={fcard}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "11px 15px", background: V.bg3, borderBottom: `1px solid ${V.bd}` }}>
+                    <div style={{ fontFamily: V.mono, fontSize: 12, color: V.green }}>agent_{peer?.id || "?"}</div>
+                    <div style={{ flex: 1, fontSize: 10, color: V.t3, fontFamily: V.mono }}>{peer?.url || ""}</div>
+                    <button onClick={() => removePeer(i)} style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${V.rbrd}`, background: V.rlo, color: V.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "移除" : "Remove"}</button>
+                  </div>
+                  <div style={fieldRow}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>ID</div>
+                      <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>{zh ? "工具名：agent_<id>" : "Tool name: agent_<id>"}</div>
+                    </div>
+                    <input style={{ ...fInput, minWidth: 180 }} type="text" value={peer?.id || ""} placeholder="a1" onChange={(e) => setPeerField(i, "id", e.target.value)} />
+                  </div>
+                  <div style={fieldRow}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>URL</div>
+                      <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>{zh ? "对端 rsclaw 网关地址" : "Peer rsclaw gateway base URL"}</div>
+                    </div>
+                    <input style={{ ...fInput, minWidth: 280 }} type="text" value={peer?.url || ""} placeholder="http://127.0.0.1:19036" onChange={(e) => setPeerField(i, "url", e.target.value)} />
+                  </div>
+                  <div style={fieldRow}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "认证 Token" : "Auth Token"}</div>
+                      <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>{zh ? "对应对端 gateway.a2a.authTokens 中的某一条" : "Must match one of the peer's gateway.a2a.authTokens"}</div>
+                    </div>
+                    {authIsString ? (
+                      <input style={{ ...fInput, minWidth: 240 }} type="password" value={authVal || ""} placeholder="${RSCLAW_A2A_TOKEN}" onChange={(e) => setPeerField(i, "authToken", e.target.value)} />
+                    ) : (
+                      <div style={{ fontFamily: V.mono, fontSize: 11, color: V.t2, padding: "7px 10px", background: V.bg4, border: `1px dashed ${V.bd2}`, borderRadius: 7 }}>{JSON.stringify(authVal)}</div>
+                    )}
+                  </div>
+                  <div style={{ ...fieldRow, borderBottom: "none" }}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "目标 Agent ID（可选）" : "Target Agent ID (optional)"}</div>
+                      <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>{zh ? "留空使用对端默认 agent" : "Leave blank to use the peer's default agent"}</div>
+                    </div>
+                    <input style={{ ...fInput, minWidth: 180 }} type="text" value={peer?.remoteAgentId || ""} placeholder="main"
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        if (!v) deletePeerField(i, "remoteAgentId");
+                        else setPeerField(i, "remoteAgentId", v);
+                      }} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>);
+        })()}
+
         {/* ══ RAW JSON5 TAB ══ */}
         {activeTab === "raw" && (
           <div style={{ height: "100%", animation: "fi .15s ease" }}>
@@ -4626,7 +4817,7 @@ const RECOMMENDED_SKILLS: { name: string; icon: string; ver: string; author: str
   { name: "imap-smtp-email", icon: "\uD83D\uDCE7", ver: "v0.0.10", author: "community", desc: { cn: "IMAP/SMTP \u90AE\u4EF6\u6536\u53D1", en: "Email via IMAP/SMTP" }, tools: [], downloads: "40k", stars: "" },
 ];
 
-function SkillsPage() {
+function SkillsTab() {
   const zh = getLang() === "cn";
   const [installed, setInstalled] = useState<SkillInfo[]>([]);
   const [loading, setLoading] = useState(true);
@@ -4701,12 +4892,9 @@ function SkillsPage() {
 
   return (
     <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
-      <div style={{ padding: "24px 28px 0", flexShrink: 0 }}>
-        <div style={{ fontSize: 20, fontWeight: 700, color: V2.t0, letterSpacing: -0.4 }}>{zh ? "\u6280\u80FD\u7BA1\u7406" : "Skills"}</div>
-        <div style={{ fontSize: 11, color: V2.t3, fontFamily: V2.mono, marginTop: 3 }}>~/.rsclaw/skills/</div>
-      </div>
+      <div style={{ fontSize: 11, color: V2.t3, fontFamily: V2.mono, padding: "16px 28px 0", flexShrink: 0 }}>~/.rsclaw/skills/</div>
 
-      <div style={{ padding: "20px 28px 28px", flex: 1, overflowY: "auto" }}>
+      <div style={{ padding: "12px 28px 28px", flex: 1, overflowY: "auto" }}>
         {/* Search */}
         <div style={{ marginBottom: 20 }}>
           <input value={search} onChange={(e) => setSearch(e.target.value)}
@@ -4844,6 +5032,312 @@ function SkillsPage() {
 }
 
 // ══════════════════════════════════════════════════════════
+// ── Plugins Tab ──────────────────────────────────────────
+// ══════════════════════════════════════════════════════════
+
+interface PluginInfo {
+  name: string;
+  version?: string;
+  description?: string;
+  runtime: "wasm" | "shell";
+  runtimeRaw?: string;
+  entry?: string;
+  tools?: string[];
+  channels?: string[];
+  path?: string;
+  icon?: string;
+}
+
+type PluginRuntime = "wasm" | "shell";
+
+const RECOMMENDED_PLUGINS: { name: string; runtime: PluginRuntime; icon: string; ver: string; author: string; desc: { cn: string; en: string }; spec: string }[] = [
+  { name: "qrcode", runtime: "wasm", icon: "📱", ver: "v1.0.0", author: "@rsclaw", desc: { cn: "二维码生成/识别示例（WASM）", en: "QR code generator/decoder example (WASM)" }, spec: "https://github.com/rsclaw/plugin-qrcode/releases/latest/download/qrcode.wasm" },
+  { name: "browser-tools", runtime: "shell", icon: "🌐", ver: "v0.2.0", author: "@rsclaw", desc: { cn: "浏览器自动化 (Node shell-bridge)", en: "Browser automation via Node shell-bridge" }, spec: "https://github.com/rsclaw/plugin-browser-tools/releases/latest/download/browser-tools.zip" },
+];
+
+function PluginsTab() {
+  const zh = getLang() === "cn";
+  const [runtime, setRuntime] = useState<PluginRuntime>("wasm");
+  const [installed, setInstalled] = useState<PluginInfo[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [installing, setInstalling] = useState<string | null>(null);
+  const [installSpec, setInstallSpec] = useState("");
+  const [dropActive, setDropActive] = useState(false);
+  const [detail, setDetail] = useState<PluginInfo | null>(null);
+
+  const fetchPlugins = useCallback(async () => {
+    setLoading(true);
+    try {
+      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
+      if (tauriInvoke) {
+        const data: any = await tauriInvoke("get_plugins");
+        setInstalled((data?.plugins || []) as PluginInfo[]);
+      } else {
+        const res = await gatewayFetch("/api/v1/plugins");
+        if (res.ok) { const data = await res.json(); setInstalled(data.plugins || []); }
+      }
+    } catch {}
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { fetchPlugins(); }, [fetchPlugins]);
+
+  const doInstall = useCallback(async (spec: string) => {
+    const trimmed = spec.trim();
+    if (!trimmed) return;
+    setInstalling(trimmed);
+    try {
+      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
+      if (tauriInvoke) { await tauriInvoke("install_plugin", { spec: trimmed }); }
+      else { await gatewayFetch("/api/v1/plugins/install", { method: "POST", body: JSON.stringify({ spec: trimmed }) }); }
+      await fetchPlugins();
+      try { await reloadConfig(); } catch {}
+      setInstallSpec("");
+      toast.success(zh ? `${trimmed} 安装完成` : `${trimmed} installed`);
+    } catch (e: any) {
+      const msg = typeof e === "string" ? e : e?.message || "";
+      toast.fromError(zh ? "安装失败" : "Install failed", msg);
+    }
+    setInstalling(null);
+  }, [fetchPlugins, zh]);
+
+  const doUninstall = async (name: string) => {
+    try {
+      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
+      if (tauriInvoke) { await tauriInvoke("uninstall_plugin", { name }); }
+      else { await gatewayFetch(`/api/v1/plugins/${encodeURIComponent(name)}`, { method: "DELETE" }); }
+      await fetchPlugins(); setDetail(null);
+      try { await reloadConfig(); } catch {}
+      toast.success(zh ? `${name} 已卸载` : `${name} uninstalled`);
+    } catch (e: any) {
+      const msg = typeof e === "string" ? e : e?.message || "";
+      toast.fromError(zh ? "卸载失败" : "Uninstall failed", msg);
+    }
+  };
+
+  // Tauri v2 drag-drop: window emits "tauri://drag-drop" with { paths, position }.
+  // We only honor .wasm/.zip; everything else is ignored so other tabs (chat
+  // attachments) aren't trampled. Hover/leave events drive the highlight ring.
+  useEffect(() => {
+    if (!isTauri) return;
+    let cancelled = false;
+    let off: Array<() => void> = [];
+    (async () => {
+      try {
+        const { getCurrentWindow } = await import("@tauri-apps/api/window");
+        const win = getCurrentWindow();
+        const stop = await win.onDragDropEvent((ev: any) => {
+          if (cancelled) return;
+          if (ev.payload.type === "over") { setDropActive(true); return; }
+          if (ev.payload.type === "leave") { setDropActive(false); return; }
+          if (ev.payload.type === "drop") {
+            setDropActive(false);
+            const paths: string[] = ev.payload.paths || [];
+            const target = paths.find((p) => p.endsWith(".wasm") || p.endsWith(".zip"));
+            if (target) { doInstall(target); }
+          }
+        });
+        if (cancelled) stop();
+        else off.push(stop);
+      } catch {}
+    })();
+    return () => { cancelled = true; off.forEach((f) => f()); };
+  }, [doInstall]);
+
+  const V2 = { bg2: "#141618", bg3: "#1a1c22", bg4: "#1f2126", bg5: "#252830", bd: "rgba(255,255,255,.055)", bd2: "rgba(255,255,255,.09)", t0: "#eceaf4", t1: "#9896a4", t2: "#4a4858", t3: "#2e2c3a", or: "#f97316", olo: "rgba(249,115,22,.09)", obrd: "rgba(249,115,22,.2)", green: "#2dd4a0", glo: "rgba(45,212,160,.07)", gbrd: "rgba(45,212,160,.18)", red: "#d95f5f", rlo: "rgba(217,95,95,.08)", rbrd: "rgba(217,95,95,.18)", mono: "'JetBrains Mono', monospace" };
+
+  const isInstalled = (name: string) => installed.some((p) => p.name === name);
+  const installedFiltered = installed.filter((p) => p.runtime === runtime);
+  const recommendedFiltered = RECOMMENDED_PLUGINS.filter((p) => p.runtime === runtime);
+
+  const subTabBtn = (key: PluginRuntime, label: string) => (
+    <button key={key} onClick={() => setRuntime(key)}
+      style={{ padding: "5px 14px", borderRadius: 7, fontSize: 11, fontWeight: 600, cursor: "pointer",
+        background: runtime === key ? V2.bg4 : "transparent",
+        color: runtime === key ? V2.t0 : V2.t2,
+        border: `1px solid ${runtime === key ? V2.bd2 : "transparent"}`,
+        fontFamily: V2.mono, letterSpacing: 0.5,
+      }}>{label}</button>
+  );
+
+  return (
+    <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", position: "relative" }}>
+      <div style={{ padding: "16px 28px 0", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div style={{ fontSize: 11, color: V2.t3, fontFamily: V2.mono }}>~/.rsclaw/plugins/</div>
+        <div style={{ display: "flex", gap: 6 }}>
+          {subTabBtn("wasm", "WASM")}
+          {subTabBtn("shell", "Shell")}
+        </div>
+      </div>
+
+      <div style={{ padding: "16px 28px 28px", flex: 1, overflowY: "auto" }}>
+        {/* Install by URL / path */}
+        <div style={{ display: "flex", gap: 6, marginBottom: 18 }}>
+          <input value={installSpec} onChange={(e) => setInstallSpec(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") doInstall(installSpec); }}
+            placeholder={zh ? "URL / 本地路径 (.wasm / .zip / 目录)..." : "URL / local path (.wasm / .zip / directory)..."}
+            style={{ flex: 1, background: V2.bg2, border: `1px solid ${V2.bd}`, borderRadius: 9, padding: "9px 14px", color: V2.t0, fontSize: 12, outline: "none" }} />
+          <button onClick={() => doInstall(installSpec)} disabled={!installSpec.trim() || !!installing}
+            style={{ padding: "0 16px", borderRadius: 9, border: `1px solid ${V2.gbrd}`, background: installing ? V2.olo : V2.glo, color: installing ? V2.or : V2.green, fontSize: 11, fontWeight: 600, cursor: installing ? "not-allowed" : "pointer", fontFamily: V2.mono }}>
+            {installing ? (zh ? "安装中..." : "Installing...") : (zh ? "安装" : "Install")}
+          </button>
+        </div>
+        <div style={{ fontSize: 10, color: V2.t3, marginBottom: 18, fontFamily: V2.mono }}>
+          {zh ? "提示：可拖拽 .wasm / .zip 到窗口自动安装" : "Tip: drag .wasm / .zip into the window to install"}
+        </div>
+
+        {/* Installed */}
+        <div style={{ fontSize: 11, fontWeight: 600, color: V2.t2, letterSpacing: 0.5, textTransform: "uppercase", marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
+          {zh ? "已安装" : "Installed"} <span style={{ fontSize: 9, padding: "1px 7px", borderRadius: 3, background: V2.bg4, color: V2.t2 }}>{installedFiltered.length}</span>
+        </div>
+        {loading ? <div style={{ color: V2.t3, padding: 20, textAlign: "center" }}>...</div>
+        : installedFiltered.length === 0 ? (
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 10, padding: "30px 0", color: V2.t3, marginBottom: 24 }}>
+            <div style={{ fontSize: 32, opacity: 0.4 }}>{runtime === "wasm" ? "🧩" : "🐚"}</div>
+            <div style={{ fontSize: 12 }}>{zh ? `尚未安装 ${runtime === "wasm" ? "WASM" : "Shell"} 插件` : `No ${runtime === "wasm" ? "WASM" : "Shell"} plugins installed`}</div>
+          </div>
+        ) : (
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 24 }}>
+            {installedFiltered.map((plugin) => (
+              <div key={plugin.name} onClick={() => setDetail(plugin)} style={{ background: V2.bg2, border: `1px solid rgba(45,212,160,.15)`, borderRadius: 11, padding: "14px 16px", cursor: "pointer", display: "flex", flexDirection: "column", gap: 10 }}>
+                <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
+                  <div style={{ width: 36, height: 36, borderRadius: 9, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, flexShrink: 0, background: V2.bg3, border: `1px solid ${V2.bd}` }}>{plugin.icon || (plugin.runtime === "wasm" ? "🧩" : "🐚")}</div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: V2.t0 }}>{plugin.name}</div>
+                    <div style={{ fontSize: 10, fontFamily: V2.mono, color: V2.t3, marginTop: 1 }}>{plugin.version || "-"} {plugin.runtimeRaw && plugin.runtimeRaw !== plugin.runtime ? `· ${plugin.runtimeRaw}` : ""}</div>
+                  </div>
+                  <div style={{ fontSize: 10, color: V2.green, fontFamily: V2.mono, display: "flex", alignItems: "center", gap: 4 }}>{"●"} {zh ? "已安装" : "Installed"}</div>
+                </div>
+                {plugin.description && <div style={{ fontSize: 11, color: V2.t2, lineHeight: 1.55 }}>{plugin.description}</div>}
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                  <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                    {plugin.tools?.map((t) => <span key={t} style={{ fontSize: 9, padding: "1px 6px", borderRadius: 3, background: V2.bg4, color: V2.t2, fontFamily: V2.mono }}>{t}</span>)}
+                  </div>
+                  <button onClick={(e) => { e.stopPropagation(); doUninstall(plugin.name); }} style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${V2.rbrd}`, background: V2.rlo, color: V2.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "卸载" : "Uninstall"}</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Recommended */}
+        <div style={{ fontSize: 11, fontWeight: 600, color: V2.t2, letterSpacing: 0.5, textTransform: "uppercase", marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
+          {zh ? "推荐安装" : "Recommended"} <span style={{ fontSize: 9, padding: "1px 7px", borderRadius: 3, background: V2.bg4, color: V2.t2 }}>{recommendedFiltered.length}</span>
+        </div>
+        {recommendedFiltered.length === 0 ? (
+          <div style={{ fontSize: 11, color: V2.t3, padding: "16px 0" }}>{zh ? "暂无推荐" : "No recommendations yet"}</div>
+        ) : (
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+            {recommendedFiltered.map((rec) => (
+              <div key={rec.name} style={{ background: V2.bg2, border: `1px solid ${V2.bd}`, borderRadius: 11, padding: "14px 16px", display: "flex", flexDirection: "column", gap: 10 }}>
+                <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
+                  <div style={{ width: 36, height: 36, borderRadius: 9, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, flexShrink: 0, background: V2.bg3, border: `1px solid ${V2.bd}` }}>{rec.icon}</div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: V2.t0 }}>{rec.name}</div>
+                    <div style={{ fontSize: 10, fontFamily: V2.mono, color: V2.t3, marginTop: 1 }}>{rec.ver} {"·"} {rec.author}</div>
+                  </div>
+                  {isInstalled(rec.name) && <div style={{ fontSize: 10, color: V2.green, fontFamily: V2.mono, display: "flex", alignItems: "center", gap: 4 }}>{"●"} {zh ? "已安装" : "Installed"}</div>}
+                </div>
+                <div style={{ fontSize: 11, color: V2.t2, lineHeight: 1.55 }}>{zh ? rec.desc.cn : rec.desc.en}</div>
+                <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                  {isInstalled(rec.name)
+                    ? <span style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${V2.bd2}`, color: V2.t2, fontSize: 11 }}>{"✓"}</span>
+                    : <button onClick={() => doInstall(rec.spec)} disabled={installing === rec.spec}
+                        style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${installing === rec.spec ? V2.obrd : V2.gbrd}`, background: installing === rec.spec ? V2.olo : V2.glo, color: installing === rec.spec ? V2.or : V2.green, fontSize: 11, fontWeight: 600, cursor: installing === rec.spec ? "not-allowed" : "pointer" }}>
+                        {installing === rec.spec ? (zh ? "安装中..." : "Installing...") : (zh ? "安装" : "Install")}
+                      </button>}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Drag-drop overlay highlight */}
+      {dropActive && (
+        <div style={{ position: "absolute", inset: 0, border: `2px dashed ${V2.green}`, background: "rgba(45,212,160,.05)", display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none", color: V2.green, fontSize: 14, fontWeight: 600, fontFamily: V2.mono, letterSpacing: 0.5 }}>
+          {zh ? "松开即可安装 .wasm / .zip" : "Drop .wasm / .zip to install"}
+        </div>
+      )}
+
+      {/* Detail modal */}
+      {detail && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(5,5,7,.72)", backdropFilter: "blur(3px)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}
+          onClick={(e) => { if (e.target === e.currentTarget) setDetail(null); }}>
+          <div style={{ width: 460, background: V2.bg3, border: `1px solid ${V2.bd2}`, borderRadius: 14, overflow: "hidden", boxShadow: "0 20px 60px rgba(0,0,0,.6)" }}>
+            <div style={{ padding: "20px 22px 0", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <div style={{ fontSize: 15, fontWeight: 700 }}>{detail.name}</div>
+              <button onClick={() => setDetail(null)} style={{ width: 26, height: 26, borderRadius: "50%", border: `1px solid ${V2.bd2}`, background: "transparent", color: V2.t2, fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}>{"✕"}</button>
+            </div>
+            <div style={{ padding: "18px 22px" }}>
+              <div style={{ fontSize: 10, fontFamily: V2.mono, color: V2.t3, marginBottom: 12 }}>{detail.version || "-"} {"·"} {detail.runtimeRaw || detail.runtime}</div>
+              {detail.description && <div style={{ fontSize: 12, color: V2.t1, lineHeight: 1.6, marginBottom: 12 }}>{detail.description}</div>}
+              {detail.tools && detail.tools.length > 0 && (
+                <div style={{ marginBottom: 12 }}>
+                  <div style={{ fontSize: 10, color: V2.t3, letterSpacing: 0.4, marginBottom: 6, fontFamily: V2.mono }}>TOOLS</div>
+                  <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                    {detail.tools.map((t) => <span key={t} style={{ fontSize: 9, padding: "2px 8px", borderRadius: 4, background: V2.bg4, color: V2.t2, fontFamily: V2.mono }}>{t}</span>)}
+                  </div>
+                </div>
+              )}
+              {detail.channels && detail.channels.length > 0 && (
+                <div style={{ marginBottom: 12 }}>
+                  <div style={{ fontSize: 10, color: V2.t3, letterSpacing: 0.4, marginBottom: 6, fontFamily: V2.mono }}>CHANNELS</div>
+                  <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                    {detail.channels.map((c) => <span key={c} style={{ fontSize: 9, padding: "2px 8px", borderRadius: 4, background: V2.bg4, color: V2.t2, fontFamily: V2.mono }}>{c}</span>)}
+                  </div>
+                </div>
+              )}
+              {detail.path && <div style={{ fontSize: 10, color: V2.t3, fontFamily: V2.mono }}>{detail.path}</div>}
+            </div>
+            <div style={{ padding: "0 22px 20px", display: "flex", justifyContent: "flex-end", gap: 8 }}>
+              <button onClick={() => doUninstall(detail.name)} style={{ padding: "8px 16px", borderRadius: 8, border: `1px solid ${V2.rbrd}`, background: V2.rlo, color: V2.red, fontSize: 12, fontWeight: 500, cursor: "pointer" }}>{zh ? "卸载" : "Uninstall"}</button>
+              <button onClick={() => setDetail(null)} style={{ padding: "8px 16px", borderRadius: 8, border: `1px solid ${V2.bd2}`, background: V2.bg2, color: V2.t2, fontSize: 12, fontWeight: 500, cursor: "pointer" }}>{zh ? "关闭" : "Close"}</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════
+// ── Skills & Plugins Page (top-level container) ──────────
+// ══════════════════════════════════════════════════════════
+
+function SkillsPluginsPage() {
+  const zh = getLang() === "cn";
+  const [tab, setTab] = useState<"skills" | "plugins">(() => {
+    if (typeof window === "undefined") return "skills";
+    const qs = window.location.hash.split("?")[1] || "";
+    return new URLSearchParams(qs).get("sub") === "plugins" ? "plugins" : "skills";
+  });
+  const V2 = { bg2: "#141618", bg3: "#1a1c22", bg4: "#1f2126", bd2: "rgba(255,255,255,.09)", t0: "#eceaf4", t2: "#4a4858", t3: "#2e2c3a", mono: "'JetBrains Mono', monospace" };
+
+  const tabBtn = (key: "skills" | "plugins", label: string) => (
+    <button key={key} onClick={() => setTab(key)}
+      style={{ padding: "8px 18px", borderRadius: 9, fontSize: 13, fontWeight: 600, cursor: "pointer",
+        background: tab === key ? V2.bg4 : "transparent",
+        color: tab === key ? V2.t0 : V2.t2,
+        border: `1px solid ${tab === key ? V2.bd2 : "transparent"}`,
+      }}>{label}</button>
+  );
+
+  return (
+    <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+      <div style={{ padding: "24px 28px 0", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div style={{ fontSize: 20, fontWeight: 700, color: V2.t0, letterSpacing: -0.4 }}>{zh ? "技能插件" : "Skills & Plugins"}</div>
+        <div style={{ display: "flex", gap: 6, background: V2.bg2, border: `1px solid rgba(255,255,255,.055)`, borderRadius: 11, padding: 4 }}>
+          {tabBtn("skills", zh ? "技能管理" : "Skills")}
+          {tabBtn("plugins", zh ? "插件管理" : "Plugins")}
+        </div>
+      </div>
+      {tab === "skills" ? <SkillsTab /> : <PluginsTab />}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════
 // ── Main RsClaw Panel ────────────────────────────────────
 // ══════════════════════════════════════════════════════════
 
@@ -4960,8 +5454,12 @@ function getTabFromLocation(search?: string): PanelPage {
   const qs = search || (typeof window !== "undefined" ? window.location.hash.split("?")[1] || "" : "");
   const params = new URLSearchParams(qs);
   const tab = params.get("tab");
-  if (["config", "agents", "cron", "skills", "status", "workspace", "doctor", "pairing", "wizard", "memory"].includes(tab || "")) {
+  if (["config", "agents", "cron", "skills-plugins", "status", "workspace", "doctor", "pairing", "wizard", "memory"].includes(tab || "")) {
     return tab as PanelPage;
+  }
+  // Back-compat: bookmarked `?tab=skills` URLs redirect into the new combined page.
+  if (tab === "skills" || tab === "plugins") {
+    return "skills-plugins";
   }
   return "status";
 }
@@ -5022,7 +5520,7 @@ export function RsClawPanel() {
             {activePage === "config" && <ErrorBoundary><TauriConfigPage /></ErrorBoundary>}
             {activePage === "agents" && <AgentManagerPage />}
             {activePage === "cron" && <CronTaskPage />}
-            {activePage === "skills" && <SkillsPage />}
+            {activePage === "skills-plugins" && <SkillsPluginsPage />}
             {activePage === "workspace" && <WorkspacePage />}
             {activePage === "doctor" && <DoctorPage />}
             {activePage === "pairing" && <PairingPage />}

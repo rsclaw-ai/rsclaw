@@ -1335,6 +1335,76 @@ fn uninstall_skill(name: String) -> Result<String, String> {
     run_rsclaw_command(&["skills", "uninstall", &name])
 }
 
+/// List installed plugins by reading ~/.rsclaw/plugins/<name>/{plugin.json5,openclaw.plugin.json}
+/// Returns `{ plugins: [{ name, version, description, runtime, entry, tools, channels, path }] }`.
+/// `runtime` is normalized into `"wasm" | "shell"` for the UI (anything non-wasm = shell-bridge).
+#[tauri::command]
+fn get_plugins() -> Result<serde_json::Value, String> {
+    let plugins_dir = rsclaw_base_dir().join("plugins");
+    let mut plugins = Vec::new();
+    if plugins_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
+            for entry in entries.flatten() {
+                if !entry.file_type().map_or(false, |ft| ft.is_dir()) { continue; }
+                let dir = entry.path();
+                let name_os = entry.file_name();
+                let dir_name = name_os.to_string_lossy().to_string();
+                if dir_name.starts_with('.') { continue; }
+                let json5_path = dir.join("plugin.json5");
+                let legacy_path = dir.join("openclaw.plugin.json");
+                let raw = if json5_path.exists() {
+                    std::fs::read_to_string(&json5_path).ok()
+                } else if legacy_path.exists() {
+                    std::fs::read_to_string(&legacy_path).ok()
+                } else {
+                    continue;
+                };
+                let Some(raw) = raw else { continue };
+                let val: serde_json::Value = match json5::from_str(&raw) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let name = val.get("name").and_then(|v| v.as_str())
+                    .or_else(|| val.get("id").and_then(|v| v.as_str()))
+                    .unwrap_or(&dir_name).to_string();
+                let runtime_raw = val.get("runtime").and_then(|v| v.as_str()).unwrap_or("node");
+                let runtime = if runtime_raw == "wasm" { "wasm" } else { "shell" };
+                let tools: Vec<String> = val.get("tools").and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
+                let channels: Vec<String> = val.get("channels").and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|c| c.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
+                plugins.push(serde_json::json!({
+                    "name": name,
+                    "version": val.get("version").and_then(|v| v.as_str()).unwrap_or(""),
+                    "description": val.get("description").and_then(|v| v.as_str()).unwrap_or(""),
+                    "runtime": runtime,
+                    "runtimeRaw": runtime_raw,
+                    "entry": val.get("entry").and_then(|v| v.as_str()).unwrap_or(""),
+                    "tools": tools,
+                    "channels": channels,
+                    "path": dir.to_string_lossy(),
+                }));
+            }
+        }
+    }
+    plugins.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    Ok(serde_json::json!({ "plugins": plugins }))
+}
+
+/// Install a plugin via sidecar. `spec` can be a URL, local .wasm/.zip path, or directory.
+#[tauri::command]
+fn install_plugin(spec: String) -> Result<String, String> {
+    run_rsclaw_command(&["plugins", "install", &spec])
+}
+
+/// Uninstall a plugin by name via sidecar.
+#[tauri::command]
+fn uninstall_plugin(name: String) -> Result<String, String> {
+    run_rsclaw_command(&["plugins", "uninstall", &name])
+}
+
 /// Expand `${VAR}` placeholders in a string by reading from the process
 /// environment. Mirrors `crate::config::loader::expand_env_vars` in the
 /// gateway so the test path matches actual runtime substitution.
@@ -1769,6 +1839,9 @@ fn main() {
             install_skill,
             uninstall_skill,
             search_skills,
+            get_plugins,
+            install_plugin,
+            uninstall_plugin,
             test_provider,
             write_workspace_file,
             read_workspace_file,

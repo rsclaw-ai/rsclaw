@@ -775,7 +775,7 @@ export function SideBar(props: { className?: string }) {
               { tab: "agents", icon: "\uD83E\uDD16", label: Locale.RsClawPanel.Sidebar.Agents },
               { tab: "pairing", icon: "\uD83D\uDD10", label: getLang() === "cn" ? "\u914D\u5BF9\u5BA1\u6279" : "Pairing" },
               { tab: "cron", icon: "\u23F0", label: getLang() === "cn" ? "\u5B9A\u65F6\u4EFB\u52A1" : "Cron" },
-              { tab: "skills", icon: "\uD83D\uDD27", label: getLang() === "cn" ? "\u6280\u80FD\u7BA1\u7406" : "Skills" },
+              { tab: "skills-plugins", icon: "\uD83D\uDD27", label: getLang() === "cn" ? "\u6280\u80FD\u63D2\u4EF6" : "Skills & Plugins" },
               { tab: "doctor", icon: "\uD83D\uDEE1\uFE0F", label: getLang() === "cn" ? "\u5B89\u5168\u68C0\u67E5" : "Doctor" },
               { tab: "memory", icon: "\uD83E\uDDE0", label: Locale.RsClawPanel.Sidebar.Memory },
               // Knowledge still a placeholder \u2014 backend collections
