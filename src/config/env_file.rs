@@ -85,14 +85,17 @@ pub fn write(path: &Path, vars: &BTreeMap<String, String>) -> Result<()> {
 
         writeln!(
             f,
-            "# Auto-managed by rsclaw. Vars synced from your shell on first run."
+            "# Auto-managed by rsclaw. Missing vars are captured from your shell."
         )?;
         writeln!(
             f,
-            "# Edit by hand to override a value; the next startup respects your edit"
+            "# This file is the source of truth: hand-edits are respected and are"
         )?;
-        writeln!(f, "# unless that var is also exported in your shell with a different")?;
-        writeln!(f, "# value (shell wins on diff — see docs/env.md).")?;
+        writeln!(
+            f,
+            "# NOT overwritten by your shell on startup. To pull a rotated value"
+        )?;
+        writeln!(f, "# in from the shell, run `rsclaw env sync` (see docs/env.md).")?;
         writeln!(f)?;
 
         for (k, v) in vars {

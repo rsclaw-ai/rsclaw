@@ -6,15 +6,17 @@
 //!      cached for the rest of the process lifetime). This is the
 //!      "shell-provided" view, captured before we mutate process env
 //!      with `.env` values.
-//!   2. Load `$BASE_DIR/.env` into process env additively — vars
-//!      already set by the shell are NOT overwritten.
+//!   2. Load `$BASE_DIR/.env` into process env. `.env` is the source of
+//!      truth for the vars it defines — its values override any stale
+//!      value the launching shell may still export.
 //!   3. Scan the raw rsclaw.json5 text for `${VAR}` placeholders and
 //!      `{source:"env",id:"X"}` SecretRef nodes. Both forms reference
 //!      env vars.
-//!   4. Reconcile: for each referenced var, the shell snapshot value
-//!      wins over the `.env` value on diff (rotation case — user
-//!      updated their `~/.zshrc`). New vars (in shell, not in `.env`)
-//!      are captured. `.env` is rewritten when anything changed.
+//!   4. Capture: referenced vars present in the shell but missing from
+//!      `.env` are appended (first run / newly-referenced var). An
+//!      existing `.env` value is NEVER overwritten from the shell here —
+//!      that would silently revert a hand-edit. Rotating a value from the
+//!      shell is an explicit `rsclaw env sync`.
 //!
 //! After this runs, process env is the single source of truth for
 //! `expand_env_vars` and `SecretOrString::resolve_early`. The `.env`
@@ -53,41 +55,30 @@ pub fn reconcile(raw_config: &str, base_dir: &Path) -> Result<()> {
     let env_path = base_dir.join(".env");
     let mut file = env_file::read(&env_path)?;
 
-    // Additive load: vars only get set if not already in process env.
-    // This preserves the "shell wins by default" invariant for the
-    // common path (terminal launch). Reconcile below handles the
-    // diff case explicitly.
+    // `.env` is the source of truth for the vars it defines: load them into
+    // the process env unconditionally, overriding any stale value the
+    // launching shell may still export. This fixes a footgun where a
+    // hand-edited `.env` was silently reverted by a stale shell export.
+    // Rotating a value from the shell is now an explicit `rsclaw env sync`.
     for (k, v) in &file {
-        if std::env::var(k).is_err() {
-            // SAFETY: config load runs single-threaded during process
-            // startup, before any tokio worker is spawned. Re-loads on
-            // hot-reload are also serialized through the loader.
-            unsafe { std::env::set_var(k, v) };
-        }
+        // SAFETY: config load runs single-threaded during process
+        // startup, before any tokio worker is spawned. Re-loads on
+        // hot-reload are also serialized through the loader.
+        unsafe { std::env::set_var(k, v) };
     }
 
     let needed = scan_var_refs(raw_config);
 
-    let mut updated = Vec::new();
+    // Capture referenced vars the shell has but `.env` lacks (first run / a
+    // newly-referenced var). An existing `.env` value is never overwritten
+    // from the shell here — that drift is resolved explicitly by the user
+    // via `rsclaw env sync`, so a stale shell export can't revert a hand-edit.
     let mut added = Vec::new();
-
-    for var in &needed {
-        match (shell.get(var), file.get(var)) {
-            (Some(shell_val), Some(file_val)) if shell_val != file_val => {
-                // Rotation case: user updated `~/.zshrc`, started from
-                // terminal; `.env` is stale. Shell wins.
-                unsafe { std::env::set_var(var, shell_val) };
-                file.insert(var.clone(), shell_val.clone());
-                updated.push(var.clone());
-            }
-            (Some(shell_val), None) => {
-                // First sync: shell has it, `.env` doesn't. Capture
-                // for next service-managed launch.
-                file.insert(var.clone(), shell_val.clone());
-                added.push(var.clone());
-            }
-            _ => {}
-        }
+    for (k, v) in vars_to_capture(shell, &file, &needed) {
+        // SAFETY: same single-threaded boot phase as above.
+        unsafe { std::env::set_var(&k, &v) };
+        file.insert(k.clone(), v);
+        added.push(k);
     }
 
     // Fallback: vars that are STILL unresolved (not in shell snapshot
@@ -113,7 +104,7 @@ pub fn reconcile(raw_config: &str, base_dir: &Path) -> Result<()> {
         }
     }
 
-    let file_changed = !updated.is_empty() || !added.is_empty() || !recovered_from_rc.is_empty();
+    let file_changed = !added.is_empty() || !recovered_from_rc.is_empty();
     if file_changed {
         env_file::write(&env_path, &file)?;
         if !added.is_empty() {
@@ -121,13 +112,6 @@ pub fn reconcile(raw_config: &str, base_dir: &Path) -> Result<()> {
                 vars = ?added,
                 path = %env_path.display(),
                 ".env: added vars from shell"
-            );
-        }
-        if !updated.is_empty() {
-            tracing::info!(
-                vars = ?updated,
-                path = %env_path.display(),
-                ".env: updated vars from shell (rotation)"
             );
         }
         if !recovered_from_rc.is_empty() {
@@ -140,6 +124,25 @@ pub fn reconcile(raw_config: &str, base_dir: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Decide which referenced vars must be appended to `.env`: only those the
+/// shell provides and `.env` does not already define. An existing `.env`
+/// value is never returned for overwrite — rotation from the shell is the
+/// explicit `rsclaw env sync` path — so a stale shell export can't silently
+/// revert a hand-edited `.env`.
+fn vars_to_capture(
+    shell: &HashMap<String, String>,
+    file: &BTreeMap<String, String>,
+    needed: &BTreeSet<String>,
+) -> Vec<(String, String)> {
+    needed
+        .iter()
+        .filter_map(|var| match (shell.get(var), file.get(var)) {
+            (Some(shell_val), None) => Some((var.clone(), shell_val.clone())),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Spawn the user's login shell with `-lic 'env'` to source their
@@ -496,6 +499,61 @@ pub fn scan_var_refs(raw: &str) -> BTreeSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn bmap(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    // The bug we fixed: a hand-edited `.env` value must not be reverted by a
+    // stale shell export. `vars_to_capture` must NOT report a var that
+    // already exists in `.env`, even when the shell holds a different value.
+    #[test]
+    fn hand_edited_env_value_is_not_overwritten_by_stale_shell() {
+        let shell = map(&[("RSCLAW_API_KEY", "old-stale-from-shell")]);
+        let file = bmap(&[("RSCLAW_API_KEY", "new-hand-edited")]);
+        let needed: BTreeSet<String> = ["RSCLAW_API_KEY".to_string()].into_iter().collect();
+
+        let captured = vars_to_capture(&shell, &file, &needed);
+        assert!(
+            captured.is_empty(),
+            "must not overwrite an existing .env value from the shell, got {captured:?}"
+        );
+    }
+
+    // First run / newly-referenced var: shell has it, `.env` doesn't → capture.
+    #[test]
+    fn shell_only_var_is_captured_into_env() {
+        let shell = map(&[("RSCLAW_API_KEY", "from-shell"), ("UNRELATED", "x")]);
+        let file: BTreeMap<String, String> = BTreeMap::new();
+        let needed: BTreeSet<String> = ["RSCLAW_API_KEY".to_string()].into_iter().collect();
+
+        let captured = vars_to_capture(&shell, &file, &needed);
+        assert_eq!(
+            captured,
+            vec![("RSCLAW_API_KEY".to_string(), "from-shell".to_string())],
+            "only the referenced shell-only var should be captured"
+        );
+    }
+
+    // A var missing from both shell and `.env` is left for the rc-fallback /
+    // is simply not captured here.
+    #[test]
+    fn var_missing_everywhere_is_not_captured() {
+        let shell: HashMap<String, String> = HashMap::new();
+        let file: BTreeMap<String, String> = BTreeMap::new();
+        let needed: BTreeSet<String> = ["RSCLAW_API_KEY".to_string()].into_iter().collect();
+        assert!(vars_to_capture(&shell, &file, &needed).is_empty());
+    }
 
     #[test]
     fn scan_placeholders_collects_all_unique() {
