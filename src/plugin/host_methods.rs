@@ -1,7 +1,7 @@
 //! Host method registry — the dispatcher for plugin-initiated requests.
 //!
-//! When a shell-bridge plugin writes a JSON-RPC request with a negative id
-//! to its stdout, the reader task in `shell_bridge.rs` calls
+//! When a JS-runtime plugin writes a JSON-RPC request with a negative id
+//! to its stdout, the reader task in `js_runtime.rs` calls
 //! `HostMethodRegistry::handle(method, params)`. Each method below mirrors a
 //! host function exposed to WASM plugins via the host-runtime / host-browser /
 //! host-storage WIT interfaces, so a Node plugin and a wasm plugin see the
@@ -76,7 +76,7 @@ impl HostMethodRegistry {
         let target_id = ctx["target_id"].as_str().unwrap_or("").to_owned();
         let channel = ctx["channel"].as_str().unwrap_or("").to_owned();
 
-        tracing::info!(target: "shell_plugin_notify", "{text}");
+        tracing::info!(target: "js_plugin_notify", "{text}");
 
         let Some(tx) = &self.notify_tx else {
             warn!(
@@ -122,7 +122,7 @@ impl HostMethodRegistry {
         let target_id = ctx["target_id"].as_str().unwrap_or("").to_owned();
         let channel = ctx["channel"].as_str().unwrap_or("").to_owned();
 
-        tracing::info!(target: "shell_plugin_notify", "{text}");
+        tracing::info!(target: "js_plugin_notify", "{text}");
 
         let Some(tx) = &self.notify_tx else {
             warn!(
@@ -157,10 +157,10 @@ impl HostMethodRegistry {
         let level = params["level"].as_str().unwrap_or("info");
         let text = params["text"].as_str().unwrap_or("");
         match level {
-            "error" => tracing::error!(target: "shell_plugin", plugin_log = true, "{text}"),
-            "warn" => tracing::warn!(target: "shell_plugin",  plugin_log = true, "{text}"),
-            "debug" => tracing::debug!(target: "shell_plugin", plugin_log = true, "{text}"),
-            _ => tracing::info!(target: "shell_plugin",  plugin_log = true, "{text}"),
+            "error" => tracing::error!(target: "js_plugin", plugin_log = true, "{text}"),
+            "warn" => tracing::warn!(target: "js_plugin",  plugin_log = true, "{text}"),
+            "debug" => tracing::debug!(target: "js_plugin", plugin_log = true, "{text}"),
+            _ => tracing::info!(target: "js_plugin",  plugin_log = true, "{text}"),
         }
         Ok(Value::Null)
     }
@@ -178,7 +178,7 @@ impl HostMethodRegistry {
         let mut guard = self.browser.lock().await;
 
         if guard.is_none() {
-            tracing::info!("shell plugin: auto-starting browser session");
+            tracing::info!("JS plugin: auto-starting browser session");
             let chrome_path = crate::agent::platform::ensure_chrome()
                 .await
                 .map_err(|e| anyhow::anyhow!("failed to obtain Chrome: {e:#}"))?;
@@ -199,7 +199,7 @@ impl HostMethodRegistry {
     /// wasm plugins see results.
     ///
     /// Mirrors `wasm_runtime.rs::HostState::browser_action`. The two runtimes
-    /// MUST share this code path so a shell plugin and a wasm plugin see
+    /// MUST share this code path so a JS plugin and a wasm plugin see
     /// byte-identical browser results — except `screenshot`, which uses
     /// `browser_call_raw` directly to keep the auto-saved `image_path`.
     async fn browser_call(&self, action: &str, args: Value) -> Result<Value> {
@@ -302,7 +302,7 @@ impl HostMethodRegistry {
     /// Capture a viewport screenshot of the current page in the shared browser session.
     ///
     /// Returns the full JSON response `{image, image_path, mime}` (instead of
-    /// the single-field extraction `browser_call` does), so shell plugins can
+    /// the single-field extraction `browser_call` does), so JS plugins can
     /// notify the user with the on-disk path the host auto-saved to without
     /// re-decoding the base64 data URI. wasm plugins go through `browser_call`
     /// and only see `image`; the two surfaces deliberately differ here.

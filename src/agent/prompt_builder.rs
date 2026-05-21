@@ -465,7 +465,7 @@ pub fn build_user_system(
     ws_ctx: &WorkspaceContext,
     skills: &SkillRegistry,
     wasm_plugins: &[WasmPlugin],
-    shell_plugins: Option<&PluginRegistry>,
+    js_plugins: Option<&PluginRegistry>,
     config: &crate::config::schema::Config,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
@@ -534,7 +534,7 @@ pub fn build_user_system(
 
     // ## Installed Plugins — rendered via the existing helper. Sort
     // happens inside that helper, byte-stable for given plugin set.
-    if let Some(plugins_block) = super::tools_builder::build_plugins_system(wasm_plugins, shell_plugins) {
+    if let Some(plugins_block) = super::tools_builder::build_plugins_system(wasm_plugins, js_plugins) {
         parts.push(plugins_block);
     }
 
@@ -593,11 +593,11 @@ pub(crate) fn build_system_prompt(
     ws_ctx: &WorkspaceContext,
     skills: &SkillRegistry,
     wasm_plugins: &[WasmPlugin],
-    shell_plugins: Option<&PluginRegistry>,
+    js_plugins: Option<&PluginRegistry>,
     config: &crate::config::schema::Config,
 ) -> String {
     let prefix = build_shared_system_prefix();
-    let suffix = build_user_system(ws_ctx, skills, wasm_plugins, shell_plugins, config);
+    let suffix = build_user_system(ws_ctx, skills, wasm_plugins, js_plugins, config);
     if suffix.is_empty() {
         prefix
     } else {

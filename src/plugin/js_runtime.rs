@@ -1,4 +1,4 @@
-//! Shell Bridge — runs TypeScript/JavaScript plugins as subprocesses
+//! JS runtime — runs TypeScript/JavaScript plugins as subprocesses
 //! communicating via JSON-RPC over stdin/stdout.
 //!
 //! Protocol:

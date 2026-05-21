@@ -31,12 +31,12 @@ pub(crate) fn build_wasm_tool_defs(plugins: &[WasmPlugin]) -> Vec<ToolDef> {
 }
 
 /// Build a `Vec<ToolDef>` for every tool exported by every loaded
-/// shell-bridge plugin. Tool names are `<plugin>.<tool>`, mirroring the
+/// JS-runtime plugin. Tool names are `<plugin>.<tool>`, mirroring the
 /// wasm-plugin convention so the dispatcher in `runtime.rs` can route
 /// either with the same `split_once('.')` pattern.
 pub(crate) fn build_shell_tool_defs(plugins: &PluginRegistry) -> Vec<ToolDef> {
     plugins
-        .shell_plugins_iter()
+        .js_plugins_iter()
         .flat_map(|(plugin_name, plugin)| {
             let plugin_name = plugin_name.clone();
             plugin.manifest.tools.iter().map(move |t| ToolDef {
@@ -58,12 +58,12 @@ pub(crate) fn build_shell_tool_defs(plugins: &PluginRegistry) -> Vec<ToolDef> {
 /// generic browser-automation flow. Sorted by name for byte-stable output.
 pub(crate) fn build_plugins_system(
     wasm_plugins: &[WasmPlugin],
-    shell_plugins: Option<&PluginRegistry>,
+    js_plugins: Option<&PluginRegistry>,
 ) -> Option<String> {
-    let no_shell = shell_plugins
-        .map(|r| r.shell_plugins_iter().next().is_none())
+    let no_js = js_plugins
+        .map(|r| r.js_plugins_iter().next().is_none())
         .unwrap_or(true);
-    if wasm_plugins.is_empty() && no_shell {
+    if wasm_plugins.is_empty() && no_js {
         return None;
     }
 
@@ -88,8 +88,8 @@ pub(crate) fn build_plugins_system(
         })
         .collect();
 
-    if let Some(reg) = shell_plugins {
-        for (plugin_name, plugin) in reg.shell_plugins_iter() {
+    if let Some(reg) = js_plugins {
+        for (plugin_name, plugin) in reg.js_plugins_iter() {
             let tools_lines: Vec<String> = plugin
                 .manifest
                 .tools

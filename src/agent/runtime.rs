@@ -6231,7 +6231,7 @@ impl AgentRuntime {
             //        and we hand it the per-call ctx so it can dispatch host
             //        methods (notify, log, etc.) on the active conversation.
             if let Some(reg) = self.plugins.as_ref()
-                && let Some(plugin) = reg.get_shell(plugin_name)
+                && let Some(plugin) = reg.get_js(plugin_name)
             {
                 let target_id = if !ctx.chat_id.is_empty() {
                     ctx.chat_id.clone()

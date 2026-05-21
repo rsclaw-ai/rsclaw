@@ -1029,10 +1029,10 @@ async fn execute_tool(
                 }
             }
         }
-        // Fall through to shell plugins. The REST endpoint has no IM session
+        // Fall through to JS plugins. The REST endpoint has no IM session
         // context, so _ctx fields are empty — host.notify will return
         // logged_only rather than dispatching.
-        if let Some(plugin) = state.plugins.get_shell(plugin_name) {
+        if let Some(plugin) = state.plugins.get_js(plugin_name) {
             let params = serde_json::json!({
                 "tool": tool_inner,
                 "args": args,

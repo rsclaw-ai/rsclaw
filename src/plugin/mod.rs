@@ -4,19 +4,19 @@
 //! `plugin.json5` (or legacy `openclaw.plugin.json`) manifest.
 //!
 //! Supported runtimes:
-//!   - `node` / `bun` / `deno` — Shell Bridge (subprocess JSON-RPC)
+//!   - `node` / `bun` / `deno` — JS runtime (subprocess JSON-RPC)
 //!   - `wasm`                   — wasmtime component model
 //!
 //! Public API:
 //!   - `PluginManifest` / `load_manifest()` / `scan_plugins()`
 //!   - `SlotRegistry`   — memory + context_engine slots
-//!   - `Plugin`         — live shell plugin handle (spawned subprocess)
+//!   - `Plugin`         — live JS plugin handle (spawned subprocess)
 //!   - `WasmPlugin`     — live WASM plugin handle (wasmtime)
 //!   - `load_all_plugins()` — unified loader that dispatches by runtime
 
 pub mod host_methods;
 pub mod manifest;
-pub mod shell_bridge;
+pub mod js_runtime;
 pub mod slots;
 pub mod wasm_runtime;
 
@@ -27,7 +27,7 @@ use anyhow::Result;
 pub use manifest::{
     LEGACY_MANIFEST_FILE, MANIFEST_FILE, PluginManifest, PluginToolDef, load_manifest, scan_plugins,
 };
-pub use shell_bridge::Plugin;
+pub use js_runtime::Plugin;
 pub use slots::{ContextEngineSlot, MemoryItem, MemorySlot, MemoryStoreSlot, SlotRegistry};
 use tracing::{info, warn};
 pub use wasm_runtime::{WasmPlugin, WasmToolDef, load_wasm_plugin};
@@ -56,16 +56,16 @@ impl PluginRegistry {
         }
     }
 
-    /// Look up a shell-bridge plugin by name. Returns None if no such plugin
+    /// Look up a JS-runtime plugin by name. Returns None if no such plugin
     /// is loaded or the plugin uses the wasm runtime.
-    pub fn get_shell(&self, name: &str) -> Option<&Plugin> {
+    pub fn get_js(&self, name: &str) -> Option<&Plugin> {
         self.plugins.get(name)
     }
 
-    /// Iterate over all loaded shell-bridge plugins as (name, plugin) pairs.
+    /// Iterate over all loaded JS-runtime plugins as (name, plugin) pairs.
     /// Used by the agent runtime to build LLM tool definitions and the
     /// plugins system message.
-    pub fn shell_plugins_iter(&self) -> impl Iterator<Item = (&String, &Plugin)> {
+    pub fn js_plugins_iter(&self) -> impl Iterator<Item = (&String, &Plugin)> {
         self.plugins.iter()
     }
 
@@ -87,7 +87,7 @@ impl PluginRegistry {
         self.plugins.is_empty() && self.wasm_plugins.is_empty()
     }
 
-    /// Number of shell plugins.
+    /// Number of JS plugins.
     pub fn js_count(&self) -> usize {
         self.plugins.len()
     }
@@ -195,10 +195,10 @@ pub async fn load_all_plugins(
                 }
             }
         } else {
-            // Shell runtime (subprocess + JSON-RPC bridge: node/bun/deno)
+            // JS runtime (subprocess + JSON-RPC bridge: node/bun/deno)
             match Plugin::spawn(manifest, host_dispatch.clone()).await {
                 Ok(plugin) => {
-                    info!(plugin = %plugin.manifest.name, "shell plugin started");
+                    info!(plugin = %plugin.manifest.name, "JS plugin started");
                     registry
                         .plugins
                         .insert(plugin.manifest.name.clone(), plugin);
