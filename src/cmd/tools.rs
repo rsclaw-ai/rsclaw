@@ -451,6 +451,9 @@ fn resolve_download_url(
             };
             Some(format!("{MIRROR_BASE}/node/{ver}/{filename}"))
         }
+        // bun is fully manifest-driven: the mirror writes explicit
+        // `bun.downloads.{platform}` URLs (handled by the first branch above),
+        // so there is no built-in convention arm here.
         "python" => {
             let ver = section.get("version")?.as_str()?;
             let filename = match platform {

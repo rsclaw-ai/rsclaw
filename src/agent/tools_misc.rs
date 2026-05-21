@@ -680,7 +680,7 @@ $synth.Speak('{}')
                 "node" => which::which("node").is_ok()
                     || crate::config::loader::base_dir().join("tools/node/bin/node").exists(),
                 "bun" => which::which("bun").is_ok()
-                    || crate::config::loader::base_dir().join("tools/bun/bun").exists(),
+                    || crate::config::loader::base_dir().join("tools/bun/bin/bun").exists(),
                 "python" => which::which("python3").is_ok()
                     || crate::config::loader::base_dir().join("tools/python/bin/python3").exists(),
                 _ => true, // skip verification for unknown tools

@@ -338,27 +338,22 @@ fn resolve_runtime(runtime: &str) -> Result<String> {
 
     let base = crate::config::loader::base_dir();
 
-    // 1. Check ~/.rsclaw/tools/ first. node lands in tools/node/bin/<rt>;
-    //    bun/deno extract as a bare binary to tools/<rt>/<rt> (or tools/<rt>/bin/).
+    // 1. Check ~/.rsclaw/tools/<rt>/bin/<rt> first — the bundled-runtime layout
+    //    from `rsclaw tools install` (node: tools/node/bin/node;
+    //    bun: tools/bun/bin/bun). Path keys off the runtime name, never hardcoded.
     for candidate in &candidates {
-        let probes = [
-            base.join(format!("tools/node/bin/{candidate}")),
-            base.join(format!("tools/{candidate}/{candidate}")),
-            base.join(format!("tools/{candidate}/bin/{candidate}")),
-        ];
-        for bin in probes {
-            if bin.exists() {
-                return Ok(bin.to_string_lossy().to_string());
-            }
+        let bin = base.join(format!("tools/{candidate}/bin/{candidate}"));
+        if bin.exists() {
+            return Ok(bin.to_string_lossy().to_string());
         }
     }
     #[cfg(target_os = "windows")]
     {
         for candidate in &candidates {
+            // bin/ layout first; node on Windows is flat (tools/node/node.exe).
             let probes = [
-                base.join(format!("tools/node/{candidate}.exe")),
-                base.join(format!("tools/{candidate}/{candidate}.exe")),
                 base.join(format!("tools/{candidate}/bin/{candidate}.exe")),
+                base.join(format!("tools/{candidate}/{candidate}.exe")),
             ];
             for bin in probes {
                 if bin.exists() {
