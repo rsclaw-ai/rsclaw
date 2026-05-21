@@ -4154,7 +4154,12 @@ impl AgentRuntime {
             }
             let effective_system = system_prompt.to_owned();
 
-            // Resolve max_tokens with priority: config > built-in defaults > 15000
+            // Resolve max_tokens with priority: config > built-in defaults > 0.
+            // Sentinel semantics: 0 (or unset) means "no client-side cap" — we
+            // omit max_tokens on the wire and let the server apply its own
+            // model/tier ceiling. Only a positive value is sent. This is the
+            // single normalization point, so every provider downstream receives
+            // either None (omitted) or a positive number, never 0.
             let (provider_name, model_id) =
                 crate::provider::registry::ProviderRegistry::parse_model(&model);
             let configured_max_tokens = {
@@ -4182,7 +4187,11 @@ impl AgentRuntime {
                     .and_then(|m| m.max_tokens)
                     .map(|v| v as u32);
 
-                from_agent.or(from_defaults).or(from_provider).or(Some(15_000))
+                from_agent
+                    .or(from_defaults)
+                    .or(from_provider)
+                    .or(Some(0))
+                    .filter(|&m| m > 0)
             };
 
             if let Some(configured) = configured_max_tokens {
