@@ -86,7 +86,23 @@ pub async fn cmd_skills(sub: SkillsCommand) -> Result<()> {
             } else {
                 print!("Installing '{}'... ", cyan(&name));
             }
-            let locked = client.install_with_fallback(&name, &global_dir).await?;
+            let locked = match client.install_with_fallback(&name, &global_dir).await {
+                Ok(l) => l,
+                Err(e) => {
+                    // A failed install can leave an empty skill dir behind
+                    // (the install paths create_dir_all before downloading).
+                    // Remove it if it's empty so a retry / list stays clean.
+                    let d = global_dir.join(dir_name);
+                    let empty = std::fs::read_dir(&d)
+                        .map(|mut it| it.next().is_none())
+                        .unwrap_or(false);
+                    if empty {
+                        let _ = std::fs::remove_dir_all(&d);
+                    }
+                    println!("{}", red("failed"));
+                    return Err(e);
+                }
+            };
             if already {
                 println!("{}", dim(&format!("already up to date (v{})", locked.version)));
             } else {
