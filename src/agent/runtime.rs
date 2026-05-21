@@ -6074,6 +6074,7 @@ impl AgentRuntime {
             "read_file" | "read" => return self.tool_read(args).await,
             "read_artifact" => return self.tool_read_artifact(ctx, args).await,
             "read_session_archive" => return self.tool_read_session_archive(ctx, args).await,
+            "knowledge_base" | "kb_search" => return self.tool_knowledge_base(args).await,
             "write_file" | "write" => return self.tool_write(args).await,
             "edit_file" | "edit" => return self.tool_edit(args).await,
             "shell" | "execute_command" | "exec" => return self.tool_exec(ctx, _id, args).await,
@@ -6471,6 +6472,60 @@ impl AgentRuntime {
     // -----------------------------------------------------------------------
     // Built-in tool implementations
     // -----------------------------------------------------------------------
+
+    /// `knowledge_base` tool — hybrid search over the user's KB, returning
+    /// chunks with their source title for citation. Reads the process-global
+    /// KnowledgeService (the single instance opened at gateway startup; we do
+    /// NOT re-open redb here — it is exclusively locked).
+    pub(crate) async fn tool_knowledge_base(&self, args: Value) -> Result<Value> {
+        // Trim query defensively (v1 tool-call protocol can leak a trailing
+        // newline into string args).
+        let query = args["query"].as_str().unwrap_or("").trim().to_owned();
+        if query.is_empty() {
+            return Ok(json!({"results": [], "note": "empty query"}));
+        }
+        let collection_ids: Vec<String> = args["collection_ids"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.trim().to_owned()))
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let top_k = args["top_k"].as_u64().unwrap_or(5).clamp(1, 50) as usize;
+
+        let Some(kb) = crate::kb::global_service() else {
+            return Ok(json!({"results": [], "note": "knowledge base not available"}));
+        };
+
+        // KnowledgeService::search is synchronous and CPU-heavy (embed + HNSW +
+        // tantivy); run it off the async executor so it doesn't stall the turn.
+        let hits = tokio::task::spawn_blocking(move || {
+            kb.search(&query, &collection_ids, top_k, 0.0)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("knowledge_base search task failed: {e}"))?
+        .map_err(|e| anyhow::anyhow!("knowledge_base search failed: {e}"))?;
+
+        let results: Vec<Value> = hits
+            .into_iter()
+            .map(|h| {
+                json!({
+                    "doc_id": h.doc_id,
+                    "collection": h.collection_name,
+                    "source_title": h.source_title,
+                    "text": h.chunk_text,
+                    "score": h.score,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "count": results.len(),
+            "results": results,
+            "note": if results.is_empty() { "no matching content in the knowledge base — do NOT fabricate a citation" } else { "" },
+        }))
+    }
 
     pub(crate) async fn tool_memory_search(&self, args: Value) -> Result<Value> {
         let query = args["query"].as_str().unwrap_or("").to_owned();

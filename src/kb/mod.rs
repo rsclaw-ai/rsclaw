@@ -76,3 +76,26 @@ pub use pipeline::{ingest_canonicalized, IngestInput, IngestOutput};
 pub use worker::{DefaultDispatcher, HandlerCtx, JobHandler, WorkerConfig, WorkerPool};
 pub use index::{HnswCache, KbIndex, TantivyIndex};
 pub use service::{KnowledgeError, KnowledgeService};
+
+// ---------------------------------------------------------------------------
+// Process-global handle to the live KnowledgeService.
+//
+// The gateway opens exactly ONE KnowledgeService at startup (redb is
+// single-writer / exclusively locked — a second open would fail, cf. the
+// /memory live-store reuse fix). Agent tools need that same instance without
+// threading an Arc through the spawner + runtime constructors, so startup
+// registers it here and the `knowledge_base` tool reads it. None when KB
+// failed to open (gateway stays up; the tool reports unavailable).
+// ---------------------------------------------------------------------------
+static GLOBAL_SERVICE: std::sync::OnceLock<std::sync::Arc<KnowledgeService>> =
+    std::sync::OnceLock::new();
+
+/// Register the live KnowledgeService. Called once by gateway startup.
+pub fn set_global_service(svc: std::sync::Arc<KnowledgeService>) {
+    let _ = GLOBAL_SERVICE.set(svc);
+}
+
+/// Reach the live KnowledgeService, if the gateway opened one.
+pub fn global_service() -> Option<std::sync::Arc<KnowledgeService>> {
+    GLOBAL_SERVICE.get().cloned()
+}

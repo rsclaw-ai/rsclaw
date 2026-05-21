@@ -373,6 +373,7 @@ fn build_shared_system_prefix_uncached() -> String {
          - Install tools (python, node, ffmpeg, chrome, etc.): `install_tool`. Do NOT download manually.\n\
          - Memory: use `memory` to recall prior conversations. Search memory at session start if user references prior work.\n\
          - Save corrected/complete info to memory immediately so it survives compaction.\n\
+         - Knowledge base: when the user asks about THEIR own material (uploaded docs, PDFs, URLs, files), use `knowledge_base` to search it and CITE the returned source_title. Prefer it over `web_search` for the user's material; if it returns nothing, say so — never fabricate a citation. (`memory` = what you learned; `knowledge_base` = the user's authoritative corpus.)\n\
          \n\
          ### GUI / Desktop Automation (computer_use)\n\
          For any GUI or desktop automation task (WeChat, Finder, Safari, etc.):\n\
@@ -625,7 +626,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     // (dynamic_prefix omitted) meant they were NEVER sent to the model —
     // so the model could never call read_session_archive despite the
     // summary/system-prompt telling it to.
-    "read_session_archive","read_artifact",
+    "read_session_archive","read_artifact","knowledge_base",
     // A2A-only tool, but unconditionally registered in build_tool_list and
     // byte-identical across clients — same builtin class. Errors gracefully
     // if called on a non-A2A turn.

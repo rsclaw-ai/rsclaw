@@ -721,6 +721,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         Ok(svc) => {
             let svc = Arc::new(svc);
             svc.spawn_worker();
+            // Register the single live instance so agent tools (knowledge_base)
+            // reach it without re-opening redb (which is exclusively locked).
+            crate::kb::set_global_service(Arc::clone(&svc));
             Some(svc)
         }
         Err(e) => {

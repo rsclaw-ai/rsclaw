@@ -518,6 +518,36 @@ pub fn build_tool_list(
         }),
     });
     tools.push(ToolDef {
+        name: "knowledge_base".to_owned(),
+        description: "Search the user's KNOWLEDGE BASE — documents, PDFs, web pages and \
+            files the user explicitly added for reference. Returns the most relevant \
+            chunks WITH their source title, so you can cite where an answer came from.\n\
+            \n\
+            Use this when the user asks about THEIR material (\"what does my contract \
+            say\", \"per the spec I uploaded\", \"summarize the docs\"), or whenever a \
+            factual answer should be grounded in and cited from their corpus.\n\
+            \n\
+            How it differs from other tools:\n\
+            - `memory` = things YOU learned about the user/past sessions (self-authored, \
+              may decay, no citation). The knowledge base is user-curated, authoritative, \
+              and citable.\n\
+            - `web_search` = the live public web. The knowledge base is the user's own \
+              private/local material.\n\
+            \n\
+            Prefer the knowledge base over web_search when the question is about content \
+            the user gave you. Always cite the returned `source_title`. If it returns no \
+            hits, say so — do NOT fabricate a citation.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Natural-language search query."},
+                "collection_ids": {"type": "array", "items": {"type": "string"}, "description": "Optional: restrict to specific collection ids. Omit to search all."},
+                "top_k": {"type": "integer", "description": "Max hits to return. Default 5."}
+            },
+            "required": ["query"]
+        }),
+    });
+    tools.push(ToolDef {
         name: "write_file".to_owned(),
         description: "Write/create a file (full-overwrite). Use this for ALL file creation and full \
             rewrites — do NOT use shell with notepad, echo, or any other editor/command to \
