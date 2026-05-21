@@ -26,9 +26,12 @@ import {
   createCollection,
   deleteCollection,
   deleteDoc,
+  getDoc,
   getDocContent,
+  getEmbedders,
   getMaxDocBytes,
   getStats,
+  KbEmbedder,
   listCollections,
   listDocs,
   patchCollection,
@@ -135,6 +138,7 @@ export function KnowledgePage() {
   const [docsLoading, setDocsLoading] = useState(false);
 
   const [query, setQuery] = useState("");
+  const [searchScope, setSearchScope] = useState<"current" | "all">("all");
   const [searching, setSearching] = useState(false);
   const [hits, setHits] = useState<KbSearchHit[]>([]);
   const [queryMs, setQueryMs] = useState(0);
@@ -328,7 +332,14 @@ export function KnowledgePage() {
     }
     setSearching(true);
     try {
-      const r = await search({ query: q, topK: 20 });
+      // "current" scope only applies when a collection is actually
+      // selected — otherwise fall through to global search so the user
+      // still gets results.
+      const scoped =
+        searchScope === "current" && activeCollectionId
+          ? { collectionIds: [activeCollectionId] }
+          : {};
+      const r = await search({ query: q, topK: 20, ...scoped });
       setHits(r.hits);
       setQueryMs(r.queryMs);
     } catch (e: any) {
@@ -336,7 +347,7 @@ export function KnowledgePage() {
       setHits([]);
     }
     setSearching(false);
-  }, [query, zh]);
+  }, [query, searchScope, activeCollectionId, zh]);
 
   // ── Upload entries ───────────────────────────────────────────────
   const handleFilePick = async (files: FileList | null) => {
@@ -370,7 +381,7 @@ export function KnowledgePage() {
       <div style={fullPageMsg}>
         <div style={{ fontSize: 44, opacity: 0.5 }}>📚</div>
         <div style={{ fontSize: 16, fontWeight: 600, color: V2.t0, marginTop: 12 }}>
-          {zh ? "知识库未启用" : "Knowledge base not available"}
+          {zh ? "知识库不可用" : "Knowledge base unavailable"}
         </div>
         <div
           style={{
@@ -383,8 +394,8 @@ export function KnowledgePage() {
           }}
         >
           {zh
-            ? "Gateway 启动时未能打开 ~/.rsclaw/kb/ 存储。常见原因：磁盘已满 / 文件权限错误 / 索引文件损坏。请检查 gateway 日志后重启。"
-            : "Gateway failed to open the KB store at ~/.rsclaw/kb/ during startup. Common causes: disk full, permission error, corrupt index. Check gateway logs and restart."}
+            ? "Gateway 启动时未能打开 ~/.rsclaw/kb/ 存储（这是错误态，并非功能开关）。常见原因：磁盘已满 / 文件权限错误 / 索引文件损坏。请检查 gateway 日志后重启。"
+            : "Gateway failed to open the KB store at ~/.rsclaw/kb/ during startup (this is an error state, not a feature toggle). Common causes: disk full, permission error, corrupt index. Check gateway logs and restart."}
         </div>
         <button onClick={() => void refreshStats()} style={btnPrimary}>
           {zh ? "重试" : "Retry"}
@@ -441,7 +452,7 @@ export function KnowledgePage() {
 
       {/* Search bar */}
       <div style={{ padding: "16px 28px 0", flexShrink: 0 }}>
-        <div style={{ display: "flex", gap: 8 }}>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
@@ -452,6 +463,30 @@ export function KnowledgePage() {
             placeholder={zh ? "语义搜索（Enter 提交，Esc 清空）..." : "Semantic search (Enter, Esc to clear)..."}
             style={{ ...fInput, flex: 1, padding: "9px 14px", fontSize: 12 }}
           />
+          {/* Scope segmented switch. Disabled half = no collection selected. */}
+          <div
+            style={{
+              display: "flex",
+              gap: 2,
+              padding: 2,
+              borderRadius: 7,
+              background: V2.bg2,
+              border: `1px solid ${V2.bd2}`,
+            }}
+          >
+            <ScopeSeg
+              active={searchScope === "current"}
+              disabled={!activeCollectionId}
+              label={zh ? "本集合" : "Current"}
+              onClick={() => setSearchScope("current")}
+            />
+            <ScopeSeg
+              active={searchScope === "all"}
+              disabled={false}
+              label={zh ? "全部" : "All"}
+              onClick={() => setSearchScope("all")}
+            />
+          </div>
           {showingHits && (
             <button onClick={() => setQuery("")} style={btnSubtle}>
               {zh ? "清空" : "Clear"}
@@ -464,6 +499,9 @@ export function KnowledgePage() {
         {showingHits && (
           <div style={{ fontSize: 10, color: V2.t3, fontFamily: V2.mono, marginTop: 6 }}>
             {hits.length} {zh ? "个结果" : "hits"} · {queryMs}ms
+            {searchScope === "current" && activeCollectionId && activeCol && (
+              <> · {zh ? "限于" : "scoped to"} {activeCol.name}</>
+            )}
           </div>
         )}
       </div>
@@ -568,7 +606,31 @@ export function KnowledgePage() {
           }}
         >
           {showingHits ? (
-            <HitsPane hits={hits} zh={zh} onPick={(_h) => undefined} />
+            <HitsPane
+              hits={hits}
+              zh={zh}
+              onPick={async (h) => {
+                if (!h.collectionId) {
+                  toast.error(zh ? "该命中无所属知识库，无法打开" : "Hit has no collection — cannot open");
+                  return;
+                }
+                // Switch active collection if needed. We do this *before*
+                // fetching so the doc list refreshes alongside the modal.
+                if (h.collectionId !== activeCollectionId) {
+                  setActiveCollectionId(h.collectionId);
+                }
+                try {
+                  const d = await getDoc(h.collectionId, h.docId);
+                  setDetailDoc(d);
+                  // Clear query so closing the modal returns to doc list,
+                  // not the still-active hits view.
+                  setQuery("");
+                  setHits([]);
+                } catch (e: any) {
+                  toast.fromError(zh ? "打开文档失败" : "Failed to open doc", e);
+                }
+              }}
+            />
           ) : !activeCol ? (
             <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: V2.t3, fontSize: 12 }}>
               {zh ? "请先选择或创建一个知识库" : "Select or create a collection"}
@@ -830,6 +892,41 @@ export function KnowledgePage() {
 // Subcomponents
 // ─────────────────────────────────────────────────────────────────
 
+function ScopeSeg({
+  active,
+  disabled,
+  label,
+  onClick,
+}: {
+  active: boolean;
+  disabled: boolean;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={() => {
+        if (!disabled) onClick();
+      }}
+      disabled={disabled}
+      title={disabled ? "请先选择一个知识库 / Select a collection first" : undefined}
+      style={{
+        padding: "5px 12px",
+        fontSize: 11,
+        fontFamily: V2.mono,
+        background: active ? V2.bg4 : "transparent",
+        color: disabled ? V2.t3 : active ? V2.t0 : V2.t1,
+        border: `1px solid ${active ? V2.bd2 : "transparent"}`,
+        borderRadius: 5,
+        cursor: disabled ? "not-allowed" : "pointer",
+        whiteSpace: "nowrap",
+      }}
+    >
+      {label}
+    </button>
+  );
+}
+
 function StatPill({ label, value }: { label: string; value: string }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end" }}>
@@ -913,6 +1010,29 @@ function NewCollectionModal({
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [busy, setBusy] = useState(false);
+
+  // Embedder choice: empty string = use backend default (most common path).
+  // Non-downloaded embedders are rendered disabled in the dropdown so the
+  // user can see what they could install but can't pick one that will
+  // immediately fail at create-time.
+  const [embedders, setEmbedders] = useState<KbEmbedder[]>([]);
+  const [defaultEmbedder, setDefaultEmbedder] = useState<string | null>(null);
+  const [embedder, setEmbedder] = useState<string>("");
+  const [embedLoading, setEmbedLoading] = useState(true);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await getEmbedders();
+        setEmbedders(r.available || []);
+        setDefaultEmbedder(r.default);
+      } catch {
+        /* keep defaults */
+      }
+      setEmbedLoading(false);
+    })();
+  }, []);
+
   return (
     <ModalShell onClose={onClose} title={zh ? "新建知识库" : "New Collection"}>
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
@@ -923,6 +1043,35 @@ function NewCollectionModal({
           value={description}
           onChange={(e) => setDescription(e.target.value)}
         />
+        <div>
+          <div style={{ fontSize: 11, color: V2.t1, marginBottom: 6 }}>
+            {zh ? "嵌入模型" : "Embedder"}
+          </div>
+          <select
+            style={{ ...fInput, fontFamily: "inherit", width: "100%" }}
+            value={embedder}
+            disabled={embedLoading}
+            onChange={(e) => setEmbedder(e.target.value)}
+          >
+            <option value="">
+              {defaultEmbedder
+                ? `${zh ? "默认" : "Default"}: ${defaultEmbedder}`
+                : zh
+                  ? "默认（后端决定）"
+                  : "Default (backend-chosen)"}
+            </option>
+            {embedders.map((em) => (
+              <option key={em.id} value={em.id} disabled={!em.downloaded}>
+                {em.label} · {em.dim}d{!em.downloaded ? (zh ? "（未下载）" : " (not downloaded)") : ""}
+              </option>
+            ))}
+          </select>
+          <div style={{ fontSize: 10, color: V2.t3, marginTop: 4, lineHeight: 1.5 }}>
+            {zh
+              ? "灰色选项尚未下载，需先在「智能体管理 → 模型」处获取。建好之后不可改，要换得重建。"
+              : "Greyed options aren't downloaded yet — fetch them from Agents → Models first. Cannot be changed after creation; recreate to switch."}
+          </div>
+        </div>
       </div>
       <div style={modalFooter}>
         <button onClick={onClose} style={btnSubtle}>{zh ? "取消" : "Cancel"}</button>
@@ -934,6 +1083,7 @@ function NewCollectionModal({
               const c = await createCollection({
                 name: name.trim(),
                 description: description.trim() || undefined,
+                embedModel: embedder || undefined,
               });
               onCreated(c);
             } catch (e: any) {
