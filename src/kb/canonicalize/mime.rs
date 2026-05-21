@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::kb::canonicalize::{
+    email::{EmlCanonicalizer, MboxCanonicalizer, EML_MIME, MBOX_MIME},
     html::HtmlCanonicalizer, md::MdCanonicalizer,
     ooxml::{
         DocxCanonicalizer, PptxCanonicalizer, XlsxCanonicalizer, DOCX_MIME, PPTX_MIME, XLSX_MIME,
@@ -29,6 +30,8 @@ pub fn detect_mime(bytes: &[u8], filename_hint: Option<&str>) -> String {
             "docx" => return DOCX_MIME.into(),
             "xlsx" => return XLSX_MIME.into(),
             "pptx" => return PPTX_MIME.into(),
+            "eml" => return EML_MIME.into(),
+            "mbox" => return MBOX_MIME.into(),
             _ => {}
         }
     }
@@ -54,6 +57,8 @@ pub fn canonicalize_by_mime(
         &DocxCanonicalizer,
         &XlsxCanonicalizer,
         &PptxCanonicalizer,
+        &EmlCanonicalizer,
+        &MboxCanonicalizer,
     ];
     for c in registered {
         if c.supports_mime(input.mime) {
@@ -81,6 +86,9 @@ mod tests {
         assert_eq!(detect_mime(b"PK\x03\x04", Some("report.docx")), DOCX_MIME);
         assert_eq!(detect_mime(b"PK\x03\x04", Some("sheet.xlsx")), XLSX_MIME);
         assert_eq!(detect_mime(b"PK\x03\x04", Some("deck.pptx")), PPTX_MIME);
+        // Email: routed by extension (RFC822 has no reliable magic).
+        assert_eq!(detect_mime(b"From: a@b\r\n", Some("msg.eml")), EML_MIME);
+        assert_eq!(detect_mime(b"From a@b\r\n", Some("inbox.mbox")), MBOX_MIME);
     }
 
     #[test]

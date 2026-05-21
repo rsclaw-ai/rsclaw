@@ -11,6 +11,7 @@ pub mod md;
 pub mod html;
 pub mod pdf;
 pub mod ooxml;
+pub mod email;
 pub mod mime;
 
 use crate::kb::model::{KbSourceKind, LogicalSourceId};

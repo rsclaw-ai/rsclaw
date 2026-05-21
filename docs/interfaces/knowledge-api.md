@@ -79,9 +79,12 @@ Two content types; both canonicalize on the backend:
 `{ "title": string, "text": string, "mime"?: string, "source"?: string }`
 (`source` is accepted but currently ignored.)
 
-**Multipart** (`multipart/form-data`) — binary (pdf/docx/xlsx/pptx):
-fields `title` (optional; falls back to the uploaded filename) and `file`.
-MIME is detected from the title/extension (mime is not trusted here).
+**Multipart** (`multipart/form-data`) — binary / file uploads
+(pdf, docx, xlsx, pptx, **eml**, **mbox**, plus txt/csv/md/html):
+fields `title` (display only; optional) and `file`. MIME is detected from
+the **uploaded filename's** extension (+ magic), never from the title.
+Email: `.eml` → one doc (From/To/Subject/Date header block + best body part,
+attachments listed by name); `.mbox` → one doc, each message a `---` section.
 
 Responses:
 - `202 { "id", "title", "status": "pending", "bytes" }` — indexing runs in
