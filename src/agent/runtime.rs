@@ -5829,7 +5829,7 @@ impl AgentRuntime {
                         // @fly-ai/flyai-cli` on line 60 — past the 3000-char
                         // cut — so the agent saw only `runtime: node` in
                         // frontmatter and made up `node index.js` instead).
-                        "skill_use" | "use_skill" => {
+                        "skill_use" => {
                             limits.and_then(|l| l.default).unwrap_or(60_000)
                         }
                         "read_file" | "read" => {
@@ -6115,7 +6115,7 @@ impl AgentRuntime {
             "write_file" | "write" => return self.tool_write(args).await,
             "edit_file" | "edit" => return self.tool_edit(args).await,
             "shell" | "execute_command" | "exec" => return self.tool_exec(ctx, _id, args).await,
-            "skill_use" | "use_skill" => return self.tool_use_skill(args),
+            "skill_use" => return self.tool_use_skill(args),
             "skill_list" => return self.tool_skill_list(),
             "skill_search" => return self.tool_skill_search(args).await,
             "skill_install" => return self.tool_skill_install(args).await,
@@ -6847,9 +6847,14 @@ impl AgentRuntime {
                     `rsclaw skills install <slug>`.",
             }));
         };
+        if entry.url.is_empty() {
+            return Ok(json!({ "error": format!("allowlist entry '{name}' has no download url") }));
+        }
         let dir = crate::config::loader::base_dir().join("skills");
         let client = crate::skill::clawhub::ClawhubClient::new();
-        match client.install_with_fallback(&name, &dir).await {
+        // Install ONLY from the audited allowlist URL (a direct https:// spec
+        // routes through install_from_url, NOT the public registry search).
+        match client.install_with_fallback(&entry.url, &dir).await {
             Ok(locked) => {
                 // Content pin: the downloaded SKILL.md must match the audited
                 // hash, so a registry can't swap content under an audited slug.

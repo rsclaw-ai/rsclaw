@@ -315,12 +315,12 @@ fn build_shared_system_prefix_uncached() -> String {
          ### How to invoke an installed skill\n\
          When a task matches a skill description listed under \"## Installed Skills\":\n\
          1. Pick the skill whose description matches the user's intent.\n\
-         2. Call the `use_skill` function tool with `name=<slug>` — returns \
+         2. Call the `skill_use` function tool with `name=<slug>` — returns \
          the full SKILL.md body.\n\
          3. If SKILL.md mentions `references/<command>.md`, read_file that too.\n\
          4. Then invoke the CLI with the exact flags from SKILL.md via \
          `shell`.\n\n\
-         Prefer `use_skill` over manually `read_file`-ing SKILL.md so the \
+         Prefer `skill_use` over manually `read_file`-ing SKILL.md so the \
          discovery shows up cleanly in tool history. Guessing CLI flags from \
          the description alone is the #1 failure mode."
             .to_owned(),

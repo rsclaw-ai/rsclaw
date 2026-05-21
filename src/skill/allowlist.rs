@@ -24,6 +24,11 @@ const ALLOWLIST_BASE: &str = "https://api.rsclaw.ai/v1/hub/allowlist";
 #[derive(Debug, Clone, Deserialize)]
 pub struct AllowEntry {
     pub slug: String,
+    /// Direct download URL for the audited package (zip). The agent installs
+    /// ONLY from here — never resolved through a public registry — so it gets
+    /// exactly the hub-hosted, audited bytes.
+    #[serde(default)]
+    pub url: String,
     #[serde(default)]
     pub registry: String,
     #[serde(default)]
@@ -232,6 +237,7 @@ mod tests {
     fn empty_sha_skips_content_check() {
         let e = AllowEntry {
             slug: "x".into(),
+            url: String::new(),
             registry: String::new(),
             version: String::new(),
             sha256: String::new(),
