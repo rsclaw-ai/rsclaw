@@ -5,6 +5,7 @@ import { useEffect, useState, useCallback, useRef } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import { ErrorBoundary } from "./error";
 import { MemoryPage } from "./memory-page";
+import { KnowledgePage } from "./knowledge-page";
 import { RsclawProviderCard } from "./rsclaw-provider-card";
 import { Popover } from "./ui-lib";
 import { toast } from "../lib/toast";
@@ -90,7 +91,7 @@ interface LogEntry {
   msg: string;
 }
 
-type PanelPage = "status" | "config" | "agents" | "cron" | "skills-plugins" | "workspace" | "doctor" | "pairing" | "wizard" | "memory";
+type PanelPage = "status" | "config" | "agents" | "cron" | "skills-plugins" | "workspace" | "doctor" | "pairing" | "wizard" | "memory" | "knowledge";
 
 // ── Toggle Component ────────────────────────────────────
 function Toggle(props: {
@@ -2406,7 +2407,7 @@ function TauriConfigPageInner() {
   const V = {
     bg0: "#080809", bg1: "#0f1013", bg2: "#141618", bg3: "#1a1c22", bg4: "#1f2126", bg5: "#252830",
     bd: "rgba(255,255,255,.055)", bd2: "rgba(255,255,255,.09)", bd3: "rgba(255,255,255,.14)",
-    t0: "#eceaf4", t1: "#9896a4", t2: "#4a4858", t3: "#2e2c3a",
+    t0: "#eceaf4", t1: "#9896a4", t2: "#7e7c8c", t3: "#5a5868",
     or: "#f97316", or2: "#fb923c", olo: "rgba(249,115,22,.09)", obrd: "rgba(249,115,22,.2)",
     green: "#2dd4a0", glo: "rgba(45,212,160,.07)", gbrd: "rgba(45,212,160,.18)",
     red: "#d95f5f", rlo: "rgba(217,95,95,.08)", rbrd: "rgba(217,95,95,.18)",
@@ -4541,7 +4542,7 @@ function CronTaskPage() {
     setShowForm(true);
   };
 
-  const V2 = { bg2: "#141618", bg3: "#1a1c22", bg4: "#1f2126", bg5: "#252830", bd: "rgba(255,255,255,.055)", bd2: "rgba(255,255,255,.09)", t0: "#eceaf4", t1: "#9896a4", t2: "#4a4858", t3: "#2e2c3a", or: "#f97316", olo: "rgba(249,115,22,.09)", obrd: "rgba(249,115,22,.2)", green: "#2dd4a0", gbrd: "rgba(45,212,160,.18)", red: "#d95f5f", rbrd: "rgba(217,95,95,.18)", mono: "'JetBrains Mono', monospace" };
+  const V2 = { bg2: "#141618", bg3: "#1a1c22", bg4: "#1f2126", bg5: "#252830", bd: "rgba(255,255,255,.055)", bd2: "rgba(255,255,255,.09)", t0: "#eceaf4", t1: "#9896a4", t2: "#7e7c8c", t3: "#5a5868", or: "#f97316", olo: "rgba(249,115,22,.09)", obrd: "rgba(249,115,22,.2)", green: "#2dd4a0", gbrd: "rgba(45,212,160,.18)", red: "#d95f5f", rbrd: "rgba(217,95,95,.18)", mono: "'JetBrains Mono', monospace" };
 
   return (
     <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
@@ -4886,7 +4887,7 @@ function SkillsTab() {
     setSearching(false);
   };
 
-  const V2 = { bg2: "#141618", bg3: "#1a1c22", bg4: "#1f2126", bg5: "#252830", bd: "rgba(255,255,255,.055)", bd2: "rgba(255,255,255,.09)", t0: "#eceaf4", t1: "#9896a4", t2: "#4a4858", t3: "#2e2c3a", or: "#f97316", olo: "rgba(249,115,22,.09)", obrd: "rgba(249,115,22,.2)", green: "#2dd4a0", glo: "rgba(45,212,160,.07)", gbrd: "rgba(45,212,160,.18)", red: "#d95f5f", rlo: "rgba(217,95,95,.08)", rbrd: "rgba(217,95,95,.18)", mono: "'JetBrains Mono', monospace" };
+  const V2 = { bg2: "#141618", bg3: "#1a1c22", bg4: "#1f2126", bg5: "#252830", bd: "rgba(255,255,255,.055)", bd2: "rgba(255,255,255,.09)", t0: "#eceaf4", t1: "#9896a4", t2: "#7e7c8c", t3: "#5a5868", or: "#f97316", olo: "rgba(249,115,22,.09)", obrd: "rgba(249,115,22,.2)", green: "#2dd4a0", glo: "rgba(45,212,160,.07)", gbrd: "rgba(45,212,160,.18)", red: "#d95f5f", rlo: "rgba(217,95,95,.08)", rbrd: "rgba(217,95,95,.18)", mono: "'JetBrains Mono', monospace" };
   const isInstalled = (name: string) => installed.some((s) => s.name === name);
   const filtered = RECOMMENDED_SKILLS.filter((s) => !search || s.name.includes(search.toLowerCase()));
 
@@ -5144,7 +5145,7 @@ function PluginsTab() {
     return () => { cancelled = true; off.forEach((f) => f()); };
   }, [doInstall]);
 
-  const V2 = { bg2: "#141618", bg3: "#1a1c22", bg4: "#1f2126", bg5: "#252830", bd: "rgba(255,255,255,.055)", bd2: "rgba(255,255,255,.09)", t0: "#eceaf4", t1: "#9896a4", t2: "#4a4858", t3: "#2e2c3a", or: "#f97316", olo: "rgba(249,115,22,.09)", obrd: "rgba(249,115,22,.2)", green: "#2dd4a0", glo: "rgba(45,212,160,.07)", gbrd: "rgba(45,212,160,.18)", red: "#d95f5f", rlo: "rgba(217,95,95,.08)", rbrd: "rgba(217,95,95,.18)", mono: "'JetBrains Mono', monospace" };
+  const V2 = { bg2: "#141618", bg3: "#1a1c22", bg4: "#1f2126", bg5: "#252830", bd: "rgba(255,255,255,.055)", bd2: "rgba(255,255,255,.09)", t0: "#eceaf4", t1: "#9896a4", t2: "#7e7c8c", t3: "#5a5868", or: "#f97316", olo: "rgba(249,115,22,.09)", obrd: "rgba(249,115,22,.2)", green: "#2dd4a0", glo: "rgba(45,212,160,.07)", gbrd: "rgba(45,212,160,.18)", red: "#d95f5f", rlo: "rgba(217,95,95,.08)", rbrd: "rgba(217,95,95,.18)", mono: "'JetBrains Mono', monospace" };
 
   const isInstalled = (name: string) => installed.some((p) => p.name === name);
   const installedFiltered = installed.filter((p) => p.runtime === runtime);
@@ -5312,7 +5313,7 @@ function SkillsPluginsPage() {
     const qs = window.location.hash.split("?")[1] || "";
     return new URLSearchParams(qs).get("sub") === "plugins" ? "plugins" : "skills";
   });
-  const V2 = { bg2: "#141618", bg3: "#1a1c22", bg4: "#1f2126", bd2: "rgba(255,255,255,.09)", t0: "#eceaf4", t2: "#4a4858", t3: "#2e2c3a", mono: "'JetBrains Mono', monospace" };
+  const V2 = { bg2: "#141618", bg3: "#1a1c22", bg4: "#1f2126", bd2: "rgba(255,255,255,.09)", t0: "#eceaf4", t2: "#7e7c8c", t3: "#5a5868", mono: "'JetBrains Mono', monospace" };
 
   const tabBtn = (key: "skills" | "plugins", label: string) => (
     <button key={key} onClick={() => setTab(key)}
@@ -5385,7 +5386,7 @@ function PairingPage() {
     }
   };
 
-  const V2 = { bg2: "#141618", bg3: "#1a1c22", bd: "rgba(255,255,255,.055)", bd2: "rgba(255,255,255,.09)", t0: "#eceaf4", t1: "#9896a4", t2: "#4a4858", t3: "#2e2c3a", or: "#f97316", green: "#2dd4a0", gbrd: "rgba(45,212,160,.18)", glo: "rgba(45,212,160,.07)", red: "#d95f5f", rbrd: "rgba(217,95,95,.18)", rlo: "rgba(217,95,95,.08)", mono: "'JetBrains Mono', monospace" };
+  const V2 = { bg2: "#141618", bg3: "#1a1c22", bd: "rgba(255,255,255,.055)", bd2: "rgba(255,255,255,.09)", t0: "#eceaf4", t1: "#9896a4", t2: "#7e7c8c", t3: "#5a5868", or: "#f97316", green: "#2dd4a0", gbrd: "rgba(45,212,160,.18)", glo: "rgba(45,212,160,.07)", red: "#d95f5f", rbrd: "rgba(217,95,95,.18)", rlo: "rgba(217,95,95,.08)", mono: "'JetBrains Mono', monospace" };
 
   const fmtTtl = (s: number) => { const m = Math.floor(s / 60); return m > 0 ? `${m}min` : `${s}s`; };
 
@@ -5454,7 +5455,7 @@ function getTabFromLocation(search?: string): PanelPage {
   const qs = search || (typeof window !== "undefined" ? window.location.hash.split("?")[1] || "" : "");
   const params = new URLSearchParams(qs);
   const tab = params.get("tab");
-  if (["config", "agents", "cron", "skills-plugins", "status", "workspace", "doctor", "pairing", "wizard", "memory"].includes(tab || "")) {
+  if (["config", "agents", "cron", "skills-plugins", "status", "workspace", "doctor", "pairing", "wizard", "memory", "knowledge"].includes(tab || "")) {
     return tab as PanelPage;
   }
   // Back-compat: bookmarked `?tab=skills` URLs redirect into the new combined page.
@@ -5525,6 +5526,7 @@ export function RsClawPanel() {
             {activePage === "doctor" && <DoctorPage />}
             {activePage === "pairing" && <PairingPage />}
             {activePage === "memory" && <MemoryPage />}
+            {activePage === "knowledge" && <ErrorBoundary><KnowledgePage /></ErrorBoundary>}
           </div>
         </div>
       </div>

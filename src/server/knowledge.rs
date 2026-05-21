@@ -40,6 +40,7 @@ pub fn routes(max_doc_bytes: usize) -> Router<Arc<KnowledgeService>> {
             "/collections/{id}/docs",
             get(list_docs).post(upload_doc),
         )
+        .route("/collections/{id}/docs/from-url", post(upload_from_url))
         .route(
             "/collections/{id}/docs/{doc_id}",
             get(get_doc).delete(delete_doc),
@@ -344,6 +345,124 @@ fn ingest_and_respond(
     }
 }
 
+#[derive(Deserialize)]
+struct FromUrlReq {
+    url: String,
+}
+
+/// Ingest a document by fetching a URL server-side (delegates to the KB
+/// `UrlSyncer`: GET → canonicalize → ingest → enqueue embed). Server-side
+/// fetch avoids browser CORS and records `KbSource::Url` provenance so the
+/// doc can be re-synced later. Returns 202; indexing runs in the background.
+async fn upload_from_url(
+    State(svc): State<Arc<KnowledgeService>>,
+    Path(cid): Path<String>,
+    Json(req): Json<FromUrlReq>,
+) -> Response {
+    let url = req.url.trim();
+    if url.is_empty() {
+        return bad_request("url_required");
+    }
+    if let Err(code) = validate_public_http_url(url) {
+        return bad_request(code);
+    }
+    // 404 early if the collection is gone (before any network fetch).
+    if let Err(e) = svc.get_collection(&cid) {
+        return err_response(e);
+    }
+    match svc.ingest_url(&cid, url).await {
+        Ok(outcome) => {
+            let status = if outcome.docs_added > 0 { "pending" } else { "skipped" };
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "status": status,
+                    "docsAdded": outcome.docs_added,
+                    "docsSkipped": outcome.docs_skipped,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            use crate::kb::sync::SyncError;
+            let (status, code) = match e {
+                SyncError::RateLimited { .. } => (StatusCode::TOO_MANY_REQUESTS, "url_rate_limited"),
+                SyncError::AuthFailed(_) => (StatusCode::BAD_GATEWAY, "url_auth_failed"),
+                SyncError::Network(_) | SyncError::Permanent(_) => {
+                    (StatusCode::BAD_GATEWAY, "url_fetch_failed")
+                }
+                SyncError::Parse(_) => (StatusCode::UNPROCESSABLE_ENTITY, "url_unprocessable"),
+                _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+            };
+            tracing::warn!("kb url ingest failed: {e}");
+            (status, Json(serde_json::json!({ "error": code }))).into_response()
+        }
+    }
+}
+
+/// SSRF guard for user-supplied fetch URLs. Requires http(s) and rejects
+/// targets that resolve to loopback / private / link-local / unspecified
+/// addresses (and the literal `localhost`). NOTE: this validates at request
+/// time; a fully hardened impl would also pin the resolved IP through to the
+/// connector to defeat DNS-rebinding (deferred — v1 accepts the TOCTOU
+/// window since the fetcher re-resolves immediately after).
+fn validate_public_http_url(raw: &str) -> Result<(), &'static str> {
+    use std::net::ToSocketAddrs;
+    let parsed = url::Url::parse(raw).map_err(|_| "invalid_url")?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => return Err("invalid_url"),
+    }
+    let host = parsed.host_str().ok_or("invalid_url")?;
+    let host_l = host.to_ascii_lowercase();
+    if host_l == "localhost" || host_l.ends_with(".localhost") {
+        return Err("url_not_allowed");
+    }
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|_| "url_unresolved")?;
+    let mut any = false;
+    for addr in addrs {
+        any = true;
+        if !is_public_ip(&addr.ip()) {
+            return Err("url_not_allowed");
+        }
+    }
+    if !any {
+        return Err("url_unresolved");
+    }
+    Ok(())
+}
+
+/// True only for globally-routable addresses (best-effort, std-only).
+fn is_public_ip(ip: &std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || o[0] == 0
+                // CGNAT 100.64.0.0/10 (is_shared is unstable)
+                || (o[0] == 100 && (o[1] & 0xc0) == 0x40))
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                // unique-local fc00::/7
+                || (s[0] & 0xfe00) == 0xfc00
+                // link-local fe80::/10
+                || (s[0] & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
 async fn list_docs(State(svc): State<Arc<KnowledgeService>>, Path(cid): Path<String>) -> Response {
     match svc.list_docs(&cid) {
         Ok(docs) => {
@@ -627,5 +746,69 @@ mod http_tests {
         let (st, body) = send(&app, "GET", "/collections/col_nope", None).await;
         assert_eq!(st, StatusCode::NOT_FOUND);
         assert_eq!(body["error"], "collection_not_found");
+    }
+
+    #[test]
+    fn ssrf_guard_blocks_private_and_loopback() {
+        // Loopback / private / link-local / localhost must be rejected; these
+        // use IP literals or `localhost` so the test needs no external DNS.
+        for bad in [
+            "http://localhost/x",
+            "http://127.0.0.1/x",
+            "https://10.0.0.1/x",
+            "http://192.168.1.1/x",
+            "http://169.254.169.254/latest/meta-data", // cloud metadata SSRF classic
+            "http://[::1]/x",
+            "http://0.0.0.0/x",
+        ] {
+            assert!(
+                validate_public_http_url(bad).is_err(),
+                "should reject {bad}"
+            );
+        }
+        // Bad scheme / not-a-url.
+        assert_eq!(validate_public_http_url("ftp://example.com").unwrap_err(), "invalid_url");
+        assert_eq!(validate_public_http_url("file:///etc/passwd").unwrap_err(), "invalid_url");
+        assert_eq!(validate_public_http_url("not a url").unwrap_err(), "invalid_url");
+        // A public IP literal passes (no DNS needed).
+        assert!(validate_public_http_url("https://8.8.8.8/").is_ok());
+    }
+
+    #[test]
+    fn is_public_ip_classification() {
+        use std::net::IpAddr;
+        assert!(is_public_ip(&"8.8.8.8".parse::<IpAddr>().unwrap()));
+        assert!(is_public_ip(&"1.1.1.1".parse::<IpAddr>().unwrap()));
+        assert!(!is_public_ip(&"10.1.2.3".parse::<IpAddr>().unwrap()));
+        assert!(!is_public_ip(&"172.16.0.1".parse::<IpAddr>().unwrap()));
+        assert!(!is_public_ip(&"100.64.0.1".parse::<IpAddr>().unwrap())); // CGNAT
+        assert!(!is_public_ip(&"::1".parse::<IpAddr>().unwrap()));
+        assert!(!is_public_ip(&"fc00::1".parse::<IpAddr>().unwrap())); // ULA
+        assert!(!is_public_ip(&"fe80::1".parse::<IpAddr>().unwrap())); // link-local
+    }
+
+    #[tokio::test]
+    async fn from_url_rejects_bad_input() {
+        let (_t, _svc, app) = app();
+        // empty url → 400 url_required
+        let (st, body) = send(
+            &app,
+            "POST",
+            "/collections/col_x/docs/from-url",
+            Some(serde_json::json!({ "url": "" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "url_required");
+        // SSRF target → 400 url_not_allowed (rejected before any collection/network)
+        let (st, body) = send(
+            &app,
+            "POST",
+            "/collections/col_x/docs/from-url",
+            Some(serde_json::json!({ "url": "http://127.0.0.1:1/x" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "url_not_allowed");
     }
 }

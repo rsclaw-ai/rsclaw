@@ -305,6 +305,30 @@ impl KnowledgeService {
         Ok((out.doc_id, out.noop))
     }
 
+    /// Ingest a document by fetching a URL server-side, tagged into the
+    /// collection. Delegates to the KB `UrlSyncer` (GET → canonicalize →
+    /// ingest → enqueue embed), which records `KbSource::Url` provenance and
+    /// dedupes via ETag/content-hash. The caller is responsible for the
+    /// collection-existence check and SSRF validation of `url`.
+    pub async fn ingest_url(
+        &self,
+        collection_id: &str,
+        url: &str,
+    ) -> Result<crate::kb::sync::SyncOutcome, crate::kb::sync::SyncError> {
+        use crate::kb::sync::{KbSourceSyncer, SyncContext, SyncReason, UrlSyncer};
+        let syncer = UrlSyncer {
+            url: url.to_string(),
+            tags: vec![collection_tag(collection_id)],
+        };
+        let ctx = SyncContext {
+            store: self.store.clone(),
+            paths: self.paths.clone(),
+            index: self.index.clone(),
+            embedder: self.embedder.clone(),
+        };
+        syncer.sync(&ctx, SyncReason::Manual).await
+    }
+
     /// Active documents in a collection, newest first, with chunk counts.
     pub fn list_docs(&self, collection_id: &str) -> KResult<Vec<DocInfo>> {
         self.get_collection(collection_id)?;

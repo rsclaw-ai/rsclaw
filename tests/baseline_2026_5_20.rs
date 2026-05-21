@@ -16,10 +16,12 @@
 //!   2. If the change was INTENTIONAL (you bumped the gateway version
 //!      or added/restructured a builtin tool on purpose): regenerate
 //!      the fixture with
-//!          cargo build --release --bin rsclaw
-//!          target/release/rsclaw debug dump-prompt-spec --json
-//!              | jq '{rsclaw_version, shared_prefix, builtin_tools}'
-//!              > tests/fixtures/baseline-2026.5.20.json
+//!      ```text
+//!      cargo build --release --bin rsclaw
+//!      target/release/rsclaw debug dump-prompt-spec --json
+//!        | jq '{rsclaw_version, shared_prefix, builtin_tools}'
+//!        > tests/fixtures/baseline-2026.5.20.json
+//!      ```
 //!      and re-add the `_doc` header that lives at the top of the
 //!      fixture (preserved for human readers).
 //!
