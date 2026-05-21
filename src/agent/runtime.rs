@@ -4752,31 +4752,23 @@ impl AgentRuntime {
             // emit tool calls as XML text instead of proper function_call format.
             // Detect <tool_call>/<function=...> patterns and parse them.
             if tool_calls.is_empty() && text_buf.contains("<function=") {
-                // Match <function=NAME> ... </function> blocks, then extract
-                // all <parameter=KEY>VALUE</parameter> pairs within each block.
-                let fn_re = regex::Regex::new(
-                    r#"<function=(\w+)>([\s\S]*?)</function>"#
-                ).expect("fn_re compile");
-                let param_re = regex::Regex::new(
-                    r#"<parameter=(\w+)>([\s\S]*?)</parameter>"#
-                ).expect("param_re compile");
-                for fn_cap in fn_re.captures_iter(&text_buf) {
-                    let name = fn_cap.get(1).map(|m| m.as_str()).unwrap_or("");
-                    let body = fn_cap.get(2).map(|m| m.as_str()).unwrap_or("");
-                    if name.is_empty() {
-                        continue;
-                    }
-                    let mut input = serde_json::Map::new();
-                    for p_cap in param_re.captures_iter(body) {
-                        let key = p_cap.get(1).map(|m| m.as_str()).unwrap_or("");
-                        let val = p_cap.get(2).map(|m| m.as_str().trim()).unwrap_or("");
-                        if !key.is_empty() {
-                            input.insert(key.to_owned(), json!(val));
-                        }
-                    }
-                    let id = format!("rescued_{name}_{}", tool_calls.len());
-                    tracing::info!(name, params = ?input.keys().collect::<Vec<_>>(), "agent_loop: rescued tool call from text");
-                    tool_calls.push((id, name.to_owned(), Value::Object(input)));
+                // Parameter values are coerced to their schema-declared type
+                // (so e.g. ask_user.options stays an array, not a string).
+                let rescued =
+                    crate::agent::tool_call_repair::rescue_tool_calls_from_text(&text_buf, &tools);
+                for (id, name, input) in rescued {
+                    // WARN, not INFO: a text tool call means the inference server
+                    // did not return native `tool_calls` for this model/node.
+                    // The rescue keeps us working, but this is a fleet-config
+                    // signal (llama.cpp tool-call template/grammar) — alert on
+                    // `rescued_from_text` to find nodes still emitting text.
+                    tracing::warn!(
+                        tool = %name,
+                        rescued_from_text = true,
+                        params = ?input.as_object().map(|o| o.keys().collect::<Vec<_>>()),
+                        "agent_loop: rescued tool call from <function=> text — server returned no native tool_calls"
+                    );
+                    tool_calls.push((id, name, input));
                 }
                 if !tool_calls.is_empty() {
                     // Clear the text since it was a tool call, not a real reply.

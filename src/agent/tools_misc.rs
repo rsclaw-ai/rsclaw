@@ -755,9 +755,25 @@ $synth.Speak('{}')
             bail!("ask_user: `question` must be non-empty");
         }
 
-        let raw_options = args["options"]
-            .as_array()
-            .ok_or_else(|| anyhow!("ask_user: `options` array required (2-8 entries)"))?;
+        let raw_options = args["options"].as_array().ok_or_else(|| {
+            // Distinguish "not an array" (esp. a stringified array — the common
+            // failure when a model's tool call is rescued from text) from a
+            // count problem, and tell the model the exact shape to send.
+            match &args["options"] {
+                Value::String(s) => anyhow!(
+                    "ask_user: `options` must be a JSON array of {{\"label\":...}} objects, \
+                     not a string. You sent the string {:?}. Send it as a real array, e.g. \
+                     [{{\"label\":\"Yes\"}},{{\"label\":\"No\"}}].",
+                    s.chars().take(60).collect::<String>()
+                ),
+                Value::Null => anyhow!(
+                    "ask_user: `options` is required — a JSON array of 2-8 {{\"label\":...}} objects."
+                ),
+                _ => anyhow!(
+                    "ask_user: `options` must be a JSON array of 2-8 {{\"label\":...}} objects."
+                ),
+            }
+        })?;
         if raw_options.len() < 2 {
             bail!("ask_user: at least 2 options required (a single-choice 'question' isn't a question)");
         }

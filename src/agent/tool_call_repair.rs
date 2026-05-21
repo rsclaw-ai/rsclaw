@@ -8,8 +8,9 @@
 //! are properly paired with tool_result messages, fixing orphaned tool_calls
 //! that would cause API errors.
 
-use crate::provider::{ContentPart, Message, MessageContent, Role};
-use serde_json::Value;
+use crate::provider::{ContentPart, Message, MessageContent, Role, ToolDef};
+use regex::Regex;
+use serde_json::{Map, Value};
 
 /// Fix unescaped backslashes inside JSON string values.
 ///
@@ -513,9 +514,159 @@ pub fn repair_tool_result_pairing(messages: Vec<Message>) -> RepairResult {
     }
 }
 
+/// Coerce a tool-call parameter that was captured as plain text (from the XML
+/// `<function=...>` fallback) to the type the tool's JSON schema declares.
+///
+/// The XML fallback yields every `<parameter>` value as a string. Tools whose
+/// schema declares a non-string param (e.g. `ask_user.options` is an array,
+/// `multi_select` a bool, `recommended_index` an int) would otherwise receive a
+/// string and fail validation. Coerce ONLY when the schema asks for a
+/// non-string type; `string` / unknown params are returned verbatim, so a
+/// string that merely *looks* structured (a JSON file written via `write_file`,
+/// a numeric string like "007") is never mangled. On parse failure, fall back
+/// to the raw string and let the tool's own validation report it.
+pub fn coerce_xml_param(raw: &str, declared_type: Option<&str>) -> Value {
+    match declared_type {
+        Some("array") | Some("object") => {
+            serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_owned()))
+        }
+        Some("boolean") => match raw.trim() {
+            "true" => Value::Bool(true),
+            "false" => Value::Bool(false),
+            _ => Value::String(raw.to_owned()),
+        },
+        Some("integer") | Some("number") => serde_json::from_str::<serde_json::Number>(raw.trim())
+            .map(Value::Number)
+            .unwrap_or_else(|_| Value::String(raw.to_owned())),
+        // "string" or unknown/absent — never coerce, keep verbatim.
+        _ => Value::String(raw.to_owned()),
+    }
+}
+
+/// Rescue tool calls a model emitted as `<function=NAME>...</function>` XML text
+/// instead of structured `tool_calls`. Some local models (qwen3.5, etc.) do this
+/// when the inference server doesn't parse tool calls natively. Each
+/// `<parameter=KEY>VALUE</parameter>` value is coerced to its schema-declared
+/// type via [`coerce_xml_param`], so array/bool/int params survive.
+///
+/// Returns `(id, name, args)` triples; empty when no `<function=` block parses.
+/// A non-empty result is itself a signal that the server returned a *text* tool
+/// call — worth logging, because it means native tool-call parsing isn't
+/// happening for that model/node.
+pub fn rescue_tool_calls_from_text(text: &str, tools: &[ToolDef]) -> Vec<(String, String, Value)> {
+    use std::collections::HashMap;
+    let fn_re = Regex::new(r#"<function=(\w+)>([\s\S]*?)</function>"#).expect("fn_re compile");
+    let param_re =
+        Regex::new(r#"<parameter=(\w+)>([\s\S]*?)</parameter>"#).expect("param_re compile");
+
+    let mut out = Vec::new();
+    for fn_cap in fn_re.captures_iter(text) {
+        let name = fn_cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        let body = fn_cap.get(2).map(|m| m.as_str()).unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        // param_name -> declared JSON-schema type, for the matching tool.
+        let param_types: HashMap<&str, &str> = tools
+            .iter()
+            .find(|t| t.name == name)
+            .and_then(|t| t.parameters.get("properties"))
+            .and_then(|p| p.as_object())
+            .map(|props| {
+                props
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        v.get("type").and_then(Value::as_str).map(|ty| (k.as_str(), ty))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut input = Map::new();
+        for p_cap in param_re.captures_iter(body) {
+            let key = p_cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            let val = p_cap.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+            if key.is_empty() {
+                continue;
+            }
+            input.insert(
+                key.to_owned(),
+                coerce_xml_param(val, param_types.get(key).copied()),
+            );
+        }
+        let id = format!("rescued_{name}_{}", out.len());
+        out.push((id, name.to_owned(), Value::Object(input)));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ask_user_tool() -> ToolDef {
+        ToolDef {
+            name: "ask_user".into(),
+            description: String::new(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string"},
+                    "options": {"type": "array"},
+                    "multi_select": {"type": "boolean"},
+                    "recommended_index": {"type": "integer"}
+                }
+            }),
+        }
+    }
+
+    #[test]
+    fn rescue_ask_user_coerces_options_to_array() {
+        let tools = vec![ask_user_tool()];
+        let text = concat!(
+            "<function=ask_user>",
+            "<parameter=question>Which embedder?</parameter>",
+            r#"<parameter=options>[{"label":"Local BGE"},{"label":"Remote Qwen3"}]</parameter>"#,
+            "<parameter=multi_select>false</parameter>",
+            "<parameter=recommended_index>1</parameter>",
+            "</function>"
+        );
+        let calls = rescue_tool_calls_from_text(text, &tools);
+        assert_eq!(calls.len(), 1);
+        let (_, name, args) = &calls[0];
+        assert_eq!(name, "ask_user");
+        // The whole point: options is a real array, not a stringified one.
+        assert!(args["options"].is_array(), "got {:?}", args["options"]);
+        assert_eq!(args["options"].as_array().unwrap().len(), 2);
+        assert_eq!(args["options"][0]["label"], serde_json::json!("Local BGE"));
+        assert_eq!(args["question"], serde_json::json!("Which embedder?"));
+        assert_eq!(args["multi_select"], serde_json::json!(false));
+        assert_eq!(args["recommended_index"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn coerce_keeps_string_params_verbatim() {
+        // A write_file `content` that is valid JSON or a numeric string must NOT
+        // be coerced — that would corrupt the file or drop the leading zero.
+        assert_eq!(
+            coerce_xml_param(r#"{"a":1}"#, Some("string")),
+            Value::String(r#"{"a":1}"#.into())
+        );
+        assert_eq!(coerce_xml_param("007", Some("string")), Value::String("007".into()));
+        // Unknown/absent type also stays verbatim.
+        assert_eq!(coerce_xml_param("[1,2]", None), Value::String("[1,2]".into()));
+    }
+
+    #[test]
+    fn coerce_falls_back_to_string_on_bad_json() {
+        // options declared array but value truncated → keep raw string; the
+        // tool's own validation then reports it (no silent corruption).
+        let truncated = r#"[{"label":"A"#;
+        assert_eq!(
+            coerce_xml_param(truncated, Some("array")),
+            Value::String(truncated.into())
+        );
+    }
 
     #[test]
     fn test_extract_balanced_json_simple() {
