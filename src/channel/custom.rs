@@ -14,6 +14,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tracing::{debug, info, warn};
 
 use super::{Channel, OutboundMessage};
+use crate::channel::retry::{SendRetry, send_with_retry};
 use crate::config::schema::CustomChannelConfig;
 
 // ---------------------------------------------------------------------------
@@ -256,21 +257,28 @@ impl CustomWebhookChannel {
             .unwrap_or("POST")
             .to_uppercase();
 
-        let mut req = match method.as_str() {
-            "PUT" => self.client.put(&reply_url),
-            "PATCH" => self.client.patch(&reply_url),
-            _ => self.client.post(&reply_url),
-        };
-
-        req = req.header("Content-Type", "application/json").body(body);
-
-        if let Some(ref headers) = self.cfg.reply_headers {
-            for (k, v) in headers {
-                req = req.header(k.as_str(), expand_env_vars(v));
+        // A custom reply_url is a user-controlled webhook with no standard
+        // idempotency key, so retry only reliably protects against pre-commit
+        // resets; a post-commit reset may deliver twice. The body is held
+        // constant across attempts so a webhook that does dedupe can.
+        let resp = send_with_retry("custom", &SendRetry::default(), || {
+            let mut req = match method.as_str() {
+                "PUT" => self.client.put(&reply_url),
+                "PATCH" => self.client.patch(&reply_url),
+                _ => self.client.post(&reply_url),
+            };
+            req = req
+                .header("Content-Type", "application/json")
+                .body(body.clone());
+            if let Some(ref headers) = self.cfg.reply_headers {
+                for (k, v) in headers {
+                    req = req.header(k.as_str(), expand_env_vars(v));
+                }
             }
-        }
-
-        let resp = req.send().await.context("custom webhook reply HTTP send")?;
+            req
+        })
+        .await
+        .context("custom webhook reply HTTP send")?;
         if !resp.status().is_success() {
             warn!(
                 channel = %self.cfg.name,

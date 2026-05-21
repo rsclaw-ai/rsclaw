@@ -10,7 +10,7 @@
 
 use anyhow::{anyhow, Result};
 use jaq_core::{
-    data::{self, JustLut},
+    data::JustLut,
     load::{Arena, File, Loader},
     unwrap_valr, Compiler, Ctx, Vars,
 };

@@ -23,6 +23,30 @@ use crate::config::loader::{applicable_site_rules, applicable_site_rules_body};
 use crate::provider::{AgentEndpoint, Message, MessageContent, Role, StreamEvent};
 use crate::agent::query_planner::{Intent, QueryPlan};
 
+/// Attach a pre-written raw-markdown artifact id to a `tool_web_fetch`
+/// JSON result so the runtime's "truncated → call read_artifact"
+/// envelope still works after summarization replaced `text` with the
+/// flash-model summary. No-op when no artifact was written.
+fn attach_raw_artifact(result: &mut Value, artifact: Option<String>, raw_chars: usize) {
+    let Some(id) = artifact else { return };
+    let Some(obj) = result.as_object_mut() else { return };
+    obj.insert("_tool_result_id".to_owned(), Value::String(id));
+    obj.insert("_truncated".to_owned(), Value::Bool(true));
+    obj.insert(
+        "_raw_chars".to_owned(),
+        Value::Number(serde_json::Number::from(raw_chars)),
+    );
+    obj.insert(
+        "_hint".to_owned(),
+        Value::String(
+            "`text` above is a flash-model summary of this page. The full \
+             markdown is preserved in the artifact — call read_artifact \
+             with `mode=full|grep:…|lines:A-B` for the raw content."
+                .to_owned(),
+        ),
+    );
+}
+
 /// Extract host from a URL without pulling in the `url` crate. Strips the
 /// optional `www.` prefix so `www.reddit.com` and `reddit.com` collapse
 /// to one cache key.
@@ -626,7 +650,7 @@ impl AgentRuntime {
         Ok(results)
     }
 
-    pub(crate) async fn tool_web_fetch(&self, args: Value) -> Result<Value> {
+    pub(crate) async fn tool_web_fetch(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         use moka::future::Cache;
         use std::sync::LazyLock;
 
@@ -734,14 +758,22 @@ impl AgentRuntime {
         // inherently non-idempotent.
         if is_get && body_value.is_none() && headers.is_empty() {
             if let Some((cached_title, cached_md)) = FETCH_CACHE.get(&fetch_url).await {
-                let text = truncate_chars(&cached_md, max_length);
-                let text = self.maybe_summarize(&text, prompt).await;
-                return Ok(json!({
+                // Don't pre-truncate — the runtime backstop applies the
+                // PreviewBudget::WEB head/tail + 25k char cap losslessly,
+                // and writes full text to an artifact the LLM can grep.
+                let _ = max_length; // arg retained for API compat
+                let raw_artifact = self
+                    .preserve_raw_for_summarize(&ctx.session_key, &cached_md, prompt)
+                    .await;
+                let text = self.maybe_summarize(&cached_md, prompt).await;
+                let mut out = json!({
                     "url": url,
                     "title": cached_title,
                     "text": text,
                     "length": text.len(),
-                }));
+                });
+                attach_raw_artifact(&mut out, raw_artifact, cached_md.chars().count());
+                return Ok(out);
             }
         }
 
@@ -820,16 +852,21 @@ impl AgentRuntime {
                 tracing::warn!(url = %fetch_url, error = %e, "web_fetch: HTTP failed, trying browser fallback");
                 match self.browser_get_article(&fetch_url).await {
                     Ok((t, md)) if !md.is_empty() => {
-                        let text = truncate_chars(&md, max_length);
-                        let text = self.maybe_summarize(&text, prompt).await;
+                        let raw_chars = md.chars().count();
+                        let raw_artifact = self
+                            .preserve_raw_for_summarize(&ctx.session_key, &md, prompt)
+                            .await;
+                        let text = self.maybe_summarize(&md, prompt).await;
                         FETCH_CACHE.insert(fetch_url, (t.clone(), md)).await;
-                        return Ok(json!({
+                        let mut out = json!({
                             "url": url,
                             "title": t,
                             "text": text,
                             "length": text.len(),
                             "source": "browser_fallback",
-                        }));
+                        });
+                        attach_raw_artifact(&mut out, raw_artifact, raw_chars);
+                        return Ok(out);
                     }
                     _ => return Err(e.into()),
                 }
@@ -921,8 +958,22 @@ impl AgentRuntime {
             FETCH_CACHE.insert(fetch_url, (final_title.clone(), final_md.clone())).await;
         }
 
-        let text = truncate_chars(&final_md, max_length);
-        let text = self.maybe_summarize(&text, prompt).await;
+        // Return full clean text — the runtime backstop handles size
+        // uniformly via PreviewBudget::WEB (head 200 + tail 40 lines, 25k
+        // char cap) and writes the full payload to an artifact the LLM
+        // can grep with read_artifact when it needs more.
+        //
+        // When `prompt` is set, summarization replaces `text` with the
+        // flash-model summary; the raw markdown is then no longer
+        // visible to compact_value. preserve_raw_for_summarize writes
+        // the raw to its own artifact first so "lossless web compaction"
+        // remains lossless even on the prompt path.
+        let _ = max_length; // arg retained for API compat
+        let raw_chars = final_md.chars().count();
+        let raw_artifact = self
+            .preserve_raw_for_summarize(&ctx.session_key, &final_md, prompt)
+            .await;
+        let text = self.maybe_summarize(&final_md, prompt).await;
 
         // Surface site-rules for this host in the response so the agent
         // can see them in the tool result (prompt-only mentions are easy
@@ -945,7 +996,37 @@ impl AgentRuntime {
                  dead ends to avoid."
             );
         }
+        attach_raw_artifact(&mut result, raw_artifact, raw_chars);
         Ok(result)
+    }
+
+    /// When `maybe_summarize` is about to replace `text` with a flash-
+    /// model summary, write the raw markdown to its own artifact so the
+    /// "lossless web compaction" contract still holds. Returns the
+    /// artifact id when one was actually written, or `None` when
+    /// summarization will not run (caller's `text` IS the raw and
+    /// the runtime backstop will write it itself via compact_value).
+    async fn preserve_raw_for_summarize(
+        &self,
+        session_key: &str,
+        raw: &str,
+        prompt: Option<&str>,
+    ) -> Option<String> {
+        if !self.will_summarize(prompt).await {
+            return None;
+        }
+        // Only persist genuinely large content — small fetches don't
+        // benefit and bloat the per-session artifact dir.
+        if raw.chars().count() <= crate::artifact::ARTIFACT_THRESHOLD_CHARS {
+            return None;
+        }
+        match crate::artifact::default_store().write(session_key, raw) {
+            Ok(id) => Some(id.0),
+            Err(e) => {
+                tracing::warn!(error = %e, "web_fetch: failed to preserve raw markdown to artifact");
+                None
+            }
+        }
     }
 
     /// Use web_browser to fetch JS-rendered page content via get_article.
@@ -1063,6 +1144,27 @@ impl AgentRuntime {
 
         // Tab is automatically closed when dropped.
         Ok(vec![])
+    }
+
+    /// True iff [`maybe_summarize`] would actually call out to a flash
+    /// model — i.e. both a `summaryModel` is configured AND a `prompt`
+    /// was supplied. Used by `tool_web_fetch` to decide whether it
+    /// needs to pre-write the raw markdown to an artifact for
+    /// losslessness, since summarization replaces the returned `text`
+    /// with the summary.
+    pub(crate) async fn will_summarize(&self, prompt: Option<&str>) -> bool {
+        if prompt.is_none() {
+            return false;
+        }
+        self.live
+            .ext
+            .read()
+            .await
+            .tools
+            .as_ref()
+            .and_then(|t| t.web_fetch.as_ref())
+            .and_then(|f| f.summary_model.clone())
+            .is_some()
     }
 
     /// If summaryModel is configured and a prompt is provided, summarize
@@ -1547,7 +1649,7 @@ impl AgentRuntime {
         match self.browser_get_article(url).await {
             Ok((title, text)) if !text.is_empty() => json!({
                 "title": title,
-                "text": truncate_chars(&text, 8000),
+                "text": text,
                 "url": url,
             }),
             Ok(_) => json!({ "error": "browser returned empty content", "url": url }),

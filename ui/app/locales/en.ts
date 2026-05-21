@@ -951,6 +951,11 @@ const en: LocaleType = {
       ConfigTitle: "Configuration",
       Agents: "Agents",
       AgentsTitle: "Agent Manager",
+      Memory: "Memory",
+      MemoryTitle: "Memory",
+      Knowledge: "Knowledge",
+      KnowledgeTitle: "Knowledge Base",
+      ComingSoon: "Coming soon",
     },
 
     Nav: {

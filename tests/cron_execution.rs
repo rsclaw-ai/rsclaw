@@ -75,6 +75,7 @@ fn runtime_with_agent(agent_id: &str) -> RuntimeConfig {
             auth_token: None,
             a2a_bearer_tokens: vec![],
             a2a_api_keys: vec![],
+            a2a_max_body_bytes: 100 * 1024 * 1024,
             auth_token_configured: false,
             auth_token_is_plaintext: false,
             allow_tailscale: false,

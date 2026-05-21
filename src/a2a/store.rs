@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use super::types::{A2aArtifact, A2aMessage, A2aTask, PushNotificationConfig, TaskState};
 
@@ -20,6 +20,7 @@ impl TaskStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).context("create a2a store dir")?;
         }
+        crate::store::upgrade_legacy_if_needed(path)?;
         let db = Database::create(path).context("open a2a task redb")?;
         let txn = db.begin_write()?;
         {

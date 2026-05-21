@@ -43,6 +43,7 @@ fn minimal_config(port: u16) -> RuntimeConfig {
             auth_token: None,
             a2a_bearer_tokens: vec![],
             a2a_api_keys: vec![],
+            a2a_max_body_bytes: 100 * 1024 * 1024,
             auth_token_configured: false,
             auth_token_is_plaintext: false,
             allow_tailscale: false,
@@ -158,6 +159,7 @@ async fn start_server(addr: SocketAddr) {
             let store = Arc::new(rsclaw::a2a::store::TaskStore::open(&path).expect("a2a store"));
             Arc::new(rsclaw::a2a::push::PushDispatcher::new(store, bus))
         },
+        knowledge: None,
     };
 
     // Leak the tempdir so the store stays valid for the lifetime of the server.
@@ -273,6 +275,7 @@ async fn bare_health_alias_returns_200_without_auth() {
             let store = Arc::new(rsclaw::a2a::store::TaskStore::open(&path).expect("a2a store"));
             Arc::new(rsclaw::a2a::push::PushDispatcher::new(store, bus))
         },
+        knowledge: None,
     };
     std::mem::forget(data_dir);
     tokio::spawn(async move { serve(state, addr).await.expect("serve") });
@@ -405,6 +408,7 @@ async fn auth_token_gates_non_health_endpoints() {
             let store = Arc::new(rsclaw::a2a::store::TaskStore::open(&path).expect("a2a store"));
             Arc::new(rsclaw::a2a::push::PushDispatcher::new(store, bus))
         },
+        knowledge: None,
     };
     std::mem::forget(data_dir);
     tokio::spawn(async move { serve(state, addr).await.expect("serve") });

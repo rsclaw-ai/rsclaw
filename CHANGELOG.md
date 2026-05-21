@@ -4,6 +4,108 @@ All notable changes to RsClaw will be documented in this file.
 
 ## Unreleased
 
+### Knowledge Base MVP (Weeks 1–5 + polish) — spec §J/§K/§L/§S/§3/§5 complete
+
+Five-week build of the user-managed RAG knowledge base, plus polish.
+ADR `docs/adr/0001-knowledge-base.md`, spec
+`docs/specs/2026-05-19-knowledge-base.md`, week plans under
+`docs/plans/2026-05-19-kb-mvp-week{1..4}-*.md`. Module root
+`src/kb/`; CLI at `src/cli/kb.rs` + `src/cmd/kb.rs`.
+
+**Storage & ingest (spec §J atomicity):**
+
+- 13 redb tables (`kb_docs`, `kb_chunks`, `kb_chunk_by_logical`,
+  `kb_ledger`, `kb_jobs_*`, `kb_seen_items`, `kb_sync_state`,
+  `kb_entities`, `kb_entity_index`, …) with composable
+  `&WriteTransaction` accessors per table. `KbStore` facade owns the
+  database handle.
+- `ingest_canonicalized` writes `KbDoc + VersionPointer +
+  IngestLedgerEntry + Job + SeenItems` in **one** redb tx. NOOP
+  re-check + version compute + old_paths lookup happen inside the
+  same wtx (race-safe — concurrent ingests of the same `(lsid,
+  raw_sha)` produce exactly one doc).
+- Content store at `md/<kind>/<slug>--<lsid8>--<md8>.md` is
+  content-addressed; same lsid + new bytes lands at a different file
+  so v2 ingest doesn't collide with v1.
+- Tombstoned docs (spec §6's 30-day retention) resurrect on
+  same-content re-ingest.
+- `WorkerPool` (tokio single task + `block_in_place`) drains
+  ChunkAndEmbed jobs. Fencing-token `mark_done` / `mark_failed`
+  refuses transitions from a stale claim; `reclaim_stale` resets
+  expired claims to Ready; bounded `shutdown()` exits in
+  `poll_idle + scheduling slack`.
+
+**Retrieval (spec §3 + §K + §L):**
+
+- Hybrid: HNSW (`hnsw_rs` 0.3) for dense + tantivy 0.22 BM25 for
+  sparse, fused by RRF (k=60), diversified by MMR (λ=0.5 default).
+  `KbIndex` composes both layers; `rebuild::from_redb` is the
+  canonical recovery path (redb is source of truth).
+- CJK tokenizer (`JiebaTokenizer`, jieba-rs) registered as
+  tantivy's `cjk` analyzer so Chinese queries actually match.
+- Visibility filter (`search::filter::keep_doc`) runs on every
+  retrieval path. `CallerScope` is a runtime-injected function
+  argument; agent input cannot supply it. Stale-version filter
+  drops chunks from superseded `doc_version`s.
+- HNSW snapshot persistence — `kb compact` dumps to
+  `<paths.root>/hnsw/snapshot.*` (`hnsw_rs::file_dump` + a JSON
+  sidecar with `id_to_chunk`); `KbIndex::open_and_rebuild` tries
+  `restore()` before `rebuild()`.
+- Five MCP-shaped tools: `kb_search`, `kb_fetch`, `kb_list_docs`,
+  `kb_similar`, `kb_search_entities`. JSON-friendly IO, no
+  caller-controlled scope override.
+- Regex entity extraction (URLs / emails / hashtags / @-mentions,
+  CJK-aware) runs in the chunk_embed handler and populates
+  `KbEntityIndex` edges. `require_entities` / `boost_entities`
+  filters in the search pipeline use those edges. `kb_search`
+  emits `entity_alignment` + warnings keyed off a query-side regex
+  pass so the agent spots cross-entity hallucinations.
+
+**Syncers + compactor (spec §S + §J Compactor):**
+
+- `KbSourceSyncer` trait + `SyncContext`. `ManualUploadSyncer`
+  (file → ingest), `UrlSyncer` (reqwest with conditional GET via
+  ETag/Last-Modified, content-hash fallback). `SyncRegistry` for
+  load/save of `SyncState`.
+- Compactor (`run_compactor_tick`) does orphan-file scan with
+  grace window + ledger state advance (`IndexingComplete →
+  CleanupPending → Done`). Safe to run anytime.
+
+**CLI (spec §5 v1 complete):**
+
+`rsclaw kb add | ls | rm | search | show | visibility | compact |
+stats | export | sync-all`.
+
+- `kb add` supports files, directories (`--recursive --ext`), and
+  URLs (auto-detected by scheme). Synchronously drains the worker
+  pool in CLI-only mode so a follow-up `kb search` sees fresh
+  chunks.
+- `kb rm` accepts either a `doc_id` or `--tag <name>` for bulk
+  tombstone (with `--yes`).
+- `kb show` resolves both `doc_id` (lists chunks + metadata) and
+  `chunk_id` (fetches with neighbor expansion).
+- `kb search --json` emits the full `KbSearchOutput` for piping.
+- `kb sync-all [--interval-min N] [--max M] [--dry-run]` refreshes
+  every Active URL doc whose `SyncState.last_sync_at` is stale.
+
+**Tests:** 215 unit + 25 integration across 7 test files
+(`kb_week1_e2e`, `kb_week2_pipeline`, `kb_week2_recovery`,
+`kb_week3_search`, `kb_week4_syncers`, `kb_week4_compactor`,
+`kb_entities_e2e`, `kb_cli_smoke`). 0 ignored, 0 failed.
+
+**Deferred to Week 6 / V2 (not in MVP):**
+
+- BGE-M3 real embedder (today: `StubEmbedder` — deterministic
+  sha256-derived 1024-dim vectors; same `KbEmbedder` trait
+  interface).
+- Gateway-resident syncer scheduler (today: `kb sync-all`
+  invoked manually or from user cron).
+- ML-based NER (today: regex extractor for URLs / emails /
+  hashtags / @-mentions).
+- LocalFolder / Mail / Chat syncers, Tauri admin UI, `kb_explain`
+  trace tool, citation_confidence, recency_policy, Reranker — all
+  spec V2.
+
 ### rsclaw protocol §2.4 — in-place compact splice
 
 - New trait method `LlmProvider::compact_splice` (default `Err` for

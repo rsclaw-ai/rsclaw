@@ -136,6 +136,17 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     );
     info!("{} skill(s) loaded", skills.len());
 
+    // Auto-install allowlist (security gate for the skill_install tool): load
+    // the local cache now so the gate has data immediately, then refresh from
+    // the hub in the background. Fail-closed — no cache + failed fetch = empty.
+    let (al_s, al_p) = crate::skill::allowlist::load_cached();
+    info!(skills = al_s, plugins = al_p, "allowlist: loaded from cache");
+    tokio::spawn(async {
+        if let Err(e) = crate::skill::allowlist::refresh().await {
+            warn!("allowlist refresh failed (keeping cache; fail-closed): {e:#}");
+        }
+    });
+
     // 5. Build agent registry with live receivers.
     let (registry, receivers) =
         AgentRegistry::from_config_with_receivers(&config, Arc::clone(&providers));
@@ -724,6 +735,25 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         a2a_bus.clone(),
     ));
 
+    // User-managed RAG knowledge base. Open once; spawn the async indexing
+    // worker that drains embed jobs in the background. A failure here (corrupt
+    // store, bad permissions, full disk) disables KB but must not abort the
+    // gateway — every other channel and provider stays up.
+    let knowledge_svc = match crate::kb::KnowledgeService::open(base_dir.join("kb")) {
+        Ok(svc) => {
+            let svc = Arc::new(svc);
+            svc.spawn_worker();
+            // Register the single live instance so agent tools (knowledge_base)
+            // reach it without re-opening redb (which is exclusively locked).
+            crate::kb::set_global_service(Arc::clone(&svc));
+            Some(svc)
+        }
+        Err(e) => {
+            tracing::error!("knowledge base disabled: failed to open store: {e:#}");
+            None
+        }
+    };
+
     let state = AppState {
         config: Arc::clone(&config),
         live: Arc::clone(&live),
@@ -756,6 +786,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         suspended_tasks: Arc::new(dashmap::DashMap::new()),
         task_store: a2a_task_store,
         push_dispatcher: a2a_push_dispatcher,
+        knowledge: knowledge_svc,
     };
     crate::ws::tick::start_tick_loop(Arc::clone(&state.ws_conns));
 
@@ -1284,6 +1315,7 @@ fn spawn_agent_tasks(
         runtime.computer_runs = Some(Arc::clone(&computer_runs));
 
         let event_tx_task = event_tx.clone();
+        let config_for_task = Arc::clone(&config);
         tokio::spawn(async move {
             info!(agent_id = %handle.id, "agent runtime task started");
             while let Some(msg) = rx.recv().await {
@@ -1342,8 +1374,27 @@ fn spawn_agent_tasks(
                     } else {
                         crate::agent::registry::ReplyOutcome::Error
                     };
+                    // User-facing text: don't leak the raw anyhow Error
+                    // (HTTP status codes, internal IDs, JSON error bodies)
+                    // to the chat channel — that material is operator-
+                    // debug-only and lives in the ERROR log above. The
+                    // end user sees an i18n'd "service unavailable" line
+                    // for real LLM / transport errors; the original
+                    // outcome tag (Error / Canceled) survives so A2A
+                    // consumers still key off the terminal status.
+                    let i18n_lang = config_for_task
+                        .raw
+                        .gateway
+                        .as_ref()
+                        .and_then(|g| g.language.as_deref())
+                        .map(crate::i18n::resolve_lang)
+                        .unwrap_or("en");
+                    let user_text = match outcome {
+                        crate::agent::registry::ReplyOutcome::Canceled => "[canceled]".to_owned(),
+                        _ => crate::i18n::t("backend_unavailable", i18n_lang),
+                    };
                     AgentReply {
-                        text: format!("[error: {e}]"),
+                        text: user_text,
                         is_empty: false,
                         tool_calls: None,
                         images: vec![],

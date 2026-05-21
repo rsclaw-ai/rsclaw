@@ -226,6 +226,10 @@ function Screen() {
           const gw: any = await tauriInvoke("get_gateway_port");
           if (gw?.url) {
             setGatewayUrl(gw.url);
+            // Persist alongside the token so the next launch's first
+            // gatewayFetch (which runs before this effect resolves)
+            // doesn't fall through to the stale env default.
+            try { localStorage.setItem("rsclaw-gateway-url", gw.url); } catch {}
             if (gw.token) {
               setAuthToken(gw.token);
               try { localStorage.setItem("rsclaw-auth-token", gw.token); } catch {}

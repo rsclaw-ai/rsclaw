@@ -1,0 +1,12 @@
+//! Full rebuild of both index layers from redb. Used at startup,
+//! after detecting a corrupt tantivy dir, or on manual admin trigger.
+
+use super::KbIndex;
+use crate::kb::store::KbStore;
+use anyhow::Result;
+
+pub fn from_redb(idx: &KbIndex, store: &KbStore) -> Result<()> {
+    idx.hnsw.rebuild(store)?;
+    idx.tantivy.rebuild(store)?;
+    Ok(())
+}

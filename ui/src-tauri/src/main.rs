@@ -806,13 +806,20 @@ async fn open_rsclaw_console(
         return Ok(());
     }
 
+    // Base is stored without trailing slash so sub-paths join cleanly
+    // (e.g. base + "/keys" → ".../console/keys"). The canonical root
+    // URL is `.../console/` WITH trailing slash though, so when no
+    // sub-path is requested we explicitly append one — landing on
+    // `.../console` and relying on the server to 301 us would be
+    // sloppy and breaks on staging deploys that don't redirect.
     let suffix = path.unwrap_or_default();
+    let trimmed = RSCLAW_CONSOLE_BASE.trim_end_matches('/');
     let full_url = if suffix.is_empty() {
-        RSCLAW_CONSOLE_BASE.to_string()
+        format!("{}/", trimmed)
     } else if suffix.starts_with('/') {
-        format!("{}{}", RSCLAW_CONSOLE_BASE, suffix)
+        format!("{}{}", trimmed, suffix)
     } else {
-        format!("{}/{}", RSCLAW_CONSOLE_BASE, suffix)
+        format!("{}/{}", trimmed, suffix)
     };
 
     let parsed: url::Url = full_url
@@ -863,6 +870,30 @@ async fn rsclaw_console_install_key(
 ) -> Result<(), String> {
     app.emit("rsclaw:console-install-key", data)
         .map_err(|e| format!("emit install-key event: {e}"))?;
+
+    // Close the console webview right here on the Rust side. Previously
+    // we left this to a frontend `closeRsclawConsole()` call in the
+    // main window's install listener, but that path was flaky in
+    // practice — the close apparently never fired even when the
+    // install event reached the card. Closing from the same Tauri
+    // command the webview calls in to is the simplest reliable
+    // sequencing: emit-then-close, synchronous, no JS round-trip.
+    if let Some(console) = app.get_webview_window("rsclaw-console") {
+        let _ = console.close();
+    }
+
+    // Surface the main window — the user just installed a key inside
+    // the console webview, but the main RsClaw window (where the
+    // onboarding card lives) might be backgrounded behind other apps.
+    // Pop it to the front so the "Connected" state is actually seen.
+    // All operations are best-effort: failures here shouldn't block
+    // the install path (the key is already written to config by the
+    // listener that fires off the emit above).
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.unminimize();
+        let _ = main.show();
+        let _ = main.set_focus();
+    }
     Ok(())
 }
 
@@ -1260,26 +1291,68 @@ fn install_skill(name: String) -> Result<String, String> {
     run_rsclaw_command(&["skills", "install", &name])
 }
 
-/// Search skills online via sidecar, parse table output
+/// Search skills online via sidecar, parse the human-readable table.
+///
+/// The CLI prints two formats depending on whether the registry returns
+/// install/star stats:
+///   - 3 cols: `NAME              REGISTRY  DESCRIPTION`
+///   - 5 cols: `NAME  INSTALLS  STARS  REGISTRY  DESCRIPTION`
+/// and trails the table with a blank line + footer hint
+/// (`Install with: rsclaw skills install <name>`). We detect the format
+/// from the header row and stop at the first blank line after results so
+/// the footer doesn't get scraped into a fake skill entry.
 #[tauri::command]
 fn search_skills(query: String) -> Result<serde_json::Value, String> {
     let raw = run_rsclaw_command(&["skills", "search", &query])?;
     let mut results = Vec::new();
-    for line in raw.lines().skip(1) {
+    let mut has_stats: Option<bool> = None;
+    let mut seen_any_result = false;
+    for line in raw.lines() {
         let stripped = strip_ansi(line);
-        let parts: Vec<&str> = stripped.splitn(3, |c: char| c.is_whitespace()).filter(|s| !s.is_empty()).collect();
-        if parts.len() >= 2 {
-            let name = parts[0].trim();
-            let version = parts[1].trim();
-            let desc = if parts.len() >= 3 { parts[2].trim() } else { "" };
-            if !name.is_empty() && name != "NAME" {
-                results.push(serde_json::json!({
-                    "name": name,
-                    "version": version,
-                    "description": desc,
-                }));
-            }
+        let trimmed = stripped.trim();
+
+        // Empty line after the result rows terminates the table — the
+        // footer ("Install with: rsclaw skills install <name>") lives
+        // below it and must not be parsed as a result.
+        if trimmed.is_empty() {
+            if seen_any_result { break; }
+            continue;
         }
+
+        // First non-empty line is the header. Use it to fix column count.
+        if has_stats.is_none() {
+            let cols: Vec<&str> = trimmed.split_whitespace().collect();
+            // Stats header: "NAME INSTALLS STARS REGISTRY DESCRIPTION"
+            has_stats = Some(cols.len() >= 5 && cols[1] == "INSTALLS");
+            // The header itself is not a result; skip it.
+            if cols.first().copied() == Some("NAME") { continue; }
+        }
+
+        let stats_mode = has_stats.unwrap_or(false);
+        let need = if stats_mode { 5 } else { 3 };
+        let parts: Vec<&str> = trimmed.splitn(need, |c: char| c.is_whitespace()).filter(|s| !s.is_empty()).collect();
+        if parts.len() < need { continue; }
+
+        let name = parts[0].trim();
+        if name.is_empty() || name == "NAME" { continue; }
+
+        let (installs, stars, registry, desc) = if stats_mode {
+            (parts[1].trim(), parts[2].trim(), parts[3].trim(), parts[4].trim())
+        } else {
+            ("", "", parts[1].trim(), parts[2].trim())
+        };
+
+        seen_any_result = true;
+        results.push(serde_json::json!({
+            "name": name,
+            // No version in the CLI output — leave blank rather than
+            // misclaim. UI can show `registry` instead.
+            "version": "",
+            "registry": registry,
+            "installs": installs,
+            "stars": stars,
+            "description": desc,
+        }));
     }
     Ok(serde_json::json!({ "results": results }))
 }
@@ -1302,6 +1375,81 @@ fn strip_ansi(s: &str) -> String {
 #[tauri::command]
 fn uninstall_skill(name: String) -> Result<String, String> {
     run_rsclaw_command(&["skills", "uninstall", &name])
+}
+
+/// List installed plugins by reading ~/.rsclaw/plugins/<name>/{plugin.json5,openclaw.plugin.json}
+/// Returns `{ plugins: [{ name, version, description, runtime, entry, tools, channels, path }] }`.
+/// `runtime` is normalized into `"wasm" | "js"` for the UI. JS covers
+/// node/bun/deno (shell-bridge subprocess speaking JSON-RPC over stdio).
+/// Future non-JS subprocess runtimes (python/go binary/etc.) will need
+/// a new bucket; for now they fall back to "js" too — the manifest's
+/// actual runtime hint is passed through verbatim in `runtimeRaw` so
+/// the detail modal can show the precise interpreter.
+#[tauri::command]
+fn get_plugins() -> Result<serde_json::Value, String> {
+    let plugins_dir = rsclaw_base_dir().join("plugins");
+    let mut plugins = Vec::new();
+    if plugins_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
+            for entry in entries.flatten() {
+                if !entry.file_type().map_or(false, |ft| ft.is_dir()) { continue; }
+                let dir = entry.path();
+                let name_os = entry.file_name();
+                let dir_name = name_os.to_string_lossy().to_string();
+                if dir_name.starts_with('.') { continue; }
+                let json5_path = dir.join("plugin.json5");
+                let legacy_path = dir.join("openclaw.plugin.json");
+                let raw = if json5_path.exists() {
+                    std::fs::read_to_string(&json5_path).ok()
+                } else if legacy_path.exists() {
+                    std::fs::read_to_string(&legacy_path).ok()
+                } else {
+                    continue;
+                };
+                let Some(raw) = raw else { continue };
+                let val: serde_json::Value = match json5::from_str(&raw) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let name = val.get("name").and_then(|v| v.as_str())
+                    .or_else(|| val.get("id").and_then(|v| v.as_str()))
+                    .unwrap_or(&dir_name).to_string();
+                let runtime_raw = val.get("runtime").and_then(|v| v.as_str()).unwrap_or("node");
+                let runtime = if runtime_raw == "wasm" { "wasm" } else { "js" };
+                let tools: Vec<String> = val.get("tools").and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
+                let channels: Vec<String> = val.get("channels").and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|c| c.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
+                plugins.push(serde_json::json!({
+                    "name": name,
+                    "version": val.get("version").and_then(|v| v.as_str()).unwrap_or(""),
+                    "description": val.get("description").and_then(|v| v.as_str()).unwrap_or(""),
+                    "runtime": runtime,
+                    "runtimeRaw": runtime_raw,
+                    "entry": val.get("entry").and_then(|v| v.as_str()).unwrap_or(""),
+                    "tools": tools,
+                    "channels": channels,
+                    "path": dir.to_string_lossy(),
+                }));
+            }
+        }
+    }
+    plugins.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    Ok(serde_json::json!({ "plugins": plugins }))
+}
+
+/// Install a plugin via sidecar. `spec` can be a URL, local .wasm/.zip path, or directory.
+#[tauri::command]
+fn install_plugin(spec: String) -> Result<String, String> {
+    run_rsclaw_command(&["plugins", "install", &spec])
+}
+
+/// Uninstall a plugin by name via sidecar.
+#[tauri::command]
+fn uninstall_plugin(name: String) -> Result<String, String> {
+    run_rsclaw_command(&["plugins", "uninstall", &name])
 }
 
 /// Expand `${VAR}` placeholders in a string by reading from the process
@@ -1738,6 +1886,9 @@ fn main() {
             install_skill,
             uninstall_skill,
             search_skills,
+            get_plugins,
+            install_plugin,
+            uninstall_plugin,
             test_provider,
             write_workspace_file,
             read_workspace_file,
@@ -1950,13 +2101,21 @@ fn main() {
                         let _ = window.set_focus();
                     }
                 }
-                // Window close:
-                // - Gateway stopped by user → quit app
-                // - Gateway running → hide to tray
+                // Window close — only intercept for the MAIN window.
+                // Child webviews (rsclaw-console, computer-use-glow,
+                // any future ones) must close normally; previously
+                // this arm fired for every window's close request and
+                //   (a) blocked the console webview from ever closing
+                //       via `api.prevent_close()`, and
+                //   (b) hid the main window because `window.hide()`
+                //       wasn't filtered by which window asked to close.
+                // The `if label == "main"` guard scopes the hide-to-tray
+                // logic to its intended target.
                 tauri::RunEvent::WindowEvent {
+                    label,
                     event: tauri::WindowEvent::CloseRequested { api, .. },
                     ..
-                } => {
+                } if label == "main" => {
                     if GATEWAY_USER_STOPPED.load(Ordering::Relaxed) {
                         // Gateway already stopped — let the window close (app will exit)
                         stop_gateway_sync();

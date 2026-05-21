@@ -20,7 +20,7 @@ use crate::{
     a2a::{
         errors as a2a_errors,
         types::{
-            A2aArtifact, A2aMessage, A2aPart, A2aTask, A2aTaskStatus, AgentCapabilities,
+            A2aArtifact, A2aMessage, A2aTask, A2aTaskStatus, AgentCapabilities,
             AgentCard, AgentExtension, AgentInterface, AgentProvider, AgentSkill,
             JsonRpcRequest, JsonRpcResponse, PushNotificationConfig, SendMessageParams,
             TaskState,

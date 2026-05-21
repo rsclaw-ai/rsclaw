@@ -163,7 +163,7 @@ pub(crate) fn msg_tokens(m: &Message) -> usize {
 /// within the model's context budget.
 ///
 /// Budget calculation:
-///   reply_reserve      = max(context_budget * 20%, 2000)
+///   reply_reserve      = max(context_budget * 5%, 2000)
 ///   system_tokens      = system_prompt.len() / 4
 ///   tools_tokens       = tools JSON size / 4
 ///   scratchpad_tokens  = caller-supplied overhead (current-turn working buffer)
@@ -171,6 +171,13 @@ pub(crate) fn msg_tokens(m: &Message) -> usize {
 ///                        - tools_tokens - scratchpad_tokens
 ///
 /// Always keeps at least the last 3 user-assistant pairs (6 messages).
+///
+/// `reply_reserve` was 20% historically — a heuristic from the
+/// pre-incremental-cache era when models routinely produced multi-thousand-
+/// token answers. Real agentic replies are typically ≤ 2K tokens (the
+/// `.max(2000)` floor already covers that worst case), so 5% claws back
+/// 9.6K tokens of history budget on a 64K context — meaningful headroom
+/// before the server-side cache gets invalidated by client-side trim.
 pub(crate) fn apply_context_budget_trim(
     messages: &mut Vec<Message>,
     context_tokens: usize,
@@ -178,7 +185,7 @@ pub(crate) fn apply_context_budget_trim(
     tools: &[ToolDef],
     scratchpad_tokens: usize,
 ) {
-    let reply_reserve = (context_tokens / 5).max(2000);
+    let reply_reserve = (context_tokens / 20).max(2000);
     let sys_tokens = estimate_tokens(system_prompt);
     let tools_tokens = serde_json::to_string(tools)
         .map(|s| estimate_tokens(&s))

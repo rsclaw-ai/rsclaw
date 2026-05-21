@@ -146,7 +146,10 @@ impl AgentRuntime {
     }
 
     pub(crate) async fn tool_session_consolidated(&self, ctx: &RunContext, args: Value) -> Result<Value> {
-        let action = args["action"].as_str().unwrap_or("list");
+        // .trim() — v1 block protocol can shard tool_call JSON such that
+        // string values land with leading/trailing whitespace; see
+        // tool_memory_consolidated for the diagnosis.
+        let action = args["action"].as_str().unwrap_or("list").trim();
         match action {
             "send" => self.tool_sessions_send(ctx, args).await,
             "list" => self.tool_sessions_list().await,

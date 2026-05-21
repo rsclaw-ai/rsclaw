@@ -87,6 +87,11 @@ src/
   hooks/      Hook registration
   heartbeat/  Heartbeat engine
   migrate/    Schema migrations
+  kb/         Knowledge base (RAG): canonicalize → IngestLedger →
+              Outbox worker → HNSW + tantivy + RRF/MMR retrieval;
+              5 kb_* MCP tools + `rsclaw kb` CLI;
+              spec docs/specs/2026-05-19-knowledge-base.md +
+              ADR docs/adr/0001-knowledge-base.md
 
 ui/
   app/        Next.js 15 chat UI + control panel (NextChat-derived)

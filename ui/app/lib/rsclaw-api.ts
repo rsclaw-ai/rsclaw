@@ -24,11 +24,18 @@ export async function gatewayFetch(
   path: string,
   options?: RequestInit,
 ): Promise<Response> {
+  // Resolve URL + token through the accessors so localStorage fallbacks
+  // and Tauri-set runtime values always win over module-init env defaults.
+  // The closure-cached `GATEWAY_URL` / `AUTH_TOKEN` were the source of a
+  // "stuck offline" bug: env (.env.local) pinned URL to a stale port and
+  // requests kept hitting it even after Tauri called setGatewayUrl().
+  const url = getGatewayUrl();
+  const token = getAuthToken();
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
-    ...(AUTH_TOKEN ? { Authorization: `Bearer ${AUTH_TOKEN}` } : {}),
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
   };
-  return fetch(`${GATEWAY_URL}${path}`, {
+  return fetch(`${url}${path}`, {
     ...options,
     headers: { ...headers, ...(options?.headers as Record<string, string>) },
   });
@@ -59,6 +66,23 @@ export async function saveConfig(config: any) {
 
 export async function reloadConfig() {
   return gatewayFetch("/api/v1/config/reload", { method: "POST" }).then((r) =>
+    r.json(),
+  );
+}
+
+/**
+ * Graceful re-exec of the gateway binary. Backend does flag-and-flush:
+ * sets the shutdown flag, returns `{ restarting: true }` immediately,
+ * then axum's `with_graceful_shutdown` drains in-flight requests before
+ * the listener releases the port and a replacement process binds.
+ *
+ * Loopback-only — backend rejects with 403 from non-127.0.0.1 peers.
+ * Use after operations that change live state the gateway caches in-
+ * memory (e.g. installing a plugin: its WASM/manifest needs to be
+ * registered into PluginRegistry, which only happens at boot).
+ */
+export async function restartGateway() {
+  return gatewayFetch("/api/v1/restart", { method: "POST" }).then((r) =>
     r.json(),
   );
 }
@@ -164,6 +188,71 @@ export async function writeWorkspaceFile(
     `/api/v1/workspace/files/${encodeURIComponent(fileName)}${q}`,
     { method: "PUT", body: JSON.stringify({ content }) },
   ).then((r) => r.json());
+}
+
+// ---------------------------------------------------------------------------
+// Memory management (read-only browse for the desktop UI)
+// ---------------------------------------------------------------------------
+
+export type MemoryDoc = {
+  id: string;
+  scope: string;
+  kind: string;
+  text: string;
+  abstract_text: string | null;
+  overview_text: string | null;
+  tags: string[];
+  tier: "core" | "working" | "peripheral";
+  importance: number;
+  pinned: boolean;
+  created_at: number;
+  accessed_at: number;
+  access_count: number;
+  /** Computed server-side via Weibull stretched-exponential decay. */
+  relevance_score: number;
+};
+
+export type MemoryListResponse = {
+  docs: MemoryDoc[];
+  /** Total before `limit` was applied. */
+  total: number;
+};
+
+export type MemoryStatsResponse = {
+  total: number;
+  by_tier: Record<string, number>;
+  by_kind: Record<string, number>;
+  by_scope: Record<string, number>;
+  pinned: number;
+};
+
+export type MemoryListFilters = {
+  /** Semantic-search query. Empty / undefined → list all. */
+  q?: string;
+  scope?: string;
+  kind?: string;
+  /** Default 200, hard cap 1000 server-side. */
+  limit?: number;
+};
+
+export async function listMemoryDocs(
+  filters?: MemoryListFilters,
+): Promise<MemoryListResponse> {
+  const params = new URLSearchParams();
+  if (filters?.q) params.set("q", filters.q);
+  if (filters?.scope) params.set("scope", filters.scope);
+  if (filters?.kind) params.set("kind", filters.kind);
+  if (filters?.limit) params.set("limit", String(filters.limit));
+  const qs = params.toString();
+  return gatewayFetch(`/api/v1/memory/docs${qs ? "?" + qs : ""}`, {
+    signal: AbortSignal.timeout(15000),
+  }).then((r) => r.json());
+}
+
+export async function getMemoryStats(): Promise<MemoryStatsResponse> {
+  return gatewayFetch("/api/v1/memory/stats", {
+    signal: AbortSignal.timeout(8000),
+  }).then((r) => r.json());
 }
 
 export { GATEWAY_URL, AUTH_TOKEN };

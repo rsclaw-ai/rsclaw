@@ -951,8 +951,8 @@ const V = {
   bd3: "rgba(255,255,255,.14)",
   t0: "#eceaf4",
   t1: "#9896a4",
-  t2: "#4a4858",
-  t3: "#2e2c3a",
+  t2: "#7e7c8c",
+  t3: "#5a5868",
   or: "#f97316",
   or2: "#fb923c",
   olo: "rgba(249,115,22,.1)",
@@ -1643,21 +1643,12 @@ export function OnboardingPage() {
     });
     return m;
   });
-  // Select first channel when entering step 3
-  const chsInitRef = useRef(false);
-  useEffect(() => {
-    if (step === 3 && !chsInitRef.current && CHANNELS.length > 0) {
-      chsInitRef.current = true;
-      const firstId = CHANNELS[0].id;
-      setChs((prev) => {
-        const c: Record<string, ChState> = {};
-        for (const [k, v] of Object.entries(prev)) {
-          c[k] = { ...v, enabled: k === firstId };
-        }
-        return c;
-      });
-    }
-  }, [step, CHANNELS]);
+  // Step 3 intentionally starts with no channel selected — the user
+  // picks one manually, and `toggleChannel` auto-starts QR for
+  // channels that support it. (Previously we auto-selected the first
+  // channel + auto-fired its QR, which forced users into WeChat by
+  // default and pinned a stale QR while they were still browsing the
+  // list.)
   const qrPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const qrTokenRef = useRef<string | null>(null);
 
@@ -1872,6 +1863,32 @@ export function OnboardingPage() {
       return p;
     });
 
+    // rsclaw short-circuit: the cloud agent endpoint doesn't expose an
+    // OpenAI-compatible `/models` listing, and we're often clicking
+    // this button before the local gateway has started (onboarding
+    // step 2 runs pre-launch). Trust the key, use the hardcoded model
+    // list — if it's actually invalid the user finds out at the
+    // gateway-start step's health check.
+    if (id === "rsclaw") {
+      const fallback = MODELS["rsclaw"] || [];
+      const defaultModel =
+        fallback.find((m) => m.rec)?.id || fallback[0]?.id || "rsclaw-agent-v1";
+      setProvs((prev) => {
+        const p = { ...prev };
+        p[id] = {
+          ...p[id],
+          testStatus: "success",
+          inputState: "ok",
+          testError: "",
+          modelsLoading: false,
+          models: fallback,
+          selectedModel: p[id].selectedModel || defaultModel,
+        };
+        return p;
+      });
+      return;
+    }
+
     try {
       // Test provider API directly (Tauri) or via gateway (browser)
       const provDef = PROVIDERS.find((p) => p.id === id);
@@ -2001,17 +2018,22 @@ export function OnboardingPage() {
       // Start login process in background (spawns rsclaw channels login <channel>)
       await tauriInvoke("channel_login_start", { channel: channelId });
 
-      // Poll for QR image + login completion
+      // Poll for QR image + login completion. The interval runs for
+      // as long as the channel is being authed — the only natural exit
+      // is `status === "done"` (or the parent component unmounting,
+      // which the cleanup effect below handles). We used to cap at
+      // 60 attempts (~120s); in practice users often navigate
+      // back / forth between steps and consumed the budget without
+      // ever scanning, leaving the UI stuck on "waiting".
       if (qrPollRef.current) clearInterval(qrPollRef.current);
-      let attempts = 0;
-      let qrFound = false;
+      let lastQrUri: string | null = null;
       qrPollRef.current = setInterval(async () => {
-        attempts++;
         try {
           // Check login status
           const status: string = await tauriInvoke("channel_login_status");
           if (status === "done") {
             if (qrPollRef.current) clearInterval(qrPollRef.current);
+            qrPollRef.current = null;
             // Read credentials written by sidecar into state
             let loginCreds: Record<string, string> = {};
             try {
@@ -2027,21 +2049,21 @@ export function OnboardingPage() {
             });
             return;
           }
-          // Check for QR image
-          if (!qrFound) {
-            const dataUri: string | null = await tauriInvoke("channel_login_qr");
-            if (dataUri) {
-              qrFound = true;
-              setChs((prev) => {
-                const c = { ...prev };
-                c[channelId] = { ...c[channelId], qrUrl: dataUri, qrStatus: "waiting" };
-                return c;
-              });
-            }
+          // Re-fetch the QR every iteration — the sidecar rotates the
+          // file when the server-side QR expires (typically 60–90s).
+          // Sticking with the first dataUri we saw means the rendered
+          // image goes stale and scans against it silently fail.
+          const dataUri: string | null = await tauriInvoke("channel_login_qr");
+          if (dataUri && dataUri !== lastQrUri) {
+            lastQrUri = dataUri;
+            setChs((prev) => {
+              const c = { ...prev };
+              c[channelId] = { ...c[channelId], qrUrl: dataUri, qrStatus: "waiting" };
+              return c;
+            });
           }
-        } catch {}
-        if (attempts > 60) {
-          if (qrPollRef.current) clearInterval(qrPollRef.current);
+        } catch {
+          /* transient — keep polling */
         }
       }, 2000);
     } catch {
@@ -2076,7 +2098,11 @@ export function OnboardingPage() {
         providers[id] = { api: "ollama", baseUrl: ps.baseUrl || ps.apiKey };
       } else if (ps.apiKey) {
         const entry: Record<string, any> = { apiKey: ps.apiKey };
-        if (ps.baseUrl) entry.baseUrl = ps.baseUrl;
+        // RsClaw uses the gateway-compiled-in managed fleet URL
+        // (`RSCLAW_DEFAULT_BASE` in providers.rs). Writing a baseUrl
+        // here is redundant and clutters the config; users with a
+        // self-hosted worker can add it back manually.
+        if (ps.baseUrl && id !== "rsclaw") entry.baseUrl = ps.baseUrl;
         if (ps.userAgent) entry.userAgent = ps.userAgent;
         // Standard providers that opt into the api_type field (e.g. doubao
         // for CodingPlan) save the user's selection. Default to "openai"
@@ -2084,12 +2110,6 @@ export function OnboardingPage() {
         // silently drop and the gateway would have to autodetect.
         if (id === "doubao") entry.api = ps.apiType || "openai-responses";
         if (id === "kimi") entry.api = ps.apiType || "openai";
-        // RsClaw: the bare provider name `rsclaw` auto-resolves to
-        // ApiFormat::Rsclaw + the managed fleet baseUrl in
-        // gateway/providers.rs (build_providers, RSCLAW_DEFAULT_BASE
-        // fallback). No `api` / `baseUrl` keys needed unless the user
-        // pointed at a self-hosted worker — `ps.baseUrl` above is
-        // already preserved when set.
         providers[id] = entry;
       } else {
         providers[id] = {};
@@ -2533,6 +2553,16 @@ export function OnboardingPage() {
               <RsclawRecommendedCard
                 zh={isZh}
                 onInstalled={(data: InstalledKeyData) => {
+                  // Auto-callback path: web side handed back a valid
+                  // key, gateway-side ownership is implied. Synthesize
+                  // a "tested successfully" state so `canNextStep2`
+                  // flips immediately — no need for the user to click
+                  // 获取模型 (which would fail anyway, see below).
+                  const rsclawModels = MODELS["rsclaw"] || [];
+                  const defaultModel =
+                    rsclawModels.find((m) => m.rec)?.id ||
+                    rsclawModels[0]?.id ||
+                    "rsclaw-agent-v1";
                   setProvs((prev) => {
                     const next: Record<string, ProvState> = {};
                     for (const [k, v] of Object.entries(prev)) {
@@ -2543,17 +2573,17 @@ export function OnboardingPage() {
                         selected: k === "rsclaw",
                       };
                     }
-                    // Make sure rsclaw exists in the map (it should
-                    // already, but defensive) and fill in the key.
                     const existing = next["rsclaw"] || ({} as ProvState);
                     next["rsclaw"] = {
                       ...existing,
                       selected: true,
                       apiKey: data.key,
-                      // Reset any stale test/model state from a prior
-                      // attempt so the user sees a fresh flow.
-                      inputState: "",
-                      models: existing.models || null,
+                      testStatus: "success",
+                      inputState: "ok",
+                      testError: "",
+                      modelsLoading: false,
+                      models: rsclawModels,
+                      selectedModel: defaultModel,
                     };
                     return next;
                   });

@@ -59,6 +59,7 @@ pub fn minimal_config(port: u16) -> RuntimeConfig {
             auth_token: None,
             a2a_bearer_tokens: vec![],
             a2a_api_keys: vec![],
+            a2a_max_body_bytes: 100 * 1024 * 1024,
             auth_token_configured: false,
             auth_token_is_plaintext: false,
             allow_tailscale: false,
@@ -201,6 +202,7 @@ pub async fn start_server_with_handles(addr: SocketAddr) -> ServerHandles {
             let store = Arc::new(rsclaw::a2a::store::TaskStore::open(&path).expect("a2a store"));
             Arc::new(rsclaw::a2a::push::PushDispatcher::new(store, bus))
         },
+        knowledge: None,
     };
 
     // Leak tempdir — store must stay live for the lifetime of the server task.

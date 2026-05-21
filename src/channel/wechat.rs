@@ -26,6 +26,7 @@ use tracing::{debug, error, info, warn};
 
 use super::{Channel, OutboundMessage};
 use crate::channel::chunker::{ChunkConfig, chunk_text};
+use crate::channel::retry::{SendRetry, send_with_retry};
 
 const ILINK_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
 const DEFAULT_BOT_TYPE: &str = "3";
@@ -444,6 +445,8 @@ impl WeChatPersonalChannel {
 
     async fn send_text(&self, to_user_id: &str, text: &str) -> Result<()> {
         let url = format!("{}/ilink/bot/sendmessage", self.base_url);
+        // client_id is generated once and held constant across retries so a
+        // post-commit reset does not double-send (ilink dedupes on it).
         let client_id = uuid::Uuid::new_v4().to_string();
         let body = json!({
             "msg": {
@@ -461,15 +464,14 @@ impl WeChatPersonalChannel {
         });
 
         let body_str = serde_json::to_string(&body).unwrap_or_default();
-        let headers = ilink_headers(&self.bot_token, body_str.len());
-        let resp = self
-            .client
-            .post(&url)
-            .headers(headers)
-            .timeout(Duration::from_millis(SEND_TIMEOUT_MS))
-            .body(body_str)
-            .send()
-            .await?;
+        let resp = send_with_retry("wechat", &SendRetry::default(), || {
+            self.client
+                .post(&url)
+                .headers(ilink_headers(&self.bot_token, body_str.len()))
+                .timeout(Duration::from_millis(SEND_TIMEOUT_MS))
+                .body(body_str.clone())
+        })
+        .await?;
 
         let status = resp.status();
         let resp_body = resp.text().await.unwrap_or_default();

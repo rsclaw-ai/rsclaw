@@ -9,6 +9,14 @@ use super::LlmProvider;
 #[derive(Default)]
 pub struct ProviderRegistry {
     providers: HashMap<String, Arc<dyn LlmProvider>>,
+    /// Providers that were configured but couldn't be built — typically
+    /// because a required SecretOrString resolved to an unset `${VAR}`
+    /// placeholder and no env fallback found a value. Maps name → human
+    /// reason. `get(name)` returns an error containing the reason, so
+    /// failover and runtime callers see the actual cause instead of a
+    /// generic "provider not registered". Exposed via `/api/v1/status`
+    /// so operators can fix the env without parsing logs.
+    disabled: HashMap<String, String>,
     /// Model alias table: full model key -> target provider name.
     /// When a model matches, the request is routed to the alias provider
     /// with the original full model key preserved as model_id.
@@ -19,6 +27,7 @@ impl std::fmt::Debug for ProviderRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProviderRegistry")
             .field("providers", &self.providers.keys().collect::<Vec<_>>())
+            .field("disabled", &self.disabled.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -33,6 +42,21 @@ impl ProviderRegistry {
         self.providers.insert(name.into(), provider);
     }
 
+    /// Mark a configured provider as disabled with a human-readable
+    /// reason. Used at boot when a required Secret resolves to an
+    /// unresolved `${VAR}` placeholder — better to fail fast at
+    /// `get(name)` than to register a provider that will 401 every
+    /// request.
+    pub fn disable(&mut self, name: impl Into<String>, reason: impl Into<String>) {
+        let name = name.into();
+        let reason = reason.into();
+        // If both register and disable are called for the same name
+        // (shouldn't happen, but defend), disabling wins — operator
+        // sees the reason instead of silent fail.
+        self.providers.remove(&name);
+        self.disabled.insert(name, reason);
+    }
+
     /// Set model aliases from config (agents.defaults.models).
     /// Maps a full model key (e.g. "minimax/minimax-m2.1") to a provider name
     /// (e.g. "gaterouter"). When resolved, the full model key is preserved as
@@ -41,8 +65,15 @@ impl ProviderRegistry {
         self.model_aliases = aliases;
     }
 
-    /// Look up a provider by name.
+    /// Look up a provider by name. If the name was explicitly disabled
+    /// at boot (e.g. unresolved API key), the error includes the boot
+    /// reason so callers and end users see the underlying cause.
     pub fn get(&self, name: &str) -> Result<Arc<dyn LlmProvider>> {
+        if let Some(reason) = self.disabled.get(name) {
+            return Err(anyhow::anyhow!(
+                "provider '{name}' is disabled: {reason}"
+            ));
+        }
         self.providers
             .get(name)
             .cloned()
@@ -52,6 +83,18 @@ impl ProviderRegistry {
     /// List all registered provider names.
     pub fn names(&self) -> Vec<&str> {
         self.providers.keys().map(String::as_str).collect()
+    }
+
+    /// List `(name, reason)` for every disabled provider. Empty when
+    /// nothing is disabled. Stable order for predictable status output.
+    pub fn disabled_list(&self) -> Vec<(&str, &str)> {
+        let mut entries: Vec<(&str, &str)> = self
+            .disabled
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        entries.sort_by_key(|(k, _)| *k);
+        entries
     }
 
     /// Parse a model string like `"anthropic/claude-sonnet-4-5"` into

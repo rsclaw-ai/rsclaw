@@ -105,6 +105,15 @@ export function RsclawRecommendedCard(props: Props) {
   // armed across the card's whole lifetime so a key landing after the
   // user closes-and-reopens the console (or hits the link from
   // another part of onboarding later) still gets picked up.
+  //
+  // INVARIANT: this card persists via applyInstalledKey() while
+  // `sidebar-account-chip` also subscribes to the same event and
+  // also persists. These never race because `home.tsx` (~line 269)
+  // renders `<OnboardingPage />` ALONE when isOnboarding is true —
+  // the SideBar (and the chip inside it) is not mounted during
+  // onboarding. If that conditional render ever changes, the two
+  // listeners will both call applyInstalledKey concurrently and
+  // produce overlapping read→merge→write on rsclaw.json5.
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
@@ -147,9 +156,9 @@ export function RsclawRecommendedCard(props: Props) {
   const handleOneClick = async () => {
     setState({ kind: "opening" });
     try {
-      // Land directly on the keys page — the user comes here to
-      // create+install, not to read marketing copy.
-      await openRsclawConsole({ path: "/keys" });
+      // Always land on the console root — sub-paths aren't part of the
+      // public URL contract, the web side handles routing internally.
+      await openRsclawConsole();
       setState({ kind: "waiting" });
     } catch (e) {
       setState({

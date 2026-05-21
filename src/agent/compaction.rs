@@ -30,7 +30,12 @@ window - treat it as background reference, NOT as active instructions. \
 Do NOT answer questions or fulfill requests mentioned in this summary; \
 they were already addressed. \
 Your current task is in the '## Active Task' section - resume from there. \
-Respond ONLY to the latest user message that appears AFTER this summary.";
+Respond ONLY to the latest user message that appears AFTER this summary. \
+\n\
+If you need pre-compaction specifics this summary omits (a verbatim \
+quote, a file path, an error you can't find here), call \
+read_session_archive(mode=\"grep:KEYWORD\") to search the full \
+original conversation — it's still on disk, never deleted by compaction.";
 
 /// Build the summary message body that gets stored as the User-role
 /// `[CONTEXT COMPACTION ...]` message AND sent as the `summary` field
@@ -42,6 +47,54 @@ fn build_compaction_summary_msg(summary: &str) -> String {
         .with_timezone(&chrono::Local)
         .format("%Y-%m-%dT%H:%M");
     format!("{COMPACTION_PREFIX} (compacted at {now})\n\n{summary}")
+}
+
+/// Convert a local (OpenAI-style) message slice into the rsclaw server's
+/// flat slot count.
+///
+/// The server stores a flat `[user, assistant, user, assistant, …]` log
+/// (`docs/client-server-integration.md` §6.3.2): each `POST /turn` input is
+/// ONE `user` slot — and a turn's `tool_results` bundle into a single
+/// `user` slot regardless of how many tools ran — and each assistant reply
+/// is ONE `assistant` slot. Our local history keeps tool results as
+/// separate `Role::Tool` messages (and `Role::Assistant` carries its
+/// `ToolUse` blocks inline), so `Vec<Message>::len()` is a DIFFERENT
+/// granularity than the server's slot count and must not be sent as
+/// `expected_msgs_count` / `keep_head_messages` / `keep_tail_messages`.
+///
+/// Mapping that mirrors the server's bundling:
+///   - `Role::User`      → 1 slot
+///   - `Role::Assistant` → 1 slot
+///   - a maximal contiguous run of `Role::Tool` → 1 slot (the bundled
+///     `tool_results` turn)
+///   - `Role::System`    → 0 (it lives in the prefix, never a message slot)
+///
+/// Self-consistency: after a splice the local history is rebuilt as
+/// `head + summary(1 user) + tail`, so `count_server_slots` of the new
+/// history equals `keep_head + 1 + keep_tail`, which is exactly the
+/// server's reported post-splice `msgs_count` — the basis stays aligned
+/// across repeated compactions with no extra bookkeeping.
+fn count_server_slots(msgs: &[Message]) -> usize {
+    let mut slots = 0usize;
+    let mut in_tool_run = false;
+    for m in msgs {
+        match m.role {
+            Role::User | Role::Assistant => {
+                slots += 1;
+                in_tool_run = false;
+            }
+            Role::Tool => {
+                if !in_tool_run {
+                    slots += 1;
+                    in_tool_run = true;
+                }
+            }
+            Role::System => {
+                in_tool_run = false;
+            }
+        }
+    }
+    slots
 }
 
 /// Returns true if a JSON message value represents a compaction summary (internal only).
@@ -96,33 +149,83 @@ impl AgentRuntime {
         let cfg = self.live.agents.read().await.defaults.compaction.clone()
             .unwrap_or_default();
 
-        // Compaction trigger: token threshold ONLY.
-        // Turn count and time-based triggers were removed because they
-        // unnecessarily discard context and break KV cache in the new
-        // append-only architecture.
-        let context_tokens = self.live.agents.read().await.defaults.context_tokens.unwrap_or(64_000) as usize;
-        let kv_cache_mode = self.live.agents.read().await.defaults.kv_cache_mode.unwrap_or(1);
-        // kvCacheMode >= 1: append-only mode, compact at 80% to leave headroom
-        // for token estimation inaccuracy (10-15%). Mode 0: legacy 50% threshold.
-        let default_threshold = if kv_cache_mode >= 1 {
-            (context_tokens * 4 / 5).max(16_000) // 80% — safe margin for estimation error
+        // Compaction trigger: token threshold against the FULL prompt size
+        // (system + tools + message history), not message history alone.
+        //
+        // Previously this compared `sum(msg_tokens)` against an 80%-of-context
+        // threshold — but msg_tokens excludes the ~24K of system prompt + tool
+        // definitions that every request also carries. On a 64K context with
+        // 6K system + 17.5K tools, the backend rejects at ~40K msg_tokens, yet
+        // the old check didn't fire until 51K msg_tokens — so the model 413'd
+        // before compaction ever ran. Compare against `total` instead.
+        // Per-agent context window wins (agent.model.contextTokens), then
+        // the global default, then 64K. handle.context_window already
+        // resolved that chain at construction (0 = unset → use default).
+        let context_tokens = if self.handle.context_window > 0 {
+            self.handle.context_window
         } else {
-            (context_tokens / 2).max(16_000)      // 50% — same as hermes, save tokens/cost
+            self.live.agents.read().await.defaults.context_tokens.unwrap_or(64_000) as usize
         };
-        // reserveTokensFloor is the MINIMUM tokens to keep free for replies.
-        // Trigger compaction when used tokens exceed (contextTokens - reserveFloor).
-        // NOT a direct threshold — it's how much headroom to leave.
+        // Used later to pick the splice strategy (mode 2 = rsclaw stateful).
+        //
+        // Mirror the auto-force at runtime.rs (~4277): the actual turn LLM
+        // calls force kv_cache_mode=2 whenever the resolved provider is
+        // `rsclaw`, regardless of agents.defaults.kv_cache_mode (which is
+        // unset → 1 by default). Compaction MUST use the same effective
+        // mode, otherwise the `kv_cache_mode == 2` splice path below is
+        // skipped: the session gets rewritten locally but the server is
+        // never told, so the next turn's lookup sees msgs.len() drop,
+        // forces a /sessions/replay, opens a NEW server session_id, and
+        // cold-prefills the entire post-compact history (~50s/turn,
+        // observed as rs_w4_* session churn in the worker log). With the
+        // effective mode the splice preserves session_id and the cache.
+        let configured_kv_mode =
+            self.live.agents.read().await.defaults.kv_cache_mode.unwrap_or(1);
+        let (resolved_provider, _) = self.providers.resolve_model(model);
+        let kv_cache_mode = if resolved_provider == "rsclaw" {
+            2
+        } else {
+            configured_kv_mode
+        };
+
+        // Headroom to leave below the context window for: the model's reply,
+        // the next user message, and token-estimation drift. `reserveTokensFloor`
+        // (if configured) is authoritative; otherwise reserve 5% + a fixed
+        // margin for the next inbound message.
+        const NEXT_MSG_MARGIN: usize = 4_000;
+        let reply_reserve = (context_tokens / 20).max(2_000);
         let token_threshold = if let Some(floor) = cfg.reserve_tokens_floor {
             context_tokens.saturating_sub(floor as usize).max(16_000)
         } else {
-            default_threshold
+            context_tokens
+                .saturating_sub(reply_reserve)
+                .saturating_sub(NEXT_MSG_MARGIN)
+                .max(16_000)
         };
 
-        let total_tokens: usize = self
-            .sessions
-            .get(session_key)
-            .map(|msgs| msgs.iter().map(msg_tokens).sum())
-            .unwrap_or(0);
+        // Prefer the server-measured prompt size (input_tokens from the last
+        // turn's usage, stored as `SessionTokens.total`) — it's exact, vs the
+        // chars/4 heuristic which drifts 10-30% on CJK / code. Falls back to
+        // the estimate (msg_tokens sum + fixed sys/tools overhead) when usage
+        // wasn't reported (e.g. first turn, or a provider that omits usage).
+        let real_total = self
+            .handle
+            .session_tokens
+            .read()
+            .ok()
+            .and_then(|m| m.get(session_key).map(|t| t.total))
+            .filter(|&t| t > 0);
+        let total_tokens: usize = real_total.unwrap_or_else(|| {
+            let msgs: usize = self
+                .sessions
+                .get(session_key)
+                .map(|msgs| msgs.iter().map(msg_tokens).sum())
+                .unwrap_or(0);
+            // Add the fixed system+tools overhead so the estimate is
+            // comparable to `total` (a full-prompt number).
+            let overhead = self.estimate_fixed_overhead();
+            msgs + overhead
+        });
 
         let turns = self
             .compaction_state
@@ -502,8 +605,13 @@ impl AgentRuntime {
         if kv_cache_mode == 2 {
             let (resolved_provider, _) = self.providers.resolve_model(model);
             if let Ok(provider) = self.providers.get(resolved_provider) {
-                let head_count = head_msgs.len();
-                let tail_count = recent_msgs.len();
+                // keep_head/keep_tail/expected MUST be in the server's
+                // flat-slot unit, not local Vec<Message> length — see
+                // count_server_slots. head is the first user+assistant
+                // (2 slots, or 0 post-/clear); tail is the kept recent
+                // window collapsed to server slots.
+                let head_count = count_server_slots(&head_msgs);
+                let tail_count = count_server_slots(&recent_msgs);
                 // Honest Option: when there's no cached session locally
                 // we send None instead of misleading Some(0) — the
                 // server would 409 against 0 and the log would
@@ -513,7 +621,7 @@ impl AgentRuntime {
                 let expected: Option<usize> = self
                     .sessions
                     .get(session_key)
-                    .map(|m| m.len());
+                    .map(|m| count_server_slots(m));
                 match provider
                     .compact_splice(
                         session_key,
@@ -566,6 +674,11 @@ impl AgentRuntime {
         // Reset compaction state after successful compaction.
         self.compaction_state
             .insert(session_key.to_owned(), (std::time::Instant::now(), 0));
+
+        // Compaction is a natural refresh point: pick up any skills installed
+        // (skill_install) since the last load. Cache-safe — only re-prefills
+        // the per-session user_system layer, and only if the set changed.
+        self.reload_skills();
 
         // Persist compacted session to redb (survives restarts).
         if let Some(sess) = self.sessions.get(session_key) {
@@ -1193,4 +1306,90 @@ fn parse_entities_from_summary(summary: &str) -> Vec<crate::agent::context_mgr::
     }
 
     entities
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(role: Role, text: &str) -> Message {
+        Message {
+            role,
+            content: MessageContent::Text(text.to_owned()),
+        }
+    }
+
+    #[test]
+    fn count_server_slots_plain_turns() {
+        // [user, assistant, user, assistant] → 4 server slots, one per
+        // /turn input + one per assistant reply.
+        let msgs = vec![
+            msg(Role::User, "hi"),
+            msg(Role::Assistant, "hello"),
+            msg(Role::User, "bye"),
+            msg(Role::Assistant, "later"),
+        ];
+        assert_eq!(count_server_slots(&msgs), 4);
+    }
+
+    #[test]
+    fn count_server_slots_bundles_tool_run() {
+        // One tool round: user, assistant(tool_calls), tool, tool, assistant.
+        // The server bundles the two tool_results into a SINGLE user slot
+        // (the tool_results /turn), so 5 local messages → 4 server slots:
+        // [user, assistant, user(bundled), assistant].
+        let msgs = vec![
+            msg(Role::User, "q"),
+            msg(Role::Assistant, "calling tools"),
+            msg(Role::Tool, "result-a"),
+            msg(Role::Tool, "result-b"),
+            msg(Role::Assistant, "final"),
+        ];
+        assert_eq!(count_server_slots(&msgs), 4);
+    }
+
+    #[test]
+    fn count_server_slots_two_tool_rounds() {
+        // user, assistant(tc), [tool], assistant(tc), [tool], assistant
+        // → server: user, asst, user, asst, user, asst = 6 slots.
+        let msgs = vec![
+            msg(Role::User, "q"),
+            msg(Role::Assistant, "tc1"),
+            msg(Role::Tool, "r1"),
+            msg(Role::Assistant, "tc2"),
+            msg(Role::Tool, "r2"),
+            msg(Role::Assistant, "final"),
+        ];
+        assert_eq!(count_server_slots(&msgs), 6);
+    }
+
+    #[test]
+    fn count_server_slots_skips_system() {
+        // A leading system message lives in the prefix, not a message slot.
+        let msgs = vec![
+            msg(Role::System, "you are concise"),
+            msg(Role::User, "hi"),
+            msg(Role::Assistant, "hello"),
+        ];
+        assert_eq!(count_server_slots(&msgs), 2);
+    }
+
+    #[test]
+    fn count_server_slots_post_splice_self_consistent() {
+        // After a splice the local history is head(2) + summary(1 user) +
+        // tail. count_server_slots of that rebuild must equal
+        // keep_head + 1 + keep_tail so the basis stays aligned with the
+        // server's reported msgs_count across repeated compactions.
+        let keep_head = 2;
+        let keep_tail = 4;
+        let mut rebuilt = vec![msg(Role::User, "first"), msg(Role::Assistant, "first-reply")];
+        rebuilt.push(msg(Role::User, "[CONTEXT COMPACTION] summary"));
+        rebuilt.extend(vec![
+            msg(Role::User, "t1"),
+            msg(Role::Assistant, "t1r"),
+            msg(Role::User, "t2"),
+            msg(Role::Assistant, "t2r"),
+        ]);
+        assert_eq!(count_server_slots(&rebuilt), keep_head + 1 + keep_tail);
+    }
 }

@@ -151,7 +151,7 @@ pub(crate) fn toolset_allowed_names(
         "memory",
         "clarify",
         "anycli",
-        "use_skill",
+        "skill_use",
     ];
     const WEB: &[&str] = &[
         "web_search",
@@ -162,7 +162,7 @@ pub(crate) fn toolset_allowed_names(
         "list_dir",
         "search_file",
         "memory",
-        "use_skill",
+        "skill_use",
     ];
     const CODE: &[&str] = &[
         "shell",
@@ -172,7 +172,7 @@ pub(crate) fn toolset_allowed_names(
         "search_file",
         "search_content",
         "memory",
-        "use_skill",
+        "skill_use",
     ];
     const STANDARD: &[&str] = &[
         "shell",
@@ -192,7 +192,11 @@ pub(crate) fn toolset_allowed_names(
         "computer_use",
         "clarify",
         "anycli",
-        "use_skill",
+        "skill_use",
+        "skill_list",
+        "skill_search",
+        "skill_install",
+        "skill_remove",
         "task",
     ];
 
@@ -260,8 +264,13 @@ pub fn build_tool_list(
     });
     // `use_skill` — first-class entry point for installed skills. Listed
     // EARLY in the tool list so the LLM notices it before web_fetch /
-    // web_browser / shell. Only registered when at least one
-    // skill is installed; otherwise it'd be dead surface area.
+    // web_browser / shell. Registered UNCONDITIONALLY (even with zero
+    // skills installed) so the cacheable base-layer prefix — and the
+    // exported baseline that seeds the rsclaw-server prefix slot — is
+    // DETERMINISTIC regardless of the generating host's skill set. With no
+    // skills installed the model just has nothing valid to pass; that's
+    // cheaper than a baseline whose tool set silently depends on whether
+    // the dump machine happened to have a skill on disk.
     //
     // Critical invariant: this description does NOT enumerate installed
     // skill names. The skill list lives in `user_system` (rendered by
@@ -270,37 +279,85 @@ pub fn build_tool_list(
     // base layer hash. Embedding skill names HERE — inside `tools` —
     // would put them in the base-layer hash input and break cross-host
     // cache reuse for clients with different skill sets installed.
-    if skills.all().next().is_some() {
-        tools.push(ToolDef {
-            name: "use_skill".to_owned(),
-            description:
-                "ACTIVATE an installed skill. Use this BEFORE web_fetch / web_browser / \
-                shell whenever the user's task matches any skill description \
-                shown in the system prompt under '## Installed Skills' (flights, hotels, \
-                stocks, weather, finance data, etc.).\n\n\
-                Returns the full SKILL.md so you know the exact CLI command and flags. \
-                After calling use_skill you typically call shell with the CLI \
-                from skill_md.\n\n\
-                Common failure to avoid: defaulting to web_fetch on a domain a skill \
-                already covers. If a skill description matches, you MUST use_skill first.\n\n\
-                Anti-loop guard: if you can already see the skill's content rendered in \
-                the current turn (e.g. injected via a system message or returned by a \
-                previous use_skill call), DO NOT call use_skill again — follow the \
-                instructions directly. Re-invoking on already-loaded content wastes a \
-                turn and burns context."
-                    .to_owned(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Exact skill name from the '## Installed Skills' list in the system prompt (e.g. 'flyai', 'hithink-market-query'). Case-sensitive."
-                    }
-                },
-                "required": ["name"]
-            }),
-        });
-    }
+    tools.push(ToolDef {
+        name: "skill_use".to_owned(),
+        description:
+            "ACTIVATE an installed skill. Use this BEFORE web_fetch / web_browser / \
+            shell whenever the user's task matches any skill description \
+            shown in the system prompt under '## Installed Skills' (flights, hotels, \
+            stocks, weather, finance data, etc.).\n\n\
+            Returns the full SKILL.md so you know the exact CLI command and flags. \
+            After calling skill_use you typically call shell with the CLI \
+            from skill_md.\n\n\
+            Common failure to avoid: defaulting to web_fetch on a domain a skill \
+            already covers. If a skill description matches, you MUST skill_use first. \
+            If NO installed skill matches but one likely exists (e.g. restaurants → \
+            meituan, stocks → hithink), `skill_search` for it, `skill_install` it, \
+            then skill_use it.\n\n\
+            Anti-loop guard: if you can already see the skill's content rendered in \
+            the current turn (returned by a previous skill_use call), DO NOT call \
+            skill_use again — follow the instructions directly."
+                .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Exact skill name from the '## Installed Skills' list (e.g. 'flyai', 'hithink-market-query'). Case-sensitive."
+                }
+            },
+            "required": ["name"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "skill_list".to_owned(),
+        description: "List the skills currently installed locally (name + description). \
+            Use to see what's available before reaching for skill_search/web."
+            .to_owned(),
+        parameters: json!({ "type": "object", "properties": {} }),
+    });
+    tools.push(ToolDef {
+        name: "skill_search".to_owned(),
+        description: "Search the remote skill registries for an installable skill when no \
+            installed skill matches the task and web tools won't cut it (e.g. \
+            'restaurant'→meituan, 'stock quote'→hithink). Returns candidate slugs; \
+            install one with skill_install then activate with skill_use."
+            .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "What capability you need, e.g. 'restaurant booking', 'stock market data'."}
+            },
+            "required": ["query"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "skill_install".to_owned(),
+        description: "Install a skill by slug (from skill_search results) into the local \
+            skills store. Usable immediately via skill_use. Only install skills the \
+            user's task clearly needs."
+            .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Skill slug to install (from skill_search)."}
+            },
+            "required": ["name"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "skill_remove".to_owned(),
+        description: "Uninstall a locally-installed skill by name. Use only when the user \
+            asks to remove it."
+            .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Installed skill name to remove."}
+            },
+            "required": ["name"]
+        }),
+    });
     // `task` — escalate the current chat into a multi-turn background task.
     // The LLM decides when sustained work is warranted (implementation
     // spanning many tool calls, multi-file refactor, deep research). For
@@ -454,6 +511,97 @@ pub fn build_tool_list(
         }),
     });
     tools.push(ToolDef {
+        name: "read_session_archive".to_owned(),
+        description: "Search the FULL pre-compaction conversation history of the current session.\n\
+            \n\
+            When a session is compacted, you receive `[head + summary + recent]` in context, \
+            but every original message is still on disk (redb archive table, never deleted). \
+            Use this tool when the summary lacks specifics you need — e.g. the user asks \
+            about something discussed earlier and the summary doesn't have the verbatim detail.\n\
+            \n\
+            Modes:\n\
+              - mode=\"stat\"      — totals + seq range + generations, no content (CHEAP — check first)\n\
+              - mode=\"head:N\"    — first N archived messages (oldest)\n\
+              - mode=\"tail:N\"    — last N archived messages (newest)\n\
+              - mode=\"seq:A-B\"   — inclusive 1-indexed seq range, e.g. \"seq:120-140\"\n\
+              - mode=\"grep:PAT\"  — case-insensitive substring or alternation, e.g. \"grep:error|warn\" or \"grep:user paid\"\n\
+            \n\
+            Strategy: PREFER grep when you know a keyword — cheapest way to scan thousands of \
+            messages. Use stat first if the session is huge and you want to estimate cost. \
+            Use tail when the user says \"just earlier\" / \"刚刚\". Use seq:A-B for targeted \
+            scrolling around a known seq. Don't pull head/tail with large N; use grep.\n\
+            \n\
+            Large messages get nested through the artifact pipeline — if a result row has \
+            `tool_result_id`, call read_artifact for its full content. Grep results are \
+            capped at 50 hits per call; tighten the pattern if more.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "description": "stat | head:N | tail:N | seq:A-B | grep:PATTERN. Default `stat`."},
+                "generation": {"type": "integer", "description": "Optional — restrict to a specific session generation (post-/clear). Omit for all."}
+            }
+        }),
+    });
+    tools.push(ToolDef {
+        name: "read_artifact".to_owned(),
+        description: "Read the full content of a tool_result artifact written by the runtime backstop.\n\
+            \n\
+            When any tool produces output larger than ~4 KB, the runtime writes the full \
+            payload to disk and shows you only a head+tail preview in the tool_result. The \
+            preview ends with `... N lines omitted — call read_artifact(tool_result_id=\"tr_xxxxxxxx\") ...`. \
+            That id is your handle.\n\
+            \n\
+            Modes:\n\
+              - mode=\"stat\"        size + line count only, no content (CHEAP — check first if you don't know how big it is)\n\
+              - mode=\"full\"        (default) entire artifact text\n\
+              - mode=\"head:N\"      first N lines\n\
+              - mode=\"tail:N\"      last N lines\n\
+              - mode=\"lines:A-B\"   inclusive 1-indexed line range\n\
+              - mode=\"grep:PAT\"    case-insensitive regex over lines (substring works; alternation `a|b|c` works)\n\
+            \n\
+            Artifacts are session-scoped — an id from another session won't resolve. They \
+            also expire after 7 days. If you only need to scan for a known substring, \
+            `mode=\"grep:...\"` is much cheaper than `full`.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "tool_result_id": {"type": "string", "description": "Artifact id of the form `tr_xxxxxxxx` returned in a prior compacted tool_result."},
+                "mode": {"type": "string", "description": "full | head:N | tail:N | lines:A-B | grep:PATTERN. Default `full`."}
+            },
+            "required": ["tool_result_id"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "knowledge_base".to_owned(),
+        description: "Search the user's KNOWLEDGE BASE — documents, PDFs, web pages and \
+            files the user explicitly added for reference. Returns the most relevant \
+            chunks WITH their source title, so you can cite where an answer came from.\n\
+            \n\
+            Use this when the user asks about THEIR material (\"what does my contract \
+            say\", \"per the spec I uploaded\", \"summarize the docs\"), or whenever a \
+            factual answer should be grounded in and cited from their corpus.\n\
+            \n\
+            How it differs from other tools:\n\
+            - `memory` = things YOU learned about the user/past sessions (self-authored, \
+              may decay, no citation). The knowledge base is user-curated, authoritative, \
+              and citable.\n\
+            - `web_search` = the live public web. The knowledge base is the user's own \
+              private/local material.\n\
+            \n\
+            Prefer the knowledge base over web_search when the question is about content \
+            the user gave you. Always cite the returned `source_title`. If it returns no \
+            hits, say so — do NOT fabricate a citation.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Natural-language search query."},
+                "collection_ids": {"type": "array", "items": {"type": "string"}, "description": "Optional: restrict to specific collection ids. Omit to search all."},
+                "top_k": {"type": "integer", "description": "Max hits to return. Default 5."}
+            },
+            "required": ["query"]
+        }),
+    });
+    tools.push(ToolDef {
         name: "write_file".to_owned(),
         description: "Write/create a file (full-overwrite). Use this for ALL file creation and full \
             rewrites — do NOT use shell with notepad, echo, or any other editor/command to \
@@ -531,7 +679,7 @@ pub fn build_tool_list(
                         },
                         "required": ["label"]
                     },
-                    "description": "2-8 distinct choices. Always include enough that 'Other' (free-text) isn't needed for the common path."
+                    "description": "2-8 distinct choices. Each entry is a {label, description} object, OR a bare string (the string becomes the label). Always include enough that 'Other' (free-text) isn't needed for the common path."
                 },
                 "multi_select": {
                     "type": "boolean",
@@ -601,27 +749,29 @@ pub fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "shell".to_owned(),
-        description: if cfg!(target_os = "windows") {
-            windows_shell_description()
-        } else if cfg!(target_os = "macos") {
-            "Run a shell command (bash/zsh) on macOS.\n\
+        // OS-AGNOSTIC by design: this description is hashed into the
+        // cacheable base-layer prefix, so it must be byte-identical across
+        // macOS / Linux / Windows clients. The actual OS, shell, package
+        // manager, and shell-specific syntax (chaining/quoting/encoding,
+        // PowerShell edition quirks) live in the per-session `user_system`
+        // "Platform" section (see prompt_builder::build_user_system), which
+        // reflects the CLIENT's real OS and never enters the base hash.
+        description: "Run a shell command. Your OS, shell, package manager, and \
+             shell-specific syntax (command chaining, quoting, encoding) are described in \
+             the system prompt's \"Platform\" section — follow those.\n\
              IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`, for HTTP/API requests use `web_fetch`. Only use shell for commands that have no dedicated tool.\n\
-             Use shell for: git operations, running scripts (node/python/cargo), system info (uname, df, top), package management (brew/npm/pip), process management (ps, kill).\n\
+             Use shell for: git operations, running scripts (node/python/cargo), system info, package management, process management.\n\
              Do NOT use shell for HTTP requests (curl/wget) or file downloads — use `web_fetch` / `web_download` instead.\n\
              \n\
-             Tool selection: bash for file/text/system ops; python3 for data processing (CSV/JSON/automation).\n\
-             Check tool availability first (`which python3`, `which node`). Use `install_tool` for system tools.\n\
+             Tool selection: shell for file/text/system ops; python for data processing (CSV/JSON/automation).\n\
+             Check tool availability first (e.g. `which python3` / `Get-Command python`). Use `install_tool` for system tools.\n\
              \n\
-             Bash patterns: `| head -n 20` to limit output, `date +%s` for timestamps, `find . -name '*.py' -mtime -7`.\n\
-             Python patterns: `python3 -c \"import json; ...\"` for one-liners, write to /tmp/script.py for multi-line, `pip install` for packages.\n\
-             \n\
-             Best practices: pipe large output through head/tail, use wait=false for long tasks, never run destructive commands on personal dirs.\n\
+             Best practices: pipe large output through a head/limit, use wait=false for long tasks, never run destructive commands on personal dirs.\n\
              If a command fails, do NOT retry with the same arguments. Try a different approach or ask the user.\n\
              \n\
              Multiple commands:\n\
              - Independent → emit MULTIPLE shell tool calls in ONE message for parallelism.\n\
-             - Dependent → single shell call with shell-native chaining (`&&` on bash/zsh; on Windows PowerShell 5.1 use `; if ($?) { ... }` since 5.1 lacks `&&`).\n\
-             - Use `;` only when you don't care whether earlier commands succeed.\n\
+             - Dependent → a single shell call chained with the OS-appropriate operator (see the Platform section).\n\
              - Do NOT use newlines to separate commands — use chaining or separate calls.\n\
              \n\
              Sleep is rarely the right answer:\n\
@@ -634,40 +784,7 @@ pub fn build_tool_list(
              - NEVER `--no-verify`, `--no-gpg-sign`, or `-c commit.gpgsign=false` unless the user explicitly asks — fix the hook failure instead.\n\
              - AVOID `git add -A` / `git add .` — stage specific files so you don't leak `.env`, credentials, or build artifacts.\n\
              - Prefer NEW commits over `--amend`; amending after a pre-commit-hook failure can destroy work because the failed commit never landed."
-                .to_owned()
-        } else {
-            "Run a shell command (bash/sh) on Linux.\n\
-             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`, for HTTP/API requests use `web_fetch`. Only use shell for commands that have no dedicated tool.\n\
-             Use shell for: git operations, running scripts (node/python/cargo), system info (uname, df, top), package management (apt/npm/pip), process management (ps, kill).\n\
-             Do NOT use shell for HTTP requests (curl/wget) or file downloads — use `web_fetch` / `web_download` instead.\n\
-             \n\
-             Tool selection: bash for file/text/system ops; python3 for data processing (CSV/JSON/automation).\n\
-             Check tool availability first (`which python3`, `which node`). Use `install_tool` for system tools.\n\
-             \n\
-             Bash patterns: `| head -n 20` to limit output, `date +%s` for timestamps, `find . -name '*.py' -mtime -7`.\n\
-             Python patterns: `python3 -c \"import json; ...\"` for one-liners, write to /tmp/script.py for multi-line, `pip install` for packages.\n\
-             \n\
-             Best practices: pipe large output through head/tail, use wait=false for long tasks, never run destructive commands on personal dirs.\n\
-             If a command fails, do NOT retry with the same arguments. Try a different approach or ask the user.\n\
-             \n\
-             Multiple commands:\n\
-             - Independent → emit MULTIPLE shell tool calls in ONE message for parallelism.\n\
-             - Dependent → single shell call with shell-native chaining (`&&` on bash/zsh; on Windows PowerShell 5.1 use `; if ($?) { ... }` since 5.1 lacks `&&`).\n\
-             - Use `;` only when you don't care whether earlier commands succeed.\n\
-             - Do NOT use newlines to separate commands — use chaining or separate calls.\n\
-             \n\
-             Sleep is rarely the right answer:\n\
-             - Don't sleep between commands that can run back-to-back.\n\
-             - Don't sleep-poll a background task you started with `wait=false` — task results are delivered on your next turn automatically.\n\
-             - Don't sleep-retry a failing command — find the actual cause and change something.\n\
-             \n\
-             Git safety:\n\
-             - NEVER force-push to main / master.\n\
-             - NEVER `--no-verify`, `--no-gpg-sign`, or `-c commit.gpgsign=false` unless the user explicitly asks — fix the hook failure instead.\n\
-             - AVOID `git add -A` / `git add .` — stage specific files so you don't leak `.env`, credentials, or build artifacts.\n\
-             - Prefer NEW commits over `--amend`; amending after a pre-commit-hook failure can destroy work because the failed commit never landed."
-                .to_owned()
-        },
+            .to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -1616,7 +1733,13 @@ pub fn build_tool_list(
 /// The 5.1 / 7+ branches differ sharply (`&&`, `??`, ternary, `2>&1`
 /// semantics, file encoding defaults). Steering the model with the right
 /// syntax up front avoids a class of parser-error retries.
-fn windows_shell_description() -> String {
+/// Windows shell guidance for the per-session `user_system` "Platform"
+/// section (NOT the cached `shell` tool description — that's OS-agnostic).
+/// Lives here next to the shell tool for cohesion, but is consumed by
+/// `prompt_builder::build_user_system`. Reflects the actual host's
+/// PowerShell edition via runtime detection, so it must stay in the
+/// per-session layer that never enters the base-layer prefix hash.
+pub(crate) fn windows_shell_guidance() -> String {
     use super::platform::{detect_powershell_edition, PowerShellEdition};
 
     let edition_section = match detect_powershell_edition() {
@@ -1643,7 +1766,7 @@ fn windows_shell_description() -> String {
     };
 
     format!(
-        "Run a shell command (PowerShell) on Windows.\n\
+        "Platform: Windows. Shell: PowerShell. Package manager: winget/scoop/choco (npm/pip for language deps).\n\
          IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`, for HTTP/API requests use `web_fetch`. Only use shell for commands that have no dedicated tool.\n\
          Use shell for: git operations, running scripts (node/python/cargo), system info (systeminfo, ipconfig, Get-Process), package management (npm/pip), process management (Start-Process, Stop-Process, taskkill).\n\
          Do NOT use shell for HTTP requests (curl/wget/Invoke-WebRequest) or file downloads — use `web_fetch` / `web_download` instead.\n\

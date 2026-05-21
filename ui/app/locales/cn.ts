@@ -939,8 +939,13 @@ const cn = {
       ServiceTitle: "网关状态",
       Config: "配置管理",
       ConfigTitle: "配置管理",
-      Agents: "多智能体",
-      AgentsTitle: "多智能体管理",
+      Agents: "智能体管理",
+      AgentsTitle: "智能体管理",
+      Memory: "记忆管理",
+      MemoryTitle: "记忆管理",
+      Knowledge: "知识库管理",
+      KnowledgeTitle: "知识库管理",
+      ComingSoon: "即将上线",
     },
 
     Nav: {

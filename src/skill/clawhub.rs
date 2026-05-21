@@ -139,9 +139,16 @@ struct SkillhubUrls {
     primary_download: String,
 }
 
-/// Load iwencai URLs from defaults.toml. `IWENCAI_BASE_URL` env (or the
-/// `base_url_env` field) overrides the static defaults so 同花顺 can roll
-/// out a new gateway without us shipping a release.
+/// Load the iwencai skill-MARKETPLACE URLs from defaults.toml.
+///
+/// IMPORTANT: this is the skill marketplace (search/download) at
+/// `ms.10jqka.com.cn`, which is unauthenticated. It is DISTINCT from the
+/// `openapi.iwencai.com` DATA API that an *installed* skill calls at runtime
+/// with `IWENCAI_API_KEY` (+ `X-Claw-Skill-Version`). Do NOT rebase these
+/// marketplace URLs with `IWENCAI_BASE_URL` — users set that to the data-API
+/// gateway (openapi.iwencai.com), which 401s the marketplace endpoints. Use a
+/// dedicated `IWENCAI_MARKET_BASE_URL` if 同花顺 ever needs to move the
+/// marketplace (unset → the ms.10jqka default, which works without auth).
 fn iwencai_urls() -> IwencaiUrls {
     static URLS: std::sync::LazyLock<IwencaiUrls> = std::sync::LazyLock::new(|| {
         #[derive(serde::Deserialize, Default)]
@@ -164,7 +171,11 @@ fn iwencai_urls() -> IwencaiUrls {
             .and_then(|v| v.as_str())
             .unwrap_or("http://ms.10jqka.com.cn/gateway/market/api/v1/skills/square")
             .to_owned();
-        let env_override = std::env::var("IWENCAI_BASE_URL").ok().filter(|s| !s.is_empty());
+        // Marketplace-specific override ONLY — never IWENCAI_BASE_URL (that's
+        // the data-API gateway and 401s these endpoints). Unset → ms.10jqka.
+        let env_override = std::env::var("IWENCAI_MARKET_BASE_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
         IwencaiUrls {
             install_template: rebase_url(&install_template, env_override.as_deref()),
             list: rebase_url(&list_url, env_override.as_deref()),
@@ -776,7 +787,23 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> Result<()> {
             continue;
         }
 
-        let out_path = dest.join(rel_path);
+        // Zip Slip guard: an entry like `pkg/../../.ssh/authorized_keys` would
+        // otherwise resolve outside `dest` and write into the home dir. Reject
+        // absolute paths and any `..` / root / prefix component, then confirm
+        // the resolved path stays under `dest`.
+        let rel = Path::new(rel_path);
+        if rel.components().any(|c| {
+            !matches!(
+                c,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        }) {
+            bail!("refusing zip entry with unsafe path: {name:?}");
+        }
+        let out_path = dest.join(rel);
+        if !out_path.starts_with(dest) {
+            bail!("refusing zip entry that escapes destination: {name:?}");
+        }
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -850,5 +877,42 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let lock = LockFile::read(tmp.path()).expect("read");
         assert!(lock.skills.is_empty());
+    }
+
+    /// Build an in-memory zip with the given (name, contents) entries.
+    fn make_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+            for (name, data) in entries {
+                w.start_file(*name, opts).expect("start_file");
+                w.write_all(data).expect("write");
+            }
+            w.finish().expect("finish");
+        }
+        buf
+    }
+
+    #[test]
+    fn extract_zip_blocks_path_traversal() {
+        let outer = tempfile::tempdir().expect("tempdir");
+        let dest = outer.path().join("dest");
+        std::fs::create_dir_all(&dest).expect("mkdir dest");
+
+        // "pkg/" is the shared top-level dir that gets stripped, leaving
+        // "../evil.txt" which would land in `outer/evil.txt` — outside dest.
+        let zip = make_zip(&[
+            ("pkg/SKILL.md", b"# legit"),
+            ("pkg/../evil.txt", b"pwned"),
+        ]);
+
+        let _ = extract_zip(&zip, &dest);
+
+        assert!(
+            !outer.path().join("evil.txt").exists(),
+            "zip slip: file escaped the destination directory"
+        );
     }
 }

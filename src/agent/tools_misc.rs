@@ -617,7 +617,13 @@ $synth.Speak('{}')
     // -------------------------------------------------------------------
 
     pub(crate) async fn tool_memory_consolidated(&self, ctx: &RunContext, args: Value) -> Result<Value> {
-        let action = args["action"].as_str().unwrap_or("search");
+        // Trim whitespace/newlines: the rsclaw v1 block protocol shards
+        // tool_call input JSON across deltas and occasionally introduces
+        // leading/trailing whitespace inside string values (seen in
+        // production as e.g. `{"action": "\nsearch\n"}`). A bare match
+        // against "search" then fails and the user gets a confusing
+        // "unknown action 'search\n'" error.
+        let action = args["action"].as_str().unwrap_or("search").trim();
         match action {
             "search" => self.tool_memory_search(args).await,
             "get" => self.tool_memory_get(args).await,
@@ -749,9 +755,25 @@ $synth.Speak('{}')
             bail!("ask_user: `question` must be non-empty");
         }
 
-        let raw_options = args["options"]
-            .as_array()
-            .ok_or_else(|| anyhow!("ask_user: `options` array required (2-8 entries)"))?;
+        let raw_options = args["options"].as_array().ok_or_else(|| {
+            // Distinguish "not an array" (esp. a stringified array — the common
+            // failure when a model's tool call is rescued from text) from a
+            // count problem, and tell the model the exact shape to send.
+            match &args["options"] {
+                Value::String(s) => anyhow!(
+                    "ask_user: `options` must be a JSON array of {{\"label\":...}} objects, \
+                     not a string. You sent the string {:?}. Send it as a real array, e.g. \
+                     [{{\"label\":\"Yes\"}},{{\"label\":\"No\"}}].",
+                    s.chars().take(60).collect::<String>()
+                ),
+                Value::Null => anyhow!(
+                    "ask_user: `options` is required — a JSON array of 2-8 {{\"label\":...}} objects."
+                ),
+                _ => anyhow!(
+                    "ask_user: `options` must be a JSON array of 2-8 {{\"label\":...}} objects."
+                ),
+            }
+        })?;
         if raw_options.len() < 2 {
             bail!("ask_user: at least 2 options required (a single-choice 'question' isn't a question)");
         }
@@ -768,19 +790,31 @@ $synth.Speak('{}')
         // fallback (L1: every channel works).
         let mut options: Vec<crate::events::AskUserOption> = Vec::with_capacity(raw_options.len());
         for (idx, opt) in raw_options.iter().enumerate() {
-            let label = opt["label"]
-                .as_str()
-                .ok_or_else(|| anyhow!("ask_user: option[{idx}].label required"))?
-                .trim()
-                .to_owned();
+            // Accept either a {"label","description"} object (the schema's
+            // canonical shape) OR a bare string. Qwen-style local models emit a
+            // plain string list ["A","B"] for simple choices instead of objects;
+            // a bare string becomes its own label so the agent doesn't dead-loop
+            // on "option[i].label required".
+            let (label, description) = if let Some(s) = opt.as_str() {
+                (s.trim().to_owned(), None)
+            } else {
+                let label = opt["label"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!(
+                        "ask_user: option[{idx}] must be a string or an object with a `label`"
+                    ))?
+                    .trim()
+                    .to_owned();
+                let description = opt["description"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+                (label, description)
+            };
             if label.is_empty() {
                 bail!("ask_user: option[{idx}].label must be non-empty");
             }
-            let description = opt["description"]
-                .as_str()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned);
             options.push(crate::events::AskUserOption { label, description });
         }
 

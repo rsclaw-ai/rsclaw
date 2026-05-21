@@ -28,6 +28,8 @@ import dynamic from "next/dynamic";
 import { showConfirm } from "./ui-lib";
 import clsx from "clsx";
 import { isTauri, invoke as tauriInvokeV2 } from "../utils/tauri";
+import { SidebarAccountChip } from "./sidebar-account-chip";
+import { toast } from "../lib/toast";
 import { getAgents, getHealth } from "../lib/rsclaw-api";
 import { useRestartBanner } from "../hooks/useRestartBanner";
 
@@ -303,21 +305,54 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
   React.useEffect(() => {
     const check = () => {
       getHealth()
-        .then(() => { setStatus("online"); autoStarted.current = false; })
+        .then(() => {
+          setStatus("online");
+          autoStarted.current = false;
+          failCount.current = 0;
+        })
         .catch(() => {
           if (starting) return; // don't overwrite "starting" state
-          setStatus("offline");
-          // Auto-start on first offline detection (unless user manually stopped)
+
           const tauriInvoke = isTauri ? tauriInvokeV2 : null;
-          if (tauriInvoke && !getUserStopped() && !autoStarted.current) {
+          const userStopped = getUserStopped();
+
+          if (userStopped) {
+            // Only path that legitimately shows "offline": the user
+            // explicitly stopped via tray / button. They expect to see
+            // the gateway off and the Start button.
+            setStatus("offline");
+            return;
+          }
+
+          // Not user-stopped — they didn't ask for this. Don't scare
+          // them with "offline" when the gateway might just be slow to
+          // boot, restarting, or briefly unreachable across a wake-from-
+          // sleep / window-restore. Stay on "checking" (or kick into
+          // "starting" if we're about to auto-start).
+          if (tauriInvoke && !autoStarted.current) {
             autoStarted.current = true;
             doStart();
+            // doStart() already sets status="starting"; nothing else to do.
+            return;
           }
+
+          setStatus("checking");
         });
     };
     check();
-    const timer = setInterval(check, 10000);
-    return () => clearInterval(timer);
+    const timer = setInterval(check, 5000);
+
+    // Re-check immediately when the window comes back from background
+    // (restoring from tray, switching workspace, waking from sleep).
+    // Without this the user can stare at a stale state for up to 10s
+    // before the next interval tick fires.
+    const onFocus = () => check();
+    window.addEventListener("focus", onFocus);
+
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener("focus", onFocus);
+    };
   }, []);
 
   // Auto-restart: when a `restart.required` event arrives and the gateway is
@@ -679,14 +714,55 @@ export function SideBarBody(props: {
 
 export function SideBarTail(props: {
   primaryAction?: React.ReactNode;
+  /**
+   * Optional middle slot that absorbs the empty space between
+   * `primaryAction` (anchored left) and `secondaryAction` (anchored
+   * right). Used for the cloud-account chip — placing it here means
+   * the chip doesn't add a new row to the sidebar footer.
+   */
+  centerAction?: React.ReactNode;
   secondaryAction?: React.ReactNode;
 }) {
-  const { primaryAction, secondaryAction } = props;
+  const { primaryAction, centerAction, secondaryAction } = props;
 
   return (
-    <div className={styles["sidebar-tail"]}>
-      <div className={styles["sidebar-actions"]}>{primaryAction}</div>
-      <div className={styles["sidebar-actions"]}>{secondaryAction}</div>
+    <div
+      className={styles["sidebar-tail"]}
+      // `.sidebar-tail` has no `align-items` in its SCSS — flex
+      // default is `stretch`, which lets each slot grow to its own
+      // content height and end up visually misaligned next to a
+      // center-action chip that's shorter than the icon buttons.
+      // Lock everything to the same vertical centerline here.
+      style={{ alignItems: "center" }}
+    >
+      <div
+        className={styles["sidebar-actions"]}
+        style={{ alignItems: "center" }}
+      >
+        {primaryAction}
+      </div>
+      {centerAction && (
+        <div
+          className={styles["sidebar-actions"]}
+          style={{
+            flex: 1,
+            minWidth: 0,
+            alignItems: "center",
+            // Center the chip horizontally in the available gap so
+            // it doesn't crowd either of the action buttons.
+            justifyContent: "center",
+            padding: "0 8px",
+          }}
+        >
+          {centerAction}
+        </div>
+      )}
+      <div
+        className={styles["sidebar-actions"]}
+        style={{ alignItems: "center" }}
+      >
+        {secondaryAction}
+      </div>
     </div>
   );
 }
@@ -732,13 +808,17 @@ export function SideBar(props: { className?: string }) {
               { tab: "agents", icon: "\uD83E\uDD16", label: Locale.RsClawPanel.Sidebar.Agents },
               { tab: "pairing", icon: "\uD83D\uDD10", label: getLang() === "cn" ? "\u914D\u5BF9\u5BA1\u6279" : "Pairing" },
               { tab: "cron", icon: "\u23F0", label: getLang() === "cn" ? "\u5B9A\u65F6\u4EFB\u52A1" : "Cron" },
-              { tab: "skills", icon: "\uD83D\uDD27", label: getLang() === "cn" ? "\u6280\u80FD\u7BA1\u7406" : "Skills" },
+              { tab: "skills-plugins", icon: "\uD83D\uDD27", label: getLang() === "cn" ? "\u6280\u80FD\u63D2\u4EF6" : "Skills & Plugins" },
               { tab: "doctor", icon: "\uD83D\uDEE1\uFE0F", label: getLang() === "cn" ? "\u5B89\u5168\u68C0\u67E5" : "Doctor" },
+              { tab: "memory", icon: "\uD83E\uDDE0", label: Locale.RsClawPanel.Sidebar.Memory },
+              { tab: "knowledge", icon: "\uD83D\uDCDA", label: Locale.RsClawPanel.Sidebar.Knowledge },
             ].map((item) => (
               <button
                 key={item.tab}
                 className={styles["sidebar-quick-btn"]}
-                onClick={() => navigate(Path.RsClawPanel + "?tab=" + item.tab)}
+                onClick={() => {
+                  navigate(Path.RsClawPanel + "?tab=" + item.tab);
+                }}
                 title={item.label}
               >
                 <span>{item.icon}</span>
@@ -781,10 +861,15 @@ export function SideBar(props: { className?: string }) {
             </div>
           </>
         }
+        centerAction={<SidebarAccountChip narrow={shouldNarrow} />}
         secondaryAction={
           <IconButton
             icon={<AddIcon />}
-            text={shouldNarrow ? undefined : Locale.Home.NewChat}
+            // Icon-only — the "新建会话 / New Chat" text used to take
+            // ~120px on the right and crowded the account chip into a
+            // single dot. The AddIcon + aria label is enough.
+            aria={Locale.Home.NewChat}
+            title={Locale.Home.NewChat}
             onClick={() => setShowNewChat(true)}
             shadow
           />

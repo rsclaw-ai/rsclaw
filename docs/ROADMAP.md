@@ -15,6 +15,11 @@ AI Agent Engine with long-term memory, self-learning, and multi-agent orchestrat
 - WASM plugin system (wasmtime v29)
 - Skill auto-crystallization from usage patterns
 - KV cache optimization (API key isolation, TTL, incremental messages)
+- User-managed RAG knowledge base (`rsclaw kb …`): manual file
+  uploads + URL ingest, hybrid retrieval (HNSW + tantivy + RRF +
+  MMR), per-doc visibility, CJK tokenizer, atomic IngestLedger +
+  Outbox worker, regex entity extraction with alignment warnings,
+  5 MCP `kb_*` tools — see `docs/adr/0001-knowledge-base.md`
 
 ## v2.0 — Planned
 

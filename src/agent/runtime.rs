@@ -87,6 +87,11 @@ pub(crate) const DEFAULT_TIMEOUT_SECONDS: u64 = 1800;
 /// Max consecutive tool parse errors before aborting the turn.
 /// Prevents infinite retry loops when model output gets corrupted.
 const MAX_PARSE_ERRORS: usize = 10;
+/// Per-tool wall-clock ceiling inside a single turn's parallel dispatch.
+/// One wedged sub-agent / hung HTTP call no longer holds the whole batch
+/// hostage — it is reported as a tool error after this many seconds.
+/// Generous because legitimate exec/image-gen tools may run minutes.
+const TOOL_DISPATCH_TIMEOUT_SECS: u64 = 600;
 /// Token string that suppresses any reply to the channel.
 const NO_REPLY_TOKEN: &str = "NO_REPLY";
 /// Default max file size before first confirmation (bytes): 50 MB.
@@ -1101,8 +1106,9 @@ pub fn vision_unavailable_message(reason: &str) -> String {
 impl AgentRuntime {
 
     /// Estimate fixed context overhead: system prompt + tools tokens.
-    /// Used for pre-flight context budget check before LLM call.
-    fn estimate_fixed_overhead(&self) -> usize {
+    /// Used for pre-flight context budget check before LLM call, and by
+    /// the compaction module's estimate fallback.
+    pub(crate) fn estimate_fixed_overhead(&self) -> usize {
         // Estimate system prompt from last known size (more accurate than guessing).
         let sys_tokens = self.handle.last_sys_tokens.load(Ordering::Relaxed);
         let tools_tokens = self.handle.last_tools_tokens.load(Ordering::Relaxed);
@@ -1542,7 +1548,10 @@ impl AgentRuntime {
                 }
                 self.sessions.insert(key, vec![msg]);
             }
-            // /clear does NOT invalidate plugins/skills cache (same conversation continues).
+            // Refresh installed skills from disk (picks up skill_install/remove
+            // since last load). Only invalidates the prompt cache if the set
+            // actually changed — see reload_skills.
+            self.reload_skills();
         }
 
         // /new — start a fresh conversation with new archive generation.
@@ -1568,6 +1577,7 @@ impl AgentRuntime {
                     Err(e) => tracing::warn!("failed to start new generation: {e:#}"),
                 }
             }
+            self.reload_skills();
         }
 
         // Reclaim idle browser session (kills Chrome process) to free memory.
@@ -3446,6 +3456,30 @@ impl AgentRuntime {
     }
 
     /// Resolve a session key through the alias table.
+    /// Reload installed skills from disk and invalidate the cached system
+    /// prompt so newly-installed (or removed) skills appear in the per-session
+    /// "## Installed Skills" list. Cache-safe: skills live in user_system, not
+    /// the base-layer hash, so this only re-prefills that per-session layer —
+    /// and only when the byte-stable prompt actually changed. Called at the
+    /// natural refresh points (compact / clear / new).
+    pub(crate) fn reload_skills(&mut self) {
+        let dir = crate::config::loader::base_dir().join("skills");
+        match crate::skill::load_skills(&dir, None, None) {
+            Ok(reg) => {
+                let before = self.skills.all().count();
+                self.skills = Arc::new(reg);
+                let after = self.skills.all().count();
+                if before != after {
+                    // Skill set changed → drop the cached prompt so the next
+                    // turn rebuilds user_system with the new skill list.
+                    self.cached_system_prompt = None;
+                    tracing::info!(before, after, "reloaded skills (set changed)");
+                }
+            }
+            Err(e) => tracing::warn!("reload_skills failed: {e:#}"),
+        }
+    }
+
     /// If the key has an alias, returns the canonical (old) key so all data
     /// stays under one key. Otherwise returns the key unchanged.
     fn resolve_session_key<'a>(&'a self, session_key: &'a str) -> &'a str {
@@ -3977,8 +4011,30 @@ impl AgentRuntime {
             // persistent session fits within the context window.  The scratchpad
             // (current-turn working buffer) is NOT trimmed but its token cost is
             // subtracted from the available budget so session is trimmed enough.
+            //
+            // kvCacheMode >= 2 (rsclaw-server's stateful incremental protocol)
+            // owns the cache server-side. Client-side trimming would delete
+            // msgs the server still has cached, invalidating the prefix and
+            // forcing a cold recompute on the next turn (observed in
+            // production as a 75s turn after a 27K-token threshold trip).
+            // Defer to the server in that mode; it splices locally without
+            // breaking incremental cache hits.
+            //
+            // Mirror the auto-force at line ~4277: when the resolved
+            // provider is `rsclaw`, the provider IS the kvCacheMode=2
+            // protocol, so treat it as mode 2 even if agents.defaults
+            // didn't set kv_cache_mode (default is 1).
+            let configured_kv_mode = self.live.agents.read().await.defaults.kv_cache_mode.unwrap_or(1);
+            let (resolved_provider, _) = self.providers.resolve_model(model);
+            let effective_kv_mode = if resolved_provider == "rsclaw" {
+                2
+            } else {
+                configured_kv_mode
+            };
             let scratchpad_tokens: usize = turn_scratchpad.iter().map(msg_tokens).sum();
-            if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
+            if effective_kv_mode < 2
+                && let Some(sess) = self.sessions.get_mut(&ctx.session_key)
+            {
                 apply_context_budget_trim(
                     sess,
                     context_tokens,
@@ -4126,7 +4182,12 @@ impl AgentRuntime {
             }
             let effective_system = system_prompt.to_owned();
 
-            // Resolve max_tokens with priority: config > built-in defaults > 8192
+            // Resolve max_tokens with priority: config > built-in defaults > 0.
+            // Sentinel semantics: 0 (or unset) means "no client-side cap" — we
+            // omit max_tokens on the wire and let the server apply its own
+            // model/tier ceiling. Only a positive value is sent. This is the
+            // single normalization point, so every provider downstream receives
+            // either None (omitted) or a positive number, never 0.
             let (provider_name, model_id) =
                 crate::provider::registry::ProviderRegistry::parse_model(&model);
             let configured_max_tokens = {
@@ -4154,7 +4215,11 @@ impl AgentRuntime {
                     .and_then(|m| m.max_tokens)
                     .map(|v| v as u32);
 
-                from_agent.or(from_defaults).or(from_provider).or(Some(30_000))
+                from_agent
+                    .or(from_defaults)
+                    .or(from_provider)
+                    .or(Some(0))
+                    .filter(|&m| m > 0)
             };
 
             if let Some(configured) = configured_max_tokens {
@@ -4687,31 +4752,23 @@ impl AgentRuntime {
             // emit tool calls as XML text instead of proper function_call format.
             // Detect <tool_call>/<function=...> patterns and parse them.
             if tool_calls.is_empty() && text_buf.contains("<function=") {
-                // Match <function=NAME> ... </function> blocks, then extract
-                // all <parameter=KEY>VALUE</parameter> pairs within each block.
-                let fn_re = regex::Regex::new(
-                    r#"<function=(\w+)>([\s\S]*?)</function>"#
-                ).expect("fn_re compile");
-                let param_re = regex::Regex::new(
-                    r#"<parameter=(\w+)>([\s\S]*?)</parameter>"#
-                ).expect("param_re compile");
-                for fn_cap in fn_re.captures_iter(&text_buf) {
-                    let name = fn_cap.get(1).map(|m| m.as_str()).unwrap_or("");
-                    let body = fn_cap.get(2).map(|m| m.as_str()).unwrap_or("");
-                    if name.is_empty() {
-                        continue;
-                    }
-                    let mut input = serde_json::Map::new();
-                    for p_cap in param_re.captures_iter(body) {
-                        let key = p_cap.get(1).map(|m| m.as_str()).unwrap_or("");
-                        let val = p_cap.get(2).map(|m| m.as_str().trim()).unwrap_or("");
-                        if !key.is_empty() {
-                            input.insert(key.to_owned(), json!(val));
-                        }
-                    }
-                    let id = format!("rescued_{name}_{}", tool_calls.len());
-                    tracing::info!(name, params = ?input.keys().collect::<Vec<_>>(), "agent_loop: rescued tool call from text");
-                    tool_calls.push((id, name.to_owned(), Value::Object(input)));
+                // Parameter values are coerced to their schema-declared type
+                // (so e.g. ask_user.options stays an array, not a string).
+                let rescued =
+                    crate::agent::tool_call_repair::rescue_tool_calls_from_text(&text_buf, &tools);
+                for (id, name, input) in rescued {
+                    // WARN, not INFO: a text tool call means the inference server
+                    // did not return native `tool_calls` for this model/node.
+                    // The rescue keeps us working, but this is a fleet-config
+                    // signal (llama.cpp tool-call template/grammar) — alert on
+                    // `rescued_from_text` to find nodes still emitting text.
+                    tracing::warn!(
+                        tool = %name,
+                        rescued_from_text = true,
+                        params = ?input.as_object().map(|o| o.keys().collect::<Vec<_>>()),
+                        "agent_loop: rescued tool call from <function=> text — server returned no native tool_calls"
+                    );
+                    tool_calls.push((id, name, input));
                 }
                 if !tool_calls.is_empty() {
                     // Clear the text since it was a tool call, not a real reply.
@@ -4995,7 +5052,31 @@ impl AgentRuntime {
                 });
             }
 
-            // Execute each tool and push results.
+            // Three-phase tool dispatch:
+            //   Phase 1 (serial): preflight — parse-error skip, loop
+            //     detection, last_tool_key bookkeeping, max_iterations
+            //     upgrade. Anything that may early-return BEFORE side
+            //     effects must happen here.
+            //   Phase 2a (serial): pre-dispatch side effects — live_status,
+            //     before_tool_call hook, A2A progress emit, cancel check.
+            //     Deferred from Phase 1 so a Phase-1 early-return doesn't
+            //     leave dangling before_tool_call hooks without a matching
+            //     after_tool_call.
+            //   Phase 2b (parallel): join_all(dispatch_tool) with per-tool
+            //     timeout — one stuck sub-agent / wedged HTTP call no
+            //     longer blocks every other tool in the same turn.
+            //   Phase 3 (serial, in LLM emit order): after_tool_call hook,
+            //     metrics, full_trace, loop_detector, image/file extraction,
+            //     event-bus emit, session compression, turn_scratchpad push.
+            struct PendingDispatch {
+                tool_id: String,
+                tool_name: String,
+                tool_input: Value,
+                tool_input_str: String,
+            }
+            let mut to_dispatch: Vec<PendingDispatch> = Vec::new();
+
+            // ---- Phase 1: serial preflight ----
             for (tool_id, tool_name, tool_input) in tool_calls {
                 // Skip tools with parse errors — do not execute, return error directly.
                 // This prevents infinite retry loops when model output gets truncated.
@@ -5041,8 +5122,6 @@ impl AgentRuntime {
                     turn_scratchpad.push(tool_msg);
                     continue;
                 }
-
-                info!(tool = %tool_name, "dispatching tool call");
 
                 // Detect consecutive identical tool calls (same name + same args).
                 let call_key = crate::agent::loop_detection::hash_tool_call(&tool_name, &tool_input);
@@ -5102,39 +5181,170 @@ impl AgentRuntime {
                     max_iterations = max_iterations.max(configured_complex);
                 }
 
-                // Update live status: tool call starting.
+                let tool_input_str = tool_input.to_string();
+                to_dispatch.push(PendingDispatch {
+                    tool_id,
+                    tool_name,
+                    tool_input,
+                    tool_input_str,
+                });
+            }
+
+            // ---- Phase 2a: serial pre-dispatch side effects ----
+            for p in &to_dispatch {
+                info!(tool = %p.tool_name, "dispatching tool call");
                 if let Ok(mut status) = self.live_status.try_write() {
                     status.state = "tool_call".to_owned();
-                    status.tool_history.push(tool_name.clone());
+                    status.tool_history.push(p.tool_name.clone());
                 }
-
                 self.fire_hook(
                     "before_tool_call",
                     json!({
                         "agent_id": self.handle.id,
-                        "tool": tool_name,
-                        "input": tool_input,
+                        "tool": p.tool_name,
+                        "input": p.tool_input,
                     }),
                 )
                 .await;
-
-                let tool_input_str = tool_input.to_string();
-                // Clone for the per-turn metrics record (after dispatch
-                // moves the value).
-                let tool_input_for_metrics = tool_input.clone();
-                // A2A progress signal: publish "calling tool X" before
-                // dispatch so the client / push subscribers can render
-                // tool-level progress. No-op for non-A2A turns. Cancel
-                // check too — a long-running prior tool may have
-                // observed the token between iterations.
                 ctx.turn_ctx
-                    .emit_working(&format!("calling tool {tool_name}"));
+                    .emit_working(&format!("calling tool {}", p.tool_name));
                 if ctx.turn_ctx.is_cancelled() {
                     return Err(anyhow!("canceled by A2A CancelTask"));
                 }
-                let result = self
-                    .dispatch_tool(ctx, &tool_id, &tool_name, tool_input)
-                    .await;
+            }
+
+            // ---- Phase 2b: parallel dispatch + real-time per-tool emit ----
+            // FuturesUnordered (instead of join_all) lets the user see
+            // each tool's result the instant it completes — no longer
+            // batched at max(t1,t2,t3). dispatch_tool is (&self, &ctx)
+            // immutable, so concurrent calls are safe. Per-tool timeout
+            // caps a hung sub-agent / wedged HTTP call.
+            //
+            // The `<rstool>` channel emit that previously lived in Phase 3
+            // now fires here inside each future's tail, so streaming
+            // channel subscribers (desktop WS, etc.) get per-tool cards
+            // as they finish rather than all at the slowest's latency.
+            let dispatch_stream: futures::stream::FuturesUnordered<_> = to_dispatch
+                .iter()
+                .enumerate()
+                .map(|(idx, p)| {
+                    let bus = self.event_bus.clone();
+                    let session_id = ctx.session_key.clone();
+                    let agent_id = ctx.agent_id.clone();
+                    let tool_name = p.tool_name.clone();
+                    let tool_input_str = p.tool_input_str.clone();
+                    let fut = self
+                        .dispatch_tool(ctx, &p.tool_id, &p.tool_name, p.tool_input.clone());
+                    async move {
+                        let timed = time::timeout(
+                            Duration::from_secs(TOOL_DISPATCH_TIMEOUT_SECS),
+                            fut,
+                        )
+                        .await;
+                        if let Some(bus) = bus {
+                            let preview = match &timed {
+                                Ok(Ok(v)) => {
+                                    // Render through `format_tool_result` so
+                                    // shape-specific tools (exec, read,
+                                    // web_search, …) emit clean text instead
+                                    // of raw JSON. Then collapse any oversize
+                                    // string fields (image data URLs, full
+                                    // HTML, base64 blobs) so the UI card
+                                    // doesn't carry raw payload —
+                                    // `compact_value` runs in Phase 3 against
+                                    // the same value and produces the canonical
+                                    // artifact, so duplicating that write here
+                                    // would burn disk; we just squash for the
+                                    // streaming preview.
+                                    let raw = if v.is_string() {
+                                        v.as_str().unwrap_or("").to_owned()
+                                    } else {
+                                        let squashed = squash_large_strings(v, 1_000);
+                                        format_tool_result(&squashed)
+                                    };
+                                    if raw.chars().count() > 4000 {
+                                        let truncated: String =
+                                            raw.chars().take(2000).collect();
+                                        format!("{truncated}…(truncated)")
+                                    } else {
+                                        raw
+                                    }
+                                }
+                                Ok(Err(e)) => format!("[error: {e:#}]"),
+                                Err(_) => format!(
+                                    "[timeout after {TOOL_DISPATCH_TIMEOUT_SECS}s]"
+                                ),
+                            };
+                            // Exec tools: prepend `$ command` so the UI's
+                            // card header shows what was run (parity with
+                            // the old Phase-3 emit).
+                            let display_out = if matches!(
+                                tool_name.as_str(),
+                                "shell" | "execute_command" | "exec"
+                            ) {
+                                serde_json::from_str::<serde_json::Value>(&tool_input_str)
+                                    .ok()
+                                    .and_then(|a| {
+                                        a.get("command")
+                                            .and_then(|c| c.as_str())
+                                            .map(|cmd| format!("$ {cmd}\n{preview}"))
+                                    })
+                                    .unwrap_or(preview)
+                            } else {
+                                preview
+                            };
+                            let marker = format!(
+                                "<rstool name=\"{tool_name}\">{display_out}</rstool>"
+                            );
+                            let _ = bus.send(AgentEvent {
+                                session_id,
+                                agent_id,
+                                delta: marker,
+                                done: false,
+                                files: vec![],
+                                images: vec![],
+                                tool_log: vec![],
+                                question: None,
+                            });
+                        }
+                        (idx, timed)
+                    }
+                })
+                .collect();
+
+            // Drain in completion order so the emit above fires real-time,
+            // then re-index by emit position so Phase 3 can iterate the LLM's
+            // original tool_call order (matters for scratchpad / loop
+            // detector / metrics determinism).
+            let mut timed_results: Vec<Option<_>> =
+                (0..to_dispatch.len()).map(|_| None).collect();
+            {
+                use futures::StreamExt as _;
+                let mut stream = dispatch_stream;
+                while let Some((idx, r)) = stream.next().await {
+                    timed_results[idx] = Some(r);
+                }
+            }
+            let timed_results: Vec<_> =
+                timed_results.into_iter().map(|o| o.expect("every dispatch future yields exactly one result")).collect();
+
+            // ---- Phase 3: serial post-processing in LLM emit order ----
+            for (pending, timed_result) in to_dispatch.into_iter().zip(timed_results.into_iter()) {
+                let PendingDispatch {
+                    tool_id,
+                    tool_name,
+                    tool_input: tool_input_for_metrics,
+                    tool_input_str,
+                } = pending;
+
+                let result: Result<Value> = match timed_result {
+                    Ok(inner) => inner,
+                    Err(_elapsed) => Err(anyhow!(
+                        "tool '{}' timed out after {}s",
+                        tool_name,
+                        TOOL_DISPATCH_TIMEOUT_SECS
+                    )),
+                };
 
                 self.fire_hook(
                     "after_tool_call",
@@ -5269,11 +5479,73 @@ impl AgentRuntime {
                                 ),
                                 vec![img.to_owned()],
                             )
-                        } else if v.is_string() {
-                            (v.as_str().unwrap_or("").to_owned(), vec![])
                         } else {
-                            // Format structured tool results (exec, read, etc.) for better LLM comprehension
-                            (format_tool_result(&v), vec![])
+                            // Runtime backstop: every tool's output funnels through here.
+                            // Oversized payloads get written to the artifact store and
+                            // replaced with a head+tail preview + read_artifact hint.
+                            // One enforcement point — no tool can leak a giant payload
+                            // even if its handler forgot to compact.
+                            //
+                            // Exception: `read_artifact` itself is the recovery path —
+                            // compacting its return would re-write the user's full-read
+                            // request back to a new artifact and loop the LLM through
+                            // increasingly nested previews.
+                            // Both recovery tools (read_artifact / read_session_archive)
+                            // bypass the backstop — re-compacting their full-read
+                            // response would write a new artifact and force the LLM
+                            // into a nested re-fetch loop.
+                            let v = if matches!(tool_name.as_str(), "read_artifact" | "read_session_archive") {
+                                v
+                            } else {
+                                // Web tools fetch articles where the LLM
+                                // usually wants the lede + structure in
+                                // one shot; a wider preview saves a
+                                // follow-up read_artifact call.
+                                let budget = match tool_name.as_str() {
+                                    "web_fetch" | "web_browser" | "web_search" => {
+                                        crate::artifact::PreviewBudget::WEB
+                                    }
+                                    _ => crate::artifact::PreviewBudget::DEFAULT,
+                                };
+                                crate::artifact::compact_value(
+                                    crate::artifact::default_store(),
+                                    &ctx.session_key,
+                                    v,
+                                    budget,
+                                )
+                            };
+                            if let Some(s) = v.as_str() {
+                                (s.to_owned(), vec![])
+                            } else {
+                                // Format structured tool results (exec, read, etc.) for better LLM comprehension
+                                let mut text = format_tool_result(&v);
+                                // Surface the artifact envelope to the LLM —
+                                // format_tool_result is shape-specific (exec
+                                // returns stdout+stderr, read returns content,
+                                // …) and drops envelope metadata. Append an
+                                // explicit marker so the LLM sees the
+                                // tool_result_id even when the preview text's
+                                // inline hint sits buried mid-output.
+                                if v.get("_truncated").and_then(|x| x.as_bool()).unwrap_or(false) {
+                                    if let Some(id) = v.get("_tool_result_id").and_then(|x| x.as_str()) {
+                                        text.push_str(&format!(
+                                            "\n\n[truncated — call read_artifact(tool_result_id=\"{id}\") for full output]"
+                                        ));
+                                    } else if let Some(ids) = v.get("_tool_result_ids").and_then(|x| x.as_object()) {
+                                        let pairs: Vec<String> = ids
+                                            .iter()
+                                            .filter_map(|(k, v)| v.as_str().map(|s| format!("{k}={s}")))
+                                            .collect();
+                                        if !pairs.is_empty() {
+                                            text.push_str(&format!(
+                                                "\n\n[truncated — fields compacted: {}. Call read_artifact with the id of the field you need.]",
+                                                pairs.join(", ")
+                                            ));
+                                        }
+                                    }
+                                }
+                                (text, vec![])
+                            }
                         }
                     }
                     Err(e) => {
@@ -5300,7 +5572,10 @@ impl AgentRuntime {
                 tool_images.extend(result_images);
 
                 // Record tool call for frontend display (truncated to 4000 chars).
-                // Also emit immediately so the desktop chat shows results in real time.
+                // The companion `<rstool>` channel emit moved to Phase 2b so
+                // streaming subscribers see per-tool cards in real time; this
+                // block only builds `tool_log` for the final AgentReply
+                // (rendered by non-streaming channels like Feishu/WeChat).
                 {
                     let args_str = tool_input_str;
                     let out_str = if result_text.len() > 4000 {
@@ -5309,38 +5584,7 @@ impl AgentRuntime {
                     } else {
                         result_text.clone()
                     };
-                    tool_log.push((tool_name.clone(), args_str.clone(), out_str.clone()));
-                    if let Some(ref bus) = self.event_bus {
-                        // Prepend `$ command` line for exec tools so the
-                        // desktop UI can show a command preview in the header.
-                        let display_out = if matches!(tool_name.as_str(), "shell" | "execute_command" | "exec") {
-                            if let Ok(a) = serde_json::from_str::<serde_json::Value>(&args_str) {
-                                if let Some(cmd) = a.get("command").and_then(|c| c.as_str()) {
-                                    format!("$ {cmd}\n{out_str}")
-                                } else {
-                                    out_str.clone()
-                                }
-                            } else {
-                                out_str.clone()
-                            }
-                        } else {
-                            out_str.clone()
-                        };
-                        let marker = format!(
-                            "<rstool name=\"{}\">{}</rstool>",
-                            tool_name, display_out
-                        );
-                        let _ = bus.send(AgentEvent {
-                            session_id: ctx.session_key.clone(),
-                            agent_id: ctx.agent_id.clone(),
-                            delta: marker,
-                            done: false,
-                            files: vec![],
-                            images: vec![],
-                            tool_log: vec![],
-                            question: None,
-                        });
-                    }
+                    tool_log.push((tool_name.clone(), args_str, out_str));
                 }
 
                 // Auto-send files: any tool returning __send_file=true queues the
@@ -5577,7 +5821,7 @@ impl AgentRuntime {
                         // @fly-ai/flyai-cli` on line 60 — past the 3000-char
                         // cut — so the agent saw only `runtime: node` in
                         // frontmatter and made up `node index.js` instead).
-                        "use_skill" => {
+                        "skill_use" => {
                             limits.and_then(|l| l.default).unwrap_or(60_000)
                         }
                         "read_file" | "read" => {
@@ -5857,10 +6101,17 @@ impl AgentRuntime {
                 }));
             }
             "read_file" | "read" => return self.tool_read(args).await,
+            "read_artifact" => return self.tool_read_artifact(ctx, args).await,
+            "read_session_archive" => return self.tool_read_session_archive(ctx, args).await,
+            "knowledge_base" | "kb_search" => return self.tool_knowledge_base(args).await,
             "write_file" | "write" => return self.tool_write(args).await,
             "edit_file" | "edit" => return self.tool_edit(args).await,
             "shell" | "execute_command" | "exec" => return self.tool_exec(ctx, _id, args).await,
-            "use_skill" => return self.tool_use_skill(args),
+            "skill_use" => return self.tool_use_skill(args),
+            "skill_list" => return self.tool_skill_list(),
+            "skill_search" => return self.tool_skill_search(args).await,
+            "skill_install" => return self.tool_skill_install(args).await,
+            "skill_remove" => return self.tool_skill_remove(args).await,
             "task" => return self.tool_task(ctx, args).await,
             "task_finish" => return self.tool_task_finish(ctx, args).await,
             "ask_user" => return self.tool_ask_user(ctx, args).await,
@@ -5887,7 +6138,7 @@ impl AgentRuntime {
                 }
                 return self.tool_web_search(args).await;
             }
-            "web_fetch" => return self.tool_web_fetch(args).await,
+            "web_fetch" => return self.tool_web_fetch(ctx, args).await,
             "web_download" => return self.tool_web_download(args).await,
             "web_browser" | "browser" => return self.tool_web_browser(ctx, args).await,
             "computer_use" => return self.tool_computer_use(ctx, args).await,
@@ -6085,8 +6336,8 @@ impl AgentRuntime {
             let client = A2aClient::new();
             // Use remote agent ID if configured, otherwise omit (uses remote default).
             let remote_id = ext.remote_agent_id.as_deref().unwrap_or("");
-            let reply = client
-                .send_task(
+            let stream = client
+                .send_streaming_message(
                     &ext.url,
                     remote_id,
                     &text,
@@ -6095,7 +6346,120 @@ impl AgentRuntime {
                 )
                 .await
                 .map_err(|e| anyhow!("A2A remote `{agent_id}`: {e}"))?;
-            return Ok(Value::String(reply));
+            tokio::pin!(stream);
+
+            // Drain the SSE stream until the remote publishes a terminal
+            // status event.
+            //   - status-update with message text: forward to lead's channel
+            //     so streaming subscribers see sub-agent progress in real
+            //     time (e.g. "calling tool memory_search").
+            //   - artifact-update text parts: accumulate as the reply text
+            //     ultimately returned to the LLM.
+            //   - final=true: terminate; FAILED captures the error message,
+            //     CANCELED short-circuits with an error.
+            //
+            // Cancellation: if the lead's turn_ctx is cancelled, dropping the
+            // pinned SSE stream closes the HTTP connection; the remote's SSE
+            // handler observes the close and publishes a Canceled terminal
+            // event, propagating cancel down to the sub-agent.
+            let mut accumulated = String::new();
+            let mut last_msg = String::new();
+            let mut last_error: Option<String> = None;
+            loop {
+                let cancel_fut = async {
+                    match &ctx.turn_ctx.cancel_token {
+                        Some(t) => t.cancelled().await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    _ = cancel_fut => {
+                        return Err(anyhow!(
+                            "A2A remote `{agent_id}`: cancelled by client"
+                        ));
+                    }
+                    next = stream.next() => {
+                        let Some(event) = next else { break; };
+                        let event = event.map_err(|e| anyhow!(
+                            "A2A remote `{agent_id}` SSE: {e}"
+                        ))?;
+                        let kind = event
+                            .get("kind")
+                            .and_then(|k| k.as_str())
+                            .unwrap_or("");
+                        match kind {
+                            "status-update" => {
+                                let final_ = event
+                                    .get("final")
+                                    .and_then(|f| f.as_bool())
+                                    .unwrap_or(false);
+                                let state = event["status"]["state"]
+                                    .as_str()
+                                    .unwrap_or("");
+                                let msg_text = event["status"]["message"]
+                                    ["parts"][0]["text"]
+                                    .as_str()
+                                    .unwrap_or("");
+                                if !msg_text.is_empty() && msg_text != last_msg {
+                                    last_msg = msg_text.to_owned();
+                                    if let Some(ref bus) = self.event_bus {
+                                        let marker = format!(
+                                            "<rstool name=\"agent\">[{agent_id}] {msg_text}</rstool>"
+                                        );
+                                        let _ = bus.send(AgentEvent {
+                                            session_id: ctx.session_key.clone(),
+                                            agent_id: ctx.agent_id.clone(),
+                                            delta: marker,
+                                            done: false,
+                                            files: vec![],
+                                            images: vec![],
+                                            tool_log: vec![],
+                                            question: None,
+                                        });
+                                    }
+                                }
+                                if final_ {
+                                    if state == "TASK_STATE_FAILED"
+                                        && !msg_text.is_empty()
+                                    {
+                                        last_error = Some(msg_text.to_owned());
+                                    } else if state == "TASK_STATE_CANCELED" {
+                                        return Err(anyhow!(
+                                            "A2A remote `{agent_id}`: canceled"
+                                        ));
+                                    }
+                                    break;
+                                }
+                            }
+                            "artifact-update" => {
+                                if let Some(parts) = event["artifact"]["parts"]
+                                    .as_array()
+                                {
+                                    for part in parts {
+                                        if part["type"] == "text"
+                                            && let Some(t) = part["text"].as_str()
+                                        {
+                                            accumulated.push_str(t);
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            if let Some(err) = last_error {
+                return Err(anyhow!("A2A remote `{agent_id}`: {err}"));
+            }
+            if accumulated.is_empty() {
+                return Err(anyhow!(
+                    "A2A remote `{agent_id}`: no text artifact received"
+                ));
+            }
+            return Ok(Value::String(accumulated));
         }
 
         Err(anyhow!(
@@ -6141,6 +6505,60 @@ impl AgentRuntime {
     // -----------------------------------------------------------------------
     // Built-in tool implementations
     // -----------------------------------------------------------------------
+
+    /// `knowledge_base` tool — hybrid search over the user's KB, returning
+    /// chunks with their source title for citation. Reads the process-global
+    /// KnowledgeService (the single instance opened at gateway startup; we do
+    /// NOT re-open redb here — it is exclusively locked).
+    pub(crate) async fn tool_knowledge_base(&self, args: Value) -> Result<Value> {
+        // Trim query defensively (v1 tool-call protocol can leak a trailing
+        // newline into string args).
+        let query = args["query"].as_str().unwrap_or("").trim().to_owned();
+        if query.is_empty() {
+            return Ok(json!({"results": [], "note": "empty query"}));
+        }
+        let collection_ids: Vec<String> = args["collection_ids"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.trim().to_owned()))
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let top_k = args["top_k"].as_u64().unwrap_or(5).clamp(1, 50) as usize;
+
+        let Some(kb) = crate::kb::global_service() else {
+            return Ok(json!({"results": [], "note": "knowledge base not available"}));
+        };
+
+        // KnowledgeService::search is synchronous and CPU-heavy (embed + HNSW +
+        // tantivy); run it off the async executor so it doesn't stall the turn.
+        let hits = tokio::task::spawn_blocking(move || {
+            kb.search(&query, &collection_ids, top_k, 0.0)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("knowledge_base search task failed: {e}"))?
+        .map_err(|e| anyhow::anyhow!("knowledge_base search failed: {e}"))?;
+
+        let results: Vec<Value> = hits
+            .into_iter()
+            .map(|h| {
+                json!({
+                    "doc_id": h.doc_id,
+                    "collection": h.collection_name,
+                    "source_title": h.source_title,
+                    "text": h.chunk_text,
+                    "score": h.score,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "count": results.len(),
+            "results": results,
+            "note": if results.is_empty() { "no matching content in the knowledge base — do NOT fabricate a citation" } else { "" },
+        }))
+    }
 
     pub(crate) async fn tool_memory_search(&self, args: Value) -> Result<Value> {
         let query = args["query"].as_str().unwrap_or("").to_owned();
@@ -6312,20 +6730,34 @@ impl AgentRuntime {
                     args
                 )
             })?;
-        let Some(skill) = self.skills.get(name) else {
-            let available: Vec<&str> = self.skills.all().map(|s| s.name.as_str()).collect();
-            return Ok(serde_json::json!({
-                "error": format!("skill '{name}' not installed"),
-                "available": available,
-            }));
+        // Resolve the skill dir: prefer the live registry, else fall back to
+        // the skills dir on disk so a freshly `skill_install`ed skill is usable
+        // the SAME turn (before the next compact/clear/new reload folds it into
+        // the registry + system prompt).
+        let skill_dir = if let Some(skill) = self.skills.get(name) {
+            skill.dir.clone()
+        } else if !crate::skill::valid_slug(name) {
+            // Disk fallback joins `name` onto the skills root — reject traversal.
+            return Ok(serde_json::json!({ "error": format!("invalid skill name: {name:?}") }));
+        } else {
+            let disk = crate::config::loader::base_dir().join("skills").join(name);
+            if disk.join("SKILL.md").is_file() {
+                disk
+            } else {
+                let available: Vec<&str> = self.skills.all().map(|s| s.name.as_str()).collect();
+                return Ok(serde_json::json!({
+                    "error": format!("skill '{name}' not installed"),
+                    "available": available,
+                }));
+            }
         };
-        let dir = skill.dir.display().to_string();
-        let skill_md_path = skill.dir.join("SKILL.md");
+        let dir = skill_dir.display().to_string();
+        let skill_md_path = skill_dir.join("SKILL.md");
         let skill_md = std::fs::read_to_string(&skill_md_path).unwrap_or_else(|e| {
             format!("(failed to read SKILL.md: {e}; check {})", skill_md_path.display())
         });
         Ok(serde_json::json!({
-            "name": skill.name,
+            "name": name,
             "dir": dir,
             "skill_md": skill_md,
             "next_step": "Read skill_md to find the exact CLI command and flags, \
@@ -6333,6 +6765,142 @@ impl AgentRuntime {
                           Pass the user's actual question / parameters via the \
                           flags documented in skill_md."
         }))
+    }
+
+    /// `skill_list` — list locally-installed skills (name + description).
+    pub(crate) fn tool_skill_list(&self) -> Result<Value> {
+        let skills: Vec<Value> = self
+            .skills
+            .all()
+            .map(|s| {
+                json!({
+                    "name": s.name,
+                    "description": s.description.clone().unwrap_or_default(),
+                })
+            })
+            .collect();
+        Ok(json!({ "count": skills.len(), "skills": skills }))
+    }
+
+    /// `skill_search` — search the remote skill registries (clawhub / skillhub /
+    /// iwencai). Returns candidate slugs the model can `skill_install`.
+    pub(crate) async fn tool_skill_search(&self, args: Value) -> Result<Value> {
+        let query = args["query"]
+            .as_str()
+            .or_else(|| args["q"].as_str())
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        if query.is_empty() {
+            return Ok(json!({ "error": "query is required" }));
+        }
+        let client = crate::skill::clawhub::ClawhubClient::new();
+        let results = match client.search_with_fallback(&query).await {
+            Ok(r) => r,
+            Err(e) => return Ok(json!({ "error": format!("skill search failed: {e}") })),
+        };
+        let out: Vec<Value> = results
+            .into_iter()
+            .take(20)
+            .map(|r| {
+                json!({
+                    "slug": r.slug,
+                    "description": r.description,
+                    "installs": r.installs,
+                    "registry": r.registry,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "count": out.len(),
+            "results": out,
+            "hint": "To use one: skill_install(name=\"<slug>\") then skill_use(name=\"<slug>\").",
+        }))
+    }
+
+    /// `skill_install` — install a skill from a registry into the global skills
+    /// dir. Usable the same turn via `skill_use` (disk fallback); it folds into
+    /// the system-prompt skill list on the next compaction/clear/new reload.
+    pub(crate) async fn tool_skill_install(&self, args: Value) -> Result<Value> {
+        let name = args["name"]
+            .as_str()
+            .or_else(|| args["slug"].as_str())
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        if name.is_empty() {
+            return Ok(json!({ "error": "name is required" }));
+        }
+        if !crate::skill::valid_slug(&name) {
+            return Ok(json!({ "error": format!("invalid skill name: {name:?}") }));
+        }
+        // Security gate: the agent may AUTO-install only audited, content-pinned
+        // skills (allowlist). Off-list installs are blocked here and must go
+        // through the human-initiated CLI (`rsclaw skills install`).
+        let Some(entry) = crate::skill::allowlist::snapshot().lookup_skill(&name) else {
+            return Ok(json!({
+                "error": format!("'{name}' is not on the audited auto-install allowlist"),
+                "guidance": "This skill is not pre-audited, so it cannot be auto-installed. \
+                    Tell the user; if they trust it they can install it themselves with \
+                    `rsclaw skills install <slug>`.",
+            }));
+        };
+        if entry.url.is_empty() {
+            return Ok(json!({ "error": format!("allowlist entry '{name}' has no download url") }));
+        }
+        let dir = crate::config::loader::base_dir().join("skills");
+        let client = crate::skill::clawhub::ClawhubClient::new();
+        // Install ONLY from the audited allowlist URL (a direct https:// spec
+        // routes through install_from_url, NOT the public registry search).
+        match client.install_with_fallback(&entry.url, &dir).await {
+            Ok(locked) => {
+                // Content pin: the downloaded SKILL.md must match the audited
+                // hash, so a registry can't swap content under an audited slug.
+                if let Err(e) =
+                    crate::skill::allowlist::verify_skill_content(&locked.install_dir, &entry, true)
+                {
+                    let _ = std::fs::remove_dir_all(&locked.install_dir);
+                    return Ok(json!({ "error": e.to_string(), "name": name }));
+                }
+                Ok(json!({
+                    "installed": name,
+                    "version": locked.version,
+                    "dir": locked.install_dir.display().to_string(),
+                    "next_step": "Usable now: skill_use(name=\"...\") to read its SKILL.md, then run the CLI it documents via shell.",
+                }))
+            }
+            Err(e) => Ok(json!({ "error": format!("install failed: {e}"), "name": name })),
+        }
+    }
+
+    /// `skill_remove` — uninstall a locally-installed skill (delete its dir).
+    pub(crate) async fn tool_skill_remove(&self, args: Value) -> Result<Value> {
+        let name = args["name"]
+            .as_str()
+            .or_else(|| args["slug"].as_str())
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        if name.is_empty() {
+            return Ok(json!({ "error": "name is required" }));
+        }
+        // Path-traversal guard: `name` is model-controlled and joined onto the
+        // skills root, then `remove_dir_all`'d. Without this, name = "../../.ssh"
+        // would delete a directory outside skills. Reject anything non-slug.
+        if !crate::skill::valid_slug(&name) {
+            return Ok(json!({ "error": format!("invalid skill name: {name:?}") }));
+        }
+        let dir = crate::config::loader::base_dir().join("skills").join(&name);
+        if !dir.is_dir() {
+            return Ok(json!({ "error": format!("skill '{name}' not installed") }));
+        }
+        match std::fs::remove_dir_all(&dir) {
+            Ok(_) => Ok(json!({
+                "removed": name,
+                "note": "Removed from disk. Drops from the system-prompt skill list on the next compaction/clear/new reload.",
+            })),
+            Err(e) => Ok(json!({ "error": format!("remove failed: {e}") })),
+        }
     }
 
     pub(crate) async fn tool_memory_put(&self, ctx: &RunContext, args: Value) -> Result<Value> {
@@ -6673,6 +7241,36 @@ fn is_likely_text_file(lower: &str) -> bool {
 
 
 /// Format a tool call result as human-readable markdown.
+/// Walk a `Value` and replace any string longer than `max_chars` with a
+/// `[N chars]` placeholder. Used by Phase 2b's streaming preview so a
+/// tool that returns a giant base64 image / full-page HTML doesn't dump
+/// the raw payload into the UI bus marker. Non-mutating: returns a
+/// fresh `Value`.
+fn squash_large_strings(val: &serde_json::Value, max_chars: usize) -> serde_json::Value {
+    use serde_json::Value;
+    match val {
+        Value::String(s) => {
+            let chars = s.chars().count();
+            if chars > max_chars {
+                Value::String(format!("[{chars} chars elided]"))
+            } else {
+                Value::String(s.clone())
+            }
+        }
+        Value::Array(arr) => Value::Array(
+            arr.iter().map(|v| squash_large_strings(v, max_chars)).collect(),
+        ),
+        Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                out.insert(k.clone(), squash_large_strings(v, max_chars));
+            }
+            Value::Object(out)
+        }
+        _ => val.clone(),
+    }
+}
+
 fn format_tool_result(val: &serde_json::Value) -> String {
     // exec tool: { exit_code, stdout, stderr }
     if val.get("stdout").is_some() || val.get("stderr").is_some() {
@@ -7221,6 +7819,7 @@ mod tests {
             enabled: Some(true),
             user_agent: None,
             prefix_id: None,
+            compact_timeout_secs: None,
         };
         let mut providers = std::collections::HashMap::new();
         providers.insert(provider_name.to_owned(), pc);

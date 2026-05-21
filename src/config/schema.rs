@@ -37,6 +37,7 @@ pub struct Config {
     pub secrets: Option<SecretsConfig>,
     pub memory_search: Option<MemorySearchConfig>,
     pub memory: Option<MemoryTopConfig>,
+    pub kb: Option<KbConfig>,
     pub mcp: Option<McpConfig>,
     /// Per-registry overrides keyed by registry name (`iwencai`, `clawhub`,
     /// `skillhub`, ...). Lets users put `apiKey`/`baseUrl` for paid skill
@@ -102,7 +103,7 @@ pub struct GatewayConfig {
     /// for back-compat — env-set lists are merged into the accepted set.
     /// When everything is empty, the middleware passes through (dev mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub a2a_auth: Option<GatewayA2aAuth>,
+    pub a2a: Option<GatewayA2a>,
     pub control_ui: Option<ControlUiConfig>,
     pub reload: Option<ReloadMode>,
     pub push: Option<PushConfig>,
@@ -179,19 +180,23 @@ pub struct GatewayAuth {
     pub allow_local: Option<bool>,
 }
 
-/// A2A inbound credentials configured in the gateway block. JSON5 key
-/// `gateway.a2aAuth`. Both fields are optional Vecs of `SecretOrString` so
-/// they support plain strings, `${VAR}` expansion, and `{ source: "env",
-/// id: "..." }` refs.
+/// A2A inbound configuration in the gateway block. JSON5 key
+/// `gateway.a2a`. Auth lists support plain strings, `${VAR}` expansion,
+/// and `{ source: "env", id: "..." }` refs.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct GatewayA2aAuth {
+pub struct GatewayA2a {
     /// Accepted Bearer tokens for `/api/v1/a2a`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tokens: Option<Vec<SecretOrString>>,
+    pub auth_tokens: Option<Vec<SecretOrString>>,
     /// Accepted `X-API-Key` values for `/api/v1/a2a`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_keys: Option<Vec<SecretOrString>>,
+    /// Max body size in megabytes for `/api/v1/a2a` requests. Default
+    /// 100 MB. axum's built-in default is 2 MB which immediately
+    /// 413's any non-trivial file attachment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_body_mb: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -730,6 +735,15 @@ pub struct ProviderConfig {
     /// when omitted. Ignored for non-rsclaw `api` formats.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_id: Option<String>,
+    /// HTTP timeout (seconds) for the `rsclaw` `/sessions/<id>/compact`
+    /// splice call. The server holds the per-session lock and dispatches
+    /// the splice to a worker; a large tail can take a while, so this must
+    /// be ≥ the server's splice ceiling or the client times out before the
+    /// splice returns. Defaults to
+    /// `provider::rsclaw::RSCLAW_DEFAULT_COMPACT_TIMEOUT_SECS` (180) when
+    /// omitted. Ignored for non-rsclaw `api` formats.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -1918,6 +1932,12 @@ pub struct MemorySearchConfig {
     pub provider: Option<String>,
     /// Embedding model name, e.g. "text-embedding-3-small"
     pub model: Option<String>,
+    /// Output vector dimension. Required for OpenAI-compatible models that
+    /// `openai_model_dim` doesn't recognize (e.g. Qwen3-Embedding = 1024 on
+    /// the GPU fleet). When unset, the dimension is inferred from the model
+    /// name. Must match the model's actual output dim or the HNSW index will
+    /// reject vectors.
+    pub dimensions: Option<i32>,
     /// What to index: ["memory", "sessions"]
     pub sources: Option<Vec<String>>,
     /// Custom base URL for the embedding API
@@ -1926,6 +1946,11 @@ pub struct MemorySearchConfig {
     pub api_key: Option<SecretOrString>,
     /// Local model settings
     pub local: Option<LocalEmbeddingConfig>,
+    /// Optional query instruction for asymmetric embedding models (Qwen3-
+    /// Embedding). When set, retrieval *queries* (not stored docs) are wrapped
+    /// as `Instruct: {this}\nQuery: {q}`, which materially improves recall.
+    /// Default unset = symmetric embedding (current behaviour).
+    pub query_instruction: Option<String>,
     /// Experimental flags
     pub experimental: Option<Value>,
 }
@@ -1940,6 +1965,46 @@ pub struct LocalEmbeddingConfig {
     pub model_download_url: Option<String>,
     /// Model repo name on HuggingFace (default: "BAAI/bge-small-zh-v1.5")
     pub model_repo: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// kb (Knowledge Base — RAG over local docs)
+// ---------------------------------------------------------------------------
+
+/// Embedding-provider configuration. KB's `kb.embed` and the memory subsystem's
+/// `memorySearch` share this exact shape, so a KB-specific embedder is
+/// configured identically to memory (local BGE or remote OpenAI-compatible).
+pub type EmbedConfig = MemorySearchConfig;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KbConfig {
+    /// Per-KB embedder override. Same shape as `memorySearch` (local or
+    /// remote). When unset, KB falls back to the shared `memorySearch` config,
+    /// then to a local-model-dir scan, then to the deterministic stub. Set this
+    /// to point KB at a different embedder than memory — e.g. KB on the remote
+    /// GPU-fleet Qwen3 while memory stays on a fast local BGE. Changing it on a
+    /// populated KB requires a reindex (KB does not auto-migrate like memory).
+    pub embed: Option<EmbedConfig>,
+    /// DEPRECATED (unused): superseded by `embed`. Kept only so existing
+    /// configs that still set it continue to parse (deny_unknown_fields). No
+    /// code reads it — embedder selection goes through `embed` / `memorySearch`.
+    pub embedder: Option<String>,
+    /// DEPRECATED (unused): superseded by `embed.local`. Kept for parse
+    /// compatibility only; no code reads it.
+    pub embedder_model_path: Option<String>,
+    /// Persist the original raw bytes under `raw/<doc_id>.<ext>`
+    /// (default true; users can disable to save disk).
+    pub keep_raw: Option<bool>,
+    /// Compactor grace period (seconds) before an orphan file is
+    /// reaped. Default 3600 (1h).
+    pub compactor_grace_secs: Option<i64>,
+    /// Tombstone retention (days) before physical deletion.
+    /// Default 30.
+    pub tombstone_retention_days: Option<i64>,
+    /// Max accepted document size (MB) for the `/api/v1/knowledge` upload
+    /// endpoints (JSON body or multipart file). Default 50.
+    pub max_doc_mb: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------

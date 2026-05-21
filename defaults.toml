@@ -56,7 +56,7 @@ label      = "Kimi"
 env_var    = "MOONSHOT_API_KEY"
 model      = "kimi/kimi-k2.6"
 base_url   = "https://api.moonshot.cn/v1"
-user_agent = "rsclaw/2026.5.15"
+user_agent = "rsclaw/2026.5.20"
 needs_key  = true
 
 [[providers]]
@@ -349,10 +349,12 @@ primary_download_url = "https://api.skillhub.cn/api/v1/skills"
 label                = "iWenCai SkillHub (同花顺金融技能库)"
 list_url             = "http://ms.10jqka.com.cn/gateway/market/api/v1/skills/square"
 install_url_template = "http://ms.10jqka.com.cn/gateway/market/api/v1/skills/square/download?name={slug}"
-# `IWENCAI_BASE_URL` env can rebase scheme+host of both URLs above (path
-# kept). API key is per-skill at runtime — read from `IWENCAI_API_KEY` env
-# by the installed skill itself, not the registry adapter.
-base_url_env         = "IWENCAI_BASE_URL"
+# These are the MARKETPLACE URLs (ms.10jqka.com.cn, unauthenticated). They are
+# NOT rebased by `IWENCAI_BASE_URL` — that env points at the openapi.iwencai.com
+# DATA gateway (which an installed skill calls at runtime with IWENCAI_API_KEY +
+# X-Claw-Skill-Version) and 401s these marketplace endpoints. Use the dedicated
+# `IWENCAI_MARKET_BASE_URL` only if the marketplace host itself moves.
+base_url_env         = "IWENCAI_MARKET_BASE_URL"
 env_var              = "IWENCAI_API_KEY"
 needs_key            = false
 

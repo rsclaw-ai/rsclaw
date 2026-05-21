@@ -29,6 +29,7 @@ use tracing::{debug, error, info, warn};
 
 use super::{Channel, OutboundMessage};
 use crate::channel::chunker::{ChunkConfig, chunk_text, platform_chunk_limit};
+use crate::channel::retry::{SendRetry, send_with_retry};
 
 // ---------------------------------------------------------------------------
 // API endpoints
@@ -218,20 +219,22 @@ impl QQBotChannel {
             format!("{}/v2/users/{}/messages", self.api_base, target_id)
         };
 
+        // Body is identical across retries; QQ dedupes on msg_id+msg_seq so a
+        // post-commit reset will not double-send.
         let body = json!({
             "content": text,
             "msg_type": 0,
             "msg_id": msg_id,
         });
 
-        let resp = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("QQBot {token}"))
-            .json(&body)
-            .send()
-            .await
-            .context("qq: send message request failed")?;
+        let resp = send_with_retry("qq", &SendRetry::default(), || {
+            self.client
+                .post(&url)
+                .header("Authorization", format!("QQBot {token}"))
+                .json(&body)
+        })
+        .await
+        .context("qq: send message request failed")?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -253,14 +256,14 @@ impl QQBotChannel {
             "msg_id": msg_id,
         });
 
-        let resp = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("QQBot {token}"))
-            .json(&body)
-            .send()
-            .await
-            .context("qq: guild send failed")?;
+        let resp = send_with_retry("qq", &SendRetry::default(), || {
+            self.client
+                .post(&url)
+                .header("Authorization", format!("QQBot {token}"))
+                .json(&body)
+        })
+        .await
+        .context("qq: guild send failed")?;
 
         let status = resp.status();
         if !status.is_success() {

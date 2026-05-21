@@ -216,6 +216,10 @@ pub fn build_shared_system_prefix() -> String {
     SHARED_SYSTEM_PREFIX.clone()
 }
 
+// Pre-existing (not part of the KB work): the sequential `parts.push(..)`
+// blocks below read more clearly than one giant `vec![..]` literal. Suppress
+// the clippy lint locally rather than restructure unrelated prompt code.
+#[allow(clippy::vec_init_then_push)]
 fn build_shared_system_prefix_uncached() -> String {
     let mut parts: Vec<String> = Vec::new();
 
@@ -255,6 +259,36 @@ fn build_shared_system_prefix_uncached() -> String {
     );
 
     parts.push(
+        "<context_recovery>\n\
+         The runtime auto-compacts large outputs to keep context bounded — you have two recovery tools.\n\
+         \n\
+         **Tool-result artifact** (one-shot tool output > ~4 KB):\n\
+         Tool results that crossed the size budget come back with `_truncated: true`, a head+tail\n\
+         preview, and a `tool_result_id` (the inline marker `... call read_artifact(...) ...` carries it).\n\
+         Full payload is on disk. Fetch with `read_artifact(tool_result_id=\"tr_xxx\", mode=...)`.\n\
+         \n\
+         **Session archive** (the conversation itself, after `/compact` or auto-compaction):\n\
+         Older turns get summarised, but every original message is preserved in the redb archive.\n\
+         When the compaction summary lacks a specific you need (verbatim quote, exact path, the user's\n\
+         earlier wording), call `read_session_archive(mode=...)`. Modes mirror read_artifact.\n\
+         \n\
+         **Strategy — pick the cheapest mode that answers the question:**\n\
+           - `mode=stat` first if you don't know the size — cheap, returns total_lines/byte_size.\n\
+           - `mode=grep:KEYWORD` when you know a substring — scans 10000 lines in 1 response.\n\
+             Alternation works: `grep:error|fail|timeout`.\n\
+           - `mode=tail:N` for \"just now\" / \"刚刚\" style queries.\n\
+           - `mode=head:N` for openings, prefaces, the user's original ask.\n\
+           - `mode=lines:A-B` / `mode=seq:A-B` for exact ranges when you have line/seq numbers.\n\
+           - `mode=full` is the most expensive — use only when you genuinely need everything.\n\
+         \n\
+         Every response already returns `total_lines` (read_artifact) or `total_archived`\n\
+         (read_session_archive) — never call `wc -l` (Linux) or `Measure-Object` (Windows) to count;\n\
+         the size is already in the JSON.\n\
+         </context_recovery>"
+            .to_owned(),
+    );
+
+    parts.push(
         "## CAPABILITY PRIORITY (read before every action)\n\
          \n\
          For every user request, evaluate sources in this order and use \
@@ -281,12 +315,12 @@ fn build_shared_system_prefix_uncached() -> String {
          ### How to invoke an installed skill\n\
          When a task matches a skill description listed under \"## Installed Skills\":\n\
          1. Pick the skill whose description matches the user's intent.\n\
-         2. Call the `use_skill` function tool with `name=<slug>` — returns \
+         2. Call the `skill_use` function tool with `name=<slug>` — returns \
          the full SKILL.md body.\n\
          3. If SKILL.md mentions `references/<command>.md`, read_file that too.\n\
          4. Then invoke the CLI with the exact flags from SKILL.md via \
          `shell`.\n\n\
-         Prefer `use_skill` over manually `read_file`-ing SKILL.md so the \
+         Prefer `skill_use` over manually `read_file`-ing SKILL.md so the \
          discovery shows up cleanly in tool history. Guessing CLI flags from \
          the description alone is the #1 failure mode."
             .to_owned(),
@@ -307,6 +341,8 @@ fn build_shared_system_prefix_uncached() -> String {
 
     parts.push(
         "## Tool Usage Guidelines\n\
+         ### Permission errors\n\
+         If a tool returns \"Permission denied\" with an \"Allowed:\" list, pick a tool from that list and continue. Do NOT retry the denied tool. If nothing on the list can complete the task, tell the user honestly what's missing.\n\
          ### File Operations (use dedicated tools, NOT shell)\n\
          - List directory: `list_dir`. Find files: `search_file`. Search contents: `search_content`.\n\
          - Read file: `read_file`. Write/create file: `write_file`.\n\
@@ -337,6 +373,8 @@ fn build_shared_system_prefix_uncached() -> String {
          - Install tools (python, node, ffmpeg, chrome, etc.): `install_tool`. Do NOT download manually.\n\
          - Memory: use `memory` to recall prior conversations. Search memory at session start if user references prior work.\n\
          - Save corrected/complete info to memory immediately so it survives compaction.\n\
+         - Knowledge base: when the user asks about THEIR own material (uploaded docs, PDFs, URLs, files), use `knowledge_base` to search it and CITE the returned source_title. Prefer it over `web_search` for the user's material; if it returns nothing, say so — never fabricate a citation. (`memory` = what you learned; `knowledge_base` = the user's authoritative corpus.)\n\
+         - Skills: prefer an installed skill (see '## Installed Skills') via `skill_use` over raw web/shell. If none matches and web tools can't solve it, `skill_search` for one (restaurants→meituan, stock/finance→hithink, etc.), `skill_install` it, then `skill_use`. `skill_list` shows what's installed; `skill_remove` uninstalls.\n\
          \n\
          ### GUI / Desktop Automation (computer_use)\n\
          For any GUI or desktop automation task (WeChat, Finder, Safari, etc.):\n\
@@ -438,18 +476,28 @@ pub fn build_user_system(
         ));
     }
 
-    let platform_info = if cfg!(target_os = "windows") {
-        "Platform: Windows. Shell: PowerShell. \
-         Use PowerShell commands: Get-ChildItem (or dir), Get-Content, Get-Date, Select-Object -Last N (tail). \
-         Pipes and filters work naturally: | Where-Object, | Select-Object, | Sort-Object. \
-         Paths: backslash or forward slash both work. \
-         Examples: Get-Date -Format 'yyyy-MM-dd'; Get-ChildItem | Select-Object -Last 5; Get-Content file.txt."
+    // Per-session OS / shell guidance. This reflects the CLIENT's actual
+    // OS and lives in user_system (NOT the cached `shell` tool description,
+    // which is OS-agnostic), so a Windows client never inherits a macOS-
+    // baked prefix's shell conventions. On Windows this includes runtime
+    // PowerShell-edition detection — inherently per-machine, must not enter
+    // the base-layer hash.
+    let platform_info: String = if cfg!(target_os = "windows") {
+        super::tools_builder::windows_shell_guidance()
     } else if cfg!(target_os = "macos") {
-        "Platform: macOS. Shell: bash/zsh. Standard Unix commands available (ls, cat, grep, tail, date)."
+        "Platform: macOS. Shell: bash/zsh. Package manager: brew (npm/pip for \
+         language deps). Standard Unix commands available (ls, cat, grep, tail, date).\n\
+         Chain dependent commands with `&&`; use `;` only when you don't care whether \
+         earlier commands succeed."
+            .to_owned()
     } else {
-        "Platform: Linux. Shell: bash/sh. Standard Unix commands available (ls, cat, grep, tail, date)."
+        "Platform: Linux. Shell: bash/sh. Package manager: apt (or the distro's; npm/pip \
+         for language deps). Standard Unix commands available (ls, cat, grep, tail, date).\n\
+         Chain dependent commands with `&&`; use `;` only when you don't care whether \
+         earlier commands succeed."
+            .to_owned()
     };
-    parts.push(platform_info.to_owned());
+    parts.push(platform_info);
 
     if cfg!(target_os = "windows") {
         parts.push(
@@ -566,13 +614,26 @@ pub(crate) fn build_system_prompt(
 /// `user_tools` (the per-client subset). Also dumped in the
 /// `RSCLAW_DUMP_PROMPT` debug payload.
 pub const BUILTIN_TOOL_NAMES: &[&str] = &[
-    "memory","use_skill","task","task_finish","read_file","write_file",
+    "memory","skill_use","task","task_finish","read_file","write_file",
     "edit_file","send_file","shell","agent","ask_user","install_tool",
     "list_dir","search_file","search_content","web_search","web_fetch",
     "web_download","web_browser","computer_use","image_gen","video_gen",
     "pdf","text_to_voice","send_message","cron","session","gateway",
     "opencode","claudecode","codex","channel","anycli","clarify","pairing",
     "create_docx","create_pdf","create_xlsx","create_pptx","doc",
+    // Context-recovery tools: static, byte-identical for every client of
+    // this prefix version, so they belong in the cacheable builtin prefix.
+    // Previously misclassified as user_tools, which under prefix_id mode
+    // (dynamic_prefix omitted) meant they were NEVER sent to the model —
+    // so the model could never call read_session_archive despite the
+    // summary/system-prompt telling it to.
+    "read_session_archive","read_artifact","knowledge_base",
+    // A2A-only tool, but unconditionally registered in build_tool_list and
+    // byte-identical across clients — same builtin class. Errors gracefully
+    // if called on a non-A2A turn.
+    "wait_input",
+    // Self-service skill management (discover → install → use → remove).
+    "skill_list","skill_search","skill_install","skill_remove",
 ];
 
 /// Build a minimal system prompt for internal sessions (heartbeat/cron/system).

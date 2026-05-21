@@ -4,6 +4,9 @@ import JSON5 from "json5";
 import { useEffect, useState, useCallback, useRef } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import { ErrorBoundary } from "./error";
+import { MemoryPage } from "./memory-page";
+import { KnowledgePage } from "./knowledge-page";
+import { RsclawProviderCard } from "./rsclaw-provider-card";
 import { Popover } from "./ui-lib";
 import { toast } from "../lib/toast";
 import { EmojiAvatar, AvatarPicker } from "./emoji";
@@ -19,6 +22,7 @@ import {
   getConfig,
   saveConfig,
   reloadConfig,
+  restartGateway,
   getLogs,
   getAgents,
   saveAgent,
@@ -88,7 +92,7 @@ interface LogEntry {
   msg: string;
 }
 
-type PanelPage = "status" | "config" | "agents" | "cron" | "skills" | "workspace" | "doctor" | "pairing" | "wizard";
+type PanelPage = "status" | "config" | "agents" | "cron" | "skills-plugins" | "workspace" | "doctor" | "pairing" | "wizard" | "memory" | "knowledge";
 
 // ── Toggle Component ────────────────────────────────────
 function Toggle(props: {
@@ -463,938 +467,6 @@ function StatusPage() {
           </div>
         </div>
       )}
-    </div>
-  );
-}
-
-// ══════════════════════════════════════════════════════════
-// ── Config Editor Page ───────────────────────────────────
-// ══════════════════════════════════════════════════════════
-function ConfigEditorPage() {
-  type TabKey = "gateway" | "models" | "channels" | "tools";
-  const tabs: { key: TabKey; label: string }[] = [
-    { key: "gateway", label: getLang() === "cn" ? "\u7F51\u5173" : "Gateway" },
-    { key: "models", label: getLang() === "cn" ? "\u6A21\u578B\u63D0\u4F9B\u5546" : "Models" },
-    { key: "channels", label: getLang() === "cn" ? "\u6D88\u606F\u901A\u9053" : "Channels" },
-    { key: "tools", label: getLang() === "cn" ? "\u5DE5\u5177 & \u529F\u80FD" : "Tools" },
-  ];
-
-  const [activeTab, setActiveTab] = useState<TabKey>("gateway");
-  const [rawMode, setRawMode] = useState(() => isTauri);
-  const [rawConfig, setRawConfig] = useState("");
-  const [configPath, setConfigPath] = useState("");
-  const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [dirty, setDirty] = useState(false);
-
-  // Parsed config fields - Gateway
-  const [port, setPort] = useState(18889);
-  const [bind, setBind] = useState("127.0.0.1");
-  const [language, setLanguage] = useState("zh-CN");
-  const [authToken, setAuthToken] = useState("");
-  const [agentModel, setAgentModel] = useState("");
-  const [agentMaxTokens, setAgentMaxTokens] = useState(0);
-
-  // Parsed config fields - Models
-  const [providers, setProviders] = useState<{
-    name: string; key: string; enabled: boolean; apiKey: string; baseUrl: string; apiType?: ApiType; userAgent?: string;
-  }[]>([
-    { name: "Doubao (\u8C46\u5305)", key: "doubao", enabled: false, apiKey: "", baseUrl: "", apiType: "openai-responses" },
-    { name: "Qwen (\u5343\u95EE)", key: "qwen", enabled: false, apiKey: "", baseUrl: "" },
-    { name: "Anthropic", key: "anthropic", enabled: false, apiKey: "", baseUrl: "" },
-    { name: "OpenAI", key: "openai", enabled: false, apiKey: "", baseUrl: "" },
-    { name: "DeepSeek", key: "deepseek", enabled: false, apiKey: "", baseUrl: "" },
-    { name: "Kimi", key: "kimi", enabled: false, apiKey: "", baseUrl: "", apiType: "openai", userAgent: "rsclaw/2026.5.5" },
-    { name: "CodingPlan", key: "codingplan", enabled: false, apiKey: "", baseUrl: "" },
-    { name: "Ollama", key: "ollama", enabled: true, apiKey: "", baseUrl: "http://localhost:11434" },
-    { name: "Custom Provider", key: "custom", enabled: false, apiKey: "", baseUrl: "" },
-  ]);
-
-  // Parsed config fields - Channels
-  const [channels, setChannels] = useState<{
-    type: string; enabled: boolean; status: string;
-  }[]>([]);
-
-  // Parsed config fields - Tools
-  const [execSandbox, setExecSandbox] = useState(true);
-  const [uploadMaxSize, setUploadMaxSize] = useState(10);
-  const [webSearchProvider, setWebSearchProvider] = useState("none");
-  const [memoryShortTermLimit, setMemoryShortTermLimit] = useState(20);
-  const [memoryLongTermLimit, setMemoryLongTermLimit] = useState(100);
-
-  // Simple JSON5 parser helper - extract value for a key from raw text
-  const extractVal = useCallback((raw: string, key: string): string | undefined => {
-    // Match key: value or "key": value patterns in json5
-    const patterns = [
-      new RegExp(`["']?${key}["']?\\s*:\\s*"([^"]*)"`, "m"),
-      new RegExp(`["']?${key}["']?\\s*:\\s*'([^']*)'`, "m"),
-      new RegExp(`["']?${key}["']?\\s*:\\s*([\\d.]+)`, "m"),
-      new RegExp(`["']?${key}["']?\\s*:\\s*(true|false)`, "m"),
-    ];
-    for (const p of patterns) {
-      const m = raw.match(p);
-      if (m) return m[1];
-    }
-    return undefined;
-  }, []);
-
-  const parseConfig = useCallback((raw: string) => {
-    // Gateway fields
-    const p = extractVal(raw, "port");
-    if (p) setPort(parseInt(p, 10) || 18889);
-    const b = extractVal(raw, "bind");
-    if (b) setBind(b);
-    const l = extractVal(raw, "language");
-    if (l) {
-      setLanguage(l);
-    } else {
-      // Config has no `language` field — the dropdown still shows the
-      // useState default ("zh-CN") which gives the user a false sense
-      // that it's persisted. Mark dirty so the next save writes the
-      // default value, and the tray menu (which reads gateway.language
-      // from rsclaw.json5) starts following it.
-      setDirty(true);
-    }
-    const at = extractVal(raw, "authToken");
-    if (at) { setAuthToken(at); setApiAuthToken(at); }
-
-    // Agent defaults
-    const am = extractVal(raw, "model");
-    if (am) setAgentModel(am);
-    const amt = extractVal(raw, "maxTokens");
-    if (amt) setAgentMaxTokens(parseInt(amt, 10) || 4096);
-
-    // Models - try to detect provider blocks
-    const providerNames = ["doubao", "qwen", "anthropic", "openai", "deepseek", "kimi", "codingplan", "ollama", "custom"];
-    const displayNames: Record<string, string> = {
-      doubao: "Doubao (\u8C46\u5305)", qwen: "Qwen (\u5343\u95EE)", anthropic: "Anthropic", openai: "OpenAI", deepseek: "DeepSeek", kimi: "Kimi", codingplan: "CodingPlan", ollama: "Ollama", custom: "Custom Provider",
-    };
-    const newProviders = providerNames.map((pName) => {
-      // Look for a block like anthropic: { ... }
-      const blockRe = new RegExp(`["']?${pName}["']?\\s*:\\s*\\{([^}]*)\\}`, "ms");
-      const blockMatch = raw.match(blockRe);
-      const block = blockMatch ? blockMatch[1] : "";
-      const apiKey = extractVal(block, "apiKey") || "";
-      const baseUrl = extractVal(block, "baseUrl") || extractVal(block, "base_url") || "";
-      const userAgent = extractVal(block, "userAgent") || extractVal(block, "user_agent") || "";
-      const enabled = extractVal(block, "enabled");
-      const apiField = extractVal(block, "api") || extractVal(block, "api_type");
-      const apiType: ApiType | undefined = (apiField === "anthropic" || apiField === "gemini" || apiField === "ollama" || apiField === "openai" || apiField === "openai-responses")
-        ? (apiField as ApiType)
-        : undefined;
-      const isCustomLike = pName === "custom" || pName === "codingplan";
-      return {
-        name: displayNames[pName] || pName,
-        key: pName,
-        enabled: enabled !== undefined ? enabled === "true" : (isCustomLike ? !!baseUrl : apiKey.length > 0),
-        apiKey,
-        baseUrl: baseUrl || "",
-        userAgent: userAgent || (pName === "kimi" ? "rsclaw/2026.5.5" : ""),
-        ...((isCustomLike || pName === "doubao" || pName === "kimi") ? { apiType } : {}),
-      };
-    });
-    setProviders(newProviders);
-
-    // Channels - detect channel blocks
-    const channelTypes = ["wechat", "wecom", "telegram", "slack", "dingtalk", "feishu", "http", "terminal"];
-    const detectedChannels: { type: string; enabled: boolean; status: string }[] = [];
-    for (const ct of channelTypes) {
-      const re = new RegExp(`["']?${ct}["']?\\s*:\\s*\\{`, "m");
-      if (raw.match(re)) {
-        const blockRe = new RegExp(`["']?${ct}["']?\\s*:\\s*\\{([^}]*)\\}`, "ms");
-        const bm = raw.match(blockRe);
-        const block = bm ? bm[1] : "";
-        const en = extractVal(block, "enabled");
-        detectedChannels.push({
-          type: ct,
-          enabled: en !== undefined ? en === "true" : true,
-          status: en === "false" ? "disabled" : "configured",
-        });
-      }
-    }
-    setChannels(detectedChannels);
-
-    // Tools
-    const es = extractVal(raw, "sandbox");
-    if (es !== undefined) setExecSandbox(es === "true");
-    const ums = extractVal(raw, "maxUploadSize");
-    if (ums) setUploadMaxSize(parseInt(ums, 10) || 10);
-    const wsp = extractVal(raw, "webSearchProvider") || extractVal(raw, "searchProvider");
-    if (wsp) setWebSearchProvider(wsp);
-    const stl = extractVal(raw, "shortTermLimit");
-    if (stl) setMemoryShortTermLimit(parseInt(stl, 10) || 20);
-    const ltl = extractVal(raw, "longTermLimit");
-    if (ltl) setMemoryLongTermLimit(parseInt(ltl, 10) || 100);
-  }, [extractVal]);
-
-  useEffect(() => {
-    (async () => {
-      try {
-        const data = await getConfig();
-        if (data.raw) {
-          setRawConfig(data.raw);
-          setConfigPath(data.path || "");
-          parseConfig(data.raw);
-        } else {
-          throw new Error("no raw config");
-        }
-      } catch {
-        // Fallback: read config file directly via Tauri
-        try {
-          const tauriInvoke = isTauri ? tauriInvokeV2 : null;
-          if (tauriInvoke) {
-            const cp: string = await tauriInvoke("get_config_path");
-            const home = cp || "~/.rsclaw";
-            const configFile = home + "/rsclaw.json5";
-            // Use rsclaw config get to read raw content
-            const raw: string = await tauriInvoke("read_config_file");
-            if (raw) {
-              setRawConfig(raw);
-              setConfigPath(configFile);
-              parseConfig(raw);
-            } else {
-              setRawConfig("// Failed to load config");
-            }
-          } else {
-            setRawConfig("// Failed to load config (gateway auth required)");
-          }
-        } catch {
-          setRawConfig("// Failed to load config");
-        }
-      } finally {
-        setLoading(false);
-      }
-    })();
-  }, [parseConfig]);
-
-  // Rebuild raw config from structured fields is complex for json5.
-  // Instead, we do targeted find-replace on the raw text for known keys.
-  const applyFieldToRaw = useCallback((raw: string, key: string, value: string | number | boolean): string => {
-    const strVal = typeof value === "string" ? `"${value}"` : String(value);
-    // Try to find and replace existing key
-    const patterns = [
-      new RegExp(`(["']?${key}["']?\\s*:\\s*)"[^"]*"`, "m"),
-      new RegExp(`(["']?${key}["']?\\s*:\\s*)'[^']*'`, "m"),
-      new RegExp(`(["']?${key}["']?\\s*:\\s*)[\\d.]+`, "m"),
-      new RegExp(`(["']?${key}["']?\\s*:\\s*)(?:true|false)`, "m"),
-    ];
-    for (const p of patterns) {
-      if (raw.match(p)) {
-        return raw.replace(p, `$1${strVal}`);
-      }
-    }
-    return raw; // key not found, leave unchanged
-  }, []);
-
-  const buildRawFromFields = useCallback(() => {
-    // Parse existing config (JSON5-safe), overlay structured fields, re-serialize.
-    let cfg: any = {};
-    try { cfg = JSON5.parse(rawConfig); } catch { cfg = {}; }
-
-    // Gateway fields
-    if (!cfg.gateway) cfg.gateway = {};
-    cfg.gateway.port = port;
-    cfg.gateway.bind = bind;
-    cfg.gateway.language = language;
-    if (authToken) {
-      if (!cfg.gateway.auth) cfg.gateway.auth = {};
-      cfg.gateway.auth.token = authToken;
-    }
-
-    // Providers
-    if (!cfg.models) cfg.models = {};
-    if (!cfg.models.providers) cfg.models.providers = {};
-    for (const prov of providers) {
-      const isCustomLike = prov.key === "custom" || prov.key === "codingplan";
-      if (!prov.enabled) {
-        // Remove disabled provider
-        delete cfg.models.providers[prov.key];
-        continue;
-      }
-      const entry: any = cfg.models.providers[prov.key] || {};
-      if (prov.apiKey) entry.apiKey = prov.apiKey;
-      else delete entry.apiKey;
-      if (prov.baseUrl) entry.baseUrl = prov.baseUrl;
-      else if (isCustomLike || prov.key === "ollama") delete entry.baseUrl;
-      // Doubao opts into the api_type field too (CodingPlan offering).
-      // For doubao, default to "openai" when the user enables it without
-      // touching the API Type dropdown — the dropdown's "-- Select --"
-      // placeholder used to silently skip the save, leaving gateway to
-      // autodetect a wrong protocol later.
-      if (isCustomLike) {
-        if (prov.apiType) entry.api = prov.apiType;
-      } else if (prov.key === "doubao") {
-        entry.api = prov.apiType || "openai-responses";
-      } else if (prov.key === "kimi") {
-        entry.api = prov.apiType || "openai";
-      }
-      if (prov.userAgent) entry.userAgent = prov.userAgent;
-      else delete entry.userAgent;
-      cfg.models.providers[prov.key] = entry;
-    }
-
-    return JSON.stringify(cfg, null, 2);
-  }, [rawConfig, port, bind, language, authToken, providers]);
-
-  const handleSave = async () => {
-    setSaving(true);
-    try {
-      const finalRaw = rawMode ? rawConfig : buildRawFromFields();
-      const result = await saveConfig({ raw: finalRaw });
-      if (result.error) {
-        toast.error(Locale.RsClawPanel.Config.SaveFailed, result.error);
-      } else {
-        setDirty(false);
-        setRawConfig(finalRaw);
-        toast.success(Locale.RsClawPanel.Config.SaveSuccess);
-        try { await reloadConfig(); } catch {}
-      }
-    } catch (e) {
-      toast.fromError(Locale.RsClawPanel.Config.SaveFailed, e);
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const markDirty = () => { if (!dirty) setDirty(true); };
-
-  if (loading) return <div className={styles["empty-state"]}>{Locale.RsClawPanel.Config.Loading}</div>;
-
-  // Safety: if raw config couldn't be loaded or starts with error comment
-  if (!rawConfig || rawConfig.startsWith("//")) {
-    return (
-      <div style={{ padding: 20 }}>
-        <div style={{ fontSize: 14, color: "#d95f5f", marginBottom: 12 }}>{rawConfig || "No config loaded"}</div>
-        <div style={{ fontSize: 12, color: "#888" }}>
-          {getLang() === "cn" ? "\u65E0\u6CD5\u52A0\u8F7D\u914D\u7F6E\uFF0C\u8BF7\u786E\u8BA4\u7F51\u5173\u5DF2\u542F\u52A8\u5E76\u4E14 auth token \u6B63\u786E\u3002" : "Cannot load config. Ensure gateway is running and auth token is correct."}
-        </div>
-      </div>
-    );
-  }
-
-
-  // ---- Inline style constants ----
-  const sectionCard: React.CSSProperties = {
-    background: "var(--white)", borderRadius: "12px", border: "1px solid var(--border-in-light)",
-    padding: "20px", marginBottom: "16px",
-  };
-  const sectionTitle: React.CSSProperties = {
-    fontSize: "14px", fontWeight: 600, color: "var(--black)", marginBottom: "16px",
-    paddingBottom: "10px", borderBottom: "1px solid var(--border-in-light)",
-  };
-  const fieldRow: React.CSSProperties = {
-    display: "flex", alignItems: "center", justifyContent: "space-between",
-    padding: "10px 0", borderBottom: "1px solid rgba(0,0,0,0.04)",
-  };
-  const fieldLabel: React.CSSProperties = {
-    fontSize: "13px", color: "var(--black)", fontWeight: 500, minWidth: "140px",
-  };
-  const fieldSub: React.CSSProperties = {
-    fontSize: "11px", color: "#999", marginTop: "2px",
-  };
-  const fieldInput: React.CSSProperties = {
-    padding: "6px 10px", borderRadius: "6px", border: "1px solid var(--border-in-light)",
-    fontSize: "13px", background: "var(--white)", outline: "none", width: "220px",
-  };
-  const fieldSelect: React.CSSProperties = { ...fieldInput, width: "230px" };
-  const toggleTrack = (on: boolean): React.CSSProperties => ({
-    width: "40px", height: "22px", borderRadius: "11px", cursor: "pointer",
-    background: on ? "#f0a500" : "#ccc", position: "relative", transition: "background 0.2s",
-    display: "inline-block", flexShrink: 0,
-  });
-  const toggleThumb = (on: boolean): React.CSSProperties => ({
-    width: "18px", height: "18px", borderRadius: "50%", background: "#fff",
-    position: "absolute", top: "2px", left: on ? "20px" : "2px", transition: "left 0.2s",
-    boxShadow: "0 1px 3px rgba(0,0,0,0.2)",
-  });
-  const providerCard: React.CSSProperties = {
-    border: "1px solid var(--border-in-light)", borderRadius: "10px", padding: "16px",
-    marginBottom: "12px", background: "var(--white)",
-  };
-  const providerHeader: React.CSSProperties = {
-    display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "12px",
-  };
-  const providerName: React.CSSProperties = { fontSize: "14px", fontWeight: 600 };
-  const channelRow: React.CSSProperties = {
-    display: "flex", alignItems: "center", justifyContent: "space-between",
-    padding: "12px 16px", borderRadius: "8px", border: "1px solid var(--border-in-light)",
-    marginBottom: "8px", background: "var(--white)",
-  };
-  const statusPill = (status: string): React.CSSProperties => ({
-    padding: "2px 10px", borderRadius: "10px", fontSize: "11px", fontWeight: 500,
-    background: status === "configured" ? "rgba(45,212,160,0.12)" : status === "pending" ? "rgba(240,165,0,0.12)" : "rgba(0,0,0,0.06)",
-    color: status === "configured" ? "#2dd4a0" : status === "pending" ? "#f0a500" : "#999",
-  });
-  const sliderContainer: React.CSSProperties = {
-    display: "flex", alignItems: "center", gap: "10px", width: "220px",
-  };
-
-  // Toggle component
-  const Toggle = ({ on, onToggle }: { on: boolean; onToggle: () => void }) => (
-    <div style={toggleTrack(on)} onClick={onToggle}>
-      <div style={toggleThumb(on)} />
-    </div>
-  );
-
-  // ---- Tab content renderers ----
-  const renderGateway = () => (
-    <div>
-      <div style={sectionCard}>
-        <div style={sectionTitle}>{Locale.RsClawPanel.Config.Gateway}</div>
-        <div style={fieldRow}>
-          <div>
-            <div style={fieldLabel}>{Locale.RsClawPanel.Config.Port}</div>
-            <div style={fieldSub}>HTTP API port</div>
-          </div>
-          <input style={fieldInput} type="number" value={port}
-            onChange={(e) => { setPort(parseInt(e.target.value, 10) || 18889); markDirty(); }} />
-        </div>
-        <div style={fieldRow}>
-          <div>
-            <div style={fieldLabel}>{Locale.RsClawPanel.Config.Bind}</div>
-            <div style={fieldSub}>{Locale.RsClawPanel.Config.BindLoopback} / {Locale.RsClawPanel.Config.BindAll}</div>
-          </div>
-          <select style={fieldSelect} value={bind}
-            onChange={(e) => { setBind(e.target.value); markDirty(); }}>
-            <option value="127.0.0.1">{Locale.RsClawPanel.Config.BindLoopback}</option>
-            <option value="0.0.0.0">{Locale.RsClawPanel.Config.BindAll}</option>
-          </select>
-        </div>
-        <div style={fieldRow}>
-          <div>
-            <div style={fieldLabel}>{Locale.RsClawPanel.Config.Language}</div>
-          </div>
-          <select style={fieldSelect} value={language}
-            onChange={(e) => { setLanguage(e.target.value); markDirty(); }}>
-            <option value="zh-CN">zh-CN</option>
-            <option value="en">en</option>
-            <option value="ja">ja</option>
-          </select>
-        </div>
-        <div style={{ ...fieldRow, borderBottom: "none" }}>
-          <div>
-            <div style={fieldLabel}>Auth Token</div>
-            <div style={fieldSub}>API authentication token</div>
-          </div>
-          <input style={fieldInput} type="password" value={authToken} placeholder="(not set)"
-            onChange={(e) => { setAuthToken(e.target.value); setApiAuthToken(e.target.value); markDirty(); }} />
-        </div>
-      </div>
-      <div style={sectionCard}>
-        <div style={sectionTitle}>Agent Defaults</div>
-        <div style={fieldRow}>
-          <div>
-            <div style={fieldLabel}>Default Model</div>
-          </div>
-          <input style={fieldInput} value={agentModel} placeholder="e.g. claude-sonnet-4-20250514"
-            onChange={(e) => { setAgentModel(e.target.value); markDirty(); }} />
-        </div>
-        <div style={{ ...fieldRow, borderBottom: "none" }}>
-          <div>
-            <div style={fieldLabel}>Max Tokens <span style={{ color: "#666", fontWeight: 400 }}>(0 = auto)</span></div>
-          </div>
-          <input style={fieldInput} type="number" value={agentMaxTokens}
-            onChange={(e) => { setAgentMaxTokens(parseInt(e.target.value, 10) || 0); markDirty(); }} />
-        </div>
-      </div>
-    </div>
-  );
-
-  const renderModels = () => (
-    <div>
-      {providers.map((prov, idx) => {
-        const isCustomLike = prov.key === "custom" || prov.key === "codingplan";
-        const curApiType: ApiType | undefined = prov.apiType;
-        const hideKey = prov.key === "ollama";
-        const keyOptional = isCustomLike && curApiType && !API_TYPE_NEEDS_KEY[curApiType];
-        const isZh = getLang() === "cn";
-        // Determine configuration status
-        const hasCredentials = prov.apiKey.length > 0 || (["ollama", "custom", "codingplan"].includes(prov.key) && prov.baseUrl.length > 0);
-        const badgeLabel = prov.enabled
-          ? (hasCredentials ? (isZh ? "已配置" : "Configured") : (isZh ? "待配置" : "Pending"))
-          : (isZh ? "关闭" : "OFF");
-        const badgeBg = prov.enabled
-          ? (hasCredentials ? "rgba(45,212,160,0.12)" : "rgba(240,165,0,0.12)")
-          : "rgba(0,0,0,0.06)";
-        const badgeColor = prov.enabled
-          ? (hasCredentials ? "#2dd4a0" : "#f0a500")
-          : "#999";
-        return (
-        <div key={prov.key} style={providerCard}>
-          <div style={providerHeader}>
-            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-              <span style={providerName}>{prov.name}</span>
-              <span style={{
-                padding: "2px 8px", borderRadius: "8px", fontSize: "11px",
-                background: badgeBg,
-                color: badgeColor,
-              }}>
-                {badgeLabel}
-              </span>
-            </div>
-            <Toggle on={prov.enabled} onToggle={() => {
-              const next = [...providers];
-              next[idx] = { ...next[idx], enabled: !next[idx].enabled };
-              setProviders(next);
-              markDirty();
-            }} />
-          </div>
-          {(isCustomLike || prov.key === "doubao" || prov.key === "kimi") && (
-            <div style={fieldRow}>
-              <div style={fieldLabel}>API Type</div>
-              <select
-                style={{ ...fieldInput, cursor: "pointer" }}
-                value={curApiType || ""}
-                onChange={(e) => {
-                  const val = e.target.value;
-                  if (!val) return;
-                  const at = val as ApiType;
-                  const next = [...providers];
-                  // For custom-like providers, switching api_type wipes the
-                  // base URL (each api_type has its own default). For doubao,
-                  // keep the existing base URL — only the auth/format changes.
-                  const baseUrlReset = isCustomLike ? "" : next[idx].baseUrl;
-                  next[idx] = { ...next[idx], apiType: at, baseUrl: baseUrlReset };
-                  setProviders(next);
-                  markDirty();
-                }}
-              >
-                {!curApiType && <option value="">-- Select --</option>}
-                {(Object.keys(API_TYPE_LABELS) as ApiType[]).map((at) => (
-                  <option key={at} value={at}>{API_TYPE_LABELS[at]}</option>
-                ))}
-              </select>
-            </div>
-          )}
-          {!hideKey && (
-          <div style={fieldRow}>
-              <div style={fieldLabel}>API Key{keyOptional ? <span style={{ color: "#999", fontWeight: 400 }}> (optional)</span> : null}</div>
-              <input style={fieldInput} type="password" value={prov.apiKey}
-                placeholder={keyOptional ? "(optional)" : "sk-..."}
-                onChange={(e) => {
-                  const next = [...providers];
-                  next[idx] = { ...next[idx], apiKey: e.target.value };
-                  setProviders(next);
-                  markDirty();
-                }} />
-            </div>
-          )}
-          {(isCustomLike || prov.key === "doubao" || prov.key === "ollama" || prov.key === "kimi") && (
-          <div style={fieldRow}>
-            <div style={fieldLabel}>API URL</div>
-            <input style={fieldInput} value={prov.baseUrl}
-              placeholder={
-                isCustomLike ? "https://your-api-server.com/v1" :
-                prov.key === "kimi" ? "https://api.moonshot.cn/v1" :
-                prov.key === "doubao" ? "https://ark.cn-beijing.volces.com/api/v3" :
-                prov.key === "ollama" ? "http://localhost:11434" :
-                "(default)"
-              }
-              onChange={(e) => {
-                const next = [...providers];
-                next[idx] = { ...next[idx], baseUrl: e.target.value };
-                setProviders(next);
-                markDirty();
-              }} />
-          </div>
-          )}
-          {(isCustomLike || prov.key === "kimi") && (
-          <div style={{ ...fieldRow, borderBottom: "none" }}>
-            <div style={fieldLabel}>User-Agent</div>
-            <input style={fieldInput} value={prov.userAgent || ""}
-              placeholder="e.g. rsclaw/2026.5.5"
-              onChange={(e) => {
-                const next = [...providers];
-                next[idx] = { ...next[idx], userAgent: e.target.value };
-                setProviders(next);
-                markDirty();
-              }} />
-          </div>
-          )}
-        </div>
-        );
-      })}
-    </div>
-  );
-
-  // All 13 channels with their credential fields
-  const zh = getLang() === "cn";
-  const ALL_CHANNELS_DEF = [
-    { id: "wechat", icon: "\u5FAE", name: zh ? "\u5FAE\u4FE1" : "WeChat", fields: [
-      { key: "botId", label: "Bot ID", type: "text", placeholder: "xxx@im.bot" },
-      { key: "botToken", label: "Bot Token", type: "password", placeholder: "${WECHAT_BOT_TOKEN}" },
-    ]},
-    { id: "wecom", icon: "WC", name: zh ? "\u4F01\u4E1A\u5FAE\u4FE1" : "WeCom", fields: [
-      { key: "botId", label: "Bot ID", type: "text", placeholder: "" },
-      { key: "secret", label: "Secret", type: "password", placeholder: "${WECOM_SECRET}" },
-    ]},
-    { id: "feishu", icon: "\u98DE", name: zh ? "\u98DE\u4E66" : "Feishu", fields: [
-      { key: "appId", label: "App ID", type: "text", placeholder: "cli_xxx" },
-      { key: "appSecret", label: "App Secret", type: "password", placeholder: "${FEISHU_APP_SECRET}" },
-      { key: "brand", label: "Brand", type: "select", options: ["feishu", "lark"] },
-    ]},
-    { id: "dingtalk", icon: "DT", name: zh ? "\u9489\u9489" : "DingTalk", fields: [
-      { key: "appKey", label: "App Key", type: "text", placeholder: "" },
-      { key: "appSecret", label: "App Secret", type: "password", placeholder: "${DINGTALK_APP_SECRET}" },
-    ]},
-    { id: "telegram", icon: "Tg", name: "Telegram", fields: [
-      { key: "botToken", label: "Bot Token", type: "password", placeholder: "${TELEGRAM_BOT_TOKEN}" },
-    ]},
-    { id: "discord", icon: "Dc", name: "Discord", fields: [
-      { key: "token", label: "Bot Token", type: "password", placeholder: "${DISCORD_BOT_TOKEN}" },
-    ]},
-    { id: "slack", icon: "Sl", name: "Slack", fields: [
-      { key: "botToken", label: "Bot Token", type: "password", placeholder: "${SLACK_BOT_TOKEN}" },
-      { key: "appToken", label: "App Token", type: "password", placeholder: "${SLACK_APP_TOKEN}" },
-    ]},
-    { id: "whatsapp", icon: "WA", name: "WhatsApp", fields: [
-      { key: "phoneNumberId", label: "Phone Number ID", type: "text", placeholder: "" },
-      { key: "accessToken", label: "Access Token", type: "password", placeholder: "${WHATSAPP_TOKEN}" },
-    ]},
-    { id: "qq", icon: "QQ", name: "QQ", fields: [
-      { key: "appId", label: "App ID", type: "text", placeholder: "" },
-      { key: "appSecret", label: "App Secret", type: "password", placeholder: "${QQ_APP_SECRET}" },
-    ]},
-    { id: "line", icon: "Li", name: "LINE", fields: [
-      { key: "channelSecret", label: "Channel Secret", type: "password", placeholder: "${LINE_CHANNEL_SECRET}" },
-      { key: "channelAccessToken", label: "Access Token", type: "password", placeholder: "${LINE_ACCESS_TOKEN}" },
-    ]},
-    { id: "zalo", icon: "Za", name: "Zalo", fields: [
-      { key: "appId", label: "App ID", type: "text", placeholder: "" },
-      { key: "accessToken", label: "Access Token", type: "password", placeholder: "${ZALO_ACCESS_TOKEN}" },
-    ]},
-    { id: "matrix", icon: "Mx", name: "Matrix", fields: [
-      { key: "homeserver", label: "Homeserver", type: "text", placeholder: "https://matrix.org" },
-      { key: "userId", label: "User ID", type: "text", placeholder: "@bot:matrix.org" },
-      { key: "accessToken", label: "Access Token", type: "password", placeholder: "${MATRIX_ACCESS_TOKEN}" },
-    ]},
-    { id: "signal", icon: "Sg", name: "Signal", fields: [
-      { key: "phoneNumber", label: "Phone Number", type: "text", placeholder: "+1234567890" },
-    ]},
-  ];
-
-  const POLICY_OPTIONS = ["pairing", "open", "allowlist", "disabled"];
-
-  // Channel config state: { [channelId]: { enabled, expanded, fields: {key: value}, dmPolicy, groupPolicy } }
-  const [channelConfigs, setChannelConfigs] = useState<Record<string, {
-    enabled: boolean; expanded: boolean; fields: Record<string, string>; dmPolicy: string; groupPolicy: string;
-  }>>(() => {
-    const init: any = {};
-    ALL_CHANNELS_DEF.forEach((ch) => {
-      // Check if channel exists in parsed config
-      const existing = channels.find((c) => c.type === ch.id);
-      init[ch.id] = {
-        enabled: !!existing?.enabled,
-        expanded: false,
-        fields: {},
-        dmPolicy: "pairing",
-        groupPolicy: "allowlist",
-      };
-    });
-    return init;
-  });
-
-  // Sync from parsed config on load
-  useEffect(() => {
-    if (!rawConfig) return;
-    const next = { ...channelConfigs };
-    ALL_CHANNELS_DEF.forEach((chDef) => {
-      // Try to extract channel block from raw config
-      const blockRe = new RegExp(`["']?${chDef.id}["']?\\s*:\\s*\\{([^}]*)\\}`, "ms");
-      const m = rawConfig.match(blockRe);
-      if (m) {
-        next[chDef.id].enabled = true;
-        const block = m[1];
-        chDef.fields.forEach((f) => {
-          const valRe = new RegExp(`["']?${f.key}["']?\\s*:\\s*["']([^"']*)["']`);
-          const vm = block.match(valRe);
-          if (vm) next[chDef.id].fields[f.key] = vm[1];
-        });
-        const dmRe = /["']?dmPolicy["']?\s*:\s*["']([^"']*)["']/;
-        const dm = block.match(dmRe);
-        if (dm) next[chDef.id].dmPolicy = dm[1];
-        const gpRe = /["']?groupPolicy["']?\s*:\s*["']([^"']*)["']/;
-        const gp = block.match(gpRe);
-        if (gp) next[chDef.id].groupPolicy = gp[1];
-      }
-    });
-    setChannelConfigs(next);
-  }, [rawConfig]);
-
-  const updateChannelField = (chId: string, key: string, value: string) => {
-    setChannelConfigs((prev) => ({
-      ...prev,
-      [chId]: { ...prev[chId], fields: { ...prev[chId].fields, [key]: value } },
-    }));
-    markDirty();
-  };
-
-  const toggleChannelEnabled = (chId: string) => {
-    setChannelConfigs((prev) => ({
-      ...prev,
-      [chId]: { ...prev[chId], enabled: !prev[chId].enabled },
-    }));
-    markDirty();
-  };
-
-  const toggleChannelExpanded = (chId: string) => {
-    setChannelConfigs((prev) => ({
-      ...prev,
-      [chId]: { ...prev[chId], expanded: !prev[chId].expanded },
-    }));
-  };
-
-  const chIconStyle = (on: boolean) => ({
-    width: 32, height: 32, borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "center",
-    fontSize: 11, fontWeight: 700, flexShrink: 0 as const,
-    background: on ? "rgba(249,115,22,0.15)" : "#1a1c20",
-    color: on ? "#f97316" : "#2e2c3a",
-    border: `1px solid ${on ? "rgba(249,115,22,0.25)" : "#252830"}`,
-  });
-
-  const renderChannels = () => (
-    <div>
-      <div style={{ fontSize: 11, color: "#2a2836", marginBottom: 12 }}>
-        {zh ? "\u70B9\u51FB\u901A\u9053\u53F3\u4FA7\u5F00\u5173\u542F\u7528\uFF0C\u5C55\u5F00\u586B\u5199\u51ED\u8BC1\uFF0C\u4FDD\u5B58\u540E\u751F\u6548\u3002" : "Toggle channels on, expand to fill credentials, save to apply."}
-      </div>
-      <div style={sectionCard}>
-        {ALL_CHANNELS_DEF.map((chDef) => {
-          const cc = channelConfigs[chDef.id] || { enabled: false, expanded: false, fields: {}, dmPolicy: "pairing", groupPolicy: "allowlist" };
-          return (
-            <div key={chDef.id} style={{ borderBottom: "1px solid #111315" }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "11px 14px", cursor: "pointer" }}
-                onClick={() => toggleChannelExpanded(chDef.id)}>
-                <div style={chIconStyle(cc.enabled)}>{chDef.icon}</div>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 12, fontWeight: 500, color: cc.enabled ? "#c8c6d4" : "#6a6878" }}>{chDef.name}</div>
-                  <div style={{ fontSize: 10, color: "#252530", fontFamily: "'JetBrains Mono', monospace", marginTop: 1 }}>
-                    {cc.enabled && Object.values(cc.fields).some(Boolean) ? chDef.id + " \u00B7 " + cc.dmPolicy : (zh ? "\u672A\u914D\u7F6E" : "Not configured")}
-                  </div>
-                </div>
-                <span style={statusPill(cc.enabled ? (Object.values(cc.fields).some(Boolean) ? "configured" : "pending") : "disabled")}>
-                  {cc.enabled
-                    ? (Object.values(cc.fields).some(Boolean) ? (zh ? "\u5DF2\u914D\u7F6E" : "Configured") : (zh ? "\u5F85\u914D\u7F6E" : "Pending"))
-                    : (zh ? "\u672A\u542F\u7528" : "disabled")}
-                </span>
-                <div onClick={(e) => e.stopPropagation()}>
-                  <Toggle on={cc.enabled} onToggle={() => toggleChannelEnabled(chDef.id)} />
-                </div>
-                <span style={{ fontSize: 10, color: "#3e3c4a", transition: "transform 0.15s", transform: cc.expanded ? "rotate(90deg)" : "none" }}>{"\u25B6"}</span>
-              </div>
-              {cc.expanded && (
-                <div style={{ padding: "0 14px 14px 56px", display: "flex", flexDirection: "column", gap: 8 }}>
-                  {chDef.fields.map((f) => (
-                    <div key={f.key}>
-                      <div style={{ fontSize: 10, color: "#35323f", marginBottom: 4, fontFamily: "'JetBrains Mono', monospace" }}>{f.label}</div>
-                      {f.type === "select" ? (
-                        <select style={fieldSelect} value={cc.fields[f.key] || f.options?.[0] || ""}
-                          onChange={(e) => updateChannelField(chDef.id, f.key, e.target.value)}>
-                          {f.options?.map((o) => <option key={o} value={o}>{o}</option>)}
-                        </select>
-                      ) : (
-                        <input style={fieldInput} type={f.type} value={cc.fields[f.key] || ""}
-                          placeholder={f.placeholder}
-                          onChange={(e) => updateChannelField(chDef.id, f.key, e.target.value)} />
-                      )}
-                    </div>
-                  ))}
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <div style={{ flex: 1 }}>
-                      <div style={{ fontSize: 10, color: "#35323f", marginBottom: 4 }}>dmPolicy</div>
-                      <select style={fieldSelect} value={cc.dmPolicy}
-                        onChange={(e) => { setChannelConfigs((p) => ({ ...p, [chDef.id]: { ...p[chDef.id], dmPolicy: e.target.value } })); markDirty(); }}>
-                        {POLICY_OPTIONS.map((o) => <option key={o} value={o}>{o}</option>)}
-                      </select>
-                    </div>
-                    <div style={{ flex: 1 }}>
-                      <div style={{ fontSize: 10, color: "#35323f", marginBottom: 4 }}>groupPolicy</div>
-                      <select style={fieldSelect} value={cc.groupPolicy}
-                        onChange={(e) => { setChannelConfigs((p) => ({ ...p, [chDef.id]: { ...p[chDef.id], groupPolicy: e.target.value } })); markDirty(); }}>
-                        {POLICY_OPTIONS.map((o) => <option key={o} value={o}>{o}</option>)}
-                      </select>
-                    </div>
-                  </div>
-                </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-
-  const renderTools = () => (
-    <div>
-      <div style={sectionCard}>
-        <div style={sectionTitle}>{getLang() === "cn" ? "\u6267\u884C\u5DE5\u5177" : "Exec Tool"}</div>
-        <div style={{ ...fieldRow, borderBottom: "none" }}>
-          <div>
-            <div style={fieldLabel}>{getLang() === "cn" ? "\u6C99\u7BB1\u6A21\u5F0F" : "Sandbox Mode"}</div>
-            <div style={fieldSub}>{getLang() === "cn" ? "\u9650\u5236\u4EE3\u7801\u6267\u884C\u73AF\u5883" : "Restrict code execution environment"}</div>
-          </div>
-          <Toggle on={execSandbox} onToggle={() => { setExecSandbox(!execSandbox); markDirty(); }} />
-        </div>
-      </div>
-      <div style={sectionCard}>
-        <div style={sectionTitle}>{getLang() === "cn" ? "\u4E0A\u4F20\u9650\u5236" : "Upload Limits"}</div>
-        <div style={{ ...fieldRow, borderBottom: "none" }}>
-          <div>
-            <div style={fieldLabel}>{getLang() === "cn" ? "\u6700\u5927\u4E0A\u4F20\u5927\u5C0F (MB)" : "Max Upload Size (MB)"}</div>
-          </div>
-          <input style={fieldInput} type="number" value={uploadMaxSize}
-            onChange={(e) => { setUploadMaxSize(parseInt(e.target.value, 10) || 10); markDirty(); }} />
-        </div>
-      </div>
-      <div style={sectionCard}>
-        <div style={sectionTitle}>{getLang() === "cn" ? "\u7F51\u7EDC\u641C\u7D22" : "Web Search"}</div>
-        <div style={{ ...fieldRow, borderBottom: "none" }}>
-          <div>
-            <div style={fieldLabel}>{getLang() === "cn" ? "\u641C\u7D22\u63D0\u4F9B\u5546" : "Search Provider"}</div>
-          </div>
-          <select style={fieldSelect} value={webSearchProvider}
-            onChange={(e) => { setWebSearchProvider(e.target.value); markDirty(); }}>
-            <option value="none">{getLang() === "cn" ? "\u5173\u95ED" : "None"}</option>
-            <option value="tavily">Tavily</option>
-            <option value="searxng">SearXNG</option>
-            <option value="bing">Bing</option>
-          </select>
-        </div>
-      </div>
-      <div style={sectionCard}>
-        <div style={sectionTitle}>{getLang() === "cn" ? "\u8BB0\u5FC6\u7BA1\u7406" : "Memory"}</div>
-        <div style={fieldRow}>
-          <div>
-            <div style={fieldLabel}>{getLang() === "cn" ? "\u77ED\u671F\u8BB0\u5FC6\u4E0A\u9650" : "Short-term Limit"}</div>
-          </div>
-          <div style={sliderContainer}>
-            <input type="range" min={5} max={50} value={memoryShortTermLimit}
-              style={{ flex: 1, accentColor: "#f0a500" }}
-              onChange={(e) => { setMemoryShortTermLimit(parseInt(e.target.value, 10)); markDirty(); }} />
-            <span style={{ fontSize: "13px", fontWeight: 500, minWidth: "30px", textAlign: "right" }}>{memoryShortTermLimit}</span>
-          </div>
-        </div>
-        <div style={{ ...fieldRow, borderBottom: "none" }}>
-          <div>
-            <div style={fieldLabel}>{getLang() === "cn" ? "\u957F\u671F\u8BB0\u5FC6\u4E0A\u9650" : "Long-term Limit"}</div>
-          </div>
-          <div style={sliderContainer}>
-            <input type="range" min={10} max={500} value={memoryLongTermLimit}
-              style={{ flex: 1, accentColor: "#f0a500" }}
-              onChange={(e) => { setMemoryLongTermLimit(parseInt(e.target.value, 10)); markDirty(); }} />
-            <span style={{ fontSize: "13px", fontWeight: 500, minWidth: "30px", textAlign: "right" }}>{memoryLongTermLimit}</span>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-
-  const renderRawEditor = () => (
-    <div>
-      <div className={styles["ws-editor"]} style={{ height: "calc(100vh - 48px - 200px)" }}>
-        <textarea
-          className={styles["ws-textarea"]}
-          value={rawConfig}
-          onChange={(e) => { setRawConfig(e.target.value); setDirty(true); }}
-          spellCheck={false}
-        />
-      </div>
-      <div className={styles["note"] + " " + styles["info"]} style={{ marginTop: "12px" }}>
-        <span>i</span>
-        <span>{Locale.RsClawPanel.Config.ReloadNote}</span>
-      </div>
-    </div>
-  );
-
-  // Debug: catch render errors
-  try {
-    // test all locale keys to find undefined ones
-    const _test = [
-      Locale.RsClawPanel.Config.PageTitle,
-      Locale.RsClawPanel.Config.Gateway,
-      Locale.RsClawPanel.Config.Port,
-      Locale.RsClawPanel.Config.Bind,
-      Locale.RsClawPanel.Config.BindLoopback,
-      Locale.RsClawPanel.Config.BindAll,
-      Locale.RsClawPanel.Config.Language,
-      Locale.RsClawPanel.Config.SaveAndReload,
-      Locale.RsClawPanel.Config.Saving,
-      Locale.RsClawPanel.Config.ReloadNote,
-    ];
-    const missing = _test.findIndex(v => v === undefined);
-    if (missing >= 0) console.error("[Config] Missing locale key at index", missing);
-  } catch (e) {
-    return <div style={{padding:20,color:"#d95f5f"}}>Config render error: {String(e)}</div>;
-  }
-
-  return (
-    <div>
-      <div className={styles["page-header"]}>
-        <div>
-          <div className={styles["page-title"]}>{Locale.RsClawPanel.Config.PageTitle}</div>
-          <div className={styles["page-sub"]}>{configPath}</div>
-        </div>
-      </div>
-
-      {/* Tab bar + action buttons */}
-      <div style={{
-        display: "flex", alignItems: "center", justifyContent: "space-between",
-        borderBottom: "1px solid var(--border-in-light)", marginBottom: "16px", paddingBottom: "0",
-      }}>
-        <div style={{ display: "flex", gap: "0" }}>
-          {!rawMode && tabs.map((tab) => (
-            <button key={tab.key}
-              onClick={() => setActiveTab(tab.key)}
-              style={{
-                padding: "10px 18px", fontSize: "13px", fontWeight: activeTab === tab.key ? 600 : 400,
-                color: activeTab === tab.key ? "#f0a500" : "var(--black)",
-                background: "transparent", border: "none", cursor: "pointer",
-                borderBottom: activeTab === tab.key ? "2px solid #f0a500" : "2px solid transparent",
-                transition: "all 0.15s", marginBottom: "-1px",
-              }}>
-              {tab.label}
-            </button>
-          ))}
-          {rawMode && (
-            <div style={{ padding: "10px 18px", fontSize: "13px", fontWeight: 600, color: "#f0a500" }}>
-              {getLang() === "cn" ? "\u539F\u59CB JSON5" : "Raw JSON5"}
-            </div>
-          )}
-        </div>
-        <div style={{ display: "flex", gap: "8px", paddingBottom: "8px" }}>
-          <button
-            className={styles["btn"]}
-            onClick={() => {
-              if (rawMode) {
-                // Switching back to structured - re-parse
-                parseConfig(rawConfig);
-              }
-              setRawMode(!rawMode);
-            }}
-            style={{ fontSize: "12px" }}
-          >
-            {rawMode
-              ? (getLang() === "cn" ? "\u8FD4\u56DE\u7ED3\u6784\u5316\u7F16\u8F91" : "Back to Structured")
-              : (getLang() === "cn" ? "\u67E5\u770B\u539F\u59CB JSON5" : "View Raw JSON5")}
-          </button>
-          <button
-            className={`${styles["btn"]} ${styles["primary"]}`}
-            onClick={handleSave}
-            disabled={saving || !dirty}
-            style={{ fontSize: "12px" }}
-          >
-            {saving ? Locale.RsClawPanel.Config.Saving : Locale.RsClawPanel.Config.SaveAndReload}
-          </button>
-        </div>
-      </div>
-
-      {/* Tab content */}
-      <div style={{ overflowY: "auto", maxHeight: "calc(100vh - 48px - 200px)", paddingRight: "4px" }}>
-        {rawMode ? renderRawEditor()
-          : activeTab === "gateway" ? renderGateway()
-          : activeTab === "models" ? renderModels()
-          : activeTab === "channels" ? renderChannels()
-          : renderTools()}
-      </div>
     </div>
   );
 }
@@ -3312,7 +2384,7 @@ function TauriConfigPageInner() {
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [parseError, setParseError] = useState("");
-  const [activeTab, setActiveTab] = useState<"gateway"|"models"|"channels"|"tools"|"raw">("gateway");
+  const [activeTab, setActiveTab] = useState<"gateway"|"models"|"channels"|"tools"|"a2a"|"raw">("gateway");
 
   // Provider state: open cards, test status, fetched model lists, selected model
   const [openProvs, setOpenProvs] = useState<Set<string>>(new Set());
@@ -3336,7 +2408,7 @@ function TauriConfigPageInner() {
   const V = {
     bg0: "#080809", bg1: "#0f1013", bg2: "#141618", bg3: "#1a1c22", bg4: "#1f2126", bg5: "#252830",
     bd: "rgba(255,255,255,.055)", bd2: "rgba(255,255,255,.09)", bd3: "rgba(255,255,255,.14)",
-    t0: "#eceaf4", t1: "#9896a4", t2: "#4a4858", t3: "#2e2c3a",
+    t0: "#eceaf4", t1: "#9896a4", t2: "#7e7c8c", t3: "#5a5868",
     or: "#f97316", or2: "#fb923c", olo: "rgba(249,115,22,.09)", obrd: "rgba(249,115,22,.2)",
     green: "#2dd4a0", glo: "rgba(45,212,160,.07)", gbrd: "rgba(45,212,160,.18)",
     red: "#d95f5f", rlo: "rgba(217,95,95,.08)", rbrd: "rgba(217,95,95,.18)",
@@ -3364,6 +2436,65 @@ function TauriConfigPageInner() {
       setLoading(false);
     })();
   }, []);
+
+  // ── External-write watcher ──
+  // The sidebar account chip / onboarding card writes to rsclaw.json5
+  // via the install event. Our cached `raw` state goes stale unless we
+  // re-read on the same event. Belt-and-suspenders: also re-read every
+  // time the user enters the raw JSON5 tab (covers external editors,
+  // missed events, etc.). Both paths skip when `dirty` so we never
+  // blow away unsaved local edits.
+  useEffect(() => {
+    if (!isTauri) return;
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    (async () => {
+      try {
+        const { listen } = await import("@tauri-apps/api/event");
+        const fn = await listen("rsclaw:console-install-key", async () => {
+          if (cancelled || dirty) return;
+          try {
+            const content = (await tauriInvokeV2("read_config_file")) as string;
+            if (!cancelled && content) {
+              setRaw(content);
+              try { setConfig(JSON5.parse(content)); setParseError(""); } catch {}
+            }
+          } catch {
+            /* swallow */
+          }
+        });
+        if (cancelled) fn();
+        else unlisten = fn;
+      } catch {
+        /* event subscription unavailable */
+      }
+    })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [dirty]);
+
+  useEffect(() => {
+    if (activeTab !== "raw") return;
+    if (!isTauri) return;
+    if (dirty) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const content = (await tauriInvokeV2("read_config_file")) as string;
+        if (!cancelled && content) {
+          setRaw(content);
+          try { setConfig(JSON5.parse(content)); setParseError(""); } catch {}
+        }
+      } catch {
+        /* tolerate */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, dirty]);
 
   // ── Auto-detect configured providers on load ──
   useEffect(() => {
@@ -3497,7 +2628,13 @@ function TauriConfigPageInner() {
 
   // ── Ordered providers / channels ──
   const provOrder = zh ? PROV_ORDER_ZH : PROV_ORDER_EN;
-  const provList = provOrder.map((id) => ALL_PROVIDERS[id]).filter(Boolean);
+  // rsclaw lives in its own card above this list (account-managed,
+  // not BYOK). Drop it from the regular grid so the user doesn't see
+  // it twice.
+  const provList = provOrder
+    .filter((id) => id !== "rsclaw")
+    .map((id) => ALL_PROVIDERS[id])
+    .filter(Boolean);
   const chOrder = zh ? CH_ORDER_ZH : CH_ORDER_EN;
   const chList = chOrder.map((id) => ALL_CHANNELS[id]).filter(Boolean);
 
@@ -3575,6 +2712,28 @@ function TauriConfigPageInner() {
     }
     setProvTest((prev) => ({ ...prev, [provId]: "testing" }));
     setProvErr((prev) => ({ ...prev, [provId]: "" }));
+
+    // rsclaw short-circuit — same rationale as the onboarding flow:
+    // the cloud agent endpoint doesn't expose an OpenAI-compatible
+    // `/models` listing, so the Tauri `test_provider` command bails
+    // out with "unknown provider". Trust the key, use the hardcoded
+    // MODELS["rsclaw"] preset list. Real validation happens at the
+    // gateway-start health check.
+    if (provId === "rsclaw") {
+      const presets = (MODELS["rsclaw"] || []).map((m) => ({
+        id: m.id,
+        tag: zh ? m.tag : m.tagEn,
+      }));
+      setProvTest((prev) => ({ ...prev, [provId]: "ok" }));
+      setProvModels((prev) => ({ ...prev, [provId]: presets }));
+      toast.success(
+        zh
+          ? `rsclaw 已就绪 (${presets.length} 个模型)`
+          : `rsclaw ready (${presets.length} models)`,
+      );
+      return;
+    }
+
     try {
       const tauriInvoke = isTauri ? tauriInvokeV2 : null;
       let res: any;
@@ -3682,6 +2841,7 @@ function TauriConfigPageInner() {
     { key: "models", label: zh ? "\u6A21\u578B\u63D0\u4F9B\u5546" : "Models" },
     { key: "channels", label: zh ? "\u6D88\u606F\u901A\u9053" : "Channels" },
     { key: "tools", label: zh ? "\u5DE5\u5177 & \u529F\u80FD" : "Tools" },
+    { key: "a2a", label: "A2A" },
     { key: "raw", label: "JSON5" },
   ];
 
@@ -4153,6 +3313,14 @@ function TauriConfigPageInner() {
 
           {secHead(zh ? "LLM \u63D0\u4F9B\u5546" : "LLM PROVIDERS")}
           <div style={{ fontSize: 11, color: V.t3, marginBottom: 12 }}>{zh ? "\u9009\u4E2D\u63D0\u4F9B\u5546\u586B\u5165 Key\uFF0C\u6D4B\u8BD5\u8FDE\u63A5\u6210\u529F\u540E\u4ECE API \u83B7\u53D6\u53EF\u7528\u6A21\u578B\u5217\u8868\uFF0C\u9009\u62E9\u9ED8\u8BA4\u6A21\u578B\u3002" : "Enter API Key per provider, test connection, then select a default model."}</div>
+
+          {/* rsclaw account card \u2014 sits above the regular BYOK
+              provider grid. Different visual treatment because
+              rsclaw is cloud-managed (account-based) rather than
+              bring-your-own-key. The card handles its own state from
+              rsclaw.json5 + install events; the panel doesn't need
+              to thread anything through. */}
+          <RsclawProviderCard />
 
           {/* Provider cards */}
           <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 24 }}>
@@ -4881,6 +4049,196 @@ function TauriConfigPageInner() {
           </div>
         </div>)}
 
+        {/* ══ A2A TAB ══ */}
+        {/* gateway.a2a = inbound auth for /api/v1/a2a (this instance accepts).
+            agents.a2a   = outbound peers exposed as agent_<id> tools.
+            authTokens / apiKeys allow plain strings or { source:"env", id:"NAME" }
+            refs. We edit strings as <input type=password>; object refs render
+            read-only with a "convert to string" affordance so we never silently
+            drop a user-authored env binding. */}
+        {activeTab === "a2a" && (() => {
+          // Normalize a single auth entry into { kind, display, raw }. We round-trip
+          // env-ref objects through `raw` so save preserves them untouched.
+          const describeSecret = (v: any): { kind: "string" | "envRef" | "other"; display: string; isEnv: boolean } => {
+            if (typeof v === "string") return { kind: "string", display: v, isEnv: false };
+            if (v && typeof v === "object" && v.source === "env" && typeof v.id === "string") {
+              return { kind: "envRef", display: `\${${v.id}}`, isEnv: true };
+            }
+            return { kind: "other", display: JSON.stringify(v), isEnv: false };
+          };
+
+          const renderSecretList = (path: string, labelCN: string, labelEN: string, hint: string, placeholder: string) => {
+            const list: any[] = getVal(path, []) as any[];
+            const arr = Array.isArray(list) ? list : [];
+            const setAt = (i: number, v: any) => updateConfig(path, arr.map((x, idx) => idx === i ? v : x));
+            const removeAt = (i: number) => updateConfig(path, arr.filter((_, idx) => idx !== i));
+            const append = () => updateConfig(path, [...arr, ""]);
+            return (
+              <div style={fcard}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "11px 15px", background: V.bg3, borderBottom: `1px solid ${V.bd}` }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? labelCN : labelEN}</div>
+                    <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>{path}</div>
+                  </div>
+                  <button onClick={append} style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${V.gbrd}`, background: V.glo, color: V.green, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
+                    {zh ? "+ 添加" : "+ Add"}
+                  </button>
+                </div>
+                {arr.length === 0 ? (
+                  <div style={{ ...fieldRow, borderBottom: "none", color: V.t3, fontSize: 11 }}>{hint}</div>
+                ) : arr.map((entry, i) => {
+                  const desc = describeSecret(entry);
+                  const isLast = i === arr.length - 1;
+                  if (desc.kind === "string") {
+                    return (
+                      <div key={i} style={{ ...fieldRow, borderBottom: isLast ? "none" : "1px solid rgba(255,255,255,.03)" }}>
+                        <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, width: 22 }}>{`[${i}]`}</div>
+                        <input style={{ ...fInput, flex: 1, minWidth: 200 }} type="password" value={entry} placeholder={placeholder} onChange={(e) => setAt(i, e.target.value)} />
+                        <button onClick={() => removeAt(i)} style={{ padding: "5px 10px", borderRadius: 7, border: `1px solid ${V.rbrd}`, background: V.rlo, color: V.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "删除" : "Remove"}</button>
+                      </div>
+                    );
+                  }
+                  // envRef or other: render the literal display; the user can convert to a string to edit.
+                  return (
+                    <div key={i} style={{ ...fieldRow, borderBottom: isLast ? "none" : "1px solid rgba(255,255,255,.03)" }}>
+                      <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, width: 22 }}>{`[${i}]`}</div>
+                      <div style={{ flex: 1, fontFamily: V.mono, fontSize: 11, color: V.t2, padding: "7px 10px", background: V.bg4, border: `1px dashed ${V.bd2}`, borderRadius: 7 }}>{desc.display}</div>
+                      <button onClick={() => setAt(i, desc.isEnv ? desc.display : "")} style={{ padding: "5px 10px", borderRadius: 7, border: `1px solid ${V.bd2}`, background: V.bg4, color: V.t2, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "转为字符串" : "To string"}</button>
+                      <button onClick={() => removeAt(i)} style={{ padding: "5px 10px", borderRadius: 7, border: `1px solid ${V.rbrd}`, background: V.rlo, color: V.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "删除" : "Remove"}</button>
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          };
+
+          // ── Peers (agents.a2a[]) ──
+          const peers: any[] = getVal("agents.a2a", []) as any[];
+          const peerArr = Array.isArray(peers) ? peers : [];
+          const setPeerField = (i: number, field: string, value: any) => {
+            const next = peerArr.map((p, idx) => idx === i ? { ...p, [field]: value } : p);
+            updateConfig("agents.a2a", next);
+          };
+          const deletePeerField = (i: number, field: string) => {
+            const next = peerArr.map((p, idx) => {
+              if (idx !== i) return p;
+              const copy: any = { ...p };
+              delete copy[field];
+              return copy;
+            });
+            updateConfig("agents.a2a", next);
+          };
+          const removePeer = (i: number) => updateConfig("agents.a2a", peerArr.filter((_, idx) => idx !== i));
+          const addPeer = () => {
+            // Generate a fresh `id` slot — a1/a2/a3... — skipping any in use.
+            const existing = new Set(peerArr.map((p) => p?.id).filter(Boolean));
+            let next = 1;
+            while (existing.has(`a${next}`)) next++;
+            updateConfig("agents.a2a", [...peerArr, { id: `a${next}`, url: "" }]);
+          };
+
+          return (<div style={{ animation: "fi .15s ease" }}>
+            <div style={{ padding: "0 0 14px", fontSize: 11, color: V.t2, lineHeight: 1.55 }}>
+              {zh
+                ? "A2A（Agent-to-Agent）允许此 rsclaw 实例与其它实例互相调用。入站凭据用于接受其它实例的请求；出站对端会以 agent_<id> 工具暴露给本地智能体。"
+                : "A2A (Agent-to-Agent) lets this rsclaw instance call and be called by other rsclaw instances. Inbound credentials authenticate incoming requests; outbound peers are exposed to the local agent as agent_<id> tools."}
+            </div>
+
+            {/* ── Inbound ── */}
+            {secHead(zh ? "入站（gateway.a2a）" : "INBOUND (gateway.a2a)")}
+            {renderSecretList(
+              "gateway.a2a.authTokens",
+              "Bearer Tokens",
+              "Bearer Tokens",
+              zh ? "尚未设置；/api/v1/a2a 将拒绝所有 Bearer 请求（除非匹配 gateway.auth.token）" : "Not set; /api/v1/a2a will reject Bearer requests (unless matching gateway.auth.token).",
+              "${RSCLAW_A2A_BEARER}"
+            )}
+            {renderSecretList(
+              "gateway.a2a.apiKeys",
+              "API Keys (X-API-Key)",
+              "API Keys (X-API-Key)",
+              zh ? "尚未设置；/api/v1/a2a 不会接受 X-API-Key 请求" : "Not set; /api/v1/a2a will reject X-API-Key requests.",
+              "${RSCLAW_A2A_APIKEY}"
+            )}
+            <div style={fcard}>
+              <div style={{ ...fieldRow, borderBottom: "none" }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "最大请求体" : "Max Body Size"} <span style={{ color: V.t3, fontWeight: 400 }}>(MB)</span></div>
+                  <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>gateway.a2a.maxBodyMb</div>
+                  <div style={{ fontSize: 10, color: V.t3, marginTop: 2, lineHeight: 1.5 }}>{zh ? "默认 100MB。低于客户端发送的附件大小会触发 413。" : "Default 100MB. Setting it below incoming attachment size triggers 413."}</div>
+                </div>
+                <input style={{ ...fInput, minWidth: 100 }} type="number" min={1} max={1024}
+                  value={getVal("gateway.a2a.maxBodyMb", 100)}
+                  onChange={(e) => updateConfig("gateway.a2a.maxBodyMb", parseInt(e.target.value) || 100)} />
+              </div>
+            </div>
+
+            {/* ── Outbound peers ── */}
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12, marginTop: 22 }}>
+              <div style={{ fontSize: 11, fontWeight: 600, color: V.t1, letterSpacing: 0.4, textTransform: "uppercase" as const }}>{zh ? "出站对端（agents.a2a）" : "OUTBOUND PEERS (agents.a2a)"}</div>
+              <div style={{ flex: 1, height: 1, background: V.bd }} />
+              <button onClick={addPeer} style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${V.gbrd}`, background: V.glo, color: V.green, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
+                {zh ? "+ 添加对端" : "+ Add Peer"}
+              </button>
+            </div>
+
+            {peerArr.length === 0 ? (
+              <div style={{ ...fcard, padding: "26px 16px", textAlign: "center", color: V.t3, fontSize: 12 }}>
+                {zh ? "尚未配置任何 A2A 对端。点击右上 “+ 添加对端” 注册第一个。" : "No A2A peers configured yet. Click “+ Add Peer” to register the first one."}
+              </div>
+            ) : peerArr.map((peer, i) => {
+              const authVal = peer?.authToken;
+              const authIsString = typeof authVal === "string" || authVal === undefined || authVal === null;
+              return (
+                <div key={`peer-${i}`} style={fcard}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "11px 15px", background: V.bg3, borderBottom: `1px solid ${V.bd}` }}>
+                    <div style={{ fontFamily: V.mono, fontSize: 12, color: V.green }}>agent_{peer?.id || "?"}</div>
+                    <div style={{ flex: 1, fontSize: 10, color: V.t3, fontFamily: V.mono }}>{peer?.url || ""}</div>
+                    <button onClick={() => removePeer(i)} style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${V.rbrd}`, background: V.rlo, color: V.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "移除" : "Remove"}</button>
+                  </div>
+                  <div style={fieldRow}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>ID</div>
+                      <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>{zh ? "工具名：agent_<id>" : "Tool name: agent_<id>"}</div>
+                    </div>
+                    <input style={{ ...fInput, minWidth: 180 }} type="text" value={peer?.id || ""} placeholder="a1" onChange={(e) => setPeerField(i, "id", e.target.value)} />
+                  </div>
+                  <div style={fieldRow}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>URL</div>
+                      <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>{zh ? "对端 rsclaw 网关地址" : "Peer rsclaw gateway base URL"}</div>
+                    </div>
+                    <input style={{ ...fInput, minWidth: 280 }} type="text" value={peer?.url || ""} placeholder="http://127.0.0.1:19036" onChange={(e) => setPeerField(i, "url", e.target.value)} />
+                  </div>
+                  <div style={fieldRow}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "认证 Token" : "Auth Token"}</div>
+                      <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>{zh ? "对应对端 gateway.a2a.authTokens 中的某一条" : "Must match one of the peer's gateway.a2a.authTokens"}</div>
+                    </div>
+                    {authIsString ? (
+                      <input style={{ ...fInput, minWidth: 240 }} type="password" value={authVal || ""} placeholder="${RSCLAW_A2A_TOKEN}" onChange={(e) => setPeerField(i, "authToken", e.target.value)} />
+                    ) : (
+                      <div style={{ fontFamily: V.mono, fontSize: 11, color: V.t2, padding: "7px 10px", background: V.bg4, border: `1px dashed ${V.bd2}`, borderRadius: 7 }}>{JSON.stringify(authVal)}</div>
+                    )}
+                  </div>
+                  <div style={{ ...fieldRow, borderBottom: "none" }}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "目标 Agent ID（可选）" : "Target Agent ID (optional)"}</div>
+                      <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>{zh ? "留空使用对端默认 agent" : "Leave blank to use the peer's default agent"}</div>
+                    </div>
+                    <input style={{ ...fInput, minWidth: 180 }} type="text" value={peer?.remoteAgentId || ""} placeholder="main"
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        if (!v) deletePeerField(i, "remoteAgentId");
+                        else setPeerField(i, "remoteAgentId", v);
+                      }} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>);
+        })()}
+
         {/* ══ RAW JSON5 TAB ══ */}
         {activeTab === "raw" && (
           <div style={{ height: "100%", animation: "fi .15s ease" }}>
@@ -5185,7 +4543,7 @@ function CronTaskPage() {
     setShowForm(true);
   };
 
-  const V2 = { bg2: "#141618", bg3: "#1a1c22", bg4: "#1f2126", bg5: "#252830", bd: "rgba(255,255,255,.055)", bd2: "rgba(255,255,255,.09)", t0: "#eceaf4", t1: "#9896a4", t2: "#4a4858", t3: "#2e2c3a", or: "#f97316", olo: "rgba(249,115,22,.09)", obrd: "rgba(249,115,22,.2)", green: "#2dd4a0", gbrd: "rgba(45,212,160,.18)", red: "#d95f5f", rbrd: "rgba(217,95,95,.18)", mono: "'JetBrains Mono', monospace" };
+  const V2 = { bg2: "#141618", bg3: "#1a1c22", bg4: "#1f2126", bg5: "#252830", bd: "rgba(255,255,255,.055)", bd2: "rgba(255,255,255,.09)", t0: "#eceaf4", t1: "#9896a4", t2: "#7e7c8c", t3: "#5a5868", or: "#f97316", olo: "rgba(249,115,22,.09)", obrd: "rgba(249,115,22,.2)", green: "#2dd4a0", gbrd: "rgba(45,212,160,.18)", red: "#d95f5f", rbrd: "rgba(217,95,95,.18)", mono: "'JetBrains Mono', monospace" };
 
   return (
     <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
@@ -5443,32 +4801,19 @@ function CronTaskPage() {
 
 interface SkillInfo { name: string; description?: string; version?: string; author?: string; tools?: { name: string; description?: string }[]; path?: string; icon?: string; }
 
-const RECOMMENDED_SKILLS: { name: string; icon: string; ver: string; author: string; desc: { cn: string; en: string }; tools: string[]; downloads?: string; stars?: string }[] = [
-  { name: "self-improving-agent", icon: "\uD83E\uDDE0", ver: "v3.0.13", author: "@pskoett", desc: { cn: "\u6355\u83B7\u5B66\u4E60\u3001\u9519\u8BEF\u548C\u4FEE\u6B63\uFF0C\u5B9E\u73B0\u6301\u7EED\u6539\u8FDB", en: "Captures learnings, errors, and corrections for continuous improvement" }, tools: [], downloads: "345k", stars: "2.9k" },
-  { name: "ontology", icon: "\uD83D\uDD17", ver: "v1.0.4", author: "@oswalpalash", desc: { cn: "\u7ED3\u6784\u5316\u667A\u80FD\u4F53\u8BB0\u5FC6\u77E5\u8BC6\u56FE\u8C31", en: "Typed knowledge graph for structured agent memory and composable skills" }, tools: [], downloads: "150k", stars: "472" },
-  { name: "Self-Improving-Proactive-Agent", icon: "\u2728", ver: "v1.2.16", author: "@ivangdavila", desc: { cn: "\u81EA\u53CD\u601D+\u81EA\u6279\u8BC4+\u81EA\u5B66\u4E60+\u81EA\u7EC4\u7EC7\u8BB0\u5FC6", en: "Self-reflection, self-criticism, self-learning, self-organizing memory" }, tools: [], downloads: "144k", stars: "866" },
-  { name: "AdMapix", icon: "\uD83D\uDCCA", ver: "v1.0.28", author: "@fly0pants", desc: { cn: "\u5E7F\u544A\u60C5\u62A5\u4E0E\u5E94\u7528\u5206\u6790\u52A9\u624B", en: "Ad intelligence & app analytics assistant" }, tools: [], downloads: "78.9k", stars: "212" },
-  { name: "nano-banana-pro", icon: "\uD83C\uDF4C", ver: "v1.0.1", author: "@steipete", desc: { cn: "Gemini 3 Pro \u56FE\u50CF\u751F\u6210/\u7F16\u8F91\uFF0C\u652F\u6301 1K/2K/4K", en: "Generate/edit images with Nano Banana Pro (Gemini 3 Pro Image)" }, tools: [], downloads: "77.5k", stars: "308" },
-  { name: "obsidian", icon: "\uD83D\uDCDD", ver: "v1.0.0", author: "@steipete", desc: { cn: "Obsidian \u77E5\u8BC6\u5E93\u64CD\u4F5C\u4E0E\u81EA\u52A8\u5316", en: "Work with Obsidian vaults and automate via obsidian-cli" }, tools: [], downloads: "73.1k", stars: "297" },
-  { name: "baidu-search", icon: "\uD83D\uDD0D", ver: "v1.1.3", author: "@ide-rea", desc: { cn: "\u767E\u5EA6 AI \u641C\u7D22\u5F15\u64CE", en: "Search the web using Baidu AI Search Engine" }, tools: [], downloads: "71.5k", stars: "188" },
-  { name: "Agent-Browser", icon: "\uD83C\uDF10", ver: "v0.1.0", author: "@matrixy", desc: { cn: "\u65E0\u5934\u6D4F\u89C8\u5668\u81EA\u52A8\u5316 CLI\uFF0C\u4F18\u5316 AI \u4EA4\u4E92", en: "Headless browser automation CLI optimized for AI agents" }, tools: [], downloads: "67k", stars: "236" },
-  { name: "api-gateway", icon: "\uD83D\uDD0C", ver: "v1.0.76", author: "@byungkyu", desc: { cn: "\u8FDE\u63A5 100+ API\uFF08Google, Microsoft, GitHub, Notion, Slack \u7B49\uFF09", en: "Connect to 100+ APIs with managed OAuth" }, tools: [], downloads: "61.9k", stars: "303" },
-  { name: "mcporter", icon: "\uD83D\uDEE0\uFE0F", ver: "v1.0.0", author: "@steipete", desc: { cn: "MCP \u670D\u52A1\u5668/\u5DE5\u5177\u7BA1\u7406 CLI", en: "List, configure, auth, and call MCP servers/tools directly" }, tools: [], downloads: "51.3k", stars: "156" },
-  { name: "free-ride", icon: "\uD83C\uDD93", ver: "v1.0.8", author: "@shaivpidadi", desc: { cn: "\u514D\u8D39 AI \u6A21\u578B\u7BA1\u7406\uFF0C\u81EA\u52A8\u6392\u540D\u548C fallback", en: "Manages free AI models from OpenRouter with auto-ranking and fallbacks" }, tools: [], downloads: "50.9k", stars: "363" },
-  { name: "prismfy-search", icon: "\uD83D\uDD0E", ver: "v1.1.0", author: "@uroboros1205", desc: { cn: "10 \u5F15\u64CE\u7F51\u7EDC\u641C\u7D22\uFF08Google, Reddit, GitHub, arXiv \u7B49\uFF09", en: "Search across 10 engines: Google, Reddit, GitHub, arXiv, Hacker News" }, tools: [], downloads: "49.3k", stars: "16" },
-  { name: "word-docx", icon: "\uD83D\uDCC4", ver: "v1.0.2", author: "@ivangdavila", desc: { cn: "Word/DOCX \u6587\u6863\u521B\u5EFA\u3001\u68C0\u67E5\u548C\u7F16\u8F91", en: "Create, inspect, and edit Microsoft Word documents and DOCX files" }, tools: [], downloads: "48.2k", stars: "222" },
-  { name: "excel-xlsx", icon: "\uD83D\uDCCA", ver: "v1.0.2", author: "@ivangdavila", desc: { cn: "Excel/XLSX \u5DE5\u4F5C\u7C3F\u521B\u5EFA\u3001\u68C0\u67E5\u548C\u7F16\u8F91", en: "Create, inspect, and edit Microsoft Excel workbooks and XLSX files" }, tools: [], downloads: "42.9k", stars: "173" },
-  { name: "imap-smtp-email", icon: "\uD83D\uDCE7", ver: "v0.0.10", author: "community", desc: { cn: "IMAP/SMTP \u90AE\u4EF6\u6536\u53D1", en: "Email via IMAP/SMTP" }, tools: [], downloads: "40k", stars: "" },
-];
+// Recommended skills list was previously hardcoded here (16 entries
+// curated from clawhub). It's been removed pending a real marketplace
+// endpoint (`GET /api/v1/marketplace?kind=skill`) \u2014 UI now shows only
+// the installed list + clawhub search results.
 
-function SkillsPage() {
+function SkillsTab() {
   const zh = getLang() === "cn";
   const [installed, setInstalled] = useState<SkillInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [installing, setInstalling] = useState<string | null>(null);
   const [detailSkill, setDetailSkill] = useState<SkillInfo | null>(null);
   const [search, setSearch] = useState("");
-  const [searchResults, setSearchResults] = useState<{ name: string; version?: string; description?: string }[]>([]);
+  const [searchResults, setSearchResults] = useState<{ name: string; version?: string; description?: string; registry?: string; installs?: string; stars?: string }[]>([]);
   const [searching, setSearching] = useState(false);
 
   const fetchSkills = useCallback(async () => {
@@ -5530,18 +4875,14 @@ function SkillsPage() {
     setSearching(false);
   };
 
-  const V2 = { bg2: "#141618", bg3: "#1a1c22", bg4: "#1f2126", bg5: "#252830", bd: "rgba(255,255,255,.055)", bd2: "rgba(255,255,255,.09)", t0: "#eceaf4", t1: "#9896a4", t2: "#4a4858", t3: "#2e2c3a", or: "#f97316", olo: "rgba(249,115,22,.09)", obrd: "rgba(249,115,22,.2)", green: "#2dd4a0", glo: "rgba(45,212,160,.07)", gbrd: "rgba(45,212,160,.18)", red: "#d95f5f", rlo: "rgba(217,95,95,.08)", rbrd: "rgba(217,95,95,.18)", mono: "'JetBrains Mono', monospace" };
+  const V2 = { bg2: "#141618", bg3: "#1a1c22", bg4: "#1f2126", bg5: "#252830", bd: "rgba(255,255,255,.055)", bd2: "rgba(255,255,255,.09)", t0: "#eceaf4", t1: "#9896a4", t2: "#7e7c8c", t3: "#5a5868", or: "#f97316", olo: "rgba(249,115,22,.09)", obrd: "rgba(249,115,22,.2)", green: "#2dd4a0", glo: "rgba(45,212,160,.07)", gbrd: "rgba(45,212,160,.18)", red: "#d95f5f", rlo: "rgba(217,95,95,.08)", rbrd: "rgba(217,95,95,.18)", mono: "'JetBrains Mono', monospace" };
   const isInstalled = (name: string) => installed.some((s) => s.name === name);
-  const filtered = RECOMMENDED_SKILLS.filter((s) => !search || s.name.includes(search.toLowerCase()));
 
   return (
     <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
-      <div style={{ padding: "24px 28px 0", flexShrink: 0 }}>
-        <div style={{ fontSize: 20, fontWeight: 700, color: V2.t0, letterSpacing: -0.4 }}>{zh ? "\u6280\u80FD\u7BA1\u7406" : "Skills"}</div>
-        <div style={{ fontSize: 11, color: V2.t3, fontFamily: V2.mono, marginTop: 3 }}>~/.rsclaw/skills/</div>
-      </div>
+      <div style={{ fontSize: 11, color: V2.t3, fontFamily: V2.mono, padding: "16px 28px 0", flexShrink: 0 }}>~/.rsclaw/skills/</div>
 
-      <div style={{ padding: "20px 28px 28px", flex: 1, overflowY: "auto" }}>
+      <div style={{ padding: "12px 28px 28px", flex: 1, overflowY: "auto" }}>
         {/* Search */}
         <div style={{ marginBottom: 20 }}>
           <input value={search} onChange={(e) => setSearch(e.target.value)}
@@ -5595,7 +4936,11 @@ function SkillsPage() {
                 <div key={sr.name} style={{ background: V2.bg2, border: `1px solid ${V2.bd}`, borderRadius: 11, padding: "14px 16px", display: "flex", flexDirection: "column", gap: 10 }}>
                   <div>
                     <div style={{ fontSize: 13, fontWeight: 600, color: V2.t0 }}>{sr.name}</div>
-                    <div style={{ fontSize: 10, fontFamily: V2.mono, color: V2.t3, marginTop: 1 }}>{sr.version}</div>
+                    <div style={{ fontSize: 10, fontFamily: V2.mono, color: V2.t3, marginTop: 1 }}>
+                      {sr.registry || sr.version || ""}
+                      {sr.installs && sr.installs !== "-" ? ` · ${sr.installs} installs` : ""}
+                      {sr.stars && sr.stars !== "-" ? ` · ★ ${sr.stars}` : ""}
+                    </div>
                   </div>
                   {sr.description && <div style={{ fontSize: 11, color: V2.t2, lineHeight: 1.55 }}>{sr.description}</div>}
                   <div style={{ display: "flex", justifyContent: "flex-end" }}>
@@ -5613,36 +4958,16 @@ function SkillsPage() {
         )}
         {searching && <div style={{ textAlign: "center", color: V2.t3, padding: 20 }}>...</div>}
 
-        {/* Recommended */}
-        <div style={{ fontSize: 11, fontWeight: 600, color: V2.t2, letterSpacing: 0.5, textTransform: "uppercase", marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
-          {zh ? "\u63A8\u8350\u5B89\u88C5" : "Recommended"} <span style={{ fontSize: 9, padding: "1px 7px", borderRadius: 3, background: V2.bg4, color: V2.t2 }}>{filtered.length}</span>
-        </div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, maxHeight: 420, overflowY: "auto" }}>
-          {filtered.map((rec) => (
-            <div key={rec.name} style={{ background: V2.bg2, border: `1px solid ${V2.bd}`, borderRadius: 11, padding: "14px 16px", display: "flex", flexDirection: "column", gap: 10, transition: "border-color .13s" }}>
-              <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
-                <div style={{ width: 36, height: 36, borderRadius: 9, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, flexShrink: 0, background: V2.bg3, border: `1px solid ${V2.bd}` }}>{rec.icon}</div>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 13, fontWeight: 600, color: V2.t0 }}>{rec.name}</div>
-                  <div style={{ fontSize: 10, fontFamily: V2.mono, color: V2.t3, marginTop: 1 }}>{rec.ver} {"\u00B7"} {rec.author}{rec.downloads ? ` \u00B7 ${rec.downloads}` : ""}{rec.stars ? ` \u2605 ${rec.stars}` : ""}</div>
-                </div>
-                {isInstalled(rec.name) && <div style={{ fontSize: 10, color: V2.green, fontFamily: V2.mono, display: "flex", alignItems: "center", gap: 4 }}>{"●"} {zh ? "\u5DF2\u5B89\u88C5" : "Installed"}</div>}
-              </div>
-              <div style={{ fontSize: 11, color: V2.t2, lineHeight: 1.55 }}>{zh ? rec.desc.cn : rec.desc.en}</div>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-                  {rec.tools.map((t) => <span key={t} style={{ fontSize: 9, padding: "1px 6px", borderRadius: 3, background: V2.bg4, color: V2.t2, fontFamily: V2.mono }}>{t}</span>)}
-                </div>
-                {isInstalled(rec.name)
-                  ? <span style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${V2.bd2}`, color: V2.t2, fontSize: 11 }}>{"\u2713"}</span>
-                  : <button onClick={() => doInstall(rec.name)} disabled={installing === rec.name}
-                      style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${installing === rec.name ? V2.obrd : V2.gbrd}`, background: installing === rec.name ? V2.olo : V2.glo, color: installing === rec.name ? V2.or : V2.green, fontSize: 11, fontWeight: 600, cursor: installing === rec.name ? "not-allowed" : "pointer" }}>
-                      {installing === rec.name ? (zh ? "\u5B89\u88C5\u4E2D..." : "Installing...") : (zh ? "\u5B89\u88C5" : "Install")}
-                    </button>}
-              </div>
-            </div>
-          ))}
-        </div>
+        {/* Recommended block removed \u2014 pending GET /api/v1/marketplace?kind=skill
+            on the backend. Empty-state hint replaces the old 16-entry hardcoded
+            list so users still know how to discover new skills. */}
+        {searchResults.length === 0 && !searching && (
+          <div style={{ fontSize: 11, color: V2.t3, padding: "20px 0", textAlign: "center", lineHeight: 1.6 }}>
+            {zh
+              ? "\u63A8\u8350\u5217\u8868\u672A\u5C31\u7EEA\uFF08\u7B49\u5F85\u540E\u7AEF marketplace \u63A5\u53E3\uFF09\u3002\u53EF\u5728\u4E0A\u65B9\u641C\u7D22\u6D4F\u89C8 clawhub\u3002"
+              : "Recommendations not wired yet (pending backend marketplace endpoint). Use the search box above to browse clawhub."}
+          </div>
+        )}
       </div>
 
       {/* Detail modal */}
@@ -5674,6 +4999,355 @@ function SkillsPage() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════
+// ── Plugins Tab ──────────────────────────────────────────
+// ══════════════════════════════════════════════════════════
+
+interface PluginInfo {
+  name: string;
+  version?: string;
+  description?: string;
+  runtime: "wasm" | "js";
+  runtimeRaw?: string;
+  entry?: string;
+  tools?: string[];
+  channels?: string[];
+  path?: string;
+  icon?: string;
+}
+
+// Runtime bucket exposed to the UI. JS today covers node/bun/deno
+// (subprocess JSON-RPC bridge). Future non-JS subprocess runtimes
+// (python/go binary/…) would need their own bucket here.
+type PluginRuntime = "wasm" | "js";
+
+// Recommended plugins list was previously hardcoded here (2 entries).
+// Removed pending a real marketplace endpoint
+// (`GET /api/v1/marketplace?kind=plugin`) — UI now relies on the
+// URL/path install input + drag-drop only.
+
+function PluginsTab() {
+  const zh = getLang() === "cn";
+  const [runtime, setRuntime] = useState<PluginRuntime>("wasm");
+  const [installed, setInstalled] = useState<PluginInfo[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [installing, setInstalling] = useState<string | null>(null);
+  const [installSpec, setInstallSpec] = useState("");
+  const [dropActive, setDropActive] = useState(false);
+  const [detail, setDetail] = useState<PluginInfo | null>(null);
+
+  const fetchPlugins = useCallback(async () => {
+    setLoading(true);
+    try {
+      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
+      if (tauriInvoke) {
+        const data: any = await tauriInvoke("get_plugins");
+        setInstalled((data?.plugins || []) as PluginInfo[]);
+      } else {
+        const res = await gatewayFetch("/api/v1/plugins");
+        if (res.ok) { const data = await res.json(); setInstalled(data.plugins || []); }
+      }
+    } catch {}
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { fetchPlugins(); }, [fetchPlugins]);
+
+  const doInstall = useCallback(async (spec: string) => {
+    const trimmed = spec.trim();
+    if (!trimmed) return;
+    setInstalling(trimmed);
+    try {
+      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
+      if (tauriInvoke) { await tauriInvoke("install_plugin", { spec: trimmed }); }
+      else { await gatewayFetch("/api/v1/plugins/install", { method: "POST", body: JSON.stringify({ spec: trimmed }) }); }
+      await fetchPlugins();
+      setInstallSpec("");
+      // Plugin manifests are only registered into PluginRegistry /
+      // WasmPlugin slot at gateway boot. reloadConfig() doesn't pick
+      // up new manifest files — only a full re-exec does. POST /restart
+      // is a graceful drain: in-flight requests finish, the listener
+      // releases the port, then the same binary re-execs and rebinds.
+      // User-visible: ~1-2s of "checking..." in the sidebar status dot.
+      let restarting = false;
+      try {
+        await restartGateway();
+        restarting = true;
+      } catch {
+        // Endpoint is loopback-only — non-Tauri / remote UI would 403.
+        // Fall back to the in-process reload so at least the channel
+        // and provider registries refresh. Plugin won't go live until
+        // the next manual restart.
+        try { await reloadConfig(); } catch {}
+      }
+      toast.success(
+        zh
+          ? `${trimmed} ${restarting ? "已安装，网关重启中…" : "已安装"}`
+          : `${trimmed} ${restarting ? "installed, gateway restarting…" : "installed"}`,
+      );
+    } catch (e: any) {
+      const msg = typeof e === "string" ? e : e?.message || "";
+      toast.fromError(zh ? "安装失败" : "Install failed", msg);
+    }
+    setInstalling(null);
+  }, [fetchPlugins, zh]);
+
+  const doUninstall = async (name: string) => {
+    try {
+      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
+      if (tauriInvoke) { await tauriInvoke("uninstall_plugin", { name }); }
+      else { await gatewayFetch(`/api/v1/plugins/${encodeURIComponent(name)}`, { method: "DELETE" }); }
+      await fetchPlugins(); setDetail(null);
+      // Mirror install path — the gateway still has the plugin loaded
+      // in PluginRegistry until restart. reloadConfig() doesn't unload
+      // a WASM module; only re-exec does.
+      let restarting = false;
+      try {
+        await restartGateway();
+        restarting = true;
+      } catch {
+        try { await reloadConfig(); } catch {}
+      }
+      toast.success(
+        zh
+          ? `${name} ${restarting ? "已卸载，网关重启中…" : "已卸载"}`
+          : `${name} ${restarting ? "uninstalled, gateway restarting…" : "uninstalled"}`,
+      );
+    } catch (e: any) {
+      const msg = typeof e === "string" ? e : e?.message || "";
+      toast.fromError(zh ? "卸载失败" : "Uninstall failed", msg);
+    }
+  };
+
+  // Tauri v2 drag-drop: window emits "tauri://drag-drop" with { paths, position }.
+  // We only honor .wasm/.zip; everything else is ignored so other tabs (chat
+  // attachments) aren't trampled. Hover/leave events drive the highlight ring.
+  useEffect(() => {
+    if (!isTauri) return;
+    let cancelled = false;
+    let off: Array<() => void> = [];
+    (async () => {
+      try {
+        const { getCurrentWindow } = await import("@tauri-apps/api/window");
+        const win = getCurrentWindow();
+        const stop = await win.onDragDropEvent((ev: any) => {
+          if (cancelled) return;
+          if (ev.payload.type === "over") { setDropActive(true); return; }
+          if (ev.payload.type === "leave") { setDropActive(false); return; }
+          if (ev.payload.type === "drop") {
+            setDropActive(false);
+            const paths: string[] = ev.payload.paths || [];
+            const target = paths.find((p) => p.endsWith(".wasm") || p.endsWith(".zip"));
+            if (target) { doInstall(target); }
+          }
+        });
+        if (cancelled) stop();
+        else off.push(stop);
+      } catch {}
+    })();
+    return () => { cancelled = true; off.forEach((f) => f()); };
+  }, [doInstall]);
+
+  const V2 = { bg2: "#141618", bg3: "#1a1c22", bg4: "#1f2126", bg5: "#252830", bd: "rgba(255,255,255,.055)", bd2: "rgba(255,255,255,.09)", t0: "#eceaf4", t1: "#9896a4", t2: "#7e7c8c", t3: "#5a5868", or: "#f97316", olo: "rgba(249,115,22,.09)", obrd: "rgba(249,115,22,.2)", green: "#2dd4a0", glo: "rgba(45,212,160,.07)", gbrd: "rgba(45,212,160,.18)", red: "#d95f5f", rlo: "rgba(217,95,95,.08)", rbrd: "rgba(217,95,95,.18)", mono: "'JetBrains Mono', monospace" };
+
+  const isInstalled = (name: string) => installed.some((p) => p.name === name);
+  const installedFiltered = installed.filter((p) => p.runtime === runtime);
+
+  const subTabBtn = (key: PluginRuntime, label: string) => (
+    <button key={key} onClick={() => setRuntime(key)}
+      style={{ padding: "5px 14px", borderRadius: 7, fontSize: 11, fontWeight: 600, cursor: "pointer",
+        background: runtime === key ? V2.bg4 : "transparent",
+        color: runtime === key ? V2.t0 : V2.t2,
+        border: `1px solid ${runtime === key ? V2.bd2 : "transparent"}`,
+        fontFamily: V2.mono, letterSpacing: 0.5,
+      }}>{label}</button>
+  );
+
+  return (
+    <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", position: "relative" }}>
+      <div style={{ padding: "16px 28px 0", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div style={{ fontSize: 11, color: V2.t3, fontFamily: V2.mono }}>~/.rsclaw/plugins/</div>
+        <div style={{ display: "flex", gap: 6 }}>
+          {subTabBtn("wasm", "WASM")}
+          {subTabBtn("js", "JS")}
+        </div>
+      </div>
+
+      <div style={{ padding: "16px 28px 28px", flex: 1, overflowY: "auto" }}>
+        {/* Install by URL / path */}
+        <div style={{ display: "flex", gap: 6, marginBottom: 18 }}>
+          <input value={installSpec} onChange={(e) => setInstallSpec(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") doInstall(installSpec); }}
+            placeholder={zh ? "URL / 本地路径 (.wasm / .zip / 目录)..." : "URL / local path (.wasm / .zip / directory)..."}
+            style={{ flex: 1, background: V2.bg2, border: `1px solid ${V2.bd}`, borderRadius: 9, padding: "9px 14px", color: V2.t0, fontSize: 12, outline: "none" }} />
+          {/* Native file picker (Tauri only). Filters to .wasm / .zip so the
+              user can't accidentally hand the CLI a directory of garbage —
+              for .git repos / arbitrary dirs they can still type the path. */}
+          {isTauri && (
+            <button
+              onClick={async () => {
+                try {
+                  const { open } = await import("@tauri-apps/plugin-dialog");
+                  const selected = await open({
+                    multiple: false,
+                    filters: [{ name: zh ? "插件文件" : "Plugin file", extensions: ["wasm", "zip"] }],
+                  });
+                  if (typeof selected === "string" && selected) setInstallSpec(selected);
+                } catch (e: any) {
+                  toast.fromError(zh ? "打开文件失败" : "File picker failed", e);
+                }
+              }}
+              title={zh ? "选择 .wasm / .zip 文件" : "Pick a .wasm / .zip file"}
+              style={{ padding: "0 14px", borderRadius: 9, border: `1px solid ${V2.bd2}`, background: V2.bg4, color: V2.t1, fontSize: 12, cursor: "pointer", whiteSpace: "nowrap" }}
+            >
+              📂 {zh ? "选择" : "Browse"}
+            </button>
+          )}
+          <button onClick={() => doInstall(installSpec)} disabled={!installSpec.trim() || !!installing}
+            style={{ padding: "0 16px", borderRadius: 9, border: `1px solid ${V2.gbrd}`, background: installing ? V2.olo : V2.glo, color: installing ? V2.or : V2.green, fontSize: 11, fontWeight: 600, cursor: installing ? "not-allowed" : "pointer", fontFamily: V2.mono }}>
+            {installing ? (zh ? "安装中..." : "Installing...") : (zh ? "安装" : "Install")}
+          </button>
+        </div>
+        <div style={{ fontSize: 10, color: V2.t3, marginBottom: 18, fontFamily: V2.mono }}>
+          {zh ? "提示：可拖拽 .wasm / .zip 到窗口自动安装" : "Tip: drag .wasm / .zip into the window to install"}
+        </div>
+
+        {/* Installed */}
+        <div style={{ fontSize: 11, fontWeight: 600, color: V2.t2, letterSpacing: 0.5, textTransform: "uppercase", marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
+          {zh ? "已安装" : "Installed"} <span style={{ fontSize: 9, padding: "1px 7px", borderRadius: 3, background: V2.bg4, color: V2.t2 }}>{installedFiltered.length}</span>
+        </div>
+        {loading ? <div style={{ color: V2.t3, padding: 20, textAlign: "center" }}>...</div>
+        : installedFiltered.length === 0 ? (
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 10, padding: "30px 0", color: V2.t3, marginBottom: 24 }}>
+            <div style={{ fontSize: 32, opacity: 0.4 }}>{runtime === "wasm" ? "🧩" : "⚙️"}</div>
+            <div style={{ fontSize: 12 }}>{zh ? `尚未安装 ${runtime === "wasm" ? "WASM" : "JS"} 插件` : `No ${runtime === "wasm" ? "WASM" : "JS"} plugins installed`}</div>
+          </div>
+        ) : (
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 24 }}>
+            {installedFiltered.map((plugin) => (
+              <div key={plugin.name} onClick={() => setDetail(plugin)} style={{ background: V2.bg2, border: `1px solid rgba(45,212,160,.15)`, borderRadius: 11, padding: "14px 16px", cursor: "pointer", display: "flex", flexDirection: "column", gap: 10 }}>
+                <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
+                  <div style={{ width: 36, height: 36, borderRadius: 9, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, flexShrink: 0, background: V2.bg3, border: `1px solid ${V2.bd}` }}>{plugin.icon || (plugin.runtime === "wasm" ? "🧩" : "⚙️")}</div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: V2.t0 }}>{plugin.name}</div>
+                    <div style={{ fontSize: 10, fontFamily: V2.mono, color: V2.t3, marginTop: 1 }}>{plugin.version || "-"} {plugin.runtimeRaw && plugin.runtimeRaw !== plugin.runtime ? `· ${plugin.runtimeRaw}` : ""}</div>
+                  </div>
+                  <div style={{ fontSize: 10, color: V2.green, fontFamily: V2.mono, display: "flex", alignItems: "center", gap: 4 }}>{"●"} {zh ? "已安装" : "Installed"}</div>
+                </div>
+                {plugin.description && <div style={{ fontSize: 11, color: V2.t2, lineHeight: 1.55 }}>{plugin.description}</div>}
+                {/* Tools chips intentionally omitted from the card — keep the
+                    summary compact. Full tool list still surfaces in the
+                    detail modal (clicking the card). */}
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end" }}>
+                  <button onClick={(e) => { e.stopPropagation(); doUninstall(plugin.name); }} style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${V2.rbrd}`, background: V2.rlo, color: V2.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "卸载" : "Uninstall"}</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Recommended block removed — pending GET /api/v1/marketplace?kind=plugin
+            on the backend. Until then, install by URL/path (input above) or
+            drag a .wasm/.zip into the window. */}
+        <div style={{ fontSize: 11, color: V2.t3, padding: "20px 0", textAlign: "center", lineHeight: 1.6 }}>
+          {zh
+            ? "推荐列表未就绪（等待后端 marketplace 接口）。可通过上方 URL/路径 输入框或拖拽 .wasm/.zip 安装。"
+            : "Recommendations not wired yet (pending backend marketplace endpoint). Use the URL/path input above or drag a .wasm/.zip into the window."}
+        </div>
+      </div>
+
+      {/* Drag-drop overlay highlight */}
+      {dropActive && (
+        <div style={{ position: "absolute", inset: 0, border: `2px dashed ${V2.green}`, background: "rgba(45,212,160,.05)", display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none", color: V2.green, fontSize: 14, fontWeight: 600, fontFamily: V2.mono, letterSpacing: 0.5 }}>
+          {zh ? "松开即可安装 .wasm / .zip" : "Drop .wasm / .zip to install"}
+        </div>
+      )}
+
+      {/* Detail modal */}
+      {detail && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(5,5,7,.72)", backdropFilter: "blur(3px)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}
+          onClick={(e) => { if (e.target === e.currentTarget) setDetail(null); }}>
+          <div style={{ width: 460, background: V2.bg3, border: `1px solid ${V2.bd2}`, borderRadius: 14, overflow: "hidden", boxShadow: "0 20px 60px rgba(0,0,0,.6)" }}>
+            <div style={{ padding: "20px 22px 0", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <div style={{ fontSize: 15, fontWeight: 700 }}>{detail.name}</div>
+              <button onClick={() => setDetail(null)} style={{ width: 26, height: 26, borderRadius: "50%", border: `1px solid ${V2.bd2}`, background: "transparent", color: V2.t2, fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}>{"✕"}</button>
+            </div>
+            <div style={{ padding: "18px 22px" }}>
+              <div style={{ fontSize: 10, fontFamily: V2.mono, color: V2.t3, marginBottom: 6 }}>{detail.version || "-"} {"·"} {detail.runtimeRaw || detail.runtime}</div>
+              {/* Execution-model hint — clarifies the security profile. WASM
+                  is sandboxed; native runs as a host subprocess with the
+                  user's full FS/network perms. */}
+              <div style={{ fontSize: 10, color: V2.t2, marginBottom: 12, lineHeight: 1.5 }}>
+                {detail.runtime === "wasm"
+                  ? (zh ? "wasmtime 沙箱内运行，受限文件/网络访问" : "Sandboxed in wasmtime; restricted FS/network access")
+                  : (zh ? "JS 子进程运行 (node/bun/deno)，具备完整文件/网络权限" : "Runs as a JS subprocess (node/bun/deno) with full FS/network access")}
+              </div>
+              {detail.description && <div style={{ fontSize: 12, color: V2.t1, lineHeight: 1.6, marginBottom: 12 }}>{detail.description}</div>}
+              {detail.tools && detail.tools.length > 0 && (
+                <div style={{ marginBottom: 12 }}>
+                  <div style={{ fontSize: 10, color: V2.t3, letterSpacing: 0.4, marginBottom: 6, fontFamily: V2.mono }}>TOOLS</div>
+                  <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                    {detail.tools.map((t) => <span key={t} style={{ fontSize: 9, padding: "2px 8px", borderRadius: 4, background: V2.bg4, color: V2.t2, fontFamily: V2.mono }}>{t}</span>)}
+                  </div>
+                </div>
+              )}
+              {detail.channels && detail.channels.length > 0 && (
+                <div style={{ marginBottom: 12 }}>
+                  <div style={{ fontSize: 10, color: V2.t3, letterSpacing: 0.4, marginBottom: 6, fontFamily: V2.mono }}>CHANNELS</div>
+                  <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                    {detail.channels.map((c) => <span key={c} style={{ fontSize: 9, padding: "2px 8px", borderRadius: 4, background: V2.bg4, color: V2.t2, fontFamily: V2.mono }}>{c}</span>)}
+                  </div>
+                </div>
+              )}
+              {detail.path && <div style={{ fontSize: 10, color: V2.t3, fontFamily: V2.mono }}>{detail.path}</div>}
+            </div>
+            <div style={{ padding: "0 22px 20px", display: "flex", justifyContent: "flex-end", gap: 8 }}>
+              <button onClick={() => doUninstall(detail.name)} style={{ padding: "8px 16px", borderRadius: 8, border: `1px solid ${V2.rbrd}`, background: V2.rlo, color: V2.red, fontSize: 12, fontWeight: 500, cursor: "pointer" }}>{zh ? "卸载" : "Uninstall"}</button>
+              <button onClick={() => setDetail(null)} style={{ padding: "8px 16px", borderRadius: 8, border: `1px solid ${V2.bd2}`, background: V2.bg2, color: V2.t2, fontSize: 12, fontWeight: 500, cursor: "pointer" }}>{zh ? "关闭" : "Close"}</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════
+// ── Skills & Plugins Page (top-level container) ──────────
+// ══════════════════════════════════════════════════════════
+
+function SkillsPluginsPage() {
+  const zh = getLang() === "cn";
+  const [tab, setTab] = useState<"skills" | "plugins">(() => {
+    if (typeof window === "undefined") return "skills";
+    const qs = window.location.hash.split("?")[1] || "";
+    return new URLSearchParams(qs).get("sub") === "plugins" ? "plugins" : "skills";
+  });
+  const V2 = { bg2: "#141618", bg3: "#1a1c22", bg4: "#1f2126", bd2: "rgba(255,255,255,.09)", t0: "#eceaf4", t2: "#7e7c8c", t3: "#5a5868", mono: "'JetBrains Mono', monospace" };
+
+  const tabBtn = (key: "skills" | "plugins", label: string) => (
+    <button key={key} onClick={() => setTab(key)}
+      style={{ padding: "8px 18px", borderRadius: 9, fontSize: 13, fontWeight: 600, cursor: "pointer",
+        background: tab === key ? V2.bg4 : "transparent",
+        color: tab === key ? V2.t0 : V2.t2,
+        border: `1px solid ${tab === key ? V2.bd2 : "transparent"}`,
+      }}>{label}</button>
+  );
+
+  return (
+    <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+      <div style={{ padding: "24px 28px 0", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div style={{ fontSize: 20, fontWeight: 700, color: V2.t0, letterSpacing: -0.4 }}>{zh ? "技能插件" : "Skills & Plugins"}</div>
+        <div style={{ display: "flex", gap: 6, background: V2.bg2, border: `1px solid rgba(255,255,255,.055)`, borderRadius: 11, padding: 4 }}>
+          {tabBtn("skills", zh ? "技能管理" : "Skills")}
+          {tabBtn("plugins", zh ? "插件管理" : "Plugins")}
+        </div>
+      </div>
+      {tab === "skills" ? <SkillsTab /> : <PluginsTab />}
     </div>
   );
 }
@@ -5726,7 +5400,7 @@ function PairingPage() {
     }
   };
 
-  const V2 = { bg2: "#141618", bg3: "#1a1c22", bd: "rgba(255,255,255,.055)", bd2: "rgba(255,255,255,.09)", t0: "#eceaf4", t1: "#9896a4", t2: "#4a4858", t3: "#2e2c3a", or: "#f97316", green: "#2dd4a0", gbrd: "rgba(45,212,160,.18)", glo: "rgba(45,212,160,.07)", red: "#d95f5f", rbrd: "rgba(217,95,95,.18)", rlo: "rgba(217,95,95,.08)", mono: "'JetBrains Mono', monospace" };
+  const V2 = { bg2: "#141618", bg3: "#1a1c22", bd: "rgba(255,255,255,.055)", bd2: "rgba(255,255,255,.09)", t0: "#eceaf4", t1: "#9896a4", t2: "#7e7c8c", t3: "#5a5868", or: "#f97316", green: "#2dd4a0", gbrd: "rgba(45,212,160,.18)", glo: "rgba(45,212,160,.07)", red: "#d95f5f", rbrd: "rgba(217,95,95,.18)", rlo: "rgba(217,95,95,.08)", mono: "'JetBrains Mono', monospace" };
 
   const fmtTtl = (s: number) => { const m = Math.floor(s / 60); return m > 0 ? `${m}min` : `${s}s`; };
 
@@ -5795,8 +5469,12 @@ function getTabFromLocation(search?: string): PanelPage {
   const qs = search || (typeof window !== "undefined" ? window.location.hash.split("?")[1] || "" : "");
   const params = new URLSearchParams(qs);
   const tab = params.get("tab");
-  if (["config", "agents", "cron", "skills", "status", "workspace", "doctor", "pairing", "wizard"].includes(tab || "")) {
+  if (["config", "agents", "cron", "skills-plugins", "status", "workspace", "doctor", "pairing", "wizard", "memory", "knowledge"].includes(tab || "")) {
     return tab as PanelPage;
+  }
+  // Back-compat: bookmarked `?tab=skills` URLs redirect into the new combined page.
+  if (tab === "skills" || tab === "plugins") {
+    return "skills-plugins";
   }
   return "status";
 }
@@ -5854,13 +5532,15 @@ export function RsClawPanel() {
         <div className={styles["panel-body"]}>
           <div className={styles["rsp-content"]} style={{ flex: 1 }}>
             {activePage === "status" && <StatusPage />}
-            {activePage === "config" && <ErrorBoundary>{isTauri ? <TauriConfigPage /> : <ConfigEditorPage />}</ErrorBoundary>}
+            {activePage === "config" && <ErrorBoundary><TauriConfigPage /></ErrorBoundary>}
             {activePage === "agents" && <AgentManagerPage />}
             {activePage === "cron" && <CronTaskPage />}
-            {activePage === "skills" && <SkillsPage />}
+            {activePage === "skills-plugins" && <SkillsPluginsPage />}
             {activePage === "workspace" && <WorkspacePage />}
             {activePage === "doctor" && <DoctorPage />}
             {activePage === "pairing" && <PairingPage />}
+            {activePage === "memory" && <MemoryPage />}
+            {activePage === "knowledge" && <ErrorBoundary><KnowledgePage /></ErrorBoundary>}
           </div>
         </div>
       </div>
