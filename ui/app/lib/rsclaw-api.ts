@@ -255,4 +255,64 @@ export async function getMemoryStats(): Promise<MemoryStatsResponse> {
   }).then((r) => r.json());
 }
 
+// ---------------------------------------------------------------------------
+// Hub catalog (read-only) — tools / skills / plugins for the desktop module.
+// Backed by GET /api/v1/hub/{catalog,tools,skills,plugins}. `installed` reflects
+// local state; descriptions/versions come from the signed hub manifest.
+// ---------------------------------------------------------------------------
+
+export interface HubToolEntry {
+  name: string;
+  description: string;
+  version: string;
+  installed: boolean;
+  installed_version: string | null;
+}
+
+export interface HubSkillEntry {
+  slug: string;
+  version: string;
+  installed: boolean;
+  publisher: string;
+  description: string;
+}
+
+export interface HubPluginEntry {
+  slug: string;
+  version: string;
+  installed: boolean;
+  description: string;
+}
+
+export interface HubCatalog {
+  tools: HubToolEntry[];
+  skills: HubSkillEntry[];
+  plugins: HubPluginEntry[];
+}
+
+export async function getHubCatalog(): Promise<HubCatalog> {
+  // May lazy-fetch the hub manifests on a cold gateway → generous timeout.
+  return gatewayFetch("/api/v1/hub/catalog", {
+    signal: AbortSignal.timeout(30000),
+  }).then((r) => r.json());
+}
+
+export async function getHubTools(): Promise<HubToolEntry[]> {
+  return gatewayFetch("/api/v1/hub/tools", {
+    signal: AbortSignal.timeout(30000),
+  }).then((r) => r.json());
+}
+
+export async function getHubSkills(): Promise<HubSkillEntry[]> {
+  return gatewayFetch("/api/v1/hub/skills", {
+    signal: AbortSignal.timeout(30000),
+  }).then((r) => r.json());
+}
+
+export async function getHubPlugins(): Promise<HubPluginEntry[]> {
+  return gatewayFetch("/api/v1/hub/plugins", {
+    signal: AbortSignal.timeout(30000),
+  }).then((r) => r.json());
+}
+
 export { GATEWAY_URL, AUTH_TOKEN };
