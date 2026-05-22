@@ -6,6 +6,7 @@ import { useNavigate, useLocation } from "react-router-dom";
 import { ErrorBoundary } from "./error";
 import { MemoryPage } from "./memory-page";
 import { KnowledgePage } from "./knowledge-page";
+import { Json5Editor } from "./json5-editor";
 import { RsclawProviderCard } from "./rsclaw-provider-card";
 import { Popover } from "./ui-lib";
 import { toast } from "../lib/toast";
@@ -23,6 +24,12 @@ import {
   saveConfig,
   reloadConfig,
   restartGateway,
+  getHubTools,
+  getHubSkills,
+  getHubPlugins,
+  type HubToolEntry,
+  type HubSkillEntry,
+  type HubPluginEntry,
   getLogs,
   getAgents,
   saveAgent,
@@ -4243,12 +4250,38 @@ function TauriConfigPageInner() {
         {activeTab === "raw" && (
           <div style={{ height: "100%", animation: "fi .15s ease" }}>
             <div style={{ fontSize: 11, color: V.t3, marginBottom: 8, fontFamily: V.mono }}>{cfgPath}</div>
-            <textarea value={raw} spellCheck={false}
-              onChange={(e) => {
-                setRaw(e.target.value); setDirty(true);
-                try { setConfig(JSON5.parse(e.target.value)); setParseError(""); } catch { setParseError(zh ? "JSON5 \u683C\u5F0F\u9519\u8BEF" : "Invalid JSON5"); }
-              }}
-              style={{ width: "100%", height: "calc(100% - 50px)", background: V.bg1, border: `1px solid ${V.bd}`, borderRadius: 10, padding: "14px 16px", color: V.t0, fontFamily: V.mono, fontSize: 12, lineHeight: 1.6, outline: "none", resize: "none" }} />
+            {(() => {
+              // Platform-aware modifier label. CodeMirror's keymap uses
+              // Mod (= Cmd on macOS, Ctrl elsewhere) so the shortcuts
+              // work as-is on Windows/Linux \u2014 only the displayed hint
+              // needs to track. navigator.platform is deprecated but
+              // still the most reliable signal across Tauri webviews
+              // (userAgentData isn't always populated).
+              const isMac =
+                typeof navigator !== "undefined" &&
+                /Mac|iPhone|iPad/i.test(navigator.platform || navigator.userAgent || "");
+              const mod = isMac ? "\u2318" : "Ctrl+";
+              const shift = isMac ? "\u21E7" : "Shift+";
+              return (
+                <div style={{ fontSize: 10, color: V.t3, marginBottom: 6, fontFamily: V.mono, textAlign: "right" }}>
+                  {zh
+                    ? `${mod}F \u641C\u7D22 \u00B7 ${mod}G \u4E0B\u4E00\u5904 \u00B7 ${mod}${shift}G \u4E0A\u4E00\u5904`
+                    : `${mod}F find \u00B7 ${mod}G next \u00B7 ${mod}${shift}G prev`}
+                </div>
+              );
+            })()}
+            {/* CodeMirror 6 replaces the old <textarea>. Cmd+F opens an
+                inline find panel with highlight-all + next/prev (built-in
+                via @codemirror/search). Cmd+G / Cmd+Shift+G cycle. */}
+            <div style={{ height: "calc(100% - 68px)", border: `1px solid ${V.bd}`, borderRadius: 10, overflow: "hidden", background: V.bg1 }}>
+              <Json5Editor
+                value={raw}
+                onChange={(v) => {
+                  setRaw(v); setDirty(true);
+                  try { setConfig(JSON5.parse(v)); setParseError(""); } catch { setParseError(zh ? "JSON5 \u683C\u5F0F\u9519\u8BEF" : "Invalid JSON5"); }
+                }}
+              />
+            </div>
             {parseError && <div style={{ fontSize: 11, color: V.red, marginTop: 6, padding: "6px 10px", background: V.rlo, border: `1px solid ${V.rbrd}`, borderRadius: 6 }}>{parseError}</div>}
           </div>
         )}
@@ -4815,20 +4848,27 @@ function SkillsTab() {
   const [search, setSearch] = useState("");
   const [searchResults, setSearchResults] = useState<{ name: string; version?: string; description?: string; registry?: string; installs?: string; stars?: string }[]>([]);
   const [searching, setSearching] = useState(false);
+  // Hub recommended catalog (GET /api/v1/hub/skills). Shown below the
+  // installed list when the user isn't actively searching clawhub.
+  const [hubSkills, setHubSkills] = useState<HubSkillEntry[]>([]);
+
+  useEffect(() => {
+    getHubSkills().then(setHubSkills).catch(() => setHubSkills([]));
+  }, []);
 
   const fetchSkills = useCallback(async () => {
+    // Skill management (list/install/uninstall) is desktop-only \u2014 it
+    // runs the rsclaw CLI via the Tauri sidecar. There's no HTTP route
+    // for these on the gateway (by design: keep install off the network
+    // attack surface). In web mode the installed list stays empty.
+    if (!isTauri) { setLoading(false); return; }
     try {
-      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
-      if (tauriInvoke) {
-        const data: any = await tauriInvoke("get_skills");
-        const skills = (data?.skills || []).map((s: any) => ({
-          ...s,
-          tools: (s.tools || []).map((t: string) => ({ name: t })),
-        }));
-        setInstalled(skills);
-      } else {
-        const res = await gatewayFetch("/api/v1/skills"); if (res.ok) { const data = await res.json(); setInstalled(data.skills || []); }
-      }
+      const data: any = await tauriInvokeV2("get_skills");
+      const skills = (data?.skills || []).map((s: any) => ({
+        ...s,
+        tools: (s.tools || []).map((t: string) => ({ name: t })),
+      }));
+      setInstalled(skills);
     } catch {}
     setLoading(false);
   }, []);
@@ -4836,11 +4876,10 @@ function SkillsTab() {
   useEffect(() => { fetchSkills(); }, [fetchSkills]);
 
   const doInstall = async (name: string) => {
+    if (!isTauri) { toast.error(zh ? "\u5B89\u88C5\u6280\u80FD\u9700\u8981\u684C\u9762\u7248" : "Installing skills requires the desktop app"); return; }
     setInstalling(name);
     try {
-      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
-      if (tauriInvoke) { await tauriInvoke("install_skill", { name }); }
-      else { await gatewayFetch("/api/v1/skills/install", { method: "POST", body: JSON.stringify({ name }) }); }
+      await tauriInvokeV2("install_skill", { name });
       await fetchSkills();
       // Trigger gateway config reload so new skill is active
       try { await reloadConfig(); } catch {}
@@ -4852,10 +4891,9 @@ function SkillsTab() {
     setInstalling(null);
   };
   const doUninstall = async (name: string) => {
+    if (!isTauri) { toast.error(zh ? "\u5378\u8F7D\u6280\u80FD\u9700\u8981\u684C\u9762\u7248" : "Uninstalling skills requires the desktop app"); return; }
     try {
-      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
-      if (tauriInvoke) { await tauriInvoke("uninstall_skill", { name }); }
-      else { await gatewayFetch(`/api/v1/skills/${encodeURIComponent(name)}`, { method: "DELETE" }); }
+      await tauriInvokeV2("uninstall_skill", { name });
       await fetchSkills(); setDetailSkill(null);
       try { await reloadConfig(); } catch {}
       toast.success(zh ? `${name} \u5DF2\u5378\u8F7D` : `${name} uninstalled`);
@@ -4958,15 +4996,38 @@ function SkillsTab() {
         )}
         {searching && <div style={{ textAlign: "center", color: V2.t3, padding: 20 }}>...</div>}
 
-        {/* Recommended block removed \u2014 pending GET /api/v1/marketplace?kind=skill
-            on the backend. Empty-state hint replaces the old 16-entry hardcoded
-            list so users still know how to discover new skills. */}
-        {searchResults.length === 0 && !searching && (
-          <div style={{ fontSize: 11, color: V2.t3, padding: "20px 0", textAlign: "center", lineHeight: 1.6 }}>
-            {zh
-              ? "\u63A8\u8350\u5217\u8868\u672A\u5C31\u7EEA\uFF08\u7B49\u5F85\u540E\u7AEF marketplace \u63A5\u53E3\uFF09\u3002\u53EF\u5728\u4E0A\u65B9\u641C\u7D22\u6D4F\u89C8 clawhub\u3002"
-              : "Recommendations not wired yet (pending backend marketplace endpoint). Use the search box above to browse clawhub."}
-          </div>
+        {/* Hub recommended \u2014 GET /api/v1/hub/skills. Hidden while the user
+            is browsing clawhub search results to avoid a cluttered double
+            list. Install resolves the slug via `rsclaw skills install`
+            (clawhub fallback). */}
+        {searchResults.length === 0 && !searching && hubSkills.length > 0 && (
+          <>
+            <div style={{ fontSize: 11, fontWeight: 600, color: V2.t2, letterSpacing: 0.5, textTransform: "uppercase", marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
+              {zh ? "\u63A8\u8350\u5B89\u88C5" : "Recommended"} <span style={{ fontSize: 9, padding: "1px 7px", borderRadius: 3, background: V2.bg4, color: V2.t2 }}>{hubSkills.length}</span>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              {hubSkills.map((s) => (
+                <div key={s.slug} style={{ background: V2.bg2, border: `1px solid ${s.installed ? "rgba(45,212,160,.15)" : V2.bd}`, borderRadius: 11, padding: "14px 16px", display: "flex", flexDirection: "column", gap: 10 }}>
+                  <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 13, fontWeight: 600, color: V2.t0 }}>{s.slug}</div>
+                      <div style={{ fontSize: 10, fontFamily: V2.mono, color: V2.t3, marginTop: 1 }}>{s.version || "-"}{s.publisher ? ` \u00B7 ${s.publisher}` : ""}</div>
+                    </div>
+                    {s.installed && <div style={{ fontSize: 10, color: V2.green, fontFamily: V2.mono, display: "flex", alignItems: "center", gap: 4 }}>{"\u25CF"} {zh ? "\u5DF2\u5B89\u88C5" : "Installed"}</div>}
+                  </div>
+                  {s.description && <div style={{ fontSize: 11, color: V2.t2, lineHeight: 1.55, display: "-webkit-box", WebkitLineClamp: 3, WebkitBoxOrient: "vertical", overflow: "hidden" }}>{s.description}</div>}
+                  <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                    {s.installed
+                      ? <span style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${V2.bd2}`, color: V2.t2, fontSize: 11 }}>{"\u2713"}</span>
+                      : <button onClick={() => doInstall(s.slug)} disabled={installing === s.slug}
+                          style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${installing === s.slug ? V2.obrd : V2.gbrd}`, background: installing === s.slug ? V2.olo : V2.glo, color: installing === s.slug ? V2.or : V2.green, fontSize: 11, fontWeight: 600, cursor: installing === s.slug ? "not-allowed" : "pointer" }}>
+                          {installing === s.slug ? (zh ? "\u5B89\u88C5\u4E2D..." : "Installing...") : (zh ? "\u5B89\u88C5" : "Install")}
+                        </button>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
         )}
       </div>
 
@@ -5039,18 +5100,21 @@ function PluginsTab() {
   const [installSpec, setInstallSpec] = useState("");
   const [dropActive, setDropActive] = useState(false);
   const [detail, setDetail] = useState<PluginInfo | null>(null);
+  // Hub recommended catalog (GET /api/v1/hub/plugins).
+  const [hubPlugins, setHubPlugins] = useState<HubPluginEntry[]>([]);
+
+  useEffect(() => {
+    getHubPlugins().then(setHubPlugins).catch(() => setHubPlugins([]));
+  }, []);
 
   const fetchPlugins = useCallback(async () => {
+    // Desktop-only, same rationale as skills: list/install/uninstall run
+    // the rsclaw CLI via the Tauri sidecar; no gateway HTTP route exists.
+    if (!isTauri) { setLoading(false); return; }
     setLoading(true);
     try {
-      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
-      if (tauriInvoke) {
-        const data: any = await tauriInvoke("get_plugins");
-        setInstalled((data?.plugins || []) as PluginInfo[]);
-      } else {
-        const res = await gatewayFetch("/api/v1/plugins");
-        if (res.ok) { const data = await res.json(); setInstalled(data.plugins || []); }
-      }
+      const data: any = await tauriInvokeV2("get_plugins");
+      setInstalled((data?.plugins || []) as PluginInfo[]);
     } catch {}
     setLoading(false);
   }, []);
@@ -5060,11 +5124,10 @@ function PluginsTab() {
   const doInstall = useCallback(async (spec: string) => {
     const trimmed = spec.trim();
     if (!trimmed) return;
+    if (!isTauri) { toast.error(zh ? "安装插件需要桌面版" : "Installing plugins requires the desktop app"); return; }
     setInstalling(trimmed);
     try {
-      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
-      if (tauriInvoke) { await tauriInvoke("install_plugin", { spec: trimmed }); }
-      else { await gatewayFetch("/api/v1/plugins/install", { method: "POST", body: JSON.stringify({ spec: trimmed }) }); }
+      await tauriInvokeV2("install_plugin", { spec: trimmed });
       await fetchPlugins();
       setInstallSpec("");
       // Plugin manifests are only registered into PluginRegistry /
@@ -5097,10 +5160,9 @@ function PluginsTab() {
   }, [fetchPlugins, zh]);
 
   const doUninstall = async (name: string) => {
+    if (!isTauri) { toast.error(zh ? "卸载插件需要桌面版" : "Uninstalling plugins requires the desktop app"); return; }
     try {
-      const tauriInvoke = isTauri ? tauriInvokeV2 : null;
-      if (tauriInvoke) { await tauriInvoke("uninstall_plugin", { name }); }
-      else { await gatewayFetch(`/api/v1/plugins/${encodeURIComponent(name)}`, { method: "DELETE" }); }
+      await tauriInvokeV2("uninstall_plugin", { name });
       await fetchPlugins(); setDetail(null);
       // Mirror install path — the gateway still has the plugin loaded
       // in PluginRegistry until restart. reloadConfig() doesn't unload
@@ -5250,14 +5312,42 @@ function PluginsTab() {
           </div>
         )}
 
-        {/* Recommended block removed — pending GET /api/v1/marketplace?kind=plugin
-            on the backend. Until then, install by URL/path (input above) or
-            drag a .wasm/.zip into the window. */}
-        <div style={{ fontSize: 11, color: V2.t3, padding: "20px 0", textAlign: "center", lineHeight: 1.6 }}>
-          {zh
-            ? "推荐列表未就绪（等待后端 marketplace 接口）。可通过上方 URL/路径 输入框或拖拽 .wasm/.zip 安装。"
-            : "Recommendations not wired yet (pending backend marketplace endpoint). Use the URL/path input above or drag a .wasm/.zip into the window."}
-        </div>
+        {/* Hub recommended — GET /api/v1/hub/plugins. Shown flat (hub
+            entries carry no wasm/js runtime, so we don't split by the
+            sub-tab). Install passes the slug to `plugins install`; this
+            only works once the backend resolves slugs via the allowlist
+            (the AllowEntry has a download url that isn't exposed in the
+            catalog yet) — until then non-installed entries surface a
+            clear install error. */}
+        {hubPlugins.length > 0 && (
+          <>
+            <div style={{ fontSize: 11, fontWeight: 600, color: V2.t2, letterSpacing: 0.5, textTransform: "uppercase", marginBottom: 10, marginTop: 4, display: "flex", alignItems: "center", gap: 8 }}>
+              {zh ? "推荐安装" : "Recommended"} <span style={{ fontSize: 9, padding: "1px 7px", borderRadius: 3, background: V2.bg4, color: V2.t2 }}>{hubPlugins.length}</span>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              {hubPlugins.map((p) => (
+                <div key={p.slug} style={{ background: V2.bg2, border: `1px solid ${p.installed ? "rgba(45,212,160,.15)" : V2.bd}`, borderRadius: 11, padding: "14px 16px", display: "flex", flexDirection: "column", gap: 10 }}>
+                  <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 13, fontWeight: 600, color: V2.t0 }}>{p.slug}</div>
+                      <div style={{ fontSize: 10, fontFamily: V2.mono, color: V2.t3, marginTop: 1 }}>{p.version || "-"}</div>
+                    </div>
+                    {p.installed && <div style={{ fontSize: 10, color: V2.green, fontFamily: V2.mono, display: "flex", alignItems: "center", gap: 4 }}>{"●"} {zh ? "已安装" : "Installed"}</div>}
+                  </div>
+                  {p.description && <div style={{ fontSize: 11, color: V2.t2, lineHeight: 1.55, display: "-webkit-box", WebkitLineClamp: 3, WebkitBoxOrient: "vertical", overflow: "hidden" }}>{p.description}</div>}
+                  <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                    {p.installed
+                      ? <span style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${V2.bd2}`, color: V2.t2, fontSize: 11 }}>{"✓"}</span>
+                      : <button onClick={() => doInstall(p.slug)} disabled={installing === p.slug}
+                          style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${installing === p.slug ? V2.obrd : V2.gbrd}`, background: installing === p.slug ? V2.olo : V2.glo, color: installing === p.slug ? V2.or : V2.green, fontSize: 11, fontWeight: 600, cursor: installing === p.slug ? "not-allowed" : "pointer" }}>
+                          {installing === p.slug ? (zh ? "安装中..." : "Installing...") : (zh ? "安装" : "Install")}
+                        </button>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
       </div>
 
       {/* Drag-drop overlay highlight */}
@@ -5317,19 +5407,122 @@ function PluginsTab() {
 }
 
 // ══════════════════════════════════════════════════════════
-// ── Skills & Plugins Page (top-level container) ──────────
+// ── Tools Tab ────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════
+
+// External tool binaries (chrome / ffmpeg / node / python / opencode /
+// claude-code / ...) installed into ~/.rsclaw/tools/. Catalog comes from
+// GET /api/v1/hub/tools; install runs `rsclaw tools install <name>` via
+// the Tauri sidecar. No uninstall — these are host binaries, removal is
+// manual.
+function ToolsTab() {
+  const zh = getLang() === "cn";
+  const [tools, setTools] = useState<HubToolEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [installing, setInstalling] = useState<string | null>(null);
+  const [errored, setErrored] = useState(false);
+
+  const V2 = { bg2: "#141618", bg3: "#1a1c22", bg4: "#1f2126", bd: "rgba(255,255,255,.055)", bd2: "rgba(255,255,255,.09)", t0: "#eceaf4", t1: "#9896a4", t2: "#7e7c8c", t3: "#5a5868", or: "#f97316", olo: "rgba(249,115,22,.09)", obrd: "rgba(249,115,22,.2)", green: "#2dd4a0", glo: "rgba(45,212,160,.07)", gbrd: "rgba(45,212,160,.18)", mono: "'JetBrains Mono', monospace" };
+
+  const fetchTools = useCallback(async () => {
+    setLoading(true);
+    setErrored(false);
+    try {
+      setTools(await getHubTools());
+    } catch {
+      setErrored(true);
+    }
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { fetchTools(); }, [fetchTools]);
+
+  const doInstall = async (name: string) => {
+    if (!isTauri) {
+      toast.error(zh ? "安装工具需要桌面版" : "Installing tools requires the desktop app");
+      return;
+    }
+    setInstalling(name);
+    try {
+      await tauriInvokeV2("install_tool", { name });
+      await fetchTools();
+      toast.success(zh ? `${name} 安装完成` : `${name} installed`);
+    } catch (e: any) {
+      const msg = typeof e === "string" ? e : e?.message || "";
+      toast.fromError(zh ? "安装失败" : "Install failed", msg);
+    }
+    setInstalling(null);
+  };
+
+  return (
+    <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+      <div style={{ fontSize: 11, color: V2.t3, fontFamily: V2.mono, padding: "16px 28px 0", flexShrink: 0 }}>~/.rsclaw/tools/</div>
+      <div style={{ padding: "16px 28px 28px", flex: 1, overflowY: "auto" }}>
+        {loading ? (
+          <div style={{ color: V2.t3, padding: 20, textAlign: "center" }}>...</div>
+        ) : errored ? (
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 12, padding: "40px 0", color: V2.t3 }}>
+            <div style={{ fontSize: 32, opacity: 0.4 }}>{"⚠️"}</div>
+            <div style={{ fontSize: 12 }}>{zh ? "无法加载工具目录（hub 接口不可用）" : "Couldn't load tools catalog (hub endpoint unavailable)"}</div>
+            <button onClick={() => void fetchTools()} style={{ padding: "6px 14px", borderRadius: 7, border: `1px solid ${V2.gbrd}`, background: V2.glo, color: V2.green, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "重试" : "Retry"}</button>
+          </div>
+        ) : tools.length === 0 ? (
+          <div style={{ textAlign: "center", padding: "40px 0", color: V2.t3, fontSize: 12 }}>{zh ? "工具目录为空" : "Tools catalog is empty"}</div>
+        ) : (
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+            {tools.map((tool) => (
+              <div key={tool.name} style={{ background: V2.bg2, border: `1px solid ${tool.installed ? "rgba(45,212,160,.15)" : V2.bd}`, borderRadius: 11, padding: "14px 16px", display: "flex", flexDirection: "column", gap: 10 }}>
+                <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
+                  <div style={{ width: 36, height: 36, borderRadius: 9, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, flexShrink: 0, background: V2.bg3, border: `1px solid ${V2.bd}` }}>{"🛠️"}</div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: V2.t0 }}>{tool.name}</div>
+                    <div style={{ fontSize: 10, fontFamily: V2.mono, color: V2.t3, marginTop: 1 }}>
+                      {tool.version}
+                      {tool.installed && tool.installed_version && tool.installed_version !== tool.version ? ` · 已装 ${tool.installed_version}` : ""}
+                    </div>
+                  </div>
+                  {tool.installed && <div style={{ fontSize: 10, color: V2.green, fontFamily: V2.mono, display: "flex", alignItems: "center", gap: 4 }}>{"●"} {zh ? "已安装" : "Installed"}</div>}
+                </div>
+                {tool.description && <div style={{ fontSize: 11, color: V2.t2, lineHeight: 1.55 }}>{tool.description}</div>}
+                <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                  {tool.installed ? (
+                    <button onClick={() => void doInstall(tool.name)} disabled={installing === tool.name}
+                      style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${V2.bd2}`, background: V2.bg4, color: V2.t1, fontSize: 11, cursor: installing === tool.name ? "not-allowed" : "pointer" }}>
+                      {installing === tool.name ? (zh ? "更新中..." : "Updating...") : (zh ? "重新安装" : "Reinstall")}
+                    </button>
+                  ) : (
+                    <button onClick={() => void doInstall(tool.name)} disabled={installing === tool.name}
+                      style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${installing === tool.name ? V2.obrd : V2.gbrd}`, background: installing === tool.name ? V2.olo : V2.glo, color: installing === tool.name ? V2.or : V2.green, fontSize: 11, fontWeight: 600, cursor: installing === tool.name ? "not-allowed" : "pointer" }}>
+                      {installing === tool.name ? (zh ? "安装中..." : "Installing...") : (zh ? "安装" : "Install")}
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════
+// ── Skills & Tools Page (top-level container) ────────────
+// ══════════════════════════════════════════════════════════
+
+type SkillsToolsTab = "skills" | "tools" | "plugins";
 
 function SkillsPluginsPage() {
   const zh = getLang() === "cn";
-  const [tab, setTab] = useState<"skills" | "plugins">(() => {
+  const [tab, setTab] = useState<SkillsToolsTab>(() => {
     if (typeof window === "undefined") return "skills";
     const qs = window.location.hash.split("?")[1] || "";
-    return new URLSearchParams(qs).get("sub") === "plugins" ? "plugins" : "skills";
+    const sub = new URLSearchParams(qs).get("sub");
+    return sub === "plugins" || sub === "tools" ? sub : "skills";
   });
   const V2 = { bg2: "#141618", bg3: "#1a1c22", bg4: "#1f2126", bd2: "rgba(255,255,255,.09)", t0: "#eceaf4", t2: "#7e7c8c", t3: "#5a5868", mono: "'JetBrains Mono', monospace" };
 
-  const tabBtn = (key: "skills" | "plugins", label: string) => (
+  const tabBtn = (key: SkillsToolsTab, label: string) => (
     <button key={key} onClick={() => setTab(key)}
       style={{ padding: "8px 18px", borderRadius: 9, fontSize: 13, fontWeight: 600, cursor: "pointer",
         background: tab === key ? V2.bg4 : "transparent",
@@ -5339,15 +5532,21 @@ function SkillsPluginsPage() {
   );
 
   return (
-    <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+    // height:100% (not flex:1) — the parent `.rsp-content` is a block
+    // overflow-y:auto scroller, so flex:1 collapses to content height and
+    // the whole page (tabs included) scrolls inside rsp-content. height:100%
+    // pins us to rsp-content's bounded height so the tab strip stays fixed
+    // and each sub-tab owns its own inner scroll.
+    <div style={{ height: "100%", minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
       <div style={{ padding: "24px 28px 0", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        <div style={{ fontSize: 20, fontWeight: 700, color: V2.t0, letterSpacing: -0.4 }}>{zh ? "技能插件" : "Skills & Plugins"}</div>
+        <div style={{ fontSize: 20, fontWeight: 700, color: V2.t0, letterSpacing: -0.4 }}>{zh ? "技能工具" : "Skills & Tools"}</div>
         <div style={{ display: "flex", gap: 6, background: V2.bg2, border: `1px solid rgba(255,255,255,.055)`, borderRadius: 11, padding: 4 }}>
           {tabBtn("skills", zh ? "技能管理" : "Skills")}
+          {tabBtn("tools", zh ? "工具管理" : "Tools")}
           {tabBtn("plugins", zh ? "插件管理" : "Plugins")}
         </div>
       </div>
-      {tab === "skills" ? <SkillsTab /> : <PluginsTab />}
+      {tab === "skills" ? <SkillsTab /> : tab === "tools" ? <ToolsTab /> : <PluginsTab />}
     </div>
   );
 }

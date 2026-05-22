@@ -449,10 +449,42 @@ fn seed_bundled_bge_model<R: tauri::Runtime>(
     Ok(())
 }
 
-/// Write a file to an agent's workspace directory (~/.rsclaw/workspace-{agentId}/{fileName})
+/// Resolve the workspace directory for a given agent id.
+///
+/// Convention matches the backend (src/cmd/setup.rs, src/plugin/wasm_runtime.rs
+/// etc.): the default is `<base_dir>/workspace/` for every agent. An
+/// individual agent can override via `agents.list[].workspace` in
+/// rsclaw.json5 — typically only the lead orchestrator pattern uses
+/// this, multi-agent setups give each agent its own folder.
+///
+/// Previously this was hardcoded to `<base_dir>/workspace-{agent_id}/`,
+/// which silently mismatched the actual agent layout — written files
+/// landed in a sibling directory the agent never reads.
+fn resolve_workspace_dir(agent_id: &str) -> std::path::PathBuf {
+    let base = rsclaw_base_dir();
+    let cfg_path = base.join("rsclaw.json5");
+    if let Ok(raw) = std::fs::read_to_string(&cfg_path) {
+        if let Ok(val) = json5::from_str::<serde_json::Value>(&raw) {
+            if let Some(list) = val.pointer("/agents/list").and_then(|v| v.as_array()) {
+                for entry in list {
+                    let id = entry.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    if id == agent_id {
+                        if let Some(ws) = entry.get("workspace").and_then(|v| v.as_str()) {
+                            return std::path::PathBuf::from(ws);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    base.join("workspace")
+}
+
+/// Write a file to an agent's workspace directory.
 #[tauri::command]
 fn write_workspace_file(agent_id: String, file_name: String, content: String) -> Result<String, String> {
-    let ws_dir = rsclaw_base_dir().join(format!("workspace-{}", agent_id));
+    let ws_dir = resolve_workspace_dir(&agent_id);
     let _ = std::fs::create_dir_all(&ws_dir);
     let file_path = ws_dir.join(&file_name);
     std::fs::write(&file_path, &content)
@@ -460,10 +492,10 @@ fn write_workspace_file(agent_id: String, file_name: String, content: String) ->
     Ok(file_path.to_string_lossy().to_string())
 }
 
-/// Read a file from an agent's workspace directory
+/// Read a file from an agent's workspace directory.
 #[tauri::command]
 fn read_workspace_file(agent_id: String, file_name: String) -> Result<String, String> {
-    let file_path = rsclaw_base_dir().join(format!("workspace-{}", agent_id)).join(&file_name);
+    let file_path = resolve_workspace_dir(&agent_id).join(&file_name);
     std::fs::read_to_string(&file_path).map_err(|e| format!("read failed: {e}"))
 }
 
@@ -1452,6 +1484,18 @@ fn uninstall_plugin(name: String) -> Result<String, String> {
     run_rsclaw_command(&["plugins", "uninstall", &name])
 }
 
+/// Install an external tool binary (chrome/ffmpeg/node/python/opencode/
+/// claude-code/...) via sidecar. There is no uninstall — tools are host
+/// binaries; removal is manual. `force` reinstalls even if present.
+#[tauri::command]
+fn install_tool(name: String, force: Option<bool>) -> Result<String, String> {
+    if force.unwrap_or(false) {
+        run_rsclaw_command(&["tools", "install", &name, "--force"])
+    } else {
+        run_rsclaw_command(&["tools", "install", &name])
+    }
+}
+
 /// Expand `${VAR}` placeholders in a string by reading from the process
 /// environment. Mirrors `crate::config::loader::expand_env_vars` in the
 /// gateway so the test path matches actual runtime substitution.
@@ -1889,6 +1933,7 @@ fn main() {
             get_plugins,
             install_plugin,
             uninstall_plugin,
+            install_tool,
             test_provider,
             write_workspace_file,
             read_workspace_file,
