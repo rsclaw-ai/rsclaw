@@ -10,8 +10,9 @@
 //!   6. Reply shaping (NO_REPLY filter)
 //!   7. Write JSONL transcript
 //!   8. Compaction check
-//!   9. Auto-Recall (inject relevant memories) + Auto-Capture (store user
-//!      message)
+//!   9. Auto-Recall (inject relevant memories) + Auto-Capture (extract
+//!      durable entities — NOT raw user messages; see
+//!      docs/memory-extraction-redesign.md)
 
 use std::{sync::Arc, sync::atomic::{AtomicBool, Ordering}, time::Duration};
 
@@ -3299,60 +3300,41 @@ impl AgentRuntime {
             }
         }
 
-        // Auto-Capture (AGENTS.md §31): persist user message as memory note.
-        // Threshold is 8 bytes (not 20) so short messages with key data like
-        // "手机号18674030927" (20 bytes) are not silently dropped.
-        // Messages containing long digit sequences (phone numbers, IDs, codes)
-        // get higher importance so they survive memory decay.
-        let has_key_digits = {
-            let mut run = 0usize;
-            let mut max_run = 0usize;
-            for b in text.bytes() {
-                if b.is_ascii_digit() { run += 1; max_run = max_run.max(run); } else { run = 0; }
-            }
-            max_run >= 8 // 8+ consecutive digits = phone number / ID / code
-        };
+        // Auto-Capture (see docs/memory-extraction-redesign.md).
+        // Phase 1 — stop the bleeding: we NO LONGER persist every user turn
+        // verbatim as a `note`. That made the store a chat log: "在吗?",
+        // injected banner prompts, and test instructions were all dumped in as
+        // kind=note/tier=working with zero distillation. Only deterministic
+        // entity extraction (phone/ID/email → pinned `entity` memories) runs
+        // here now. Distilled fact/preference/procedure extraction lands in the
+        // L1 extractor in a later phase. Key data like "手机号18674030927" is
+        // still captured — via the entity path, which is more precise than a
+        // raw note ever was.
+        //
+        // Gated by `agents.defaults.memory.autoCapture` (default on). The flag
+        // used to be defined-but-never-read; this is the first reader, so
+        // setting it false now actually disables auto-capture.
+        let auto_capture_enabled = self
+            .config
+            .agents
+            .defaults
+            .memory
+            .as_ref()
+            .and_then(|m| m.auto_capture)
+            .unwrap_or(true);
         // Skip auto-capture for internal channels — heartbeat/cron/system
         // don't need long-term memory and would pollute user recall results.
         let internal_channel = matches!(channel, "heartbeat" | "cron" | "system");
         if let Some(ref mem) = self.memory
+            && auto_capture_enabled
             && text.len() > 8
             && !reply.text.starts_with(NO_REPLY_TOKEN)
             && !internal_channel
         {
-            let doc_id = Uuid::new_v4().to_string();
             let doc_scope = format!("agent:{}", self.handle.id);
-            let doc = MemoryDoc {
-                id: doc_id.clone(),
-                scope: doc_scope.clone(),
-                kind: "note".to_owned(),
-                text: text.to_owned(),
-                created_at: 0, // backfilled in MemoryStore::add()
-                accessed_at: 0,
-                access_count: 0,
-                // Bump importance for messages with phone numbers / long IDs so
-                // they survive memory decay and compaction fact extraction.
-                importance: if has_key_digits { 0.85 } else { 0.5 },
-                vector: vec![],
-                tier: Default::default(),
-                abstract_text: None,
-                overview_text: None,
-                tags: vec![],
-                pinned: false,
-            };
-            if let Err(e) = mem.lock().await.add(doc).await {
-                tracing::warn!("auto-capture memory add failed: {e:#}");
-            }
-            // Also index in tantivy BM25 for hybrid search.
-            if let Err(e) = self
-                .store
-                .search
-                .index_memory_doc(&doc_id, &doc_scope, "note", text)
-            {
-                tracing::warn!("BM25 index failed for auto-capture doc: {e:#}");
-            }
 
             // Deterministic entity extraction: phone numbers, ID cards, emails.
+            // These become proper pinned `entity` memories — not raw notes.
             let user_entities = crate::agent::context_mgr::extract_key_entities(text);
             if !user_entities.is_empty() {
                 crate::agent::context_mgr::write_entity_memories(
