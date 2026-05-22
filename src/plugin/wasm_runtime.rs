@@ -71,6 +71,11 @@ pub struct WasmPlugin {
     pub version: Option<String>,
     /// Human-readable description (from manifest).
     pub description: Option<String>,
+    /// Catalog summary (from manifest `summary`, else None → falls back to
+    /// `description` at render time).
+    pub summary: Option<String>,
+    /// Tool names the manifest marks as common (from `commonTools`).
+    pub common_tools: Vec<String>,
     /// Tools this plugin exposes.
     pub tools: Vec<WasmToolDef>,
     /// Path to the `.wasm` file on disk.
@@ -1236,6 +1241,8 @@ pub async fn load_wasm_plugin(
         name: manifest.name.clone(),
         version: manifest.version.clone(),
         description: manifest.description.clone(),
+        summary: manifest.summary.clone(),
+        common_tools: manifest.common_tools.clone(),
         tools,
         wasm_path: path.to_path_buf(),
         engine: engine.clone(),
