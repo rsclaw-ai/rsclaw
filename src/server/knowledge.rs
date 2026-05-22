@@ -41,6 +41,7 @@ pub fn routes(max_doc_bytes: usize) -> Router<Arc<KnowledgeService>> {
             get(list_docs).post(upload_doc),
         )
         .route("/collections/{id}/docs/from-url", post(upload_from_url))
+        .route("/collections/{id}/docs/from-path", post(upload_from_path))
         .route(
             "/collections/{id}/docs/{doc_id}",
             get(get_doc).delete(delete_doc),
@@ -348,6 +349,104 @@ fn ingest_and_respond(
         )
             .into_response(),
         Err(e) => err_response(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct FromPathReq {
+    path: String,
+}
+
+/// Ingest a document the gateway reads directly off the local filesystem.
+///
+/// This exists purely as a same-machine optimization for the desktop app:
+/// dragging a 50MB PDF would otherwise read it into JS memory, wrap it in
+/// multipart, and POST the bytes to a server running on the same box that
+/// immediately writes them back to disk. With a path the gateway reads the
+/// file itself — no byte round-trip.
+///
+/// SECURITY: this lets the caller make the gateway read an arbitrary local
+/// file, so it is gated twice — (1) loopback peers only (a LAN/WAN client or a
+/// remote UI must use the multipart path), and (2) the resolved path must live
+/// under an allowed root (home / temp). Without (2) a malicious page hitting
+/// `127.0.0.1` via the permissive CORS could exfiltrate `/etc/passwd`.
+async fn upload_from_path(
+    State(svc): State<Arc<KnowledgeService>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    Path(cid): Path<String>,
+    Json(req): Json<FromPathReq>,
+) -> Response {
+    if !crate::server::is_loopback(peer) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "from_path_loopback_only" })),
+        )
+            .into_response();
+    }
+    let raw = req.path.trim();
+    if raw.is_empty() {
+        return bad_request("path_required");
+    }
+    // 404 early if the collection is gone (before touching the filesystem).
+    if let Err(e) = svc.get_collection(&cid) {
+        return err_response(e);
+    }
+    let resolved = match validate_local_path(raw) {
+        Ok(p) => p,
+        Err(code) => return bad_request(code),
+    };
+    // Enforce the same size cap the multipart path gets from the body limit —
+    // std::fs::read bypasses axum's DefaultBodyLimit, so check up front.
+    match std::fs::metadata(&resolved) {
+        Ok(m) if m.len() as usize > svc.max_doc_bytes() => return bad_request("body_too_large"),
+        Ok(_) => {}
+        Err(_) => return bad_request("path_unreadable"),
+    }
+    let bytes = match std::fs::read(&resolved) {
+        Ok(b) => b,
+        Err(_) => return bad_request("path_unreadable"),
+    };
+    // Title + MIME key off the real filename (extension), exactly like the
+    // multipart path — OOXML / email types are distinguished by extension.
+    let file_name = resolved
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+    let mime = crate::kb::canonicalize::detect_mime(&bytes, Some(&file_name));
+    ingest_and_respond(&svc, &cid, file_name.trim(), &bytes, Some(&mime))
+}
+
+/// Resolve and authorize a local path for `from-path` ingest. Returns the
+/// canonical path on success or a stable error code. Rules: must be absolute,
+/// must canonicalize (resolves `..` and symlinks → defeats symlink escape and
+/// confirms existence), must be a regular file, and must live under an allowed
+/// root (the user's home dir or the system temp dir).
+fn validate_local_path(raw: &str) -> Result<std::path::PathBuf, &'static str> {
+    let p = std::path::Path::new(raw);
+    if !p.is_absolute() {
+        return Err("path_not_absolute");
+    }
+    // Canonicalize collapses `..` and resolves symlinks, so a symlink under
+    // home pointing at /etc/passwd resolves to /etc/passwd and fails the
+    // allowlist below. Also errors if the file doesn't exist.
+    let canon = std::fs::canonicalize(p).map_err(|_| "path_unreadable")?;
+    if !canon.is_file() {
+        return Err("path_not_a_file");
+    }
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(home) = dirs_next::home_dir() {
+        if let Ok(h) = std::fs::canonicalize(&home) {
+            roots.push(h);
+        }
+    }
+    if let Ok(tmp) = std::fs::canonicalize(std::env::temp_dir()) {
+        roots.push(tmp);
+    }
+    if roots.iter().any(|r| canon.starts_with(r)) {
+        Ok(canon)
+    } else {
+        Err("path_not_allowed")
     }
 }
 
@@ -778,6 +877,40 @@ mod http_tests {
         assert_eq!(validate_public_http_url("not a url").unwrap_err(), "invalid_url");
         // A public IP literal passes (no DNS needed).
         assert!(validate_public_http_url("https://8.8.8.8/").is_ok());
+    }
+
+    #[test]
+    fn from_path_validation() {
+        use std::io::Write;
+
+        // Relative path rejected.
+        assert_eq!(validate_local_path("relative/x.txt").unwrap_err(), "path_not_absolute");
+        // Nonexistent absolute path rejected.
+        assert_eq!(
+            validate_local_path("/nonexistent/definitely/not/here.txt").unwrap_err(),
+            "path_unreadable"
+        );
+        // A real file under the temp dir (an allowed root) is accepted.
+        let dir = std::env::temp_dir();
+        let f = dir.join(format!("rsclaw_frompath_test_{}.txt", std::process::id()));
+        std::fs::File::create(&f).unwrap().write_all(b"hi").unwrap();
+        assert!(validate_local_path(f.to_str().unwrap()).is_ok());
+        // A directory is not a file.
+        assert_eq!(
+            validate_local_path(dir.to_str().unwrap()).unwrap_err(),
+            "path_not_a_file"
+        );
+        std::fs::remove_file(&f).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn from_path_rejects_outside_allowed_roots() {
+        // /etc/hosts exists, is absolute and a regular file, but lives outside
+        // home/temp — the allowlist must reject it (arbitrary-read defense).
+        if std::path::Path::new("/etc/hosts").is_file() {
+            assert_eq!(validate_local_path("/etc/hosts").unwrap_err(), "path_not_allowed");
+        }
     }
 
     #[test]

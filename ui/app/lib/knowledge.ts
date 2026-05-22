@@ -280,6 +280,44 @@ export async function uploadDocFromUrl(
   return ok<KbUrlIngestAccepted>(res);
 }
 
+/**
+ * True when the gateway runs on this same machine (desktop app talking to a
+ * loopback gateway). Only then is the `from-path` optimization valid — the
+ * gateway must be able to std::fs::read the path the client hands it. A remote
+ * UI (web, or pointed at a LAN gateway) must keep uploading bytes.
+ */
+export function isSameMachineGateway(): boolean {
+  const isTauri =
+    typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+  if (!isTauri) return false;
+  try {
+    const host = new URL(getGatewayUrl()).hostname.toLowerCase();
+    return host === "127.0.0.1" || host === "localhost" || host === "::1";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Same-machine fast path: hand the gateway an absolute local path and let it
+ * read the file itself, skipping the read-into-JS → multipart → write-to-disk
+ * byte round-trip. Backend is loopback-gated and path-allowlisted; callers
+ * MUST first confirm isSameMachineGateway(). Same 202 envelope as the others.
+ */
+export async function uploadDocFromPath(
+  collectionId: string,
+  path: string,
+): Promise<KbUploadAccepted> {
+  const res = await gatewayFetch(
+    `/api/v1/knowledge/collections/${encodeURIComponent(collectionId)}/docs/from-path`,
+    {
+      method: "POST",
+      body: JSON.stringify({ path }),
+    },
+  );
+  return ok<KbUploadAccepted>(res);
+}
+
 export async function deleteDoc(
   collectionId: string,
   docId: string,

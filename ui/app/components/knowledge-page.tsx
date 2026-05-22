@@ -40,8 +40,10 @@ import {
   search,
   subscribeDocStatus,
   uploadDocFile,
+  uploadDocFromPath,
   uploadDocFromUrl,
   uploadDocJson,
+  isSameMachineGateway,
 } from "../lib/knowledge";
 import { toast } from "../lib/toast";
 import { getLang } from "../locales";
@@ -343,6 +345,29 @@ export function KnowledgePage() {
     [activeCollectionId, maxDocBytes, zh, refreshDocs, refreshStats],
   );
 
+  // Same-machine path upload: gateway reads each absolute path off disk. Size
+  // is enforced backend-side (it bypasses the multipart body limit). Used only
+  // when isSameMachineGateway() — see the drag-drop handler below.
+  const doUploadPaths = useCallback(
+    async (paths: string[]) => {
+      if (!activeCollectionId) {
+        toast.error(zh ? "请先选择一个知识库" : "Select a collection first");
+        return;
+      }
+      for (const p of paths) {
+        const name = p.split("/").pop() || p;
+        try {
+          await uploadDocFromPath(activeCollectionId, p);
+        } catch (e: any) {
+          toast.fromError(`${zh ? "上传失败" : "Upload failed"}: ${name}`, e);
+        }
+      }
+      await refreshDocs(activeCollectionId);
+      await refreshStats();
+    },
+    [activeCollectionId, zh, refreshDocs, refreshStats],
+  );
+
   useEffect(() => {
     if (!isTauri || bootState !== "ready") return;
     let cancelled = false;
@@ -365,7 +390,15 @@ export function KnowledgePage() {
             setDropActive(false);
             const paths: string[] = ev.payload.paths || [];
             if (paths.length === 0 || !activeCollectionId) return;
-            // Read each file via Tauri fs plugin and forward as Blob.
+            // Same-machine fast path: hand the gateway the absolute path and
+            // let it read the file off disk — skip reading bytes into JS,
+            // wrapping multipart, and shipping them to a server on this very
+            // box. The win is largest exactly here (drag-drop of big PDFs).
+            if (isSameMachineGateway()) {
+              await doUploadPaths(paths);
+              return;
+            }
+            // Remote/web fallback: read each file via Tauri fs and forward bytes.
             const fs = await import("@tauri-apps/plugin-fs");
             const loaded: { name: string; bytes: ArrayBuffer; type?: string }[] = [];
             for (const p of paths) {
@@ -393,7 +426,7 @@ export function KnowledgePage() {
       cancelled = true;
       off.forEach((f) => f());
     };
-  }, [bootState, activeCollectionId, doUploadFiles]);
+  }, [bootState, activeCollectionId, doUploadFiles, doUploadPaths]);
 
   // ── Search ───────────────────────────────────────────────────────
   const runSearch = useCallback(async () => {

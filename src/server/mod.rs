@@ -1289,7 +1289,7 @@ async fn config_reload(State(_state): State<AppState>) -> impl IntoResponse {
 /// would incorrectly authorize remote shutdowns. In that deployment, bind the
 /// gateway to 127.0.0.1 so only the proxy can reach it, OR put `/shutdown` and
 /// `/restart` behind an explicit proxy ACL.
-fn is_loopback(addr: std::net::SocketAddr) -> bool {
+pub(crate) fn is_loopback(addr: std::net::SocketAddr) -> bool {
     match addr.ip() {
         std::net::IpAddr::V4(v4) => v4.is_loopback(),
         std::net::IpAddr::V6(v6) => v6.is_loopback(),
