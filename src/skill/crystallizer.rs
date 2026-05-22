@@ -333,7 +333,11 @@ pub async fn distill_with_llm(
         max_tokens: Some(4096),
         temperature: Some(0.3),
         frequency_penalty: None,
-        thinking_budget: None,
+        // Disable thinking: distill callers (memory extraction, lessons,
+        // crystallization) want clean structured output, not <think> blocks.
+        // Some(0) → enable_thinking=false on the wire (see stream_oneshot /
+        // TurnOptions). The reasoning model otherwise wraps JSON in <think>…</think>.
+        thinking_budget: Some(0),
         endpoint: Default::default(),
         kv_cache_mode: 0,
         session_key: None,

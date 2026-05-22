@@ -460,11 +460,35 @@ fn collect_value(v: &serde_json::Value, out: &mut Vec<Item>) {
     }
 }
 
+/// Clean a model completion down to its JSON payload. The agent model
+/// (rsclaw-agent-v1) is a reasoning model: it emits `<think>…</think>` blocks
+/// and often wraps the JSON array in prose. So we (1) strip every think block,
+/// (2) strip code fences, (3) slice from the first `[`/`{` to the last `]`/`}`.
+/// Brackets are ASCII, so the byte-index slice is always on a char boundary —
+/// safe even when the JSON contains CJK.
 fn strip_fences(s: &str) -> String {
-    let t = s.trim();
+    let mut t = s.trim().to_owned();
+    // Remove matched <think>...</think> reasoning blocks (can be several).
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+    while let Some(open) = t.find(OPEN) {
+        match t[open..].find(CLOSE) {
+            Some(rel) => {
+                let close_end = open + rel + CLOSE.len();
+                t.replace_range(open..close_end, "");
+            }
+            None => break, // unmatched (truncated stream) — leave for bracket slice
+        }
+    }
+    let t = t.trim();
     let t = t.strip_prefix("```json").or_else(|| t.strip_prefix("```")).unwrap_or(t);
-    let t = t.strip_suffix("```").unwrap_or(t);
-    t.trim().to_owned()
+    let t = t.strip_suffix("```").unwrap_or(t).trim();
+    // Slice out the outermost JSON value, dropping leading/trailing prose
+    // (and any unmatched-`<think>` remnant before the first bracket).
+    match (t.find(['[', '{']), t.rfind([']', '}'])) {
+        (Some(a), Some(b)) if b >= a => t[a..=b].to_owned(),
+        _ => t.to_owned(),
+    }
 }
 
 #[cfg(test)]

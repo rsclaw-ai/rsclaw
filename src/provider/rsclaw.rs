@@ -1392,6 +1392,14 @@ impl RsclawProvider {
         if let Some(t) = req.temperature {
             options.insert("temperature".to_owned(), super::json_f32(t));
         }
+        // Forward thinking control (mirrors TurnOptions for /sessions). Without
+        // this, /oneshot + /fastshot always run with the reasoning model's
+        // thinking ON, wrapping every answer in <think>…</think>. Structured
+        // one-shot callers (distill: extraction, lessons, crystallization) pass
+        // thinking_budget=Some(0) to get clean JSON directly.
+        if let Some(budget) = req.thinking_budget {
+            options.insert("enable_thinking".to_owned(), Value::Bool(budget > 0));
+        }
         if !options.is_empty() {
             body.insert("options".to_owned(), Value::Object(options));
         }
@@ -2363,6 +2371,7 @@ async fn parse_oneshot_sse_chunk(
         };
         let ty = val.get("type").and_then(Value::as_str).unwrap_or("");
         match ty {
+            // Legacy fastshot frame: {"type":"delta","content":"..."}.
             "delta" => {
                 if let Some(content) = val.get("content").and_then(Value::as_str) {
                     if !content.is_empty() {
@@ -2370,6 +2379,29 @@ async fn parse_oneshot_sse_chunk(
                     }
                 }
             }
+            // Current Anthropic-block-style frame the worker actually emits:
+            //   {"type":"block_delta","index":0,"delta":"..."}
+            // Text lives in `delta` (not `content`) and the type is
+            // `block_delta` (not `delta`). Without this arm the entire stream
+            // parses to zero TextDelta — `done` still fires, so callers get a
+            // clean-but-EMPTY completion. That silent "empty output from LLM"
+            // broke /oneshot AND /fastshot, taking down L1/lesson extraction
+            // and crystallization. Prefer `delta`, fall back to
+            // `content`/`text` for forward/backward compatibility.
+            "block_delta" => {
+                let piece = val
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .or_else(|| val.get("content").and_then(Value::as_str))
+                    .or_else(|| val.get("text").and_then(Value::as_str));
+                if let Some(t) = piece {
+                    if !t.is_empty() {
+                        events.push(Ok(StreamEvent::TextDelta(t.to_owned())));
+                    }
+                }
+            }
+            // Block-framing markers carry no text — ignore quietly.
+            "start" | "block_start" | "block_stop" | "ping" => {}
             "done" => {
                 let usage = val
                     .get("usage")
