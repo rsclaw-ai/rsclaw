@@ -9,6 +9,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Virtuoso } from "react-virtuoso";
 
 import {
   getMemoryStats,
@@ -18,6 +19,12 @@ import {
   type MemoryStatsResponse,
 } from "../lib/rsclaw-api";
 import { getLang } from "../locales";
+
+// Fetch ceiling. Backend hard-caps at 1000 and exposes no cursor/offset,
+// so this is "top N active docs". 500 + virtualized rendering scrolls
+// smoothly; if memory routinely blows past 1000 we'd add keyset
+// pagination on the backend and switch to infinite scroll.
+const MEMORY_FETCH_LIMIT = 500;
 
 type TierFilter = "all" | "core" | "working" | "peripheral";
 
@@ -77,7 +84,7 @@ export function MemoryPage() {
       q: debouncedQuery.trim() || undefined,
       kind: kindFilter || undefined,
       scope: scopeFilter || undefined,
-      limit: 200,
+      limit: MEMORY_FETCH_LIMIT,
     };
     try {
       const [docResp, statsResp] = await Promise.all([
@@ -110,14 +117,15 @@ export function MemoryPage() {
     return out;
   }, [docs, tierFilter, pinnedOnly]);
 
+  // `?? {}` guards a malformed stats payload — e.g. a 401/500 error body
+  // that got parsed as JSON and assigned to `stats` (by_kind/by_scope
+  // undefined). Object.keys(undefined) would otherwise crash the page.
   const kindOptions = useMemo(() => {
-    if (!stats) return [];
-    return Object.keys(stats.by_kind).sort();
+    return Object.keys(stats?.by_kind ?? {}).sort();
   }, [stats]);
 
   const scopeOptions = useMemo(() => {
-    if (!stats) return [];
-    return Object.keys(stats.by_scope).sort();
+    return Object.keys(stats?.by_scope ?? {}).sort();
   }, [stats]);
 
   return (
@@ -154,7 +162,7 @@ export function MemoryPage() {
           />
           <StatPill
             label={zh ? "核心" : "Core"}
-            value={stats.by_tier.core || 0}
+            value={stats.by_tier?.core || 0}
             accent={TIER_COLOR.core}
             tooltip={zh ? "核心层：高频访问 / 高重要度，衰减最慢。系统自动按 importance + access_count + 时间评分" : "Core tier: high-frequency / high-importance, slowest decay. Auto-classified by importance × access_count × age."}
             onClick={() => setTierFilter(tierFilter === "core" ? "all" : "core")}
@@ -162,7 +170,7 @@ export function MemoryPage() {
           />
           <StatPill
             label={zh ? "工作" : "Working"}
-            value={stats.by_tier.working || 0}
+            value={stats.by_tier?.working || 0}
             accent={TIER_COLOR.working}
             tooltip={zh ? "工作层：近期活跃但尚未沉淀的记忆，标准衰减速度" : "Working tier: recently active but not yet consolidated. Standard decay rate."}
             onClick={() => setTierFilter(tierFilter === "working" ? "all" : "working")}
@@ -170,7 +178,7 @@ export function MemoryPage() {
           />
           <StatPill
             label={zh ? "外围" : "Peripheral"}
-            value={stats.by_tier.peripheral || 0}
+            value={stats.by_tier?.peripheral || 0}
             accent={TIER_COLOR.peripheral}
             tooltip={zh ? "外围层：低频 / 低重要度，衰减最快，可能被清理" : "Peripheral tier: low-frequency / low-importance, fastest decay, candidate for cleanup."}
             onClick={() => setTierFilter(tierFilter === "peripheral" ? "all" : "peripheral")}
@@ -227,7 +235,8 @@ export function MemoryPage() {
         </div>
         <span style={countLabelStyle}>
           {zh ? "显示" : "Showing"} {visibleDocs.length}
-          {tierFilter !== "all" ? ` / ${docs.length}` : ""} {zh ? "条，共" : "of"} {total}
+          {tierFilter !== "all" || pinnedOnly ? ` / ${docs.length}` : ""} {zh ? "条，共" : "of"} {total}
+          {total > docs.length ? (zh ? `（已加载前 ${docs.length}）` : ` (loaded ${docs.length})`) : ""}
         </span>
       </div>
 
@@ -238,9 +247,10 @@ export function MemoryPage() {
         </div>
       )}
 
-      {/* Doc list */}
-      <div style={listStyle}>
-        {visibleDocs.length === 0 && !loading && !error && (
+      {/* Doc list — virtualized so only the visible window of cards
+          renders. Empty/loading states render in place of the list. */}
+      {visibleDocs.length === 0 ? (
+        (!loading && !error && (
           <div style={emptyStyle}>
             {debouncedQuery
               ? (zh ? "没有匹配的记忆" : "No matching memories")
@@ -248,11 +258,19 @@ export function MemoryPage() {
                   ? "暂时还没有记忆 — agent 在会话中产生记忆后会出现在这里"
                   : "No memories yet — agent-collected memories will appear here as you chat")}
           </div>
-        )}
-        {visibleDocs.map((d) => (
-          <MemoryCard key={d.id} doc={d} zh={zh} />
-        ))}
-      </div>
+        )) || null
+      ) : (
+        <Virtuoso
+          style={{ flex: 1, minHeight: 0 }}
+          data={visibleDocs}
+          computeItemKey={(_, d) => d.id}
+          itemContent={(_, d) => (
+            <div style={{ paddingBottom: 8 }}>
+              <MemoryCard doc={d} zh={zh} />
+            </div>
+          )}
+        />
+      )}
     </div>
   );
 }
@@ -355,7 +373,9 @@ function StatPill({
 const pageStyle: React.CSSProperties = {
   padding: "20px 24px",
   height: "100%",
-  overflowY: "auto",
+  // Page itself no longer scrolls — the virtualized doc list owns the
+  // scroll so only on-screen cards render (smooth at 500-1000 docs).
+  overflow: "hidden",
   display: "flex",
   flexDirection: "column",
   gap: 12,

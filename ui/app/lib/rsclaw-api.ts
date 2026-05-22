@@ -244,15 +244,23 @@ export async function listMemoryDocs(
   if (filters?.kind) params.set("kind", filters.kind);
   if (filters?.limit) params.set("limit", String(filters.limit));
   const qs = params.toString();
-  return gatewayFetch(`/api/v1/memory/docs${qs ? "?" + qs : ""}`, {
+  const r = await gatewayFetch(`/api/v1/memory/docs${qs ? "?" + qs : ""}`, {
     signal: AbortSignal.timeout(15000),
-  }).then((r) => r.json());
+  });
+  // Reject non-2xx so an error envelope (401/500 body) never gets parsed
+  // as a MemoryListResponse — the caller's catch handles it.
+  if (!r.ok) throw new Error(`memory/docs ${r.status}`);
+  return r.json();
 }
 
 export async function getMemoryStats(): Promise<MemoryStatsResponse> {
-  return gatewayFetch("/api/v1/memory/stats", {
+  const r = await gatewayFetch("/api/v1/memory/stats", {
     signal: AbortSignal.timeout(8000),
-  }).then((r) => r.json());
+  });
+  // Same guard — without it a 401 body like {"error":"..."} would be
+  // assigned to `stats` and Object.keys(stats.by_kind) crashes the page.
+  if (!r.ok) throw new Error(`memory/stats ${r.status}`);
+  return r.json();
 }
 
 // ---------------------------------------------------------------------------
