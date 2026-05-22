@@ -106,6 +106,31 @@ function isDocStuck(d: KbDoc, now = Date.now()): boolean {
   return Number.isFinite(created) && now - created > STUCK_INDEXING_MS;
 }
 
+// Canonical accepted upload formats — mirrors the backend's file
+// processors (text / md / html / pdf / ooxml / email). Extensions +
+// MIMEs both listed so stricter pickers filter correctly. NOTE: no
+// .json — there's no json doc processor; JSON is only a paste-text
+// body mime, not a file format. URL ingest is a separate entry point.
+const KB_ACCEPT = [
+  // text
+  ".txt", ".log", "text/plain", "text/x-log",
+  // csv (handled as text)
+  ".csv", "text/csv",
+  // markdown
+  ".md", ".markdown", "text/markdown", "text/x-markdown",
+  // html
+  ".html", ".htm", "text/html", "application/xhtml+xml",
+  // pdf
+  ".pdf", "application/pdf",
+  // ooxml
+  ".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  // email
+  ".eml", "message/rfc822",
+  ".mbox", "application/mbox",
+].join(",");
+
 // Virtuoso `List` slot — restores the 8px 10px gutter the old plain
 // scroll container had (Virtuoso renders items into this element).
 const docListComponent = forwardRef<
@@ -834,12 +859,7 @@ export function KnowledgePage() {
                   ref={fileInputRef}
                   type="file"
                   multiple
-                  // Mirror the backend's accepted set (multipart in
-                  // /api/v1/knowledge/.../docs): pdf/docx/xlsx/pptx
-                  // binaries + plain/markdown/csv/html/json + email
-                  // archives (.eml / .mbox). MIME types listed alongside
-                  // extensions for stricter browsers.
-                  accept=".md,.markdown,.txt,.csv,.html,.htm,.json,.pdf,.docx,.xlsx,.pptx,.eml,.mbox,text/markdown,text/plain,text/csv,text/html,application/json,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.openxmlformats-officedocument.presentationml.presentation,message/rfc822,application/mbox"
+                  accept={KB_ACCEPT}
                   // Don't use display:none — WKWebView occasionally
                   // refuses to dispatch click() on a fully-removed input.
                   // Render off-screen + pointer-events:none so it
