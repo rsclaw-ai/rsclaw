@@ -22,8 +22,8 @@ const DEFAULT_MAX_TOKENS: u32 = 65536;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OpenAiMode {
-    Chat,       // /chat/completions (default)
-    Responses,  // /responses (newer format)
+    Chat,      // /chat/completions (default)
+    Responses, // /responses (newer format)
 }
 
 // TODO(M-17): consolidate 7 constructors into a builder pattern
@@ -446,27 +446,36 @@ impl OpenAiProvider {
                                 let done = v["done"].as_bool().unwrap_or(false);
                                 if done {
                                     // Close thinking block if still open
-                                    if in_thinking.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                                        return Some(Ok(StreamEvent::TextDelta("</think>".to_owned())));
+                                    if in_thinking.swap(false, std::sync::atomic::Ordering::Relaxed)
+                                    {
+                                        return Some(Ok(StreamEvent::TextDelta(
+                                            "</think>".to_owned(),
+                                        )));
                                     }
                                     return Some(Ok(StreamEvent::Done { usage: None }));
                                 }
 
                                 // Emit thinking content with boundary tags
                                 if !thinking.is_empty() {
-                                    let was_thinking = in_thinking.swap(true, std::sync::atomic::Ordering::Relaxed);
+                                    let was_thinking = in_thinking
+                                        .swap(true, std::sync::atomic::Ordering::Relaxed);
                                     if !was_thinking {
                                         // First thinking chunk: prepend <think>
-                                        return Some(Ok(StreamEvent::TextDelta(format!("<think>{thinking}"))));
+                                        return Some(Ok(StreamEvent::TextDelta(format!(
+                                            "<think>{thinking}"
+                                        ))));
                                     }
                                     return Some(Ok(StreamEvent::TextDelta(thinking.to_owned())));
                                 }
 
                                 if !content.is_empty() {
-                                    let was_thinking = in_thinking.swap(false, std::sync::atomic::Ordering::Relaxed);
+                                    let was_thinking = in_thinking
+                                        .swap(false, std::sync::atomic::Ordering::Relaxed);
                                     if was_thinking {
                                         // Transition from thinking to content: close tag
-                                        return Some(Ok(StreamEvent::TextDelta(format!("</think>{content}"))));
+                                        return Some(Ok(StreamEvent::TextDelta(format!(
+                                            "</think>{content}"
+                                        ))));
                                     }
                                     Some(Ok(StreamEvent::TextDelta(content.to_owned())))
                                 } else {
@@ -570,7 +579,10 @@ impl OpenAiProvider {
             }
         }
 
-        tracing::info!(count = data_uris.len(), "upload_images: found data URIs to upload");
+        tracing::info!(
+            count = data_uris.len(),
+            "upload_images: found data URIs to upload"
+        );
         // Upload each unique data URI
         for uri in data_uris {
             match self.upload_image_to_files(&uri).await {
@@ -634,8 +646,10 @@ impl OpenAiProvider {
 
         // Non-streaming JSON fallback
         if !content_type.contains("text/event-stream") && content_type.contains("json") {
-            let body: Value =
-                resp.json().await.context("OpenAI Responses: parse JSON response")?;
+            let body: Value = resp
+                .json()
+                .await
+                .context("OpenAI Responses: parse JSON response")?;
             tracing::debug!(
                 body = %body.to_string().chars().take(300).collect::<String>(),
                 "openai-responses: non-streaming JSON response"
@@ -700,7 +714,11 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
 
     // Strip provider prefix (e.g. "doubao/doubao-seed-2.0-lite" →
     // "doubao-seed-2.0-lite") — downstream APIs expect the bare model id.
-    let bare_model = req.model.rsplit_once('/').map(|(_, m)| m).unwrap_or(&req.model);
+    let bare_model = req
+        .model
+        .rsplit_once('/')
+        .map(|(_, m)| m)
+        .unwrap_or(&req.model);
 
     let mut body = json!({
         "model":      bare_model,
@@ -713,8 +731,9 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
         }
     }
 
-    // Thinking/reasoning mode: configurable via agents.defaults.thinking or per-agent thinking.
-    // Default: disabled. When enabled with budget > 0, model uses reasoning_content field.
+    // Thinking/reasoning mode: configurable via agents.defaults.thinking or
+    // per-agent thinking. Default: disabled. When enabled with budget > 0,
+    // model uses reasoning_content field.
     let model_lower = req.model.to_lowercase();
     let is_minimax = model_lower.contains("minimax");
 
@@ -809,10 +828,7 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
         // alongside "moonshot-v1-8k" and "qwen-coder-plus".
         let needs_explicit_tool_choice = {
             let m = req.model.to_lowercase();
-            m.contains("kimi")
-                || m.contains("moonshot")
-                || m.contains("k1.5")
-                || m.contains("k2")
+            m.contains("kimi") || m.contains("moonshot") || m.contains("k1.5") || m.contains("k2")
         };
         if needs_explicit_tool_choice {
             body["tool_choice"] = json!("auto");
@@ -844,7 +860,11 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
 fn normalize_messages_for_cache(messages: &mut [Value]) {
     for msg in messages.iter_mut() {
         // Trim content whitespace.
-        if let Some(content) = msg.get_mut("content").and_then(|v| v.as_str()).map(|s| s.trim().to_owned()) {
+        if let Some(content) = msg
+            .get_mut("content")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_owned())
+        {
             msg["content"] = json!(content);
         }
         // Normalize tool_call arguments to sorted-key compact JSON.
@@ -854,7 +874,10 @@ fn normalize_messages_for_cache(messages: &mut [Value]) {
                     if let Ok(parsed) = serde_json::from_str::<Value>(args_str) {
                         // serde_json with preserve_order still sorts within to_string;
                         // force canonical form by round-tripping through BTreeMap.
-                        if let Ok(canonical) = serde_json::from_str::<std::collections::BTreeMap<String, Value>>(&parsed.to_string()) {
+                        if let Ok(canonical) = serde_json::from_str::<
+                            std::collections::BTreeMap<String, Value>,
+                        >(&parsed.to_string())
+                        {
                             if let Ok(sorted) = serde_json::to_string(&canonical) {
                                 tc["function"]["arguments"] = json!(sorted);
                             }
@@ -869,9 +892,9 @@ fn normalize_messages_for_cache(messages: &mut [Value]) {
 /// Fix tool_call / tool_result pairing issues.
 ///
 /// Some providers (MiniMax error 2013) require that every `role: tool` message
-/// immediately follows an `assistant` message containing the matching `tool_calls`,
-/// and vice versa. After compaction or session manipulation, orphaned entries
-/// can appear. This function removes them.
+/// immediately follows an `assistant` message containing the matching
+/// `tool_calls`, and vice versa. After compaction or session manipulation,
+/// orphaned entries can appear. This function removes them.
 fn fix_tool_call_pairing(messages: &mut Vec<Value>) {
     // Collect all tool_call_ids from assistant messages
     let mut valid_call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -911,15 +934,21 @@ fn fix_tool_call_pairing(messages: &mut Vec<Value>) {
     for msg in messages.iter_mut() {
         if msg.get("role").and_then(|r| r.as_str()) == Some("assistant") {
             if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()).cloned() {
-                let filtered: Vec<Value> = tcs.into_iter().filter(|tc| {
-                    tc.get("id").and_then(|v| v.as_str())
-                        .map(|id| result_ids.contains(id))
-                        .unwrap_or(true)
-                }).collect();
+                let filtered: Vec<Value> = tcs
+                    .into_iter()
+                    .filter(|tc| {
+                        tc.get("id")
+                            .and_then(|v| v.as_str())
+                            .map(|id| result_ids.contains(id))
+                            .unwrap_or(true)
+                    })
+                    .collect();
                 if filtered.is_empty() {
                     // No tool_calls left — remove the field entirely
                     msg.as_object_mut().map(|m| m.remove("tool_calls"));
-                } else if filtered.len() != msg["tool_calls"].as_array().map(|a| a.len()).unwrap_or(0) {
+                } else if filtered.len()
+                    != msg["tool_calls"].as_array().map(|a| a.len()).unwrap_or(0)
+                {
                     msg["tool_calls"] = json!(filtered);
                 }
             }
@@ -927,14 +956,16 @@ fn fix_tool_call_pairing(messages: &mut Vec<Value>) {
     }
 }
 
-/// Reorder tool result messages so each immediately follows its assistant(tool_calls).
+/// Reorder tool result messages so each immediately follows its
+/// assistant(tool_calls).
 ///
 /// Parallel tool execution can scatter results throughout the message list.
 /// This rebuilds the list with correct ordering:
 ///   assistant(tool_calls=[A,B]) → tool(A) → tool(B) → next message
 fn reorder_tool_messages(messages: &mut Vec<Value>) {
     // Extract all tool results by call_id.
-    let mut tool_results: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
+    let mut tool_results: std::collections::HashMap<String, Vec<Value>> =
+        std::collections::HashMap::new();
     let mut non_tool: Vec<Value> = Vec::new();
 
     for msg in messages.drain(..) {
@@ -952,7 +983,8 @@ fn reorder_tool_messages(messages: &mut Vec<Value>) {
     for msg in non_tool {
         if msg.get("role").and_then(|r| r.as_str()) == Some("assistant") {
             if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) {
-                let call_ids: Vec<String> = tcs.iter()
+                let call_ids: Vec<String> = tcs
+                    .iter()
                     .filter_map(|tc| tc.get("id").and_then(|v| v.as_str()).map(String::from))
                     .collect();
                 messages.push(msg);
@@ -1078,9 +1110,7 @@ fn serialize_message(msg: &Message, thinking_enabled: bool) -> Value {
         // Assistant + Text content in thinking mode: still owes a
         // `reasoning_content` field per the contract above. Emit
         // empty so the next-turn request validates.
-        if thinking_enabled
-            && let MessageContent::Text(t) = &msg.content
-        {
+        if thinking_enabled && let MessageContent::Text(t) = &msg.content {
             return json!({
                 "role": "assistant",
                 "content": t,
@@ -1131,7 +1161,8 @@ fn serialize_part(part: &ContentPart) -> Value {
 
 // ---------------------------------------------------------------------------
 // SSE parser with line buffering (handles chunks that split lines)
-// TODO: SSE buffered parsing is duplicated across openai.rs, anthropic.rs, gemini.rs — extract shared utility
+// TODO: SSE buffered parsing is duplicated across openai.rs, anthropic.rs,
+// gemini.rs — extract shared utility
 // ---------------------------------------------------------------------------
 
 /// Parse SSE chunk with line buffering.
@@ -1148,7 +1179,8 @@ async fn parse_sse_chunk_with_buffer(
         Err(e) => return vec![Err(e)],
     };
 
-    // Prepend any leftover bytes from the previous chunk (incomplete UTF-8 sequence).
+    // Prepend any leftover bytes from the previous chunk (incomplete UTF-8
+    // sequence).
     let mut remainder = utf8_remainder.lock().await;
     let full_bytes = if remainder.is_empty() {
         bytes.to_vec()
@@ -1401,6 +1433,7 @@ fn parse_event(data: &str) -> Vec<StreamEvent> {
                 .and_then(|d| d.get("cached_tokens"))
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
+            ..Default::default()
         });
         events.push(StreamEvent::Done { usage });
     }
@@ -1496,13 +1529,16 @@ fn serialize_input_items(msg: &Message, file_id_map: &HashMap<String, String>) -
                     }
                 })
                 .collect();
-            if !items.is_empty() { return items; }
+            if !items.is_empty() {
+                return items;
+            }
         }
         // Skip tool messages without valid call_id — legacy history
         return vec![];
     }
 
-    // Assistant messages → text as message item + tool calls as separate top-level items
+    // Assistant messages → text as message item + tool calls as separate top-level
+    // items
     if msg.role == Role::Assistant {
         let mut result: Vec<Value> = Vec::new();
         let mut text_parts = Vec::new();
@@ -1534,17 +1570,21 @@ fn serialize_input_items(msg: &Message, file_id_map: &HashMap<String, String>) -
         let text = text_parts.join("");
         // Only emit assistant message if there's actual text or valid tool calls
         if !text.is_empty() {
-            result.insert(0, json!({
-                "type": "message",
-                "role": "assistant",
-                "status": "completed",
-                "content": [{ "type": "output_text", "text": text }],
-            }));
+            result.insert(
+                0,
+                json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{ "type": "output_text", "text": text }],
+                }),
+            );
         }
         if !result.is_empty() {
             return result;
         }
-        // Empty assistant message with no valid tool calls — skip (legacy history)
+        // Empty assistant message with no valid tool calls — skip (legacy
+        // history)
     }
 
     // User messages → only text/image parts (no tool parts in content)
@@ -1554,7 +1594,9 @@ fn serialize_input_items(msg: &Message, file_id_map: &HashMap<String, String>) -
             let serialized: Vec<Value> = parts
                 .iter()
                 .filter_map(|p| match p {
-                    ContentPart::Text { text } => Some(json!({ "type": "input_text", "text": text })),
+                    ContentPart::Text { text } => {
+                        Some(json!({ "type": "input_text", "text": text }))
+                    }
                     ContentPart::Image { url } => {
                         Some(serialize_media_for_responses(url, file_id_map))
                     }
@@ -1586,7 +1628,8 @@ fn serialize_media_for_responses(url: &str, file_id_map: &HashMap<String, String
             }
             return json!({ "type": "input_image", "file_id": file_id });
         }
-        // Video fallback: skip (too large for inline, runtime will handle transcription)
+        // Video fallback: skip (too large for inline, runtime will handle
+        // transcription)
         if url.starts_with("data:video/") {
             tracing::warn!("video upload failed, skipping input_video (fallback to transcription)");
             return json!({ "type": "input_text", "text": "[video attached — audio transcription fallback]" });
@@ -1626,7 +1669,8 @@ async fn parse_responses_sse_chunk_buffered(
         Err(e) => return vec![Err(e)],
     };
 
-    // Prepend any leftover bytes from the previous chunk (incomplete UTF-8 sequence).
+    // Prepend any leftover bytes from the previous chunk (incomplete UTF-8
+    // sequence).
     let mut remainder = utf8_remainder.lock().await;
     let full_bytes = if remainder.is_empty() {
         bytes.to_vec()
@@ -1687,9 +1731,7 @@ async fn parse_responses_sse_chunk_buffered(
                 events.push(Ok(StreamEvent::Done { usage: None }));
                 continue;
             }
-            if let Some(event) =
-                parse_responses_event(data, current_event_type.as_deref())
-            {
+            if let Some(event) = parse_responses_event(data, current_event_type.as_deref()) {
                 events.push(Ok(event));
             } else {
                 tracing::debug!(data, "openai-responses: unparsed SSE data");
@@ -1713,9 +1755,7 @@ fn parse_responses_event(data: &str, event_type: Option<&str>) -> Option<StreamE
     }
 
     // Use the `event:` line type if available, otherwise check `type` field in JSON
-    let evt_type = event_type
-        .or_else(|| v["type"].as_str())
-        .unwrap_or("");
+    let evt_type = event_type.or_else(|| v["type"].as_str()).unwrap_or("");
 
     match evt_type {
         // Text delta
@@ -1761,20 +1801,15 @@ fn parse_responses_event(data: &str, event_type: Option<&str>) -> Option<StreamE
                 .or_else(|| v.get("usage"))
                 .and_then(|u| u.as_object())
                 .map(|u| TokenUsage {
-                    input: u
-                        .get("input_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0),
-                    output: u
-                        .get("output_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0),
+                    input: u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
+                    output: u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
                     cache_creation: 0,
                     cache_read: u
                         .get("input_tokens_details")
                         .and_then(|d| d.get("cached_tokens"))
                         .and_then(Value::as_u64)
                         .unwrap_or(0),
+                    ..Default::default()
                 });
             Some(StreamEvent::Done { usage })
         }
@@ -1821,10 +1856,7 @@ fn parse_completions_fallback(v: &Value) -> Option<StreamEvent> {
     // Finish
     if choice["finish_reason"].is_string() {
         let usage = v["usage"].as_object().map(|u| TokenUsage {
-            input: u
-                .get("prompt_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
+            input: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
             output: u
                 .get("completion_tokens")
                 .and_then(Value::as_u64)
@@ -1835,6 +1867,7 @@ fn parse_completions_fallback(v: &Value) -> Option<StreamEvent> {
                 .and_then(|d| d.get("cached_tokens"))
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
+            ..Default::default()
         });
         return Some(StreamEvent::Done { usage });
     }
@@ -1873,6 +1906,7 @@ mod tests {
             messages: vec![Message {
                 role: Role::User,
                 content: MessageContent::Text("hello".to_owned()),
+                rsclaw_hidden: None,
             }],
             ..make_request()
         };
@@ -1904,6 +1938,7 @@ mod tests {
                 name: "web_search".into(),
                 input: serde_json::json!({"q": "rust"}),
             }]),
+            rsclaw_hidden: None,
         };
         let out = serialize_message(&msg, true);
         assert_eq!(out["role"], "assistant");
@@ -1923,6 +1958,7 @@ mod tests {
         let msg = Message {
             role: Role::Assistant,
             content: MessageContent::Text("hello".into()),
+            rsclaw_hidden: None,
         };
         let out = serialize_message(&msg, true);
         assert_eq!(out["role"], "assistant");
@@ -1946,6 +1982,7 @@ mod tests {
                     input: serde_json::json!({}),
                 },
             ]),
+            rsclaw_hidden: None,
         };
         let out = serialize_message(&msg, true);
         assert_eq!(out["reasoning_content"], "Let me think...");
@@ -1964,7 +2001,11 @@ mod tests {
         // accumulator.
         let data = r#"{"choices":[{"delta":{"reasoning_content":"Let me think","tool_calls":[{"id":"call_1","type":"function","function":{"name":"web_search","arguments":"{\"q\":\"rust\"}"}}]}}]}"#;
         let events = parse_event(data);
-        assert_eq!(events.len(), 2, "expected reasoning + tool_call; got {events:?}");
+        assert_eq!(
+            events.len(),
+            2,
+            "expected reasoning + tool_call; got {events:?}"
+        );
         match &events[0] {
             StreamEvent::ReasoningDelta(t) => assert_eq!(t, "Let me think"),
             other => panic!("expected ReasoningDelta first, got {other:?}"),
@@ -1984,7 +2025,8 @@ mod tests {
         // chunk: trailing reasoning fragment plus the start of the
         // visible answer. Both must reach the runtime so the
         // <think>...</think> boundary fires correctly.
-        let data = r#"{"choices":[{"delta":{"reasoning_content":"...so the answer is","content":"42"}}]}"#;
+        let data =
+            r#"{"choices":[{"delta":{"reasoning_content":"...so the answer is","content":"42"}}]}"#;
         let events = parse_event(data);
         assert_eq!(events.len(), 2);
         assert!(matches!(&events[0], StreamEvent::ReasoningDelta(t) if t == "...so the answer is"));
@@ -2019,7 +2061,10 @@ mod tests {
         // boundary toggles or zero-width text chunks.
         let data = r#"{"choices":[{"delta":{"reasoning_content":"","content":""}}]}"#;
         let events = parse_event(data);
-        assert!(events.is_empty(), "empty fields should produce no events, got {events:?}");
+        assert!(
+            events.is_empty(),
+            "empty fields should produce no events, got {events:?}"
+        );
     }
 
     #[test]
@@ -2036,6 +2081,7 @@ mod tests {
                 name: "x".into(),
                 input: serde_json::json!({}),
             }]),
+            rsclaw_hidden: None,
         };
         let out = serialize_message(&msg, false);
         assert!(
@@ -2064,12 +2110,16 @@ mod tests {
                 messages: vec![Message {
                     role: Role::User,
                     content: MessageContent::Text("hello".to_owned()),
+                    rsclaw_hidden: None,
                 }],
                 ..make_responses_request()
             };
             let body = build_responses_body(&req, &HashMap::new()).unwrap();
             assert!(body.get("input").is_some(), "should have 'input' field");
-            assert!(body.get("messages").is_none(), "should NOT have 'messages' field");
+            assert!(
+                body.get("messages").is_none(),
+                "should NOT have 'messages' field"
+            );
         }
 
         #[test]
@@ -2088,6 +2138,7 @@ mod tests {
                 messages: vec![Message {
                     role: Role::User,
                     content: MessageContent::Text("hello".to_owned()),
+                    rsclaw_hidden: None,
                 }],
                 ..make_responses_request()
             };
@@ -2105,6 +2156,7 @@ mod tests {
                     content: MessageContent::Parts(vec![ContentPart::Image {
                         url: "https://example.com/img.png".to_owned(),
                     }]),
+                    rsclaw_hidden: None,
                 }],
                 ..make_responses_request()
             };
@@ -2173,8 +2225,14 @@ mod tests {
             // This caused the original code to eat content between them
             let text = "</think>\nThe IP is 127.0.0.1 port 5432\n<think>extra</think>";
             let result = strip_think_tags(text);
-            assert!(result.contains("127.0.0.1"), "IP should not be eaten: {result:?}");
-            assert!(result.contains("5432"), "port should not be eaten: {result:?}");
+            assert!(
+                result.contains("127.0.0.1"),
+                "IP should not be eaten: {result:?}"
+            );
+            assert!(
+                result.contains("5432"),
+                "port should not be eaten: {result:?}"
+            );
         }
 
         #[test]
@@ -2203,8 +2261,11 @@ mod tests {
             let raw = b"event: response.output_text.delta\ndata: {\"delta\":\"hi\"}\n\nevent: response.completed\ndata: {\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n";
             let buffer = tokio::sync::Mutex::new(String::new());
             let events = parse_responses_sse_chunk_buffered(
-                Ok(bytes::Bytes::from_static(raw)), &buffer, &tokio::sync::Mutex::new(Vec::new()),
-            ).await;
+                Ok(bytes::Bytes::from_static(raw)),
+                &buffer,
+                &tokio::sync::Mutex::new(Vec::new()),
+            )
+            .await;
             assert_eq!(events.len(), 2);
             assert!(matches!(&events[0], Ok(StreamEvent::TextDelta(t)) if t == "hi"));
             assert!(matches!(&events[1], Ok(StreamEvent::Done { .. })));
@@ -2216,8 +2277,11 @@ mod tests {
             let raw = b"event: response.output_text.delta\ndata: {\"delta\":42}\n\n";
             let buffer = tokio::sync::Mutex::new(String::new());
             let events = parse_responses_sse_chunk_buffered(
-                Ok(bytes::Bytes::from_static(raw)), &buffer, &tokio::sync::Mutex::new(Vec::new()),
-            ).await;
+                Ok(bytes::Bytes::from_static(raw)),
+                &buffer,
+                &tokio::sync::Mutex::new(Vec::new()),
+            )
+            .await;
             assert_eq!(events.len(), 1);
             assert!(matches!(&events[0], Ok(StreamEvent::TextDelta(t)) if t == "42"));
         }
@@ -2233,11 +2297,19 @@ mod tests {
             r#"data: {"choices":[{"delta":{"content":"he"#,
         ));
         let events1 = parse_sse_chunk_with_buffer(chunk1, &buffer, &utf8_rem).await;
-        assert!(events1.is_empty(), "Expected no events from incomplete chunk, got {:?}", events1);
+        assert!(
+            events1.is_empty(),
+            "Expected no events from incomplete chunk, got {:?}",
+            events1
+        );
 
         {
             let buf = buffer.lock().await;
-            assert!(buf.contains("he"), "Buffer should contain 'he', got: {}", *buf);
+            assert!(
+                buf.contains("he"),
+                "Buffer should contain 'he', got: {}",
+                *buf
+            );
         }
 
         let chunk2 = Ok(bytes::Bytes::from("l\"}}]}\n"));

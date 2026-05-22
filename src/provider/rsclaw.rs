@@ -23,8 +23,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
-    AgentEndpoint, ContentPart, LlmProvider, LlmRequest, LlmStream, Message, MessageContent, Role,
-    StreamEvent, TokenUsage,
+    AgentEndpoint, ContentPart, LlmProvider, LlmRequest, LlmStream, Message, MessageContent,
+    RecallMetadata, Role, StreamEvent, TokenUsage,
 };
 
 /// Default base for the rsclaw-server fleet. The `/v1/agent` suffix
@@ -209,10 +209,13 @@ impl RedirectCache {
 
     fn store(&mut self, origin: String, target_origin: String, ttl: Duration) {
         let expires_at = std::time::Instant::now() + ttl;
-        self.entries.insert(origin, RedirectEntry {
-            target_origin,
-            expires_at,
-        });
+        self.entries.insert(
+            origin,
+            RedirectEntry {
+                target_origin,
+                expires_at,
+            },
+        );
     }
 
     fn invalidate(&mut self, origin: &str) {
@@ -322,11 +325,7 @@ impl RsclawProvider {
         // before it ever leaves the process. Same hazard applies to
         // base_url where stray whitespace flips reqwest into
         // url-parse-error territory.
-        let base_url = base_url
-            .into()
-            .trim()
-            .trim_end_matches('/')
-            .to_string();
+        let base_url = base_url.into().trim().trim_end_matches('/').to_string();
         let bearer = bearer
             .map(|b| b.trim().to_string())
             .filter(|b| !b.is_empty());
@@ -544,10 +543,14 @@ enum DispatchRoute {
 ///   1. model rsclaw-flash-*                            → /fastshot
 ///   2. model rsclaw-vision-*                           → /vision
 ///   3. model rsclaw-agent-* + session_key=None         → /oneshot
-///   4. model rsclaw-agent-* + session_key=Some         → /sessions (kvCacheMode=2 required)
-///   5. non-canonical model + endpoint=Flash            → /fastshot (server may 400)
-///   6. non-canonical model + endpoint=Vision           → /vision (server may 400)
-///   7. Primary + session_key=Some                      → /sessions (kvCacheMode=2 required)
+///   4. model rsclaw-agent-* + session_key=Some         → /sessions
+///      (kvCacheMode=2 required)
+///   5. non-canonical model + endpoint=Flash            → /fastshot (server may
+///      400)
+///   6. non-canonical model + endpoint=Vision           → /vision (server may
+///      400)
+///   7. Primary + session_key=Some                      → /sessions
+///      (kvCacheMode=2 required)
 ///   8. Primary + session_key=None                      → /oneshot
 ///
 /// Bails (before any rule fires):
@@ -660,46 +663,43 @@ impl LlmProvider for RsclawProvider {
             // what the server has hydrated. open() can't hydrate, so
             // when history exists we go straight to replay; an empty
             // history list takes the cheaper open() path.
-            let entry = match self.lookup_and_bump(
-                &session_key,
-                &split.prefix_id,
-                req.messages.len(),
-            ) {
-                Some(e) => e,
-                None => {
-                    self.forget(&session_key);
-                    let history = history_for_replay(&req.messages);
-                    let resp = if history.is_empty() {
-                        self.open(&split).await?
-                    } else {
-                        self.replay(&split, history).await?
-                    };
-                    let entry = SessionEntry {
-                        session_id: resp.session_id.clone(),
-                        // Cache key MUST be the request value, not the
-                        // upstream canonical. open()'s response echoes
-                        // the resolved prefix_id (per §2.1.6), which can
-                        // differ from the requested alias — e.g. request
-                        // `rsclaw/latest`, response `rsclaw/2026.5.15`.
-                        // `lookup_and_bump` compares the cached value
-                        // against the next call's `split.prefix_id` (also
-                        // the alias), so caching the canonical
-                        // guarantees a miss on every subsequent call:
-                        // re-hydrate every turn, defeating kvCacheMode=2
-                        // entirely. Replay's response per §2.2 omits the
-                        // field, which happened to make recovery-path
-                        // entries self-consistent — but open()-path
-                        // entries were always broken. Version drift is
-                        // detected server-side via 409 (handled by
-                        // is_session_evicted), so we don't need the
-                        // canonical here for freshness.
-                        prefix_id: split.prefix_id.clone(),
-                        last_seen_msgs_len: req.messages.len(),
-                    };
-                    self.store(&session_key, entry.clone());
-                    entry
-                }
-            };
+            let entry =
+                match self.lookup_and_bump(&session_key, &split.prefix_id, req.messages.len()) {
+                    Some(e) => e,
+                    None => {
+                        self.forget(&session_key);
+                        let history = history_for_replay(&req.messages);
+                        let resp = if history.is_empty() {
+                            self.open(&split).await?
+                        } else {
+                            self.replay(&split, history).await?
+                        };
+                        let entry = SessionEntry {
+                            session_id: resp.session_id.clone(),
+                            // Cache key MUST be the request value, not the
+                            // upstream canonical. open()'s response echoes
+                            // the resolved prefix_id (per §2.1.6), which can
+                            // differ from the requested alias — e.g. request
+                            // `rsclaw/latest`, response `rsclaw/2026.5.15`.
+                            // `lookup_and_bump` compares the cached value
+                            // against the next call's `split.prefix_id` (also
+                            // the alias), so caching the canonical
+                            // guarantees a miss on every subsequent call:
+                            // re-hydrate every turn, defeating kvCacheMode=2
+                            // entirely. Replay's response per §2.2 omits the
+                            // field, which happened to make recovery-path
+                            // entries self-consistent — but open()-path
+                            // entries were always broken. Version drift is
+                            // detected server-side via 409 (handled by
+                            // is_session_evicted), so we don't need the
+                            // canonical here for freshness.
+                            prefix_id: split.prefix_id.clone(),
+                            last_seen_msgs_len: req.messages.len(),
+                        };
+                        self.store(&session_key, entry.clone());
+                        entry
+                    }
+                };
 
             let delta = TurnDelta::from_request(&req)?;
 
@@ -1025,17 +1025,16 @@ impl RsclawProvider {
     /// POST `body` to `path` (e.g. `/sessions`) under `base_url`,
     /// transparently capturing 307/308 redirects.
     ///
-    /// - 308 responses: extract `Location` + `Cache-Control: max-age`,
-    ///   record the target origin in [`RedirectCache`] with that TTL
-    ///   (or [`DEFAULT_REDIRECT_TTL`] if absent), then follow once.
-    ///   Subsequent calls through [`resolve_url`] go DIRECT to the
-    ///   target until the TTL expires — amortising the LB cost across
-    ///   the whole cache window instead of paying it per request.
+    /// - 308 responses: extract `Location` + `Cache-Control: max-age`, record
+    ///   the target origin in [`RedirectCache`] with that TTL (or
+    ///   [`DEFAULT_REDIRECT_TTL`] if absent), then follow once. Subsequent
+    ///   calls through [`resolve_url`] go DIRECT to the target until the TTL
+    ///   expires — amortising the LB cost across the whole cache window instead
+    ///   of paying it per request.
     /// - 307 responses: follow without caching (temporary by spec).
-    /// - All other statuses: returned as-is to the caller, even
-    ///   error statuses. Callers decide how to interpret them
-    ///   (e.g. turn() recognises 404/409/503 as session-evicted and
-    ///   triggers replay).
+    /// - All other statuses: returned as-is to the caller, even error statuses.
+    ///   Callers decide how to interpret them (e.g. turn() recognises
+    ///   404/409/503 as session-evicted and triggers replay).
     ///
     /// `body_max_age_fallback` is the per-request override for the
     /// "no Cache-Control on 308" fallback TTL. Passing `None` uses
@@ -1072,14 +1071,14 @@ impl RsclawProvider {
                     // failure on the cached target is the canonical
                     // "target host is dead, LB should reroute" signal.
                     self.invalidate_redirect_for(&current_url);
-                    return Err(anyhow::Error::from(e)
-                        .context(format!("rsclaw POST {current_url}")));
+                    return Err(
+                        anyhow::Error::from(e).context(format!("rsclaw POST {current_url}"))
+                    );
                 }
             };
 
             let status = resp.status();
-            if status != StatusCode::TEMPORARY_REDIRECT
-                && status != StatusCode::PERMANENT_REDIRECT
+            if status != StatusCode::TEMPORARY_REDIRECT && status != StatusCode::PERMANENT_REDIRECT
             {
                 return Ok(resp);
             }
@@ -1122,14 +1121,10 @@ impl RsclawProvider {
                     // loop), surface it via the hop counter below
                     // rather than caching the self-loop.
                     if current_origin != next_origin {
-                        let ttl = parse_max_age(cache_control.as_deref())
-                            .unwrap_or(DEFAULT_REDIRECT_TTL);
+                        let ttl =
+                            parse_max_age(cache_control.as_deref()).unwrap_or(DEFAULT_REDIRECT_TTL);
                         if let Ok(mut cache) = self.redirect_cache.lock() {
-                            cache.store(
-                                current_origin.to_owned(),
-                                next_origin.to_owned(),
-                                ttl,
-                            );
+                            cache.store(current_origin.to_owned(), next_origin.to_owned(), ttl);
                         }
                         tracing::info!(
                             from = %current_origin,
@@ -1241,11 +1236,7 @@ impl RsclawProvider {
         // Deadline applies per redirect hop so a redirected replay
         // still gets the full budget against the ultimate target.
         let resp = self
-            .send_following_redirects(
-                "/sessions/replay",
-                &body,
-                Some(Duration::from_secs(300)),
-            )
+            .send_following_redirects("/sessions/replay", &body, Some(Duration::from_secs(300)))
             .await?;
         let status = resp.status();
         if !status.is_success() {
@@ -1264,22 +1255,22 @@ impl RsclawProvider {
     /// session's KV slot — and therefore its `session_id` — survives.
     ///
     /// Caller responsibilities:
-    /// - Provide `session_id` from the cached `SessionEntry`. Server
-    ///   returns 410 if the slot has been evicted.
-    /// - Choose `keep_head_messages` consistently across the lifetime of
-    ///   a session (typically 2 = first user/assistant pair carrying
-    ///   `[Session started: ...]`). Changing it mid-session breaks the
-    ///   head-byte-stability invariant and forces a head re-prefill on
-    ///   the server.
-    /// - Provide a self-contained `summary` (no `[Session started:]` —
-    ///   that's preserved in head — but a fresh `[CONTEXT COMPACTION
-    ///   compacted at <ISO ts>]` header is the convention so the model
-    ///   has a "recent-vs-summarized" temporal anchor; this struct does
-    ///   not enforce that format).
+    /// - Provide `session_id` from the cached `SessionEntry`. Server returns
+    ///   410 if the slot has been evicted.
+    /// - Choose `keep_head_messages` consistently across the lifetime of a
+    ///   session (typically 2 = first user/assistant pair carrying `[Session
+    ///   started: ...]`). Changing it mid-session breaks the
+    ///   head-byte-stability invariant and forces a head re-prefill on the
+    ///   server.
+    /// - Provide a self-contained `summary` (no `[Session started:]` — that's
+    ///   preserved in head — but a fresh `[CONTEXT COMPACTION compacted at <ISO
+    ///   ts>]` header is the convention so the model has a
+    ///   "recent-vs-summarized" temporal anchor; this struct does not enforce
+    ///   that format).
     /// - On any `Err`, callers MUST fall back to `/sessions/replay` —
     ///   `compact_inner` does this unconditionally (per user 2026-05-16
-    ///   decision). 409 / 410 / 422 are the documented fallback codes but
-    ///   the contract is "any non-2xx + any transport error → replay".
+    ///   decision). 409 / 410 / 422 are the documented fallback codes but the
+    ///   contract is "any non-2xx + any transport error → replay".
     ///
     /// Timeout: 180s. The server-side splice involves dropping KV pages
     /// and prefilling the summary (~2K tokens by default), which is
@@ -1450,9 +1441,7 @@ impl RsclawProvider {
             .then(move |chunk| {
                 let line_buffer = line_buffer.clone();
                 let utf8_remainder = utf8_remainder.clone();
-                async move {
-                    parse_oneshot_sse_chunk(chunk, &line_buffer, &utf8_remainder).await
-                }
+                async move { parse_oneshot_sse_chunk(chunk, &line_buffer, &utf8_remainder).await }
             })
             .flat_map(|events| futures::stream::iter(events));
         Ok(Box::pin(event_stream) as LlmStream)
@@ -1465,8 +1454,11 @@ impl RsclawProvider {
         req: &LlmRequest,
     ) -> Result<TurnOutcome> {
         let path = format!("/sessions/{}/turn", session_id);
+        let recall = req.recall.as_ref().filter(|r| !r.context.trim().is_empty());
         let body = TurnReq {
             delta,
+            recall_context: recall.map(|r| r.context.as_str()),
+            recall: recall.map(|r| &r.metadata),
             options: Some(TurnOptions::from_request(req)),
             stream: true,
         };
@@ -1499,10 +1491,7 @@ impl RsclawProvider {
         // `backend_unavailable` (pinned-node) body code go through
         // `is_session_evicted` above and return SessionNotFound so the
         // caller can drive a clean `/sessions/replay` recovery.
-        const RETRY_BACKOFFS: [Duration; 2] = [
-            Duration::from_millis(500),
-            Duration::from_secs(2),
-        ];
+        const RETRY_BACKOFFS: [Duration; 2] = [Duration::from_millis(500), Duration::from_secs(2)];
         let mut attempt: usize = 0;
         let resp = loop {
             let send_fut = self.send_following_redirects(&path, &body, None);
@@ -1550,17 +1539,18 @@ impl RsclawProvider {
         let line_buffer = Arc::new(tokio::sync::Mutex::new(String::new()));
         let utf8_remainder = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
         let block_state = Arc::new(tokio::sync::Mutex::new(SseState::default()));
-        let event_stream = byte_stream
-            .map_err(|e| anyhow::anyhow!("stream read error: {e}"))
-            .then(move |chunk| {
-                let line_buffer = line_buffer.clone();
-                let utf8_remainder = utf8_remainder.clone();
-                let block_state = block_state.clone();
-                async move {
-                    parse_sse_chunk(chunk, &line_buffer, &utf8_remainder, &block_state).await
-                }
-            })
-            .flat_map(futures::stream::iter);
+        let event_stream =
+            byte_stream
+                .map_err(|e| anyhow::anyhow!("stream read error: {e}"))
+                .then(move |chunk| {
+                    let line_buffer = line_buffer.clone();
+                    let utf8_remainder = utf8_remainder.clone();
+                    let block_state = block_state.clone();
+                    async move {
+                        parse_sse_chunk(chunk, &line_buffer, &utf8_remainder, &block_state).await
+                    }
+                })
+                .flat_map(futures::stream::iter);
 
         Ok(TurnOutcome::Stream(Box::pin(event_stream)))
     }
@@ -1708,9 +1698,9 @@ enum SpliceOutcome {
 }
 
 /// Body of a `409 msg_count_mismatch` from `/compact`:
-/// `{"error":{"code":"msg_count_mismatch","detail":"expected 20, got 21","current":21}}`.
-/// `current` is the server's authoritative post-turn slot count; the client
-/// re-aligns `expected_msgs_count` to it and retries.
+/// `{"error":{"code":"msg_count_mismatch","detail":"expected 20, got
+/// 21","current":21}}`. `current` is the server's authoritative post-turn slot
+/// count; the client re-aligns `expected_msgs_count` to it and retries.
 #[derive(Debug, Deserialize)]
 struct CompactSplice409 {
     error: CompactSplice409Error,
@@ -1761,6 +1751,10 @@ struct CreateSessionResp {
 struct TurnReq<'a> {
     #[serde(flatten)]
     delta: &'a TurnDelta,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recall_context: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recall: Option<&'a RecallMetadata>,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<TurnOptions>,
     stream: bool,
@@ -1846,7 +1840,9 @@ impl TurnDelta {
         if user_text.is_empty() {
             anyhow::bail!("rsclaw: last message has no usable content for delta")
         }
-        Ok(TurnDelta::User { user_message: user_text })
+        Ok(TurnDelta::User {
+            user_message: user_text,
+        })
     }
 }
 
@@ -1877,9 +1873,15 @@ fn ser_opt_f32<S: serde::Serializer>(
 struct TurnOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none", serialize_with = "ser_opt_f32")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "ser_opt_f32"
+    )]
     temperature: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none", serialize_with = "ser_opt_f32")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "ser_opt_f32"
+    )]
     top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     enable_thinking: Option<bool>,
@@ -1912,18 +1914,17 @@ impl TurnOptions {
 /// When the runtime populated `req.system_shared` / `req.user_system`
 /// (kvCacheMode=2 path on the main agent loop), the split lands in the
 /// "real" hybrid shape:
-/// - `dynamic_system`        ← shared system prefix (byte-stable across
-///   every RsClaw client of this version) → wire `dynamic_prefix.system`
+/// - `dynamic_system`        ← shared system prefix (byte-stable across every
+///   RsClaw client of this version) → wire `dynamic_prefix.system`
 /// - `dynamic_user_system`   ← per-machine non-hashed segment → wire
-///   `dynamic_prefix.user_system` (worker layer-2 cache key
-///   intentionally EXCLUDES this, so it can vary per session without
-///   collapsing the hit rate)
+///   `dynamic_prefix.user_system` (worker layer-2 cache key intentionally
+///   EXCLUDES this, so it can vary per session without collapsing the hit rate)
 /// - `dynamic_tools`         ← all tools, builtin-first then per-client.
-///   Encoded as a single array because rsclaw-server's post-rename
-///   contract drops top-level `user_tools` (verified by its own
+///   Encoded as a single array because rsclaw-server's post-rename contract
+///   drops top-level `user_tools` (verified by its own
 ///   `body.get("user_tools").is_none()` test). The ordering preserves a
-///   byte-stable rendered prefix across clients of the same RsClaw
-///   version regardless of their per-machine MCP/plugin tools.
+///   byte-stable rendered prefix across clients of the same RsClaw version
+///   regardless of their per-machine MCP/plugin tools.
 ///
 /// When the split fields are missing (internal sessions / non-runtime
 /// callers) we degrade gracefully: stuff `req.system` into
@@ -2018,9 +2019,12 @@ fn dump_turn_for_debug(
     // symptom would see *different* bytes from what `/sessions/.../turn`
     // received — masking exactly the kind of byte-level bug the dump
     // tool exists to diagnose. R1 review I2.
+    let recall = req.recall.as_ref().filter(|r| !r.context.trim().is_empty());
     let turn_body = to_canonical_value(
         serde_json::to_value(&TurnReq {
             delta,
+            recall_context: recall.map(|r| r.context.as_str()),
+            recall: recall.map(|r| &r.metadata),
             options: Some(opts.clone()),
             stream: true,
         })
@@ -2100,7 +2104,9 @@ fn dump_turn_for_debug(
     match serde_json::to_string_pretty(&dump) {
         Ok(s) => match std::fs::write(&path, s) {
             Ok(_) => tracing::info!(path = %path.display(), "RSCLAW_DUMP_TURN: turn dumped"),
-            Err(e) => tracing::warn!(error = %e, path = %path.display(), "RSCLAW_DUMP_TURN: write failed"),
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(), "RSCLAW_DUMP_TURN: write failed")
+            }
         },
         Err(e) => tracing::warn!(error = %e, "RSCLAW_DUMP_TURN: serialize failed"),
     }
@@ -2127,8 +2133,10 @@ fn to_canonical_value(v: serde_json::Value) -> serde_json::Value {
         serde_json::Value::Object(map) => {
             // BTreeMap forces alphabetical key order regardless of
             // the original IndexMap's insertion sequence.
-            let sorted: BTreeMap<String, serde_json::Value> =
-                map.into_iter().map(|(k, v)| (k, to_canonical_value(v))).collect();
+            let sorted: BTreeMap<String, serde_json::Value> = map
+                .into_iter()
+                .map(|(k, v)| (k, to_canonical_value(v)))
+                .collect();
             let canon: serde_json::Map<String, serde_json::Value> = sorted.into_iter().collect();
             serde_json::Value::Object(canon)
         }
@@ -2190,9 +2198,7 @@ fn split_request<'a>(req: &'a LlmRequest, prefix_id: &str) -> Result<SplitReques
             let mut builtin_t = Vec::new();
             let mut user_t = Vec::new();
             for t in &req.tools {
-                if crate::agent::prompt_builder::BUILTIN_TOOL_NAMES
-                    .contains(&t.name.as_str())
-                {
+                if crate::agent::prompt_builder::BUILTIN_TOOL_NAMES.contains(&t.name.as_str()) {
                     builtin_t.push(tool_json(t));
                 } else {
                     user_t.push(tool_json(t));
@@ -2210,11 +2216,7 @@ fn split_request<'a>(req: &'a LlmRequest, prefix_id: &str) -> Result<SplitReques
             // the full system + tools, so every distinct caller still
             // gets its own slot (same as pre-split behaviour).
             let all_tools: Vec<Value> = req.tools.iter().map(tool_json).collect();
-            (
-                req.system.as_deref().unwrap_or(""),
-                "",
-                all_tools,
-            )
+            (req.system.as_deref().unwrap_or(""), "", all_tools)
         };
 
     Ok(SplitRequest {
@@ -2384,8 +2386,22 @@ async fn parse_oneshot_sse_chunk(
                         ),
                         cache_read: extract_usage_count(
                             u,
-                            &["cache_read_input_tokens", "cached_tokens", "cache_read_tokens"],
+                            &[
+                                "cache_read_input_tokens",
+                                "cached_tokens",
+                                "cache_read_tokens",
+                            ],
                         ),
+                        recall_tokens: extract_usage_count(u, &["recall_tokens"]),
+                        recall_doc_ids: extract_usage_string_array(u, "recall_doc_ids"),
+                        recall_hash: u
+                            .get("recall_hash")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        recall_truncated: u
+                            .get("recall_truncated")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
                     });
                 events.push(Ok(StreamEvent::Done { usage }));
             }
@@ -2598,7 +2614,16 @@ fn serialize_history_message(msg: &Message) -> Value {
             json!(mapped)
         }
     };
-    json!({ "role": role, "content": content })
+    let mut out = json!({ "role": role, "content": content });
+    if let Some(hidden) = &msg.rsclaw_hidden
+        && let Some(obj) = out.as_object_mut()
+    {
+        obj.insert(
+            "rsclaw_hidden".to_owned(),
+            serde_json::to_value(hidden).unwrap_or(Value::Null),
+        );
+    }
+    out
 }
 
 fn serialize_history_part(p: &ContentPart) -> Value {
@@ -2677,7 +2702,10 @@ fn serialize_replay_history(messages: &[&Message]) -> Vec<Value> {
                          replay (no tool_use_id to pair with — runtime contract \
                          expects Parts(ToolResult{{..}}))",
                     );
-                    debug_assert!(false, "Role::Tool must carry Parts(ToolResult{{..}}); got Text");
+                    debug_assert!(
+                        false,
+                        "Role::Tool must carry Parts(ToolResult{{..}}); got Text"
+                    );
                 }
             }
             i += 1;
@@ -2690,7 +2718,8 @@ fn serialize_replay_history(messages: &[&Message]) -> Vec<Value> {
 }
 
 // ---------------------------------------------------------------------------
-// SSE parsing — rsclaw-native event shape (docs/client-server-integration.md §4.2)
+// SSE parsing — rsclaw-native event shape (docs/client-server-integration.md
+// §4.2)
 // ---------------------------------------------------------------------------
 //
 // Five top-level frame types share a flat `{type, ...}` shape across every
@@ -2698,11 +2727,12 @@ fn serialize_replay_history(messages: &[&Message]) -> Vec<Value> {
 // `/v1/agent/fastshot`, `/v1/agent/oneshot`, `/v1/agent/vision`):
 //
 //   data: {"type":"delta","content":"Hello"}
-//   data: {"type":"thinking","content":"reasoning fragment..."}    (reasoning models)
-//   data: {"type":"tool_call","id":"...","name":"...","input":{...}} (whole frame, not accumulated)
-//   data: {"type":"done","finish_reason":"...","usage":{...}}
-//   data: {"type":"error","error":{"code":"...","message":"..."}}
-//   data: [DONE]                                                   (SSE framing sentinel)
+//   data: {"type":"thinking","content":"reasoning fragment..."}    (reasoning
+// models)   data: {"type":"tool_call","id":"...","name":"...","input":{...}}
+// (whole frame, not accumulated)   data: {"type":"done","finish_reason":"...","
+// usage":{...}}   data: {"type":"error","error":{"code":"...","message":"..."}}
+//   data: [DONE]                                                   (SSE framing
+// sentinel)
 //
 // Forward-compat rule: unknown `type` values are silently ignored — the
 // server may add new types (e.g. `cache_hit_summary`) without breaking
@@ -2812,7 +2842,10 @@ async fn parse_sse_chunk(
         // for SDK compatibility. We key off the JSON `"type"` since
         // that's authoritative — `event:` lines without a body, comment
         // lines (`:keepalive`), and stray blank lines are dropped here.
-        let Some(payload) = line.strip_prefix("data:").map(|s| s.trim_start_matches(' ')) else {
+        let Some(payload) = line
+            .strip_prefix("data:")
+            .map(|s| s.trim_start_matches(' '))
+        else {
             continue;
         };
         // v1 native protocol emits a trailing `[DONE]` sentinel after
@@ -2837,7 +2870,9 @@ async fn parse_sse_chunk(
         let value: Value = match serde_json::from_str(payload) {
             Ok(v) => v,
             Err(e) => {
-                events.push(Err(anyhow::anyhow!("rsclaw SSE parse: {e}; line: {payload}")));
+                events.push(Err(anyhow::anyhow!(
+                    "rsclaw SSE parse: {e}; line: {payload}"
+                )));
                 continue;
             }
         };
@@ -2981,8 +3016,22 @@ async fn parse_sse_chunk(
                         ),
                         cache_read: extract_usage_count(
                             u,
-                            &["cache_read_input_tokens", "cached_tokens", "cache_read_tokens"],
+                            &[
+                                "cache_read_input_tokens",
+                                "cached_tokens",
+                                "cache_read_tokens",
+                            ],
                         ),
+                        recall_tokens: extract_usage_count(u, &["recall_tokens"]),
+                        recall_doc_ids: extract_usage_string_array(u, "recall_doc_ids"),
+                        recall_hash: u
+                            .get("recall_hash")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        recall_truncated: u
+                            .get("recall_truncated")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
                     });
                 events.push(Ok(StreamEvent::Done { usage }));
             }
@@ -3029,6 +3078,18 @@ fn extract_usage_count(u: &serde_json::Map<String, Value>, names: &[&str]) -> u6
     0
 }
 
+fn extract_usage_string_array(u: &serde_json::Map<String, Value>, name: &str) -> Vec<String> {
+    u.get(name)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// True when the (status, body) pair is a documented session-eviction
 /// signal that the gateway should recover from via replay:
 /// - `404 session_not_found` — slot evicted (LRU, idle TTL) or upstream
@@ -3065,8 +3126,14 @@ mod tests {
 
     #[test]
     fn origin_of_extracts_origin() {
-        assert_eq!(origin_of("https://api.rsclaw.ai/v1/agent/sessions"), Some("https://api.rsclaw.ai"));
-        assert_eq!(origin_of("http://localhost:8443/path"), Some("http://localhost:8443"));
+        assert_eq!(
+            origin_of("https://api.rsclaw.ai/v1/agent/sessions"),
+            Some("https://api.rsclaw.ai")
+        );
+        assert_eq!(
+            origin_of("http://localhost:8443/path"),
+            Some("http://localhost:8443")
+        );
         assert_eq!(origin_of("https://host"), Some("https://host"));
         assert_eq!(origin_of("not-a-url"), None);
     }
@@ -3075,7 +3142,10 @@ mod tests {
     fn rewrite_origin_preserves_path_and_query() {
         let url = "https://api.rsclaw.ai/v1/agent/sessions/rs_w7_abc/turn";
         let new = rewrite_origin(url, "https://server.rsclaw.ai:8443");
-        assert_eq!(new, "https://server.rsclaw.ai:8443/v1/agent/sessions/rs_w7_abc/turn");
+        assert_eq!(
+            new,
+            "https://server.rsclaw.ai:8443/v1/agent/sessions/rs_w7_abc/turn"
+        );
     }
 
     #[test]
@@ -3108,9 +3178,18 @@ mod tests {
 
     #[test]
     fn parse_max_age_extracts_seconds() {
-        assert_eq!(parse_max_age(Some("max-age=3600")), Some(Duration::from_secs(3600)));
-        assert_eq!(parse_max_age(Some("public, max-age=300, must-revalidate")), Some(Duration::from_secs(300)));
-        assert_eq!(parse_max_age(Some("MAX-AGE=120")), Some(Duration::from_secs(120))); // case-insensitive
+        assert_eq!(
+            parse_max_age(Some("max-age=3600")),
+            Some(Duration::from_secs(3600))
+        );
+        assert_eq!(
+            parse_max_age(Some("public, max-age=300, must-revalidate")),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(
+            parse_max_age(Some("MAX-AGE=120")),
+            Some(Duration::from_secs(120))
+        ); // case-insensitive
     }
 
     #[test]
@@ -3247,21 +3326,10 @@ mod tests {
         let (b, c) = b.split_at(2);
 
         for piece in [a, b, c] {
-            let _ = parse_sse_test(
-                Ok(bytes::Bytes::copy_from_slice(piece)),
-                &buf,
-                &rem,
-                &state,
-            )
-            .await;
+            let _ =
+                parse_sse_test(Ok(bytes::Bytes::copy_from_slice(piece)), &buf, &rem, &state).await;
         }
-        let evs = parse_sse_test(
-            Ok(bytes::Bytes::from_static(b"")),
-            &buf,
-            &rem,
-            &state,
-        )
-        .await;
+        let evs = parse_sse_test(Ok(bytes::Bytes::from_static(b"")), &buf, &rem, &state).await;
 
         let texts: Vec<_> = evs
             .into_iter()
@@ -3341,7 +3409,8 @@ mod tests {
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
         let state = new_state();
         for _ in 0..50 {
-            let _ = parse_sse_test(Ok(bytes::Bytes::from_static(b"\xff")), &buf, &rem, &state).await;
+            let _ =
+                parse_sse_test(Ok(bytes::Bytes::from_static(b"\xff")), &buf, &rem, &state).await;
         }
         let r = rem.lock().await;
         assert!(
@@ -3549,7 +3618,8 @@ data: {"type":"block_stop","index":0}
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
         let state = new_state();
-        let line = b"data: {\"type\":\"done\",\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":13}}\n";
+        let line =
+            b"data: {\"type\":\"done\",\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":13}}\n";
         let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         let u = evs
             .into_iter()
@@ -3560,6 +3630,56 @@ data: {"type":"block_stop","index":0}
             .expect("expected Done with usage");
         assert_eq!(u.input, 7);
         assert_eq!(u.output, 13);
+    }
+
+    #[tokio::test]
+    async fn parse_sse_chunk_native_done_usage_includes_recall_accounting() {
+        let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let state = new_state();
+        let line = b"data: {\"type\":\"done\",\"usage\":{\"input_tokens\":17,\"output_tokens\":5,\"recall_tokens\":3,\"recall_doc_ids\":[\"doc-1\",\"doc-2\"],\"recall_hash\":\"sha256:abc\",\"recall_truncated\":true}}\n";
+        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
+        let u = evs
+            .into_iter()
+            .find_map(|e| match e {
+                Ok(StreamEvent::Done { usage }) => usage,
+                _ => None,
+            })
+            .expect("expected Done with usage");
+        assert_eq!(u.input, 17);
+        assert_eq!(u.recall_tokens, 3);
+        assert_eq!(u.recall_doc_ids, vec!["doc-1", "doc-2"]);
+        assert_eq!(u.recall_hash.as_deref(), Some("sha256:abc"));
+        assert!(u.recall_truncated);
+    }
+
+    #[test]
+    fn serialize_history_message_preserves_rsclaw_hidden_recall() {
+        let msg = Message {
+            role: Role::User,
+            content: MessageContent::Text("我的手机号是什么?".into()),
+            rsclaw_hidden: Some(crate::provider::RsclawHidden {
+                recall_context: "- 用户手机号: 13900001234".into(),
+                recall_format: "xml".into(),
+                recall_mode: "committed".into(),
+                recall_doc_ids: vec!["mem-1".into()],
+                recall_hash: "sha256:abc".into(),
+                recall_truncated: false,
+                recall_input_tokens: Some(12),
+                recall_trace_id: Some("recall_1".into()),
+            }),
+        };
+
+        let out = serialize_history_message(&msg);
+
+        assert_eq!(out["role"], "user");
+        assert_eq!(out["content"], "我的手机号是什么?");
+        assert_eq!(
+            out["rsclaw_hidden"]["recall_context"],
+            "- 用户手机号: 13900001234"
+        );
+        assert_eq!(out["rsclaw_hidden"]["recall_doc_ids"][0], "mem-1");
+        assert_eq!(out["rsclaw_hidden"]["recall_trace_id"], "recall_1");
     }
 
     #[tokio::test]
@@ -3597,7 +3717,10 @@ data: {"type":"block_stop","index":0}
         let mut saw_done = false;
         for e in evs {
             if let Ok(StreamEvent::Done { usage }) = e {
-                assert!(usage.is_none(), "null usage must collapse to None, got {usage:?}");
+                assert!(
+                    usage.is_none(),
+                    "null usage must collapse to None, got {usage:?}"
+                );
                 saw_done = true;
             }
         }
@@ -3640,7 +3763,10 @@ data: {"type":"block_stop","index":0}
             })
             .expect("expected one Error event");
         assert!(msg.contains("slot_evicted"), "missing code: {msg}");
-        assert!(msg.contains("slot was reclaimed mid-decode"), "missing message: {msg}");
+        assert!(
+            msg.contains("slot was reclaimed mid-decode"),
+            "missing message: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -3710,7 +3836,13 @@ data: {"type":"block_start","index":0,"block":{"type":"text"}}
 data: {"type":"block_delta","index":0,"delta":"hi"}
 data: {"type":"block_stop","index":0}
 "#;
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frames)), &buf, &rem, &state).await;
+        let evs = parse_sse_test(
+            Ok(bytes::Bytes::copy_from_slice(frames)),
+            &buf,
+            &rem,
+            &state,
+        )
+        .await;
         let texts: Vec<String> = evs
             .into_iter()
             .filter_map(|e| match e {
@@ -3739,7 +3871,13 @@ data: {"type":"block_stop","index":0}
 data: {"type":"done","finish_reason":"stop","usage":{"input_tokens":1,"output_tokens":2}}
 data: [DONE]
 "#;
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frames)), &buf, &rem, &state).await;
+        let evs = parse_sse_test(
+            Ok(bytes::Bytes::copy_from_slice(frames)),
+            &buf,
+            &rem,
+            &state,
+        )
+        .await;
         let mut texts = Vec::new();
         let mut got_done = false;
         for e in evs {
@@ -3773,7 +3911,13 @@ data: {"type":"block_stop","index":0}
 data: {"type":"done"}
 data: [DONE]
 "#;
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frames)), &buf, &rem, &state).await;
+        let evs = parse_sse_test(
+            Ok(bytes::Bytes::copy_from_slice(frames)),
+            &buf,
+            &rem,
+            &state,
+        )
+        .await;
         // Exactly one ToolCall, no intermediate TextDelta events.
         let mut tool_calls = Vec::new();
         for e in &evs {
@@ -3809,7 +3953,13 @@ data: {"type":"block_delta","index":1,"delta":"ls\"}"}
 data: {"type":"block_stop","index":1}
 data: {"type":"block_stop","index":0}
 "#;
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frames)), &buf, &rem, &state).await;
+        let evs = parse_sse_test(
+            Ok(bytes::Bytes::copy_from_slice(frames)),
+            &buf,
+            &rem,
+            &state,
+        )
+        .await;
         let mut texts = Vec::new();
         let mut tool_calls = Vec::new();
         for e in evs {
@@ -3819,7 +3969,10 @@ data: {"type":"block_stop","index":0}
                 _ => {}
             }
         }
-        assert_eq!(texts, vec!["Running... ".to_string(), "please wait".to_string()]);
+        assert_eq!(
+            texts,
+            vec!["Running... ".to_string(), "please wait".to_string()]
+        );
         assert_eq!(tool_calls.len(), 1);
         let (id, name, input) = tool_calls.into_iter().next().unwrap();
         assert_eq!(id, "t1");
@@ -3839,7 +3992,13 @@ data: {"type":"block_stop","index":0}
 data: {"type":"ping"}
 data: {"type":"ping"}
 "#;
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frames)), &buf, &rem, &state).await;
+        let evs = parse_sse_test(
+            Ok(bytes::Bytes::copy_from_slice(frames)),
+            &buf,
+            &rem,
+            &state,
+        )
+        .await;
         for e in evs {
             match e {
                 Ok(ev) => panic!("start/ping must not emit events; got {ev:?}"),
@@ -3858,7 +4017,13 @@ data: {"type":"ping"}
         let frames = br#"data: {"type":"done"}
 data: [DONE]
 "#;
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frames)), &buf, &rem, &state).await;
+        let evs = parse_sse_test(
+            Ok(bytes::Bytes::copy_from_slice(frames)),
+            &buf,
+            &rem,
+            &state,
+        )
+        .await;
         let dones: Vec<_> = evs
             .iter()
             .filter_map(|e| match e {
@@ -3886,7 +4051,13 @@ data: [DONE]
         let frames = br#"data: {"type":"block_delta","index":99,"delta":"orphan"}
 data: {"type":"block_stop","index":99}
 "#;
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frames)), &buf, &rem, &state).await;
+        let evs = parse_sse_test(
+            Ok(bytes::Bytes::copy_from_slice(frames)),
+            &buf,
+            &rem,
+            &state,
+        )
+        .await;
         for e in evs {
             match e {
                 Ok(ev) => panic!("orphan delta must not emit; got {ev:?}"),
@@ -3947,7 +4118,8 @@ data: {"type":"block_stop","index":99}
         let buf = Arc::new(tokio::sync::Mutex::new(String::new()));
         let rem = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
         let state = new_state();
-        let line = b"data: {\"type\":\"done\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}\n";
+        let line =
+            b"data: {\"type\":\"done\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}\n";
         let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(line)), &buf, &rem, &state).await;
         let usage = evs
             .into_iter()
@@ -3974,7 +4146,13 @@ data: {"type":"block_stop","index":99}
 data: {"type":"block_delta","index":0,"delta":"{not valid json"}
 data: {"type":"block_stop","index":0}
 "#;
-        let evs = parse_sse_test(Ok(bytes::Bytes::copy_from_slice(frames)), &buf, &rem, &state).await;
+        let evs = parse_sse_test(
+            Ok(bytes::Bytes::copy_from_slice(frames)),
+            &buf,
+            &rem,
+            &state,
+        )
+        .await;
         let input = evs
             .into_iter()
             .find_map(|e| match e {
@@ -3993,7 +4171,10 @@ data: {"type":"block_stop","index":0}
         // failures on a slow TLS handshake; too long would let a dead
         // server hang the runtime indefinitely.
         let s = TURN_HEADERS_TIMEOUT.as_secs();
-        assert!((30..=120).contains(&s), "TURN_HEADERS_TIMEOUT={s}s out of range");
+        assert!(
+            (30..=120).contains(&s),
+            "TURN_HEADERS_TIMEOUT={s}s out of range"
+        );
     }
 
     #[test]
@@ -4025,10 +4206,7 @@ data: {"type":"block_stop","index":0}
         // containing `\n` (RFC 7230), so without trimming every signed
         // request fails before leaving the process. Same hazard for
         // base_url where leading/trailing whitespace breaks URL parse.
-        let p = RsclawProvider::new(
-            "  http://x:8090/v1/agent/  ",
-            Some("  sk-abc\n  ".into()),
-        );
+        let p = RsclawProvider::new("  http://x:8090/v1/agent/  ", Some("  sk-abc\n  ".into()));
         assert_eq!(p.base_url, "http://x:8090/v1/agent");
         let (k, v) = p.auth_header().expect("bearer survived trim");
         assert_eq!(k, "authorization");
@@ -4392,12 +4570,30 @@ data: {"type":"block_stop","index":0}
             v.get("dynamic_prefix").is_none(),
             "non-empty prefix_id must OMIT dynamic_prefix (mutually exclusive)"
         );
-        assert!(v.get("user_tools").is_none(), "post-rename body must omit top-level user_tools");
-        assert!(v.get("rsclaw_version").is_none(), "rsclaw_version is the pre-rename name; never send");
-        assert!(v.get("user_suffix").is_none(), "user_suffix is the legacy name; never send (top-level or otherwise)");
-        assert!(v.get("user_system").is_none(), "user_system lives inside dynamic_prefix, never at top-level");
-        assert!(v.get("plugins_system").is_none(), "pre-rename field; folded into dynamic_prefix.system");
-        assert!(v.get("skills_system").is_none(), "pre-rename field; folded into dynamic_prefix.system");
+        assert!(
+            v.get("user_tools").is_none(),
+            "post-rename body must omit top-level user_tools"
+        );
+        assert!(
+            v.get("rsclaw_version").is_none(),
+            "rsclaw_version is the pre-rename name; never send"
+        );
+        assert!(
+            v.get("user_suffix").is_none(),
+            "user_suffix is the legacy name; never send (top-level or otherwise)"
+        );
+        assert!(
+            v.get("user_system").is_none(),
+            "user_system lives inside dynamic_prefix, never at top-level"
+        );
+        assert!(
+            v.get("plugins_system").is_none(),
+            "pre-rename field; folded into dynamic_prefix.system"
+        );
+        assert!(
+            v.get("skills_system").is_none(),
+            "pre-rename field; folded into dynamic_prefix.system"
+        );
     }
 
     #[test]
@@ -4443,6 +4639,7 @@ data: {"type":"block_stop","index":0}
         let m = |role, txt: &str| Message {
             role,
             content: MessageContent::Text(txt.into()),
+            rsclaw_hidden: None,
         };
         let msgs = vec![
             m(Role::User, "hi"),
@@ -4462,6 +4659,7 @@ data: {"type":"block_stop","index":0}
         let one = vec![Message {
             role: Role::User,
             content: MessageContent::Text("solo".into()),
+            rsclaw_hidden: None,
         }];
         assert!(history_for_replay(&one).is_empty());
     }
@@ -4477,6 +4675,7 @@ data: {"type":"block_stop","index":0}
         let m = |role, txt: &str| Message {
             role,
             content: MessageContent::Text(txt.into()),
+            rsclaw_hidden: None,
         };
         let tool = |id: &str| Message {
             role: Role::Tool,
@@ -4485,6 +4684,7 @@ data: {"type":"block_stop","index":0}
                 content: "ok".into(),
                 is_error: None,
             }]),
+            rsclaw_hidden: None,
         };
         let msgs = vec![
             m(Role::User, "do all three"),
@@ -4509,6 +4709,7 @@ data: {"type":"block_stop","index":0}
         let m = |role, txt: &str| Message {
             role,
             content: MessageContent::Text(txt.into()),
+            rsclaw_hidden: None,
         };
         let tool = |id: &str| Message {
             role: Role::Tool,
@@ -4517,6 +4718,7 @@ data: {"type":"block_stop","index":0}
                 content: "ok".into(),
                 is_error: None,
             }]),
+            rsclaw_hidden: None,
         };
         let msgs = vec![
             m(Role::User, "go"),
@@ -4546,21 +4748,28 @@ data: {"type":"block_stop","index":0}
                 content: body.into(),
                 is_error: None,
             }]),
+            rsclaw_hidden: None,
         };
         let user = Message {
             role: Role::User,
             content: MessageContent::Text("go".into()),
+            rsclaw_hidden: None,
         };
         let asst = Message {
             role: Role::Assistant,
             content: MessageContent::Text("calling tools".into()),
+            rsclaw_hidden: None,
         };
         let ta = mk_tool("a", "ra");
         let tb = mk_tool("b", "rb");
         let tc = mk_tool("c", "rc");
         let msgs = vec![&user, &asst, &ta, &tb, &tc];
         let out = serialize_replay_history(&msgs);
-        assert_eq!(out.len(), 3, "user + assistant + 1 coalesced tool entry: {out:?}");
+        assert_eq!(
+            out.len(),
+            3,
+            "user + assistant + 1 coalesced tool entry: {out:?}"
+        );
         assert_eq!(out[0]["role"], "user");
         assert_eq!(out[1]["role"], "assistant");
         assert_eq!(out[2]["role"], "user");
@@ -4586,10 +4795,12 @@ data: {"type":"block_stop","index":0}
                 content: "ok".into(),
                 is_error: None,
             }]),
+            rsclaw_hidden: None,
         };
         let asst = Message {
             role: Role::Assistant,
             content: MessageContent::Text("step".into()),
+            rsclaw_hidden: None,
         };
         let ta = mk_tool("a");
         let tb = mk_tool("b");
@@ -4611,11 +4822,15 @@ data: {"type":"block_stop","index":0}
         // some chat templates reject.
         let bad = Message {
             role: Role::Tool,
-            content: MessageContent::Parts(vec![ContentPart::Text { text: "noise".into() }]),
+            content: MessageContent::Parts(vec![ContentPart::Text {
+                text: "noise".into(),
+            }]),
+            rsclaw_hidden: None,
         };
         let user = Message {
             role: Role::User,
             content: MessageContent::Text("hi".into()),
+            rsclaw_hidden: None,
         };
         let msgs = vec![&user, &bad];
         let out = serialize_replay_history(&msgs);
@@ -4629,6 +4844,7 @@ data: {"type":"block_stop","index":0}
             vec![Message {
                 role: Role::User,
                 content: MessageContent::Text("hello".into()),
+                rsclaw_hidden: None,
             }],
             2,
             Some("k"),
@@ -4639,11 +4855,90 @@ data: {"type":"block_stop","index":0}
     }
 
     #[test]
+    fn turn_request_serializes_recall_as_independent_top_level_fields() {
+        let mut req = req_with(
+            vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("hello".into()),
+                rsclaw_hidden: None,
+            }],
+            2,
+            Some("k"),
+        );
+        req.recall = Some(crate::provider::RecallBundle {
+            context: "用户手机号: 13900001234".into(),
+            metadata: crate::provider::RecallMetadata {
+                mode: "committed".into(),
+                format: "xml".into(),
+                source: "server".into(),
+                trace_id: Some("recall_test".into()),
+                max_tokens: Some(1200),
+                doc_ids: vec!["doc-1".into()],
+                hash: "sha256:abc".into(),
+                truncated: false,
+            },
+        });
+        let delta = TurnDelta::from_request(&req).unwrap();
+        let body = serde_json::to_value(&TurnReq {
+            delta: &delta,
+            recall_context: req.recall.as_ref().map(|r| r.context.as_str()),
+            recall: req.recall.as_ref().map(|r| &r.metadata),
+            options: Some(TurnOptions::from_request(&req)),
+            stream: true,
+        })
+        .unwrap();
+
+        assert_eq!(body["user_message"], "hello");
+        assert_eq!(body["recall_context"], "用户手机号: 13900001234");
+        assert_eq!(body["recall"]["mode"], "committed");
+        assert_eq!(body["recall"]["format"], "xml");
+        assert_eq!(body["recall"]["doc_ids"][0], "doc-1");
+        assert!(
+            !body["user_message"].as_str().unwrap().contains("<recall>"),
+            "worker owns canonical recall wrapper"
+        );
+    }
+
+    #[test]
+    fn turn_request_omits_empty_recall_fields() {
+        let mut req = req_with(
+            vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("hello".into()),
+                rsclaw_hidden: None,
+            }],
+            2,
+            Some("k"),
+        );
+        req.recall = Some(crate::provider::RecallBundle {
+            context: "  ".into(),
+            metadata: crate::provider::RecallMetadata::default(),
+        });
+        let delta = TurnDelta::from_request(&req).unwrap();
+        let recall = req
+            .recall
+            .as_ref()
+            .filter(|r| !r.context.trim().is_empty());
+        let body = serde_json::to_value(&TurnReq {
+            delta: &delta,
+            recall_context: recall.map(|r| r.context.as_str()),
+            recall: recall.map(|r| &r.metadata),
+            options: Some(TurnOptions::from_request(&req)),
+            stream: true,
+        })
+        .unwrap();
+
+        assert!(body.get("recall_context").is_none());
+        assert!(body.get("recall").is_none());
+    }
+
+    #[test]
     fn turn_delta_user_text_empty_bails() {
         let req = req_with(
             vec![Message {
                 role: Role::User,
                 content: MessageContent::Text(String::new()),
+                rsclaw_hidden: None,
             }],
             2,
             Some("k"),
@@ -4658,9 +4953,14 @@ data: {"type":"block_stop","index":0}
             vec![Message {
                 role: Role::User,
                 content: MessageContent::Parts(vec![
-                    ContentPart::Text { text: String::new() },
-                    ContentPart::Text { text: String::new() },
+                    ContentPart::Text {
+                        text: String::new(),
+                    },
+                    ContentPart::Text {
+                        text: String::new(),
+                    },
                 ]),
+                rsclaw_hidden: None,
             }],
             2,
             Some("k"),
@@ -4675,9 +4975,14 @@ data: {"type":"block_stop","index":0}
             vec![Message {
                 role: Role::User,
                 content: MessageContent::Parts(vec![
-                    ContentPart::Text { text: "hello ".into() },
-                    ContentPart::Text { text: "world".into() },
+                    ContentPart::Text {
+                        text: "hello ".into(),
+                    },
+                    ContentPart::Text {
+                        text: "world".into(),
+                    },
                 ]),
+                rsclaw_hidden: None,
             }],
             2,
             Some("k"),
@@ -4697,6 +5002,7 @@ data: {"type":"block_stop","index":0}
                     content: "ok".into(),
                     is_error: None,
                 }]),
+                rsclaw_hidden: None,
             }],
             2,
             Some("k"),
@@ -4718,15 +5024,35 @@ data: {"type":"block_stop","index":0}
             },
         );
         // Same len → cached entry returned, last_seen unchanged.
-        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.20", 12).is_some());
+        assert!(
+            provider
+                .lookup_and_bump("k", "rsclaw/2026.5.20", 12)
+                .is_some()
+        );
         // Growth → bumped, returned.
-        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.20", 14).is_some());
+        assert!(
+            provider
+                .lookup_and_bump("k", "rsclaw/2026.5.20", 14)
+                .is_some()
+        );
         // Shrink (compaction trimmed history) → None, caller re-hydrates.
-        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.20", 8).is_none());
+        assert!(
+            provider
+                .lookup_and_bump("k", "rsclaw/2026.5.20", 8)
+                .is_none()
+        );
         // Version drift → None even if len matches.
-        assert!(provider.lookup_and_bump("k", "rsclaw/2026.5.6", 14).is_none());
+        assert!(
+            provider
+                .lookup_and_bump("k", "rsclaw/2026.5.6", 14)
+                .is_none()
+        );
         // Missing key → None.
-        assert!(provider.lookup_and_bump("missing", "rsclaw/2026.5.20", 14).is_none());
+        assert!(
+            provider
+                .lookup_and_bump("missing", "rsclaw/2026.5.20", 14)
+                .is_none()
+        );
     }
 
     #[test]
@@ -4818,9 +5144,9 @@ data: {"type":"block_stop","index":0}
                 last_seen_msgs_len: 5,
             },
         );
-        let inner: LlmStream = Box::pin(futures::stream::iter(vec![
-            Ok(StreamEvent::Error("model_overloaded".into())),
-        ]));
+        let inner: LlmStream = Box::pin(futures::stream::iter(vec![Ok(StreamEvent::Error(
+            "model_overloaded".into(),
+        ))]));
         let wrapped = invalidate_on_error(inner, Arc::clone(&provider.sessions), "k".into());
         let _: Vec<_> = wrapped.collect().await;
         assert!(provider.lock_sessions().get("k").is_none());
@@ -4859,12 +5185,14 @@ data: {"type":"block_stop","index":0}
                 content: body.into(),
                 is_error: None,
             }]),
+            rsclaw_hidden: None,
         };
         let req = req_with(
             vec![
                 Message {
                     role: Role::User,
                     content: MessageContent::Text("do three things".into()),
+                    rsclaw_hidden: None,
                 },
                 tool_msg("toolu_a", "result a"),
                 tool_msg("toolu_b", "result b"),
@@ -4895,10 +5223,12 @@ data: {"type":"block_stop","index":0}
                         content: "stale".into(),
                         is_error: None,
                     }]),
+                    rsclaw_hidden: None,
                 },
                 Message {
                     role: Role::Assistant,
                     content: MessageContent::Text("ack".into()),
+                    rsclaw_hidden: None,
                 },
                 Message {
                     role: Role::Tool,
@@ -4907,6 +5237,7 @@ data: {"type":"block_stop","index":0}
                         content: "fresh".into(),
                         is_error: None,
                     }]),
+                    rsclaw_hidden: None,
                 },
             ],
             2,
@@ -4927,6 +5258,7 @@ data: {"type":"block_stop","index":0}
         let m = |role: Role, txt: &str| Message {
             role,
             content: MessageContent::Text(txt.into()),
+            rsclaw_hidden: None,
         };
         let msgs = vec![
             m(Role::System, "PLUGINS"),
@@ -4949,9 +5281,14 @@ data: {"type":"block_stop","index":0}
         let msgs = vec![Message {
             role: Role::System,
             content: MessageContent::Parts(vec![
-                ContentPart::Text { text: "hello ".into() },
-                ContentPart::Text { text: "world".into() },
+                ContentPart::Text {
+                    text: "hello ".into(),
+                },
+                ContentPart::Text {
+                    text: "world".into(),
+                },
             ]),
+            rsclaw_hidden: None,
         }];
         let (filtered, suffix) = split_system_messages(&msgs);
         assert!(filtered.is_empty());
@@ -4963,6 +5300,7 @@ data: {"type":"block_stop","index":0}
         let msgs = vec![Message {
             role: Role::User,
             content: MessageContent::Text("hi".into()),
+            rsclaw_hidden: None,
         }];
         let (filtered, suffix) = split_system_messages(&msgs);
         assert_eq!(filtered.len(), 1);
@@ -4978,14 +5316,17 @@ data: {"type":"block_stop","index":0}
             Message {
                 role: Role::User,
                 content: MessageContent::Text("hi".into()),
+                rsclaw_hidden: None,
             },
             Message {
                 role: Role::System,
                 content: MessageContent::Text(String::new()),
+                rsclaw_hidden: None,
             },
             Message {
                 role: Role::System,
                 content: MessageContent::Text("real ctx".into()),
+                rsclaw_hidden: None,
             },
         ];
         let (filtered, suffix) = split_system_messages(&msgs);
@@ -5003,9 +5344,14 @@ data: {"type":"block_stop","index":0}
         let msgs = vec![Message {
             role: Role::System,
             content: MessageContent::Parts(vec![
-                ContentPart::Text { text: String::new() },
-                ContentPart::Image { url: "https://x/i".into() },
+                ContentPart::Text {
+                    text: String::new(),
+                },
+                ContentPart::Image {
+                    url: "https://x/i".into(),
+                },
             ]),
+            rsclaw_hidden: None,
         }];
         let (_filtered, suffix) = split_system_messages(&msgs);
         assert!(
@@ -5022,6 +5368,7 @@ data: {"type":"block_stop","index":0}
         let m = |role: Role, txt: &str| Message {
             role,
             content: MessageContent::Text(txt.into()),
+            rsclaw_hidden: None,
         };
         let mut msgs = vec![
             m(Role::User, "fix the bug"),
@@ -5043,6 +5390,7 @@ data: {"type":"block_stop","index":0}
         let m = |role: Role, txt: &str| Message {
             role,
             content: MessageContent::Text(txt.into()),
+            rsclaw_hidden: None,
         };
         let mut msgs = vec![
             m(Role::User, "go"),
@@ -5063,6 +5411,7 @@ data: {"type":"block_stop","index":0}
         let m = |role: Role, txt: &str| Message {
             role,
             content: MessageContent::Text(txt.into()),
+            rsclaw_hidden: None,
         };
         let original = vec![m(Role::User, "hi"), m(Role::Assistant, "yo")];
         let mut msgs = original.clone();
@@ -5083,13 +5432,19 @@ data: {"type":"block_stop","index":0}
             Message {
                 role: Role::User,
                 content: MessageContent::Parts(vec![
-                    ContentPart::Text { text: "look at this".into() },
-                    ContentPart::Image { url: "https://x/y.png".into() },
+                    ContentPart::Text {
+                        text: "look at this".into(),
+                    },
+                    ContentPart::Image {
+                        url: "https://x/y.png".into(),
+                    },
                 ]),
+                rsclaw_hidden: None,
             },
             Message {
                 role: Role::System,
                 content: MessageContent::Text("CTX".into()),
+                rsclaw_hidden: None,
             },
         ];
         normalize_trailing_system(&mut msgs);
@@ -5118,10 +5473,12 @@ data: {"type":"block_stop","index":0}
                     content: "result".into(),
                     is_error: None,
                 }]),
+                rsclaw_hidden: None,
             },
             Message {
                 role: Role::System,
                 content: MessageContent::Text("dynamic ctx".into()),
+                rsclaw_hidden: None,
             },
         ];
         normalize_trailing_system(&mut msgs);
@@ -5136,6 +5493,7 @@ data: {"type":"block_stop","index":0}
         let m = |role: Role, txt: &str| Message {
             role,
             content: MessageContent::Text(txt.into()),
+            rsclaw_hidden: None,
         };
         let mut msgs = vec![
             m(Role::User, "hi"),
@@ -5174,11 +5532,11 @@ data: {"type":"block_stop","index":0}
             s.contains("\"temperature\":0.6"),
             "expected temperature:0.6, got {s}"
         );
-        assert!(!s.contains("0.6000000238418579"), "leaked f32→f64 noise: {s}");
         assert!(
-            s.contains("\"top_p\":0.95"),
-            "expected top_p:0.95, got {s}"
+            !s.contains("0.6000000238418579"),
+            "leaked f32→f64 noise: {s}"
         );
+        assert!(s.contains("\"top_p\":0.95"), "expected top_p:0.95, got {s}");
         // sanity — body is still well-formed JSON.
         assert!(body.is_object());
     }
@@ -5247,8 +5605,8 @@ data: {"type":"block_stop","index":0}
             "prefix_source":"dynamic_miss",
             "rsclaw_version":""
         }"#;
-        let resp: CreateSessionResp = serde_json::from_str(body)
-            .expect("mixed post-rename + legacy fields must parse");
+        let resp: CreateSessionResp =
+            serde_json::from_str(body).expect("mixed post-rename + legacy fields must parse");
         assert_eq!(resp.session_id, "rs_w7_8cebc736");
         assert_eq!(
             resp.prefix_id.as_deref(),
@@ -5571,18 +5929,20 @@ data: {"type":"block_stop","index":0}
         use crate::provider::LlmProvider;
         struct StubProvider;
         impl LlmProvider for StubProvider {
-            fn name(&self) -> &str { "stub" }
+            fn name(&self) -> &str {
+                "stub"
+            }
             fn stream(
                 &self,
                 _req: crate::provider::LlmRequest,
-            ) -> futures::future::BoxFuture<'_, anyhow::Result<crate::provider::LlmStream>> {
+            ) -> futures::future::BoxFuture<'_, anyhow::Result<crate::provider::LlmStream>>
+            {
                 Box::pin(async { anyhow::bail!("stub provider has no streaming") })
             }
         }
         let p = StubProvider;
-        let err = futures::executor::block_on(
-            p.compact_splice("k", 2, "x", 10, None)
-        ).expect_err("default impl must Err");
+        let err = futures::executor::block_on(p.compact_splice("k", 2, "x", 10, None))
+            .expect_err("default impl must Err");
         let msg = err.to_string();
         assert!(
             msg.contains("not supported") && msg.contains("stub"),
@@ -5616,22 +5976,23 @@ data: {"type":"block_stop","index":0}
         // the gateway-local computation (head + 1 + tail). Without this
         // update, the next turn's lookup_and_bump would (incorrectly)
         // see msgs.len() < last_seen and force an unnecessary replay.
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
         use crate::provider::LlmProvider;
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
         let session_id = "rs_w7_abc";
 
         Mock::given(method("POST"))
             .and(path(format!("/sessions/{}/compact", session_id)))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "session_id": session_id,
-                    "msgs_count": 13,
-                    "tokens_count": 8421,
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": session_id,
+                "msgs_count": 13,
+                "tokens_count": 8421,
+            })))
             .expect(1)
             .mount(&mock_server)
             .await;
@@ -5681,8 +6042,7 @@ data: {"type":"block_stop","index":0}
     #[test]
     fn compact_splice_409_body_parses() {
         let body = r#"{"error":{"code":"msg_count_mismatch","detail":"expected 50, got 52","current":52}}"#;
-        let parsed: CompactSplice409 =
-            serde_json::from_str(body).expect("409 body must parse");
+        let parsed: CompactSplice409 = serde_json::from_str(body).expect("409 body must parse");
         assert_eq!(parsed.error.current, 52);
     }
 
@@ -5694,9 +6054,12 @@ data: {"type":"block_stop","index":0}
         // First POST 409s (server has 52, we sent 50); the client grows the
         // tail by the delta (2) and retries, which succeeds. No replay
         // fallback, session_id preserved.
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
         use crate::provider::LlmProvider;
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
         let session_id = "rs_w7_retry";
@@ -5747,7 +6110,10 @@ data: {"type":"block_stop","index":0}
             .compact_splice("retry-key", 2, "<summary>", 10, Some(50))
             .await
             .expect("splice should succeed after one 409 retry");
-        assert_eq!(result, 15, "returns server msgs_count from the retried call");
+        assert_eq!(
+            result, 15,
+            "returns server msgs_count from the retried call"
+        );
 
         let map = provider.lock_sessions();
         let entry = map.get("retry-key").expect("entry preserved");

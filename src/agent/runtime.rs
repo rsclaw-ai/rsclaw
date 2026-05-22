@@ -10,11 +10,17 @@
 //!   6. Reply shaping (NO_REPLY filter)
 //!   7. Write JSONL transcript
 //!   8. Compaction check
-//!   9. Auto-Recall (inject relevant memories) + Auto-Capture (extract
-//!      durable entities — NOT raw user messages; see
+//!   9. Auto-Recall (inject relevant memories) + Auto-Capture (extract durable
+//!      entities — NOT raw user messages; see
 //!      docs/memory-extraction-redesign.md)
 
-use std::{sync::Arc, sync::atomic::{AtomicBool, Ordering}, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::{Result, anyhow};
 use futures::StreamExt;
@@ -48,34 +54,32 @@ pub struct LiveStatus {
     pub session_key: String,
 }
 
-use super::{
-    loop_detection::LoopDetector,
-    memory::{MemoryDoc, MemoryStore},
-    registry::{AgentHandle, AgentMessage, AgentRegistry, AgentReply},
-    tool_call_repair::repair_tool_result_pairing,
-    workspace::{
-        DEFAULT_MAX_CHARS_PER_FILE, DEFAULT_TOTAL_MAX_CHARS, SessionType,
-    },
-};
 pub use super::context_mgr::estimate_tokens;
-use super::context_mgr::{
-    apply_context_budget_trim, apply_context_pruning, build_clear_summary,
-    msg_tokens,
+use super::{
+    context_mgr::{
+        apply_context_budget_trim, apply_context_pruning, build_clear_summary, msg_tokens,
+    },
+    loop_detection::LoopDetector,
+    memory::{MemDocTier, MemoryDoc, MemoryStore},
+    prompt_builder::{
+        READONLY_COMMANDS, build_help_text_filtered, build_minimal_system_prompt,
+        build_system_prompt, format_duration, memory_age_label,
+    },
+    registry::{AgentHandle, AgentMessage, AgentRegistry, AgentReply},
+    security::check_read_safety,
+    tool_call_repair::repair_tool_result_pairing,
+    tools_builder::{build_tool_list, toolset_allowed_names},
+    workspace::{DEFAULT_MAX_CHARS_PER_FILE, DEFAULT_TOTAL_MAX_CHARS, SessionType},
 };
-use super::prompt_builder::{
-    build_help_text_filtered, build_minimal_system_prompt, build_system_prompt, format_duration,
-    memory_age_label, READONLY_COMMANDS,
-};
-use super::security::check_read_safety;
-use super::tools_builder::{build_tool_list, toolset_allowed_names};
 use crate::{
     config::runtime::RuntimeConfig,
     events::AgentEvent,
     gateway::live_config::LiveConfig,
     plugin::PluginRegistry,
     provider::{
-        AgentEndpoint, ContentPart, LlmRequest, Message, MessageContent, Role, StreamEvent,
-        ToolDef, failover::FailoverManager, registry::ProviderRegistry,
+        AgentEndpoint, ContentPart, LlmRequest, Message, MessageContent, RecallBundle,
+        RecallMetadata, Role, StreamEvent, ToolDef, failover::FailoverManager,
+        registry::ProviderRegistry,
     },
     skill::{RunOptions, SkillRegistry, run_tool},
     store::Store,
@@ -137,7 +141,6 @@ impl Drop for AbortFlagGuard {
         }
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // PendingFile — file awaiting user confirmation (two-layer)
@@ -258,13 +261,13 @@ fn parse_voice_mode_intent(text: &str) -> Option<bool> {
     let lower = trimmed.to_lowercase();
 
     const OFF_ZH: &[&str] = &[
-        "\u{7528}\u{6587}\u{5B57}",     // 用文字
+        "\u{7528}\u{6587}\u{5B57}",         // 用文字
         "\u{6539}\u{6210}\u{6587}\u{5B57}", // 改成文字
         "\u{56DE}\u{590D}\u{6587}\u{5B57}", // 回复文字
         "\u{6587}\u{5B57}\u{56DE}\u{590D}", // 文字回复
         "\u{4E0D}\u{8981}\u{8BED}\u{97F3}", // 不要语音
         "\u{4E0D}\u{7528}\u{8BED}\u{97F3}", // 不用语音
-        "\u{522B}\u{8BED}\u{97F3}",      // 别语音
+        "\u{522B}\u{8BED}\u{97F3}",         // 别语音
         "\u{505C}\u{6B62}\u{8BED}\u{97F3}", // 停止语音
         "\u{5173}\u{6389}\u{8BED}\u{97F3}", // 关掉语音
         "\u{5173}\u{95ED}\u{8BED}\u{97F3}", // 关闭语音
@@ -279,10 +282,10 @@ fn parse_voice_mode_intent(text: &str) -> Option<bool> {
         "switch to text",
     ];
     const ON_ZH: &[&str] = &[
-        "\u{7528}\u{8BED}\u{97F3}",      // 用语音
+        "\u{7528}\u{8BED}\u{97F3}",         // 用语音
         "\u{8BED}\u{97F3}\u{56DE}\u{590D}", // 语音回复
         "\u{6539}\u{6210}\u{8BED}\u{97F3}", // 改成语音
-        "\u{5207}\u{8BED}\u{97F3}",      // 切语音
+        "\u{5207}\u{8BED}\u{97F3}",         // 切语音
     ];
     const ON_EN: &[&str] = &[
         "reply in voice",
@@ -291,10 +294,10 @@ fn parse_voice_mode_intent(text: &str) -> Option<bool> {
         "switch to voice",
     ];
 
-    let says_off = OFF_ZH.iter().any(|p| trimmed.contains(p))
-        || OFF_EN.iter().any(|p| lower.contains(p));
-    let says_on = ON_ZH.iter().any(|p| trimmed.contains(p))
-        || ON_EN.iter().any(|p| lower.contains(p));
+    let says_off =
+        OFF_ZH.iter().any(|p| trimmed.contains(p)) || OFF_EN.iter().any(|p| lower.contains(p));
+    let says_on =
+        ON_ZH.iter().any(|p| trimmed.contains(p)) || ON_EN.iter().any(|p| lower.contains(p));
     match (says_off, says_on) {
         (true, false) => Some(false),
         (false, true) => Some(true),
@@ -363,8 +366,11 @@ pub struct RunContext {
     pub user_msg_with_images: Option<Message>,
     /// Count of consecutive tool parse errors in this turn.
     pub parse_error_count: usize,
-    /// Memory doc IDs recalled during this turn (auto-recall + tool_memory_search).
+    /// Memory doc IDs recalled during this turn (auto-recall +
+    /// tool_memory_search).
     pub recalled_memory_ids: std::collections::HashSet<String>,
+    /// Hidden committed recall bundle for the first user-delta LLM call.
+    pub auto_recall: Option<RecallBundle>,
     /// Whether a loop-detection warning was triggered during this turn.
     pub loop_warning_triggered: bool,
     /// Per-turn difficulty counters for workflow crystallization.
@@ -396,12 +402,8 @@ fn init_full_trace(user_text: &str) -> Option<super::trace_capture::FullTrace> {
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     );
-    let mut t = super::trace_capture::FullTrace::new(
-        trace_id,
-        String::new(),
-        String::new(),
-        json!([]),
-    );
+    let mut t =
+        super::trace_capture::FullTrace::new(trace_id, String::new(), String::new(), json!([]));
     t.push_user(user_text);
     Some(t)
 }
@@ -411,14 +413,13 @@ fn init_full_trace(user_text: &str) -> Option<super::trace_capture::FullTrace> {
 /// Two correctness requirements drove the refactor away from a direct
 /// sync write inside `maybe_emit_trace`:
 ///   1. Hot path: the previous implementation ran `std::fs::File` +
-///      `BufWriter::write_all` synchronously on the tokio worker thread
-///      that just finished an agent turn. Under disk pressure / slow
-///      network FS that thread blocked, stalling other agents sharing
-///      the runtime.
-///   2. Concurrency safety: two agent loops emitting traces for the
-///      same path interleaved bytes (POSIX `O_APPEND` is only atomic
-///      for writes ≤ PIPE_BUF). A realistic trace is tens of KB and
-///      torn lines fail to parse, silently dropping training samples.
+///      `BufWriter::write_all` synchronously on the tokio worker thread that
+///      just finished an agent turn. Under disk pressure / slow network FS that
+///      thread blocked, stalling other agents sharing the runtime.
+///   2. Concurrency safety: two agent loops emitting traces for the same path
+///      interleaved bytes (POSIX `O_APPEND` is only atomic for writes ≤
+///      PIPE_BUF). A realistic trace is tens of KB and torn lines fail to
+///      parse, silently dropping training samples.
 ///
 /// The dedicated writer task owns the file handle, receives owned
 /// FullTrace values over an unbounded mpsc, and serializes async writes
@@ -432,8 +433,7 @@ fn spawn_trace_writer(
     path: std::path::PathBuf,
 ) -> tokio::sync::mpsc::UnboundedSender<super::trace_capture::FullTrace> {
     use tokio::io::AsyncWriteExt;
-    let (tx, mut rx) =
-        tokio::sync::mpsc::unbounded_channel::<super::trace_capture::FullTrace>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<super::trace_capture::FullTrace>();
     tokio::spawn(async move {
         let file = match tokio::fs::OpenOptions::new()
             .create(true)
@@ -449,9 +449,8 @@ fn spawn_trace_writer(
         };
         let mut w = tokio::io::BufWriter::new(file);
         while let Some(trace) = rx.recv().await {
-            let entry = match serde_json::to_string(
-                &super::sft_exporter::trace_to_sharegpt(&trace),
-            ) {
+            let entry = match serde_json::to_string(&super::sft_exporter::trace_to_sharegpt(&trace))
+            {
                 Ok(s) => s,
                 Err(e) => {
                     warn!(trace_id = %trace.trace_id, "trace writer: serialize failed: {e:#}");
@@ -513,14 +512,17 @@ pub struct AgentRuntime {
     /// Broadcast channel that surfaces VlmDriver progress
     /// (`ComputerUseStatus::Started/Step/Finished`) to the WS gateway
     /// for the live status panel. `None` outside the gateway.
-    pub computer_status_tx:
-        Option<broadcast::Sender<crate::computer::status::ComputerUseStatus>>,
+    pub computer_status_tx: Option<broadcast::Sender<crate::computer::status::ComputerUseStatus>>,
     /// Shared registry of in-flight `computer_use` run abort flags.
     /// `tool_vlm_drive` inserts on driver start and removes on exit; the
     /// HTTP abort endpoint flips the bool to wake the driver loop.
     /// `None` outside the gateway.
     pub computer_runs: Option<
-        Arc<tokio::sync::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
+        Arc<
+            tokio::sync::RwLock<
+                std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>,
+            >,
+        >,
     >,
     /// Dynamic agent spawner — None when running outside the gateway.
     pub spawner: Option<Arc<crate::agent::AgentSpawner>>,
@@ -532,7 +534,8 @@ pub struct AgentRuntime {
     /// WASM plugin instances for tool dispatch (shared across agents).
     pub wasm_plugins: Arc<Vec<crate::plugin::WasmPlugin>>,
     /// CDP browser session -- lazy-initialized on first web_browser tool call.
-    /// Stored as Option so it can be dropped (killing Chrome) when idle expires.
+    /// Stored as Option so it can be dropped (killing Chrome) when idle
+    /// expires.
     pub(crate) browser: Arc<tokio::sync::Mutex<Option<crate::browser::BrowserSession>>>,
     /// In-memory session cache: session_key -> conversation history.
     pub(crate) sessions: std::collections::HashMap<String, Vec<Message>>,
@@ -553,13 +556,14 @@ pub struct AgentRuntime {
     /// Cached system prompt — built once per gateway lifetime, never
     /// invalidated (only rebuilt on gateway restart).
     pub(crate) cached_system_prompt: Option<String>,
-    /// Cached minimal system prompt for internal sessions (heartbeat/cron/system).
-    /// Built on first internal session use.
+    /// Cached minimal system prompt for internal sessions
+    /// (heartbeat/cron/system). Built on first internal session use.
     pub(crate) cached_minimal_prompt: Option<String>,
     /// Cached tool definitions from the last run_turn — reused by compaction
     /// to match the KV cache prefix exactly.
     pub(crate) cached_tools: Vec<crate::provider::ToolDef>,
-    pub(crate) notification_tx: Option<tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>>,
+    pub(crate) notification_tx:
+        Option<tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>>,
     pub(crate) opencode_client: Arc<tokio::sync::OnceCell<crate::acp::client::AcpClient>>,
     pub(crate) claudecode_client: Arc<tokio::sync::OnceCell<crate::acp::client::AcpClient>>,
     pub(crate) codex_client: Arc<tokio::sync::OnceCell<crate::acp::CodexClient>>,
@@ -572,7 +576,8 @@ pub struct AgentRuntime {
     /// Sessions in voice mode: auto-TTS reply when user sent voice.
     /// Set when audio attachment detected, cleared by "/text" command.
     voice_mode_sessions: std::collections::HashSet<String>,
-    /// Background exec pool — runs long commands without blocking the agent loop.
+    /// Background exec pool — runs long commands without blocking the agent
+    /// loop.
     pub(crate) exec_pool: Arc<super::exec_pool::ExecPool>,
 }
 
@@ -608,11 +613,7 @@ impl AgentRuntime {
         );
         let session_aliases = store.db.load_all_aliases().unwrap_or_default();
         let live_status = Arc::clone(&handle.live_status);
-        let max_concurrent = config
-            .agents
-            .defaults
-            .max_concurrent
-            .unwrap_or(4);
+        let max_concurrent = config.agents.defaults.max_concurrent.unwrap_or(4);
         let exec_pool = super::exec_pool::ExecPool::new(max_concurrent as usize);
         let rt = Self {
             handle,
@@ -730,12 +731,7 @@ pub fn resolve_primary_model_for(
         .model
         .as_ref()
         .and_then(|m| m.primary.as_deref())
-        .or_else(|| {
-            defaults
-                .model
-                .as_ref()
-                .and_then(|m| m.primary.as_deref())
-        })
+        .or_else(|| defaults.model.as_ref().and_then(|m| m.primary.as_deref()))
         .map(str::to_owned)
 }
 
@@ -748,12 +744,12 @@ pub fn resolve_primary_model_for(
 ///   2. per-agent `flash_model.primary` (legacy)
 ///   3. `defaults.model.flash`
 ///   4. `defaults.flash_model.primary` (legacy)
-///   5. **RsClaw provider inference**: if the effective primary lives
-///      under the `rsclaw/` namespace (managed fleet), auto-pick
-///      [`RSCLAW_DEFAULT_FLASH`]. Saves users from having to repeat the
-///      rsclaw flash slot when their primary already names a rsclaw
-///      model — the same "convention over configuration" treatment the
-///      provider gets for api/baseUrl/prefix_id.
+///   5. **RsClaw provider inference**: if the effective primary lives under the
+///      `rsclaw/` namespace (managed fleet), auto-pick
+///      [`RSCLAW_DEFAULT_FLASH`]. Saves users from having to repeat the rsclaw
+///      flash slot when their primary already names a rsclaw model — the same
+///      "convention over configuration" treatment the provider gets for
+///      api/baseUrl/prefix_id.
 pub fn resolve_flash_model_for(
     per_agent: &crate::config::schema::AgentEntry,
     defaults: &crate::config::schema::AgentDefaults,
@@ -768,12 +764,7 @@ pub fn resolve_flash_model_for(
                 .as_ref()
                 .and_then(|m| m.primary.as_deref())
         })
-        .or_else(|| {
-            defaults
-                .model
-                .as_ref()
-                .and_then(|m| m.flash.as_deref())
-        })
+        .or_else(|| defaults.model.as_ref().and_then(|m| m.flash.as_deref()))
         .or_else(|| {
             defaults
                 .flash_model
@@ -790,12 +781,7 @@ pub fn resolve_flash_model_for(
         .model
         .as_ref()
         .and_then(|m| m.primary.as_deref())
-        .or_else(|| {
-            defaults
-                .model
-                .as_ref()
-                .and_then(|m| m.primary.as_deref())
-        });
+        .or_else(|| defaults.model.as_ref().and_then(|m| m.primary.as_deref()));
     if let Some(p) = primary {
         if p.starts_with("rsclaw/") {
             return Some(crate::provider::rsclaw::RSCLAW_DEFAULT_FLASH.to_owned());
@@ -868,12 +854,7 @@ pub fn resolve_vision_model_for(
         .model
         .as_ref()
         .and_then(|m| m.primary.as_deref())
-        .or_else(|| {
-            defaults
-                .model
-                .as_ref()
-                .and_then(|m| m.primary.as_deref())
-        });
+        .or_else(|| defaults.model.as_ref().and_then(|m| m.primary.as_deref()));
     if let Some(p) = primary {
         if p.starts_with("rsclaw/") {
             return VisionResolution::Configured(
@@ -907,8 +888,8 @@ pub fn resolve_vision_model_for(
 ///   - `Some(true)` — explicitly declared as image-capable.
 ///   - `Some(false)` — explicitly declared as text-only (no `image` in the
 ///     array).
-///   - `None` — no `models[].input` entry found; caller should fall back
-///     to the blocklist heuristic.
+///   - `None` — no `models[].input` entry found; caller should fall back to the
+///     blocklist heuristic.
 ///
 /// The lookup is fuzzy: it tries `provider/model_id` first (when the
 /// name contains `/`), then falls back to scanning every provider for a
@@ -972,131 +953,203 @@ pub fn is_known_vision_model(model: &str) -> bool {
         // -------- universal suffixes (covers most "-vision" / "-vl"
         // -------- variants across vendors without per-model entries)
         "-vision",
-        "-vl-", "-vl/", "-vl:",
+        "-vl-",
+        "-vl/",
+        "-vl:",
         "-omni",
-
         // -------- OpenAI
-        "gpt-4o", "gpt-4-vision", "gpt-4-turbo", "gpt-4.1",
-        "gpt-5", "chatgpt-4o", "o1-", "o3-", "o4-",
+        "gpt-4o",
+        "gpt-4-vision",
+        "gpt-4-turbo",
+        "gpt-4.1",
+        "gpt-5",
+        "chatgpt-4o",
+        "o1-",
+        "o3-",
+        "o4-",
         // (bare "gpt-4" intentionally NOT included — original GPT-4 base is text-only)
 
         // -------- Anthropic Claude 3+
-        "claude-3", "claude-sonnet-4", "claude-opus-4", "claude-haiku-4",
-        "claude-4", "claude-5",
+        "claude-3",
+        "claude-sonnet-4",
+        "claude-opus-4",
+        "claude-haiku-4",
+        "claude-4",
+        "claude-5",
         // (claude-instant / claude-2 are text-only)
 
         // -------- Google Gemini + Gemma 3+
-        "gemini-1.5", "gemini-2", "gemini-3", "gemini-pro-vision",
-        "gemma-3", "gemma-4",
+        "gemini-1.5",
+        "gemini-2",
+        "gemini-3",
+        "gemini-pro-vision",
+        "gemma-3",
+        "gemma-4",
         "paligemma",
         // (gemma-1/-2 text-only)
 
         // -------- Meta Llama (3.2 vision + Llama 4 multimodal)
-        "llama-3.2-11b-vision", "llama-3.2-90b-vision", "llama-3.2-vision",
+        "llama-3.2-11b-vision",
+        "llama-3.2-90b-vision",
+        "llama-3.2-vision",
         "llama-4",
         // (llama-3 / llama-3.1 / llama-3.3 / llama-3.2-1b / llama-3.2-3b are text-only)
 
         // -------- Mistral
         "pixtral",
-        "mistral-small-3.1", "mistral-small-3.2", "mistral-small-4",
+        "mistral-small-3.1",
+        "mistral-small-3.2",
+        "mistral-small-4",
         "mistral-medium-3",
-
         // -------- Cohere
-        "aya-vision", "command-a-vision",
-
+        "aya-vision",
+        "command-a-vision",
         // -------- xAI Grok (3+ natively multimodal; older variants need -vision)
-        "grok-2-vision", "grok-1.5-vision",
-        "grok-3", "grok-4", "grok-5",
-
+        "grok-2-vision",
+        "grok-1.5-vision",
+        "grok-3",
+        "grok-4",
+        "grok-5",
         // -------- ByteDance Doubao
         // Seed 1.x: required `-vision` suffix to be multimodal.
-        "doubao-seed-1.5-vision", "doubao-1.5-vision", "doubao-1-5-vision",
+        "doubao-seed-1.5-vision",
+        "doubao-1.5-vision",
+        "doubao-1-5-vision",
         "doubao-seed-1.6-vision",
         // Seed 2+ family: entire subtree is multimodal-by-default
         // (pro / lite / code / flash / vision all accept image input).
         // List 2..=9 explicitly so future generations (3.x, 4.x, ...)
         // are auto-recognised without a code change.
-        "doubao-seed-2", "doubao-seed-3", "doubao-seed-4", "doubao-seed-5",
-        "doubao-seed-6", "doubao-seed-7", "doubao-seed-8", "doubao-seed-9",
+        "doubao-seed-2",
+        "doubao-seed-3",
+        "doubao-seed-4",
+        "doubao-seed-5",
+        "doubao-seed-6",
+        "doubao-seed-7",
+        "doubao-seed-8",
+        "doubao-seed-9",
         // Other vision lines.
-        "doubao-pro-vision", "doubao-vision",
-        "seedream", "seedance",
-
+        "doubao-pro-vision",
+        "doubao-vision",
+        "seedream",
+        "seedance",
         // -------- Alibaba Qwen
-        "qwen-vl", "qwen2-vl", "qwen2.5-vl", "qwen3-vl",
+        "qwen-vl",
+        "qwen2-vl",
+        "qwen2.5-vl",
+        "qwen3-vl",
         "qwen-max-vision",
         // Qwen 3.5+ base series multimodal; both spellings.
-        "qwen3.5", "qwen-3.5",
-        "qwen3.6", "qwen-3.6",
-        "qwen3.7", "qwen-3.7",
-        "qwen3.8", "qwen-3.8",
-        "qwen3.9", "qwen-3.9",
-        "qwen4", "qwen-4",
-        "qvq",  // Qwen visual-question
-
+        "qwen3.5",
+        "qwen-3.5",
+        "qwen3.6",
+        "qwen-3.6",
+        "qwen3.7",
+        "qwen-3.7",
+        "qwen3.8",
+        "qwen-3.8",
+        "qwen3.9",
+        "qwen-3.9",
+        "qwen4",
+        "qwen-4",
+        "qvq", // Qwen visual-question
         // -------- Moonshot Kimi
         "kimi-for-coding",
-        "kimi-k2.5", "kimi-k2.6", "kimi-k2.7", "kimi-k2.8", "kimi-k2.9",
+        "kimi-k2.5",
+        "kimi-k2.6",
+        "kimi-k2.7",
+        "kimi-k2.8",
+        "kimi-k2.9",
         "kimi-vl",
         "moonshot-v1-vision",
-
         // -------- Zhipu GLM (look for "vN" suffix — glm-4v, glm-4.5v, ...)
-        "glm-4v", "glm-4.1v", "glm-4.5v", "glm-4.6v", "glm-5v",
-        "cogvlm", "cogagent",
-
+        "glm-4v",
+        "glm-4.1v",
+        "glm-4.5v",
+        "glm-4.6v",
+        "glm-5v",
+        "cogvlm",
+        "cogagent",
         // -------- Baidu ERNIE
-        "ernie-vl", "ernie-4.5-vl", "ernie-5",
+        "ernie-vl",
+        "ernie-4.5-vl",
+        "ernie-5",
         "ernie-vision",
-
         // -------- SenseTime SenseChat
-        "sensechat-vision", "sensechat-v",
+        "sensechat-vision",
+        "sensechat-v",
         "sensenova-v6",
-
         // -------- 01.AI Yi
-        "yi-vl", "yi-vision",
-
+        "yi-vl",
+        "yi-vision",
         // -------- Baichuan
-        "baichuan-omni", "baichuan-vl", "baichuan2-vl",
-
+        "baichuan-omni",
+        "baichuan-vl",
+        "baichuan2-vl",
         // -------- DeepSeek
-        "deepseek-vl", "deepseek-vl2",
+        "deepseek-vl",
+        "deepseek-vl2",
         "janus",
-
         // -------- Tencent Hunyuan
-        "hunyuan-vision", "hunyuan-vl", "hunyuanocr",
-
+        "hunyuan-vision",
+        "hunyuan-vl",
+        "hunyuanocr",
         // -------- MiniMax
         // NOTE: M2 / M2.5 / M2.7 base models are TEXT-ONLY despite
         // marketing claims of "native multimodality" — confirmed by
         // Artificial Analysis (artificialanalysis.ai) and the official
         // model card on build.nvidia.com (text input only). Only the
         // explicitly vision-tagged variants accept images.
-        "minimax-vl", "abab-vision", "abab6.5-vision",
-
+        "minimax-vl",
+        "abab-vision",
+        "abab6.5-vision",
         // -------- StepFun
-        "step-1v", "step-1o", "step-2-vision",
-        "step-3", "step-3.5",
-
+        "step-1v",
+        "step-1o",
+        "step-2-vision",
+        "step-3",
+        "step-3.5",
         // -------- Open-source major VLMs
         "llava",
-        "internvl", "mini-internvl", "xcomposer",
-        "minicpm-v", "minicpm-o", "minicpm-llama3-v",
-        "phi-3-vision", "phi-3.5-vision", "phi-4-multimodal",
+        "internvl",
+        "mini-internvl",
+        "xcomposer",
+        "minicpm-v",
+        "minicpm-o",
+        "minicpm-llama3-v",
+        "phi-3-vision",
+        "phi-3.5-vision",
+        "phi-4-multimodal",
         "idefics",
-        "blip", "instructblip", "xgen-mm",
-        "fuyu", "kosmos",
-        "ferret", "openelm-vision", "mm1",
-        "florence-2", "florence-vl",
+        "blip",
+        "instructblip",
+        "xgen-mm",
+        "fuyu",
+        "kosmos",
+        "ferret",
+        "openelm-vision",
+        "mm1",
+        "florence-2",
+        "florence-vl",
         "smolvlm",
-        "vila", "nvila", "eagle2", "nvlm", "nemotron-vl",
+        "vila",
+        "nvila",
+        "eagle2",
+        "nvlm",
+        "nemotron-vl",
         "pali-3",
-
         // -------- GUI-agent / screen-understanding VLMs (RsClaw's core
         //          user community — keep this list eager)
         "ui-tars",
-        "showui", "os-atlas", "seeclick", "screenagent",
-        "aria-ui", "omniparser",
-        "mobileagent", "appagent", "autoui",
+        "showui",
+        "os-atlas",
+        "seeclick",
+        "screenagent",
+        "aria-ui",
+        "omniparser",
+        "mobileagent",
+        "appagent",
+        "autoui",
     ]
     .iter()
     .any(|needle| m.contains(needle))
@@ -1114,7 +1167,6 @@ pub fn vision_unavailable_message(reason: &str) -> String {
 }
 
 impl AgentRuntime {
-
     /// Estimate fixed context overhead: system prompt + tools tokens.
     /// Used for pre-flight context budget check before LLM call, and by
     /// the compaction module's estimate fallback.
@@ -1153,17 +1205,12 @@ impl AgentRuntime {
     /// Use this from anywhere that wants to drive a VLM-backed loop
     /// (`computer_use vlm_drive`).
     pub(crate) fn resolve_vision_model_name(&self) -> Result<String, String> {
-        match resolve_vision_model_for(
-            &self.handle.config,
-            &self.config.agents.defaults,
-        ) {
+        match resolve_vision_model_for(&self.handle.config, &self.config.agents.defaults) {
             VisionResolution::Configured(name) => Ok(name),
             VisionResolution::FallbackToPrimary(name) => {
-                // 1. Honour the per-model `input` declaration in
-                //    `models.providers[].models[]` first. If the user
-                //    has listed `image` we trust them; if they
-                //    explicitly listed only `text` we surface that as
-                //    a config error.
+                // 1. Honour the per-model `input` declaration in `models.providers[].models[]`
+                //    first. If the user has listed `image` we trust them; if they explicitly
+                //    listed only `text` we surface that as a config error.
                 match model_supports_image_input(&self.config.raw, &name) {
                     Some(true) => return Ok(name),
                     Some(false) => {
@@ -1177,11 +1224,10 @@ impl AgentRuntime {
                     None => {} // no declaration → fall through to heuristic
                 }
 
-                // 2. No declaration: fall back to a vision-allow-list.
-                //    Defaulting to text-only here is the safer choice
-                //    — an unknown model name is more likely text-only
-                //    than vision-capable, and a clear error pointing
-                //    at the config beats a cryptic API failure later.
+                // 2. No declaration: fall back to a vision-allow-list. Defaulting to text-only
+                //    here is the safer choice — an unknown model name is more likely text-only
+                //    than vision-capable, and a clear error pointing at the config beats a
+                //    cryptic API failure later.
                 if is_known_vision_model(&name) {
                     Ok(name)
                 } else {
@@ -1231,7 +1277,14 @@ impl AgentRuntime {
     async fn handle_side_query(&mut self, session_key: &str, question: &str) -> Result<AgentReply> {
         // Read current session history — only User/Assistant text messages,
         // skip Tool/ToolCall messages (btw has no tools, they'd confuse the model).
-        let btw_budget = self.live.agents.read().await.defaults.btw_tokens.unwrap_or(10_000) as usize;
+        let btw_budget = self
+            .live
+            .agents
+            .read()
+            .await
+            .defaults
+            .btw_tokens
+            .unwrap_or(10_000) as usize;
         let history: Vec<Message> = self.sessions.get(session_key).cloned().unwrap_or_default();
         let mut messages = Vec::new();
         let mut token_count = 0usize;
@@ -1255,13 +1308,18 @@ impl AgentRuntime {
             } else {
                 MessageContent::Text(text)
             };
-            messages.push(Message { role: m.role.clone(), content });
+            messages.push(Message {
+                role: m.role.clone(),
+                content,
+                rsclaw_hidden: None,
+            });
             token_count += msg_tokens;
         }
         messages.reverse();
         messages.push(Message {
             role: Role::User,
             content: MessageContent::Text(question.to_owned()),
+            rsclaw_hidden: None,
         });
 
         let model = self.resolve_model_name();
@@ -1284,6 +1342,7 @@ impl AgentRuntime {
             session_key: None,
             system_shared: None,
             user_system: None,
+            recall: None,
         };
 
         let providers = Arc::clone(&self.providers);
@@ -1320,7 +1379,8 @@ impl AgentRuntime {
         })
     }
 
-    /// Compress a web tool result for session storage via an ephemeral LLM call.
+    /// Compress a web tool result for session storage via an ephemeral LLM
+    /// call.
     ///
     /// Only the extracted answer is stored in session history — raw web content
     /// (HTML, search results, screenshots) is never concatenated into the
@@ -1393,6 +1453,7 @@ impl AgentRuntime {
             messages: vec![Message {
                 role: Role::User,
                 content: MessageContent::Text(prompt),
+                rsclaw_hidden: None,
             }],
             tools: vec![],
             system: Some(
@@ -1413,6 +1474,7 @@ impl AgentRuntime {
             session_key: None,
             system_shared: None,
             user_system: None,
+            recall: None,
         };
         // session_key keeps it lints-quiet now that fastshot doesn't
         // route through a stateful session — callers still pass one
@@ -1475,7 +1537,10 @@ impl AgentRuntime {
         const VOICE_INPUT_TAG: &str = "[__VOICE_INPUT__]";
         let text: String = if let Some(stripped) = text.strip_prefix(VOICE_INPUT_TAG) {
             self.voice_mode_sessions.insert(session_key.to_owned());
-            debug!(session = session_key, "voice mode enabled (channel-side transcription tag)");
+            debug!(
+                session = session_key,
+                "voice mode enabled (channel-side transcription tag)"
+            );
             stripped.trim_start_matches('\n').to_owned()
         } else {
             text
@@ -1492,10 +1557,16 @@ impl AgentRuntime {
         if let Some(want_voice) = parse_voice_mode_intent(text) {
             if want_voice {
                 self.voice_mode_sessions.insert(session_key.to_owned());
-                debug!(session = session_key, "voice mode enabled (natural-language intent)");
+                debug!(
+                    session = session_key,
+                    "voice mode enabled (natural-language intent)"
+                );
             } else {
                 self.voice_mode_sessions.remove(session_key);
-                debug!(session = session_key, "voice mode disabled (natural-language intent)");
+                debug!(
+                    session = session_key,
+                    "voice mode disabled (natural-language intent)"
+                );
             }
         }
 
@@ -1544,7 +1615,9 @@ impl AgentRuntime {
 
             self.sessions.clear();
             self.compaction_state.clear();
-            if let Ok(mut map) = self.handle.session_tokens.write() { map.clear(); }
+            if let Ok(mut map) = self.handle.session_tokens.write() {
+                map.clear();
+            }
             // Also clear persisted sessions from redb
             for key in self.store.db.list_sessions().unwrap_or_default() {
                 let _ = self.store.db.delete_session(&key);
@@ -1566,21 +1639,33 @@ impl AgentRuntime {
 
         // /new — start a fresh conversation with new archive generation.
         if self.handle.new_session_signal.load(Ordering::SeqCst) {
-            self.handle.new_session_signal.store(false, Ordering::SeqCst);
+            self.handle
+                .new_session_signal
+                .store(false, Ordering::SeqCst);
             info!("new_session_signal received, starting new generation");
 
             // Save session summary to memory before clearing — no summary
             // will be injected into the new session, so memory is the only
             // way the LLM can find prior context.
-            let compaction_model = self.live.agents.read().await.defaults.compaction
-                .as_ref().and_then(|c| c.model.clone())
+            let compaction_model = self
+                .live
+                .agents
+                .read()
+                .await
+                .defaults
+                .compaction
+                .as_ref()
+                .and_then(|c| c.model.clone())
                 .or_else(|| self.handle.config.model.as_ref()?.primary.clone())
                 .unwrap_or_else(|| "default".to_owned());
-            self.save_session_summaries_to_memory(&compaction_model).await;
+            self.save_session_summaries_to_memory(&compaction_model)
+                .await;
 
             self.sessions.clear();
             self.compaction_state.clear();
-            if let Ok(mut map) = self.handle.session_tokens.write() { map.clear(); }
+            if let Ok(mut map) = self.handle.session_tokens.write() {
+                map.clear();
+            }
             for key in self.store.db.list_sessions().unwrap_or_default() {
                 match self.store.db.new_generation(&key) {
                     Ok(g) => info!(session = %key, generation = g, "new generation started"),
@@ -1880,14 +1965,21 @@ impl AgentRuntime {
                 // Handle special directives
                 let reply_text = match response.as_str() {
                     "__HELP__" => {
-                        let lang = self.config.raw.gateway.as_ref()
+                        let lang = self
+                            .config
+                            .raw
+                            .gateway
+                            .as_ref()
                             .and_then(|g| g.language.as_deref())
                             .map(crate::i18n::resolve_lang)
                             .unwrap_or("en");
                         build_help_text_filtered(allowed, lang)
                     }
-                    "__VERSION__" => format!("rsclaw {}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")),
-"__STATUS__" => self.handle.format_status(),
+                    "__VERSION__" => format!(
+                        "rsclaw {}",
+                        option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
+                    ),
+                    "__STATUS__" => self.handle.format_status(),
                     "__HEALTH__" => {
                         let model = self.resolve_model_name();
                         let (prov_name, _) =
@@ -1944,11 +2036,15 @@ impl AgentRuntime {
                                     )
                                 };
                                 let default_transcript = (context_tokens * 7 / 10).max(16_000);
-                                let max_transcript = cfg.max_transcript_tokens.map(|t| t as usize).unwrap_or(default_transcript);
+                                let max_transcript = cfg
+                                    .max_transcript_tokens
+                                    .map(|t| t as usize)
+                                    .unwrap_or(default_transcript);
                                 // Render transcript (reuse the same logic as compaction).
                                 let transcript = Self::msgs_to_text_static(msgs, max_transcript);
                                 let compaction_model = cfg.model.as_deref().unwrap_or(&model);
-                                self.compact_single(compaction_model, &transcript, None).await
+                                self.compact_single(compaction_model, &transcript, None)
+                                    .await
                             }
                         } else {
                             None
@@ -1962,9 +2058,10 @@ impl AgentRuntime {
                         if let Some(summary) = summary_text {
                             let msg = Message {
                                 role: crate::provider::Role::User,
-                                content: crate::provider::MessageContent::Text(
-                                    format!("[Session summary before /clear]\n{summary}")
-                                ),
+                                content: crate::provider::MessageContent::Text(format!(
+                                    "[Session summary before /clear]\n{summary}"
+                                )),
+                                rsclaw_hidden: None,
                             };
                             self.sessions.insert(session_key.to_owned(), vec![msg]);
                         }
@@ -1975,23 +2072,37 @@ impl AgentRuntime {
                         let model = self.resolve_model_name();
                         self.compact_force(session_key, &model).await;
                         // Extract summary from the compacted session for memory storage.
-                        // Look for the compaction-tagged message (role=User with COMPACTION prefix).
+                        // Look for the compaction-tagged message (role=User with COMPACTION
+                        // prefix).
                         const COMPACTION_TAG: &str = "[CONTEXT COMPACTION";
                         if let Some(msgs) = self.sessions.get(session_key) {
                             let summary_text = msgs.iter().find_map(|m| {
                                 let text = match &m.content {
                                     crate::provider::MessageContent::Text(s) => s.clone(),
-                                    crate::provider::MessageContent::Parts(parts) => parts.iter().filter_map(|p| {
-                                        if let crate::provider::ContentPart::Text { text } = p { Some(text.as_str()) } else { None }
-                                    }).collect::<Vec<_>>().join(" "),
+                                    crate::provider::MessageContent::Parts(parts) => parts
+                                        .iter()
+                                        .filter_map(|p| {
+                                            if let crate::provider::ContentPart::Text { text } = p {
+                                                Some(text.as_str())
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(" "),
                                 };
-                                if text.starts_with(COMPACTION_TAG) { Some(text) } else { None }
+                                if text.starts_with(COMPACTION_TAG) {
+                                    Some(text)
+                                } else {
+                                    None
+                                }
                             });
                             if let Some(summary) = summary_text {
                                 if let Some(ref mem) = self.memory {
                                     // UTF-8 safe truncation.
                                     let truncated: String = summary.chars().take(2000).collect();
-                                    let mem_text = format!("Session compaction summary:\n{truncated}");
+                                    let mem_text =
+                                        format!("Session compaction summary:\n{truncated}");
                                     let now = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .map(|d| d.as_secs() as i64)
@@ -2010,25 +2121,38 @@ impl AgentRuntime {
                                         abstract_text: None,
                                         overview_text: None,
                                         tags: vec![],
-                pinned: false,
+                                        pinned: false,
                                     };
                                     match mem.lock().await.add(doc).await {
-                                        Ok(_) => info!("compact: summary saved to memory ({} chars)", mem_text.len()),
+                                        Ok(_) => info!(
+                                            "compact: summary saved to memory ({} chars)",
+                                            mem_text.len()
+                                        ),
                                         Err(e) => warn!("compact: failed to save to memory: {e}"),
                                     }
                                 }
-                                crate::i18n::t("compact_done", crate::i18n::default_lang()).to_owned()
+                                crate::i18n::t("compact_done", crate::i18n::default_lang())
+                                    .to_owned()
                             } else {
-                                crate::i18n::t("compact_done_no_summary", crate::i18n::default_lang()).to_owned()
+                                crate::i18n::t(
+                                    "compact_done_no_summary",
+                                    crate::i18n::default_lang(),
+                                )
+                                .to_owned()
                             }
                         } else {
-                            crate::i18n::t("compact_nothing", crate::i18n::default_lang()).to_owned()
+                            crate::i18n::t("compact_nothing", crate::i18n::default_lang())
+                                .to_owned()
                         }
                     }
                     "__ABORT__" => {
                         // Set abort flag for this session to interrupt running turn
                         let resolved_key = self.resolve_session_key(session_key);
-                        let flags = self.handle.abort_flags.write().expect("abort_flags lock poisoned");
+                        let flags = self
+                            .handle
+                            .abort_flags
+                            .write()
+                            .expect("abort_flags lock poisoned");
                         if let Some(flag) = flags.get(resolved_key) {
                             flag.store(true, std::sync::atomic::Ordering::SeqCst);
                             "Abort signal sent. The running task will stop shortly.".to_owned()
@@ -2039,14 +2163,20 @@ impl AgentRuntime {
                     "__TEXT_MODE__" => {
                         self.voice_mode_sessions.remove(session_key);
                         let zh = crate::i18n::default_lang() == "zh";
-                        if zh { "已切换到文字回复模式。".to_owned() }
-                        else { "Switched to text reply mode.".to_owned() }
+                        if zh {
+                            "已切换到文字回复模式。".to_owned()
+                        } else {
+                            "Switched to text reply mode.".to_owned()
+                        }
                     }
                     "__VOICE_MODE__" => {
                         self.voice_mode_sessions.insert(session_key.to_owned());
                         let zh = crate::i18n::default_lang() == "zh";
-                        if zh { "已切换到语音回复模式。".to_owned() }
-                        else { "Switched to voice reply mode.".to_owned() }
+                        if zh {
+                            "已切换到语音回复模式。".to_owned()
+                        } else {
+                            "Switched to voice reply mode.".to_owned()
+                        }
                     }
                     s if s.starts_with("__HISTORY__:") => {
                         let n: usize = s
@@ -2057,9 +2187,11 @@ impl AgentRuntime {
                         if let Some(msgs) = self.sessions.get(session_key) {
                             let total_tokens: usize = msgs.iter().map(msg_tokens).sum();
                             let start = msgs.len().saturating_sub(n);
-                            let mut lines = vec![
-                                format!("📊 Context: {} messages, ~{} tokens", msgs.len(), total_tokens),
-                            ];
+                            let mut lines = vec![format!(
+                                "📊 Context: {} messages, ~{} tokens",
+                                msgs.len(),
+                                total_tokens
+                            )];
                             for (i, msg) in msgs[start..].iter().enumerate() {
                                 let role = match msg.role {
                                     crate::provider::Role::User => "You",
@@ -2105,9 +2237,15 @@ impl AgentRuntime {
                                 vec![format!("Active sessions: {}", self.sessions.len())];
                             for (key, msgs) in &self.sessions {
                                 let short_key = if key.len() > 30 {
-                                    let end = key.char_indices().nth(30).map(|(i, _)| i).unwrap_or(key.len());
+                                    let end = key
+                                        .char_indices()
+                                        .nth(30)
+                                        .map(|(i, _)| i)
+                                        .unwrap_or(key.len());
                                     &key[..end]
-                                } else { key };
+                                } else {
+                                    key
+                                };
                                 lines.push(format!("  {} ({} messages)", short_key, msgs.len()));
                             }
                             lines.join("\n")
@@ -2252,7 +2390,18 @@ impl AgentRuntime {
             {
                 // Group chat safety: block dangerous preparse commands (/run, /ls, /cat, etc.)
                 let is_group = session_key.contains(":group:");
-                if is_group && matches!(tool.as_str(), "shell" | "execute_command" | "exec" | "read_file" | "read" | "write_file" | "write") {
+                if is_group
+                    && matches!(
+                        tool.as_str(),
+                        "shell"
+                            | "execute_command"
+                            | "exec"
+                            | "read_file"
+                            | "read"
+                            | "write_file"
+                            | "write"
+                    )
+                {
                     return Ok(AgentReply {
                         text: "[Blocked] Shell/file commands are not allowed in group chats for security.".to_owned(),
                         is_empty: false,
@@ -2288,6 +2437,7 @@ impl AgentRuntime {
                             user_msg_with_images: None,
                             parse_error_count: 0,
                             recalled_memory_ids: std::collections::HashSet::new(),
+                            auto_recall: None,
                             loop_warning_triggered: false,
                             turn_metrics: super::turn_metrics::TurnMetrics::new(),
                             user_text: String::new(),
@@ -2440,7 +2590,8 @@ impl AgentRuntime {
         if !images.is_empty() && !is_ref_image {
             for img in &images {
                 use base64::Engine;
-                let b64 = img.data
+                let b64 = img
+                    .data
                     .strip_prefix("data:image/png;base64,")
                     .or_else(|| img.data.strip_prefix("data:image/jpeg;base64,"))
                     .or_else(|| img.data.strip_prefix("data:image/webp;base64,"))
@@ -2456,7 +2607,11 @@ impl AgentRuntime {
                     } else {
                         "png"
                     };
-                    let mime = if img.mime_type.is_empty() { format!("image/{ext}") } else { img.mime_type.clone() };
+                    let mime = if img.mime_type.is_empty() {
+                        format!("image/{ext}")
+                    } else {
+                        img.mime_type.clone()
+                    };
                     files.push(super::registry::FileAttachment {
                         filename: format!("image.{ext}"),
                         data: bytes,
@@ -2469,13 +2624,16 @@ impl AgentRuntime {
 
         if !media_files.is_empty() {
             // Auto-enable voice mode when user sends audio (not video).
-            let has_audio = media_files.iter().any(|f|
+            let has_audio = media_files.iter().any(|f| {
                 crate::channel::is_audio_attachment(&f.mime_type, &f.filename)
-                && !crate::channel::is_video_attachment(&f.mime_type, &f.filename)
-            );
+                    && !crate::channel::is_video_attachment(&f.mime_type, &f.filename)
+            });
             if has_audio {
                 self.voice_mode_sessions.insert(session_key.to_owned());
-                debug!(session = session_key, "voice mode enabled (audio attachment detected)");
+                debug!(
+                    session = session_key,
+                    "voice mode enabled (audio attachment detected)"
+                );
             }
             let mut transcriptions = Vec::new();
             for mf in &media_files {
@@ -2628,7 +2786,8 @@ impl AgentRuntime {
                     // Placeholder — actual analysis via vision when user chooses "1".
                     Some(format!("[image:vision:@{std_name}]"))
                 } else if crate::channel::is_video_attachment(&file.mime_type, &file.filename)
-                    || crate::channel::is_audio_attachment(&file.mime_type, &file.filename) {
+                    || crate::channel::is_audio_attachment(&file.mime_type, &file.filename)
+                {
                     None
                 } else {
                     extract_file_text(&file.filename, &file.data).await
@@ -2773,7 +2932,8 @@ impl AgentRuntime {
                 );
                 // DEBUG: dump full system prompt to file for inspection
                 if std::env::var("RSCLAW_DUMP_PROMPT").is_ok() {
-                    let dump_path = crate::config::loader::base_dir().join("debug_system_prompt.txt");
+                    let dump_path =
+                        crate::config::loader::base_dir().join("debug_system_prompt.txt");
                     if let Err(e) = std::fs::write(&dump_path, &prompt) {
                         tracing::warn!("failed to dump system prompt: {e}");
                     }
@@ -2783,12 +2943,6 @@ impl AgentRuntime {
             }
             self.cached_system_prompt.clone().expect("just set")
         };
-
-        // Loop A (organic evolution): collect recalled memory IDs for feedback.
-        // Auto-recall is disabled — LLM uses the memory tool to search when needed.
-        // This avoids injecting dynamic content into user messages which would break
-        // prefix KV cache across turns.
-        let auto_recalled_ids = std::collections::HashSet::<String>::new();
 
         // Plugin hook: before_prompt_build (AGENTS.md §20).
         self.fire_hook(
@@ -2831,6 +2985,22 @@ impl AgentRuntime {
                 .unwrap_or("rsclaw/rsclaw-agent-v1")
                 .to_owned()
         };
+        let (model_provider, _) = self.providers.resolve_model(&model);
+
+        // Loop A (organic evolution): collect recalled memory IDs for feedback.
+        // Auto-recall is turn-local committed recall. It is enabled only for
+        // native rsclaw sessions; external providers do not understand hidden
+        // replay state and must not persist rsclaw_hidden they never consumed.
+        let auto_recall_bundle = if model_provider == "rsclaw" {
+            self.build_auto_recall_bundle(&self.handle.id, channel, text)
+                .await
+        } else {
+            None
+        };
+        let auto_recalled_ids = auto_recall_bundle
+            .as_ref()
+            .map(|b| b.metadata.doc_ids.iter().cloned().collect())
+            .unwrap_or_else(std::collections::HashSet::<String>::new);
 
         // Build tool list from skills and registered agents (local + remote).
         // Tool selection: toolsEnabled -> toolset level -> tools whitelist
@@ -2874,8 +3044,8 @@ impl AgentRuntime {
             // flag (newer setup template) still resolve main as the default —
             // matches the convention used at runtime.rs:1763 and
             // RuntimeConfig::default_agent.
-            let is_default = self.handle.config.default.unwrap_or(false)
-                || self.handle.id == "main";
+            let is_default =
+                self.handle.config.default.unwrap_or(false) || self.handle.id == "main";
             let default_toolset = if is_default { "full" } else { "standard" };
             let toolset = model_cfg
                 .and_then(|m| m.toolset.as_deref())
@@ -2891,7 +3061,16 @@ impl AgentRuntime {
             // Group chat safety: strip dangerous tools to prevent exec via LLM
             let is_group = session_key.contains(":group:");
             if is_group {
-                const GROUP_BLOCKED_TOOLS: &[&str] = &["shell", "execute_command", "exec", "read_file", "read", "write_file", "write", "computer_use"];
+                const GROUP_BLOCKED_TOOLS: &[&str] = &[
+                    "shell",
+                    "execute_command",
+                    "exec",
+                    "read_file",
+                    "read",
+                    "write_file",
+                    "write",
+                    "computer_use",
+                ];
                 all.retain(|t| !GROUP_BLOCKED_TOOLS.contains(&t.name.as_str()));
             }
 
@@ -2946,7 +3125,13 @@ impl AgentRuntime {
         if std::env::var("RSCLAW_DUMP_PROMPT").is_ok() {
             let safe_key = session_key
                 .chars()
-                .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
                 .collect::<String>();
             let dump_path = crate::config::loader::base_dir()
                 .join(format!("debug_prompt_spec.{safe_key}.json"));
@@ -3011,12 +3196,24 @@ impl AgentRuntime {
         }
 
         // Check vision support before loading session (avoids borrow conflict).
-        let kv_mode = self.live.agents.read().await.defaults.kv_cache_mode.unwrap_or(1);
-        // Always detect vision capability — used to decide which model describes images.
-        // kvCacheMode >= 1: images are described then stored as text (never base64 in session).
-        // kvCacheMode = 0: images kept as base64 in session for vision models.
+        let kv_mode = self
+            .live
+            .agents
+            .read()
+            .await
+            .defaults
+            .kv_cache_mode
+            .unwrap_or(1);
+        // Always detect vision capability — used to decide which model describes
+        // images. kvCacheMode >= 1: images are described then stored as text
+        // (never base64 in session). kvCacheMode = 0: images kept as base64 in
+        // session for vision models.
         let model_has_vision = model_supports_vision(&model, &self.config);
-        let _vision = if kv_mode >= 1 { false } else { model_has_vision };
+        let _vision = if kv_mode >= 1 {
+            false
+        } else {
+            model_has_vision
+        };
 
         // ---------------------------------------------------------------
         // Media processing: convert images/videos to text descriptions.
@@ -3034,7 +3231,8 @@ impl AgentRuntime {
             }
         }
 
-        // (Image → FileAttachment conversion already done above, before file processing.)
+        // (Image → FileAttachment conversion already done above, before file
+        // processing.)
 
         // Build the persisted message: user text + media descriptions (text only).
         let persist_text = if media_descriptions.is_empty() {
@@ -3056,7 +3254,8 @@ impl AgentRuntime {
         // First user message in session: prepend session metadata (date, timezone,
         // channel). Stored in session so it becomes part of the stable prefix
         // for KV cache — never changes across turns.
-        // Also triggers after /clear (session may contain a summary but no user messages).
+        // Also triggers after /clear (session may contain a summary but no user
+        // messages).
         let has_user_msg = session_messages.iter().any(|m| m.role == Role::User);
         let persist_text = if !has_user_msg {
             let now = chrono::Local::now();
@@ -3076,6 +3275,9 @@ impl AgentRuntime {
         let persist_msg = Message {
             role: Role::User,
             content: MessageContent::Text(persist_text),
+            rsclaw_hidden: auto_recall_bundle
+                .as_ref()
+                .and_then(RecallBundle::to_rsclaw_hidden),
         };
         session_messages.push(persist_msg.clone());
         // Internal sessions (heartbeat/cron/system): skip DB persist —
@@ -3100,11 +3302,16 @@ impl AgentRuntime {
 
         // Get or create abort flag for this session.
         let abort_flag: Arc<AtomicBool> = {
-            let mut flags = self.handle.abort_flags.write()
+            let mut flags = self
+                .handle
+                .abort_flags
+                .write()
                 .expect("abort_flags lock poisoned");
-            Arc::clone(flags.entry(session_key.to_string()).or_insert_with(|| {
-                Arc::new(AtomicBool::new(false))
-            }))
+            Arc::clone(
+                flags
+                    .entry(session_key.to_string())
+                    .or_insert_with(|| Arc::new(AtomicBool::new(false))),
+            )
         };
 
         // RAII guard: clears abort flag when turn exits (normal or error).
@@ -3178,20 +3385,35 @@ impl AgentRuntime {
                 // The persisted message is text-only; this adds images back for vision.
                 let base_text = match &persist_msg.content {
                     MessageContent::Text(t) => t.clone(),
-                    MessageContent::Parts(p) => p.iter().filter_map(|part| {
-                        if let ContentPart::Text { text } = part { Some(text.as_str()) } else { None }
-                    }).collect::<Vec<_>>().join(""),
+                    MessageContent::Parts(p) => p
+                        .iter()
+                        .filter_map(|part| {
+                            if let ContentPart::Text { text } = part {
+                                Some(text.as_str())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(""),
                 };
                 let mut parts = vec![ContentPart::Text { text: base_text }];
                 for img_uri in &vision_images_for_current_turn {
-                    parts.push(ContentPart::Image { url: img_uri.clone() });
+                    parts.push(ContentPart::Image {
+                        url: img_uri.clone(),
+                    });
                 }
-                Some(Message { role: Role::User, content: MessageContent::Parts(parts) })
+                Some(Message {
+                    role: Role::User,
+                    content: MessageContent::Parts(parts),
+                    rsclaw_hidden: persist_msg.rsclaw_hidden.clone(),
+                })
             } else {
                 None
             },
             parse_error_count: 0,
             recalled_memory_ids: auto_recalled_ids,
+            auto_recall: auto_recall_bundle,
             loop_warning_triggered: false,
             turn_metrics: super::turn_metrics::TurnMetrics::new(),
             user_text: text.to_owned(),
@@ -3212,8 +3434,12 @@ impl AgentRuntime {
         let reply = time::timeout(
             Duration::from_secs(timeout_secs),
             self.agent_loop(
-                &mut ctx, &model, &system_prompt,
-                tools, extra_tools, abort_flag.clone(),
+                &mut ctx,
+                &model,
+                &system_prompt,
+                tools,
+                extra_tools,
+                abort_flag.clone(),
             ),
         )
         .await
@@ -3230,7 +3456,9 @@ impl AgentRuntime {
             status.current_task.clear();
             status.text_preview.clear();
         }
-        self.handle.session_count.store(self.sessions.len(), std::sync::atomic::Ordering::Relaxed);
+        self.handle
+            .session_count
+            .store(self.sessions.len(), std::sync::atomic::Ordering::Relaxed);
 
         // Append to JSONL transcript (AGENTS.md §20 step 11).
         self.append_transcript(session_key, text, &reply.text).await;
@@ -3247,7 +3475,11 @@ impl AgentRuntime {
             && !ctx.recalled_memory_ids.is_empty()
         {
             let signal = Self::infer_outcome_signal(&reply, &ctx, channel);
-            tracing::debug!(signal, recalled = ctx.recalled_memory_ids.len(), "evolution: applying feedback");
+            tracing::debug!(
+                signal,
+                recalled = ctx.recalled_memory_ids.len(),
+                "evolution: applying feedback"
+            );
             if signal.abs() > f32::EPSILON {
                 let mut store = mem.lock().await;
                 for mem_id in &ctx.recalled_memory_ids {
@@ -3345,9 +3577,21 @@ impl AgentRuntime {
             // These become proper pinned `entity` memories — not raw notes.
             let user_entities = crate::agent::context_mgr::extract_key_entities(text);
             if !user_entities.is_empty() {
-                crate::agent::context_mgr::write_entity_memories(
-                    mem, &doc_scope, user_entities,
-                ).await;
+                let docs = crate::agent::context_mgr::write_entity_memories(
+                    mem,
+                    &doc_scope,
+                    user_entities,
+                )
+                .await;
+                for doc in docs {
+                    if let Err(e) = self
+                        .store
+                        .search
+                        .index_memory_doc(&doc.id, &doc.scope, &doc.kind, &doc.text)
+                    {
+                        tracing::warn!("BM25 index failed for auto-captured entity: {e:#}");
+                    }
+                }
             }
 
             // LLM-based entity extraction moved to compaction — the summary
@@ -3389,31 +3633,30 @@ impl AgentRuntime {
                 } else {
                     "sherpa-onnx-offline-tts"
                 });
-            let has_vits_dir = std::fs::read_dir(
-                crate::config::loader::base_dir().join("models"),
-            )
-            .map(|entries| {
-                entries.flatten().any(|e| {
-                    e.path().is_dir()
-                        && e.file_name()
-                            .to_string_lossy()
-                            .starts_with("vits-")
+            let has_vits_dir = std::fs::read_dir(crate::config::loader::base_dir().join("models"))
+                .map(|entries| {
+                    entries.flatten().any(|e| {
+                        e.path().is_dir() && e.file_name().to_string_lossy().starts_with("vits-")
+                    })
                 })
-            })
-            .unwrap_or(false);
+                .unwrap_or(false);
             let sherpa_tts_ready = sherpa_tts_bin.exists() && has_vits_dir;
-            if !sherpa_tts_ready
-                && super::install_hints::claim_first_hint("tts-sherpa")
-            {
+            if !sherpa_tts_ready && super::install_hints::claim_first_hint("tts-sherpa") {
                 let lang = crate::i18n::default_lang();
-                reply.text.push_str(&crate::i18n::t("install_hint_tts_sherpa", lang));
+                reply
+                    .text
+                    .push_str(&crate::i18n::t("install_hint_tts_sherpa", lang));
             }
 
             match self.generate_tts_audio(&reply.text).await {
                 Ok(audio_path) => {
-                    let mime = if audio_path.ends_with(".wav") { "audio/wav" }
-                        else if audio_path.ends_with(".mp3") { "audio/mpeg" }
-                        else { "audio/wav" };
+                    let mime = if audio_path.ends_with(".wav") {
+                        "audio/wav"
+                    } else if audio_path.ends_with(".mp3") {
+                        "audio/mpeg"
+                    } else {
+                        "audio/wav"
+                    };
                     reply.files.push((
                         std::path::Path::new(&audio_path)
                             .file_name()
@@ -3486,12 +3729,23 @@ impl AgentRuntime {
     /// session, memory is the only way the LLM can find prior context.
     /// Uses KV cache mode when available (session is still in memory).
     async fn save_session_summaries_to_memory(&mut self, model: &str) {
-        if self.memory.is_none() { return; }
+        if self.memory.is_none() {
+            return;
+        }
 
-        let kv_cache_mode = self.live.agents.read().await.defaults.kv_cache_mode.unwrap_or(1);
+        let kv_cache_mode = self
+            .live
+            .agents
+            .read()
+            .await
+            .defaults
+            .kv_cache_mode
+            .unwrap_or(1);
 
         // Collect session data upfront to avoid borrow conflicts.
-        let session_data: Vec<(String, String)> = self.sessions.iter()
+        let session_data: Vec<(String, String)> = self
+            .sessions
+            .iter()
             .filter(|(_, msgs)| msgs.len() > 2)
             .map(|(key, msgs)| {
                 let transcript = Self::msgs_to_text_static(msgs, 16_000);
@@ -3502,8 +3756,12 @@ impl AgentRuntime {
         for (session_key, transcript) in &session_data {
             // Generate summary — try KV cache mode first.
             let summary = if kv_cache_mode >= 1 {
-                let result = self.compact_with_kv_cache(session_key, model, transcript, None).await;
-                if result.is_some() { result } else {
+                let result = self
+                    .compact_with_kv_cache(session_key, model, transcript, None)
+                    .await;
+                if result.is_some() {
+                    result
+                } else {
                     self.compact_single(model, transcript, None).await
                 }
             } else {
@@ -3707,7 +3965,10 @@ impl AgentRuntime {
 
         // Inject completed async task results into the session.
         {
-            let mut pending = self.pending_task_results.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pending = self
+                .pending_task_results
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let mut completed = Vec::new();
             pending.retain(|(tid, sk, result)| {
                 if sk == &ctx.session_key {
@@ -3726,6 +3987,7 @@ impl AgentRuntime {
                             content: MessageContent::Text(format!(
                                 "[async task {task_id} completed]\n{result}"
                             )),
+                            rsclaw_hidden: None,
                         });
                     }
                     info!(
@@ -3738,31 +4000,54 @@ impl AgentRuntime {
         }
 
         // Check for pending exec results from background tasks.
-        let pending_results = self.exec_pool.collect_pending_for_session(&ctx.session_key).await;
+        let pending_results = self
+            .exec_pool
+            .collect_pending_for_session(&ctx.session_key)
+            .await;
         if !pending_results.is_empty() {
             info!(session = %ctx.session_key, count = pending_results.len(), "exec_pool: collected pending results");
             if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
                 // Collect existing ToolUse IDs in session
-                let session_tool_ids: std::collections::HashSet<String> = sess.iter()
+                let session_tool_ids: std::collections::HashSet<String> = sess
+                    .iter()
                     .filter_map(|m| {
                         if m.role == Role::Assistant {
                             if let MessageContent::Parts(parts) = &m.content {
-                                Some(parts.iter().filter_map(|p| {
-                                    if let ContentPart::ToolUse { id, .. } = p { Some(id.clone()) } else { None }
-                                }).collect::<Vec<_>>())
-                            } else { None }
-                        } else { None }
+                                Some(
+                                    parts
+                                        .iter()
+                                        .filter_map(|p| {
+                                            if let ContentPart::ToolUse { id, .. } = p {
+                                                Some(id.clone())
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect::<Vec<_>>(),
+                                )
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
                     })
                     .flatten()
                     .collect();
 
                 // Find running ToolResults to replace
-                let running_ids: std::collections::HashSet<String> = sess.iter()
+                let running_ids: std::collections::HashSet<String> = sess
+                    .iter()
                     .filter_map(|m| {
                         if m.role == Role::Tool {
                             if let MessageContent::Parts(parts) = &m.content {
                                 for p in parts {
-                                    if let ContentPart::ToolResult { tool_use_id, content, .. } = p {
+                                    if let ContentPart::ToolResult {
+                                        tool_use_id,
+                                        content,
+                                        ..
+                                    } = p
+                                    {
                                         if content.contains("\"status\": \"running\"") {
                                             return Some(tool_use_id.clone());
                                         }
@@ -3775,7 +4060,8 @@ impl AgentRuntime {
                     .collect();
 
                 // Remove running status ToolResults that will be replaced
-                let ids_to_replace: std::collections::HashSet<String> = pending_results.iter()
+                let ids_to_replace: std::collections::HashSet<String> = pending_results
+                    .iter()
                     .map(|r| r.tool_call_id.clone())
                     .filter(|id| running_ids.contains(id))
                     .collect();
@@ -3784,8 +4070,15 @@ impl AgentRuntime {
                         if m.role == Role::Tool {
                             if let MessageContent::Parts(parts) = &m.content {
                                 for p in parts {
-                                    if let ContentPart::ToolResult { tool_use_id, content, .. } = p {
-                                        if ids_to_replace.contains(tool_use_id) && content.contains("\"status\": \"running\"") {
+                                    if let ContentPart::ToolResult {
+                                        tool_use_id,
+                                        content,
+                                        ..
+                                    } = p
+                                    {
+                                        if ids_to_replace.contains(tool_use_id)
+                                            && content.contains("\"status\": \"running\"")
+                                        {
                                             return false;
                                         }
                                     }
@@ -3807,6 +4100,7 @@ impl AgentRuntime {
                                 name: "exec".to_owned(),
                                 input: serde_json::json!({"command": result.command, "_synthetic": true}),
                             }]),
+                            rsclaw_hidden: None,
                         });
                     }
                     let is_error = result.exit_code.map(|c| c != 0).unwrap_or(true);
@@ -3814,7 +4108,8 @@ impl AgentRuntime {
                         "exit_code": result.exit_code,
                         "stdout": result.stdout,
                         "stderr": result.stderr,
-                    }).to_string();
+                    })
+                    .to_string();
                     sess.push(Message {
                         role: Role::Tool,
                         content: MessageContent::Parts(vec![ContentPart::ToolResult {
@@ -3822,15 +4117,23 @@ impl AgentRuntime {
                             content,
                             is_error: Some(is_error),
                         }]),
+                        rsclaw_hidden: None,
                     });
                 }
             }
         }
 
         // Dynamic iteration limit based on task complexity.
-        // Default: 20 iterations. Complex tools (browser/opencode/exec): up to configured max.
+        // Default: 20 iterations. Complex tools (browser/opencode/exec): up to
+        // configured max.
         const BASE_ITERATIONS: usize = 20;
-        let configured_complex: usize = self.live.agents.read().await.defaults.max_iterations
+        let configured_complex: usize = self
+            .live
+            .agents
+            .read()
+            .await
+            .defaults
+            .max_iterations
             .map(|v| v as usize)
             .unwrap_or(30);
         // Track consecutive identical tool calls (same name + same args).
@@ -3921,11 +4224,8 @@ impl AgentRuntime {
                     iterations = iteration,
                     "agent_loop: hit max iteration limit, breaking out"
                 );
-                let terminal_text = crate::i18n::t(
-                    "agent_max_iterations",
-                    crate::i18n::default_lang(),
-                )
-                .to_owned();
+                let terminal_text =
+                    crate::i18n::t("agent_max_iterations", crate::i18n::default_lang()).to_owned();
                 // Emit a done=true event so WS subscribers get both the
                 // terminal text and the terminator frame. Without this, the
                 // UI hangs waiting for done and never shows this message.
@@ -4014,7 +4314,14 @@ impl AgentRuntime {
             // provider is `rsclaw`, the provider IS the kvCacheMode=2
             // protocol, so treat it as mode 2 even if agents.defaults
             // didn't set kv_cache_mode (default is 1).
-            let configured_kv_mode = self.live.agents.read().await.defaults.kv_cache_mode.unwrap_or(1);
+            let configured_kv_mode = self
+                .live
+                .agents
+                .read()
+                .await
+                .defaults
+                .kv_cache_mode
+                .unwrap_or(1);
             let (resolved_provider, _) = self.providers.resolve_model(model);
             let effective_kv_mode = if resolved_provider == "rsclaw" {
                 2
@@ -4117,8 +4424,13 @@ impl AgentRuntime {
             let msg_tokens_sum: usize = messages.iter().map(msg_tokens).sum();
             // Include system prompt + tools in total context estimate.
             let sys_tokens = estimate_tokens(system_prompt);
-            let tools_tokens: usize = tools.iter()
-                .map(|t| estimate_tokens(&t.name) + estimate_tokens(&t.description) + estimate_tokens(&t.parameters.to_string()))
+            let tools_tokens: usize = tools
+                .iter()
+                .map(|t| {
+                    estimate_tokens(&t.name)
+                        + estimate_tokens(&t.description)
+                        + estimate_tokens(&t.parameters.to_string())
+                })
                 .sum();
             // Use the larger of: component-based estimate vs JSON body estimate.
             // Component estimate misses JSON structure overhead, message formatting,
@@ -4130,16 +4442,21 @@ impl AgentRuntime {
                 let tools_json = serde_json::to_string(&tools).unwrap_or_default();
                 // Use estimate_tokens on the full JSON body — handles CJK vs ASCII correctly.
                 // Add per-message overhead for chat template tokens (~10 per message).
-                estimate_tokens(&msgs_json) + estimate_tokens(system_prompt)
-                    + estimate_tokens(&tools_json) + msg_count * 10
+                estimate_tokens(&msgs_json)
+                    + estimate_tokens(system_prompt)
+                    + estimate_tokens(&tools_json)
+                    + msg_count * 10
             };
             let approx_tokens = component_est.max(body_est);
-            self.handle.update_session_tokens(&ctx.session_key, crate::agent::registry::SessionTokens {
-                sys: sys_tokens,
-                tools: tools_tokens,
-                msgs: msg_tokens_sum,
-                total: approx_tokens,
-            });
+            self.handle.update_session_tokens(
+                &ctx.session_key,
+                crate::agent::registry::SessionTokens {
+                    sys: sys_tokens,
+                    tools: tools_tokens,
+                    msgs: msg_tokens_sum,
+                    total: approx_tokens,
+                },
+            );
             info!(session = %ctx.session_key, msg_count, approx_tokens, sys_tokens, tools_tokens, msg_tokens = msg_tokens_sum, model = %model, "LLM call: context size");
 
             // Context usage awareness: inject hint into the LAST user message
@@ -4147,24 +4464,32 @@ impl AgentRuntime {
             if approx_tokens > 0 && context_tokens > 0 {
                 let usage_pct = (approx_tokens * 100) / context_tokens;
                 let usage_hint = if usage_pct >= 90 {
-                    Some(format!("[Context usage: {usage_pct}% — CRITICAL. \
+                    Some(format!(
+                        "[Context usage: {usage_pct}% — CRITICAL. \
                         Keep responses very concise. Do not re-read files already in context. \
-                        Suggest user start a new session if task is complete.]"))
+                        Suggest user start a new session if task is complete.]"
+                    ))
                 } else if usage_pct >= 70 {
-                    Some(format!("[Context usage: {usage_pct}%. \
+                    Some(format!(
+                        "[Context usage: {usage_pct}%. \
                         Optimize: keep tool outputs short (use offset/limit for reads, \
-                        pipe to head/tail for commands). Avoid re-reading files already in context.]"))
+                        pipe to head/tail for commands). Avoid re-reading files already in context.]"
+                    ))
                 } else {
                     None
                 };
                 if let Some(hint) = usage_hint {
-                    if let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == Role::User) {
+                    if let Some(last_user) =
+                        messages.iter_mut().rev().find(|m| m.role == Role::User)
+                    {
                         match &mut last_user.content {
                             MessageContent::Text(t) => {
                                 t.push_str(&format!("\n\n{hint}"));
                             }
                             MessageContent::Parts(parts) => {
-                                parts.push(ContentPart::Text { text: format!("\n\n{hint}") });
+                                parts.push(ContentPart::Text {
+                                    text: format!("\n\n{hint}"),
+                                });
                             }
                         }
                     }
@@ -4242,10 +4567,7 @@ impl AgentRuntime {
             // compaction kicked in too early.
             let (temperature, context_limit) = {
                 let agents_live = self.live.agents.read().await;
-                let per_agent_entry = agents_live
-                    .list
-                    .iter()
-                    .find(|a| a.id == self.handle.id);
+                let per_agent_entry = agents_live.list.iter().find(|a| a.id == self.handle.id);
                 let per_agent_temp = per_agent_entry.and_then(|a| a.temperature);
                 let temperature = per_agent_temp
                     .or(agents_live.defaults.temperature)
@@ -4259,8 +4581,8 @@ impl AgentRuntime {
                             Some(0.6)
                         }
                     });
-                let per_agent_ctx = per_agent_entry
-                    .and_then(|a| a.model.as_ref().and_then(|m| m.context_tokens));
+                let per_agent_ctx =
+                    per_agent_entry.and_then(|a| a.model.as_ref().and_then(|m| m.context_tokens));
                 let context_limit = per_agent_ctx
                     .or(agents_live.defaults.context_tokens)
                     .unwrap_or(64_000) as usize;
@@ -4269,7 +4591,8 @@ impl AgentRuntime {
 
             // Pre-flight check: emergency compact if we'd exceed context.
             let overhead = self.estimate_fixed_overhead();
-            let session_tokens: usize = self.sessions
+            let session_tokens: usize = self
+                .sessions
                 .get(&ctx.session_key)
                 .map(|msgs| msgs.iter().map(super::context_mgr::msg_tokens).sum())
                 .unwrap_or(0);
@@ -4287,7 +4610,8 @@ impl AgentRuntime {
                 );
                 self.compact_inner(&ctx.session_key, model, true).await;
                 // Re-read messages after compaction.
-                messages = self.sessions
+                messages = self
+                    .sessions
                     .get(&ctx.session_key)
                     .cloned()
                     .unwrap_or_default();
@@ -4325,19 +4649,18 @@ impl AgentRuntime {
             // shared-prefix layout — leave the split unset for those (the
             // provider falls back to `system` as a single blob, with no
             // cross-client cache reuse, which matches today's behaviour).
-            let (system_shared, user_system) = if kv_cache_mode >= 2
-                && !is_minimal_context_session(&ctx.session_key)
-            {
-                let shared = crate::agent::prompt_builder::build_shared_system_prefix();
-                if let Some(rest) = effective_system.strip_prefix(&shared) {
-                    let user = rest.trim_start_matches("\n\n").to_owned();
-                    (Some(shared), Some(user))
+            let (system_shared, user_system) =
+                if kv_cache_mode >= 2 && !is_minimal_context_session(&ctx.session_key) {
+                    let shared = crate::agent::prompt_builder::build_shared_system_prefix();
+                    if let Some(rest) = effective_system.strip_prefix(&shared) {
+                        let user = rest.trim_start_matches("\n\n").to_owned();
+                        (Some(shared), Some(user))
+                    } else {
+                        (None, None)
+                    }
                 } else {
                     (None, None)
-                }
-            } else {
-                (None, None)
-            };
+                };
             // Populate trace metadata on first iteration so SFT export
             // carries model + system_prompt + tools_schema. These don't
             // change within a turn, so init-once is correct. Without this
@@ -4348,10 +4671,18 @@ impl AgentRuntime {
                 if ft.model.is_empty() {
                     ft.model = model.to_owned();
                     ft.system_prompt = effective_system.clone();
-                    ft.tools_schema = serde_json::to_value(&tools)
-                        .unwrap_or_else(|_| serde_json::json!([]));
+                    ft.tools_schema =
+                        serde_json::to_value(&tools).unwrap_or_else(|_| serde_json::json!([]));
                 }
             }
+            let turn_recall = if messages
+                .last()
+                .is_some_and(|m| matches!(m.role, Role::User))
+            {
+                ctx.auto_recall.clone()
+            } else {
+                None
+            };
 
             let req = LlmRequest {
                 model: model.to_owned(),
@@ -4364,9 +4695,14 @@ impl AgentRuntime {
                 thinking_budget,
                 endpoint: Default::default(),
                 kv_cache_mode,
-                session_key: if kv_cache_mode >= 2 { Some(ctx.session_key.clone()) } else { None },
+                session_key: if kv_cache_mode >= 2 {
+                    Some(ctx.session_key.clone())
+                } else {
+                    None
+                },
                 system_shared,
                 user_system,
+                recall: turn_recall,
             };
 
             // Update live status: LLM call starting.
@@ -4379,11 +4715,14 @@ impl AgentRuntime {
 
             // If the LLM rejects for context overflow, compact and retry once.
             let mut stream = match stream_result {
-                Err(ref e) if e.to_string().contains("exceed") || e.to_string().contains("context") => {
+                Err(ref e)
+                    if e.to_string().contains("exceed") || e.to_string().contains("context") =>
+                {
                     warn!(session = %ctx.session_key, error = %e, "LLM context overflow, compacting and retrying");
                     self.compact_inner(&ctx.session_key, &model, true).await;
                     // Rebuild messages after compaction.
-                    let compacted = self.sessions
+                    let compacted = self
+                        .sessions
                         .get(&ctx.session_key)
                         .cloned()
                         .unwrap_or_default();
@@ -4471,8 +4810,9 @@ impl AgentRuntime {
                     StreamEvent::ToolCall { id, name, input } => {
                         if !id.is_empty() && !name.is_empty() {
                             // New tool call with both id and name — start fresh entry.
-                            // Use check_with_params which hashes the full input (OpenClaw-compatible).
-                            // This ensures different arguments count as different calls.
+                            // Use check_with_params which hashes the full input
+                            // (OpenClaw-compatible). This ensures
+                            // different arguments count as different calls.
                             if let Some(warning_msg) = ctx
                                 .loop_detector
                                 .check_with_params(&name, &input)
@@ -4527,16 +4867,24 @@ impl AgentRuntime {
                                         other => serde_json::to_string(other).unwrap_or_default(),
                                     };
                                     let existing = last.2.as_str().unwrap_or("");
-                                    last.2 = serde_json::Value::String(format!("{existing}{fragment}"));
+                                    last.2 =
+                                        serde_json::Value::String(format!("{existing}{fragment}"));
                                 } else if let Some(new_str) = input.as_str() {
                                     // Last is Object but new chunk is String — convert.
-                                    let existing_str = serde_json::to_string(&last.2).unwrap_or_default();
-                                    last.2 = serde_json::Value::String(format!("{existing_str}{new_str}"));
+                                    let existing_str =
+                                        serde_json::to_string(&last.2).unwrap_or_default();
+                                    last.2 = serde_json::Value::String(format!(
+                                        "{existing_str}{new_str}"
+                                    ));
                                 } else {
                                     // Last resort: convert both to string.
-                                    let existing_str = serde_json::to_string(&last.2).unwrap_or_default();
-                                    let fragment = serde_json::to_string(&input).unwrap_or_default();
-                                    last.2 = serde_json::Value::String(format!("{existing_str}{fragment}"));
+                                    let existing_str =
+                                        serde_json::to_string(&last.2).unwrap_or_default();
+                                    let fragment =
+                                        serde_json::to_string(&input).unwrap_or_default();
+                                    last.2 = serde_json::Value::String(format!(
+                                        "{existing_str}{fragment}"
+                                    ));
                                     tracing::debug!(
                                         "streaming tool call: merged non-string types as strings"
                                     );
@@ -4598,7 +4946,14 @@ impl AgentRuntime {
             // Can be overridden via agents.defaults.stripThinkTags.
             let pre_strip_len = text_buf.trim().len();
             let thinking_active = thinking_budget.unwrap_or(0) > 0;
-            let strip_enabled = self.live.agents.read().await.defaults.strip_think_tags.unwrap_or(!thinking_active);
+            let strip_enabled = self
+                .live
+                .agents
+                .read()
+                .await
+                .defaults
+                .strip_think_tags
+                .unwrap_or(!thinking_active);
             if strip_enabled {
                 let before = text_buf.clone();
                 text_buf = crate::provider::openai::strip_think_tags_pub(&text_buf);
@@ -4632,7 +4987,10 @@ impl AgentRuntime {
                 && !reasoning_buf.trim().is_empty()
                 && tool_calls.is_empty()
             {
-                tracing::info!(reasoning_len = reasoning_buf.len(), "agent_loop: using reasoning as reply text");
+                tracing::info!(
+                    reasoning_len = reasoning_buf.len(),
+                    "agent_loop: using reasoning as reply text"
+                );
                 text_buf = reasoning_buf.clone();
             }
 
@@ -4779,16 +5137,30 @@ impl AgentRuntime {
                 // IMPORTANT: Check turn_scratchpad for tool calls from earlier iterations,
                 // not just current iteration's tool_calls (which is empty at this point).
                 let deception_keywords = [
-                    "已委托", "已用opencode", "已让opencode", "委托给opencode",
-                    "已检查", "已搜索", "已运行", "已执行",
-                    "已交给", "交给opencode", "opencode正在", "opencode已经",
-                    "I delegated", "I asked opencode", "opencode is", "I ran",
-                    "I checked", "I searched", "I executed",
+                    "已委托",
+                    "已用opencode",
+                    "已让opencode",
+                    "委托给opencode",
+                    "已检查",
+                    "已搜索",
+                    "已运行",
+                    "已执行",
+                    "已交给",
+                    "交给opencode",
+                    "opencode正在",
+                    "opencode已经",
+                    "I delegated",
+                    "I asked opencode",
+                    "opencode is",
+                    "I ran",
+                    "I checked",
+                    "I searched",
+                    "I executed",
                 ];
                 let lower_text = text_buf.to_lowercase();
-                let claims_action = deception_keywords.iter().any(|kw| {
-                    lower_text.contains(&kw.to_lowercase()) || text_buf.contains(kw)
-                });
+                let claims_action = deception_keywords
+                    .iter()
+                    .any(|kw| lower_text.contains(&kw.to_lowercase()) || text_buf.contains(kw));
 
                 // Check if turn_scratchpad contains tool calls (from earlier iterations)
                 let has_tool_in_turn = turn_scratchpad.iter().any(|msg| {
@@ -4803,7 +5175,8 @@ impl AgentRuntime {
                     }
                 });
 
-                // Only flag deception if model claims action AND no tool was called in entire turn
+                // Only flag deception if model claims action AND no tool was called in entire
+                // turn
                 if claims_action && !text_buf.trim().is_empty() && !has_tool_in_turn {
                     tracing::warn!(
                         session = %ctx.session_key,
@@ -4827,7 +5200,8 @@ impl AgentRuntime {
                             target_id: notif_target,
                             is_group: false,
                             text: "⚠️ **欺骗警告**: 模型声称「已委托/已检查」但没有调用任何工具。\
-                                这是欺骗行为。\n\n请回复「重试」强制模型实际调用 opencode 工具。".to_owned(),
+                                这是欺骗行为。\n\n请回复「重试」强制模型实际调用 opencode 工具。"
+                                .to_owned(),
                             reply_to: None,
                             images: vec![],
                             files: vec![],
@@ -4844,6 +5218,7 @@ impl AgentRuntime {
                     let assistant_msg = Message {
                         role: Role::Assistant,
                         content: MessageContent::Text(text_buf.clone()),
+                        rsclaw_hidden: None,
                     };
                     // Internal sessions (heartbeat/cron/system): skip DB
                     // persist so replies like "HEARTBEAT_OK" don't
@@ -4909,7 +5284,11 @@ impl AgentRuntime {
                 self.maybe_crystallize_workflow(&ctx, &final_text);
 
                 if !tool_images.is_empty() {
-                    info!("AgentReply returning with {} image(s), first {} bytes", tool_images.len(), tool_images.first().map(|s| s.len()).unwrap_or(0));
+                    info!(
+                        "AgentReply returning with {} image(s), first {} bytes",
+                        tool_images.len(),
+                        tool_images.first().map(|s| s.len()).unwrap_or(0)
+                    );
                 }
                 // tool_images may contain file paths (from computer_use
                 // screenshots saved to disk) OR data URLs (from image-gen
@@ -4946,9 +5325,15 @@ impl AgentRuntime {
             // standalone bubble (the "ws" alias in startup.rs bridges
             // notification_tx to the desktop channel, so it lands in chat
             // alongside the streaming bubble).
-            let is_streaming_channel =
-                ctx.channel == "ws" || ctx.channel == "desktop";
-            let intermediate_enabled = self.live.agents.read().await.defaults.intermediate_output.unwrap_or(true);
+            let is_streaming_channel = ctx.channel == "ws" || ctx.channel == "desktop";
+            let intermediate_enabled = self
+                .live
+                .agents
+                .read()
+                .await
+                .defaults
+                .intermediate_output
+                .unwrap_or(true);
             if intermediate_enabled
                 && !is_streaming_channel
                 && !text_buf.is_empty()
@@ -4970,7 +5355,10 @@ impl AgentRuntime {
                         channel: Some(ctx.channel.clone()),
                         account: None,
                     });
-                    tracing::debug!(text_len = text_buf.len(), "agent_loop: sent intermediate text to user");
+                    tracing::debug!(
+                        text_len = text_buf.len(),
+                        "agent_loop: sent intermediate text to user"
+                    );
                 }
             }
 
@@ -4985,7 +5373,9 @@ impl AgentRuntime {
             // Persist reasoning_content so providers that require it (e.g.
             // kimi-for-coding) see it on subsequent turns.
             if !reasoning_buf.is_empty() {
-                parts.push(crate::provider::ContentPart::Reasoning { text: reasoning_buf });
+                parts.push(crate::provider::ContentPart::Reasoning {
+                    text: reasoning_buf,
+                });
             }
             for (id, name, input) in &tool_calls {
                 parts.push(crate::provider::ContentPart::ToolUse {
@@ -4997,6 +5387,7 @@ impl AgentRuntime {
             let assistant_msg = Message {
                 role: Role::Assistant,
                 content: MessageContent::Parts(parts),
+                rsclaw_hidden: None,
             };
             // Tool-use responses are scratch-paper: the LLM needs to see them
             // in this turn's messages, but they must not persist in session history.
@@ -5087,7 +5478,8 @@ impl AgentRuntime {
                             "Too many consecutive parse errors, aborting turn"
                         );
                         // Record for loop detection
-                        ctx.loop_detector.record_result(&serde_json::json!({"error": "too many parse errors"}));
+                        ctx.loop_detector
+                            .record_result(&serde_json::json!({"error": "too many parse errors"}));
                         // Return error to break the loop
                         return Err(anyhow!(
                             "Turn aborted: {} consecutive tool parse errors. Model output may be corrupted.",
@@ -5096,7 +5488,8 @@ impl AgentRuntime {
                     }
 
                     // Record for loop detection so error doesn't count as a "different result"
-                    ctx.loop_detector.record_result(&serde_json::json!({"error": err_msg}));
+                    ctx.loop_detector
+                        .record_result(&serde_json::json!({"error": err_msg}));
 
                     // Directly return error to scratch-paper buffer without executing the tool.
                     let tool_msg = Message {
@@ -5108,13 +5501,15 @@ impl AgentRuntime {
                                 is_error: Some(true),
                             },
                         ]),
+                        rsclaw_hidden: None,
                     };
                     turn_scratchpad.push(tool_msg);
                     continue;
                 }
 
                 // Detect consecutive identical tool calls (same name + same args).
-                let call_key = crate::agent::loop_detection::hash_tool_call(&tool_name, &tool_input);
+                let call_key =
+                    crate::agent::loop_detection::hash_tool_call(&tool_name, &tool_input);
                 if call_key == last_tool_key {
                     same_call_streak += 1;
                     ctx.turn_metrics.same_call_streak_max =
@@ -5126,11 +5521,9 @@ impl AgentRuntime {
                             "agent_loop: identical tool call repeated {} times, breaking loop",
                             same_call_streak
                         );
-                        let terminal_text = crate::i18n::t(
-                            "agent_loop_detected",
-                            crate::i18n::default_lang(),
-                        )
-                        .to_owned();
+                        let terminal_text =
+                            crate::i18n::t("agent_loop_detected", crate::i18n::default_lang())
+                                .to_owned();
                         // Emit done=true so WS subscribers (desktop chat) see
                         // the terminal text and the terminator frame together.
                         // Same fix pattern as the clear_signal / abort /
@@ -5164,9 +5557,17 @@ impl AgentRuntime {
                 }
 
                 // Upgrade iteration limit when complex or multi-step tools are used.
-                if matches!(tool_name.as_str(),
-                    "web_browser" | "opencode" | "claudecode" | "agent"
-                    | "search_content" | "search_file" | "shell" | "execute_command" | "exec"
+                if matches!(
+                    tool_name.as_str(),
+                    "web_browser"
+                        | "opencode"
+                        | "claudecode"
+                        | "agent"
+                        | "search_content"
+                        | "search_file"
+                        | "shell"
+                        | "execute_command"
+                        | "exec"
                 ) {
                     max_iterations = max_iterations.max(configured_complex);
                 }
@@ -5223,14 +5624,12 @@ impl AgentRuntime {
                     let agent_id = ctx.agent_id.clone();
                     let tool_name = p.tool_name.clone();
                     let tool_input_str = p.tool_input_str.clone();
-                    let fut = self
-                        .dispatch_tool(ctx, &p.tool_id, &p.tool_name, p.tool_input.clone());
+                    let fut =
+                        self.dispatch_tool(ctx, &p.tool_id, &p.tool_name, p.tool_input.clone());
                     async move {
-                        let timed = time::timeout(
-                            Duration::from_secs(TOOL_DISPATCH_TIMEOUT_SECS),
-                            fut,
-                        )
-                        .await;
+                        let timed =
+                            time::timeout(Duration::from_secs(TOOL_DISPATCH_TIMEOUT_SECS), fut)
+                                .await;
                         if let Some(bus) = bus {
                             let preview = match &timed {
                                 Ok(Ok(v)) => {
@@ -5253,17 +5652,14 @@ impl AgentRuntime {
                                         format_tool_result(&squashed)
                                     };
                                     if raw.chars().count() > 4000 {
-                                        let truncated: String =
-                                            raw.chars().take(2000).collect();
+                                        let truncated: String = raw.chars().take(2000).collect();
                                         format!("{truncated}…(truncated)")
                                     } else {
                                         raw
                                     }
                                 }
                                 Ok(Err(e)) => format!("[error: {e:#}]"),
-                                Err(_) => format!(
-                                    "[timeout after {TOOL_DISPATCH_TIMEOUT_SECS}s]"
-                                ),
+                                Err(_) => format!("[timeout after {TOOL_DISPATCH_TIMEOUT_SECS}s]"),
                             };
                             // Exec tools: prepend `$ command` so the UI's
                             // card header shows what was run (parity with
@@ -5283,9 +5679,8 @@ impl AgentRuntime {
                             } else {
                                 preview
                             };
-                            let marker = format!(
-                                "<rstool name=\"{tool_name}\">{display_out}</rstool>"
-                            );
+                            let marker =
+                                format!("<rstool name=\"{tool_name}\">{display_out}</rstool>");
                             let _ = bus.send(AgentEvent {
                                 session_id,
                                 agent_id,
@@ -5306,8 +5701,7 @@ impl AgentRuntime {
             // then re-index by emit position so Phase 3 can iterate the LLM's
             // original tool_call order (matters for scratchpad / loop
             // detector / metrics determinism).
-            let mut timed_results: Vec<Option<_>> =
-                (0..to_dispatch.len()).map(|_| None).collect();
+            let mut timed_results: Vec<Option<_>> = (0..to_dispatch.len()).map(|_| None).collect();
             {
                 use futures::StreamExt as _;
                 let mut stream = dispatch_stream;
@@ -5315,8 +5709,10 @@ impl AgentRuntime {
                     timed_results[idx] = Some(r);
                 }
             }
-            let timed_results: Vec<_> =
-                timed_results.into_iter().map(|o| o.expect("every dispatch future yields exactly one result")).collect();
+            let timed_results: Vec<_> = timed_results
+                .into_iter()
+                .map(|o| o.expect("every dispatch future yields exactly one result"))
+                .collect();
 
             // ---- Phase 3: serial post-processing in LLM emit order ----
             for (pending, timed_result) in to_dispatch.into_iter().zip(timed_results.into_iter()) {
@@ -5359,7 +5755,8 @@ impl AgentRuntime {
                                     .map(|c| c != 0)
                                     .unwrap_or(false)
                                     || obj.contains_key("error")
-                                    || obj.get("stderr")
+                                    || obj
+                                        .get("stderr")
                                         .and_then(|s| s.as_str())
                                         .map(|s| !s.is_empty())
                                         .unwrap_or(false)
@@ -5386,12 +5783,11 @@ impl AgentRuntime {
                         // crystallization. Truncate args/result so we don't
                         // hold megabytes of base64 screenshots in RAM.
                         const SUMMARY_CHARS: usize = 400;
-                        let args_summary: String =
-                            serde_json::to_string(&tool_input_for_metrics)
-                                .unwrap_or_default()
-                                .chars()
-                                .take(SUMMARY_CHARS)
-                                .collect();
+                        let args_summary: String = serde_json::to_string(&tool_input_for_metrics)
+                            .unwrap_or_default()
+                            .chars()
+                            .take(SUMMARY_CHARS)
+                            .collect();
                         let result_summary: String =
                             v.to_string().chars().take(SUMMARY_CHARS).collect();
                         ctx.turn_metrics.record_tool(
@@ -5401,17 +5797,17 @@ impl AgentRuntime {
                             has_error,
                         );
                         if let Some(ft) = ctx.full_trace.as_mut() {
-                            ft.push_tool_call(
-                                &tool_name,
-                                tool_input_for_metrics.clone(),
-                                &tool_id,
-                            );
+                            ft.push_tool_call(&tool_name, tool_input_for_metrics.clone(), &tool_id);
                             ft.push_tool_result(&tool_id, v.to_string(), has_error);
                         }
                         // Record result for progress-aware loop detection.
                         // Same args + different results = making progress, not a loop.
-                        // For exec tool: exclude task_id (uuid changes each call) to properly detect loops.
-                        let result_for_loop = if tool_name == "shell" || tool_name == "exec" || tool_name == "execute_command" {
+                        // For exec tool: exclude task_id (uuid changes each call) to properly
+                        // detect loops.
+                        let result_for_loop = if tool_name == "shell"
+                            || tool_name == "exec"
+                            || tool_name == "execute_command"
+                        {
                             // Strip task_id from exec results - it's a uuid that changes every call
                             match &v {
                                 serde_json::Value::Object(obj) => {
@@ -5423,7 +5819,7 @@ impl AgentRuntime {
                                     }
                                     serde_json::Value::Object(cleaned)
                                 }
-                                _ => v.clone()
+                                _ => v.clone(),
                             }
                         } else {
                             v.clone()
@@ -5455,9 +5851,7 @@ impl AgentRuntime {
                         // never auto-send to the user. Only image-gen and explicit uploads
                         // should forward images.
                         let is_internal_screenshot = tool_name == "computer_use";
-                        if !is_internal_screenshot
-                            && let Some(img) = img_data.or(img_path)
-                        {
+                        if !is_internal_screenshot && let Some(img) = img_data.or(img_path) {
                             let desc = v
                                 .get("revised_prompt")
                                 .and_then(|p| p.as_str())
@@ -5484,7 +5878,10 @@ impl AgentRuntime {
                             // bypass the backstop — re-compacting their full-read
                             // response would write a new artifact and force the LLM
                             // into a nested re-fetch loop.
-                            let v = if matches!(tool_name.as_str(), "read_artifact" | "read_session_archive") {
+                            let v = if matches!(
+                                tool_name.as_str(),
+                                "read_artifact" | "read_session_archive"
+                            ) {
                                 v
                             } else {
                                 // Web tools fetch articles where the LLM
@@ -5507,7 +5904,8 @@ impl AgentRuntime {
                             if let Some(s) = v.as_str() {
                                 (s.to_owned(), vec![])
                             } else {
-                                // Format structured tool results (exec, read, etc.) for better LLM comprehension
+                                // Format structured tool results (exec, read, etc.) for better LLM
+                                // comprehension
                                 let mut text = format_tool_result(&v);
                                 // Surface the artifact envelope to the LLM —
                                 // format_tool_result is shape-specific (exec
@@ -5516,15 +5914,24 @@ impl AgentRuntime {
                                 // explicit marker so the LLM sees the
                                 // tool_result_id even when the preview text's
                                 // inline hint sits buried mid-output.
-                                if v.get("_truncated").and_then(|x| x.as_bool()).unwrap_or(false) {
-                                    if let Some(id) = v.get("_tool_result_id").and_then(|x| x.as_str()) {
+                                if v.get("_truncated")
+                                    .and_then(|x| x.as_bool())
+                                    .unwrap_or(false)
+                                {
+                                    if let Some(id) =
+                                        v.get("_tool_result_id").and_then(|x| x.as_str())
+                                    {
                                         text.push_str(&format!(
                                             "\n\n[truncated — call read_artifact(tool_result_id=\"{id}\") for full output]"
                                         ));
-                                    } else if let Some(ids) = v.get("_tool_result_ids").and_then(|x| x.as_object()) {
+                                    } else if let Some(ids) =
+                                        v.get("_tool_result_ids").and_then(|x| x.as_object())
+                                    {
                                         let pairs: Vec<String> = ids
                                             .iter()
-                                            .filter_map(|(k, v)| v.as_str().map(|s| format!("{k}={s}")))
+                                            .filter_map(|(k, v)| {
+                                                v.as_str().map(|s| format!("{k}={s}"))
+                                            })
                                             .collect();
                                         if !pairs.is_empty() {
                                             text.push_str(&format!(
@@ -5581,17 +5988,32 @@ impl AgentRuntime {
                 // file for delivery. Images go to tool_images, others to tool_files.
                 {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&result_text) {
-                        if v.get("__send_file").and_then(|b| b.as_bool()).unwrap_or(false) {
+                        if v.get("__send_file")
+                            .and_then(|b| b.as_bool())
+                            .unwrap_or(false)
+                        {
                             if let Some(path_str) = v.get("path").and_then(|p| p.as_str()) {
-                                let send_workspace = self.handle.config.workspace.as_deref()
+                                let send_workspace = self
+                                    .handle
+                                    .config
+                                    .workspace
+                                    .as_deref()
                                     .or(self.live.agents.read().await.defaults.workspace.as_deref())
                                     .map(expand_tilde)
-                                    .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
+                                    .unwrap_or_else(|| {
+                                        crate::config::loader::base_dir().join("workspace")
+                                    });
                                 let full = canonicalize_external_path(path_str, &send_workspace);
-                                let filename = v.get("filename").and_then(|f| f.as_str()).unwrap_or("file").to_owned();
+                                let filename = v
+                                    .get("filename")
+                                    .and_then(|f| f.as_str())
+                                    .unwrap_or("file")
+                                    .to_owned();
                                 let lower = filename.to_lowercase();
-                                let is_image = lower.ends_with(".jpg") || lower.ends_with(".jpeg")
-                                    || lower.ends_with(".png") || lower.ends_with(".webp")
+                                let is_image = lower.ends_with(".jpg")
+                                    || lower.ends_with(".jpeg")
+                                    || lower.ends_with(".png")
+                                    || lower.ends_with(".webp")
                                     || lower.ends_with(".gif");
                                 if is_image {
                                     // Send the path inline. Desktop UI loads via Tauri's
@@ -5605,17 +6027,29 @@ impl AgentRuntime {
                                         tracing::warn!(path = %full.display(), "agent: send_file image path missing, dropping");
                                     }
                                 } else {
-                                    let mime = if lower.ends_with(".xlsx") { "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }
-                                        else if lower.ends_with(".docx") { "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
-                                        else if lower.ends_with(".pptx") { "application/vnd.openxmlformats-officedocument.presentationml.presentation" }
-                                        else if lower.ends_with(".pdf") { "application/pdf" }
-                                        else if lower.ends_with(".csv") { "text/csv" }
-                                        else if lower.ends_with(".mp4") { "video/mp4" }
-                                        else if lower.ends_with(".mp3") { "audio/mpeg" }
-                                        else if lower.ends_with(".ogg") { "audio/ogg" }
-                                        else if lower.ends_with(".opus") { "audio/opus" }
-                                        else if lower.ends_with(".zip") { "application/zip" }
-                                        else { "application/octet-stream" };
+                                    let mime = if lower.ends_with(".xlsx") {
+                                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                    } else if lower.ends_with(".docx") {
+                                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                                    } else if lower.ends_with(".pptx") {
+                                        "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                                    } else if lower.ends_with(".pdf") {
+                                        "application/pdf"
+                                    } else if lower.ends_with(".csv") {
+                                        "text/csv"
+                                    } else if lower.ends_with(".mp4") {
+                                        "video/mp4"
+                                    } else if lower.ends_with(".mp3") {
+                                        "audio/mpeg"
+                                    } else if lower.ends_with(".ogg") {
+                                        "audio/ogg"
+                                    } else if lower.ends_with(".opus") {
+                                        "audio/opus"
+                                    } else if lower.ends_with(".zip") {
+                                        "application/zip"
+                                    } else {
+                                        "application/octet-stream"
+                                    };
                                     let full_str = full.to_string_lossy().to_string();
                                     if !tool_files.iter().any(|(_, _, p)| p == &full_str) {
                                         tool_files.push((filename, mime.to_owned(), full_str));
@@ -5628,8 +6062,15 @@ impl AgentRuntime {
                 }
 
                 // Collect sendable file attachments from write/exec tool results.
-                if matches!(tool_name.as_str(), "write_file" | "write" | "shell" | "execute_command" | "exec") {
-                    let workspace = self.handle.config.workspace.as_deref()
+                if matches!(
+                    tool_name.as_str(),
+                    "write_file" | "write" | "shell" | "execute_command" | "exec"
+                ) {
+                    let workspace = self
+                        .handle
+                        .config
+                        .workspace
+                        .as_deref()
                         .or(self.live.agents.read().await.defaults.workspace.as_deref())
                         .map(expand_tilde)
                         .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
@@ -5637,29 +6078,60 @@ impl AgentRuntime {
                     // Helper: check if a path is a sendable file type and add to tool_files.
                     let mut try_add_file = |path_str: &str| {
                         let lower = path_str.to_lowercase();
-                        let sendable_exts = [".xlsx", ".xls", ".docx", ".doc", ".pptx", ".ppt",
-                            ".pdf", ".csv", ".mp4", ".mp3", ".zip", ".tar.gz", ".txt", ".json",
-                            ".html", ".py", ".md"];
-                        if !sendable_exts.iter().any(|ext| lower.ends_with(ext)) { return; }
+                        let sendable_exts = [
+                            ".xlsx", ".xls", ".docx", ".doc", ".pptx", ".ppt", ".pdf", ".csv",
+                            ".mp4", ".mp3", ".zip", ".tar.gz", ".txt", ".json", ".html", ".py",
+                            ".md",
+                        ];
+                        if !sendable_exts.iter().any(|ext| lower.ends_with(ext)) {
+                            return;
+                        }
                         let full = canonicalize_external_path(path_str, &workspace);
-                        if !full.exists() { return; }
+                        if !full.exists() {
+                            return;
+                        }
                         // Skip very large files (>50MB)
                         if let Ok(meta) = full.metadata() {
-                            if meta.len() > 50_000_000 { return; }
+                            if meta.len() > 50_000_000 {
+                                return;
+                            }
                         }
-                        let filename = full.file_name().unwrap_or_default().to_string_lossy().to_string();
+                        let filename = full
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string();
                         // Avoid duplicates
-                        if tool_files.iter().any(|(_, _, p)| p == &full.to_string_lossy().to_string()) { return; }
-                        let mime = if lower.ends_with(".xlsx") { "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }
-                            else if lower.ends_with(".docx") { "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
-                            else if lower.ends_with(".pptx") { "application/vnd.openxmlformats-officedocument.presentationml.presentation" }
-                            else if lower.ends_with(".pdf") { "application/pdf" }
-                            else if lower.ends_with(".csv") { "text/csv" }
-                            else if lower.ends_with(".mp4") { "video/mp4" }
-                            else if lower.ends_with(".mp3") { "audio/mpeg" }
-                            else if lower.ends_with(".zip") { "application/zip" }
-                            else { "application/octet-stream" };
-                        tool_files.push((filename, mime.to_owned(), full.to_string_lossy().to_string()));
+                        if tool_files
+                            .iter()
+                            .any(|(_, _, p)| p == &full.to_string_lossy().to_string())
+                        {
+                            return;
+                        }
+                        let mime = if lower.ends_with(".xlsx") {
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        } else if lower.ends_with(".docx") {
+                            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                        } else if lower.ends_with(".pptx") {
+                            "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                        } else if lower.ends_with(".pdf") {
+                            "application/pdf"
+                        } else if lower.ends_with(".csv") {
+                            "text/csv"
+                        } else if lower.ends_with(".mp4") {
+                            "video/mp4"
+                        } else if lower.ends_with(".mp3") {
+                            "audio/mpeg"
+                        } else if lower.ends_with(".zip") {
+                            "application/zip"
+                        } else {
+                            "application/octet-stream"
+                        };
+                        tool_files.push((
+                            filename,
+                            mime.to_owned(),
+                            full.to_string_lossy().to_string(),
+                        ));
                         tracing::info!(path = %full.display(), "agent: sendable file detected");
                     };
 
@@ -5672,7 +6144,10 @@ impl AgentRuntime {
                         if let Some(stdout) = v.get("stdout").and_then(|s| s.as_str()) {
                             for line in stdout.lines() {
                                 let trimmed = line.trim();
-                                if trimmed.contains('.') && !trimmed.contains(' ') && trimmed.len() < 256 {
+                                if trimmed.contains('.')
+                                    && !trimmed.contains(' ')
+                                    && trimmed.len() < 256
+                                {
                                     try_add_file(trimmed);
                                 }
                             }
@@ -5680,7 +6155,7 @@ impl AgentRuntime {
                     }
                 }
 
-// Extract inline images and file attachments from WASM plugin results.
+                // Extract inline images and file attachments from WASM plugin results.
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&result_text) {
                     // data:image/ URIs → tool_images
                     if let Some(imgs) = v.get("images").and_then(|i| i.as_array()) {
@@ -5688,44 +6163,63 @@ impl AgentRuntime {
                             if let Some(s) = img.as_str() {
                                 if s.starts_with("data:image/") {
                                     tool_images.push(s.to_string());
-                                    tracing::info!("extracted inline image from tool result ({} bytes)", s.len());
+                                    tracing::info!(
+                                        "extracted inline image from tool result ({} bytes)",
+                                        s.len()
+                                    );
                                 }
                             }
                         }
                         if !tool_images.is_empty() {
                             let mut cleaned = v.clone();
-                            cleaned["images"] = serde_json::json!(format!("[{} images extracted as attachments]", tool_images.len()));
+                            cleaned["images"] = serde_json::json!(format!(
+                                "[{} images extracted as attachments]",
+                                tool_images.len()
+                            ));
                             result_text = cleaned.to_string();
                         }
                     }
 
                     // File paths from "files" array → tool_images/tool_files (auto-send)
-                    // Jimeng plugin returns: {"files": ["{\"path\":\"/path/to/1.png\",\"size\":123}", ...]}
+                    // Jimeng plugin returns: {"files":
+                    // ["{\"path\":\"/path/to/1.png\",\"size\":123}", ...]}
                     if let Some(files) = v.get("files").and_then(|f| f.as_array()) {
                         for file_entry in files {
                             let path_str = if let Some(s) = file_entry.as_str() {
                                 // May be a JSON string with path field
                                 if let Ok(fv) = serde_json::from_str::<serde_json::Value>(s) {
-                                    fv.get("path").and_then(|p| p.as_str()).unwrap_or(s).to_string()
+                                    fv.get("path")
+                                        .and_then(|p| p.as_str())
+                                        .unwrap_or(s)
+                                        .to_string()
                                 } else {
                                     s.to_string()
                                 }
-                            } else if let Some(p) = file_entry.get("path").and_then(|p| p.as_str()) {
+                            } else if let Some(p) = file_entry.get("path").and_then(|p| p.as_str())
+                            {
                                 p.to_string()
                             } else {
                                 continue;
                             };
 
-                            let files_workspace = self.handle.config.workspace.as_deref()
+                            let files_workspace = self
+                                .handle
+                                .config
+                                .workspace
+                                .as_deref()
                                 .or(self.live.agents.read().await.defaults.workspace.as_deref())
                                 .map(expand_tilde)
-                                .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
+                                .unwrap_or_else(|| {
+                                    crate::config::loader::base_dir().join("workspace")
+                                });
                             let pb = canonicalize_external_path(&path_str, &files_workspace);
                             let pb_str = pb.to_string_lossy().to_string();
                             if pb.exists() {
                                 let lower = path_str.to_lowercase();
-                                let is_image = lower.ends_with(".png") || lower.ends_with(".jpg")
-                                    || lower.ends_with(".jpeg") || lower.ends_with(".webp");
+                                let is_image = lower.ends_with(".png")
+                                    || lower.ends_with(".jpg")
+                                    || lower.ends_with(".jpeg")
+                                    || lower.ends_with(".webp");
                                 if is_image {
                                     // Push the file path (not base64). The desktop UI loads
                                     // it via Tauri's asset protocol; non-WS channels rehydrate
@@ -5736,12 +6230,17 @@ impl AgentRuntime {
                                     tracing::info!(path = %pb_str, "auto-sending image file as attachment (path)");
                                 } else {
                                     // Non-image file (video, etc.) → tool_files
-                                    let filename = pb.file_name()
+                                    let filename = pb
+                                        .file_name()
                                         .map(|f| f.to_string_lossy().to_string())
                                         .unwrap_or_else(|| "file".to_string());
-                                    let mime = if lower.ends_with(".mp4") { "video/mp4" }
-                                        else if lower.ends_with(".mp3") { "audio/mpeg" }
-                                        else { "application/octet-stream" };
+                                    let mime = if lower.ends_with(".mp4") {
+                                        "video/mp4"
+                                    } else if lower.ends_with(".mp3") {
+                                        "audio/mpeg"
+                                    } else {
+                                        "application/octet-stream"
+                                    };
                                     tool_files.push((filename, mime.to_string(), pb_str.clone()));
                                     tracing::info!(path = %pb_str, "auto-sending file as attachment");
                                 }
@@ -5763,21 +6262,16 @@ impl AgentRuntime {
                 // Cap or compress tool result for session storage.
                 //
                 // Routing per tool:
-                //   - web_search       -> truncate to limits.web_search (snippets
-                //                         only; no inline page content since the
-                //                         auto-fetch pipeline was removed).
-                //   - web_fetch        -> compress on the flash model when raw
-                //                         exceeds limits.web_fetch, else truncate.
-                //   - web_browser/browser -> compress on the flash model when raw
-                //                         exceeds limits.web_browser, else
-                //                         truncate. Stateful browser tasks fire
-                //                         many snapshots per turn, so compression
-                //                         must NOT compete with the primary
-                //                         model's KV cache — see
-                //                         compress_tool_result_for_session.
-                //   - everything else  -> per-tool truncate, with use_skill
-                //                         kept large because SKILL.md must
-                //                         arrive verbatim.
+                //   - web_search       -> truncate to limits.web_search (snippets only; no
+                //     inline page content since the auto-fetch pipeline was removed).
+                //   - web_fetch        -> compress on the flash model when raw exceeds
+                //     limits.web_fetch, else truncate.
+                //   - web_browser/browser -> compress on the flash model when raw exceeds
+                //     limits.web_browser, else truncate. Stateful browser tasks fire many
+                //     snapshots per turn, so compression must NOT compete with the primary
+                //     model's KV cache — see compress_tool_result_for_session.
+                //   - everything else  -> per-tool truncate, with use_skill kept large because
+                //     SKILL.md must arrive verbatim.
                 let session_text = {
                     use super::web_parsers::truncate_chars;
 
@@ -5795,12 +6289,8 @@ impl AgentRuntime {
                         "shell" | "execute_command" | "exec" => {
                             limits.and_then(|l| l.exec).unwrap_or(3000)
                         }
-                        "web_search" => {
-                            limits.and_then(|l| l.web_search).unwrap_or(2000)
-                        }
-                        "web_fetch" => {
-                            limits.and_then(|l| l.web_fetch).unwrap_or(5000)
-                        }
+                        "web_search" => limits.and_then(|l| l.web_search).unwrap_or(2000),
+                        "web_fetch" => limits.and_then(|l| l.web_fetch).unwrap_or(5000),
                         "web_browser" | "browser" => {
                             limits.and_then(|l| l.web_browser).unwrap_or(2000)
                         }
@@ -5811,19 +6301,13 @@ impl AgentRuntime {
                         // @fly-ai/flyai-cli` on line 60 — past the 3000-char
                         // cut — so the agent saw only `runtime: node` in
                         // frontmatter and made up `node index.js` instead).
-                        "skill_use" => {
-                            limits.and_then(|l| l.default).unwrap_or(60_000)
-                        }
-                        "read_file" | "read" => {
-                            limits.and_then(|l| l.default).unwrap_or(3000)
-                        }
+                        "skill_use" => limits.and_then(|l| l.default).unwrap_or(60_000),
+                        "read_file" | "read" => limits.and_then(|l| l.default).unwrap_or(3000),
                         _ => limits.and_then(|l| l.default).unwrap_or(3000),
                     };
 
-                    let needs_compression = matches!(
-                        tool_name.as_str(),
-                        "web_fetch" | "web_browser" | "browser"
-                    );
+                    let needs_compression =
+                        matches!(tool_name.as_str(), "web_fetch" | "web_browser" | "browser");
 
                     if needs_compression && result_text.chars().count() > max_chars {
                         let sk = ctx.session_key.clone();
@@ -5886,13 +6370,14 @@ impl AgentRuntime {
                             // Detect error from result content (exit_code != 0 or error field)
                             is_error: Some(
                                 result_text.contains("\"exit_code\":")
-                                && !result_text.contains("\"exit_code\": 0")
-                                || result_text.contains("\"error\"")
-                                || result_text.contains("[stderr]")
-                                || result_text.contains("[exit code:")
+                                    && !result_text.contains("\"exit_code\": 0")
+                                    || result_text.contains("\"error\"")
+                                    || result_text.contains("[stderr]")
+                                    || result_text.contains("[exit code:"),
                             ),
                         },
                     ]),
+                    rsclaw_hidden: None,
                 };
                 // Tool results are scratch-paper: keep in the working buffer for
                 // this turn's LLM iterations but never persist to session / redb.
@@ -5927,9 +6412,10 @@ impl AgentRuntime {
                         runtime: "js",
                         tool: tool.name.clone(),
                         description: tool.description.clone(),
-                        input_schema: tool.input_schema.clone().unwrap_or_else(|| {
-                            json!({"type": "object", "properties": {}})
-                        }),
+                        input_schema: tool
+                            .input_schema
+                            .clone()
+                            .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
                     });
                 }
             }
@@ -6059,7 +6545,10 @@ impl AgentRuntime {
         if query.is_empty() {
             return Ok(json!({"error": "plugin.search_tools requires non-empty query"}));
         }
-        let plugin_filter = args["plugin"].as_str().map(str::trim).filter(|s| !s.is_empty());
+        let plugin_filter = args["plugin"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         let limit = args["limit"].as_u64().unwrap_or(8).clamp(1, 20) as usize;
 
         let mut scored: Vec<(i32, PluginToolInfo)> = self
@@ -6114,7 +6603,10 @@ impl AgentRuntime {
         }))
     }
 
-    fn validate_plugin_arguments(tool: &PluginToolInfo, args: &Value) -> std::result::Result<(), Value> {
+    fn validate_plugin_arguments(
+        tool: &PluginToolInfo,
+        args: &Value,
+    ) -> std::result::Result<(), Value> {
         if !args.is_object() {
             return Err(json!({
                 "error": "plugin.invoke arguments must be an object",
@@ -6171,7 +6663,9 @@ impl AgentRuntime {
                     channel: ctx.channel.clone(),
                 }
             });
-            return wp.call_tool_with_ctx(tool_name, arguments, notify_ctx).await;
+            return wp
+                .call_tool_with_ctx(tool_name, arguments, notify_ctx)
+                .await;
         }
 
         if let Some(reg) = self.plugins.as_ref()
@@ -6238,7 +6732,7 @@ impl AgentRuntime {
             }
             "memory_put" => {
                 return self
-                    .tool_memory_consolidated(ctx, inject_action(args, "put"))
+                    .tool_memory_consolidated(ctx, inject_memory_put_compat(args))
                     .await;
             }
             "memory_delete" => {
@@ -6338,9 +6832,7 @@ impl AgentRuntime {
                     || lower_path.ends_with(".flac")
                     || lower_path.ends_with(".silk")
                     || lower_path.ends_with(".amr");
-                if path_is_audio
-                    && self.voice_mode_sessions.contains(&ctx.session_key)
-                {
+                if path_is_audio && self.voice_mode_sessions.contains(&ctx.session_key) {
                     debug!(
                         session = %ctx.session_key,
                         path = %path,
@@ -6352,12 +6844,20 @@ impl AgentRuntime {
                         "path": path,
                     }));
                 }
-                let workspace = self.handle.config.workspace.as_deref()
+                let workspace = self
+                    .handle
+                    .config
+                    .workspace
+                    .as_deref()
                     .or(self.live.agents.read().await.defaults.workspace.as_deref())
                     .map(expand_tilde)
                     .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
                 let pb = std::path::PathBuf::from(&path);
-                let full = if pb.is_absolute() { pb } else { workspace.join(&path) };
+                let full = if pb.is_absolute() {
+                    pb
+                } else {
+                    workspace.join(&path)
+                };
 
                 // Reuse the same safety checks as the read tool.
                 if let Err(e) = check_read_safety(&path, &full) {
@@ -6373,7 +6873,11 @@ impl AgentRuntime {
                         return Ok(json!({"error": "file too large (>50MB)"}));
                     }
                 }
-                let filename = full.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let filename = full
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
                 return Ok(json!({
                     "__send_file": true,
                     "path": full.to_string_lossy(),
@@ -6409,7 +6913,9 @@ impl AgentRuntime {
                 let mut args = args;
                 if args.get("_user_query").is_none() {
                     if let Some(msgs) = self.sessions.get(&ctx.session_key) {
-                        if let Some(uq) = msgs.iter().rev()
+                        if let Some(uq) = msgs
+                            .iter()
+                            .rev()
                             .find(|m| m.role == crate::provider::Role::User)
                             .and_then(|m| match &m.content {
                                 crate::provider::MessageContent::Text(t) => Some(t.as_str()),
@@ -6493,8 +6999,8 @@ impl AgentRuntime {
             return Err(anyhow!("MCP tool `{name}` not found"));
         }
 
-        // 4. Plugin tool: `<plugin>.<tool>` (must precede skill match because
-        //    plugins win the priority ladder). Wasm wins on collision.
+        // 4. Plugin tool: `<plugin>.<tool>` (must precede skill match because plugins
+        //    win the priority ladder). Wasm wins on collision.
         if let Some((plugin_name, tool_name)) = name.split_once('.') {
             if let Some(wp) = self.wasm_plugins.iter().find(|p| p.name == plugin_name) {
                 let notify_ctx = self.notification_tx.as_ref().map(|tx| {
@@ -6636,13 +7142,13 @@ impl AgentRuntime {
 
             // Drain the SSE stream until the remote publishes a terminal
             // status event.
-            //   - status-update with message text: forward to lead's channel
-            //     so streaming subscribers see sub-agent progress in real
-            //     time (e.g. "calling tool memory_search").
-            //   - artifact-update text parts: accumulate as the reply text
-            //     ultimately returned to the LLM.
-            //   - final=true: terminate; FAILED captures the error message,
-            //     CANCELED short-circuits with an error.
+            //   - status-update with message text: forward to lead's channel so streaming
+            //     subscribers see sub-agent progress in real time (e.g. "calling tool
+            //     memory_search").
+            //   - artifact-update text parts: accumulate as the reply text ultimately
+            //     returned to the LLM.
+            //   - final=true: terminate; FAILED captures the error message, CANCELED
+            //     short-circuits with an error.
             //
             // Cancellation: if the lead's turn_ctx is cancelled, dropping the
             // pinned SSE stream closes the HTTP connection; the remote's SSE
@@ -6759,8 +7265,8 @@ impl AgentRuntime {
 
     /// Infer an outcome signal from the completed turn.
     ///
-    /// Returns a value in \[-0.3, 0.3\]: positive = helpful, negative = unhelpful.
-    /// Used by Loop A to adjust importance of recalled memories.
+    /// Returns a value in \[-0.3, 0.3\]: positive = helpful, negative =
+    /// unhelpful. Used by Loop A to adjust importance of recalled memories.
     fn infer_outcome_signal(reply: &AgentReply, ctx: &RunContext, channel: &str) -> f32 {
         // Internal channels produce no signal.
         if matches!(channel, "heartbeat" | "system" | "cron") {
@@ -6792,11 +7298,86 @@ impl AgentRuntime {
     // Built-in tool implementations
     // -----------------------------------------------------------------------
 
-    /// `knowledge_base` tool — hybrid search over the user's KB, returning
-    /// chunks with their source title for citation. Reads the process-global
-    /// KnowledgeService (the single instance opened at gateway startup; we do
-    /// NOT re-open redb here — it is exclusively locked).
+    /// `knowledge_base` tool — read (hybrid search) plus user-directed write
+    /// (build a collection / ingest text the agent prepared). Reads the
+    /// process-global KnowledgeService (opened at gateway startup; redb is
+    /// exclusively locked, so we never re-open it here). Write actions run in
+    /// spawn_blocking (sync redb writes).
     pub(crate) async fn tool_knowledge_base(&self, args: Value) -> Result<Value> {
+        let action = args["action"].as_str().unwrap_or("search").trim();
+        let Some(kb) = crate::kb::global_service() else {
+            return Ok(json!({"results": [], "note": "knowledge base not available"}));
+        };
+        match action {
+            "search" | "" => self.kb_action_search(kb, args).await,
+            "list_collections" => {
+                let cols = tokio::task::spawn_blocking(move || kb.list_collections())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("kb list task failed: {e}"))?
+                    .map_err(|e| anyhow::anyhow!("kb list_collections failed: {e}"))?;
+                let list: Vec<Value> = cols
+                    .into_iter()
+                    .map(|c| json!({"id": c.id, "name": c.name, "description": c.description}))
+                    .collect();
+                Ok(json!({ "collections": list }))
+            }
+            "create_collection" => {
+                let name = args["name"].as_str().unwrap_or("").trim().to_owned();
+                if name.is_empty() {
+                    return Ok(json!({"error": "name required for create_collection"}));
+                }
+                let desc = args["description"]
+                    .as_str()
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty());
+                let (id, name, created) = tokio::task::spawn_blocking(move || {
+                    resolve_or_create_collection(&kb, &name, desc)
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("kb create task failed: {e}"))??;
+                Ok(json!({ "collection_id": id, "name": name, "created": created }))
+            }
+            "add" => {
+                let coll = args["collection"].as_str().unwrap_or("").trim().to_owned();
+                let title = args["title"].as_str().unwrap_or("").trim().to_owned();
+                let content = args["content"].as_str().unwrap_or("").to_owned();
+                if coll.is_empty() || title.is_empty() || content.trim().is_empty() {
+                    return Ok(json!({"error": "add requires collection, title, and content"}));
+                }
+                // Agent-authored content is markdown/plain text; default to
+                // markdown (the md canonicalizer handles plain text fine).
+                let mime = args["mime"]
+                    .as_str()
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "text/markdown".to_owned());
+                let out = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+                    let (cid, _name, _created) = resolve_or_create_collection(&kb, &coll, None)?;
+                    let (doc_id, noop) = kb
+                        .ingest(&cid, &title, content.as_bytes(), Some(&mime))
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    Ok(json!({
+                        "doc_id": doc_id,
+                        "collection_id": cid,
+                        "status": if noop { "duplicate" } else { "pending" },
+                    }))
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("kb add task failed: {e}"))??;
+                Ok(out)
+            }
+            other => Ok(json!({
+                "error": format!("unknown action '{other}' (use search, add, create_collection, list_collections)")
+            })),
+        }
+    }
+
+    /// The read path of `knowledge_base` (action=search).
+    async fn kb_action_search(
+        &self,
+        kb: std::sync::Arc<crate::kb::KnowledgeService>,
+        args: Value,
+    ) -> Result<Value> {
         // Trim query defensively (v1 tool-call protocol can leak a trailing
         // newline into string args).
         let query = args["query"].as_str().unwrap_or("").trim().to_owned();
@@ -6814,18 +7395,13 @@ impl AgentRuntime {
             .unwrap_or_default();
         let top_k = args["top_k"].as_u64().unwrap_or(5).clamp(1, 50) as usize;
 
-        let Some(kb) = crate::kb::global_service() else {
-            return Ok(json!({"results": [], "note": "knowledge base not available"}));
-        };
-
         // KnowledgeService::search is synchronous and CPU-heavy (embed + HNSW +
         // tantivy); run it off the async executor so it doesn't stall the turn.
-        let hits = tokio::task::spawn_blocking(move || {
-            kb.search(&query, &collection_ids, top_k, 0.0)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("knowledge_base search task failed: {e}"))?
-        .map_err(|e| anyhow::anyhow!("knowledge_base search failed: {e}"))?;
+        let hits =
+            tokio::task::spawn_blocking(move || kb.search(&query, &collection_ids, top_k, 0.0))
+                .await
+                .map_err(|e| anyhow::anyhow!("knowledge_base search task failed: {e}"))?
+                .map_err(|e| anyhow::anyhow!("knowledge_base search failed: {e}"))?;
 
         let results: Vec<Value> = hits
             .into_iter()
@@ -6846,16 +7422,22 @@ impl AgentRuntime {
         }))
     }
 
-    pub(crate) async fn tool_memory_search(&self, args: Value) -> Result<Value> {
-        let query = args["query"].as_str().unwrap_or("").to_owned();
-        let scope = args["scope"].as_str().map(str::to_owned);
-        let top_k = args["top_k"].as_u64().unwrap_or(5) as usize;
+    pub(crate) async fn tool_memory_search(&self, ctx: &RunContext, args: Value) -> Result<Value> {
+        let query = args["query"].as_str().unwrap_or("").trim().to_owned();
+        if query.is_empty() {
+            return Ok(json!({"results": [], "note": "empty query"}));
+        }
+        let default_scope = default_memory_scope(&ctx.agent_id, &ctx.channel);
+        let scope = args["scope"]
+            .as_str()
+            .map(|s| normalize_memory_scope(s, &ctx.agent_id))
+            .unwrap_or(default_scope);
+        let top_k = args["top_k"].as_u64().unwrap_or(5).clamp(1, 25) as usize;
 
         let Some(ref mem) = self.memory else {
             return Ok(json!({"results": [], "note": "memory store not available"}));
         };
-        let mut store = mem.lock().await;
-        let docs = store.search(&query, scope.as_deref(), top_k).await?;
+        let docs = self.search_memory_docs(mem, &query, &scope, top_k).await?;
         let results: Vec<Value> = docs
             .into_iter()
             .map(|d| {
@@ -6874,6 +7456,85 @@ impl AgentRuntime {
         Ok(json!({"count": results.len(), "results": results}))
     }
 
+    async fn search_memory_docs(
+        &self,
+        mem: &Arc<Mutex<MemoryStore>>,
+        query: &str,
+        scope: &str,
+        top_k: usize,
+    ) -> Result<Vec<MemoryDoc>> {
+        let bm25_hits = match self.store.search.search(
+            query,
+            Some(scope),
+            top_k.saturating_mul(4).max(16),
+        ) {
+            Ok(hits) => hits,
+            Err(e) => {
+                tracing::debug!(query = %query, scope = %scope, "BM25 memory search skipped: {e:#}");
+                Vec::new()
+            }
+        };
+        let mut store = mem.lock().await;
+        let vec_docs = store
+            .search(query, Some(scope), top_k.saturating_mul(3).max(top_k))
+            .await?;
+        let bm25_docs: Vec<MemoryDoc> = bm25_hits
+            .into_iter()
+            .filter_map(|hit| store.get_sync(&hit.id).cloned())
+            .collect();
+        Ok(rrf_fuse(vec_docs, bm25_docs, top_k))
+    }
+
+    async fn build_auto_recall_bundle(
+        &self,
+        agent_id: &str,
+        channel: &str,
+        query: &str,
+    ) -> Option<RecallBundle> {
+        if query.trim().is_empty() || matches!(channel, "heartbeat" | "cron" | "system") {
+            return None;
+        }
+        let enabled = self
+            .config
+            .agents
+            .defaults
+            .memory
+            .as_ref()
+            .and_then(|m| m.auto_recall)
+            .unwrap_or(true);
+        if !enabled {
+            return None;
+        }
+        let Some(ref mem) = self.memory else {
+            return None;
+        };
+        let memory_cfg = self.config.agents.defaults.memory.as_ref();
+        let final_k = memory_cfg
+            .and_then(|m| m.recall_final_k)
+            .unwrap_or(5)
+            .clamp(1, 12);
+        let max_tokens = memory_cfg
+            .and_then(|m| {
+                m.retrieval
+                    .as_ref()
+                    .and_then(|v| v.get("maxTokens"))
+                    .and_then(Value::as_u64)
+                    .map(|v| v as usize)
+            })
+            .unwrap_or(1200)
+            .clamp(128, 4096);
+        let scope = default_memory_scope(agent_id, channel);
+        let docs = match self.search_memory_docs(mem, query, &scope, final_k).await {
+            Ok(docs) => docs,
+            Err(e) => {
+                tracing::debug!(error = %e, "auto recall search failed");
+                return None;
+            }
+        };
+        let trace_id = format!("recall_{}", Uuid::new_v4());
+        recall_bundle_from_docs(docs, max_tokens, &trace_id)
+    }
+
     /// A2A v1.0 INPUT_REQUIRED / AUTH_REQUIRED bridge tool.
     ///
     /// The agent calls this when it needs the client to supply more text
@@ -6883,11 +7544,11 @@ impl AgentRuntime {
     /// agent-role message, registers a one-shot resume handle on
     /// `state.suspended_tasks`, and awaits the client's reply.
     ///
-    /// Resume protocol: the client sends a fresh SendMessage / SendStreamingMessage
-    /// with the **same taskId** and the new text. The dispatcher detects the
-    /// existing `SuspendedTask` entry, pops it, and pushes the text into the
-    /// `resume_tx`. This tool then returns the text as its result and the
-    /// agent loop continues.
+    /// Resume protocol: the client sends a fresh SendMessage /
+    /// SendStreamingMessage with the **same taskId** and the new text. The
+    /// dispatcher detects the existing `SuspendedTask` entry, pops it, and
+    /// pushes the text into the `resume_tx`. This tool then returns the
+    /// text as its result and the agent loop continues.
     ///
     /// Non-A2A turns (TurnContext default) have no `input_request_tx`, so
     /// this returns an error — the LLM can recover with a plain reply.
@@ -6896,10 +7557,7 @@ impl AgentRuntime {
             .get("prompt")
             .and_then(|v| v.as_str())
             .unwrap_or("Please provide additional input to continue.");
-        let auth = args
-            .get("auth")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let auth = args.get("auth").and_then(|v| v.as_bool()).unwrap_or(false);
         if ctx.turn_ctx.input_request_tx.is_none() {
             return Ok(json!({
                 "error": "wait_input is only supported on A2A turns",
@@ -6907,9 +7565,7 @@ impl AgentRuntime {
         }
         match ctx.turn_ctx.request_input(prompt, auth).await {
             Some(text) => Ok(json!({ "input": text })),
-            None => Err(anyhow!(
-                "resume channel dropped while awaiting input"
-            )),
+            None => Err(anyhow!("resume channel dropped while awaiting input")),
         }
     }
 
@@ -6983,7 +7639,13 @@ impl AgentRuntime {
         };
 
         let (task_id, merged) = manager
-            .submit_task(&ctx.session_key, message, Priority::User, max_turns, ttl_secs)
+            .submit_task(
+                &ctx.session_key,
+                message,
+                Priority::User,
+                max_turns,
+                ttl_secs,
+            )
             .map_err(|e| anyhow!("failed to submit task: {e:#}"))?;
 
         Ok(json!({
@@ -7007,8 +7669,7 @@ impl AgentRuntime {
             .or_else(|| args.get("skill_name"))
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                let available: Vec<String> =
-                    self.skills.all().map(|s| s.name.clone()).collect();
+                let available: Vec<String> = self.skills.all().map(|s| s.name.clone()).collect();
                 anyhow!(
                     "use_skill: 'name' is required. Available skills: {}. \
                      Received args: {}",
@@ -7040,7 +7701,10 @@ impl AgentRuntime {
         let dir = skill_dir.display().to_string();
         let skill_md_path = skill_dir.join("SKILL.md");
         let skill_md = std::fs::read_to_string(&skill_md_path).unwrap_or_else(|e| {
-            format!("(failed to read SKILL.md: {e}; check {})", skill_md_path.display())
+            format!(
+                "(failed to read SKILL.md: {e}; check {})",
+                skill_md_path.display()
+            )
         });
         Ok(serde_json::json!({
             "name": name,
@@ -7068,8 +7732,8 @@ impl AgentRuntime {
         Ok(json!({ "count": skills.len(), "skills": skills }))
     }
 
-    /// `skill_search` — search the remote skill registries (clawhub / skillhub /
-    /// iwencai). Returns candidate slugs the model can `skill_install`.
+    /// `skill_search` — search the remote skill registries (clawhub / skillhub
+    /// / iwencai). Returns candidate slugs the model can `skill_install`.
     pub(crate) async fn tool_skill_search(&self, args: Value) -> Result<Value> {
         let query = args["query"]
             .as_str()
@@ -7190,20 +7854,33 @@ impl AgentRuntime {
     }
 
     pub(crate) async fn tool_memory_put(&self, ctx: &RunContext, args: Value) -> Result<Value> {
-        let text = args["text"].as_str().unwrap_or("").to_owned();
+        let text = args["text"].as_str().unwrap_or("").trim().to_owned();
+        if text.is_empty() {
+            return Ok(json!({"stored": false, "note": "empty memory text"}));
+        }
         // Internal channels (heartbeat/cron/system) get a separate scope so
         // their memories don't pollute normal conversation auto-recall.
-        let default_scope = if matches!(ctx.channel.as_str(), "heartbeat" | "cron" | "system") {
-            format!("agent:{}:{}", ctx.agent_id, ctx.channel)
-        } else {
-            ctx.agent_id.clone()
-        };
-        let scope = args["scope"].as_str().unwrap_or(&default_scope).to_owned();
-        let kind = args["kind"].as_str().unwrap_or("note").to_owned();
+        let default_scope = default_memory_scope(&ctx.agent_id, &ctx.channel);
+        let scope = args["scope"]
+            .as_str()
+            .map(|s| normalize_memory_scope(s, &ctx.agent_id))
+            .unwrap_or(default_scope);
+        let kind = normalize_memory_kind(args["kind"].as_str());
         let id = args["id"]
             .as_str()
             .map(str::to_owned)
             .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let mut importance = default_memory_importance(&kind);
+        if let Some(v) = args["importance"].as_f64() {
+            importance = (v as f32).clamp(0.01, 1.0);
+        }
+        let tier = default_memory_doc_tier(&kind);
+        let pinned = kind == "entity" || args["pinned"].as_bool().unwrap_or(false);
+        let tags = if pinned {
+            vec!["pinned".to_owned()]
+        } else {
+            Vec::new()
+        };
 
         let Some(ref mem) = self.memory else {
             return Ok(json!({"error": "memory store not available"}));
@@ -7221,27 +7898,44 @@ impl AgentRuntime {
                 created_at: 0,
                 accessed_at: 0,
                 access_count: 0,
-                importance: 0.5,
-                tier: Default::default(),
+                importance,
+                tier,
                 abstract_text: None,
                 overview_text: None,
-                tags: vec![],
-                pinned: false,
+                tags,
+                pinned,
             },
         )
         .await?;
+        let (effective_id, effective_scope, effective_kind, effective_text) = {
+            let store = mem.lock().await;
+            store
+                .find_exact(&scope, &kind, &text)
+                .map(|doc| {
+                    (
+                        doc.id.clone(),
+                        doc.scope.clone(),
+                        doc.kind.clone(),
+                        doc.text.clone(),
+                    )
+                })
+                .unwrap_or_else(|| (id.clone(), scope.clone(), kind.clone(), text.clone()))
+        };
         // Also index in tantivy BM25 for hybrid search.
-        if let Err(e) = self
-            .store
-            .search
-            .index_memory_doc(&id, &scope, &kind, &text)
-        {
+        if let Err(e) = self.store.search.index_memory_doc(
+            &effective_id,
+            &effective_scope,
+            &effective_kind,
+            &effective_text,
+        ) {
             tracing::warn!("BM25 index failed for memory_put doc: {e:#}");
         }
         // Only append to MEMORY.md for user-initiated /remember commands,
         // not for automatic memory_put calls by the model.
         if kind != "remember" {
-            return Ok(json!({"stored": true, "id": id}));
+            return Ok(
+                json!({"stored": true, "id": effective_id, "scope": effective_scope, "kind": effective_kind}),
+            );
         }
         // Snapshot defaults.workspace before the chain — `.or_else` takes a
         // sync closure so we can't await inside it.
@@ -7277,7 +7971,9 @@ impl AgentRuntime {
         {
             tracing::warn!("failed to append to MEMORY.md: {e:#}");
         }
-        Ok(json!({"stored": true, "id": id}))
+        Ok(
+            json!({"stored": true, "id": effective_id, "scope": effective_scope, "kind": effective_kind}),
+        )
     }
 
     pub(crate) async fn tool_memory_delete(&self, args: Value) -> Result<Value> {
@@ -7307,7 +8003,6 @@ impl AgentRuntime {
     // -----------------------------------------------------------------------
     // Compaction (AGENTS.md §15)
     // -----------------------------------------------------------------------
-
 
     // Compaction methods (compact_if_needed, compact_force, compact_inner,
     // msgs_to_text_static, compact_single, extract_key_facts,
@@ -7525,7 +8220,6 @@ fn is_likely_text_file(lower: &str) -> bool {
     .any(|e| lower.ends_with(e))
 }
 
-
 /// Format a tool call result as human-readable markdown.
 /// Walk a `Value` and replace any string longer than `max_chars` with a
 /// `[N chars]` placeholder. Used by Phase 2b's streaming preview so a
@@ -7544,7 +8238,9 @@ fn squash_large_strings(val: &serde_json::Value, max_chars: usize) -> serde_json
             }
         }
         Value::Array(arr) => Value::Array(
-            arr.iter().map(|v| squash_large_strings(v, max_chars)).collect(),
+            arr.iter()
+                .map(|v| squash_large_strings(v, max_chars))
+                .collect(),
         ),
         Value::Object(map) => {
             let mut out = serde_json::Map::with_capacity(map.len());
@@ -7694,8 +8390,6 @@ fn write_config_value(dot_path: &str, value: serde_json::Value) -> anyhow::Resul
     Ok(())
 }
 
-
-
 // ---------------------------------------------------------------------------
 // Hybrid memory retrieval — Reciprocal Rank Fusion
 // ---------------------------------------------------------------------------
@@ -7708,17 +8402,15 @@ fn write_config_value(dot_path: &str, value: serde_json::Value) -> anyhow::Resul
 #[allow(dead_code)]
 fn rrf_fuse(
     vec_hits: Vec<crate::agent::memory::MemoryDoc>,
-    bm25_hits: Vec<crate::store::search::IndexDoc>,
+    bm25_hits: Vec<crate::agent::memory::MemoryDoc>,
     top_k: usize,
 ) -> Vec<crate::agent::memory::MemoryDoc> {
     use std::collections::HashMap;
 
-    use crate::agent::memory::MemoryDoc;
-
     const K: f32 = 60.0;
 
     // score_map: doc_id → (rrf_score, MemoryDoc)
-    let mut scores: HashMap<String, (f32, MemoryDoc)> = HashMap::new();
+    let mut scores: HashMap<String, (f32, crate::agent::memory::MemoryDoc)> = HashMap::new();
 
     // Vector hits — rank 1-based.
     for (rank, doc) in vec_hits.into_iter().enumerate() {
@@ -7729,43 +8421,29 @@ fn rrf_fuse(
             .or_insert((rrf, doc));
     }
 
-    // BM25 hits — convert IndexDoc → MemoryDoc for docs not yet in map.
+    // BM25 hits — rank 1-based.
     for (rank, doc) in bm25_hits.into_iter().enumerate() {
         let rrf = 1.0 / (K + (rank + 1) as f32);
         scores
             .entry(doc.id.clone())
             .and_modify(|(s, _)| *s += rrf)
-            .or_insert_with(|| {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
-                (
-                    rrf,
-                    MemoryDoc {
-                        id: doc.id,
-                        scope: doc.scope,
-                        kind: doc.kind,
-                        text: doc.content,
-                        vector: vec![],
-                        created_at: now,
-                        accessed_at: now,
-                        access_count: 0,
-                        importance: 0.5,
-                        tier: Default::default(),
-                        abstract_text: None,
-                        overview_text: None,
-                        tags: vec![],
-                pinned: false,
-                    },
-                )
-            });
+            .or_insert((rrf, doc));
     }
 
-    // Apply lifecycle decay multiplier — older/less-accessed docs score lower.
+    // Apply lifecycle + quality multiplier. Pinned/Core/important docs should
+    // beat low-value notes when both are plausible matches.
     let mut ranked: Vec<(f32, MemoryDoc)> = scores
         .into_values()
-        .map(|(score, doc)| (score * doc.decay_multiplier(), doc))
+        .map(|(score, doc)| {
+            let quality = if doc.pinned { 1.25 } else { 1.0 }
+                * match doc.tier {
+                    MemDocTier::Core => 1.15,
+                    MemDocTier::Working => 1.0,
+                    MemDocTier::Peripheral => 0.8,
+                }
+                * (0.75 + doc.importance.clamp(0.01, 1.0) * 0.5);
+            (score * doc.decay_multiplier() * quality, doc)
+        })
         .collect();
     ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     ranked.into_iter().take(top_k).map(|(_, doc)| doc).collect()
@@ -7775,10 +8453,162 @@ fn rrf_fuse(
 // Tool dispatch helpers — inject fields for backward-compat routing
 // ---------------------------------------------------------------------------
 
+fn default_memory_scope(agent_id: &str, channel: &str) -> String {
+    if matches!(channel, "heartbeat" | "cron" | "system") {
+        format!("agent:{agent_id}:{channel}")
+    } else {
+        format!("agent:{agent_id}")
+    }
+}
+
+/// Resolve a KB collection by name, creating it if absent. Returns
+/// `(id, name, created)`. Used by the `knowledge_base` write actions so the
+/// agent can target a collection by human name ("会议记录") without first
+/// looking up its id. Name match is case-insensitive; a create racing with a
+/// concurrent create falls back to the existing one.
+fn resolve_or_create_collection(
+    kb: &crate::kb::KnowledgeService,
+    name: &str,
+    desc: Option<String>,
+) -> anyhow::Result<(String, String, bool)> {
+    let find = || -> anyhow::Result<Option<crate::kb::model::KbCollection>> {
+        Ok(kb
+            .list_collections()
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .into_iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name)))
+    };
+    if let Some(c) = find()? {
+        return Ok((c.id, c.name, false));
+    }
+    match kb.create_collection(name, desc, None) {
+        Ok(c) => Ok((c.id, c.name, true)),
+        Err(crate::kb::KnowledgeError::DuplicateName) => {
+            let c =
+                find()?.ok_or_else(|| anyhow::anyhow!("collection vanished after duplicate"))?;
+            Ok((c.id, c.name, false))
+        }
+        Err(e) => Err(anyhow::anyhow!("{e}")),
+    }
+}
+
+fn normalize_memory_scope(scope: &str, agent_id: &str) -> String {
+    let scope = scope.trim();
+    if scope.is_empty() {
+        return format!("agent:{agent_id}");
+    }
+    if scope == agent_id {
+        return format!("agent:{agent_id}");
+    }
+    scope.to_owned()
+}
+
+fn normalize_memory_kind(kind: Option<&str>) -> String {
+    match kind.unwrap_or("fact").trim() {
+        "remember" => "remember",
+        "entity" => "entity",
+        "preference" => "preference",
+        "procedure" => "procedure",
+        "summary" => "summary",
+        "note" => "note",
+        "fact" | "" => "fact",
+        _ => "fact",
+    }
+    .to_owned()
+}
+
+fn default_memory_importance(kind: &str) -> f32 {
+    match kind {
+        "entity" => 0.95,
+        "remember" => 0.8,
+        "preference" => 0.75,
+        "procedure" => 0.65,
+        "summary" => 0.55,
+        "note" => 0.3,
+        _ => 0.65,
+    }
+}
+
+fn default_memory_doc_tier(kind: &str) -> MemDocTier {
+    match kind {
+        "entity" => MemDocTier::Core,
+        "note" => MemDocTier::Peripheral,
+        _ => MemDocTier::Working,
+    }
+}
+
+fn recall_bundle_from_docs(
+    docs: Vec<MemoryDoc>,
+    max_tokens: usize,
+    trace_id: &str,
+) -> Option<RecallBundle> {
+    let mut lines = Vec::new();
+    let mut doc_ids = Vec::new();
+    let mut used_tokens = 0usize;
+    let mut truncated = false;
+
+    for doc in docs {
+        if doc.kind == "note" {
+            continue;
+        }
+        let text = doc.display_text().trim();
+        if text.is_empty() {
+            continue;
+        }
+        let line = format!("- {text}");
+        let line_tokens = estimate_tokens(&line);
+        if used_tokens + line_tokens > max_tokens {
+            truncated = true;
+            if lines.is_empty() {
+                let char_limit = max_tokens.saturating_mul(4).max(64);
+                let clipped: String = line.chars().take(char_limit).collect();
+                lines.push(clipped);
+                doc_ids.push(doc.id);
+            }
+            break;
+        }
+        used_tokens += line_tokens;
+        lines.push(line);
+        doc_ids.push(doc.id);
+    }
+
+    if lines.is_empty() {
+        return None;
+    }
+    let context = lines.join("\n");
+    let hash = {
+        use sha2::{Digest, Sha256};
+        format!("sha256:{:x}", Sha256::digest(context.as_bytes()))
+    };
+    Some(RecallBundle {
+        context,
+        metadata: RecallMetadata {
+            mode: "committed".to_owned(),
+            format: "xml".to_owned(),
+            source: "server".to_owned(),
+            trace_id: Some(trace_id.to_owned()),
+            max_tokens: Some(max_tokens as u32),
+            doc_ids,
+            hash,
+            truncated,
+        },
+    })
+}
+
 /// Inject an `action` field into `args` if not already present.
 fn inject_action(mut args: Value, action: &str) -> Value {
     if let Some(obj) = args.as_object_mut() {
         obj.entry("action").or_insert_with(|| json!(action));
+    }
+    args
+}
+
+/// Backward-compatible `/remember`/`memory_put` routing should preserve the
+/// explicit user intent instead of falling through to the generic fact default.
+fn inject_memory_put_compat(mut args: Value) -> Value {
+    if let Some(obj) = args.as_object_mut() {
+        obj.entry("action").or_insert_with(|| json!("put"));
+        obj.entry("kind").or_insert_with(|| json!("remember"));
     }
     args
 }
@@ -7800,26 +8630,26 @@ fn inject_channel(mut args: Value, channel: &str) -> Value {
     args
 }
 
-
 /// Maximum characters to send from file content to LLM.
 #[allow(dead_code)]
 const MAX_FILE_CONTENT_CHARS: usize = 20_000;
-
-
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // Persist dynamic agent to config file
 // ---------------------------------------------------------------------------
 
-/// Patch fields of an existing `AgentEntry` in `agents.list` in the config file.
+/// Patch fields of an existing `AgentEntry` in `agents.list` in the config
+/// file.
 ///
-/// - `model`: `Some("")` or `Some("default")` removes the field (agent falls back to defaults).
-///   `Some("provider/model")` sets `model.primary`.
-///   `None` leaves it untouched.
-/// - `name`:  `Some("")` removes the field. `Some(x)` sets it. `None` leaves it.
+/// - `model`: `Some("")` or `Some("default")` removes the field (agent falls
+///   back to defaults). `Some("provider/model")` sets `model.primary`. `None`
+///   leaves it untouched.
+/// - `name`:  `Some("")` removes the field. `Some(x)` sets it. `None` leaves
+///   it.
 ///
-/// The config hot-reload watcher picks up the change automatically — no restart needed.
+/// The config hot-reload watcher picks up the change automatically — no restart
+/// needed.
 pub(crate) async fn update_agent_in_config(
     id: &str,
     model: Option<&str>,
@@ -7830,8 +8660,8 @@ pub(crate) async fn update_agent_in_config(
     let config_path = crate::config::loader::detect_config_path()
         .ok_or_else(|| anyhow!("no config file found"))?;
     let raw = tokio::fs::read_to_string(&config_path).await?;
-    let mut doc: serde_json::Value = json5::from_str(&raw)
-        .map_err(|e| anyhow!("parse config: {e}"))?;
+    let mut doc: serde_json::Value =
+        json5::from_str(&raw).map_err(|e| anyhow!("parse config: {e}"))?;
 
     let list = doc
         .pointer_mut("/agents/list")
@@ -7847,7 +8677,11 @@ pub(crate) async fn update_agent_in_config(
 
     if let Some(m) = model {
         if m.is_empty() || m == "default" {
-            if entry.as_object_mut().and_then(|o| o.remove("model")).is_some() {
+            if entry
+                .as_object_mut()
+                .and_then(|o| o.remove("model"))
+                .is_some()
+            {
                 changes.push("model removed (falls back to defaults)".to_owned());
             }
         } else {
@@ -7882,18 +8716,24 @@ pub(crate) async fn update_agent_in_config(
 
 /// Append an AgentEntry to the `agents.list` array in the config file.
 /// The hot-reload watcher will pick up the change automatically.
-pub(crate) async fn persist_agent_to_config(entry: &crate::config::schema::AgentEntry) -> anyhow::Result<()> {
+pub(crate) async fn persist_agent_to_config(
+    entry: &crate::config::schema::AgentEntry,
+) -> anyhow::Result<()> {
     let config_path = crate::config::loader::detect_config_path()
         .ok_or_else(|| anyhow!("no config file found"))?;
     let raw = tokio::fs::read_to_string(&config_path).await?;
-    let mut doc: serde_json::Value = json5::from_str(&raw)
-        .map_err(|e| anyhow!("parse config: {e}"))?;
+    let mut doc: serde_json::Value =
+        json5::from_str(&raw).map_err(|e| anyhow!("parse config: {e}"))?;
 
     // Don't duplicate if agent already exists.
     let id = entry.id.as_str();
-    let already_exists = doc.pointer("/agents/list")
+    let already_exists = doc
+        .pointer("/agents/list")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().any(|e| e.get("id").and_then(|v| v.as_str()) == Some(id)))
+        .map(|arr| {
+            arr.iter()
+                .any(|e| e.get("id").and_then(|v| v.as_str()) == Some(id))
+        })
         .unwrap_or(false);
     if already_exists {
         return Ok(());
@@ -7903,10 +8743,14 @@ pub(crate) async fn persist_agent_to_config(entry: &crate::config::schema::Agent
 
     // Strip model field if it matches agents.defaults.model.primary
     // (no need to persist what the defaults already provide).
-    let defaults_primary = doc.pointer("/agents/defaults/model/primary")
-        .and_then(|v| v.as_str()).map(|s| s.to_owned());
-    let entry_primary = entry_val.pointer("/model/primary")
-        .and_then(|v| v.as_str()).map(|s| s.to_owned());
+    let defaults_primary = doc
+        .pointer("/agents/defaults/model/primary")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_owned());
+    let entry_primary = entry_val
+        .pointer("/model/primary")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_owned());
     if defaults_primary.is_some() && defaults_primary == entry_primary {
         entry_val.as_object_mut().map(|o| o.remove("model"));
     }
@@ -7937,10 +8781,32 @@ mod tests {
         skill::SkillRegistry,
     };
 
+    #[test]
+    fn resolve_or_create_collection_creates_then_reuses_by_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let kb = crate::kb::KnowledgeService::open(tmp.path().join("kb")).unwrap();
+
+        // First call creates it.
+        let (id1, name1, created1) = resolve_or_create_collection(&kb, "会议记录", None).unwrap();
+        assert!(created1);
+        assert_eq!(name1, "会议记录");
+
+        // Second call reuses the same collection (no duplicate).
+        let (id2, _n, created2) = resolve_or_create_collection(&kb, "会议记录", None).unwrap();
+        assert!(!created2);
+        assert_eq!(id1, id2);
+
+        // Case-insensitive match for ASCII names.
+        let (_, _, created3) = resolve_or_create_collection(&kb, "notes", None).unwrap();
+        let (_, _, created4) = resolve_or_create_collection(&kb, "NOTES", None).unwrap();
+        assert!(created3 && !created4);
+    }
+
     fn text_msg(role: Role, text: &str) -> Message {
         Message {
             role,
             content: MessageContent::Text(text.to_owned()),
+            rsclaw_hidden: None,
         }
     }
 
@@ -7955,6 +8821,74 @@ mod tests {
     }
 
     #[test]
+    fn default_memory_scope_keeps_user_turns_in_agent_scope() {
+        assert_eq!(default_memory_scope("main", "chat"), "agent:main");
+        assert_eq!(default_memory_scope("main", "a2a"), "agent:main");
+        assert_eq!(default_memory_scope("main", "cron"), "agent:main:cron");
+        assert_eq!(
+            default_memory_scope("main", "heartbeat"),
+            "agent:main:heartbeat"
+        );
+    }
+
+    #[test]
+    fn normalize_memory_scope_accepts_legacy_bare_agent_id() {
+        assert_eq!(normalize_memory_scope("main", "main"), "agent:main");
+        assert_eq!(normalize_memory_scope("agent:main", "main"), "agent:main");
+        assert_eq!(normalize_memory_scope("global", "main"), "global");
+    }
+
+    #[test]
+    fn recall_bundle_from_docs_is_raw_context_with_metadata() {
+        let docs = vec![
+            MemoryDoc {
+                id: "note-1".into(),
+                scope: "agent:main".into(),
+                kind: "note".into(),
+                text: "在吗".into(),
+                vector: vec![],
+                created_at: 0,
+                accessed_at: 0,
+                access_count: 0,
+                importance: 0.1,
+                tier: MemDocTier::Peripheral,
+                abstract_text: None,
+                overview_text: None,
+                tags: vec![],
+                pinned: false,
+            },
+            MemoryDoc {
+                id: "entity-1".into(),
+                scope: "agent:main".into(),
+                kind: "entity".into(),
+                text: "用户手机号: 13900001234".into(),
+                vector: vec![],
+                created_at: 0,
+                accessed_at: 0,
+                access_count: 0,
+                importance: 0.95,
+                tier: MemDocTier::Core,
+                abstract_text: None,
+                overview_text: None,
+                tags: vec!["pinned".into()],
+                pinned: true,
+            },
+        ];
+
+        let bundle = recall_bundle_from_docs(docs, 1200, "trace-1").expect("bundle");
+        assert_eq!(bundle.context, "- 用户手机号: 13900001234");
+        assert!(!bundle.context.contains("<recall>"));
+        assert_eq!(bundle.metadata.doc_ids, vec!["entity-1"]);
+        assert_eq!(bundle.metadata.mode, "committed");
+        assert_eq!(bundle.metadata.format, "xml");
+        assert_eq!(bundle.metadata.source, "server");
+        assert_eq!(bundle.metadata.trace_id.as_deref(), Some("trace-1"));
+        assert_eq!(bundle.metadata.max_tokens, Some(1200));
+        assert!(bundle.metadata.hash.starts_with("sha256:"));
+        assert!(!bundle.metadata.truncated);
+    }
+
+    #[test]
     fn msg_chars_parts_variant() {
         let m = Message {
             role: Role::Assistant,
@@ -7966,6 +8900,7 @@ mod tests {
                     text: "de".to_owned(),
                 },
             ]),
+            rsclaw_hidden: None,
         };
         assert_eq!(msg_chars(&m), 5);
     }
@@ -8051,7 +8986,13 @@ mod tests {
         let tools = build_tool_list(&skills, None, "test-agent", &[]);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         for expected in &[
-            "memory", "session", "agent", "channel", "read_file", "write_file", "shell",
+            "memory",
+            "session",
+            "agent",
+            "channel",
+            "read_file",
+            "write_file",
+            "shell",
         ] {
             assert!(
                 names.contains(expected),
@@ -8094,9 +9035,7 @@ mod tests {
         provider_name: &str,
         models: Vec<crate::config::schema::ModelDef>,
     ) -> crate::config::schema::Config {
-        use crate::config::schema::{
-            ApiFormat, Config, ModelsConfig, ProviderConfig,
-        };
+        use crate::config::schema::{ApiFormat, Config, ModelsConfig, ProviderConfig};
         let pc = ProviderConfig {
             base_url: None,
             api_key: None,
@@ -8118,7 +9057,10 @@ mod tests {
         }
     }
 
-    fn model_def(id: &str, inputs: Option<Vec<crate::config::schema::InputType>>) -> crate::config::schema::ModelDef {
+    fn model_def(
+        id: &str,
+        inputs: Option<Vec<crate::config::schema::InputType>>,
+    ) -> crate::config::schema::ModelDef {
         crate::config::schema::ModelDef {
             id: id.to_owned(),
             name: None,
@@ -8136,11 +9078,20 @@ mod tests {
         use crate::config::schema::InputType;
         let cfg = build_config_with_models(
             "kimi",
-            vec![model_def("kimi-for-coding", Some(vec![InputType::Text, InputType::Image]))],
+            vec![model_def(
+                "kimi-for-coding",
+                Some(vec![InputType::Text, InputType::Image]),
+            )],
         );
         // Both qualified and unqualified lookups resolve.
-        assert_eq!(model_supports_image_input(&cfg, "kimi/kimi-for-coding"), Some(true));
-        assert_eq!(model_supports_image_input(&cfg, "kimi-for-coding"), Some(true));
+        assert_eq!(
+            model_supports_image_input(&cfg, "kimi/kimi-for-coding"),
+            Some(true)
+        );
+        assert_eq!(
+            model_supports_image_input(&cfg, "kimi-for-coding"),
+            Some(true)
+        );
     }
 
     #[test]
@@ -8150,17 +9101,20 @@ mod tests {
             "deepseek",
             vec![model_def("deepseek-chat", Some(vec![InputType::Text]))],
         );
-        assert_eq!(model_supports_image_input(&cfg, "deepseek/deepseek-chat"), Some(false));
+        assert_eq!(
+            model_supports_image_input(&cfg, "deepseek/deepseek-chat"),
+            Some(false)
+        );
     }
 
     #[test]
     fn model_supports_image_input_no_input_field_returns_none() {
-        let cfg = build_config_with_models(
-            "kimi",
-            vec![model_def("kimi-for-coding", None)],
-        );
+        let cfg = build_config_with_models("kimi", vec![model_def("kimi-for-coding", None)]);
         // input field absent → caller should fall back to blocklist.
-        assert_eq!(model_supports_image_input(&cfg, "kimi/kimi-for-coding"), None);
+        assert_eq!(
+            model_supports_image_input(&cfg, "kimi/kimi-for-coding"),
+            None
+        );
     }
 
     #[test]
@@ -8211,9 +9165,10 @@ mod tests {
             "mistral/pixtral-12b",
             "mistral/mistral-small-3.1-24b",
             "cohere/aya-vision-32b",
-            "xai/grok-3", "xai/grok-4-fast",
-
-            // Chinese — ByteDance / Alibaba / Moonshot / Zhipu / Baidu / 01 / Baichuan / DeepSeek / Tencent / MiniMax / StepFun
+            "xai/grok-3",
+            "xai/grok-4-fast",
+            // Chinese — ByteDance / Alibaba / Moonshot / Zhipu / Baidu / 01 / Baichuan / DeepSeek
+            // / Tencent / MiniMax / StepFun
             "doubao/doubao-seed-1.5-vision-pro",
             "doubao/doubao-seed-1.6-vision-thinking",
             // Doubao Seed 2+ — entire 2.x / 3.x / ... subtree is multimodal
@@ -8222,8 +9177,8 @@ mod tests {
             "doubao/doubao-seed-2.0-code",
             "doubao/doubao-seed-2.0-vision",
             "doubao/doubao-seed-2.0-flash",
-            "doubao/doubao-seed-2.5-pro",       // future minor
-            "doubao/doubao-seed-3.0-pro",       // future major (auto-covered)
+            "doubao/doubao-seed-2.5-pro", // future minor
+            "doubao/doubao-seed-3.0-pro", // future major (auto-covered)
             "doubao/doubao-seed-4-omni",
             "doubao/doubao-vision",
             "doubao/seedream",
@@ -8251,7 +9206,6 @@ mod tests {
             "minimax/minimax-vl-01",
             "stepfun/step-1o-vision-32k",
             "stepfun/step-3",
-
             // Open-source
             "liuhaotian/llava-1.6-34b",
             "opengvlab/internvl3-78b",
@@ -8261,13 +9215,11 @@ mod tests {
             "huggingfaceh4/idefics3-8b",
             "huggingfaceh4/smolvlm-instruct",
             "nvidia/nvila-15b",
-
             // GUI-agent VLMs
             "bytedance/ui-tars-1.5-7b",
             "bytedance/ui-tars-2",
             "showui-2b",
             "os-atlas-pro-7b",
-
             // Universal suffix matchers
             "anything-with-vision-suffix",
             "weird-foo-omni",
@@ -8281,7 +9233,7 @@ mod tests {
         for name in [
             // OpenAI text-only
             "openai/gpt-3.5-turbo",
-            "openai/gpt-4",                 // bare GPT-4 base is text-only
+            "openai/gpt-4", // bare GPT-4 base is text-only
             "openai/text-davinci-003",
             // Anthropic legacy
             "anthropic/claude-2.1",
@@ -8292,7 +9244,7 @@ mod tests {
             "deepseek/deepseek-coder",
             "deepseek/deepseek-v3",
             // Doubao text-only
-            "doubao/doubao-seed-1.6",       // text variant; only -vision suffix is multimodal
+            "doubao/doubao-seed-1.6", // text variant; only -vision suffix is multimodal
             "doubao/doubao-pro-256k",
             "doubao/doubao-lite",
             // Qwen text-only (pre-3.5)
@@ -8302,14 +9254,14 @@ mod tests {
             "qwen/qwen3.0",
             "qwen/qwen3.4",
             "qwen/qwen-3.4-instruct",
-            "qwen/qwen3-coder",             // coder is text-only
+            "qwen/qwen3-coder", // coder is text-only
             // Pre-3 Gemma
             "google/gemma-2-9b",
             "google/gemma-1-7b",
             // Llama text-only
             "meta/llama-3-70b",
             "meta/llama-3.1-405b",
-            "meta/llama-3.2-3b",            // small Llama 3.2 are text
+            "meta/llama-3.2-3b", // small Llama 3.2 are text
             // Mistral text-only
             "mistral/mistral-7b-instruct",
             "mistral/mixtral-8x7b",
@@ -8319,11 +9271,11 @@ mod tests {
             "kimi/kimi-k1",
             "kimi/kimi-k2.0",
             "kimi/kimi-k2.4",
-            "kimi/moonshot-v1-128k",        // base v1 is text without -vision
+            "kimi/moonshot-v1-128k", // base v1 is text without -vision
             // Zhipu text-only (no v suffix)
             "zhipu/glm-4-flash",
             "zhipu/glm-4.5",
-            "zhipu/glm-5",                  // bare GLM-5 (the VL variant is glm-5v)
+            "zhipu/glm-5", // bare GLM-5 (the VL variant is glm-5v)
             // Baidu text-only
             "baidu/ernie-3.5-128k",
             "baidu/ernie-4.0-turbo",
@@ -8357,12 +9309,15 @@ mod tests {
             "openbmb/minicpm3-4b",
             // Phi text-only
             "microsoft/phi-3-mini-4k",
-            "microsoft/phi-4",              // bare phi-4 is text; phi-4-multimodal is vision
+            "microsoft/phi-4", // bare phi-4 is text; phi-4-multimodal is vision
             // Generic / unknown model — defaults to text-only.
             "some-new-llm/v1",
             "future-vendor/futurelm-2030",
         ] {
-            assert!(!is_known_vision_model(name), "should NOT match (false positive): {name}");
+            assert!(
+                !is_known_vision_model(name),
+                "should NOT match (false positive): {name}"
+            );
         }
     }
 }

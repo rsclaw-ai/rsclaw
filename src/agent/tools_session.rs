@@ -1,7 +1,9 @@
-//! Session tool handlers — send, list, history, status, and consolidated dispatch.
+//! Session tool handlers — send, list, history, status, and consolidated
+//! dispatch.
 //!
 //! Split from `tools_misc.rs` for maintainability.  All methods live in
-//! `impl AgentRuntime` via the split-impl pattern (same struct, different file).
+//! `impl AgentRuntime` via the split-impl pattern (same struct, different
+//! file).
 
 use std::time::Duration;
 
@@ -9,8 +11,10 @@ use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::registry::{AgentMessage, AgentReply};
-use super::runtime::{AgentRuntime, RunContext, DEFAULT_TIMEOUT_SECONDS};
+use super::{
+    registry::{AgentMessage, AgentReply},
+    runtime::{AgentRuntime, DEFAULT_TIMEOUT_SECONDS, RunContext},
+};
 
 impl AgentRuntime {
     async fn tool_sessions_send(&self, ctx: &RunContext, args: Value) -> Result<Value> {
@@ -31,8 +35,9 @@ impl AgentRuntime {
             .ok_or_else(|| anyhow!("sessions_send: agent registry not available"))?;
 
         // Resolve target: agentId is required to avoid accidentally sending to self.
-        let target_id = agent_id
-            .ok_or_else(|| anyhow!("sessions_send: `agentId` required (specify which agent to send to)"))?;
+        let target_id = agent_id.ok_or_else(|| {
+            anyhow!("sessions_send: `agentId` required (specify which agent to send to)")
+        })?;
         let target = registry
             .get(target_id)
             .map_err(|_| anyhow!("sessions_send: agent `{target_id}` not found"))?;
@@ -109,7 +114,13 @@ impl AgentRuntime {
             .ok_or_else(|| anyhow!("sessions_history: `sessionKey` required"))?;
         let limit = args["limit"].as_u64().unwrap_or(50) as usize;
 
-        let messages = self.store.db.load_messages(session_key)?;
+        let messages: Vec<_> = self
+            .store
+            .db
+            .load_messages(session_key)?
+            .into_iter()
+            .map(crate::provider::redact_rsclaw_hidden_value)
+            .collect();
         let total = messages.len();
         let truncated: Vec<&Value> = messages.iter().rev().take(limit).collect();
 
@@ -145,7 +156,11 @@ impl AgentRuntime {
         }
     }
 
-    pub(crate) async fn tool_session_consolidated(&self, ctx: &RunContext, args: Value) -> Result<Value> {
+    pub(crate) async fn tool_session_consolidated(
+        &self,
+        ctx: &RunContext,
+        args: Value,
+    ) -> Result<Value> {
         // .trim() — v1 block protocol can shard tool_call JSON such that
         // string values land with leading/trailing whitespace; see
         // tool_memory_consolidated for the diagnosis.

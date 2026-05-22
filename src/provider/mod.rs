@@ -36,8 +36,10 @@ pub(crate) fn warn_unsupported_kv_cache_mode_2(provider: &str, req: &LlmRequest)
     if req.kv_cache_mode < 2 {
         return;
     }
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
+    use std::{
+        collections::HashSet,
+        sync::{Mutex, OnceLock},
+    };
     static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     let session = req.session_key.as_deref().unwrap_or("<no-session>");
     let key = format!("{provider}:{session}");
@@ -122,14 +124,14 @@ pub(crate) async fn send_with_transport_retry(
 /// Build a `reqwest::Client` with a custom or default User-Agent.
 ///
 /// Tuning notes:
-/// - `pool_idle_timeout` set to 10s (down from 60s). llama-server / vLLM /
-///   most local OpenAI-compatible servers default their HTTP keep-alive to
-///   ~5-15s. With a 60s pool-idle window the client kept reusing pooled
-///   connections that the server had already half-closed, surfacing as
-///   "connection closed before message completed" on the next request.
+/// - `pool_idle_timeout` set to 10s (down from 60s). llama-server / vLLM / most
+///   local OpenAI-compatible servers default their HTTP keep-alive to ~5-15s.
+///   With a 60s pool-idle window the client kept reusing pooled connections
+///   that the server had already half-closed, surfacing as "connection closed
+///   before message completed" on the next request.
 /// - `tcp_keepalive(30s)` keeps long-prefill streaming connections alive
-///   through any intermediate timeouts during a 20+ second prefill on
-///   large prompts.
+///   through any intermediate timeouts during a 20+ second prefill on large
+///   prompts.
 pub(crate) fn http_client_with_ua(user_agent: Option<&str>) -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent(user_agent.unwrap_or(DEFAULT_USER_AGENT))
@@ -151,6 +153,26 @@ use serde::{Deserialize, Serialize};
 pub struct Message {
     pub role: Role,
     pub content: MessageContent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rsclaw_hidden: Option<RsclawHidden>,
+}
+
+/// Native rsclaw hidden per-turn context.
+///
+/// Persist this for replay correctness, but redact it from client-visible
+/// history APIs by default.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RsclawHidden {
+    pub recall_context: String,
+    pub recall_format: String,
+    pub recall_mode: String,
+    pub recall_doc_ids: Vec<String>,
+    pub recall_hash: String,
+    pub recall_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall_input_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall_trace_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -241,14 +263,21 @@ pub enum AgentEndpoint {
 // on violations, so canonical model names take priority over the endpoint
 // variant. The endpoint variant is only consulted for non-canonical models.
 //
-//   1. model rsclaw/rsclaw-flash-*                          → /v1/agent/fastshot
+//   1. model rsclaw/rsclaw-flash-*                          →
+//      /v1/agent/fastshot
 //   2. model rsclaw/rsclaw-vision-*                         → /v1/agent/vision
-//   3. model rsclaw/rsclaw-agent-* + session_key=None       → /v1/agent/oneshot   (stateless agent call)
-//   4. model rsclaw/rsclaw-agent-* + session_key=Some       → /v1/agent/sessions  (kvCacheMode=2)
-//   5. non-canonical model + endpoint=Flash                  → /v1/agent/fastshot  (server may 400)
-//   6. non-canonical model + endpoint=Vision                 → /v1/agent/vision    (server may 400)
-//   7. endpoint=Primary + session_key=Some                   → /v1/agent/sessions  (kvCacheMode=2)
-//   8. endpoint=Primary + session_key=None                   → /v1/agent/oneshot
+//   3. model rsclaw/rsclaw-agent-* + session_key=None       → /v1/agent/oneshot
+//      (stateless agent call)
+//   4. model rsclaw/rsclaw-agent-* + session_key=Some       →
+//      /v1/agent/sessions  (kvCacheMode=2)
+//   5. non-canonical model + endpoint=Flash                  →
+//      /v1/agent/fastshot  (server may 400)
+//   6. non-canonical model + endpoint=Vision                 → /v1/agent/vision
+//      (server may 400)
+//   7. endpoint=Primary + session_key=Some                   →
+//      /v1/agent/sessions  (kvCacheMode=2)
+//   8. endpoint=Primary + session_key=None                   →
+//      /v1/agent/oneshot
 //
 // Non-rsclaw providers (OpenAI/Anthropic/Gemini/…) ignore `endpoint` and
 // route purely by `model`.
@@ -269,7 +298,8 @@ pub struct LlmRequest {
     /// Defaults to `Primary` so existing call sites need no change.
     /// Non-rsclaw providers ignore this field.
     pub endpoint: AgentEndpoint,
-    /// KV cache mode: 0=off, 1=append-only (default), 2=incremental (cache_id + delta).
+    /// KV cache mode: 0=off, 1=append-only (default), 2=incremental (cache_id +
+    /// delta).
     pub kv_cache_mode: u8,
     /// Session key for cache_id tracking (used when kv_cache_mode=2).
     pub session_key: Option<String>,
@@ -288,6 +318,71 @@ pub struct LlmRequest {
     /// rsclaw-protocol §2.1.2 post-2026-05-16 rename). Other providers
     /// ignore this field.
     pub user_system: Option<String>,
+    /// Hidden, turn-local recall bundle for native rsclaw committed recall.
+    /// Providers that do not understand rsclaw sessions ignore this field.
+    pub recall: Option<RecallBundle>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecallBundle {
+    /// Raw recall text. The worker owns canonical wrapping and escaping.
+    pub context: String,
+    pub metadata: RecallMetadata,
+}
+
+impl RecallBundle {
+    pub fn to_rsclaw_hidden(&self) -> Option<RsclawHidden> {
+        let context = self.context.trim();
+        if context.is_empty() || self.metadata.mode != "committed" {
+            return None;
+        }
+        Some(RsclawHidden {
+            recall_context: self.context.clone(),
+            recall_format: self.metadata.format.clone(),
+            recall_mode: self.metadata.mode.clone(),
+            recall_doc_ids: self.metadata.doc_ids.clone(),
+            recall_hash: self.metadata.hash.clone(),
+            recall_truncated: self.metadata.truncated,
+            recall_input_tokens: None,
+            recall_trace_id: self.metadata.trace_id.clone(),
+        })
+    }
+}
+
+pub fn redact_rsclaw_hidden_value(mut value: serde_json::Value) -> serde_json::Value {
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("rsclaw_hidden");
+    }
+    value
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecallMetadata {
+    pub mode: String,
+    pub format: String,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    pub doc_ids: Vec<String>,
+    pub hash: String,
+    pub truncated: bool,
+}
+
+impl Default for RecallMetadata {
+    fn default() -> Self {
+        Self {
+            mode: "committed".to_owned(),
+            format: "xml".to_owned(),
+            source: "server".to_owned(),
+            trace_id: None,
+            max_tokens: None,
+            doc_ids: Vec::new(),
+            hash: String::new(),
+            truncated: false,
+        }
+    }
 }
 
 /// Serialize an `f32` to a JSON number with 2 decimal places.
@@ -304,7 +399,8 @@ pub fn json_f32(v: f32) -> serde_json::Value {
 pub enum StreamEvent {
     /// Assistant text delta
     TextDelta(String),
-    /// Reasoning/thinking delta (collected separately, used as fallback if content is empty)
+    /// Reasoning/thinking delta (collected separately, used as fallback if
+    /// content is empty)
     ReasoningDelta(String),
     /// Tool call requested by the model
     ToolCall {
@@ -331,6 +427,14 @@ pub struct TokenUsage {
     /// and OpenAI's `usage.prompt_tokens_details.cached_tokens`.
     /// Zero when the provider doesn't report it.
     pub cache_read: u64,
+    /// Input-token subset consumed by hidden recall context.
+    pub recall_tokens: u64,
+    /// Ordered memory document IDs injected into this turn.
+    pub recall_doc_ids: Vec<String>,
+    /// Digest of the exact raw recall context accepted upstream.
+    pub recall_hash: Option<String>,
+    /// Whether recall context was truncated before model consumption.
+    pub recall_truncated: bool,
 }
 
 /// Boxed streaming response.
@@ -384,9 +488,7 @@ pub trait LlmProvider: Send + Sync {
         expected_msgs_count: Option<usize>,
     ) -> BoxFuture<'a, Result<usize>> {
         let name = self.name().to_owned();
-        Box::pin(async move {
-            anyhow::bail!("compact splice not supported by provider {name}")
-        })
+        Box::pin(async move { anyhow::bail!("compact splice not supported by provider {name}") })
     }
 }
 

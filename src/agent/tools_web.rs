@@ -11,17 +11,20 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
-use super::platform::{detect_chrome, has_display};
-use super::runtime::{AgentRuntime, RunContext, expand_tilde};
-use super::web_parsers::{
-    extract_html_title, html_dehydrate_to_text, is_captcha_page, lang_to_bing_mkt,
-    parse_baidu_results, parse_bing_html_results, parse_ddg_results, parse_sogou_results,
-    search_engine_url, truncate_chars, urlencoding,
+use super::{
+    platform::{detect_chrome, has_display},
+    runtime::{AgentRuntime, RunContext, expand_tilde},
+    web_parsers::{
+        extract_html_title, html_dehydrate_to_text, is_captcha_page, lang_to_bing_mkt,
+        parse_baidu_results, parse_bing_html_results, parse_ddg_results, parse_sogou_results,
+        search_engine_url, truncate_chars, urlencoding,
+    },
 };
-
-use crate::config::loader::{applicable_site_rules, applicable_site_rules_body};
-use crate::provider::{AgentEndpoint, Message, MessageContent, Role, StreamEvent};
-use crate::agent::query_planner::{Intent, QueryPlan};
+use crate::{
+    agent::query_planner::{Intent, QueryPlan},
+    config::loader::{applicable_site_rules, applicable_site_rules_body},
+    provider::{AgentEndpoint, Message, MessageContent, Role, StreamEvent},
+};
 
 /// Attach a pre-written raw-markdown artifact id to a `tool_web_fetch`
 /// JSON result so the runtime's "truncated → call read_artifact"
@@ -29,7 +32,9 @@ use crate::agent::query_planner::{Intent, QueryPlan};
 /// flash-model summary. No-op when no artifact was written.
 fn attach_raw_artifact(result: &mut Value, artifact: Option<String>, raw_chars: usize) {
     let Some(id) = artifact else { return };
-    let Some(obj) = result.as_object_mut() else { return };
+    let Some(obj) = result.as_object_mut() else {
+        return;
+    };
     obj.insert("_tool_result_id".to_owned(), Value::String(id));
     obj.insert("_truncated".to_owned(), Value::Bool(true));
     obj.insert(
@@ -76,8 +81,9 @@ fn host_of(url: &str) -> Option<String> {
 /// isn't available. `contains_key` is synchronous on the future cache,
 /// `insert` is async.
 fn site_rule_cache() -> &'static moka::future::Cache<String, ()> {
-    use moka::future::Cache;
     use std::sync::LazyLock;
+
+    use moka::future::Cache;
     static CACHE: LazyLock<Cache<String, ()>> = LazyLock::new(|| {
         Cache::builder()
             .max_capacity(2_000)
@@ -107,17 +113,24 @@ impl AgentRuntime {
         // (wttr.in for weather, etc.) — no search engine needed.
         // If the planner fails or returns only `general`, we fall through to
         // the normal search logic below with the original query unchanged.
-        if !args.get("_planned").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if !args
+            .get("_planned")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             // Prefer the original user query for intent recognition — the agent
             // often rewrites queries (adds dates, site: operators) which confuses
             // the planner. Fall back to the tool's `query` arg if unavailable.
             let planner_input = args["_user_query"].as_str().unwrap_or(query);
             let flash = self.resolve_flash_model_name();
-            let plan = crate::agent::query_planner::plan(planner_input, &flash, &self.providers).await;
+            let plan =
+                crate::agent::query_planner::plan(planner_input, &flash, &self.providers).await;
 
             // Count structured (non-general) intents. If we have any, dispatch
             // them through the planner path and return structured results.
-            let structured_count = plan.sub_queries.iter()
+            let structured_count = plan
+                .sub_queries
+                .iter()
                 .filter(|s| !matches!(s.intent, crate::agent::query_planner::Intent::General))
                 .count();
 
@@ -444,8 +457,8 @@ impl AgentRuntime {
                 .as_ref()
                 .and_then(|g| g.language.as_deref())
                 .unwrap_or("");
-            let is_zh = lang.to_lowercase().starts_with("zh")
-                || lang.to_lowercase().starts_with("chinese");
+            let is_zh =
+                lang.to_lowercase().starts_with("zh") || lang.to_lowercase().starts_with("chinese");
             let bing_host = if is_zh { "cn.bing.com" } else { "www.bing.com" };
             let mkt = lang_to_bing_mkt(lang);
             let mkt_param = if mkt.is_empty() {
@@ -481,7 +494,11 @@ impl AgentRuntime {
         let free_providers = ["duckduckgo-free", "bing-free", "baidu-free", "sogou-free"];
         let is_free_mode = free_providers.contains(&chosen.as_str());
         if is_free_mode {
-            let lang = self.config.raw.gateway.as_ref()
+            let lang = self
+                .config
+                .raw
+                .gateway
+                .as_ref()
                 .and_then(|g| g.language.as_deref())
                 .unwrap_or("");
             // Match the same Chinese-detection rule the DDG-empty
@@ -542,14 +559,21 @@ impl AgentRuntime {
             info!("web_search: all free providers returned empty, trying browser fallback");
             match self.browser_search(query, limit).await {
                 Ok(browser_results) if !browser_results.is_empty() => {
-                    info!(count = browser_results.len(), "web_search: browser fallback succeeded");
+                    info!(
+                        count = browser_results.len(),
+                        "web_search: browser fallback succeeded"
+                    );
                     results = browser_results;
                 }
                 Ok(_) => {
-                    bail!("web_search: all search providers and browser fallback returned empty. The IP may be rate-limited by search engines. Try again later or configure an API-key search provider.");
+                    bail!(
+                        "web_search: all search providers and browser fallback returned empty. The IP may be rate-limited by search engines. Try again later or configure an API-key search provider."
+                    );
                 }
                 Err(e) => {
-                    bail!("web_search: all search providers failed and browser fallback error: {e:#}. Try again later or configure an API-key search provider.");
+                    bail!(
+                        "web_search: all search providers failed and browser fallback error: {e:#}. Try again later or configure an API-key search provider."
+                    );
                 }
             }
         }
@@ -593,11 +617,15 @@ impl AgentRuntime {
         limit: usize,
         client: &reqwest::Client,
     ) -> Result<Vec<Value>> {
-        let lang = self.config.raw.gateway.as_ref()
+        let lang = self
+            .config
+            .raw
+            .gateway
+            .as_ref()
             .and_then(|g| g.language.as_deref())
             .unwrap_or("");
-        let is_zh = lang.to_lowercase().starts_with("zh")
-            || lang.to_lowercase().starts_with("chinese");
+        let is_zh =
+            lang.to_lowercase().starts_with("zh") || lang.to_lowercase().starts_with("chinese");
         let (html, results) = match provider {
             "bing-free" => {
                 let bing_host = if is_zh { "cn.bing.com" } else { "www.bing.com" };
@@ -619,13 +647,19 @@ impl AgentRuntime {
                 (html, r)
             }
             "duckduckgo-free" => {
-                let url = format!("https://html.duckduckgo.com/html/?q={}", urlencoding::encode(query));
+                let url = format!(
+                    "https://html.duckduckgo.com/html/?q={}",
+                    urlencoding::encode(query)
+                );
                 let html = client.get(&url).send().await?.text().await?;
                 let r = parse_ddg_results(&html, limit);
                 (html, r)
             }
             "baidu-free" => {
-                let url = format!("https://www.baidu.com/s?wd={}&rn={limit}", urlencoding::encode(query));
+                let url = format!(
+                    "https://www.baidu.com/s?wd={}&rn={limit}",
+                    urlencoding::encode(query)
+                );
                 let html = client.get(&url)
                     .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15")
                     .send().await?.text().await?;
@@ -633,7 +667,10 @@ impl AgentRuntime {
                 (html, r)
             }
             "sogou-free" => {
-                let url = format!("https://www.sogou.com/web?query={}", urlencoding::encode(query));
+                let url = format!(
+                    "https://www.sogou.com/web?query={}",
+                    urlencoding::encode(query)
+                );
                 let html = client.get(&url)
                     .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15")
                     .send().await?.text().await?;
@@ -644,15 +681,19 @@ impl AgentRuntime {
         };
 
         if results.is_empty() && is_captcha_page(&html) {
-            warn!(provider, "web_search: CAPTCHA detected, provider may be rate-limited");
+            warn!(
+                provider,
+                "web_search: CAPTCHA detected, provider may be rate-limited"
+            );
         }
 
         Ok(results)
     }
 
     pub(crate) async fn tool_web_fetch(&self, ctx: &RunContext, args: Value) -> Result<Value> {
-        use moka::future::Cache;
         use std::sync::LazyLock;
+
+        use moka::future::Cache;
 
         /// LRU cache for GET responses: URL -> (title, markdown). 15 min TTL,
         /// ~50 MB. Non-GET requests bypass the cache entirely — POST/PUT/DELETE
@@ -714,7 +755,8 @@ impl AgentRuntime {
         // dropped — reqwest manages those.
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(map) = args.get("headers").and_then(|v| v.as_object()) {
-            const RESERVED: &[&str] = &["host", "content-length", "transfer-encoding", "connection"];
+            const RESERVED: &[&str] =
+                &["host", "content-length", "transfer-encoding", "connection"];
             for (k, v) in map {
                 if RESERVED.iter().any(|r| r.eq_ignore_ascii_case(k)) {
                     continue;
@@ -735,16 +777,26 @@ impl AgentRuntime {
         // Content-Type via headers). Anything else → error.
         let body_value = args.get("body").cloned();
 
-        let wf_cfg = self.live.ext.read().await
-            .tools.as_ref()
+        let wf_cfg = self
+            .live
+            .ext
+            .read()
+            .await
+            .tools
+            .as_ref()
             .and_then(|t| t.web_fetch.clone());
-        let max_length = wf_cfg.as_ref()
+        let max_length = wf_cfg
+            .as_ref()
             .and_then(|f| f.max_length)
             .unwrap_or(100_000);
-        let user_agent = wf_cfg.as_ref()
+        let user_agent = wf_cfg
+            .as_ref()
             .and_then(|f| f.user_agent.clone())
-            .unwrap_or_else(|| "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
-                AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36".to_owned());
+            .unwrap_or_else(|| {
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+                AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    .to_owned()
+            });
 
         // Upgrade http -> https.
         let fetch_url = if url.starts_with("http://") {
@@ -875,10 +927,14 @@ impl AgentRuntime {
 
         // Surface unfollowed redirects to the caller. Two cases reach here:
         //   - GET cross-host redirect (policy stops cross-host).
-        //   - Non-GET 301/302/303 redirect (policy stops to avoid silent
-        //     POST→GET method downgrade and unintended header forwarding).
+        //   - Non-GET 301/302/303 redirect (policy stops to avoid silent POST→GET
+        //     method downgrade and unintended header forwarding).
         if response.status().is_redirection() {
-            if let Some(loc) = response.headers().get("location").and_then(|v| v.to_str().ok()) {
+            if let Some(loc) = response
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+            {
                 let status = response.status().as_u16();
                 let hint = if is_get {
                     format!("Redirected to {loc}. Fetch that URL if appropriate.")
@@ -906,7 +962,8 @@ impl AgentRuntime {
             }
         }
 
-        let content_type = response.headers()
+        let content_type = response
+            .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
@@ -930,14 +987,13 @@ impl AgentRuntime {
         let plain_len = markdown.trim().len();
         let is_spa = content_type.contains("text/html") && plain_len < 200 && html.len() > 10_000;
         let html_lower = html.to_lowercase();
-        let is_captcha = content_type.contains("text/html") && (
-            html_lower.contains("captcha") ||
-            html_lower.contains("challenge-form") ||
-            html_lower.contains("cf-browser-verification") ||
-            html_lower.contains("just a moment") ||
-            html_lower.contains("verify you are human") ||
-            html_lower.contains("bot detection")
-        );
+        let is_captcha = content_type.contains("text/html")
+            && (html_lower.contains("captcha")
+                || html_lower.contains("challenge-form")
+                || html_lower.contains("cf-browser-verification")
+                || html_lower.contains("just a moment")
+                || html_lower.contains("verify you are human")
+                || html_lower.contains("bot detection"));
         if is_captcha {
             tracing::warn!(url = %fetch_url, "web_fetch: CAPTCHA/bot-check detected, trying browser fallback");
         }
@@ -955,7 +1011,9 @@ impl AgentRuntime {
 
         // Only cache cacheable requests: GET with no headers / body.
         if is_get && body_value.is_none() && headers.is_empty() {
-            FETCH_CACHE.insert(fetch_url, (final_title.clone(), final_md.clone())).await;
+            FETCH_CACHE
+                .insert(fetch_url, (final_title.clone(), final_md.clone()))
+                .await;
         }
 
         // Return full clean text — the runtime backstop handles size
@@ -1031,11 +1089,15 @@ impl AgentRuntime {
 
     /// Use web_browser to fetch JS-rendered page content via get_article.
     pub(crate) async fn browser_get_article(&self, url: &str) -> Result<(String, String)> {
-        let tab = crate::browser::pool::BrowserPool::global().acquire_tab().await?;
+        let tab = crate::browser::pool::BrowserPool::global()
+            .acquire_tab()
+            .await?;
         tab.navigate(url).await?;
 
         // Wait for content to load, then extract article text.
-        let _ = tab.wait_for_selector("article, main, .content, body", 10).await;
+        let _ = tab
+            .wait_for_selector("article, main, .content, body", 10)
+            .await;
         let js = r#"(function(){
             var el = document.querySelector('article') || document.querySelector('main')
                 || document.querySelector('.content') || document.body;
@@ -1052,17 +1114,24 @@ impl AgentRuntime {
         Ok((title, md))
     }
 
-    /// Browser-based search fallback: open a search engine in the shared browser pool,
-    /// extract results from the rendered page. Uses a pooled tab (not per-agent Chrome).
+    /// Browser-based search fallback: open a search engine in the shared
+    /// browser pool, extract results from the rendered page. Uses a pooled
+    /// tab (not per-agent Chrome).
     pub(crate) async fn browser_search(&self, query: &str, limit: usize) -> Result<Vec<Value>> {
-        let tab = crate::browser::pool::BrowserPool::global().acquire_tab().await?;
+        let tab = crate::browser::pool::BrowserPool::global()
+            .acquire_tab()
+            .await?;
 
         // Try multiple search engines, auto-switch on CAPTCHA/empty results.
-        let lang = self.config.raw.gateway.as_ref()
+        let lang = self
+            .config
+            .raw
+            .gateway
+            .as_ref()
             .and_then(|g| g.language.as_deref())
             .unwrap_or("");
-        let is_zh = lang.to_lowercase().starts_with("zh")
-            || lang.to_lowercase().starts_with("chinese");
+        let is_zh =
+            lang.to_lowercase().starts_with("zh") || lang.to_lowercase().starts_with("chinese");
 
         // Engine list: (name, url_template, result_css, snippet_css)
         // Round-robin start index to distribute concurrent searches across engines,
@@ -1070,15 +1139,45 @@ impl AgentRuntime {
         let q = urlencoding::encode(query);
         let mut engines: Vec<(&str, String, &str, &str)> = if is_zh {
             vec![
-                ("baidu", format!("https://www.baidu.com/s?wd={q}"), ".result.c-container", "p, .c-abstract"),
-                ("bing", format!("https://cn.bing.com/search?q={q}"), ".b_algo", "p"),
-                ("sogou", format!("https://www.sogou.com/web?query={q}"), ".vrwrap, .rb", "p, .ft"),
+                (
+                    "baidu",
+                    format!("https://www.baidu.com/s?wd={q}"),
+                    ".result.c-container",
+                    "p, .c-abstract",
+                ),
+                (
+                    "bing",
+                    format!("https://cn.bing.com/search?q={q}"),
+                    ".b_algo",
+                    "p",
+                ),
+                (
+                    "sogou",
+                    format!("https://www.sogou.com/web?query={q}"),
+                    ".vrwrap, .rb",
+                    "p, .ft",
+                ),
             ]
         } else {
             vec![
-                ("google", format!("https://www.google.com/search?q={q}"), "div.g", "span.st, div[data-sncf]"),
-                ("brave", format!("https://search.brave.com/search?q={q}"), "[data-type='web'], .snippet", ".snippet-description, .snippet-content"),
-                ("bing", format!("https://www.bing.com/search?q={q}"), ".b_algo", "p"),
+                (
+                    "google",
+                    format!("https://www.google.com/search?q={q}"),
+                    "div.g",
+                    "span.st, div[data-sncf]",
+                ),
+                (
+                    "brave",
+                    format!("https://search.brave.com/search?q={q}"),
+                    "[data-type='web'], .snippet",
+                    ".snippet-description, .snippet-content",
+                ),
+                (
+                    "bing",
+                    format!("https://www.bing.com/search?q={q}"),
+                    ".b_algo",
+                    "p",
+                ),
             ]
         };
         let rotation = crate::browser::pool::BrowserPool::global().next_engine_index() as usize;
@@ -1105,13 +1204,17 @@ impl AgentRuntime {
             if let Ok(v) = tab.evaluate(captcha_js).await {
                 let status = v.as_str().unwrap_or("");
                 if status == "captcha" {
-                    warn!(engine = name, "browser_search: CAPTCHA detected, trying next engine");
+                    warn!(
+                        engine = name,
+                        "browser_search: CAPTCHA detected, trying next engine"
+                    );
                     continue;
                 }
             }
 
             // Extract results
-            let js = format!(r#"(function(){{
+            let js = format!(
+                r#"(function(){{
                 var results = [];
                 var items = document.querySelectorAll('{result_selector}');
                 for (var i = 0; i < Math.min(items.length, {limit}); i++) {{
@@ -1126,20 +1229,31 @@ impl AgentRuntime {
                     }}
                 }}
                 return JSON.stringify(results);
-            }})()"#);
+            }})()"#
+            );
 
             if let Ok(result) = tab.evaluate(&js).await {
                 let result_str = result.as_str().unwrap_or("[]");
-                let parsed: Vec<Value> = serde_json::from_str(
-                    if result_str.starts_with('[') { result_str } else { "[]" }
-                ).unwrap_or_default();
+                let parsed: Vec<Value> = serde_json::from_str(if result_str.starts_with('[') {
+                    result_str
+                } else {
+                    "[]"
+                })
+                .unwrap_or_default();
 
                 if !parsed.is_empty() {
-                    info!(engine = name, count = parsed.len(), "browser_search: got results");
+                    info!(
+                        engine = name,
+                        count = parsed.len(),
+                        "browser_search: got results"
+                    );
                     return Ok(parsed);
                 }
             }
-            warn!(engine = name, "browser_search: no results, trying next engine");
+            warn!(
+                engine = name,
+                "browser_search: no results, trying next engine"
+            );
         }
 
         // Tab is automatically closed when dropped.
@@ -1170,8 +1284,13 @@ impl AgentRuntime {
     /// If summaryModel is configured and a prompt is provided, summarize
     /// the content with a secondary model. Otherwise return content as-is.
     pub(crate) async fn maybe_summarize(&self, content: &str, prompt: Option<&str>) -> String {
-        let summary_model = self.live.ext.read().await
-            .tools.as_ref()
+        let summary_model = self
+            .live
+            .ext
+            .read()
+            .await
+            .tools
+            .as_ref()
             .and_then(|t| t.web_fetch.as_ref())
             .and_then(|f| f.summary_model.clone());
 
@@ -1208,6 +1327,7 @@ impl AgentRuntime {
                 "Web page content:\n---\n{content_capped}\n---\n\n{prompt}\n\n\
                  Provide a concise response based on the content above."
             )),
+            rsclaw_hidden: None,
         }];
 
         let req = crate::provider::LlmRequest {
@@ -1218,8 +1338,13 @@ impl AgentRuntime {
             max_tokens: Some(2000),
             temperature: None,
             frequency_penalty: None,
-            thinking_budget: None, endpoint: AgentEndpoint::Flash, kv_cache_mode: 0, session_key: None,
-            system_shared: None, user_system: None,
+            thinking_budget: None,
+            endpoint: AgentEndpoint::Flash,
+            kv_cache_mode: 0,
+            session_key: None,
+            system_shared: None,
+            user_system: None,
+            recall: None,
         };
 
         match provider.stream(req).await {
@@ -1233,7 +1358,11 @@ impl AgentRuntime {
                         Err(_) => break,
                     }
                 }
-                if buf.is_empty() { content.to_owned() } else { buf }
+                if buf.is_empty() {
+                    content.to_owned()
+                } else {
+                    buf
+                }
             }
             Err(e) => {
                 warn!("web_fetch summary model failed: {e:#}");
@@ -1251,7 +1380,8 @@ impl AgentRuntime {
             .ok_or_else(|| anyhow!("web_download: `path` required"))?;
 
         // Resolve path: always under workspace/downloads.
-        // Strip common prefixes that models hallucinate (~/Downloads/, ~/,  /workspace/).
+        // Strip common prefixes that models hallucinate (~/Downloads/, ~/,
+        // /workspace/).
         let mut cleaned = path_str
             .trim_start_matches("~/Downloads/")
             .trim_start_matches("~/downloads/")
@@ -1261,7 +1391,11 @@ impl AgentRuntime {
         if cleaned.is_empty() {
             cleaned = "download";
         }
-        let workspace = self.handle.config.workspace.as_deref()
+        let workspace = self
+            .handle
+            .config
+            .workspace
+            .as_deref()
             .or(self.config.agents.defaults.workspace.as_deref())
             .map(expand_tilde)
             .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
@@ -1269,8 +1403,12 @@ impl AgentRuntime {
 
         // Ensure parent directory exists.
         if let Some(parent) = full.parent() {
-            tokio::fs::create_dir_all(parent).await
-                .map_err(|e| anyhow!("web_download: cannot create directory {}: {e}", parent.display()))?;
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                anyhow!(
+                    "web_download: cannot create directory {}: {e}",
+                    parent.display()
+                )
+            })?;
         }
 
         // Build cookie header: manual cookies param > auto from browser session
@@ -1286,7 +1424,8 @@ impl AgentRuntime {
                         if let Some(cookies) = resp["cookies"].as_array() {
                             let url_parsed = reqwest::Url::parse(url).ok();
                             let domain = url_parsed.as_ref().and_then(|u| u.host_str());
-                            let parts: Vec<String> = cookies.iter()
+                            let parts: Vec<String> = cookies
+                                .iter()
                                 .filter(|c| {
                                     // Filter cookies matching the download URL domain
                                     if let (Some(d), Some(cd)) = (domain, c["domain"].as_str()) {
@@ -1303,7 +1442,10 @@ impl AgentRuntime {
                                 })
                                 .collect();
                             cookie_header = parts.join("; ");
-                            tracing::debug!(cookies_count = parts.len(), "web_download: extracted browser cookies");
+                            tracing::debug!(
+                                cookies_count = parts.len(),
+                                "web_download: extracted browser cookies"
+                            );
                         }
                     }
                     Err(e) => {
@@ -1319,7 +1461,10 @@ impl AgentRuntime {
             .build()?;
 
         // Resume support: if file exists, try Range request to continue download.
-        let existing_size = tokio::fs::metadata(&full).await.map(|m| m.len()).unwrap_or(0);
+        let existing_size = tokio::fs::metadata(&full)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
         let mut req = client.get(url);
         if !cookie_header.is_empty() {
             req = req.header("Cookie", &cookie_header);
@@ -1341,7 +1486,9 @@ impl AgentRuntime {
             req = req.header("Range", format!("bytes={existing_size}-"));
         }
 
-        let resp = req.send().await
+        let resp = req
+            .send()
+            .await
             .map_err(|e| anyhow!("web_download: request failed: {e}"))?;
 
         if !resp.status().is_success() && resp.status().as_u16() != 206 {
@@ -1349,12 +1496,16 @@ impl AgentRuntime {
         }
 
         // Warn if response is HTML (likely a redirect/login page, not the actual file).
-        let content_type = resp.headers().get("content-type")
+        let content_type = resp
+            .headers()
+            .get("content-type")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_lowercase();
         if content_type.contains("text/html") {
-            bail!("web_download: server returned HTML instead of file. The URL may require different cookies or is a redirect page. Content-Type: {content_type}");
+            bail!(
+                "web_download: server returned HTML instead of file. The URL may require different cookies or is a redirect page. Content-Type: {content_type}"
+            );
         }
 
         let resumed = resp.status().as_u16() == 206;
@@ -1364,10 +1515,19 @@ impl AgentRuntime {
         use futures::StreamExt;
         use tokio::io::AsyncWriteExt;
         let mut file = if resumed {
-            tokio::fs::OpenOptions::new().append(true).open(&full).await
-                .map_err(|e| anyhow!("web_download: cannot open for append {}: {e}", full.display()))?
+            tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&full)
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "web_download: cannot open for append {}: {e}",
+                        full.display()
+                    )
+                })?
         } else {
-            tokio::fs::File::create(&full).await
+            tokio::fs::File::create(&full)
+                .await
                 .map_err(|e| anyhow!("web_download: cannot create {}: {e}", full.display()))?
         };
         let mut downloaded: u64 = 0;
@@ -1681,8 +1841,13 @@ impl AgentRuntime {
             // Task agents (non-main) always use headless to save resources.
             // Snapshot owned so the live read lock is released before entering
             // any awaits below.
-            let wb_cfg_owned = self.live.ext.read().await
-                .tools.as_ref()
+            let wb_cfg_owned = self
+                .live
+                .ext
+                .read()
+                .await
+                .tools
+                .as_ref()
                 .and_then(|t| t.web_browser.clone());
             let wb_cfg = wb_cfg_owned.as_ref();
             let is_main = self.handle.id == "main";
@@ -1754,7 +1919,10 @@ impl AgentRuntime {
                     } else {
                         // No user Chrome — share the agent pool instead of
                         // launching a 3rd process.
-                        match crate::browser::pool::BrowserPool::global().chrome_ws_url().await {
+                        match crate::browser::pool::BrowserPool::global()
+                            .chrome_ws_url()
+                            .await
+                        {
                             Ok(ws_url) => {
                                 info!("no user Chrome — connecting to shared agent pool Chrome");
                                 crate::browser::BrowserSession::connect_existing(&ws_url).await?
@@ -1762,13 +1930,21 @@ impl AgentRuntime {
                             Err(e) => {
                                 warn!(error = %e, "pool Chrome unavailable, last-resort launch");
                                 crate::browser::can_launch_chrome()?;
-                                crate::browser::BrowserSession::start(&chrome_path, true, profile.as_deref()).await?
+                                crate::browser::BrowserSession::start(
+                                    &chrome_path,
+                                    true,
+                                    profile.as_deref(),
+                                )
+                                .await?
                             }
                         }
                     }
                 } else {
                     // Sub/task agents always use the shared pool Chrome.
-                    match crate::browser::pool::BrowserPool::global().chrome_ws_url().await {
+                    match crate::browser::pool::BrowserPool::global()
+                        .chrome_ws_url()
+                        .await
+                    {
                         Ok(ws_url) => {
                             info!("sub-agent connecting to shared pool Chrome (headless)");
                             crate::browser::BrowserSession::connect_existing(&ws_url).await?
@@ -1776,7 +1952,12 @@ impl AgentRuntime {
                         Err(e) => {
                             warn!(error = %e, "pool Chrome unavailable, last-resort headless launch");
                             crate::browser::can_launch_chrome()?;
-                            crate::browser::BrowserSession::start(&chrome_path, false, profile.as_deref()).await?
+                            crate::browser::BrowserSession::start(
+                                &chrome_path,
+                                false,
+                                profile.as_deref(),
+                            )
+                            .await?
                         }
                     }
                 };
@@ -1784,7 +1965,8 @@ impl AgentRuntime {
             }
         }
 
-        // Special action: capture_video — open page, inject interceptor, wait, collect video URLs.
+        // Special action: capture_video — open page, inject interceptor, wait, collect
+        // video URLs.
         if action == "capture_video" {
             let url = args["url"].as_str().unwrap_or("");
             if url.is_empty() {
@@ -1818,7 +2000,8 @@ impl AgentRuntime {
             session.execute("open", &json!({"url": url})).await?;
             tokio::time::sleep(Duration::from_millis(1000)).await;
 
-            // 3. Inject interceptor (page scripts may have already loaded, so also check performance).
+            // 3. Inject interceptor (page scripts may have already loaded, so also check
+            //    performance).
             let _ = session.execute("evaluate", &json!({"js": inject_js})).await;
 
             // 3b. Kick the player into life. Many sites (Douyin, Bilibili,
@@ -1861,12 +2044,13 @@ impl AgentRuntime {
                 } catch(_){}
                 return tries.join('|');
             })()"#;
-            let _ = session.execute("evaluate", &json!({"js": kick_play_js})).await;
+            let _ = session
+                .execute("evaluate", &json!({"js": kick_play_js}))
+                .await;
 
-            // 4. Wait for video to start streaming. We sleep BEFORE the
-            //    final collect, because the kick_play above only fires
-            //    the events; the actual XHR/fetch + segment loads happen
-            //    over the next several seconds.
+            // 4. Wait for video to start streaming. We sleep BEFORE the final collect,
+            //    because the kick_play above only fires the events; the actual XHR/fetch +
+            //    segment loads happen over the next several seconds.
             tokio::time::sleep(Duration::from_millis(wait_ms)).await;
 
             // 5. Collect captured URLs + performance entries + video element src.
@@ -1887,8 +2071,11 @@ impl AgentRuntime {
                 return JSON.stringify([...new Set(urls)]);
             })()"#;
 
-            let result = session.execute("evaluate", &json!({"js": collect_js})).await?;
-            let urls_str = result["result"].as_str()
+            let result = session
+                .execute("evaluate", &json!({"js": collect_js}))
+                .await?;
+            let urls_str = result["result"]
+                .as_str()
                 .or_else(|| result.as_str())
                 .unwrap_or("[]");
 
@@ -1896,12 +2083,20 @@ impl AgentRuntime {
 
             // 6. If empty, try reload + re-collect.
             if urls.is_empty() {
-                let _ = session.execute("evaluate", &json!({"js": "window.__vUrls=[];location.reload()"})).await;
+                let _ = session
+                    .execute(
+                        "evaluate",
+                        &json!({"js": "window.__vUrls=[];location.reload()"}),
+                    )
+                    .await;
                 tokio::time::sleep(Duration::from_millis(wait_ms)).await;
                 let _ = session.execute("evaluate", &json!({"js": inject_js})).await;
                 tokio::time::sleep(Duration::from_millis(wait_ms)).await;
-                let result2 = session.execute("evaluate", &json!({"js": collect_js})).await?;
-                let urls_str2 = result2["result"].as_str()
+                let result2 = session
+                    .execute("evaluate", &json!({"js": collect_js}))
+                    .await?;
+                let urls_str2 = result2["result"]
+                    .as_str()
                     .or_else(|| result2.as_str())
                     .unwrap_or("[]");
                 let urls2: Vec<String> = serde_json::from_str(urls_str2).unwrap_or_default();
@@ -1959,16 +2154,24 @@ async fn fetch_weather(client: &reqwest::Client, location: &str) -> (&'static st
     // covers international cities.
     match fetch_weather_cn(client, location).await {
         Some(cn) => return cn,
-        None => tracing::info!(location, "weather.com.cn path declined, falling back to wttr.in"),
+        None => tracing::info!(
+            location,
+            "weather.com.cn path declined, falling back to wttr.in"
+        ),
     }
 
     let cfg = &super::direct_apis::config().weather.wttr;
-    let url = cfg.url.replace("{location}", &urlencoding::encode(location));
+    let url = cfg
+        .url
+        .replace("{location}", &urlencoding::encode(location));
     match client.get(&url).send().await {
         Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
             Ok(j) => {
                 let summary = summarize_wttr(&j);
-                ("wttr.in", json!({ "location": location, "summary": summary, "raw": j }))
+                (
+                    "wttr.in",
+                    json!({ "location": location, "summary": summary, "raw": j }),
+                )
             }
             Err(e) => ("wttr.in", json!({ "error": format!("json parse: {e}") })),
         },
@@ -1989,8 +2192,8 @@ async fn fetch_weather(client: &reqwest::Client, location: &str) -> (&'static st
 ///
 /// Returns `None` on:
 ///   - city search failure (network / parse / 0 matches)
-///   - non-CN cityid (foreign cities resolve but the calendar endpoint
-///     302s for them)
+///   - non-CN cityid (foreign cities resolve but the calendar endpoint 302s for
+///     them)
 ///   - calendar fetch failure
 ///   - JS-wrapped-JSON parse failure
 ///
@@ -2045,7 +2248,11 @@ async fn fetch_weather_cn(
         return None;
     }
     let body = resp.text().await.ok()?;
-    tracing::info!(cityid, body_len = body.len(), "weather.com.cn: calendar body received");
+    tracing::info!(
+        cityid,
+        body_len = body.len(),
+        "weather.com.cn: calendar body received"
+    );
 
     // The payload is a JS assignment, not raw JSON: `var fc40 = [...];`
     // The variable name is config-driven (currently "fc40") so an
@@ -2096,7 +2303,8 @@ async fn fetch_weather_cn(
 /// planner stopped normalising to English.
 ///
 /// Response is JSONP-flavored, wrapped in `(…)`:
-///   ([{"ref":"101010100~beijing~北京~Beijing~北京~Beijing~10~100000~BJ~北京"}, …])
+///   ([{"ref":"101010100~beijing~北京~Beijing~北京~Beijing~10~100000~BJ~北京"},
+/// …])
 async fn lookup_cn_city_id(
     client: &reqwest::Client,
     search_url_tmpl: &str,
@@ -2149,9 +2357,7 @@ fn summarize_cn_weather(arr: &Value, max_days: usize) -> Value {
                 })
                 .take(max_days)
                 .map(|e| {
-                    let get = |k: &str| {
-                        e.get(k).and_then(Value::as_str).unwrap_or("").to_owned()
-                    };
+                    let get = |k: &str| e.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
                     json!({
                         "date":   get("date"),       // YYYYMMDD
                         "weekday": get("wk"),         // 一/二/三 ...
@@ -2188,9 +2394,15 @@ fn summarize_wttr(v: &Value) -> Value {
         .and_then(|c| c.get("temp_C").and_then(|t| t.as_str()))
         .unwrap_or("?");
     let now_desc = current
-        .and_then(|c| c.get("weatherDesc").and_then(|d| d.get(0)).and_then(|d| d.get("value")).and_then(|s| s.as_str()))
+        .and_then(|c| {
+            c.get("weatherDesc")
+                .and_then(|d| d.get(0))
+                .and_then(|d| d.get("value"))
+                .and_then(|s| s.as_str())
+        })
         .unwrap_or("?");
-    let days: Vec<Value> = v.get("weather")
+    let days: Vec<Value> = v
+        .get("weather")
         .and_then(|w| w.as_array())
         .map(|arr| {
             arr.iter()
@@ -2231,12 +2443,15 @@ async fn fetch_currency(client: &reqwest::Client, from: &str, to: &str) -> (&'st
         Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
             Ok(j) => {
                 let rate = j.pointer(&format!("/rates/{}", to.to_uppercase()));
-                ("open.er-api.com", json!({
-                    "from": from,
-                    "to": to,
-                    "rate": rate,
-                    "time_last_update_utc": j.get("time_last_update_utc"),
-                }))
+                (
+                    "open.er-api.com",
+                    json!({
+                        "from": from,
+                        "to": to,
+                        "rate": rate,
+                        "time_last_update_utc": j.get("time_last_update_utc"),
+                    }),
+                )
             }
             Err(e) => ("open.er-api.com", json!({ "error": e.to_string() })),
         },
@@ -2269,10 +2484,13 @@ async fn fetch_timezone(client: &reqwest::Client, location: &str) -> (&'static s
 async fn fetch_wiki(client: &reqwest::Client, topic: &str) -> (&'static str, Value) {
     // Pick language by heuristic: Chinese chars → zh.wikipedia, else en.
     let has_cjk = topic.chars().any(|c| {
-        (0x4E00..=0x9FFF).contains(&(c as u32))
-            || (0x3400..=0x4DBF).contains(&(c as u32))
+        (0x4E00..=0x9FFF).contains(&(c as u32)) || (0x3400..=0x4DBF).contains(&(c as u32))
     });
-    let host = if has_cjk { "zh.wikipedia.org" } else { "en.wikipedia.org" };
+    let host = if has_cjk {
+        "zh.wikipedia.org"
+    } else {
+        "en.wikipedia.org"
+    };
     let url = format!(
         "https://{host}/api/rest_v1/page/summary/{}",
         urlencoding::encode(topic),
@@ -2282,7 +2500,10 @@ async fn fetch_wiki(client: &reqwest::Client, topic: &str) -> (&'static str, Val
             Ok(j) => ("wikipedia", json!({ "topic": topic, "summary": j })),
             Err(e) => ("wikipedia", json!({ "error": e.to_string() })),
         },
-        Ok(resp) => ("wikipedia", json!({ "error": format!("HTTP {}", resp.status()) })),
+        Ok(resp) => (
+            "wikipedia",
+            json!({ "error": format!("HTTP {}", resp.status()) }),
+        ),
         Err(e) => ("wikipedia", json!({ "error": e.to_string() })),
     }
 }
@@ -2298,7 +2519,10 @@ async fn fetch_github(client: &reqwest::Client, owner: &str, repo: &str) -> (&'s
             Ok(j) => ("api.github.com", j),
             Err(e) => ("api.github.com", json!({ "error": e.to_string() })),
         },
-        Ok(resp) => ("api.github.com", json!({ "error": format!("HTTP {}", resp.status()) })),
+        Ok(resp) => (
+            "api.github.com",
+            json!({ "error": format!("HTTP {}", resp.status()) }),
+        ),
         Err(e) => ("api.github.com", json!({ "error": e.to_string() })),
     }
 }
@@ -2314,7 +2538,10 @@ async fn fetch_crypto(client: &reqwest::Client, coin: &str) -> (&'static str, Va
             Ok(j) => ("coingecko", j),
             Err(e) => ("coingecko", json!({ "error": format!("json parse: {e}") })),
         },
-        Ok(resp) => ("coingecko", json!({ "error": format!("HTTP {}", resp.status()) })),
+        Ok(resp) => (
+            "coingecko",
+            json!({ "error": format!("HTTP {}", resp.status()) }),
+        ),
         Err(e) => ("coingecko", json!({ "error": e.to_string() })),
     }
 }
@@ -2345,7 +2572,9 @@ fn compute_unit_convert(query: &str) -> Value {
 /// Evaluate a math expression. Simple expressions only.
 fn compute_math(expr: &str) -> Value {
     // Security: only allow digits, operators, parens, decimal points, spaces.
-    let safe = expr.chars().all(|c| c.is_ascii_digit() || "+-*/.() %^".contains(c));
+    let safe = expr
+        .chars()
+        .all(|c| c.is_ascii_digit() || "+-*/.() %^".contains(c));
     if !safe {
         return json!({ "error": "unsafe expression", "expr": expr });
     }
@@ -2373,7 +2602,10 @@ async fn fetch_ip(client: &reqwest::Client, ip: &str) -> (&'static str, Value) {
             Ok(j) => ("ip-api.com", j),
             Err(e) => ("ip-api.com", json!({ "error": format!("json parse: {e}") })),
         },
-        Ok(resp) => ("ip-api.com", json!({ "error": format!("HTTP {}", resp.status()) })),
+        Ok(resp) => (
+            "ip-api.com",
+            json!({ "error": format!("HTTP {}", resp.status()) }),
+        ),
         Err(e) => ("ip-api.com", json!({ "error": e.to_string() })),
     }
 }
@@ -2384,18 +2616,30 @@ async fn fetch_dns(client: &reqwest::Client, domain: &str) -> (&'static str, Val
         "https://cloudflare-dns.com/dns-query?name={}&type=A",
         urlencoding::encode(domain),
     );
-    match client.get(&url).header("Accept", "application/dns-json").send().await {
+    match client
+        .get(&url)
+        .header("Accept", "application/dns-json")
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
             Ok(j) => ("cloudflare-dns", j),
-            Err(e) => ("cloudflare-dns", json!({ "error": format!("json parse: {e}") })),
+            Err(e) => (
+                "cloudflare-dns",
+                json!({ "error": format!("json parse: {e}") }),
+            ),
         },
-        Ok(resp) => ("cloudflare-dns", json!({ "error": format!("HTTP {}", resp.status()) })),
+        Ok(resp) => (
+            "cloudflare-dns",
+            json!({ "error": format!("HTTP {}", resp.status()) }),
+        ),
         Err(e) => ("cloudflare-dns", json!({ "error": e.to_string() })),
     }
 }
 
 /// Fetch stock quote from Sina Finance API (free, no key).
-/// The query is a stock name; we first search for the code, then fetch the quote.
+/// The query is a stock name; we first search for the code, then fetch the
+/// quote.
 async fn fetch_stock_sina(client: &reqwest::Client, query: &str) -> (&'static str, Value) {
     // Step 1: search for stock code via Sina suggest API.
     let suggest_url = format!(
@@ -2434,7 +2678,12 @@ async fn fetch_stock_sina(client: &reqwest::Client, query: &str) -> (&'static st
         });
     let code = match code {
         Some(c) if !c.is_empty() => c,
-        _ => return ("sina_finance", json!({ "error": "stock not found", "query": query })),
+        _ => {
+            return (
+                "sina_finance",
+                json!({ "error": "stock not found", "query": query }),
+            );
+        }
     };
 
     // Step 2: fetch real-time quote.
@@ -2458,19 +2707,25 @@ async fn fetch_stock_sina(client: &reqwest::Client, query: &str) -> (&'static st
     let data = quote_text.split('"').nth(1).unwrap_or("");
     let fields: Vec<&str> = data.split(',').collect();
     if fields.len() < 32 {
-        return ("sina_finance", json!({ "error": "unexpected quote format", "raw": data }));
+        return (
+            "sina_finance",
+            json!({ "error": "unexpected quote format", "raw": data }),
+        );
     }
-    ("sina_finance", json!({
-        "code": code,
-        "name": fields[0],
-        "open": fields[1],
-        "prev_close": fields[2],
-        "price": fields[3],
-        "high": fields[4],
-        "low": fields[5],
-        "volume": fields[8],
-        "amount": fields[9],
-        "date": fields[30],
-        "time": fields[31],
-    }))
+    (
+        "sina_finance",
+        json!({
+            "code": code,
+            "name": fields[0],
+            "open": fields[1],
+            "prev_close": fields[2],
+            "price": fields[3],
+            "high": fields[4],
+            "low": fields[5],
+            "volume": fields[8],
+            "amount": fields[9],
+            "date": fields[30],
+            "time": fields[31],
+        }),
+    )
 }

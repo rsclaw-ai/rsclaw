@@ -78,7 +78,9 @@ impl LlmProvider for GeminiProvider {
                 .header("x-goog-api-key", &self.api_key)
                 .header(
                     "user-agent",
-                    self.user_agent.as_deref().unwrap_or(super::DEFAULT_USER_AGENT),
+                    self.user_agent
+                        .as_deref()
+                        .unwrap_or(super::DEFAULT_USER_AGENT),
                 )
                 .json(&body)
                 .send()
@@ -239,7 +241,8 @@ fn serialize_part(part: &ContentPart) -> Value {
 // ---------------------------------------------------------------------------
 
 /// Buffered SSE parser — handles TCP chunk boundaries that split lines.
-// TODO: SSE buffered parsing is duplicated across openai.rs, anthropic.rs, gemini.rs — extract shared utility
+// TODO: SSE buffered parsing is duplicated across openai.rs, anthropic.rs,
+// gemini.rs — extract shared utility
 async fn parse_sse_chunk_buffered(
     chunk: Result<bytes::Bytes>,
     line_buffer: &tokio::sync::Mutex<String>,
@@ -252,7 +255,11 @@ async fn parse_sse_chunk_buffered(
     let text = match std::str::from_utf8(&bytes) {
         Ok(t) => std::borrow::Cow::Borrowed(t),
         Err(e) => {
-            tracing::warn!("gemini: UTF-8 decode error at byte {}, replacing: {}", e.valid_up_to(), e);
+            tracing::warn!(
+                "gemini: UTF-8 decode error at byte {}, replacing: {}",
+                e.valid_up_to(),
+                e
+            );
             std::borrow::Cow::Owned(String::from_utf8_lossy(&bytes).into_owned())
         }
     };
@@ -334,6 +341,7 @@ fn parse_event(data: &str) -> Option<StreamEvent> {
             // no separate creation counter (cache is implicit).
             cache_creation: 0,
             cache_read: u["cachedContentTokenCount"].as_u64().unwrap_or(0),
+            ..Default::default()
         });
         return Some(StreamEvent::Done { usage });
     }
@@ -366,10 +374,12 @@ mod tests {
                 Message {
                     role: Role::User,
                     content: MessageContent::Text("hi".to_owned()),
+                    rsclaw_hidden: None,
                 },
                 Message {
                     role: Role::Assistant,
                     content: MessageContent::Text("hello".to_owned()),
+                    rsclaw_hidden: None,
                 },
             ],
             ..make_request()

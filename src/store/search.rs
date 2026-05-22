@@ -147,23 +147,21 @@ impl SearchIndex {
         let searcher = self.reader.searcher();
 
         let content_field = self.schema.get_field(FIELD_CONTENT).expect("field");
-        let _scope_field = self.schema.get_field(FIELD_SCOPE).expect("field");
 
         let search_fields = vec![content_field];
         let parser = QueryParser::for_index(&self.index, search_fields);
 
-        // Combine content query with optional scope filter.
-        let query_str = match scope {
-            Some(s) => format!("{query} AND scope:{s}"),
-            None => query.to_owned(),
-        };
-
         let parsed = parser
-            .parse_query(&query_str)
-            .with_context(|| format!("parse query: {query_str}"))?;
+            .parse_query(query)
+            .with_context(|| format!("parse query: {query}"))?;
 
+        let scan_limit = if scope.is_some() {
+            limit.saturating_mul(8).max(limit).max(32)
+        } else {
+            limit
+        };
         let top_docs = searcher
-            .search(&parsed, &TopDocs::with_limit(limit))
+            .search(&parsed, &TopDocs::with_limit(scan_limit))
             .context("search")?;
 
         let id_field = self.schema.get_field(FIELD_ID).expect("field");
@@ -183,12 +181,22 @@ impl SearchIndex {
                     .to_owned()
             };
 
+            let doc_scope = get_str(scope_fld);
+            if let Some(wanted_scope) = scope
+                && doc_scope != wanted_scope
+            {
+                continue;
+            }
+
             results.push(IndexDoc {
                 id: get_str(id_field),
-                scope: get_str(scope_fld),
+                scope: doc_scope,
                 content: get_str(content_fld),
                 kind: get_str(kind_fld),
             });
+            if results.len() >= limit {
+                break;
+            }
         }
 
         Ok(results)
@@ -295,5 +303,32 @@ mod tests {
         let (idx, _dir) = open_tmp();
         let results = idx.search("anything", None, 10).expect("search");
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_filters_by_scope() {
+        let (idx, _dir) = open_tmp();
+
+        idx.index_document(&IndexDoc {
+            id: "main-doc".to_owned(),
+            scope: "agent:main".to_owned(),
+            content: "sentinel lucky number 975318642".to_owned(),
+            kind: "remember".to_owned(),
+        })
+        .expect("index main");
+        idx.index_document(&IndexDoc {
+            id: "other-doc".to_owned(),
+            scope: "agent:other".to_owned(),
+            content: "sentinel lucky number 111111111".to_owned(),
+            kind: "remember".to_owned(),
+        })
+        .expect("index other");
+        idx.commit().expect("commit");
+
+        let results = idx
+            .search("sentinel lucky number", Some("agent:main"), 10)
+            .expect("search");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "main-doc");
     }
 }

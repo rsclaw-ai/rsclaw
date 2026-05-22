@@ -7,20 +7,24 @@
 //! distill them into a `SKILL.md` file that can be loaded by the skill
 //! subsystem.
 
-use std::collections::HashSet;
-use std::fs;
-use std::hash::{DefaultHasher, Hash, Hasher};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::{
+    collections::HashSet,
+    fs,
+    hash::{DefaultHasher, Hash, Hasher},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt as _;
 use tokio::sync::Semaphore;
 
-use crate::agent::memory::{MemDocTier, MemoryDoc, MemoryStore};
-use crate::provider::registry::ProviderRegistry;
-use crate::provider::{
-    LlmProvider, LlmRequest, Message, MessageContent, Role, StreamEvent,
+use crate::{
+    agent::memory::{MemDocTier, MemoryDoc, MemoryStore},
+    provider::{
+        LlmProvider, LlmRequest, Message, MessageContent, Role, StreamEvent,
+        registry::ProviderRegistry,
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -122,11 +126,8 @@ pub fn find_cluster(
         return Ok(None);
     }
 
-    let neighbours = store.find_near_duplicates(
-        doc_id,
-        Some(scope),
-        evo.cluster.similarity_threshold,
-    )?;
+    let neighbours =
+        store.find_near_duplicates(doc_id, Some(scope), evo.cluster.similarity_threshold)?;
 
     let mut cluster: Vec<MemoryDoc> = neighbours
         .into_iter()
@@ -152,10 +153,10 @@ pub fn find_cluster(
 /// memory documents into a standard-compliant `SKILL.md` file.
 ///
 /// The output follows the Anthropic skill-creator standard:
-/// - YAML frontmatter with `name` and a "pushy" `description` that states
-///   both what the skill does and when it should trigger.
-/// - Imperative Markdown body (under 500 lines) covering the workflow in
-///   enough detail that an agent can execute it without further context.
+/// - YAML frontmatter with `name` and a "pushy" `description` that states both
+///   what the skill does and when it should trigger.
+/// - Imperative Markdown body (under 500 lines) covering the workflow in enough
+///   detail that an agent can execute it without further context.
 /// - Optionally references `scripts/` or `references/` bundled resources when
 ///   the cluster content implies reusable scripts or large reference material.
 pub fn build_distill_prompt(cluster: &[MemoryDoc]) -> String {
@@ -325,6 +326,7 @@ pub async fn distill_with_llm(
         messages: vec![Message {
             role: Role::User,
             content: MessageContent::Text(prompt.to_owned()),
+            rsclaw_hidden: None,
         }],
         tools: Vec::new(),
         system: None,
@@ -337,6 +339,7 @@ pub async fn distill_with_llm(
         session_key: None,
         system_shared: None,
         user_system: None,
+        recall: None,
     };
 
     let mut stream = provider
@@ -372,8 +375,8 @@ pub async fn distill_with_llm(
 /// - Starts with a `---` frontmatter fence and has a closing `---`.
 /// - Frontmatter parses as YAML.
 /// - `name:` is present and non-empty.
-/// - `description:` is present and non-empty (skill-creator standard
-///   requires it; an empty one renders the skill invisible to the agent).
+/// - `description:` is present and non-empty (skill-creator standard requires
+///   it; an empty one renders the skill invisible to the agent).
 ///
 /// Returns the parsed name+description on success so the caller can re-use
 /// them without re-parsing.
@@ -419,8 +422,8 @@ pub fn validate_skill_md(content: &str) -> Result<(String, String)> {
 /// Returns:
 /// - `Ok(Some(path))` if a SKILL.md was written and the cluster tagged.
 /// - `Ok(None)` if no work was done (no cluster, in-flight, model missing,
-///   provider missing, distillation failed, validation failed). Logging
-///   happens inside; the caller just continues.
+///   provider missing, distillation failed, validation failed). Logging happens
+///   inside; the caller just continues.
 /// - `Err` only on hard infrastructure failure (file write, tag persistence).
 pub async fn crystallize_one(
     store: &Arc<tokio::sync::Mutex<MemoryStore>>,
@@ -513,8 +516,8 @@ pub async fn crystallize_one(
 
     tracing::info!(?path, slug = %slug, n = ids.len(), "crystallized memories into skill");
 
-    // 8. Tag cluster docs as crystallized only after successful write so
-    //    transient failures stay retryable.
+    // 8. Tag cluster docs as crystallized only after successful write so transient
+    //    failures stay retryable.
     let mut s = store.lock().await;
     for id in &ids {
         if let Err(e) = s.tag_doc(id, "crystallized").await {

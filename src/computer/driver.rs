@@ -2,20 +2,23 @@
 //!
 //! The driver owns the per-turn flow:
 //!
-//!   1. Permission gate — check the cached/persisted decision; if the
-//!      user has never decided, register a oneshot, emit a
-//!      `PermissionRequest` event for the UI to surface, await the
-//!      user's response, and record it. `Deny` short-circuits with
-//!      `DriverOutcome::PermissionDenied`.
+//!   1. Permission gate — check the cached/persisted decision; if the user has
+//!      never decided, register a oneshot, emit a `PermissionRequest` event for
+//!      the UI to surface, await the user's response, and record it. `Deny`
+//!      short-circuits with `DriverOutcome::PermissionDenied`.
 //!   2. Build the system prompt: base GUI-agent skeleton + operator's
 //!      `action_spaces()` + matched app-rules.
 //!   3. Loop:
 //!     a. `operator.screenshot()` captures the current screen / window.
-//!     b. Compose a fresh `LlmRequest` with the screenshot + history summary as a single user message — the system prompt stays the same across iterations.
-//!     c. `provider.stream(req)` accumulates assistant text until `StreamEvent::Done`.
-//!     d. `parser::parse_vlm_response()` extracts a `Vec<ParsedAction>`.
-//!     e. Each parsed action maps to an executable [`Action`] via `parsed_to_action` — `finished` / `call_user` terminate with the matching [`DriverOutcome`], everything else runs through `operator.execute(action)` with the result appended to history.
-//!     f. Bump the loop counter, then check the abort flag + max_loop.
+//!     b. Compose a fresh `LlmRequest` with the screenshot + history summary as
+//! a single user message — the system prompt stays the same across iterations.
+//!     c. `provider.stream(req)` accumulates assistant text until
+//! `StreamEvent::Done`.     d. `parser::parse_vlm_response()` extracts a
+//! `Vec<ParsedAction>`.     e. Each parsed action maps to an executable
+//! [`Action`] via `parsed_to_action` — `finished` / `call_user` terminate with
+//! the matching [`DriverOutcome`], everything else runs through
+//! `operator.execute(action)` with the result appended to history.     f. Bump
+//! the loop counter, then check the abort flag + max_loop.
 //!
 //! The driver is fully model-agnostic — it works with any vision model
 //! that follows the Thought/Action format the prompt asks for. Providers
@@ -23,27 +26,30 @@
 //! abstraction, so any registered VLM (UI-TARS, Doubao-vision, GPT-4o,
 //! Claude vision, Qwen-VL, …) can drive it.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use anyhow::{Context as _, Result};
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures::StreamExt;
 use tracing::{debug, info, warn};
 
-use super::action::{Action, ExecCtx, MouseButton, ParsedAction, ScrollDir};
-use super::app_rules::AppRuleSet;
-use super::operator::Operator;
-use super::parser::{CoordFormat, parse_vlm_response};
-use super::permission::{PermissionDecision, PermissionRequest, PermissionStore};
-use super::prompt::{PromptInputs, build_system_prompt};
-use super::status::ComputerUseStatus;
-
+use super::{
+    action::{Action, ExecCtx, MouseButton, ParsedAction, ScrollDir},
+    app_rules::AppRuleSet,
+    operator::Operator,
+    parser::{CoordFormat, parse_vlm_response},
+    permission::{PermissionDecision, PermissionRequest, PermissionStore},
+    prompt::{PromptInputs, build_system_prompt},
+    status::ComputerUseStatus,
+};
 use crate::provider::{
-    AgentEndpoint, ContentPart, LlmProvider, LlmRequest, Message, MessageContent, Role,
-    StreamEvent,
+    AgentEndpoint, ContentPart, LlmProvider, LlmRequest, Message, MessageContent, Role, StreamEvent,
 };
 
 // ---------------------------------------------------------------------------
@@ -106,8 +112,7 @@ pub struct VlmDriver<'a> {
     /// `PermissionDenied` — defends against a misconfigured gateway
     /// where the broadcast channel is missing but the permission gate
     /// must still block. R3 review I4.
-    pub permission_emit:
-        Option<Arc<dyn Fn(PermissionRequest) + Send + Sync + 'a>>,
+    pub permission_emit: Option<Arc<dyn Fn(PermissionRequest) + Send + Sync + 'a>>,
     /// When true and `permission_emit` is None, silently auto-grant
     /// AllowOnce instead of denying. Set explicitly by CLI callers
     /// (`true`); gateway callers leave `false` so a wiring bug
@@ -118,8 +123,7 @@ pub struct VlmDriver<'a> {
     /// each executed action, and a `Finished` on exit. Surfaced to the
     /// settings UI's live status panel. `None` (CLI / tests) makes
     /// emission a no-op.
-    pub status_emit:
-        Option<Arc<dyn Fn(ComputerUseStatus) + Send + Sync + 'a>>,
+    pub status_emit: Option<Arc<dyn Fn(ComputerUseStatus) + Send + Sync + 'a>>,
     /// Stable identifier for this run, included in every emitted status
     /// event so the UI can correlate them. Caller-minted (typically
     /// `vlm_drive-<uuid>`).
@@ -136,17 +140,16 @@ impl VlmDriver<'_> {
     }
 
     async fn run_inner(&self, instruction: &str) -> Result<DriverOutcome> {
-        // 1. Permission gate. No `Started` is emitted on denial — the
-        //    permission dialog already handled the visual; the wrapper
-        //    will still emit `Finished { kind = "permission_denied" }`
-        //    so the UI can surface a brief "denied" state.
+        // 1. Permission gate. No `Started` is emitted on denial — the permission dialog
+        //    already handled the visual; the wrapper will still emit `Finished { kind =
+        //    "permission_denied" }` so the UI can surface a brief "denied" state.
         if let Some(deny) = self.permission_gate(instruction).await? {
             return Ok(deny);
         }
         self.emit_started(instruction);
 
-        // 2. Build the system prompt once. The action space + matched
-        //    app-rules are stable across the loop, so we don't rebuild.
+        // 2. Build the system prompt once. The action space + matched app-rules are
+        //    stable across the loop, so we don't rebuild.
         // Probe the screen once up-front so the system prompt can
         // anchor "absolute pixel coordinates are in this 2880x1800
         // space" — without that, general LLMs (kimi/gpt-4o/claude
@@ -154,7 +157,11 @@ impl VlmDriver<'_> {
         // that any heuristic re-interpretation would distort. The
         // first screenshot is reused for turn 1 so we don't pay the
         // capture cost twice.
-        let probe_snap = self.operator.screenshot().await.context("initial screenshot")?;
+        let probe_snap = self
+            .operator
+            .screenshot()
+            .await
+            .context("initial screenshot")?;
         let probe_dims = probe_snap.physical_size;
         let mut next_snap: Option<super::action::Screenshot> = Some(probe_snap);
 
@@ -236,6 +243,7 @@ impl VlmDriver<'_> {
                         url: format!("data:image/png;base64,{snap_b64}"),
                     },
                 ]),
+                rsclaw_hidden: None,
             }];
 
             let req = LlmRequest {
@@ -252,30 +260,26 @@ impl VlmDriver<'_> {
                 session_key: None,
                 system_shared: None,
                 user_system: None,
+                recall: None,
             };
 
             // 3c. Stream the prediction. Abort flag is polled per
             //     chunk so a stop click takes effect within ~one
             //     roundtrip instead of waiting for the 30s tail.
-            let prediction = match stream_prediction(
-                self.provider.as_ref(),
-                req,
-                self.abort.as_ref(),
-            )
-            .await
-            {
-                Ok(p) => p,
-                Err(e) if e.to_string().contains(STREAM_ABORTED) => {
-                    return Ok(DriverOutcome::UserAbort { steps });
-                }
-                Err(e) => {
-                    warn!(error = %e, "VLM stream failed");
-                    return Ok(DriverOutcome::OperatorError {
-                        message: format!("vlm stream: {e}"),
-                        steps,
-                    });
-                }
-            };
+            let prediction =
+                match stream_prediction(self.provider.as_ref(), req, self.abort.as_ref()).await {
+                    Ok(p) => p,
+                    Err(e) if e.to_string().contains(STREAM_ABORTED) => {
+                        return Ok(DriverOutcome::UserAbort { steps });
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "VLM stream failed");
+                        return Ok(DriverOutcome::OperatorError {
+                            message: format!("vlm stream: {e}"),
+                            steps,
+                        });
+                    }
+                };
             debug!(prediction_len = prediction.len(), "VLM prediction received");
 
             // 3d. Parse.
@@ -469,14 +473,12 @@ impl VlmDriver<'_> {
                 // await the user's response. When `permission_emit` is
                 // None we fall back to one of two behaviors based on
                 // `headless_auto_allow`:
-                //   - true  (CLI / headless test rigs): auto-AllowOnce
-                //     so the loop can proceed without UI plumbing.
-                //   - false (default; gateway with mis-wired channel):
-                //     return PermissionDenied. The pre-fix code silently
-                //     auto-allowed in both cases, so a gateway that
-                //     somehow ended up with permission_emit=None would
-                //     bypass every permission gate without an audit
-                //     trail. R3 review I4.
+                //   - true  (CLI / headless test rigs): auto-AllowOnce so the loop can proceed
+                //     without UI plumbing.
+                //   - false (default; gateway with mis-wired channel): return PermissionDenied.
+                //     The pre-fix code silently auto-allowed in both cases, so a gateway that
+                //     somehow ended up with permission_emit=None would bypass every permission
+                //     gate without an audit trail. R3 review I4.
                 let Some(emit) = self.permission_emit.as_ref() else {
                     if self.headless_auto_allow {
                         info!("no permission emitter; headless_auto_allow → AllowOnce");
@@ -529,8 +531,7 @@ impl VlmDriver<'_> {
                 // oneshot rx so the driver awaits directly. Polling is
                 // simpler and good enough since user-decision latency
                 // is human-scale.)
-                let deadline = tokio::time::Instant::now()
-                    + std::time::Duration::from_secs(60);
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
                 let mut delay = std::time::Duration::from_millis(200);
                 loop {
                     if tokio::time::Instant::now() >= deadline {
@@ -733,11 +734,7 @@ async fn stream_prediction(
 /// To support UI-TARS 1.5 (which emits 0-1000 internally), add an
 /// explicit `coord_space="normalized"` config flag and a separate
 /// codepath; do NOT bring back a magnitude heuristic.
-fn parsed_to_action(
-    p: &ParsedAction,
-    screen_w: u32,
-    screen_h: u32,
-) -> Option<Action> {
+fn parsed_to_action(p: &ParsedAction, screen_w: u32, screen_h: u32) -> Option<Action> {
     // Coord pipeline: model emits in a 0-1000 normalized grid (see
     // the prompt's "Coordinate Space" section + UITARS_1_5-style
     // examples), so we rescale `x/1000 * screen_w` to physical

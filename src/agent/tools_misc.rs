@@ -8,20 +8,26 @@
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 
-use super::platform::powershell_hidden;
-use super::runtime::{AgentRuntime, RunContext};
+use super::{
+    platform::powershell_hidden,
+    runtime::{AgentRuntime, RunContext},
+};
 
 impl AgentRuntime {
     // -----------------------------------------------------------------------
     // TTS (text-to-speech)
     // -----------------------------------------------------------------------
 
-    /// Generate TTS audio from text. Prefers sherpa-onnx, falls back to system TTS.
-    /// Returns the path to the generated audio file.
+    /// Generate TTS audio from text. Prefers sherpa-onnx, falls back to system
+    /// TTS. Returns the path to the generated audio file.
     pub(crate) async fn generate_tts_audio(&self, text: &str) -> Result<String> {
         // Truncate long text for TTS (avoid very long audio).
         let tts_text = if text.chars().count() > 500 {
-            let idx = text.char_indices().nth(500).map(|(i, _)| i).unwrap_or(text.len());
+            let idx = text
+                .char_indices()
+                .nth(500)
+                .map(|(i, _)| i)
+                .unwrap_or(text.len());
             &text[..idx]
         } else {
             text
@@ -46,7 +52,11 @@ impl AgentRuntime {
             .join("tools")
             .join("sherpa-onnx")
             .join("bin")
-            .join(if cfg!(target_os = "windows") { "sherpa-onnx-offline-tts.exe" } else { "sherpa-onnx-offline-tts" });
+            .join(if cfg!(target_os = "windows") {
+                "sherpa-onnx-offline-tts.exe"
+            } else {
+                "sherpa-onnx-offline-tts"
+            });
 
         if sherpa_bin.exists()
             && let Some(vits) = find_vits_model()
@@ -67,8 +77,7 @@ impl AgentRuntime {
             // hook for English bundles that DO use espeak-ng.
             if let Some(data) = vits.data_dir.as_ref() {
                 let path_str = data.to_string_lossy();
-                let looks_like_jieba = path_str.ends_with("/dict")
-                    || path_str.ends_with("\\dict");
+                let looks_like_jieba = path_str.ends_with("/dict") || path_str.ends_with("\\dict");
                 if !looks_like_jieba {
                     cmd.arg(format!("--vits-data-dir={path_str}"));
                 }
@@ -114,7 +123,8 @@ impl AgentRuntime {
             let safe_text = tts_text.replace('\'', "''");
             let script = format!(
                 "Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.SetOutputToWaveFile('{}'); $s.Speak('{}')",
-                out_str.replace('\'', "''"), safe_text
+                out_str.replace('\'', "''"),
+                safe_text
             );
             let output = powershell_hidden()
                 .args(["-Command", &script])
@@ -183,7 +193,8 @@ impl AgentRuntime {
                 return Err(anyhow!("tts: say failed: {stderr}"));
             }
             // Convert aiff to mp3 via ffmpeg (required for feishu/weixin/etc.)
-            let ffmpeg_bin = crate::agent::platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned());
+            let ffmpeg_bin =
+                crate::agent::platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned());
             let ffmpeg = tokio::process::Command::new(&ffmpeg_bin)
                 .args(["-i", &aiff_str, "-y", "-q:a", "4", &out_path_str])
                 .output()
@@ -344,18 +355,26 @@ $synth.Speak('{}')
                             .params
                             .iter()
                             .map(|(k, v)| {
-                                (k.clone(), json!({
-                                    "type": v.param_type,
-                                    "required": v.required,
-                                    "default": v.default,
-                                    "description": v.description,
-                                }))
+                                (
+                                    k.clone(),
+                                    json!({
+                                        "type": v.param_type,
+                                        "required": v.required,
+                                        "default": v.default,
+                                        "description": v.description,
+                                    }),
+                                )
                             })
                             .collect();
-                        (name.clone(), json!({"description": cmd.description, "params": params}))
+                        (
+                            name.clone(),
+                            json!({"description": cmd.description, "params": params}),
+                        )
                     })
                     .collect();
-                Ok(json!({"name": adapter.name, "description": adapter.description, "base_url": adapter.base_url, "commands": commands}))
+                Ok(
+                    json!({"name": adapter.name, "description": adapter.description, "base_url": adapter.base_url, "commands": commands}),
+                )
             }
             "run" => {
                 let adapter_name = args["adapter"]
@@ -376,23 +395,38 @@ $synth.Speak('{}')
                         params_vec.push((k.clone(), val));
                     }
                 }
-                let param_refs: Vec<(&str, &str)> = params_vec.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                let param_refs: Vec<(&str, &str)> = params_vec
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
                 let result = anycli::Pipeline::execute(adapter, command, &param_refs).await?;
                 let fmt_str = args["format"].as_str().unwrap_or("json");
-                let fmt: anycli::OutputFormat = fmt_str.parse().unwrap_or(anycli::OutputFormat::Json);
-                Ok(json!({"adapter": result.adapter, "command": result.command, "count": result.count, "data": result.format(fmt)?}))
+                let fmt: anycli::OutputFormat =
+                    fmt_str.parse().unwrap_or(anycli::OutputFormat::Json);
+                Ok(
+                    json!({"adapter": result.adapter, "command": result.command, "count": result.count, "data": result.format(fmt)?}),
+                )
             }
             "search" => {
-                let query = args["query"].as_str().ok_or_else(|| anyhow!("anycli search: `query` required"))?;
+                let query = args["query"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("anycli search: `query` required"))?;
                 let hub = anycli::Hub::new()?;
                 let results = hub.search(query).await?;
-                let entries: Vec<serde_json::Value> = results.iter().map(|e| json!({"name": e.name, "description": e.description})).collect();
+                let entries: Vec<serde_json::Value> = results
+                    .iter()
+                    .map(|e| json!({"name": e.name, "description": e.description}))
+                    .collect();
                 Ok(json!({"results": entries, "count": entries.len()}))
             }
             "install" => {
-                let name = args["name"].as_str().or_else(|| args["adapter"].as_str()).ok_or_else(|| anyhow!("anycli install: `name` required"))?;
+                let name = args["name"]
+                    .as_str()
+                    .or_else(|| args["adapter"].as_str())
+                    .ok_or_else(|| anyhow!("anycli install: `name` required"))?;
                 let hub = anycli::Hub::new()?;
-                let dir = anycli::hub::default_adapters_dir().ok_or_else(|| anyhow!("cannot determine home directory"))?;
+                let dir = anycli::hub::default_adapters_dir()
+                    .ok_or_else(|| anyhow!("cannot determine home directory"))?;
                 let path = hub.install(name, &dir).await?;
                 Ok(json!({"installed": name, "path": path.display().to_string()}))
             }
@@ -541,7 +575,11 @@ $synth.Speak('{}')
             .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
 
         let pb = std::path::PathBuf::from(path_str);
-        let full = if pb.is_absolute() { pb } else { workspace.join(path_str) };
+        let full = if pb.is_absolute() {
+            pb
+        } else {
+            workspace.join(path_str)
+        };
         if let Some(parent) = full.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -616,7 +654,11 @@ $synth.Speak('{}')
     // Consolidated memory tool handler
     // -------------------------------------------------------------------
 
-    pub(crate) async fn tool_memory_consolidated(&self, ctx: &RunContext, args: Value) -> Result<Value> {
+    pub(crate) async fn tool_memory_consolidated(
+        &self,
+        ctx: &RunContext,
+        args: Value,
+    ) -> Result<Value> {
         // Trim whitespace/newlines: the rsclaw v1 block protocol shards
         // tool_call input JSON across deltas and occasionally introduces
         // leading/trailing whitespace inside string values (seen in
@@ -625,15 +667,18 @@ $synth.Speak('{}')
         // "unknown action 'search\n'" error.
         let action = args["action"].as_str().unwrap_or("search").trim();
         match action {
-            "search" => self.tool_memory_search(args).await,
+            "search" => self.tool_memory_search(ctx, args).await,
             "get" => self.tool_memory_get(args).await,
             "put" => self.tool_memory_put(ctx, args).await,
             "delete" => {
                 // Memory deletion only allowed from internal channels (meditation/cron).
-                // User conversations cannot delete memories — use /memory clear command instead.
+                // User conversations cannot delete memories — use /memory clear command
+                // instead.
                 let ch = &ctx.channel;
                 if ch != "system" && ch != "cron" && ch != "heartbeat" {
-                    bail!("memory delete is not available in conversations. Use the /memory clear command instead.")
+                    bail!(
+                        "memory delete is not available in conversations. Use the /memory clear command instead."
+                    )
                 }
                 self.tool_memory_delete(args).await
             }
@@ -664,7 +709,8 @@ $synth.Speak('{}')
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         }
-        let output = cmd.output()
+        let output = cmd
+            .output()
             .await
             .map_err(|e| anyhow!("tool_install: failed to run: {e}"))?;
 
@@ -677,12 +723,24 @@ $synth.Speak('{}')
             match name {
                 "chrome" => super::platform::detect_chrome().is_some(),
                 "ffmpeg" => super::platform::detect_ffmpeg().is_some(),
-                "node" => which::which("node").is_ok()
-                    || crate::config::loader::base_dir().join("tools/node/bin/node").exists(),
-                "bun" => which::which("bun").is_ok()
-                    || crate::config::loader::base_dir().join("tools/bun/bin/bun").exists(),
-                "python" => which::which("python3").is_ok()
-                    || crate::config::loader::base_dir().join("tools/python/bin/python3").exists(),
+                "node" => {
+                    which::which("node").is_ok()
+                        || crate::config::loader::base_dir()
+                            .join("tools/node/bin/node")
+                            .exists()
+                }
+                "bun" => {
+                    which::which("bun").is_ok()
+                        || crate::config::loader::base_dir()
+                            .join("tools/bun/bin/bun")
+                            .exists()
+                }
+                "python" => {
+                    which::which("python3").is_ok()
+                        || crate::config::loader::base_dir()
+                            .join("tools/python/bin/python3")
+                            .exists()
+                }
                 _ => true, // skip verification for unknown tools
             }
         } else {
@@ -706,7 +764,11 @@ $synth.Speak('{}')
         self.tool_channel_actions(&channel_type, args).await
     }
 
-    pub(crate) async fn tool_channel_actions(&self, channel_type: &str, args: Value) -> Result<Value> {
+    pub(crate) async fn tool_channel_actions(
+        &self,
+        channel_type: &str,
+        args: Value,
+    ) -> Result<Value> {
         let action = args["action"]
             .as_str()
             .ok_or_else(|| anyhow!("{channel_type}_actions: `action` required"))?;
@@ -743,11 +805,7 @@ $synth.Speak('{}')
     /// L1 implementation: text-only rendering that works across all 13
     /// channels uniformly. L2 (per-channel structured cards — Feishu/Discord/
     /// Telegram inline keyboards) is a follow-up PR.
-    pub(crate) async fn tool_ask_user(
-        &self,
-        ctx: &RunContext,
-        args: Value,
-    ) -> Result<Value> {
+    pub(crate) async fn tool_ask_user(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         let question = args["question"]
             .as_str()
             .ok_or_else(|| anyhow!("ask_user: `question` required"))?
@@ -777,15 +835,23 @@ $synth.Speak('{}')
             }
         })?;
         if raw_options.len() < 2 {
-            bail!("ask_user: at least 2 options required (a single-choice 'question' isn't a question)");
+            bail!(
+                "ask_user: at least 2 options required (a single-choice 'question' isn't a question)"
+            );
         }
         if raw_options.len() > 8 {
-            bail!("ask_user: at most 8 options allowed — collapse rarely-picked variants into 'Other (free text)'");
+            bail!(
+                "ask_user: at most 8 options allowed — collapse rarely-picked variants into 'Other (free text)'"
+            );
         }
 
         let multi_select = args["multi_select"].as_bool().unwrap_or(false);
         let recommended_index = args["recommended_index"].as_u64().map(|n| n as usize);
-        let header = args["header"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+        let header = args["header"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
 
         // Build structured options once, used for both the WS prompt payload
         // (L2: capable channels render natively) and the formatted text
@@ -797,23 +863,24 @@ $synth.Speak('{}')
             // plain string list ["A","B"] for simple choices instead of objects;
             // a bare string becomes its own label so the agent doesn't dead-loop
             // on "option[i].label required".
-            let (label, description) = if let Some(s) = opt.as_str() {
-                (s.trim().to_owned(), None)
-            } else {
-                let label = opt["label"]
+            let (label, description) =
+                if let Some(s) = opt.as_str() {
+                    (s.trim().to_owned(), None)
+                } else {
+                    let label = opt["label"]
                     .as_str()
                     .ok_or_else(|| anyhow!(
                         "ask_user: option[{idx}] must be a string or an object with a `label`"
                     ))?
                     .trim()
                     .to_owned();
-                let description = opt["description"]
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned);
-                (label, description)
-            };
+                    let description = opt["description"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    (label, description)
+                };
             if label.is_empty() {
                 bail!("ask_user: option[{idx}].label must be non-empty");
             }
@@ -888,11 +955,7 @@ $synth.Speak('{}')
     /// Stages the outcome in a session-keyed stash that the task-queue worker
     /// drains before classifying the turn — once drained, it becomes
     /// `TaskOutcome::Structured`, taking precedence over the string classifier.
-    pub(crate) async fn tool_task_finish(
-        &self,
-        ctx: &RunContext,
-        args: Value,
-    ) -> Result<Value> {
+    pub(crate) async fn tool_task_finish(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         let outcome: crate::gateway::task_queue::StructuredOutcome =
             serde_json::from_value(args.clone()).map_err(|e| {
                 anyhow!(
@@ -1063,4 +1126,3 @@ fn find_vits_model() -> Option<VitsModel> {
     }
     None
 }
-

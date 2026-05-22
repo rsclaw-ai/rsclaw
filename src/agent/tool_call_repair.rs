@@ -2,15 +2,17 @@
 //!
 //! Some models (Kimi, Qwen, GLM, MiniMax) emit malformed JSON during streaming
 //! where there's garbage text before the actual JSON arguments. This module
-//! provides repair logic to extract usable arguments from such malformed chunks.
+//! provides repair logic to extract usable arguments from such malformed
+//! chunks.
 //!
 //! Also provides transcript repair to ensure assistant messages with tool_calls
 //! are properly paired with tool_result messages, fixing orphaned tool_calls
 //! that would cause API errors.
 
-use crate::provider::{ContentPart, Message, MessageContent, Role, ToolDef};
 use regex::Regex;
 use serde_json::{Map, Value};
+
+use crate::provider::{ContentPart, Message, MessageContent, Role, ToolDef};
 
 /// Fix unescaped backslashes inside JSON string values.
 ///
@@ -84,7 +86,8 @@ pub fn fix_json_backslashes(raw: &str) -> String {
     out
 }
 
-/// Result of extracting usable tool call arguments from potentially malformed input.
+/// Result of extracting usable tool call arguments from potentially malformed
+/// input.
 #[derive(Debug)]
 pub struct ToolCallRepair {
     pub args: Value,
@@ -101,8 +104,9 @@ pub enum RepairKind {
     Repaired,
 }
 
-/// Extract a balanced JSON prefix from raw text that may have garbage before/after.
-/// Returns (json_string, start_index) or None if no valid JSON found.
+/// Extract a balanced JSON prefix from raw text that may have garbage
+/// before/after. Returns (json_string, start_index) or None if no valid JSON
+/// found.
 pub fn extract_balanced_json_prefix(raw: &str) -> Option<(String, usize)> {
     let mut start = 0;
     while start < raw.len() {
@@ -205,7 +209,8 @@ fn is_allowed_trailing_suffix(suffix: &str) -> bool {
     })
 }
 
-/// Try to extract usable tool call arguments from raw text that may be malformed.
+/// Try to extract usable tool call arguments from raw text that may be
+/// malformed.
 pub fn try_extract_usable_args(raw: &str) -> Option<ToolCallRepair> {
     if raw.trim().is_empty() {
         return None;
@@ -225,16 +230,10 @@ pub fn try_extract_usable_args(raw: &str) -> Option<ToolCallRepair> {
 
     // Try to extract balanced JSON prefix
     let extracted = extract_balanced_json_prefix(raw)?;
-    let leading_prefix = raw.get(..extracted.1)
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    let leading_prefix = raw.get(..extracted.1).unwrap_or("").trim().to_string();
     let json_part = &extracted.0;
     let suffix_start = extracted.1 + json_part.len();
-    let trailing_suffix = raw.get(suffix_start..)
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    let trailing_suffix = raw.get(suffix_start..).unwrap_or("").trim().to_string();
 
     // Validate leading prefix - be more lenient for incomplete JSON
     if !leading_prefix.is_empty() && !is_allowed_leading_prefix(&leading_prefix) {
@@ -260,8 +259,9 @@ pub fn try_extract_usable_args(raw: &str) -> Option<ToolCallRepair> {
         }
     }
 
-    // NEW: If JSON parsing failed but we found a valid JSON boundary, try to fix common issues
-    // This handles unescaped newlines and Windows paths with single backslashes
+    // NEW: If JSON parsing failed but we found a valid JSON boundary, try to fix
+    // common issues This handles unescaped newlines and Windows paths with
+    // single backslashes
     if !json_part.is_empty() {
         // Fix unescaped backslashes inside JSON string values.
         // In valid JSON, `\` must be followed by one of: " \ / b f n r t u
@@ -284,8 +284,8 @@ pub fn try_extract_usable_args(raw: &str) -> Option<ToolCallRepair> {
     }
 
     // NEW: Handle INCOMPLETE but otherwise valid JSON
-    // If the JSON structure looks valid (starts with { and has some key-value pairs)
-    // but is truncated at the end, try to fix common truncation patterns
+    // If the JSON structure looks valid (starts with { and has some key-value
+    // pairs) but is truncated at the end, try to fix common truncation patterns
     if json_part.starts_with('{') && json_part.contains(':') {
         // Try to find the last complete key-value pair and close the JSON
         let incomplete = json_part.to_string();
@@ -368,8 +368,8 @@ fn fix_incomplete_json(incomplete: &str) -> String {
 // Transcript repair: ensure tool_calls are paired with tool_results
 // ---------------------------------------------------------------------------
 
-/// Result of transcript repair, containing repaired messages and synthetic messages
-/// that need to be persisted to session storage.
+/// Result of transcript repair, containing repaired messages and synthetic
+/// messages that need to be persisted to session storage.
 #[derive(Debug)]
 pub struct RepairResult {
     /// The repaired message list (for LLM request)
@@ -392,7 +392,8 @@ pub struct RepairResult {
 /// 4. Inserts synthetic error ToolResults for missing ids
 /// 5. Removes orphaned ToolResult messages (no matching ToolUse)
 ///
-/// Returns a `RepairResult` with repaired messages and synthetic messages to persist.
+/// Returns a `RepairResult` with repaired messages and synthetic messages to
+/// persist.
 pub fn repair_tool_result_pairing(messages: Vec<Message>) -> RepairResult {
     // Collect all tool_use_ids from assistant messages
     let mut all_tool_ids: Vec<String> = Vec::new();
@@ -445,15 +446,13 @@ pub fn repair_tool_result_pairing(messages: Vec<Message>) -> RepairResult {
         // Check if this is an orphaned ToolResult (tool_use_id not in all_tool_ids)
         if msg.role == Role::Tool {
             let is_orphan = match &msg.content {
-                MessageContent::Parts(parts) => {
-                    parts.iter().all(|part| {
-                        if let ContentPart::ToolResult { tool_use_id, .. } = part {
-                            !all_tool_ids.contains(tool_use_id)
-                        } else {
-                            false
-                        }
-                    })
-                }
+                MessageContent::Parts(parts) => parts.iter().all(|part| {
+                    if let ContentPart::ToolResult { tool_use_id, .. } = part {
+                        !all_tool_ids.contains(tool_use_id)
+                    } else {
+                        false
+                    }
+                }),
                 _ => false,
             };
             if is_orphan {
@@ -464,21 +463,20 @@ pub fn repair_tool_result_pairing(messages: Vec<Message>) -> RepairResult {
             }
         }
 
-        // Extract tool_ids from this message BEFORE pushing (to avoid borrow-after-move)
+        // Extract tool_ids from this message BEFORE pushing (to avoid
+        // borrow-after-move)
         let tool_ids_in_this_msg: Vec<String> = if msg.role == Role::Assistant {
             match &msg.content {
-                MessageContent::Parts(parts) => {
-                    parts
-                        .iter()
-                        .filter_map(|part| {
-                            if let ContentPart::ToolUse { id, .. } = part {
-                                Some(id.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect()
-                }
+                MessageContent::Parts(parts) => parts
+                    .iter()
+                    .filter_map(|part| {
+                        if let ContentPart::ToolUse { id, .. } = part {
+                            Some(id.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
                 _ => Vec::new(),
             }
         } else {
@@ -488,20 +486,22 @@ pub fn repair_tool_result_pairing(messages: Vec<Message>) -> RepairResult {
         repaired.push(msg);
 
         // After assistant message, add synthetic ToolResults for missing ids
-        for missing_id in tool_ids_in_this_msg.iter().filter(|id| missing_ids.contains(id)) {
+        for missing_id in tool_ids_in_this_msg
+            .iter()
+            .filter(|id| missing_ids.contains(id))
+        {
             tracing::warn!(
                 tool_call_id = %missing_id,
                 "repair_tool_result_pairing: adding synthetic error result for missing tool_call_id"
             );
             let synthetic = Message {
                 role: Role::Tool,
-                content: MessageContent::Parts(vec![
-                    ContentPart::ToolResult {
-                        tool_use_id: missing_id.clone(),
-                        content: "[Session interrupted: tool execution was not completed]".to_owned(),
-                        is_error: Some(true),
-                    },
-                ]),
+                content: MessageContent::Parts(vec![ContentPart::ToolResult {
+                    tool_use_id: missing_id.clone(),
+                    content: "[Session interrupted: tool execution was not completed]".to_owned(),
+                    is_error: Some(true),
+                }]),
+                rsclaw_hidden: None,
             };
             repaired.push(synthetic.clone());
             synthetic_messages.push(synthetic);
@@ -543,9 +543,9 @@ pub fn coerce_xml_param(raw: &str, declared_type: Option<&str>) -> Value {
     }
 }
 
-/// Rescue tool calls a model emitted as `<function=NAME>...</function>` XML text
-/// instead of structured `tool_calls`. Some local models (qwen3.5, etc.) do this
-/// when the inference server doesn't parse tool calls natively. Each
+/// Rescue tool calls a model emitted as `<function=NAME>...</function>` XML
+/// text instead of structured `tool_calls`. Some local models (qwen3.5, etc.)
+/// do this when the inference server doesn't parse tool calls natively. Each
 /// `<parameter=KEY>VALUE</parameter>` value is coerced to its schema-declared
 /// type via [`coerce_xml_param`], so array/bool/int params survive.
 ///
@@ -576,7 +576,9 @@ pub fn rescue_tool_calls_from_text(text: &str, tools: &[ToolDef]) -> Vec<(String
                 props
                     .iter()
                     .filter_map(|(k, v)| {
-                        v.get("type").and_then(Value::as_str).map(|ty| (k.as_str(), ty))
+                        v.get("type")
+                            .and_then(Value::as_str)
+                            .map(|ty| (k.as_str(), ty))
                     })
                     .collect()
             })
@@ -652,9 +654,15 @@ mod tests {
             coerce_xml_param(r#"{"a":1}"#, Some("string")),
             Value::String(r#"{"a":1}"#.into())
         );
-        assert_eq!(coerce_xml_param("007", Some("string")), Value::String("007".into()));
+        assert_eq!(
+            coerce_xml_param("007", Some("string")),
+            Value::String("007".into())
+        );
         // Unknown/absent type also stays verbatim.
-        assert_eq!(coerce_xml_param("[1,2]", None), Value::String("[1,2]".into()));
+        assert_eq!(
+            coerce_xml_param("[1,2]", None),
+            Value::String("[1,2]".into())
+        );
     }
 
     #[test]
@@ -748,16 +756,16 @@ mod tests {
             Message {
                 role: Role::User,
                 content: MessageContent::Text("hello".to_owned()),
+                rsclaw_hidden: None,
             },
             Message {
                 role: Role::Assistant,
-                content: MessageContent::Parts(vec![
-                    ContentPart::ToolUse {
-                        id: "call_123".to_owned(),
-                        name: "test_tool".to_owned(),
-                        input: serde_json::json!({"arg": "value"}),
-                    },
-                ]),
+                content: MessageContent::Parts(vec![ContentPart::ToolUse {
+                    id: "call_123".to_owned(),
+                    name: "test_tool".to_owned(),
+                    input: serde_json::json!({"arg": "value"}),
+                }]),
+                rsclaw_hidden: None,
             },
         ];
 
@@ -775,7 +783,11 @@ mod tests {
             MessageContent::Parts(parts) => {
                 assert_eq!(parts.len(), 1);
                 match &parts[0] {
-                    ContentPart::ToolResult { tool_use_id, content, is_error } => {
+                    ContentPart::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => {
                         assert_eq!(tool_use_id, "call_123");
                         assert!(content.contains("interrupted"));
                         assert_eq!(*is_error, Some(true));
@@ -797,26 +809,25 @@ mod tests {
             Message {
                 role: Role::User,
                 content: MessageContent::Text("hello".to_owned()),
+                rsclaw_hidden: None,
             },
             Message {
                 role: Role::Assistant,
-                content: MessageContent::Parts(vec![
-                    ContentPart::ToolUse {
-                        id: "call_123".to_owned(),
-                        name: "test_tool".to_owned(),
-                        input: serde_json::json!({}),
-                    },
-                ]),
+                content: MessageContent::Parts(vec![ContentPart::ToolUse {
+                    id: "call_123".to_owned(),
+                    name: "test_tool".to_owned(),
+                    input: serde_json::json!({}),
+                }]),
+                rsclaw_hidden: None,
             },
             Message {
                 role: Role::Tool,
-                content: MessageContent::Parts(vec![
-                    ContentPart::ToolResult {
-                        tool_use_id: "call_123".to_owned(),
-                        content: "result".to_owned(),
-                        is_error: Some(false),
-                    },
-                ]),
+                content: MessageContent::Parts(vec![ContentPart::ToolResult {
+                    tool_use_id: "call_123".to_owned(),
+                    content: "result".to_owned(),
+                    is_error: Some(false),
+                }]),
+                rsclaw_hidden: None,
             },
         ];
 
@@ -846,32 +857,38 @@ mod tests {
                         input: serde_json::json!({}),
                     },
                 ]),
+                rsclaw_hidden: None,
             },
             Message {
                 role: Role::Tool,
-                content: MessageContent::Parts(vec![
-                    ContentPart::ToolResult {
-                        tool_use_id: "call_1".to_owned(),
-                        content: "result 1".to_owned(),
-                        is_error: Some(false),
-                    },
-                ]),
+                content: MessageContent::Parts(vec![ContentPart::ToolResult {
+                    tool_use_id: "call_1".to_owned(),
+                    content: "result 1".to_owned(),
+                    is_error: Some(false),
+                }]),
+                rsclaw_hidden: None,
             },
         ];
 
         let result = repair_tool_result_pairing(messages);
         let repaired = &result.messages;
 
-        // Should have 3 messages: assistant + synthetic for call_2 + existing for call_1
+        // Should have 3 messages: assistant + synthetic for call_2 + existing for
+        // call_1
         assert_eq!(repaired.len(), 3);
         assert_eq!(repaired[0].role, Role::Assistant);
         assert_eq!(repaired[1].role, Role::Tool);
         assert_eq!(repaired[2].role, Role::Tool);
 
-        // Synthetic result for call_2 should be immediately after assistant (position 1)
+        // Synthetic result for call_2 should be immediately after assistant (position
+        // 1)
         match &repaired[1].content {
             MessageContent::Parts(parts) => match &parts[0] {
-                ContentPart::ToolResult { tool_use_id, content, is_error } => {
+                ContentPart::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => {
                     assert_eq!(tool_use_id, "call_2");
                     assert!(content.contains("interrupted"));
                     assert_eq!(*is_error, Some(true));
@@ -884,7 +901,11 @@ mod tests {
         // Existing result for call_1 should be at position 2
         match &repaired[2].content {
             MessageContent::Parts(parts) => match &parts[0] {
-                ContentPart::ToolResult { tool_use_id, content, is_error } => {
+                ContentPart::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => {
                     assert_eq!(tool_use_id, "call_1");
                     assert_eq!(content, "result 1");
                     assert_eq!(*is_error, Some(false));
@@ -905,16 +926,16 @@ mod tests {
             Message {
                 role: Role::Assistant,
                 content: MessageContent::Text("just text".to_owned()),
+                rsclaw_hidden: None,
             },
             Message {
                 role: Role::Tool,
-                content: MessageContent::Parts(vec![
-                    ContentPart::ToolResult {
-                        tool_use_id: "orphan_123".to_owned(),
-                        content: "orphaned result".to_owned(),
-                        is_error: Some(false),
-                    },
-                ]),
+                content: MessageContent::Parts(vec![ContentPart::ToolResult {
+                    tool_use_id: "orphan_123".to_owned(),
+                    content: "orphaned result".to_owned(),
+                    is_error: Some(false),
+                }]),
+                rsclaw_hidden: None,
             },
         ];
 

@@ -27,13 +27,15 @@ use anyhow::{Result, anyhow};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
-use crate::provider::{AgentEndpoint, LlmRequest, Message, MessageContent, Role};
-use crate::provider::registry::ProviderRegistry;
+use crate::provider::{
+    AgentEndpoint, LlmRequest, Message, MessageContent, Role, registry::ProviderRegistry,
+};
 
 /// A single planned sub-query with its recognized intent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubQuery {
-    /// Rewritten, keyword-optimized query string (use this for search, not the original).
+    /// Rewritten, keyword-optimized query string (use this for search, not the
+    /// original).
     pub q: String,
     /// Detected intent — caller dispatches accordingly.
     pub intent: Intent,
@@ -55,10 +57,20 @@ pub enum Intent {
     /// GitHub repo info.
     GithubRepo { owner: String, repo: String },
     /// Flight search — browser pool → ctrip/google flights.
-    /// `trip` is "oneway" or "roundtrip". Default "oneway" if user doesn't specify.
-    Flight { from: String, to: String, date: String, trip: String },
+    /// `trip` is "oneway" or "roundtrip". Default "oneway" if user doesn't
+    /// specify.
+    Flight {
+        from: String,
+        to: String,
+        date: String,
+        trip: String,
+    },
     /// Train/rail search — browser pool → 12306/ctrip.
-    Train { from: String, to: String, date: String },
+    Train {
+        from: String,
+        to: String,
+        date: String,
+    },
     /// Hotel search — browser pool → ctrip/meituan.
     Hotel { city: String, checkin: String },
     /// Movie listings or info — browser pool → maoyan/douban.
@@ -149,7 +161,7 @@ fn planner_system() -> String {
     let tz = now.format("%Z").to_string();
     let ts = now.format("%Y-%m-%d %H:%M %A").to_string();
     format!(
-r#"Current time: {ts} ({tz})
+        r#"Current time: {ts} ({tz})
 
 You analyze a user search query and decide how to answer it.
 
@@ -282,7 +294,8 @@ Output: {{"sub_queries":[
 Input: "翻译 hello world 成中文"
 Output: {{"sub_queries":[
   {{"q":"hello world","intent":{{"kind":"translate","text":"hello world","to":"zh"}}}}
-]}}"#)
+]}}"#
+    )
 }
 
 /// Plan a query using the flash model. Returns a structured `QueryPlan`.
@@ -294,11 +307,7 @@ Output: {{"sub_queries":[
 ///
 /// On any error (missing provider, non-JSON output, timeout) we fall back
 /// to `QueryPlan::passthrough` so callers can't be blocked.
-pub async fn plan(
-    query: &str,
-    flash_model: &str,
-    providers: &ProviderRegistry,
-) -> QueryPlan {
+pub async fn plan(query: &str, flash_model: &str, providers: &ProviderRegistry) -> QueryPlan {
     // Hard timeout — planner is a cheap call, 5s is very generous. If the
     // flash provider is hung, we fall back to passthrough rather than
     // blocking the main search path.
@@ -306,47 +315,51 @@ pub async fn plan(
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), fut).await;
     match result {
         Ok(Ok(p)) => {
-            let intents: Vec<&str> = p.sub_queries.iter().map(|s| match &s.intent {
-                Intent::Weather { .. } => "weather",
-                Intent::Currency { .. } => "currency",
-                Intent::Timezone { .. } => "timezone",
-                Intent::Wikipedia { .. } => "wikipedia",
-                Intent::GithubRepo { .. } => "github_repo",
-                Intent::Flight { .. } => "flight",
-                Intent::Train { .. } => "train",
-                Intent::Hotel { .. } => "hotel",
-                Intent::Movie { .. } => "movie",
-                Intent::Concert { .. } => "concert",
-                Intent::Restaurant { .. } => "restaurant",
-                Intent::Shopping { .. } => "shopping",
-                Intent::Stock { .. } => "stock",
-                Intent::Express { .. } => "express",
-                Intent::News { .. } => "news",
-                Intent::Map { .. } => "map",
-                Intent::Translate { .. } => "translate",
-                Intent::CryptoPrice { .. } => "crypto_price",
-                Intent::Calendar { .. } => "calendar",
-                Intent::UnitConvert { .. } => "unit_convert",
-                Intent::Math { .. } => "math",
-                Intent::IpLookup { .. } => "ip_lookup",
-                Intent::DnsLookup { .. } => "dns_lookup",
-                Intent::Whois { .. } => "whois",
-                Intent::Phone { .. } => "phone",
-                Intent::Idiom { .. } => "idiom",
-                Intent::Poem { .. } => "poem",
-                Intent::Law { .. } => "law",
-                Intent::Hospital { .. } => "hospital",
-                Intent::Recipe { .. } => "recipe",
-                Intent::Sports { .. } => "sports",
-                Intent::Lottery { .. } => "lottery",
-                Intent::Academic { .. } => "academic",
-                Intent::Job { .. } => "job",
-                Intent::Video { .. } => "video",
-                Intent::Book { .. } => "book",
-                Intent::Package { .. } => "package",
-                Intent::Forum { .. } => "forum",
-                Intent::General => "general",
-            }).collect();
+            let intents: Vec<&str> = p
+                .sub_queries
+                .iter()
+                .map(|s| match &s.intent {
+                    Intent::Weather { .. } => "weather",
+                    Intent::Currency { .. } => "currency",
+                    Intent::Timezone { .. } => "timezone",
+                    Intent::Wikipedia { .. } => "wikipedia",
+                    Intent::GithubRepo { .. } => "github_repo",
+                    Intent::Flight { .. } => "flight",
+                    Intent::Train { .. } => "train",
+                    Intent::Hotel { .. } => "hotel",
+                    Intent::Movie { .. } => "movie",
+                    Intent::Concert { .. } => "concert",
+                    Intent::Restaurant { .. } => "restaurant",
+                    Intent::Shopping { .. } => "shopping",
+                    Intent::Stock { .. } => "stock",
+                    Intent::Express { .. } => "express",
+                    Intent::News { .. } => "news",
+                    Intent::Map { .. } => "map",
+                    Intent::Translate { .. } => "translate",
+                    Intent::CryptoPrice { .. } => "crypto_price",
+                    Intent::Calendar { .. } => "calendar",
+                    Intent::UnitConvert { .. } => "unit_convert",
+                    Intent::Math { .. } => "math",
+                    Intent::IpLookup { .. } => "ip_lookup",
+                    Intent::DnsLookup { .. } => "dns_lookup",
+                    Intent::Whois { .. } => "whois",
+                    Intent::Phone { .. } => "phone",
+                    Intent::Idiom { .. } => "idiom",
+                    Intent::Poem { .. } => "poem",
+                    Intent::Law { .. } => "law",
+                    Intent::Hospital { .. } => "hospital",
+                    Intent::Recipe { .. } => "recipe",
+                    Intent::Sports { .. } => "sports",
+                    Intent::Lottery { .. } => "lottery",
+                    Intent::Academic { .. } => "academic",
+                    Intent::Job { .. } => "job",
+                    Intent::Video { .. } => "video",
+                    Intent::Book { .. } => "book",
+                    Intent::Package { .. } => "package",
+                    Intent::Forum { .. } => "forum",
+                    Intent::General => "general",
+                })
+                .collect();
             tracing::info!(
                 query = %query,
                 sub_count = p.sub_queries.len(),
@@ -382,9 +395,8 @@ async fn try_plan(
 
     let messages = vec![Message {
         role: Role::User,
-        content: MessageContent::Text(format!(
-            "Query: {query}\n\nOutput the JSON plan now."
-        )),
+        content: MessageContent::Text(format!("Query: {query}\n\nOutput the JSON plan now.")),
+        rsclaw_hidden: None,
     }];
 
     let req = LlmRequest {
@@ -401,6 +413,7 @@ async fn try_plan(
         session_key: None,
         system_shared: None,
         user_system: None,
+        recall: None,
     };
 
     // Stream the response and accumulate — we don't need streaming semantics
@@ -421,13 +434,19 @@ async fn try_plan(
     // Strip leading/trailing whitespace and accept common wrappers the LLM
     // might add even after being told not to (```json ... ```).
     let json = extract_json_object(&buf).ok_or_else(|| {
-        anyhow!("planner output has no JSON object; got: {}", truncate(&buf, 200))
+        anyhow!(
+            "planner output has no JSON object; got: {}",
+            truncate(&buf, 200)
+        )
     })?;
 
     tracing::debug!(raw = %truncate(json, 500), "query_planner: raw LLM output");
 
     let plan: QueryPlan = serde_json::from_str(json).map_err(|e| {
-        anyhow!("planner JSON parse failed: {e}; raw: {}", truncate(json, 200))
+        anyhow!(
+            "planner JSON parse failed: {e}; raw: {}",
+            truncate(json, 200)
+        )
     })?;
 
     if plan.sub_queries.is_empty() {
@@ -476,7 +495,11 @@ fn extract_json_object(s: &str) -> Option<&str> {
 }
 
 fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n { s.to_owned() } else { format!("{}…", crate::util::truncate_str(s, n)) }
+    if s.len() <= n {
+        s.to_owned()
+    } else {
+        format!("{}…", crate::util::truncate_str(s, n))
+    }
 }
 
 #[cfg(test)]
@@ -539,6 +562,8 @@ mod tests {
           {"q":"USD to CNY","intent":{"kind":"currency","from":"USD","to":"CNY"}}
         ]}"#;
         let p: QueryPlan = serde_json::from_str(json).unwrap();
-        assert!(matches!(&p.sub_queries[0].intent, Intent::Currency { from, to } if from == "USD" && to == "CNY"));
+        assert!(
+            matches!(&p.sub_queries[0].intent, Intent::Currency { from, to } if from == "USD" && to == "CNY")
+        );
     }
 }

@@ -75,7 +75,9 @@ impl LlmProvider for AnthropicProvider {
                 .header("content-type", "application/json")
                 .header(
                     "user-agent",
-                    self.user_agent.as_deref().unwrap_or(super::DEFAULT_USER_AGENT),
+                    self.user_agent
+                        .as_deref()
+                        .unwrap_or(super::DEFAULT_USER_AGENT),
                 )
                 .json(&body)
                 .timeout(std::time::Duration::from_secs(120))
@@ -88,7 +90,11 @@ impl LlmProvider for AnthropicProvider {
                 let resp_body = resp.text().await.unwrap_or_default();
                 let req_body_str = serde_json::to_string(&body).unwrap_or_default();
                 let req_body_preview = if req_body_str.len() > 4000 {
-                    format!("{}...[truncated, total {} bytes]", crate::util::truncate_str(&req_body_str, 4000), req_body_str.len())
+                    format!(
+                        "{}...[truncated, total {} bytes]",
+                        crate::util::truncate_str(&req_body_str, 4000),
+                        req_body_str.len()
+                    )
                 } else {
                     req_body_str
                 };
@@ -353,11 +359,7 @@ fn inject_cache_control(body: &mut Value) {
         }
 
         // Anchor: first user message.
-        if messages[0]
-            .get("role")
-            .and_then(|r| r.as_str())
-            == Some("user")
-        {
+        if messages[0].get("role").and_then(|r| r.as_str()) == Some("user") {
             tag_last_content_block(&mut messages[0], &cache_marker);
         }
 
@@ -371,8 +373,8 @@ fn inject_cache_control(body: &mut Value) {
 
 /// Add `cache_control` to the last content block of a message.
 ///
-/// If the message content is a plain string, convert it to a content-block array
-/// so the marker can be attached.
+/// If the message content is a plain string, convert it to a content-block
+/// array so the marker can be attached.
 fn tag_last_content_block(msg: &mut Value, marker: &Value) {
     let content = match msg.get_mut("content") {
         Some(c) => c,
@@ -404,7 +406,8 @@ fn tag_last_content_block(msg: &mut Value, marker: &Value) {
 // ---------------------------------------------------------------------------
 
 /// Buffered SSE parser — handles TCP chunk boundaries that split lines.
-// TODO: SSE buffered parsing is duplicated across openai.rs, anthropic.rs, gemini.rs — extract shared utility
+// TODO: SSE buffered parsing is duplicated across openai.rs, anthropic.rs,
+// gemini.rs — extract shared utility
 async fn parse_sse_chunk_buffered(
     chunk: Result<bytes::Bytes>,
     line_buffer: &tokio::sync::Mutex<String>,
@@ -417,7 +420,11 @@ async fn parse_sse_chunk_buffered(
     let text = match std::str::from_utf8(&bytes) {
         Ok(t) => std::borrow::Cow::Borrowed(t),
         Err(e) => {
-            tracing::warn!("anthropic: UTF-8 decode error at byte {}, replacing: {}", e.valid_up_to(), e);
+            tracing::warn!(
+                "anthropic: UTF-8 decode error at byte {}, replacing: {}",
+                e.valid_up_to(),
+                e
+            );
             std::borrow::Cow::Owned(String::from_utf8_lossy(&bytes).into_owned())
         }
     };
@@ -437,7 +444,10 @@ async fn parse_sse_chunk_buffered(
 
     let mut events = Vec::new();
     for line in complete_portion.lines() {
-        if let Some(data) = line.strip_prefix("data: ").or_else(|| line.strip_prefix("data:")) {
+        if let Some(data) = line
+            .strip_prefix("data: ")
+            .or_else(|| line.strip_prefix("data:"))
+        {
             if data == "[DONE]" {
                 continue;
             }
@@ -464,7 +474,11 @@ fn parse_event(data: &str) -> Option<StreamEvent> {
                 }
                 "thinking_delta" => {
                     let text = v["delta"]["thinking"].as_str().unwrap_or("").to_owned();
-                    if text.is_empty() { None } else { Some(StreamEvent::ReasoningDelta(text)) }
+                    if text.is_empty() {
+                        None
+                    } else {
+                        Some(StreamEvent::ReasoningDelta(text))
+                    }
                 }
                 "input_json_delta" => {
                     // Tool input streaming — emit as ToolCall so the agent loop
@@ -513,6 +527,7 @@ fn parse_event(data: &str) -> Option<StreamEvent> {
                     .get("cache_read_input_tokens")
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
+                ..Default::default()
             });
             if v["delta"]["stop_reason"].is_string() {
                 Some(StreamEvent::Done { usage })
@@ -556,10 +571,12 @@ mod tests {
                 Message {
                     role: Role::User,
                     content: MessageContent::Text("hi".to_owned()),
+                    rsclaw_hidden: None,
                 },
                 Message {
                     role: Role::Assistant,
                     content: MessageContent::Text("hello".to_owned()),
+                    rsclaw_hidden: None,
                 },
             ],
             ..make_request()
@@ -579,11 +596,15 @@ mod tests {
         };
         let body = build_request_body(&req).expect("build request body");
         // After cache_control injection, system is an array of content blocks.
-        let blocks = body["system"].as_array().expect("system should be content-block array");
+        let blocks = body["system"]
+            .as_array()
+            .expect("system should be content-block array");
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0]["text"].as_str().expect("text is str"), "hello");
         assert_eq!(
-            blocks[0]["cache_control"]["type"].as_str().expect("cache_control type is str"),
+            blocks[0]["cache_control"]["type"]
+                .as_str()
+                .expect("cache_control type is str"),
             "ephemeral"
         );
     }
@@ -597,22 +618,27 @@ mod tests {
                 Message {
                     role: Role::User,
                     content: MessageContent::Text("m1".to_owned()),
+                    rsclaw_hidden: None,
                 },
                 Message {
                     role: Role::Assistant,
                     content: MessageContent::Text("m2".to_owned()),
+                    rsclaw_hidden: None,
                 },
                 Message {
                     role: Role::User,
                     content: MessageContent::Text("m3".to_owned()),
+                    rsclaw_hidden: None,
                 },
                 Message {
                     role: Role::Assistant,
                     content: MessageContent::Text("m4".to_owned()),
+                    rsclaw_hidden: None,
                 },
                 Message {
                     role: Role::User,
                     content: MessageContent::Text("m5".to_owned()),
+                    rsclaw_hidden: None,
                 },
             ],
             ..make_request()
@@ -622,7 +648,9 @@ mod tests {
         // System should have cache_control.
         let sys_blocks = body["system"].as_array().expect("system content blocks");
         assert_eq!(
-            sys_blocks[0]["cache_control"]["type"].as_str().expect("cache_control type"),
+            sys_blocks[0]["cache_control"]["type"]
+                .as_str()
+                .expect("cache_control type"),
             "ephemeral"
         );
 
@@ -636,7 +664,9 @@ mod tests {
             "m1 should be converted to content-block array"
         );
         assert_eq!(
-            m1_content[0]["cache_control"]["type"].as_str().expect("m1 cache_control type"),
+            m1_content[0]["cache_control"]["type"]
+                .as_str()
+                .expect("m1 cache_control type"),
             "ephemeral"
         );
 
@@ -666,12 +696,11 @@ mod tests {
     #[test]
     fn cache_control_fewer_than_3_messages() {
         let req = LlmRequest {
-            messages: vec![
-                Message {
-                    role: Role::User,
-                    content: MessageContent::Text("only one".to_owned()),
-                },
-            ],
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("only one".to_owned()),
+                rsclaw_hidden: None,
+            }],
             ..make_request()
         };
         let body = build_request_body(&req).expect("build request body");
@@ -680,7 +709,9 @@ mod tests {
         let content = &msgs[0]["content"];
         assert!(content.is_array());
         assert_eq!(
-            content[0]["cache_control"]["type"].as_str().expect("cache_control type"),
+            content[0]["cache_control"]["type"]
+                .as_str()
+                .expect("cache_control type"),
             "ephemeral"
         );
     }

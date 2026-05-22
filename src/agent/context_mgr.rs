@@ -2,15 +2,17 @@
 //!
 //! Extracted from `runtime.rs` to reduce file size.
 
+use std::sync::Arc;
+
+use futures::StreamExt as _;
+
 use crate::{
     config::schema::ContextPruningConfig,
     provider::{
-        failover::FailoverManager, registry::ProviderRegistry, AgentEndpoint, ContentPart,
-        LlmRequest, Message, MessageContent, Role, StreamEvent, ToolDef,
+        AgentEndpoint, ContentPart, LlmRequest, Message, MessageContent, Role, StreamEvent,
+        ToolDef, failover::FailoverManager, registry::ProviderRegistry,
     },
 };
-use futures::StreamExt as _;
-use std::sync::Arc;
 
 /// Estimate token count for mixed-language text.
 /// - ASCII/Latin: ~4 chars per token
@@ -40,9 +42,13 @@ pub fn estimate_tokens(text: &str) -> usize {
 /// Prune the session message history in-place according to config.
 ///
 /// Strategy (applied in order):
-///   1. Hard-clear: if total chars > threshold, keep only the last user message.
+///   1. Hard-clear: if total chars > threshold, keep only the last user
+///      message.
 ///   2. Soft-trim: if total chars > tail_chars limit, remove old Tool messages.
-pub(crate) fn apply_context_pruning(messages: &mut Vec<Message>, cfg: Option<&ContextPruningConfig>) {
+pub(crate) fn apply_context_pruning(
+    messages: &mut Vec<Message>,
+    cfg: Option<&ContextPruningConfig>,
+) {
     let Some(cfg) = cfg else { return };
 
     let total: usize = messages.iter().map(msg_chars).sum();
@@ -109,9 +115,12 @@ pub(crate) fn msg_chars(m: &Message) -> usize {
     }
 }
 
-/// Build a summary Message from the last 10 user/assistant messages (for /clear).
+/// Build a summary Message from the last 10 user/assistant messages (for
+/// /clear).
 pub(crate) fn build_clear_summary(messages: &[Message]) -> Option<Message> {
-    if messages.is_empty() { return None; }
+    if messages.is_empty() {
+        return None;
+    }
     let recent: Vec<&Message> = messages.iter().rev().take(10).rev().collect();
     let mut parts = Vec::new();
     for m in &recent {
@@ -122,23 +131,43 @@ pub(crate) fn build_clear_summary(messages: &[Message]) -> Option<Message> {
         };
         let text = match &m.content {
             MessageContent::Text(s) => s.clone(),
-            MessageContent::Parts(ps) => ps.iter().filter_map(|p| {
-                if let ContentPart::Text { text } = p { Some(text.as_str()) } else { None }
-            }).collect::<Vec<_>>().join(" "),
+            MessageContent::Parts(ps) => ps
+                .iter()
+                .filter_map(|p| {
+                    if let ContentPart::Text { text } = p {
+                        Some(text.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
         };
-        if text.is_empty() { continue; }
+        if text.is_empty() {
+            continue;
+        }
         let truncated = if text.chars().count() > 200 {
-            let idx = text.char_indices().nth(200).map(|(i, _)| i).unwrap_or(text.len());
+            let idx = text
+                .char_indices()
+                .nth(200)
+                .map(|(i, _)| i)
+                .unwrap_or(text.len());
             format!("{}...", &text[..idx])
-        } else { text };
+        } else {
+            text
+        };
         parts.push(format!("{role}: {truncated}"));
     }
-    if parts.is_empty() { return None; }
+    if parts.is_empty() {
+        return None;
+    }
     Some(Message {
         role: Role::System,
-        content: MessageContent::Text(
-            format!("[Session summary before /clear]\n{}", parts.join("\n"))
-        ),
+        content: MessageContent::Text(format!(
+            "[Session summary before /clear]\n{}",
+            parts.join("\n")
+        )),
+        rsclaw_hidden: None,
     })
 }
 
@@ -166,8 +195,9 @@ pub(crate) fn msg_tokens(m: &Message) -> usize {
 ///   reply_reserve      = max(context_budget * 5%, 2000)
 ///   system_tokens      = system_prompt.len() / 4
 ///   tools_tokens       = tools JSON size / 4
-///   scratchpad_tokens  = caller-supplied overhead (current-turn working buffer)
-///   history_budget     = context_budget - reply_reserve - system_tokens
+///   scratchpad_tokens  = caller-supplied overhead (current-turn working
+/// buffer)   history_budget     = context_budget - reply_reserve -
+/// system_tokens
 ///                        - tools_tokens - scratchpad_tokens
 ///
 /// Always keeps at least the last 3 user-assistant pairs (6 messages).
@@ -426,8 +456,7 @@ pub(crate) fn extract_key_entities(text: &str) -> Vec<KeyEntity> {
             // Walk forward to find domain
             let mut domain_end = j + 1;
             while domain_end < bytes.len()
-                && (bytes[domain_end].is_ascii_alphanumeric()
-                    || b".-".contains(&bytes[domain_end]))
+                && (bytes[domain_end].is_ascii_alphanumeric() || b".-".contains(&bytes[domain_end]))
             {
                 domain_end += 1;
             }
@@ -451,21 +480,59 @@ pub(crate) fn extract_key_entities(text: &str) -> Vec<KeyEntity> {
     // Also detects standalone addresses with province/city/district markers.
     {
         const ADDR_MARKERS: &[&str] = &[
-            "省", "市", "区", "县", "镇", "乡", "村",
-            "路", "街", "道", "巷", "弄",
-            "号", "栋", "楼", "层", "室", "单元",
+            "省", "市", "区", "县", "镇", "乡", "村", "路", "街", "道", "巷", "弄", "号", "栋",
+            "楼", "层", "室", "单元",
         ];
         const ADDR_PREFIXES: &[&str] = &[
-            "北京", "上海", "天津", "重庆", "广东", "浙江", "江苏", "山东",
-            "河南", "河北", "湖北", "湖南", "四川", "福建", "安徽", "江西",
-            "辽宁", "吉林", "黑龙江", "陕西", "山西", "云南", "贵州", "广西",
-            "海南", "甘肃", "青海", "宁夏", "新疆", "西藏", "内蒙古",
+            "北京",
+            "上海",
+            "天津",
+            "重庆",
+            "广东",
+            "浙江",
+            "江苏",
+            "山东",
+            "河南",
+            "河北",
+            "湖北",
+            "湖南",
+            "四川",
+            "福建",
+            "安徽",
+            "江西",
+            "辽宁",
+            "吉林",
+            "黑龙江",
+            "陕西",
+            "山西",
+            "云南",
+            "贵州",
+            "广西",
+            "海南",
+            "甘肃",
+            "青海",
+            "宁夏",
+            "新疆",
+            "西藏",
+            "内蒙古",
         ];
         // Filter words commonly used as labels in address forms
         const FILTER_WORDS: &[&str] = &[
-            "收货人", "收件人", "收货", "所在地区", "详细地址",
-            "地址", "邮编", "电话", "手机", "手机号", "手机号码",
-            "号码", "身份证号码", "身份证号", "身份证",
+            "收货人",
+            "收件人",
+            "收货",
+            "所在地区",
+            "详细地址",
+            "地址",
+            "邮编",
+            "电话",
+            "手机",
+            "手机号",
+            "手机号码",
+            "号码",
+            "身份证号码",
+            "身份证号",
+            "身份证",
         ];
 
         for segment in text.split(|c: char| c == '\n' || c == '。') {
@@ -520,7 +587,9 @@ pub(crate) fn extract_key_entities(text: &str) -> Vec<KeyEntity> {
 
             // Shortest remaining part is likely the name (2-4 chars Chinese)
             if addr_parts.len() >= 2 {
-                let min_idx = addr_parts.iter().enumerate()
+                let min_idx = addr_parts
+                    .iter()
+                    .enumerate()
                     .min_by_key(|(_, p)| p.chars().count())
                     .map(|(i, _)| i)
                     .unwrap_or(0);
@@ -540,7 +609,9 @@ pub(crate) fn extract_key_entities(text: &str) -> Vec<KeyEntity> {
             }
 
             // Store as composite shipping address if we have name or phone
-            if (!addr_name.is_empty() || !addr_phone.is_empty()) && seen.insert(format!("addr:{addr_text}")) {
+            if (!addr_name.is_empty() || !addr_phone.is_empty())
+                && seen.insert(format!("addr:{addr_text}"))
+            {
                 let mut full = String::new();
                 if !addr_name.is_empty() {
                     full.push_str(&addr_name);
@@ -570,7 +641,8 @@ pub(crate) fn extract_key_entities(text: &str) -> Vec<KeyEntity> {
     entities
 }
 
-/// Write key entities as pinned Core memories, deduplicating against existing entries.
+/// Write key entities as pinned Core memories, deduplicating against existing
+/// entries.
 ///
 /// For each entity:
 /// 1. Search memory for an existing entry of the same kind.
@@ -580,29 +652,33 @@ pub(crate) async fn write_entity_memories(
     mem: &std::sync::Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>,
     scope: &str,
     entities: Vec<KeyEntity>,
-) {
+) -> Vec<crate::agent::memory::MemoryDoc> {
     if entities.is_empty() {
-        return;
+        return Vec::new();
     }
-    // Hold lock for the entire search+add pair to avoid TOCTOU races.
-    let mut guard = mem.lock().await;
+    let mut written = Vec::new();
     for entity in entities {
         // Dedup: skip if memory already contains this exact entity value.
-        let already_exact = match guard.search(&entity.value, Some(scope), 10).await {
-            Ok(results) => results.iter().any(|d| {
-                d.kind == "entity" && d.text.contains(&entity.value)
-            }),
-            Err(_) => false,
+        let already_exact = {
+            let guard = mem.lock().await;
+            guard
+                .find_exact(scope, "entity", &entity.memory_text)
+                .is_some()
         };
         if already_exact {
-            tracing::debug!(kind = entity.kind, value = entity.value, "entity already pinned, skipping");
+            tracing::debug!(
+                kind = entity.kind,
+                value = entity.value,
+                "entity already pinned, skipping"
+            );
             continue;
         }
+        let memory_text = entity.memory_text.clone();
         let doc = crate::agent::memory::MemoryDoc {
             id: uuid::Uuid::new_v4().to_string(),
             scope: scope.to_owned(),
             kind: "entity".to_owned(),
-            text: entity.memory_text,
+            text: memory_text.clone(),
             vector: vec![],
             created_at: 0,
             accessed_at: 0,
@@ -614,11 +690,30 @@ pub(crate) async fn write_entity_memories(
             tags: vec!["pinned".to_owned()],
             pinned: true,
         };
-        match guard.add(doc).await {
-            Ok(_) => tracing::info!(kind = entity.kind, value = entity.value, "entity pinned to memory"),
-            Err(e) => tracing::warn!(kind = entity.kind, value = entity.value, "failed to pin entity: {e:#}"),
+        match crate::agent::memory::add_off_lock(mem, doc).await {
+            Ok(_) => {
+                tracing::info!(
+                    kind = entity.kind,
+                    value = entity.value,
+                    "entity pinned to memory"
+                );
+                if let Some(doc) = mem
+                    .lock()
+                    .await
+                    .find_exact(scope, "entity", &memory_text)
+                    .cloned()
+                {
+                    written.push(doc);
+                }
+            }
+            Err(e) => tracing::warn!(
+                kind = entity.kind,
+                value = entity.value,
+                "failed to pin entity: {e:#}"
+            ),
         }
     }
+    written
 }
 
 /// Extract semantic entities via a lightweight LLM call.
@@ -658,14 +753,20 @@ pub(crate) async fn extract_entities_via_llm(
         messages: vec![Message {
             role: Role::User,
             content: MessageContent::Text(prompt),
+            rsclaw_hidden: None,
         }],
         tools: vec![],
         system: Some("Extract personal info. JSON array only. No explanation.".to_owned()),
         max_tokens: Some(512),
         temperature: Some(0.0),
         frequency_penalty: None,
-        thinking_budget: None, endpoint: AgentEndpoint::Flash, kv_cache_mode: 0, session_key: None,
-        system_shared: None, user_system: None,
+        thinking_budget: None,
+        endpoint: AgentEndpoint::Flash,
+        kv_cache_mode: 0,
+        session_key: None,
+        system_shared: None,
+        user_system: None,
+        recall: None,
     };
 
     let mut stream = match failover.call(req, providers).await {
@@ -811,14 +912,20 @@ pub(crate) async fn describe_image_via_llm(
                     url: image_data_uri.to_owned(),
                 },
             ]),
+            rsclaw_hidden: None,
         }],
         tools: vec![],
         system: None,
         max_tokens: Some(300),
         temperature: Some(0.0),
         frequency_penalty: None,
-        thinking_budget: None, endpoint: AgentEndpoint::Vision, kv_cache_mode: 0, session_key: None,
-        system_shared: None, user_system: None,
+        thinking_budget: None,
+        endpoint: AgentEndpoint::Vision,
+        kv_cache_mode: 0,
+        session_key: None,
+        system_shared: None,
+        user_system: None,
+        recall: None,
     };
 
     let mut stream = match failover.call(req, providers).await {
@@ -847,7 +954,11 @@ pub(crate) async fn describe_image_via_llm(
     }
 
     let trimmed = output.trim().to_owned();
-    if trimmed.is_empty() { None } else { Some(trimmed) }
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 /// Build a text description for a video attachment.
@@ -900,7 +1011,11 @@ pub(crate) fn compress_tool_results(messages: &mut Vec<Message>, preserve_tail: 
                         let original_len = text.len();
                         let first_line = text.lines().next().unwrap_or(text);
                         let summary: String = first_line.chars().take(100).collect();
-                        let ellipsis = if first_line.chars().count() > 100 { "..." } else { "" };
+                        let ellipsis = if first_line.chars().count() > 100 {
+                            "..."
+                        } else {
+                            ""
+                        };
                         msg.content = MessageContent::Text(format!(
                             "[tool result] {summary}{ellipsis} ({original_len} chars)"
                         ));
@@ -914,7 +1029,11 @@ pub(crate) fn compress_tool_results(messages: &mut Vec<Message>, preserve_tail: 
                                 let original_len = content.len();
                                 let first_line = content.lines().next().unwrap_or(content);
                                 let summary: String = first_line.chars().take(100).collect();
-                                let ellipsis = if first_line.chars().count() > 100 { "..." } else { "" };
+                                let ellipsis = if first_line.chars().count() > 100 {
+                                    "..."
+                                } else {
+                                    ""
+                                };
                                 *content = format!(
                                     "[tool result] {summary}{ellipsis} ({original_len} chars)"
                                 );

@@ -1,4 +1,7 @@
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use crate::{
     agent::AgentMessage,
@@ -227,6 +230,7 @@ pub async fn chat_history(ctx: MethodCtx) -> MethodResult {
     let filtered: Vec<_> = all_messages
         .into_iter()
         .filter(|v| !is_compaction_message(v))
+        .map(crate::provider::redact_rsclaw_hidden_value)
         .collect();
 
     let messages: Vec<_> = if filtered.len() > limit {
@@ -336,5 +340,6 @@ pub async fn chat_permission_response(ctx: MethodCtx) -> MethodResult {
     }))
 }
 
-// is_compaction_message moved to crate::agent::compaction::is_compaction_message
+// is_compaction_message moved to
+// crate::agent::compaction::is_compaction_message
 use crate::agent::compaction::is_compaction_message;

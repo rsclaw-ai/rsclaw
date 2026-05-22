@@ -1,12 +1,14 @@
 //! WASM plugin runtime — loads `.wasm` component-model plugins via wasmtime.
 //!
 //! Each WASM plugin exports (via WIT `plugin-api` interface):
-//!   - `handle-tool(tool-name, args-json) -> result<string, string>` — executes a tool
+//!   - `handle-tool(tool-name, args-json) -> result<string, string>` — executes
+//!     a tool
 //!
 //! Tool metadata (name, description, JSON schema) lives in `plugin.json5` —
 //! the host does not call back into the wasm to discover tools.
 //!
-//! Host functions provided to plugins (via WIT `host-browser` and `host-runtime`):
+//! Host functions provided to plugins (via WIT `host-browser` and
+//! `host-runtime`):
 //!   - 13 browser automation functions (open, snapshot, click, fill, etc.)
 //!   - `log`, `sleep`, `read-file`
 
@@ -27,11 +29,12 @@ use wasmtime::{
     component::{Component, Linker, bindgen},
 };
 
-/// Per-call wall-clock deadline in epoch ticks, relative to `set_epoch_deadline`
-/// being called. The engine ticks every 100ms (see `mod.rs::load_all_plugins`),
-/// so 18000 ticks ≈ 30 minutes. Browser-automation plugins (image / video
-/// generation, scrape pagination) routinely run for several minutes; the
-/// deadline only needs to be tight enough to kill a true runaway.
+/// Per-call wall-clock deadline in epoch ticks, relative to
+/// `set_epoch_deadline` being called. The engine ticks every 100ms (see
+/// `mod.rs::load_all_plugins`), so 18000 ticks ≈ 30 minutes. Browser-automation
+/// plugins (image / video generation, scrape pagination) routinely run for
+/// several minutes; the deadline only needs to be tight enough to kill a true
+/// runaway.
 const EPOCH_DEADLINE_TICKS: u64 = 18000;
 
 /// Per-store memory cap for wasm linear memory.
@@ -129,7 +132,8 @@ struct HostState {
     cdn_rules: Vec<crate::plugin::manifest::CdnDownloadRule>,
     /// Plugin name — used to scope per-plugin resources (SQLite DB path, etc.).
     plugin_name: String,
-    /// Desktop session for host-desktop interface (input synthesis, screenshots).
+    /// Desktop session for host-desktop interface (input synthesis,
+    /// screenshots).
     desktop: Box<dyn crate::desktop::DesktopSession>,
     /// Optional provider registry for host-vlm interface.
     providers: Option<Arc<crate::provider::registry::ProviderRegistry>>,
@@ -174,7 +178,14 @@ fn new_sandboxed_store(
 ) -> Store<HostState> {
     let mut store = Store::new(
         engine,
-        new_host_state(browser, notify_ctx, cdn_rules, plugin_name, providers, vision_model),
+        new_host_state(
+            browser,
+            notify_ctx,
+            cdn_rules,
+            plugin_name,
+            providers,
+            vision_model,
+        ),
     );
     store.limiter(|s| &mut s.limits);
     store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
@@ -536,14 +547,21 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
         }
     }
 
-    async fn write_file(&mut self, path: String, contents: String) -> Result<Result<String, String>> {
+    async fn write_file(
+        &mut self,
+        path: String,
+        contents: String,
+    ) -> Result<Result<String, String>> {
         let canonical = match canonicalize_writable_path(&path) {
             Ok(p) => p,
             Err(e) => return Ok(Err(e)),
         };
         if let Some(parent) = canonical.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                return Ok(Err(format!("failed to create parent dirs for {}: {e}", canonical.display())));
+                return Ok(Err(format!(
+                    "failed to create parent dirs for {}: {e}",
+                    canonical.display()
+                )));
             }
         }
         match tokio::fs::write(&canonical, contents).await {
@@ -574,10 +592,7 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
                     ))),
                 }
             }
-            Err(e) => Ok(Err(format!(
-                "failed to stat {}: {e}",
-                canonical.display()
-            ))),
+            Err(e) => Ok(Err(format!("failed to stat {}: {e}", canonical.display()))),
         }
     }
 
@@ -599,10 +614,13 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
                 params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
             let rows_affected = stmt.execute(params_ref.as_slice())?;
             let last_id = conn.last_insert_rowid();
-            Ok::<_, rusqlite::Error>(json!({
-                "rows_affected": rows_affected,
-                "last_insert_rowid": last_id,
-            }).to_string())
+            Ok::<_, rusqlite::Error>(
+                json!({
+                    "rows_affected": rows_affected,
+                    "last_insert_rowid": last_id,
+                })
+                .to_string(),
+            )
         })
         .await;
         match result {
@@ -641,7 +659,9 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
                         rusqlite::types::ValueRef::Integer(v) => json!(v),
                         rusqlite::types::ValueRef::Real(v) => json!(v),
                         rusqlite::types::ValueRef::Text(v) => json!(String::from_utf8_lossy(v)),
-                        rusqlite::types::ValueRef::Blob(v) => json!(base64::engine::general_purpose::STANDARD.encode(v)),
+                        rusqlite::types::ValueRef::Blob(v) => {
+                            json!(base64::engine::general_purpose::STANDARD.encode(v))
+                        }
                     };
                     obj.insert(name.clone(), val);
                 }
@@ -695,7 +715,11 @@ impl rsclaw::plugin::host_media::Host for HostState {
     async fn extract_audio(&mut self, input_path: String) -> Result<Result<String, String>> {
         let ffmpeg_bin = match crate::agent::platform::detect_ffmpeg() {
             Some(p) => p,
-            None => return Ok(Err("ffmpeg not found. Run: rsclaw tools install ffmpeg".to_string())),
+            None => {
+                return Ok(Err(
+                    "ffmpeg not found. Run: rsclaw tools install ffmpeg".to_string()
+                ));
+            }
         };
 
         let out_path = match allocate_dl_paths("audio.wav", 1) {
@@ -730,7 +754,11 @@ impl rsclaw::plugin::host_media::Host for HostState {
         }
     }
 
-    async fn transcribe(&mut self, audio_path: String, _language: String) -> Result<Result<String, String>> {
+    async fn transcribe(
+        &mut self,
+        audio_path: String,
+        _language: String,
+    ) -> Result<Result<String, String>> {
         let bytes = match tokio::fs::read(&audio_path).await {
             Ok(b) => b,
             Err(e) => return Ok(Err(format!("read audio file failed: {e}"))),
@@ -743,16 +771,26 @@ impl rsclaw::plugin::host_media::Host for HostState {
         };
 
         let client = reqwest::Client::new();
-        match crate::channel::transcription::transcribe_audio(&client, &bytes, &audio_path, mime).await {
+        match crate::channel::transcription::transcribe_audio(&client, &bytes, &audio_path, mime)
+            .await
+        {
             Ok(text) => Ok(Ok(text)),
             Err(e) => Ok(Err(format!("transcription failed: {e:#}"))),
         }
     }
 
-    async fn extract_keyframes(&mut self, video_path: String, count: u32) -> Result<Result<Vec<String>, String>> {
+    async fn extract_keyframes(
+        &mut self,
+        video_path: String,
+        count: u32,
+    ) -> Result<Result<Vec<String>, String>> {
         let ffmpeg_bin = match crate::agent::platform::detect_ffmpeg() {
             Some(p) => p,
-            None => return Ok(Err("ffmpeg not found. Run: rsclaw tools install ffmpeg".to_string())),
+            None => {
+                return Ok(Err(
+                    "ffmpeg not found. Run: rsclaw tools install ffmpeg".to_string()
+                ));
+            }
         };
 
         let count = count.max(1).min(20) as usize;
@@ -764,13 +802,22 @@ impl rsclaw::plugin::host_media::Host for HostState {
         // Get video duration via ffprobe
         let duration_secs: f64 = {
             let probe = tokio::process::Command::new(&ffmpeg_bin)
-                .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", &video_path])
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    &video_path,
+                ])
                 .output()
                 .await;
             match probe {
-                Ok(o) if o.status.success() => {
-                    String::from_utf8_lossy(&o.stdout).trim().parse().unwrap_or(0.0)
-                }
+                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .parse()
+                    .unwrap_or(0.0),
                 _ => 0.0,
             }
         };
@@ -1023,9 +1070,7 @@ impl rsclaw::plugin::host_desktop::Host for HostState {
         Ok(self.desktop.clipboard_set_file(&file_path).await)
     }
 
-    async fn desktop_clipboard_get_image(
-        &mut self,
-    ) -> wasmtime::Result<Result<String, String>> {
+    async fn desktop_clipboard_get_image(&mut self) -> wasmtime::Result<Result<String, String>> {
         Ok(self.desktop.clipboard_get_image().await)
     }
 
@@ -1067,15 +1112,22 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
         let (provider_name, model_id) = providers.resolve_model(vision_model);
         let provider = match providers.get(provider_name) {
             Ok(p) => p,
-            Err(e) => return Ok(Err(format!("vlm_parse: provider {provider_name} not found: {e}"))),
+            Err(e) => {
+                return Ok(Err(format!(
+                    "vlm_parse: provider {provider_name} not found: {e}"
+                )));
+            }
         };
 
         let messages = vec![crate::provider::Message {
             role: crate::provider::Role::User,
             content: crate::provider::MessageContent::Parts(vec![
                 crate::provider::ContentPart::Text { text: prompt },
-                crate::provider::ContentPart::Image { url: image_data_uri },
+                crate::provider::ContentPart::Image {
+                    url: image_data_uri,
+                },
             ]),
+            rsclaw_hidden: None,
         }];
 
         let req = crate::provider::LlmRequest {
@@ -1092,6 +1144,7 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
             session_key: None,
             system_shared: None,
             user_system: None,
+            recall: None,
         };
 
         match provider.stream(req).await {
@@ -1102,7 +1155,9 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
                 while let Some(event) = stream.next().await {
                     match event {
                         Ok(crate::provider::StreamEvent::TextDelta(d)) => text.push_str(&d),
-                        Ok(crate::provider::StreamEvent::ReasoningDelta(d)) => reasoning.push_str(&d),
+                        Ok(crate::provider::StreamEvent::ReasoningDelta(d)) => {
+                            reasoning.push_str(&d)
+                        }
                         Ok(crate::provider::StreamEvent::Done { .. }) => break,
                         Ok(crate::provider::StreamEvent::ToolCall { .. }) => {}
                         Ok(crate::provider::StreamEvent::Error(e)) => {
@@ -1132,7 +1187,8 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
 /// Build a `Linker<HostState>` with all host functions registered.
 fn build_linker(engine: &Engine) -> Result<Linker<HostState>> {
     let mut linker = Linker::new(engine);
-    // Add WASI interfaces (io, filesystem, etc.) required by wasm32-wasip2 components.
+    // Add WASI interfaces (io, filesystem, etc.) required by wasm32-wasip2
+    // components.
     wasmtime_wasi::add_to_linker_async(&mut linker)?;
     // Add our custom host interfaces.
     rsclaw::plugin::host_browser::add_to_linker(&mut linker, |state: &mut HostState| state)?;

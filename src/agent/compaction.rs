@@ -8,8 +8,10 @@ use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt as _;
 use tracing::{debug, info, warn};
 
-use super::context_mgr::{compress_tool_results, estimate_tokens, msg_tokens};
-use super::runtime::AgentRuntime;
+use super::{
+    context_mgr::{compress_tool_results, estimate_tokens, msg_tokens},
+    runtime::AgentRuntime,
+};
 use crate::provider::{
     AgentEndpoint, ContentPart, LlmRequest, Message, MessageContent, Role, StreamEvent,
 };
@@ -97,9 +99,9 @@ fn count_server_slots(msgs: &[Message]) -> usize {
     slots
 }
 
-/// Returns true if a JSON message value represents a compaction summary (internal only).
-/// Used by both the REST API (server/mod.rs) and WebSocket chat handler to filter
-/// compaction messages from user-visible history.
+/// Returns true if a JSON message value represents a compaction summary
+/// (internal only). Used by both the REST API (server/mod.rs) and WebSocket
+/// chat handler to filter compaction messages from user-visible history.
 pub fn is_compaction_message(v: &serde_json::Value) -> bool {
     let obj = match v.as_object() {
         Some(o) => o,
@@ -146,7 +148,14 @@ impl AgentRuntime {
         use crate::config::schema::CompactionMode;
 
         // Use configured compaction settings, or sensible defaults.
-        let cfg = self.live.agents.read().await.defaults.compaction.clone()
+        let cfg = self
+            .live
+            .agents
+            .read()
+            .await
+            .defaults
+            .compaction
+            .clone()
             .unwrap_or_default();
 
         // Compaction trigger: token threshold against the FULL prompt size
@@ -164,7 +173,13 @@ impl AgentRuntime {
         let context_tokens = if self.handle.context_window > 0 {
             self.handle.context_window
         } else {
-            self.live.agents.read().await.defaults.context_tokens.unwrap_or(64_000) as usize
+            self.live
+                .agents
+                .read()
+                .await
+                .defaults
+                .context_tokens
+                .unwrap_or(64_000) as usize
         };
         // Used later to pick the splice strategy (mode 2 = rsclaw stateful).
         //
@@ -179,8 +194,14 @@ impl AgentRuntime {
         // cold-prefills the entire post-compact history (~50s/turn,
         // observed as rs_w4_* session churn in the worker log). With the
         // effective mode the splice preserves session_id and the cache.
-        let configured_kv_mode =
-            self.live.agents.read().await.defaults.kv_cache_mode.unwrap_or(1);
+        let configured_kv_mode = self
+            .live
+            .agents
+            .read()
+            .await
+            .defaults
+            .kv_cache_mode
+            .unwrap_or(1);
         let (resolved_provider, _) = self.providers.resolve_model(model);
         let kv_cache_mode = if resolved_provider == "rsclaw" {
             2
@@ -237,12 +258,7 @@ impl AgentRuntime {
 
         debug!(
             session = session_key,
-            total_tokens,
-            token_threshold,
-            turns,
-            token_trigger,
-            force,
-            "compaction check"
+            total_tokens, token_threshold, turns, token_trigger, force, "compaction check"
         );
 
         if !force && !token_trigger {
@@ -253,11 +269,7 @@ impl AgentRuntime {
             return;
         }
 
-        let trigger_reason = if token_trigger {
-            "tokens"
-        } else {
-            "time"
-        };
+        let trigger_reason = if token_trigger { "tokens" } else { "time" };
         info!(
             session = session_key,
             trigger = trigger_reason,
@@ -285,15 +297,16 @@ impl AgentRuntime {
 
         let msgs_to_text = |msgs: &[Message]| -> String {
             let default_transcript = (context_tokens * 7 / 10).max(16_000);
-            let max_total_tokens: usize = cfg.max_transcript_tokens
+            let max_total_tokens: usize = cfg
+                .max_transcript_tokens
                 .map(|t| t as usize)
                 .unwrap_or(default_transcript);
             Self::msgs_to_text_static(msgs, max_total_tokens)
         };
 
         // Split messages into (head, old_portion, recent_portion) for layered mode.
-        // Head: first user-assistant pair (contains [Session started:...], preserved verbatim)
-        // Middle: compressed into summary
+        // Head: first user-assistant pair (contains [Session started:...], preserved
+        // verbatim) Middle: compressed into summary
         // Tail: recent N pairs (preserved verbatim)
         let (head_msgs, old_text, recent_msgs) = if mode == CompactionMode::Layered {
             let msgs = self.sessions.get(session_key).cloned().unwrap_or_default();
@@ -320,8 +333,15 @@ impl AgentRuntime {
             // already lost (/clear discarded it) and `keep_head_messages
             // = 0` is the honest wire value.
             let head_end = {
-                let first_is_summary = msgs.first()
-                    .and_then(|m| if let MessageContent::Text(t) = &m.content { Some(t.starts_with("[CONTEXT COMPACTION")) } else { None })
+                let first_is_summary = msgs
+                    .first()
+                    .and_then(|m| {
+                        if let MessageContent::Text(t) = &m.content {
+                            Some(t.starts_with("[CONTEXT COMPACTION"))
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or(false);
                 if first_is_summary {
                     0 // post-/clear path — head sanctuary already lost
@@ -333,7 +353,9 @@ impl AgentRuntime {
                         if m.role == Role::Assistant {
                             count += 1;
                             end = idx + 1;
-                            if count >= 1 { break; }
+                            if count >= 1 {
+                                break;
+                            }
                         }
                     }
                     end.min(msgs.len())
@@ -387,7 +409,10 @@ impl AgentRuntime {
                 if let Some(ref mem) = self.memory {
                     let scope = format!("agent:{}", self.handle.id);
                     crate::agent::context_mgr::write_entity_memories(mem, &scope, entities).await;
-                    debug!(session = session_key, "pre-compaction deterministic entities pinned");
+                    debug!(
+                        session = session_key,
+                        "pre-compaction deterministic entities pinned"
+                    );
                 }
             }
             // LLM-based entity extraction is now handled by the summary prompt
@@ -479,17 +504,18 @@ impl AgentRuntime {
             } else {
                 // Legacy slot-cache fallback is harmless: same provider,
                 // same prefix bytes, worker slot still amortizes.
-                info!(session = session_key, "KV cache compact failed, falling back to standalone");
-                self.compact_single(compaction_model, &old_text, previous_summary.as_deref()).await
+                info!(
+                    session = session_key,
+                    "KV cache compact failed, falling back to standalone"
+                );
+                self.compact_single(compaction_model, &old_text, previous_summary.as_deref())
+                    .await
             }
         } else {
             match mode {
                 CompactionMode::Default | CompactionMode::Layered => {
-                    self.compact_single(
-                        compaction_model,
-                        &old_text,
-                        previous_summary.as_deref(),
-                    ).await
+                    self.compact_single(compaction_model, &old_text, previous_summary.as_deref())
+                        .await
                 }
                 CompactionMode::Safeguard => {
                     const CHUNK_SIZE: usize = 40_000;
@@ -517,7 +543,11 @@ impl AgentRuntime {
                             None => return,
                         }
                     }
-                    if combined.is_empty() { None } else { Some(combined) }
+                    if combined.is_empty() {
+                        None
+                    } else {
+                        Some(combined)
+                    }
                 }
             }
         };
@@ -532,7 +562,10 @@ impl AgentRuntime {
             if !entities.is_empty() {
                 let scope = format!("agent:{}", self.handle.id);
                 crate::agent::context_mgr::write_entity_memories(mem, &scope, entities).await;
-                debug!(session = session_key, "entities extracted from compaction summary");
+                debug!(
+                    session = session_key,
+                    "entities extracted from compaction summary"
+                );
             }
         }
 
@@ -559,7 +592,7 @@ impl AgentRuntime {
                                 abstract_text: None,
                                 overview_text: None,
                                 tags: vec![],
-                pinned: false,
+                                pinned: false,
                             };
                             if let Err(e) = guard.add(doc).await {
                                 tracing::warn!("compaction fact memory add failed: {e:#}");
@@ -623,13 +656,7 @@ impl AgentRuntime {
                     .get(session_key)
                     .map(|m| count_server_slots(m));
                 match provider
-                    .compact_splice(
-                        session_key,
-                        head_count,
-                        &summary_body,
-                        tail_count,
-                        expected,
-                    )
+                    .compact_splice(session_key, head_count, &summary_body, tail_count, expected)
                     .await
                 {
                     Ok(new_msgs_count) => {
@@ -661,6 +688,7 @@ impl AgentRuntime {
             let summary_msg = Message {
                 role: Role::User,
                 content: MessageContent::Text(summary_body),
+                rsclaw_hidden: None,
             };
             sess.clear();
             // Head: preserved verbatim (first user + first assistant).
@@ -723,6 +751,7 @@ impl AgentRuntime {
                 sess.push(Message {
                     role: Role::System,
                     content: MessageContent::Text(hint.to_owned()),
+                    rsclaw_hidden: None,
                 });
             }
             warn!(
@@ -742,11 +771,13 @@ impl AgentRuntime {
         .await;
     }
 
-    /// Render messages as plain text transcript with two-pass budget allocation.
+    /// Render messages as plain text transcript with two-pass budget
+    /// allocation.
     ///
     /// Total output is capped at `max_total_tokens` to avoid blowing up the
     /// compact LLM's context window. Recent messages get full detail first;
-    /// older messages get progressively reduced detail until budget is exhausted.
+    /// older messages get progressively reduced detail until budget is
+    /// exhausted.
     pub(crate) fn msgs_to_text_static(msgs: &[Message], max_total_tokens: usize) -> String {
         // Helper: truncate to N chars (UTF-8 safe).
         fn trunc(s: &str, max: usize) -> String {
@@ -769,17 +800,27 @@ impl AgentRuntime {
 
             if let Some(obj) = input.as_object() {
                 let needs = obj.iter().any(|(k, v)| {
-                    let limit = if BULK_FIELDS.contains(&k.as_str()) { MAX_BULK }
-                                else if k == "command" { MAX_CMD }
-                                else { return false; };
-                    v.as_str().map(|s| s.char_indices().nth(limit).is_some()).unwrap_or(false)
+                    let limit = if BULK_FIELDS.contains(&k.as_str()) {
+                        MAX_BULK
+                    } else if k == "command" {
+                        MAX_CMD
+                    } else {
+                        return false;
+                    };
+                    v.as_str()
+                        .map(|s| s.char_indices().nth(limit).is_some())
+                        .unwrap_or(false)
                 });
                 if needs {
                     let mut compact = serde_json::Map::new();
                     for (k, v) in obj {
-                        let limit = if BULK_FIELDS.contains(&k.as_str()) { Some(MAX_BULK) }
-                                    else if k == "command" { Some(MAX_CMD) }
-                                    else { None };
+                        let limit = if BULK_FIELDS.contains(&k.as_str()) {
+                            Some(MAX_BULK)
+                        } else if k == "command" {
+                            Some(MAX_CMD)
+                        } else {
+                            None
+                        };
                         if let (Some(lim), Some(s)) = (limit, v.as_str()) {
                             compact.insert(k.clone(), Value::String(trunc(s, lim)));
                         } else {
@@ -787,11 +828,19 @@ impl AgentRuntime {
                         }
                     }
                     let ser = serde_json::to_string(&Value::Object(compact)).unwrap_or_default();
-                    return if ser.char_indices().nth(MAX_TOTAL).is_some() { trunc(&ser, MAX_TOTAL) } else { ser };
+                    return if ser.char_indices().nth(MAX_TOTAL).is_some() {
+                        trunc(&ser, MAX_TOTAL)
+                    } else {
+                        ser
+                    };
                 }
             }
             let full = serde_json::to_string(input).unwrap_or_default();
-            if full.char_indices().nth(MAX_TOTAL).is_some() { trunc(&full, MAX_TOTAL) } else { full }
+            if full.char_indices().nth(MAX_TOTAL).is_some() {
+                trunc(&full, MAX_TOTAL)
+            } else {
+                full
+            }
         }
 
         // Render a single message at the given detail level:
@@ -800,21 +849,33 @@ impl AgentRuntime {
             let role = format!("{:?}", m.role).to_lowercase();
             let body = match &m.content {
                 MessageContent::Text(t) => {
-                    if detail == 0 { trunc(t, 200) } else { t.clone() }
+                    if detail == 0 {
+                        trunc(t, 200)
+                    } else {
+                        t.clone()
+                    }
                 }
                 MessageContent::Parts(parts) => parts
                     .iter()
                     .filter_map(|p| match p {
-                        ContentPart::Text { text } => Some(
-                            if detail == 0 { trunc(text, 200) } else { text.clone() }
-                        ),
+                        ContentPart::Text { text } => Some(if detail == 0 {
+                            trunc(text, 200)
+                        } else {
+                            text.clone()
+                        }),
                         ContentPart::ToolUse { name, input, .. } => match detail {
                             2 => Some(format!("[tool_call: {name}({})]", compact_args(input))),
-                            1 => Some(format!("[tool_call: {name}({})]",
-                                trunc(&serde_json::to_string(input).unwrap_or_default(), 100))),
+                            1 => Some(format!(
+                                "[tool_call: {name}({})]",
+                                trunc(&serde_json::to_string(input).unwrap_or_default(), 100)
+                            )),
                             _ => Some(format!("[tool_call: {name}]")),
                         },
-                        ContentPart::ToolResult { tool_use_id: _, content, .. } => match detail {
+                        ContentPart::ToolResult {
+                            tool_use_id: _,
+                            content,
+                            ..
+                        } => match detail {
                             2 => Some(format!("[tool_result: {}]", trunc(content, 800))),
                             1 => Some(format!("[tool_result: {}]", trunc(content, 150))),
                             _ => None,
@@ -900,11 +961,7 @@ impl AgentRuntime {
 
         // Clone session messages — we'll append the summary instruction
         // to the API copy only, not to the stored session.
-        let mut messages = self
-            .sessions
-            .get(session_key)
-            .cloned()
-            .unwrap_or_default();
+        let mut messages = self.sessions.get(session_key).cloned().unwrap_or_default();
 
         if messages.is_empty() {
             return None;
@@ -932,6 +989,7 @@ impl AgentRuntime {
         messages.push(Message {
             role: Role::User,
             content: MessageContent::Text(instruction),
+            rsclaw_hidden: None,
         });
 
         // Reuse the cached tools from the last run_turn for exact prefix match.
@@ -977,6 +1035,7 @@ impl AgentRuntime {
             session_key: session_key_opt,
             system_shared: None,
             user_system: None,
+            recall: None,
         };
 
         let providers = Arc::clone(&self.providers);
@@ -1008,7 +1067,10 @@ impl AgentRuntime {
         if summary.is_empty() {
             None
         } else {
-            info!("compact_with_kv_cache: summary generated ({} chars)", summary.len());
+            info!(
+                "compact_with_kv_cache: summary generated ({} chars)",
+                summary.len()
+            );
             Some(summary)
         }
     }
@@ -1084,14 +1146,20 @@ impl AgentRuntime {
             messages: vec![Message {
                 role: Role::User,
                 content: MessageContent::Text(prompt),
+                rsclaw_hidden: None,
             }],
             tools: vec![], // no tools — compact must only produce text
-            system: None, // preamble is in the user message
+            system: None,  // preamble is in the user message
             max_tokens: Some(4096),
             temperature: None,
             frequency_penalty: None,
-            thinking_budget: None, endpoint: AgentEndpoint::Flash, kv_cache_mode: 0, session_key: None,
-            system_shared: None, user_system: None,
+            thinking_budget: None,
+            endpoint: AgentEndpoint::Flash,
+            kv_cache_mode: 0,
+            session_key: None,
+            system_shared: None,
+            user_system: None,
+            recall: None,
         };
 
         let providers = Arc::clone(&self.providers);
@@ -1150,6 +1218,7 @@ impl AgentRuntime {
                      IMPORTANT: copy numeric values (phone numbers, IDs) character-for-character — \
                      never truncate or paraphrase them. Be concise. Skip ephemeral chit-chat.\n\n{input}"
                 )),
+                rsclaw_hidden: None,
             }],
             tools: vec![],
             system: Some(
@@ -1158,8 +1227,13 @@ impl AgentRuntime {
             max_tokens: Some(1024),
             temperature: None,
             frequency_penalty: None,
-            thinking_budget: None, endpoint: AgentEndpoint::Flash, kv_cache_mode: 0, session_key: None,
-            system_shared: None, user_system: None,
+            thinking_budget: None,
+            endpoint: AgentEndpoint::Flash,
+            kv_cache_mode: 0,
+            session_key: None,
+            system_shared: None,
+            user_system: None,
+            recall: None,
         };
 
         let providers = Arc::clone(&self.providers);
@@ -1191,10 +1265,16 @@ impl AgentRuntime {
     // JSONL transcript (AGENTS.md $20 step 11)
     // -----------------------------------------------------------------------
 
-    /// Append user + assistant messages to `<base_dir>/transcripts/<key>.jsonl`.
-    /// Routes through `config::loader::base_dir()` so non-default profiles
+    /// Append user + assistant messages to
+    /// `<base_dir>/transcripts/<key>.jsonl`. Routes through
+    /// `config::loader::base_dir()` so non-default profiles
     /// (`--dev`, `--profile`) write transcripts under the matching base dir.
-    pub(crate) async fn append_transcript(&self, session_key: &str, user_text: &str, assistant_text: &str) {
+    pub(crate) async fn append_transcript(
+        &self,
+        session_key: &str,
+        user_text: &str,
+        assistant_text: &str,
+    ) {
         let transcripts_dir = crate::config::loader::base_dir().join("transcripts");
 
         // Sanitize session key for use as a filename.
@@ -1266,7 +1346,10 @@ fn parse_entities_from_summary(summary: &str) -> Vec<crate::agent::context_mgr::
     };
     let content = &summary[start..];
     // Take lines until next ## section or end of string
-    let section_end = content[3..].find("\n## ").map(|i| i + 3).unwrap_or(content.len());
+    let section_end = content[3..]
+        .find("\n## ")
+        .map(|i| i + 3)
+        .unwrap_or(content.len());
     let section = &content[..section_end];
 
     let kind_to_label: &[(&str, &str, &'static str)] = &[
@@ -1295,7 +1378,8 @@ fn parse_entities_from_summary(summary: &str) -> Vec<crate::agent::context_mgr::
             if value.is_empty() {
                 continue;
             }
-            if let Some((_, label, static_kind)) = kind_to_label.iter().find(|(k, _, _)| *k == kind) {
+            if let Some((_, label, static_kind)) = kind_to_label.iter().find(|(k, _, _)| *k == kind)
+            {
                 entities.push(crate::agent::context_mgr::KeyEntity {
                     kind: static_kind,
                     value: value.to_owned(),
@@ -1316,6 +1400,7 @@ mod tests {
         Message {
             role,
             content: MessageContent::Text(text.to_owned()),
+            rsclaw_hidden: None,
         }
     }
 
@@ -1382,7 +1467,10 @@ mod tests {
         // server's reported msgs_count across repeated compactions.
         let keep_head = 2;
         let keep_tail = 4;
-        let mut rebuilt = vec![msg(Role::User, "first"), msg(Role::Assistant, "first-reply")];
+        let mut rebuilt = vec![
+            msg(Role::User, "first"),
+            msg(Role::Assistant, "first-reply"),
+        ];
         rebuilt.push(msg(Role::User, "[CONTEXT COMPACTION] summary"));
         rebuilt.extend(vec![
             msg(Role::User, "t1"),

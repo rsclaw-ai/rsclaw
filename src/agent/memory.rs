@@ -13,7 +13,7 @@
 
 use std::{path::Path, sync::Arc};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use hnsw_rs::{hnsw::Hnsw, prelude::DistCosine};
 use redb::ReadableDatabase;
 use tracing::{debug, info, warn};
@@ -32,9 +32,9 @@ const HNSW_EF_CONSTRUCTION: usize = 200;
 // knowledge base can reuse it. Re-export for backward compatibility:
 // existing `crate::agent::memory::EmbedderBackend` paths still resolve.
 pub use crate::embed::{
-    Embedder, EmbedderBackend, FnvEmbedder, LocalBgeEmbedder, OllamaEmbedder, OpenAiEmbedder,
-    DEFAULT_EMBED_DIM, OLLAMA_DEFAULT_MODEL, OLLAMA_DEFAULT_URL, OPENAI_DEFAULT_BASE_URL,
-    OPENAI_DEFAULT_MODEL,
+    DEFAULT_EMBED_DIM, Embedder, EmbedderBackend, FnvEmbedder, LocalBgeEmbedder,
+    OLLAMA_DEFAULT_MODEL, OLLAMA_DEFAULT_URL, OPENAI_DEFAULT_BASE_URL, OPENAI_DEFAULT_MODEL,
+    OllamaEmbedder, OpenAiEmbedder,
 };
 
 // redb table for memory docs metadata.
@@ -178,14 +178,14 @@ impl MemoryDoc {
         let promo = &crate::agent::evolution::evolution_config().promotion;
         if self.access_count >= promo.access_only
             || self.importance >= promo.importance_only
-            || (self.access_count >= promo.both_access
-                && self.importance >= promo.both_importance)
+            || (self.access_count >= promo.both_access && self.importance >= promo.both_importance)
         {
             self.tier = MemDocTier::Core;
             return !was_core;
         }
 
-        // Demote to Peripheral: relevance_score < 0.15 OR (age > 60 days AND access_count < 3)
+        // Demote to Peripheral: relevance_score < 0.15 OR (age > 60 days AND
+        // access_count < 3)
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -291,6 +291,21 @@ fn extract_overview(text: &str) -> Option<String> {
     }
 }
 
+fn normalized_memory_text(text: &str) -> String {
+    text.chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>()
+        .to_lowercase()
+}
+
+fn tier_rank(tier: &MemDocTier) -> u8 {
+    match tier {
+        MemDocTier::Peripheral => 0,
+        MemDocTier::Working => 1,
+        MemDocTier::Core => 2,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // MemoryStore -- hnsw_rs + redb
 // ---------------------------------------------------------------------------
@@ -303,7 +318,8 @@ pub struct MigrationCtx {
     new_embedder: Arc<dyn Embedder>,
     new_hnsw: Hnsw<'static, f32, DistCosine>,
     new_embed_dim: i32,
-    /// Per-doc-index → new vector. Indices are positions in `MemoryStore::docs`.
+    /// Per-doc-index → new vector. Indices are positions in
+    /// `MemoryStore::docs`.
     new_vectors: std::collections::HashMap<usize, Vec<f32>>,
 }
 
@@ -328,6 +344,17 @@ pub struct MemoryStore {
 }
 
 impl MemoryStore {
+    fn persist_memory_doc(&self, doc: &MemoryDoc) -> Result<()> {
+        let serialized = serialize_doc(doc)?;
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(REDB_TABLE)?;
+            table.insert(doc.id.as_str(), serialized.as_slice())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
     /// Open memory store with exclusive write access (for gateway).
     pub async fn open(
         data_dir: &Path,
@@ -343,7 +370,8 @@ impl MemoryStore {
         Self::open_with_db(db, model_dir, search_cfg).await
     }
 
-    /// Open memory store in read-only mode (for CLI, won't conflict with running gateway).
+    /// Open memory store in read-only mode (for CLI, won't conflict with
+    /// running gateway).
     pub async fn open_readonly(
         data_dir: &Path,
         model_dir: Option<&Path>,
@@ -545,6 +573,46 @@ impl MemoryStore {
             doc.overview_text = extract_overview(&doc.text);
         }
 
+        let doc_identity = normalized_memory_text(&doc.text);
+        if let Some(idx) = self.docs.iter().position(|existing| {
+            !existing.id.is_empty()
+                && existing.scope == doc.scope
+                && existing.kind == doc.kind
+                && normalized_memory_text(&existing.text) == doc_identity
+        }) {
+            let mut persisted = {
+                let existing = &mut self.docs[idx];
+                existing.touch();
+                existing.importance = existing.importance.max(doc.importance);
+                existing.pinned |= doc.pinned;
+                if tier_rank(&doc.tier) > tier_rank(&existing.tier) {
+                    existing.tier = doc.tier.clone();
+                }
+                for tag in &doc.tags {
+                    if !existing.tags.iter().any(|t| t == tag) {
+                        existing.tags.push(tag.clone());
+                    }
+                }
+                if existing.abstract_text.is_none() {
+                    existing.abstract_text = doc.abstract_text.clone();
+                }
+                if existing.overview_text.is_none() {
+                    existing.overview_text = doc.overview_text.clone();
+                }
+                existing.evaluate_tier_transition();
+                existing.clone()
+            };
+            persisted.vector.clear();
+            self.persist_memory_doc(&persisted)?;
+            debug!(
+                id = %self.docs[idx].id,
+                kind = %self.docs[idx].kind,
+                scope = %self.docs[idx].scope,
+                "memory doc duplicate merged"
+            );
+            return Ok(());
+        }
+
         // The caller may have snapshotted embedders before a `begin_swap` /
         // `commit_swap` / `abort_swap` race that changed the active dim
         // between then and now. Recover by re-embedding under lock when
@@ -563,15 +631,7 @@ impl MemoryStore {
         doc.vector = primary_vec;
 
         // Persist to redb.
-        let serialized = serialize_doc(&doc)?;
-        {
-            let write = self.db.begin_write()?;
-            {
-                let mut table = write.open_table(REDB_TABLE)?;
-                table.insert(doc.id.as_str(), serialized.as_slice())?;
-            }
-            write.commit()?;
-        }
+        self.persist_memory_doc(&doc)?;
 
         // Insert into HNSW index.
         let idx = self.docs.len();
@@ -778,7 +838,12 @@ impl MemoryStore {
         let mut applied = 0usize;
         for (idx, vector) in batch {
             if vector.len() != expected {
-                tracing::warn!(idx, got = vector.len(), expected, "swap_apply_batch: dim mismatch, skipping");
+                tracing::warn!(
+                    idx,
+                    got = vector.len(),
+                    expected,
+                    "swap_apply_batch: dim mismatch, skipping"
+                );
                 continue;
             }
             // Idempotency guard: a concurrent `add` could have dual-written
@@ -798,10 +863,7 @@ impl MemoryStore {
     /// Atomically replace primary with secondary and persist new vectors to
     /// redb in a single transaction. Returns the number of docs migrated.
     pub fn commit_swap(&mut self) -> Result<usize> {
-        let ctx = self
-            .swap
-            .take()
-            .context("memory: no swap in progress")?;
+        let ctx = self.swap.take().context("memory: no swap in progress")?;
         let MigrationCtx {
             new_embedder,
             new_hnsw,
@@ -897,7 +959,8 @@ impl MemoryStore {
         Ok(count)
     }
 
-    /// Count tokens precisely using the loaded tokenizer (or heuristic fallback).
+    /// Count tokens precisely using the loaded tokenizer (or heuristic
+    /// fallback).
     pub fn count_tokens(&self, text: &str) -> usize {
         self.embedder.count_tokens(text)
     }
@@ -930,6 +993,17 @@ impl MemoryStore {
     /// Synchronous lookup by ID (in-memory only, no I/O).
     pub fn get_sync(&self, id: &str) -> Option<&MemoryDoc> {
         self.docs.iter().find(|d| !d.id.is_empty() && d.id == id)
+    }
+
+    /// Find a non-deleted memory by exact normalized identity.
+    pub fn find_exact(&self, scope: &str, kind: &str, text: &str) -> Option<&MemoryDoc> {
+        let wanted = normalized_memory_text(text);
+        self.docs.iter().find(|d| {
+            !d.id.is_empty()
+                && d.scope == scope
+                && d.kind == kind
+                && normalized_memory_text(&d.text) == wanted
+        })
     }
 
     /// Adjust the importance score of a memory document by `delta`, clamping
@@ -996,11 +1070,7 @@ impl MemoryStore {
     pub fn find_by_tier(&self, tier: &MemDocTier, scope: Option<&str>) -> Vec<&MemoryDoc> {
         self.docs
             .iter()
-            .filter(|d| {
-                !d.id.is_empty()
-                    && d.tier == *tier
-                    && scope.map_or(true, |s| d.scope == s)
-            })
+            .filter(|d| !d.id.is_empty() && d.tier == *tier && scope.map_or(true, |s| d.scope == s))
             .collect()
     }
 
@@ -1203,14 +1273,19 @@ mod swap_tests {
 
     /// Hand-rolled embedder so tests don't depend on BGE/FNV: each text → a
     /// fixed-dim vector seeded by the first byte (deterministic & cheap).
-    struct StubEmbedder { dim: i32, seed_bias: f32 }
+    struct StubEmbedder {
+        dim: i32,
+        seed_bias: f32,
+    }
     impl Embedder for StubEmbedder {
         fn embed(&self, text: &str) -> Vec<f32> {
-            let bias = text.bytes().next().map(|b| b as f32 / 255.0).unwrap_or(0.0)
-                + self.seed_bias;
+            let bias =
+                text.bytes().next().map(|b| b as f32 / 255.0).unwrap_or(0.0) + self.seed_bias;
             vec![bias; self.dim as usize]
         }
-        fn dimension(&self) -> i32 { self.dim }
+        fn dimension(&self) -> i32 {
+            self.dim
+        }
     }
 
     async fn open_temp_store() -> (MemoryStore, tempfile::TempDir) {
@@ -1231,14 +1306,19 @@ mod swap_tests {
         }
         assert!(!store.is_migrating());
 
-        let new_emb: Arc<dyn Embedder> = Arc::new(StubEmbedder { dim: 8, seed_bias: 0.1 });
+        let new_emb: Arc<dyn Embedder> = Arc::new(StubEmbedder {
+            dim: 8,
+            seed_bias: 0.1,
+        });
         store.begin_swap(Arc::clone(&new_emb)).expect("begin_swap");
         assert!(store.is_migrating());
 
         // Drain pending in batches; tests the snapshot/apply flow.
         loop {
             let pending = store.swap_pending(2);
-            if pending.is_empty() { break; }
+            if pending.is_empty() {
+                break;
+            }
             let batch: Vec<_> = pending
                 .into_iter()
                 .map(|(i, t)| (i, new_emb.embed(&t)))
@@ -1261,16 +1341,25 @@ mod swap_tests {
         let (mut store, _tmp) = open_temp_store().await;
         store.add(doc("d0", "first")).await.unwrap();
 
-        let new_emb: Arc<dyn Embedder> = Arc::new(StubEmbedder { dim: 8, seed_bias: 0.0 });
+        let new_emb: Arc<dyn Embedder> = Arc::new(StubEmbedder {
+            dim: 8,
+            seed_bias: 0.0,
+        });
         store.begin_swap(Arc::clone(&new_emb)).unwrap();
         // Drain initial pending.
         let pending = store.swap_pending(10);
-        let batch: Vec<_> = pending.into_iter().map(|(i, t)| (i, new_emb.embed(&t))).collect();
+        let batch: Vec<_> = pending
+            .into_iter()
+            .map(|(i, t)| (i, new_emb.embed(&t)))
+            .collect();
         store.swap_apply_batch(batch).unwrap();
 
         // Now add a doc mid-migration — it should auto-populate both indexes.
         store.add(doc("d1", "second")).await.unwrap();
-        assert!(store.swap_pending(10).is_empty(), "dual-write should leave nothing pending");
+        assert!(
+            store.swap_pending(10).is_empty(),
+            "dual-write should leave nothing pending"
+        );
 
         let migrated = store.commit_swap().unwrap();
         assert_eq!(migrated, 2);
@@ -1302,7 +1391,10 @@ mod swap_tests {
         // Mid-swap dual-write path: begin_swap, then add through the off-lock
         // helper. Secondary index must pick up the new doc the same way the
         // in-line add does.
-        let new_emb: Arc<dyn Embedder> = Arc::new(StubEmbedder { dim: 16, seed_bias: 0.5 });
+        let new_emb: Arc<dyn Embedder> = Arc::new(StubEmbedder {
+            dim: 16,
+            seed_bias: 0.5,
+        });
         {
             let mut m = mem.lock().await;
             m.begin_swap(Arc::clone(&new_emb)).unwrap();
@@ -1312,8 +1404,10 @@ mod swap_tests {
                 if pending.is_empty() {
                     break;
                 }
-                let batch: Vec<_> =
-                    pending.into_iter().map(|(i, t)| (i, new_emb.embed(&t))).collect();
+                let batch: Vec<_> = pending
+                    .into_iter()
+                    .map(|(i, t)| (i, new_emb.embed(&t)))
+                    .collect();
                 m.swap_apply_batch(batch).unwrap();
             }
         }
@@ -1338,8 +1432,10 @@ mod swap_tests {
     async fn add_pre_embedded_recovers_from_stale_snapshot() {
         let (mut store, _tmp) = open_temp_store().await;
         // Caller's "snapshotted" embedders — what they had a moment ago.
-        let stale_primary: Arc<dyn Embedder> =
-            Arc::new(StubEmbedder { dim: 32, seed_bias: 0.1 });
+        let stale_primary: Arc<dyn Embedder> = Arc::new(StubEmbedder {
+            dim: 32,
+            seed_bias: 0.1,
+        });
         let stale_vec = stale_primary.embed("hello world");
         assert_eq!(stale_vec.len(), 32);
 
@@ -1355,6 +1451,31 @@ mod swap_tests {
         // Doc landed with a fresh 384-dim vector from the active embedder.
         assert_eq!(store.docs.len(), 1);
         assert_eq!(store.docs[0].vector.len(), 384);
+    }
+
+    #[tokio::test]
+    async fn add_pre_embedded_merges_exact_duplicate_memory() {
+        let (mut store, _tmp) = open_temp_store().await;
+        let mut first = doc("d-first", "用户幸运数字是 975318642");
+        first.scope = "agent:main".into();
+        first.kind = "remember".into();
+        first.importance = 0.6;
+        store.add(first).await.unwrap();
+
+        let mut duplicate = doc("d-second", " 用户幸运数字是   975318642 ");
+        duplicate.scope = "agent:main".into();
+        duplicate.kind = "remember".into();
+        duplicate.importance = 0.9;
+        duplicate.pinned = true;
+        duplicate.tags.push("pinned".into());
+        store.add(duplicate).await.unwrap();
+
+        assert_eq!(store.docs.len(), 1, "exact duplicate content should merge");
+        assert_eq!(store.docs[0].id, "d-first", "stable id should be retained");
+        assert_eq!(store.docs[0].importance, 0.9);
+        assert!(store.docs[0].pinned);
+        assert!(store.docs[0].tags.iter().any(|t| t == "pinned"));
+        assert!(store.docs[0].access_count > 0);
     }
 
     /// Stress test: 100 concurrent `add_off_lock` tasks against the same
@@ -1388,7 +1509,10 @@ mod swap_tests {
                 }
             }
         }
-        assert_eq!(errors, 0, "no add_off_lock call should fail under concurrency");
+        assert_eq!(
+            errors, 0,
+            "no add_off_lock call should fail under concurrency"
+        );
 
         let m = mem.lock().await;
         let active: Vec<&MemoryDoc> = m.docs.iter().filter(|d| !d.id.is_empty()).collect();
@@ -1411,7 +1535,10 @@ mod swap_tests {
         store.add(doc("d0", "x")).await.unwrap();
         let original_dim = store.embed_dim();
 
-        let new_emb: Arc<dyn Embedder> = Arc::new(StubEmbedder { dim: 16, seed_bias: 0.0 });
+        let new_emb: Arc<dyn Embedder> = Arc::new(StubEmbedder {
+            dim: 16,
+            seed_bias: 0.0,
+        });
         store.begin_swap(new_emb).unwrap();
         store.abort_swap();
         assert!(!store.is_migrating());
@@ -1422,9 +1549,14 @@ mod swap_tests {
     #[tokio::test]
     async fn double_begin_swap_errors() {
         let (mut store, _tmp) = open_temp_store().await;
-        let new_emb: Arc<dyn Embedder> = Arc::new(StubEmbedder { dim: 4, seed_bias: 0.0 });
+        let new_emb: Arc<dyn Embedder> = Arc::new(StubEmbedder {
+            dim: 4,
+            seed_bias: 0.0,
+        });
         store.begin_swap(Arc::clone(&new_emb)).unwrap();
-        let err = store.begin_swap(new_emb).expect_err("second begin should fail");
+        let err = store
+            .begin_swap(new_emb)
+            .expect_err("second begin should fail");
         assert!(err.to_string().contains("swap is already in progress"));
     }
 
@@ -1451,8 +1583,10 @@ mod swap_tests {
                 .await
                 .expect("reopen for migration");
             assert_eq!(store.pending_migration_count(), 0);
-            let new_emb: Arc<dyn Embedder> =
-                Arc::new(StubEmbedder { dim: 16, seed_bias: 0.0 });
+            let new_emb: Arc<dyn Embedder> = Arc::new(StubEmbedder {
+                dim: 16,
+                seed_bias: 0.0,
+            });
             store.begin_swap(Arc::clone(&new_emb)).unwrap();
             loop {
                 let pending = store.swap_pending(10);

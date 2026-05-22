@@ -12,8 +12,7 @@ use crate::{
     config::runtime::RuntimeConfig,
     provider::{
         AgentEndpoint, LlmRequest, Message, MessageContent, Role, StreamEvent,
-        failover::FailoverManager,
-        registry::ProviderRegistry,
+        failover::FailoverManager, registry::ProviderRegistry,
     },
 };
 
@@ -25,14 +24,16 @@ pub enum PreparseOrigin {
     Cron,
 }
 
-/// Handle certain fast preparse commands locally — without going through the agent queue.
-/// Returns `Some(reply_text)` for commands that can be answered immediately, `None` otherwise.
-/// This avoids blocking on the agent's sequential LLM loop for simple commands like /ls, /status.
+/// Handle certain fast preparse commands locally — without going through the
+/// agent queue. Returns `Some(reply_text)` for commands that can be answered
+/// immediately, `None` otherwise. This avoids blocking on the agent's
+/// sequential LLM loop for simple commands like /ls, /status.
 ///
-/// `channel` (e.g. "telegram", "wechat") and `peer_id` are passed through so commands
-/// that need to schedule deliveries back to the originating channel/peer (e.g. `/loop`)
-/// can populate a `CronDelivery` correctly. `origin` tells preparse whether the call
-/// came from a real user or from cron's replay of `/loop`-scheduled text.
+/// `channel` (e.g. "telegram", "wechat") and `peer_id` are passed through so
+/// commands that need to schedule deliveries back to the originating
+/// channel/peer (e.g. `/loop`) can populate a `CronDelivery` correctly.
+/// `origin` tells preparse whether the call came from a real user or from
+/// cron's replay of `/loop`-scheduled text.
 pub(crate) async fn try_preparse_locally(
     text: &str,
     handle: &crate::agent::AgentHandle,
@@ -76,7 +77,10 @@ pub(crate) async fn try_preparse_locally_with_account(
     // Workspace resolver (shared by /ls, /cat, shell cmds).
     let workspace = || {
         let base = crate::config::loader::base_dir();
-        handle.config.workspace.as_deref()
+        handle
+            .config
+            .workspace
+            .as_deref()
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| base.join("workspace"))
     };
@@ -92,48 +96,86 @@ pub(crate) async fn try_preparse_locally_with_account(
     }
     // /version
     if lower == "/version" {
-        return Some(txt(format!("rsclaw v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"))));
+        return Some(txt(format!(
+            "rsclaw v{}",
+            option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
+        )));
     }
     // /health
     if lower == "/health" {
         let secs = handle.started_at.elapsed().as_secs();
-        let uptime = if secs < 60 { format!("{secs}s") }
-            else if secs < 3600 { format!("{}m {}s", secs/60, secs%60) }
-            else { format!("{}h {}m", secs/3600, (secs%3600)/60) };
+        let uptime = if secs < 60 {
+            format!("{secs}s")
+        } else if secs < 3600 {
+            format!("{}m {}s", secs / 60, secs % 60)
+        } else {
+            format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+        };
         return Some(txt(format!("OK · up {uptime}")));
     }
     // /uptime
     if lower == "/uptime" {
         let secs = handle.started_at.elapsed().as_secs();
-        let s = if secs < 60 { format!("{secs}s") }
-            else if secs < 3600 { format!("{}m {}s", secs/60, secs%60) }
-            else { format!("{}h {}m", secs/3600, (secs%3600)/60) };
+        let s = if secs < 60 {
+            format!("{secs}s")
+        } else if secs < 3600 {
+            format!("{}m {}s", secs / 60, secs % 60)
+        } else {
+            format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+        };
         return Some(txt(s));
     }
     // /abort — set all abort flags
     if lower == "/abort" {
-        let flags = handle.abort_flags.read().expect("abort_flags lock poisoned");
+        let flags = handle
+            .abort_flags
+            .read()
+            .expect("abort_flags lock poisoned");
         let count = flags.len();
-        for f in flags.values() { f.store(true, Ordering::SeqCst); }
-        return Some(txt(if count > 0 { format!("abort signal sent ({count} session(s))") } else { "nothing to abort".to_owned() }));
+        for f in flags.values() {
+            f.store(true, Ordering::SeqCst);
+        }
+        return Some(txt(if count > 0 {
+            format!("abort signal sent ({count} session(s))")
+        } else {
+            "nothing to abort".to_owned()
+        }));
     }
     // /clear — abort running turns + signal session clear (fully non-blocking)
     if lower == "/clear" {
         // 1. Abort all running turns
-        let flags = handle.abort_flags.read().expect("abort_flags lock poisoned");
-        for f in flags.values() { f.store(true, Ordering::SeqCst); }
+        let flags = handle
+            .abort_flags
+            .read()
+            .expect("abort_flags lock poisoned");
+        for f in flags.values() {
+            f.store(true, Ordering::SeqCst);
+        }
         drop(flags);
         // 2. Signal runtime to clear sessions at next opportunity
         handle.clear_signal.store(true, Ordering::SeqCst);
-        return Some(txt(crate::i18n::t("session_cleared", crate::i18n::default_lang()).to_owned()));
+        return Some(txt(crate::i18n::t(
+            "session_cleared",
+            crate::i18n::default_lang(),
+        )
+        .to_owned()));
     }
     // /new — start a fresh conversation (new generation, no summary)
     if lower == "/new" {
-        let flags = handle.abort_flags.read().expect("abort_flags lock poisoned");
-        for f in flags.values() { f.store(true, Ordering::SeqCst); }
+        let flags = handle
+            .abort_flags
+            .read()
+            .expect("abort_flags lock poisoned");
+        for f in flags.values() {
+            f.store(true, Ordering::SeqCst);
+        }
         drop(flags);
         handle.new_session_signal.store(true, Ordering::SeqCst);
-        return Some(txt(crate::i18n::t("session_new", crate::i18n::default_lang()).to_owned()));
+        return Some(txt(crate::i18n::t(
+            "session_new",
+            crate::i18n::default_lang(),
+        )
+        .to_owned()));
     }
     // /status
     if lower == "/status" {
@@ -147,7 +189,11 @@ pub(crate) async fn try_preparse_locally_with_account(
             ws
         } else {
             let p = std::path::PathBuf::from(path_arg);
-            if p.is_absolute() { p } else { ws.join(path_arg) }
+            if p.is_absolute() {
+                p
+            } else {
+                ws.join(path_arg)
+            }
         };
         let out = tokio::process::Command::new("ls")
             .current_dir(&target)
@@ -155,7 +201,11 @@ pub(crate) async fn try_preparse_locally_with_account(
             .await
             .ok()?;
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        return Some(txt(if stdout.trim().is_empty() { "(empty directory)".to_owned() } else { stdout }));
+        return Some(txt(if stdout.trim().is_empty() {
+            "(empty directory)".to_owned()
+        } else {
+            stdout
+        }));
     }
     // /cat <path> — read file from workspace
     if lower.starts_with("/cat ") {
@@ -163,9 +213,14 @@ pub(crate) async fn try_preparse_locally_with_account(
         let ws = workspace();
         let target = {
             let p = std::path::PathBuf::from(path_arg);
-            if p.is_absolute() { p } else { ws.join(path_arg) }
+            if p.is_absolute() {
+                p
+            } else {
+                ws.join(path_arg)
+            }
         };
-        let content = tokio::fs::read_to_string(&target).await
+        let content = tokio::fs::read_to_string(&target)
+            .await
             .unwrap_or_else(|e| format!("error reading {}: {e}", target.display()));
         return Some(txt(content));
     }
@@ -175,7 +230,11 @@ pub(crate) async fn try_preparse_locally_with_account(
         let tmp_s = tmp_path.to_string_lossy().to_string();
         let ok = if cfg!(target_os = "macos") {
             tokio::process::Command::new("screencapture")
-                .args(["-x", &tmp_s]).status().await.map(|s| s.success()).unwrap_or(false)
+                .args(["-x", &tmp_s])
+                .status()
+                .await
+                .map(|s| s.success())
+                .unwrap_or(false)
         } else if cfg!(target_os = "windows") {
             let script = format!(
                 r#"Add-Type -AssemblyName System.Windows.Forms,System.Drawing
@@ -196,11 +255,18 @@ $g.Dispose();$b.Dispose()"#
                 #[cfg(not(target_os = "windows"))]
                 let mut cmd = tokio::process::Command::new("powershell");
                 cmd.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
-                    .status().await.map(|s| s.success()).unwrap_or(false)
+                    .status()
+                    .await
+                    .map(|s| s.success())
+                    .unwrap_or(false)
             }
         } else {
             tokio::process::Command::new("scrot")
-                .arg(&tmp_s).status().await.map(|s| s.success()).unwrap_or(false)
+                .arg(&tmp_s)
+                .status()
+                .await
+                .map(|s| s.success())
+                .unwrap_or(false)
         };
         if ok {
             if let Ok(bytes) = tokio::fs::read(&tmp_path).await {
@@ -218,7 +284,11 @@ $g.Dispose();$b.Dispose()"#
                 });
             }
         }
-        return Some(txt(crate::i18n::t("screenshot_failed", crate::i18n::default_lang()).to_owned()));
+        return Some(txt(crate::i18n::t(
+            "screenshot_failed",
+            crate::i18n::default_lang(),
+        )
+        .to_owned()));
     }
     // /webshot <url> — headless-Chrome screenshot of a web page. Distinct
     // from /ss (desktop) because the LLM's `web_browser action=screenshot`
@@ -229,7 +299,8 @@ $g.Dispose();$b.Dispose()"#
         let arg = t.get(9..).unwrap_or("").trim();
         if arg.is_empty() {
             return Some(txt(
-                "/webshot <url> — screenshot a web page. Example: /webshot https://example.com".to_owned(),
+                "/webshot <url> — screenshot a web page. Example: /webshot https://example.com"
+                    .to_owned(),
             ));
         }
         let url = if arg.starts_with("http://") || arg.starts_with("https://") {
@@ -333,13 +404,17 @@ $g.Dispose();$b.Dispose()"#
         if global.is_empty() {
             lines.push("  (none)".to_owned());
         } else {
-            for s in &global { lines.push(format!("  {s}")); }
+            for s in &global {
+                lines.push(format!("  {s}"));
+            }
         }
         lines.push(format!("Agent skills ({}):", agent.len()));
         if agent.is_empty() {
             lines.push("  (none)".to_owned());
         } else {
-            for s in &agent { lines.push(format!("  {s}")); }
+            for s in &agent {
+                lines.push(format!("  {s}"));
+            }
         }
         return Some(txt(lines.join("\n")));
     }
@@ -378,8 +453,7 @@ $g.Dispose();$b.Dispose()"#
         {
             Some(jobs.remove(idx - 1))
         } else {
-            jobs
-                .iter()
+            jobs.iter()
                 .position(|j| j["id"].as_str() == Some(key))
                 .map(|p| jobs.remove(p))
         };
@@ -440,10 +514,16 @@ $g.Dispose();$b.Dispose()"#
         let every_ms = match parse_interval_ms(interval_s) {
             Some(v) if v >= 2_000 => v,
             Some(_) => return Some(txt("/loop: interval must be >= 2s".to_owned())),
-            None => return Some(txt(format!("/loop: cannot parse interval `{interval_s}` (e.g. 30s, 5m, 1h, 2h30m)"))),
+            None => {
+                return Some(txt(format!(
+                    "/loop: cannot parse interval `{interval_s}` (e.g. 30s, 5m, 1h, 2h30m)"
+                )));
+            }
         };
         if peer_id.is_empty() || channel.is_empty() {
-            return Some(txt("/loop: missing channel/peer context (cannot schedule delivery)".to_owned()));
+            return Some(txt(
+                "/loop: missing channel/peer context (cannot schedule delivery)".to_owned(),
+            ));
         }
         let now_ms = chrono::Utc::now().timestamp_millis() as u64;
         let id = format!("loop-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
@@ -470,13 +550,22 @@ $g.Dispose();$b.Dispose()"#
         let zh = crate::i18n::default_lang() == "zh";
         let human = format_interval_ms(every_ms);
         return Some(txt(if zh {
-            format!("已安排循环（每 {human}）：{prompt}\nID: {id}\n停止：/cron remove {id}（通过 agent）")
+            format!(
+                "已安排循环（每 {human}）：{prompt}\nID: {id}\n停止：/cron remove {id}（通过 agent）"
+            )
         } else {
-            format!("Scheduled loop (every {human}): {prompt}\nID: {id}\nStop with: /cron remove {id} (via agent)")
+            format!(
+                "Scheduled loop (every {human}): {prompt}\nID: {id}\nStop with: /cron remove {id} (via agent)"
+            )
         }));
     }
-    // /watch — live event stream → chat. See docs/superpowers/specs/2026-05-13-watch-design.md
-    if lower == "/watch" || lower == "/watch -h" || lower == "/watch --help" || lower == "/watch help" {
+    // /watch — live event stream → chat. See
+    // docs/superpowers/specs/2026-05-13-watch-design.md
+    if lower == "/watch"
+        || lower == "/watch -h"
+        || lower == "/watch --help"
+        || lower == "/watch help"
+    {
         return Some(txt(watch_help_text(crate::i18n::default_lang())));
     }
     if let Some(body) = t.strip_prefix("/watch ") {
@@ -486,7 +575,7 @@ $g.Dispose();$b.Dispose()"#
             None => {
                 return Some(txt(
                     "/watch: registry not initialized (gateway still starting?)".to_owned(),
-                ))
+                ));
             }
         };
         let origin_for_watch = match origin {
@@ -494,7 +583,13 @@ $g.Dispose();$b.Dispose()"#
             PreparseOrigin::Cron => crate::gateway::watch::Origin::Cron,
         };
         return match registry
-            .handle_command(channel, peer_id, account.map(str::to_owned), body, origin_for_watch)
+            .handle_command(
+                channel,
+                peer_id,
+                account.map(str::to_owned),
+                body,
+                origin_for_watch,
+            )
             .await
         {
             crate::gateway::watch::WatchCommandReply::Reply(s) => Some(txt(s)),
@@ -508,7 +603,10 @@ $g.Dispose();$b.Dispose()"#
     }
     // /model — show current model; /models — list providers; /model <name> — switch
     if lower == "/model" || lower == "/models" {
-        let model = handle.config.model.as_ref()
+        let model = handle
+            .config
+            .model
+            .as_ref()
             .and_then(|m| m.primary.as_deref())
             .unwrap_or("default");
         let mut lines = vec![format!("Current model: {model}")];
@@ -521,21 +619,21 @@ $g.Dispose();$b.Dispose()"#
     }
     if lower.starts_with("/model ") {
         let model = t.get(7..).unwrap_or("").trim();
-        return Some(txt(format!("Model switched to: {model} (runtime only, use configure to persist)")));
+        return Some(txt(format!(
+            "Model switched to: {model} (runtime only, use configure to persist)"
+        )));
     }
     // /run <cmd>, /sh <cmd>, /exec <cmd>, ! <cmd>, $ <cmd> — shell execution
-    let shell_cmd: Option<&str> = if lower.starts_with("/run ")
-        || lower.starts_with("/sh ")
-        || lower.starts_with("/exec ")
-    {
-        t.find(' ').map(|i| t[i + 1..].trim())
-    } else if t.starts_with("! ") {
-        Some(t[2..].trim())
-    } else if t.starts_with("$ ") {
-        Some(t[2..].trim())
-    } else {
-        None
-    };
+    let shell_cmd: Option<&str> =
+        if lower.starts_with("/run ") || lower.starts_with("/sh ") || lower.starts_with("/exec ") {
+            t.find(' ').map(|i| t[i + 1..].trim())
+        } else if t.starts_with("! ") {
+            Some(t[2..].trim())
+        } else if t.starts_with("$ ") {
+            Some(t[2..].trim())
+        } else {
+            None
+        };
     if let Some(cmd) = shell_cmd {
         tracing::warn!(command = %cmd, "executing shell command via preparse (open dmPolicy)");
 
@@ -562,13 +660,20 @@ $g.Dispose();$b.Dispose()"#
                 let mut result = String::from_utf8_lossy(&o.stdout).into_owned();
                 let stderr = String::from_utf8_lossy(&o.stderr);
                 if !stderr.trim().is_empty() {
-                    if !result.is_empty() { result.push('\n'); }
+                    if !result.is_empty() {
+                        result.push('\n');
+                    }
                     result.push_str(stderr.trim());
                 }
                 if result.trim().is_empty() {
-                    if o.status.success() { "(no output)".to_owned() }
-                    else { format!("exit {}", o.status.code().unwrap_or(-1)) }
-                } else { result }
+                    if o.status.success() {
+                        "(no output)".to_owned()
+                    } else {
+                        format!("exit {}", o.status.code().unwrap_or(-1))
+                    }
+                } else {
+                    result
+                }
             }
             Err(e) => format!("exec error: {e}"),
         };
@@ -577,9 +682,9 @@ $g.Dispose();$b.Dispose()"#
     None
 }
 
-/// Check if a message is a fast preparse command that should bypass the per-user queue.
-/// These are local slash commands that execute instantly and should not wait behind
-/// slow LLM requests in the queue.
+/// Check if a message is a fast preparse command that should bypass the
+/// per-user queue. These are local slash commands that execute instantly and
+/// should not wait behind slow LLM requests in the queue.
 pub(crate) fn is_fast_preparse(text: &str) -> bool {
     let t = text.trim();
     let lower = t.to_lowercase();
@@ -662,11 +767,23 @@ fn format_interval_ms(ms: u64) -> String {
     let m = (secs % 3600) / 60;
     let s = secs % 60;
     let mut parts: Vec<String> = Vec::new();
-    if d > 0 { parts.push(format!("{d}d")); }
-    if h > 0 { parts.push(format!("{h}h")); }
-    if m > 0 { parts.push(format!("{m}m")); }
-    if s > 0 { parts.push(format!("{s}s")); }
-    if parts.is_empty() { "0s".to_owned() } else { parts.join("") }
+    if d > 0 {
+        parts.push(format!("{d}d"));
+    }
+    if h > 0 {
+        parts.push(format!("{h}h"));
+    }
+    if m > 0 {
+        parts.push(format!("{m}m"));
+    }
+    if s > 0 {
+        parts.push(format!("{s}s"));
+    }
+    if parts.is_empty() {
+        "0s".to_owned()
+    } else {
+        parts.join("")
+    }
 }
 
 /// Top-level /help text — one-screen overview of all preparse slash
@@ -891,14 +1008,20 @@ pub(crate) async fn btw_direct_call(
         messages: vec![Message {
             role: Role::User,
             content: MessageContent::Text(question.to_owned()),
+            rsclaw_hidden: None,
         }],
         tools: vec![],
         system: Some(system),
         max_tokens: Some(500),
         temperature: None,
         frequency_penalty: None,
-        thinking_budget: None, endpoint: AgentEndpoint::Flash, kv_cache_mode: 0, session_key: None,
-        system_shared: None, user_system: None,
+        thinking_budget: None,
+        endpoint: AgentEndpoint::Flash,
+        kv_cache_mode: 0,
+        session_key: None,
+        system_shared: None,
+        user_system: None,
+        recall: None,
     };
 
     // 3. Create a simple failover manager (no fallbacks needed for /btw).

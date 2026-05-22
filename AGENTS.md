@@ -261,6 +261,13 @@ it work") require constant clarification.
 
 ```
 - Env vars required: RSCLAW_BUILD_VERSION, RSCLAW_BUILD_DATE.
+- Format Rust with `cargo +nightly fmt` only. Do NOT use stable `cargo fmt`:
+  this repo's rustfmt config uses nightly-only options, and stable fmt creates
+  noisy/incorrect diffs. If formatting is needed, run the nightly command and
+  keep the diff scoped to files intentionally touched. Do not casually run
+  formatting across the whole repository; format only files changed in the
+  current task, and verify the resulting diff did not expand into unrelated
+  files.
 - Tag before build, not after.
 - Dev gateway flag: --dev (port 18889).
 - Test command: RSCLAW_BUILD_VERSION=dev RSCLAW_BUILD_DATE=test cargo test.

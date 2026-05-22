@@ -803,6 +803,7 @@ async fn message_read(
         .into_iter()
         .rev()
         .take(limit)
+        .map(crate::provider::redact_rsclaw_hidden_value)
         .collect::<Vec<serde_json::Value>>()
         .into_iter()
         .rev()
@@ -2117,6 +2118,7 @@ async fn get_session_messages(
             let visible: Vec<_> = messages
                 .into_iter()
                 .filter(|v| !is_compaction_message(v))
+                .map(crate::provider::redact_rsclaw_hidden_value)
                 .collect();
             Json(serde_json::json!({"messages": visible})).into_response()
         }

@@ -6,7 +6,6 @@
 mod common;
 
 use common::init_tls;
-
 use rsclaw::provider::{
     LlmProvider, LlmRequest, Message, MessageContent, Role, anthropic::AnthropicProvider,
     openai::OpenAiProvider,
@@ -290,6 +289,7 @@ fn stream_event_done_with_usage() {
             output: 50,
             cache_creation: 0,
             cache_read: 0,
+            ..Default::default()
         }),
     };
     match event {
