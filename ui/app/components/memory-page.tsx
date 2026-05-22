@@ -95,9 +95,14 @@ export function MemoryPage() {
       setTotal(docResp.total || 0);
       setStats(statsResp);
     } catch (e) {
+      // 401 {"error":"unauthorized"} (or any non-2xx) lands here because
+      // the API helpers throw on !r.ok instead of parsing the error body
+      // as data. Clear stats too so a stale (pre-deauth) stats row doesn't
+      // linger next to the error banner.
       setError(e instanceof Error ? e.message : String(e));
       setDocs([]);
       setTotal(0);
+      setStats(null);
     } finally {
       setLoading(false);
     }
