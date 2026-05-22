@@ -56,31 +56,66 @@ pub(crate) fn build_plugin_meta_tool_defs() -> Vec<ToolDef> {
     ]
 }
 
-fn plugin_tool_examples<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
-    let mut examples: Vec<&str> = names.into_iter().take(8).collect();
-    examples.sort_unstable();
-    if examples.is_empty() {
-        "(no declared tools)".to_owned()
-    } else {
-        examples.join(", ")
+/// Render a plugin's tools as `- name: one-line purpose` lines for the catalog.
+/// Tools named in `common` come first (in `common` order); the rest follow
+/// sorted by name. Output is capped at `cap`; the remainder is summarised with
+/// a pointer to plugin.search_tools. Byte-stable for a given input (KV-cache
+/// hygiene in the per-machine layer). `tools` is (name, description) pairs.
+fn plugin_tool_list(tools: &[(&str, &str)], common: &[String], cap: usize) -> String {
+    if tools.is_empty() {
+        return "  (no declared tools)".to_owned();
     }
+    let is_common = |n: &str| common.iter().any(|c| c == n);
+    // Common first, in declared order (only those that actually exist).
+    let mut ordered: Vec<(&str, &str)> = common
+        .iter()
+        .filter_map(|c| tools.iter().find(|(n, _)| n == c).copied())
+        .collect();
+    // Then the rest, sorted by name.
+    let mut rest: Vec<(&str, &str)> =
+        tools.iter().filter(|(n, _)| !is_common(n)).copied().collect();
+    rest.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    ordered.extend(rest);
+
+    let total = ordered.len();
+    let mut lines: Vec<String> = ordered
+        .iter()
+        .take(cap)
+        .map(|(n, d)| {
+            let d = d.trim();
+            if d.is_empty() {
+                format!("- {n}")
+            } else {
+                let short: String = d.chars().take(100).collect();
+                format!("- {n}: {}", short.trim_end())
+            }
+        })
+        .collect();
+    if total > cap {
+        let n = total - cap;
+        let noun = if n == 1 { "tool" } else { "tools" };
+        lines.push(format!("- …{n} more {noun} — plugin.search_tools to find them"));
+    }
+    lines.join("\n")
 }
 
+/// Render one plugin's catalog block, SKILL.md-style: heading with summary,
+/// then its common tools. `summary_or_desc` is the manifest summary (falls back
+/// to description upstream). `tools` is (name, description) pairs.
 fn render_plugin_catalog_block(
     name: &str,
     version: &str,
-    description: &str,
-    tool_count: usize,
-    tool_examples: &str,
+    summary_or_desc: &str,
+    tools: &[(&str, &str)],
+    common: &[String],
+    cap: usize,
 ) -> String {
+    let list = plugin_tool_list(tools, common, cap);
     format!(
-        "<plugin name=\"{name}\" version=\"{version}\" tools=\"{tool_count}\">\n\
-         {description}\n\
-         Tool catalog is available on demand. Use `plugin.search_tools` with \
-         plugin=\"{name}\" to find the right tool, `plugin.describe_tool` for \
-         exact arguments, then `plugin.invoke` to call it.\n\
-         Example tool names: {tool_examples}\n\
-         </plugin>"
+        "### {name} — {summary_or_desc} (v{version})\n\
+         Common tools (call via plugin.invoke {{plugin:\"{name}\", tool, arguments}}; \
+         use plugin.search_tools {{plugin:\"{name}\", query}} for others):\n\
+         {list}"
     )
 }
 
@@ -101,15 +136,18 @@ pub(crate) fn build_plugins_system(
     let mut blocks: Vec<(String, String)> = wasm_plugins
         .iter()
         .map(|p| {
-            let examples = plugin_tool_examples(p.tools.iter().map(|t| t.name.as_str()));
+            let tools: Vec<(&str, &str)> =
+                p.tools.iter().map(|t| (t.name.as_str(), t.description.as_str())).collect();
+            let blurb = p.summary.as_deref().or(p.description.as_deref()).unwrap_or("");
             (
                 p.name.clone(),
                 render_plugin_catalog_block(
                     &p.name,
                     p.version.as_deref().unwrap_or(""),
-                    p.description.as_deref().unwrap_or(""),
-                    p.tools.len(),
-                    &examples,
+                    blurb,
+                    &tools,
+                    &p.common_tools,
+                    8,
                 ),
             )
         })
@@ -117,16 +155,19 @@ pub(crate) fn build_plugins_system(
 
     if let Some(reg) = js_plugins {
         for (plugin_name, plugin) in reg.js_plugins_iter() {
-            let examples =
-                plugin_tool_examples(plugin.manifest.tools.iter().map(|t| t.name.as_str()));
+            let m = &plugin.manifest;
+            let tools: Vec<(&str, &str)> =
+                m.tools.iter().map(|t| (t.name.as_str(), t.description.as_str())).collect();
+            let blurb = m.summary.as_deref().or(m.description.as_deref()).unwrap_or("");
             blocks.push((
                 plugin_name.clone(),
                 render_plugin_catalog_block(
                     plugin_name,
-                    plugin.manifest.version.as_deref().unwrap_or(""),
-                    plugin.manifest.description.as_deref().unwrap_or(""),
-                    plugin.manifest.tools.len(),
-                    &examples,
+                    m.version.as_deref().unwrap_or(""),
+                    blurb,
+                    &tools,
+                    &m.common_tools,
+                    8,
                 ),
             ));
         }
@@ -147,11 +188,10 @@ pub(crate) fn build_plugins_system(
     // disturb the rsclaw-llm static prefix cache assumptions.
     Some(format!(
         "## Installed Plugins\n\
-         Plugins automate external services (e.g. image/video generation, \
-         marketplace ops). WASM plugins outrank JS plugins; plugins outrank \
-         skills and built-in tools when the user's task matches a plugin \
-         capability. Prefer plugin.invoke over a generic browser-automation \
-         flow.\n\n\
+         Each plugin bundles many tools. The common ones are listed below; \
+         call them with `plugin.invoke`, and use `plugin.search_tools` \
+         {{plugin, query}} to find any not listed. Prefer a plugin over a \
+         generic browser flow when it covers the task.\n\n\
          {}",
         blocks_text.join("\n\n"),
     ))
@@ -1913,20 +1953,40 @@ mod plugin_catalog_tests {
     }
 
     #[test]
-    fn plugin_catalog_block_is_compact_and_does_not_embed_tool_descriptions() {
-        let examples = plugin_tool_examples(["publish", "check_comments", "reply_comment"]);
-        let block = render_plugin_catalog_block(
-            "douyin",
-            "0.1.0",
-            "Douyin creator automation",
-            300,
-            &examples,
+    fn catalog_lists_common_tools_first_with_overflow() {
+        // (name, description) pairs; "publish"/"list" are common.
+        let tools = vec![
+            ("zeta", "z"),
+            ("publish", "Publish a video"),
+            ("list", "List items"),
+            ("alpha", "a"),
+        ];
+        let common = vec!["publish".to_string(), "list".to_string()];
+        let out = plugin_tool_list(&tools, &common, 3);
+        // Common first, in commonTools order; then others by name; capped at 3.
+        assert_eq!(
+            out,
+            "- publish: Publish a video\n- list: List items\n- alpha: a\n- …1 more tool — plugin.search_tools to find them"
         );
 
-        assert!(block.contains("tools=\"300\""));
+        // No common declared → first N by name + overflow.
+        let none: Vec<String> = vec![];
+        let out2 = plugin_tool_list(&tools, &none, 2);
+        assert_eq!(
+            out2,
+            "- alpha: a\n- list: List items\n- …2 more tools — plugin.search_tools to find them"
+        );
+
+        // Empty.
+        assert_eq!(plugin_tool_list(&[], &none, 5), "  (no declared tools)");
+    }
+
+    #[test]
+    fn catalog_block_is_skill_md_shaped() {
+        let tools = vec![("publish", "Publish a video")];
+        let block = render_plugin_catalog_block("douyin", "0.1.0", "Douyin ops", &tools, &[], 5);
+        assert!(block.contains("### douyin — Douyin ops"));
+        assert!(block.contains("- publish: Publish a video"));
         assert!(block.contains("plugin.search_tools"));
-        assert!(block.contains("publish"));
-        assert!(!block.contains("Publish content to Douyin. Supports video"));
-        assert!(!block.contains("Tools:\n  - douyin.publish"));
     }
 }
