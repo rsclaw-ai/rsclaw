@@ -3594,9 +3594,33 @@ impl AgentRuntime {
                 }
             }
 
-            // LLM-based entity extraction moved to compaction — the summary
-            // prompt includes an Entities section, so extraction happens at
-            // compaction time with zero extra LLM calls.
+            // L1 extraction (docs/memory-extraction-redesign.md, Phase 3):
+            // distill soft durable signal — preferences, identity, procedures,
+            // relationships, project state — that the deterministic pass above
+            // can't see. Gated by a cheap salience check so chit-chat / task
+            // requests never hit the LLM, and spawned so the flash call never
+            // delays this turn's reply.
+            if crate::agent::memory_extractor::salience_gate(text) {
+                let mem_clone = Arc::clone(mem);
+                let providers = Arc::clone(&self.providers);
+                let flash_model = self.resolve_flash_model_name();
+                let scope = doc_scope.clone();
+                let user_text = text.to_owned();
+                tokio::spawn(async move {
+                    crate::agent::memory_extractor::extract_l1(
+                        mem_clone,
+                        providers,
+                        flash_model,
+                        scope,
+                        user_text,
+                    )
+                    .await;
+                });
+            }
+
+            // Note: structured-entity extraction from the compaction summary
+            // still runs at compaction time (zero extra LLM calls there); L1
+            // above is the per-turn complement for the soft kinds.
         }
 
         // NOTE: We intentionally do NOT extract entities from reply.text.
