@@ -516,8 +516,14 @@ impl AgentRuntime {
             // for more events The collected events are already in
             // `events` variable
 
-            // Inject result back into main agent's inbox so it can act on the result
-            // (e.g. send_file). This triggers a new agent turn.
+            // Inject the result so the agent can act on it (e.g. send_file), but
+            // on a DETACHED follow-up session — NOT the originating live session.
+            // Reusing the live `session_key` re-activates the user's turn: the WS
+            // desktop client is subscribed to that session, sees it go busy again
+            // after it had already settled, and never clears its input "wait".
+            // The follow-up's reply is still delivered to the user via the
+            // notification path below; the completion notification above already
+            // carried the summary + files.
             let file_paths: Vec<String> = result_files.iter().map(|(_, _, p)| p.clone()).collect();
             let inject_text = if file_paths.is_empty() {
                 format!("[OpenCode completed] {}", if result_summary.is_empty() { "Task finished.".to_owned() } else { result_summary })
@@ -526,8 +532,9 @@ impl AgentRuntime {
                     file_paths.join(", "))
             };
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<AgentReply>();
+            let followup_session = format!("{self_session}:acp-followup");
             let inject_msg = AgentMessage {
-                session_key: self_session,
+                session_key: followup_session,
                 text: inject_text,
                 channel: self_channel.clone(),
                 peer_id: self_peer_id,
