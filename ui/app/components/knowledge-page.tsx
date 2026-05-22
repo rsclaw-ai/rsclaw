@@ -14,7 +14,8 @@
  * to gateway logs — there's no enable knob, the service opens
  * automatically at startup.
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { forwardRef, useCallback, useEffect, useRef, useState } from "react";
+import { Virtuoso } from "react-virtuoso";
 
 import {
   KbCollection,
@@ -104,6 +105,19 @@ function isDocStuck(d: KbDoc, now = Date.now()): boolean {
   const created = new Date(d.createdAt).getTime();
   return Number.isFinite(created) && now - created > STUCK_INDEXING_MS;
 }
+
+// Virtuoso `List` slot — restores the 8px 10px gutter the old plain
+// scroll container had (Virtuoso renders items into this element).
+const docListComponent = forwardRef<
+  HTMLDivElement,
+  { style?: React.CSSProperties; children?: React.ReactNode }
+>(function DocList({ style, children }, ref) {
+  return (
+    <div ref={ref} style={{ ...style, padding: "8px 10px" }}>
+      {children}
+    </div>
+  );
+});
 
 const fmtBytes = (n: number): string => {
   if (n < 1024) return `${n} B`;
@@ -478,7 +492,7 @@ export function KnowledgePage() {
   const showingHits = lastQuery.length > 0;
 
   return (
-    <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", position: "relative" }}>
+    <div style={{ height: "100%", minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column", position: "relative" }}>
       {/* Header */}
       <div
         style={{
@@ -846,20 +860,26 @@ export function KnowledgePage() {
                 />
               </div>
 
-              {/* Doc list */}
-              <div style={{ flex: 1, overflowY: "auto", padding: "8px 10px" }}>
-                {docsLoading ? (
-                  <div style={{ textAlign: "center", padding: 20, color: V2.t3, fontSize: 11 }}>...</div>
-                ) : docs.length === 0 ? (
-                  <div style={{ textAlign: "center", padding: "40px 0", color: V2.t3, fontSize: 12 }}>
-                    {zh ? "尚无文档。可拖拽文件到窗口，或使用上方按钮上传。" : "No docs yet. Drag files into the window or use the buttons above."}
-                  </div>
-                ) : (
-                  docs.map((d) => {
+              {/* Doc list — virtualized (a RAG corpus can hold thousands
+                  of docs; only the visible window renders). */}
+              {docsLoading ? (
+                <div style={{ flex: 1, textAlign: "center", padding: 20, color: V2.t3, fontSize: 11 }}>...</div>
+              ) : docs.length === 0 ? (
+                <div style={{ flex: 1, textAlign: "center", padding: "40px 0", color: V2.t3, fontSize: 12 }}>
+                  {zh ? "尚无文档。可拖拽文件到窗口，或使用上方按钮上传。" : "No docs yet. Drag files into the window or use the buttons above."}
+                </div>
+              ) : (
+                <Virtuoso
+                  style={{ flex: 1, minHeight: 0 }}
+                  data={docs}
+                  computeItemKey={(_, d) => d.id}
+                  components={{
+                    List: docListComponent,
+                  }}
+                  itemContent={(_, d) => {
                     const stuck = isDocStuck(d);
                     return (
                       <div
-                        key={d.id}
                         onClick={() => setDetailDoc(d)}
                         style={{
                           padding: "10px 12px",
@@ -931,9 +951,9 @@ export function KnowledgePage() {
                         </div>
                       </div>
                     );
-                  })
-                )}
-              </div>
+                  }}
+                />
+              )}
             </>
           )}
         </div>
