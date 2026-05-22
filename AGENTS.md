@@ -221,6 +221,11 @@ it work") require constant clarification.
 - LLM-facing prompts (system messages, tool descriptions, summarize/analyze prompts,
   agent instructions) are ALWAYS English. Hardcoded English literals in source.
   English instruction-following is consistently strongest across providers.
+- String truncation: NEVER `&s[..n]` or `&s[..s.len().min(n)]` — both PANIC when the
+  byte offset lands inside a multi-byte char (CJK is the norm here). Use
+  `crate::util::truncate_str(s, max_bytes)` (bin crate: `rsclaw::util::truncate_str`)
+  for ALL log/error/preview truncation. Bare `[..N]` is acceptable only on
+  ASCII-by-construction strings (hex ids, auth tokens, ISO timestamps, market codes).
 - Config fields: camelCase in JSON5, snake_case in Rust via #[serde(rename_all = "camelCase")].
 - Secrets: SecretOrString — plain string or { source: "env", id: "VAR_NAME" }.
 - Channel handler order: group policy → DM policy (pairing/allowlist) → per-user queue → agent dispatch.
