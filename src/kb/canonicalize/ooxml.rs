@@ -46,8 +46,6 @@ fn decode_xml_entities(s: &str) -> String {
 
 pub const DOCX_MIME: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-pub const XLSX_MIME: &str =
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 pub const PPTX_MIME: &str =
     "application/vnd.openxmlformats-officedocument.presentationml.presentation";
 
@@ -132,38 +130,7 @@ impl Canonicalizer for DocxCanonicalizer {
     }
 }
 
-// --- xlsx ----------------------------------------------------------------
-
-pub struct XlsxCanonicalizer;
-
-impl Canonicalizer for XlsxCanonicalizer {
-    fn source_kind(&self) -> KbSourceKind {
-        KbSourceKind::Doc
-    }
-    fn supports_mime(&self, mime: &str) -> bool {
-        mime == XLSX_MIME
-    }
-    fn canonicalize(&self, input: CanonicalizeInput<'_>) -> Result<Option<CanonicalizedSource>> {
-        // v1: pull every distinct cell string from the shared-string table.
-        // Loses grid layout but captures all the text the KB needs to embed.
-        // Numeric-only sheets (no shared strings) yield no text → Ok(None).
-        let xml = match read_zip_part(input.bytes, "xl/sharedStrings.xml")? {
-            Some(x) => x,
-            None => return Ok(None),
-        };
-        let cells: Vec<String> = extract_tag_text(&xml, "t")
-            .into_iter()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if cells.is_empty() {
-            return Ok(None);
-        }
-        let md = cells.join("\n");
-        let extra = serde_json::json!({ "n_strings": cells.len() });
-        Ok(Some(make_source(&input, md, "Untitled.xlsx", extra)))
-    }
-}
+// xlsx now lives in `spreadsheet.rs` (calamine-based; also handles .xls/.ods).
 
 // --- pptx ----------------------------------------------------------------
 
@@ -255,17 +222,6 @@ mod canon_tests {
             .unwrap()
             .expect("some");
         assert_eq!(out.markdown, "第一段中文\n\nsecond paragraph");
-    }
-
-    #[test]
-    fn xlsx_extracts_shared_strings() {
-        let sst = r#"<sst><si><t>姓名</t></si><si><t>Alice</t></si><si><t xml:space="preserve">Bob </t></si></sst>"#;
-        let bytes = make_zip(&[("xl/sharedStrings.xml", sst)]);
-        let out = XlsxCanonicalizer
-            .canonicalize(input(&bytes, XLSX_MIME))
-            .unwrap()
-            .expect("some");
-        assert_eq!(out.markdown, "姓名\nAlice\nBob");
     }
 
     #[test]

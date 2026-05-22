@@ -11,6 +11,8 @@ pub mod md;
 pub mod html;
 pub mod pdf;
 pub mod ooxml;
+pub mod spreadsheet;
+pub mod legacy;
 pub mod email;
 pub mod mime;
 

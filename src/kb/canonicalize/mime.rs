@@ -4,10 +4,11 @@ use super::*;
 use crate::kb::canonicalize::{
     email::{EmlCanonicalizer, MboxCanonicalizer, EML_MIME, MBOX_MIME},
     html::HtmlCanonicalizer, md::MdCanonicalizer,
-    ooxml::{
-        DocxCanonicalizer, PptxCanonicalizer, XlsxCanonicalizer, DOCX_MIME, PPTX_MIME, XLSX_MIME,
-    },
-    pdf::PdfCanonicalizer, text::TextCanonicalizer,
+    legacy::{LegacyOfficeCanonicalizer, DOC_MIME, PPT_MIME},
+    ooxml::{DocxCanonicalizer, PptxCanonicalizer, DOCX_MIME, PPTX_MIME},
+    pdf::PdfCanonicalizer,
+    spreadsheet::{SpreadsheetCanonicalizer, ODS_MIME, XLS_MIME, XLSX_MIME},
+    text::TextCanonicalizer,
 };
 
 /// Detect MIME from byte magic + filename hint. Conservative: returns
@@ -30,6 +31,13 @@ pub fn detect_mime(bytes: &[u8], filename_hint: Option<&str>) -> String {
             "docx" => return DOCX_MIME.into(),
             "xlsx" => return XLSX_MIME.into(),
             "pptx" => return PPTX_MIME.into(),
+            // Spreadsheets calamine can read directly (legacy Excel + ODF).
+            "xls" => return XLS_MIME.into(),
+            "ods" => return ODS_MIME.into(),
+            // Legacy binary Word/PowerPoint: detected so we can return a
+            // clear "save as .docx/.pptx" message instead of a generic error.
+            "doc" => return DOC_MIME.into(),
+            "ppt" => return PPT_MIME.into(),
             "eml" => return EML_MIME.into(),
             "mbox" => return MBOX_MIME.into(),
             _ => {}
@@ -55,8 +63,9 @@ pub fn canonicalize_by_mime(
         &PdfCanonicalizer,
         &TextCanonicalizer,
         &DocxCanonicalizer,
-        &XlsxCanonicalizer,
+        &SpreadsheetCanonicalizer,
         &PptxCanonicalizer,
+        &LegacyOfficeCanonicalizer,
         &EmlCanonicalizer,
         &MboxCanonicalizer,
     ];
@@ -89,6 +98,26 @@ mod tests {
         // Email: routed by extension (RFC822 has no reliable magic).
         assert_eq!(detect_mime(b"From: a@b\r\n", Some("msg.eml")), EML_MIME);
         assert_eq!(detect_mime(b"From a@b\r\n", Some("inbox.mbox")), MBOX_MIME);
+        // Legacy/ODF spreadsheets and binary Office (OLE2 magic, by extension).
+        assert_eq!(detect_mime(b"\xd0\xcf\x11\xe0", Some("old.xls")), XLS_MIME);
+        assert_eq!(detect_mime(b"PK\x03\x04", Some("calc.ods")), ODS_MIME);
+        assert_eq!(detect_mime(b"\xd0\xcf\x11\xe0", Some("old.doc")), DOC_MIME);
+        assert_eq!(detect_mime(b"\xd0\xcf\x11\xe0", Some("old.ppt")), PPT_MIME);
+    }
+
+    #[test]
+    fn legacy_doc_ppt_give_actionable_error() {
+        for (mime, want) in [(DOC_MIME, ".docx"), (PPT_MIME, ".pptx")] {
+            let err = canonicalize_by_mime(CanonicalizeInput {
+                bytes: b"\xd0\xcf\x11\xe0junk",
+                mime,
+                hint_title: None,
+                logical_source_id_seed: None,
+            })
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(want), "error should suggest {want}: {err}");
+        }
     }
 
     #[test]
