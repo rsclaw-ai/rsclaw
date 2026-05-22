@@ -307,6 +307,10 @@ pub fn build_router(state: AppState) -> Router {
                 )),
         )
         .route("/tools/execute", post(execute_tool))
+        .route("/hub/catalog", get(hub_catalog))
+        .route("/hub/skills", get(hub_skills))
+        .route("/hub/plugins", get(hub_plugins))
+        .route("/hub/tools", get(hub_tools))
         .route("/computer-use/permissions", get(computer_use_permissions_list))
         .route(
             "/computer-use/permissions/{agent_id}/{app}",
@@ -1047,6 +1051,103 @@ async fn execute_tool(
     }
 
     Json(serde_json::json!({"error": "use 'plugin.tool' format, e.g. 'jimeng.txt2img'"}))
+}
+
+// ---------------------------------------------------------------------------
+// Hub catalog (read-only) — for the desktop tools/skills/plugins module.
+// Available (from the signed allowlist/tools manifest) + installed status.
+// Lazy-fetches the caches if missing; fail-open (returns cached/empty on hub down).
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct SkillCatalogEntry {
+    slug: String,
+    version: String,
+    installed: bool,
+    publisher: String,
+    description: String,
+}
+
+#[derive(Serialize)]
+struct PluginCatalogEntry {
+    slug: String,
+    version: String,
+    installed: bool,
+    description: String,
+}
+
+#[derive(Serialize)]
+struct HubCatalogResponse {
+    tools: Vec<crate::cmd::tools::ToolCatalogEntry>,
+    skills: Vec<SkillCatalogEntry>,
+    plugins: Vec<PluginCatalogEntry>,
+}
+
+fn installed_skill(slug: &str) -> bool {
+    crate::config::loader::base_dir().join("skills").join(slug).join("SKILL.md").is_file()
+}
+
+fn installed_plugin(slug: &str) -> bool {
+    crate::config::loader::base_dir().join("plugins").join(slug).is_dir()
+}
+
+async fn build_skill_catalog() -> Vec<SkillCatalogEntry> {
+    if crate::skill::allowlist::snapshot().counts() == (0, 0) {
+        let _ = crate::skill::allowlist::refresh().await; // lazy; fail-open
+    }
+    crate::skill::allowlist::snapshot()
+        .skills_sorted()
+        .into_iter()
+        .map(|e| SkillCatalogEntry {
+            installed: installed_skill(&e.slug),
+            slug: e.slug,
+            version: e.version,
+            publisher: e.publisher,
+            description: e.description,
+        })
+        .collect()
+}
+
+async fn build_plugin_catalog() -> Vec<PluginCatalogEntry> {
+    if crate::skill::allowlist::snapshot().counts() == (0, 0) {
+        let _ = crate::skill::allowlist::refresh().await;
+    }
+    crate::skill::allowlist::snapshot()
+        .plugins_sorted()
+        .into_iter()
+        .map(|e| PluginCatalogEntry {
+            installed: installed_plugin(&e.slug),
+            slug: e.slug,
+            version: e.version,
+            description: e.description,
+        })
+        .collect()
+}
+
+/// GET /api/v1/hub/catalog — tools + skills + plugins in one shot.
+async fn hub_catalog() -> impl IntoResponse {
+    crate::cmd::tools::ensure_manifest_cached().await;
+    Json(HubCatalogResponse {
+        tools: crate::cmd::tools::tools_catalog(),
+        skills: build_skill_catalog().await,
+        plugins: build_plugin_catalog().await,
+    })
+}
+
+/// GET /api/v1/hub/skills
+async fn hub_skills() -> impl IntoResponse {
+    Json(build_skill_catalog().await)
+}
+
+/// GET /api/v1/hub/plugins
+async fn hub_plugins() -> impl IntoResponse {
+    Json(build_plugin_catalog().await)
+}
+
+/// GET /api/v1/hub/tools
+async fn hub_tools() -> impl IntoResponse {
+    crate::cmd::tools::ensure_manifest_cached().await;
+    Json(crate::cmd::tools::tools_catalog())
 }
 
 async fn health(State(_state): State<AppState>) -> impl IntoResponse {

@@ -41,6 +41,10 @@ pub struct AllowEntry {
     pub publisher: String,
     #[serde(default)]
     pub audited_at: String,
+    /// One-line description (from SKILL.md frontmatter / plugin manifest, written
+    /// by the hub packager). Empty on older manifests.
+    #[serde(default)]
+    pub description: String,
 }
 
 #[derive(Debug, Default)]
@@ -58,6 +62,18 @@ impl Allowlist {
     }
     pub fn counts(&self) -> (usize, usize) {
         (self.skills.len(), self.plugins.len())
+    }
+    /// All audited skill entries, sorted by slug (stable for the catalog API).
+    pub fn skills_sorted(&self) -> Vec<AllowEntry> {
+        let mut v: Vec<_> = self.skills.values().cloned().collect();
+        v.sort_by(|a, b| a.slug.cmp(&b.slug));
+        v
+    }
+    /// All audited plugin entries, sorted by slug.
+    pub fn plugins_sorted(&self) -> Vec<AllowEntry> {
+        let mut v: Vec<_> = self.plugins.values().cloned().collect();
+        v.sort_by(|a, b| a.slug.cmp(&b.slug));
+        v
     }
 }
 
@@ -296,6 +312,7 @@ mod tests {
             sha256: String::new(),
             publisher: String::new(),
             audited_at: String::new(),
+            description: String::new(),
         };
         let dir = std::path::Path::new("/nonexistent");
         // Human CLI path (require_pin = false): no sha256 → skip, legacy behavior.

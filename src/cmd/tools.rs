@@ -174,6 +174,54 @@ pub(crate) fn installed_tools(tools_dir: &std::path::Path) -> Vec<(String, Optio
     out
 }
 
+/// One tool row for the `/api/v1/hub/*` catalog.
+#[derive(serde::Serialize)]
+pub struct ToolCatalogEntry {
+    pub name: String,
+    pub description: String,
+    /// Available version (from the manifest), empty if unknown.
+    pub version: String,
+    pub installed: bool,
+    pub installed_version: Option<String>,
+}
+
+/// Assemble the tools catalog: available (cache ∪ baseline) + installed status.
+/// Description comes from the compiled-in `TOOLS` label; version from the cache.
+pub fn tools_catalog() -> Vec<ToolCatalogEntry> {
+    let dir = tools_dir();
+    let cache = load_manifest_cache(&dir);
+    let installed = installed_tools(&dir);
+    available_tools(cache.as_ref())
+        .into_iter()
+        .map(|name| {
+            let description = TOOLS
+                .iter()
+                .find(|d| d.name == name)
+                .map(|d| d.display.to_owned())
+                .unwrap_or_default();
+            let version = cache
+                .as_ref()
+                .and_then(|c| c.pointer(&format!("/tools/{name}/version")))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            let inst = installed.iter().find(|(n, _)| n == &name);
+            ToolCatalogEntry {
+                installed: inst.is_some(),
+                installed_version: inst.and_then(|(_, v)| v.clone()),
+                name,
+                description,
+                version,
+            }
+        })
+        .collect()
+}
+
+/// Lazy-populate the tools manifest cache (no-op if present). For the catalog API.
+pub async fn ensure_manifest_cached() {
+    fetch_manifest_if_missing().await;
+}
+
 /// First-startup fetch only runs when there is no cache yet (NOT an
 /// auto-update poll — later startups always skip).
 fn should_fetch_manifest(tools_dir: &std::path::Path) -> bool {
