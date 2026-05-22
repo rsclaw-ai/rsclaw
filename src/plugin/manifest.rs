@@ -11,7 +11,7 @@
 //!   name: "myplugin",
 //!   version: "1.0.0",
 //!   description: "What the plugin does (shown to the LLM)",
-//!   runtime: "wasm",            // "wasm" | "node" | "bun" | "deno"
+//!   runtime: "wasm",            // "wasm" | "js" | "node" | "bun" | "deno"
 //!   entry: "./myplugin.wasm",   // or "./dist/index.js"
 //!   tools: [
 //!     {
@@ -56,7 +56,7 @@ pub struct PluginManifest {
     pub version: Option<String>,
     /// Human-readable description.
     pub description: Option<String>,
-    /// Runtime: "node" | "bun" | "deno" | "wasm". Defaults to "node".
+    /// Runtime: "js" | "node" | "bun" | "deno" | "wasm". Defaults to "js".
     #[serde(default = "default_runtime")]
     pub runtime: String,
     /// Entry point relative to the plugin directory.
@@ -144,7 +144,7 @@ pub struct PluginToolDef {
 }
 
 fn default_runtime() -> String {
-    "node".to_owned()
+    "js".to_owned()
 }
 
 impl PluginManifest {
@@ -314,7 +314,7 @@ mod tests {
 
         let m = load_manifest(tmp.path()).expect("load");
         assert_eq!(m.name, "legacy");
-        assert_eq!(m.runtime, "node"); // default
+        assert_eq!(m.runtime, "js"); // default
         assert!(!m.is_wasm());
     }
 
