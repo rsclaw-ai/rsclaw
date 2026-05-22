@@ -769,7 +769,7 @@ impl Channel for QQBotChannel {
                     warn!("qq: image upload failed {upload_status}: {upload_text}");
                     continue;
                 }
-                info!(response = &upload_text[..upload_text.len().min(500)], "qq: image upload response");
+                info!(response = crate::util::truncate_str(&upload_text, 500), "qq: image upload response");
                 let file_info: serde_json::Value = match serde_json::from_str(&upload_text) {
                     Ok(v) => v,
                     Err(e) => {

@@ -8,6 +8,12 @@
 
 use std::{collections::HashMap, process::Stdio, sync::Arc};
 
+/// Char-safe log preview — delegates to the shared [`crate::util::truncate_str`]
+/// so ACP request/response previews never split a CJK char.
+fn preview(s: &str, max: usize) -> &str {
+    crate::util::truncate_str(s, max)
+}
+
 use anyhow::{Context, Result};
 use futures::future::BoxFuture;
 use tokio::{
@@ -1156,7 +1162,7 @@ impl AcpClient {
             method,
             id,
             timeout_secs = timeout_duration.as_secs(),
-            request_preview = &request[..request.len().min(200)],
+            request_preview = preview(&request, 200),
             "ACP: sending request"
         );
 
@@ -1328,7 +1334,7 @@ async fn run_subprocess(
 
                         tracing::info!(
                             request_id,
-                            request_preview = &request[..request.len().min(200)],
+                            request_preview = preview(&request, 200),
                             "ACP subprocess: writing request to stdin"
                         );
 
@@ -1377,7 +1383,7 @@ async fn run_subprocess(
                                                 if let Some(method) = method_field {
                                                     tracing::info!("ACP subprocess: received notification method={} id={:?}", method, resp_id);
                                                 } else if resp_id.is_some() {
-                                                    tracing::info!("ACP subprocess: received response id={:?} preview={}", resp_id, &line[..line.len().min(200)]);
+                                                    tracing::info!("ACP subprocess: received response id={:?} preview={}", resp_id, preview(&line, 200));
                                                 } else {
                                                     tracing::debug!("ACP subprocess: received message: {}", line);
                                                 }

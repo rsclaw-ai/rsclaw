@@ -554,7 +554,7 @@ async fn transcribe_local(audio_bytes: &[u8], file_name: &str) -> Result<String>
     if !stderr_str.is_empty() {
         debug!(
             "whisper stderr: {}",
-            &stderr_str[..stderr_str.len().min(500)]
+            crate::util::truncate_str(&stderr_str, 500)
         );
     }
 

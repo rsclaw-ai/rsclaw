@@ -66,7 +66,7 @@ pub async fn cmd_secrets(sub: SecretsCommand) -> Result<()> {
                             "  {}  {}={}",
                             label,
                             cyan(k),
-                            &s[..s.len().min(4)].replace(|_: char| true, "*")
+                            crate::util::truncate_str(&s, 4).replace(|_: char| true, "*")
                         );
                         count += 1;
                     }

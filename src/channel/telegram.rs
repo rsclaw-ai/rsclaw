@@ -452,12 +452,12 @@ impl TelegramChannel {
         let resp: TgResponse<TgFile> = match serde_json::from_str(&raw_text) {
             Ok(r) => r,
             Err(e) => {
-                warn!(file_id = file_id, response = &raw_text[..raw_text.len().min(300)], "Telegram getFile parse error: {e}");
+                warn!(file_id = file_id, response = crate::util::truncate_str(&raw_text, 300), "Telegram getFile parse error: {e}");
                 anyhow::bail!("Telegram getFile parse error");
             }
         };
         if !resp.ok {
-            warn!(file_id = file_id, response = &raw_text[..raw_text.len().min(300)], "Telegram getFile failed");
+            warn!(file_id = file_id, response = crate::util::truncate_str(&raw_text, 300), "Telegram getFile failed");
         }
 
         let file_path = match resp.result {

@@ -278,7 +278,7 @@ impl WeComChannel {
 
         let cmd = frame.get("cmd").and_then(|c| c.as_str()).unwrap_or("");
         let raw_preview = frame.to_string();
-        debug!(cmd, raw = &raw_preview[..raw_preview.len().min(300)], "WeCom WS: frame received");
+        debug!(cmd, raw = crate::util::truncate_str(&raw_preview, 300), "WeCom WS: frame received");
 
         // Route upload RPC responses back to pending waiters via req_id.
         // These frames are responses to our own requests (errcode present,

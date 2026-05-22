@@ -253,7 +253,7 @@ pub fn verify_skill_content(
             "audited-hash mismatch for '{}': SKILL.md content changed since audit \
              (got {}, expected {})",
             entry.slug,
-            &got[..got.len().min(12)],
+            crate::util::truncate_str(&got, 12),
             &entry.sha256[..entry.sha256.len().min(12)],
         );
     }

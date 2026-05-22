@@ -670,7 +670,7 @@ impl FeishuChannel {
                     info!(
                         len = text.len(),
                         "feishu: WS frame received: {}",
-                        &text[..text.len().min(300)]
+                        crate::util::truncate_str(&text, 300)
                     );
                     self.handle_ws_event(&text).await;
                 }

@@ -391,7 +391,7 @@ async fn cmd_acp(sub: AcpCommand) -> Result<()> {
             eprintln!(
                 "[rsclaw] Running task with {}: {}",
                 command,
-                &task[..task.len().min(50)]
+                rsclaw::util::truncate_str(&task, 50)
             );
 
             let client = AcpClient::spawn(&command, &["acp"]).await?;

@@ -2061,7 +2061,7 @@ async fn fetch_weather_cn(
         None => {
             tracing::warn!(
                 expected_var = %cfg.js_var_name,
-                head = %&body[..body.len().min(80)],
+                head = %crate::util::truncate_str(&body, 80),
                 "weather.com.cn: body doesn't start with expected JS var assignment"
             );
             return None;

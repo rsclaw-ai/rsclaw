@@ -745,7 +745,7 @@ impl DingTalkChannel {
                     idle_deadline = tokio::time::Instant::now() + Duration::from_secs(90);
                     match msg {
                         Some(Ok(WsMessage::Text(text))) => {
-                            debug!(text_len = text.len(), preview = &text[..text.len().min(200)], "DingTalk: WS text frame received");
+                            debug!(text_len = text.len(), preview = crate::util::truncate_str(&text, 200), "DingTalk: WS text frame received");
                             match serde_json::from_str::<Value>(&text) {
                                 Ok(event) => {
                                     // Check if this is a system ping/pong.

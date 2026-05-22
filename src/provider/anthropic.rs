@@ -88,7 +88,7 @@ impl LlmProvider for AnthropicProvider {
                 let resp_body = resp.text().await.unwrap_or_default();
                 let req_body_str = serde_json::to_string(&body).unwrap_or_default();
                 let req_body_preview = if req_body_str.len() > 4000 {
-                    format!("{}...[truncated, total {} bytes]", &req_body_str[..4000], req_body_str.len())
+                    format!("{}...[truncated, total {} bytes]", crate::util::truncate_str(&req_body_str, 4000), req_body_str.len())
                 } else {
                     req_body_str
                 };

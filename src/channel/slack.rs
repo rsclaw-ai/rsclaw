@@ -622,7 +622,7 @@ fn slack_process_file(filename: &str, bytes: &[u8]) -> String {
     let lower = filename.to_lowercase();
     if lower.ends_with(".pdf") {
         if let Ok(text) = crate::agent::doc::safe_extract_pdf_from_mem(bytes) {
-            return format!("[PDF: {filename}]\n{}", &text[..text.len().min(20000)]);
+            return format!("[PDF: {filename}]\n{}", crate::util::truncate_str(&text, 20000));
         }
         // Fallback to pdftotext CLI
         let tmp = std::env::temp_dir().join(format!("rsclaw_slack_{filename}"));
@@ -634,7 +634,7 @@ fn slack_process_file(filename: &str, bytes: &[u8]) -> String {
             if let Ok(o) = output {
                 if o.status.success() {
                     let text = String::from_utf8_lossy(&o.stdout);
-                    return format!("[PDF: {filename}]\n{}", &text[..text.len().min(20000)]);
+                    return format!("[PDF: {filename}]\n{}", crate::util::truncate_str(&text, 20000));
                 }
             }
             format!("[PDF: {filename} ({} bytes)]", bytes.len())
@@ -646,7 +646,7 @@ fn slack_process_file(filename: &str, bytes: &[u8]) -> String {
             let label = if lower.ends_with(".docx") { "Word" }
                 else if lower.ends_with(".xlsx") { "Excel" }
                 else { "PowerPoint" };
-            format!("[{label}: {filename}]\n{}", &text[..text.len().min(20000)])
+            format!("[{label}: {filename}]\n{}", crate::util::truncate_str(&text, 20000))
         } else {
             let label = if lower.ends_with(".docx") { "Word" }
                 else if lower.ends_with(".xlsx") { "Excel" }
@@ -655,7 +655,7 @@ fn slack_process_file(filename: &str, bytes: &[u8]) -> String {
         }
     } else if slack_is_text_file(&lower) {
         let text = String::from_utf8_lossy(bytes);
-        format!("[File: {filename}]\n```\n{}\n```", &text[..text.len().min(20000)])
+        format!("[File: {filename}]\n```\n{}\n```", crate::util::truncate_str(&text, 20000))
     } else {
         let ws = crate::config::loader::base_dir().join("workspace/uploads");
         let _ = std::fs::create_dir_all(&ws);

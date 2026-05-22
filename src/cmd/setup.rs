@@ -2852,7 +2852,7 @@ async fn test_provider_connectivity(
         Ok(())
     } else {
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("{status}: {}", &body[..body.len().min(200)]);
+        anyhow::bail!("{status}: {}", crate::util::truncate_str(&body, 200));
     }
 }
 
@@ -2922,7 +2922,7 @@ async fn probe_rsclaw_connectivity(
             )),
             _ => Err(anyhow::anyhow!(
                 "{status}: {}",
-                &body[..body.len().min(200)]
+                crate::util::truncate_str(&body, 200)
             )),
         };
     }

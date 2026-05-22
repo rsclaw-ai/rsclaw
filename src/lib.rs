@@ -89,6 +89,7 @@ pub mod server;
 pub mod skill;
 pub mod store;
 pub mod sys;
+pub mod util;
 pub mod ws;
 
 pub use sys::MemoryTier;

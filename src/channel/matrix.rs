@@ -691,7 +691,7 @@ impl Channel for MatrixChannel {
                     url.push_str("&filter=%7B%22room%22%3A%7B%22timeline%22%3A%7B%22limit%22%3A0%7D%7D%7D");
                 }
 
-                debug!(url = &url[..url.len().min(120)], "Matrix: sync request");
+                debug!(url = crate::util::truncate_str(&url, 120), "Matrix: sync request");
 
                 match self
                     .client
@@ -889,7 +889,7 @@ impl Channel for MatrixChannel {
                     Ok(resp) => {
                         let status = resp.status();
                         let body = resp.text().await.unwrap_or_default();
-                        warn!("Matrix: sync error {} -- {}", status, &body[..body.len().min(200)]);
+                        warn!("Matrix: sync error {} -- {}", status, crate::util::truncate_str(&body, 200));
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                     Err(e) => {

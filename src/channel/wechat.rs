@@ -718,14 +718,14 @@ impl WeChatPersonalChannel {
         let text = resp.text().await.unwrap_or_default();
 
         if !status.is_success() {
-            info!(status = %status, body = &text[..text.len().min(200)], "wechat: getupdates error");
+            info!(status = %status, body = crate::util::truncate_str(&text, 200), "wechat: getupdates error");
             bail!("getupdates failed: {status} {text}");
         }
 
         let parsed: GetUpdatesResponse = serde_json::from_str(&text).with_context(|| {
             format!(
                 "wechat: parse getupdates response: {}",
-                &text[..text.len().min(300)]
+                crate::util::truncate_str(&text, 300)
             )
         })?;
 
@@ -767,12 +767,12 @@ impl WeChatPersonalChannel {
             let text = resp.text().await.unwrap_or_default();
             warn!(
                 status = %status,
-                body = &text[..text.len().min(500)],
+                body = crate::util::truncate_str(&text, 500),
                 param_len = encrypt_query_param.len(),
                 has_aes_key = !aes_key_b64.is_empty(),
                 "wechat: CDN download failed"
             );
-            bail!("CDN download failed: {status} {}", &text[..text.len().min(200)]);
+            bail!("CDN download failed: {status} {}", crate::util::truncate_str(&text, 200));
         }
 
         let encrypted = resp.bytes().await?;
@@ -909,14 +909,14 @@ impl WeChatPersonalChannel {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            bail!("getuploadurl failed: {status} {}", &text[..text.len().min(300)]);
+            bail!("getuploadurl failed: {status} {}", crate::util::truncate_str(&text, 300));
         }
 
-        debug!(response = &text[..text.len().min(500)], "wechat: getuploadurl response");
+        debug!(response = crate::util::truncate_str(&text, 500), "wechat: getuploadurl response");
         let parsed: GetUploadUrlResponse = serde_json::from_str(&text)
-            .with_context(|| format!("parse getuploadurl response: {}", &text[..text.len().min(300)]))?;
+            .with_context(|| format!("parse getuploadurl response: {}", crate::util::truncate_str(&text, 300)))?;
         if parsed.upload_param.is_none() {
-            warn!(response = &text[..text.len().min(500)], "wechat: getuploadurl returned no upload_param");
+            warn!(response = crate::util::truncate_str(&text, 500), "wechat: getuploadurl returned no upload_param");
         }
         Ok(parsed)
     }
