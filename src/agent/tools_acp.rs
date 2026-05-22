@@ -16,6 +16,39 @@ use super::runtime::{AgentRuntime, RunContext, expand_tilde};
 use crate::acp::notification::{Notification, NotificationPriority, NotificationSink};
 use crate::channel::OutboundMessage;
 
+/// Deliver an async ACP result to WS/desktop clients in real time.
+///
+/// The completion `OutboundMessage` is routed by `channel_senders` to IM
+/// channels (feishu/telegram/...), but WS/desktop clients aren't registered
+/// there — they consume the session event stream instead. Emitting a terminal
+/// `AgentEvent` on the ORIGINATING session lets a subscribed desktop see the
+/// result live (the subscription is connection-level and persists after the
+/// submitting turn settled). IM clients ignore the event bus, so this never
+/// double-delivers. No-op when there's nothing to show or no bus.
+fn emit_acp_result_event(
+    bus: &Option<tokio::sync::broadcast::Sender<crate::events::AgentEvent>>,
+    session_id: &str,
+    agent_id: &str,
+    text: String,
+    files: Vec<(String, String, String)>,
+) {
+    if text.is_empty() && files.is_empty() {
+        return;
+    }
+    if let Some(bus) = bus {
+        let _ = bus.send(crate::events::AgentEvent {
+            session_id: session_id.to_owned(),
+            agent_id: agent_id.to_owned(),
+            delta: text,
+            done: true,
+            files,
+            images: vec![],
+            tool_log: vec![],
+            question: None,
+        });
+    }
+}
+
 /// A notification sink that forwards ACP notifications to a channel.
 /// Used to send OpenCode/ClaudeCode tool progress notifications to the user.
 struct ChannelNotifier {
@@ -264,6 +297,9 @@ impl AgentRuntime {
         let lang_bg = lang;
         // Clone agent's own inbox for result injection after completion.
         let self_tx = self.handle.tx.clone();
+        // Event bus + agent id for real-time WS/desktop delivery of the result.
+        let self_event_bus = self.event_bus.clone();
+        let self_agent_id = ctx.agent_id.clone();
         let self_session = ctx.session_key.clone();
         let self_channel = ctx.channel.clone();
         let self_peer_id = ctx.peer_id.clone();
@@ -496,6 +532,8 @@ impl AgentRuntime {
                 }
                 Err(e) => {
                     tracing::error!("tool_opencode: send_prompt failed: {}", e);
+                    // Carry the error to the desktop event below as well.
+                    result_summary = crate::i18n::t_fmt("acp_error", lang_bg, &[("name", "OpenCode"), ("error", &e.to_string())]);
                     if let Some(ref tx) = notif_tx_bg {
                         tracing::info!("tool_opencode: sending error notification to {}", target_id_bg);
                         let _ = tx.send(crate::channel::OutboundMessage {
@@ -511,6 +549,14 @@ impl AgentRuntime {
                     }
                 }
             }
+            // Real-time delivery to WS/desktop (IM already got the notification).
+            emit_acp_result_event(
+                &self_event_bus,
+                &self_session,
+                &self_agent_id,
+                result_summary.clone(),
+                result_files.clone(),
+            );
             tracing::info!("tool_opencode: background task finished");
             // IMPORTANT: DON'T await event_collector - it runs forever waiting
             // for more events The collected events are already in
@@ -853,6 +899,9 @@ impl AgentRuntime {
         let target_id_bg = target_id.clone();
         let channel_bg = channel_name.clone();
         let lang_bg = lang;
+        let self_event_bus = self.event_bus.clone();
+        let self_agent_id = ctx.agent_id.clone();
+        let self_session = ctx.session_key.clone();
         tokio::spawn(async move {
             tracing::info!("tool_claudecode: background task started");
             // Start event collection FIRST (in parallel with send_prompt)
@@ -1039,6 +1088,10 @@ impl AgentRuntime {
                         ])
                     };
 
+                    // Clone for the real-time WS/desktop event below (summary +
+                    // notif_files are moved into the IM notification next).
+                    let event_text = summary.clone();
+                    let event_files = notif_files.clone();
                     // Send notification to user
                     tracing::info!(
                         "tool_claudecode: sending completion notification, summary_len={}, files={}",
@@ -1065,9 +1118,11 @@ impl AgentRuntime {
                     } else {
                         tracing::warn!("tool_claudecode: no notification channel available");
                     }
+                    emit_acp_result_event(&self_event_bus, &self_session, &self_agent_id, event_text, event_files);
                 }
                 Err(e) => {
                     tracing::error!("tool_claudecode: send_prompt failed: {}", e);
+                    emit_acp_result_event(&self_event_bus, &self_session, &self_agent_id, crate::i18n::t_fmt("acp_error", lang_bg, &[("name", "Claude Code"), ("error", &e.to_string())]), vec![]);
                     if let Some(ref tx) = notif_tx_bg {
                         tracing::info!("tool_claudecode: sending error notification to {}", target_id_bg);
                         let _ = tx.send(crate::channel::OutboundMessage {
@@ -1205,6 +1260,9 @@ impl AgentRuntime {
         let target_id_bg = target_id.clone();
         let channel_bg = channel_name.clone();
         let lang_bg = lang;
+        let self_event_bus = self.event_bus.clone();
+        let self_agent_id = ctx.agent_id.clone();
+        let self_session = ctx.session_key.clone();
         tokio::spawn(async move {
             tracing::info!("tool_codex: background task started, calling execute");
 
@@ -1241,6 +1299,7 @@ impl AgentRuntime {
                     };
 
                     // Send notification to user
+                    let event_text = summary.clone();
                     if let Some(ref tx) = notif_tx_bg {
                         let _ = tx.send(crate::channel::OutboundMessage {
                             target_id: target_id_bg.clone(),
@@ -1253,9 +1312,12 @@ impl AgentRuntime {
                             account: None,
                         });
                     }
+                    // Real-time delivery to WS/desktop.
+                    emit_acp_result_event(&self_event_bus, &self_session, &self_agent_id, event_text, vec![]);
                 }
                 Err(e) => {
                     tracing::error!("tool_codex: execute failed: {}", e);
+                    emit_acp_result_event(&self_event_bus, &self_session, &self_agent_id, crate::i18n::t_fmt("acp_error", lang_bg, &[("name", "Codex"), ("error", &e.to_string())]), vec![]);
                     if let Some(ref tx) = notif_tx_bg {
                         let _ = tx.send(crate::channel::OutboundMessage {
                             target_id: target_id_bg.clone(),
