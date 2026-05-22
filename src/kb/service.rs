@@ -474,8 +474,18 @@ impl KnowledgeService {
     pub fn stats(&self) -> KResult<KbStats> {
         let rtx = self.store.begin_read()?;
         let collection_count = collections::list(&rtx)?.len();
-        let chunk_count: usize = self.chunk_counts(&rtx)?.values().sum();
         let docs = self.all_active_docs(&rtx)?;
+        // Count only chunks whose parent doc is still active. `delete_doc`
+        // tombstones the doc but leaves its chunks Active until the compactor
+        // reaps them, so summing all active chunks would report chunk_count > 0
+        // while doc_count == 0 during that window.
+        let active_ids: HashSet<&str> = docs.iter().map(|d| d.id.as_str()).collect();
+        let chunk_count: usize = self
+            .chunk_counts(&rtx)?
+            .iter()
+            .filter(|(doc_id, _)| active_ids.contains(doc_id.as_str()))
+            .map(|(_, n)| *n)
+            .sum();
         let bytes: u64 = docs
             .iter()
             .map(|d| {
@@ -839,6 +849,27 @@ mod tests {
         assert_eq!(st.collection_count, 1);
         assert_eq!(st.doc_count, 2);
         assert!(st.chunk_count >= 2);
+    }
+
+    #[test]
+    fn stats_excludes_tombstoned_doc_chunks() {
+        // `delete_doc` tombstones the doc but leaves its chunks Active until
+        // the compactor reaps them. `stats()` must not report those orphan
+        // chunks, or a fully-emptied KB shows chunk_count > 0 / doc_count == 0.
+        let (_t, s) = svc();
+        let c = s.create_collection("kb", None, None).unwrap();
+        let (doc_id, _) = s
+            .ingest(&c.id, "a.md", b"# A\n\nquantum entanglement links two particles.", Some("text/markdown"))
+            .unwrap();
+        while s.drain_once().unwrap() {}
+        let before = s.stats().unwrap();
+        assert_eq!(before.doc_count, 1);
+        assert!(before.chunk_count >= 1);
+        // Tombstone the only doc; chunks remain Active in redb (compactor lag).
+        s.delete_doc(&c.id, &doc_id).unwrap();
+        let after = s.stats().unwrap();
+        assert_eq!(after.doc_count, 0);
+        assert_eq!(after.chunk_count, 0, "tombstoned doc's chunks must not count");
     }
 
     #[test]

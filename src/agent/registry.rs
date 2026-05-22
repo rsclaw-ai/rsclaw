@@ -78,8 +78,6 @@ pub struct AgentHandle {
     /// Signal to start a new session (set by /new bypass, consumed by runtime).
     /// Unlike clear_signal, this increments the archive generation.
     pub new_session_signal: Arc<AtomicBool>,
-    /// Shared memory store for this agent (used by meditation heartbeat).
-    pub memory: Option<Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>>,
     /// Context window in tokens for this agent's primary model. Resolved
     /// at construction time by looking up the model name (e.g.
     /// `brain/brain-model`) in the provider config's `contextWindow`
@@ -596,7 +594,6 @@ impl AgentRegistry {
                     last_msg_tokens: Arc::new(AtomicUsize::new(0)),
                     clear_signal: Arc::new(AtomicBool::new(false)),
                     new_session_signal: Arc::new(AtomicBool::new(false)),
-                    memory: None, // populated by agent runtime after memory store opens
                     context_window,
                 });
                 inner.agents.insert(entry.id.clone(), handle);

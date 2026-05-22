@@ -202,6 +202,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     };
     ensure_bge_model_present(&model_dir, search_cfg).await?;
 
+    // `memory` is an `Option<Arc<…>>`: clone it freely at every sink below
+    // (agent tasks, heartbeat, AppState ~795) — clones are cheap refcount bumps
+    // and order-independent. Never move it; the final owner is `AppState.memory`.
     let memory = match MemoryStore::open(&data_dir, Some(&model_dir), tier, search_cfg).await {
         Ok(m) => {
             info!("memory store opened");
@@ -349,7 +352,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         Arc::clone(&store),
         Arc::clone(&skills),
         Arc::clone(&providers),
-        memory,
+        memory.clone(),
         event_tx.clone(),
         Some(Arc::clone(&spawner)),
         Some(Arc::clone(&plugins)),
@@ -792,6 +795,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         task_store: a2a_task_store,
         push_dispatcher: a2a_push_dispatcher,
         knowledge: knowledge_svc,
+        memory: memory.clone(),
     };
     crate::ws::tick::start_tick_loop(Arc::clone(&state.ws_conns));
 

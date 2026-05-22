@@ -180,6 +180,11 @@ pub struct AppState {
     /// the KB store failed to open — the gateway still serves everything
     /// else and the `/knowledge` routes are simply not mounted.
     pub knowledge: Option<Arc<crate::kb::KnowledgeService>>,
+    /// Gateway-wide agent memory store (redb), opened once at startup with an
+    /// exclusive write lock. The `/api/v1/memory/*` handlers read it through
+    /// here — it is a singleton, not per-agent, so it does not hang off an
+    /// `AgentHandle`. `None` when memory is disabled.
+    pub memory: Option<Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>>,
 }
 
 // AgentEvent is defined in crate::events to avoid circular deps with agent.
@@ -3619,16 +3624,12 @@ struct MemoryListResponse {
 
 /// The gateway already holds the memory store open with redb's exclusive
 /// write lock. A second `MemoryStore::open_readonly` on the same file fails
-/// ("open memory redb (readonly)"), so HTTP handlers must reuse the live
-/// store from the agent handle instead of opening their own.
+/// ("open memory redb (readonly)"), so HTTP handlers reuse the live
+/// gateway-wide store from `AppState` instead of opening their own.
 fn live_memory_store(
     state: &AppState,
 ) -> Option<std::sync::Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>> {
-    state
-        .agents
-        .default_agent()
-        .ok()
-        .and_then(|h| h.memory.clone())
+    state.memory.clone()
 }
 
 async fn memory_list_docs(
