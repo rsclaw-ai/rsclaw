@@ -156,6 +156,19 @@ export async function applyInstalledKey(
     },
   };
 
+  /// After merging the provider patch, point the default agent's
+  /// primary model at rsclaw — always. Clicking "Connect rsclaw" is
+  /// the user explicitly declaring intent to use it, so we overwrite
+  /// any prior value (anthropic, openai, …). They can still edit the
+  /// primary back to whatever they want from the config panel; this
+  /// is just the obvious default for the connect action.
+  const seedDefaultModel = (merged: any) => {
+    if (!merged.agents) merged.agents = {};
+    if (!merged.agents.defaults) merged.agents.defaults = {};
+    if (!merged.agents.defaults.model) merged.agents.defaults.model = {};
+    merged.agents.defaults.model.primary = "rsclaw/rsclaw-agent-v1";
+  };
+
   try {
     if (isTauri) {
       // Ensure the config dir exists. This is a no-op if rsclaw is
@@ -183,6 +196,7 @@ export async function applyInstalledKey(
       if (merged?.models?.providers?.rsclaw) {
         delete merged.models.providers.rsclaw.baseUrl;
       }
+      seedDefaultModel(merged);
       await invoke("write_config", { content: JSON.stringify(merged, null, 2) });
 
       // Refresh in-memory auth token if a gateway is already running.
@@ -217,6 +231,7 @@ export async function applyInstalledKey(
     if (merged?.models?.providers?.rsclaw) {
       delete merged.models.providers.rsclaw.baseUrl;
     }
+    seedDefaultModel(merged);
     await saveConfig({ raw: JSON.stringify(merged, null, 2) });
     return { ok: true };
   } catch (e) {
