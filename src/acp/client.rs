@@ -1185,7 +1185,11 @@ impl AcpClient {
             .context("RPC timeout")?
             .context("Channel closed")?;
 
-        tracing::info!(method, id, response_preview = ?resp.as_ref().ok().and_then(|r| serde_json::to_string(r).ok()).map(|s| s[..200.min(s.len())].to_string()), "ACP: received response");
+        tracing::info!(method, id, response_preview = ?resp
+            .as_ref()
+            .ok()
+            .and_then(|r| serde_json::to_string(r).ok())
+            .map(|s| preview(&s, 200).to_string()), "ACP: received response");
         resp
     }
 

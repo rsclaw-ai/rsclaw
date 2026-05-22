@@ -476,7 +476,7 @@ fn extract_json_object(s: &str) -> Option<&str> {
 }
 
 fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n { s.to_owned() } else { format!("{}…", &s[..n]) }
+    if s.len() <= n { s.to_owned() } else { format!("{}…", crate::util::truncate_str(s, n)) }
 }
 
 #[cfg(test)]
