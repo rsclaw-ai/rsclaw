@@ -373,6 +373,9 @@ pub struct RunContext {
     pub auto_recall: Option<RecallBundle>,
     /// Whether a loop-detection warning was triggered during this turn.
     pub loop_warning_triggered: bool,
+    /// Factual trace of the looping tool call (tool name + args + warning) set
+    /// when a loop is detected. Drives failure-lesson extraction at end of turn.
+    pub loop_failure: Option<String>,
     /// Per-turn difficulty counters for workflow crystallization.
     pub turn_metrics: super::turn_metrics::TurnMetrics,
     /// The original user request text for this turn — saved on RunContext
@@ -2439,6 +2442,7 @@ impl AgentRuntime {
                             recalled_memory_ids: std::collections::HashSet::new(),
                             auto_recall: None,
                             loop_warning_triggered: false,
+                            loop_failure: None,
                             turn_metrics: super::turn_metrics::TurnMetrics::new(),
                             user_text: String::new(),
                             full_trace: None,
@@ -3415,6 +3419,7 @@ impl AgentRuntime {
             recalled_memory_ids: auto_recalled_ids,
             auto_recall: auto_recall_bundle,
             loop_warning_triggered: false,
+            loop_failure: None,
             turn_metrics: super::turn_metrics::TurnMetrics::new(),
             user_text: text.to_owned(),
             full_trace: init_full_trace(text),
@@ -3644,6 +3649,30 @@ impl AgentRuntime {
                         model,
                         scope,
                         user_text,
+                    )
+                    .await;
+                });
+            }
+
+            // Failure-lesson extraction: if the agent loop got stuck repeating a
+            // tool call this turn, distill a generalizable lesson from the task
+            // + the factual loop trace (kind=failure, Working tier). Triggered
+            // only by the hard loop signal, so transient single calls don't
+            // create noise.
+            if let Some(failure_trace) = ctx.loop_failure.clone() {
+                let mem_clone = Arc::clone(mem);
+                let providers = Arc::clone(&self.providers);
+                let model = self.resolve_model_name();
+                let scope = doc_scope.clone();
+                let user_text = text.to_owned();
+                tokio::spawn(async move {
+                    crate::agent::memory_extractor::extract_failure_lesson(
+                        mem_clone,
+                        providers,
+                        model,
+                        scope,
+                        user_text,
+                        failure_trace,
                     )
                     .await;
                 });
@@ -4875,8 +4904,17 @@ impl AgentRuntime {
                             {
                                 tracing::warn!(tool = %name, params = ?input, "{}", warning_msg);
                                 // Store warning to inject into tool result (so LLM sees it)
-                                loop_warnings.insert(id.clone(), warning_msg);
+                                loop_warnings.insert(id.clone(), warning_msg.clone());
                                 ctx.loop_warning_triggered = true;
+                                // Factual trace for end-of-turn failure-lesson
+                                // extraction (ground truth: what was actually
+                                // called, truncated). First loop of the turn wins.
+                                if ctx.loop_failure.is_none() {
+                                    let args = serde_json::to_string(&input).unwrap_or_default();
+                                    let args: String = args.chars().take(400).collect();
+                                    ctx.loop_failure =
+                                        Some(format!("tool={name}; args={args}; {warning_msg}"));
+                                }
                             }
                             tool_calls.push((id, name, input));
                         } else if !id.is_empty() && name.is_empty() {

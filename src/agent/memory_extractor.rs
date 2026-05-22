@@ -73,6 +73,11 @@ fn kind_policy(kind: &str) -> Option<(MemDocTier, f32, bool)> {
         // near-permanent) but NOT pinned — a later, contradicting correction
         // should be able to supersede it rather than both lingering forever.
         "lesson" => Some((MemDocTier::Core, 0.85, false)),
+        // A lesson inferred from the assistant's OWN failure (a detected tool
+        // loop). Lower-confidence than a user correction — one stuck turn isn't
+        // proof an approach is permanently bad — so Working tier (decays out if
+        // it was a one-off) rather than Core.
+        "failure" => Some((MemDocTier::Working, 0.6, false)),
         _ => None,
     }
 }
@@ -304,6 +309,100 @@ pub(crate) async fn extract_lesson(
     }
 }
 
+/// Spawn-friendly failure-lesson extraction. Triggered when the agent loop
+/// detected the assistant repeating a tool call without progress. Distills a
+/// generalizable lesson from the user's TASK (trusted) plus a FACTUAL trace of
+/// the looping tool call (the harness recorded what was actually invoked — this
+/// is ground truth, not the assistant's prose account, so it stays on the right
+/// side of the don't-crystallize-agent-output boundary).
+///
+/// Writes `kind=failure` (Working tier, decays). Best-effort; failures logged
+/// and swallowed.
+pub(crate) async fn extract_failure_lesson(
+    mem: Arc<Mutex<MemoryStore>>,
+    providers: Arc<ProviderRegistry>,
+    flash_model: String,
+    scope: String,
+    task_text: String,
+    failure_trace: String,
+) {
+    let Ok(_inflight) = L1_INFLIGHT.try_acquire() else {
+        tracing::debug!("failure extract: at concurrency cap, skipping turn");
+        return;
+    };
+    let (provider_name, model_id) = providers.resolve_model(&flash_model);
+    let provider_arc = match providers.get(provider_name) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(provider = provider_name, "failure extract: provider not registered: {e:#}");
+            return;
+        }
+    };
+    let _permit = match acquire_distill_permit().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("failure extract: permit acquire failed: {e:#}");
+            return;
+        }
+    };
+    let prompt = format!(
+        "The assistant got stuck repeating a tool call while handling the user's task and made no progress (a loop was detected). From the user's task and the factual trace of the repeated tool call below, extract a durable, GENERALIZABLE lesson — an approach that doesn't work for this kind of task and what to try instead. Do NOT just restate the error. If there is no generalizable lesson (e.g. a one-off transient glitch), output an empty array [].\nOutput a JSON array; each element: {{\"kind\":\"failure\",\"text\":\"<concise imperative lesson for next time>\",\"confidence\":<number 0..1>}}\nOutput ONLY JSON — no explanation, no code fences.\n\nUser task:\n{task_text}\n\nRepeated tool call (factual trace):\n{failure_trace}\n"
+    );
+    let raw = match distill_with_llm(&prompt, provider_arc, model_id.to_owned()).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("failure extract: LLM call failed: {e:#}");
+            return;
+        }
+    };
+
+    let items = parse_items(&raw);
+    let mut written = 0usize;
+    // At most one failure lesson per stuck turn.
+    for item in items.into_iter().take(1) {
+        if item.kind != "failure" || item.confidence < MIN_CONFIDENCE {
+            continue;
+        }
+        let text = item.text.trim().to_owned();
+        if text.chars().count() < 3 {
+            continue;
+        }
+        let Some((tier, importance, pinned)) = kind_policy("failure") else {
+            continue;
+        };
+        let dup = {
+            let guard = mem.lock().await;
+            guard.find_exact(&scope, "failure", &text).is_some()
+        };
+        if dup {
+            continue;
+        }
+        let doc = MemoryDoc {
+            id: uuid::Uuid::new_v4().to_string(),
+            scope: scope.clone(),
+            kind: "failure".to_owned(),
+            text,
+            vector: vec![],
+            created_at: 0,
+            accessed_at: 0,
+            access_count: 0,
+            importance,
+            tier,
+            abstract_text: None,
+            overview_text: None,
+            tags: vec![],
+            pinned,
+        };
+        match add_off_lock(&mem, doc).await {
+            Ok(_) => written += 1,
+            Err(e) => tracing::warn!("failure extract: add failed: {e:#}"),
+        }
+    }
+    if written > 0 {
+        tracing::info!(scope = %scope, "failure lesson extracted");
+    }
+}
+
 struct Item {
     kind: String,
     text: String,
@@ -433,6 +532,13 @@ mod tests {
         assert!(matches!(tier, MemDocTier::Core));
         assert!(importance > 0.8);
         assert!(!pinned, "a later correction must be able to supersede it");
+    }
+
+    #[test]
+    fn failure_kind_is_working_tier_decaying() {
+        let (tier, importance, pinned) = kind_policy("failure").expect("failure allowed");
+        assert!(matches!(tier, MemDocTier::Working), "failures decay, not Core");
+        assert!(importance < 0.7 && !pinned);
     }
 
     #[test]
