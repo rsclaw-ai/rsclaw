@@ -44,6 +44,7 @@ pub fn routes(max_doc_bytes: usize) -> Router<Arc<KnowledgeService>> {
         .route("/collections/{id}/docs", get(list_docs).post(upload_doc))
         .route("/collections/{id}/docs/from-url", post(upload_from_url))
         .route("/collections/{id}/docs/from-path", post(upload_from_path))
+        .route("/collections/{id}/docs/from-dir", post(upload_from_dir))
         .route(
             "/collections/{id}/docs/{doc_id}",
             get(get_doc).delete(delete_doc),
@@ -457,6 +458,167 @@ fn validate_local_path(
     } else {
         Err((StatusCode::FORBIDDEN, "path_not_allowed"))
     }
+}
+
+/// Recursive directory walk depth cap (defends against pathological trees).
+const MAX_DIR_DEPTH: usize = 16;
+/// Max files ingested in a single from-dir call (defends against importing a
+/// huge tree in one synchronous sweep). Hitting it sets `truncated: true`.
+const MAX_DIR_FILES: usize = 2000;
+
+/// Ingest every supported file under a local directory (recursive). Same
+/// loopback + allowlist gate as `from-path`; the directory itself must
+/// canonicalize under an allowed root. Returns a from-url-style summary
+/// `{ docsAdded, docsSkipped, truncated }`. Unsupported / oversized / unreadable
+/// files are skipped (counted), never fatal — one bad file can't abort the
+/// import. Hidden entries and symlinks are skipped (the latter avoids loops and
+/// allowlist escape).
+async fn upload_from_dir(
+    State(svc): State<Arc<KnowledgeService>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    Path(cid): Path<String>,
+    Json(req): Json<FromPathReq>,
+) -> Response {
+    if !crate::server::is_loopback(peer) {
+        return status_err(StatusCode::FORBIDDEN, "forbidden_remote");
+    }
+    let raw = req.path.trim();
+    if raw.is_empty() {
+        return bad_request("path_required");
+    }
+    if let Err(e) = svc.get_collection(&cid) {
+        return err_response(e);
+    }
+    let dir = match validate_local_dir(raw, svc.allowed_upload_roots()) {
+        Ok(p) => p,
+        Err((status, code)) => return status_err(status, code),
+    };
+
+    // The walk reads + ingests many files synchronously (redb writes); keep it
+    // off the async runtime. Re-check each file stays under the allowed roots
+    // so a symlink-free `..` can't escape (canonicalize already collapses it,
+    // but defense in depth).
+    let roots: Vec<std::path::PathBuf> = svc.allowed_upload_roots().to_vec();
+    let max_bytes = svc.max_doc_bytes();
+    let svc2 = Arc::clone(&svc);
+    let cid2 = cid.clone();
+    let summary = tokio::task::spawn_blocking(move || {
+        walk_and_ingest(&svc2, &cid2, &dir, &roots, max_bytes)
+    })
+    .await;
+
+    match summary {
+        Ok((added, skipped, truncated)) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "status": if added > 0 { "pending" } else { "skipped" },
+                "docsAdded": added,
+                "docsSkipped": skipped,
+                "truncated": truncated,
+            })),
+        )
+            .into_response(),
+        Err(_) => status_err(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+    }
+}
+
+/// Like `validate_local_path` but requires a directory.
+fn validate_local_dir(
+    raw: &str,
+    allowed_roots: &[std::path::PathBuf],
+) -> Result<std::path::PathBuf, (StatusCode, &'static str)> {
+    let p = std::path::Path::new(raw);
+    if !p.is_absolute() {
+        return Err((StatusCode::FORBIDDEN, "path_not_allowed"));
+    }
+    let canon = std::fs::canonicalize(p).map_err(|_| (StatusCode::NOT_FOUND, "file_not_found"))?;
+    if !canon.is_dir() {
+        return Err((StatusCode::BAD_REQUEST, "not_a_dir"));
+    }
+    if allowed_roots.iter().any(|r| canon.starts_with(r)) {
+        Ok(canon)
+    } else {
+        Err((StatusCode::FORBIDDEN, "path_not_allowed"))
+    }
+}
+
+/// Bounded recursive walk under `dir`, ingesting each supported regular file.
+/// Returns `(added, skipped, truncated)`. Skips hidden entries and symlinks.
+fn walk_and_ingest(
+    svc: &KnowledgeService,
+    cid: &str,
+    dir: &std::path::Path,
+    roots: &[std::path::PathBuf],
+    max_bytes: usize,
+) -> (usize, usize, bool) {
+    let (mut added, mut skipped, mut count) = (0usize, 0usize, 0usize);
+    let mut stack = vec![(dir.to_path_buf(), 0usize)];
+    while let Some((d, depth)) = stack.pop() {
+        let rd = match std::fs::read_dir(&d) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for entry in rd.flatten() {
+            let name = entry.file_name();
+            // Skip dotfiles / dotdirs (.git, .DS_Store, ...).
+            if name.to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let ft = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            // Never follow symlinks: avoids directory loops and allowlist escape.
+            if ft.is_symlink() {
+                continue;
+            }
+            let p = entry.path();
+            if ft.is_dir() {
+                if depth < MAX_DIR_DEPTH {
+                    stack.push((p, depth + 1));
+                }
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
+            if count >= MAX_DIR_FILES {
+                return (added, skipped, true);
+            }
+            count += 1;
+            // Stay under the allowed roots (defense in depth).
+            if !roots.iter().any(|r| p.starts_with(r)) {
+                skipped += 1;
+                continue;
+            }
+            match std::fs::metadata(&p) {
+                Ok(m) if m.len() as usize > max_bytes => {
+                    skipped += 1;
+                    continue;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            }
+            let bytes = match std::fs::read(&p) {
+                Ok(b) => b,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+            let mime = crate::kb::canonicalize::detect_mime(&bytes, Some(&fname));
+            match svc.ingest(cid, fname.trim(), &bytes, Some(&mime)) {
+                Ok((_, true)) => skipped += 1, // dedupe: identical content already present
+                Ok((_, false)) => added += 1,
+                Err(_) => skipped += 1, // unsupported / empty / etc — skip, keep going
+            }
+        }
+    }
+    (added, skipped, false)
 }
 
 #[derive(Deserialize)]
@@ -940,6 +1102,51 @@ mod http_tests {
             (StatusCode::BAD_REQUEST, "not_a_file")
         );
         std::fs::remove_file(&f).ok();
+    }
+
+    #[test]
+    fn from_dir_validation() {
+        let root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let roots = vec![root.clone()];
+        // A directory under an allowed root is accepted.
+        assert!(validate_local_dir(root.to_str().unwrap(), &roots).is_ok());
+        // A file is not a directory.
+        use std::io::Write;
+        let f = root.join(format!("rsclaw_fromdir_test_{}.txt", std::process::id()));
+        std::fs::File::create(&f).unwrap().write_all(b"x").unwrap();
+        assert_eq!(
+            validate_local_dir(f.to_str().unwrap(), &roots).unwrap_err(),
+            (StatusCode::BAD_REQUEST, "not_a_dir")
+        );
+        std::fs::remove_file(&f).ok();
+    }
+
+    #[test]
+    fn walk_ingests_supported_files_recursively() {
+        use std::io::Write;
+        let (_tmp, svc, _app) = app();
+        let cid = svc.create_collection("c", None, None).unwrap().id;
+
+        // Build a tree under a scratch dir: 2 supported at top, 1 in a subdir,
+        // 1 unsupported extension, 1 hidden file. roots = the scratch dir.
+        let base = std::env::temp_dir().join(format!("rsclaw_walk_{}", std::process::id()));
+        let sub = base.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let write = |p: &std::path::Path, b: &[u8]| std::fs::File::create(p).unwrap().write_all(b).unwrap();
+        write(&base.join("a.md"), b"# hello");
+        write(&base.join("b.txt"), b"plain text body");
+        write(&sub.join("c.md"), b"# nested");
+        write(&base.join("data.unknownext"), &[0x00, 0x01, 0x02, 0xff]); // unsupported
+        write(&base.join(".hidden.md"), b"# secret"); // hidden → skipped entirely
+
+        let roots = vec![std::fs::canonicalize(&base).unwrap()];
+        let (added, skipped, truncated) =
+            walk_and_ingest(&svc, &cid, &std::fs::canonicalize(&base).unwrap(), &roots, svc.max_doc_bytes());
+
+        assert_eq!(added, 3, "a.md + b.txt + sub/c.md");
+        assert!(skipped >= 1, "the unsupported file is counted as skipped");
+        assert!(!truncated);
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

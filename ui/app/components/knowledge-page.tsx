@@ -41,6 +41,7 @@ import {
   subscribeDocStatus,
   uploadDocFile,
   uploadDocFromPath,
+  uploadDocFromDir,
   uploadDocFromUrl,
   uploadDocJson,
   isSameMachineGateway,
@@ -354,10 +355,23 @@ export function KnowledgePage() {
         toast.error(zh ? "请先选择一个知识库" : "Select a collection first");
         return;
       }
+      // stat each path so a dropped folder goes to the recursive from-dir
+      // endpoint and a file goes to from-path.
+      const { stat } = await import("@tauri-apps/plugin-fs");
       for (const p of paths) {
         const name = p.split("/").pop() || p;
         try {
-          await uploadDocFromPath(activeCollectionId, p);
+          const isDir = (await stat(p)).isDirectory;
+          if (isDir) {
+            const r = await uploadDocFromDir(activeCollectionId, p);
+            toast.success(
+              zh
+                ? `已导入 ${r.docsAdded} 个文件${r.docsSkipped ? `，跳过 ${r.docsSkipped}` : ""}${r.truncated ? "（已达上限，未全部导入）" : ""}`
+                : `Imported ${r.docsAdded}${r.docsSkipped ? `, skipped ${r.docsSkipped}` : ""}${r.truncated ? " (capped)" : ""}`,
+            );
+          } else {
+            await uploadDocFromPath(activeCollectionId, p);
+          }
         } catch (e: any) {
           toast.fromError(`${zh ? "上传失败" : "Upload failed"}: ${name}`, e);
         }

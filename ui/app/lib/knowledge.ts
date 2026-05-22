@@ -318,6 +318,34 @@ export async function uploadDocFromPath(
   return ok<KbUploadAccepted>(res);
 }
 
+export interface KbDirIngestAccepted {
+  status: string;
+  docsAdded: number;
+  docsSkipped: number;
+  /** True when the directory had more files than the per-call cap. */
+  truncated: boolean;
+}
+
+/**
+ * Same-machine recursive directory import: the gateway walks the tree and
+ * ingests every supported file. Loopback-gated + path-allowlisted like
+ * from-path; callers MUST first confirm isSameMachineGateway(). Returns a
+ * summary (added/skipped/truncated), not a single doc handle.
+ */
+export async function uploadDocFromDir(
+  collectionId: string,
+  path: string,
+): Promise<KbDirIngestAccepted> {
+  const res = await gatewayFetch(
+    `/api/v1/knowledge/collections/${encodeURIComponent(collectionId)}/docs/from-dir`,
+    {
+      method: "POST",
+      body: JSON.stringify({ path }),
+    },
+  );
+  return ok<KbDirIngestAccepted>(res);
+}
+
 export async function deleteDoc(
   collectionId: string,
   docId: string,
