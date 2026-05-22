@@ -69,9 +69,44 @@ fn kind_policy(kind: &str) -> Option<(MemDocTier, f32, bool)> {
         "fact" => Some((MemDocTier::Working, 0.65, false)),
         "project_state" => Some((MemDocTier::Working, 0.65, false)),
         "relationship" => Some((MemDocTier::Working, 0.65, false)),
+        // A lesson learned from a user correction. Core tier (slow decay,
+        // near-permanent) but NOT pinned — a later, contradicting correction
+        // should be able to supersede it rather than both lingering forever.
+        "lesson" => Some((MemDocTier::Core, 0.85, false)),
         _ => None,
     }
 }
+
+/// Max lesson items per correction — a single correction rarely teaches more
+/// than one or two durable rules.
+const MAX_LESSON_ITEMS: usize = 2;
+
+/// Cheap pre-gate for the lesson extractor: fires when the user message looks
+/// like a correction of the assistant or a durable behavioral instruction.
+/// Precision over recall — the LLM judge filters further and emits `[]` when
+/// there's no durable lesson, so a loose match here only costs a skipped
+/// flash call, never a bad memory.
+pub(crate) fn correction_gate(text: &str) -> bool {
+    let t = text.trim();
+    let n = t.chars().count();
+    if n < 2 || n > 4000 {
+        return false;
+    }
+    let lower = t.to_lowercase();
+    const SIGNALS: &[&str] = &[
+        // Chinese correction / "do it this way from now on".
+        "不对", "错了", "搞错", "弄错", "不是这", "不是我要", "我说的是", "应该是",
+        "应该用", "别这样", "别用", "不要这样", "重新", "纠正", "下次", "以后不要",
+        "以后别", "记住别", "不准",
+        // English.
+        "that's wrong", "thats wrong", "not what i", "not correct", "incorrect",
+        "you should", "should have", "don't do", "do not do", "stop doing", "next time",
+        "actually i meant", "i meant", "not like that", "redo", "you misunderstood",
+    ];
+    SIGNALS.iter().any(|s| lower.contains(s))
+}
+
+const LESSON_PROMPT: &str = "The user message below is reacting to the assistant. ONLY if it corrects a mistake the assistant made, or states a durable rule about how the assistant should behave or answer in future, capture that as a concise imperative lesson the assistant should follow next time. Ignore one-off task requests, questions, greetings, and venting that carry no reusable rule.\nOutput a JSON array; each element: {\"kind\":\"lesson\",\"text\":\"<concise imperative lesson, written about the assistant, preserving the user's language for specifics>\",\"confidence\":<number 0..1>}\nExamples of text: \"When the user asks for code, do not add explanatory comments unless asked\", \"回答用户时不要用表格，用要点列表\".\nIf there is no durable behavioral lesson, output an empty array []. Output ONLY JSON — no explanation, no code fences.\n\nUser message:\n";
 
 const EXTRACTION_PROMPT: &str = "Extract durable, long-term-worthy information from the user message below. Capture only stable, reusable knowledge: identity, contact details, preferences, stable facts, project state, relationships between people/orgs, and reusable procedures. Ignore greetings, questions, one-off task requests, and emotional venting.\nOutput a JSON array; each element: {\"kind\":\"<kind>\",\"text\":\"<concise third-person statement>\",\"confidence\":<number 0..1>}\nkind must be exactly one of: entity, preference, fact, project_state, relationship, procedure.\nWrite text in the third person and self-contained, preserving the user's original language for the content itself (e.g. \"User's name is 东升\", \"User prefers concise, direct answers\", \"User's release flow: cargo test, then check UI, then commit\").\nEvery item must include a numeric confidence in [0,1]. If nothing is worth remembering long-term, output an empty array []. Output ONLY JSON — no explanation, no code fences.\n\nUser message:\n";
 
@@ -166,6 +201,106 @@ pub(crate) async fn extract_l1(
     }
     if written > 0 {
         tracing::info!(scope = %scope, written, "L1 memories extracted");
+    }
+}
+
+/// Spawn-friendly lesson extraction from a user correction. Mirrors
+/// [`extract_l1`] but uses the correction-focused prompt and writes only
+/// `kind=lesson` items (Core tier, supersedable). Gated upstream by
+/// [`correction_gate`]; best-effort, all failures logged and swallowed.
+///
+/// Source is the USER message only — never the assistant's own output — so we
+/// don't crystallize the model's possibly-confabulated account of what it did
+/// (the same trust boundary the per-turn entity/L1 paths respect).
+pub(crate) async fn extract_lesson(
+    mem: Arc<Mutex<MemoryStore>>,
+    providers: Arc<ProviderRegistry>,
+    flash_model: String,
+    scope: String,
+    user_text: String,
+) {
+    // Shares the L1 in-flight cap: lesson + L1 distills are both flash calls
+    // and shouldn't pile up together.
+    let Ok(_inflight) = L1_INFLIGHT.try_acquire() else {
+        tracing::debug!("lesson extract: at concurrency cap, skipping turn");
+        return;
+    };
+    let (provider_name, model_id) = providers.resolve_model(&flash_model);
+    let provider_arc = match providers.get(provider_name) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(provider = provider_name, "lesson extract: provider not registered: {e:#}");
+            return;
+        }
+    };
+    let _permit = match acquire_distill_permit().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("lesson extract: permit acquire failed: {e:#}");
+            return;
+        }
+    };
+    let prompt = format!("{LESSON_PROMPT}{user_text}");
+    let raw = match distill_with_llm(&prompt, provider_arc, model_id.to_owned()).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("lesson extract: LLM call failed: {e:#}");
+            return;
+        }
+    };
+
+    let items = parse_items(&raw);
+    if items.is_empty() {
+        tracing::debug!(scope = %scope, "lesson extract: no durable lesson");
+        return;
+    }
+
+    let mut written = 0usize;
+    for item in items.into_iter().take(MAX_LESSON_ITEMS) {
+        // Only accept lesson items; ignore anything else the model emits.
+        if item.kind != "lesson" {
+            continue;
+        }
+        let Some((tier, importance, pinned)) = kind_policy("lesson") else {
+            continue;
+        };
+        if item.confidence < MIN_CONFIDENCE {
+            continue;
+        }
+        let text = item.text.trim().to_owned();
+        if text.chars().count() < 3 {
+            continue;
+        }
+        let dup = {
+            let guard = mem.lock().await;
+            guard.find_exact(&scope, "lesson", &text).is_some()
+        };
+        if dup {
+            continue;
+        }
+        let doc = MemoryDoc {
+            id: uuid::Uuid::new_v4().to_string(),
+            scope: scope.clone(),
+            kind: "lesson".to_owned(),
+            text,
+            vector: vec![],
+            created_at: 0,
+            accessed_at: 0,
+            access_count: 0,
+            importance,
+            tier,
+            abstract_text: None,
+            overview_text: None,
+            tags: vec![],
+            pinned,
+        };
+        match add_off_lock(&mem, doc).await {
+            Ok(_) => written += 1,
+            Err(e) => tracing::warn!("lesson extract: add failed: {e:#}"),
+        }
+    }
+    if written > 0 {
+        tracing::info!(scope = %scope, written, "lesson memories extracted");
     }
 }
 
@@ -290,5 +425,25 @@ mod tests {
         assert!(kind_policy("summary").is_none());
         assert!(kind_policy("garbage").is_none());
         assert!(kind_policy("preference").is_some());
+    }
+
+    #[test]
+    fn lesson_kind_is_core_durable_but_not_pinned() {
+        let (tier, importance, pinned) = kind_policy("lesson").expect("lesson allowed");
+        assert!(matches!(tier, MemDocTier::Core));
+        assert!(importance > 0.8);
+        assert!(!pinned, "a later correction must be able to supersede it");
+    }
+
+    #[test]
+    fn correction_gate_fires_on_corrections_not_chitchat() {
+        assert!(correction_gate("不对，应该用 cargo test 不是 npm"));
+        assert!(correction_gate("以后别用表格回答"));
+        assert!(correction_gate("that's wrong, you should use the debug build"));
+        assert!(correction_gate("next time don't add comments"));
+        // Plain task requests / questions / acks must not fire.
+        assert!(!correction_gate("帮我查下天气"));
+        assert!(!correction_gate("好的谢谢"));
+        assert!(!correction_gate("how do I build this?"));
     }
 }

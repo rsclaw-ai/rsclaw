@@ -3603,14 +3603,45 @@ impl AgentRuntime {
             if crate::agent::memory_extractor::salience_gate(text) {
                 let mem_clone = Arc::clone(mem);
                 let providers = Arc::clone(&self.providers);
-                let flash_model = self.resolve_flash_model_name();
+                // Use the primary model: the flash endpoint (/fastshot) returns
+                // empty output for these structured-extraction prompts. Bounded
+                // by the salience/correction gates + the cap-4 in-flight limit,
+                // so the cost stays contained. Revisit flash if /fastshot is fixed.
+                let model = self.resolve_model_name();
                 let scope = doc_scope.clone();
                 let user_text = text.to_owned();
                 tokio::spawn(async move {
                     crate::agent::memory_extractor::extract_l1(
                         mem_clone,
                         providers,
-                        flash_model,
+                        model,
+                        scope,
+                        user_text,
+                    )
+                    .await;
+                });
+            }
+
+            // Lesson extraction: when the user message looks like a correction
+            // or a durable behavioral instruction, distill it into a `lesson`
+            // memory (Core tier) so the same mistake isn't repeated. Same
+            // user-message-only trust boundary and spawn/best-effort shape as
+            // L1; separate gate so it fires on corrections L1's gate misses.
+            if crate::agent::memory_extractor::correction_gate(text) {
+                let mem_clone = Arc::clone(mem);
+                let providers = Arc::clone(&self.providers);
+                // Use the primary model: the flash endpoint (/fastshot) returns
+                // empty output for these structured-extraction prompts. Bounded
+                // by the salience/correction gates + the cap-4 in-flight limit,
+                // so the cost stays contained. Revisit flash if /fastshot is fixed.
+                let model = self.resolve_model_name();
+                let scope = doc_scope.clone();
+                let user_text = text.to_owned();
+                tokio::spawn(async move {
+                    crate::agent::memory_extractor::extract_lesson(
+                        mem_clone,
+                        providers,
+                        model,
                         scope,
                         user_text,
                     )
