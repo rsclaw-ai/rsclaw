@@ -56,6 +56,14 @@ pub struct PluginManifest {
     pub version: Option<String>,
     /// Human-readable description.
     pub description: Option<String>,
+    /// One-line catalog blurb shown in the `## Installed Plugins` prompt
+    /// section. Falls back to `description` when absent.
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// Tool names to surface as "common" in the catalog (the rest are found
+    /// via plugin.search_tools). Empty → renderer shows the first few + count.
+    #[serde(default, rename = "commonTools")]
+    pub common_tools: Vec<String>,
     /// Runtime: "node" | "bun" | "deno" | "wasm". Defaults to "node".
     #[serde(default = "default_runtime")]
     pub runtime: String,
@@ -271,6 +279,27 @@ mod tests {
 
     fn write_file(dir: &Path, name: &str, content: &str) {
         std::fs::write(dir.join(name), content).expect("write file");
+    }
+
+    #[test]
+    fn manifest_parses_summary_and_common_tools() {
+        let json5 = r#"{
+            name: "demo",
+            version: "1.0.0",
+            description: "d",
+            summary: "Does demo things",
+            commonTools: ["publish", "list"],
+            tools: [{ name: "publish", description: "p" }],
+        }"#;
+        let m: PluginManifest = json5::from_str(json5).unwrap();
+        assert_eq!(m.summary.as_deref(), Some("Does demo things"));
+        assert_eq!(m.common_tools, vec!["publish".to_string(), "list".to_string()]);
+
+        // Backward compat: absent fields default cleanly.
+        let bare = r#"{ name: "x", tools: [] }"#;
+        let m2: PluginManifest = json5::from_str(bare).unwrap();
+        assert!(m2.summary.is_none());
+        assert!(m2.common_tools.is_empty());
     }
 
     #[test]
