@@ -111,8 +111,15 @@ fn render_plugin_catalog_block(
     cap: usize,
 ) -> String {
     let list = plugin_tool_list(tools, common, cap);
+    // Omit the " — <blurb>" when neither summary nor description is set, so the
+    // heading doesn't render a dangling em-dash.
+    let heading = if summary_or_desc.is_empty() {
+        format!("### {name} (v{version})")
+    } else {
+        format!("### {name} — {summary_or_desc} (v{version})")
+    };
     format!(
-        "### {name} — {summary_or_desc} (v{version})\n\
+        "{heading}\n\
          Common tools (call via plugin.invoke {{plugin:\"{name}\", tool, arguments}}; \
          use plugin.search_tools {{plugin:\"{name}\", query}} for others):\n\
          {list}"
@@ -1988,5 +1995,10 @@ mod plugin_catalog_tests {
         assert!(block.contains("### douyin — Douyin ops"));
         assert!(block.contains("- publish: Publish a video"));
         assert!(block.contains("plugin.search_tools"));
+
+        // Empty blurb → no dangling em-dash.
+        let bare = render_plugin_catalog_block("p", "1.0", "", &tools, &[], 5);
+        assert!(bare.contains("### p (v1.0)"));
+        assert!(!bare.contains("—"));
     }
 }
