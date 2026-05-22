@@ -7,19 +7,19 @@
 //! embedder. P1 covers collection metadata CRUD; docs + search grow the
 //! service in P2/P3.
 
-use crate::kb::canonicalize::{canonicalize_by_mime, detect_mime, CanonicalizeInput};
+use crate::kb::canonicalize::{CanonicalizeInput, canonicalize_by_mime, detect_mime};
 use crate::kb::content_store::read::read_doc_body;
 use crate::kb::embedder::resolve_embedder;
 use crate::kb::jobs::{Job, JobKind, JobStatus};
 use crate::kb::model::{
-    collection_tag, CallerScope, ChunkStatus, KbChunk, KbCollection, KbDoc, KbStatus,
-    COLLECTION_TAG_PREFIX,
+    COLLECTION_TAG_PREFIX, CallerScope, ChunkStatus, KbChunk, KbCollection, KbDoc, KbStatus,
+    collection_tag,
 };
-use crate::kb::pipeline::{ingest_canonicalized, IngestInput};
+use crate::kb::pipeline::{IngestInput, ingest_canonicalized};
+use crate::kb::search::SearchCtx;
 use crate::kb::store::codec::decode;
 use crate::kb::store::schema::{KB_CHUNKS, KB_DOCS};
 use crate::kb::store::{collections, docs};
-use crate::kb::search::SearchCtx;
 use crate::kb::tools::kb_search::{self, KbSearchFilter, KbSearchInput};
 use crate::kb::worker::{DefaultDispatcher, HandlerCtx, WorkerConfig, WorkerPool};
 use crate::kb::{KbEmbedder, KbIndex, KbPaths, KbStore};
@@ -116,10 +116,44 @@ pub struct KnowledgeService {
     query_instruction: Option<String>,
     /// Max accepted upload size in bytes (`kb.maxDocMb`, default 50 MB).
     max_doc_bytes: usize,
+    /// Canonicalized allowed roots for the loopback-only `/docs/from-path`
+    /// ingest endpoint (`kb.allowedUploadRoots`, default ~/Documents,
+    /// ~/Downloads, ~/Desktop). A from-path target must live under one of these.
+    allowed_upload_roots: Vec<PathBuf>,
 }
 
 /// Default max upload size when `kb.maxDocMb` is unset (50 MB).
 const DEFAULT_MAX_DOC_BYTES: usize = 50 * 1024 * 1024;
+
+/// Resolve `kb.allowedUploadRoots` into canonical absolute paths. Leading `~`
+/// expands to the home dir; unset/empty falls back to ~/Documents, ~/Downloads,
+/// ~/Desktop. Roots that don't exist are dropped (canonicalize fails) — an
+/// empty result simply means every from-path request is rejected (fail-closed).
+fn resolve_upload_roots(configured: Option<&Vec<String>>) -> Vec<PathBuf> {
+    let home = dirs_next::home_dir();
+    let raw: Vec<PathBuf> = match configured {
+        Some(list) if !list.is_empty() => list
+            .iter()
+            .map(|s| match s.strip_prefix("~") {
+                Some(rest) if home.is_some() => {
+                    home.clone().unwrap().join(rest.trim_start_matches('/'))
+                }
+                _ => PathBuf::from(s),
+            })
+            .collect(),
+        _ => home
+            .iter()
+            .flat_map(|h| {
+                ["Documents", "Downloads", "Desktop"]
+                    .iter()
+                    .map(move |d| h.join(d))
+            })
+            .collect(),
+    };
+    raw.into_iter()
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .collect()
+}
 
 impl KnowledgeService {
     /// Open (or create) the KB under `kb_root` (e.g. `<base>/kb`): store,
@@ -136,8 +170,8 @@ impl KnowledgeService {
         // queryInstruction comes from the SAME effective embed config the
         // embedder was resolved from (`kb.embed` override, else `memorySearch`),
         // so a KB-specific asymmetric model uses its own instruction.
-        let query_instruction = crate::kb::embedder::effective_embed_config()
-            .and_then(|m| m.query_instruction);
+        let query_instruction =
+            crate::kb::embedder::effective_embed_config().and_then(|m| m.query_instruction);
         // kb.maxDocMb → bytes; default 50 MB, clamp negatives/zero to default.
         let max_doc_bytes = cfg
             .as_ref()
@@ -146,6 +180,11 @@ impl KnowledgeService {
             .filter(|mb| *mb > 0)
             .map(|mb| mb as usize * 1024 * 1024)
             .unwrap_or(DEFAULT_MAX_DOC_BYTES);
+        let allowed_upload_roots = resolve_upload_roots(
+            cfg.as_ref()
+                .and_then(|c| c.raw.kb.as_ref())
+                .and_then(|k| k.allowed_upload_roots.as_ref()),
+        );
         Ok(Self {
             store,
             paths,
@@ -155,12 +194,19 @@ impl KnowledgeService {
             events,
             query_instruction,
             max_doc_bytes,
+            allowed_upload_roots,
         })
     }
 
     /// Max accepted upload size in bytes (`kb.maxDocMb`, default 50 MB).
     pub fn max_doc_bytes(&self) -> usize {
         self.max_doc_bytes
+    }
+
+    /// Canonicalized allowed roots for `/docs/from-path` (see
+    /// `kb.allowedUploadRoots`). A from-path target must live under one of these.
+    pub fn allowed_upload_roots(&self) -> &[PathBuf] {
+        &self.allowed_upload_roots
     }
 
     /// Subscribe to `knowledge.doc.status_changed` events (for SSE).
@@ -286,7 +332,11 @@ impl KnowledgeService {
         let detected = mime
             .map(|m| m.to_string())
             .unwrap_or_else(|| detect_mime(bytes, Some(title)));
-        let ext = title.rsplit('.').next().filter(|e| *e != title).unwrap_or("");
+        let ext = title
+            .rsplit('.')
+            .next()
+            .filter(|e| *e != title)
+            .unwrap_or("");
         let mut canon = canonicalize_by_mime(CanonicalizeInput {
             bytes,
             mime: &detected,
@@ -294,7 +344,9 @@ impl KnowledgeService {
             logical_source_id_seed: None,
         })?
         .ok_or_else(|| {
-            KnowledgeError::Internal(anyhow::anyhow!("unsupported or empty content (mime={detected})"))
+            KnowledgeError::Internal(anyhow::anyhow!(
+                "unsupported or empty content (mime={detected})"
+            ))
         })?;
         canon.metadata.tags.push(collection_tag(collection_id));
         let lsid = canon.metadata.logical_source_id.as_str().to_string();
@@ -433,7 +485,10 @@ impl KnowledgeService {
             KbSearchInput {
                 query: query.to_string(),
                 k: top_k,
-                filter: KbSearchFilter { tags, ..Default::default() },
+                filter: KbSearchFilter {
+                    tags,
+                    ..Default::default()
+                },
                 mode: "hybrid".into(),
                 diversity: "mmr".into(),
                 mmr_lambda: 0.5,
@@ -512,7 +567,11 @@ impl KnowledgeService {
             ("bge-small-zh", "BGE-Small-ZH", 512usize),
             ("bge-base-zh", "BGE-Base-ZH", 768),
             ("bge-small-en", "BGE-Small-EN", 384),
-            ("Qwen3-Embedding-0.6B", "Qwen3-Embedding-0.6B (remote)", 1024),
+            (
+                "Qwen3-Embedding-0.6B",
+                "Qwen3-Embedding-0.6B (remote)",
+                1024,
+            ),
         ]
         .iter()
         .map(|(id, label, dim)| EmbedderInfo {
@@ -583,7 +642,11 @@ impl KnowledgeService {
     ) -> anyhow::Result<HashSet<(String, u32)>> {
         let mut out = HashSet::new();
         for job in crate::kb::store::jobs::list_by_status(rtx, JobStatus::Failed)? {
-            if let JobKind::ChunkAndEmbed { doc_id, doc_version } = job.kind {
+            if let JobKind::ChunkAndEmbed {
+                doc_id,
+                doc_version,
+            } = job.kind
+            {
                 out.insert((doc_id, doc_version));
             }
         }
@@ -728,7 +791,9 @@ mod tests {
     #[test]
     fn create_then_list_and_get() {
         let (_t, s) = svc();
-        let c = s.create_collection("产品手册", Some("v3".into()), None).unwrap();
+        let c = s
+            .create_collection("产品手册", Some("v3".into()), None)
+            .unwrap();
         assert!(c.id.starts_with("col_"));
         assert_eq!(s.get_collection(&c.id).unwrap().name, "产品手册");
         assert_eq!(s.list_collections().unwrap().len(), 1);
@@ -739,7 +804,12 @@ mod tests {
         let (_t, s) = svc();
         let c = s.create_collection("kb", None, None).unwrap();
         let (doc_id, _) = s
-            .ingest(&c.id, "a.md", b"# A\n\nbody one here", Some("text/markdown"))
+            .ingest(
+                &c.id,
+                "a.md",
+                b"# A\n\nbody one here",
+                Some("text/markdown"),
+            )
             .unwrap();
         // Before the worker runs: still indexing.
         assert_eq!(s.get_doc(&c.id, &doc_id).unwrap().status(), "indexing");
@@ -749,7 +819,9 @@ mod tests {
             use crate::kb::store::jobs;
             let now = chrono::Utc::now().timestamp_millis();
             let wtx = s.store().begin_write().unwrap();
-            let (job, token) = jobs::claim_next(&wtx, "test", now, 60_000).unwrap().unwrap();
+            let (job, token) = jobs::claim_next(&wtx, "test", now, 60_000)
+                .unwrap()
+                .unwrap();
             jobs::mark_failed(&wtx, &job.id, &token.token, "boom").unwrap();
             wtx.commit().unwrap();
         }
@@ -774,7 +846,8 @@ mod tests {
     fn rename_frees_old_name() {
         let (_t, s) = svc();
         let c = s.create_collection("旧名", None, None).unwrap();
-        s.update_collection(&c.id, Some("新名".into()), None).unwrap();
+        s.update_collection(&c.id, Some("新名".into()), None)
+            .unwrap();
         // old name is now reusable
         s.create_collection("旧名", None, None).unwrap();
         assert_eq!(s.get_collection(&c.id).unwrap().name, "新名");
@@ -837,12 +910,26 @@ mod tests {
     fn search_and_stats_after_ingest() {
         let (_t, s) = svc();
         let c = s.create_collection("kb", None, None).unwrap();
-        s.ingest(&c.id, "a.md", b"# A\n\nquantum entanglement links two particles.", Some("text/markdown")).unwrap();
-        s.ingest(&c.id, "b.md", b"# B\n\nthe capital of France is Paris.", Some("text/markdown")).unwrap();
+        s.ingest(
+            &c.id,
+            "a.md",
+            b"# A\n\nquantum entanglement links two particles.",
+            Some("text/markdown"),
+        )
+        .unwrap();
+        s.ingest(
+            &c.id,
+            "b.md",
+            b"# B\n\nthe capital of France is Paris.",
+            Some("text/markdown"),
+        )
+        .unwrap();
         while s.drain_once().unwrap() {}
         // BM25 side of the hybrid search matches the lexical term regardless of
         // the (stub) embedder, so the doc is findable.
-        let hits = s.search("two particles", std::slice::from_ref(&c.id), 5, 0.0).unwrap();
+        let hits = s
+            .search("two particles", std::slice::from_ref(&c.id), 5, 0.0)
+            .unwrap();
         assert!(!hits.is_empty(), "expected a hit for 'two particles'");
         assert_eq!(hits[0].collection_id.as_deref(), Some(c.id.as_str()));
         let st = s.stats().unwrap();
@@ -859,7 +946,12 @@ mod tests {
         let (_t, s) = svc();
         let c = s.create_collection("kb", None, None).unwrap();
         let (doc_id, _) = s
-            .ingest(&c.id, "a.md", b"# A\n\nquantum entanglement links two particles.", Some("text/markdown"))
+            .ingest(
+                &c.id,
+                "a.md",
+                b"# A\n\nquantum entanglement links two particles.",
+                Some("text/markdown"),
+            )
             .unwrap();
         while s.drain_once().unwrap() {}
         let before = s.stats().unwrap();
@@ -869,7 +961,10 @@ mod tests {
         s.delete_doc(&c.id, &doc_id).unwrap();
         let after = s.stats().unwrap();
         assert_eq!(after.doc_count, 0);
-        assert_eq!(after.chunk_count, 0, "tombstoned doc's chunks must not count");
+        assert_eq!(
+            after.chunk_count, 0,
+            "tombstoned doc's chunks must not count"
+        );
     }
 
     #[test]
@@ -878,7 +973,12 @@ mod tests {
         let c = s.create_collection("kb", None, None).unwrap();
         let mut rx = s.subscribe();
         let (doc_id, _) = s
-            .ingest(&c.id, "a.md", b"# A\n\nhello indexed body", Some("text/markdown"))
+            .ingest(
+                &c.id,
+                "a.md",
+                b"# A\n\nhello indexed body",
+                Some("text/markdown"),
+            )
             .unwrap();
         while s.drain_once().unwrap() {}
         let mut emitted = HashSet::new();
@@ -888,15 +988,30 @@ mod tests {
         assert!(msg.contains(&doc_id), "got: {msg}");
         // idempotent: no duplicate for the same doc
         s.emit_ready_transitions(&mut emitted);
-        assert!(rx.try_recv().is_err(), "should not re-emit for the same doc");
+        assert!(
+            rx.try_recv().is_err(),
+            "should not re-emit for the same doc"
+        );
     }
 
     #[test]
     fn delete_collection_cascades_docs() {
         let (_t, s) = svc();
         let c = s.create_collection("kb", None, None).unwrap();
-        s.ingest(&c.id, "a.md", b"# A\n\nbody one here", Some("text/markdown")).unwrap();
-        s.ingest(&c.id, "b.md", b"# B\n\nbody two here", Some("text/markdown")).unwrap();
+        s.ingest(
+            &c.id,
+            "a.md",
+            b"# A\n\nbody one here",
+            Some("text/markdown"),
+        )
+        .unwrap();
+        s.ingest(
+            &c.id,
+            "b.md",
+            b"# B\n\nbody two here",
+            Some("text/markdown"),
+        )
+        .unwrap();
         while s.drain_once().unwrap() {}
         let removed = s.delete_collection(&c.id).unwrap();
         assert_eq!(removed, 2);
@@ -911,7 +1026,12 @@ mod tests {
         let (_t, s) = svc();
         let c = s.create_collection("kb", None, None).unwrap();
         let (doc_id, _) = s
-            .ingest(&c.id, "a.md", b"# A\n\nhello particles here", Some("text/markdown"))
+            .ingest(
+                &c.id,
+                "a.md",
+                b"# A\n\nhello particles here",
+                Some("text/markdown"),
+            )
             .unwrap();
         while s.drain_once().unwrap() {}
         s.reindex_doc(&c.id, &doc_id).unwrap();

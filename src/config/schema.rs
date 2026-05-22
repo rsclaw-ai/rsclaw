@@ -2031,6 +2031,13 @@ pub struct KbConfig {
     /// Max accepted document size (MB) for the `/api/v1/knowledge` upload
     /// endpoints (JSON body or multipart file). Default 50.
     pub max_doc_mb: Option<i64>,
+    /// Allowed roots for the loopback-only `/docs/from-path` ingest endpoint.
+    /// A path the gateway is asked to read off disk must canonicalize under
+    /// one of these. Leading `~` expands to the user's home. Unset/empty →
+    /// the default set (`~/Documents`, `~/Downloads`, `~/Desktop`). This is a
+    /// defense-in-depth bound on an arbitrary-file-read surface; widen it only
+    /// if you trust every local process that can reach the gateway.
+    pub allowed_upload_roots: Option<Vec<String>>,
 }
 
 // ---------------------------------------------------------------------------

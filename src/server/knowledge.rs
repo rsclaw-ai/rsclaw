@@ -9,7 +9,7 @@ use axum::{
     Json, Router,
     body::to_bytes,
     extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Request, State},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -31,22 +31,27 @@ use crate::kb::{KnowledgeError, KnowledgeService};
 /// `max_doc_bytes` (from `kb.maxDocMb`) caps the request body size.
 pub fn routes(max_doc_bytes: usize) -> Router<Arc<KnowledgeService>> {
     Router::new()
-        .route("/collections", get(list_collections).post(create_collection))
+        .route(
+            "/collections",
+            get(list_collections).post(create_collection),
+        )
         .route(
             "/collections/{id}",
-            get(get_collection).patch(patch_collection).delete(delete_collection),
+            get(get_collection)
+                .patch(patch_collection)
+                .delete(delete_collection),
         )
-        .route(
-            "/collections/{id}/docs",
-            get(list_docs).post(upload_doc),
-        )
+        .route("/collections/{id}/docs", get(list_docs).post(upload_doc))
         .route("/collections/{id}/docs/from-url", post(upload_from_url))
         .route("/collections/{id}/docs/from-path", post(upload_from_path))
         .route(
             "/collections/{id}/docs/{doc_id}",
             get(get_doc).delete(delete_doc),
         )
-        .route("/collections/{id}/docs/{doc_id}/content", get(get_doc_content))
+        .route(
+            "/collections/{id}/docs/{doc_id}/content",
+            get(get_doc_content),
+        )
         .route("/collections/{id}/docs/{doc_id}/reindex", post(reindex_doc))
         .route("/search", post(search))
         .route("/stats", get(stats))
@@ -167,7 +172,10 @@ async fn create_collection(
     }
 }
 
-async fn get_collection(State(svc): State<Arc<KnowledgeService>>, Path(id): Path<String>) -> Response {
+async fn get_collection(
+    State(svc): State<Arc<KnowledgeService>>,
+    Path(id): Path<String>,
+) -> Response {
     match svc.get_collection(&id) {
         Ok(c) => Json(CollectionDto::from(c)).into_response(),
         Err(e) => err_response(e),
@@ -189,7 +197,10 @@ async fn patch_collection(
     }
 }
 
-async fn delete_collection(State(svc): State<Arc<KnowledgeService>>, Path(id): Path<String>) -> Response {
+async fn delete_collection(
+    State(svc): State<Arc<KnowledgeService>>,
+    Path(id): Path<String>,
+) -> Response {
     match svc.delete_collection(&id) {
         Ok(deleted_docs) => {
             Json(serde_json::json!({ "deletedDocs": deleted_docs })).into_response()
@@ -244,18 +255,22 @@ struct UploadJsonReq {
 }
 
 fn bad_request(code: &str) -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(serde_json::json!({ "error": code })),
-    )
-        .into_response()
+    status_err(StatusCode::BAD_REQUEST, code)
+}
+
+fn status_err(status: StatusCode, code: &str) -> Response {
+    (status, Json(serde_json::json!({ "error": code }))).into_response()
 }
 
 /// Upload a document. Accepts either `application/json` ({title, text, mime?})
 /// for text/markdown, or `multipart/form-data` (title field + file field) for
 /// binary files (pdf/docx/xlsx/pptx) — the backend canonicalizes either way.
 /// Returns 202; indexing runs in the background.
-async fn upload_doc(State(svc): State<Arc<KnowledgeService>>, Path(cid): Path<String>, req: Request) -> Response {
+async fn upload_doc(
+    State(svc): State<Arc<KnowledgeService>>,
+    Path(cid): Path<String>,
+    req: Request,
+) -> Response {
     let ct = req
         .headers()
         .get(header::CONTENT_TYPE)
@@ -377,11 +392,7 @@ async fn upload_from_path(
     Json(req): Json<FromPathReq>,
 ) -> Response {
     if !crate::server::is_loopback(peer) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "error": "from_path_loopback_only" })),
-        )
-            .into_response();
+        return status_err(StatusCode::FORBIDDEN, "forbidden_remote");
     }
     let raw = req.path.trim();
     if raw.is_empty() {
@@ -391,20 +402,22 @@ async fn upload_from_path(
     if let Err(e) = svc.get_collection(&cid) {
         return err_response(e);
     }
-    let resolved = match validate_local_path(raw) {
+    let resolved = match validate_local_path(raw, svc.allowed_upload_roots()) {
         Ok(p) => p,
-        Err(code) => return bad_request(code),
+        Err((status, code)) => return status_err(status, code),
     };
     // Enforce the same size cap the multipart path gets from the body limit —
     // std::fs::read bypasses axum's DefaultBodyLimit, so check up front.
     match std::fs::metadata(&resolved) {
-        Ok(m) if m.len() as usize > svc.max_doc_bytes() => return bad_request("body_too_large"),
+        Ok(m) if m.len() as usize > svc.max_doc_bytes() => {
+            return status_err(StatusCode::PAYLOAD_TOO_LARGE, "file_too_large");
+        }
         Ok(_) => {}
-        Err(_) => return bad_request("path_unreadable"),
+        Err(_) => return status_err(StatusCode::NOT_FOUND, "file_not_found"),
     }
     let bytes = match std::fs::read(&resolved) {
         Ok(b) => b,
-        Err(_) => return bad_request("path_unreadable"),
+        Err(_) => return status_err(StatusCode::NOT_FOUND, "file_not_found"),
     };
     // Title + MIME key off the real filename (extension), exactly like the
     // multipart path — OOXML / email types are distinguished by extension.
@@ -417,36 +430,32 @@ async fn upload_from_path(
     ingest_and_respond(&svc, &cid, file_name.trim(), &bytes, Some(&mime))
 }
 
-/// Resolve and authorize a local path for `from-path` ingest. Returns the
-/// canonical path on success or a stable error code. Rules: must be absolute,
-/// must canonicalize (resolves `..` and symlinks → defeats symlink escape and
-/// confirms existence), must be a regular file, and must live under an allowed
-/// root (the user's home dir or the system temp dir).
-fn validate_local_path(raw: &str) -> Result<std::path::PathBuf, &'static str> {
+/// Resolve and authorize a local path for `from-path` ingest against the
+/// configured allowed roots. Returns the canonical path or an
+/// `(HTTP status, error code)` matching the UI contract. Rules: absolute, must
+/// canonicalize (resolves `..` + symlinks → defeats symlink escape and confirms
+/// existence), must be a regular file, must live under an allowed root.
+fn validate_local_path(
+    raw: &str,
+    allowed_roots: &[std::path::PathBuf],
+) -> Result<std::path::PathBuf, (StatusCode, &'static str)> {
     let p = std::path::Path::new(raw);
+    // A relative path can't be checked against the absolute allowed roots; the
+    // desktop client always sends absolute paths, so treat it as out-of-bounds.
     if !p.is_absolute() {
-        return Err("path_not_absolute");
+        return Err((StatusCode::FORBIDDEN, "path_not_allowed"));
     }
-    // Canonicalize collapses `..` and resolves symlinks, so a symlink under
-    // home pointing at /etc/passwd resolves to /etc/passwd and fails the
-    // allowlist below. Also errors if the file doesn't exist.
-    let canon = std::fs::canonicalize(p).map_err(|_| "path_unreadable")?;
+    // Canonicalize collapses `..` and resolves symlinks, so a symlink under an
+    // allowed root pointing at /etc/passwd resolves to /etc/passwd and fails the
+    // root check below. Also errors if the path doesn't exist.
+    let canon = std::fs::canonicalize(p).map_err(|_| (StatusCode::NOT_FOUND, "file_not_found"))?;
     if !canon.is_file() {
-        return Err("path_not_a_file");
+        return Err((StatusCode::BAD_REQUEST, "not_a_file"));
     }
-    let mut roots: Vec<std::path::PathBuf> = Vec::new();
-    if let Some(home) = dirs_next::home_dir() {
-        if let Ok(h) = std::fs::canonicalize(&home) {
-            roots.push(h);
-        }
-    }
-    if let Ok(tmp) = std::fs::canonicalize(std::env::temp_dir()) {
-        roots.push(tmp);
-    }
-    if roots.iter().any(|r| canon.starts_with(r)) {
+    if allowed_roots.iter().any(|r| canon.starts_with(r)) {
         Ok(canon)
     } else {
-        Err("path_not_allowed")
+        Err((StatusCode::FORBIDDEN, "path_not_allowed"))
     }
 }
 
@@ -477,7 +486,11 @@ async fn upload_from_url(
     }
     match svc.ingest_url(&cid, url).await {
         Ok(outcome) => {
-            let status = if outcome.docs_added > 0 { "pending" } else { "skipped" };
+            let status = if outcome.docs_added > 0 {
+                "pending"
+            } else {
+                "skipped"
+            };
             (
                 StatusCode::ACCEPTED,
                 Json(serde_json::json!({
@@ -491,7 +504,9 @@ async fn upload_from_url(
         Err(e) => {
             use crate::kb::sync::SyncError;
             let (status, code) = match e {
-                SyncError::RateLimited { .. } => (StatusCode::TOO_MANY_REQUESTS, "url_rate_limited"),
+                SyncError::RateLimited { .. } => {
+                    (StatusCode::TOO_MANY_REQUESTS, "url_rate_limited")
+                }
                 SyncError::AuthFailed(_) => (StatusCode::BAD_GATEWAY, "url_auth_failed"),
                 SyncError::Network(_) | SyncError::Permanent(_) => {
                     (StatusCode::BAD_GATEWAY, "url_fetch_failed")
@@ -579,7 +594,10 @@ async fn list_docs(State(svc): State<Arc<KnowledgeService>>, Path(cid): Path<Str
     }
 }
 
-async fn get_doc(State(svc): State<Arc<KnowledgeService>>, Path((cid, did)): Path<(String, String)>) -> Response {
+async fn get_doc(
+    State(svc): State<Arc<KnowledgeService>>,
+    Path((cid, did)): Path<(String, String)>,
+) -> Response {
     match svc.get_doc(&cid, &did) {
         Ok(d) => Json(DocDto::from(d)).into_response(),
         Err(e) => err_response(e),
@@ -682,7 +700,9 @@ async fn stats(State(svc): State<Arc<KnowledgeService>>) -> Response {
 /// SSE stream of `knowledge.doc.status_changed` events, so the UI can react to
 /// async indexing finishing without polling. Each event's data is the JSON
 /// `{ type, docId, status }`.
-async fn events(State(svc): State<Arc<KnowledgeService>>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+async fn events(
+    State(svc): State<Arc<KnowledgeService>>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = svc.subscribe();
     let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|msg| async move {
         let data = msg.ok()?;
@@ -712,7 +732,7 @@ async fn embedders(State(svc): State<Arc<KnowledgeService>>) -> Response {
 #[cfg(test)]
 mod http_tests {
     use super::*;
-    use axum::body::{to_bytes, Body};
+    use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use tempfile::TempDir;
     use tower::ServiceExt; // oneshot
@@ -740,7 +760,11 @@ mod http_tests {
             }
             None => Body::empty(),
         };
-        let resp = app.clone().oneshot(builder.body(body).unwrap()).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(builder.body(body).unwrap())
+            .await
+            .unwrap();
         let status = resp.status();
         let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let val = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
@@ -872,9 +896,18 @@ mod http_tests {
             );
         }
         // Bad scheme / not-a-url.
-        assert_eq!(validate_public_http_url("ftp://example.com").unwrap_err(), "invalid_url");
-        assert_eq!(validate_public_http_url("file:///etc/passwd").unwrap_err(), "invalid_url");
-        assert_eq!(validate_public_http_url("not a url").unwrap_err(), "invalid_url");
+        assert_eq!(
+            validate_public_http_url("ftp://example.com").unwrap_err(),
+            "invalid_url"
+        );
+        assert_eq!(
+            validate_public_http_url("file:///etc/passwd").unwrap_err(),
+            "invalid_url"
+        );
+        assert_eq!(
+            validate_public_http_url("not a url").unwrap_err(),
+            "invalid_url"
+        );
         // A public IP literal passes (no DNS needed).
         assert!(validate_public_http_url("https://8.8.8.8/").is_ok());
     }
@@ -883,22 +916,28 @@ mod http_tests {
     fn from_path_validation() {
         use std::io::Write;
 
-        // Relative path rejected.
-        assert_eq!(validate_local_path("relative/x.txt").unwrap_err(), "path_not_absolute");
-        // Nonexistent absolute path rejected.
+        // Use the temp dir as the single allowed root for a hermetic test.
+        let root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let roots = vec![root.clone()];
+
+        // Relative path → not allowed (can't be checked against absolute roots).
         assert_eq!(
-            validate_local_path("/nonexistent/definitely/not/here.txt").unwrap_err(),
-            "path_unreadable"
+            validate_local_path("relative/x.txt", &roots).unwrap_err(),
+            (StatusCode::FORBIDDEN, "path_not_allowed")
         );
-        // A real file under the temp dir (an allowed root) is accepted.
-        let dir = std::env::temp_dir();
-        let f = dir.join(format!("rsclaw_frompath_test_{}.txt", std::process::id()));
+        // Nonexistent absolute path → 404.
+        assert_eq!(
+            validate_local_path("/nonexistent/definitely/not/here.txt", &roots).unwrap_err(),
+            (StatusCode::NOT_FOUND, "file_not_found")
+        );
+        // A real file under an allowed root is accepted.
+        let f = root.join(format!("rsclaw_frompath_test_{}.txt", std::process::id()));
         std::fs::File::create(&f).unwrap().write_all(b"hi").unwrap();
-        assert!(validate_local_path(f.to_str().unwrap()).is_ok());
+        assert!(validate_local_path(f.to_str().unwrap(), &roots).is_ok());
         // A directory is not a file.
         assert_eq!(
-            validate_local_path(dir.to_str().unwrap()).unwrap_err(),
-            "path_not_a_file"
+            validate_local_path(root.to_str().unwrap(), &roots).unwrap_err(),
+            (StatusCode::BAD_REQUEST, "not_a_file")
         );
         std::fs::remove_file(&f).ok();
     }
@@ -906,10 +945,14 @@ mod http_tests {
     #[test]
     #[cfg(unix)]
     fn from_path_rejects_outside_allowed_roots() {
-        // /etc/hosts exists, is absolute and a regular file, but lives outside
-        // home/temp — the allowlist must reject it (arbitrary-read defense).
+        // /etc/hosts exists and is a regular file, but lives outside the
+        // allowed root — the allowlist must reject it (arbitrary-read defense).
+        let roots = vec![std::fs::canonicalize(std::env::temp_dir()).unwrap()];
         if std::path::Path::new("/etc/hosts").is_file() {
-            assert_eq!(validate_local_path("/etc/hosts").unwrap_err(), "path_not_allowed");
+            assert_eq!(
+                validate_local_path("/etc/hosts", &roots).unwrap_err(),
+                (StatusCode::FORBIDDEN, "path_not_allowed")
+            );
         }
     }
 
