@@ -628,15 +628,30 @@ pub fn build_tool_list(
             \n\
             Prefer the knowledge base over web_search when the question is about content \
             the user gave you. Always cite the returned `source_title`. If it returns no \
-            hits, say so — do NOT fabricate a citation.".to_owned(),
+            hits, say so — do NOT fabricate a citation.\n\
+            \n\
+            Writing — ONLY when the user explicitly asks you to save/organize material into \
+            their knowledge base (e.g. \"整理这些微信记录录入知识库\", meeting notes, emails). \
+            Never curate proactively.\n\
+            - action=list_collections — see existing collections (reuse one before creating).\n\
+            - action=create_collection {name, description?} — make a new collection.\n\
+            - action=add {collection, title, content, mime?} — ingest text you prepared; \
+              `collection` is a NAME (created if absent); `content` is markdown/plain text.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Natural-language search query."},
-                "collection_ids": {"type": "array", "items": {"type": "string"}, "description": "Optional: restrict to specific collection ids. Omit to search all."},
-                "top_k": {"type": "integer", "description": "Max hits to return. Default 5."}
+                "action": {"type": "string", "enum": ["search", "add", "create_collection", "list_collections"], "description": "Default \"search\". Write actions only when the user asks."},
+                "query": {"type": "string", "description": "Natural-language search query (action=search)."},
+                "collection_ids": {"type": "array", "items": {"type": "string"}, "description": "Optional: restrict search to specific collection ids. Omit to search all."},
+                "top_k": {"type": "integer", "description": "Max hits to return (action=search). Default 5."},
+                "collection": {"type": "string", "description": "Target collection NAME (action=add); created if it doesn't exist."},
+                "name": {"type": "string", "description": "New collection name (action=create_collection)."},
+                "description": {"type": "string", "description": "Optional collection description (action=create_collection)."},
+                "title": {"type": "string", "description": "Document title (action=add)."},
+                "content": {"type": "string", "description": "Document text to ingest (action=add)."},
+                "mime": {"type": "string", "description": "Optional MIME for content (action=add). Default text/markdown."}
             },
-            "required": ["query"]
+            "required": []
         }),
     });
     tools.push(ToolDef {
