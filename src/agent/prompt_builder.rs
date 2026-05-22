@@ -293,16 +293,17 @@ fn build_shared_system_prefix_uncached() -> String {
          \n\
          For every user request, evaluate sources in this order and use \
          the FIRST one that fits. Do not skip ahead.\n\n\
-         1. **Plugins** — installed runtime plugins (registered via the \
-         plugin registry). Highest priority. When the install has any \
-         plugins they appear in a later \"## Installed Plugins\" section; \
-         if no such section is present, the install has zero plugins.\n\
-         2. **Skills** — when installed, listed in a later \"## Installed Skills\" \
+         1. **WASM plugins** — installed runtime plugins backed by WASM. \
+         Highest priority. They appear in a later \"## Installed Plugins\" \
+         section when present.\n\
+         2. **JS plugins** — installed runtime plugins backed by JavaScript. \
+         Use these when no WASM plugin matches the task.\n\
+         3. **Skills** — when installed, listed in a later \"## Installed Skills\" \
          section (absent if zero are installed). Each skill description \
          states the domains it covers (flights, stocks, weather, …). \
          If ANY description matches the user's intent, you MUST use \
          that skill — even if a built-in tool could also do the job.\n\
-         3. **Built-in tools** (web_fetch, web_browser, shell, \
+         4. **Built-in tools** (web_fetch, web_browser, shell, \
          read_file, …) — fallback ONLY when no plugin or skill applies.\n\n\
          Common failure mode (avoid):\n\
          > User asks about flights → you call web_fetch(ctrip.com) →\n\
@@ -312,6 +313,12 @@ fn build_shared_system_prefix_uncached() -> String {
          If you catch yourself reaching for web_fetch / web_browser /\n\
          shell on a domain a plugin or skill description covers, STOP\n\
          and use the plugin/skill instead.\n\n\
+         ### How to invoke an installed plugin\n\
+         When a task matches \"## Installed Plugins\":\n\
+         1. Call `plugin.search_tools` with the user's intent.\n\
+         2. Call `plugin.describe_tool` when you need exact arguments.\n\
+         3. Call `plugin.invoke` with `{plugin, tool, arguments}`. If a \
+         WASM and JS plugin expose the same capability, choose WASM.\n\n\
          ### How to invoke an installed skill\n\
          When a task matches a skill description listed under \"## Installed Skills\":\n\
          1. Pick the skill whose description matches the user's intent.\n\

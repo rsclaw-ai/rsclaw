@@ -104,6 +104,15 @@ const SESSION_IDLE_TTL_SECS: u64 = 7 * 24 * 3600;
 /// Eviction only triggers when the session count exceeds this threshold.
 const MAX_SESSIONS_PER_AGENT: usize = 10_000;
 
+#[derive(Debug, Clone)]
+struct PluginToolInfo {
+    plugin: String,
+    runtime: &'static str,
+    tool: String,
+    description: String,
+    input_schema: Value,
+}
+
 /// RAII guard that clears the abort flag for a session when dropped.
 struct AbortFlagGuard {
     handle: Arc<AgentHandle>,
@@ -2852,10 +2861,9 @@ impl AgentRuntime {
                 &self.config.agents.a2a,
             );
             all.extend(extra_tools.iter().cloned());
-            all.extend(super::tools_builder::build_wasm_tool_defs(&self.wasm_plugins));
-            if let Some(ref reg) = self.plugins {
-                all.extend(super::tools_builder::build_shell_tool_defs(reg));
-            }
+            // Plugin catalogs are exposed through compact meta tools
+            // (`plugin.search_tools`, `plugin.describe_tool`, `plugin.invoke`)
+            // instead of exporting every concrete plugin tool into provider tools.
             if let Some(ref mcp) = self.mcp {
                 all.extend(mcp.all_tool_defs().await);
             }
@@ -5898,6 +5906,297 @@ impl AgentRuntime {
     // Tool dispatch (AGENTS.md §20)
     // -----------------------------------------------------------------------
 
+    fn collect_plugin_tools(&self) -> Vec<PluginToolInfo> {
+        let mut out = Vec::new();
+        for plugin in self.wasm_plugins.iter() {
+            for tool in &plugin.tools {
+                out.push(PluginToolInfo {
+                    plugin: plugin.name.clone(),
+                    runtime: "wasm",
+                    tool: tool.name.clone(),
+                    description: tool.description.clone(),
+                    input_schema: tool.parameters.clone(),
+                });
+            }
+        }
+        if let Some(reg) = self.plugins.as_ref() {
+            for (plugin_name, plugin) in reg.js_plugins_iter() {
+                for tool in &plugin.manifest.tools {
+                    out.push(PluginToolInfo {
+                        plugin: plugin_name.clone(),
+                        runtime: "js",
+                        tool: tool.name.clone(),
+                        description: tool.description.clone(),
+                        input_schema: tool.input_schema.clone().unwrap_or_else(|| {
+                            json!({"type": "object", "properties": {}})
+                        }),
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    fn find_plugin_tool(&self, plugin: &str, tool: &str) -> Option<PluginToolInfo> {
+        self.collect_plugin_tools()
+            .into_iter()
+            .find(|t| t.plugin == plugin && t.tool == tool)
+    }
+
+    fn compact_input_schema(schema: &Value) -> Value {
+        let required = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut props = serde_json::Map::new();
+        if let Some(obj) = schema.get("properties").and_then(|v| v.as_object()) {
+            for (name, raw) in obj.iter().take(16) {
+                let mut compact = serde_json::Map::new();
+                if let Some(t) = raw.get("type") {
+                    compact.insert("type".to_owned(), t.clone());
+                }
+                if let Some(en) = raw.get("enum") {
+                    compact.insert("enum".to_owned(), en.clone());
+                }
+                if let Some(default) = raw.get("default") {
+                    compact.insert("default".to_owned(), default.clone());
+                }
+                if let Some(desc) = raw.get("description").and_then(|d| d.as_str()) {
+                    compact.insert(
+                        "description".to_owned(),
+                        json!(crate::util::truncate_str(desc, 180)),
+                    );
+                }
+                props.insert(name.clone(), Value::Object(compact));
+            }
+        }
+        json!({
+            "required": required,
+            "properties": props,
+        })
+    }
+
+    fn plugin_tool_summary(tool: &PluginToolInfo) -> Value {
+        json!({
+            "plugin": tool.plugin,
+            "tool": tool.tool,
+            "name": format!("{}.{}", tool.plugin, tool.tool),
+            "runtime": tool.runtime,
+            "description": crate::util::truncate_str(&tool.description, 280),
+            "input_schema_compact": Self::compact_input_schema(&tool.input_schema),
+        })
+    }
+
+    fn plugin_runtime_priority(runtime: &str) -> u8 {
+        match runtime {
+            "wasm" => 0,
+            "js" => 1,
+            _ => 2,
+        }
+    }
+
+    fn is_cjk_char(ch: char) -> bool {
+        matches!(
+            ch,
+            '\u{3400}'..='\u{4DBF}'
+                | '\u{4E00}'..='\u{9FFF}'
+                | '\u{F900}'..='\u{FAFF}'
+                | '\u{3040}'..='\u{30FF}'
+                | '\u{AC00}'..='\u{D7AF}'
+        )
+    }
+
+    fn score_plugin_tool(query: &str, tool: &PluginToolInfo) -> i32 {
+        let query_l = query.to_lowercase();
+        let haystack = format!(
+            "{} {} {} {}",
+            tool.plugin,
+            tool.tool,
+            tool.tool.replace('_', " "),
+            tool.description
+        )
+        .to_lowercase();
+
+        let mut score = 0;
+        if !query_l.is_empty() && haystack.contains(&query_l) {
+            score += 30;
+        }
+        for token in query_l
+            .split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '，' | '；' | ':' | '：'))
+            .filter(|t| !t.is_empty())
+        {
+            if tool.tool.to_lowercase().contains(token) {
+                score += 12;
+            }
+            if tool.description.to_lowercase().contains(token) {
+                score += 6;
+            }
+            if tool.plugin.to_lowercase().contains(token) {
+                score += 3;
+            }
+        }
+
+        let mut cjk_total = 0;
+        let mut cjk_hits = 0;
+        for ch in query_l.chars().filter(|ch| Self::is_cjk_char(*ch)) {
+            cjk_total += 1;
+            if haystack.contains(ch) {
+                cjk_hits += 1;
+            }
+        }
+        if cjk_total > 0 {
+            score += cjk_hits * 4;
+            if cjk_hits == cjk_total {
+                score += 10;
+            }
+        }
+        score
+    }
+
+    pub(crate) async fn tool_plugin_search_tools(&self, args: Value) -> Result<Value> {
+        let query = args["query"].as_str().unwrap_or("").trim();
+        if query.is_empty() {
+            return Ok(json!({"error": "plugin.search_tools requires non-empty query"}));
+        }
+        let plugin_filter = args["plugin"].as_str().map(str::trim).filter(|s| !s.is_empty());
+        let limit = args["limit"].as_u64().unwrap_or(8).clamp(1, 20) as usize;
+
+        let mut scored: Vec<(i32, PluginToolInfo)> = self
+            .collect_plugin_tools()
+            .into_iter()
+            .filter(|t| plugin_filter.is_none_or(|p| t.plugin == p))
+            .map(|t| (Self::score_plugin_tool(query, &t), t))
+            .filter(|(score, _)| *score > 0 || plugin_filter.is_some())
+            .collect();
+
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| {
+                    Self::plugin_runtime_priority(a.1.runtime)
+                        .cmp(&Self::plugin_runtime_priority(b.1.runtime))
+                })
+                .then_with(|| a.1.plugin.cmp(&b.1.plugin))
+                .then_with(|| a.1.tool.cmp(&b.1.tool))
+        });
+        scored.truncate(limit);
+
+        Ok(json!({
+            "query": query,
+            "plugin": plugin_filter,
+            "tools": scored.into_iter().map(|(score, tool)| {
+                let mut summary = Self::plugin_tool_summary(&tool);
+                summary["score"] = json!(score);
+                summary
+            }).collect::<Vec<_>>(),
+        }))
+    }
+
+    pub(crate) async fn tool_plugin_describe_tool(&self, args: Value) -> Result<Value> {
+        let plugin = args["plugin"].as_str().unwrap_or("").trim();
+        let tool = args["tool"].as_str().unwrap_or("").trim();
+        if plugin.is_empty() || tool.is_empty() {
+            return Ok(json!({"error": "plugin.describe_tool requires plugin and tool"}));
+        }
+        let Some(info) = self.find_plugin_tool(plugin, tool) else {
+            return Ok(json!({
+                "error": format!("plugin tool not found: {plugin}.{tool}"),
+                "hint": "Use plugin.search_tools to discover installed plugin tools."
+            }));
+        };
+        Ok(json!({
+            "plugin": info.plugin,
+            "tool": info.tool,
+            "name": format!("{}.{}", info.plugin, info.tool),
+            "runtime": info.runtime,
+            "description": info.description,
+            "input_schema": info.input_schema,
+        }))
+    }
+
+    fn validate_plugin_arguments(tool: &PluginToolInfo, args: &Value) -> std::result::Result<(), Value> {
+        if !args.is_object() {
+            return Err(json!({
+                "error": "plugin.invoke arguments must be an object",
+                "plugin": tool.plugin,
+                "tool": tool.tool,
+                "schema_hint": Self::compact_input_schema(&tool.input_schema),
+            }));
+        }
+        if let Some(required) = tool.input_schema.get("required").and_then(|v| v.as_array()) {
+            let missing: Vec<&str> = required
+                .iter()
+                .filter_map(|v| v.as_str())
+                .filter(|key| args.get(*key).is_none_or(Value::is_null))
+                .collect();
+            if !missing.is_empty() {
+                return Err(json!({
+                    "error": "plugin.invoke missing required arguments",
+                    "plugin": tool.plugin,
+                    "tool": tool.tool,
+                    "missing": missing,
+                    "schema_hint": Self::compact_input_schema(&tool.input_schema),
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn tool_plugin_invoke(&self, ctx: &RunContext, args: Value) -> Result<Value> {
+        let plugin_name = args["plugin"].as_str().unwrap_or("").trim();
+        let tool_name = args["tool"].as_str().unwrap_or("").trim();
+        let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+        if plugin_name.is_empty() || tool_name.is_empty() {
+            return Ok(json!({"error": "plugin.invoke requires plugin, tool, and arguments"}));
+        }
+        let Some(info) = self.find_plugin_tool(plugin_name, tool_name) else {
+            return Ok(json!({
+                "error": format!("plugin tool not found: {plugin_name}.{tool_name}"),
+                "hint": "Use plugin.search_tools to discover installed plugin tools."
+            }));
+        };
+        if let Err(err) = Self::validate_plugin_arguments(&info, &arguments) {
+            return Ok(err);
+        }
+
+        if let Some(wp) = self.wasm_plugins.iter().find(|p| p.name == plugin_name) {
+            let notify_ctx = self.notification_tx.as_ref().map(|tx| {
+                crate::plugin::wasm_runtime::WasmNotifyCtx {
+                    tx: tx.clone(),
+                    target_id: if !ctx.chat_id.is_empty() {
+                        ctx.chat_id.clone()
+                    } else {
+                        ctx.peer_id.clone()
+                    },
+                    channel: ctx.channel.clone(),
+                }
+            });
+            return wp.call_tool_with_ctx(tool_name, arguments, notify_ctx).await;
+        }
+
+        if let Some(reg) = self.plugins.as_ref()
+            && let Some(plugin) = reg.get_js(plugin_name)
+        {
+            let target_id = if !ctx.chat_id.is_empty() {
+                ctx.chat_id.clone()
+            } else {
+                ctx.peer_id.clone()
+            };
+            let params = serde_json::json!({
+                "tool": tool_name,
+                "args": arguments,
+                "_ctx": {
+                    "target_id": target_id,
+                    "channel": ctx.channel.clone(),
+                    "session_key": ctx.session_key.clone(),
+                }
+            });
+            return plugin.call("tool_call", params).await;
+        }
+
+        Ok(json!({"error": format!("plugin runtime not loaded: {plugin_name}")}))
+    }
+
     async fn dispatch_tool(
         &self,
         ctx: &RunContext,
@@ -6094,6 +6393,9 @@ impl AgentRuntime {
             "skill_search" => return self.tool_skill_search(args).await,
             "skill_install" => return self.tool_skill_install(args).await,
             "skill_remove" => return self.tool_skill_remove(args).await,
+            "plugin.search_tools" => return self.tool_plugin_search_tools(args).await,
+            "plugin.describe_tool" => return self.tool_plugin_describe_tool(args).await,
+            "plugin.invoke" => return self.tool_plugin_invoke(ctx, args).await,
             "task" => return self.tool_task(ctx, args).await,
             "task_finish" => return self.tool_task_finish(ctx, args).await,
             "ask_user" => return self.tool_ask_user(ctx, args).await,
@@ -8064,4 +8366,3 @@ mod tests {
         }
     }
 }
-

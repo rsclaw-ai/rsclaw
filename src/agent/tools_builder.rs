@@ -13,44 +13,75 @@ use crate::{
     skill::SkillRegistry,
 };
 
-/// Build a `Vec<ToolDef>` advertising every tool exported by every loaded
-/// WASM plugin. Tool names are namespaced as `<plugin>.<tool>` so the
-/// dispatcher can route them back to the right plugin instance.
-pub(crate) fn build_wasm_tool_defs(plugins: &[WasmPlugin]) -> Vec<ToolDef> {
-    plugins
-        .iter()
-        .flat_map(|p| {
-            let plugin_name = p.name.clone();
-            p.tools.iter().map(move |t| ToolDef {
-                name: format!("{}.{}", plugin_name, t.name),
-                description: t.description.clone(),
-                parameters: t.parameters.clone(),
-            })
-        })
-        .collect()
+pub(crate) fn build_plugin_meta_tool_defs() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: "plugin.search_tools".to_owned(),
+            description: "Search installed plugin tool catalogs by natural-language intent. Use before plugin.invoke when you need a plugin capability but the exact tool name or arguments are not already known.".to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "plugin": {"type": "string", "description": "Optional installed plugin name, e.g. douyin. Omit to search all plugins."},
+                    "query": {"type": "string", "description": "Short user intent, e.g. 'publish video to douyin' or 'check high value comments'."},
+                    "limit": {"type": "integer", "description": "Maximum tools to return. Default 8, cap 20."}
+                },
+                "required": ["query"]
+            }),
+        },
+        ToolDef {
+            name: "plugin.describe_tool".to_owned(),
+            description: "Return the full manifest description and input schema for one installed plugin tool. Use after plugin.search_tools when you need exact argument details.".to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "plugin": {"type": "string", "description": "Installed plugin name, e.g. douyin."},
+                    "tool": {"type": "string", "description": "Tool name inside the plugin, without plugin prefix, e.g. publish."}
+                },
+                "required": ["plugin", "tool"]
+            }),
+        },
+        ToolDef {
+            name: "plugin.invoke".to_owned(),
+            description: "Call an installed plugin tool after discovering it with plugin.search_tools or plugin.describe_tool. The host validates the tool exists and checks required arguments against the plugin manifest before dispatch.".to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "plugin": {"type": "string", "description": "Installed plugin name, e.g. douyin."},
+                    "tool": {"type": "string", "description": "Tool name inside the plugin, without plugin prefix, e.g. publish."},
+                    "arguments": {"type": "object", "description": "Arguments for the plugin tool. Must match the schema returned by plugin.search_tools or plugin.describe_tool."}
+                },
+                "required": ["plugin", "tool", "arguments"]
+            }),
+        },
+    ]
 }
 
-/// Build a `Vec<ToolDef>` for every tool exported by every loaded
-/// JS-runtime plugin. Tool names are `<plugin>.<tool>`, mirroring the
-/// wasm-plugin convention so the dispatcher in `runtime.rs` can route
-/// either with the same `split_once('.')` pattern.
-pub(crate) fn build_shell_tool_defs(plugins: &PluginRegistry) -> Vec<ToolDef> {
-    plugins
-        .js_plugins_iter()
-        .flat_map(|(plugin_name, plugin)| {
-            let plugin_name = plugin_name.clone();
-            plugin.manifest.tools.iter().map(move |t| ToolDef {
-                name: format!("{plugin_name}.{}", t.name),
-                description: t.description.clone(),
-                parameters: t.input_schema.clone().unwrap_or_else(|| {
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": {}
-                    })
-                }),
-            })
-        })
-        .collect()
+fn plugin_tool_examples<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
+    let mut examples: Vec<&str> = names.into_iter().take(8).collect();
+    examples.sort_unstable();
+    if examples.is_empty() {
+        "(no declared tools)".to_owned()
+    } else {
+        examples.join(", ")
+    }
+}
+
+fn render_plugin_catalog_block(
+    name: &str,
+    version: &str,
+    description: &str,
+    tool_count: usize,
+    tool_examples: &str,
+) -> String {
+    format!(
+        "<plugin name=\"{name}\" version=\"{version}\" tools=\"{tool_count}\">\n\
+         {description}\n\
+         Tool catalog is available on demand. Use `plugin.search_tools` with \
+         plugin=\"{name}\" to find the right tool, `plugin.describe_tool` for \
+         exact arguments, then `plugin.invoke` to call it.\n\
+         Example tool names: {tool_examples}\n\
+         </plugin>"
+    )
 }
 
 /// Build a system-prompt section that lists installed plugins (wasm + shell).
@@ -70,19 +101,15 @@ pub(crate) fn build_plugins_system(
     let mut blocks: Vec<(String, String)> = wasm_plugins
         .iter()
         .map(|p| {
-            let tools_lines: Vec<String> = p
-                .tools
-                .iter()
-                .map(|t| format!("  - {}.{}: {}", p.name, t.name, t.description))
-                .collect();
+            let examples = plugin_tool_examples(p.tools.iter().map(|t| t.name.as_str()));
             (
                 p.name.clone(),
-                format!(
-                    "<plugin name=\"{}\" version=\"{}\">\n{}\n\nTools:\n{}\n</plugin>",
-                    p.name,
+                render_plugin_catalog_block(
+                    &p.name,
                     p.version.as_deref().unwrap_or(""),
                     p.description.as_deref().unwrap_or(""),
-                    tools_lines.join("\n"),
+                    p.tools.len(),
+                    &examples,
                 ),
             )
         })
@@ -90,20 +117,16 @@ pub(crate) fn build_plugins_system(
 
     if let Some(reg) = js_plugins {
         for (plugin_name, plugin) in reg.js_plugins_iter() {
-            let tools_lines: Vec<String> = plugin
-                .manifest
-                .tools
-                .iter()
-                .map(|t| format!("  - {}.{}: {}", plugin_name, t.name, t.description))
-                .collect();
+            let examples =
+                plugin_tool_examples(plugin.manifest.tools.iter().map(|t| t.name.as_str()));
             blocks.push((
                 plugin_name.clone(),
-                format!(
-                    "<plugin name=\"{}\" version=\"{}\">\n{}\n\nTools:\n{}\n</plugin>",
+                render_plugin_catalog_block(
                     plugin_name,
                     plugin.manifest.version.as_deref().unwrap_or(""),
                     plugin.manifest.description.as_deref().unwrap_or(""),
-                    tools_lines.join("\n"),
+                    plugin.manifest.tools.len(),
+                    &examples,
                 ),
             ));
         }
@@ -115,7 +138,7 @@ pub(crate) fn build_plugins_system(
     blocks.sort_by(|a, b| a.0.cmp(&b.0));
     let blocks_text: Vec<String> = blocks.into_iter().map(|(_, b)| b).collect();
 
-    // Priority ordering (plugins > skills > built-in tools) lives in
+    // Priority ordering (WASM plugins > JS plugins > skills > built-in tools) lives in
     // the shared `CAPABILITY PRIORITY` section of
     // `build_shared_system_prefix` so it ships unconditionally with the
     // version baseline. Repeating it here would (a) duplicate ~30 tokens
@@ -125,8 +148,10 @@ pub(crate) fn build_plugins_system(
     Some(format!(
         "## Installed Plugins\n\
          Plugins automate external services (e.g. image/video generation, \
-         marketplace ops). When the user's task matches a plugin tool, prefer \
-         it over a generic browser-automation flow.\n\n\
+         marketplace ops). WASM plugins outrank JS plugins; plugins outrank \
+         skills and built-in tools when the user's task matches a plugin \
+         capability. Prefer plugin.invoke over a generic browser-automation \
+         flow.\n\n\
          {}",
         blocks_text.join("\n\n"),
     ))
@@ -152,8 +177,14 @@ pub(crate) fn toolset_allowed_names(
         "clarify",
         "anycli",
         "skill_use",
+        "plugin.search_tools",
+        "plugin.describe_tool",
+        "plugin.invoke",
     ];
     const WEB: &[&str] = &[
+        "plugin.search_tools",
+        "plugin.describe_tool",
+        "plugin.invoke",
         "web_search",
         "web_fetch",
         "web_download",
@@ -165,6 +196,9 @@ pub(crate) fn toolset_allowed_names(
         "skill_use",
     ];
     const CODE: &[&str] = &[
+        "plugin.search_tools",
+        "plugin.describe_tool",
+        "plugin.invoke",
         "shell",
         "read_file",
         "write_file",
@@ -198,6 +232,9 @@ pub(crate) fn toolset_allowed_names(
         "skill_install",
         "skill_remove",
         "task",
+        "plugin.search_tools",
+        "plugin.describe_tool",
+        "plugin.invoke",
     ];
 
     let base: Option<&[&str]> = match toolset {
@@ -316,6 +353,7 @@ pub fn build_tool_list(
             .to_owned(),
         parameters: json!({ "type": "object", "properties": {} }),
     });
+    tools.extend(build_plugin_meta_tool_defs());
     tools.push(ToolDef {
         name: "skill_search".to_owned(),
         description: "Search the remote skill registries for an installable skill when no \
@@ -1824,4 +1862,56 @@ pub(crate) fn windows_shell_guidance() -> String {
          - AVOID `git add -A` / `git add .` — stage specific files so you don't leak `.env`, credentials, or build artifacts.\n\
          - Prefer NEW commits over `--amend`; amending after a pre-commit-hook failure can destroy work because the failed commit never landed."
     )
+}
+
+#[cfg(test)]
+mod plugin_catalog_tests {
+    use super::*;
+    use crate::{
+        agent::registry::AgentRegistry, config::schema::A2aPeerConfig, skill::SkillRegistry,
+    };
+
+    #[test]
+    fn plugin_meta_tools_are_advertised_as_consolidated_entrypoints() {
+        let tools = build_tool_list(
+            &SkillRegistry::default(),
+            None::<&AgentRegistry>,
+            "main",
+            &[] as &[A2aPeerConfig],
+        );
+        let names: std::collections::HashSet<_> = tools.iter().map(|t| t.name.as_str()).collect();
+
+        assert!(names.contains("plugin.search_tools"));
+        assert!(names.contains("plugin.describe_tool"));
+        assert!(names.contains("plugin.invoke"));
+    }
+
+    #[test]
+    fn plugin_meta_tools_are_available_in_filtered_toolsets() {
+        for toolset in ["minimal", "web", "code", "standard"] {
+            let names = toolset_allowed_names(toolset, None).expect("filtered toolset");
+
+            assert!(names.contains("plugin.search_tools"), "{toolset}");
+            assert!(names.contains("plugin.describe_tool"), "{toolset}");
+            assert!(names.contains("plugin.invoke"), "{toolset}");
+        }
+    }
+
+    #[test]
+    fn plugin_catalog_block_is_compact_and_does_not_embed_tool_descriptions() {
+        let examples = plugin_tool_examples(["publish", "check_comments", "reply_comment"]);
+        let block = render_plugin_catalog_block(
+            "douyin",
+            "0.1.0",
+            "Douyin creator automation",
+            300,
+            &examples,
+        );
+
+        assert!(block.contains("tools=\"300\""));
+        assert!(block.contains("plugin.search_tools"));
+        assert!(block.contains("publish"));
+        assert!(!block.contains("Publish content to Douyin. Supports video"));
+        assert!(!block.contains("Tools:\n  - douyin.publish"));
+    }
 }
