@@ -34,14 +34,13 @@ use std::{convert::Infallible, sync::Arc, time::Duration};
 use anyhow::Result;
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Multipart, Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    extract::Multipart,
     routing::{delete, get, patch, post, put},
 };
 use futures::{Stream, StreamExt as _};
@@ -66,9 +65,9 @@ mod knowledge;
 // ---------------------------------------------------------------------------
 
 /// Compare two strings in constant time to prevent timing side-channel attacks.
-/// Note: length difference is still detectable via timing (early return), but for
-/// auth tokens of known format this is acceptable. The byte comparison itself
-/// does not short-circuit.
+/// Note: length difference is still detectable via timing (early return), but
+/// for auth tokens of known format this is acceptable. The byte comparison
+/// itself does not short-circuit.
 pub fn constant_time_eq(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
@@ -101,14 +100,12 @@ pub struct AppState {
     /// Broadcast channel for `PermissionRequest` events. Subscribed by
     /// the WS gateway (delivered to the desktop UI as `permission_request`
     /// frames).
-    pub computer_permission_tx:
-        broadcast::Sender<crate::computer::permission::PermissionRequest>,
+    pub computer_permission_tx: broadcast::Sender<crate::computer::permission::PermissionRequest>,
     /// Broadcast channel for `ComputerUseStatus` events (Started/Step/
     /// Finished). Same WS plumbing as `computer_permission_tx`; delivered
     /// to the desktop UI as `computer_use_status` frames so the live
     /// status panel can show what the GUI agent is doing right now.
-    pub computer_status_tx:
-        broadcast::Sender<crate::computer::status::ComputerUseStatus>,
+    pub computer_status_tx: broadcast::Sender<crate::computer::status::ComputerUseStatus>,
     /// Live registry of in-flight `computer_use` runs.
     /// Maps `run_id` -> the driver's abort flag. Inserted when
     /// `tool_vlm_drive` mints a run and removed on driver exit. The
@@ -116,8 +113,9 @@ pub struct AppState {
     /// flag; the driver's loop checks it between steps and exits with
     /// `DriverOutcome::UserAbort` -> `Finished { outcome_kind: "user_abort" }`,
     /// which the overlay UI consumes to fade itself out.
-    pub computer_runs:
-        Arc<tokio::sync::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
+    pub computer_runs: Arc<
+        tokio::sync::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    >,
     /// Device token store for WebSocket gateway auth.
     pub devices: Arc<crate::ws::DeviceStore>,
     /// Active WebSocket connections registry.
@@ -166,10 +164,12 @@ pub struct AppState {
     /// and the push notification dispatcher).
     pub task_event_bus: crate::a2a::event::TaskEventBus,
     /// Cancellation tokens for in-flight A2A tasks, keyed by task_id.
-    /// Inserted on SendMessage / SendStreamingMessage entry; fired by CancelTask.
+    /// Inserted on SendMessage / SendStreamingMessage entry; fired by
+    /// CancelTask.
     pub task_cancels: Arc<dashmap::DashMap<String, tokio_util::sync::CancellationToken>>,
-    /// Tasks paused on TASK_STATE_INPUT_REQUIRED / AUTH_REQUIRED, keyed by task_id.
-    /// Resumed when the client sends another SendMessage with the matching taskId.
+    /// Tasks paused on TASK_STATE_INPUT_REQUIRED / AUTH_REQUIRED, keyed by
+    /// task_id. Resumed when the client sends another SendMessage with the
+    /// matching taskId.
     pub suspended_tasks: Arc<dashmap::DashMap<String, crate::a2a::event::SuspendedTask>>,
     /// Persistent A2A task / push-config store (redb).
     pub task_store: Arc<crate::a2a::store::TaskStore>,
@@ -277,7 +277,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/cron", get(cron_list).post(cron_create))
         .route("/cron/reload", post(cron_reload))
         .route("/cron/bulk_replace", put(cron_bulk_replace))
-        .route("/cron/{id}", get(cron_get).put(cron_update).delete(cron_delete))
+        .route(
+            "/cron/{id}",
+            get(cron_get).put(cron_update).delete(cron_delete),
+        )
         .route("/cron/{id}/trigger", post(cron_trigger))
         .route("/cron/{id}/history", get(cron_history))
         .route("/channels/pair", post(channels_pair))
@@ -291,7 +294,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/channels/wechat/qr-login", post(wechat_qr_start))
         .route("/channels/wechat/qr-status", post(wechat_qr_status))
         .route("/workspace/files", get(list_workspace_files))
-        .route("/workspace/files/{*path}", get(read_workspace_file).put(write_workspace_file))
+        .route(
+            "/workspace/files/{*path}",
+            get(read_workspace_file).put(write_workspace_file),
+        )
         .route("/stream", get(stream_sse))
         .route(
             "/a2a",
@@ -303,9 +309,15 @@ pub fn build_router(state: AppState) -> Router {
             // see the larger limit.
             post(crate::a2a::server::a2a_dispatch)
                 .layer(axum::extract::DefaultBodyLimit::max(
-                    state.config.gateway.a2a_max_body_bytes.min(usize::MAX as u64) as usize,
+                    state
+                        .config
+                        .gateway
+                        .a2a_max_body_bytes
+                        .min(usize::MAX as u64) as usize,
                 ))
-                .layer(axum::middleware::from_fn(crate::a2a::version::a2a_version_layer))
+                .layer(axum::middleware::from_fn(
+                    crate::a2a::version::a2a_version_layer,
+                ))
                 .layer(axum::middleware::from_fn_with_state(
                     state.clone(),
                     crate::a2a::auth::a2a_auth_layer,
@@ -316,7 +328,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/hub/skills", get(hub_skills))
         .route("/hub/plugins", get(hub_plugins))
         .route("/hub/tools", get(hub_tools))
-        .route("/computer-use/permissions", get(computer_use_permissions_list))
+        .route(
+            "/computer-use/permissions",
+            get(computer_use_permissions_list),
+        )
         .route(
             "/computer-use/permissions/{agent_id}/{app}",
             delete(computer_use_permissions_revoke),
@@ -373,7 +388,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/models", get(openai_list_models))
         // OpenAI Files API — file upload/management for doubao and other providers.
         .route("/v1/files", post(upload_file).get(list_files))
-        .route("/v1/files/{file_id}", get(get_file_meta).delete(delete_file))
+        .route(
+            "/v1/files/{file_id}",
+            get(get_file_meta).delete(delete_file),
+        )
         .route("/v1/files/{file_id}/content", get(get_file_content))
         // WebSocket gateway — auth is handled inside the WS handshake.
         // OpenClaw WebUI connects on "/" (root), "/ws", or "/gateway-ws".
@@ -425,8 +443,8 @@ async fn auth_middleware(
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
-    // Health, agent card discovery, WS, and internal reload endpoints are always open
-    // (WS performs its own handshake-level auth).
+    // Health, agent card discovery, WS, and internal reload endpoints are always
+    // open (WS performs its own handshake-level auth).
     //
     // Both the bare `/health` and the namespaced `/api/v1/health` are
     // listed: the bare path is the default for container orchestrators
@@ -555,7 +573,11 @@ async fn send_message(
     };
 
     // Subscribe to event_bus BEFORE sending message so we don't miss early deltas.
-    let event_rx = if req.stream { Some(state.event_bus.subscribe()) } else { None };
+    let event_rx = if req.stream {
+        Some(state.event_bus.subscribe())
+    } else {
+        None
+    };
 
     if handle.tx.send(msg).await.is_err() {
         return (
@@ -618,15 +640,27 @@ async fn send_message(
             });
 
         let mut hdrs = axum::http::HeaderMap::new();
-        hdrs.insert(header::CONTENT_TYPE, "text/event-stream; charset=utf-8".parse().expect("ct"));
+        hdrs.insert(
+            header::CONTENT_TYPE,
+            "text/event-stream; charset=utf-8".parse().expect("ct"),
+        );
         hdrs.insert(header::CACHE_CONTROL, "no-cache".parse().expect("cc"));
-        hdrs.insert("x-accel-buffering".parse::<axum::http::HeaderName>().expect("hdr"), "no".parse().expect("v"));
+        hdrs.insert(
+            "x-accel-buffering"
+                .parse::<axum::http::HeaderName>()
+                .expect("hdr"),
+            "no".parse().expect("v"),
+        );
         return (StatusCode::OK, hdrs, axum::body::Body::from_stream(stream)).into_response();
     }
 
     // Non-streaming: track inflight while we await the agent's full reply.
     let _inflight_guard = state.shutdown.begin_work();
-    let timeout_secs = state.config.raw.agents.as_ref()
+    let timeout_secs = state
+        .config
+        .raw
+        .agents
+        .as_ref()
         .and_then(|a| a.defaults.as_ref())
         .and_then(|d| d.timeout_seconds)
         .unwrap_or(600) as u64;
@@ -820,17 +854,15 @@ async fn message_broadcast(
     let text = body["message"].as_str().unwrap_or("");
     let targets = body["targets"]
         .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str())
-                .collect::<Vec<_>>()
-        })
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
         .unwrap_or_default();
 
     if text.is_empty() || channel.is_empty() || targets.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "missing required fields: channel, message, targets"})),
+            Json(
+                serde_json::json!({"error": "missing required fields: channel, message, targets"}),
+            ),
         );
     }
 
@@ -982,7 +1014,8 @@ async fn delete_agent(State(_state): State<AppState>, Path(id): Path<String>) ->
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "error": "cannot delete the main agent" })),
-        ).into_response();
+        )
+            .into_response();
     }
     let result: Result<(), anyhow::Error> = (|| {
         let (path, mut val) = load_config_json()?;
@@ -1035,7 +1068,9 @@ async fn execute_tool(
             if wp.name == plugin_name {
                 match wp.call_tool(tool_inner, args.clone()).await {
                     Ok(result) => return Json(serde_json::json!({"ok": true, "result": result})),
-                    Err(e) => return Json(serde_json::json!({"ok": false, "error": format!("{e:#}")})),
+                    Err(e) => {
+                        return Json(serde_json::json!({"ok": false, "error": format!("{e:#}")}));
+                    }
                 }
             }
         }
@@ -1062,7 +1097,8 @@ async fn execute_tool(
 // ---------------------------------------------------------------------------
 // Hub catalog (read-only) — for the desktop tools/skills/plugins module.
 // Available (from the signed allowlist/tools manifest) + installed status.
-// Lazy-fetches the caches if missing; fail-open (returns cached/empty on hub down).
+// Lazy-fetches the caches if missing; fail-open (returns cached/empty on hub
+// down).
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
@@ -1090,11 +1126,18 @@ struct HubCatalogResponse {
 }
 
 fn installed_skill(slug: &str) -> bool {
-    crate::config::loader::base_dir().join("skills").join(slug).join("SKILL.md").is_file()
+    crate::config::loader::base_dir()
+        .join("skills")
+        .join(slug)
+        .join("SKILL.md")
+        .is_file()
 }
 
 fn installed_plugin(slug: &str) -> bool {
-    crate::config::loader::base_dir().join("plugins").join(slug).is_dir()
+    crate::config::loader::base_dir()
+        .join("plugins")
+        .join(slug)
+        .is_dir()
 }
 
 async fn build_skill_catalog() -> Vec<SkillCatalogEntry> {
@@ -1191,8 +1234,10 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
                 })*
             }
         }
-        check_ch!(telegram, discord, slack, whatsapp, signal, feishu,
-                   dingtalk, wecom, wechat, qq, line, zalo, matrix);
+        check_ch!(
+            telegram, discord, slack, whatsapp, signal, feishu, dingtalk, wecom, wechat, qq, line,
+            zalo, matrix
+        );
         chs
     };
 
@@ -1202,12 +1247,20 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
         let cutoff = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs() as i64 - 86400;
-        all.iter().filter(|key| {
-            state.store.db.get_session_meta(key).ok().flatten()
-                .map(|m| m.last_active > cutoff)
-                .unwrap_or(false)
-        }).count()
+            .as_secs() as i64
+            - 86400;
+        all.iter()
+            .filter(|key| {
+                state
+                    .store
+                    .db
+                    .get_session_meta(key)
+                    .ok()
+                    .flatten()
+                    .map(|m| m.last_active > cutoff)
+                    .unwrap_or(false)
+            })
+            .count()
     };
 
     // Memory usage (RSS on supported platforms).
@@ -1223,13 +1276,18 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
                 .and_then(|o| String::from_utf8(o.stdout).ok())
                 .and_then(|s| s.trim().parse::<u64>().ok())
                 .map(|kb| {
-                    if kb > 1024 { format!("{} MB", kb / 1024) }
-                    else { format!("{} KB", kb) }
+                    if kb > 1024 {
+                        format!("{} MB", kb / 1024)
+                    } else {
+                        format!("{} KB", kb)
+                    }
                 })
                 .unwrap_or_else(|| "--".into())
         }
         #[cfg(not(target_os = "macos"))]
-        { "--".to_string() }
+        {
+            "--".to_string()
+        }
     };
 
     // Disabled providers — Phase 3 surface. Empty list when every
@@ -1327,9 +1385,9 @@ async fn http_shutdown(
 ///      stops, in-flight HTTP connections (including this response) finish.
 ///   2. Send the "restarting" response so the client knows the request landed.
 ///   3. `axum::serve` returns; `start_gateway` notices `is_restart_requested`
-///      and spawns the replacement process AFTER the listener has been
-///      released — closing the race where the child's `bind()` would fail
-///      because the parent still owns the port.
+///      and spawns the replacement process AFTER the listener has been released
+///      — closing the race where the child's `bind()` would fail because the
+///      parent still owns the port.
 ///
 /// Persistent task queue items left behind are picked up by the new process
 /// on startup, so the user-visible behavior is "brief unavailability".
@@ -1528,7 +1586,11 @@ async fn cron_create(
         body["agent_id"] = serde_json::json!("main");
     }
     // Normalize schedule: accept both flat string and nested object
-    if let Some(sched) = body.get("schedule").and_then(|s| s.as_str()).map(|s| s.to_owned()) {
+    if let Some(sched) = body
+        .get("schedule")
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_owned())
+    {
         // Validate before normalizing — reject bad expressions with a friendly error.
         if let Err(msg) = crate::cron::validate_cron_expr(&sched) {
             return (
@@ -1537,7 +1599,10 @@ async fn cron_create(
             )
                 .into_response();
         }
-        let tz = body.get("timezone").and_then(|t| t.as_str()).map(|t| t.to_owned());
+        let tz = body
+            .get("timezone")
+            .and_then(|t| t.as_str())
+            .map(|t| t.to_owned());
         if let Some(tz) = tz {
             body["schedule"] = serde_json::json!({"kind": "cron", "expr": sched, "tz": tz});
         } else {
@@ -1547,7 +1612,11 @@ async fn cron_create(
         if let Some(obj) = body.as_object_mut() {
             obj.remove("timezone");
         }
-    } else if let Some(expr) = body.get("schedule").and_then(|s| s.get("expr")).and_then(|e| e.as_str()) {
+    } else if let Some(expr) = body
+        .get("schedule")
+        .and_then(|s| s.get("expr"))
+        .and_then(|e| e.as_str())
+    {
         // Nested schedule form — validate the expr here too.
         if let Err(msg) = crate::cron::validate_cron_expr(expr) {
             return (
@@ -1564,7 +1633,8 @@ async fn cron_create(
     body["created_at_ms"] = serde_json::json!(now_ms);
     body["updated_at_ms"] = serde_json::json!(now_ms);
 
-    // Serialize read-modify-write so parallel cron.add calls don't clobber each other.
+    // Serialize read-modify-write so parallel cron.add calls don't clobber each
+    // other.
     let _guard = crate::cron::CRON_FILE_LOCK.lock().await;
     let mut jobs = cron_load_jobs().await;
     // Prevent duplicate IDs
@@ -1602,7 +1672,7 @@ async fn cron_update(
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({"error": "job not found"})),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -1693,7 +1763,7 @@ async fn cron_trigger(State(state): State<AppState>, Path(id): Path<String>) -> 
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({"error": "job not found"})),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -1708,7 +1778,8 @@ async fn cron_trigger(State(state): State<AppState>, Path(id): Path<String>) -> 
         .unwrap_or("main");
 
     // Send message to the agent via registry.
-    // After the agent replies, deliver the result through the job's delivery channel.
+    // After the agent replies, deliver the result through the job's delivery
+    // channel.
     if let Ok(handle) = state.agents.get(agent_id) {
         let session_key = format!("cron:{}", id);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -1794,11 +1865,7 @@ async fn cron_trigger(State(state): State<AppState>, Path(id): Path<String>) -> 
 /// "Always allow" grant for the settings UI.
 async fn computer_use_permissions_list(State(state): State<AppState>) -> Response {
     match state.computer_permission.list_grants().await {
-        Ok(grants) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"grants": grants})),
-        )
-            .into_response(),
+        Ok(grants) => (StatusCode::OK, Json(serde_json::json!({"grants": grants}))).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
@@ -1921,19 +1988,20 @@ async fn channels_pair(
     }
 
     // Collect enforcers outside the lock to avoid holding it across await.
-    let enforcers: Vec<(String, Arc<crate::channel::DmPolicyEnforcer>)> = match state
-        .dm_enforcers
-        .read()
-    {
-        Ok(guard) => guard.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect(),
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal lock error"})),
-            )
-                .into_response();
-        }
-    };
+    let enforcers: Vec<(String, Arc<crate::channel::DmPolicyEnforcer>)> =
+        match state.dm_enforcers.read() {
+            Ok(guard) => guard
+                .iter()
+                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                .collect(),
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "internal lock error"})),
+                )
+                    .into_response();
+            }
+        };
 
     for (channel, enforcer) in &enforcers {
         if let Some(peer_id) = enforcer.approve_pairing(code).await {
@@ -1969,19 +2037,20 @@ async fn channels_unpair(
     }
 
     // Revoke from in-memory enforcer.
-    let enforcers: Vec<(String, Arc<crate::channel::DmPolicyEnforcer>)> = match state
-        .dm_enforcers
-        .read()
-    {
-        Ok(guard) => guard.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect(),
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal lock error"})),
-            )
-                .into_response();
-        }
-    };
+    let enforcers: Vec<(String, Arc<crate::channel::DmPolicyEnforcer>)> =
+        match state.dm_enforcers.read() {
+            Ok(guard) => guard
+                .iter()
+                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                .collect(),
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "internal lock error"})),
+                )
+                    .into_response();
+            }
+        };
 
     let mut found = false;
     for (ch, enforcer) in &enforcers {
@@ -2009,19 +2078,20 @@ async fn channels_unpair(
 }
 
 async fn list_pairings(State(state): State<AppState>) -> Response {
-    let enforcers: Vec<(String, Arc<crate::channel::DmPolicyEnforcer>)> = match state
-        .dm_enforcers
-        .read()
-    {
-        Ok(guard) => guard.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect(),
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal lock error"})),
-            )
-                .into_response();
-        }
-    };
+    let enforcers: Vec<(String, Arc<crate::channel::DmPolicyEnforcer>)> =
+        match state.dm_enforcers.read() {
+            Ok(guard) => guard
+                .iter()
+                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                .collect(),
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "internal lock error"})),
+                )
+                    .into_response();
+            }
+        };
 
     let mut pending = Vec::new();
     let mut approved = Vec::new();
@@ -2058,11 +2128,13 @@ async fn get_config(State(_state): State<AppState>) -> Response {
         Ok(content) => Json(serde_json::json!({
             "raw": content,
             "path": config_path.display().to_string(),
-        })).into_response(),
+        }))
+        .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
 
@@ -2084,7 +2156,8 @@ async fn save_config(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": format!("invalid config: {e}")})),
-        ).into_response();
+        )
+            .into_response();
     }
 
     // Backup current file.
@@ -2099,13 +2172,15 @@ async fn save_config(
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
-        ).into_response();
+        )
+            .into_response();
     }
 
     Json(serde_json::json!({
         "saved": true,
         "path": config_path.display().to_string(),
-    })).into_response()
+    }))
+    .into_response()
 }
 
 async fn get_session_messages(
@@ -2130,7 +2205,8 @@ async fn get_session_messages(
     }
 }
 
-// is_compaction_message moved to crate::agent::compaction::is_compaction_message
+// is_compaction_message moved to
+// crate::agent::compaction::is_compaction_message
 use crate::agent::compaction::is_compaction_message;
 
 async fn clear_session(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
@@ -2287,7 +2363,11 @@ async fn openai_chat_completions(
 
     // Subscribe to event_bus BEFORE sending message to agent,
     // so we don't miss early deltas for streaming responses.
-    let event_rx = if req.stream { Some(state.event_bus.subscribe()) } else { None };
+    let event_rx = if req.stream {
+        Some(state.event_bus.subscribe())
+    } else {
+        None
+    };
 
     if handle.tx.send(msg).await.is_err() {
         return (
@@ -2360,18 +2440,27 @@ async fn openai_chat_completions(
         let mut response_headers = axum::http::HeaderMap::new();
         response_headers.insert(
             header::CONTENT_TYPE,
-            "text/event-stream; charset=utf-8".parse().expect("header value"),
+            "text/event-stream; charset=utf-8"
+                .parse()
+                .expect("header value"),
         );
         response_headers.insert(
             header::CACHE_CONTROL,
             "no-cache".parse().expect("header value"),
         );
         response_headers.insert(
-            "x-accel-buffering".parse::<axum::http::HeaderName>().expect("header name"),
+            "x-accel-buffering"
+                .parse::<axum::http::HeaderName>()
+                .expect("header name"),
             "no".parse().expect("header value"),
         );
 
-        return (StatusCode::OK, response_headers, axum::body::Body::from_stream(stream)).into_response();
+        return (
+            StatusCode::OK,
+            response_headers,
+            axum::body::Body::from_stream(stream),
+        )
+            .into_response();
     }
 
     // Non-streaming: track inflight while we await the agent's full reply.
@@ -2564,7 +2653,8 @@ struct WhatsAppVerifyParams {
 /// Meta webhook verification (GET /hooks/whatsapp).
 async fn whatsapp_verify(Query(params): Query<WhatsAppVerifyParams>) -> impl IntoResponse {
     // Meta sends GET with hub.mode=subscribe, hub.verify_token, hub.challenge.
-    // We accept any verify_token for now (operator should secure via WHATSAPP_VERIFY_TOKEN env).
+    // We accept any verify_token for now (operator should secure via
+    // WHATSAPP_VERIFY_TOKEN env).
     let expected = std::env::var("WHATSAPP_VERIFY_TOKEN").unwrap_or_default();
     if params.hub_mode.as_deref() == Some("subscribe")
         && (expected.is_empty() || params.hub_verify_token.as_deref() == Some(expected.as_str()))
@@ -2705,10 +2795,10 @@ fn build_provider_models_request(
 ) -> Result<reqwest::RequestBuilder, String> {
     use crate::provider::defaults as prov_defaults;
 
-    // Expand `${VAR}` placeholders so a config like `apiKey: "${ANTHROPIC_API_KEY}"`
-    // tests the actual key, matching the gateway's runtime expansion done in
-    // `config::loader::load_config`. Without this the test sends the literal
-    // template string and Anthropic/etc. return 401.
+    // Expand `${VAR}` placeholders so a config like `apiKey:
+    // "${ANTHROPIC_API_KEY}"` tests the actual key, matching the gateway's
+    // runtime expansion done in `config::loader::load_config`. Without this the
+    // test sends the literal template string and Anthropic/etc. return 401.
     let raw_key = req.api_key.clone();
     let api_key = crate::config::loader::expand_env_vars(&req.api_key);
     let base_url_in: Option<String> = req
@@ -2721,7 +2811,10 @@ fn build_provider_models_request(
     // error saves the user from chasing a misleading "invalid key".
     let needs_key = !matches!(req.provider.as_str(), "ollama");
     if needs_key && api_key.is_empty() && raw_key.contains("${") {
-        let var = raw_key.trim().trim_start_matches("${").trim_end_matches('}');
+        let var = raw_key
+            .trim()
+            .trim_start_matches("${")
+            .trim_end_matches('}');
         return Err(format!(
             "API key expanded to empty — env var '{var}' is unset or empty in the gateway process. \
              Either export it before starting the gateway, or replace the placeholder in rsclaw.json5 \
@@ -2752,9 +2845,13 @@ fn build_provider_models_request(
 
     // Resolve base URL
     let base_url = if let Some(ref explicit) = base_url_in {
-        if !explicit.is_empty() { explicit.trim_end_matches('/').to_owned() }
-        else if !default_url.is_empty() { default_url }
-        else { return Err("no base URL provided".to_owned()); }
+        if !explicit.is_empty() {
+            explicit.trim_end_matches('/').to_owned()
+        } else if !default_url.is_empty() {
+            default_url
+        } else {
+            return Err("no base URL provided".to_owned());
+        }
     } else if !default_url.is_empty() {
         default_url
     } else {
@@ -2769,7 +2866,13 @@ fn build_provider_models_request(
             "anthropic" => "x-api-key",
             "gemini" => "gemini-key",
             "ollama" => "none",
-            _ => if api_key.is_empty() { "none" } else { "bearer" },
+            _ => {
+                if api_key.is_empty() {
+                    "none"
+                } else {
+                    "bearer"
+                }
+            }
         }
     } else if effective_type == "gemini" {
         "gemini-key"
@@ -2791,7 +2894,9 @@ fn build_provider_models_request(
 
     let mut request = client.get(&url);
     match auth_style {
-        "bearer" => { request = request.header("Authorization", format!("Bearer {}", api_key)); }
+        "bearer" => {
+            request = request.header("Authorization", format!("Bearer {}", api_key));
+        }
         "x-api-key" => {
             // Send BOTH headers so the same code path covers:
             //   - Standard Anthropic (api.anthropic.com) — uses x-api-key
@@ -2818,9 +2923,11 @@ fn extract_model_ids(body: &serde_json::Value) -> Vec<String> {
             .collect()
     } else if let Some(models) = body.get("models").and_then(|m| m.as_array()) {
         // Ollama / Gemini format: { models: [{ name: "..." }] }
-        models.iter()
+        models
+            .iter()
             .filter_map(|m| {
-                m.get("name").or_else(|| m.get("id"))
+                m.get("name")
+                    .or_else(|| m.get("id"))
                     .and_then(|v| v.as_str())
                     .map(|s| s.strip_prefix("models/").unwrap_or(s).to_owned())
             })
@@ -2844,7 +2951,13 @@ async fn test_provider(Json(req): Json<TestProviderRequest>) -> Response {
 
     let request = match build_provider_models_request(&client, &req) {
         Ok(r) => r,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e})),
+            )
+                .into_response();
+        }
     };
 
     match request.send().await {
@@ -2861,12 +2974,14 @@ async fn test_provider(Json(req): Json<TestProviderRequest>) -> Response {
                 "detail": body.chars().take(200).collect::<String>(),
             }))).into_response()
         }
-        Err(e) => {
-            (StatusCode::OK, Json(serde_json::json!({
+        Err(e) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
                 "ok": false,
                 "error": e.to_string(),
-            }))).into_response()
-        }
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -2884,7 +2999,13 @@ async fn list_provider_models(Json(req): Json<TestProviderRequest>) -> Response 
 
     let request = match build_provider_models_request(&client, &req) {
         Ok(r) => r,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"models": [], "error": e}))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"models": [], "error": e})),
+            )
+                .into_response();
+        }
     };
 
     match request.send().await {
@@ -2893,12 +3014,16 @@ async fn list_provider_models(Json(req): Json<TestProviderRequest>) -> Response 
             let models = extract_model_ids(&body);
             Json(serde_json::json!({"models": models})).into_response()
         }
-        Ok(resp) => {
-            (StatusCode::OK, Json(serde_json::json!({"models": [], "error": format!("HTTP {}", resp.status())}))).into_response()
-        }
-        Err(e) => {
-            (StatusCode::OK, Json(serde_json::json!({"models": [], "error": e.to_string()}))).into_response()
-        }
+        Ok(resp) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"models": [], "error": format!("HTTP {}", resp.status())})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"models": [], "error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -2916,11 +3041,13 @@ async fn wechat_qr_start() -> Response {
         Ok((qrcode_url, qrcode_token)) => Json(serde_json::json!({
             "qrcode_url": qrcode_url,
             "qrcode_token": qrcode_token,
-        })).into_response(),
+        }))
+        .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
 
@@ -2933,19 +3060,24 @@ struct QrStatusRequest {
 /// Poll WeChat QR scan status. Returns bot_token + bot_id when scanned.
 async fn wechat_qr_status(Json(req): Json<QrStatusRequest>) -> Response {
     let client = reqwest::Client::new();
-    match crate::channel::wechat::WeChatPersonalChannel::poll_qr_status(&client, &req.qrcode_token).await {
+    match crate::channel::wechat::WeChatPersonalChannel::poll_qr_status(&client, &req.qrcode_token)
+        .await
+    {
         Ok(Some((bot_token, bot_id))) => Json(serde_json::json!({
             "status": "ok",
             "bot_token": bot_token,
             "bot_id": bot_id,
-        })).into_response(),
+        }))
+        .into_response(),
         Ok(None) => Json(serde_json::json!({
             "status": "waiting",
-        })).into_response(),
+        }))
+        .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
 
@@ -2992,7 +3124,10 @@ async fn run_doctor_cmd(fix: bool) -> Response {
                     checks.push(serde_json::json!({"status": "ok", "message": msg.trim()}));
                 } else if let Some(msg) = clean.strip_prefix("[warn]") {
                     checks.push(serde_json::json!({"status": "warn", "message": msg.trim()}));
-                } else if let Some(msg) = clean.strip_prefix("[error]").or_else(|| clean.strip_prefix("[err]")) {
+                } else if let Some(msg) = clean
+                    .strip_prefix("[error]")
+                    .or_else(|| clean.strip_prefix("[err]"))
+                {
                     checks.push(serde_json::json!({"status": "error", "message": msg.trim()}));
                 } else if let Some(msg) = clean.strip_prefix("[fixed]") {
                     checks.push(serde_json::json!({"status": "fixed", "message": msg.trim()}));
@@ -3003,12 +3138,14 @@ async fn run_doctor_cmd(fix: bool) -> Response {
                 "checks": checks,
                 "raw": stdout,
                 "stderr": stderr,
-            })).into_response()
+            }))
+            .into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
 
@@ -3022,7 +3159,8 @@ struct LogsQuery {
 }
 
 /// GET /api/v1/logs?limit=50
-/// Read the last N lines from the gateway log file, parse into structured entries.
+/// Read the last N lines from the gateway log file, parse into structured
+/// entries.
 async fn get_logs(Query(q): Query<LogsQuery>) -> Response {
     let limit = q.limit.unwrap_or(50).min(200);
     let log_path = crate::config::loader::log_file();
@@ -3078,8 +3216,13 @@ async fn get_logs(Query(q): Query<LogsQuery>) -> Response {
             chrono::NaiveDateTime::parse_from_str(&ts[..19], "%Y-%m-%dT%H:%M:%S")
                 .ok()
                 .map(|naive| {
-                    let utc = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive, chrono::Utc);
-                    utc.with_timezone(&chrono::Local).format("%H:%M:%S").to_string()
+                    let utc = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                        naive,
+                        chrono::Utc,
+                    );
+                    utc.with_timezone(&chrono::Local)
+                        .format("%H:%M:%S")
+                        .to_string()
                 })
                 .unwrap_or_else(|| ts[11..19].to_owned())
         } else {
@@ -3123,9 +3266,7 @@ struct WorkspaceQuery {
 
 /// GET /api/v1/workspace/files?agent=xxx
 /// List .md files in a workspace directory.
-async fn list_workspace_files(
-    Query(q): Query<WorkspaceQuery>,
-) -> Response {
+async fn list_workspace_files(Query(q): Query<WorkspaceQuery>) -> Response {
     let ws = resolve_workspace(q.agent.as_deref());
     if !ws.exists() {
         return Json(serde_json::json!({ "files": [] })).into_response();
@@ -3142,7 +3283,8 @@ async fn list_workspace_files(
         }
     }
     files.sort();
-    Json(serde_json::json!({ "files": files, "workspace": ws.display().to_string() })).into_response()
+    Json(serde_json::json!({ "files": files, "workspace": ws.display().to_string() }))
+        .into_response()
 }
 
 /// GET /api/v1/workspace/files/{path}?agent=xxx
@@ -3161,18 +3303,21 @@ async fn read_workspace_file(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "invalid file path"})),
-        ).into_response();
+        )
+            .into_response();
     }
     let full_path = ws.join(file_name);
     match std::fs::read_to_string(&full_path) {
         Ok(content) => Json(serde_json::json!({
             "file": file_name,
             "content": content,
-        })).into_response(),
+        }))
+        .into_response(),
         Err(_) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "file not found"})),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
 
@@ -3197,7 +3342,8 @@ async fn write_workspace_file(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "invalid file path"})),
-        ).into_response();
+        )
+            .into_response();
     }
     // Create workspace dir if it doesn't exist.
     if !ws.exists() {
@@ -3205,7 +3351,8 @@ async fn write_workspace_file(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": e.to_string()})),
-            ).into_response();
+            )
+                .into_response();
         }
     }
     let full_path = ws.join(file_name);
@@ -3213,11 +3360,13 @@ async fn write_workspace_file(
         Ok(()) => Json(serde_json::json!({
             "ok": true,
             "file": file_name,
-        })).into_response(),
+        }))
+        .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
 
@@ -3225,13 +3374,22 @@ async fn write_workspace_file(
 // OpenAI Files API
 // ---------------------------------------------------------------------------
 
-/// Maximum file upload size (100 MB). TODO: make configurable via gateway.max_upload_size.
+/// Maximum file upload size (100 MB). TODO: make configurable via
+/// gateway.max_upload_size.
 const MAX_UPLOAD_SIZE: usize = 100 * 1024 * 1024;
 
 /// Validate a file_id to prevent path traversal attacks.
 fn validate_file_id(file_id: &str) -> Result<(), Response> {
-    if !file_id.starts_with("file-") || file_id.contains('/') || file_id.contains('\\') || file_id.contains("..") {
-        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid file_id"}))).into_response());
+    if !file_id.starts_with("file-")
+        || file_id.contains('/')
+        || file_id.contains('\\')
+        || file_id.contains("..")
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid file_id"})),
+        )
+            .into_response());
     }
     Ok(())
 }
@@ -3277,7 +3435,12 @@ fn read_file_meta_from_disk(file_id: &str) -> Option<FileObject> {
 
 /// Derive Content-Type from file extension.
 fn content_type_for(filename: &str) -> &'static str {
-    match filename.rsplit('.').next().map(|e| e.to_ascii_lowercase()).as_deref() {
+    match filename
+        .rsplit('.')
+        .next()
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
         Some("png") => "image/png",
         Some("jpg" | "jpeg") => "image/jpeg",
         Some("gif") => "image/gif",
@@ -3301,10 +3464,7 @@ async fn file_content_url(state: &AppState, file_id: &str) -> String {
 }
 
 /// POST /v1/files — upload a file via multipart/form-data.
-async fn upload_file(
-    State(state): State<AppState>,
-    mut multipart: Multipart,
-) -> impl IntoResponse {
+async fn upload_file(State(state): State<AppState>, mut multipart: Multipart) -> impl IntoResponse {
     let dir = files_dir();
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return (
@@ -3321,10 +3481,7 @@ async fn upload_file(
         let name = field.name().unwrap_or("").to_string();
         match name.as_str() {
             "file" => {
-                let filename = field
-                    .file_name()
-                    .unwrap_or("upload")
-                    .to_string();
+                let filename = field.file_name().unwrap_or("upload").to_string();
                 match field.bytes().await {
                     Ok(b) => file_data = Some((filename, b.to_vec())),
                     Err(e) => {
@@ -3355,9 +3512,13 @@ async fn upload_file(
 
     // Max upload size: 100 MB (gateway.max_upload_size TODO).
     if data.len() > MAX_UPLOAD_SIZE {
-        return (StatusCode::PAYLOAD_TOO_LARGE, Json(serde_json::json!({
-            "error": "file too large, max 100MB"
-        }))).into_response();
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": "file too large, max 100MB"
+            })),
+        )
+            .into_response();
     }
 
     let file_id = generate_file_id();
@@ -3450,7 +3611,9 @@ async fn get_file_meta(
     State(state): State<AppState>,
     Path(file_id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = validate_file_id(&file_id) { return e; }
+    if let Err(e) = validate_file_id(&file_id) {
+        return e;
+    }
     match read_file_meta_from_disk(&file_id) {
         Some(mut meta) => {
             meta.url = Some(file_content_url(&state, &file_id).await);
@@ -3466,7 +3629,9 @@ async fn get_file_meta(
 
 /// GET /v1/files/{file_id}/content — download file content.
 async fn get_file_content(Path(file_id): Path<String>) -> impl IntoResponse {
-    if let Err(e) = validate_file_id(&file_id) { return e; }
+    if let Err(e) = validate_file_id(&file_id) {
+        return e;
+    }
     let dir = files_dir();
 
     // Find the data file matching this file_id prefix.
@@ -3489,10 +3654,7 @@ async fn get_file_content(Path(file_id): Path<String>) -> impl IntoResponse {
             .into_response();
     };
 
-    let filename = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("file");
+    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let ct = content_type_for(filename);
 
     match std::fs::read(&path) {
@@ -3511,7 +3673,9 @@ async fn get_file_content(Path(file_id): Path<String>) -> impl IntoResponse {
 
 /// DELETE /v1/files/{file_id} — delete a file.
 async fn delete_file(Path(file_id): Path<String>) -> impl IntoResponse {
-    if let Err(e) = validate_file_id(&file_id) { return e.into_response(); }
+    if let Err(e) = validate_file_id(&file_id) {
+        return e.into_response();
+    }
     let dir = files_dir();
 
     // Remove the metadata file.
@@ -3543,7 +3707,8 @@ async fn delete_file(Path(file_id): Path<String>) -> impl IntoResponse {
         "id": file_id,
         "object": "file",
         "deleted": true,
-    })).into_response()
+    }))
+    .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -3622,7 +3787,6 @@ struct MemoryListResponse {
     /// Total before `limit` is applied (so the UI can show "X of Y").
     total: usize,
 }
-
 
 /// The gateway already holds the memory store open with redb's exclusive
 /// write lock. A second `MemoryStore::open_readonly` on the same file fails
