@@ -26,7 +26,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import RsClawIcon from "../icons/rsclaw-icon.svg";
 import { rsclawWs, type ComputerUseStatusPayload } from "../lib/rsclaw-ws";
 import { gatewayFetch } from "../lib/rsclaw-api";
-import { invoke as tauriInvoke, isTauri } from "../utils/tauri";
+import { invoke as tauriInvoke, isTauriRuntime } from "../utils/tauri";
 import { getLang } from "../locales";
 
 import styles from "./computer-use-overlay.module.scss";
@@ -119,7 +119,7 @@ type WindowSnapshot = {
  * null and the overlay still works without window resize.
  */
 async function shrinkWindow(): Promise<WindowSnapshot | null> {
-  if (!isTauri) return null;
+  if (!isTauriRuntime()) return null;
   try {
     const winApi = await import("@tauri-apps/api/window");
     const win = winApi.getCurrentWindow();
@@ -157,7 +157,8 @@ async function shrinkWindow(): Promise<WindowSnapshot | null> {
     await win.setPosition(new LogicalPosition(targetX, targetY));
 
     return snapshot;
-  } catch {
+  } catch (e) {
+    console.error("[computer-use-overlay] shrinkWindow failed:", e);
     return null;
   }
 }
@@ -168,7 +169,7 @@ async function shrinkWindow(): Promise<WindowSnapshot | null> {
  * so we restore via `PhysicalSize`/`PhysicalPosition`.
  */
 async function restoreWindow(snap: WindowSnapshot): Promise<void> {
-  if (!isTauri) return;
+  if (!isTauriRuntime()) return;
   try {
     const winApi = await import("@tauri-apps/api/window");
     const win = winApi.getCurrentWindow();
@@ -187,18 +188,19 @@ async function restoreWindow(snap: WindowSnapshot): Promise<void> {
  * the shrunken main window). Failures fall through to the CSS fallback.
  */
 async function openNativeGlow(): Promise<boolean> {
-  if (!isTauri) return false;
+  if (!isTauriRuntime()) return false;
   try {
     await tauriInvoke("open_glow_overlay");
     return true;
-  } catch {
+  } catch (e) {
+    console.error("[computer-use-overlay] openNativeGlow failed:", e);
     return false;
   }
 }
 
 /** Best-effort close of the native glow overlay; failures are ignored. */
 async function closeNativeGlow(): Promise<void> {
-  if (!isTauri) return;
+  if (!isTauriRuntime()) return;
   try {
     await tauriInvoke("close_glow_overlay");
   } catch {

@@ -11,6 +11,18 @@ import { listen as tauriListen } from "@tauri-apps/api/event";
 export const isTauri =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
+/**
+ * Runtime Tauri check. Prefer this over the module-level `isTauri` const
+ * in any code path that may evaluate before `__TAURI_INTERNALS__` is
+ * present (lazily-loaded chunks, early/post-hydration evaluation): the
+ * const captures its value at module-init and can freeze to `false`,
+ * silently disabling Tauri-only behavior for that caller. Same reason
+ * `convertFileSrc` (below) does the check inline.
+ */
+export function isTauriRuntime(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
 /** Call a Tauri command. Returns undefined in browser. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export async function invoke(

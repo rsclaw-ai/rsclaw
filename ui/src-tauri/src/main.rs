@@ -612,7 +612,7 @@ fn get_version() -> Result<String, String> {
 /// main UI bundle.
 const GLOW_OVERLAY_HTML: &str = r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>RsClaw Activity</title><style>
 html,body{margin:0;padding:0;width:100vw;height:100vh;background:transparent;overflow:hidden;pointer-events:none;-webkit-user-select:none;user-select:none}
-.glow{position:fixed;inset:0;pointer-events:none;background:radial-gradient(ellipse at center, transparent 55%, rgba(255,165,0,0) 65%, rgba(255,140,0,0.18) 80%, rgba(255,100,0,0.42) 100%);box-shadow:inset 0 0 200px 60px rgba(255,140,0,0.5),inset 0 0 80px 25px rgba(255,165,0,0.7);animation:pulse 2.4s ease-in-out infinite}
+.glow{position:fixed;inset:0;pointer-events:none;box-shadow:inset 0 0 0 3px rgba(255,150,40,0.92),inset 0 0 55px 12px rgba(255,140,0,0.85),inset 0 0 170px 55px rgba(255,115,0,0.45);animation:pulse 2s ease-in-out infinite}
 @keyframes pulse{0%,100%{opacity:0.65}50%{opacity:1}}
 </style></head><body><div class="glow"></div></body></html>"#;
 
@@ -626,7 +626,9 @@ html,body{margin:0;padding:0;width:100vw;height:100vh;background:transparent;ove
 async fn open_glow_overlay(app: tauri::AppHandle) -> Result<(), String> {
     use tauri::{LogicalPosition, LogicalSize, WebviewUrl, WebviewWindowBuilder};
 
+    eprintln!("[glow] open_glow_overlay: enter");
     if app.get_webview_window("computer-use-glow").is_some() {
+        eprintln!("[glow] already open — noop");
         return Ok(());
     }
 
@@ -641,6 +643,7 @@ async fn open_glow_overlay(app: tauri::AppHandle) -> Result<(), String> {
     let logical_h = size.height as f64 / scale;
     let logical_x = pos.x as f64 / scale;
     let logical_y = pos.y as f64 / scale;
+    eprintln!("[glow] geom logical=({logical_w}x{logical_h}) at ({logical_x},{logical_y}) scale={scale}");
 
     use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
     let encoded = utf8_percent_encode(GLOW_OVERLAY_HTML, NON_ALPHANUMERIC).to_string();
@@ -662,7 +665,7 @@ async fn open_glow_overlay(app: tauri::AppHandle) -> Result<(), String> {
         .inner_size(logical_w, logical_h)
         .position(logical_x, logical_y)
         .build()
-        .map_err(|e| format!("build glow window: {e}"))?;
+        .map_err(|e| { eprintln!("[glow] build FAILED: {e}"); format!("build glow window: {e}") })?;
 
     // Ignore cursor events so the overlay is fully click-through.
     window
@@ -676,6 +679,7 @@ async fn open_glow_overlay(app: tauri::AppHandle) -> Result<(), String> {
         .set_position(LogicalPosition::new(logical_x, logical_y))
         .map_err(|e| format!("set_position: {e}"))?;
     window.show().map_err(|e| format!("show: {e}"))?;
+    eprintln!("[glow] window shown ok");
     Ok(())
 }
 
