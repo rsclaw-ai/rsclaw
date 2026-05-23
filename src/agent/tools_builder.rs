@@ -2029,17 +2029,6 @@ mod plugin_catalog_tests {
     }
 
     #[test]
-    fn plugin_usage_prompt_names_only_supported_plugin_tools() {
-        let prompt = build_tool_usage_instructions(false, false);
-
-        assert!(prompt.contains("plugin.info"));
-        assert!(prompt.contains("plugin.search_tools"));
-        assert!(prompt.contains("plugin.describe_tool"));
-        assert!(prompt.contains("plugin.invoke"));
-        assert!(prompt.contains("Never invent other `plugin.*` tool names"));
-    }
-
-    #[test]
     fn catalog_block_is_skill_md_shaped() {
         let tools = vec![("publish", "Publish a video")];
         let block = render_plugin_catalog_block("douyin", "0.1.0", "Douyin ops", &tools, &[], 5);

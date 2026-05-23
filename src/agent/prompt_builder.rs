@@ -897,6 +897,7 @@ pub(crate) fn build_minimal_system_prompt() -> String {
 
 /// Return a relative time label for memory recall.
 /// LLMs can't do date arithmetic, so we use relative descriptions.
+
 pub(crate) fn memory_age_label(now_ts: i64, created_at: i64) -> String {
     let age_secs = (now_ts - created_at).max(0);
     let days = age_secs / 86400;
@@ -916,5 +917,21 @@ pub(crate) fn memory_age_label(now_ts: i64, created_at: i64) -> String {
             "~{} years ago — likely outdated, verify before using",
             days / 365
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_prompt_names_only_supported_plugin_tools() {
+        let prompt = build_shared_system_prefix_uncached();
+
+        assert!(prompt.contains("plugin.info"));
+        assert!(prompt.contains("plugin.search_tools"));
+        assert!(prompt.contains("plugin.describe_tool"));
+        assert!(prompt.contains("plugin.invoke"));
+        assert!(prompt.contains("Never invent other `plugin.*` tool names"));
     }
 }
