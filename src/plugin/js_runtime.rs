@@ -12,7 +12,7 @@
 //!   - `call(method, params)`       — send a request, wait for response
 //!   - `Drop`                       — kill the subprocess (RAII)
 //!
-//! Supported runtimes: `node`, `bun`, `deno`.
+//! Supported runtimes: `js`, `node`, `bun`, `deno`.
 
 use std::{
     collections::HashMap,
@@ -339,7 +339,7 @@ fn resolve_runtime(runtime: &str) -> Result<String> {
     let candidates = match runtime {
         "bun" => vec!["bun"],
         "deno" => vec!["deno"],
-        "node" => vec!["node"],
+        "js" | "node" => vec!["node"],
         other => vec![other],
     };
 
