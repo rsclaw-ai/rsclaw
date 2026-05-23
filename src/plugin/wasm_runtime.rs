@@ -46,6 +46,8 @@ const MEMORY_CAP_BYTES: usize = 256 * 1024 * 1024;
 /// travel + jimeng's downstream login flows, etc.
 const SHARED_BROWSER_PROFILE: &str = "rsclaw";
 
+type HostTrapResult<T> = std::result::Result<T, wasmtime::Error>;
+
 use crate::browser::BrowserSession;
 
 // ---------------------------------------------------------------------------
@@ -55,8 +57,9 @@ use crate::browser::BrowserSession;
 bindgen!({
     path: "src/plugin/wit/world.wit",
     world: "jimeng-plugin",
-    async: true,
-    trappable_imports: true,
+    imports: { default: async | trappable },
+    exports: { default: async },
+    require_store_data_send: true,
 });
 
 // ---------------------------------------------------------------------------
@@ -198,11 +201,11 @@ fn new_sandboxed_store(
 }
 
 impl wasmtime_wasi::WasiView for HostState {
-    fn ctx(&mut self) -> &mut wasmtime_wasi::WasiCtx {
-        &mut self.wasi
-    }
-    fn table(&mut self) -> &mut wasmtime::component::ResourceTable {
-        &mut self.wasi_table
+    fn ctx(&mut self) -> wasmtime_wasi::WasiCtxView<'_> {
+        wasmtime_wasi::WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.wasi_table,
+        }
     }
 }
 
@@ -244,19 +247,19 @@ fn canonicalize_writable_path(input: &str) -> Result<PathBuf, String> {
 }
 
 impl rsclaw::plugin::host_browser::Host for HostState {
-    async fn browser_open(&mut self, url: String) -> Result<Result<String, String>> {
+    async fn browser_open(&mut self, url: String) -> HostTrapResult<Result<String, String>> {
         Ok(self.browser_action("open", json!({"url": url})).await)
     }
 
-    async fn browser_snapshot(&mut self) -> Result<Result<String, String>> {
+    async fn browser_snapshot(&mut self) -> HostTrapResult<Result<String, String>> {
         Ok(self.browser_action("snapshot", json!({})).await)
     }
 
-    async fn browser_click(&mut self, ref_str: String) -> Result<Result<String, String>> {
+    async fn browser_click(&mut self, ref_str: String) -> HostTrapResult<Result<String, String>> {
         Ok(self.browser_action("click", json!({"ref": ref_str})).await)
     }
 
-    async fn browser_click_at(&mut self, x: u32, y: u32) -> Result<Result<String, String>> {
+    async fn browser_click_at(&mut self, x: u32, y: u32) -> HostTrapResult<Result<String, String>> {
         Ok(self
             .browser_action("click_at", json!({"x": x, "y": y}))
             .await)
@@ -266,17 +269,17 @@ impl rsclaw::plugin::host_browser::Host for HostState {
         &mut self,
         ref_str: String,
         text: String,
-    ) -> Result<Result<String, String>> {
+    ) -> HostTrapResult<Result<String, String>> {
         Ok(self
             .browser_action("fill", json!({"ref": ref_str, "text": text}))
             .await)
     }
 
-    async fn browser_press(&mut self, key: String) -> Result<Result<String, String>> {
+    async fn browser_press(&mut self, key: String) -> HostTrapResult<Result<String, String>> {
         Ok(self.browser_action("press", json!({"key": key})).await)
     }
 
-    async fn browser_eval(&mut self, code: String) -> Result<Result<String, String>> {
+    async fn browser_eval(&mut self, code: String) -> HostTrapResult<Result<String, String>> {
         Ok(self.browser_action("evaluate", json!({"js": code})).await)
     }
 
@@ -284,7 +287,7 @@ impl rsclaw::plugin::host_browser::Host for HostState {
         &mut self,
         text: String,
         timeout_ms: u32,
-    ) -> Result<Result<String, String>> {
+    ) -> HostTrapResult<Result<String, String>> {
         let timeout_secs = u64::from(timeout_ms / 1000).max(1);
         Ok(self
             .browser_action(
@@ -299,7 +302,7 @@ impl rsclaw::plugin::host_browser::Host for HostState {
         &mut self,
         css_selector: String,
         timeout_ms: u32,
-    ) -> Result<Result<String, String>> {
+    ) -> HostTrapResult<Result<String, String>> {
         let timeout_secs = u64::from(timeout_ms / 1000).max(1);
         Ok(self
             .browser_action(
@@ -310,7 +313,10 @@ impl rsclaw::plugin::host_browser::Host for HostState {
             .map(|_| "ok".to_string()))
     }
 
-    async fn wait_for_network_idle(&mut self, timeout_ms: u32) -> Result<Result<String, String>> {
+    async fn wait_for_network_idle(
+        &mut self,
+        timeout_ms: u32,
+    ) -> HostTrapResult<Result<String, String>> {
         let timeout_secs = u64::from(timeout_ms / 1000).max(1);
         Ok(self
             .browser_action(
@@ -325,7 +331,7 @@ impl rsclaw::plugin::host_browser::Host for HostState {
         &mut self,
         code: String,
         args_json: String,
-    ) -> Result<Result<String, String>> {
+    ) -> HostTrapResult<Result<String, String>> {
         // JSON is valid JS expression syntax, so we can embed args_json
         // directly as an object literal — no escaping dance required.
         let args_literal = if args_json.trim().is_empty() {
@@ -346,7 +352,7 @@ impl rsclaw::plugin::host_browser::Host for HostState {
             .await)
     }
 
-    async fn switch_latest_tab(&mut self) -> Result<Result<String, String>> {
+    async fn switch_latest_tab(&mut self) -> HostTrapResult<Result<String, String>> {
         let mut guard = self.browser.lock().await;
         if guard.is_none() {
             return Ok(Err("browser not initialized".to_string()));
@@ -378,7 +384,7 @@ impl rsclaw::plugin::host_browser::Host for HostState {
         }
     }
 
-    async fn browser_screenshot(&mut self) -> Result<Result<String, String>> {
+    async fn browser_screenshot(&mut self) -> HostTrapResult<Result<String, String>> {
         Ok(self.browser_action("screenshot", json!({})).await)
     }
 
@@ -386,7 +392,7 @@ impl rsclaw::plugin::host_browser::Host for HostState {
         &mut self,
         ref_str: String,
         filename: String,
-    ) -> Result<Result<String, String>> {
+    ) -> HostTrapResult<Result<String, String>> {
         let mut args = json!({"ref": ref_str, "path": filename});
         // If the ref looks like a URL, consult the calling plugin's CDN
         // rules and attach a Referer when one matches. The host itself has
@@ -408,7 +414,7 @@ impl rsclaw::plugin::host_browser::Host for HostState {
         &mut self,
         ref_str: String,
         filepath: String,
-    ) -> Result<Result<String, String>> {
+    ) -> HostTrapResult<Result<String, String>> {
         // Uploads send a file *out* of the host to a remote site. Unlike
         // read_file (which enforces workspace containment to prevent reading
         // /etc/passwd etc.), upload paths are typically user-supplied via
@@ -429,13 +435,13 @@ impl rsclaw::plugin::host_browser::Host for HostState {
             .await)
     }
 
-    async fn browser_get_url(&mut self) -> Result<Result<String, String>> {
+    async fn browser_get_url(&mut self) -> HostTrapResult<Result<String, String>> {
         Ok(self.browser_action("get_url", json!({})).await)
     }
 }
 
 impl rsclaw::plugin::host_runtime::Host for HostState {
-    async fn log(&mut self, level: String, msg: String) -> Result<()> {
+    async fn log(&mut self, level: String, msg: String) -> HostTrapResult<()> {
         // Use the module path as target (instead of "wasm_plugin") so plugin
         // logs inherit the default tracing filter level for this crate.
         match level.as_str() {
@@ -448,12 +454,12 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
         Ok(())
     }
 
-    async fn sleep(&mut self, ms: u32) -> Result<()> {
+    async fn sleep(&mut self, ms: u32) -> HostTrapResult<()> {
         tokio::time::sleep(std::time::Duration::from_millis(u64::from(ms))).await;
         Ok(())
     }
 
-    async fn notify(&mut self, message: String) -> Result<Result<String, String>> {
+    async fn notify(&mut self, message: String) -> HostTrapResult<Result<String, String>> {
         tracing::info!(target: "wasm_plugin_notify", "{message}");
         if let Some(ctx) = &self.notify_ctx {
             let _ = ctx.tx.send(crate::channel::OutboundMessage {
@@ -476,7 +482,7 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
         &mut self,
         message: String,
         image_data_uri: String,
-    ) -> Result<Result<String, String>> {
+    ) -> HostTrapResult<Result<String, String>> {
         tracing::info!(target: "wasm_plugin_notify", "{message}");
         if let Some(ctx) = &self.notify_ctx {
             match ctx.tx.send(crate::channel::OutboundMessage {
@@ -502,7 +508,7 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
         message: String,
         file_path: String,
         mime: String,
-    ) -> Result<Result<String, String>> {
+    ) -> HostTrapResult<Result<String, String>> {
         tracing::info!(target: "wasm_plugin_notify", "{message}");
         if let Some(ctx) = &self.notify_ctx {
             // Enforce workspace allowlist on the supplied path. Plugins
@@ -541,7 +547,7 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
         }
     }
 
-    async fn read_file(&mut self, path: String) -> Result<Result<String, String>> {
+    async fn read_file(&mut self, path: String) -> HostTrapResult<Result<String, String>> {
         let canonical = match canonicalize_plugin_path(&path) {
             Ok(p) => p,
             Err(e) => return Ok(Err(e)),
@@ -556,7 +562,7 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
         &mut self,
         path: String,
         contents: String,
-    ) -> Result<Result<String, String>> {
+    ) -> HostTrapResult<Result<String, String>> {
         let canonical = match canonicalize_writable_path(&path) {
             Ok(p) => p,
             Err(e) => return Ok(Err(e)),
@@ -575,7 +581,7 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
         }
     }
 
-    async fn ensure_dir(&mut self, path: String) -> Result<Result<String, String>> {
+    async fn ensure_dir(&mut self, path: String) -> HostTrapResult<Result<String, String>> {
         let canonical = match canonicalize_writable_path(&path) {
             Ok(p) => p,
             Err(e) => return Ok(Err(e)),
@@ -605,7 +611,7 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
         &mut self,
         sql: String,
         params: Vec<String>,
-    ) -> Result<Result<String, String>> {
+    ) -> HostTrapResult<Result<String, String>> {
         let db_path = plugin_db_path(&self.plugin_name);
         if let Some(parent) = db_path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
@@ -639,7 +645,7 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
         &mut self,
         sql: String,
         params: Vec<String>,
-    ) -> Result<Result<String, String>> {
+    ) -> HostTrapResult<Result<String, String>> {
         let db_path = plugin_db_path(&self.plugin_name);
         if let Some(parent) = db_path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
@@ -698,7 +704,10 @@ fn plugin_db_path(plugin_name: &str) -> PathBuf {
 }
 
 impl rsclaw::plugin::host_storage::Host for HostState {
-    async fn allocate_artifact(&mut self, filename: String) -> Result<Result<String, String>> {
+    async fn allocate_artifact(
+        &mut self,
+        filename: String,
+    ) -> HostTrapResult<Result<String, String>> {
         Ok(allocate_dl_paths(&filename, 1)
             .map(|paths| paths.into_iter().next().unwrap_or_default()))
     }
@@ -707,7 +716,7 @@ impl rsclaw::plugin::host_storage::Host for HostState {
         &mut self,
         filename: String,
         count: u32,
-    ) -> Result<Result<Vec<String>, String>> {
+    ) -> HostTrapResult<Result<Vec<String>, String>> {
         Ok(allocate_dl_paths(&filename, count.max(1) as usize))
     }
 }
@@ -717,7 +726,10 @@ impl rsclaw::plugin::host_storage::Host for HostState {
 // ---------------------------------------------------------------------------
 
 impl rsclaw::plugin::host_media::Host for HostState {
-    async fn extract_audio(&mut self, input_path: String) -> Result<Result<String, String>> {
+    async fn extract_audio(
+        &mut self,
+        input_path: String,
+    ) -> HostTrapResult<Result<String, String>> {
         let ffmpeg_bin = match crate::agent::platform::detect_ffmpeg() {
             Some(p) => p,
             None => {
@@ -763,7 +775,7 @@ impl rsclaw::plugin::host_media::Host for HostState {
         &mut self,
         audio_path: String,
         _language: String,
-    ) -> Result<Result<String, String>> {
+    ) -> HostTrapResult<Result<String, String>> {
         let bytes = match tokio::fs::read(&audio_path).await {
             Ok(b) => b,
             Err(e) => return Ok(Err(format!("read audio file failed: {e}"))),
@@ -788,7 +800,7 @@ impl rsclaw::plugin::host_media::Host for HostState {
         &mut self,
         video_path: String,
         count: u32,
-    ) -> Result<Result<Vec<String>, String>> {
+    ) -> HostTrapResult<Result<Vec<String>, String>> {
         let ffmpeg_bin = match crate::agent::platform::detect_ffmpeg() {
             Some(p) => p,
             None => {
@@ -1194,14 +1206,39 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostState>> {
     let mut linker = Linker::new(engine);
     // Add WASI interfaces (io, filesystem, etc.) required by wasm32-wasip2
     // components.
-    wasmtime_wasi::add_to_linker_async(&mut linker)?;
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)
+        .map_err(|e| anyhow::anyhow!("failed to add WASI linker interfaces: {e}"))?;
     // Add our custom host interfaces.
-    rsclaw::plugin::host_browser::add_to_linker(&mut linker, |state: &mut HostState| state)?;
-    rsclaw::plugin::host_runtime::add_to_linker(&mut linker, |state: &mut HostState| state)?;
-    rsclaw::plugin::host_storage::add_to_linker(&mut linker, |state: &mut HostState| state)?;
-    rsclaw::plugin::host_media::add_to_linker(&mut linker, |state: &mut HostState| state)?;
-    rsclaw::plugin::host_desktop::add_to_linker(&mut linker, |state: &mut HostState| state)?;
-    rsclaw::plugin::host_vlm::add_to_linker(&mut linker, |state: &mut HostState| state)?;
+    rsclaw::plugin::host_browser::add_to_linker::<
+        HostState,
+        wasmtime::component::HasSelf<HostState>,
+    >(&mut linker, |state: &mut HostState| state)
+    .map_err(|e| anyhow::anyhow!("failed to add host-browser linker interfaces: {e}"))?;
+    rsclaw::plugin::host_runtime::add_to_linker::<
+        HostState,
+        wasmtime::component::HasSelf<HostState>,
+    >(&mut linker, |state: &mut HostState| state)
+    .map_err(|e| anyhow::anyhow!("failed to add host-runtime linker interfaces: {e}"))?;
+    rsclaw::plugin::host_storage::add_to_linker::<
+        HostState,
+        wasmtime::component::HasSelf<HostState>,
+    >(&mut linker, |state: &mut HostState| state)
+    .map_err(|e| anyhow::anyhow!("failed to add host-storage linker interfaces: {e}"))?;
+    rsclaw::plugin::host_media::add_to_linker::<
+        HostState,
+        wasmtime::component::HasSelf<HostState>,
+    >(&mut linker, |state: &mut HostState| state)
+    .map_err(|e| anyhow::anyhow!("failed to add host-media linker interfaces: {e}"))?;
+    rsclaw::plugin::host_desktop::add_to_linker::<
+        HostState,
+        wasmtime::component::HasSelf<HostState>,
+    >(&mut linker, |state: &mut HostState| state)
+    .map_err(|e| anyhow::anyhow!("failed to add host-desktop linker interfaces: {e}"))?;
+    rsclaw::plugin::host_vlm::add_to_linker::<HostState, wasmtime::component::HasSelf<HostState>>(
+        &mut linker,
+        |state: &mut HostState| state,
+    )
+    .map_err(|e| anyhow::anyhow!("failed to add host-vlm linker interfaces: {e}"))?;
     Ok(linker)
 }
 
@@ -1222,8 +1259,9 @@ pub async fn load_wasm_plugin(
     let wasm_bytes = std::fs::read(&path)
         .with_context(|| format!("failed to read WASM file: {}", path.display()))?;
 
-    let component = Component::new(engine, &wasm_bytes)
-        .with_context(|| format!("failed to compile WASM component: {}", path.display()))?;
+    let component = Component::new(engine, &wasm_bytes).map_err(|e| {
+        anyhow::anyhow!("failed to compile WASM component: {}: {e}", path.display())
+    })?;
 
     let linker = build_linker(engine)?;
 
@@ -1327,20 +1365,20 @@ impl WasmPlugin {
             .linker
             .instantiate_async(&mut store, &self.component)
             .await
-            .context("failed to instantiate component for tool call")?;
+            .map_err(|e| anyhow::anyhow!("failed to instantiate component for tool call: {e}"))?;
 
         // Drill into the plugin-api interface to find handle-tool.
         let iface_idx = instance
-            .get_export(&mut store, None, "rsclaw:plugin/plugin-api")
+            .get_export_index(&mut store, None, "rsclaw:plugin/plugin-api")
             .with_context(|| "plugin-api interface not found")?;
 
         let handle_tool_idx = instance
-            .get_export(&mut store, Some(&iface_idx), "handle-tool")
+            .get_export_index(&mut store, Some(&iface_idx), "handle-tool")
             .with_context(|| "handle-tool export not found")?;
 
         let handle_tool_fn = instance
             .get_typed_func::<(&str, &str), (Result<String, String>,)>(&mut store, &handle_tool_idx)
-            .with_context(|| "handle-tool has unexpected type")?;
+            .map_err(|e| anyhow::anyhow!("handle-tool has unexpected type: {e}"))?;
 
         let args_json =
             serde_json::to_string(&args).context("failed to serialize tool arguments")?;
@@ -1348,12 +1386,7 @@ impl WasmPlugin {
         let (result,) = handle_tool_fn
             .call_async(&mut store, (tool_name, &args_json))
             .await
-            .with_context(|| format!("handle-tool call failed for '{tool_name}'"))?;
-
-        handle_tool_fn
-            .post_return_async(&mut store)
-            .await
-            .with_context(|| "handle-tool post-return failed")?;
+            .map_err(|e| anyhow::anyhow!("handle-tool call failed for '{tool_name}': {e}"))?;
 
         match result {
             Ok(json_str) => {

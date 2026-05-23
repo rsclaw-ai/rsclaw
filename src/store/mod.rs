@@ -9,12 +9,11 @@
 pub mod redb_store;
 pub mod search;
 
-use std::path::Path;
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use anyhow::Result;
-pub use redb_store::RedbStore;
 pub(crate) use redb_store::upgrade_legacy_if_needed;
+pub use redb_store::{LEGACY_REDB_UPGRADE_HELPER_ENV, RedbStore, run_legacy_redb_upgrade_helper};
 pub use search::SearchIndex;
 use tracing::info;
 

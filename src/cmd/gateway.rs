@@ -3,7 +3,10 @@ use anyhow::Result;
 use super::style::{banner, dim, green, kv, red, yellow};
 use crate::{cli::GatewayCommand, config, gateway, sys::detect_memory_tier};
 
-const VERSION: &str = match option_env!("RSCLAW_BUILD_VERSION") { Some(v) => v, None => "dev" };
+const VERSION: &str = match option_env!("RSCLAW_BUILD_VERSION") {
+    Some(v) => v,
+    None => "dev",
+};
 
 /// Spawn `rsclaw gateway run` as a detached background process, propagating
 /// instance-isolation env vars set by `--dev` / `--profile`.
@@ -32,9 +35,7 @@ pub fn spawn_gateway_bg_pub() -> Result<std::process::Child> {
         .create(true)
         .append(true)
         .open(&log_path)
-        .unwrap_or_else(|_| {
-            std::fs::File::open(null_path).expect("failed to open null device")
-        });
+        .unwrap_or_else(|_| std::fs::File::open(null_path).expect("failed to open null device"));
     let log_file2 = log_file
         .try_clone()
         .unwrap_or_else(|_| std::fs::File::open(null_path).expect("failed to open null device"));
@@ -57,6 +58,18 @@ pub fn spawn_gateway_bg_pub() -> Result<std::process::Child> {
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
         const DETACHED_PROCESS: u32 = 0x00000008;
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
 
     Ok(cmd.spawn()?)
@@ -118,22 +131,34 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
             // If a system service is installed, start via service manager
             // instead of spawning a bare process (avoids dual-start conflicts).
             if service_installed() {
-                println!("  {} Service detected, starting via service manager...", dim("[..]"));
+                println!(
+                    "  {} Service detected, starting via service manager...",
+                    dim("[..]")
+                );
                 if try_service_start() {
                     // Verify the gateway actually started (service may load OK
                     // but the binary may fail to run).
                     std::thread::sleep(std::time::Duration::from_secs(2));
                     if let Some(pid) = gateway_read_pid() {
                         if process_alive(pid) {
-                            println!("  {} Gateway started (via service, pid {pid})", green("[ok]"));
+                            println!(
+                                "  {} Gateway started (via service, pid {pid})",
+                                green("[ok]")
+                            );
                             kv("URL:", &detect_url());
                             println!();
                             return Ok(());
                         }
                     }
-                    eprintln!("  {} Service loaded but gateway not running, falling back to direct start", yellow("[!]"));
+                    eprintln!(
+                        "  {} Service loaded but gateway not running, falling back to direct start",
+                        yellow("[!]")
+                    );
                 } else {
-                    eprintln!("  {} Service start failed, falling back to direct start", yellow("[!]"));
+                    eprintln!(
+                        "  {} Service start failed, falling back to direct start",
+                        yellow("[!]")
+                    );
                 }
             }
 
@@ -173,15 +198,24 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
                     std::thread::sleep(std::time::Duration::from_secs(2));
                     if let Some(pid) = gateway_read_pid() {
                         if process_alive(pid) {
-                            println!("  {} Gateway restarted (via service, pid {pid})", green("[ok]"));
+                            println!(
+                                "  {} Gateway restarted (via service, pid {pid})",
+                                green("[ok]")
+                            );
                             kv("URL:", &detect_url());
                             println!();
                             return Ok(());
                         }
                     }
-                    eprintln!("  {} Service loaded but gateway not running, falling back to direct start", yellow("[!]"));
+                    eprintln!(
+                        "  {} Service loaded but gateway not running, falling back to direct start",
+                        yellow("[!]")
+                    );
                 } else {
-                    eprintln!("  {} Service start failed, falling back to direct start", yellow("[!]"));
+                    eprintln!(
+                        "  {} Service start failed, falling back to direct start",
+                        yellow("[!]")
+                    );
                 }
             }
 
@@ -234,7 +268,9 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
         GatewayCommand::UsageCost => {
             let config = config::load_quiet().ok();
             let port = config.as_ref().map(|c| c.gateway.port).unwrap_or(18888);
-            let auth_token = config.and_then(|c| c.gateway.auth_token).unwrap_or_default();
+            let auth_token = config
+                .and_then(|c| c.gateway.auth_token)
+                .unwrap_or_default();
             let url = format!("http://127.0.0.1:{port}/api/v1/usage");
             let mut req = reqwest::Client::new().get(&url);
             if !auth_token.is_empty() {
@@ -385,7 +421,11 @@ fn detect_url() -> String {
         .and_then(|c| c.gateway.bind_address.as_deref())
         .unwrap_or("127.0.0.1");
     // 0.0.0.0 means "all interfaces" but for display use 127.0.0.1.
-    let display_host = if bind == "0.0.0.0" || bind == "::" { "127.0.0.1" } else { bind };
+    let display_host = if bind == "0.0.0.0" || bind == "::" {
+        "127.0.0.1"
+    } else {
+        bind
+    };
     format!("http://{display_host}:{port}")
 }
 
@@ -402,7 +442,9 @@ pub fn gateway_signal_stop() -> Result<()> {
     // Try PID file first, then scan for running gateway processes.
     let pid = gateway_read_pid()
         .or_else(|| find_gateway_pid())
-        .ok_or_else(|| anyhow::anyhow!("gateway is not running (no PID file and no matching process)"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("gateway is not running (no PID file and no matching process)")
+        })?;
     if !process_alive(pid) {
         let _ = std::fs::remove_file(gateway_pid_file());
         anyhow::bail!("gateway process {pid} is not running");
@@ -421,13 +463,16 @@ pub fn gateway_signal_stop() -> Result<()> {
 }
 
 /// Check if gateway is installed as a system service.
-/// Returns true if the service unit/plist/sc entry exists (even if not running).
+/// Returns true if the service unit/plist/sc entry exists (even if not
+/// running).
 fn service_installed() -> bool {
     #[cfg(target_os = "macos")]
     {
         if let Some(home) = dirs_next::home_dir() {
             let plist = home.join("Library/LaunchAgents/ai.rsclaw.gateway.plist");
-            if plist.exists() { return true; }
+            if plist.exists() {
+                return true;
+            }
         }
     }
 
@@ -435,11 +480,15 @@ fn service_installed() -> bool {
     {
         if let Some(home) = dirs_next::home_dir() {
             let unit = home.join(".config/systemd/user/rsclaw-gateway.service");
-            if unit.exists() { return true; }
+            if unit.exists() {
+                return true;
+            }
         }
         // Also check system-level.
         let sys_unit = std::path::Path::new("/etc/systemd/system/rsclaw-gateway.service");
-        if sys_unit.exists() { return true; }
+        if sys_unit.exists() {
+            return true;
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -515,8 +564,8 @@ fn try_service_start() -> bool {
 fn try_service_stop() -> bool {
     #[cfg(target_os = "macos")]
     {
-        let plist = dirs_next::home_dir()
-            .map(|h| h.join("Library/LaunchAgents/ai.rsclaw.gateway.plist"));
+        let plist =
+            dirs_next::home_dir().map(|h| h.join("Library/LaunchAgents/ai.rsclaw.gateway.plist"));
         if let Some(ref path) = plist {
             if path.exists() {
                 // Use unload (without -w) to stop without disabling auto-start.
@@ -789,10 +838,14 @@ async fn cmd_gateway_install() -> Result<()> {
     let bin_path = format!("\"{}\" gateway run", binary_str);
     let status = std::process::Command::new("sc")
         .args([
-            "create", "rsclaw",
-            "binPath=", &bin_path,
-            "start=", "auto",
-            "DisplayName=", "RsClaw AI Gateway",
+            "create",
+            "rsclaw",
+            "binPath=",
+            &bin_path,
+            "start=",
+            "auto",
+            "DisplayName=",
+            "RsClaw AI Gateway",
         ])
         .status()?;
     if !status.success() {

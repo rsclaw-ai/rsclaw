@@ -129,6 +129,7 @@ fn simple_request(model: &str) -> LlmRequest {
         messages: vec![Message {
             role: Role::User,
             content: MessageContent::Text("test".to_owned()),
+            rsclaw_hidden: None,
         }],
         max_tokens: Some(64),
         ..Default::default()
@@ -392,7 +393,7 @@ async fn test_multiple_profiles_tried_in_order() {
 fn test_cooldown_bounds() {
     let cfg = RetryConfig {
         attempts: 3,
-        min_delay_ms: 1, // very small
+        min_delay_ms: 1,         // very small
         max_delay_ms: 1_000_000, // very large
         jitter: 0.0,
     };
@@ -409,7 +410,9 @@ fn test_cooldown_bounds() {
     // At high attempt: base = 1 * 2^30, but clamped at max_delay_ms=1_000_000 ms.
     // After .max(5s).min(300s): should be capped at 300s.
     let d_high = backoff_delay(30, &cfg);
-    let effective_high = d_high.max(Duration::from_secs(5)).min(Duration::from_secs(300));
+    let effective_high = d_high
+        .max(Duration::from_secs(5))
+        .min(Duration::from_secs(300));
     assert!(
         effective_high <= Duration::from_secs(300),
         "cooldown should be at most 300s, got {effective_high:?}"
@@ -550,7 +553,11 @@ async fn test_empty_fallback_list() {
     let result = mgr.call(req, &registry).await;
 
     assert!(result.is_err(), "should fail with no fallbacks");
-    let err_msg = result.err().expect("expected error").to_string().to_lowercase();
+    let err_msg = result
+        .err()
+        .expect("expected error")
+        .to_string()
+        .to_lowercase();
     assert!(
         err_msg.contains("exhausted") || err_msg.contains("unavailable"),
         "error should mention exhaustion or unavailability: {err_msg}"

@@ -155,7 +155,8 @@ impl JsPlugin {
     /// Call a plugin method and return the result.
     ///
     /// Host-initiated: assigns a positive id, writes the request, registers a
-    /// oneshot waiter in `pending`, and awaits the response from the reader task.
+    /// oneshot waiter in `pending`, and awaits the response from the reader
+    /// task.
     pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
@@ -237,10 +238,11 @@ impl JsPlugin {
 // ---------------------------------------------------------------------------
 
 /// Demultiplex one stdout line from a plugin subprocess:
-/// - `{"id": <pos>, "result"|"error": ...}` → response to a host-initiated call;
-///   look up `id` in pending and fulfill its oneshot.
+/// - `{"id": <pos>, "result"|"error": ...}` → response to a host-initiated
+///   call; look up `id` in pending and fulfill its oneshot.
 /// - `{"id": <neg>, "method": ..., "params": ...}` → plugin-initiated request;
-///   dispatch to host_methods on a fresh task and write the response back to stdin.
+///   dispatch to host_methods on a fresh task and write the response back to
+///   stdin.
 async fn handle_incoming(
     line: &str,
     pending: &Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>,
@@ -329,6 +331,11 @@ async fn handle_incoming(
 /// system PATH. node installs to `tools/node/bin/node`; bun/deno extract as a
 /// single binary to `tools/<rt>/<rt>`.
 fn resolve_runtime(runtime: &str) -> Result<String> {
+    let runtime = if runtime.trim().is_empty() || runtime == "js" {
+        "node"
+    } else {
+        runtime
+    };
     let candidates = match runtime {
         "bun" => vec!["bun"],
         "deno" => vec!["deno"],
@@ -339,8 +346,8 @@ fn resolve_runtime(runtime: &str) -> Result<String> {
     let base = crate::config::loader::base_dir();
 
     // 1. Check ~/.rsclaw/tools/<rt>/bin/<rt> first — the bundled-runtime layout
-    //    from `rsclaw tools install` (node: tools/node/bin/node;
-    //    bun: tools/bun/bin/bun). Path keys off the runtime name, never hardcoded.
+    //    from `rsclaw tools install` (node: tools/node/bin/node; bun:
+    //    tools/bun/bin/bun). Path keys off the runtime name, never hardcoded.
     for candidate in &candidates {
         let bin = base.join(format!("tools/{candidate}/bin/{candidate}"));
         if bin.exists() {

@@ -2,18 +2,20 @@
 
 mod common;
 
-use common::init_tls;
-
+use common::{
+    init_tls,
+    mock_provider::{
+        OpenAiEvent, assert_stream_done, assert_stream_text, assert_stream_tool_call,
+        collect_stream_events, mount_openai_json, mount_openai_stream,
+    },
+};
 use rsclaw::provider::{
     LlmProvider, LlmRequest, Message, MessageContent, Role,
     openai::{OpenAiProvider, strip_think_tags_pub},
 };
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
-
-use common::mock_provider::{
-    OpenAiEvent, assert_stream_done, assert_stream_text, assert_stream_tool_call,
-    collect_stream_events, mount_openai_json, mount_openai_stream,
+use wiremock::{
+    Mock, MockServer, ResponseTemplate,
+    matchers::{method, path},
 };
 
 fn simple_request(model: &str) -> LlmRequest {
@@ -22,6 +24,7 @@ fn simple_request(model: &str) -> LlmRequest {
         messages: vec![Message {
             role: Role::User,
             content: MessageContent::Text("hello".to_owned()),
+            rsclaw_hidden: None,
         }],
         max_tokens: Some(1024),
         ..Default::default()

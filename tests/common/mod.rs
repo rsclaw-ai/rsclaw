@@ -57,8 +57,7 @@ pub fn minimal_config(port: u16) -> RuntimeConfig {
             bind_address: None,
             reload: ReloadMode::Hybrid,
             auth_token: None,
-            a2a_bearer_tokens: vec![],
-            a2a_api_keys: vec![],
+            a2a_principals: vec![],
             a2a_max_body_bytes: 100 * 1024 * 1024,
             auth_token_configured: false,
             auth_token_is_plaintext: false,
@@ -144,12 +143,10 @@ pub async fn start_server_with_handles(addr: SocketAddr) -> ServerHandles {
     // dialog, so the permission store starts in non-bypass mode (every
     // request would prompt) and the broadcast channels exist purely so
     // dependent handlers don't blow up if they touch the field.
-    let computer_permission = Arc::new(
-        rsclaw::computer::permission::RedbPermissionStore::new(
-            Arc::clone(&store.db),
-            false,
-        ),
-    );
+    let computer_permission = Arc::new(rsclaw::computer::permission::RedbPermissionStore::new(
+        Arc::clone(&store.db),
+        false,
+    ));
     let (computer_permission_tx, _) =
         broadcast::channel::<rsclaw::computer::permission::PermissionRequest>(64);
     let (computer_status_tx, _) =
@@ -177,7 +174,9 @@ pub async fn start_server_with_handles(addr: SocketAddr) -> ServerHandles {
         zalo: Arc::new(tokio::sync::OnceCell::new()),
         started_at: std::time::Instant::now(),
         dm_enforcers: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-        custom_webhooks: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        custom_webhooks: std::sync::Arc::new(std::sync::RwLock::new(
+            std::collections::HashMap::new(),
+        )),
         cron_reload: broadcast::channel(1).0,
         notification_tx: broadcast::channel(16).0,
         wasm_plugins: Arc::new(Vec::new()),
@@ -203,6 +202,7 @@ pub async fn start_server_with_handles(addr: SocketAddr) -> ServerHandles {
             Arc::new(rsclaw::a2a::push::PushDispatcher::new(store, bus))
         },
         knowledge: None,
+        memory: None,
     };
 
     // Leak tempdir — store must stay live for the lifetime of the server task.

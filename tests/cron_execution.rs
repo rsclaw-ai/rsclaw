@@ -9,6 +9,7 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use rsclaw::{
+    MemoryTier,
     agent::{AgentRegistry, AgentReply},
     channel::ChannelManager,
     config::{
@@ -16,7 +17,6 @@ use rsclaw::{
         schema::{AgentEntry, CronConfig, CronJobConfig},
     },
     cron::{CronJob, CronRunner},
-    MemoryTier,
 };
 use serde_json::Value;
 
@@ -73,8 +73,7 @@ fn runtime_with_agent(agent_id: &str) -> RuntimeConfig {
             bind_address: None,
             reload: ReloadMode::Hybrid,
             auth_token: None,
-            a2a_bearer_tokens: vec![],
-            a2a_api_keys: vec![],
+            a2a_principals: vec![],
             a2a_max_body_bytes: 100 * 1024 * 1024,
             auth_token_configured: false,
             auth_token_is_plaintext: false,
@@ -154,7 +153,10 @@ async fn test_cron_job_runs() {
     let cfg = runtime_with_agent("agent-a");
 
     // Build registry + receivers.
-    let (registry, mut receivers) = AgentRegistry::from_config_with_receivers(&cfg, std::sync::Arc::new(rsclaw::provider::registry::ProviderRegistry::new()));
+    let (registry, mut receivers) = AgentRegistry::from_config_with_receivers(
+        &cfg,
+        std::sync::Arc::new(rsclaw::provider::registry::ProviderRegistry::new()),
+    );
 
     // Spawn an echo task for "agent-a".
     if let Some(mut rx) = receivers.remove("agent-a") {
@@ -202,7 +204,10 @@ async fn test_cron_job_runs() {
 #[tokio::test(flavor = "current_thread")]
 async fn test_cron_enable_disable() {
     let cfg = runtime_with_agent("agent-b");
-    let (registry, mut receivers) = AgentRegistry::from_config_with_receivers(&cfg, std::sync::Arc::new(rsclaw::provider::registry::ProviderRegistry::new()));
+    let (registry, mut receivers) = AgentRegistry::from_config_with_receivers(
+        &cfg,
+        std::sync::Arc::new(rsclaw::provider::registry::ProviderRegistry::new()),
+    );
 
     if let Some(mut rx) = receivers.remove("agent-b") {
         tokio::spawn(async move {
@@ -270,7 +275,10 @@ async fn test_cron_enable_disable() {
 #[tokio::test(flavor = "current_thread")]
 async fn test_cron_invalid_agent() {
     let cfg = runtime_with_agent("real-agent");
-    let (registry, _receivers) = AgentRegistry::from_config_with_receivers(&cfg, std::sync::Arc::new(rsclaw::provider::registry::ProviderRegistry::new()));
+    let (registry, _receivers) = AgentRegistry::from_config_with_receivers(
+        &cfg,
+        std::sync::Arc::new(rsclaw::provider::registry::ProviderRegistry::new()),
+    );
 
     let data_dir = tempfile::tempdir().expect("tempdir");
     let job = make_job("job-bad-agent", "* * * * *", "nonexistent-agent", true);
@@ -325,7 +333,10 @@ fn test_cron_schedule_stored_verbatim() {
 #[tokio::test(flavor = "current_thread")]
 async fn test_cron_trigger_unknown_job_returns_error() {
     let cfg = runtime_with_agent("agent-c");
-    let (registry, _receivers) = AgentRegistry::from_config_with_receivers(&cfg, std::sync::Arc::new(rsclaw::provider::registry::ProviderRegistry::new()));
+    let (registry, _receivers) = AgentRegistry::from_config_with_receivers(
+        &cfg,
+        std::sync::Arc::new(rsclaw::provider::registry::ProviderRegistry::new()),
+    );
 
     let data_dir = tempfile::tempdir().expect("tempdir");
     let runner = CronRunner::new(
@@ -452,8 +463,7 @@ fn test_every_schedule_fires_at_interval() {
         "message": "tick"
     });
 
-    let job: CronJob =
-        serde_json::from_value(job_json).expect("every schedule should deserialise");
+    let job: CronJob = serde_json::from_value(job_json).expect("every schedule should deserialise");
     assert_eq!(job.cron_expr(), "every");
 
     // Walk the schedule like the runner does: each fire is the input to the

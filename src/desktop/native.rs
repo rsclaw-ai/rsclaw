@@ -8,7 +8,9 @@ use std::process::Command;
 
 use base64::Engine;
 use enigo::{
-    Axis, Button, Coordinate, Direction::{Click, Press, Release}, Enigo, Key, Keyboard, Mouse, Settings,
+    Axis, Button, Coordinate,
+    Direction::{Click, Press, Release},
+    Enigo, Key, Keyboard, Mouse, Settings,
 };
 use image::{ImageFormat, RgbaImage};
 use tracing::warn;
@@ -136,15 +138,43 @@ fn run_osascript(script: &str) -> Result<String, String> {
 fn key_to_applescript_code(name: &str) -> Result<u16, String> {
     let code = match name.trim().to_lowercase().as_str() {
         // Letters
-        "a" => 0, "b" => 11, "c" => 8, "d" => 2, "e" => 14,
-        "f" => 3, "g" => 5, "h" => 4, "i" => 34, "j" => 38,
-        "k" => 40, "l" => 37, "m" => 46, "n" => 45, "o" => 31,
-        "p" => 35, "q" => 12, "r" => 15, "s" => 1, "t" => 17,
-        "u" => 32, "v" => 9, "w" => 13, "x" => 7, "y" => 16,
+        "a" => 0,
+        "b" => 11,
+        "c" => 8,
+        "d" => 2,
+        "e" => 14,
+        "f" => 3,
+        "g" => 5,
+        "h" => 4,
+        "i" => 34,
+        "j" => 38,
+        "k" => 40,
+        "l" => 37,
+        "m" => 46,
+        "n" => 45,
+        "o" => 31,
+        "p" => 35,
+        "q" => 12,
+        "r" => 15,
+        "s" => 1,
+        "t" => 17,
+        "u" => 32,
+        "v" => 9,
+        "w" => 13,
+        "x" => 7,
+        "y" => 16,
         "z" => 6,
         // Numbers
-        "0" => 29, "1" => 18, "2" => 19, "3" => 20, "4" => 21,
-        "5" => 23, "6" => 22, "7" => 26, "8" => 28, "9" => 25,
+        "0" => 29,
+        "1" => 18,
+        "2" => 19,
+        "3" => 20,
+        "4" => 21,
+        "5" => 23,
+        "6" => 22,
+        "7" => 26,
+        "8" => 28,
+        "9" => 25,
         // Special keys
         "return" | "enter" => 36,
         "delete" | "del" => 51,
@@ -159,9 +189,18 @@ fn key_to_applescript_code(name: &str) -> Result<u16, String> {
         "pagedown" | "pgdn" => 121,
         "home" => 115,
         "end" => 119,
-        "f1" => 122, "f2" => 120, "f3" => 99, "f4" => 118,
-        "f5" => 96, "f6" => 97, "f7" => 98, "f8" => 100,
-        "f9" => 101, "f10" => 109, "f11" => 103, "f12" => 111,
+        "f1" => 122,
+        "f2" => 120,
+        "f3" => 99,
+        "f4" => 118,
+        "f5" => 96,
+        "f6" => 97,
+        "f7" => 98,
+        "f8" => 100,
+        "f9" => 101,
+        "f10" => 109,
+        "f11" => 103,
+        "f12" => 111,
         _ => return Err(format!("unknown key for AppleScript: {name}")),
     };
     Ok(code)
@@ -258,7 +297,9 @@ else:
         Ok(out) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if text.is_empty() {
-                Err(format!("cgwindow_fallback: no {owner_name} window found via CGWindowList"))
+                Err(format!(
+                    "cgwindow_fallback: no {owner_name} window found via CGWindowList"
+                ))
             } else {
                 Ok(text)
             }
@@ -269,6 +310,13 @@ else:
         )),
         Err(e) => Err(format!("cgwindow_fallback: python3 spawn failed: {e}")),
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cgwindow_fallback(owner_name: &str) -> Result<String, String> {
+    Err(format!(
+        "cgwindow_fallback: {owner_name} is only available on macOS"
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -509,7 +557,8 @@ end tell"#,
         tokio::task::spawn_blocking(move || {
             let mut enigo = new_enigo()?;
             let (lx, ly) = scale_for_input(x, y);
-            enigo.move_mouse(lx, ly, Coordinate::Abs)
+            enigo
+                .move_mouse(lx, ly, Coordinate::Abs)
                 .map_err(|e| format!("move_mouse: {e}"))?;
             Ok("ok".to_string())
         })
@@ -521,9 +570,11 @@ end tell"#,
         tokio::task::spawn_blocking(move || {
             let mut enigo = new_enigo()?;
             let (lx, ly) = scale_for_input(x, y);
-            enigo.move_mouse(lx, ly, Coordinate::Abs)
+            enigo
+                .move_mouse(lx, ly, Coordinate::Abs)
                 .map_err(|e| format!("move_mouse: {e}"))?;
-            enigo.button(Button::Left, Click)
+            enigo
+                .button(Button::Left, Click)
                 .map_err(|e| format!("button click: {e}"))?;
             Ok("ok".to_string())
         })
@@ -535,12 +586,15 @@ end tell"#,
         tokio::task::spawn_blocking(move || {
             let mut enigo = new_enigo()?;
             let (lx, ly) = scale_for_input(x, y);
-            enigo.move_mouse(lx, ly, Coordinate::Abs)
+            enigo
+                .move_mouse(lx, ly, Coordinate::Abs)
                 .map_err(|e| format!("move_mouse: {e}"))?;
-            enigo.button(Button::Left, Click)
+            enigo
+                .button(Button::Left, Click)
                 .map_err(|e| format!("button click 1: {e}"))?;
             std::thread::sleep(std::time::Duration::from_millis(80));
-            enigo.button(Button::Left, Click)
+            enigo
+                .button(Button::Left, Click)
                 .map_err(|e| format!("button click 2: {e}"))?;
             Ok("ok".to_string())
         })
@@ -596,13 +650,17 @@ print('ok')
                 let mut enigo = new_enigo()?;
                 let (fx, fy) = scale_for_input(x1, y1);
                 let (tx, ty) = scale_for_input(x2, y2);
-                enigo.move_mouse(fx, fy, Coordinate::Abs)
+                enigo
+                    .move_mouse(fx, fy, Coordinate::Abs)
                     .map_err(|e| format!("move_mouse start: {e}"))?;
-                enigo.button(Button::Left, Press)
+                enigo
+                    .button(Button::Left, Press)
                     .map_err(|e| format!("button press: {e}"))?;
-                enigo.move_mouse(tx, ty, Coordinate::Abs)
+                enigo
+                    .move_mouse(tx, ty, Coordinate::Abs)
                     .map_err(|e| format!("move_mouse end: {e}"))?;
-                enigo.button(Button::Left, Release)
+                enigo
+                    .button(Button::Left, Release)
                     .map_err(|e| format!("button release: {e}"))?;
                 Ok("ok".to_string())
             }
@@ -615,7 +673,8 @@ print('ok')
         tokio::task::spawn_blocking(move || {
             let mut enigo = new_enigo()?;
             let axis = Axis::Vertical;
-            enigo.scroll(clicks, axis)
+            enigo
+                .scroll(clicks, axis)
                 .map_err(|e| format!("scroll: {e}"))?;
             Ok("ok".to_string())
         })
@@ -639,19 +698,19 @@ print('ok')
                 run_osascript(&script)
             } else {
                 let mut enigo = new_enigo()?;
-                let target = parse_key(&key)
-                    .ok_or_else(|| format!("unknown key: {key}"))?;
+                let target = parse_key(&key).ok_or_else(|| format!("unknown key: {key}"))?;
                 let mut mod_keys = Vec::new();
                 for m in &modifiers {
-                    let mk = parse_key(m)
-                        .ok_or_else(|| format!("unknown modifier: {m}"))?;
+                    let mk = parse_key(m).ok_or_else(|| format!("unknown modifier: {m}"))?;
                     mod_keys.push(mk);
                 }
                 for mk in &mod_keys {
-                    enigo.key(*mk, Press)
+                    enigo
+                        .key(*mk, Press)
                         .map_err(|e| format!("modifier press: {e}"))?;
                 }
-                enigo.key(target, Click)
+                enigo
+                    .key(target, Click)
                     .map_err(|e| format!("key press: {e}"))?;
                 for mk in mod_keys.iter().rev() {
                     if let Err(e) = enigo.key(*mk, Release) {
@@ -669,7 +728,10 @@ print('ok')
         let text = text.to_owned();
         tokio::task::spawn_blocking(move || {
             if cfg!(target_os = "macos") {
-                match Command::new("pbcopy").stdin(std::process::Stdio::piped()).spawn() {
+                match Command::new("pbcopy")
+                    .stdin(std::process::Stdio::piped())
+                    .spawn()
+                {
                     Ok(mut child) => {
                         use std::io::Write;
                         if let Some(mut stdin) = child.stdin.take() {
@@ -715,7 +777,10 @@ print('ok')
                     .output()
                 {
                     Ok(out) if out.status.success() => Ok("ok".to_string()),
-                    Ok(out) => Err(format!("Set-Clipboard failed: {}", String::from_utf8_lossy(&out.stderr))),
+                    Ok(out) => Err(format!(
+                        "Set-Clipboard failed: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    )),
                     Err(e) => Err(format!("powershell spawn failed: {e}")),
                 }
             } else {
@@ -733,7 +798,10 @@ print('ok')
                     Ok(out) if out.status.success() => {
                         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
                     }
-                    Ok(out) => Err(format!("pbpaste failed: {}", String::from_utf8_lossy(&out.stderr))),
+                    Ok(out) => Err(format!(
+                        "pbpaste failed: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    )),
                     Err(e) => Err(format!("pbpaste spawn failed: {e}")),
                 }
             } else if cfg!(target_os = "linux") {
@@ -751,7 +819,10 @@ print('ok')
                     Ok(out) if out.status.success() => {
                         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
                     }
-                    Ok(out) => Err(format!("xclip/xsel failed: {}", String::from_utf8_lossy(&out.stderr))),
+                    Ok(out) => Err(format!(
+                        "xclip/xsel failed: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    )),
                     Err(e) => Err(format!("no clipboard tool available: {e}")),
                 }
             } else if cfg!(target_os = "windows") {
@@ -762,7 +833,10 @@ print('ok')
                     Ok(out) if out.status.success() => {
                         Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
                     }
-                    Ok(out) => Err(format!("Get-Clipboard failed: {}", String::from_utf8_lossy(&out.stderr))),
+                    Ok(out) => Err(format!(
+                        "Get-Clipboard failed: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    )),
                     Err(e) => Err(format!("powershell spawn failed: {e}")),
                 }
             } else {
@@ -783,7 +857,10 @@ print('ok')
                 );
                 match Command::new("osascript").args(["-e", &script]).output() {
                     Ok(out) if out.status.success() => Ok("ok".to_string()),
-                    Ok(out) => Err(format!("osascript failed: {}", String::from_utf8_lossy(&out.stderr))),
+                    Ok(out) => Err(format!(
+                        "osascript failed: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    )),
                     Err(e) => Err(format!("osascript spawn failed: {e}")),
                 }
             } else if cfg!(target_os = "linux") {
@@ -808,16 +885,16 @@ print('ok')
                     Err(e) => Err(format!("xclip spawn failed: {e}")),
                 }
             } else if cfg!(target_os = "windows") {
-                let ps = format!(
-                    "Set-Clipboard -Path '{}'",
-                    file_path.replace('\'', "''")
-                );
+                let ps = format!("Set-Clipboard -Path '{}'", file_path.replace('\'', "''"));
                 match Command::new("powershell")
                     .args(["-NoProfile", "-Command", &ps])
                     .output()
                 {
                     Ok(out) if out.status.success() => Ok("ok".to_string()),
-                    Ok(out) => Err(format!("Set-Clipboard failed: {}", String::from_utf8_lossy(&out.stderr))),
+                    Ok(out) => Err(format!(
+                        "Set-Clipboard failed: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    )),
                     Err(e) => Err(format!("powershell spawn failed: {e}")),
                 }
             } else {
@@ -887,14 +964,15 @@ print('ok')
         .map_err(|e| format!("clipboard_get_image join failed: {e}"))?
     }
 
-
     async fn mouse_right_click(&self, x: u32, y: u32) -> Result<String, String> {
         tokio::task::spawn_blocking(move || {
             let mut enigo = new_enigo()?;
             let (lx, ly) = scale_for_input(x, y);
-            enigo.move_mouse(lx, ly, Coordinate::Abs)
+            enigo
+                .move_mouse(lx, ly, Coordinate::Abs)
                 .map_err(|e| format!("move_mouse: {e}"))?;
-            enigo.button(Button::Right, Click)
+            enigo
+                .button(Button::Right, Click)
                 .map_err(|e| format!("right button click: {e}"))?;
             Ok("ok".to_string())
         })
@@ -918,7 +996,10 @@ print('ok')
                         if path.starts_with("alias ") {
                             let alias_path = path.strip_prefix("alias ").unwrap_or(&path);
                             match Command::new("osascript")
-                                .args(["-e", &format!("POSIX path of {} \"{}\"", "alias", alias_path)])
+                                .args([
+                                    "-e",
+                                    &format!("POSIX path of {} \"{}\"", "alias", alias_path),
+                                ])
                                 .output()
                             {
                                 Ok(out2) if out2.status.success() => {
@@ -930,7 +1011,10 @@ print('ok')
                             Ok(path)
                         }
                     }
-                    Ok(out) => Err(format!("osascript failed: {}", String::from_utf8_lossy(&out.stderr))),
+                    Ok(out) => Err(format!(
+                        "osascript failed: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    )),
                     Err(e) => Err(format!("osascript spawn failed: {e}")),
                 }
             } else {

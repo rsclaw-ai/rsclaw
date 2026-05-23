@@ -1,18 +1,18 @@
-//! Wiremock integration tests for Ollama JSONL format via OpenAiProvider::ollama.
+//! Wiremock integration tests for Ollama JSONL format via
+//! OpenAiProvider::ollama.
 
 mod common;
 
-use common::init_tls;
-
-use rsclaw::provider::{
-    LlmProvider, LlmRequest, Message, MessageContent, Role, StreamEvent,
-    openai::OpenAiProvider,
+use common::{
+    init_tls,
+    mock_provider::{OllamaEvent, collect_stream_events, mount_ollama_native},
 };
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
-
-use common::mock_provider::{
-    OllamaEvent, collect_stream_events, mount_ollama_native,
+use rsclaw::provider::{
+    LlmProvider, LlmRequest, Message, MessageContent, Role, StreamEvent, openai::OpenAiProvider,
+};
+use wiremock::{
+    Mock, MockServer, ResponseTemplate,
+    matchers::{method, path},
 };
 
 fn simple_request(model: &str) -> LlmRequest {
@@ -21,6 +21,7 @@ fn simple_request(model: &str) -> LlmRequest {
         messages: vec![Message {
             role: Role::User,
             content: MessageContent::Text("hello".to_owned()),
+            rsclaw_hidden: None,
         }],
         max_tokens: Some(1024),
         ..Default::default()
@@ -47,10 +48,7 @@ async fn qwen3_routes_to_api_chat() {
     .await;
 
     let provider = OpenAiProvider::ollama(server.uri(), None);
-    let stream = provider
-        .stream(simple_request("qwen3:8b"))
-        .await
-        .unwrap();
+    let stream = provider.stream(simple_request("qwen3:8b")).await.unwrap();
     let events = collect_stream_events(stream).await;
 
     let text: String = events
@@ -85,10 +83,7 @@ async fn non_reasoning_model_routes_to_v1_completions() {
         .await;
 
     let provider = OpenAiProvider::ollama(format!("{}/v1", server.uri()), None);
-    let stream = provider
-        .stream(simple_request("llama3:8b"))
-        .await
-        .unwrap();
+    let stream = provider.stream(simple_request("llama3:8b")).await.unwrap();
     let events = collect_stream_events(stream).await;
 
     let text: String = events
@@ -123,10 +118,7 @@ async fn ollama_content_stream() {
     .await;
 
     let provider = OpenAiProvider::ollama(server.uri(), None);
-    let stream = provider
-        .stream(simple_request("qwen3:8b"))
-        .await
-        .unwrap();
+    let stream = provider.stream(simple_request("qwen3:8b")).await.unwrap();
     let events = collect_stream_events(stream).await;
 
     let text: String = events
@@ -157,10 +149,7 @@ async fn ollama_thinking_stream() {
     .await;
 
     let provider = OpenAiProvider::ollama(server.uri(), None);
-    let stream = provider
-        .stream(simple_request("qwen3:8b"))
-        .await
-        .unwrap();
+    let stream = provider.stream(simple_request("qwen3:8b")).await.unwrap();
     let events = collect_stream_events(stream).await;
 
     // Thinking should be wrapped in <think> tags
@@ -202,10 +191,7 @@ async fn ollama_tool_call() {
     .await;
 
     let provider = OpenAiProvider::ollama(server.uri(), None);
-    let stream = provider
-        .stream(simple_request("qwen3:8b"))
-        .await
-        .unwrap();
+    let stream = provider.stream(simple_request("qwen3:8b")).await.unwrap();
     let events = collect_stream_events(stream).await;
 
     let tool_call = events.iter().find_map(|e| match e {
@@ -228,9 +214,7 @@ async fn ollama_http_error() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/chat"))
-        .respond_with(
-            ResponseTemplate::new(500).set_body_string("model not found"),
-        )
+        .respond_with(ResponseTemplate::new(500).set_body_string("model not found"))
         .mount(&server)
         .await;
 

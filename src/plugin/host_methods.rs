@@ -14,8 +14,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast};
 use tracing::{debug, warn};
 
-use crate::browser::BrowserSession;
-use crate::channel::OutboundMessage;
+use crate::{browser::BrowserSession, channel::OutboundMessage};
 
 /// All dependencies a host method might need. Cloned cheaply (everything is
 /// behind Arc) and shared across plugin spawns.
@@ -26,7 +25,8 @@ pub struct HostMethodRegistry {
 }
 
 impl HostMethodRegistry {
-    /// Create a new registry with the given notification sender and browser session.
+    /// Create a new registry with the given notification sender and browser
+    /// session.
     pub fn new(
         notify_tx: Option<broadcast::Sender<OutboundMessage>>,
         browser: Arc<Mutex<Option<BrowserSession>>>,
@@ -101,7 +101,8 @@ impl HostMethodRegistry {
         }
     }
 
-    /// Notify the user with an inline image (e.g. login QR, captcha screenshot).
+    /// Notify the user with an inline image (e.g. login QR, captcha
+    /// screenshot).
     ///
     /// Mirrors `wasm_runtime.rs::notify_with_image`. Requires `text`,
     /// `image_data_uri` (a `data:image/...;base64,...` URI — what the
@@ -234,7 +235,8 @@ impl HostMethodRegistry {
         self.browser_call("evaluate", json!({"js": code})).await
     }
 
-    /// Evaluate a JavaScript function with arguments in the shared browser session.
+    /// Evaluate a JavaScript function with arguments in the shared browser
+    /// session.
     ///
     /// Params: `{ "fn": "<async fn source>", "args": <any JSON value> }`.
     /// The function is wrapped in an IIFE matching the wasm `eval_with_args`
@@ -255,7 +257,8 @@ impl HostMethodRegistry {
         );
         self.browser_call("evaluate", json!({"js": wrapped})).await
     }
-    /// Click on a DOM element by accessibility ref in the shared browser session.
+    /// Click on a DOM element by accessibility ref in the shared browser
+    /// session.
     ///
     /// Params: `{ "ref": "<element ref>" }`. Mirrors wasm `browser_click`.
     async fn host_browser_click(&self, params: Value) -> Result<Value> {
@@ -280,7 +283,8 @@ impl HostMethodRegistry {
     }
     /// Fill a form field by accessibility ref in the shared browser session.
     ///
-    /// Params: `{ "ref": "<element ref>", "text": "<value>" }`. Mirrors wasm `browser_fill`.
+    /// Params: `{ "ref": "<element ref>", "text": "<value>" }`. Mirrors wasm
+    /// `browser_fill`.
     async fn host_browser_fill(&self, params: Value) -> Result<Value> {
         let element_ref = params["ref"]
             .as_str()
@@ -292,14 +296,16 @@ impl HostMethodRegistry {
             .await
     }
 
-    /// Capture an accessibility snapshot of the current page in the shared browser session.
+    /// Capture an accessibility snapshot of the current page in the shared
+    /// browser session.
     ///
     /// Params: `{}` (none required). Mirrors wasm `browser_snapshot`.
     async fn host_browser_snapshot(&self, _params: Value) -> Result<Value> {
         self.browser_call("snapshot", json!({})).await
     }
 
-    /// Capture a viewport screenshot of the current page in the shared browser session.
+    /// Capture a viewport screenshot of the current page in the shared browser
+    /// session.
     ///
     /// Returns the full JSON response `{image, image_path, mime}` (instead of
     /// the single-field extraction `browser_call` does), so JS plugins can
@@ -309,12 +315,13 @@ impl HostMethodRegistry {
     async fn host_browser_screenshot(&self, _params: Value) -> Result<Value> {
         self.browser_call_raw("screenshot", json!({})).await
     }
-    /// Download a resource (URL or element ref) to a local path in the shared browser session.
+    /// Download a resource (URL or element ref) to a local path in the shared
+    /// browser session.
     ///
-    /// Params: `{ "url": "<url or element ref>", "dest_path": "<local path>" }`.
-    /// Optional `"referer"` may be supplied for sites that require it; on the wasm side
-    /// referer attachment is automatic via per-plugin CDN rules — Node plugins pass it
-    /// explicitly instead.
+    /// Params: `{ "url": "<url or element ref>", "dest_path": "<local path>"
+    /// }`. Optional `"referer"` may be supplied for sites that require it;
+    /// on the wasm side referer attachment is automatic via per-plugin CDN
+    /// rules — Node plugins pass it explicitly instead.
     /// Mirrors wasm `browser_download`.
     async fn host_browser_download(&self, params: Value) -> Result<Value> {
         let url = params["url"]
@@ -370,7 +377,9 @@ impl HostMethodRegistry {
 
         let ffmpeg_bin = match crate::agent::platform::detect_ffmpeg() {
             Some(p) => p,
-            None => return Ok(json!({"error": "ffmpeg not found. Run: rsclaw tools install ffmpeg"})),
+            None => {
+                return Ok(json!({"error": "ffmpeg not found. Run: rsclaw tools install ffmpeg"}));
+            }
         };
 
         let out_path = match crate::plugin::wasm_runtime::allocate_dl_paths("audio.wav", 1) {
@@ -380,9 +389,16 @@ impl HostMethodRegistry {
 
         let output = tokio::process::Command::new(&ffmpeg_bin)
             .args([
-                "-y", "-i", input_path,
-                "-vn", "-acodec", "pcm_s16le",
-                "-ar", "16000", "-ac", "1",
+                "-y",
+                "-i",
+                input_path,
+                "-vn",
+                "-acodec",
+                "pcm_s16le",
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
                 &out_path,
             ])
             .output()
@@ -399,7 +415,8 @@ impl HostMethodRegistry {
     }
 
     /// Transcribe audio to text using the host's STT engine.
-    /// Params: `{ "audio_path": "<path>", "language": "zh-CN" }`. Mirrors wasm `transcribe`.
+    /// Params: `{ "audio_path": "<path>", "language": "zh-CN" }`. Mirrors wasm
+    /// `transcribe`.
     async fn host_transcribe(&self, params: Value) -> Result<Value> {
         let audio_path = params["audio_path"]
             .as_str()
@@ -418,14 +435,17 @@ impl HostMethodRegistry {
         };
 
         let client = reqwest::Client::new();
-        match crate::channel::transcription::transcribe_audio(&client, &bytes, audio_path, mime).await {
+        match crate::channel::transcription::transcribe_audio(&client, &bytes, audio_path, mime)
+            .await
+        {
             Ok(text) => Ok(json!({"text": text})),
             Err(e) => Ok(json!({"error": format!("transcription failed: {e:#}")})),
         }
     }
 
     /// Extract keyframes from a video file using ffmpeg.
-    /// Params: `{ "video_path": "<path>", "count": 5 }`. Mirrors wasm `extract_keyframes`.
+    /// Params: `{ "video_path": "<path>", "count": 5 }`. Mirrors wasm
+    /// `extract_keyframes`.
     async fn host_extract_keyframes(&self, params: Value) -> Result<Value> {
         let video_path = params["video_path"]
             .as_str()
@@ -434,7 +454,9 @@ impl HostMethodRegistry {
 
         let ffmpeg_bin = match crate::agent::platform::detect_ffmpeg() {
             Some(p) => p,
-            None => return Ok(json!({"error": "ffmpeg not found. Run: rsclaw tools install ffmpeg"})),
+            None => {
+                return Ok(json!({"error": "ffmpeg not found. Run: rsclaw tools install ffmpeg"}));
+            }
         };
 
         let out_paths = match crate::plugin::wasm_runtime::allocate_dl_paths("frame.png", count) {
@@ -445,14 +467,22 @@ impl HostMethodRegistry {
         // Get video duration.
         let duration_secs: f64 = {
             let probe = tokio::process::Command::new(&ffmpeg_bin)
-                .args(["-v", "error", "-show_entries", "format=duration",
-                       "-of", "default=noprint_wrappers=1:nokey=1", video_path])
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    video_path,
+                ])
                 .output()
                 .await;
             match probe {
-                Ok(o) if o.status.success() => {
-                    String::from_utf8_lossy(&o.stdout).trim().parse().unwrap_or(0.0)
-                }
+                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .parse()
+                    .unwrap_or(0.0),
                 _ => 0.0,
             }
         };
@@ -466,8 +496,11 @@ impl HostMethodRegistry {
 
         let output = tokio::process::Command::new(&ffmpeg_bin)
             .args([
-                "-y", "-i", video_path,
-                "-vf", &format!("fps=1/{interval},scale=480:-1"),
+                "-y",
+                "-i",
+                video_path,
+                "-vf",
+                &format!("fps=1/{interval},scale=480:-1"),
                 &out_pattern,
             ])
             .output()

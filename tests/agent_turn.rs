@@ -43,8 +43,7 @@ fn config_with_echo_agent(port: u16) -> RuntimeConfig {
             bind_address: None,
             reload: ReloadMode::Hybrid,
             auth_token: None,
-            a2a_bearer_tokens: vec![],
-            a2a_api_keys: vec![],
+            a2a_principals: vec![],
             a2a_max_body_bytes: 100 * 1024 * 1024,
             auth_token_configured: false,
             auth_token_is_plaintext: false,
@@ -143,12 +142,10 @@ async fn start_echo_server(addr: SocketAddr) {
         });
     }
 
-    let computer_permission = Arc::new(
-        rsclaw::computer::permission::RedbPermissionStore::new(
-            Arc::clone(&store.db),
-            false,
-        ),
-    );
+    let computer_permission = Arc::new(rsclaw::computer::permission::RedbPermissionStore::new(
+        Arc::clone(&store.db),
+        false,
+    ));
     let (computer_permission_tx, _) =
         broadcast::channel::<rsclaw::computer::permission::PermissionRequest>(64);
     let (computer_status_tx, _) =
@@ -178,7 +175,9 @@ async fn start_echo_server(addr: SocketAddr) {
         zalo: Arc::new(tokio::sync::OnceCell::new()),
         started_at: std::time::Instant::now(),
         dm_enforcers: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-        custom_webhooks: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        custom_webhooks: std::sync::Arc::new(std::sync::RwLock::new(
+            std::collections::HashMap::new(),
+        )),
         cron_reload: broadcast::channel(1).0,
         notification_tx: broadcast::channel(16).0,
         wasm_plugins: Arc::new(Vec::new()),
@@ -204,6 +203,7 @@ async fn start_echo_server(addr: SocketAddr) {
             Arc::new(rsclaw::a2a::push::PushDispatcher::new(store, bus))
         },
         knowledge: None,
+        memory: None,
     };
 
     // Leak the tempdir so the store stays valid for the server's lifetime.

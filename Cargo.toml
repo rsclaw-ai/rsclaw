@@ -133,8 +133,8 @@ htmd    = "0.5"
 lol_html = "1.2"
 # Embed `tools/` site-rules + app-rules into the binary at compile time
 include_dir = "0.7"
-wasmtime = { version = "29", features = ["async"] }
-wasmtime-wasi = "29"
+wasmtime = { version = "36.0.10", features = ["async"] }
+wasmtime-wasi = "36.0.10"
 moka = { version = "0.12", features = ["future"] }
 
 # System tray (optional)

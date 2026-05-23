@@ -2,18 +2,19 @@
 
 mod common;
 
-use common::init_tls;
-
-use rsclaw::provider::{
-    LlmProvider, LlmRequest, Message, MessageContent, Role, StreamEvent,
-    gemini::GeminiProvider,
+use common::{
+    init_tls,
+    mock_provider::{
+        GeminiEvent, assert_stream_done, assert_stream_text, assert_stream_tool_call, assert_usage,
+        collect_stream_events, mount_gemini_stream,
+    },
 };
-use wiremock::matchers::{header, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
-
-use common::mock_provider::{
-    GeminiEvent, assert_stream_done, assert_stream_text, assert_stream_tool_call, assert_usage,
-    collect_stream_events, mount_gemini_stream,
+use rsclaw::provider::{
+    LlmProvider, LlmRequest, Message, MessageContent, Role, StreamEvent, gemini::GeminiProvider,
+};
+use wiremock::{
+    Mock, MockServer, ResponseTemplate,
+    matchers::{header, method, path},
 };
 
 fn simple_request(model: &str) -> LlmRequest {
@@ -22,6 +23,7 @@ fn simple_request(model: &str) -> LlmRequest {
         messages: vec![Message {
             role: Role::User,
             content: MessageContent::Text("hello".to_owned()),
+            rsclaw_hidden: None,
         }],
         max_tokens: Some(1024),
         ..Default::default()
@@ -50,7 +52,8 @@ async fn stream_text_parts() {
     )
     .await;
 
-    let provider = GeminiProvider::with_base_url("test-api-key", format!("{}/v1beta", server.uri()));
+    let provider =
+        GeminiProvider::with_base_url("test-api-key", format!("{}/v1beta", server.uri()));
     let stream = provider
         .stream(simple_request("gemini-2.0-flash"))
         .await
@@ -117,9 +120,9 @@ async fn stream_error_field() {
         .unwrap();
     let events = collect_stream_events(stream).await;
 
-    let has_error = events.iter().any(|e| {
-        matches!(e, StreamEvent::Error(msg) if msg.contains("quota exceeded"))
-    });
+    let has_error = events
+        .iter()
+        .any(|e| matches!(e, StreamEvent::Error(msg) if msg.contains("quota exceeded")));
     assert!(has_error, "expected Error event with 'quota exceeded'");
 }
 
@@ -194,10 +197,10 @@ async fn gemini_http_error() {
     init_tls();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/v1beta/models/gemini-2.0-flash:streamGenerateContent"))
-        .respond_with(
-            ResponseTemplate::new(403).set_body_string("API key invalid"),
-        )
+        .and(path(
+            "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+        ))
+        .respond_with(ResponseTemplate::new(403).set_body_string("API key invalid"))
         .mount(&server)
         .await;
 

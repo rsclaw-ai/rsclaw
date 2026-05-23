@@ -374,7 +374,8 @@ pub struct RunContext {
     /// Whether a loop-detection warning was triggered during this turn.
     pub loop_warning_triggered: bool,
     /// Factual trace of the looping tool call (tool name + args + warning) set
-    /// when a loop is detected. Drives failure-lesson extraction at end of turn.
+    /// when a loop is detected. Drives failure-lesson extraction at end of
+    /// turn.
     pub loop_failure: Option<String>,
     /// Per-turn difficulty counters for workflow crystallization.
     pub turn_metrics: super::turn_metrics::TurnMetrics,
@@ -3617,11 +3618,7 @@ impl AgentRuntime {
                 let user_text = text.to_owned();
                 tokio::spawn(async move {
                     crate::agent::memory_extractor::extract_l1(
-                        mem_clone,
-                        providers,
-                        model,
-                        scope,
-                        user_text,
+                        mem_clone, providers, model, scope, user_text,
                     )
                     .await;
                 });
@@ -3644,11 +3641,7 @@ impl AgentRuntime {
                 let user_text = text.to_owned();
                 tokio::spawn(async move {
                     crate::agent::memory_extractor::extract_lesson(
-                        mem_clone,
-                        providers,
-                        model,
-                        scope,
-                        user_text,
+                        mem_clone, providers, model, scope, user_text,
                     )
                     .await;
                 });
@@ -6990,9 +6983,13 @@ impl AgentRuntime {
             "skill_search" => return self.tool_skill_search(args).await,
             "skill_install" => return self.tool_skill_install(args).await,
             "skill_remove" => return self.tool_skill_remove(args).await,
-            "plugin.search_tools" => return self.tool_plugin_search_tools(args).await,
-            "plugin.describe_tool" => return self.tool_plugin_describe_tool(args).await,
-            "plugin.invoke" => return self.tool_plugin_invoke(ctx, args).await,
+            "plugin.search_tools" | "plugin_search_tools" => {
+                return self.tool_plugin_search_tools(args).await;
+            }
+            "plugin.describe_tool" | "plugin_describe_tool" => {
+                return self.tool_plugin_describe_tool(args).await;
+            }
+            "plugin.invoke" | "plugin_invoke" => return self.tool_plugin_invoke(ctx, args).await,
             "task" => return self.tool_task(ctx, args).await,
             "task_finish" => return self.tool_task_finish(ctx, args).await,
             "ask_user" => return self.tool_ask_user(ctx, args).await,

@@ -2,7 +2,8 @@
 //!
 //! Every plugin lives in its own directory under `~/.rsclaw/plugins/<name>/`.
 //! rsclaw looks for a manifest file in this order:
-//!   1. `plugin.json5`          — rsclaw native format (json5, supports wasm + js)
+//!   1. `plugin.json5`          — rsclaw native format (json5, supports wasm +
+//!      js)
 //!   2. `openclaw.plugin.json`  — OpenClaw compatibility (json, js-only)
 //!
 //! Example `plugin.json5`:
@@ -11,7 +12,7 @@
 //!   name: "myplugin",
 //!   version: "1.0.0",
 //!   description: "What the plugin does (shown to the LLM)",
-//!   runtime: "wasm",            // "wasm" | "node" | "bun" | "deno"
+//!   runtime: "wasm",            // "wasm" | "js" | "node" | "bun" | "deno"
 //!   entry: "./myplugin.wasm",   // or "./dist/index.js"
 //!   tools: [
 //!     {
@@ -65,6 +66,7 @@ pub struct PluginManifest {
     #[serde(default, rename = "commonTools")]
     pub common_tools: Vec<String>,
     /// Runtime: "node" | "bun" | "deno" | "wasm". Defaults to "node".
+    /// The legacy/generic "js" runtime is accepted and normalized to "node".
     #[serde(default = "default_runtime")]
     pub runtime: String,
     /// Entry point relative to the plugin directory.
@@ -164,6 +166,9 @@ impl PluginManifest {
                 self.name = id.clone();
             }
         }
+        if self.runtime.trim().is_empty() || self.runtime == "js" {
+            self.runtime = default_runtime();
+        }
     }
 
     /// Whether this plugin uses the WASM runtime.
@@ -209,8 +214,8 @@ pub fn load_manifest(plugin_dir: &Path) -> Result<PluginManifest> {
 
 /// Parse a `plugin.json5` manifest.
 fn load_manifest_json5(path: &Path, plugin_dir: &Path) -> Result<PluginManifest> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("cannot read {}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
 
     let mut manifest: PluginManifest = json5::from_str(&raw)
         .with_context(|| format!("json5 parse error in {}", path.display()))?;
@@ -222,8 +227,8 @@ fn load_manifest_json5(path: &Path, plugin_dir: &Path) -> Result<PluginManifest>
 
 /// Parse a legacy `openclaw.plugin.json` manifest.
 fn load_manifest_json(path: &Path, plugin_dir: &Path) -> Result<PluginManifest> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("cannot read {}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
 
     let mut manifest: PluginManifest = serde_json::from_str(&raw)
         .with_context(|| format!("JSON parse error in {}", path.display()))?;
@@ -293,7 +298,10 @@ mod tests {
         }"#;
         let m: PluginManifest = json5::from_str(json5).unwrap();
         assert_eq!(m.summary.as_deref(), Some("Does demo things"));
-        assert_eq!(m.common_tools, vec!["publish".to_string(), "list".to_string()]);
+        assert_eq!(
+            m.common_tools,
+            vec!["publish".to_string(), "list".to_string()]
+        );
 
         // Backward compat: absent fields default cleanly.
         let bare = r#"{ name: "x", tools: [] }"#;
@@ -379,6 +387,20 @@ mod tests {
         assert_eq!(m.name, "minimal");
         assert_eq!(m.runtime, "node");
         assert!(m.slots.is_empty());
+    }
+
+    #[test]
+    fn parse_js_runtime_alias_as_node() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_file(
+            tmp.path(),
+            MANIFEST_FILE,
+            r#"{ name: "travel", entry: "./src/index.mjs", runtime: "js" }"#,
+        );
+
+        let m = load_manifest(tmp.path()).expect("load");
+        assert_eq!(m.runtime, "node");
+        assert!(!m.is_wasm());
     }
 
     #[test]

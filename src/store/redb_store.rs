@@ -22,6 +22,8 @@ use tracing::debug;
 
 use crate::MemoryTier;
 
+pub const LEGACY_REDB_UPGRADE_HELPER_ENV: &str = "RSCLAW_INTERNAL_REDB_LEGACY_UPGRADE";
+
 // ---------------------------------------------------------------------------
 // Table definitions
 // ---------------------------------------------------------------------------
@@ -119,10 +121,10 @@ impl std::fmt::Debug for RedbStore {
 /// * v1/v2 file (`DatabaseError::UpgradeRequired`) → write a `.v2.bak` copy
 ///   next to the file (only if no backup exists yet, never overwriting), then
 ///   run the one-shot `Database::upgrade()` via the bundled `redb 2.6` crate.
-/// * Any other open failure (permission denied, lock conflict, real
-///   corruption, …) → return `Ok(())` so the caller's own `Database::open`
-///   surfaces the true root cause rather than being masked by a confusing
-///   "legacy upgrade failed" wrapper.
+/// * Any other open failure (permission denied, lock conflict, real corruption,
+///   …) → return `Ok(())` so the caller's own `Database::open` surfaces the
+///   true root cause rather than being masked by a confusing "legacy upgrade
+///   failed" wrapper.
 pub(crate) fn upgrade_legacy_if_needed(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
@@ -134,6 +136,16 @@ pub(crate) fn upgrade_legacy_if_needed(path: &Path) -> Result<()> {
         }
         Err(_) => Ok(()),
     }
+}
+
+pub fn run_legacy_redb_upgrade_helper(path: &Path) -> Result<()> {
+    let mut legacy = redb_legacy::Database::open(path)
+        .with_context(|| format!("legacy open of {} for upgrade", path.display()))?;
+    let did_upgrade = legacy
+        .upgrade()
+        .with_context(|| format!("v2→v3 upgrade of {}", path.display()))?;
+    tracing::info!(path = %path.display(), did_upgrade, "redb file format upgrade complete");
+    Ok(())
 }
 
 fn backup_and_upgrade(path: &Path, legacy_version: u8) -> Result<()> {
@@ -158,34 +170,28 @@ fn backup_and_upgrade(path: &Path, legacy_version: u8) -> Result<()> {
         from_version = legacy_version,
         "upgrading redb file format to v3 (one-time)",
     );
-    // redb 2.6's opener can hit `unreachable!()` and PANIC (not just return
-    // Err) on a file that isn't a clean v1/v2 — e.g. a half-migrated file, or
-    // one written by a newer redb that 4.1 still flags `UpgradeRequired`.
-    // Without this guard that panic crashes the gateway on boot (and, with a
-    // supervisor restarting it, boot-loops). catch_unwind turns it into a
-    // recoverable error: we log and return Ok so the caller's own open surfaces
-    // the real state — and ephemeral stores (a2a tasks) can self-heal.
-    let upgraded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<bool> {
-        let mut legacy = redb_legacy::Database::open(path)
-            .with_context(|| format!("legacy open of {} for upgrade", path.display()))?;
-        legacy
-            .upgrade()
-            .with_context(|| format!("v2→v3 upgrade of {}", path.display()))
-    }));
-    match upgraded {
-        Ok(Ok(did_upgrade)) => {
-            tracing::info!(path = %path.display(), did_upgrade, "redb file format upgrade complete");
-        }
-        Ok(Err(e)) => {
-            tracing::warn!(path = %path.display(), error = %e,
-                "legacy redb upgrade failed; leaving file for caller's open to handle");
-        }
-        Err(_) => {
-            tracing::warn!(path = %path.display(),
-                "legacy redb opener panicked (file is not a clean v1/v2); leaving file for caller's open to handle");
-        }
+    match run_legacy_redb_upgrade_child(path) {
+        Ok(()) => {}
+        Err(e) => tracing::warn!(path = %path.display(), error = %e,
+            "legacy redb upgrade failed; leaving file for caller's open to handle"),
     }
     Ok(())
+}
+
+fn run_legacy_redb_upgrade_child(path: &Path) -> Result<()> {
+    let exe = std::env::current_exe().context("resolve current executable for redb upgrade")?;
+    let status = std::process::Command::new(exe)
+        .env(LEGACY_REDB_UPGRADE_HELPER_ENV, path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .context("spawn redb upgrade helper")?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("redb upgrade helper exited with {status}");
+    }
 }
 
 impl RedbStore {
@@ -216,15 +222,11 @@ impl RedbStore {
             write
                 .open_table(SESSION_ALIASES)
                 .context("init SESSION_ALIASES")?;
-            write
-                .open_table(TASK_QUEUE)
-                .context("init TASK_QUEUE")?;
+            write.open_table(TASK_QUEUE).context("init TASK_QUEUE")?;
             write
                 .open_table(EXTERNAL_JOBS)
                 .context("init EXTERNAL_JOBS")?;
-            write
-                .open_table(IDEM_KEYS)
-                .context("init IDEM_KEYS")?;
+            write.open_table(IDEM_KEYS).context("init IDEM_KEYS")?;
             write
                 .open_table(COMPUTER_PERMISSIONS)
                 .context("init COMPUTER_PERMISSIONS")?;
@@ -446,7 +448,10 @@ impl RedbStore {
                 if let Err(e) = write.commit() {
                     tracing::error!(error = %e, "failed to commit archive backfill transaction");
                 }
-                debug!("backfilled {} archive entries for session {session_key}", messages.len());
+                debug!(
+                    "backfilled {} archive entries for session {session_key}",
+                    messages.len()
+                );
             }
         }
 
@@ -496,8 +501,12 @@ impl RedbStore {
                 Some(pair) => pair,
                 None => continue,
             };
-            let Ok(generation) = gen_str.parse::<u32>() else { continue };
-            let Ok(seq) = seq_str.parse::<u64>() else { continue };
+            let Ok(generation) = gen_str.parse::<u32>() else {
+                continue;
+            };
+            let Ok(seq) = seq_str.parse::<u64>() else {
+                continue;
+            };
             let Ok(msg) = serde_json::from_str::<serde_json::Value>(v.value()) else {
                 continue;
             };
@@ -554,7 +563,8 @@ impl RedbStore {
     }
 
     /// List all approved peer IDs for a channel.
-    // TODO: use prefix range query (range(prefix..prefix_end)) instead of full table scan
+    // TODO: use prefix range query (range(prefix..prefix_end)) instead of full
+    // table scan
     pub fn list_pairings(&self, channel: &str) -> Result<Vec<String>> {
         let prefix = format!("{channel}:");
         let read = self.db.begin_read()?;
@@ -696,16 +706,13 @@ impl RedbStore {
             // Scan all tasks to find the best candidate.
             for entry in table.iter()? {
                 let (_k, v) = entry?;
-                let task: crate::gateway::task_queue::QueuedTask =
-                    serde_json::from_str(v.value())?;
+                let task: crate::gateway::task_queue::QueuedTask = serde_json::from_str(v.value())?;
                 if task.status != TaskStatus::Pending {
                     continue;
                 }
                 let dominated = match &best {
                     None => true,
-                    Some(b) => {
-                        (task.priority, task.created_at) < (b.priority, b.created_at)
-                    }
+                    Some(b) => (task.priority, task.created_at) < (b.priority, b.created_at),
                 };
                 if dominated {
                     best = Some(task);
@@ -739,8 +746,7 @@ impl RedbStore {
             let mut to_revive = Vec::new();
             for entry in table.iter()? {
                 let (_k, v) = entry?;
-                let task: crate::gateway::task_queue::QueuedTask =
-                    serde_json::from_str(v.value())?;
+                let task: crate::gateway::task_queue::QueuedTask = serde_json::from_str(v.value())?;
                 if task.status == TaskStatus::Running {
                     to_revive.push(task);
                 }
@@ -905,8 +911,7 @@ impl RedbStore {
         let mut tasks = Vec::new();
         for entry in table.iter()? {
             let (_k, v) = entry?;
-            let task: crate::gateway::task_queue::QueuedTask =
-                serde_json::from_str(v.value())?;
+            let task: crate::gateway::task_queue::QueuedTask = serde_json::from_str(v.value())?;
             if let Some(ref s) = status {
                 if task.status != *s {
                     continue;
@@ -925,8 +930,7 @@ impl RedbStore {
             let mut expired_ids = Vec::new();
             for entry in table.iter()? {
                 let (_k, v) = entry?;
-                let task: crate::gateway::task_queue::QueuedTask =
-                    serde_json::from_str(v.value())?;
+                let task: crate::gateway::task_queue::QueuedTask = serde_json::from_str(v.value())?;
                 if task.is_expired() {
                     expired_ids.push(task.id);
                 }
@@ -950,8 +954,7 @@ impl RedbStore {
         let table = read.open_table(TASK_QUEUE)?;
         for entry in table.iter()? {
             let (_k, v) = entry?;
-            let task: crate::gateway::task_queue::QueuedTask =
-                serde_json::from_str(v.value())?;
+            let task: crate::gateway::task_queue::QueuedTask = serde_json::from_str(v.value())?;
             if task.session_key == session_key
                 && task.content_hash == content_hash
                 && task.status == TaskStatus::Pending
@@ -978,8 +981,7 @@ impl RedbStore {
 
             for entry in table.iter()? {
                 let (_k, v) = entry?;
-                let task: crate::gateway::task_queue::QueuedTask =
-                    serde_json::from_str(v.value())?;
+                let task: crate::gateway::task_queue::QueuedTask = serde_json::from_str(v.value())?;
                 if task.session_key == session_key && task.status == TaskStatus::Pending {
                     target_id = Some(task.id);
                     break;
@@ -1259,8 +1261,7 @@ impl RedbStore {
         let mut due = Vec::new();
         for entry in table.iter()? {
             let (_k, v) = entry?;
-            let job: crate::gateway::external_jobs::ExternalJob =
-                serde_json::from_str(v.value())?;
+            let job: crate::gateway::external_jobs::ExternalJob = serde_json::from_str(v.value())?;
             if job.next_poll_at > now {
                 continue;
             }
@@ -1570,7 +1571,10 @@ mod tests {
         }
         // One more message in gen 12 so we test the bigger range.
         store
-            .append_message(sk, &serde_json::json!({ "role": "user", "content": "final" }))
+            .append_message(
+                sk,
+                &serde_json::json!({ "role": "user", "content": "final" }),
+            )
             .expect("append");
 
         let rows = store.archive_load(sk, None).expect("archive_load");
@@ -1614,7 +1618,10 @@ mod tests {
         let (store, _dir) = open_tmp();
         let sk = "sess:permanence";
         store
-            .append_message(sk, &serde_json::json!({"role": "user", "content": "remember me"}))
+            .append_message(
+                sk,
+                &serde_json::json!({"role": "user", "content": "remember me"}),
+            )
             .expect("append");
         // Confirm archive write happened.
         assert_eq!(store.archive_stat(sk).unwrap().total_messages, 1);

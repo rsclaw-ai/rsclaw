@@ -1,7 +1,11 @@
 # rsclaw defaults — provider, channel, and search engine definitions
 #
 # Edit this file to customize providers, channels, search engines, etc.
-# Generated on first `rsclaw setup` and never overwritten.
+# Generated on first `rsclaw setup`; future releases only append missing
+# built-in entries and never overwrite user-customized entries.
+
+[meta]
+defaults_version = "2026.5.20"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Providers

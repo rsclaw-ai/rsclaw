@@ -10,8 +10,7 @@ use redb::TableDefinition;
 // Core data
 pub const KB_DOCS: TableDefinition<&str, &[u8]> = TableDefinition::new("kb_docs");
 /// Collection metadata (id → KbCollection). Desktop "知识库/合集" veneer.
-pub const KB_COLLECTIONS: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("kb_collections");
+pub const KB_COLLECTIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("kb_collections");
 /// Collection name → id, for uniqueness checks and name lookup.
 pub const KB_COLLECTION_BY_NAME: TableDefinition<&str, &str> =
     TableDefinition::new("kb_collection_by_name");
@@ -23,8 +22,7 @@ pub const KB_CHUNK_BY_LOGICAL: TableDefinition<&str, &[u8]> =
 
 // Entities
 pub const KB_ENTITIES: TableDefinition<&str, &[u8]> = TableDefinition::new("kb_entities");
-pub const KB_ENTITY_INDEX: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("kb_entity_index");
+pub const KB_ENTITY_INDEX: TableDefinition<&str, &[u8]> = TableDefinition::new("kb_entity_index");
 
 // Sync + dedup
 pub const KB_SEEN_ITEMS: TableDefinition<&str, &[u8]> = TableDefinition::new("kb_seen_items");
@@ -41,6 +39,10 @@ pub const KB_JOB_CLAIMS: TableDefinition<&str, &[u8]> = TableDefinition::new("kb
 
 /// Open the KB redb file and ensure all 13 tables exist. Idempotent.
 pub fn open_db(path: &std::path::Path) -> anyhow::Result<redb::Database> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::store::upgrade_legacy_if_needed(path)?;
     let db = redb::Database::create(path)?;
     let wtx = db.begin_write()?;
     // Open all tables to ensure they exist.
@@ -65,9 +67,10 @@ pub fn open_db(path: &std::path::Path) -> anyhow::Result<redb::Database> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use redb::ReadableDatabase;
     use tempfile::TempDir;
+
+    use super::*;
 
     #[test]
     fn open_creates_all_13_tables() {

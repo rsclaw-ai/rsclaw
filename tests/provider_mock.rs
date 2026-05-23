@@ -58,6 +58,7 @@ fn llm_request_fields_are_accessible() {
         messages: vec![Message {
             role: Role::User,
             content: MessageContent::Text("hello".to_owned()),
+            rsclaw_hidden: None,
         }],
         system: Some("You are helpful.".to_owned()),
         max_tokens: Some(1024),
@@ -92,6 +93,7 @@ fn message_role_serializes_to_lowercase() {
     let msg = Message {
         role: Role::Assistant,
         content: MessageContent::Text("hi".to_owned()),
+        rsclaw_hidden: None,
     };
     let v = serde_json::to_value(&msg).expect("serialize");
     assert_eq!(v["role"].as_str().unwrap(), "assistant");
@@ -99,6 +101,7 @@ fn message_role_serializes_to_lowercase() {
     let msg2 = Message {
         role: Role::System,
         content: MessageContent::Text("sys".to_owned()),
+        rsclaw_hidden: None,
     };
     let v2 = serde_json::to_value(&msg2).expect("serialize");
     assert_eq!(v2["role"].as_str().unwrap(), "system");
@@ -218,6 +221,7 @@ fn llm_request_clone_independence() {
         messages: vec![Message {
             role: Role::User,
             content: MessageContent::Text("original".to_owned()),
+            rsclaw_hidden: None,
         }],
         system: Some("system prompt".to_owned()),
         max_tokens: Some(100),

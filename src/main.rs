@@ -25,20 +25,20 @@
     clippy::unused_async,
     clippy::match_wildcard_for_single_variants,
     clippy::map_unwrap_or,
-    clippy::doc_markdown,
+    clippy::doc_markdown
 )]
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use cli::{AcpCommand, Cli, Command};
 use cmd::{
-    cmd_agent_turn, cmd_agents, cmd_anycli, cmd_browser, cmd_approvals, cmd_backup, cmd_channels, cmd_completion,
-    cmd_config, cmd_configure, cmd_cron, cmd_daemon, cmd_dashboard, cmd_debug, cmd_devices, cmd_directory,
-    cmd_dns, cmd_docs, cmd_doctor, cmd_env, cmd_gateway, cmd_health, cmd_hooks, cmd_kb, cmd_logs,
-    cmd_memory,
-    cmd_message, cmd_migrate, cmd_models, cmd_onboard, cmd_plugins, cmd_qr, cmd_reset, cmd_sandbox,
-    cmd_secrets, cmd_security, cmd_sessions, cmd_setup, cmd_skills, cmd_status, cmd_system,
-    cmd_tools, cmd_tray, cmd_tui, cmd_uninstall, cmd_update, cmd_watch, cmd_webhooks,
+    cmd_agent_turn, cmd_agents, cmd_anycli, cmd_approvals, cmd_backup, cmd_browser, cmd_channels,
+    cmd_completion, cmd_config, cmd_configure, cmd_cron, cmd_daemon, cmd_dashboard, cmd_debug,
+    cmd_devices, cmd_directory, cmd_dns, cmd_docs, cmd_doctor, cmd_env, cmd_gateway, cmd_health,
+    cmd_hooks, cmd_kb, cmd_logs, cmd_memory, cmd_message, cmd_migrate, cmd_models, cmd_onboard,
+    cmd_plugins, cmd_qr, cmd_reset, cmd_sandbox, cmd_secrets, cmd_security, cmd_sessions,
+    cmd_setup, cmd_skills, cmd_status, cmd_system, cmd_tools, cmd_tray, cmd_tui, cmd_uninstall,
+    cmd_update, cmd_watch, cmd_webhooks,
 };
 use rsclaw::{cli, cmd, sys};
 use tracing_subscriber::EnvFilter;
@@ -109,10 +109,17 @@ fn resolve_instance(cli: &Cli) -> (std::path::PathBuf, u16) {
 
 #[allow(clippy::large_futures)]
 async fn run() -> Result<()> {
+    if let Some(path) = std::env::var_os(rsclaw::store::LEGACY_REDB_UPGRADE_HELPER_ENV) {
+        return rsclaw::store::run_legacy_redb_upgrade_helper(std::path::Path::new(&path));
+    }
+
     // Handle -v and -version before clap (clap handles --version and -V)
     let raw_args: Vec<String> = std::env::args().collect();
     if raw_args.len() == 2 && (raw_args[1] == "-v" || raw_args[1] == "-version") {
-        println!("rsclaw v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"));
+        println!(
+            "rsclaw v{}",
+            option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
+        );
         return Ok(());
     }
 
@@ -196,7 +203,9 @@ async fn run() -> Result<()> {
         Command::Backup(sub) => cmd_backup(sub).await,
         Command::Reset(args) => cmd_reset(args).await,
         Command::Update(wrapper) | Command::Upgrade(wrapper) => {
-            let sub = wrapper.cmd.unwrap_or(cli::UpdateCommand::Run(wrapper.run_args));
+            let sub = wrapper
+                .cmd
+                .unwrap_or(cli::UpdateCommand::Run(wrapper.run_args));
             cmd_update(sub).await
         }
         Command::Pairing(sub) => cmd_pairing(sub).await,
@@ -306,7 +315,10 @@ async fn cmd_acp(sub: AcpCommand) -> Result<()> {
             .await?;
 
             let init_resp = client
-                .initialize("rsclaw", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"))
+                .initialize(
+                    "rsclaw",
+                    option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
+                )
                 .await?;
             eprintln!(
                 "Agent initialized: {} v{}",
@@ -397,7 +409,10 @@ async fn cmd_acp(sub: AcpCommand) -> Result<()> {
             let client = AcpClient::spawn(&command, &["acp"]).await?;
 
             let init_resp = client
-                .initialize("rsclaw", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"))
+                .initialize(
+                    "rsclaw",
+                    option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
+                )
                 .await?;
             eprintln!(
                 "[rsclaw] Agent initialized: {} v{}",
@@ -443,7 +458,10 @@ async fn cmd_acp(sub: AcpCommand) -> Result<()> {
         AcpCommand::List { url, token } => {
             let auth = resolve_gateway_token(token);
             let client = reqwest::Client::new();
-            let mut req = client.get(format!("{}/api/v1/acp/connections", url.trim_end_matches('/')));
+            let mut req = client.get(format!(
+                "{}/api/v1/acp/connections",
+                url.trim_end_matches('/')
+            ));
             if !auth.is_empty() {
                 req = req.header("Authorization", format!("Bearer {auth}"));
             }
@@ -451,9 +469,18 @@ async fn cmd_acp(sub: AcpCommand) -> Result<()> {
             if !resp.status().is_success() {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
-                anyhow::bail!("gateway returned {}: {}", status, if body.is_empty() { "endpoint not available (restart gateway?)" } else { &body });
+                anyhow::bail!(
+                    "gateway returned {}: {}",
+                    status,
+                    if body.is_empty() {
+                        "endpoint not available (restart gateway?)"
+                    } else {
+                        &body
+                    }
+                );
             }
-            let conns: Vec<serde_json::Value> = resp.json().await.context("invalid JSON response")?;
+            let conns: Vec<serde_json::Value> =
+                resp.json().await.context("invalid JSON response")?;
             if conns.is_empty() {
                 println!("No active ACP connections");
             } else {
@@ -480,7 +507,11 @@ async fn cmd_acp(sub: AcpCommand) -> Result<()> {
         } => {
             let auth = resolve_gateway_token(token);
             let client = reqwest::Client::new();
-            let mut req = client.delete(format!("{}/api/v1/agents/{}", url.trim_end_matches('/'), agent_id));
+            let mut req = client.delete(format!(
+                "{}/api/v1/agents/{}",
+                url.trim_end_matches('/'),
+                agent_id
+            ));
             if !auth.is_empty() {
                 req = req.header("Authorization", format!("Bearer {auth}"));
             }
@@ -567,7 +598,6 @@ async fn interactive_gateway_loop(client: &rsclaw::acp::GatewayClient) -> Result
     Ok(())
 }
 
-
 // ---------------------------------------------------------------------------
 // Tracing initialisation
 // ---------------------------------------------------------------------------
@@ -580,7 +610,9 @@ fn resolve_gateway_token(explicit: Option<String>) -> String {
     // Try loading from config file.
     if let Some(path) = rsclaw::config::loader::detect_config_path() {
         if let Ok(cfg) = rsclaw::config::loader::load_json5(&path) {
-            if let Some(t) = cfg.gateway.as_ref()
+            if let Some(t) = cfg
+                .gateway
+                .as_ref()
                 .and_then(|g| g.auth.as_ref())
                 .and_then(|a| a.token.as_ref())
                 .and_then(|s| s.as_plain())

@@ -15,19 +15,18 @@
 //!   - `load_all_plugins()` — unified loader that dispatches by runtime
 
 pub mod host_methods;
-pub mod manifest;
 pub mod js_runtime;
+pub mod manifest;
 pub mod slots;
 pub mod wasm_runtime;
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Result;
+pub use js_runtime::Plugin;
 pub use manifest::{
     LEGACY_MANIFEST_FILE, MANIFEST_FILE, PluginManifest, PluginToolDef, load_manifest, scan_plugins,
 };
-pub use js_runtime::Plugin;
 pub use slots::{ContextEngineSlot, MemoryItem, MemorySlot, MemoryStoreSlot, SlotRegistry};
 use tracing::{info, warn};
 pub use wasm_runtime::{WasmPlugin, WasmToolDef, load_wasm_plugin};
@@ -137,11 +136,11 @@ pub async fn load_all_plugins(
     // Shared wasmtime engine for all WASM plugins.
     let wasm_engine = if manifests.iter().any(|m| m.is_wasm()) {
         let mut wasm_config = wasmtime::Config::new();
-        wasm_config.async_support(true);
         // Enable epoch interruption so we can bound wasm-CPU time per call
         // (caps runaway loops without affecting awaits on host async calls).
         wasm_config.epoch_interruption(true);
-        let engine = wasmtime::Engine::new(&wasm_config)?;
+        let engine = wasmtime::Engine::new(&wasm_config)
+            .map_err(|e| anyhow::anyhow!("create wasmtime engine: {e}"))?;
         // Tick the engine at 100ms; per-call deadline is set in wasm_runtime.
         let tick_engine = engine.clone();
         tokio::spawn(async move {

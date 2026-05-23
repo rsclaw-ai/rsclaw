@@ -1,7 +1,10 @@
 //! Config file loading: JSON5 parsing, `${VAR}` expansion, `$include`
 //! resolution.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use regex::Regex;
@@ -9,8 +12,8 @@ use tracing::debug;
 
 use super::schema::Config;
 
-/// Convert a path to a string using forward slashes (cross-platform safe for JSON/config).
-/// On Windows, backslashes in paths break JSON string parsing.
+/// Convert a path to a string using forward slashes (cross-platform safe for
+/// JSON/config). On Windows, backslashes in paths break JSON string parsing.
 pub fn path_to_forward_slash(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/")
 }
@@ -35,7 +38,10 @@ pub fn expand_env_vars(raw: &str) -> String {
                 // "invalid api key" 401 from the provider). The user
                 // needs to see this at gateway boot, not buried under
                 // debug-level traffic.
-                tracing::warn!(var, "env var referenced in config is not set; placeholder left verbatim");
+                tracing::warn!(
+                    var,
+                    "env var referenced in config is not set; placeholder left verbatim"
+                );
                 caps[0].to_string()
             })
         })
@@ -220,7 +226,8 @@ pub fn detect_config_path() -> Option<PathBuf> {
 ///
 /// Resolution order:
 ///   1. `RSCLAW_BASE_DIR` (set by `--base-dir`, `--dev`, `--profile`)
-///   2. Parent dir of the detected config file (if config is in ~/.openclaw/, base_dir = ~/.openclaw/)
+///   2. Parent dir of the detected config file (if config is in ~/.openclaw/,
+///      base_dir = ~/.openclaw/)
 ///   3. `~/.rsclaw` (default)
 pub fn base_dir() -> PathBuf {
     // 1. Explicit override
@@ -254,8 +261,8 @@ pub fn log_file() -> PathBuf {
 /// Returns relative paths under `tools/web_browser/site-rules/`. Both
 /// layouts are checked:
 ///   * `<host>.md` — flat (legacy zh sites)
-///   * `<host_root>/*.md` — nested (browser-harness imports). `host_root`
-///     is the part of the host before the first dot, e.g. `reddit` for
+///   * `<host_root>/*.md` — nested (browser-harness imports). `host_root` is
+///     the part of the host before the first dot, e.g. `reddit` for
 ///     `www.reddit.com`.
 ///
 /// Surfaced by `web_fetch` and `web_browser action=open` tool results so
@@ -381,6 +388,12 @@ pub fn cache_dir() -> PathBuf {
     base_dir().join("var").join("cache")
 }
 
+/// Defaults bundled into this binary. Unlike [`load_defaults_toml`], this
+/// never reads the user-editable `$base_dir/defaults.toml`.
+pub fn embedded_defaults_toml() -> &'static str {
+    include_str!("../../defaults.toml")
+}
+
 /// Load defaults.toml: prefer external file at `$base_dir/defaults.toml`,
 /// fallback to the version embedded at compile time.
 ///
@@ -388,12 +401,265 @@ pub fn cache_dir() -> PathBuf {
 /// exec safety rules, etc. without recompiling.
 pub fn load_defaults_toml() -> String {
     let external = base_dir().join("defaults.toml");
+    if external.exists()
+        && let Err(e) = ensure_defaults_toml_up_to_date(&external)
+    {
+        tracing::warn!(path = %external.display(), error = %e, "failed to upgrade defaults.toml; using existing file");
+    }
     if let Ok(content) = std::fs::read_to_string(&external) {
         debug!(path = %external.display(), "loaded external defaults.toml");
         content
     } else {
-        include_str!("../../defaults.toml").to_owned()
+        embedded_defaults_toml().to_owned()
     }
+}
+
+fn ensure_defaults_toml_up_to_date(path: &Path) -> Result<()> {
+    let user = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read defaults.toml: {}", path.display()))?;
+    let Some(merged) = merge_defaults_toml(&user, embedded_defaults_toml()) else {
+        return Ok(());
+    };
+
+    backup_defaults_before_upgrade(path);
+    std::fs::write(path, merged)
+        .with_context(|| format!("failed to write upgraded defaults.toml: {}", path.display()))?;
+    debug!(path = %path.display(), "upgraded defaults.toml from embedded defaults");
+    Ok(())
+}
+
+fn backup_defaults_before_upgrade(path: &Path) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let backup = path.with_extension(format!("toml.bak.{ts}"));
+    let _ = std::fs::copy(path, backup);
+}
+
+#[derive(Default, serde::Deserialize)]
+struct DefaultsMeta {
+    #[serde(default)]
+    defaults_version: Option<String>,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct NamedDefaultsEntry {
+    name: String,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct DefaultsIndex {
+    #[serde(default)]
+    meta: Option<DefaultsMeta>,
+    #[serde(default)]
+    providers: Vec<NamedDefaultsEntry>,
+    #[serde(default)]
+    channels: Vec<NamedDefaultsEntry>,
+    #[serde(default)]
+    search_engines: Vec<NamedDefaultsEntry>,
+}
+
+fn merge_defaults_toml(user_raw: &str, builtin_raw: &str) -> Option<String> {
+    let user: DefaultsIndex = toml::from_str(user_raw).ok()?;
+    let builtin: DefaultsIndex = toml::from_str(builtin_raw).ok()?;
+    let builtin_version = builtin.meta.as_ref()?.defaults_version.as_deref()?.trim();
+    if builtin_version.is_empty() || !defaults_version_is_legacy(&user, builtin_version) {
+        return None;
+    }
+
+    let blocks = builtin_array_blocks(builtin_raw);
+    let mut merged = set_defaults_meta_version(user_raw, builtin_version);
+    let mut changed = merged != user_raw;
+
+    for (table, names) in [
+        ("providers", names_for(&user.providers)),
+        ("channels", names_for(&user.channels)),
+        ("search_engines", names_for(&user.search_engines)),
+    ] {
+        for entry in builtin_entries_for(&builtin, table) {
+            if names.contains(&entry.name) {
+                continue;
+            }
+            if let Some(block) = blocks.get(&(table.to_owned(), entry.name.clone())) {
+                if !merged.ends_with('\n') {
+                    merged.push('\n');
+                }
+                merged.push('\n');
+                merged.push_str("# Added by rsclaw defaults upgrade.\n");
+                merged.push_str(block.trim_end());
+                merged.push('\n');
+                changed = true;
+            }
+        }
+    }
+
+    changed.then_some(merged)
+}
+
+fn defaults_version_is_legacy(user: &DefaultsIndex, builtin_version: &str) -> bool {
+    let Some(user_version) = user
+        .meta
+        .as_ref()
+        .and_then(|m| m.defaults_version.as_deref())
+        .map(str::trim)
+    else {
+        return true;
+    };
+    if user_version.is_empty() {
+        return true;
+    }
+    version_parts(user_version)
+        .zip(version_parts(builtin_version))
+        .is_none_or(|(user, builtin)| compare_version_parts(&user, &builtin).is_lt())
+}
+
+fn version_parts(raw: &str) -> Option<Vec<u64>> {
+    let mut parts = Vec::new();
+    for part in raw.split(|c: char| !c.is_ascii_digit()) {
+        if part.is_empty() {
+            continue;
+        }
+        parts.push(part.parse().ok()?);
+    }
+    (!parts.is_empty()).then_some(parts)
+}
+
+fn compare_version_parts(a: &[u64], b: &[u64]) -> std::cmp::Ordering {
+    let len = a.len().max(b.len());
+    for i in 0..len {
+        let left = a.get(i).copied().unwrap_or(0);
+        let right = b.get(i).copied().unwrap_or(0);
+        match left.cmp(&right) {
+            std::cmp::Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn names_for(entries: &[NamedDefaultsEntry]) -> HashSet<String> {
+    entries.iter().map(|e| e.name.clone()).collect()
+}
+
+fn builtin_entries_for<'a>(builtin: &'a DefaultsIndex, table: &str) -> &'a [NamedDefaultsEntry] {
+    match table {
+        "providers" => &builtin.providers,
+        "channels" => &builtin.channels,
+        "search_engines" => &builtin.search_engines,
+        _ => &[],
+    }
+}
+
+fn builtin_array_blocks(raw: &str) -> HashMap<(String, String), String> {
+    let mut out = HashMap::new();
+    let mut current_table: Option<String> = None;
+    let mut current = String::new();
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("[[") && trimmed.ends_with("]]") {
+            store_defaults_block(&mut out, current_table.take(), &current);
+            current.clear();
+            current_table = Some(
+                trimmed
+                    .trim_start_matches("[[")
+                    .trim_end_matches("]]")
+                    .trim()
+                    .to_owned(),
+            );
+        } else if trimmed.starts_with('[') {
+            store_defaults_block(&mut out, current_table.take(), &current);
+            current.clear();
+        }
+
+        if current_table.is_some() {
+            current.push_str(line);
+            current.push('\n');
+        }
+    }
+    store_defaults_block(&mut out, current_table, &current);
+    out
+}
+
+fn store_defaults_block(
+    out: &mut HashMap<(String, String), String>,
+    table: Option<String>,
+    block: &str,
+) {
+    let Some(table) = table else {
+        return;
+    };
+    if !matches!(table.as_str(), "providers" | "channels" | "search_engines") {
+        return;
+    }
+    let Some(name) = defaults_block_name(block) else {
+        return;
+    };
+    out.insert((table, name), block.to_owned());
+}
+
+fn defaults_block_name(block: &str) -> Option<String> {
+    block.lines().find_map(|line| {
+        let trimmed = line.trim();
+        let value = trimmed.strip_prefix("name")?.trim_start();
+        let value = value.strip_prefix('=')?.trim();
+        value
+            .strip_prefix('"')?
+            .split_once('"')
+            .map(|(name, _)| name.to_owned())
+    })
+}
+
+fn set_defaults_meta_version(raw: &str, version: &str) -> String {
+    let version_line = format!("defaults_version = \"{version}\"");
+    let mut out = String::new();
+    let mut saw_meta = false;
+    let mut in_meta = false;
+    let mut wrote_version = false;
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if in_meta && trimmed.starts_with('[') {
+            if !wrote_version {
+                out.push_str(&version_line);
+                out.push('\n');
+                wrote_version = true;
+            }
+            in_meta = false;
+        }
+
+        if trimmed == "[meta]" {
+            saw_meta = true;
+            in_meta = true;
+        }
+
+        if in_meta && trimmed.starts_with("defaults_version") {
+            out.push_str(&version_line);
+            out.push('\n');
+            wrote_version = true;
+            continue;
+        }
+
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    if saw_meta {
+        if in_meta && !wrote_version {
+            out.push_str(&version_line);
+            out.push('\n');
+        }
+    } else {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("\n[meta]\n");
+        out.push_str(&version_line);
+        out.push('\n');
+    }
+
+    out
 }
 
 /// Expand a leading `~/` in a path string to the user's home directory.
@@ -459,5 +725,46 @@ mod tests {
         let agents = cfg.agents.expect("agents should be present");
         let list = agents.list.expect("agents.list should be present");
         assert_eq!(list[0].id, "main");
+    }
+
+    #[test]
+    fn merge_defaults_adds_missing_builtin_entries_without_overwriting_user_entries() {
+        let user = r#"
+[[providers]]
+name = "openai"
+label = "My OpenAI"
+base_url = "https://proxy.example/v1"
+
+[[channels]]
+name = "feishu"
+label = "Custom Feishu"
+"#;
+        let builtin = r#"
+[meta]
+defaults_version = "2026.5.20"
+
+[[providers]]
+name = "rsclaw"
+label = "RsClaw (recommended)"
+base_url = "https://api.rsclaw.ai/v1/agent"
+
+[[providers]]
+name = "openai"
+label = "OpenAI"
+base_url = "https://api.openai.com/v1"
+
+[[channels]]
+name = "feishu"
+label = "Feishu / Lark"
+"#;
+
+        let merged = merge_defaults_toml(user, builtin).expect("legacy user defaults should merge");
+
+        assert!(merged.contains("defaults_version = \"2026.5.20\""));
+        assert!(merged.contains("name = \"rsclaw\""));
+        assert!(merged.contains("base_url = \"https://api.rsclaw.ai/v1/agent\""));
+        assert!(merged.contains("label = \"My OpenAI\""));
+        assert!(merged.contains("base_url = \"https://proxy.example/v1\""));
+        assert!(!merged.contains("base_url = \"https://api.openai.com/v1\""));
     }
 }

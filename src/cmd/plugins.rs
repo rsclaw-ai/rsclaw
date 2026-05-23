@@ -2,12 +2,11 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 
-use super::config_json::load_config_json;
-use super::style::*;
+use super::{config_json::load_config_json, style::*};
 use crate::{
     cli::PluginsCommand,
     config::loader::base_dir,
-    plugin::manifest::{MANIFEST_FILE, LEGACY_MANIFEST_FILE, load_manifest, scan_plugins},
+    plugin::manifest::{LEGACY_MANIFEST_FILE, MANIFEST_FILE, load_manifest, scan_plugins},
 };
 
 fn plugins_dir() -> PathBuf {
@@ -24,10 +23,16 @@ pub async fn cmd_plugins(sub: PluginsCommand) -> Result<()> {
         PluginsCommand::Doctor => plugins_doctor(),
         PluginsCommand::Inspect { plugin } => plugins_inspect(&plugin),
         PluginsCommand::Marketplace => {
-            banner(&format!("rsclaw plugins marketplace v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
+            banner(&format!(
+                "rsclaw plugins marketplace v{}",
+                option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
+            ));
             let url = "https://clawhub.ai/plugins";
             kv("marketplace", &bold(url));
-            println!("  {}", dim("Browse and install plugins with: rsclaw plugins install <spec>"));
+            println!(
+                "  {}",
+                dim("Browse and install plugins with: rsclaw plugins install <spec>")
+            );
             Ok(())
         }
         PluginsCommand::Uninstall { plugin } => plugins_uninstall(&plugin),
@@ -40,12 +45,18 @@ pub async fn cmd_plugins(sub: PluginsCommand) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn plugins_list() -> Result<()> {
-    banner(&format!("rsclaw plugins v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
+    banner(&format!(
+        "rsclaw plugins v{}",
+        option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
+    ));
     let dir = plugins_dir();
     let plugins = scan_plugins(&dir)?;
 
     if plugins.is_empty() {
-        warn_msg(&format!("no plugins installed in {}", dim(&dir.display().to_string())));
+        warn_msg(&format!(
+            "no plugins installed in {}",
+            dim(&dir.display().to_string())
+        ));
         return Ok(());
     }
 
@@ -133,8 +144,14 @@ fn install_from_path(src: &std::path::Path) -> Result<()> {
         bail!("expected a directory, got: {}", src.display());
     }
 
-    let manifest = load_manifest(src)
-        .with_context(|| format!("no valid {} or {} in {}", MANIFEST_FILE, LEGACY_MANIFEST_FILE, src.display()))?;
+    let manifest = load_manifest(src).with_context(|| {
+        format!(
+            "no valid {} or {} in {}",
+            MANIFEST_FILE,
+            LEGACY_MANIFEST_FILE,
+            src.display()
+        )
+    })?;
 
     let dest = plugins_dir().join(&manifest.name);
     if dest.exists() {
@@ -148,7 +165,11 @@ fn install_from_path(src: &std::path::Path) -> Result<()> {
     copy_dir_recursive(src, &dest)
         .with_context(|| format!("copy {} -> {}", src.display(), dest.display()))?;
 
-    ok(&format!("installed '{}' to {}", cyan(&manifest.name), dim(&dest.display().to_string())));
+    ok(&format!(
+        "installed '{}' to {}",
+        cyan(&manifest.name),
+        dim(&dest.display().to_string())
+    ));
     Ok(())
 }
 
@@ -188,11 +209,11 @@ fn install_from_zip(src: &std::path::Path) -> Result<()> {
         bail!("file not found: {}", src.display());
     }
     let tmp_dir = tempfile::tempdir().context("create temp dir")?;
-    let file = std::fs::File::open(src)
-        .with_context(|| format!("open {}", src.display()))?;
-    let mut archive = zip::ZipArchive::new(file)
-        .with_context(|| format!("read zip: {}", src.display()))?;
-    archive.extract(tmp_dir.path())
+    let file = std::fs::File::open(src).with_context(|| format!("open {}", src.display()))?;
+    let mut archive =
+        zip::ZipArchive::new(file).with_context(|| format!("read zip: {}", src.display()))?;
+    archive
+        .extract(tmp_dir.path())
         .with_context(|| format!("extract zip: {}", src.display()))?;
 
     let plugin_dir = find_plugin_dir(tmp_dir.path())?;
@@ -205,11 +226,11 @@ fn install_from_tarball(src: &std::path::Path) -> Result<()> {
         bail!("file not found: {}", src.display());
     }
     let tmp_dir = tempfile::tempdir().context("create temp dir")?;
-    let file = std::fs::File::open(src)
-        .with_context(|| format!("open {}", src.display()))?;
+    let file = std::fs::File::open(src).with_context(|| format!("open {}", src.display()))?;
     let gz = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(gz);
-    archive.unpack(tmp_dir.path())
+    archive
+        .unpack(tmp_dir.path())
         .with_context(|| format!("extract tar.gz: {}", src.display()))?;
 
     let plugin_dir = find_plugin_dir(tmp_dir.path())?;
@@ -228,8 +249,7 @@ fn find_plugin_dir(root: &std::path::Path) -> Result<std::path::PathBuf> {
     for entry in std::fs::read_dir(root)?.flatten() {
         let path = entry.path();
         if path.is_dir()
-            && (path.join(MANIFEST_FILE).exists()
-                || path.join(LEGACY_MANIFEST_FILE).exists())
+            && (path.join(MANIFEST_FILE).exists() || path.join(LEGACY_MANIFEST_FILE).exists())
         {
             return Ok(path);
         }
@@ -237,7 +257,8 @@ fn find_plugin_dir(root: &std::path::Path) -> Result<std::path::PathBuf> {
     bail!("no plugin manifest found in archive")
 }
 
-/// Install a `.wasm` plugin: load it to read manifest, create directory, generate `plugin.json5`.
+/// Install a `.wasm` plugin: load it to read manifest, create directory,
+/// generate `plugin.json5`.
 async fn install_wasm_file(src: &std::path::Path) -> Result<()> {
     if !src.exists() {
         bail!("file not found: {}", src.display());
@@ -248,12 +269,12 @@ async fn install_wasm_file(src: &std::path::Path) -> Result<()> {
         .and_then(|f| f.to_str())
         .ok_or_else(|| anyhow::anyhow!("invalid file name"))?;
 
-    // Load the wasm to read its embedded manifest (name, version, description, tools).
+    // Load the wasm to read its embedded manifest (name, version, description,
+    // tools).
     println!("  {} loading WASM manifest...", dim("*"));
-    let mut wasm_config = wasmtime::Config::new();
-    wasm_config.async_support(true);
+    let wasm_config = wasmtime::Config::new();
     let engine = wasmtime::Engine::new(&wasm_config)
-        .context("create wasmtime engine")?;
+        .map_err(|e| anyhow::anyhow!("create wasmtime engine: {e}"))?;
 
     let stem = src
         .file_stem()
@@ -261,7 +282,8 @@ async fn install_wasm_file(src: &std::path::Path) -> Result<()> {
         .unwrap_or("plugin")
         .to_owned();
 
-    // Build a temporary manifest pointing at the source file so load_wasm_plugin can find it.
+    // Build a temporary manifest pointing at the source file so load_wasm_plugin
+    // can find it.
     let tmp_manifest = crate::plugin::PluginManifest {
         name: stem.clone(),
         id: None,
@@ -284,7 +306,8 @@ async fn install_wasm_file(src: &std::path::Path) -> Result<()> {
     };
 
     let browser = std::sync::Arc::new(tokio::sync::Mutex::new(None));
-    let wasm_plugin = crate::plugin::load_wasm_plugin(&tmp_manifest, &engine, browser, None, None).await;
+    let wasm_plugin =
+        crate::plugin::load_wasm_plugin(&tmp_manifest, &engine, browser, None, None).await;
 
     let (name, version, description, tools_count) = match wasm_plugin {
         Ok(ref wp) => (
@@ -313,7 +336,11 @@ async fn install_wasm_file(src: &std::path::Path) -> Result<()> {
         .with_context(|| format!("copy {} -> {}", src.display(), dest_dir.display()))?;
 
     // Generate plugin.json5 with data from the wasm manifest.
-    let ver = if version.is_empty() { "0.1.0" } else { &version };
+    let ver = if version.is_empty() {
+        "0.1.0"
+    } else {
+        &version
+    };
     let desc_line = if description.is_empty() {
         String::new()
     } else {
@@ -405,7 +432,10 @@ fn plugins_set_enabled(name: &str, enabled: bool) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn plugins_doctor() -> Result<()> {
-    banner(&format!("rsclaw plugins doctor v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
+    banner(&format!(
+        "rsclaw plugins doctor v{}",
+        option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
+    ));
 
     // Check runtimes
     let runtimes = [
@@ -421,7 +451,11 @@ fn plugins_doctor() -> Result<()> {
     for (bin, label) in &runtimes {
         // Check tools dir first
         let tools_bin = tools_base.join(bin).join("bin").join(bin);
-        match if tools_bin.exists() { Ok(tools_bin) } else { which::which(bin) } {
+        match if tools_bin.exists() {
+            Ok(tools_bin)
+        } else {
+            which::which(bin)
+        } {
             Ok(path) => {
                 // Try to get version
                 let version = std::process::Command::new(bin)
@@ -541,7 +575,10 @@ fn plugins_uninstall(name: &str) -> Result<()> {
             .and_then(|v| v.as_object_mut())
         {
             entries.remove(name);
-            let _ = std::fs::write(&path, serde_json::to_string_pretty(&val).unwrap_or_default());
+            let _ = std::fs::write(
+                &path,
+                serde_json::to_string_pretty(&val).unwrap_or_default(),
+            );
         }
     }
 
@@ -554,7 +591,10 @@ fn plugins_uninstall(name: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 async fn plugins_update(name: Option<&str>) -> Result<()> {
-    banner(&format!("rsclaw plugins update v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
+    banner(&format!(
+        "rsclaw plugins update v{}",
+        option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
+    ));
     let dir = plugins_dir();
     let plugins = scan_plugins(&dir)?;
 
@@ -576,6 +616,9 @@ async fn plugins_update(name: Option<&str>) -> Result<()> {
             p.version.as_deref().unwrap_or("?")
         );
     }
-    println!("  {}", dim("Use `rsclaw plugins install <spec>` to update a specific plugin."));
+    println!(
+        "  {}",
+        dim("Use `rsclaw plugins install <spec>` to update a specific plugin.")
+    );
     Ok(())
 }

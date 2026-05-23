@@ -2,18 +2,20 @@
 
 mod common;
 
-use common::init_tls;
-
+use common::{
+    init_tls,
+    mock_provider::{
+        AnthropicEvent, assert_stream_done, assert_stream_text, assert_stream_tool_call,
+        assert_usage, collect_stream_events, mount_anthropic_stream,
+    },
+};
 use rsclaw::provider::{
     LlmProvider, LlmRequest, Message, MessageContent, Role, StreamEvent, ToolDef,
     anthropic::AnthropicProvider,
 };
-use wiremock::matchers::{header, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
-
-use common::mock_provider::{
-    AnthropicEvent, assert_stream_done, assert_stream_text, assert_stream_tool_call, assert_usage,
-    collect_stream_events, mount_anthropic_stream,
+use wiremock::{
+    Mock, MockServer, ResponseTemplate,
+    matchers::{header, method, path},
 };
 
 fn simple_request(model: &str) -> LlmRequest {
@@ -22,6 +24,7 @@ fn simple_request(model: &str) -> LlmRequest {
         messages: vec![Message {
             role: Role::User,
             content: MessageContent::Text("hello".to_owned()),
+            rsclaw_hidden: None,
         }],
         max_tokens: Some(1024),
         ..Default::default()
@@ -52,7 +55,10 @@ async fn stream_text_delta_events() {
     .await;
 
     let provider = AnthropicProvider::with_base_url("test-key", server.uri());
-    let stream = provider.stream(simple_request("claude-3-5-sonnet")).await.unwrap();
+    let stream = provider
+        .stream(simple_request("claude-3-5-sonnet"))
+        .await
+        .unwrap();
     let events = collect_stream_events(stream).await;
 
     assert_stream_text(&events, "Hello world");
@@ -82,7 +88,10 @@ async fn stream_tool_use() {
     .await;
 
     let provider = AnthropicProvider::with_base_url("test-key", server.uri());
-    let stream = provider.stream(simple_request("claude-3-5-sonnet")).await.unwrap();
+    let stream = provider
+        .stream(simple_request("claude-3-5-sonnet"))
+        .await
+        .unwrap();
     let events = collect_stream_events(stream).await;
 
     assert_stream_tool_call(&events, "search");
@@ -110,7 +119,10 @@ async fn stream_thinking_delta_discarded() {
     .await;
 
     let provider = AnthropicProvider::with_base_url("test-key", server.uri());
-    let stream = provider.stream(simple_request("claude-3-5-sonnet")).await.unwrap();
+    let stream = provider
+        .stream(simple_request("claude-3-5-sonnet"))
+        .await
+        .unwrap();
     let events = collect_stream_events(stream).await;
 
     // Thinking deltas should be discarded, only "Result" appears
@@ -126,19 +138,18 @@ async fn stream_thinking_delta_discarded() {
 async fn stream_error_event() {
     init_tls();
     let server = MockServer::start().await;
-    mount_anthropic_stream(
-        &server,
-        &[AnthropicEvent::Error("overloaded".to_owned())],
-    )
-    .await;
+    mount_anthropic_stream(&server, &[AnthropicEvent::Error("overloaded".to_owned())]).await;
 
     let provider = AnthropicProvider::with_base_url("test-key", server.uri());
-    let stream = provider.stream(simple_request("claude-3-5-sonnet")).await.unwrap();
+    let stream = provider
+        .stream(simple_request("claude-3-5-sonnet"))
+        .await
+        .unwrap();
     let events = collect_stream_events(stream).await;
 
-    let has_error = events.iter().any(|e| {
-        matches!(e, StreamEvent::Error(msg) if msg.contains("overloaded"))
-    });
+    let has_error = events
+        .iter()
+        .any(|e| matches!(e, StreamEvent::Error(msg) if msg.contains("overloaded")));
     assert!(has_error, "expected Error event with 'overloaded'");
 }
 
@@ -152,9 +163,7 @@ async fn http_401_error() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
-        .respond_with(
-            ResponseTemplate::new(401).set_body_string(r#"{"error":"invalid_api_key"}"#),
-        )
+        .respond_with(ResponseTemplate::new(401).set_body_string(r#"{"error":"invalid_api_key"}"#))
         .mount(&server)
         .await;
 
@@ -170,9 +179,7 @@ async fn http_429_error() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
-        .respond_with(
-            ResponseTemplate::new(429).set_body_string(r#"{"error":"rate_limited"}"#),
-        )
+        .respond_with(ResponseTemplate::new(429).set_body_string(r#"{"error":"rate_limited"}"#))
         .mount(&server)
         .await;
 
@@ -247,10 +254,12 @@ async fn request_body_maps_messages() {
             Message {
                 role: Role::User,
                 content: MessageContent::Text("What is 2+2?".to_owned()),
+                rsclaw_hidden: None,
             },
             Message {
                 role: Role::Assistant,
                 content: MessageContent::Text("4".to_owned()),
+                rsclaw_hidden: None,
             },
         ],
         tools: vec![ToolDef {
@@ -268,6 +277,7 @@ async fn request_body_maps_messages() {
         session_key: None,
         system_shared: None,
         user_system: None,
+        recall: None,
     };
 
     let provider = AnthropicProvider::with_base_url("key", server.uri());
