@@ -5456,14 +5456,18 @@ function ToolsTab() {
     setLoading(true);
     setErrored(false);
     try {
-      setTools(await getHubTools());
-    } catch {
+      const nextTools = await getHubTools();
+      setTools(nextTools);
+      return nextTools;
+    } catch (e) {
       setErrored(true);
+      throw e;
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   }, []);
 
-  useEffect(() => { fetchTools(); }, [fetchTools]);
+  useEffect(() => { void fetchTools().catch(() => {}); }, [fetchTools]);
 
   const doInstall = async (name: string) => {
     if (!isTauri) {
@@ -5472,8 +5476,18 @@ function ToolsTab() {
     }
     setInstalling(name);
     try {
-      await tauriInvokeV2("install_tool", { name });
-      await fetchTools();
+      await tauriInvokeV2("install_tool", { name, force: true });
+      const status = (await tauriInvokeV2("get_tool_install_status", { name })) as {
+        installed?: boolean;
+      };
+      if (!status?.installed) {
+        throw new Error(
+          zh
+            ? "安装命令已结束，但没有检测到本地工具文件"
+            : "Install command finished, but no local tool binary was detected",
+        );
+      }
+      await fetchTools().catch(() => {});
       toast.success(zh ? `${name} 安装完成` : `${name} installed`);
     } catch (e: any) {
       const msg = typeof e === "string" ? e : e?.message || "";

@@ -1494,11 +1494,96 @@ fn uninstall_plugin(name: String) -> Result<String, String> {
 /// binaries; removal is manual. `force` reinstalls even if present.
 #[tauri::command]
 fn install_tool(name: String, force: Option<bool>) -> Result<String, String> {
-    if force.unwrap_or(false) {
+    let out = if force.unwrap_or(false) {
         run_rsclaw_command(&["tools", "install", &name, "--force"])
     } else {
         run_rsclaw_command(&["tools", "install", &name])
+    }?;
+
+    if name != "all" && !is_local_tool_installed(&name) {
+        return Err(format!(
+            "{} install command finished, but no local tool binary was detected under {}",
+            name,
+            rsclaw_base_dir().join("tools").display()
+        ));
     }
+
+    Ok(out)
+}
+
+#[tauri::command]
+fn get_tool_install_status(name: String) -> Result<serde_json::Value, String> {
+    let path = local_tool_binary_path(&name);
+    Ok(serde_json::json!({
+        "name": resolve_tool_name(&name),
+        "installed": path.is_some(),
+        "path": path.map(|p| p.to_string_lossy().to_string()),
+    }))
+}
+
+fn resolve_tool_name(name: &str) -> &str {
+    match name {
+        "open-code" | "opencode-cli" => "opencode",
+        "claude" | "claude-agent" | "claudecode" => "claude-code",
+        _ => name,
+    }
+}
+
+fn is_local_tool_installed(name: &str) -> bool {
+    local_tool_binary_path(name).is_some()
+}
+
+fn local_tool_binary_path(name: &str) -> Option<std::path::PathBuf> {
+    let name = resolve_tool_name(name);
+    let dir = rsclaw_base_dir().join("tools").join(name);
+    let mut probes = Vec::<std::path::PathBuf>::new();
+    let detect_cmds: &[&str] = match name {
+        "chrome" => &["google-chrome", "chromium", "chromium-browser", "chrome"],
+        "ffmpeg" => &["ffmpeg"],
+        "node" => &["node"],
+        "bun" => &["bun"],
+        "python" => &["python3", "python"],
+        "sherpa-onnx" => &["sherpa-onnx-offline-tts", "sherpa-onnx-offline", "sherpa-onnx"],
+        "opencode" => &["opencode"],
+        "claude-code" => &["claude"],
+        _ => &[name],
+    };
+
+    for cmd in detect_cmds {
+        probes.push(dir.join(cmd));
+        probes.push(dir.join("bin").join(cmd));
+        probes.push(dir.join("node_modules").join(".bin").join(cmd));
+
+        #[cfg(target_os = "windows")]
+        {
+            probes.push(dir.join(format!("{cmd}.exe")));
+            probes.push(dir.join("bin").join(format!("{cmd}.exe")));
+            probes.push(dir.join(format!("{cmd}.cmd")));
+            probes.push(dir.join("bin").join(format!("{cmd}.cmd")));
+            probes.push(
+                dir.join("node_modules")
+                    .join(".bin")
+                    .join(format!("{cmd}.cmd")),
+            );
+        }
+    }
+
+    if name == "chrome" {
+        #[cfg(target_os = "macos")]
+        probes.extend([
+            dir.join("Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"),
+            dir.join("Chromium.app/Contents/MacOS/Chromium"),
+            dir.join("Google Chrome.app/Contents/MacOS/Google Chrome"),
+        ]);
+
+        #[cfg(target_os = "windows")]
+        probes.extend([
+            dir.join("chrome.exe"),
+            dir.join("Google Chrome for Testing.exe"),
+        ]);
+    }
+
+    probes.into_iter().find(|p| p.is_file())
 }
 
 /// Expand `${VAR}` placeholders in a string by reading from the process
@@ -1939,6 +2024,7 @@ fn main() {
             install_plugin,
             uninstall_plugin,
             install_tool,
+            get_tool_install_status,
             test_provider,
             write_workspace_file,
             read_workspace_file,

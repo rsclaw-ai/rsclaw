@@ -181,10 +181,12 @@ pub(crate) fn available_tools(cache: Option<&serde_json::Value>) -> Vec<String> 
 /// build).
 pub(crate) fn installed_tools(tools_dir: &std::path::Path) -> Vec<(String, Option<String>)> {
     // Marker + presence both key off `local_bin` (the install subdir) so the
-    // marker sits alongside the binary. name == local_bin for current tools.
+    // marker sits alongside the binary. We only count a tool as installed when
+    // a runnable binary exists; an empty staging dir from a failed install must
+    // not flip the UI to "installed".
     let mut out: Vec<(String, Option<String>)> = TOOLS
         .iter()
-        .filter(|d| tools_dir.join(d.local_bin).exists())
+        .filter(|d| local_tool_binary_exists(tools_dir, d))
         .map(|d| (d.name.to_owned(), installed_version(tools_dir, d.local_bin)))
         .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -296,8 +298,57 @@ fn is_tool_in_path(def: &ToolDef) -> bool {
 }
 
 fn is_tool_installed_locally(def: &ToolDef) -> bool {
-    let dir = tools_dir().join(def.local_bin);
-    dir.exists()
+    local_tool_binary_exists(&tools_dir(), def)
+}
+
+fn local_tool_binary_exists(tools_dir: &std::path::Path, def: &ToolDef) -> bool {
+    local_tool_binary_probes(tools_dir, def)
+        .iter()
+        .any(|p| p.is_file())
+}
+
+fn local_tool_binary_probes(tools_dir: &std::path::Path, def: &ToolDef) -> Vec<PathBuf> {
+    let dir = tools_dir.join(def.local_bin);
+    let mut probes = Vec::new();
+
+    for cmd in def.detect_cmd {
+        probes.push(dir.join(cmd));
+        probes.push(dir.join("bin").join(cmd));
+        probes.push(dir.join("node_modules").join(".bin").join(cmd));
+
+        #[cfg(target_os = "windows")]
+        {
+            probes.push(dir.join(format!("{cmd}.exe")));
+            probes.push(dir.join("bin").join(format!("{cmd}.exe")));
+            probes.push(dir.join(format!("{cmd}.cmd")));
+            probes.push(dir.join("bin").join(format!("{cmd}.cmd")));
+            probes.push(
+                dir.join("node_modules")
+                    .join(".bin")
+                    .join(format!("{cmd}.cmd")),
+            );
+        }
+    }
+
+    if def.name == "chrome" {
+        #[cfg(target_os = "macos")]
+        {
+            probes.extend([
+                dir.join("Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"),
+                dir.join("Chromium.app/Contents/MacOS/Chromium"),
+                dir.join("Google Chrome.app/Contents/MacOS/Google Chrome"),
+            ]);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            probes.extend([
+                dir.join("chrome.exe"),
+                dir.join("Google Chrome for Testing.exe"),
+            ]);
+        }
+    }
+
+    probes
 }
 
 fn tool_status(def: &ToolDef) -> &'static str {
@@ -499,7 +550,7 @@ pub async fn cmd_install(name: &str, force: bool) -> Result<()> {
                 "  Then extract to: {}",
                 bold(&tools_dir().display().to_string())
             );
-            return Ok(());
+            bail!("Cannot reach hub: {e}");
         }
     };
 
@@ -591,14 +642,24 @@ pub async fn cmd_install(name: &str, force: bool) -> Result<()> {
                 .status();
             match status {
                 Ok(s) if s.success() => {
+                    if !is_tool_installed_locally(def) {
+                        bail!(
+                            "{} install completed but no runnable binary was found in {}",
+                            def.name,
+                            dest_dir.display()
+                        );
+                    }
+                    if let Some(v) = manifest_tool_version(&manifest, def.name) {
+                        let _ = write_version_marker(&dir, def.local_bin, &v);
+                    }
                     ok(&format!("{} installed to {}", def.name, dest_dir.display()))
                 }
-                Ok(s) => err_msg(&format!("{}: npm install exited with {s}", def.name)),
+                Ok(s) => bail!("{}: npm install exited with {s}", def.name),
                 Err(e) => {
-                    err_msg(&format!(
+                    bail!(
                         "{}: npm not found ({e}). Install node first: rsclaw tools install node",
                         def.name
-                    ));
+                    );
                 }
             }
             continue;
@@ -606,11 +667,10 @@ pub async fn cmd_install(name: &str, force: bool) -> Result<()> {
 
         let download_url = resolve_download_url(&manifest, tool_name, platform);
         let Some(url) = download_url else {
-            warn_msg(&format!(
+            bail!(
                 "{}: no download available for platform {platform}. Download from https://gitfast.io",
                 def.name
-            ));
-            continue;
+            );
         };
 
         println!("  Installing {} ...", bold(def.name));
@@ -627,6 +687,13 @@ pub async fn cmd_install(name: &str, force: bool) -> Result<()> {
 
         match download_and_extract(&client, &url, &dest_dir, expected_sha).await {
             Ok(()) => {
+                if !is_tool_installed_locally(def) {
+                    bail!(
+                        "{} install completed but no runnable binary was found in {}",
+                        def.name,
+                        dest_dir.display()
+                    );
+                }
                 // Record the installed version (marker alongside the binary).
                 if let Some(v) = manifest_tool_version(&manifest, def.name) {
                     let _ = write_version_marker(&dir, def.local_bin, &v);
@@ -636,6 +703,7 @@ pub async fn cmd_install(name: &str, force: bool) -> Result<()> {
             Err(e) => {
                 err_msg(&format!("{}: {e}", def.name));
                 println!("    Download manually from: {}", bold("https://gitfast.io"));
+                bail!("{}: {e}", def.name);
             }
         }
     }
@@ -1084,5 +1152,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join(".manifest.json"), b"{ not json").unwrap();
         assert_eq!(load_manifest_cache(tmp.path()), None);
+    }
+
+    #[test]
+    fn local_install_requires_runnable_binary_not_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bun = TOOLS.iter().find(|d| d.name == "bun").unwrap();
+        std::fs::create_dir_all(tmp.path().join("bun")).unwrap();
+        assert!(!local_tool_binary_exists(tmp.path(), bun));
+
+        let bin = tmp.path().join("bun").join("bin").join("bun");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, b"").unwrap();
+        assert!(local_tool_binary_exists(tmp.path(), bun));
     }
 }
