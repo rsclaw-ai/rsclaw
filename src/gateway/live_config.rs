@@ -343,6 +343,7 @@ mod tests {
             reload: ReloadMode::Hybrid,
             auth_token: None,
             a2a_principals: vec![],
+            a2a_relay: Default::default(),
             a2a_max_body_bytes: 100 * 1024 * 1024,
             allow_tailscale: false,
             channel_health_check_minutes: 5,

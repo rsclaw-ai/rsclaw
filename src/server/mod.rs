@@ -175,6 +175,9 @@ pub struct AppState {
     pub task_store: Arc<crate::a2a::store::TaskStore>,
     /// Push notification dispatcher (subscribes to event bus, signs payloads).
     pub push_dispatcher: Arc<crate::a2a::push::PushDispatcher>,
+    /// Private rsclaw A2A relay hub state. Empty/idle unless
+    /// `gateway.a2a.relay.mode = "hub"`.
+    pub relay_hub: Arc<crate::a2a::relay::RelayHub>,
     /// User-managed RAG knowledge base (desktop `/api/v1/knowledge/*`).
     /// Collections are a tag veneer over the single KB store. `None` when
     /// the KB store failed to open — the gateway still serves everything
@@ -323,6 +326,7 @@ pub fn build_router(state: AppState) -> Router {
                     crate::a2a::auth::a2a_auth_layer,
                 )),
         )
+        .route("/a2a/relay/ws", get(crate::a2a::relay::relay_ws_handler))
         .route("/tools/execute", post(execute_tool))
         .route("/hub/catalog", get(hub_catalog))
         .route("/hub/skills", get(hub_skills))
@@ -473,6 +477,7 @@ async fn auth_middleware(
         // Otherwise the gateway token would override the A2A-advertised
         // auth and any A2A v1.0 client following the spec would 401.
         || path == "/api/v1/a2a"
+        || path == "/api/v1/a2a/relay/ws"
     {
         return next.run(request).await;
     }
