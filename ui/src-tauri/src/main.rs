@@ -658,6 +658,7 @@ async fn open_glow_overlay(app: tauri::AppHandle) -> Result<(), String> {
         .decorations(false)
         .transparent(true)
         .always_on_top(true)
+        .visible_on_all_workspaces(true)
         .skip_taskbar(true)
         .resizable(false)
         .focused(false)

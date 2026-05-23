@@ -138,6 +138,31 @@ pub(crate) fn upgrade_legacy_if_needed(path: &Path) -> Result<()> {
     }
 }
 
+#[cfg(test)]
+fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_owned()
+    }
+}
+
+#[cfg(test)]
+fn run_legacy_redb_upgrade_safely<F>(upgrade: F) -> Result<()>
+where
+    F: FnOnce() -> Result<()> + std::panic::UnwindSafe,
+{
+    match std::panic::catch_unwind(upgrade) {
+        Ok(result) => result,
+        Err(payload) => anyhow::bail!(
+            "legacy redb upgrade panicked: {}",
+            panic_payload_to_string(payload.as_ref())
+        ),
+    }
+}
+
 pub fn run_legacy_redb_upgrade_helper(path: &Path) -> Result<()> {
     let mut legacy = redb_legacy::Database::open(path)
         .with_context(|| format!("legacy open of {} for upgrade", path.display()))?;
@@ -1438,6 +1463,18 @@ mod tests {
 
         // Second run is a no-op on the already-v3 file.
         upgrade_legacy_if_needed(&path).expect("second upgrade no-op");
+    }
+
+    #[test]
+    fn legacy_upgrade_runner_converts_panic_to_error() {
+        let result = run_legacy_redb_upgrade_safely(|| -> Result<()> {
+            panic!("legacy redb panic");
+        });
+
+        let err = result.expect_err("panic should become error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("legacy redb upgrade panicked"), "{msg}");
+        assert!(msg.contains("legacy redb panic"), "{msg}");
     }
 
     /// Once a backup exists from a prior upgrade attempt, the helper must not

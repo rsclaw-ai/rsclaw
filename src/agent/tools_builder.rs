@@ -379,7 +379,8 @@ pub fn build_tool_list(
             "required": ["action"]
         }),
     });
-    // `use_skill` — first-class entry point for installed skills. Listed
+    tools.extend(build_plugin_meta_tool_defs());
+    // `skill_use` — first-class entry point for installed skills. Listed
     // EARLY in the tool list so the LLM notices it before web_fetch /
     // web_browser / shell. Registered UNCONDITIONALLY (even with zero
     // skills installed) so the cacheable base-layer prefix — and the
@@ -438,7 +439,6 @@ pub fn build_tool_list(
             }
         }),
     });
-    tools.extend(build_plugin_meta_tool_defs());
     tools.push(ToolDef {
         name: "skill_search".to_owned(),
         description: "Search the remote skill registries for an installable skill when no \

@@ -521,21 +521,14 @@ async fn activate_app(app: &str) -> Result<ActionOutput> {
 
 fn activate_app_blocking(app: &str) -> ActionOutput {
     if cfg!(target_os = "macos") {
-        // TODO(v2): swap osascript for objc2-app-kit
-        // `NSRunningApplication.activate(options: .activateAllWindows)` to
-        // remove the spawn-osascript latency (~50-100ms per call).
-        let script = format!(
-            r#"tell application "{}" to activate"#,
-            app.replace('"', r#"\""#)
-        );
-        match Command::new("osascript").arg("-e").arg(&script).output() {
-            Ok(out) if out.status.success() => ActionOutput::ok(),
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-                ActionOutput::err(format!("osascript failed: {stderr}"))
+        let mut errors = Vec::new();
+        for candidate in macos_app_candidates(app) {
+            match activate_macos_app(&candidate) {
+                Ok(()) => return ActionOutput::ok(),
+                Err(e) => errors.push(format!("{candidate}: {e}")),
             }
-            Err(e) => ActionOutput::err(format!("osascript spawn failed: {e}")),
         }
+        ActionOutput::err(format!("activate_app failed: {}", errors.join("; ")))
     } else if cfg!(target_os = "windows") {
         // PowerShell pipeline: enumerate every process whose name
         // matches and hand its main window to SetForegroundWindow.
@@ -587,6 +580,66 @@ fn activate_app_blocking(app: &str) -> ActionOutput {
         }
     } else {
         ActionOutput::err("activate_app: unsupported platform")
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_app_candidates(app: &str) -> Vec<String> {
+    let trimmed = app.trim();
+    let mut candidates = Vec::new();
+    if !trimmed.is_empty() {
+        candidates.push(trimmed.to_owned());
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "wechat" => candidates.push("微信".to_owned()),
+        "weixin" => {
+            candidates.push("WeChat".to_owned());
+            candidates.push("微信".to_owned());
+        }
+        "douyin" | "tiktok" => candidates.push("抖音".to_owned()),
+        _ => {}
+    }
+    candidates.dedup();
+    candidates
+}
+
+#[cfg(target_os = "macos")]
+fn activate_macos_app(app: &str) -> std::result::Result<(), String> {
+    let escaped = app.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!(
+        r#"tell application "{escaped}" to activate
+delay 0.4
+tell application "System Events"
+  if exists process "{escaped}" then
+    tell process "{escaped}"
+      set frontmost to true
+      if (count of windows) > 0 then
+        try
+          perform action "AXRaise" of window 1
+        end try
+      end if
+    end tell
+  end if
+end tell"#
+    );
+    match Command::new("osascript").arg("-e").arg(&script).output() {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+            let open = Command::new("open").args(["-a", app]).output();
+            match open {
+                Ok(open_out) if open_out.status.success() => {
+                    std::thread::sleep(Duration::from_millis(400));
+                    Ok(())
+                }
+                Ok(open_out) => {
+                    let open_stderr = String::from_utf8_lossy(&open_out.stderr).trim().to_owned();
+                    Err(format!("osascript failed: {stderr}; open -a failed: {open_stderr}"))
+                }
+                Err(e) => Err(format!("osascript failed: {stderr}; open -a spawn failed: {e}")),
+            }
+        }
+        Err(e) => Err(format!("osascript spawn failed: {e}")),
     }
 }
 

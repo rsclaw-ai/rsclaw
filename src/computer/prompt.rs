@@ -56,6 +56,7 @@ pub fn build_system_prompt(inputs: &PromptInputs) -> String {
     out.push_str("Every reply MUST be exactly two lines:\n");
     out.push_str("```\nThought: <one-paragraph reasoning grounded in what you see in the screenshot>\nAction: <one call from the Action Space below>\n```\n\n");
     out.push_str("Do NOT propose calling any tool such as `computer_use`, `vlm_drive`, `screenshot`, or `analyze`. Those are wrappers AROUND you — invoking them inside your output is a no-op that wastes a turn. The only valid output is the two-line Thought + Action pair using the Action Space.\n\n");
+    out.push_str("Output exactly ONE `Action:` line. Never emit a multi-step plan as multiple `Action:` lines; only the first action is executed and later actions are ignored until a fresh screenshot is available.\n\n");
 
     out.push_str("## Action Space\n");
     for spec in inputs.action_spaces {
@@ -77,7 +78,10 @@ pub fn build_system_prompt(inputs: &PromptInputs) -> String {
         "- If the screenshot is unhelpful (target app not visible), the correct next action is `activate_app(app='AppName')`, NOT prose about which tool to use.\n",
     );
     out.push_str(
-        "- When the task is complete, end with `finished(content='...')`. When stuck or needing user input, end with `call_user(reason='...')`. These are terminal actions.\n",
+        "- Use `finished(content='...')` only when the CURRENT screenshot proves the user's requested end state is already achieved. If you have clicked, typed, waited, or switched apps but cannot yet see proof of success, keep acting or wait. Do not use `finished` to mean \"my last action was submitted\".\n",
+    );
+    out.push_str(
+        "- When stuck, blocked by login/permission/captcha/ambiguous UI, or unable to verify completion from the screenshot, use `call_user(reason='...')` instead of `finished`. These are terminal actions.\n",
     );
 
     out.push_str("\n## Thought Examples\n");

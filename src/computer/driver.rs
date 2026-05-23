@@ -283,7 +283,7 @@ impl VlmDriver<'_> {
             debug!(prediction_len = prediction.len(), "VLM prediction received");
 
             // 3d. Parse.
-            let parsed = parse_vlm_response(&prediction, self.coord_format);
+            let mut parsed = parse_vlm_response(&prediction, self.coord_format);
             if parsed.is_empty() {
                 consecutive_unparseable += 1;
                 warn!(
@@ -320,6 +320,14 @@ impl VlmDriver<'_> {
                 steps += 1;
                 continue;
             }
+            if parsed.len() > 1 {
+                warn!(
+                    action_count = parsed.len(),
+                    first_action = %parsed[0].action_type,
+                    "VLM emitted multiple actions in one turn; executing only the first so every action gets a fresh screenshot"
+                );
+                parsed.truncate(1);
+            }
             // Got at least one action — reset the streak counter.
             consecutive_unparseable = 0;
 
@@ -349,16 +357,38 @@ impl VlmDriver<'_> {
                             .get("content")
                             .cloned()
                             .unwrap_or_else(|| pa.thought.clone());
-                        info!(steps, "VlmDriver: finished");
+                        let verified = verify_finished_claim(
+                            self.provider.as_ref(),
+                            &self.model_name,
+                            instruction,
+                            &history,
+                            &pa.thought,
+                            &content,
+                            &snap_b64,
+                            self.abort.as_ref(),
+                        )
+                        .await;
                         let step = Step {
                             thought: pa.thought.clone(),
                             action_summary: summary,
-                            result_ok: true,
-                            result_message: None,
+                            result_ok: verified,
+                            result_message: if verified {
+                                None
+                            } else {
+                                Some(
+                                    "Completion verifier could not confirm the requested end state from the current screenshot; continue instead of returning completed=true."
+                                        .to_owned(),
+                                )
+                            },
                         };
                         self.emit_step(steps + 1, &step);
                         history.push(step);
-                        return Ok(DriverOutcome::Finished { content, steps });
+                        steps += 1;
+                        if verified {
+                            info!(steps, "VlmDriver: finished");
+                            return Ok(DriverOutcome::Finished { content, steps });
+                        }
+                        continue;
                     }
                     "call_user" => {
                         let reason = pa
@@ -434,6 +464,13 @@ impl VlmDriver<'_> {
                     result_ok: exec_result.ok,
                     result_message: exec_result.message.clone(),
                 };
+                info!(
+                    step = steps + 1,
+                    action = %step.action_summary,
+                    ok = step.result_ok,
+                    message = ?step.result_message,
+                    "VLM action executed"
+                );
                 self.emit_step(steps + 1, &step);
                 history.push(step);
                 steps += 1;
@@ -669,6 +706,87 @@ fn summarize_parsed(p: &ParsedAction) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("{}({pretty_args})", p.action_type)
+}
+
+async fn verify_finished_claim(
+    provider: &dyn LlmProvider,
+    model_name: &str,
+    instruction: &str,
+    history: &[Step],
+    thought: &str,
+    content: &str,
+    snap_b64: &str,
+    abort: &AtomicBool,
+) -> bool {
+    let history_text = if history.is_empty() {
+        "(no previous actions)".to_owned()
+    } else {
+        history
+            .iter()
+            .enumerate()
+            .map(|(idx, step)| {
+                format!(
+                    "{}. action={} ok={} message={}",
+                    idx + 1,
+                    step.action_summary,
+                    step.result_ok,
+                    step.result_message.as_deref().unwrap_or("")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let req = LlmRequest {
+        model: model_name.to_owned(),
+        messages: vec![Message {
+            role: Role::User,
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: format!(
+                        "User instruction:\n{instruction}\n\nAction history:\n{history_text}\n\nThe GUI agent now wants to stop with:\nThought: {thought}\nfinished(content='{content}')\n\nLook only at the CURRENT screenshot. Does it prove the user's requested end state is fully achieved? Reply with exactly one line starting with YES or NO, then a short reason. If the screenshot does not prove success, reply NO."
+                    ),
+                },
+                ContentPart::Image {
+                    url: format!("data:image/png;base64,{snap_b64}"),
+                },
+            ]),
+            rsclaw_hidden: None,
+        }],
+        tools: Vec::new(),
+        system: Some(
+            "You are a strict verifier for a desktop GUI automation run. Approve completion only when the current screenshot visibly proves the user's exact requested goal is done. Submitted-but-not-confirmed, missing target app, loading states, errors, ambiguity, or lack of visible proof must be NO."
+                .to_owned(),
+        ),
+        max_tokens: Some(256),
+        temperature: Some(0.0),
+        frequency_penalty: None,
+        thinking_budget: None,
+        endpoint: AgentEndpoint::Vision,
+        kv_cache_mode: 0,
+        session_key: None,
+        system_shared: None,
+        user_system: None,
+        recall: None,
+    };
+
+    match stream_prediction(provider, req, abort).await {
+        Ok(verdict) => {
+            let normalized = verdict.trim_start().to_ascii_lowercase();
+            let ok = normalized.starts_with("yes");
+            if !ok {
+                info!(
+                    verdict = %verdict.chars().take(240).collect::<String>(),
+                    "VlmDriver: finished claim rejected"
+                );
+            }
+            ok
+        }
+        Err(e) => {
+            warn!(error = %e, "VlmDriver: finished verification failed");
+            false
+        }
+    }
 }
 
 /// Sentinel error string returned by `stream_prediction` when the

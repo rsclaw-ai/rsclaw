@@ -200,9 +200,13 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
                 RestartStrategy::DirectStopStart => {
                     match gateway_signal_stop() {
                         Ok(()) => println!("  {} Stopped old gateway", dim("[..]")),
-                        Err(_) => {
-                            println!("  {} No running gateway found, starting fresh", dim("[..]"))
-                        }
+                        Err(error) => match restart_fallback_after_stop_error(error) {
+                            RestartFallbackDecision::StartFresh => println!(
+                                "  {} No running gateway found, starting fresh",
+                                dim("[..]")
+                            ),
+                            RestartFallbackDecision::Abort { reason } => anyhow::bail!(reason),
+                        },
                     }
 
                     // Prefer service manager for restart if installed.
@@ -495,6 +499,32 @@ impl RestartStrategy {
             Self::DirectStopStart
         }
     }
+}
+
+/// Decision for direct restart fallback after attempting to stop the old
+/// gateway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestartFallbackDecision {
+    StartFresh,
+    Abort { reason: String },
+}
+
+/// Decides whether direct restart fallback may start a new gateway.
+pub fn restart_fallback_after_stop_result(
+    stop_result: std::result::Result<(), &str>,
+) -> RestartFallbackDecision {
+    match stop_result {
+        Ok(()) => RestartFallbackDecision::StartFresh,
+        Err(message) if message.contains("not running") => RestartFallbackDecision::StartFresh,
+        Err(message) => RestartFallbackDecision::Abort {
+            reason: message.to_owned(),
+        },
+    }
+}
+
+fn restart_fallback_after_stop_error(error: anyhow::Error) -> RestartFallbackDecision {
+    let message = error.to_string();
+    restart_fallback_after_stop_result(Err(&message))
 }
 
 fn health_url() -> String {
