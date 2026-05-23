@@ -27,15 +27,15 @@ pub(crate) fn build_plugin_meta_tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "plugin.search_tools".to_owned(),
-            description: "Search installed plugin tool catalogs by natural-language intent. Use before plugin.invoke when you need a plugin capability but the exact tool name or arguments are not already known.".to_owned(),
+            description: "Search or browse installed plugin tool catalogs. With non-empty `query`: ranks tools by intent match (use before plugin.invoke when you need a capability but don't know the exact tool name). With empty `query` and `plugin` set: lists ALL tools in that plugin alphabetically (paginate via `offset`/`limit`).".to_owned(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "plugin": {"type": "string", "description": "Optional installed plugin name, e.g. douyin. Omit to search all plugins."},
-                    "query": {"type": "string", "description": "Short user intent, e.g. 'publish video to douyin' or 'check high value comments'."},
-                    "limit": {"type": "integer", "description": "Maximum tools to return. Default 8, cap 20."}
-                },
-                "required": ["query"]
+                    "plugin": {"type": "string", "description": "Optional installed plugin name, e.g. douyin. Omit to search all plugins (requires non-empty query)."},
+                    "query": {"type": "string", "description": "Short user intent, e.g. 'publish video'. Empty/omitted is allowed only when `plugin` is given — then returns the alphabetical full tool list."},
+                    "limit": {"type": "integer", "description": "Maximum tools to return. Default 8, cap 50."},
+                    "offset": {"type": "integer", "description": "Pagination offset, default 0. Use with the returned `next_offset` to walk a long plugin."}
+                }
             }),
         },
         ToolDef {

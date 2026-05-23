@@ -167,12 +167,12 @@ const SESSION_IDLE_TTL_SECS: u64 = 7 * 24 * 3600;
 const MAX_SESSIONS_PER_AGENT: usize = 10_000;
 
 #[derive(Debug, Clone)]
-struct PluginToolInfo {
-    plugin: String,
-    runtime: &'static str,
-    tool: String,
-    description: String,
-    input_schema: Value,
+pub(crate) struct PluginToolInfo {
+    pub(crate) plugin: String,
+    pub(crate) runtime: &'static str,
+    pub(crate) tool: String,
+    pub(crate) description: String,
+    pub(crate) input_schema: Value,
 }
 
 /// RAII guard that clears the abort flag for a session when dropped.
@@ -6733,18 +6733,64 @@ impl AgentRuntime {
     }
 
     pub(crate) async fn tool_plugin_search_tools(&self, args: Value) -> Result<Value> {
+        Ok(Self::search_plugin_tools_pure(
+            self.collect_plugin_tools(),
+            &args,
+        ))
+    }
+
+    /// Pure resolver — same logic as the tool dispatch, but takes the tool
+    /// list as input so unit tests can drive it without constructing a full
+    /// `AgentRuntime`. Two modes:
+    /// - **search**: non-empty `query` → score + rank + paginate.
+    /// - **browse**: empty `query` + non-empty `plugin` → list-all alphabetical,
+    ///   paginated via `offset`/`limit`. Lets the model walk a giant plugin
+    ///   (e.g. douyin's 208 tools) without inventing a new meta-tool.
+    pub(crate) fn search_plugin_tools_pure(all_tools: Vec<PluginToolInfo>, args: &Value) -> Value {
         let query = args["query"].as_str().unwrap_or("").trim();
-        if query.is_empty() {
-            return Ok(json!({"error": "plugin.search_tools requires non-empty query"}));
-        }
         let plugin_filter = args["plugin"]
             .as_str()
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        let limit = args["limit"].as_u64().unwrap_or(8).clamp(1, 20) as usize;
+        let limit = args["limit"].as_u64().unwrap_or(8).clamp(1, 50) as usize;
+        let offset = args["offset"].as_u64().unwrap_or(0) as usize;
 
-        let mut scored: Vec<(i32, PluginToolInfo)> = self
-            .collect_plugin_tools()
+        if query.is_empty() && plugin_filter.is_none() {
+            return json!({
+                "error": "plugin.search_tools requires either `query` (search) or `plugin` (browse).",
+                "hint": "Examples: {plugin:\"douyin\",query:\"publish video\"} or {plugin:\"douyin\"} to list all tools."
+            });
+        }
+
+        if query.is_empty() {
+            let plugin = plugin_filter.unwrap();
+            let mut tools: Vec<PluginToolInfo> =
+                all_tools.into_iter().filter(|t| t.plugin == plugin).collect();
+            tools.sort_by(|a, b| a.tool.cmp(&b.tool));
+            let total = tools.len();
+            let page: Vec<Value> = tools
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .map(|t| Self::plugin_tool_summary(&t))
+                .collect();
+            let next_offset = if offset + page.len() < total {
+                json!(offset + page.len())
+            } else {
+                Value::Null
+            };
+            return json!({
+                "plugin": plugin,
+                "mode": "list",
+                "total": total,
+                "offset": offset,
+                "limit": limit,
+                "tools": page,
+                "next_offset": next_offset,
+            });
+        }
+
+        let mut scored: Vec<(i32, PluginToolInfo)> = all_tools
             .into_iter()
             .filter(|t| plugin_filter.is_none_or(|p| t.plugin == p))
             .map(|t| (Self::score_plugin_tool(query, &t), t))
@@ -6760,17 +6806,34 @@ impl AgentRuntime {
                 .then_with(|| a.1.plugin.cmp(&b.1.plugin))
                 .then_with(|| a.1.tool.cmp(&b.1.tool))
         });
-        scored.truncate(limit);
 
-        Ok(json!({
-            "query": query,
-            "plugin": plugin_filter,
-            "tools": scored.into_iter().map(|(score, tool)| {
+        let total = scored.len();
+        let page: Vec<Value> = scored
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|(score, tool)| {
                 let mut summary = Self::plugin_tool_summary(&tool);
                 summary["score"] = json!(score);
                 summary
-            }).collect::<Vec<_>>(),
-        }))
+            })
+            .collect();
+        let next_offset = if offset + page.len() < total {
+            json!(offset + page.len())
+        } else {
+            Value::Null
+        };
+
+        json!({
+            "query": query,
+            "plugin": plugin_filter,
+            "mode": "search",
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "tools": page,
+            "next_offset": next_offset,
+        })
     }
 
     pub(crate) async fn tool_plugin_describe_tool(&self, args: Value) -> Result<Value> {
@@ -9580,5 +9643,102 @@ mod tests {
                 "should NOT match (false positive): {name}"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // plugin.search_tools pure-helper tests (Task 1)
+    // ---------------------------------------------------------------------
+
+    fn pti(plugin: &str, tool: &str, desc: &str) -> PluginToolInfo {
+        PluginToolInfo {
+            plugin: plugin.to_owned(),
+            runtime: "wasm",
+            tool: tool.to_owned(),
+            description: desc.to_owned(),
+            input_schema: json!({"type": "object"}),
+        }
+    }
+
+    #[test]
+    fn search_empty_query_with_plugin_lists_all_alphabetical() {
+        let tools = vec![
+            pti("demo", "zeta", ""),
+            pti("demo", "alpha", ""),
+            pti("demo", "mid", ""),
+            pti("other", "noise", ""),
+        ];
+        let result =
+            AgentRuntime::search_plugin_tools_pure(tools, &json!({"plugin": "demo", "query": ""}));
+        assert_eq!(result["mode"], "list");
+        assert_eq!(result["total"], 3);
+        let names: Vec<&str> = result["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["tool"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["alpha", "mid", "zeta"]);
+        assert!(result.get("error").is_none());
+    }
+
+    #[test]
+    fn search_empty_query_no_plugin_errors() {
+        let result = AgentRuntime::search_plugin_tools_pure(vec![], &json!({"query": ""}));
+        assert!(result.get("error").is_some());
+    }
+
+    #[test]
+    fn search_supports_offset_pagination() {
+        let tools = (0..5)
+            .map(|i| pti("demo", &format!("t{i}"), ""))
+            .collect::<Vec<_>>();
+        let result = AgentRuntime::search_plugin_tools_pure(
+            tools,
+            &json!({"plugin": "demo", "query": "", "offset": 2, "limit": 2}),
+        );
+        let names: Vec<&str> = result["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["tool"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["t2", "t3"]);
+        assert_eq!(result["next_offset"], json!(4));
+    }
+
+    #[test]
+    fn search_last_page_has_null_next_offset() {
+        let tools = (0..3)
+            .map(|i| pti("demo", &format!("t{i}"), ""))
+            .collect::<Vec<_>>();
+        let result = AgentRuntime::search_plugin_tools_pure(
+            tools,
+            &json!({"plugin": "demo", "query": "", "offset": 2, "limit": 5}),
+        );
+        assert_eq!(result["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(result["next_offset"], Value::Null);
+    }
+
+    #[test]
+    fn search_query_mode_scores_and_paginates() {
+        let tools = vec![
+            pti("demo", "publish_video", "Publish a video"),
+            pti("demo", "edit_video", "Edit a video"),
+            pti("demo", "add_account", "Manage account"),
+        ];
+        let result = AgentRuntime::search_plugin_tools_pure(
+            tools,
+            &json!({"query": "video", "limit": 5}),
+        );
+        assert_eq!(result["mode"], "search");
+        let names: Vec<&str> = result["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["tool"].as_str().unwrap())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"publish_video"));
+        assert!(names.contains(&"edit_video"));
     }
 }
