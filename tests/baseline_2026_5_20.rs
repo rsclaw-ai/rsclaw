@@ -9,17 +9,14 @@
 //! gateway version — defeating the static-prefix-cache reuse design.
 //!
 //! When this test fails:
-//!   1. If the change was UNINTENTIONAL: revert the code that produced
-//!      the drift. shared_prefix changes should only happen on a
-//!      gateway version bump; builtin_tools content/order changes need
-//!      explicit justification.
-//!   2. If the change was INTENTIONAL (you bumped the gateway version
-//!      or added/restructured a builtin tool on purpose): regenerate
-//!      the fixture with
-//!      ```text
-//!      cargo build --release --bin rsclaw
-//!      target/release/rsclaw debug dump-prompt-spec --json
-//!        | jq '{rsclaw_version, shared_prefix, builtin_tools}'
+//!   1. If the change was UNINTENTIONAL: revert the code that produced the
+//!      drift. shared_prefix changes should only happen on a gateway version
+//!      bump; builtin_tools content/order changes need explicit justification.
+//!   2. If the change was INTENTIONAL (you bumped the gateway version or
+//!      added/restructured a builtin tool on purpose): regenerate the fixture
+//!      with ```text cargo build --release --bin rsclaw target/release/rsclaw
+//!      debug dump-prompt-spec --json | jq '{rsclaw_version, shared_prefix,
+//!      builtin_tools}'
 //!        > tests/fixtures/baseline-2026.5.20.json
 //!      ```
 //!      and re-add the `_doc` header that lives at the top of the
@@ -35,11 +32,14 @@
 
 use std::path::PathBuf;
 
-use rsclaw::agent::prompt_builder::{BUILTIN_TOOL_NAMES, build_shared_system_prefix};
-use rsclaw::agent::tools_builder::build_tool_list;
-use rsclaw::provider::ToolDef;
-use rsclaw::skill::SkillRegistry;
-use rsclaw::skill::manifest::SkillManifest;
+use rsclaw::{
+    agent::{
+        prompt_builder::{BUILTIN_TOOL_NAMES, build_shared_system_prefix},
+        tools_builder::build_tool_list,
+    },
+    provider::ToolDef,
+    skill::{SkillRegistry, manifest::SkillManifest},
+};
 use serde_json::Value;
 
 const FIXTURE_PATH: &str = "tests/fixtures/baseline-2026.5.20.json";
@@ -60,7 +60,9 @@ fn baseline_skill_registry() -> SkillRegistry {
     let mut reg = SkillRegistry::new();
     reg.insert(SkillManifest {
         name: "_baseline_probe".to_owned(),
-        description: Some("placeholder skill used only to trigger use_skill tool registration".to_owned()),
+        description: Some(
+            "placeholder skill used only to trigger use_skill tool registration".to_owned(),
+        ),
         version: Some("0.0.0".to_owned()),
         requires_rsclaw: None,
         tools: Vec::new(),
@@ -144,11 +146,21 @@ fn baseline_shared_prefix_byte_stable() {
     );
     if actual != expected {
         // Find first differing offset to surface a useful diff message.
-        let n = actual.bytes().zip(expected.bytes())
+        let n = actual
+            .bytes()
+            .zip(expected.bytes())
             .take_while(|(a, b)| a == b)
             .count();
-        let preview_actual: String = actual.chars().skip(n.saturating_sub(40)).take(120).collect();
-        let preview_expected: String = expected.chars().skip(n.saturating_sub(40)).take(120).collect();
+        let preview_actual: String = actual
+            .chars()
+            .skip(n.saturating_sub(40))
+            .take(120)
+            .collect();
+        let preview_expected: String = expected
+            .chars()
+            .skip(n.saturating_sub(40))
+            .take(120)
+            .collect();
         panic!(
             "shared_prefix bytes drifted from 2026.5.20 baseline at offset {n}.\n\
              actual   :  …{preview_actual}…\n\
@@ -227,9 +239,10 @@ fn baseline_builtin_tools_byte_stable() {
         let mut diff_names = Vec::new();
         for (a, e) in actual_arr.iter().zip(expected.iter()) {
             if a != e
-                && let Some(n) = a.get("name").and_then(|n| n.as_str()) {
-                    diff_names.push(n.to_owned());
-                }
+                && let Some(n) = a.get("name").and_then(|n| n.as_str())
+            {
+                diff_names.push(n.to_owned());
+            }
         }
         panic!(
             "builtin_tools CONTENT drifted from 2026.5.20 baseline (names matched, \

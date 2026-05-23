@@ -7,7 +7,8 @@ pub enum BrowserCommand {
         /// URL to navigate to.
         url: String,
     },
-    /// Take a snapshot of the current page (accessibility tree with element refs).
+    /// Take a snapshot of the current page (accessibility tree with element
+    /// refs).
     Snapshot {
         /// Only show interactive/actionable elements.
         #[arg(long, short)]

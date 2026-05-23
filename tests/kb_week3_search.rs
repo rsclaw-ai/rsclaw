@@ -1,15 +1,14 @@
 //! Week 3 end-to-end: ingest → worker drains → kb_search returns
 //! ranked chunks with visibility filtering applied.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use rsclaw::kb::{
-    canonicalize_by_mime, ingest_canonicalized,
-    search::SearchCtx,
-    tools::kb_search,
     CallerScope, CanonicalizeInput, DefaultDispatcher, HandlerCtx, IngestInput, KbEmbedder,
-    KbIndex, KbPaths, KbStore, StubEmbedder, WorkerConfig, WorkerPool,
+    KbIndex, KbPaths, KbStore, StubEmbedder, WorkerConfig, WorkerPool, canonicalize_by_mime,
+    ingest_canonicalized, search::SearchCtx, tools::kb_search,
 };
-use std::sync::Arc;
 use tempfile::TempDir;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -58,7 +57,12 @@ async fn e2e_kb_search_ranks_relevant_chunks_top() -> Result<()> {
         WorkerPool::run_one_blocking(&hctx, &cfg, &DefaultDispatcher)?;
     }
 
-    let ctx = SearchCtx { store: store.clone(), index, paths, embedder };
+    let ctx = SearchCtx {
+        store: store.clone(),
+        index,
+        paths,
+        embedder,
+    };
     let out = kb_search::run(
         &ctx,
         kb_search::KbSearchInput {
@@ -84,7 +88,10 @@ async fn e2e_kb_search_ranks_relevant_chunks_top() -> Result<()> {
         astro_hit,
         "expected an astronomy hit in top {}: {:?}",
         out.results.len(),
-        out.results.iter().map(|h| h.doc_title.clone()).collect::<Vec<_>>()
+        out.results
+            .iter()
+            .map(|h| h.doc_title.clone())
+            .collect::<Vec<_>>()
     );
     let _ = top_doc;
     Ok(())

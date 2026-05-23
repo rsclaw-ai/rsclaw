@@ -174,7 +174,8 @@ impl TaskEventBus {
         tx.send(event).unwrap_or(0)
     }
 
-    /// Drop the channel for a terminal task (call after the final status event).
+    /// Drop the channel for a terminal task (call after the final status
+    /// event).
     pub fn close(&self, task_id: &str) {
         self.inner.remove(task_id);
     }

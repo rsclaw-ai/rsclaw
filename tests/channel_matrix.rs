@@ -2,8 +2,7 @@
 
 use std::sync::Arc;
 
-use rsclaw::channel::matrix::MatrixChannel;
-use rsclaw::channel::{Channel, OutboundMessage};
+use rsclaw::channel::{Channel, OutboundMessage, matrix::MatrixChannel};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{method, path_regex},
@@ -74,9 +73,12 @@ async fn send_text_puts_room_message() {
     init_crypto();
     let server = MockServer::start().await;
 
-    // Matrix send uses PUT /_matrix/client/v3/rooms/{room_id}/send/m.room.message/{txn_id}
+    // Matrix send uses PUT
+    // /_matrix/client/v3/rooms/{room_id}/send/m.room.message/{txn_id}
     Mock::given(method("PUT"))
-        .and(path_regex(r"/_matrix/client/v3/rooms/.+/send/m.room.message/.+"))
+        .and(path_regex(
+            r"/_matrix/client/v3/rooms/.+/send/m.room.message/.+",
+        ))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(serde_json::json!({"event_id": "$mock_event"})),
@@ -94,7 +96,7 @@ async fn send_text_puts_room_message() {
             text: "Hello Matrix".to_owned(),
             reply_to: None,
             images: vec![],
-        ..Default::default()
+            ..Default::default()
         })
         .await;
 
@@ -108,10 +110,11 @@ async fn send_chunked_10000() {
     let server = MockServer::start().await;
 
     Mock::given(method("PUT"))
-        .and(path_regex(r"/_matrix/client/v3/rooms/.+/send/m.room.message/.+"))
+        .and(path_regex(
+            r"/_matrix/client/v3/rooms/.+/send/m.room.message/.+",
+        ))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"event_id": "$ev"})),
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"event_id": "$ev"})),
         )
         .expect(2)
         .mount(&server)
@@ -128,9 +131,13 @@ async fn send_chunked_10000() {
             text: long_text,
             reply_to: None,
             images: vec![],
-        ..Default::default()
+            ..Default::default()
         })
         .await;
 
-    assert!(result.is_ok(), "chunked send should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "chunked send should succeed: {:?}",
+        result.err()
+    );
 }

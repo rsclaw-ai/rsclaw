@@ -2,11 +2,13 @@
 //! Tests NativeOperator screenshot + parser + prompt builder
 //! without needing a vision LLM.
 
-use rsclaw::computer::operators::native::NativeOperator;
-use rsclaw::computer::operator::Operator;
-use rsclaw::computer::parser::{parse_vlm_response, CoordFormat};
-use rsclaw::computer::prompt::{build_system_prompt, PromptInputs};
-use rsclaw::computer::app_rules::AppRuleSet;
+use rsclaw::computer::{
+    app_rules::AppRuleSet,
+    operator::Operator,
+    operators::native::NativeOperator,
+    parser::{CoordFormat, parse_vlm_response},
+    prompt::{PromptInputs, build_system_prompt},
+};
 
 // xcap::Monitor::all needs a real display (X11/Wayland/Quartz). GitHub
 // Actions Linux runners are headless and fail with "Connection closed,
@@ -19,12 +21,16 @@ async fn native_operator_screenshot_works() {
     let snap = op.screenshot().await.expect("xcap screenshot");
 
     assert!(!snap.png_bytes.is_empty(), "got empty png");
-    assert!(snap.png_bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]), "not a PNG");
+    assert!(
+        snap.png_bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]),
+        "not a PNG"
+    );
     assert!(snap.physical_size.0 > 0);
     assert!(snap.physical_size.1 > 0);
     assert!(snap.scale_factor > 0.0);
 
-    println!("screenshot ok: {}x{} @{}x ({} bytes)",
+    println!(
+        "screenshot ok: {}x{} @{}x ({} bytes)",
         snap.physical_size.0,
         snap.physical_size.1,
         snap.scale_factor,

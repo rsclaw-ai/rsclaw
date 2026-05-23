@@ -9,10 +9,12 @@
 //!
 //! Design: docs/plans/2026-05-21-skill-allowlist.md.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, RwLock};
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, LazyLock, RwLock},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -22,7 +24,8 @@ use serde::Deserialize;
 const HUB_BASE: &str = "https://hub.rsclaw.ai";
 
 /// One audited entry. `sha256` pins the audited SKILL.md (same convention as
-/// the clawhub lockfile); empty means "not content-pinned yet" → slug-gate only.
+/// the clawhub lockfile); empty means "not content-pinned yet" → slug-gate
+/// only.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AllowEntry {
     pub slug: String,
@@ -41,8 +44,8 @@ pub struct AllowEntry {
     pub publisher: String,
     #[serde(default)]
     pub audited_at: String,
-    /// One-line description (from SKILL.md frontmatter / plugin manifest, written
-    /// by the hub packager). Empty on older manifests.
+    /// One-line description (from SKILL.md frontmatter / plugin manifest,
+    /// written by the hub packager). Empty on older manifests.
     #[serde(default)]
     pub description: String,
 }
@@ -163,7 +166,11 @@ pub fn load_cached() -> (usize, usize) {
 fn verify_meta_signature(meta: &str) -> Result<()> {
     let m: Meta = serde_json::from_str(meta).context("parse allowlist meta.json")?;
     crate::skill::sig::verify_meta_sig(
-        &m.version, &m.sha256.skills, &m.sha256.plugins, &m.sha256.tools, &m.sig,
+        &m.version,
+        &m.sha256.skills,
+        &m.sha256.plugins,
+        &m.sha256.tools,
+        &m.sig,
     )
 }
 
@@ -201,9 +208,14 @@ pub async fn refresh() -> Result<()> {
         }
     };
     let meta_txt = fetch("meta.json").await.context("fetch hub meta.json")?;
-    let skills_txt = fetch("skills/manifest.json").await.context("fetch hub skills/manifest.json")?;
-    let plugins_txt = fetch("plugins/manifest.json").await.context("fetch hub plugins/manifest.json")?;
-    // Trust anchor first: the meta signature, then the lists match the signed hashes.
+    let skills_txt = fetch("skills/manifest.json")
+        .await
+        .context("fetch hub skills/manifest.json")?;
+    let plugins_txt = fetch("plugins/manifest.json")
+        .await
+        .context("fetch hub plugins/manifest.json")?;
+    // Trust anchor first: the meta signature, then the lists match the signed
+    // hashes.
     verify_meta_signature(&meta_txt)?;
     verify_against_meta(&meta_txt, &skills_txt, &plugins_txt)?;
 
@@ -224,8 +236,8 @@ pub async fn refresh() -> Result<()> {
 /// registry can't serve different content under an audited slug. No-op when the
 /// entry isn't content-pinned yet.
 ///
-/// NOTE: pins SKILL.md (the audited contract + CLI the agent runs), matching the
-/// existing clawhub lockfile hash. Hashing `scripts/` too is a hardening
+/// NOTE: pins SKILL.md (the audited contract + CLI the agent runs), matching
+/// the existing clawhub lockfile hash. Hashing `scripts/` too is a hardening
 /// follow-up tracked in the allowlist plan.
 pub fn verify_skill_content(
     install_dir: &Path,
@@ -266,7 +278,8 @@ mod tests {
 
     #[test]
     fn parse_and_lookup() {
-        let s = r#"{"skills":[{"slug":"hithink-market-query","sha256":"abc","registry":"iwencai"}]}"#;
+        let s =
+            r#"{"skills":[{"slug":"hithink-market-query","sha256":"abc","registry":"iwencai"}]}"#;
         let a = parse(s, "{}");
         assert!(a.lookup_skill("hithink-market-query").is_some());
         assert!(a.lookup_skill("not-listed").is_none());

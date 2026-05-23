@@ -4,15 +4,14 @@
 //!   1. Base GUI-agent skeleton (Output Format, Note section).
 //!   2. Operator's `action_spaces()` rendered into `## Action Space`.
 //!   3. Matched app-rules bodies appended as `## App-Specific Rules`.
-//!   4. Optional language hint — Thought-section language is picked
-//!      from the user instruction (CJK → Chinese, else English).
+//!   4. Optional language hint — Thought-section language is picked from the
+//!      user instruction (CJK → Chinese, else English).
 //!
 //! Keep the prompt compact; the model sees this every turn.
 
 use std::fmt::Write;
 
-use super::action::ActionSpec;
-use super::app_rules::AppRule;
+use super::{action::ActionSpec, app_rules::AppRule};
 
 pub struct PromptInputs<'a> {
     pub instruction: &'a str,
@@ -73,9 +72,7 @@ pub fn build_system_prompt(inputs: &PromptInputs) -> String {
     out.push_str(
         "- You may stumble upon new rules or features while driving the GUI. Record them in your `Thought` and reuse them later in the loop.\n",
     );
-    out.push_str(
-        "- Your thought style should follow the style of the Thought Examples below.\n",
-    );
+    out.push_str("- Your thought style should follow the style of the Thought Examples below.\n");
     out.push_str(
         "- If the screenshot is unhelpful (target app not visible), the correct next action is `activate_app(app='AppName')`, NOT prose about which tool to use.\n",
     );
@@ -197,8 +194,9 @@ fn has_cjk(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::path::PathBuf;
+
+    use super::*;
 
     fn rule(name: &str, body: &str) -> AppRule {
         AppRule {
@@ -243,7 +241,10 @@ mod tests {
             screen_size: None,
         };
         let p = build_system_prompt(&inputs);
-        assert!(p.contains("Use Chinese in `Thought` part."), "prompt was:\n{p}");
+        assert!(
+            p.contains("Use Chinese in `Thought` part."),
+            "prompt was:\n{p}"
+        );
     }
 
     #[test]
@@ -255,7 +256,10 @@ mod tests {
             screen_size: None,
         };
         let p = build_system_prompt(&inputs);
-        assert!(p.contains("Use English in `Thought` part."), "prompt was:\n{p}");
+        assert!(
+            p.contains("Use English in `Thought` part."),
+            "prompt was:\n{p}"
+        );
     }
 
     #[test]
@@ -285,10 +289,7 @@ mod tests {
         assert!(p.contains("RsClaw test group"), "missing en example body");
         assert!(p.contains("## Output Examples"), "missing output section");
         // Sanity: zh body must NOT leak into the en variant.
-        assert!(
-            !p.contains("微信"),
-            "zh content leaked into en prompt"
-        );
+        assert!(!p.contains("微信"), "zh content leaked into en prompt");
     }
 
     #[test]

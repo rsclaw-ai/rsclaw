@@ -245,11 +245,7 @@ pub enum A2aPart {
     },
     Url {
         url: String,
-        #[serde(
-            rename = "mimeType",
-            skip_serializing_if = "Option::is_none",
-            default
-        )]
+        #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none", default)]
         mime_type: Option<String>,
     },
     Data {

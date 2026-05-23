@@ -6,9 +6,11 @@
 //! collects the raw counters during `agent_loop` and computes a normalized
 //! difficulty score consumed by [`crate::skill::workflow_distill`].
 
-use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashSet,
+    sync::{Mutex, OnceLock},
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 
 /// Counters maintained for the current turn.
 #[derive(Debug, Clone)]
@@ -176,7 +178,8 @@ mod tests {
 
         let mut hard = TurnMetrics::new();
         hard.tool_calls = 18;
-        hard.distinct_tools.extend(["a", "b", "c", "d", "e"].iter().map(|s| s.to_string()));
+        hard.distinct_tools
+            .extend(["a", "b", "c", "d", "e"].iter().map(|s| s.to_string()));
         hard.tool_errors = 4;
         hard.same_call_streak_max = 3;
         let hard_score = hard.difficulty_score();
@@ -189,18 +192,22 @@ mod tests {
     #[test]
     fn signature_is_order_invariant() {
         let mut a = TurnMetrics::new();
-        a.distinct_tools.extend(["x", "y", "z"].iter().map(|s| s.to_string()));
+        a.distinct_tools
+            .extend(["x", "y", "z"].iter().map(|s| s.to_string()));
         let mut b = TurnMetrics::new();
-        b.distinct_tools.extend(["z", "x", "y"].iter().map(|s| s.to_string()));
+        b.distinct_tools
+            .extend(["z", "x", "y"].iter().map(|s| s.to_string()));
         assert_eq!(a.signature(), b.signature());
     }
 
     #[test]
     fn signature_distinguishes_different_palettes() {
         let mut a = TurnMetrics::new();
-        a.distinct_tools.extend(["x", "y"].iter().map(|s| s.to_string()));
+        a.distinct_tools
+            .extend(["x", "y"].iter().map(|s| s.to_string()));
         let mut b = TurnMetrics::new();
-        b.distinct_tools.extend(["x", "z"].iter().map(|s| s.to_string()));
+        b.distinct_tools
+            .extend(["x", "z"].iter().map(|s| s.to_string()));
         assert_ne!(a.signature(), b.signature());
     }
 

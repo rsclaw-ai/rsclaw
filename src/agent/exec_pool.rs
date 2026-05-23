@@ -2,10 +2,7 @@
 //! the agent's main loop. Results are stored per-session for collection on
 //! subsequent turns.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Instant;
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
 use tokio::sync::RwLock;
 
@@ -80,7 +77,8 @@ impl ExecPool {
 
             // Run the command with timeout
             // - kill_on_drop ensures process is killed if future is dropped during timeout
-            // - stdin null prevents interactive prompts from blocking (e.g. PowerShell waiting for input)
+            // - stdin null prevents interactive prompts from blocking (e.g. PowerShell
+            //   waiting for input)
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(timeout_secs),
                 tokio::process::Command::new(shell)
@@ -108,7 +106,11 @@ impl ExecPool {
                 }
                 Err(_) => {
                     tracing::warn!(task_id = %tid, timeout_secs, "exec background timed out");
-                    (None, String::new(), format!("timed out after {} seconds", timeout_secs))
+                    (
+                        None,
+                        String::new(),
+                        format!("timed out after {} seconds", timeout_secs),
+                    )
                 }
             };
 

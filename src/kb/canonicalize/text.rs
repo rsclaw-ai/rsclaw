@@ -58,7 +58,12 @@ mod tests {
             .unwrap();
         assert_eq!(r.markdown, "hello");
         assert_eq!(r.metadata.title, "G");
-        assert!(r.metadata.logical_source_id.as_str().starts_with("file:sha256:"));
+        assert!(
+            r.metadata
+                .logical_source_id
+                .as_str()
+                .starts_with("file:sha256:")
+        );
     }
 
     #[test]

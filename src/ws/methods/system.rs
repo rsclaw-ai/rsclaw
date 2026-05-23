@@ -1,8 +1,9 @@
+use tracing::warn;
+
 use crate::ws::{
     dispatch::{MethodCtx, MethodResult},
     types::ErrorShape,
 };
-use tracing::warn;
 
 pub async fn health(ctx: MethodCtx) -> MethodResult {
     let uptime = ctx.state.started_at.elapsed();
@@ -179,7 +180,9 @@ pub async fn cron_add(ctx: MethodCtx) -> MethodResult {
 
     let (mut jobs, parse_ok) = crate::cron::load_cron_jobs();
     if !parse_ok {
-        return Err(ErrorShape::internal("cron.json5 has syntax errors - fix the file before adding jobs"));
+        return Err(ErrorShape::internal(
+            "cron.json5 has syntax errors - fix the file before adding jobs",
+        ));
     }
     // Use a UUID instead of `job-{count+1}` — the latter is unstable under
     // concurrent adds (two callers can both see the same count).
@@ -229,7 +232,9 @@ pub async fn cron_remove(ctx: MethodCtx) -> MethodResult {
     let _guard = crate::cron::CRON_FILE_LOCK.lock().await;
     let (mut jobs, parse_ok) = crate::cron::load_cron_jobs();
     if !parse_ok {
-        return Err(ErrorShape::internal("cron.json5 has syntax errors - fix the file before removing jobs"));
+        return Err(ErrorShape::internal(
+            "cron.json5 has syntax errors - fix the file before removing jobs",
+        ));
     }
     let before = jobs.len();
     jobs.retain(|j| j.id != id);
@@ -270,7 +275,9 @@ pub async fn logs_tail(ctx: MethodCtx) -> MethodResult {
     let base = crate::config::loader::base_dir();
     let candidates = [
         configured.clone(),
-        crate::config::loader::log_file().to_string_lossy().into_owned(),
+        crate::config::loader::log_file()
+            .to_string_lossy()
+            .into_owned(),
         base.join("gateway.log").to_string_lossy().into_owned(),
         base.join("logs/gateway.log").to_string_lossy().into_owned(),
     ];
@@ -538,7 +545,9 @@ pub async fn cron_update(ctx: MethodCtx) -> MethodResult {
     // Load jobs from the openclaw-compatible jobs.json file
     let (mut jobs, parse_ok) = crate::cron::load_cron_jobs();
     if !parse_ok {
-        return Err(ErrorShape::internal("cron.json5 has syntax errors - fix the file before patching jobs"));
+        return Err(ErrorShape::internal(
+            "cron.json5 has syntax errors - fix the file before patching jobs",
+        ));
     }
 
     let job = jobs

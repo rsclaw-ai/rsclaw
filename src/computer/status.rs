@@ -33,10 +33,7 @@ pub enum ComputerUseStatus {
     /// `step_index` is the iteration about to be processed (1-indexed,
     /// same numbering the subsequent `Step` will use).
     /// R3 review I3.
-    Thinking {
-        run_id: String,
-        step_index: usize,
-    },
+    Thinking { run_id: String, step_index: usize },
     /// One executed step. Emitted after the operator returns, including
     /// failed actions so the UI can surface "step failed" feedback.
     Step {

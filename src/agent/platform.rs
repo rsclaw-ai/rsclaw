@@ -49,7 +49,10 @@ fn detect_display_logical_scale() -> f64 {
             if !o.status.success() {
                 return None;
             }
-            String::from_utf8_lossy(&o.stdout).trim().parse::<f64>().ok()
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<f64>()
+                .ok()
         });
 
     let logical_w = match logical_w {
@@ -309,11 +312,14 @@ pub(crate) fn jpeg_dimensions(data: &[u8]) -> Option<(u32, u32)> {
 /// Run a PowerShell snippet with the required assemblies pre-loaded.
 /// Used for Windows computer_use actions (mouse, keyboard).
 pub(crate) async fn run_powershell_input(script: &str) -> Result<()> {
-    let full = format!("Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; {script}");
+    let full = format!(
+        "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; {script}"
+    );
     run_subprocess("powershell", &["-NoProfile", "-Command", &full]).await
 }
 
-/// Windows: mouse click with P/Invoke. Supports left/right/middle and repeat count.
+/// Windows: mouse click with P/Invoke. Supports left/right/middle and repeat
+/// count.
 ///
 /// Still used by `triple_click` in `tools_computer.rs` (the rest of the
 /// click/move pipeline now goes through enigo via `NativeOperator`).
@@ -387,9 +393,29 @@ pub(crate) fn match_skills<'a>(
 
         let hit = keywords.iter().any(|kw| {
             let kl = kw.to_lowercase();
-            if matches!(kl.as_str(), "the" | "and" | "for" | "with" | "use" | "when" | "from"
-                | "create" | "edit" | "file" | "files" | "data" | "tool" | "agent"
-                | "的" | "和" | "在" | "是" | "了" | "等") {
+            if matches!(
+                kl.as_str(),
+                "the"
+                    | "and"
+                    | "for"
+                    | "with"
+                    | "use"
+                    | "when"
+                    | "from"
+                    | "create"
+                    | "edit"
+                    | "file"
+                    | "files"
+                    | "data"
+                    | "tool"
+                    | "agent"
+                    | "的"
+                    | "和"
+                    | "在"
+                    | "是"
+                    | "了"
+                    | "等"
+            ) {
                 return false;
             }
             lower.contains(&kl)
@@ -403,7 +429,8 @@ pub(crate) fn match_skills<'a>(
     matched
 }
 
-/// Create a `tokio::process::Command` for PowerShell that hides the console window.
+/// Create a `tokio::process::Command` for PowerShell that hides the console
+/// window.
 pub(crate) fn powershell_hidden() -> tokio::process::Command {
     #[cfg(target_os = "windows")]
     {
@@ -437,9 +464,10 @@ pub(crate) enum PowerShellEdition {
 
 /// Detect the installed PowerShell edition once per process.
 ///
-/// Cheap probe: shells out to `powershell -NoProfile -Command "$PSVersionTable.PSVersion.Major"`
-/// and reads the integer. Returns `None` if PowerShell is unavailable or the
-/// probe fails. Result is cached for the process lifetime.
+/// Cheap probe: shells out to `powershell -NoProfile -Command
+/// "$PSVersionTable.PSVersion.Major"` and reads the integer. Returns `None` if
+/// PowerShell is unavailable or the probe fails. Result is cached for the
+/// process lifetime.
 pub(crate) fn detect_powershell_edition() -> Option<PowerShellEdition> {
     use std::sync::OnceLock;
     static CACHE: OnceLock<Option<PowerShellEdition>> = OnceLock::new();
@@ -466,7 +494,10 @@ fn probe_powershell_edition() -> Option<PowerShellEdition> {
     if !output.status.success() {
         return None;
     }
-    let major: u32 = String::from_utf8_lossy(&output.stdout).trim().parse().ok()?;
+    let major: u32 = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .ok()?;
     if major >= 6 {
         Some(PowerShellEdition::Core)
     } else {

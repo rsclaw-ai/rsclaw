@@ -3,11 +3,16 @@
 //! name→id index (`KB_COLLECTION_BY_NAME`) so the API can enforce unique
 //! collection names and look up by name.
 
-use crate::kb::model::KbCollection;
-use crate::kb::store::codec::{decode, encode};
-use crate::kb::store::schema::{KB_COLLECTIONS, KB_COLLECTION_BY_NAME};
 use anyhow::Result;
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
+
+use crate::kb::{
+    model::KbCollection,
+    store::{
+        codec::{decode, encode},
+        schema::{KB_COLLECTION_BY_NAME, KB_COLLECTIONS},
+    },
+};
 
 /// Insert or replace a collection and (re)index its name. On rename the
 /// caller must `unindex_name` the previous name first — `put` only writes the
@@ -67,16 +72,18 @@ pub fn delete(wtx: &WriteTransaction, id: &str) -> Result<bool> {
         }
     };
     wtx.open_table(KB_COLLECTIONS)?.remove(id)?;
-    wtx.open_table(KB_COLLECTION_BY_NAME)?.remove(name.as_str())?;
+    wtx.open_table(KB_COLLECTION_BY_NAME)?
+        .remove(name.as_str())?;
     Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use redb::ReadableDatabase;
-    use crate::kb::store::schema::open_db;
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::kb::store::schema::open_db;
 
     fn col(id: &str, name: &str) -> KbCollection {
         KbCollection {
@@ -114,7 +121,10 @@ mod tests {
             wtx.commit().unwrap();
         }
         let rtx = db.begin_read().unwrap();
-        assert_eq!(find_by_name(&rtx, "产品手册").unwrap().as_deref(), Some("c1"));
+        assert_eq!(
+            find_by_name(&rtx, "产品手册").unwrap().as_deref(),
+            Some("c1")
+        );
         assert!(find_by_name(&rtx, "不存在").unwrap().is_none());
     }
 

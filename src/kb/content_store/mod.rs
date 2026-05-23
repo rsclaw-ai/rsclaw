@@ -6,15 +6,15 @@
 //! sha256 + byte_offset only.
 
 pub mod atomic;
-pub mod paths;
 pub mod compose;
+pub mod paths;
 pub mod read;
 
-use crate::kb::model::KbSourceKind;
-use crate::kb::paths::KbPaths;
 use anyhow::{Context, Result};
-pub use compose::{compose_doc_file, parse_doc_file, FrontMatter, Parsed};
+pub use compose::{FrontMatter, Parsed, compose_doc_file, parse_doc_file};
 pub use read::{read_doc_body, read_doc_range, verify_doc_sha};
+
+use crate::kb::{model::KbSourceKind, paths::KbPaths};
 
 #[derive(Debug, Clone)]
 pub struct StagedDoc {
@@ -49,8 +49,12 @@ pub fn stage_doc(paths: &KbPaths, input: StageInput<'_>) -> Result<StagedDoc> {
     let composed = compose_doc_file(&input.front, input.body)?;
     let parsed = parse_doc_file(&composed)?;
     let new_body_sha = atomic::sha256_hex(parsed.body.as_bytes());
-    let md_rel =
-        paths::markdown_rel_path(input.kind, input.slug, input.logical_source_id, &new_body_sha);
+    let md_rel = paths::markdown_rel_path(
+        input.kind,
+        input.slug,
+        input.logical_source_id,
+        &new_body_sha,
+    );
     let md_abs = paths.root.join(&md_rel);
 
     let wrote = atomic::write_if_new(&md_abs, composed.as_bytes())?;
@@ -106,8 +110,9 @@ pub fn stage_doc(paths: &KbPaths, input: StageInput<'_>) -> Result<StagedDoc> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
+
+    use super::*;
 
     fn fm() -> FrontMatter {
         FrontMatter {
@@ -233,7 +238,10 @@ mod tests {
         // sha on disk equals returned sha
         let on_disk = std::fs::read(p.root.join(&s1.markdown_rel_path)).unwrap();
         let parsed = parse_doc_file(std::str::from_utf8(&on_disk).unwrap()).unwrap();
-        assert_eq!(atomic::sha256_hex(parsed.body.as_bytes()), s1.markdown_sha256);
+        assert_eq!(
+            atomic::sha256_hex(parsed.body.as_bytes()),
+            s1.markdown_sha256
+        );
     }
 
     #[test]

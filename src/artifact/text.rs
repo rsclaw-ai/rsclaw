@@ -55,12 +55,7 @@ pub fn head_tail(lines: &[String], head: u32, tail: u32) -> Vec<String> {
 /// — building the marker here, with the omitted-line count in hand, is
 /// race-free and avoids the previous `replacen` post-pass that
 /// silently no-op'd if the source content contained the same literal.
-pub fn head_tail_with_marker<F>(
-    lines: &[String],
-    head: u32,
-    tail: u32,
-    marker: F,
-) -> Vec<String>
+pub fn head_tail_with_marker<F>(lines: &[String], head: u32, tail: u32, marker: F) -> Vec<String>
 where
     F: FnOnce(usize) -> String,
 {

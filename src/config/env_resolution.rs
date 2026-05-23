@@ -2,21 +2,19 @@
 //! in rsclaw.json5.
 //!
 //! Pipeline at config load time:
-//!   1. Snapshot the *current* process env once (first call wins,
-//!      cached for the rest of the process lifetime). This is the
-//!      "shell-provided" view, captured before we mutate process env
-//!      with `.env` values.
-//!   2. Load `$BASE_DIR/.env` into process env. `.env` is the source of
-//!      truth for the vars it defines — its values override any stale
-//!      value the launching shell may still export.
+//!   1. Snapshot the *current* process env once (first call wins, cached for
+//!      the rest of the process lifetime). This is the "shell-provided" view,
+//!      captured before we mutate process env with `.env` values.
+//!   2. Load `$BASE_DIR/.env` into process env. `.env` is the source of truth
+//!      for the vars it defines — its values override any stale value the
+//!      launching shell may still export.
 //!   3. Scan the raw rsclaw.json5 text for `${VAR}` placeholders and
-//!      `{source:"env",id:"X"}` SecretRef nodes. Both forms reference
-//!      env vars.
-//!   4. Capture: referenced vars present in the shell but missing from
-//!      `.env` are appended (first run / newly-referenced var). An
-//!      existing `.env` value is NEVER overwritten from the shell here —
-//!      that would silently revert a hand-edit. Rotating a value from the
-//!      shell is an explicit `rsclaw env sync`.
+//!      `{source:"env",id:"X"}` SecretRef nodes. Both forms reference env vars.
+//!   4. Capture: referenced vars present in the shell but missing from `.env`
+//!      are appended (first run / newly-referenced var). An existing `.env`
+//!      value is NEVER overwritten from the shell here — that would silently
+//!      revert a hand-edit. Rotating a value from the shell is an explicit
+//!      `rsclaw env sync`.
 //!
 //! After this runs, process env is the single source of truth for
 //! `expand_env_vars` and `SecretOrString::resolve_early`. The `.env`
@@ -24,11 +22,13 @@
 //! service-managed launch (launchd / systemd) where there's no shell
 //! env to inherit from.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::Path;
-use std::process::{Command, Stdio};
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    path::Path,
+    process::{Command, Stdio},
+    sync::OnceLock,
+    time::Duration,
+};
 
 use anyhow::Result;
 use regex::Regex;
@@ -154,8 +154,8 @@ fn vars_to_capture(
 ///
 /// Returns `None` when:
 ///   - on Windows (no POSIX rc-file convention here)
-///   - `_RSCLAW_ENV_INHERITED=1` is already set (we're a self-restart
-///     child of a process that already ran this)
+///   - `_RSCLAW_ENV_INHERITED=1` is already set (we're a self-restart child of
+///     a process that already ran this)
 ///   - `RSCLAW_NO_SHELL_SOURCE=1` is set (operator opt-out)
 ///   - we couldn't determine the login shell or it doesn't exist
 ///   - the shell timed out, returned non-zero, or wrote no env output
@@ -241,7 +241,9 @@ fn resolve_login_shell() -> Option<String> {
             return Some(s);
         }
     }
-    let user = std::env::var("USER").or_else(|_| std::env::var("LOGNAME")).ok()?;
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .ok()?;
 
     #[cfg(target_os = "macos")]
     {
@@ -339,10 +341,8 @@ static PLACEHOLDER_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| 
 /// literals (e.g. a tool description that mentions `{source:'env',
 /// id:'PATH'}` would otherwise persist `PATH` into `.env`).
 static SECRETREF_ENV_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-    Regex::new(
-        r#""?source"?\s*:\s*"env"\s*,[^}]*?"?id"?\s*:\s*["']([A-Za-z_][A-Za-z0-9_]*)["']"#,
-    )
-    .expect("valid regex")
+    Regex::new(r#""?source"?\s*:\s*"env"\s*,[^}]*?"?id"?\s*:\s*["']([A-Za-z_][A-Za-z0-9_]*)["']"#)
+        .expect("valid regex")
 });
 
 /// Sentinel-wrapped placeholder used to make the raw config parseable as

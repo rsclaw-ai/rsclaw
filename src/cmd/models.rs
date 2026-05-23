@@ -1,8 +1,11 @@
-use anyhow::Result;
 use std::path::PathBuf;
 
-use super::config_json::{load_config_json, remove_nested_value, set_nested_value};
-use super::style::*;
+use anyhow::Result;
+
+use super::{
+    config_json::{load_config_json, remove_nested_value, set_nested_value},
+    style::*,
+};
 use crate::{
     cli::{
         AliasesCommand, AuthOrderCommand, FallbacksCommand, ImageFallbacksCommand,
@@ -14,7 +17,10 @@ use crate::{
 pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
     match sub {
         ModelsCommand::List | ModelsCommand::Status => {
-            banner(&format!("rsclaw models v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
+            banner(&format!(
+                "rsclaw models v{}",
+                option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
+            ));
             let config = config::load()?;
             if let Some(models_cfg) = &config.model.models {
                 println!(
@@ -67,7 +73,10 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
             ok(&format!("image model set to '{}'", cyan(&model)));
         }
         ModelsCommand::Scan => {
-            banner(&format!("rsclaw model scan v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
+            banner(&format!(
+                "rsclaw model scan v{}",
+                option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
+            ));
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()?;
@@ -79,7 +88,10 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
                         warn_msg("ollama: no models found");
                     } else {
                         for m in models {
-                            item("-", &format!("ollama/{}", m["name"].as_str().unwrap_or("?")));
+                            item(
+                                "-",
+                                &format!("ollama/{}", m["name"].as_str().unwrap_or("?")),
+                            );
                         }
                     }
                 }
@@ -88,7 +100,10 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
         }
         ModelsCommand::Aliases(sub) => match sub {
             AliasesCommand::List => {
-                banner(&format!("rsclaw model aliases v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
+                banner(&format!(
+                    "rsclaw model aliases v{}",
+                    option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
+                ));
                 let config = config::load()?;
                 let aliases = config.agents.defaults.models.as_ref();
                 if aliases.is_none_or(|a| a.is_empty()) {
@@ -119,7 +134,10 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
         },
         ModelsCommand::Fallbacks(sub) => match sub {
             FallbacksCommand::List => {
-                banner(&format!("rsclaw model fallbacks v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
+                banner(&format!(
+                    "rsclaw model fallbacks v{}",
+                    option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
+                ));
                 let config = config::load()?;
                 let fallbacks = config
                     .agents
@@ -177,7 +195,10 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
         },
         ModelsCommand::ImageFallbacks(sub) => match sub {
             ImageFallbacksCommand::List => {
-                banner(&format!("rsclaw image fallbacks v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
+                banner(&format!(
+                    "rsclaw image fallbacks v{}",
+                    option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
+                ));
                 let config = config::load()?;
                 let fallbacks = config
                     .agents
@@ -235,14 +256,26 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
         },
         ModelsCommand::Auth(sub) => match sub {
             ModelsAuthCommand::Add => {
-                banner(&format!("rsclaw models auth v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
+                banner(&format!(
+                    "rsclaw models auth v{}",
+                    option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
+                ));
                 println!("  Add a provider to rsclaw.json5:");
                 println!();
                 println!("  {}", dim(r#"models: {"#));
                 println!("  {}", dim(r#"  providers: {"#));
-                println!("  {}", dim(r#"    anthropic: { apiKey: "${ANTHROPIC_API_KEY}" },"#));
-                println!("  {}", dim(r#"    openai:    { apiKey: "${OPENAI_API_KEY}" },"#));
-                println!("  {}", dim(r#"    ollama:    { baseUrl: "http://localhost:11434" },"#));
+                println!(
+                    "  {}",
+                    dim(r#"    anthropic: { apiKey: "${ANTHROPIC_API_KEY}" },"#)
+                );
+                println!(
+                    "  {}",
+                    dim(r#"    openai:    { apiKey: "${OPENAI_API_KEY}" },"#)
+                );
+                println!(
+                    "  {}",
+                    dim(r#"    ollama:    { baseUrl: "http://localhost:11434" },"#)
+                );
                 println!("  {}", dim(r#"  }"#));
                 println!("  {}", dim(r#"}"#));
             }
@@ -255,7 +288,10 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
                 std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
                 ok("gateway.authToken generated");
                 kv("token", &bold(&token));
-                println!("  {}", dim("Use this token in Authorization: Bearer <token> headers"));
+                println!(
+                    "  {}",
+                    dim("Use this token in Authorization: Bearer <token> headers")
+                );
             }
             ModelsAuthCommand::PasteToken => {
                 use std::io::BufRead as _;
@@ -290,9 +326,7 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
                     kv("provider", &cyan(&provider));
                     println!(
                         "  {}",
-                        dim(&format!(
-                            "configure via models.providers.{provider}.order"
-                        ))
+                        dim(&format!("configure via models.providers.{provider}.order"))
                     );
                 }
                 AuthOrderCommand::Set { provider, order } => {
@@ -385,7 +419,14 @@ const AVAILABLE_MODELS: &[ModelDef] = &[
         url: "https://gitfast.org/tools/models/sherpa-onnx-paraformer-zh-2025-10-07.tar.bz2",
     },
     ModelDef {
-        names: &["vits", "tts", "melo", "melo-tts", "melo-tts-zh", "vits-melo"],
+        names: &[
+            "vits",
+            "tts",
+            "melo",
+            "melo-tts",
+            "melo-tts-zh",
+            "vits-melo",
+        ],
         label: "MeloTTS-ZH (Chinese+English TTS, default, ~300MB)",
         dir: "vits-melo-tts-zh_en",
         url: "https://gitfast.org/tools/models/vits-melo-tts-zh_en.tar.bz2",
@@ -408,12 +449,19 @@ async fn cmd_download_embedding(model: Option<String>) -> Result<()> {
 
     let Some(def) = def else {
         let available: Vec<_> = AVAILABLE_MODELS.iter().map(|m| m.names[0]).collect();
-        anyhow::bail!("Unknown model: {model_name}. Available: {}", available.join(", "));
+        anyhow::bail!(
+            "Unknown model: {model_name}. Available: {}",
+            available.join(", ")
+        );
     };
 
     let model_dir = base_dir.join("models").join(def.dir);
     if model_dir.join("config.json").exists() || model_dir.join("tokens.txt").exists() {
-        ok(&format!("{} already installed at {}", def.label, model_dir.display()));
+        ok(&format!(
+            "{} already installed at {}",
+            def.label,
+            model_dir.display()
+        ));
         return Ok(());
     }
 
@@ -424,15 +472,26 @@ fn cmd_list_installed() {
     let base_dir = crate::config::loader::base_dir();
     let models_dir = base_dir.join("models");
 
-    banner(&format!("rsclaw installed models v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
+    banner(&format!(
+        "rsclaw installed models v{}",
+        option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
+    ));
 
     let mut found = false;
     for def in AVAILABLE_MODELS {
         let dir = models_dir.join(def.dir);
         // Check for common marker files.
-        if dir.join("config.json").exists() || dir.join("tokens.txt").exists() || dir.join("model.onnx").exists() {
+        if dir.join("config.json").exists()
+            || dir.join("tokens.txt").exists()
+            || dir.join("model.onnx").exists()
+        {
             let size = dir_size(&dir);
-            println!("  {:<20} {}    {}MB", cyan(def.dir), dim(def.label), size / 1_000_000);
+            println!(
+                "  {:<20} {}    {}MB",
+                cyan(def.dir),
+                dim(def.label),
+                size / 1_000_000
+            );
             found = true;
         }
     }
@@ -441,7 +500,12 @@ fn cmd_list_installed() {
     let base_zh = models_dir.join("bge-base-zh");
     if base_zh.join("config.json").exists() {
         let size = dir_size(&base_zh);
-        println!("  {:<20} {}    {}MB", cyan("bge-base-zh"), dim("(legacy path)"), size / 1_000_000);
+        println!(
+            "  {:<20} {}    {}MB",
+            cyan("bge-base-zh"),
+            dim("(legacy path)"),
+            size / 1_000_000
+        );
         found = true;
     }
 
@@ -449,7 +513,14 @@ fn cmd_list_installed() {
         warn_msg("no models installed");
         println!();
         println!("  Run: rsclaw models download");
-        println!("  Available: {}", AVAILABLE_MODELS.iter().map(|m| m.names[0]).collect::<Vec<_>>().join(", "));
+        println!(
+            "  Available: {}",
+            AVAILABLE_MODELS
+                .iter()
+                .map(|m| m.names[0])
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
 }
 

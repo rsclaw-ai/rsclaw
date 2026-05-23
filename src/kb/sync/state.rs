@@ -1,9 +1,12 @@
 //! SyncRegistry: per-source state load/save. Reuses
 //! `store::seen::SyncState` for persistence.
 
-use crate::kb::store::seen::{get_sync_state, put_sync_state, SyncState};
-use crate::kb::store::KbStore;
 use anyhow::Result;
+
+use crate::kb::store::{
+    KbStore,
+    seen::{SyncState, get_sync_state, put_sync_state},
+};
 
 pub struct SyncRegistry;
 
@@ -23,8 +26,9 @@ impl SyncRegistry {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
+
+    use super::*;
 
     #[test]
     fn load_returns_none_for_missing() {
@@ -37,7 +41,10 @@ mod tests {
     fn save_then_load_roundtrip() {
         let tmp = TempDir::new().unwrap();
         let store = KbStore::open(&tmp.path().join("kb.redb")).unwrap();
-        let state = SyncState { cursor: "etag:abc".into(), last_sync_at: 123 };
+        let state = SyncState {
+            cursor: "etag:abc".into(),
+            last_sync_at: 123,
+        };
         SyncRegistry::save(&store, "src1", &state).unwrap();
         let got = SyncRegistry::load(&store, "src1").unwrap().unwrap();
         assert_eq!(got.cursor, "etag:abc");

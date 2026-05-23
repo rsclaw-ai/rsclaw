@@ -13,11 +13,10 @@ pub mod compact;
 pub mod store;
 pub mod text;
 
-pub use compact::{compact_text, compact_value, PreviewBudget, ARTIFACT_THRESHOLD_CHARS};
-pub use store::{ArtifactId, ArtifactStore, ARTIFACT_SUBDIR};
+use std::{sync::OnceLock, time::Duration};
 
-use std::sync::OnceLock;
-use std::time::Duration;
+pub use compact::{ARTIFACT_THRESHOLD_CHARS, PreviewBudget, compact_text, compact_value};
+pub use store::{ARTIFACT_SUBDIR, ArtifactId, ArtifactStore};
 
 /// Housekeep cadence — every 6h we walk the artifact dir and delete files
 /// past the 7-day TTL. Cheap (one `read_dir` per session + mtime check per

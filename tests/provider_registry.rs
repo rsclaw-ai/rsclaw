@@ -1,8 +1,7 @@
 //! Integration tests for ProviderRegistry: resolve_model, parse_model,
 //! alias priority, fallback chains, and CRUD operations.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Result;
 use futures::future::BoxFuture;
@@ -91,10 +90,7 @@ fn parse_model_inferred_kimi() {
         ProviderRegistry::parse_model("moonshot-v1-8k"),
         ("kimi", "moonshot-v1-8k")
     );
-    assert_eq!(
-        ProviderRegistry::parse_model("kimi-2"),
-        ("kimi", "kimi-2")
-    );
+    assert_eq!(ProviderRegistry::parse_model("kimi-2"), ("kimi", "kimi-2"));
 }
 
 #[test]
@@ -181,7 +177,10 @@ fn resolve_model_alias_target_not_registered_falls_through() {
 
     let mut aliases = HashMap::new();
     // Alias points to "missing_provider" which is not registered
-    aliases.insert("claude-sonnet-4-5".to_owned(), "missing_provider".to_owned());
+    aliases.insert(
+        "claude-sonnet-4-5".to_owned(),
+        "missing_provider".to_owned(),
+    );
     reg.set_model_aliases(aliases);
 
     let (p, m) = reg.resolve_model("claude-sonnet-4-5");

@@ -7,7 +7,10 @@ pub async fn cmd_sandbox(sub: SandboxCommand) -> Result<()> {
     let config = config::load()?;
     match sub {
         SandboxCommand::List => {
-            banner(&format!("rsclaw sandbox v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
+            banner(&format!(
+                "rsclaw sandbox v{}",
+                option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
+            ));
             match config.ops.sandbox.as_ref() {
                 Some(sb) => {
                     let mode = sb
@@ -33,7 +36,10 @@ pub async fn cmd_sandbox(sub: SandboxCommand) -> Result<()> {
             }
         }
         SandboxCommand::Explain => {
-            banner(&format!("rsclaw sandbox explain v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
+            banner(&format!(
+                "rsclaw sandbox explain v{}",
+                option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
+            ));
             println!("  Each agent runs in its own isolated environment.");
             println!(
                 "  Configure via {} in rsclaw.json5 / openclaw.json",
@@ -51,10 +57,16 @@ pub async fn cmd_sandbox(sub: SandboxCommand) -> Result<()> {
                         .and_then(|d| d.image.as_deref())
                         .unwrap_or("(default)");
                     let target = id.as_deref().unwrap_or("all");
-                    ok(&format!("sandbox recreate '{}' -- image:{}", cyan(target), bold(image)));
+                    ok(&format!(
+                        "sandbox recreate '{}' -- image:{}",
+                        cyan(target),
+                        bold(image)
+                    ));
                     println!(
                         "  {}",
-                        dim("Send SIGUSR1 to the gateway process or restart it to rebuild containers")
+                        dim(
+                            "Send SIGUSR1 to the gateway process or restart it to rebuild containers"
+                        )
                     );
                 }
             }

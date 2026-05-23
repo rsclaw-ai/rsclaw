@@ -1,9 +1,9 @@
 //! Integration test for the ShellSource event producer.
 
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
 
 use rsclaw::gateway::watch::source::{ShellSource, SourceImpl};
+use tokio::sync::{mpsc, oneshot};
 
 #[tokio::test]
 async fn shell_source_streams_stdout_lines() {

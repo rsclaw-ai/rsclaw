@@ -1,7 +1,8 @@
 //! Cron job management tool handlers and file-based job storage helpers.
 //!
 //! Split from `tools_misc.rs` for maintainability.  All methods live in
-//! `impl AgentRuntime` via the split-impl pattern (same struct, different file).
+//! `impl AgentRuntime` via the split-impl pattern (same struct, different
+//! file).
 
 use std::time::Duration;
 
@@ -12,7 +13,11 @@ use tracing::debug;
 use uuid::Uuid;
 
 impl super::runtime::AgentRuntime {
-    pub(crate) async fn tool_cron(&self, args: Value, ctx: &super::runtime::RunContext) -> Result<Value> {
+    pub(crate) async fn tool_cron(
+        &self,
+        args: Value,
+        ctx: &super::runtime::RunContext,
+    ) -> Result<Value> {
         let action = args["action"]
             .as_str()
             .ok_or_else(|| anyhow!("cron: `action` required"))?;
@@ -60,12 +65,21 @@ impl super::runtime::AgentRuntime {
                 // Schedule: support cron expr, delay (once), or interval.
                 let delay_ms = args["delay_ms"].as_u64().or(args["delayMs"].as_u64());
                 let schedule = args["schedule"].as_str();
-                // Fixed-interval schedule: prefer `every_seconds` (friendly), accept `every_ms` too.
+                // Fixed-interval schedule: prefer `every_seconds` (friendly), accept `every_ms`
+                // too.
                 let every_ms: Option<u64> = args["every_ms"]
                     .as_u64()
                     .or(args["everyMs"].as_u64())
-                    .or_else(|| args["every_seconds"].as_u64().map(|s| s.saturating_mul(1000)))
-                    .or_else(|| args["everySeconds"].as_u64().map(|s| s.saturating_mul(1000)));
+                    .or_else(|| {
+                        args["every_seconds"]
+                            .as_u64()
+                            .map(|s| s.saturating_mul(1000))
+                    })
+                    .or_else(|| {
+                        args["everySeconds"]
+                            .as_u64()
+                            .map(|s| s.saturating_mul(1000))
+                    });
 
                 if let Some(delay) = delay_ms {
                     // Short delays (<=30min): use in-memory timer, skip cron.json5.
@@ -107,10 +121,14 @@ impl super::runtime::AgentRuntime {
                                     tracing::warn!(error = %e, "cron in-memory timer: notification_tx send failed");
                                 }
                             } else {
-                                tracing::warn!("cron in-memory timer: no notification_tx wired up, reminder dropped");
+                                tracing::warn!(
+                                    "cron in-memory timer: no notification_tx wired up, reminder dropped"
+                                );
                             }
                         });
-                        return Ok(json!({"added": id, "type": "in-memory timer", "delay_ms": delay, "message": message}));
+                        return Ok(
+                            json!({"added": id, "type": "in-memory timer", "delay_ms": delay, "message": message}),
+                        );
                     }
 
                     // Long delay: persist to cron.json5
@@ -144,8 +162,10 @@ impl super::runtime::AgentRuntime {
                             "cron add: both `schedule` and `every_seconds`/`every_ms` provided; using interval and ignoring schedule"
                         );
                     }
-                    // Anchor at now so the first fire is `now + interval_ms` (per CronSchedule::compute_next_run).
-                    job["schedule"] = json!({"kind": "every", "everyMs": interval_ms, "anchorMs": now_ms});
+                    // Anchor at now so the first fire is `now + interval_ms` (per
+                    // CronSchedule::compute_next_run).
+                    job["schedule"] =
+                        json!({"kind": "every", "everyMs": interval_ms, "anchorMs": now_ms});
                 } else if let Some(sched) = schedule {
                     // Standard cron expression or interval.
                     // Always include timezone. Use LLM-provided, config, or auto-detected.
@@ -162,7 +182,8 @@ impl super::runtime::AgentRuntime {
                                 -18000 => "US/Eastern",
                                 -28800 => "US/Pacific",
                                 _ => "UTC",
-                            }.to_owned()
+                            }
+                            .to_owned()
                         });
                     job["schedule"] = json!({"kind": "cron", "expr": sched, "tz": tz_val});
                 } else {
@@ -204,20 +225,32 @@ impl super::runtime::AgentRuntime {
                     job["iter"] = json!({"items": items, "cursor": 0});
                 }
 
-                // Auto-set delivery to the originating channel+peer when not explicitly specified.
-                // Special case: WS chat transport uses ctx.channel="ws", but the delivery
-                // sink registered in ChannelManager is "desktop" (DesktopChannel broadcasts
-                // to all connected WS clients). Remap so send_delivery can route.
+                // Auto-set delivery to the originating channel+peer when not explicitly
+                // specified. Special case: WS chat transport uses
+                // ctx.channel="ws", but the delivery sink registered in
+                // ChannelManager is "desktop" (DesktopChannel broadcasts to all
+                // connected WS clients). Remap so send_delivery can route.
                 let channel = &ctx.channel;
                 let peer_id = &ctx.peer_id;
-                if !channel.is_empty() && channel != "system" && channel != "cron" && !peer_id.is_empty() {
-                    let delivery_channel: &str = if channel == "ws" { "desktop" } else { channel.as_str() };
+                if !channel.is_empty()
+                    && channel != "system"
+                    && channel != "cron"
+                    && !peer_id.is_empty()
+                {
+                    let delivery_channel: &str = if channel == "ws" {
+                        "desktop"
+                    } else {
+                        channel.as_str()
+                    };
                     job["delivery"] = json!({
                         "channel": delivery_channel,
                         "to": peer_id,
                         "mode": "always"
                     });
-                    debug!(channel = delivery_channel, peer_id, "cron add: auto-set delivery to originating channel");
+                    debug!(
+                        channel = delivery_channel,
+                        peer_id, "cron add: auto-set delivery to originating channel"
+                    );
                 }
 
                 jobs.push(job);
@@ -298,14 +331,18 @@ impl super::runtime::AgentRuntime {
                     if idx == 0 || idx > jobs.len() {
                         return Err(anyhow!(
                             "cron {}: invalid index {} (valid: 1-{})",
-                            action, index, jobs.len()
+                            action,
+                            index,
+                            jobs.len()
                         ));
                     }
                     idx - 1
                 } else if let Some(id) = args["id"].as_str() {
                     match jobs.iter().position(|j| j["id"].as_str() == Some(id)) {
                         Some(pos) => pos,
-                        None => return Err(anyhow!("cron {}: job not found with id={}", action, id)),
+                        None => {
+                            return Err(anyhow!("cron {}: job not found with id={}", action, id));
+                        }
                     }
                 } else {
                     return Err(anyhow!(
@@ -341,7 +378,8 @@ impl super::runtime::AgentRuntime {
                     if idx == 0 || idx > jobs.len() {
                         return Err(anyhow!(
                             "cron edit: invalid index {} (valid: 1-{})",
-                            index, jobs.len()
+                            index,
+                            jobs.len()
                         ));
                     }
                     idx - 1
@@ -360,7 +398,8 @@ impl super::runtime::AgentRuntime {
                 if let Some(schedule) = args["schedule"].as_str() {
                     let tz = args["tz"].as_str();
                     if let Some(tz_val) = tz {
-                        jobs[idx]["schedule"] = json!({"kind": "cron", "expr": schedule, "tz": tz_val});
+                        jobs[idx]["schedule"] =
+                            json!({"kind": "cron", "expr": schedule, "tz": tz_val});
                     } else {
                         jobs[idx]["schedule"] = json!({"kind": "cron", "expr": schedule});
                     }
@@ -466,7 +505,10 @@ pub(crate) fn format_cron_jobs(jobs: &[Value]) -> String {
         let id = job.get("id").and_then(|v| v.as_str()).unwrap_or("?");
         let enabled = job.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
         let status = if enabled { "" } else { " (disabled)" };
-        let agent = job.get("agentId").and_then(|v| v.as_str()).unwrap_or("main");
+        let agent = job
+            .get("agentId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("main");
         let name = job.get("name").and_then(|v| v.as_str());
         let schedule = match job.get("schedule") {
             Some(s) if s.is_object() => {
@@ -512,8 +554,8 @@ pub(crate) fn format_cron_jobs(jobs: &[Value]) -> String {
 }
 
 /// Read cron jobs from cron.json5.
-/// Handles both bare array `[...]` and wrapped `{"version":1,"jobs":[...]}` formats.
-/// Parses with json5 for comment support.
+/// Handles both bare array `[...]` and wrapped `{"version":1,"jobs":[...]}`
+/// formats. Parses with json5 for comment support.
 pub(crate) async fn read_cron_jobs(path: &std::path::Path) -> Vec<Value> {
     let data = tokio::fs::read_to_string(path)
         .await

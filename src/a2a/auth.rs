@@ -21,8 +21,10 @@ use axum::{
     response::Response,
 };
 
-use crate::config::runtime::A2aPrincipal;
-use crate::server::{AppState, constant_time_eq};
+use crate::{
+    config::runtime::A2aPrincipal,
+    server::{AppState, constant_time_eq},
+};
 
 /// Resolved identity for an authenticated A2A request, inserted into the
 /// request extensions. Carries the principal id and scopes but NOT the secret,

@@ -78,15 +78,16 @@ mod tests {
 
     #[test]
     fn strip_fragment() {
-        assert_eq!(canonicalize_url("https://a.com/x#frag").unwrap(), "https://a.com/x");
+        assert_eq!(
+            canonicalize_url("https://a.com/x#frag").unwrap(),
+            "https://a.com/x"
+        );
     }
 
     #[test]
     fn strip_utm() {
-        let c = canonicalize_url(
-            "https://example.com/x?utm_source=a&utm_campaign=b&real=keep",
-        )
-        .unwrap();
+        let c = canonicalize_url("https://example.com/x?utm_source=a&utm_campaign=b&real=keep")
+            .unwrap();
         assert!(!c.contains("utm_"));
         assert!(c.contains("real=keep"));
     }

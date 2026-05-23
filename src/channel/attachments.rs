@@ -5,10 +5,10 @@
 //! These helpers centralise the bits that are identical across platforms:
 //!
 //! - `parse_data_url` extracts the MIME and base64 payload from a
-//!   `data:image/<subtype>;base64,...` URI of any subtype, including those
-//!   with extra `;param=value` sections (RFC 2397).
-//! - `mime_to_ext` maps an `image/*` MIME to a sensible filename extension
-//!   so the platform's CDN inline-preview path picks up the right format.
+//!   `data:image/<subtype>;base64,...` URI of any subtype, including those with
+//!   extra `;param=value` sections (RFC 2397).
+//! - `mime_to_ext` maps an `image/*` MIME to a sensible filename extension so
+//!   the platform's CDN inline-preview path picks up the right format.
 //! - `pick_file_mime` chooses the MIME for a generic file upload, preferring
 //!   the MIME the tool layer attached and falling back to extension-based
 //!   guessing so videos/audio/PDFs aren't downgraded to opaque blobs.
@@ -98,8 +98,7 @@ mod tests {
 
     #[test]
     fn parse_data_url_strips_extra_params() {
-        let (mime, b64) =
-            parse_data_url("data:image/jpeg;charset=utf-8;base64,/9j/=").unwrap();
+        let (mime, b64) = parse_data_url("data:image/jpeg;charset=utf-8;base64,/9j/=").unwrap();
         assert_eq!(mime, "image/jpeg");
         assert_eq!(b64, "/9j/=");
     }

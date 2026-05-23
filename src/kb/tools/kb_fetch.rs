@@ -1,12 +1,17 @@
 //! kb_fetch: by chunk_id, return chunk + optional neighbor context.
 
-use crate::kb::content_store::read::{read_doc_body, read_doc_range};
-use crate::kb::model::CallerScope;
-use crate::kb::search::filter::{is_latest_version, keep_doc, SearchFilter};
-use crate::kb::search::SearchCtx;
-use crate::kb::store::{chunks, docs};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+
+use crate::kb::{
+    content_store::read::{read_doc_body, read_doc_range},
+    model::CallerScope,
+    search::{
+        SearchCtx,
+        filter::{SearchFilter, is_latest_version, keep_doc},
+    },
+    store::{chunks, docs},
+};
 
 #[derive(Debug, Deserialize)]
 pub struct KbFetchInput {
@@ -64,9 +69,7 @@ pub fn run(
             let all = chunks::chunks_for_logical(&rtx, &c.logical_source_id)?;
             let mut adj: Vec<_> = all
                 .into_iter()
-                .filter(|x| {
-                    x.doc_id == c.doc_id && (x.seq + 1 == c.seq || x.seq == c.seq + 1)
-                })
+                .filter(|x| x.doc_id == c.doc_id && (x.seq + 1 == c.seq || x.seq == c.seq + 1))
                 .collect();
             adj.sort_by_key(|x| x.seq);
             adj.into_iter()
@@ -88,5 +91,9 @@ pub fn run(
         None
     };
 
-    Ok(Some(KbFetchOutput { chunk: main, neighbors, full_doc }))
+    Ok(Some(KbFetchOutput {
+        chunk: main,
+        neighbors,
+        full_doc,
+    }))
 }

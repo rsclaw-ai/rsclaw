@@ -22,7 +22,8 @@ pub enum ModelsCommand {
     Auth(ModelsAuthCommand),
     /// Download ML models from gitfast.org.
     Download {
-        /// Model to download (default: bge). Available: bge, bge-base-zh, bge-small-en, whisper, whisper-turbo, vits
+        /// Model to download (default: bge). Available: bge, bge-base-zh,
+        /// bge-small-en, whisper, whisper-turbo, vits
         model: Option<String>,
     },
     /// List installed embedding models.

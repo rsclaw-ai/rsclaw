@@ -24,7 +24,10 @@ impl JobKind {
     /// work in flight collapses to one job.
     pub fn dedupe_key(&self) -> String {
         match self {
-            Self::ChunkAndEmbed { doc_id, doc_version } => {
+            Self::ChunkAndEmbed {
+                doc_id,
+                doc_version,
+            } => {
                 format!("chunk_embed:{doc_id}:{doc_version}")
             }
             Self::RebuildHnsw => "rebuild_hnsw:singleton".into(),
@@ -104,11 +107,20 @@ mod tests {
 
     #[test]
     fn dedupe_key_per_kind() {
-        let j1 = JobKind::ChunkAndEmbed { doc_id: "d1".into(), doc_version: 1 };
-        let j2 = JobKind::ChunkAndEmbed { doc_id: "d1".into(), doc_version: 2 };
+        let j1 = JobKind::ChunkAndEmbed {
+            doc_id: "d1".into(),
+            doc_version: 1,
+        };
+        let j2 = JobKind::ChunkAndEmbed {
+            doc_id: "d1".into(),
+            doc_version: 2,
+        };
         assert_ne!(j1.dedupe_key(), j2.dedupe_key());
         assert_eq!(JobKind::RebuildHnsw.dedupe_key(), "rebuild_hnsw:singleton");
-        assert_eq!(JobKind::RunCompactor.dedupe_key(), "run_compactor:singleton");
+        assert_eq!(
+            JobKind::RunCompactor.dedupe_key(),
+            "run_compactor:singleton"
+        );
     }
 
     #[test]
@@ -142,7 +154,10 @@ mod tests {
 
     #[test]
     fn serde_roundtrip() {
-        let j = Job::new(JobKind::ChunkAndEmbed { doc_id: "d1".into(), doc_version: 2 });
+        let j = Job::new(JobKind::ChunkAndEmbed {
+            doc_id: "d1".into(),
+            doc_version: 2,
+        });
         let s = serde_json::to_string(&j).unwrap();
         assert_eq!(serde_json::from_str::<Job>(&s).unwrap(), j);
     }

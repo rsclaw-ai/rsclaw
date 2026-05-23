@@ -10,8 +10,8 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU32, AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -74,7 +74,11 @@ fn total_system_memory_bytes() -> u64 {
                 0,
             );
         }
-        if size > 0 { size } else { 8 * 1024 * 1024 * 1024 } // fallback 8GB
+        if size > 0 {
+            size
+        } else {
+            8 * 1024 * 1024 * 1024
+        } // fallback 8GB
     }
     #[cfg(target_os = "linux")]
     {
@@ -105,11 +109,15 @@ fn available_memory_bytes() -> u64 {
             let mut inactive: u64 = 0;
             for line in text.lines() {
                 if line.starts_with("Pages free:") {
-                    free = line.split(':').nth(1)
+                    free = line
+                        .split(':')
+                        .nth(1)
                         .map(|s| s.trim().trim_end_matches('.').parse().unwrap_or(0))
                         .unwrap_or(0);
                 } else if line.starts_with("Pages inactive:") {
-                    inactive = line.split(':').nth(1)
+                    inactive = line
+                        .split(':')
+                        .nth(1)
                         .map(|s| s.trim().trim_end_matches('.').parse().unwrap_or(0))
                         .unwrap_or(0);
                 }
@@ -123,7 +131,9 @@ fn available_memory_bytes() -> u64 {
         if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
             for line in meminfo.lines() {
                 if line.starts_with("MemAvailable:") {
-                    let kb: u64 = line.split_whitespace().nth(1)
+                    let kb: u64 = line
+                        .split_whitespace()
+                        .nth(1)
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(0);
                     return kb * 1024;
@@ -174,7 +184,11 @@ pub(crate) struct ChromeProcess {
 }
 
 impl ChromeProcess {
-    pub(crate) async fn launch(chrome_path: &str, headed: bool, profile: Option<&str>) -> Result<Self> {
+    pub(crate) async fn launch(
+        chrome_path: &str,
+        headed: bool,
+        profile: Option<&str>,
+    ) -> Result<Self> {
         can_launch_chrome()?;
 
         // Resolve user-data-dir: named profile or temp dir.
@@ -337,19 +351,22 @@ impl Drop for ChromeProcess {
                 let mut attempts = 0;
                 while attempts < 100 {
                     match self.child.try_wait() {
-                        Ok(Some(_)) => break,    // Process exited
+                        Ok(Some(_)) => break, // Process exited
                         Ok(None) => {
                             std::thread::sleep(std::time::Duration::from_millis(50));
                             attempts += 1;
                         }
-                        Err(_) => break,          // Can't query, assume dead
+                        Err(_) => break, // Can't query, assume dead
                     }
                 }
             }
         }
 
         ACTIVE_INSTANCES.fetch_sub(1, Ordering::Relaxed);
-        debug!("Chrome instance dropped, active={}", ACTIVE_INSTANCES.load(Ordering::Relaxed));
+        debug!(
+            "Chrome instance dropped, active={}",
+            ACTIVE_INSTANCES.load(Ordering::Relaxed)
+        );
     }
 }
 
@@ -389,12 +406,19 @@ pub(crate) async fn detect_existing_chrome(ports: &[u16]) -> Option<String> {
                     // or other automation). The headed path is for the user's
                     // daily browser; hijacking a zombie headless instance leads
                     // to "CDP connect failed" when its renderer tree is stuck.
-                    let ua = body.get("User-Agent").and_then(|v| v.as_str()).unwrap_or("");
+                    let ua = body
+                        .get("User-Agent")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     if ua.contains("HeadlessChrome") {
-                        warn!(port, "skipping headless Chrome on remote-debugging port (not a user browser)");
+                        warn!(
+                            port,
+                            "skipping headless Chrome on remote-debugging port (not a user browser)"
+                        );
                         continue;
                     }
-                    if let Some(ws_url) = body.get("webSocketDebuggerUrl").and_then(|v| v.as_str()) {
+                    if let Some(ws_url) = body.get("webSocketDebuggerUrl").and_then(|v| v.as_str())
+                    {
                         debug!(port, ws_url, "found existing Chrome with remote debugging");
                         return Some(ws_url.to_owned());
                     }
@@ -563,7 +587,8 @@ impl CdpClient {
 
 /// A live browser session backed by a headless Chrome process and CDP.
 pub struct BrowserSession {
-    /// Chrome process handle (killed on drop). None when connected to external Chrome.
+    /// Chrome process handle (killed on drop). None when connected to external
+    /// Chrome.
     chrome: Option<ChromeProcess>,
     /// Remote debugging port extracted from the browser WS URL.
     /// Used for CDP discovery when `chrome` is None (external Chrome).
@@ -630,10 +655,7 @@ impl Drop for BrowserSession {
 fn user_chrome_profile_dir() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        return Some(
-            dirs_next::home_dir()?
-                .join("Library/Application Support/Google/Chrome"),
-        );
+        return Some(dirs_next::home_dir()?.join("Library/Application Support/Google/Chrome"));
     }
     #[cfg(target_os = "windows")]
     {
@@ -717,23 +739,22 @@ async fn find_chrome_by_profile(profile_name: &str) -> Option<String> {
 impl BrowserSession {
     /// Open a Chrome session. Decision tree (most-preferred first):
     ///
-    /// 1. **CDP attach to any debug-enabled chrome** on 9222 / 9223 — if
-    ///    the user already runs chrome with `--remote-debugging-port=`,
-    ///    we ride on their actual session (cookies, extensions, history,
-    ///    logins, anti-bot warm).
+    /// 1. **CDP attach to any debug-enabled chrome** on 9222 / 9223 — if the
+    ///    user already runs chrome with `--remote-debugging-port=`, we ride on
+    ///    their actual session (cookies, extensions, history, logins, anti-bot
+    ///    warm).
     /// 2. **rsclaw's own profile dir** (`<base>/browser-profiles/<profile>/`)
-    ///    if a chrome is alive there — keeps the rsclaw session warm
-    ///    across gateway restarts (verification dialogs hate fresh
-    ///    fingerprints).
+    ///    if a chrome is alive there — keeps the rsclaw session warm across
+    ///    gateway restarts (verification dialogs hate fresh fingerprints).
     /// 3. **Launch the user's system Chrome** with `--remote-debugging-port`
-    ///    pointing at THEIR profile dir, but ONLY if no chrome is
-    ///    currently running on it (singleton lock). User gets all their
-    ///    daily session state for free.
-    /// 4. **Refuse and surface a clear error** if user's chrome is
-    ///    running but without debug enabled — never auto-quit a live
-    ///    browser (unsaved work risk).
-    /// 5. **Launch fresh isolated profile** as the last resort (e.g.
-    ///    when only Chrome for Testing is available).
+    ///    pointing at THEIR profile dir, but ONLY if no chrome is currently
+    ///    running on it (singleton lock). User gets all their daily session
+    ///    state for free.
+    /// 4. **Refuse and surface a clear error** if user's chrome is running but
+    ///    without debug enabled — never auto-quit a live browser (unsaved work
+    ///    risk).
+    /// 5. **Launch fresh isolated profile** as the last resort (e.g. when only
+    ///    Chrome for Testing is available).
     /// Helper: launch chrome and connect CDP. Factored out so `start`
     /// can attempt path-3 (user profile) with a path-5 (rsclaw isolated)
     /// fallback without duplicating the launch sequence.
@@ -758,16 +779,18 @@ impl BrowserSession {
         // 2. rsclaw's named profile already has a chrome alive on it?
         if let Some(profile_name) = profile {
             if let Some(ws_url) = find_chrome_by_profile(profile_name).await {
-                info!(profile = profile_name, "BrowserSession: reusing existing chrome on rsclaw profile");
+                info!(
+                    profile = profile_name,
+                    "BrowserSession: reusing existing chrome on rsclaw profile"
+                );
                 return Self::connect_existing_reuse(&ws_url).await;
             }
         }
 
-        // 3. System Chrome + user's profile available + nobody using it?
-        //    Launch it on the user's behalf with debug enabled. The
-        //    `Some("default")` shortcut in ChromeProcess::launch already
-        //    resolves to the user's Library/Application Support/Google/
-        //    Chrome dir (or the platform equivalent), so we get full
+        // 3. System Chrome + user's profile available + nobody using it? Launch it on
+        //    the user's behalf with debug enabled. The `Some("default")` shortcut in
+        //    ChromeProcess::launch already resolves to the user's Library/Application
+        //    Support/Google/ Chrome dir (or the platform equivalent), so we get full
         //    cookies / extensions / history for free.
         let mut chosen_profile = profile;
         if is_system_chrome(chrome_path) {
@@ -785,17 +808,19 @@ impl BrowserSession {
             // the profile dir on first launch if missing, and using it
             // means later when the user opens chrome themselves they
             // share the same process / cookies / session naturally.
-            info!("BrowserSession: launching user's Chrome with debug enabled (using their daily profile)");
+            info!(
+                "BrowserSession: launching user's Chrome with debug enabled (using their daily profile)"
+            );
             chosen_profile = Some("default");
         }
 
-        // 5. Launch (either user's profile via "default" or rsclaw isolated).
-        //    If the path-3 attempt with the user's profile fails (broken
-        //    Chrome install / corrupted local profile / OS sandbox issue
-        //    — symptom is "Chrome quit unexpectedly"), fall back to
-        //    rsclaw's isolated profile so the gateway stays usable instead
-        //    of returning an error to every tool call.
-        let (chrome, port, cdp) = match Self::try_launch(chrome_path, headed, chosen_profile).await {
+        // 5. Launch (either user's profile via "default" or rsclaw isolated). If the
+        //    path-3 attempt with the user's profile fails (broken Chrome install /
+        //    corrupted local profile / OS sandbox issue — symptom is "Chrome quit
+        //    unexpectedly"), fall back to rsclaw's isolated profile so the gateway
+        //    stays usable instead of returning an error to every tool call.
+        let (chrome, port, cdp) = match Self::try_launch(chrome_path, headed, chosen_profile).await
+        {
             Ok(triple) => triple,
             Err(e) if chosen_profile == Some("default") && profile.is_some() => {
                 warn!(
@@ -837,7 +862,8 @@ impl BrowserSession {
         Self::connect_existing_inner(browser_ws_url, false).await
     }
 
-    /// Connect to existing Chrome, reusing the active tab instead of creating a new one.
+    /// Connect to existing Chrome, reusing the active tab instead of creating a
+    /// new one.
     pub(crate) async fn connect_existing_reuse(browser_ws_url: &str) -> Result<Self> {
         Self::connect_existing_inner(browser_ws_url, true).await
     }
@@ -858,7 +884,8 @@ impl BrowserSession {
 
         let reused = if reuse_tab {
             // Reuse the first existing page tab.
-            targets.iter()
+            targets
+                .iter()
                 .find(|t| t["type"].as_str() == Some("page"))
                 .and_then(|t| {
                     Some((
@@ -876,8 +903,11 @@ impl BrowserSession {
         } else {
             // Create a new tab — we own it and must close it on drop.
             let browser_cdp = CdpClient::connect(browser_ws_url).await?;
-            let result = browser_cdp.send("Target.createTarget", json!({"url": "about:blank"})).await?;
-            let target_id = result.get("targetId")
+            let result = browser_cdp
+                .send("Target.createTarget", json!({"url": "about:blank"}))
+                .await?;
+            let target_id = result
+                .get("targetId")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow!("Target.createTarget did not return targetId"))?
                 .to_owned();
@@ -885,7 +915,8 @@ impl BrowserSession {
 
             // Re-fetch targets to find the new tab.
             let targets: Vec<Value> = http.get(&discovery_url).send().await?.json().await?;
-            let ws_url = targets.iter()
+            let ws_url = targets
+                .iter()
                 .find(|t| t["id"].as_str() == Some(&target_id))
                 .and_then(|t| t["webSocketDebuggerUrl"].as_str())
                 .ok_or_else(|| anyhow!("new tab not found in target list"))?
@@ -900,10 +931,10 @@ impl BrowserSession {
         cdp.send("Runtime.enable", json!({})).await?;
         cdp.send("Network.enable", json!({})).await?;
         // Pretend to be Safari on macOS for the whole browser session.
-        // Some Bytedance endpoints (jimeng, dreamina, douyin) special-case Chrome (block, throttle,
-        // or vary response shape); Safari is what the user's normal browser
-        // would send and matches the UA our server-side reqwest uses for
-        // CDN downloads, so cookies + UA stay consistent end-to-end.
+        // Some Bytedance endpoints (jimeng, dreamina, douyin) special-case Chrome
+        // (block, throttle, or vary response shape); Safari is what the user's
+        // normal browser would send and matches the UA our server-side reqwest
+        // uses for CDN downloads, so cookies + UA stay consistent end-to-end.
         let _ = cdp
             .send(
                 "Network.setUserAgentOverride",
@@ -913,7 +944,8 @@ impl BrowserSession {
                 }),
             )
             .await;
-        cdp.send("Target.setDiscoverTargets", json!({"discover": true})).await?;
+        cdp.send("Target.setDiscoverTargets", json!({"discover": true}))
+            .await?;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -940,7 +972,8 @@ impl BrowserSession {
     }
 
     /// Connect CDP to a Chrome process's page target by port.
-    /// Retries discovery up to 20 times (headed mode can be slow to initialize).
+    /// Retries discovery up to 20 times (headed mode can be slow to
+    /// initialize).
     async fn connect_cdp_by_port(port: u16) -> Result<CdpClient> {
         let discovery_url = format!("http://127.0.0.1:{port}/json");
 
@@ -949,12 +982,14 @@ impl BrowserSession {
             if let Ok(resp) = reqwest::get(&discovery_url).await {
                 if let Ok(targets) = resp.json::<Vec<Value>>().await {
                     if attempt == 0 || attempt == 9 || attempt == 19 {
-                        let types: Vec<&str> = targets.iter()
-                            .filter_map(|t| t["type"].as_str())
-                            .collect();
+                        let types: Vec<&str> =
+                            targets.iter().filter_map(|t| t["type"].as_str()).collect();
                         warn!(attempt, ?types, "CDP target types discovered");
                     }
-                    if let Some(target) = targets.into_iter().find(|t| t["type"].as_str() == Some("page")) {
+                    if let Some(target) = targets
+                        .into_iter()
+                        .find(|t| t["type"].as_str() == Some("page"))
+                    {
                         page_target = Some(target);
                         break;
                     }
@@ -979,10 +1014,10 @@ impl BrowserSession {
         cdp.send("Runtime.enable", json!({})).await?;
         cdp.send("Network.enable", json!({})).await?;
         // Pretend to be Safari on macOS for the whole browser session.
-        // Some Bytedance endpoints (jimeng, dreamina, douyin) special-case Chrome (block, throttle,
-        // or vary response shape); Safari is what the user's normal browser
-        // would send and matches the UA our server-side reqwest uses for
-        // CDN downloads, so cookies + UA stay consistent end-to-end.
+        // Some Bytedance endpoints (jimeng, dreamina, douyin) special-case Chrome
+        // (block, throttle, or vary response shape); Safari is what the user's
+        // normal browser would send and matches the UA our server-side reqwest
+        // uses for CDN downloads, so cookies + UA stay consistent end-to-end.
         let _ = cdp
             .send(
                 "Network.setUserAgentOverride",
@@ -992,13 +1027,15 @@ impl BrowserSession {
                 }),
             )
             .await;
-        cdp.send("Target.setDiscoverTargets", json!({"discover": true})).await?;
+        cdp.send("Target.setDiscoverTargets", json!({"discover": true}))
+            .await?;
 
         Ok(cdp)
     }
 
     /// Check if Chrome is still alive. Returns false if the process exited.
-    /// For external Chrome (chrome is None), always returns true (we do not own it).
+    /// For external Chrome (chrome is None), always returns true (we do not own
+    /// it).
     pub fn is_alive(&mut self) -> bool {
         match self.chrome {
             Some(ref mut chrome) => matches!(chrome.child.try_wait(), Ok(None)),
@@ -1027,7 +1064,9 @@ impl BrowserSession {
         warn!("restarting Chrome browser session");
         if self.chrome.is_some() {
             // Drop old chrome (kills process via Drop) and launch new one.
-            let new_chrome = ChromeProcess::launch(&self.chrome_path, self.headed, self.profile.as_deref()).await?;
+            let new_chrome =
+                ChromeProcess::launch(&self.chrome_path, self.headed, self.profile.as_deref())
+                    .await?;
             let port = new_chrome.port()?;
             let new_cdp = Self::connect_cdp_by_port(port).await?;
             self.debug_port = port;
@@ -1035,10 +1074,7 @@ impl BrowserSession {
             self.cdp = new_cdp;
         } else {
             // External Chrome: create a fresh tab (don't hijack user's existing tabs).
-            let browser_ws = format!(
-                "ws://127.0.0.1:{}/devtools/browser",
-                self.debug_port
-            );
+            let browser_ws = format!("ws://127.0.0.1:{}/devtools/browser", self.debug_port);
             // Try to get the full browser ws URL from /json/version.
             let version_url = format!("http://127.0.0.1:{}/json/version", self.debug_port);
             let browser_ws_url = match reqwest::Client::new()
@@ -1056,11 +1092,14 @@ impl BrowserSession {
                 Err(_) => browser_ws,
             };
             let browser_cdp = CdpClient::connect(&browser_ws_url).await?;
-            let create = browser_cdp.send("Target.createTarget", json!({"url": "about:blank"})).await?;
+            let create = browser_cdp
+                .send("Target.createTarget", json!({"url": "about:blank"}))
+                .await?;
             let target_id = create["targetId"]
                 .as_str()
                 .ok_or_else(|| anyhow!("restart: no targetId from Target.createTarget"))?;
-            // browser_cdp intentionally dropped here — we only needed it for Target.createTarget.
+            // browser_cdp intentionally dropped here — we only needed it for
+            // Target.createTarget.
             drop(browser_cdp);
 
             let discovery = format!("http://127.0.0.1:{}/json", self.debug_port);
@@ -1125,10 +1164,16 @@ impl BrowserSession {
             (dialogs, fetches)
         };
         for event in &dialog_events {
-            let msg = event["params"]["message"].as_str().unwrap_or("").to_string();
+            let msg = event["params"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
             let dtype = event["params"]["type"].as_str().unwrap_or("");
             if dtype == "alert" || dtype == "beforeunload" {
-                let _ = self.cdp.send("Page.handleJavaScriptDialog", json!({"accept": true})).await;
+                let _ = self
+                    .cdp
+                    .send("Page.handleJavaScriptDialog", json!({"accept": true}))
+                    .await;
             } else {
                 self.pending_dialog = Some(msg);
             }
@@ -1141,9 +1186,15 @@ impl BrowserSession {
             for (pattern, rule_action) in &self.intercept_rules {
                 if req_url.contains(pattern.as_str()) {
                     if rule_action == "block" {
-                        let _ = self.cdp.send("Fetch.failRequest", json!({
-                            "requestId": req_id, "errorReason": "BlockedByClient"
-                        })).await;
+                        let _ = self
+                            .cdp
+                            .send(
+                                "Fetch.failRequest",
+                                json!({
+                                    "requestId": req_id, "errorReason": "BlockedByClient"
+                                }),
+                            )
+                            .await;
                     } else if let Some(body) = rule_action.strip_prefix("mock:") {
                         let encoded = base64::engine::general_purpose::STANDARD.encode(body);
                         let _ = self.cdp.send("Fetch.fulfillRequest", json!({
@@ -1158,7 +1209,10 @@ impl BrowserSession {
                 }
             }
             if !handled {
-                let _ = self.cdp.send("Fetch.continueRequest", json!({"requestId": req_id})).await;
+                let _ = self
+                    .cdp
+                    .send("Fetch.continueRequest", json!({"requestId": req_id}))
+                    .await;
             }
         }
 
@@ -1237,7 +1291,14 @@ impl BrowserSession {
                         "ts": chrono::Utc::now().timestamp_millis(),
                     });
                     // Capture low-quality screenshot for trace.
-                    if let Ok(ss) = self.cdp.send("Page.captureScreenshot", json!({"format": "jpeg", "quality": 30})).await {
+                    if let Ok(ss) = self
+                        .cdp
+                        .send(
+                            "Page.captureScreenshot",
+                            json!({"format": "jpeg", "quality": 30}),
+                        )
+                        .await
+                    {
                         if let Some(data) = ss.get("data").and_then(|v| v.as_str()) {
                             entry["screenshot"] = json!(format!("data:image/jpeg;base64,{data}"));
                         }
@@ -1248,8 +1309,8 @@ impl BrowserSession {
         }
 
         // If the command failed due to a CDP transport error (WebSocket disconnected,
-        // Chrome crashed, etc.), restart the session. Do NOT restart for normal business
-        // errors like "element not found" or "timeout".
+        // Chrome crashed, etc.), restart the session. Do NOT restart for normal
+        // business errors like "element not found" or "timeout".
         if let Err(ref e) = result {
             let msg = e.to_string();
             let is_transport_error = msg.contains("WebSocket")
@@ -1324,11 +1385,21 @@ impl BrowserSession {
         self.ref_counter = 0;
 
         // interactive mode: only return elements with @ref (saves 80% tokens)
-        let interactive = args.get("interactive").and_then(|v| v.as_bool()).unwrap_or(false)
+        let interactive = args
+            .get("interactive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
             || args.get("i").and_then(|v| v.as_bool()).unwrap_or(false);
-        let annotate = args.get("annotate").and_then(|v| v.as_bool()).unwrap_or(false);
+        let annotate = args
+            .get("annotate")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
-        let js = if interactive { SNAPSHOT_INTERACTIVE_JS } else { SNAPSHOT_JS };
+        let js = if interactive {
+            SNAPSHOT_INTERACTIVE_JS
+        } else {
+            SNAPSHOT_JS
+        };
         let result = self
             .cdp
             .send(
@@ -1360,10 +1431,7 @@ impl BrowserSession {
             })
             .unwrap_or_default();
 
-        let ref_count = parsed
-            .get("refCount")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
+        let ref_count = parsed.get("refCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
         // Rebuild refs map: @e1 .. @eN -> data-ref attribute values.
         for i in 1..=ref_count {
@@ -1372,18 +1440,27 @@ impl BrowserSession {
         }
         self.ref_counter = ref_count;
 
-        // Annotated screenshot: overlay colorful borders + numbered labels on interactive elements.
-        // Only available in interactive mode (needs data-ref attributes).
+        // Annotated screenshot: overlay colorful borders + numbered labels on
+        // interactive elements. Only available in interactive mode (needs
+        // data-ref attributes).
         if annotate && interactive && ref_count > 0 {
             let annotate_js = SNAPSHOT_ANNOTATE_JS;
-            let legend_raw = self.eval_js(annotate_js).await.unwrap_or_else(|_| "[]".to_string());
+            let legend_raw = self
+                .eval_js(annotate_js)
+                .await
+                .unwrap_or_else(|_| "[]".to_string());
 
             // Capture screenshot with overlays.
-            let ss_result = self.cdp.send("Page.captureScreenshot", json!({"format": "png"})).await?;
+            let ss_result = self
+                .cdp
+                .send("Page.captureScreenshot", json!({"format": "png"}))
+                .await?;
             let data = ss_result.get("data").and_then(|v| v.as_str()).unwrap_or("");
 
             // Remove annotations.
-            let _ = self.eval_js("document.querySelectorAll('.__rsclaw_anno').forEach(e=>e.remove())").await;
+            let _ = self
+                .eval_js("document.querySelectorAll('.__rsclaw_anno').forEach(e=>e.remove())")
+                .await;
 
             let legend: Value = serde_json::from_str(&legend_raw).unwrap_or(json!([]));
             let save_path = save_screenshot_bytes(data, "png").await?;
@@ -1435,22 +1512,36 @@ impl BrowserSession {
             WAIT_ACTIONABLE_JS = WAIT_ACTIONABLE_JS,
         );
 
-        let result = self.cdp.send("Runtime.evaluate", json!({
-            "expression": js,
-            "returnByValue": true,
-            "awaitPromise": true,
-        })).await?;
-        let value = result.get("result").and_then(|r| r.get("value"))
-            .and_then(|v| v.as_str()).unwrap_or("");
+        let result = self
+            .cdp
+            .send(
+                "Runtime.evaluate",
+                json!({
+                    "expression": js,
+                    "returnByValue": true,
+                    "awaitPromise": true,
+                }),
+            )
+            .await?;
+        let value = result
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
         match value {
-            "NOT_FOUND" => bail!("click: element not found (ref={}, text={})",
-                eref.unwrap_or(""), text_sel.unwrap_or("")),
+            "NOT_FOUND" => bail!(
+                "click: element not found (ref={}, text={})",
+                eref.unwrap_or(""),
+                text_sel.unwrap_or("")
+            ),
             "TIMEOUT" => bail!("click: element not actionable within 5s"),
             _ => {}
         }
 
-        Ok(json!({ "action": "click", "ref": eref, "text": format!("Clicked {}", eref.or(text_sel).unwrap_or("element")) }))
+        Ok(
+            json!({ "action": "click", "ref": eref, "text": format!("Clicked {}", eref.or(text_sel).unwrap_or("element")) }),
+        )
     }
 
     /// Dispatch a real mouse click via CDP `Input.dispatchMouseEvent`.
@@ -1484,10 +1575,16 @@ impl BrowserSession {
                 eref = escape_js_string(eref),
             );
 
-            let result = self.cdp.send("Runtime.evaluate", json!({
-                "expression": js,
-                "returnByValue": true,
-            })).await?;
+            let result = self
+                .cdp
+                .send(
+                    "Runtime.evaluate",
+                    json!({
+                        "expression": js,
+                        "returnByValue": true,
+                    }),
+                )
+                .await?;
             let raw = result
                 .get("result")
                 .and_then(|r| r.get("value"))
@@ -1500,9 +1597,13 @@ impl BrowserSession {
                 bail!("clickAt: element {eref} not found (run snapshot first)");
             }
 
-            let cx = parsed.get("x").and_then(|v| v.as_f64())
+            let cx = parsed
+                .get("x")
+                .and_then(|v| v.as_f64())
                 .ok_or_else(|| anyhow!("clickAt: missing x in bounding rect result"))?;
-            let cy = parsed.get("y").and_then(|v| v.as_f64())
+            let cy = parsed
+                .get("y")
+                .and_then(|v| v.as_f64())
                 .ok_or_else(|| anyhow!("clickAt: missing y in bounding rect result"))?;
             (cx, cy)
         } else if let (Some(x), Some(y)) = (explicit_x, explicit_y) {
@@ -1512,31 +1613,46 @@ impl BrowserSession {
         };
 
         // Dispatch three CDP mouse events with small delays to mimic a real click.
-        self.cdp.send("Input.dispatchMouseEvent", json!({
-            "type": "mouseMoved",
-            "x": x,
-            "y": y,
-        })).await?;
+        self.cdp
+            .send(
+                "Input.dispatchMouseEvent",
+                json!({
+                    "type": "mouseMoved",
+                    "x": x,
+                    "y": y,
+                }),
+            )
+            .await?;
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        self.cdp.send("Input.dispatchMouseEvent", json!({
-            "type": "mousePressed",
-            "x": x,
-            "y": y,
-            "button": "left",
-            "clickCount": 1,
-        })).await?;
+        self.cdp
+            .send(
+                "Input.dispatchMouseEvent",
+                json!({
+                    "type": "mousePressed",
+                    "x": x,
+                    "y": y,
+                    "button": "left",
+                    "clickCount": 1,
+                }),
+            )
+            .await?;
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        self.cdp.send("Input.dispatchMouseEvent", json!({
-            "type": "mouseReleased",
-            "x": x,
-            "y": y,
-            "button": "left",
-            "clickCount": 1,
-        })).await?;
+        self.cdp
+            .send(
+                "Input.dispatchMouseEvent",
+                json!({
+                    "type": "mouseReleased",
+                    "x": x,
+                    "y": y,
+                    "button": "left",
+                    "clickCount": 1,
+                }),
+            )
+            .await?;
 
         Ok(json!({"action": "clickAt", "x": x, "y": y}))
     }
@@ -1571,13 +1687,22 @@ impl BrowserSession {
                 WAIT_ACTIONABLE_JS = WAIT_ACTIONABLE_JS,
             );
 
-            let result = self.cdp.send("Runtime.evaluate", json!({
-                "expression": js,
-                "returnByValue": true,
-                "awaitPromise": true,
-            })).await?;
-            let value = result.get("result").and_then(|r| r.get("value"))
-                .and_then(|v| v.as_str()).unwrap_or("");
+            let result = self
+                .cdp
+                .send(
+                    "Runtime.evaluate",
+                    json!({
+                        "expression": js,
+                        "returnByValue": true,
+                        "awaitPromise": true,
+                    }),
+                )
+                .await?;
+            let value = result
+                .get("result")
+                .and_then(|r| r.get("value"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
 
             match value {
                 "NOT_FOUND" => bail!("fill: element {eref} not found (run snapshot first)"),
@@ -1637,10 +1762,7 @@ impl BrowserSession {
             .get("timeout_ms")
             .and_then(|v| v.as_u64())
             .unwrap_or(5000);
-        let index = args
-            .get("index")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
+        let index = args.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
         let ref_esc = escape_js_string(eref);
         let query_esc = escape_js_string(query);
@@ -1741,9 +1863,9 @@ impl BrowserSession {
         if let Some(err) = obj.get("error").and_then(|v| v.as_str()) {
             match err {
                 "NOT_FOUND" => bail!("pick: input {eref} not found (run snapshot first)"),
-                "TIMEOUT" => bail!(
-                    "pick: no visible candidate matching '{query}' within {timeout_ms}ms"
-                ),
+                "TIMEOUT" => {
+                    bail!("pick: no visible candidate matching '{query}' within {timeout_ms}ms")
+                }
                 other => bail!("pick: {other}"),
             }
         }
@@ -1787,13 +1909,22 @@ impl BrowserSession {
             WAIT_ACTIONABLE_JS = WAIT_ACTIONABLE_JS,
         );
 
-        let result = self.cdp.send("Runtime.evaluate", json!({
-            "expression": js,
-            "returnByValue": true,
-            "awaitPromise": true,
-        })).await?;
-        let value_str = result.get("result").and_then(|r| r.get("value"))
-            .and_then(|v| v.as_str()).unwrap_or("");
+        let result = self
+            .cdp
+            .send(
+                "Runtime.evaluate",
+                json!({
+                    "expression": js,
+                    "returnByValue": true,
+                    "awaitPromise": true,
+                }),
+            )
+            .await?;
+        let value_str = result
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
         match value_str {
             "NOT_FOUND" => bail!("select: element {eref} not found"),
@@ -1801,7 +1932,9 @@ impl BrowserSession {
             _ => {}
         }
 
-        Ok(json!({ "action": "select", "ref": eref, "text": format!("Selected {value} on {eref}") }))
+        Ok(
+            json!({ "action": "select", "ref": eref, "text": format!("Selected {value} on {eref}") }),
+        )
     }
 
     async fn cmd_check(&self, args: &Value, check: bool) -> Result<Value> {
@@ -1828,13 +1961,22 @@ impl BrowserSession {
             WAIT_ACTIONABLE_JS = WAIT_ACTIONABLE_JS,
         );
 
-        let result = self.cdp.send("Runtime.evaluate", json!({
-            "expression": js,
-            "returnByValue": true,
-            "awaitPromise": true,
-        })).await?;
-        let value = result.get("result").and_then(|r| r.get("value"))
-            .and_then(|v| v.as_str()).unwrap_or("");
+        let result = self
+            .cdp
+            .send(
+                "Runtime.evaluate",
+                json!({
+                    "expression": js,
+                    "returnByValue": true,
+                    "awaitPromise": true,
+                }),
+            )
+            .await?;
+        let value = result
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
         match value {
             "NOT_FOUND" => bail!("check: element {eref} not found"),
@@ -1843,7 +1985,9 @@ impl BrowserSession {
         }
 
         let verb = if check { "Checked" } else { "Unchecked" };
-        Ok(json!({ "action": if check { "check" } else { "uncheck" }, "ref": eref, "text": format!("{verb} {eref}") }))
+        Ok(
+            json!({ "action": if check { "check" } else { "uncheck" }, "ref": eref, "text": format!("{verb} {eref}") }),
+        )
     }
 
     async fn cmd_scroll(&self, args: &Value) -> Result<Value> {
@@ -1851,10 +1995,7 @@ impl BrowserSession {
             .get("direction")
             .and_then(|v| v.as_str())
             .unwrap_or("down");
-        let amount = args
-            .get("amount")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(500);
+        let amount = args.get("amount").and_then(|v| v.as_i64()).unwrap_or(500);
         let selector = args.get("selector").and_then(|v| v.as_str());
 
         let (dx, dy) = match direction {
@@ -1884,7 +2025,8 @@ impl BrowserSession {
 
     /// Resolve a ref (@eN) or selector from args.
     fn get_ref_or_selector<'a>(&self, args: &'a Value) -> Option<&'a str> {
-        args.get("ref").and_then(|v| v.as_str())
+        args.get("ref")
+            .and_then(|v| v.as_str())
             .or_else(|| args.get("selector").and_then(|v| v.as_str()))
     }
 
@@ -1909,98 +2051,180 @@ impl BrowserSession {
             bail!("element `{ref_or_sel}` not found (run snapshot first)");
         }
         let coords: Value = serde_json::from_str(&result)?;
-        Ok((coords["x"].as_f64().unwrap_or(0.0), coords["y"].as_f64().unwrap_or(0.0)))
+        Ok((
+            coords["x"].as_f64().unwrap_or(0.0),
+            coords["y"].as_f64().unwrap_or(0.0),
+        ))
     }
 
     /// Hover over an element (triggers tooltips, dropdown menus).
     async fn cmd_hover(&self, args: &Value) -> Result<Value> {
-        let sel = self.get_ref_or_selector(args).ok_or_else(|| anyhow!("hover: `ref` or `selector` required"))?;
+        let sel = self
+            .get_ref_or_selector(args)
+            .ok_or_else(|| anyhow!("hover: `ref` or `selector` required"))?;
         let (x, y) = self.get_element_center(sel).await?;
-        self.cdp.send("Input.dispatchMouseEvent", json!({"type": "mouseMoved", "x": x, "y": y})).await?;
+        self.cdp
+            .send(
+                "Input.dispatchMouseEvent",
+                json!({"type": "mouseMoved", "x": x, "y": y}),
+            )
+            .await?;
         Ok(json!({"action": "hover", "ref": sel}))
     }
 
     /// Double-click an element.
     async fn cmd_dblclick(&self, args: &Value) -> Result<Value> {
-        let sel = self.get_ref_or_selector(args).ok_or_else(|| anyhow!("dblclick: `ref` or `selector` required"))?;
+        let sel = self
+            .get_ref_or_selector(args)
+            .ok_or_else(|| anyhow!("dblclick: `ref` or `selector` required"))?;
         let (x, y) = self.get_element_center(sel).await?;
-        self.cdp.send("Input.dispatchMouseEvent", json!({"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 2})).await?;
-        self.cdp.send("Input.dispatchMouseEvent", json!({"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 2})).await?;
+        self.cdp
+            .send(
+                "Input.dispatchMouseEvent",
+                json!({"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 2}),
+            )
+            .await?;
+        self.cdp
+            .send(
+                "Input.dispatchMouseEvent",
+                json!({"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 2}),
+            )
+            .await?;
         Ok(json!({"action": "dblclick", "ref": sel}))
     }
 
     /// Drag from one element to another (for slider captchas, sorting, etc.).
     async fn cmd_drag(&self, args: &Value) -> Result<Value> {
-        let from = args.get("from").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("drag: `from` ref required"))?;
-        let to = args.get("to").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("drag: `to` ref required"))?;
+        let from = args
+            .get("from")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("drag: `from` ref required"))?;
+        let to = args
+            .get("to")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("drag: `to` ref required"))?;
         let (fx, fy) = self.get_element_center(from).await?;
         let (tx, ty) = self.get_element_center(to).await?;
-        self.cdp.send("Input.dispatchMouseEvent", json!({"type": "mousePressed", "x": fx, "y": fy, "button": "left"})).await?;
+        self.cdp
+            .send(
+                "Input.dispatchMouseEvent",
+                json!({"type": "mousePressed", "x": fx, "y": fy, "button": "left"}),
+            )
+            .await?;
         let steps = 10;
         for i in 1..=steps {
             let t = i as f64 / steps as f64;
-            self.cdp.send("Input.dispatchMouseEvent", json!({"type": "mouseMoved", "x": fx + (tx-fx)*t, "y": fy + (ty-fy)*t})).await?;
+            self.cdp
+                .send(
+                    "Input.dispatchMouseEvent",
+                    json!({"type": "mouseMoved", "x": fx + (tx-fx)*t, "y": fy + (ty-fy)*t}),
+                )
+                .await?;
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        self.cdp.send("Input.dispatchMouseEvent", json!({"type": "mouseReleased", "x": tx, "y": ty, "button": "left"})).await?;
+        self.cdp
+            .send(
+                "Input.dispatchMouseEvent",
+                json!({"type": "mouseReleased", "x": tx, "y": ty, "button": "left"}),
+            )
+            .await?;
         Ok(json!({"action": "drag", "from": from, "to": to}))
     }
 
     /// Focus an element.
     async fn cmd_focus(&self, args: &Value) -> Result<Value> {
-        let sel = self.get_ref_or_selector(args).ok_or_else(|| anyhow!("focus: `ref` or `selector` required"))?;
+        let sel = self
+            .get_ref_or_selector(args)
+            .ok_or_else(|| anyhow!("focus: `ref` or `selector` required"))?;
         let find = self.build_find_js(sel);
         let js = format!(r#"(function(){{{find} el.focus(); return 'OK';}})()"#);
         let result = self.eval_js(&js).await?;
-        if result == "NOT_FOUND" { bail!("focus: element `{sel}` not found"); }
+        if result == "NOT_FOUND" {
+            bail!("focus: element `{sel}` not found");
+        }
         Ok(json!({"action": "focus", "ref": sel}))
     }
 
     /// Scroll an element into view.
     async fn cmd_scroll_into_view(&self, args: &Value) -> Result<Value> {
-        let sel = self.get_ref_or_selector(args).ok_or_else(|| anyhow!("scrollintoview: `ref` or `selector` required"))?;
+        let sel = self
+            .get_ref_or_selector(args)
+            .ok_or_else(|| anyhow!("scrollintoview: `ref` or `selector` required"))?;
         let find = self.build_find_js(sel);
-        let js = format!(r#"(function(){{{find} el.scrollIntoView({{behavior:'smooth',block:'center'}}); return 'OK';}})()"#);
+        let js = format!(
+            r#"(function(){{{find} el.scrollIntoView({{behavior:'smooth',block:'center'}}); return 'OK';}})()"#
+        );
         let result = self.eval_js(&js).await?;
-        if result == "NOT_FOUND" { bail!("scrollintoview: element `{sel}` not found"); }
+        if result == "NOT_FOUND" {
+            bail!("scrollintoview: element `{sel}` not found");
+        }
         Ok(json!({"action": "scrollintoview", "ref": sel}))
     }
 
     /// Press a key down without releasing it.
     async fn cmd_keydown(&self, args: &Value) -> Result<Value> {
-        let key = args.get("key").and_then(|v| v.as_str())
+        let key = args
+            .get("key")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("keydown: `key` required"))?;
-        self.cdp.send("Input.dispatchKeyEvent", json!({
-            "type": "keyDown",
-            "key": key,
-        })).await?;
+        self.cdp
+            .send(
+                "Input.dispatchKeyEvent",
+                json!({
+                    "type": "keyDown",
+                    "key": key,
+                }),
+            )
+            .await?;
         Ok(json!({"action": "keydown", "key": key}))
     }
 
     /// Release a previously pressed key.
     async fn cmd_keyup(&self, args: &Value) -> Result<Value> {
-        let key = args.get("key").and_then(|v| v.as_str())
+        let key = args
+            .get("key")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("keyup: `key` required"))?;
-        self.cdp.send("Input.dispatchKeyEvent", json!({
-            "type": "keyUp",
-            "key": key,
-        })).await?;
+        self.cdp
+            .send(
+                "Input.dispatchKeyEvent",
+                json!({
+                    "type": "keyUp",
+                    "key": key,
+                }),
+            )
+            .await?;
         Ok(json!({"action": "keyup", "key": key}))
     }
 
     /// Raw mouse operation: move, click, down, or up at given coordinates.
     async fn cmd_mouse(&self, args: &Value) -> Result<Value> {
-        let x = args.get("x").and_then(|v| v.as_f64())
+        let x = args
+            .get("x")
+            .and_then(|v| v.as_f64())
             .ok_or_else(|| anyhow!("mouse: `x` required"))?;
-        let y = args.get("y").and_then(|v| v.as_f64())
+        let y = args
+            .get("y")
+            .and_then(|v| v.as_f64())
             .ok_or_else(|| anyhow!("mouse: `y` required"))?;
-        let button = args.get("button").and_then(|v| v.as_str()).unwrap_or("left");
-        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("click");
+        let button = args
+            .get("button")
+            .and_then(|v| v.as_str())
+            .unwrap_or("left");
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("click");
         match action {
             "move" => {
-                self.cdp.send("Input.dispatchMouseEvent", json!({
-                    "type": "mouseMoved", "x": x, "y": y,
-                })).await?;
+                self.cdp
+                    .send(
+                        "Input.dispatchMouseEvent",
+                        json!({
+                            "type": "mouseMoved", "x": x, "y": y,
+                        }),
+                    )
+                    .await?;
             }
             "down" => {
                 self.cdp.send("Input.dispatchMouseEvent", json!({
@@ -2028,21 +2252,36 @@ impl BrowserSession {
     async fn cmd_storage(&self, args: &Value) -> Result<Value> {
         let op = args.get("value").and_then(|v| v.as_str()).unwrap_or("get");
         let storage_type = args.get("type").and_then(|v| v.as_str()).unwrap_or("local");
-        let store = if storage_type == "session" { "sessionStorage" } else { "localStorage" };
+        let store = if storage_type == "session" {
+            "sessionStorage"
+        } else {
+            "localStorage"
+        };
         match op {
             "get" => {
-                let key = args.get("key").and_then(|v| v.as_str())
+                let key = args
+                    .get("key")
+                    .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("storage get: `key` required"))?;
                 let js = format!(r#"{}.getItem('{}')"#, store, escape_js_string(key));
                 let val = self.eval_js(&js).await?;
                 Ok(json!({"action": "storage", "op": "get", "key": key, "data": val}))
             }
             "set" => {
-                let key = args.get("key").and_then(|v| v.as_str())
+                let key = args
+                    .get("key")
+                    .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("storage set: `key` required"))?;
-                let data = args.get("data").and_then(|v| v.as_str())
+                let data = args
+                    .get("data")
+                    .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("storage set: `data` required"))?;
-                let js = format!(r#"{}.setItem('{}', '{}')"#, store, escape_js_string(key), escape_js_string(data));
+                let js = format!(
+                    r#"{}.setItem('{}', '{}')"#,
+                    store,
+                    escape_js_string(key),
+                    escape_js_string(data)
+                );
                 self.eval_js(&js).await?;
                 Ok(json!({"action": "storage", "op": "set", "key": key}))
             }
@@ -2051,17 +2290,24 @@ impl BrowserSession {
                 self.eval_js(&js).await?;
                 Ok(json!({"action": "storage", "op": "clear", "type": storage_type}))
             }
-            other => Err(anyhow!("storage: unsupported op `{other}`, use get/set/clear")),
+            other => Err(anyhow!(
+                "storage: unsupported op `{other}`, use get/set/clear"
+            )),
         }
     }
 
     /// Wait for a download to complete.
     async fn cmd_download_wait(&self, args: &Value) -> Result<Value> {
         let timeout_secs = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30);
-        self.cdp.send("Page.setDownloadBehavior", json!({
-            "behavior": "allow",
-            "downloadPath": "/tmp/rsclaw-downloads",
-        })).await?;
+        self.cdp
+            .send(
+                "Page.setDownloadBehavior",
+                json!({
+                    "behavior": "allow",
+                    "downloadPath": "/tmp/rsclaw-downloads",
+                }),
+            )
+            .await?;
         tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
         Ok(json!({"action": "download_wait", "timeout": timeout_secs, "status": "completed"}))
     }
@@ -2148,8 +2394,7 @@ impl BrowserSession {
             std::fs::create_dir_all(parent)
                 .map_err(|e| anyhow!("download(url): create parent dir: {e}"))?;
         }
-        std::fs::write(&dest, &bytes)
-            .map_err(|e| anyhow!("download(url): write: {e}"))?;
+        std::fs::write(&dest, &bytes).map_err(|e| anyhow!("download(url): write: {e}"))?;
 
         // NOTE: do not include a top-level "url" field here — wasm_runtime's
         // browser_action extractor checks fields in order ["text", "image",
@@ -2283,12 +2528,14 @@ impl BrowserSession {
                             std::fs::create_dir_all(parent)
                                 .map_err(|e| anyhow!("download: create dest parent: {e}"))?;
                         }
-                        std::fs::rename(&path, &dest).or_else(|_| {
-                            // Cross-device rename can fail; fall back to copy + remove.
-                            std::fs::copy(&path, &dest).map(|_| ()).and_then(|_| {
-                                std::fs::remove_file(&path).or(Ok::<(), std::io::Error>(()))
+                        std::fs::rename(&path, &dest)
+                            .or_else(|_| {
+                                // Cross-device rename can fail; fall back to copy + remove.
+                                std::fs::copy(&path, &dest).map(|_| ()).and_then(|_| {
+                                    std::fs::remove_file(&path).or(Ok::<(), std::io::Error>(()))
+                                })
                             })
-                        }).map_err(|e| anyhow!("download: move file: {e}"))?;
+                            .map_err(|e| anyhow!("download: move file: {e}"))?;
                         let _ = std::fs::remove_dir_all(&stage_dir);
                         return Ok(json!({
                             "action": "download",
@@ -2314,13 +2561,20 @@ impl BrowserSession {
 
     /// Query element state: visible, hidden, checked, enabled, disabled.
     async fn cmd_is(&self, args: &Value) -> Result<Value> {
-        let sel = self.get_ref_or_selector(args).ok_or_else(|| anyhow!("is: `ref` or `selector` required"))?;
-        let check = args.get("check").and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("is: `check` required (visible/hidden/checked/enabled/disabled)"))?;
+        let sel = self
+            .get_ref_or_selector(args)
+            .ok_or_else(|| anyhow!("is: `ref` or `selector` required"))?;
+        let check = args.get("check").and_then(|v| v.as_str()).ok_or_else(|| {
+            anyhow!("is: `check` required (visible/hidden/checked/enabled/disabled)")
+        })?;
         let find = self.build_find_js(sel);
         let js_check = match check {
-            "visible" => "var r=el.getBoundingClientRect(); return String(r.width>0 && r.height>0 && getComputedStyle(el).visibility!=='hidden');",
-            "hidden" => "var r=el.getBoundingClientRect(); return String(r.width===0 || r.height===0 || getComputedStyle(el).visibility==='hidden' || getComputedStyle(el).display==='none');",
+            "visible" => {
+                "var r=el.getBoundingClientRect(); return String(r.width>0 && r.height>0 && getComputedStyle(el).visibility!=='hidden');"
+            }
+            "hidden" => {
+                "var r=el.getBoundingClientRect(); return String(r.width===0 || r.height===0 || getComputedStyle(el).visibility==='hidden' || getComputedStyle(el).display==='none');"
+            }
             "checked" => "return String(!!el.checked);",
             "enabled" => "return String(!el.disabled);",
             "disabled" => "return String(!!el.disabled);",
@@ -2328,40 +2582,62 @@ impl BrowserSession {
         };
         let js = format!(r#"(function(){{{find} {js_check}}})()"#);
         let result = self.eval_js(&js).await?;
-        if result == "NOT_FOUND" { bail!("is: element `{sel}` not found"); }
+        if result == "NOT_FOUND" {
+            bail!("is: element `{sel}` not found");
+        }
         let value = result == "true";
         Ok(json!({"action": "is", "ref": sel, "check": check, "result": value}))
     }
 
-    /// Get an element attribute value (text, value, href, src, class, or any attribute).
+    /// Get an element attribute value (text, value, href, src, class, or any
+    /// attribute).
     async fn cmd_get(&self, args: &Value) -> Result<Value> {
-        let sel = self.get_ref_or_selector(args).ok_or_else(|| anyhow!("get: `ref` or `selector` required"))?;
-        let attr = args.get("attr").and_then(|v| v.as_str())
+        let sel = self
+            .get_ref_or_selector(args)
+            .ok_or_else(|| anyhow!("get: `ref` or `selector` required"))?;
+        let attr = args
+            .get("attr")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("get: `attr` required (text/value/href/src/class/...)"))?;
         let find = self.build_find_js(sel);
         let js_attr = match attr {
             "text" => "return el.textContent || '';".to_string(),
             "value" => "return el.value || '';".to_string(),
-            _ => format!("return el.getAttribute('{}') || '';", escape_js_string(attr)),
+            _ => format!(
+                "return el.getAttribute('{}') || '';",
+                escape_js_string(attr)
+            ),
         };
         let js = format!(r#"(function(){{{find} {js_attr}}})()"#);
         let result = self.eval_js(&js).await?;
-        if result == "NOT_FOUND" { bail!("get: element `{sel}` not found"); }
+        if result == "NOT_FOUND" {
+            bail!("get: element `{sel}` not found");
+        }
         Ok(json!({"action": "get", "ref": sel, "attr": attr, "value": result}))
     }
 
     async fn cmd_screenshot(&mut self, args: &Value) -> Result<Value> {
         let format = args.get("format").and_then(|v| v.as_str()).unwrap_or("png");
         let quality = args.get("quality").and_then(|v| v.as_i64());
-        let full_page = args.get("full_page").and_then(|v| v.as_bool()).unwrap_or(false);
-        let annotate = args.get("annotate").and_then(|v| v.as_bool()).unwrap_or(false);
+        let full_page = args
+            .get("full_page")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let annotate = args
+            .get("annotate")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         // One-shot mode: when `url` is given, navigate to it first so a
         // bare `action=screenshot url=...` call returns the page instead
         // of whatever the persistent session was last showing (often a
         // blank dark new-tab → near-black PNG that channels happily
         // forwarded as a "blank image").
-        if let Some(url) = args.get("url").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        if let Some(url) = args
+            .get("url")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
             let normalised = if url.starts_with("http://") || url.starts_with("https://") {
                 url.to_owned()
             } else {
@@ -2388,7 +2664,11 @@ impl BrowserSession {
             }
         }
 
-        let mime = if format == "jpeg" { "image/jpeg" } else { "image/png" };
+        let mime = if format == "jpeg" {
+            "image/jpeg"
+        } else {
+            "image/png"
+        };
 
         // Annotated screenshot: overlay numbered labels on interactive elements
         if annotate {
@@ -2410,7 +2690,9 @@ impl BrowserSession {
             let data = result.get("data").and_then(|v| v.as_str()).unwrap_or("");
 
             // Remove annotations
-            let _ = self.eval_js("document.querySelectorAll('.__rsclaw_annotation').forEach(e=>e.remove())").await;
+            let _ = self
+                .eval_js("document.querySelectorAll('.__rsclaw_annotation').forEach(e=>e.remove())")
+                .await;
 
             let legend: Value = serde_json::from_str(&legend_raw).unwrap_or(json!([]));
             let save_path = save_screenshot_bytes(data, format).await?;
@@ -2444,10 +2726,7 @@ impl BrowserSession {
     async fn cmd_pdf(&self) -> Result<Value> {
         let result = self.cdp.send("Page.printToPDF", json!({})).await?;
 
-        let data = result
-            .get("data")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let data = result.get("data").and_then(|v| v.as_str()).unwrap_or("");
 
         Ok(json!({
             "action": "pdf",
@@ -2509,10 +2788,7 @@ impl BrowserSession {
             .or_else(|| args.get("text"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let timeout_secs = args
-            .get("timeout")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(15);
+        let timeout_secs = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(15);
 
         // No value supplied and target isn't a special keyword: treat as a
         // pure sleep. Agents call `{"action":"wait","timeout":N}` to insert
@@ -2621,7 +2897,9 @@ impl BrowserSession {
     // -- New actions (Phase 1-3) -----------------------------------------------
 
     async fn cmd_press(&self, args: &Value) -> Result<Value> {
-        let key = args.get("key").and_then(|v| v.as_str())
+        let key = args
+            .get("key")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("press: `key` required"))?;
 
         let lower = key.to_lowercase();
@@ -2660,23 +2938,41 @@ impl BrowserSession {
                 } else {
                     0
                 };
-                (vk, key.to_string(), if ch.is_ascii() && !ch.is_ascii_control() { ch.to_string() } else { String::new() })
+                (
+                    vk,
+                    key.to_string(),
+                    if ch.is_ascii() && !ch.is_ascii_control() {
+                        ch.to_string()
+                    } else {
+                        String::new()
+                    },
+                )
             }
         };
 
-        self.cdp.send("Input.dispatchKeyEvent", json!({
-            "type": "keyDown",
-            "key": code,
-            "windowsVirtualKeyCode": key_code,
-            "nativeVirtualKeyCode": key_code,
-            "text": text,
-        })).await?;
-        self.cdp.send("Input.dispatchKeyEvent", json!({
-            "type": "keyUp",
-            "key": code,
-            "windowsVirtualKeyCode": key_code,
-            "nativeVirtualKeyCode": key_code,
-        })).await?;
+        self.cdp
+            .send(
+                "Input.dispatchKeyEvent",
+                json!({
+                    "type": "keyDown",
+                    "key": code,
+                    "windowsVirtualKeyCode": key_code,
+                    "nativeVirtualKeyCode": key_code,
+                    "text": text,
+                }),
+            )
+            .await?;
+        self.cdp
+            .send(
+                "Input.dispatchKeyEvent",
+                json!({
+                    "type": "keyUp",
+                    "key": code,
+                    "windowsVirtualKeyCode": key_code,
+                    "nativeVirtualKeyCode": key_code,
+                }),
+            )
+            .await?;
 
         Ok(json!({ "action": "press", "key": key }))
     }
@@ -2685,20 +2981,31 @@ impl BrowserSession {
         let width = args.get("width").and_then(|v| v.as_u64()).unwrap_or(1280) as u32;
         let height = args.get("height").and_then(|v| v.as_u64()).unwrap_or(720) as u32;
         let scale = args.get("scale").and_then(|v| v.as_f64()).unwrap_or(1.0);
-        let mobile = args.get("mobile").and_then(|v| v.as_bool()).unwrap_or(false);
+        let mobile = args
+            .get("mobile")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
-        self.cdp.send("Emulation.setDeviceMetricsOverride", json!({
-            "width": width,
-            "height": height,
-            "deviceScaleFactor": scale,
-            "mobile": mobile,
-        })).await?;
+        self.cdp
+            .send(
+                "Emulation.setDeviceMetricsOverride",
+                json!({
+                    "width": width,
+                    "height": height,
+                    "deviceScaleFactor": scale,
+                    "mobile": mobile,
+                }),
+            )
+            .await?;
 
         Ok(json!({ "action": "set_viewport", "width": width, "height": height, "scale": scale }))
     }
 
     async fn cmd_dialog(&mut self, args: &Value) -> Result<Value> {
-        let sub = args.get("value").and_then(|v| v.as_str()).unwrap_or("accept");
+        let sub = args
+            .get("value")
+            .and_then(|v| v.as_str())
+            .unwrap_or("accept");
         match sub {
             "accept" => {
                 let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
@@ -2715,7 +3022,11 @@ impl BrowserSession {
                 }
             }
             "dismiss" => {
-                match self.cdp.send("Page.handleJavaScriptDialog", json!({"accept": false})).await {
+                match self
+                    .cdp
+                    .send("Page.handleJavaScriptDialog", json!({"accept": false}))
+                    .await
+                {
                     Ok(_) => {
                         self.pending_dialog = None;
                         Ok(json!({"action": "dialog", "text": "Dialog dismissed"}))
@@ -2723,18 +3034,29 @@ impl BrowserSession {
                     Err(_) => Ok(json!({"action": "dialog", "text": "No dialog open to dismiss"})),
                 }
             }
-            "status" => {
-                Ok(json!({"action": "dialog", "pending": self.pending_dialog.is_some(),
-                           "message": self.pending_dialog.as_deref().unwrap_or("")}))
-            }
-            _ => Err(anyhow!("dialog: unknown sub-action (use accept/dismiss/status)"))
+            "status" => Ok(
+                json!({"action": "dialog", "pending": self.pending_dialog.is_some(),
+                           "message": self.pending_dialog.as_deref().unwrap_or("")}),
+            ),
+            _ => Err(anyhow!(
+                "dialog: unknown sub-action (use accept/dismiss/status)"
+            )),
         }
     }
 
     async fn cmd_new_tab(&self, args: &Value) -> Result<Value> {
-        let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("about:blank");
-        let result = self.cdp.send("Target.createTarget", json!({"url": url})).await?;
-        let target_id = result.get("targetId").and_then(|v| v.as_str()).unwrap_or("");
+        let url = args
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("about:blank");
+        let result = self
+            .cdp
+            .send("Target.createTarget", json!({"url": url}))
+            .await?;
+        let target_id = result
+            .get("targetId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         Ok(json!({"action": "new_tab", "targetId": target_id}))
     }
 
@@ -2742,30 +3064,39 @@ impl BrowserSession {
         let port = self.debug_port;
         let url = format!("http://127.0.0.1:{port}/json");
         let targets: Vec<Value> = reqwest::get(&url).await?.json().await?;
-        let tabs: Vec<Value> = targets.iter()
+        let tabs: Vec<Value> = targets
+            .iter()
             .filter(|t| t["type"].as_str() == Some("page"))
-            .map(|t| json!({
-                "id": t["id"],
-                "title": t["title"],
-                "url": t["url"],
-            }))
+            .map(|t| {
+                json!({
+                    "id": t["id"],
+                    "title": t["title"],
+                    "url": t["url"],
+                })
+            })
             .collect();
         Ok(json!({"action": "list_tabs", "tabs": tabs}))
     }
 
     async fn cmd_switch_tab(&mut self, args: &Value) -> Result<Value> {
-        let target_id = args.get("target_id").and_then(|v| v.as_str())
+        let target_id = args
+            .get("target_id")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("switch_tab: `target_id` required"))?;
 
-        self.cdp.send("Target.activateTarget", json!({"targetId": target_id})).await?;
+        self.cdp
+            .send("Target.activateTarget", json!({"targetId": target_id}))
+            .await?;
 
         let port = self.debug_port;
         let url = format!("http://127.0.0.1:{port}/json");
         let targets: Vec<Value> = reqwest::get(&url).await?.json().await?;
-        let target = targets.iter()
+        let target = targets
+            .iter()
             .find(|t| t["id"].as_str() == Some(target_id))
             .ok_or_else(|| anyhow!("switch_tab: target not found"))?;
-        let ws_url = target["webSocketDebuggerUrl"].as_str()
+        let ws_url = target["webSocketDebuggerUrl"]
+            .as_str()
             .ok_or_else(|| anyhow!("switch_tab: no WebSocket URL"))?;
 
         let new_cdp = CdpClient::connect(ws_url).await?;
@@ -2782,7 +3113,9 @@ impl BrowserSession {
     }
 
     async fn cmd_close_tab(&mut self, args: &Value) -> Result<Value> {
-        let target_id = args.get("target_id").and_then(|v| v.as_str())
+        let target_id = args
+            .get("target_id")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("close_tab: `target_id` required"))?;
 
         // Detect if this is the active tab by checking the current CDP ws_url.
@@ -2791,14 +3124,18 @@ impl BrowserSession {
         let url = format!("http://127.0.0.1:{port}/json");
         let targets: Vec<Value> = reqwest::get(&url).await?.json().await?;
         let is_active = targets.iter().any(|t| {
-            t["id"].as_str() == Some(target_id) &&
-            t["webSocketDebuggerUrl"].as_str().map(|ws| self.cdp.ws_url() == ws).unwrap_or(false)
+            t["id"].as_str() == Some(target_id)
+                && t["webSocketDebuggerUrl"]
+                    .as_str()
+                    .map(|ws| self.cdp.ws_url() == ws)
+                    .unwrap_or(false)
         });
 
         if is_active {
             // Find another tab to switch to
-            let other = targets.iter()
-                .find(|t| t["type"].as_str() == Some("page") && t["id"].as_str() != Some(target_id));
+            let other = targets.iter().find(|t| {
+                t["type"].as_str() == Some("page") && t["id"].as_str() != Some(target_id)
+            });
             if let Some(other_target) = other {
                 let other_id = other_target["id"].as_str().unwrap_or("");
                 self.cmd_switch_tab(&json!({"target_id": other_id})).await?;
@@ -2807,7 +3144,9 @@ impl BrowserSession {
             }
         }
 
-        self.cdp.send("Target.closeTarget", json!({"targetId": target_id})).await?;
+        self.cdp
+            .send("Target.closeTarget", json!({"targetId": target_id}))
+            .await?;
         Ok(json!({"action": "close_tab", "target_id": target_id}))
     }
 
@@ -2817,8 +3156,12 @@ impl BrowserSession {
             "save" => {
                 let cookies_result = self.cdp.send("Network.getCookies", json!({})).await?;
                 let cookies = cookies_result.get("cookies").cloned().unwrap_or(json!([]));
-                let local_storage = self.eval_js("JSON.stringify(Object.assign({}, localStorage))").await?;
-                let session_storage = self.eval_js("JSON.stringify(Object.assign({}, sessionStorage))").await?;
+                let local_storage = self
+                    .eval_js("JSON.stringify(Object.assign({}, localStorage))")
+                    .await?;
+                let session_storage = self
+                    .eval_js("JSON.stringify(Object.assign({}, sessionStorage))")
+                    .await?;
                 let url = self.eval_js("location.href").await?;
 
                 let state = json!({
@@ -2831,7 +3174,8 @@ impl BrowserSession {
                 Ok(json!({"action": "state", "sub": "save", "state": state}))
             }
             "load" => {
-                let state = args.get("state")
+                let state = args
+                    .get("state")
                     .ok_or_else(|| anyhow!("state load: `state` object required"))?;
 
                 if let Some(cookies) = state.get("cookies").and_then(|v| v.as_array()) {
@@ -2848,20 +3192,26 @@ impl BrowserSession {
                 if let Some(ls) = state.get("localStorage").and_then(|v| v.as_object()) {
                     for (k, v) in ls {
                         let val = v.as_str().unwrap_or("");
-                        let _ = self.eval_js(&format!(
-                            "localStorage.setItem('{}', '{}')",
-                            escape_js_string(k), escape_js_string(val)
-                        )).await;
+                        let _ = self
+                            .eval_js(&format!(
+                                "localStorage.setItem('{}', '{}')",
+                                escape_js_string(k),
+                                escape_js_string(val)
+                            ))
+                            .await;
                     }
                 }
 
                 if let Some(ss) = state.get("sessionStorage").and_then(|v| v.as_object()) {
                     for (k, v) in ss {
                         let val = v.as_str().unwrap_or("");
-                        let _ = self.eval_js(&format!(
-                            "sessionStorage.setItem('{}', '{}')",
-                            escape_js_string(k), escape_js_string(val)
-                        )).await;
+                        let _ = self
+                            .eval_js(&format!(
+                                "sessionStorage.setItem('{}', '{}')",
+                                escape_js_string(k),
+                                escape_js_string(val)
+                            ))
+                            .await;
                     }
                 }
 
@@ -2870,12 +3220,15 @@ impl BrowserSession {
 
                 Ok(json!({"action": "state", "sub": "load", "text": "State restored"}))
             }
-            _ => Err(anyhow!("state: unknown sub-action (use save/load)"))
+            _ => Err(anyhow!("state: unknown sub-action (use save/load)")),
         }
     }
 
     async fn cmd_network(&mut self, args: &Value) -> Result<Value> {
-        let sub = args.get("value").and_then(|v| v.as_str()).unwrap_or("requests");
+        let sub = args
+            .get("value")
+            .and_then(|v| v.as_str())
+            .unwrap_or("requests");
         match sub {
             "requests" => {
                 let js = r#"JSON.stringify(
@@ -2890,27 +3243,42 @@ impl BrowserSession {
                 Ok(json!({"action": "network", "requests": entries}))
             }
             "block" => {
-                let pattern = args.get("pattern").and_then(|v| v.as_str())
+                let pattern = args
+                    .get("pattern")
+                    .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("network block: `pattern` required"))?;
                 if !self.blocked_urls.contains(&pattern.to_string()) {
                     self.blocked_urls.push(pattern.to_string());
                 }
-                self.cdp.send("Network.setBlockedURLs", json!({"urls": self.blocked_urls})).await?;
-                Ok(json!({"action": "network", "text": format!("Blocking {} pattern(s)", self.blocked_urls.len())}))
+                self.cdp
+                    .send("Network.setBlockedURLs", json!({"urls": self.blocked_urls}))
+                    .await?;
+                Ok(
+                    json!({"action": "network", "text": format!("Blocking {} pattern(s)", self.blocked_urls.len())}),
+                )
             }
             "unblock" => {
                 self.blocked_urls.clear();
-                self.cdp.send("Network.setBlockedURLs", json!({"urls": []})).await?;
+                self.cdp
+                    .send("Network.setBlockedURLs", json!({"urls": []}))
+                    .await?;
                 Ok(json!({"action": "network", "text": "All URL blocks removed"}))
             }
             "intercept" => {
-                let pattern = args.get("pattern").and_then(|v| v.as_str())
+                let pattern = args
+                    .get("pattern")
+                    .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("network intercept: `pattern` required"))?;
-                let action = args.get("action_type").and_then(|v| v.as_str()).unwrap_or("block");
+                let action = args
+                    .get("action_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("block");
                 let body = args.get("body").and_then(|v| v.as_str()).unwrap_or("");
 
                 if self.intercept_rules.is_empty() {
-                    self.cdp.send("Fetch.enable", json!({"patterns": [{"urlPattern": "*"}]})).await?;
+                    self.cdp
+                        .send("Fetch.enable", json!({"patterns": [{"urlPattern": "*"}]}))
+                        .await?;
                 }
 
                 let rule_action = if action == "mock" {
@@ -2918,9 +3286,12 @@ impl BrowserSession {
                 } else {
                     action.to_string()
                 };
-                self.intercept_rules.push((pattern.to_string(), rule_action));
+                self.intercept_rules
+                    .push((pattern.to_string(), rule_action));
 
-                Ok(json!({"action": "network", "text": format!("Intercept rule added: {pattern} -> {action}")}))
+                Ok(
+                    json!({"action": "network", "text": format!("Intercept rule added: {pattern} -> {action}")}),
+                )
             }
             "clear_intercepts" => {
                 self.intercept_rules.clear();
@@ -2931,7 +3302,8 @@ impl BrowserSession {
                 // Discover all media resources on the page: images, videos, audio,
                 // fonts, and XHR/fetch URLs — combines DOM scanning with performance API.
                 let filter = args.get("text").and_then(|v| v.as_str()).unwrap_or("all");
-                let js = format!(r#"(function() {{
+                let js = format!(
+                    r#"(function() {{
   var r = {{}};
   // DOM: images
   document.querySelectorAll('img,picture source').forEach(function(el){{
@@ -2969,44 +3341,66 @@ impl BrowserSession {
   return JSON.stringify(entries.map(function(kv){{
     return {{url:kv[0],type:kv[1].type,tag:kv[1].tag||'',size:kv[1].size||0}};
   }}));
-}})()"#);
+}})()"#
+                );
                 let result = self.eval_js(&js).await?;
                 let resources: Value = serde_json::from_str(&result).unwrap_or(json!([]));
                 let count = resources.as_array().map(|a| a.len()).unwrap_or(0);
-                Ok(json!({"action":"network","sub":"sniff","filter":filter,"count":count,"resources":resources}))
+                Ok(
+                    json!({"action":"network","sub":"sniff","filter":filter,"count":count,"resources":resources}),
+                )
             }
-            _ => Err(anyhow!("network: unknown sub-action (use requests/sniff/block/unblock/intercept/clear_intercepts)"))
+            _ => Err(anyhow!(
+                "network: unknown sub-action (use requests/sniff/block/unblock/intercept/clear_intercepts)"
+            )),
         }
     }
 
     async fn cmd_highlight(&self, args: &Value) -> Result<Value> {
-        let eref = args.get("ref").and_then(|v| v.as_str())
+        let eref = args
+            .get("ref")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("highlight: `ref` required"))?;
         let js = format!(
             r#"(function(){{var el=document.querySelector('[data-ref="{}"]');if(!el)return 'NOT_FOUND';el.style.outline='3px solid red';el.style.outlineOffset='2px';el.scrollIntoView({{block:'center'}});return 'OK';}})()"#,
             escape_js_string(eref)
         );
         let result = self.eval_js(&js).await?;
-        if result == "NOT_FOUND" { bail!("highlight: {eref} not found"); }
+        if result == "NOT_FOUND" {
+            bail!("highlight: {eref} not found");
+        }
         Ok(json!({"action": "highlight", "ref": eref}))
     }
 
     async fn cmd_clipboard(&self, args: &Value) -> Result<Value> {
         // Grant clipboard permissions to avoid rejection in headless mode.
-        let _ = self.cdp.send("Browser.grantPermissions", json!({
-            "permissions": ["clipboardReadWrite", "clipboardSanitizedWrite"]
-        })).await;
+        let _ = self
+            .cdp
+            .send(
+                "Browser.grantPermissions",
+                json!({
+                    "permissions": ["clipboardReadWrite", "clipboardSanitizedWrite"]
+                }),
+            )
+            .await;
 
         let sub = args.get("value").and_then(|v| v.as_str()).unwrap_or("read");
         match sub {
             "read" => {
-                let result = self.cdp.send("Runtime.evaluate", json!({
-                    "expression": "navigator.clipboard.readText()",
-                    "awaitPromise": true,
-                    "returnByValue": true,
-                    "userGesture": true,
-                })).await?;
-                let text = result.get("result")
+                let result = self
+                    .cdp
+                    .send(
+                        "Runtime.evaluate",
+                        json!({
+                            "expression": "navigator.clipboard.readText()",
+                            "awaitPromise": true,
+                            "returnByValue": true,
+                            "userGesture": true,
+                        }),
+                    )
+                    .await?;
+                let text = result
+                    .get("result")
                     .and_then(|r| r.get("value"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
@@ -3026,7 +3420,7 @@ impl BrowserSession {
                 }
                 Ok(json!({"action": "clipboard", "text": "Written to clipboard"}))
             }
-            _ => Err(anyhow!("clipboard: use read/write"))
+            _ => Err(anyhow!("clipboard: use read/write")),
         }
     }
 
@@ -3066,11 +3460,18 @@ impl BrowserSession {
     }
 
     async fn cmd_upload(&self, args: &Value) -> Result<Value> {
-        let eref = args.get("ref").and_then(|v| v.as_str())
+        let eref = args
+            .get("ref")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("upload: `ref` required (file input element)"))?;
-        let files: Vec<String> = args.get("files")
+        let files: Vec<String> = args
+            .get("files")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         if files.is_empty() {
             bail!("upload: `files` array required");
@@ -3079,19 +3480,30 @@ impl BrowserSession {
         // Get the backend node ID via DOM.querySelector
         let doc_root = self.cdp.send("DOM.getDocument", json!({})).await?;
         let root_id = doc_root["root"]["nodeId"].as_i64().unwrap_or(0);
-        let node_result = self.cdp.send("DOM.querySelector", json!({
-            "nodeId": root_id,
-            "selector": format!("[data-ref=\"{}\"]", escape_js_string(eref)),
-        })).await?;
+        let node_result = self
+            .cdp
+            .send(
+                "DOM.querySelector",
+                json!({
+                    "nodeId": root_id,
+                    "selector": format!("[data-ref=\"{}\"]", escape_js_string(eref)),
+                }),
+            )
+            .await?;
         let node_id = node_result["nodeId"].as_i64().unwrap_or(0);
         if node_id == 0 {
             bail!("upload: could not resolve DOM node for {eref}");
         }
 
-        self.cdp.send("DOM.setFileInputFiles", json!({
-            "files": files,
-            "nodeId": node_id,
-        })).await?;
+        self.cdp
+            .send(
+                "DOM.setFileInputFiles",
+                json!({
+                    "files": files,
+                    "nodeId": node_id,
+                }),
+            )
+            .await?;
 
         Ok(json!({"action": "upload", "ref": eref, "files": files.len()}))
     }
@@ -3171,9 +3583,7 @@ impl BrowserSession {
             )
             .await?;
 
-        let value = result
-            .get("result")
-            .and_then(|r| r.get("value"));
+        let value = result.get("result").and_then(|r| r.get("value"));
 
         match value {
             Some(Value::String(s)) => Ok(s.clone()),
@@ -3188,25 +3598,46 @@ impl BrowserSession {
         let sub = args.get("value").and_then(|v| v.as_str()).unwrap_or("new");
         match sub {
             "new" => {
-                let result = self.cdp.send("Target.createBrowserContext", json!({})).await?;
+                let result = self
+                    .cdp
+                    .send("Target.createBrowserContext", json!({}))
+                    .await?;
                 let ctx_id = result["browserContextId"].as_str().unwrap_or("");
                 Ok(json!({"action": "context", "sub": "new", "browserContextId": ctx_id}))
             }
             "dispose" => {
-                let ctx_id = args.get("context_id").and_then(|v| v.as_str())
+                let ctx_id = args
+                    .get("context_id")
+                    .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("context dispose: `context_id` required"))?;
-                self.cdp.send("Target.disposeBrowserContext", json!({"browserContextId": ctx_id})).await?;
+                self.cdp
+                    .send(
+                        "Target.disposeBrowserContext",
+                        json!({"browserContextId": ctx_id}),
+                    )
+                    .await?;
                 Ok(json!({"action": "context", "sub": "dispose"}))
             }
             "new_tab" => {
-                let ctx_id = args.get("context_id").and_then(|v| v.as_str())
+                let ctx_id = args
+                    .get("context_id")
+                    .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("context new_tab: `context_id` required"))?;
-                let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("about:blank");
-                let result = self.cdp.send("Target.createTarget", json!({"url": url, "browserContextId": ctx_id})).await?;
+                let url = args
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("about:blank");
+                let result = self
+                    .cdp
+                    .send(
+                        "Target.createTarget",
+                        json!({"url": url, "browserContextId": ctx_id}),
+                    )
+                    .await?;
                 let target_id = result["targetId"].as_str().unwrap_or("");
                 Ok(json!({"action": "context", "sub": "new_tab", "targetId": target_id}))
             }
-            _ => Err(anyhow!("context: use new/dispose/new_tab"))
+            _ => Err(anyhow!("context: use new/dispose/new_tab")),
         }
     }
 
@@ -3216,37 +3647,68 @@ impl BrowserSession {
         let sub = args.get("value").and_then(|v| v.as_str()).unwrap_or("geo");
         match sub {
             "geo" => {
-                let lat = args.get("latitude").and_then(|v| v.as_f64())
+                let lat = args
+                    .get("latitude")
+                    .and_then(|v| v.as_f64())
                     .ok_or_else(|| anyhow!("emulate geo: `latitude` required"))?;
-                let lon = args.get("longitude").and_then(|v| v.as_f64())
+                let lon = args
+                    .get("longitude")
+                    .and_then(|v| v.as_f64())
                     .ok_or_else(|| anyhow!("emulate geo: `longitude` required"))?;
                 let accuracy = args.get("accuracy").and_then(|v| v.as_f64()).unwrap_or(1.0);
-                self.cdp.send("Emulation.setGeolocationOverride", json!({
-                    "latitude": lat, "longitude": lon, "accuracy": accuracy
-                })).await?;
-                let _ = self.cdp.send("Browser.grantPermissions", json!({"permissions": ["geolocation"]})).await;
+                self.cdp
+                    .send(
+                        "Emulation.setGeolocationOverride",
+                        json!({
+                            "latitude": lat, "longitude": lon, "accuracy": accuracy
+                        }),
+                    )
+                    .await?;
+                let _ = self
+                    .cdp
+                    .send(
+                        "Browser.grantPermissions",
+                        json!({"permissions": ["geolocation"]}),
+                    )
+                    .await;
                 Ok(json!({"action": "emulate", "sub": "geo", "latitude": lat, "longitude": lon}))
             }
             "locale" => {
-                let locale = args.get("locale").and_then(|v| v.as_str()).unwrap_or("en-US");
-                self.cdp.send("Emulation.setLocaleOverride", json!({"locale": locale})).await?;
+                let locale = args
+                    .get("locale")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("en-US");
+                self.cdp
+                    .send("Emulation.setLocaleOverride", json!({"locale": locale}))
+                    .await?;
                 Ok(json!({"action": "emulate", "sub": "locale", "locale": locale}))
             }
             "timezone" => {
-                let tz = args.get("timezone_id").and_then(|v| v.as_str())
+                let tz = args
+                    .get("timezone_id")
+                    .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("emulate timezone: `timezone_id` required"))?;
-                self.cdp.send("Emulation.setTimezoneOverride", json!({"timezoneId": tz})).await?;
+                self.cdp
+                    .send("Emulation.setTimezoneOverride", json!({"timezoneId": tz}))
+                    .await?;
                 Ok(json!({"action": "emulate", "sub": "timezone", "timezone_id": tz}))
             }
             "permission" => {
-                let perms: Vec<String> = args.get("permissions")
+                let perms: Vec<String> = args
+                    .get("permissions")
                     .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default();
-                self.cdp.send("Browser.grantPermissions", json!({"permissions": perms})).await?;
+                self.cdp
+                    .send("Browser.grantPermissions", json!({"permissions": perms}))
+                    .await?;
                 Ok(json!({"action": "emulate", "sub": "permission", "granted": perms}))
             }
-            _ => Err(anyhow!("emulate: use geo/locale/timezone/permission"))
+            _ => Err(anyhow!("emulate: use geo/locale/timezone/permission")),
         }
     }
 
@@ -3256,21 +3718,38 @@ impl BrowserSession {
         let sub = args.get("value").and_then(|v| v.as_str()).unwrap_or("mark");
         match sub {
             "mark" => {
-                let result = self.cdp.send("Page.captureScreenshot", json!({"format": "png"})).await?;
+                let result = self
+                    .cdp
+                    .send("Page.captureScreenshot", json!({"format": "png"}))
+                    .await?;
                 let data = result.get("data").and_then(|v| v.as_str()).unwrap_or("");
                 self.before_screenshot = Some(data.to_owned());
                 Ok(json!({"action": "diff", "sub": "mark", "text": "Baseline screenshot captured"}))
             }
             "compare" => {
-                let before = self.before_screenshot.as_deref()
+                let before = self
+                    .before_screenshot
+                    .as_deref()
                     .ok_or_else(|| anyhow!("diff compare: call diff mark first"))?;
-                let after_result = self.cdp.send("Page.captureScreenshot", json!({"format": "png"})).await?;
-                let after = after_result.get("data").and_then(|v| v.as_str()).unwrap_or("");
+                let after_result = self
+                    .cdp
+                    .send("Page.captureScreenshot", json!({"format": "png"}))
+                    .await?;
+                let after = after_result
+                    .get("data")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let changed = before != after;
                 let before_bytes = before.len();
                 let after_bytes = after.len();
-                let diff_ratio = if before_bytes == 0 { 1.0 } else {
-                    let common = before.bytes().zip(after.bytes()).filter(|(a, b)| a == b).count();
+                let diff_ratio = if before_bytes == 0 {
+                    1.0
+                } else {
+                    let common = before
+                        .bytes()
+                        .zip(after.bytes())
+                        .filter(|(a, b)| a == b)
+                        .count();
                     1.0 - (common as f64 / before_bytes.max(after_bytes) as f64)
                 };
                 Ok(json!({
@@ -3280,14 +3759,17 @@ impl BrowserSession {
                     "after_image": format!("data:image/png;base64,{after}"),
                 }))
             }
-            _ => Err(anyhow!("diff: use mark/compare"))
+            _ => Err(anyhow!("diff: use mark/compare")),
         }
     }
 
     // -- Task 7: Operation Recording --------------------------------------------
 
     async fn cmd_record(&mut self, args: &Value) -> Result<Value> {
-        let sub = args.get("value").and_then(|v| v.as_str()).unwrap_or("start");
+        let sub = args
+            .get("value")
+            .and_then(|v| v.as_str())
+            .unwrap_or("start");
         match sub {
             "start" => {
                 self.recording = Some(Vec::new());
@@ -3296,14 +3778,18 @@ impl BrowserSession {
             "stop" => {
                 let entries = self.recording.take().unwrap_or_default();
                 let count = entries.len();
-                Ok(json!({"action": "record", "sub": "stop", "operations": count, "trace": entries}))
+                Ok(
+                    json!({"action": "record", "sub": "stop", "operations": count, "trace": entries}),
+                )
             }
             "status" => {
                 let active = self.recording.is_some();
                 let count = self.recording.as_ref().map(|e| e.len()).unwrap_or(0);
-                Ok(json!({"action": "record", "sub": "status", "active": active, "operations": count}))
+                Ok(
+                    json!({"action": "record", "sub": "status", "active": active, "operations": count}),
+                )
             }
-            _ => Err(anyhow!("record: use start/stop/status"))
+            _ => Err(anyhow!("record: use start/stop/status")),
         }
     }
 
@@ -3314,7 +3800,9 @@ impl BrowserSession {
     /// by probing common search input patterns.
     async fn cmd_search(&mut self, args: &Value) -> Result<Value> {
         let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
-        let text = args.get("text").and_then(|v| v.as_str())
+        let text = args
+            .get("text")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("search: `text` required"))?;
         let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(15);
 
@@ -3328,7 +3816,8 @@ impl BrowserSession {
         let escaped_text = escape_js_string(text);
 
         // Auto-detect search input, fill, and submit.
-        let search_js = format!(r#"(function() {{
+        let search_js = format!(
+            r#"(function() {{
             // Priority-ordered selectors for search inputs.
             var selectors = [
                 'input[type="search"]',
@@ -3433,12 +3922,19 @@ impl BrowserSession {
             }}
 
             return JSON.stringify({{ok: true, submitted: submitted, selector: input.tagName + (input.name ? '[name=' + input.name + ']' : '')}});
-        }})()"#);
+        }})()"#
+        );
 
-        let result = self.cdp.send("Runtime.evaluate", json!({
-            "expression": search_js,
-            "returnByValue": true,
-        })).await?;
+        let result = self
+            .cdp
+            .send(
+                "Runtime.evaluate",
+                json!({
+                    "expression": search_js,
+                    "returnByValue": true,
+                }),
+            )
+            .await?;
 
         let result_str = result["result"]["value"].as_str().unwrap_or("{}");
         let parsed: Value = serde_json::from_str(result_str).unwrap_or_default();
@@ -3452,7 +3948,8 @@ impl BrowserSession {
         let _ = tokio::time::timeout(
             Duration::from_secs(timeout),
             self.cdp.wait_event("Page.loadEventFired", timeout),
-        ).await;
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(1500)).await;
 
         // Return page text content.
@@ -3502,12 +3999,19 @@ impl BrowserSession {
             });
         })()"#;
 
-        let _ = self.cdp.send("Runtime.evaluate", json!({"expression": inject})).await;
-        let result = self.cdp.send("Runtime.evaluate", json!({"expression": js})).await?;
+        let _ = self
+            .cdp
+            .send("Runtime.evaluate", json!({"expression": inject}))
+            .await;
+        let result = self
+            .cdp
+            .send("Runtime.evaluate", json!({"expression": js}))
+            .await?;
         let raw = result["result"]["value"].as_str().unwrap_or("[]");
         let entries: Vec<Value> = serde_json::from_str(raw).unwrap_or_default();
 
-        let filtered: Vec<&Value> = entries.iter()
+        let filtered: Vec<&Value> = entries
+            .iter()
             .filter(|e| level == "all" || e["level"].as_str() == Some(level))
             .rev()
             .take(limit)
@@ -3522,9 +4026,15 @@ impl BrowserSession {
 
     /// Get the full HTML content of the current page.
     async fn cmd_content(&self) -> Result<Value> {
-        let result = self.cdp.send("Runtime.evaluate", json!({
-            "expression": "document.documentElement.outerHTML"
-        })).await?;
+        let result = self
+            .cdp
+            .send(
+                "Runtime.evaluate",
+                json!({
+                    "expression": "document.documentElement.outerHTML"
+                }),
+            )
+            .await?;
         let html = result["result"]["value"].as_str().unwrap_or("");
         Ok(json!({"action": "content", "html": html, "length": html.len()}))
     }
@@ -3535,13 +4045,17 @@ impl BrowserSession {
 
     /// Switch execution context to an iframe by selector or @ref.
     async fn cmd_frame(&mut self, args: &Value) -> Result<Value> {
-        let selector = args.get("selector").or(args.get("ref"))
+        let selector = args
+            .get("selector")
+            .or(args.get("ref"))
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("frame: `selector` or `ref` required"))?;
 
         // Resolve @ref to CSS selector if needed.
         let css = if selector.starts_with('@') {
-            let idx: usize = selector.trim_start_matches("@e").parse()
+            let idx: usize = selector
+                .trim_start_matches("@e")
+                .parse()
                 .map_err(|_| anyhow!("frame: invalid ref `{selector}`"))?;
             format!("[data-rsclaw-ref='e{idx}']")
         } else {
@@ -3561,7 +4075,10 @@ impl BrowserSession {
             }})()"#,
             css = css.replace('\'', "\\'")
         );
-        let result = self.cdp.send("Runtime.evaluate", json!({"expression": js})).await?;
+        let result = self
+            .cdp
+            .send("Runtime.evaluate", json!({"expression": js}))
+            .await?;
         let raw = result["result"]["value"].as_str().unwrap_or("{}");
         let parsed: Value = serde_json::from_str(raw).unwrap_or_default();
 
@@ -3590,7 +4107,9 @@ impl BrowserSession {
 
     /// Wait for the page URL to match a pattern (useful after login/redirect).
     async fn cmd_wait_for_url(&self, args: &Value) -> Result<Value> {
-        let pattern = args.get("url").or(args.get("pattern"))
+        let pattern = args
+            .get("url")
+            .or(args.get("pattern"))
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("waitforurl: `url` pattern required"))?;
         let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30);
@@ -3599,9 +4118,15 @@ impl BrowserSession {
         let deadline = std::time::Duration::from_secs(timeout);
 
         loop {
-            let result = self.cdp.send("Runtime.evaluate", json!({
-                "expression": "window.location.href"
-            })).await?;
+            let result = self
+                .cdp
+                .send(
+                    "Runtime.evaluate",
+                    json!({
+                        "expression": "window.location.href"
+                    }),
+                )
+                .await?;
             let current_url = result["result"]["value"].as_str().unwrap_or("");
 
             if current_url.contains(pattern) {
@@ -3633,7 +4158,11 @@ impl BrowserSession {
 
     /// Find elements by semantic locators (text, role, label).
     async fn cmd_getby(&self, args: &Value, by: &str) -> Result<Value> {
-        let value = args.get("value").or(args.get("text")).or(args.get("role")).or(args.get("label"))
+        let value = args
+            .get("value")
+            .or(args.get("text"))
+            .or(args.get("role"))
+            .or(args.get("label"))
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("getby{by}: `value` required"))?;
         let exact = args.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -3695,7 +4224,10 @@ impl BrowserSession {
             _ => return Err(anyhow!("getby: unknown locator type `{by}`")),
         };
 
-        let result = self.cdp.send("Runtime.evaluate", json!({"expression": js})).await?;
+        let result = self
+            .cdp
+            .send("Runtime.evaluate", json!({"expression": js}))
+            .await?;
         let raw = result["result"]["value"].as_str().unwrap_or("[]");
         let elements: Vec<Value> = serde_json::from_str(raw).unwrap_or_default();
 
@@ -3760,7 +4292,8 @@ async fn save_screenshot_bytes(b64_data: &str, format: &str) -> Result<String> {
 // Snapshot JS -- injected into the page to build an accessibility-like tree
 // ---------------------------------------------------------------------------
 
-/// JS helper to find an element by data-ref, including inside same-origin iframes.
+/// JS helper to find an element by data-ref, including inside same-origin
+/// iframes.
 const FIND_REF_JS: &str = r#"function findRef(ref){var el=document.querySelector('[data-ref="'+ref+'"]');if(el)return el;var iframes=document.querySelectorAll('iframe');for(var i=0;i<iframes.length;i++){try{var doc=iframes[i].contentDocument;if(doc){el=doc.querySelector('[data-ref="'+ref+'"]');if(el)return el;}}catch(e){}}return null;}"#;
 
 /// JS helper: wait for element to be visible, enabled, and position-stable.
@@ -3905,8 +4438,8 @@ const SNAPSHOT_JS: &str = r#"(function(){
   return JSON.stringify({lines: lines, refCount: counter});
 })()"#;
 
-/// Interactive-only snapshot: only outputs elements that have @ref (interactive).
-/// Saves ~80% tokens compared to full snapshot.
+/// Interactive-only snapshot: only outputs elements that have @ref
+/// (interactive). Saves ~80% tokens compared to full snapshot.
 const SNAPSHOT_INTERACTIVE_JS: &str = r#"(function(){
   var lines = [];
   var counter = 0;
@@ -3971,8 +4504,9 @@ const SNAPSHOT_INTERACTIVE_JS: &str = r#"(function(){
   return JSON.stringify({lines: lines, refCount: counter});
 })()"#;
 
-/// Set-of-Marks annotation: inject colorful borders + numbered labels on elements
-/// that have `data-ref` attributes (set by snapshot). Returns a legend array.
+/// Set-of-Marks annotation: inject colorful borders + numbered labels on
+/// elements that have `data-ref` attributes (set by snapshot). Returns a legend
+/// array.
 const SNAPSHOT_ANNOTATE_JS: &str = r#"(function(){
   var refs = document.querySelectorAll('[data-ref]');
   var labels = [];
@@ -4040,9 +4574,10 @@ const SNAPSHOT_ANNOTATE_JS: &str = r#"(function(){
 
 #[cfg(test)]
 mod tests {
-    use super::{detect_existing_chrome, parse_port_from_ws_url};
     use serde_json::json;
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    use super::{detect_existing_chrome, parse_port_from_ws_url};
 
     #[test]
     fn parse_port_from_ws_url_127() {

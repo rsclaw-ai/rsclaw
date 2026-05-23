@@ -5,23 +5,23 @@
 //! Week 1 covers files only. URL fetch + HTML-from-URL canonicalizer
 //! ships in Week 2 alongside the worker pool.
 
-pub mod url_canon;
-pub mod text;
-pub mod md;
-pub mod html;
-pub mod pdf;
-pub mod ooxml;
-pub mod spreadsheet;
-pub mod legacy;
 pub mod email;
+pub mod html;
+pub mod legacy;
+pub mod md;
 pub mod mime;
+pub mod ooxml;
+pub mod pdf;
+pub mod spreadsheet;
+pub mod text;
+pub mod url_canon;
+
+use anyhow::Result;
+pub use mime::{canonicalize_by_mime, detect_mime};
+use serde::{Deserialize, Serialize};
+pub use url_canon::canonicalize_url;
 
 use crate::kb::model::{KbSourceKind, LogicalSourceId};
-use anyhow::Result;
-use serde::{Deserialize, Serialize};
-
-pub use mime::{canonicalize_by_mime, detect_mime};
-pub use url_canon::canonicalize_url;
 
 #[derive(Debug, Clone)]
 pub struct CanonicalizedSource {

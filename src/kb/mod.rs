@@ -6,9 +6,9 @@
 //! README:  `src/kb/README.md` (invariants 1–28)
 //!
 //! Layout:
-//!   model/         — KbDoc, KbChunk, KbEntity, LogicalSourceId, KbVisibility, …
-//!   content_store/ — atomic md/<kind>/<slug>--<lsid8>--<md8>.md writer + readers
-//!   store/         — redb schema (13 tables) + per-table accessors
+//!   model/         — KbDoc, KbChunk, KbEntity, LogicalSourceId, KbVisibility,
+//! …   content_store/ — atomic md/<kind>/<slug>--<lsid8>--<md8>.md writer +
+//! readers   store/         — redb schema (13 tables) + per-table accessors
 //!   canonicalize/  — text/md/html/pdf → Markdown; url string canonicalization
 //!   chunker/       — markdown → KbChunk[] with deterministic chunk_id
 //!   ledger/        — IngestLedger + Outbox types
@@ -27,55 +27,55 @@
 //!   util/          — redact() for PII-safe logging
 //!   paths.rs       — KbPaths resolves ~/.rsclaw/kb/{md,raw,db,idx,hnsw,state}/
 
-pub mod paths;
-pub mod model;
-pub mod content_store;
-pub mod store;
 pub mod canonicalize;
 pub mod chunker;
-pub mod ledger;
-pub mod jobs;
 pub mod compactor;
+pub mod content_store;
 pub mod embedder;
 pub mod entities;
 pub mod index;
+pub mod jobs;
+pub mod ledger;
+pub mod model;
+pub mod paths;
 pub mod pipeline;
 pub mod search;
 pub mod service;
+pub mod store;
 pub mod sync;
 pub mod tools;
-pub mod worker;
 pub mod util;
+pub mod worker;
 
 // Public façade — re-export the surface most callers need so they
 // can `use rsclaw::kb::{stage_doc, chunk_markdown, ...}` without
 // reaching into submodules. Submodules stay `pub` for advanced
 // callers that need finer control.
 
-pub use paths::KbPaths;
-pub use model::{
-    chunk_id, hamming64, simhash64, CallerScope, ChunkStatus, EntityKind, KbChunk, KbDoc,
-    KbEntity, KbEntityIndex, KbLocator, KbSource, KbSourceKind, KbStatus, KbVisibility,
-    LogicalSourceId, MailSource, VersionPointer,
-};
-pub use content_store::{
-    compose_doc_file, parse_doc_file, read_doc_body, read_doc_range, stage_doc,
-    verify_doc_sha, FrontMatter, StageInput, StagedDoc,
-};
 pub use canonicalize::{
-    canonicalize_by_mime, canonicalize_url, detect_mime, CanonicalMetadata, CanonicalizeInput,
-    CanonicalizedSource,
+    CanonicalMetadata, CanonicalizeInput, CanonicalizedSource, canonicalize_by_mime,
+    canonicalize_url, detect_mime,
 };
-pub use chunker::{chunk_markdown, ChunkerInput, LocatorKind};
-pub use store::{open_db, KbStore};
-pub use ledger::{IngestLedgerEntry, LedgerOp, LedgerStatus};
-pub use jobs::{ClaimToken, Job, JobKind, JobStatus};
-pub use util::{redact, RAG_DISCIPLINE_PROMPT};
+pub use chunker::{ChunkerInput, LocatorKind, chunk_markdown};
+pub use content_store::{
+    FrontMatter, StageInput, StagedDoc, compose_doc_file, parse_doc_file, read_doc_body,
+    read_doc_range, stage_doc, verify_doc_sha,
+};
 pub use embedder::{KbEmbedder, StubEmbedder};
-pub use pipeline::{ingest_canonicalized, IngestInput, IngestOutput};
-pub use worker::{DefaultDispatcher, HandlerCtx, JobHandler, WorkerConfig, WorkerPool};
 pub use index::{HnswCache, KbIndex, TantivyIndex};
+pub use jobs::{ClaimToken, Job, JobKind, JobStatus};
+pub use ledger::{IngestLedgerEntry, LedgerOp, LedgerStatus};
+pub use model::{
+    CallerScope, ChunkStatus, EntityKind, KbChunk, KbDoc, KbEntity, KbEntityIndex, KbLocator,
+    KbSource, KbSourceKind, KbStatus, KbVisibility, LogicalSourceId, MailSource, VersionPointer,
+    chunk_id, hamming64, simhash64,
+};
+pub use paths::KbPaths;
+pub use pipeline::{IngestInput, IngestOutput, ingest_canonicalized};
 pub use service::{KnowledgeError, KnowledgeService};
+pub use store::{KbStore, open_db};
+pub use util::{RAG_DISCIPLINE_PROMPT, redact};
+pub use worker::{DefaultDispatcher, HandlerCtx, JobHandler, WorkerConfig, WorkerPool};
 
 // ---------------------------------------------------------------------------
 // Process-global handle to the live KnowledgeService.

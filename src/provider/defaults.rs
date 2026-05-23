@@ -19,27 +19,30 @@ use std::{collections::HashMap, sync::OnceLock};
 /// `auth_style`: `"bearer"`, `"x-api-key"`, or `"none"`.
 fn builtin_base_url(provider: &str) -> (&'static str, &'static str) {
     match provider {
-        "anthropic"          => ("https://api.anthropic.com/v1",                       "x-api-key"),
-        "openai"             => ("https://api.openai.com/v1",                         "bearer"),
-        "deepseek"           => ("https://api.deepseek.com/v1",                       "bearer"),
-        "qwen"               => ("https://dashscope.aliyuncs.com/compatible-mode/v1",             "bearer"),
-        "doubao"             => ("https://ark.cn-beijing.volces.com/api/v3",          "bearer"),
-        "minimax"            => ("https://api.minimaxi.com/v1",                       "bearer"),
-        "kimi" | "moonshot"  => ("https://api.moonshot.cn/v1",                        "bearer"),
-        "zhipu"              => ("https://open.bigmodel.cn/api/paas/v4",              "bearer"),
-        "groq"               => ("https://api.groq.com/openai/v1",                    "bearer"),
-        "grok" | "xai"       => ("https://api.x.ai/v1",                              "bearer"),
-        "gemini"             => ("https://generativelanguage.googleapis.com/v1beta",  "bearer"),
-        "siliconflow"        => ("https://api.siliconflow.cn/v1",                     "bearer"),
-        "openrouter"         => ("https://openrouter.ai/api/v1",                      "bearer"),
-        "gaterouter"         => ("https://api.gaterouter.ai/openai/v1",               "bearer"),
-        "stepfun"            => ("https://api.stepfun.com/v1",                        "bearer"),
-        "cerebras"           => ("https://api.cerebras.ai/v1",                        "bearer"),
-        "cohere"             => ("https://api.cohere.com/v2",                         "bearer"),
-        "lingyi"             => ("https://api.lingyiwanwu.com/v1",                    "bearer"),
-        "mistral"            => ("https://api.mistral.ai/v1",                         "bearer"),
-        "ollama"             => ("http://localhost:11434",                             "none"),
-        _                    => ("",                                                  "bearer"),
+        "anthropic" => ("https://api.anthropic.com/v1", "x-api-key"),
+        "openai" => ("https://api.openai.com/v1", "bearer"),
+        "deepseek" => ("https://api.deepseek.com/v1", "bearer"),
+        "qwen" => (
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "bearer",
+        ),
+        "doubao" => ("https://ark.cn-beijing.volces.com/api/v3", "bearer"),
+        "minimax" => ("https://api.minimaxi.com/v1", "bearer"),
+        "kimi" | "moonshot" => ("https://api.moonshot.cn/v1", "bearer"),
+        "zhipu" => ("https://open.bigmodel.cn/api/paas/v4", "bearer"),
+        "groq" => ("https://api.groq.com/openai/v1", "bearer"),
+        "grok" | "xai" => ("https://api.x.ai/v1", "bearer"),
+        "gemini" => ("https://generativelanguage.googleapis.com/v1beta", "bearer"),
+        "siliconflow" => ("https://api.siliconflow.cn/v1", "bearer"),
+        "openrouter" => ("https://openrouter.ai/api/v1", "bearer"),
+        "gaterouter" => ("https://api.gaterouter.ai/openai/v1", "bearer"),
+        "stepfun" => ("https://api.stepfun.com/v1", "bearer"),
+        "cerebras" => ("https://api.cerebras.ai/v1", "bearer"),
+        "cohere" => ("https://api.cohere.com/v2", "bearer"),
+        "lingyi" => ("https://api.lingyiwanwu.com/v1", "bearer"),
+        "mistral" => ("https://api.mistral.ai/v1", "bearer"),
+        "ollama" => ("http://localhost:11434", "none"),
+        _ => ("", "bearer"),
     }
 }
 
@@ -110,10 +113,9 @@ pub fn resolve_base_url(provider: &str) -> (String, &'static str) {
 /// (e.g. `/v1`, `/v4`, `/v1beta`).
 pub fn has_version_suffix(url: &str) -> bool {
     let trimmed = url.trim_end_matches('/');
-    trimmed
-        .rsplit('/')
-        .next()
-        .is_some_and(|seg| seg.starts_with('v') && seg.chars().nth(1).is_some_and(|c| c.is_ascii_digit()))
+    trimmed.rsplit('/').next().is_some_and(|seg| {
+        seg.starts_with('v') && seg.chars().nth(1).is_some_and(|c| c.is_ascii_digit())
+    })
 }
 
 /// Build the models-list URL for a provider.
@@ -165,7 +167,9 @@ mod tests {
     fn has_version_suffix_checks() {
         assert!(has_version_suffix("https://api.openai.com/v1"));
         assert!(has_version_suffix("https://open.bigmodel.cn/api/paas/v4"));
-        assert!(has_version_suffix("https://generativelanguage.googleapis.com/v1beta"));
+        assert!(has_version_suffix(
+            "https://generativelanguage.googleapis.com/v1beta"
+        ));
         assert!(has_version_suffix("https://api.cohere.com/v2/"));
         assert!(!has_version_suffix("https://api.anthropic.com"));
         assert!(!has_version_suffix("http://localhost:11434"));

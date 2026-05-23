@@ -2,12 +2,13 @@
 
 use super::*;
 use crate::kb::canonicalize::{
-    email::{EmlCanonicalizer, MboxCanonicalizer, EML_MIME, MBOX_MIME},
-    html::HtmlCanonicalizer, md::MdCanonicalizer,
-    legacy::{LegacyOfficeCanonicalizer, DOC_MIME, PPT_MIME},
-    ooxml::{DocxCanonicalizer, PptxCanonicalizer, DOCX_MIME, PPTX_MIME},
+    email::{EML_MIME, EmlCanonicalizer, MBOX_MIME, MboxCanonicalizer},
+    html::HtmlCanonicalizer,
+    legacy::{DOC_MIME, LegacyOfficeCanonicalizer, PPT_MIME},
+    md::MdCanonicalizer,
+    ooxml::{DOCX_MIME, DocxCanonicalizer, PPTX_MIME, PptxCanonicalizer},
     pdf::PdfCanonicalizer,
-    spreadsheet::{SpreadsheetCanonicalizer, ODS_MIME, XLS_MIME, XLSX_MIME},
+    spreadsheet::{ODS_MIME, SpreadsheetCanonicalizer, XLS_MIME, XLSX_MIME},
     text::TextCanonicalizer,
 };
 
@@ -54,9 +55,7 @@ pub fn detect_mime(bytes: &[u8], filename_hint: Option<&str>) -> String {
     "application/octet-stream".into()
 }
 
-pub fn canonicalize_by_mime(
-    input: CanonicalizeInput<'_>,
-) -> Result<Option<CanonicalizedSource>> {
+pub fn canonicalize_by_mime(input: CanonicalizeInput<'_>) -> Result<Option<CanonicalizedSource>> {
     let registered: &[&dyn Canonicalizer] = &[
         &MdCanonicalizer,
         &HtmlCanonicalizer,
@@ -74,7 +73,10 @@ pub fn canonicalize_by_mime(
             return c.canonicalize(input);
         }
     }
-    Err(anyhow::anyhow!("no canonicalizer for mime '{}'", input.mime))
+    Err(anyhow::anyhow!(
+        "no canonicalizer for mime '{}'",
+        input.mime
+    ))
 }
 
 #[cfg(test)]

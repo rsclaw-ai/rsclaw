@@ -7,13 +7,12 @@ pub mod hnsw;
 pub mod rebuild;
 pub mod tantivy;
 
+use anyhow::Result;
 pub use cjk::JiebaTokenizer;
 pub use hnsw::HnswCache;
 pub use tantivy::TantivyIndex;
 
-use crate::kb::paths::KbPaths;
-use crate::kb::store::KbStore;
-use anyhow::Result;
+use crate::kb::{paths::KbPaths, store::KbStore};
 
 pub struct KbIndex {
     pub hnsw: HnswCache,
@@ -49,11 +48,7 @@ impl KbIndex {
     /// full rebuild from redb. A snapshot whose dimension doesn't
     /// match `dim` (e.g. embedder changed) fails restore and triggers
     /// a clean rebuild. Tantivy is always rebuilt from redb.
-    pub fn open_and_rebuild_with_dim(
-        paths: &KbPaths,
-        store: &KbStore,
-        dim: usize,
-    ) -> Result<Self> {
+    pub fn open_and_rebuild_with_dim(paths: &KbPaths, store: &KbStore, dim: usize) -> Result<Self> {
         let idx = Self::open_with_dim(paths, dim)?;
         let snapshot_dir = paths.root.join("hnsw");
         let restored = idx.hnsw.restore(&snapshot_dir).unwrap_or(false);
@@ -87,13 +82,17 @@ impl KbIndex {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::kb::canonicalize::{canonicalize_by_mime, CanonicalizeInput};
-    use crate::kb::embedder::{KbEmbedder, StubEmbedder};
-    use crate::kb::pipeline::{ingest_canonicalized, IngestInput};
-    use crate::kb::worker::{handlers::HandlerCtx, DefaultDispatcher, WorkerConfig, WorkerPool};
     use std::sync::Arc;
+
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::kb::{
+        canonicalize::{CanonicalizeInput, canonicalize_by_mime},
+        embedder::{KbEmbedder, StubEmbedder},
+        pipeline::{IngestInput, ingest_canonicalized},
+        worker::{DefaultDispatcher, WorkerConfig, WorkerPool, handlers::HandlerCtx},
+    };
 
     #[test]
     fn open_and_rebuild_recovers_both_layers() {
@@ -153,6 +152,9 @@ mod tests {
         let idx = KbIndex::open_and_rebuild(&paths, &store).unwrap();
         assert!(idx.hnsw.len() > 0, "hnsw should have chunks after rebuild");
         let bm25 = idx.tantivy.search("body", 5).unwrap();
-        assert!(!bm25.is_empty(), "tantivy should find at least one body match");
+        assert!(
+            !bm25.is_empty(),
+            "tantivy should find at least one body match"
+        );
     }
 }

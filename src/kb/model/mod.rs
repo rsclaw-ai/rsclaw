@@ -1,14 +1,14 @@
-pub mod source;
-pub mod locator;
-pub mod simhash;
 pub mod chunk;
 pub mod collection;
 pub mod doc;
 pub mod entity;
+pub mod locator;
+pub mod simhash;
+pub mod source;
 pub mod version;
 
-pub use chunk::{chunk_id, ChunkStatus, KbChunk};
-pub use collection::{collection_tag, KbCollection, COLLECTION_TAG_PREFIX};
+pub use chunk::{ChunkStatus, KbChunk, chunk_id};
+pub use collection::{COLLECTION_TAG_PREFIX, KbCollection, collection_tag};
 pub use doc::{CallerScope, KbDoc, KbStatus, KbVisibility};
 pub use entity::{EntityKind, KbEntity, KbEntityIndex};
 pub use locator::KbLocator;

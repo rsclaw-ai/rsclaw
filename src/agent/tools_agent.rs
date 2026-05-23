@@ -1,17 +1,23 @@
-//! Agent management tool handlers — spawn, task, send, list, and consolidated dispatch.
+//! Agent management tool handlers — spawn, task, send, list, and consolidated
+//! dispatch.
 //!
 //! Split from `tools_misc.rs` for maintainability.  All methods live in
-//! `impl AgentRuntime` via the split-impl pattern (same struct, different file).
+//! `impl AgentRuntime` via the split-impl pattern (same struct, different
+//! file).
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
-use super::registry::{AgentMessage, AgentReply};
-use super::runtime::{persist_agent_to_config, update_agent_in_config, AgentRuntime, RunContext, DEFAULT_TIMEOUT_SECONDS};
+use super::{
+    registry::{AgentMessage, AgentReply},
+    runtime::{
+        AgentRuntime, DEFAULT_TIMEOUT_SECONDS, RunContext, persist_agent_to_config,
+        update_agent_in_config,
+    },
+};
 
 impl AgentRuntime {
     // -------------------------------------------------------------------
@@ -54,8 +60,13 @@ impl AgentRuntime {
         let primary_model = self.resolve_model_name();
         let flash_model = self.resolve_flash_model_name();
         let persistent = args["persistent"].as_bool().unwrap_or(true);
-        let default_model = if persistent { &primary_model } else { &flash_model };
-        let model = args["model"].as_str()
+        let default_model = if persistent {
+            &primary_model
+        } else {
+            &flash_model
+        };
+        let model = args["model"]
+            .as_str()
             .filter(|s| !s.is_empty() && *s != "default")
             .unwrap_or(default_model)
             .to_owned();
@@ -63,13 +74,12 @@ impl AgentRuntime {
             .as_str()
             .ok_or_else(|| anyhow!("agent_spawn: `system` required"))?
             .to_owned();
-        let toolset_str = args["toolset"]
-            .as_str()
-            .unwrap_or("standard")
-            .to_owned();
-        let channels: Option<Vec<String>> = args["channels"]
-            .as_array()
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_owned())).collect());
+        let toolset_str = args["toolset"].as_str().unwrap_or("standard").to_owned();
+        let channels: Option<Vec<String>> = args["channels"].as_array().map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_owned()))
+                .collect()
+        });
 
         use crate::config::schema::{AgentEntry, ModelConfig};
 
@@ -117,14 +127,17 @@ impl AgentRuntime {
         };
         spawner.spawn_agent_with_kind(entry.clone(), kind)?;
 
-        // Write full system prompt (base + role) as SOUL.md in the new agent's workspace.
+        // Write full system prompt (base + role) as SOUL.md in the new agent's
+        // workspace.
         let ws_path = crate::config::loader::base_dir().join(format!("workspace-{id}"));
         if let Err(e) = tokio::fs::create_dir_all(&ws_path).await {
             warn!("agent_spawn: failed to create workspace for {id}: {e:#}");
         }
         let soul_path = ws_path.join("SOUL.md");
         let full_prompt = self.build_subagent_system_prompt(&system);
-        if let Err(e) = tokio::fs::write(&soul_path, format!("# Agent: {id}\n\n{full_prompt}\n")).await {
+        if let Err(e) =
+            tokio::fs::write(&soul_path, format!("# Agent: {id}\n\n{full_prompt}\n")).await
+        {
             warn!("agent_spawn: failed to write SOUL.md for {id}: {e:#}");
         }
 
@@ -176,15 +189,15 @@ impl AgentRuntime {
             .ok_or_else(|| anyhow!("agent_task: `message` required"))?
             .to_owned();
 
-        let toolset_str = args["toolset"]
-            .as_str()
-            .unwrap_or("standard")
-            .to_owned();
+        let toolset_str = args["toolset"].as_str().unwrap_or("standard").to_owned();
 
         let short_id = &uuid::Uuid::new_v4().to_string()[..8];
         let id = format!("task-{short_id}");
         let base = crate::config::loader::base_dir();
-        let parent_ws = self.handle.config.workspace
+        let parent_ws = self
+            .handle
+            .config
+            .workspace
             .as_deref()
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| base.join("workspace"));
@@ -252,7 +265,11 @@ impl AgentRuntime {
             files: vec![],
             account: None,
         };
-        target.tx.send(msg).await.map_err(|_| anyhow!("agent_task: agent inbox closed"))?;
+        target
+            .tx
+            .send(msg)
+            .await
+            .map_err(|_| anyhow!("agent_task: agent inbox closed"))?;
 
         // Spawn background worker to wait for reply, store result, then wake
         // the parent agent so it can process and respond to the user.
@@ -274,14 +291,12 @@ impl AgentRuntime {
         let task_timeout = timeout_secs.min(300); // up to 5 min for background tasks
 
         tokio::spawn(async move {
-            let result_text = match tokio::time::timeout(
-                Duration::from_secs(task_timeout),
-                reply_rx,
-            ).await {
-                Ok(Ok(reply)) => reply.text,
-                Ok(Err(_)) => "[task agent channel closed unexpectedly]".to_owned(),
-                Err(_) => format!("[task {task_id} timed out after {task_timeout}s]"),
-            };
+            let result_text =
+                match tokio::time::timeout(Duration::from_secs(task_timeout), reply_rx).await {
+                    Ok(Ok(reply)) => reply.text,
+                    Ok(Err(_)) => "[task agent channel closed unexpectedly]".to_owned(),
+                    Err(_) => format!("[task {task_id} timed out after {task_timeout}s]"),
+                };
 
             // Store result for main agent to pick up when run_turn fires.
             if let Ok(mut guard) = pending.lock() {
@@ -316,8 +331,16 @@ impl AgentRuntime {
                 if let Ok(reply) = wake_rx.await {
                     if !reply.text.is_empty() {
                         if let Some(ref ntx) = notification_tx {
-                            let target = if !chat_id.is_empty() { chat_id } else { peer_id };
-                            if !target.is_empty() && !channel.is_empty() && channel != "system" && channel != "cron" {
+                            let target = if !chat_id.is_empty() {
+                                chat_id
+                            } else {
+                                peer_id
+                            };
+                            if !target.is_empty()
+                                && !channel.is_empty()
+                                && channel != "system"
+                                && channel != "cron"
+                            {
                                 // For ws/desktop, tag with kind so UI can
                                 // badge the bubble as "[任务完成]". Other
                                 // channels (telegram/feishu/...) get plain
@@ -401,7 +424,11 @@ impl AgentRuntime {
             files: vec![],
             account: None,
         };
-        target.tx.send(msg).await.map_err(|_| anyhow!("agent_send: agent '{target_id}' inbox closed"))?;
+        target
+            .tx
+            .send(msg)
+            .await
+            .map_err(|_| anyhow!("agent_send: agent '{target_id}' inbox closed"))?;
 
         // Background: wait for reply, store result, then wake parent agent.
         let pending = Arc::clone(&self.pending_task_results);
@@ -423,14 +450,12 @@ impl AgentRuntime {
         let target_id_bg = target_id.clone();
 
         tokio::spawn(async move {
-            let result_text = match tokio::time::timeout(
-                Duration::from_secs(send_timeout),
-                reply_rx,
-            ).await {
-                Ok(Ok(reply)) => reply.text,
-                Ok(Err(_)) => format!("[agent {target_id_bg} channel closed]"),
-                Err(_) => format!("[agent {target_id_bg} timed out after {send_timeout}s]"),
-            };
+            let result_text =
+                match tokio::time::timeout(Duration::from_secs(send_timeout), reply_rx).await {
+                    Ok(Ok(reply)) => reply.text,
+                    Ok(Err(_)) => format!("[agent {target_id_bg} channel closed]"),
+                    Err(_) => format!("[agent {target_id_bg} timed out after {send_timeout}s]"),
+                };
             if let Ok(mut guard) = pending.lock() {
                 guard.push((send_id_bg.clone(), session_key.clone(), result_text));
             }
@@ -459,8 +484,16 @@ impl AgentRuntime {
             } else if let Ok(reply) = wake_rx.await {
                 if !reply.text.is_empty() {
                     if let Some(ref ntx) = notification_tx {
-                        let target = if !chat_id.is_empty() { chat_id } else { peer_id };
-                        if !target.is_empty() && !channel.is_empty() && channel != "system" && channel != "cron" {
+                        let target = if !chat_id.is_empty() {
+                            chat_id
+                        } else {
+                            peer_id
+                        };
+                        if !target.is_empty()
+                            && !channel.is_empty()
+                            && channel != "system"
+                            && channel != "cron"
+                        {
                             let body = if channel == "ws" || channel == "desktop" {
                                 crate::channel::outbound_with_kind(
                                     crate::channel::outbound_kind::ASYNC_SEND,
@@ -495,7 +528,8 @@ impl AgentRuntime {
     }
 
     /// Update fields of a named agent in the config file (model, name).
-    /// The hot-reload watcher applies the change within seconds — no restart needed.
+    /// The hot-reload watcher applies the change within seconds — no restart
+    /// needed.
     async fn tool_agent_update(&self, args: Value) -> Result<Value> {
         let id = args["id"]
             .as_str()
@@ -524,7 +558,11 @@ impl AgentRuntime {
         Ok(json!({"agents": agents}))
     }
 
-    pub(crate) async fn tool_agent_consolidated(&self, ctx: &RunContext, args: Value) -> Result<Value> {
+    pub(crate) async fn tool_agent_consolidated(
+        &self,
+        ctx: &RunContext,
+        args: Value,
+    ) -> Result<Value> {
         // .trim() — v1 block protocol can shard tool_call JSON such that
         // string values land with leading/trailing whitespace; see
         // tool_memory_consolidated for the diagnosis.

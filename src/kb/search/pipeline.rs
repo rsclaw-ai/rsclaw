@@ -1,18 +1,23 @@
 //! kb_search pipeline: dense + sparse → filter → fuse → boost → mmr → fetch.
 
-use crate::kb::content_store::read::read_doc_range;
-use crate::kb::embedder::KbEmbedder;
-use crate::kb::index::KbIndex;
-use crate::kb::model::{CallerScope, KbChunk, KbDoc, KbLocator, KbSource};
-use crate::kb::paths::KbPaths;
-use crate::kb::search::filter::{is_latest_version, keep_doc, SearchFilter};
-use crate::kb::search::mmr::{mmr_select, MmrCandidate};
-use crate::kb::search::rrf::rrf_fuse;
-use crate::kb::store::{chunks, docs, entities, KbStore};
+use std::{collections::HashMap, sync::Arc};
+
 use anyhow::Result;
 use serde::Serialize;
-use std::collections::HashMap;
-use std::sync::Arc;
+
+use crate::kb::{
+    content_store::read::read_doc_range,
+    embedder::KbEmbedder,
+    index::KbIndex,
+    model::{CallerScope, KbChunk, KbDoc, KbLocator, KbSource},
+    paths::KbPaths,
+    search::{
+        filter::{SearchFilter, is_latest_version, keep_doc},
+        mmr::{MmrCandidate, mmr_select},
+        rrf::rrf_fuse,
+    },
+    store::{KbStore, chunks, docs, entities},
+};
 
 #[derive(Debug, Clone)]
 pub struct SearchRequest {
@@ -100,28 +105,28 @@ impl SearchCtx {
         let rtx = self.store.begin_read()?;
         let mut materialised: HashMap<String, (KbChunk, KbDoc)> = HashMap::new();
 
-        let keep = |cid: &str, materialised: &mut HashMap<String, (KbChunk, KbDoc)>|
-        -> Result<bool> {
-            if materialised.contains_key(cid) {
-                return Ok(true);
-            }
-            let c = match chunks::get(&rtx, cid)? {
-                Some(c) => c,
-                None => return Ok(false),
+        let keep =
+            |cid: &str, materialised: &mut HashMap<String, (KbChunk, KbDoc)>| -> Result<bool> {
+                if materialised.contains_key(cid) {
+                    return Ok(true);
+                }
+                let c = match chunks::get(&rtx, cid)? {
+                    Some(c) => c,
+                    None => return Ok(false),
+                };
+                let d = match docs::get(&rtx, &c.doc_id)? {
+                    Some(d) => d,
+                    None => return Ok(false),
+                };
+                if !keep_doc(&d, scope, &req.filter) {
+                    return Ok(false);
+                }
+                if !is_latest_version(&rtx, &d)? {
+                    return Ok(false);
+                }
+                materialised.insert(cid.to_string(), (c, d));
+                Ok(true)
             };
-            let d = match docs::get(&rtx, &c.doc_id)? {
-                Some(d) => d,
-                None => return Ok(false),
-            };
-            if !keep_doc(&d, scope, &req.filter) {
-                return Ok(false);
-            }
-            if !is_latest_version(&rtx, &d)? {
-                return Ok(false);
-            }
-            materialised.insert(cid.to_string(), (c, d));
-            Ok(true)
-        };
 
         let mut kept_dense: Vec<(String, f32)> = Vec::new();
         for (cid, score) in &dense {
@@ -151,10 +156,11 @@ impl SearchCtx {
         if !req.filter.require_entities.is_empty() {
             let mut required_sets: Vec<std::collections::HashSet<String>> = Vec::new();
             for eid in &req.filter.require_entities {
-                let set: std::collections::HashSet<String> = entities::chunks_for_entity(&rtx, eid)?
-                    .into_iter()
-                    .map(|e| e.chunk_id)
-                    .collect();
+                let set: std::collections::HashSet<String> =
+                    entities::chunks_for_entity(&rtx, eid)?
+                        .into_iter()
+                        .map(|e| e.chunk_id)
+                        .collect();
                 required_sets.push(set);
             }
             fused.retain(|(cid, _)| required_sets.iter().all(|s| s.contains(cid)));
@@ -168,10 +174,11 @@ impl SearchCtx {
         if !req.boost_entities.is_empty() {
             let mut boost_sets: Vec<std::collections::HashSet<String>> = Vec::new();
             for eid in &req.boost_entities {
-                let set: std::collections::HashSet<String> = entities::chunks_for_entity(&rtx, eid)?
-                    .into_iter()
-                    .map(|e| e.chunk_id)
-                    .collect();
+                let set: std::collections::HashSet<String> =
+                    entities::chunks_for_entity(&rtx, eid)?
+                        .into_iter()
+                        .map(|e| e.chunk_id)
+                        .collect();
                 boost_sets.push(set);
             }
             for (cid, score) in fused.iter_mut() {
@@ -269,14 +276,16 @@ fn render_source(d: &KbDoc) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::kb::canonicalize::{canonicalize_by_mime, CanonicalizeInput};
-    use crate::kb::embedder::{KbEmbedder, StubEmbedder};
-    use crate::kb::model::KbVisibility;
-    use crate::kb::pipeline::{ingest_canonicalized, IngestInput};
-    use crate::kb::worker::handlers::HandlerCtx;
-    use crate::kb::worker::{DefaultDispatcher, WorkerConfig, WorkerPool};
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::kb::{
+        canonicalize::{CanonicalizeInput, canonicalize_by_mime},
+        embedder::{KbEmbedder, StubEmbedder},
+        model::KbVisibility,
+        pipeline::{IngestInput, ingest_canonicalized},
+        worker::{DefaultDispatcher, WorkerConfig, WorkerPool, handlers::HandlerCtx},
+    };
 
     fn ctx_with_ingested(body: &str) -> (TempDir, SearchCtx) {
         let tmp = TempDir::new().unwrap();
@@ -314,11 +323,19 @@ mod tests {
             embedder: embedder.clone(),
             index: index.clone(),
         };
-        let cfg = WorkerConfig { worker_id: "w".into(), ..WorkerConfig::default() };
+        let cfg = WorkerConfig {
+            worker_id: "w".into(),
+            ..WorkerConfig::default()
+        };
         WorkerPool::run_one_blocking(&hctx, &cfg, &DefaultDispatcher).unwrap();
         (
             tmp,
-            SearchCtx { store, index, paths, embedder },
+            SearchCtx {
+                store,
+                index,
+                paths,
+                embedder,
+            },
         )
     }
 
@@ -381,9 +398,9 @@ mod tests {
         // Re-tag the existing doc as Private + owner u1.
         let rtx = ctx.store.begin_read().unwrap();
         let all: Vec<KbDoc> = {
-            use crate::kb::store::codec::decode;
-            use crate::kb::store::schema::KB_DOCS;
             use redb::ReadableTable;
+
+            use crate::kb::store::{codec::decode, schema::KB_DOCS};
             let tbl = rtx.open_table(KB_DOCS).unwrap();
             let mut out = Vec::new();
             for e in tbl.iter().unwrap() {
@@ -411,10 +428,16 @@ mod tests {
             boost_entities: vec![],
             query_instruction: None,
         };
-        let scope_other = CallerScope { user_id: Some("u2".into()), ..Default::default() };
+        let scope_other = CallerScope {
+            user_id: Some("u2".into()),
+            ..Default::default()
+        };
         let hits = ctx.search(&req, &scope_other).unwrap();
         assert!(hits.is_empty(), "Private doc must not leak to other user");
-        let scope_owner = CallerScope { user_id: Some("u1".into()), ..Default::default() };
+        let scope_owner = CallerScope {
+            user_id: Some("u1".into()),
+            ..Default::default()
+        };
         let hits = ctx.search(&req, &scope_owner).unwrap();
         assert!(!hits.is_empty(), "owner must see their own Private doc");
     }

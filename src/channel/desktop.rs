@@ -1,8 +1,10 @@
-//! Desktop channel — delivers messages to connected WebSocket clients (Tauri UI).
+//! Desktop channel — delivers messages to connected WebSocket clients (Tauri
+//! UI).
 //!
 //! This channel does not receive inbound messages; it only supports outbound
 //! delivery (used by cron jobs configured with `delivery.channel = "desktop"`).
-//! Messages are broadcast as `"notification"` events to all active WS connections.
+//! Messages are broadcast as `"notification"` events to all active WS
+//! connections.
 
 use std::sync::Arc;
 
@@ -13,13 +15,15 @@ use tracing::debug;
 use super::{Channel, OutboundMessage};
 use crate::ws::{ConnRegistry, types::EventFrame};
 
-/// A channel that delivers outbound messages to the desktop UI via WebSocket broadcast.
+/// A channel that delivers outbound messages to the desktop UI via WebSocket
+/// broadcast.
 pub struct DesktopChannel {
     conns: Arc<ConnRegistry>,
 }
 
 impl DesktopChannel {
-    /// Create a new desktop channel backed by the given WebSocket connection registry.
+    /// Create a new desktop channel backed by the given WebSocket connection
+    /// registry.
     pub fn new(conns: Arc<ConnRegistry>) -> Self {
         Self { conns }
     }
@@ -44,7 +48,10 @@ impl Channel for DesktopChannel {
             let (kind, body) = if let Some(rest) = msg.text.strip_prefix(KIND_PREFIX) {
                 if let Some(sep_idx) = rest.find(KIND_PAYLOAD_SEP) {
                     let (k, b) = rest.split_at(sep_idx);
-                    (Some(k.to_owned()), b[KIND_PAYLOAD_SEP.len_utf8()..].to_owned())
+                    (
+                        Some(k.to_owned()),
+                        b[KIND_PAYLOAD_SEP.len_utf8()..].to_owned(),
+                    )
                 } else {
                     (None, msg.text.clone())
                 }

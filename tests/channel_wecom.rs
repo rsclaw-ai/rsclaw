@@ -2,8 +2,7 @@
 
 use std::sync::Arc;
 
-use rsclaw::channel::wecom::WeComChannel;
-use rsclaw::channel::Channel;
+use rsclaw::channel::{Channel, wecom::WeComChannel};
 
 fn init_crypto() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -74,7 +73,7 @@ async fn send_without_ws_connection_does_not_panic() {
             text: "test message".to_owned(),
             reply_to: None,
             images: vec![],
-        ..Default::default()
+            ..Default::default()
         })
         .await;
 

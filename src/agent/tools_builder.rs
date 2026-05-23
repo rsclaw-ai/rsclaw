@@ -16,6 +16,16 @@ use crate::{
 pub(crate) fn build_plugin_meta_tool_defs() -> Vec<ToolDef> {
     vec![
         ToolDef {
+            name: "plugin.info".to_owned(),
+            description: "Read-only catalog of installed plugins and their common tools. Use this when the user asks what plugins are available or when you need plugin overview before choosing plugin.search_tools, plugin.describe_tool, or plugin.invoke. This tool does not execute plugin actions.".to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "plugin": {"type": "string", "description": "Optional installed plugin name, e.g. douyin. Omit to list all installed plugins."}
+                }
+            }),
+        },
+        ToolDef {
             name: "plugin.search_tools".to_owned(),
             description: "Search installed plugin tool catalogs by natural-language intent. Use before plugin.invoke when you need a plugin capability but the exact tool name or arguments are not already known.".to_owned(),
             parameters: json!({
@@ -72,8 +82,11 @@ fn plugin_tool_list(tools: &[(&str, &str)], common: &[String], cap: usize) -> St
         .filter_map(|c| tools.iter().find(|(n, _)| n == c).copied())
         .collect();
     // Then the rest, sorted by name.
-    let mut rest: Vec<(&str, &str)> =
-        tools.iter().filter(|(n, _)| !is_common(n)).copied().collect();
+    let mut rest: Vec<(&str, &str)> = tools
+        .iter()
+        .filter(|(n, _)| !is_common(n))
+        .copied()
+        .collect();
     rest.sort_unstable_by(|a, b| a.0.cmp(b.0));
     ordered.extend(rest);
 
@@ -94,7 +107,9 @@ fn plugin_tool_list(tools: &[(&str, &str)], common: &[String], cap: usize) -> St
     if total > cap {
         let n = total - cap;
         let noun = if n == 1 { "tool" } else { "tools" };
-        lines.push(format!("- …{n} more {noun} — plugin.search_tools to find them"));
+        lines.push(format!(
+            "- …{n} more {noun} — plugin.search_tools to find them"
+        ));
     }
     lines.join("\n")
 }
@@ -143,9 +158,16 @@ pub(crate) fn build_plugins_system(
     let mut blocks: Vec<(String, String)> = wasm_plugins
         .iter()
         .map(|p| {
-            let tools: Vec<(&str, &str)> =
-                p.tools.iter().map(|t| (t.name.as_str(), t.description.as_str())).collect();
-            let blurb = p.summary.as_deref().or(p.description.as_deref()).unwrap_or("");
+            let tools: Vec<(&str, &str)> = p
+                .tools
+                .iter()
+                .map(|t| (t.name.as_str(), t.description.as_str()))
+                .collect();
+            let blurb = p
+                .summary
+                .as_deref()
+                .or(p.description.as_deref())
+                .unwrap_or("");
             (
                 p.name.clone(),
                 render_plugin_catalog_block(
@@ -163,9 +185,16 @@ pub(crate) fn build_plugins_system(
     if let Some(reg) = js_plugins {
         for (plugin_name, plugin) in reg.js_plugins_iter() {
             let m = &plugin.manifest;
-            let tools: Vec<(&str, &str)> =
-                m.tools.iter().map(|t| (t.name.as_str(), t.description.as_str())).collect();
-            let blurb = m.summary.as_deref().or(m.description.as_deref()).unwrap_or("");
+            let tools: Vec<(&str, &str)> = m
+                .tools
+                .iter()
+                .map(|t| (t.name.as_str(), t.description.as_str()))
+                .collect();
+            let blurb = m
+                .summary
+                .as_deref()
+                .or(m.description.as_deref())
+                .unwrap_or("");
             blocks.push((
                 plugin_name.clone(),
                 render_plugin_catalog_block(
@@ -186,8 +215,8 @@ pub(crate) fn build_plugins_system(
     blocks.sort_by(|a, b| a.0.cmp(&b.0));
     let blocks_text: Vec<String> = blocks.into_iter().map(|(_, b)| b).collect();
 
-    // Priority ordering (WASM plugins > JS plugins > skills > built-in tools) lives in
-    // the shared `CAPABILITY PRIORITY` section of
+    // Priority ordering (WASM plugins > JS plugins > skills > built-in tools) lives
+    // in the shared `CAPABILITY PRIORITY` section of
     // `build_shared_system_prefix` so it ships unconditionally with the
     // version baseline. Repeating it here would (a) duplicate ~30 tokens
     // every time plugins are present and (b) make the rendered bytes
@@ -224,11 +253,13 @@ pub(crate) fn toolset_allowed_names(
         "clarify",
         "anycli",
         "skill_use",
+        "plugin.info",
         "plugin.search_tools",
         "plugin.describe_tool",
         "plugin.invoke",
     ];
     const WEB: &[&str] = &[
+        "plugin.info",
         "plugin.search_tools",
         "plugin.describe_tool",
         "plugin.invoke",
@@ -243,6 +274,7 @@ pub(crate) fn toolset_allowed_names(
         "skill_use",
     ];
     const CODE: &[&str] = &[
+        "plugin.info",
         "plugin.search_tools",
         "plugin.describe_tool",
         "plugin.invoke",
@@ -279,6 +311,7 @@ pub(crate) fn toolset_allowed_names(
         "skill_install",
         "skill_remove",
         "task",
+        "plugin.info",
         "plugin.search_tools",
         "plugin.describe_tool",
         "plugin.invoke",
@@ -480,8 +513,9 @@ pub fn build_tool_list(
             "required": ["task_text"]
         }),
     });
-    // task_finish — agent-declared structured outcome. Replaces fragile string-matching
-    // in the auto-continue supervisor by letting the agent self-report what it did.
+    // task_finish — agent-declared structured outcome. Replaces fragile
+    // string-matching in the auto-continue supervisor by letting the agent
+    // self-report what it did.
     tools.push(ToolDef {
         name: "task_finish".to_owned(),
         description: "Declare your task complete (or deliberately abandoned) and report a \
@@ -1649,8 +1683,8 @@ pub fn build_tool_list(
         }),
     });
 
-    // Document tools — split into simple independent tools for better small-model compatibility.
-    // Formatting note injected into content-bearing tools.
+    // Document tools — split into simple independent tools for better small-model
+    // compatibility. Formatting note injected into content-bearing tools.
     let doc_fmt_hint = " Structure content professionally: use # headings, - bullet lists, blank lines between sections. For notices/reports: add title, organize into sections.";
 
     tools.push(ToolDef {
@@ -1718,7 +1752,8 @@ pub fn build_tool_list(
             "required": ["path", "slides"]
         }),
     });
-    // Keep doc tool for read/edit operations (less frequently used by small models).
+    // Keep doc tool for read/edit operations (less frequently used by small
+    // models).
     tools.push(ToolDef {
         name: "doc".to_owned(),
         description: "Read or edit existing documents.\n\
@@ -1780,10 +1815,7 @@ pub fn build_tool_list(
     }
 
     // External remote agent A2A tools (remote gateways).
-    tracing::debug!(
-        count = a2a_peers.len(),
-        "build_tool_list: external agents"
-    );
+    tracing::debug!(count = a2a_peers.len(), "build_tool_list: external agents");
     for ext in a2a_peers {
         if ext.id == caller_id {
             continue;
@@ -1846,29 +1878,35 @@ pub fn build_tool_list(
 /// PowerShell edition via runtime detection, so it must stay in the
 /// per-session layer that never enters the base-layer prefix hash.
 pub(crate) fn windows_shell_guidance() -> String {
-    use super::platform::{detect_powershell_edition, PowerShellEdition};
+    use super::platform::{PowerShellEdition, detect_powershell_edition};
 
     let edition_section = match detect_powershell_edition() {
-        Some(PowerShellEdition::Core) => "\
+        Some(PowerShellEdition::Core) => {
+            "\
              PowerShell edition detected: PowerShell 7+ (pwsh).\n\
              - Pipeline chain operators `&&` and `||` ARE available and work like bash. Prefer `cmd1 && cmd2` over `cmd1; cmd2` when cmd2 should only run if cmd1 succeeds.\n\
              - Ternary `$cond ? $a : $b`, null-coalescing `??`, and null-conditional `?.` ARE available.\n\
              - Default file encoding is UTF-8 without BOM.\n\
-             \n",
-        Some(PowerShellEdition::Desktop) => "\
+             \n"
+        }
+        Some(PowerShellEdition::Desktop) => {
+            "\
              PowerShell edition detected: Windows PowerShell 5.1 (powershell.exe).\n\
              - Pipeline chain operators `&&` and `||` are NOT available — they cause a parser error. To run B only if A succeeds: `A; if ($?) { B }`. To chain unconditionally: `A; B`.\n\
              - Ternary (`?:`), null-coalescing (`??`), null-conditional (`?.`) operators are NOT available. Use `if/else` and explicit `$null -eq` checks.\n\
              - Avoid `2>&1` on native executables. In 5.1, redirecting a native command's stderr inside PowerShell wraps each line in an ErrorRecord and sets `$?` to `$false` even when the exe returned exit code 0. stderr is already captured for you — don't redirect it.\n\
              - Default file encoding is UTF-16 LE with BOM. When writing files other tools will read, pass `-Encoding utf8` to `Out-File`/`Set-Content`.\n\
              - `ConvertFrom-Json` returns a PSCustomObject, not a hashtable. `-AsHashtable` is not available.\n\
-             \n",
-        None => "\
+             \n"
+        }
+        None => {
+            "\
              PowerShell edition not detected — assume Windows PowerShell 5.1 for compatibility.\n\
              - Do NOT use `&&`, `||`, ternary `?:`, null-coalescing `??`, or null-conditional `?.`. These are PowerShell 7+ only and parser-error on 5.1.\n\
              - To chain conditionally: `A; if ($?) { B }`. Unconditionally: `A; B`.\n\
              - When writing files other tools will read, pass `-Encoding utf8` to `Out-File`/`Set-Content` (5.1 default is UTF-16 LE BOM).\n\
-             \n",
+             \n"
+        }
     };
 
     format!(
@@ -1943,6 +1981,7 @@ mod plugin_catalog_tests {
         );
         let names: std::collections::HashSet<_> = tools.iter().map(|t| t.name.as_str()).collect();
 
+        assert!(names.contains("plugin.info"));
         assert!(names.contains("plugin.search_tools"));
         assert!(names.contains("plugin.describe_tool"));
         assert!(names.contains("plugin.invoke"));
@@ -1953,6 +1992,7 @@ mod plugin_catalog_tests {
         for toolset in ["minimal", "web", "code", "standard"] {
             let names = toolset_allowed_names(toolset, None).expect("filtered toolset");
 
+            assert!(names.contains("plugin.info"), "{toolset}");
             assert!(names.contains("plugin.search_tools"), "{toolset}");
             assert!(names.contains("plugin.describe_tool"), "{toolset}");
             assert!(names.contains("plugin.invoke"), "{toolset}");
@@ -1986,6 +2026,17 @@ mod plugin_catalog_tests {
 
         // Empty.
         assert_eq!(plugin_tool_list(&[], &none, 5), "  (no declared tools)");
+    }
+
+    #[test]
+    fn plugin_usage_prompt_names_only_supported_plugin_tools() {
+        let prompt = build_tool_usage_instructions(false, false);
+
+        assert!(prompt.contains("plugin.info"));
+        assert!(prompt.contains("plugin.search_tools"));
+        assert!(prompt.contains("plugin.describe_tool"));
+        assert!(prompt.contains("plugin.invoke"));
+        assert!(prompt.contains("Never invent other `plugin.*` tool names"));
     }
 
     #[test]

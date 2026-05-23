@@ -2,18 +2,21 @@
 //! markdown body on disk (`md/*.md` referenced by `KbChunk.byte_offset`);
 //! tantivy holds an inverted index keyed on `chunk_id`.
 
-use crate::kb::index::cjk::JiebaTokenizer;
-use crate::kb::store::KbStore;
+use std::{path::Path, sync::Mutex};
+
 use anyhow::{Context, Result};
-use std::path::Path;
-use std::sync::Mutex;
-use tantivy::collector::TopDocs;
-use tantivy::directory::MmapDirectory;
-use tantivy::query::QueryParser;
-use tantivy::schema::{
-    Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, STORED, STRING,
+use tantivy::{
+    Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term,
+    collector::TopDocs,
+    directory::MmapDirectory,
+    doc,
+    query::QueryParser,
+    schema::{
+        Field, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions, Value,
+    },
 };
-use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
+
+use crate::kb::{index::cjk::JiebaTokenizer, store::KbStore};
 
 const CJK_TOKENIZER: &str = "cjk";
 
@@ -56,8 +59,7 @@ impl TantivyIndex {
         let index = if Index::exists(&dir)? {
             Index::open_in_dir(path).with_context(|| "open existing tantivy")?
         } else {
-            Index::create_in_dir(path, schema_obj.clone())
-                .with_context(|| "create tantivy")?
+            Index::create_in_dir(path, schema_obj.clone()).with_context(|| "create tantivy")?
         };
         // Register the CJK tokenizer on every open (not persisted in
         // the index metadata; must re-register after each restart).
@@ -144,8 +146,7 @@ impl TantivyIndex {
         let mut n = 0;
         for entry in tbl.iter()? {
             let (_, v) = entry?;
-            let c: crate::kb::model::KbChunk =
-                crate::kb::store::codec::decode(v.value())?;
+            let c: crate::kb::model::KbChunk = crate::kb::store::codec::decode(v.value())?;
             self.upsert(&c.id, &c.doc_id, &c.indexed_text)?;
             n += 1;
         }
@@ -157,8 +158,9 @@ impl TantivyIndex {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
+
+    use super::*;
 
     fn fresh() -> (TempDir, TantivyIndex) {
         let tmp = TempDir::new().unwrap();
@@ -182,9 +184,11 @@ mod tests {
     #[test]
     fn upsert_replaces_previous() {
         let (_tmp, idx) = fresh();
-        idx.upsert("c1", "d1", "original text mentioning apples").unwrap();
+        idx.upsert("c1", "d1", "original text mentioning apples")
+            .unwrap();
         idx.commit().unwrap();
-        idx.upsert("c1", "d1", "rewritten text mentioning oranges").unwrap();
+        idx.upsert("c1", "d1", "rewritten text mentioning oranges")
+            .unwrap();
         idx.commit().unwrap();
         assert!(
             idx.search("apples", 5).unwrap().is_empty(),
@@ -216,7 +220,8 @@ mod tests {
     fn chinese_query_matches_chinese_doc() {
         // The default whitespace analyzer can't split CJK; jieba does.
         let (_tmp, idx) = fresh();
-        idx.upsert("c1", "d1", "蒙牛奶粉冲泡指南：建议比例 1:7").unwrap();
+        idx.upsert("c1", "d1", "蒙牛奶粉冲泡指南：建议比例 1:7")
+            .unwrap();
         idx.upsert("c2", "d1", "伊利酸奶发酵过程详解").unwrap();
         idx.commit().unwrap();
         let hits = idx.search("蒙牛", 5).unwrap();

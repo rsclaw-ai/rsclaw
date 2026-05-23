@@ -3,15 +3,13 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
+use super::{super::startup::handle_pending_analysis, default_dm_scope};
 use crate::{
     agent::{AgentMessage, AgentRegistry},
     channel::{Channel, OutboundMessage},
     config::runtime::RuntimeConfig,
     gateway::session::{MessageKind, SessionKeyParams, derive_session_key},
 };
-
-use super::super::startup::handle_pending_analysis;
-use super::default_dm_scope;
 
 // ---------------------------------------------------------------------------
 // Custom channels (webhook + websocket)
@@ -143,7 +141,8 @@ fn start_custom_webhook(
                             images: r.images,
                             files: r.files,
                             account: None,
-                            channel: None,                        })
+                            channel: None,
+                        })
                         .await
                     {
                         tracing::warn!("failed to send message: {e}");
@@ -266,7 +265,8 @@ fn start_custom_websocket(
                             images: r.images,
                             files: r.files,
                             account: None,
-                            channel: None,                        })
+                            channel: None,
+                        })
                         .await
                     {
                         tracing::warn!("failed to send message: {e}");

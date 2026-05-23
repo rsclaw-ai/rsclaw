@@ -11,16 +11,20 @@
 //!   let html = tab.get_text().await?;
 //!   drop(tab); // tab is closed automatically
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, warn};
 
-use super::{CdpClient, ChromeProcess, can_launch_chrome, ACTIVE_INSTANCES};
+use super::{ACTIVE_INSTANCES, CdpClient, ChromeProcess, can_launch_chrome};
 use crate::agent::platform::detect_chrome;
 
 /// Maximum concurrent tabs per Chrome instance.
@@ -91,7 +95,11 @@ impl BrowserPool {
     /// The tab is closed when the `TabSession` is dropped.
     pub async fn acquire_tab(&self) -> Result<TabSession> {
         // Acquire semaphore permit (limits concurrent tabs).
-        let permit = self.tab_semaphore.clone().acquire_owned().await
+        let permit = self
+            .tab_semaphore
+            .clone()
+            .acquire_owned()
+            .await
             .map_err(|_| anyhow!("browser pool semaphore closed"))?;
 
         // Whole acquire_tab has a 15s timeout — if Chrome is unresponsive,
@@ -106,7 +114,10 @@ impl BrowserPool {
     }
 
     /// Inner logic for acquire_tab, wrapped by a timeout.
-    async fn acquire_tab_inner(&self, permit: tokio::sync::OwnedSemaphorePermit) -> Result<TabSession> {
+    async fn acquire_tab_inner(
+        &self,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<TabSession> {
         // Ensure Chrome is running.
         let port = self.ensure_chrome().await?;
 
@@ -121,9 +132,14 @@ impl BrowserPool {
             .ok_or_else(|| anyhow!("pool: no browser webSocketDebuggerUrl"))?;
 
         let browser_cdp = CdpClient::connect(browser_ws_url).await?;
-        let create_result = browser_cdp.send("Target.createTarget", json!({
-            "url": "about:blank"
-        })).await?;
+        let create_result = browser_cdp
+            .send(
+                "Target.createTarget",
+                json!({
+                    "url": "about:blank"
+                }),
+            )
+            .await?;
         let target_id = create_result["targetId"]
             .as_str()
             .ok_or_else(|| anyhow!("pool: Target.createTarget did not return targetId"))?
@@ -131,7 +147,8 @@ impl BrowserPool {
 
         // Discover the new tab's WebSocket URL.
         let targets: Vec<Value> = reqwest::get(&discovery_url).await?.json().await?;
-        let tab_ws_url = targets.iter()
+        let tab_ws_url = targets
+            .iter()
             .find(|t| t["id"].as_str() == Some(&target_id))
             .and_then(|t| t["webSocketDebuggerUrl"].as_str())
             .ok_or_else(|| anyhow!("pool: new tab {target_id} not found in target list"))?
@@ -162,11 +179,10 @@ impl BrowserPool {
     /// so sub-agents get a new tab instead of launching yet another Chrome.
     pub async fn chrome_ws_url(&self) -> Result<String> {
         let port = self.ensure_chrome().await?;
-        let version_info: Value =
-            reqwest::get(format!("http://127.0.0.1:{port}/json/version"))
-                .await?
-                .json()
-                .await?;
+        let version_info: Value = reqwest::get(format!("http://127.0.0.1:{port}/json/version"))
+            .await?
+            .json()
+            .await?;
         version_info["webSocketDebuggerUrl"]
             .as_str()
             .map(String::from)
@@ -194,7 +210,8 @@ impl BrowserPool {
             if path_guard.is_none() {
                 *path_guard = detect_chrome();
             }
-            path_guard.clone()
+            path_guard
+                .clone()
                 .ok_or_else(|| anyhow!("pool: Chrome not found"))?
         };
 
@@ -227,7 +244,8 @@ impl BrowserPool {
     /// Get the next engine index for round-robin engine selection.
     /// This ensures concurrent searches use different engines to avoid CAPTCHA.
     pub fn next_engine_index(&self) -> u32 {
-        self.engine_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        self.engine_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Update last activity timestamp.
@@ -263,7 +281,8 @@ impl TabSession {
         let _ = tokio::time::timeout(
             Duration::from_secs(15),
             self.cdp.wait_event("Page.loadEventFired", 15),
-        ).await;
+        )
+        .await;
         Ok(())
     }
 
@@ -283,20 +302,30 @@ impl TabSession {
         );
         let _ = tokio::time::timeout(
             Duration::from_secs(timeout_secs + 1),
-            self.cdp.send("Runtime.evaluate", json!({
-                "expression": js,
-                "awaitPromise": true,
-            })),
-        ).await;
+            self.cdp.send(
+                "Runtime.evaluate",
+                json!({
+                    "expression": js,
+                    "awaitPromise": true,
+                }),
+            ),
+        )
+        .await;
         Ok(())
     }
 
     /// Execute JavaScript and return the result.
     pub async fn evaluate(&self, js: &str) -> Result<Value> {
-        let result = self.cdp.send("Runtime.evaluate", json!({
-            "expression": js,
-            "returnByValue": true,
-        })).await?;
+        let result = self
+            .cdp
+            .send(
+                "Runtime.evaluate",
+                json!({
+                    "expression": js,
+                    "returnByValue": true,
+                }),
+            )
+            .await?;
         Ok(result["result"]["value"].clone())
     }
 
@@ -308,10 +337,11 @@ impl TabSession {
 
     /// Get page HTML.
     pub async fn get_html(&self) -> Result<String> {
-        let result = self.evaluate("document.documentElement?.outerHTML || ''").await?;
+        let result = self
+            .evaluate("document.documentElement?.outerHTML || ''")
+            .await?;
         Ok(result.as_str().unwrap_or("").to_owned())
     }
-
 }
 
 impl Drop for TabSession {
@@ -330,9 +360,14 @@ impl Drop for TabSession {
                 if let Ok(info) = resp.json::<Value>().await {
                     if let Some(ws_url) = info["webSocketDebuggerUrl"].as_str() {
                         if let Ok(browser_cdp) = CdpClient::connect(ws_url).await {
-                            let _ = browser_cdp.send("Target.closeTarget", json!({
-                                "targetId": target_id
-                            })).await;
+                            let _ = browser_cdp
+                                .send(
+                                    "Target.closeTarget",
+                                    json!({
+                                        "targetId": target_id
+                                    }),
+                                )
+                                .await;
                         }
                     }
                 }

@@ -10,17 +10,21 @@
 //! session (`session:<key>`). Concurrent runs are capped by
 //! `max_concurrent_runs`.
 
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::{Datelike, TimeZone, Timelike, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, Semaphore};
-use tokio::io::AsyncWriteExt;
-use tokio::time::sleep;
+use tokio::{
+    io::AsyncWriteExt,
+    sync::{Semaphore, broadcast},
+    time::sleep,
+};
 use tracing::{debug, info, trace, warn};
 
 use crate::{
@@ -39,7 +43,8 @@ const MAX_TIMER_DELAY_MS: u64 = 60_000;
 /// Minimum gap between re-triggering the same job (ms). Prevents spin-loops.
 const MIN_REFIRE_GAP_MS: u64 = 2_000;
 
-/// Max consecutive errors before a job is silently skipped (won't block scheduler).
+/// Max consecutive errors before a job is silently skipped (won't block
+/// scheduler).
 const MAX_CONSECUTIVE_ERRORS: u32 = 5;
 
 /// After this many ms without completing, a running job is considered stale.
@@ -71,11 +76,13 @@ fn error_backoff_ms(consecutive_errors: u32) -> u64 {
 // CronJob — serialisable description of a single scheduled task
 // ---------------------------------------------------------------------------
 
-/// Schedule descriptor — supports both rsclaw flat format and OpenClaw nested format.
+/// Schedule descriptor — supports both rsclaw flat format and OpenClaw nested
+/// format.
 ///
-/// Uses `#[serde(untagged)]` at the top level to distinguish a plain string (Flat)
-/// from an object. Object variants use `#[serde(tag = "kind")]` (internally tagged)
-/// so that `{"kind": "once", "atMs": ...}` is not accidentally matched by `Every`.
+/// Uses `#[serde(untagged)]` at the top level to distinguish a plain string
+/// (Flat) from an object. Object variants use `#[serde(tag = "kind")]`
+/// (internally tagged) so that `{"kind": "once", "atMs": ...}` is not
+/// accidentally matched by `Every`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CronSchedule {
@@ -89,14 +96,16 @@ pub enum CronSchedule {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum CronScheduleTagged {
-    /// Cron expression: { kind: "cron", expr: "...", tz: "Asia/Shanghai" } (OpenClaw compat).
+    /// Cron expression: { kind: "cron", expr: "...", tz: "Asia/Shanghai" }
+    /// (OpenClaw compat).
     #[serde(rename = "cron")]
     Nested {
         expr: String,
         #[serde(default)]
         tz: Option<String>,
     },
-    /// Interval-based schedule: { kind: "every", everyMs: 259200000, anchorMs: ... } (OpenClaw compat).
+    /// Interval-based schedule: { kind: "every", everyMs: 259200000, anchorMs:
+    /// ... } (OpenClaw compat).
     #[serde(rename = "every")]
     Every {
         #[serde(default, alias = "everyMs")]
@@ -151,7 +160,10 @@ impl CronSchedule {
             CronSchedule::Tagged(CronScheduleTagged::Nested { expr, tz, .. }) => {
                 crate::cron::compute_next_run_from_expr(expr, from_ms, tz.as_deref())
             }
-            CronSchedule::Tagged(CronScheduleTagged::Every { every_ms, anchor_ms }) => {
+            CronSchedule::Tagged(CronScheduleTagged::Every {
+                every_ms,
+                anchor_ms,
+            }) => {
                 let every_ms = every_ms.unwrap_or(0);
                 if every_ms == 0 {
                     return None;
@@ -190,11 +202,13 @@ impl CronSchedule {
 pub enum CronPayload {
     /// Plain text message.
     Text(String),
-    /// Structured payload (OpenClaw compat): { kind: "agentTurn", message: "...", timeoutSeconds: 1800 }
+    /// Structured payload (OpenClaw compat): { kind: "agentTurn", message:
+    /// "...", timeoutSeconds: 1800 }
     Structured {
         #[serde(default, alias = "kind")]
         kind: Option<String>,
-        /// Message text - serializes as "message" for openclaw compat, accepts "text" too
+        /// Message text - serializes as "message" for openclaw compat, accepts
+        /// "text" too
         #[serde(alias = "text", rename = "message", default)]
         text: Option<String>,
         #[serde(default, alias = "timeoutSeconds")]
@@ -230,7 +244,8 @@ impl CronPayload {
 pub struct CronIter {
     /// Items to cycle through.
     pub items: Vec<String>,
-    /// 0-based index of the item to use on the NEXT firing. Wraps modulo `items.len()`.
+    /// 0-based index of the item to use on the NEXT firing. Wraps modulo
+    /// `items.len()`.
     #[serde(default)]
     pub cursor: usize,
 }
@@ -372,7 +387,10 @@ impl From<&CronJobConfig> for CronJob {
         Self {
             id: cfg.id.clone(),
             name: cfg.name.clone(),
-            agent_id: cfg.agent_id.clone().unwrap_or_else(|| "default".to_string()),
+            agent_id: cfg
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| "default".to_string()),
             session_key,
             enabled: cfg.enabled.unwrap_or(true),
             schedule,
@@ -401,7 +419,10 @@ struct CronStore {
 
 impl Default for CronStore {
     fn default() -> Self {
-        Self { version: 1, jobs: Vec::new() }
+        Self {
+            version: 1,
+            jobs: Vec::new(),
+        }
     }
 }
 
@@ -466,8 +487,9 @@ impl CronRunner {
     /// The runtime uses this constructor; tests typically use [`new`].
     ///
     /// # Arguments
-    /// * `parse_failed` - If true, skip ALL saves (including after job execution).
-    ///   Set to true when cron.json5 failed to parse, to avoid wiping user's config.
+    /// * `parse_failed` - If true, skip ALL saves (including after job
+    ///   execution). Set to true when cron.json5 failed to parse, to avoid
+    ///   wiping user's config.
     pub fn new_with_shutdown(
         config: &CronConfig,
         jobs: Vec<CronJob>,
@@ -655,20 +677,27 @@ impl CronRunner {
             );
         }
 
-        // Persist initial state (skip if file failed to parse - don't wipe user's config)
+        // Persist initial state (skip if file failed to parse - don't wipe user's
+        // config)
         if !self.parse_failed {
             if let Err(e) = self.save_store(&jobs).await {
                 warn!(err = %e, "cron: failed to save initial store");
             }
         } else {
-            warn!("cron: parse failed - all saves disabled until cron.json5 syntax errors are fixed");
+            warn!(
+                "cron: parse failed - all saves disabled until cron.json5 syntax errors are fixed"
+            );
         }
 
         let enabled_count = jobs.iter().filter(|j| j.enabled).count();
         info!(
             total = jobs.len(),
             enabled = enabled_count,
-            next_wake = jobs.iter().filter_map(|j| j.state.as_ref().and_then(|s| s.next_run_at_ms)).min().unwrap_or(0),
+            next_wake = jobs
+                .iter()
+                .filter_map(|j| j.state.as_ref().and_then(|s| s.next_run_at_ms))
+                .min()
+                .unwrap_or(0),
             "cron scheduler started"
         );
 
@@ -680,7 +709,9 @@ impl CronRunner {
 
         let runner = self.clone();
         let timer_handle = tokio::spawn(async move {
-            runner.timer_loop(jobs, running_clone, semaphore, reload_rx).await;
+            runner
+                .timer_loop(jobs, running_clone, semaphore, reload_rx)
+                .await;
         });
 
         // Wait for shutdown: prefer the shared coordinator (gateway-wide
@@ -711,7 +742,8 @@ impl CronRunner {
         mut reload_rx: broadcast::Receiver<()>,
     ) {
         // Channel for collecting job results asynchronously.
-        let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<(String, bool, u64, u64, Option<String>)>(64);
+        let (result_tx, mut result_rx) =
+            tokio::sync::mpsc::channel::<(String, bool, u64, u64, Option<String>)>(64);
 
         // Cancel flags for running jobs — set to true to signal abort on deletion.
         let mut cancel_flags: HashMap<String, Arc<std::sync::atomic::AtomicBool>> = HashMap::new();
@@ -719,19 +751,29 @@ impl CronRunner {
         // Clear orphaned running_at_ms states from previous app run.
         // When the app restarts, any jobs that were running at shutdown will have
         // running_at_ms set but no actual spawned task, causing them to be stuck.
-        let orphan_count = jobs.iter_mut()
+        let orphan_count = jobs
+            .iter_mut()
             .filter(|j| j.state.as_ref().and_then(|s| s.running_at_ms).is_some())
             .count();
         if orphan_count > 0 {
-            warn!(count = orphan_count, "cron: clearing orphaned running_at_ms states from previous run");
+            warn!(
+                count = orphan_count,
+                "cron: clearing orphaned running_at_ms states from previous run"
+            );
             for job in jobs.iter_mut() {
                 if let Some(state) = job.state.as_mut() {
                     if state.running_at_ms.is_some() {
                         info!(job_id = %job.id, "cron: clearing orphaned running_at_ms");
                         state.running_at_ms = None;
                         // Recompute next_run_at_ms if needed
-                        if state.next_run_at_ms.is_none() || state.next_run_at_ms.map(|t| t <= current_timestamp_ms()).unwrap_or(true) {
-                            state.next_run_at_ms = job.schedule.compute_next_run(current_timestamp_ms());
+                        if state.next_run_at_ms.is_none()
+                            || state
+                                .next_run_at_ms
+                                .map(|t| t <= current_timestamp_ms())
+                                .unwrap_or(true)
+                        {
+                            state.next_run_at_ms =
+                                job.schedule.compute_next_run(current_timestamp_ms());
                         }
                     }
                 }
@@ -760,13 +802,16 @@ impl CronRunner {
                 .iter()
                 .filter(|j| j.enabled)
                 .filter_map(|j| {
-                    j.state.as_ref().and_then(|s| s.next_run_at_ms).map(|t| (t, &j.id, &j.name))
+                    j.state
+                        .as_ref()
+                        .and_then(|s| s.next_run_at_ms)
+                        .map(|t| (t, &j.id, &j.name))
                 })
                 .min_by_key(|(t, _, _)| *t);
 
             let next_wake = next_wake_job.map(|(t, _, _)| t);
 
-// Auto-remove expired once jobs (past due by > 5 minutes).
+            // Auto-remove expired once jobs (past due by > 5 minutes).
             // This prevents stale once jobs from spamming "next_wake in the past" warnings.
             let expired_threshold_ms = 5 * 60 * 1000;
             let before_len = jobs.len();
@@ -788,7 +833,10 @@ impl CronRunner {
                 }
             }
 
-            debug!(next_wake = next_wake.unwrap_or(0), now_ms, "cron: timer tick");
+            debug!(
+                next_wake = next_wake.unwrap_or(0),
+                now_ms, "cron: timer tick"
+            );
 
             let delay_ms = match next_wake {
                 Some(next_wake) => {
@@ -850,14 +898,18 @@ impl CronRunner {
 
                 if !parse_ok {
                     // File has syntax errors - don't replace jobs, don't save
-                    warn!(old_count, "cron: reload skipped - cron.json5 has syntax errors, fix before modifying");
+                    warn!(
+                        old_count,
+                        "cron: reload skipped - cron.json5 has syntax errors, fix before modifying"
+                    );
                     continue;
                 }
 
                 let file_count = new_jobs.len();
 
                 // Debug: check if disabled job is in new_jobs
-                let disabled_in_file: Vec<_> = new_jobs.iter()
+                let disabled_in_file: Vec<_> = new_jobs
+                    .iter()
                     .filter(|j| !j.enabled)
                     .map(|j| (&j.id, j.enabled))
                     .collect();
@@ -867,7 +919,8 @@ impl CronRunner {
                 jobs = merged_jobs;
 
                 // Debug: check enabled state after merge
-                let disabled_after_merge: Vec<_> = jobs.iter()
+                let disabled_after_merge: Vec<_> = jobs
+                    .iter()
                     .filter(|j| !j.enabled)
                     .map(|j| (&j.id, j.enabled))
                     .collect();
@@ -879,11 +932,13 @@ impl CronRunner {
                 // 5-minute schedule to 30 minutes) expects the old in-flight
                 // run on the OLD config to stop — otherwise it keeps using the
                 // old message/payload/cadence side-by-side with the new one.
-                let active_unchanged: HashSet<&str> = jobs.iter()
+                let active_unchanged: HashSet<&str> = jobs
+                    .iter()
                     .filter(|j| j.enabled && !modified_ids.contains(&j.id))
                     .map(|j| j.id.as_str())
                     .collect();
-                let to_cancel: Vec<String> = cancel_flags.keys()
+                let to_cancel: Vec<String> = cancel_flags
+                    .keys()
                     .filter(|id| !active_unchanged.contains(id.as_str()))
                     .cloned()
                     .collect();
@@ -902,7 +957,12 @@ impl CronRunner {
                 if let Err(e) = self.save_store(&jobs).await {
                     warn!(err = %e, "cron: failed to save store after reload");
                 }
-                info!(old_count, new_count = jobs.len(), file_count, "cron jobs reloaded");
+                info!(
+                    old_count,
+                    new_count = jobs.len(),
+                    file_count,
+                    "cron jobs reloaded"
+                );
                 continue;
             }
 
@@ -910,7 +970,9 @@ impl CronRunner {
             // This is critical: if we skip try_recv when due.is_empty(), runningAtMs
             // will never be cleared, causing the job to be stuck forever.
             let mut collected_count = 0;
-            while let Ok((job_id, success, duration_ms, started_at, error_msg)) = result_rx.try_recv() {
+            while let Ok((job_id, success, duration_ms, started_at, error_msg)) =
+                result_rx.try_recv()
+            {
                 collected_count += 1;
                 info!(job_id = %job_id, success, duration_ms, "cron: collected job result via try_recv");
                 cancel_flags.remove(&job_id);
@@ -934,8 +996,9 @@ impl CronRunner {
                                 state.next_run_at_ms = None;
                                 job.enabled = false;
                             } else {
-                            // Compute next run normally
-                            state.next_run_at_ms = job.schedule.compute_next_run(completion_time);
+                                // Compute next run normally
+                                state.next_run_at_ms =
+                                    job.schedule.compute_next_run(completion_time);
                             }
                             info!(job_id = %job.id, next_run_at_ms = state.next_run_at_ms, "cron: updated next_run_at_ms after success");
                         } else if error_msg.as_deref() == Some(CANCEL_BY_RELOAD) {
@@ -965,7 +1028,11 @@ impl CronRunner {
                             let backoff_next = completion_time + backoff;
                             let normal_next = job.schedule.compute_next_run(completion_time);
                             // Use whichever is later: the natural next run or the backoff delay
-                            state.next_run_at_ms = Some(normal_next.map(|n| n.max(backoff_next)).unwrap_or(backoff_next));
+                            state.next_run_at_ms = Some(
+                                normal_next
+                                    .map(|n| n.max(backoff_next))
+                                    .unwrap_or(backoff_next),
+                            );
 
                             info!(
                                 job_id = %job.id,
@@ -1005,18 +1072,23 @@ impl CronRunner {
                             .and_then(|s| s.next_run_at_ms)
                             .map(|t| t <= now_ms)
                             .unwrap_or(false)
-                        && j.state
-                            .as_ref()
-                            .and_then(|s| s.running_at_ms)
-                            .is_none()
+                        && j.state.as_ref().and_then(|s| s.running_at_ms).is_none()
                 })
                 .map(|j| j.id.clone())
                 .collect();
 
             // Debug: log enabled state of all jobs that are due but shouldn't fire
             if !due.is_empty() {
-                let disabled_due: Vec<_> = jobs.iter()
-                    .filter(|j| !j.enabled && j.state.as_ref().and_then(|s| s.next_run_at_ms).map(|t| t <= now_ms).unwrap_or(false))
+                let disabled_due: Vec<_> = jobs
+                    .iter()
+                    .filter(|j| {
+                        !j.enabled
+                            && j.state
+                                .as_ref()
+                                .and_then(|s| s.next_run_at_ms)
+                                .map(|t| t <= now_ms)
+                                .unwrap_or(false)
+                    })
                     .map(|j| j.id.clone())
                     .collect();
                 if !disabled_due.is_empty() {
@@ -1046,7 +1118,10 @@ impl CronRunner {
                 // 60s drain window.
                 if let Some(s) = &self.shutdown {
                     if s.is_draining() {
-                        info!("cron scheduler: drain signaled during permit await, dropping job {}", job_id);
+                        info!(
+                            "cron scheduler: drain signaled during permit await, dropping job {}",
+                            job_id
+                        );
                         drop(permit);
                         break;
                     }
@@ -1061,8 +1136,10 @@ impl CronRunner {
                     };
                     if let Some(state) = job_ref.state.as_mut() {
                         state.running_at_ms = Some(started_at);
-                        // Don't compute next_run_at_ms here; compute it AFTER the job finishes
-                        // using the completion time, so interval-based jobs don't fire early
+                        // Don't compute next_run_at_ms here; compute it AFTER
+                        // the job finishes
+                        // using the completion time, so interval-based jobs
+                        // don't fire early
                     }
                     let rendered = if job_ref.iter.is_some() {
                         let r = job_ref.render_message();
@@ -1107,7 +1184,7 @@ impl CronRunner {
                 let permit = permit.expect("permit checked above");
                 let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 cancel_flags.insert(job.id.clone(), Arc::clone(&cancelled));
-                let job_id_for_log = job.id.clone();  // Clone BEFORE async move
+                let job_id_for_log = job.id.clone(); // Clone BEFORE async move
                 let agents = Arc::clone(&self.agents);
                 let channels = Arc::clone(&self.channels);
                 let run_log_dir = self.run_log_dir.clone();
@@ -1121,31 +1198,42 @@ impl CronRunner {
                     let _inflight_guard = inflight_guard;
                     let start_time = current_timestamp_ms();
                     let job_started_at = started_at;
-                    let prev_consecutive_errors = job.state.as_ref().map(|s| s.consecutive_errors).unwrap_or(0);
+                    let prev_consecutive_errors = job
+                        .state
+                        .as_ref()
+                        .map(|s| s.consecutive_errors)
+                        .unwrap_or(0);
                     info!(job_id = %job.id, "cron job triggered");
 
                     // systemEvent: deliver payload text directly — no agent call needed.
-                    // execCommand: execute the command directly, bypassing agent and session history.
+                    // execCommand: execute the command directly, bypassing agent and session
+                    // history.
                     let result: Result<String> = if job.payload.as_ref().and_then(|p| match p {
                         CronPayload::Structured { kind, .. } => kind.as_deref(),
                         _ => None,
-                    }) == Some("systemEvent") {
+                    }) == Some("systemEvent")
+                    {
                         Ok(job.effective_message().to_owned())
                     } else if job.payload.as_ref().and_then(|p| match p {
                         CronPayload::Structured { kind, .. } => kind.as_deref(),
                         _ => None,
-                    }) == Some("execCommand") {
-                        // Execute command directly, bypassing agent to avoid session history pollution
+                    }) == Some("execCommand")
+                    {
+                        // Execute command directly, bypassing agent to avoid session history
+                        // pollution
                         run_exec_command(
                             job.effective_message(),
                             job.payload.as_ref().and_then(|p| match p {
-                                CronPayload::Structured { timeout_seconds, .. } => *timeout_seconds,
+                                CronPayload::Structured {
+                                    timeout_seconds, ..
+                                } => *timeout_seconds,
                                 _ => None,
                             }),
                             job.payload.as_ref().map(|p| p.summarize()).unwrap_or(false),
                             &job,
                             &agents,
-                        ).await
+                        )
+                        .await
                     } else {
                         // Run with cancellation check — polls cancel flag every second.
                         tokio::select! {
@@ -1191,7 +1279,8 @@ impl CronRunner {
                             None
                         }
                         Err(e) => {
-                            // Error - send error notification with consecutive failure count and backoff
+                            // Error - send error notification with consecutive failure count and
+                            // backoff
                             let job_name = job.name.as_deref().unwrap_or(&job.id);
                             let consecutive = prev_consecutive_errors + 1;
                             let backoff = error_backoff_ms(consecutive);
@@ -1267,7 +1356,13 @@ impl CronRunner {
                     }
 
                     let error_msg = result.as_ref().err().map(|e| e.to_string());
-                    (job.id, result.is_ok(), duration_ms, job_started_at, error_msg)
+                    (
+                        job.id,
+                        result.is_ok(),
+                        duration_ms,
+                        job_started_at,
+                        error_msg,
+                    )
                 });
 
                 // Send result back via channel for async collection.
@@ -1292,7 +1387,10 @@ impl CronRunner {
             let before = jobs.len();
             jobs.retain(|j| !(j.schedule.is_once() && !j.enabled));
             if jobs.len() < before {
-                info!(removed = before - jobs.len(), "cron: cleaned up completed one-shot jobs");
+                info!(
+                    removed = before - jobs.len(),
+                    "cron: cleaned up completed one-shot jobs"
+                );
                 if let Err(e) = self.save_store(&jobs).await {
                     warn!(err = %e, "cron: failed to save store after removing one-shot jobs");
                 }
@@ -1314,28 +1412,38 @@ impl CronRunner {
         // a manual /api/v1/cron/run invocation to finish (until drain timeout)
         // before re-execing.
         let _inflight_guard = self.shutdown.as_ref().map(|s| s.begin_work());
-        let prev_consecutive_errors = job.state.as_ref().map(|s| s.consecutive_errors).unwrap_or(0);
+        let prev_consecutive_errors = job
+            .state
+            .as_ref()
+            .map(|s| s.consecutive_errors)
+            .unwrap_or(0);
         // systemEvent: deliver payload text directly — no agent call needed.
-        // execCommand: execute the command directly, bypassing agent and session history.
+        // execCommand: execute the command directly, bypassing agent and session
+        // history.
         let result: Result<String> = if job.payload.as_ref().and_then(|p| match p {
             CronPayload::Structured { kind, .. } => kind.as_deref(),
             _ => None,
-        }) == Some("systemEvent") {
+        }) == Some("systemEvent")
+        {
             Ok(job.effective_message().to_owned())
         } else if job.payload.as_ref().and_then(|p| match p {
             CronPayload::Structured { kind, .. } => kind.as_deref(),
             _ => None,
-        }) == Some("execCommand") {
+        }) == Some("execCommand")
+        {
             run_exec_command(
                 job.effective_message(),
                 job.payload.as_ref().and_then(|p| match p {
-                    CronPayload::Structured { timeout_seconds, .. } => *timeout_seconds,
+                    CronPayload::Structured {
+                        timeout_seconds, ..
+                    } => *timeout_seconds,
                     _ => None,
                 }),
                 job.payload.as_ref().map(|p| p.summarize()).unwrap_or(false),
                 job,
                 &self.agents,
-            ).await
+            )
+            .await
         } else {
             run_cron_job(job, &self.agents).await
         };
@@ -1530,7 +1638,9 @@ fn field_matches(field: &str, value: u32) -> bool {
     }
     // Handle comma-separated lists (each part may be a value, range, or step)
     if field.contains(',') {
-        return field.split(',').any(|part| field_matches(part.trim(), value));
+        return field
+            .split(',')
+            .any(|part| field_matches(part.trim(), value));
     }
     // Handle range: "9-17" means 9 through 17 inclusive (standard cron semantics)
     if field.contains('-') {
@@ -1602,8 +1712,10 @@ fn compute_next_run_from_expr(cron_expr: &str, from_ms: u64, tz: Option<&str>) -
     // Current minute in the target timezone
     let local_now = utc_dt.with_timezone(&tz_for_search);
     let mut cand = local_now
-        .with_second(0).expect("second 0 always valid")
-        .with_nanosecond(0).expect("nanosecond 0 always valid");
+        .with_second(0)
+        .expect("second 0 always valid")
+        .with_nanosecond(0)
+        .expect("nanosecond 0 always valid");
     cand += chrono::Duration::minutes(1);
 
     // Search up to 1 year ahead (in local time).
@@ -1611,7 +1723,8 @@ fn compute_next_run_from_expr(cron_expr: &str, from_ms: u64, tz: Option<&str>) -
 
     while cand < max_cand {
         // Use naive date's weekday to get the weekday in local time (not UTC)
-        // chrono weekday IS compatible with openclaw dow (both use Sunday=0/1 as the anchor)
+        // chrono weekday IS compatible with openclaw dow (both use Sunday=0/1 as the
+        // anchor)
         let dow = cand.date_naive().weekday().num_days_from_sunday();
         let m = field_matches(mon_f, cand.month());
         let d = field_matches(dom_f, cand.day());
@@ -1669,14 +1782,18 @@ async fn run_cron_job(job: &CronJob, agents: &AgentRegistry) -> Result<String> {
         .payload
         .as_ref()
         .and_then(|p| match p {
-CronPayload::Structured { timeout_seconds, .. } => *timeout_seconds,
+            CronPayload::Structured {
+                timeout_seconds, ..
+            } => *timeout_seconds,
             CronPayload::Text(_) => None,
         })
         .unwrap_or(300);
 
     // Register abort flag for this session before dispatching
     let abort_flag = {
-        let mut flags = handle.abort_flags.write()
+        let mut flags = handle
+            .abort_flags
+            .write()
             .expect("abort_flags lock poisoned");
         flags
             .entry(session_key.clone())
@@ -1751,7 +1868,8 @@ CronPayload::Structured { timeout_seconds, .. } => *timeout_seconds,
     let reply = tokio::time::timeout(Duration::from_secs(timeout_secs), reply_rx)
         .await
         .map_err(|_| {
-            // Timeout fired: abort the agent execution and capture status for error reporting.
+            // Timeout fired: abort the agent execution and capture status for error
+            // reporting.
             abort_flag.store(true, std::sync::atomic::Ordering::SeqCst);
             warn!(job_id = %job.id, session = %session_key, "cron: timeout fired, aborting agent");
 
@@ -1796,7 +1914,8 @@ CronPayload::Structured { timeout_seconds, .. } => *timeout_seconds,
             if let Some(code_str) = exit_match.split(':').nth(1) {
                 if let Ok(code) = code_str.trim().replace(']', "").parse::<i64>() {
                     if code != 0 {
-                        let error_detail = text.lines()
+                        let error_detail = text
+                            .lines()
                             .filter(|l| !l.contains("[exit code:"))
                             .collect::<Vec<_>>()
                             .join("\n");
@@ -1826,7 +1945,11 @@ CronPayload::Structured { timeout_seconds, .. } => *timeout_seconds,
                         "command failed with no output"
                     };
                     info!(job_id = %job.id, exit_code, "cron job exec failed");
-                    return Err(anyhow!("command exit_code={}, error: {}", exit_code, error_detail));
+                    return Err(anyhow!(
+                        "command exit_code={}, error: {}",
+                        exit_code,
+                        error_detail
+                    ));
                 }
             }
         }
@@ -1936,11 +2059,7 @@ async fn send_delivery(
     }
 }
 
-fn build_run_log_entry(
-    job: &CronJob,
-    success: bool,
-    error: Option<anyhow::Error>,
-) -> RunLogEntry {
+fn build_run_log_entry(job: &CronJob, success: bool, error: Option<anyhow::Error>) -> RunLogEntry {
     RunLogEntry {
         id: uuid::Uuid::new_v4().to_string(),
         job_id: job.id.clone(),
@@ -2006,7 +2125,11 @@ async fn run_exec_command(
             }
             Err(_) => {
                 tracing::warn!(task_id = %tid, timeout_secs = cmd_timeout.as_secs(), "cron exec background timed out");
-                (None, String::new(), format!("timed out after {} seconds", cmd_timeout.as_secs()))
+                (
+                    None,
+                    String::new(),
+                    format!("timed out after {} seconds", cmd_timeout.as_secs()),
+                )
             }
         };
 
@@ -2024,7 +2147,8 @@ async fn run_exec_command(
         let _ = result_tx.send((exit_code, stdout, stderr));
     });
 
-    // Wait for background task result (non-blocking for spawned task, but waits here)
+    // Wait for background task result (non-blocking for spawned task, but waits
+    // here)
     let (exit_code, stdout, stderr) = result_rx
         .await
         .map_err(|_| anyhow!("background exec channel closed"))?;
@@ -2040,7 +2164,11 @@ async fn run_exec_command(
         } else {
             "command failed with no output".to_string()
         };
-        return Err(anyhow!("command exit_code={}, error: {}", exit_code, error_msg));
+        return Err(anyhow!(
+            "command exit_code={}, error: {}",
+            exit_code,
+            error_msg
+        ));
     }
 
     // Get raw output
@@ -2061,8 +2189,7 @@ async fn run_exec_command(
     } else {
         format!(
             "{}\n\n---\n\n[FULL CONTENT OF SAVED REPORT FILES]\n{}\n\n[NOTE] The above is the full report the script saved. Base your summary on this content; don't omit key information.",
-            raw_output,
-            saved_files_content
+            raw_output, saved_files_content
         )
     };
 
@@ -2276,7 +2403,8 @@ pub fn save_cron_jobs(jobs: &[CronJob]) -> anyhow::Result<()> {
             .iter()
             .filter_map(|j| serde_json::to_string(j).ok().map(|s| (j.id.clone(), s)))
             .collect();
-        store.cron_bulk_replace(&entries)
+        store
+            .cron_bulk_replace(&entries)
             .context("redb cron_bulk_replace failed")?;
         // Best-effort export so users can still read / git-diff / hand-edit.
         export_cron_jobs_to_file(jobs);
@@ -2286,8 +2414,8 @@ pub fn save_cron_jobs(jobs: &[CronJob]) -> anyhow::Result<()> {
     // Fallback: legacy file-only path (tests, standalone tools).
     let cron_file = resolve_cron_store_path();
     let store = serde_json::json!({ "version": 1, "jobs": jobs });
-    let json = serde_json::to_string_pretty(&store)
-        .context("failed to serialize cron jobs to JSON")?;
+    let json =
+        serde_json::to_string_pretty(&store).context("failed to serialize cron jobs to JSON")?;
     if let Some(parent) = cron_file.parent() {
         std::fs::create_dir_all(parent).context("failed to create cron directory")?;
     }
@@ -2340,17 +2468,17 @@ pub fn cron_store() -> Option<std::sync::Arc<crate::store::RedbStore>> {
 ///   imported here → cron runner sees the new config.
 ///
 /// Merge rules (file = user intent, redb = runtime state):
-///   - **User-config fields** (enabled, schedule, payload, message,
-///     delivery, agent_id, name, …) → take from FILE.
-///     If the file omits a field and redb has it, keep redb's.
+///   - **User-config fields** (enabled, schedule, payload, message, delivery,
+///     agent_id, name, …) → take from FILE. If the file omits a field and redb
+///     has it, keep redb's.
 ///   - **`state` sub-object** (next_run_at_ms, last_run_at_ms,
-///     consecutive_errors, …) → take from REDB. Run statistics must
-///     not be reset by an unrelated config edit.
+///     consecutive_errors, …) → take from REDB. Run statistics must not be
+///     reset by an unrelated config edit.
 ///   - Job present in file but not in redb → add to redb.
-///   - Job present in redb but not in file → user deleted it →
-///     remove from redb.
-///   - File parse failure → skip the merge (don't wipe redb based on
-///     a broken file).
+///   - Job present in redb but not in file → user deleted it → remove from
+///     redb.
+///   - File parse failure → skip the merge (don't wipe redb based on a broken
+///     file).
 ///
 /// Returns the number of jobs in redb after the merge (for logging).
 pub(crate) fn reconcile_file_to_redb_on_boot(store: &crate::store::RedbStore) -> usize {
@@ -2413,9 +2541,7 @@ pub(crate) fn reconcile_file_to_redb_on_boot(store: &crate::store::RedbStore) ->
     if added > 0 || removed > 0 {
         info!(
             total = merged.len(),
-            added,
-            removed,
-            "cron: boot reconcile cron.json5 -> redb"
+            added, removed, "cron: boot reconcile cron.json5 -> redb"
         );
     }
     merged.len()
@@ -2701,7 +2827,11 @@ mod cron_iter_tests {
 
     #[test]
     fn render_substitutes_current_and_next() {
-        let j = iter_job(&["东京", "曼谷", "迪拜"], 0, "查询{current}天气，下一次：{next}");
+        let j = iter_job(
+            &["东京", "曼谷", "迪拜"],
+            0,
+            "查询{current}天气，下一次：{next}",
+        );
         assert_eq!(j.render_message(), "查询东京天气，下一次：曼谷");
     }
 
@@ -2800,7 +2930,10 @@ mod cron_iter_tests {
             version: u32,
             jobs: Vec<CronJob>,
         }
-        let store = Store { version: 1, jobs: vec![job] };
+        let store = Store {
+            version: 1,
+            jobs: vec![job],
+        };
         let json = serde_json::to_string_pretty(&store).expect("serialize");
         let tmp_path = format!("{}.tmp", path.display());
         tokio::fs::write(&tmp_path, &json).await.expect("write tmp");
@@ -2811,9 +2944,15 @@ mod cron_iter_tests {
         let restored: Store = serde_json::from_slice(&bytes).expect("deserialize");
         assert_eq!(restored.jobs.len(), 1);
         let iter = restored.jobs[0].iter.as_ref().expect("iter present");
-        assert_eq!(iter.cursor, 1, "cursor must persist before dispatch returns");
-        assert_eq!(restored.jobs[0].render_message(), "do b",
-            "next fire post-restart must pick the next item, not replay 'a'");
+        assert_eq!(
+            iter.cursor, 1,
+            "cursor must persist before dispatch returns"
+        );
+        assert_eq!(
+            restored.jobs[0].render_message(),
+            "do b",
+            "next fire post-restart must pick the next item, not replay 'a'"
+        );
     }
 }
 
@@ -2859,7 +2998,10 @@ pub fn validate_cron_expr(expr: &str) -> Result<(), String> {
     if fields.len() != 5 {
         // Build a hint that catches the common "forgot a space" mistake.
         // E.g. "017 * * *" → hint that "017" might be "0 17" (4 fields → 5).
-        let hint = if fields.len() == 4 && fields[0].len() >= 2 && fields[0].chars().all(|c| c.is_ascii_digit()) {
+        let hint = if fields.len() == 4
+            && fields[0].len() >= 2
+            && fields[0].chars().all(|c| c.is_ascii_digit())
+        {
             let n = fields[0];
             format!(
                 " — looks like a missing space: '{}' could be '{} {}' which makes 5 fields (e.g. '0 17 * * *' for 5pm daily)",

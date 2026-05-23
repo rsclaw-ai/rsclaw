@@ -144,8 +144,8 @@ impl TaskStore {
             .get(id)?
             .ok_or_else(|| anyhow!("task not found: {id}"))?;
 
-        let outcome_value = serde_json::to_value(outcome)
-            .map_err(|e| anyhow!("serialize outcome: {e}"))?;
+        let outcome_value =
+            serde_json::to_value(outcome).map_err(|e| anyhow!("serialize outcome: {e}"))?;
 
         let mut meta = task
             .metadata

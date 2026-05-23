@@ -65,7 +65,11 @@ pub async fn onboard_silent(client: &Client, brand: &str) -> Result<(String, Str
     onboard_inner(client, brand, true).await
 }
 
-async fn onboard_inner(client: &Client, brand: &str, silent: bool) -> Result<(String, String, String)> {
+async fn onboard_inner(
+    client: &Client,
+    brand: &str,
+    silent: bool,
+) -> Result<(String, String, String)> {
     let base = accounts_url(brand);
 
     // 1. Init

@@ -1,15 +1,14 @@
 //! Integration tests for `send_with_retry` retry logic.
 
 use std::sync::{
-    atomic::{AtomicU32, Ordering},
     Arc,
+    atomic::{AtomicU32, Ordering},
 };
 
 use anyhow::Result;
 use futures::future::BoxFuture;
-
 use rsclaw::{
-    channel::{send_with_retry, Channel, OutboundMessage},
+    channel::{Channel, OutboundMessage, send_with_retry},
     provider::RetryConfig,
 };
 

@@ -462,14 +462,15 @@ impl DiscordChannel {
                             // Audio/video still get auto-transcribed inline.
                             let mut images: Vec<crate::agent::registry::ImageAttachment> =
                                 Vec::new();
-                            let mut files: Vec<crate::agent::registry::FileAttachment> =
-                                Vec::new();
+                            let mut files: Vec<crate::agent::registry::FileAttachment> = Vec::new();
                             if let Some(attachments) = d["attachments"].as_array() {
                                 for att in attachments {
                                     let url = att["url"].as_str().unwrap_or("");
                                     let filename = att["filename"].as_str().unwrap_or("file");
                                     let content_type = att["content_type"].as_str().unwrap_or("");
-                                    if url.is_empty() { continue; }
+                                    if url.is_empty() {
+                                        continue;
+                                    }
 
                                     let download = self.client.get(url).send().await;
                                     let bytes = match download {
@@ -480,18 +481,34 @@ impl DiscordChannel {
                                     };
 
                                     if let Some(bytes) = bytes {
-                                        if content_type.starts_with("audio/") || content_type.starts_with("video/") {
+                                        if content_type.starts_with("audio/")
+                                            || content_type.starts_with("video/")
+                                        {
                                             match crate::channel::transcription::transcribe_audio(
-                                                &self.client, &bytes, filename, content_type,
-                                            ).await {
+                                                &self.client,
+                                                &bytes,
+                                                filename,
+                                                content_type,
+                                            )
+                                            .await
+                                            {
                                                 Ok(text) => {
-                                                    info!("Discord: attachment transcribed ({} chars)", text.len());
-                                                    if !content.is_empty() { content.push('\n'); }
+                                                    info!(
+                                                        "Discord: attachment transcribed ({} chars)",
+                                                        text.len()
+                                                    );
+                                                    if !content.is_empty() {
+                                                        content.push('\n');
+                                                    }
                                                     content.push_str(&text);
                                                 }
                                                 Err(_) => {
-                                                    if !content.is_empty() { content.push('\n'); }
-                                                    content.push_str(&format!("[{content_type} attachment: {filename}]"));
+                                                    if !content.is_empty() {
+                                                        content.push('\n');
+                                                    }
+                                                    content.push_str(&format!(
+                                                        "[{content_type} attachment: {filename}]"
+                                                    ));
                                                 }
                                             }
                                         } else if content_type.starts_with("image/") {
@@ -519,8 +536,7 @@ impl DiscordChannel {
                                             // keep the inline text extraction
                                             // (PDF/Office/text) so plain Q&A
                                             // works without two roundtrips.
-                                            let processed =
-                                                discord_process_file(filename, &bytes);
+                                            let processed = discord_process_file(filename, &bytes);
                                             files.push(crate::agent::registry::FileAttachment {
                                                 filename: filename.to_owned(),
                                                 data: bytes.clone(),
@@ -530,12 +546,18 @@ impl DiscordChannel {
                                                     content_type.to_owned()
                                                 },
                                             });
-                                            if !content.is_empty() { content.push('\n'); }
+                                            if !content.is_empty() {
+                                                content.push('\n');
+                                            }
                                             content.push_str(&processed);
                                         }
                                     } else {
-                                        if !content.is_empty() { content.push('\n'); }
-                                        content.push_str(&format!("[attachment download failed: {filename}]"));
+                                        if !content.is_empty() {
+                                            content.push('\n');
+                                        }
+                                        content.push_str(&format!(
+                                            "[attachment download failed: {filename}]"
+                                        ));
                                     }
                                 }
                             }
@@ -552,14 +574,22 @@ impl DiscordChannel {
                             // /ss / /webshot / /help. Mirrors the Slack
                             // alias added earlier.
                             if let Some(rest) = content.strip_prefix('\\') {
-                                if rest.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) {
+                                if rest
+                                    .chars()
+                                    .next()
+                                    .is_some_and(|c| c.is_ascii_alphanumeric())
+                                {
                                     content = format!("/{rest}");
                                 }
                             }
 
-                            if content.is_empty() { continue; }
+                            if content.is_empty() {
+                                continue;
+                            }
                             debug!(peer = %peer_id, channel = %channel_id, "Discord: MESSAGE_CREATE");
-                            (self.on_message)(peer_id, content, channel_id, is_guild, images, files);
+                            (self.on_message)(
+                                peer_id, content, channel_id, is_guild, images, files,
+                            );
                         }
                         _ => {
                             debug!("Discord: event {event_type}");
@@ -595,8 +625,8 @@ impl Channel for DiscordChannel {
 
             // Send image attachments. Two modes:
             //   - http(s):// URL → embed.image.url (no upload, Discord fetches)
-            //   - data:image/<mime>;base64,... → multipart upload with the
-            //     correct MIME and matching filename extension.
+            //   - data:image/<mime>;base64,... → multipart upload with the correct MIME and
+            //     matching filename extension.
             //
             // Previously this path only recognised PNG/JPEG data URLs and fell
             // back to feeding the entire `data:image/webp;base64,...` string
@@ -610,10 +640,7 @@ impl Channel for DiscordChannel {
                     let payload = serde_json::json!({
                         "embeds": [{ "image": { "url": image_data } }],
                     });
-                    let url = format!(
-                        "{}/channels/{}/messages",
-                        self.api_base, msg.target_id
-                    );
+                    let url = format!("{}/channels/{}/messages", self.api_base, msg.target_id);
                     match self
                         .client
                         .post(&url)
@@ -634,8 +661,8 @@ impl Channel for DiscordChannel {
                     continue;
                 }
 
-                let (mime, b64) = parse_data_url(image_data)
-                    .unwrap_or(("image/png", image_data.as_str()));
+                let (mime, b64) =
+                    parse_data_url(image_data).unwrap_or(("image/png", image_data.as_str()));
                 use base64::Engine;
                 let bytes = match base64::engine::general_purpose::STANDARD.decode(b64) {
                     Ok(b) => b,
@@ -655,16 +682,11 @@ impl Channel for DiscordChannel {
                         continue;
                     }
                 };
-                let form = reqwest::multipart::Form::new()
-                    .part("files[0]", part)
-                    .text(
-                        "payload_json",
-                        serde_json::json!({"content": ""}).to_string(),
-                    );
-                let url = format!(
-                    "{}/channels/{}/messages",
-                    self.api_base, msg.target_id
+                let form = reqwest::multipart::Form::new().part("files[0]", part).text(
+                    "payload_json",
+                    serde_json::json!({"content": ""}).to_string(),
                 );
+                let url = format!("{}/channels/{}/messages", self.api_base, msg.target_id);
                 match self
                     .client
                     .post(&url)
@@ -707,16 +729,11 @@ impl Channel for DiscordChannel {
                         continue;
                     }
                 };
-                let form = reqwest::multipart::Form::new()
-                    .part("files[0]", part)
-                    .text(
-                        "payload_json",
-                        serde_json::json!({"content": ""}).to_string(),
-                    );
-                let url = format!(
-                    "{}/channels/{}/messages",
-                    self.api_base, msg.target_id
+                let form = reqwest::multipart::Form::new().part("files[0]", part).text(
+                    "payload_json",
+                    serde_json::json!({"content": ""}).to_string(),
                 );
+                let url = format!("{}/channels/{}/messages", self.api_base, msg.target_id);
                 match self
                     .client
                     .post(&url)
@@ -768,8 +785,8 @@ impl Channel for DiscordChannel {
 
 fn discord_is_text_file(name: &str) -> bool {
     let exts = [
-        ".txt", ".md", ".csv", ".json", ".toml", ".yaml", ".yml", ".xml", ".html",
-        ".rs", ".py", ".js", ".ts", ".go", ".sh", ".log", ".conf", ".cfg", ".c", ".h", ".java",
+        ".txt", ".md", ".csv", ".json", ".toml", ".yaml", ".yml", ".xml", ".html", ".rs", ".py",
+        ".js", ".ts", ".go", ".sh", ".log", ".conf", ".cfg", ".c", ".h", ".java",
     ];
     exts.iter().any(|e| name.ends_with(e))
 }
@@ -778,7 +795,10 @@ fn discord_process_file(filename: &str, bytes: &[u8]) -> String {
     let lower = filename.to_lowercase();
     if lower.ends_with(".pdf") {
         if let Ok(text) = crate::agent::doc::safe_extract_pdf_from_mem(bytes) {
-            return format!("[PDF: {filename}]\n{}", crate::util::truncate_str(&text, 20000));
+            return format!(
+                "[PDF: {filename}]\n{}",
+                crate::util::truncate_str(&text, 20000)
+            );
         }
         // Fallback to pdftotext CLI
         let tmp = std::env::temp_dir().join(format!("rsclaw_discord_{filename}"));
@@ -790,7 +810,10 @@ fn discord_process_file(filename: &str, bytes: &[u8]) -> String {
             if let Ok(o) = output {
                 if o.status.success() {
                     let text = String::from_utf8_lossy(&o.stdout);
-                    return format!("[PDF: {filename}]\n{}", crate::util::truncate_str(&text, 20000));
+                    return format!(
+                        "[PDF: {filename}]\n{}",
+                        crate::util::truncate_str(&text, 20000)
+                    );
                 }
             }
             format!("[PDF: {filename} ({} bytes)]", bytes.len())
@@ -799,25 +822,43 @@ fn discord_process_file(filename: &str, bytes: &[u8]) -> String {
         }
     } else if lower.ends_with(".docx") || lower.ends_with(".xlsx") || lower.ends_with(".pptx") {
         if let Some(text) = crate::channel::extract_office_text(filename, bytes) {
-            let label = if lower.ends_with(".docx") { "Word" }
-                else if lower.ends_with(".xlsx") { "Excel" }
-                else { "PowerPoint" };
-            format!("[{label}: {filename}]\n{}", crate::util::truncate_str(&text, 20000))
+            let label = if lower.ends_with(".docx") {
+                "Word"
+            } else if lower.ends_with(".xlsx") {
+                "Excel"
+            } else {
+                "PowerPoint"
+            };
+            format!(
+                "[{label}: {filename}]\n{}",
+                crate::util::truncate_str(&text, 20000)
+            )
         } else {
-            let label = if lower.ends_with(".docx") { "Word" }
-                else if lower.ends_with(".xlsx") { "Excel" }
-                else { "PowerPoint" };
+            let label = if lower.ends_with(".docx") {
+                "Word"
+            } else if lower.ends_with(".xlsx") {
+                "Excel"
+            } else {
+                "PowerPoint"
+            };
             format!("[{label} file: {filename} ({} bytes)]", bytes.len())
         }
     } else if discord_is_text_file(&lower) {
         let text = String::from_utf8_lossy(bytes);
-        format!("[File: {filename}]\n```\n{}\n```", crate::util::truncate_str(&text, 20000))
+        format!(
+            "[File: {filename}]\n```\n{}\n```",
+            crate::util::truncate_str(&text, 20000)
+        )
     } else {
         let ws = crate::config::loader::base_dir().join("workspace/uploads");
         let _ = std::fs::create_dir_all(&ws);
         let dest = ws.join(filename);
         let _ = std::fs::write(&dest, bytes);
-        format!("[File saved: {filename} ({} bytes) at {}]", bytes.len(), dest.display())
+        format!(
+            "[File saved: {filename} ({} bytes) at {}]",
+            bytes.len(),
+            dest.display()
+        )
     }
 }
 
@@ -860,7 +901,13 @@ mod tests {
     #[test]
     fn auth_header_format() {
         init_crypto();
-        let ch = DiscordChannel::new("my-token", false, Arc::new(|_, _, _, _, _, _| {}), None, None);
+        let ch = DiscordChannel::new(
+            "my-token",
+            false,
+            Arc::new(|_, _, _, _, _, _| {}),
+            None,
+            None,
+        );
         assert_eq!(ch.auth_header(), "Bot my-token");
     }
 
@@ -872,7 +919,10 @@ mod tests {
     #[test]
     fn strip_mention_removes_nickname_form() {
         // Discord's legacy `<@!id>` form (used when the bot has a server nick).
-        assert_eq!(strip_bot_mention("<@!123> /screenshot", "123"), "/screenshot");
+        assert_eq!(
+            strip_bot_mention("<@!123> /screenshot", "123"),
+            "/screenshot"
+        );
     }
 
     #[test]

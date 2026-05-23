@@ -1,22 +1,22 @@
 //! redb-backed KB store. `KbStore` owns the database handle; all
 //! reads/writes go through tx accessors defined in the submodules.
 
-pub mod schema;
-pub mod codec;
-pub mod docs;
-pub mod collections;
 pub mod chunks;
-pub mod seen;
-pub mod ledger;
-pub mod jobs;
+pub mod codec;
+pub mod collections;
+pub mod docs;
 pub mod entities;
+pub mod jobs;
+pub mod ledger;
+pub mod schema;
+pub mod seen;
 
-pub use schema::open_db;
-pub use seen::{SeenRecord, SyncState};
+use std::path::Path;
 
 use anyhow::Result;
 use redb::{Database, ReadTransaction, ReadableDatabase, WriteTransaction};
-use std::path::Path;
+pub use schema::open_db;
+pub use seen::{SeenRecord, SyncState};
 
 pub struct KbStore {
     pub db: Database,
@@ -39,8 +39,9 @@ impl KbStore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
+
+    use super::*;
 
     #[test]
     fn open_creates_db() {

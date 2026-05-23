@@ -12,20 +12,21 @@
 //! - `head:N`       — first N messages (oldest)
 //! - `tail:N`       — last N messages (newest)
 //! - `seq:A-B`      — 1-indexed inclusive seq range
-//! - `grep:PAT`     — case-insensitive regex over each message's text (substring works since literal patterns are valid regex; alternation like `error|fail|warn` works)
+//! - `grep:PAT`     — case-insensitive regex over each message's text
+//!   (substring works since literal patterns are valid regex; alternation like
+//!   `error|fail|warn` works)
 //!
 //! Large messages (> ARTIFACT_THRESHOLD_CHARS) get nested through the
 //! artifact pipeline: each oversized hit is written to its own artifact
 //! and returned with a `tool_result_id` instead of inline content. This
 //! keeps the read_session_archive response itself bounded.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use regex::RegexBuilder;
-use serde_json::{json, Value};
-
-use crate::artifact::{compact_text, default_store, PreviewBudget, ARTIFACT_THRESHOLD_CHARS};
+use serde_json::{Value, json};
 
 use super::runtime::{AgentRuntime, RunContext};
+use crate::artifact::{ARTIFACT_THRESHOLD_CHARS, PreviewBudget, compact_text, default_store};
 
 /// Per-mode cap on how many archive rows we return in one call. Bigger
 /// modes (full grep results) get chopped here so the response itself
@@ -60,19 +61,15 @@ fn message_text(msg: &Value) -> String {
             return out;
         }
     }
-    // Last resort — stringify the whole message so grep still has something to match.
+    // Last resort — stringify the whole message so grep still has something to
+    // match.
     msg.to_string()
 }
 
 /// Render one archive entry as a result row. If its text payload is
 /// large, nest it through the artifact pipeline so this response stays
 /// bounded (per the artifact-style design).
-fn render_entry(
-    session_key: &str,
-    seq: u64,
-    generation: u32,
-    msg: &Value,
-) -> Value {
+fn render_entry(session_key: &str, seq: u64, generation: u32, msg: &Value) -> Value {
     let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
     let text = message_text(msg);
     let raw_chars = text.chars().count();
@@ -81,7 +78,8 @@ fn render_entry(
         // Nest through artifact pipeline — write full text to its own
         // artifact, return only a head/tail preview with a fresh
         // tool_result_id pointing at it. LLM can drill in via read_artifact.
-        let (preview, id) = compact_text(default_store(), session_key, &text, PreviewBudget::DEFAULT);
+        let (preview, id) =
+            compact_text(default_store(), session_key, &text, PreviewBudget::DEFAULT);
         json!({
             "seq": seq,
             "generation": generation,
@@ -216,8 +214,8 @@ impl AgentRuntime {
         }
 
         let (selected, _summary) = apply_archive_mode(&rows, mode)?;
-        let truncated = selected.len() >= ARCHIVE_RESULT_LIMIT
-            && matches!(mode.strip_prefix("grep:"), Some(_));
+        let truncated =
+            selected.len() >= ARCHIVE_RESULT_LIMIT && matches!(mode.strip_prefix("grep:"), Some(_));
 
         let results: Vec<Value> = selected
             .into_iter()
@@ -246,11 +244,7 @@ mod tests {
     use super::*;
 
     fn row(seq: u64, role: &str, content: &str) -> (u64, u32, Value) {
-        (
-            seq,
-            1,
-            json!({ "role": role, "content": content }),
-        )
+        (seq, 1, json!({ "role": role, "content": content }))
     }
 
     fn sample() -> Vec<(u64, u32, Value)> {
@@ -287,7 +281,11 @@ mod tests {
 
         // grep with trailing newline still matches the keyword.
         let (out, _) = apply_archive_mode(&sample(), "grep:weather\n").unwrap();
-        assert_eq!(out.len(), 1, "grep:weather should match the Beijing-weather row");
+        assert_eq!(
+            out.len(),
+            1,
+            "grep:weather should match the Beijing-weather row"
+        );
         assert_eq!(out[0].0, 3);
 
         // head/seq with surrounding whitespace parse cleanly.
@@ -312,7 +310,10 @@ mod tests {
     #[test]
     fn seq_range_inclusive() {
         let (out, _) = apply_archive_mode(&sample(), "seq:3-5").unwrap();
-        assert_eq!(out.iter().map(|(s, _, _)| *s).collect::<Vec<_>>(), vec![3, 4, 5]);
+        assert_eq!(
+            out.iter().map(|(s, _, _)| *s).collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
     }
 
     #[test]
@@ -335,7 +336,8 @@ mod tests {
 
     #[test]
     fn grep_alternation_works() {
-        // "error|warning" should hit row 5 (mentions errors) AND row 6 (mentions warnings).
+        // "error|warning" should hit row 5 (mentions errors) AND row 6 (mentions
+        // warnings).
         let (out, _) = apply_archive_mode(&sample(), "grep:error|warning").unwrap();
         let seqs: Vec<u64> = out.iter().map(|(s, _, _)| *s).collect();
         assert!(seqs.contains(&5), "missing row 5: {seqs:?}");

@@ -1,7 +1,9 @@
 use anyhow::Result;
 
-use crate::cli::{DaemonCommand, GatewayCommand};
-use crate::cmd::gateway::cmd_gateway;
+use crate::{
+    cli::{DaemonCommand, GatewayCommand},
+    cmd::gateway::cmd_gateway,
+};
 
 /// Delegate daemon sub-commands to gateway equivalents.
 pub async fn cmd_daemon(sub: DaemonCommand) -> Result<()> {

@@ -6,8 +6,8 @@
 //!   2. `<|box_start|>(x, y)<|box_end|>`  (UI-TARS native, single point)
 //!   3. `<point>x y</point>`              (Doubao, space-separated point)
 //!   4. `(x, y)`                          (plain parenthesised tuple)
-//!   5. `[x1, y1, x2, y2]` — UI-TARS-desktop bbox; the parser collapses to
-//!      the centre point so downstream actions stay scalar.
+//!   5. `[x1, y1, x2, y2]` — UI-TARS-desktop bbox; the parser collapses to the
+//!      centre point so downstream actions stay scalar.
 //!
 //! And the action types: click / left_double / right_single / drag /
 //! hotkey / type / scroll / wait / finished / call_user / ... .
@@ -22,8 +22,9 @@
 //! `ExecCtx.factors`. The parser keeps the model-emitted numbers
 //! verbatim; nothing here is screen-aware.
 
-use super::action::ParsedAction;
 use std::collections::BTreeMap;
+
+use super::action::ParsedAction;
 
 /// Coordinate format hint. `Auto` tries all four; specific values are
 /// faster and avoid ambiguity when the upstream model is known.
@@ -101,7 +102,12 @@ fn split_blocks(text: &str) -> Vec<Block> {
 
         if let Some(rest) = strip_prefix_ci(trimmed, "Thought:") {
             // New Thought starts a new block — flush whatever we had.
-            flush(&mut blocks, &mut cur_thought, &mut cur_action, &mut have_any);
+            flush(
+                &mut blocks,
+                &mut cur_thought,
+                &mut cur_action,
+                &mut have_any,
+            );
             cur_thought.push_str(rest.trim_start());
             section = Section::Thought;
             have_any = true;
@@ -110,7 +116,12 @@ fn split_blocks(text: &str) -> Vec<Block> {
             // Thought, flush it (two Actions back-to-back implies two
             // separate blocks even with no Thought between them).
             if matches!(section, Section::Action) {
-                flush(&mut blocks, &mut cur_thought, &mut cur_action, &mut have_any);
+                flush(
+                    &mut blocks,
+                    &mut cur_thought,
+                    &mut cur_action,
+                    &mut have_any,
+                );
             }
             cur_action.push_str(rest.trim_start());
             section = Section::Action;
@@ -135,7 +146,12 @@ fn split_blocks(text: &str) -> Vec<Block> {
         }
     }
 
-    flush(&mut blocks, &mut cur_thought, &mut cur_action, &mut have_any);
+    flush(
+        &mut blocks,
+        &mut cur_thought,
+        &mut cur_action,
+        &mut have_any,
+    );
     blocks
 }
 
@@ -265,7 +281,11 @@ fn split_args(s: &str) -> Vec<(String, String)> {
             i += 1;
             continue;
         }
-        let key: String = bytes[key_start..i].iter().collect::<String>().trim().to_owned();
+        let key: String = bytes[key_start..i]
+            .iter()
+            .collect::<String>()
+            .trim()
+            .to_owned();
         i += 1; // consume '='
 
         // Skip whitespace before value.
@@ -463,11 +483,7 @@ fn parse_numeric_tuple(s: &str, seps: &[char]) -> Option<Vec<f32>> {
         }
         out.push(tok.parse::<f32>().ok()?);
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 // ---------------------------------------------------------------------------
@@ -486,7 +502,8 @@ mod tests {
 
     #[test]
     fn ui_tars_15_box_pair() {
-        let text = "Thought: click button\nAction: click(start_box='<|box_start|>(133,487)<|box_end|>')";
+        let text =
+            "Thought: click button\nAction: click(start_box='<|box_start|>(133,487)<|box_end|>')";
         let a = one(text);
         assert_eq!(a.action_type, "click");
         assert_eq!(a.thought, "click button");
@@ -538,7 +555,8 @@ mod tests {
 
     #[test]
     fn drag_with_two_boxes() {
-        let text = "Thought: drag\nAction: drag(start_box='[10,20,30,40]', end_box='[50,60,70,80]')";
+        let text =
+            "Thought: drag\nAction: drag(start_box='[10,20,30,40]', end_box='[50,60,70,80]')";
         let a = one(text);
         assert_eq!(a.action_type, "drag");
         // Centres: (20, 30) and (60, 70).
@@ -553,7 +571,10 @@ Action: type(content='hello \"world\"')"#;
         let a = one(text);
         assert_eq!(a.action_type, "type");
         // Escapes are preserved verbatim — the operator decodes.
-        assert_eq!(a.raw_args.get("content"), Some(&"hello \\\"world\\\"".to_owned()));
+        assert_eq!(
+            a.raw_args.get("content"),
+            Some(&"hello \\\"world\\\"".to_owned())
+        );
         assert_eq!(a.start, None);
     }
 
@@ -665,7 +686,8 @@ Action: type(content='hello\n')";
     #[test]
     fn stray_text_before_thought() {
         // Some models prepend chatter; we should skip until Thought:.
-        let text = "Some random preamble.\nMore filler.\nThought: real\nAction: click(start_box='(5,5)')";
+        let text =
+            "Some random preamble.\nMore filler.\nThought: real\nAction: click(start_box='(5,5)')";
         let a = one(text);
         assert_eq!(a.action_type, "click");
         assert_eq!(a.thought, "real");

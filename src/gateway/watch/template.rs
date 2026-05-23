@@ -10,7 +10,7 @@
 //! "pretty-print any JSON" templates are not the goal; that's what
 //! the bare `--jq` flag is for.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 #[derive(Debug)]
 pub struct Template {
@@ -29,9 +29,7 @@ pub struct Template {
 pub fn lookup(name: &str) -> Result<&'static Template> {
     match name {
         "astock" => Ok(&ASTOCK),
-        other => Err(anyhow!(
-            "unknown template `{other}` — available: astock"
-        )),
+        other => Err(anyhow!("unknown template `{other}` — available: astock")),
     }
 }
 
@@ -40,11 +38,12 @@ pub fn lookup(name: &str) -> Result<&'static Template> {
 // ---------------------------------------------------------------------------
 //
 // Schema reference (see ~/.claude/skills/quick-stream/SKILL.md):
-//   event: snapshot        .data = {filter, codes:[{code,name,diag}], count, ts}
-//   event: hit             .data = {filter, code, name, diag, ts}
-//   event: drop            .data = {filter, code, name, current_close, current_pct, ts}
-//   event: heartbeat       (suppressed)
-//   event: stale_reset / error / reconnected  (passed through with [type] prefix)
+//   event: snapshot        .data = {filter, codes:[{code,name,diag}], count,
+// ts}   event: hit             .data = {filter, code, name, diag, ts}
+//   event: drop            .data = {filter, code, name, current_close,
+// current_pct, ts}   event: heartbeat       (suppressed)
+//   event: stale_reset / error / reconnected  (passed through with [type]
+// prefix)
 //
 // Per-filter hit formatting follows the skill doc — each match becomes
 // one short, human-readable line. snapshot events surface a one-line
@@ -105,9 +104,10 @@ static ASTOCK: Template = Template {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
     use crate::gateway::watch::jq::CompiledJq;
-    use serde_json::json;
 
     fn run_astock(input: serde_json::Value) -> Vec<String> {
         let f = CompiledJq::compile(ASTOCK_JQ).expect("astock jq compiles");

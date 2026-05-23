@@ -7,8 +7,8 @@ pub mod acp;
 pub mod agent_turn;
 pub mod agents;
 pub mod anycli;
-pub mod browser;
 pub mod approvals;
+pub mod browser;
 pub mod channels;
 pub mod completion;
 pub mod config;
@@ -44,8 +44,8 @@ pub use acp::AcpCommand;
 pub use agent_turn::AgentTurnArgs;
 pub use agents::{AgentsCommand, BindArgs};
 pub use anycli::AnycliCommand;
-pub use browser::BrowserCommand;
 pub use approvals::ApprovalsCommand;
+pub use browser::BrowserCommand;
 pub use channels::ChannelsCommand;
 pub use completion::CompletionArgs;
 pub use config::ConfigCommand;
@@ -273,7 +273,6 @@ pub enum Command {
     /// ACP protocol commands - control coding agents
     #[command(subcommand)]
     Acp(AcpCommand),
-
 
     /// Manage exec approvals.
     #[command(subcommand)]

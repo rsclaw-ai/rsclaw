@@ -3,9 +3,13 @@
 
 use std::{collections::HashMap, sync::Arc, time::SystemTime};
 
-use axum::extract::ws::{Message, WebSocket};
-use axum::extract::FromRequest;
-use axum::response::IntoResponse;
+use axum::{
+    extract::{
+        FromRequest,
+        ws::{Message, WebSocket},
+    },
+    response::IntoResponse,
+};
 use futures::StreamExt;
 use serde_json::json;
 use tokio::sync::{RwLock, mpsc};
@@ -79,7 +83,10 @@ impl DeviceStore {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                if let Err(e) = tokio::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600)).await {
+                if let Err(e) =
+                    tokio::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))
+                        .await
+                {
                     tracing::warn!(error = %e, "device store set_permissions failed");
                 }
             }
@@ -168,8 +175,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         return;
     }
 
-    // 2. Wait for the first text frame — must be a req with method="connect".
-    //    Apply a 30-second timeout so stale connections don't hang forever.
+    // 2. Wait for the first text frame — must be a req with method="connect". Apply
+    //    a 30-second timeout so stale connections don't hang forever.
     let connect_params: ConnectParams;
     let req_id: String;
     let handshake_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -189,7 +196,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             connect_params = req
                                 .params
                                 .as_ref()
-                                .and_then(|v| serde_json::from_value::<ConnectParams>(v.clone()).ok())
+                                .and_then(|v| {
+                                    serde_json::from_value::<ConnectParams>(v.clone()).ok()
+                                })
                                 .unwrap_or_default();
                             break;
                         }
@@ -295,7 +304,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         protocol: PROTOCOL_VERSION,
         server: ServerInfo {
             name: "rsclaw".to_owned(),
-            version: option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev").to_owned(),
+            version: option_env!("RSCLAW_BUILD_VERSION")
+                .unwrap_or("dev")
+                .to_owned(),
             agent_count,
         },
         features: FeaturesInfo {
@@ -336,12 +347,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     // 6b. Replay any latched pending restart so late-connecting UIs see the
     //     current pending event without having to wait for the next publish.
-    if let Some(req) = state
-        .pending_restart
-        .read()
-        .ok()
-        .and_then(|g| g.clone())
-    {
+    if let Some(req) = state.pending_restart.read().ok().and_then(|g| g.clone()) {
         let payload = serde_json::to_value(&req).unwrap_or(json!({}));
         let frame = EventFrame::new("restart.required", payload, 0);
         let _ = send_frame(&outbound_tx, &frame).await; // receiver may have disconnected
@@ -357,9 +363,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     // 8. Auto-relay: forward ALL AgentEvents to this WS connection. OpenClaw WebUI
     //    sends messages via HTTP and receives events via WS.
-    // NOTE(H-18): This relay duplicates the per-request relay in ws/methods/chat.rs.
-    // Both are intentional: this one covers HTTP-initiated requests, chat.rs covers
-    // WS-initiated requests. Removing either would break a client path.
+    // NOTE(H-18): This relay duplicates the per-request relay in
+    // ws/methods/chat.rs. Both are intentional: this one covers HTTP-initiated
+    // requests, chat.rs covers WS-initiated requests. Removing either would
+    // break a client path.
     {
         let rx = state.event_bus.subscribe();
         let relay_tx = outbound_tx.clone();
@@ -571,7 +578,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         let _ = send_serialized(&outbound_tx, &frame).await; // receiver may have disconnected
                     }
                     Err(e) => {
-                        warn!("ws parse error: {e} — raw: {}", crate::util::truncate_str(&raw, 200));
+                        warn!(
+                            "ws parse error: {e} — raw: {}",
+                            crate::util::truncate_str(&raw, 200)
+                        );
                         let err = ResFrame::err("0", ErrorShape::bad_request(e.to_string()));
                         let _ = send_serialized(&outbound_tx, &err).await; // best-effort error reply
                     }

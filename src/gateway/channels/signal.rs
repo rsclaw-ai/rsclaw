@@ -3,17 +3,16 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use super::{
+    super::preparse::{btw_direct_call, is_fast_preparse, try_preparse_locally},
+    default_dm_scope,
+};
 use crate::{
     agent::{AgentMessage, AgentRegistry},
     channel::{Channel, OutboundMessage},
     config::runtime::RuntimeConfig,
     gateway::session::{MessageKind, SessionKeyParams, derive_session_key},
 };
-
-use super::super::preparse::{
-    btw_direct_call, is_fast_preparse, try_preparse_locally,
-};
-use super::default_dm_scope;
 
 pub(crate) fn start_signal_if_configured(
     config: &RuntimeConfig,
@@ -94,7 +93,9 @@ pub(crate) fn start_signal_if_configured(
 
         // Register Signal channel sender for notification routing.
         {
-            let mut senders = channel_senders.write().expect("channel_senders lock poisoned");
+            let mut senders = channel_senders
+                .write()
+                .expect("channel_senders lock poisoned");
             senders.insert("signal".to_string(), out_tx.clone());
         }
 
@@ -158,7 +159,8 @@ pub(crate) fn start_signal_if_configured(
                                     channel: None,
 
                                     account: None,
-                    files: vec![],                                })
+                                    files: vec![],
+                                })
                                 .await
                             {
                                 tracing::warn!("failed to send message: {e}");
@@ -180,7 +182,8 @@ pub(crate) fn start_signal_if_configured(
                                     channel: None,
 
                                     account: None,
-                    files: vec![],                                })
+                                    files: vec![],
+                                })
                                 .await
                             {
                                 tracing::warn!("failed to send message: {e}");
@@ -213,7 +216,10 @@ pub(crate) fn start_signal_if_configured(
                                 // handles rapid consecutive messages automatically.
                                 let handle = match w_reg.route("signal") {
                                     Ok(h) => h,
-                                    Err(e) => { error!("signal route: {e:#}"); continue; }
+                                    Err(e) => {
+                                        error!("signal route: {e:#}");
+                                        continue;
+                                    }
                                 };
                                 let dm_scope = default_dm_scope(&w_cfg);
                                 let session_key = derive_session_key(&SessionKeyParams {
@@ -242,7 +248,11 @@ pub(crate) fn start_signal_if_configured(
                                     files: vec![],
                                     account: None,
                                 };
-                                if let Err(e) = w_tq.submit(&session_key, qmsg, crate::gateway::task_queue::Priority::User) {
+                                if let Err(e) = w_tq.submit(
+                                    &session_key,
+                                    qmsg,
+                                    crate::gateway::task_queue::Priority::User,
+                                ) {
                                     error!(user = %w_uid, "signal: queue submit failed: {e:#}");
                                 }
                             }
@@ -279,7 +289,8 @@ pub(crate) fn start_signal_if_configured(
                                     channel: None,
 
                                     account: None,
-                    files: vec![],                                })
+                                    files: vec![],
+                                })
                                 .await
                             {
                                 tracing::warn!("failed to send message: {e}");
@@ -314,14 +325,20 @@ pub(crate) fn start_signal_if_configured(
                             peer_id: sender.clone(),
                             dm_scope,
                         });
-                        if let Some(mut reply) = try_preparse_locally(&text, &handle, "signal", &sender, crate::gateway::preparse::PreparseOrigin::User).await {
+                        if let Some(mut reply) = try_preparse_locally(
+                            &text,
+                            &handle,
+                            "signal",
+                            &sender,
+                            crate::gateway::preparse::PreparseOrigin::User,
+                        )
+                        .await
+                        {
                             reply.target_id = sender.clone();
                             reply.is_group = is_group;
                             if !reply.text.is_empty() || !reply.images.is_empty() {
                                 if let Err(e) = tx.send(reply).await {
-
                                     tracing::warn!("failed to send message: {e}");
-
                                 }
                             }
                             return;
@@ -347,18 +364,22 @@ pub(crate) fn start_signal_if_configured(
                         if handle.tx.send(msg).await.is_err() {
                             return;
                         }
-                        if let Ok(Ok(r)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
+                        if let Ok(Ok(r)) =
+                            tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await
+                        {
                             if !r.is_empty {
-                                if let Err(e) = tx.send(OutboundMessage {
-                                    target_id: sender,
-                                    is_group,
-                                    text: r.text,
-                                    reply_to: None,
-                                    images: r.images,
-                                    files: r.files,
-                                    channel: None,
-                                    account: None,
-                                }).await
+                                if let Err(e) = tx
+                                    .send(OutboundMessage {
+                                        target_id: sender,
+                                        is_group,
+                                        text: r.text,
+                                        reply_to: None,
+                                        images: r.images,
+                                        files: r.files,
+                                        channel: None,
+                                        account: None,
+                                    })
+                                    .await
                                 {
                                     tracing::warn!("failed to send message: {e}");
                                 }

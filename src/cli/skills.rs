@@ -8,9 +8,7 @@ pub enum SkillsCommand {
     /// Show detailed info about an installed skill
     ///
     /// Example: rsclaw skills info web-search
-    Info {
-        skill: String,
-    },
+    Info { skill: String },
 
     /// Check installed skill health (missing commands, broken manifests)
     ///

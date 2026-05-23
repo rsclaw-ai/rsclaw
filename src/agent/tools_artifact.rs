@@ -10,20 +10,20 @@
 //! - `lines:A-B` — line range (1-indexed, inclusive)
 //! - `grep:PATTERN` — lines matching regex (case-insensitive)
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use regex::RegexBuilder;
-use serde_json::{json, Value};
-
-use crate::artifact::{default_store, ArtifactId};
+use serde_json::{Value, json};
 
 use super::runtime::{AgentRuntime, RunContext};
+use crate::artifact::{ArtifactId, default_store};
 
 /// Apply `mode` to `full` text and return the selected slice.
 ///
 /// Factored out from the tool handler so unit tests can hit the parser
 /// without standing up a `RunContext`. Modes:
 /// - `full`         — entire text (returns `full` clone)
-/// - `stat`         — size summary only, no content (kept as `Ok("")` here; the handler attaches structured fields to the response Value)
+/// - `stat`         — size summary only, no content (kept as `Ok("")` here; the
+///   handler attaches structured fields to the response Value)
 /// - `head:N`       — first N lines (N=0 → empty)
 /// - `tail:N`       — last N lines (N=0 → empty)
 /// - `lines:A-B`    — 1-indexed inclusive range, clamped to `[1, total]`
@@ -94,11 +94,7 @@ pub(crate) fn apply_mode(full: &str, mode: &str) -> Result<String> {
 }
 
 impl AgentRuntime {
-    pub(crate) async fn tool_read_artifact(
-        &self,
-        ctx: &RunContext,
-        args: Value,
-    ) -> Result<Value> {
+    pub(crate) async fn tool_read_artifact(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         // Trim string args: the rsclaw v1 tool-call protocol leaks a trailing
         // newline into them (same root cause as read_session_archive `mode`
         // and the computer `action` arg). Untrimmed, `tool_result_id="tr_x\n"`
@@ -146,7 +142,10 @@ mod tests {
     use super::*;
 
     fn sample() -> String {
-        (1..=5).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n")
+        (1..=5)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -185,7 +184,10 @@ mod tests {
 
     #[test]
     fn lines_range_inclusive_one_indexed() {
-        assert_eq!(apply_mode(&sample(), "lines:2-4").unwrap(), "line2\nline3\nline4");
+        assert_eq!(
+            apply_mode(&sample(), "lines:2-4").unwrap(),
+            "line2\nline3\nline4"
+        );
     }
 
     #[test]

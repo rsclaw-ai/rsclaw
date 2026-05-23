@@ -1,30 +1,34 @@
 //! /watch — live event stream → chat slash command.
 
 pub mod dedup;
-pub mod parser;
-pub mod rate_limit;
+pub mod delivery;
 pub mod filter;
 pub mod jq;
+pub mod parser;
+pub mod rate_limit;
 pub mod source;
-pub mod delivery;
 mod sse;
 pub mod template;
 
-use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use anyhow::Result;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{info, warn};
 
-use crate::channel::ChannelManager;
-use crate::gateway::watch::dedup::{dedup_key, DedupKey};
-use crate::gateway::watch::filter::Filter;
-use crate::gateway::watch::parser::{ParsedCommand, SourceKind, StopTarget, WatchSpec};
-use crate::gateway::watch::rate_limit::{DeliveryMsg, RateLimiter};
-use crate::gateway::watch::source::{
-    EventRecord, FileSource, ShellSource, SourceImpl, SseSource, WatchStartError,
+use crate::{
+    channel::ChannelManager,
+    gateway::watch::{
+        dedup::{DedupKey, dedup_key},
+        filter::Filter,
+        parser::{ParsedCommand, SourceKind, StopTarget, WatchSpec},
+        rate_limit::{DeliveryMsg, RateLimiter},
+        source::{EventRecord, FileSource, ShellSource, SourceImpl, SseSource, WatchStartError},
+    },
 };
 
 /// Per (channel, peer) concurrent watch cap. Spec §"并发上限". Prevents a
@@ -36,8 +40,8 @@ pub const MAX_WATCHES_PER_PEER: usize = 5;
 /// `try_send` drops events and bumps a counter (visible in /watch list).
 const PROCESSOR_BUFFER: usize = 256;
 
-/// How often the processor checks "no events seen in this window — still alive?"
-/// Spec §"心跳": 10 min silent ⇒ emit a heartbeat note.
+/// How often the processor checks "no events seen in this window — still
+/// alive?" Spec §"心跳": 10 min silent ⇒ emit a heartbeat note.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Unique watch identifier shown to users (`w_<8 hex>`).
@@ -126,7 +130,9 @@ impl WatchRegistry {
     ) -> WatchCommandReply {
         match parser::parse(body) {
             Err(e) => WatchCommandReply::Reply(format!("/watch: {e}")),
-            Ok(ParsedCommand::List) => WatchCommandReply::Reply(self.format_list(channel, peer).await),
+            Ok(ParsedCommand::List) => {
+                WatchCommandReply::Reply(self.format_list(channel, peer).await)
+            }
             Ok(ParsedCommand::Stop(StopTarget::All)) => {
                 let n = self.stop_all_for(channel, peer).await;
                 WatchCommandReply::Reply(format!("Stopped {n} watch(es)."))
@@ -139,7 +145,10 @@ impl WatchRegistry {
                     format!("No active watch `{id}` for this channel/peer.")
                 })
             }
-            Ok(ParsedCommand::Start(spec)) => self.handle_start(channel, peer, account, spec, origin).await,
+            Ok(ParsedCommand::Start(spec)) => {
+                self.handle_start(channel, peer, account, spec, origin)
+                    .await
+            }
         }
     }
 
@@ -162,7 +171,9 @@ impl WatchRegistry {
         if let Some(existing) = inner.get(&key) {
             let id = existing.id.clone();
             let started = existing.started_at_ms;
-            let count = existing.event_count.load(std::sync::atomic::Ordering::Relaxed);
+            let count = existing
+                .event_count
+                .load(std::sync::atomic::Ordering::Relaxed);
             drop(inner);
             if origin == Origin::Cron {
                 return WatchCommandReply::Silent;
@@ -406,7 +417,13 @@ impl WatchRegistry {
         info!(channel = %channel, peer = %peer, id = %id, "watch processor exited");
     }
 
-    async fn send_delivery(&self, channel: &str, account: Option<&str>, peer: &str, msg: DeliveryMsg) {
+    async fn send_delivery(
+        &self,
+        channel: &str,
+        account: Option<&str>,
+        peer: &str,
+        msg: DeliveryMsg,
+    ) {
         let body = match msg {
             DeliveryMsg::Single(s) => s,
             DeliveryMsg::Batch { last, dropped } => {
@@ -525,12 +542,14 @@ pub fn resolve_template_defaults_for_cli(
 fn resolve_template_defaults(
     spec: &WatchSpec,
 ) -> (Option<String>, Option<String>, Option<parser::EventFilter>) {
-    let template = spec.template.as_deref().and_then(|name| template::lookup(name).ok());
-    let jq = spec.jq.clone().or_else(|| {
-        template
-            .and_then(|t| t.jq)
-            .map(|s| s.to_owned())
-    });
+    let template = spec
+        .template
+        .as_deref()
+        .and_then(|name| template::lookup(name).ok());
+    let jq = spec
+        .jq
+        .clone()
+        .or_else(|| template.and_then(|t| t.jq).map(|s| s.to_owned()));
     let event_filter = spec.event_filter.clone().or_else(|| {
         template
             .and_then(|t| t.event_filter)

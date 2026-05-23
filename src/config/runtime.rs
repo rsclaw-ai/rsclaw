@@ -17,10 +17,10 @@
 use anyhow::Result;
 
 use super::schema::{
-    AgentDefaults, AgentEntry, AuthConfig, BindMode, BindingConfig, ChannelsConfig, Config,
-    CronConfig, DmScope, A2aPeerConfig, GatewayMode, HooksConfig, LoggingConfig,
-    ModelsConfig, PluginsConfig, ReloadMode, SandboxConfig, SecretOrString, SecretsConfig,
-    SessionConfig, SkillsConfig, ToolsConfig,
+    A2aPeerConfig, AgentDefaults, AgentEntry, AuthConfig, BindMode, BindingConfig, ChannelsConfig,
+    Config, CronConfig, DmScope, GatewayMode, HooksConfig, LoggingConfig, ModelsConfig,
+    PluginsConfig, ReloadMode, SandboxConfig, SecretOrString, SecretsConfig, SessionConfig,
+    SkillsConfig, ToolsConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -73,9 +73,11 @@ pub struct GatewayRuntime {
     pub channel_health_check_minutes: u32,
     pub channel_stale_event_threshold_minutes: u32,
     pub channel_max_restarts_per_hour: u32,
-    /// Global default User-Agent for LLM provider requests. Provider-level overrides this.
+    /// Global default User-Agent for LLM provider requests. Provider-level
+    /// overrides this.
     pub user_agent: Option<String>,
-    /// Default response language (e.g. "Chinese", "English"). Affects registry selection.
+    /// Default response language (e.g. "Chinese", "English"). Affects registry
+    /// selection.
     pub language: Option<String>,
 }
 
@@ -237,13 +239,8 @@ impl IntoRuntime for Config {
         {
             a2a_principals.push(anon(s, "apikey", n));
         }
-        let a2a_max_body_bytes: u64 = gw
-            .a2a
-            .as_ref()
-            .and_then(|a| a.max_body_mb)
-            .unwrap_or(100) as u64
-            * 1024
-            * 1024;
+        let a2a_max_body_bytes: u64 =
+            gw.a2a.as_ref().and_then(|a| a.max_body_mb).unwrap_or(100) as u64 * 1024 * 1024;
 
         Ok(RuntimeConfig {
             gateway: GatewayRuntime {

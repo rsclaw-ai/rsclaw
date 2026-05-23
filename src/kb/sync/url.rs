@@ -2,15 +2,19 @@
 //! conditional-get when SyncState has a prior cursor; falls back to
 //! content-hash dedupe via the seen_items table.
 
-use super::{KbSourceSyncer, SyncContext, SyncError, SyncOutcome, SyncReason};
-use crate::kb::canonicalize::{canonicalize_by_mime, canonicalize_url, detect_mime, CanonicalizeInput};
-use crate::kb::content_store::atomic::sha256_hex;
-use crate::kb::model::{KbSource, KbSourceKind};
-use crate::kb::pipeline::{ingest_canonicalized, IngestInput};
-use crate::kb::store::seen::{is_seen, SyncState};
-use crate::kb::sync::SyncRegistry;
-use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 use std::time::Duration;
+
+use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
+
+use super::{KbSourceSyncer, SyncContext, SyncError, SyncOutcome, SyncReason};
+use crate::kb::{
+    canonicalize::{CanonicalizeInput, canonicalize_by_mime, canonicalize_url, detect_mime},
+    content_store::atomic::sha256_hex,
+    model::{KbSource, KbSourceKind},
+    pipeline::{IngestInput, ingest_canonicalized},
+    store::seen::{SyncState, is_seen},
+    sync::SyncRegistry,
+};
 
 const DEFAULT_TIMEOUT_S: u64 = 30;
 
@@ -28,11 +32,7 @@ impl KbSourceSyncer for UrlSyncer {
         &self.url
     }
 
-    async fn sync(
-        &self,
-        ctx: &SyncContext,
-        _reason: SyncReason,
-    ) -> Result<SyncOutcome, SyncError> {
+    async fn sync(&self, ctx: &SyncContext, _reason: SyncReason) -> Result<SyncOutcome, SyncError> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(DEFAULT_TIMEOUT_S))
             .user_agent("rsclaw-kb-syncer/1.0")
@@ -63,9 +63,7 @@ impl KbSourceSyncer for UrlSyncer {
                 ..Default::default()
             });
         }
-        if status == reqwest::StatusCode::UNAUTHORIZED
-            || status == reqwest::StatusCode::FORBIDDEN
-        {
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(SyncError::AuthFailed(format!(
                 "status {status} for {canonical_url}"
             )));
@@ -131,8 +129,7 @@ impl KbSourceSyncer for UrlSyncer {
             }
         }
 
-        let mime = content_type
-            .unwrap_or_else(|| detect_mime(&bytes, Some(&canonical_url)));
+        let mime = content_type.unwrap_or_else(|| detect_mime(&bytes, Some(&canonical_url)));
         let canon = canonicalize_by_mime(CanonicalizeInput {
             bytes: &bytes,
             mime: &mime,

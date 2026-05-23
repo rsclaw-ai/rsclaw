@@ -20,8 +20,8 @@ use tracing::info;
 /// Display a URL as a QR code in the terminal.
 ///
 /// Rendering strategy:
-///   1. Non-TTY stdout (Tauri sidecar, daemon, redirected pipe) — silently
-///      drop the PNG to disk only. No banner, no Windows image viewer popup.
+///   1. Non-TTY stdout (Tauri sidecar, daemon, redirected pipe) — silently drop
+///      the PNG to disk only. No banner, no Windows image viewer popup.
 ///      Equivalent to [`save_qr_to_path`] for safety in headless contexts.
 ///   2. iTerm2 / WezTerm / Kitty — inline PNG image (pixel-perfect).
 ///   3. Other terminals — Unicode half-block characters (best-effort).
@@ -382,7 +382,9 @@ pub fn save_token(platform: &str, token_data: &serde_json::Value) -> Result<()> 
     }
 
     // Ensure the channel is enabled
-    section.entry("enabled").or_insert(serde_json::Value::Bool(true));
+    section
+        .entry("enabled")
+        .or_insert(serde_json::Value::Bool(true));
 
     // Write back
     let json = serde_json::to_string_pretty(&config)?;

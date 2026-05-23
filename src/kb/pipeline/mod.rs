@@ -1,2 +1,2 @@
 pub mod ingest;
-pub use ingest::{ingest_canonicalized, IngestInput, IngestOutput};
+pub use ingest::{IngestInput, IngestOutput, ingest_canonicalized};

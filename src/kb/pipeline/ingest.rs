@@ -2,17 +2,21 @@
 //! CanonicalizedSource into a persisted KbDoc + enqueued
 //! ChunkAndEmbed job. See spec §J Ingest 流程.
 
-use crate::kb::canonicalize::CanonicalizedSource;
-use crate::kb::content_store::{
-    atomic::sha256_hex, compose::FrontMatter, paths::slugify, stage_doc, StageInput,
-};
-use crate::kb::jobs::{Job, JobKind};
-use crate::kb::ledger::{IngestLedgerEntry, LedgerOp, LedgerStatus};
-use crate::kb::model::{KbDoc, KbSource, KbStatus, KbVisibility, VersionPointer};
-use crate::kb::paths::KbPaths;
-use crate::kb::store::{docs, jobs, ledger, seen, KbStore};
-use anyhow::Result;
 use std::path::PathBuf;
+
+use anyhow::Result;
+
+use crate::kb::{
+    canonicalize::CanonicalizedSource,
+    content_store::{
+        StageInput, atomic::sha256_hex, compose::FrontMatter, paths::slugify, stage_doc,
+    },
+    jobs::{Job, JobKind},
+    ledger::{IngestLedgerEntry, LedgerOp, LedgerStatus},
+    model::{KbDoc, KbSource, KbStatus, KbVisibility, VersionPointer},
+    paths::KbPaths,
+    store::{KbStore, docs, jobs, ledger, seen},
+};
 
 #[derive(Debug, Clone)]
 pub struct IngestInput<'a> {
@@ -97,8 +101,7 @@ pub fn ingest_canonicalized(store: &KbStore, input: IngestInput<'_>) -> Result<I
     // Same status semantics as the fast-path: Active → NOOP;
     // Tombstoned → resurrect (flip status + bump updated_at) and
     // commit so the user can keep using the doc.
-    if let Some(existing_doc_id) =
-        docs::find_by_logical_and_hash_in_wtx(&wtx, &lsid_str, &raw_sha)?
+    if let Some(existing_doc_id) = docs::find_by_logical_and_hash_in_wtx(&wtx, &lsid_str, &raw_sha)?
     {
         if let Some(mut existing) = docs::get_in_wtx(&wtx, &existing_doc_id)? {
             if existing.status == KbStatus::Active {
@@ -156,10 +159,9 @@ pub fn ingest_canonicalized(store: &KbStore, input: IngestInput<'_>) -> Result<I
     };
 
     // 3c. Build records.
-    let source = input
-        .source
-        .clone()
-        .unwrap_or(KbSource::Doc { path: PathBuf::from("(manual)") });
+    let source = input.source.clone().unwrap_or(KbSource::Doc {
+        path: PathBuf::from("(manual)"),
+    });
     let visibility = input
         .visibility
         .clone()
@@ -243,13 +245,16 @@ pub fn ingest_canonicalized(store: &KbStore, input: IngestInput<'_>) -> Result<I
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::kb::canonicalize::{canonicalize_by_mime, CanonicalizeInput};
-    use crate::kb::content_store::atomic::sha256_hex;
-    use crate::kb::jobs::JobStatus;
-    use crate::kb::ledger::LedgerStatus;
-    use crate::kb::store::{jobs as jobs_store, ledger as ledger_store};
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::kb::{
+        canonicalize::{CanonicalizeInput, canonicalize_by_mime},
+        content_store::atomic::sha256_hex,
+        jobs::JobStatus,
+        ledger::LedgerStatus,
+        store::{jobs as jobs_store, ledger as ledger_store},
+    };
 
     fn fixture() -> (TempDir, KbStore, KbPaths) {
         let tmp = TempDir::new().unwrap();
@@ -306,7 +311,9 @@ mod tests {
         assert_eq!(doc.version, 1);
         assert_eq!(doc.raw_sha256, sha256_hex(raw));
 
-        let ptr = docs::latest_version(&rtx, &c.metadata.logical_source_id.0).unwrap().unwrap();
+        let ptr = docs::latest_version(&rtx, &c.metadata.logical_source_id.0)
+            .unwrap()
+            .unwrap();
         assert_eq!(ptr.doc_id, out.doc_id);
 
         let pending = ledger_store::list_by_status(&rtx, LedgerStatus::Pending).unwrap();
@@ -357,14 +364,18 @@ mod tests {
         assert_eq!(first.doc_id, second.doc_id);
         assert!(second.noop);
         let rtx = store.begin_read().unwrap();
-        assert_eq!(jobs_store::list_by_status(&rtx, JobStatus::Ready).unwrap().len(), 1);
+        assert_eq!(
+            jobs_store::list_by_status(&rtx, JobStatus::Ready)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
     fn reingest_different_bytes_bumps_version() {
         let (_tmp, store, paths) = fixture();
-        use crate::kb::canonicalize::CanonicalizeInput;
-        use crate::kb::model::LogicalSourceId;
+        use crate::kb::{canonicalize::CanonicalizeInput, model::LogicalSourceId};
         let lsid = LogicalSourceId("file:custom:x".into());
         let c1 = canonicalize_by_mime(CanonicalizeInput {
             bytes: b"version 1",
@@ -540,7 +551,10 @@ mod tests {
         let b = h2.join().unwrap();
 
         assert_eq!(a.doc_id, b.doc_id);
-        assert!(a.noop || b.noop, "expected one of the racing ingests to noop");
+        assert!(
+            a.noop || b.noop,
+            "expected one of the racing ingests to noop"
+        );
         let rtx = store.begin_read().unwrap();
         let ready = jobs_store::list_by_status(&rtx, JobStatus::Ready).unwrap();
         assert_eq!(ready.len(), 1, "race produced duplicate jobs");

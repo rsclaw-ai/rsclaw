@@ -8,8 +8,10 @@ use std::time::Duration;
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 
-use super::runtime::{canonicalize_external_path, expand_tilde};
-use super::security::{check_file_content_safety, check_read_safety, check_write_safety};
+use super::{
+    runtime::{canonicalize_external_path, expand_tilde},
+    security::{check_file_content_safety, check_read_safety, check_write_safety},
+};
 
 /// Fix common LLM shell-writing mistakes around redirects that bash would
 /// otherwise silently mis-parse. The target is constructs like
@@ -17,10 +19,10 @@ use super::security::{check_file_content_safety, check_read_safety, check_write_
 /// character of a preceding token.
 ///
 /// Rules applied:
-/// 1. Insert a space before `2>&1` / `&>` / `>&N` redirects when they are
-///    glued to a previous non-space, non-redirect character.
-/// 2. Same for plain `>` / `>>` / `<` when glued (but only when the prior
-///    token ends with a digit or letter — don't break `1>&2` etc).
+/// 1. Insert a space before `2>&1` / `&>` / `>&N` redirects when they are glued
+///    to a previous non-space, non-redirect character.
+/// 2. Same for plain `>` / `>>` / `<` when glued (but only when the prior token
+///    ends with a digit or letter — don't break `1>&2` etc).
 /// 3. Leave the rest of the command untouched.
 /// Surface CLI auto-correction hints from stderr at the top of the tool
 /// result. LLMs routinely miss tip lines buried in a wall of error text;
@@ -29,8 +31,8 @@ use super::security::{check_file_content_safety, check_read_safety, check_write_
 /// thing on a typo'd subcommand.
 ///
 /// Recognised formats (one per line, case-insensitive on the trigger):
-/// - clap (Rust):      `tip: some similar subcommands exist: 'a', 'b'`
-///   `tip: a similar argument exists: '--foo'`
+/// - clap (Rust):      `tip: some similar subcommands exist: 'a', 'b'` `tip: a
+///   similar argument exists: '--foo'`
 /// - cobra (Go):       `Did you mean this?\n  xyz`
 /// - commander (Node): `(Did you mean --xyz?)`
 /// - click (Python):   `Did you mean "xyz"?` / `Did you mean 'xyz'?`
@@ -96,7 +98,12 @@ mod hint_tests {
     #[test]
     fn commander_did_you_mean() {
         let s = "error: unknown option '--depDate'\n(Did you mean --dep-date?)";
-        assert!(extract_cli_hint(s).unwrap().to_lowercase().contains("dep-date"));
+        assert!(
+            extract_cli_hint(s)
+                .unwrap()
+                .to_lowercase()
+                .contains("dep-date")
+        );
     }
 
     #[test]
@@ -168,10 +175,7 @@ mod shell_sanitize_tests {
     }
     #[test]
     fn leaves_proper_redirect_alone() {
-        assert_eq!(
-            sanitize_shell_redirects("ls /path 2>&1"),
-            "ls /path 2>&1"
-        );
+        assert_eq!(sanitize_shell_redirects("ls /path 2>&1"), "ls /path 2>&1");
     }
     #[test]
     fn fixes_glued_amp_redirect() {
@@ -190,10 +194,15 @@ mod shell_sanitize_tests {
 }
 
 impl super::runtime::AgentRuntime {
-    /// List files and directories in a path (structured alternative to `exec ls`).
+    /// List files and directories in a path (structured alternative to `exec
+    /// ls`).
     pub(crate) async fn tool_list_dir(&self, args: Value) -> Result<Value> {
         let fallback_ws = crate::config::loader::base_dir().join("workspace");
-        let default_ws = self.handle.config.workspace.as_deref()
+        let default_ws = self
+            .handle
+            .config
+            .workspace
+            .as_deref()
             .or(self.config.agents.defaults.workspace.as_deref())
             .unwrap_or(fallback_ws.to_str().unwrap_or("."));
         let path_str = args["path"].as_str().unwrap_or(default_ws);
@@ -220,10 +229,16 @@ impl super::runtime::AgentRuntime {
             Err(e) => return Ok(json!({"error": format!("invalid pattern: {e}")})),
         };
         for entry in entries_iter {
-            if entries.len() >= 100 { break; }
+            if entries.len() >= 100 {
+                break;
+            }
             if let Ok(p) = entry {
                 let is_dir = p.is_dir();
-                let size = if is_dir { 0 } else { p.metadata().map(|m| m.len()).unwrap_or(0) };
+                let size = if is_dir {
+                    0
+                } else {
+                    p.metadata().map(|m| m.len()).unwrap_or(0)
+                };
                 entries.push(json!({
                     "name": p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
                     "path": p.to_string_lossy(),
@@ -240,10 +255,15 @@ impl super::runtime::AgentRuntime {
         }))
     }
 
-    /// Search for files by name pattern (structured alternative to `exec find`).
+    /// Search for files by name pattern (structured alternative to `exec
+    /// find`).
     pub(crate) async fn tool_search_file(&self, args: Value) -> Result<Value> {
         let fallback_ws = crate::config::loader::base_dir().join("workspace");
-        let default_ws = self.handle.config.workspace.as_deref()
+        let default_ws = self
+            .handle
+            .config
+            .workspace
+            .as_deref()
             .or(self.config.agents.defaults.workspace.as_deref())
             .unwrap_or(fallback_ws.to_str().unwrap_or("."));
         let root = args["path"].as_str().unwrap_or(default_ws);
@@ -306,7 +326,11 @@ impl super::runtime::AgentRuntime {
     /// are ignored on that path.
     pub(crate) async fn tool_search_content(&self, args: Value) -> Result<Value> {
         let fallback_ws = crate::config::loader::base_dir().join("workspace");
-        let default_ws = self.handle.config.workspace.as_deref()
+        let default_ws = self
+            .handle
+            .config
+            .workspace
+            .as_deref()
             .or(self.config.agents.defaults.workspace.as_deref())
             .unwrap_or(fallback_ws.to_str().unwrap_or("."));
         let root = args["path"].as_str().unwrap_or(default_ws);
@@ -337,11 +361,15 @@ impl super::runtime::AgentRuntime {
         let output = {
             let mut cmd = tokio::process::Command::new("grep");
             cmd.arg("-rn");
-            if ignore_case { cmd.arg("-i"); }
+            if ignore_case {
+                cmd.arg("-i");
+            }
             if let Some(inc) = include {
                 cmd.arg("--include").arg(inc);
             }
-            cmd.arg("--").arg(pattern).arg(root_path.to_str().unwrap_or("."));
+            cmd.arg("--")
+                .arg(pattern)
+                .arg(root_path.to_str().unwrap_or("."));
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::null());
             tokio::time::timeout(Duration::from_secs(15), cmd.output())
@@ -353,16 +381,14 @@ impl super::runtime::AgentRuntime {
         #[cfg(target_os = "windows")]
         let output = {
             // PowerShell Select-String is the Windows equivalent of grep -rn.
-            let mut ps_args = vec![
-                "-NoProfile".to_owned(),
-                "-Command".to_owned(),
-            ];
+            let mut ps_args = vec!["-NoProfile".to_owned(), "-Command".to_owned()];
             let inc_filter = include
                 .map(|i| format!(" -Include '{}'", i.replace('\'', "''")))
                 .unwrap_or_default();
             let case_flag = if ignore_case { "" } else { " -CaseSensitive" };
-            // Use TAB as separator to avoid conflicts with drive-letter colons in Windows paths.
-            // Escape single quotes in all interpolated values to prevent PowerShell injection.
+            // Use TAB as separator to avoid conflicts with drive-letter colons in Windows
+            // paths. Escape single quotes in all interpolated values to prevent
+            // PowerShell injection.
             let safe_path = root_path.display().to_string().replace('\'', "''");
             let safe_pattern = pattern.replace('\'', "''");
             let ps_cmd = format!(
@@ -387,9 +413,15 @@ impl super::runtime::AgentRuntime {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut matches: Vec<Value> = Vec::new();
         // Windows uses TAB separator, Unix uses colon.
-        let sep = if cfg!(target_os = "windows") { '\t' } else { ':' };
+        let sep = if cfg!(target_os = "windows") {
+            '\t'
+        } else {
+            ':'
+        };
         for line in stdout.lines() {
-            if matches.len() >= max_results { break; }
+            if matches.len() >= max_results {
+                break;
+            }
             // Parse: file<sep>line<sep>content
             // On Unix with colons: handle drive-less paths (no ambiguity).
             // On Windows with TABs: no ambiguity with path colons.
@@ -587,9 +619,7 @@ impl super::runtime::AgentRuntime {
                 "stderr": result.stderr,
                 "is_error": is_error,
             });
-            if is_error
-                && let Some(hint) = extract_cli_hint(&result.stderr)
-            {
+            if is_error && let Some(hint) = extract_cli_hint(&result.stderr) {
                 payload["hint"] = json!(hint);
             }
             return Ok(payload);
@@ -601,12 +631,18 @@ impl super::runtime::AgentRuntime {
         }))
     }
 
-    /// Execute a shell command with timeout, safety checks, and sandbox support.
+    /// Execute a shell command with timeout, safety checks, and sandbox
+    /// support.
     ///
     /// Supports background execution via `wait=false` (default). When running
     /// in background mode, returns a `task_id` that can be polled with
     /// `task_id` parameter.
-    pub(crate) async fn tool_exec(&self, ctx: &super::runtime::RunContext, tool_call_id: &str, args: Value) -> Result<Value> {
+    pub(crate) async fn tool_exec(
+        &self,
+        ctx: &super::runtime::RunContext,
+        tool_call_id: &str,
+        args: Value,
+    ) -> Result<Value> {
         tracing::debug!(?args, "tool_exec called");
 
         // Poll existing task
@@ -616,7 +652,8 @@ impl super::runtime::AgentRuntime {
         // Default to synchronous: most commands (osascript, grep, ls) finish in
         // seconds. Background is an explicit opt-in for long-running tasks.
         let wait = args["wait"].as_bool().unwrap_or(true);
-        // Accept both "command" (rsclaw native) and "cmd"+"args" (preparse/openclaw format).
+        // Accept both "command" (rsclaw native) and "cmd"+"args" (preparse/openclaw
+        // format).
         let command = if let Some(cmd) = args["command"].as_str() {
             cmd.to_owned()
         } else if let Some(cmd) = args["cmd"].as_str() {
@@ -794,7 +831,10 @@ impl super::runtime::AgentRuntime {
             }
             if !extra_paths.is_empty() {
                 let sys_path = std::env::var("PATH").unwrap_or_default();
-                let mut all: Vec<String> = extra_paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+                let mut all: Vec<String> = extra_paths
+                    .iter()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .collect();
                 // Add common user bin paths that may be missing when launched
                 // from a desktop app (macOS/Windows don't inherit shell profile).
                 if let Some(home) = dirs_next::home_dir() {
@@ -893,7 +933,7 @@ impl super::runtime::AgentRuntime {
                 let started_at = std::time::Instant::now();
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_secs),
-                    cmd.output()
+                    cmd.output(),
                 )
                 .await;
 
@@ -910,7 +950,11 @@ impl super::runtime::AgentRuntime {
                     }
                     Err(_) => {
                         tracing::warn!(task_id = %tid, timeout_secs, "exec background timed out");
-                        (None, String::new(), format!("timed out after {} seconds", timeout_secs))
+                        (
+                            None,
+                            String::new(),
+                            format!("timed out after {} seconds", timeout_secs),
+                        )
                     }
                 };
 
@@ -945,11 +989,12 @@ impl super::runtime::AgentRuntime {
         }
     }
 
-    /// Edit a file by exact-string replacement (Edit-style, not full overwrite).
+    /// Edit a file by exact-string replacement (Edit-style, not full
+    /// overwrite).
     ///
-    /// Fails fast if `old_string` is absent or non-unique (unless `replace_all`).
-    /// The agent is expected to `read_file` first so it can copy a verbatim
-    /// substring; the check is not enforced server-side.
+    /// Fails fast if `old_string` is absent or non-unique (unless
+    /// `replace_all`). The agent is expected to `read_file` first so it can
+    /// copy a verbatim substring; the check is not enforced server-side.
     pub(crate) async fn tool_edit(&self, args: Value) -> Result<Value> {
         let path = args["path"]
             .as_str()

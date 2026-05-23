@@ -59,7 +59,11 @@ mod tests {
     use super::*;
 
     fn cand<'a>(id: &str, rel: f32, v: &'a [f32]) -> MmrCandidate<'a> {
-        MmrCandidate { chunk_id: id.into(), relevance: rel, vector: v }
+        MmrCandidate {
+            chunk_id: id.into(),
+            relevance: rel,
+            vector: v,
+        }
     }
 
     #[test]
@@ -68,7 +72,11 @@ mod tests {
         let v2 = vec![1.0, 0.0];
         let v3 = vec![0.0, 1.0];
         let r = mmr_select(
-            vec![cand("c1", 0.9, &v1), cand("c2", 0.5, &v2), cand("c3", 0.4, &v3)],
+            vec![
+                cand("c1", 0.9, &v1),
+                cand("c2", 0.5, &v2),
+                cand("c3", 0.4, &v3),
+            ],
             3,
             1.0,
         );
@@ -82,7 +90,11 @@ mod tests {
         let v2 = vec![1.0, 0.0]; // identical to c1
         let v3 = vec![0.0, 1.0]; // orthogonal
         let r = mmr_select(
-            vec![cand("c1", 0.9, &v1), cand("c2", 0.85, &v2), cand("c3", 0.4, &v3)],
+            vec![
+                cand("c1", 0.9, &v1),
+                cand("c2", 0.85, &v2),
+                cand("c3", 0.4, &v3),
+            ],
             2,
             0.0,
         );

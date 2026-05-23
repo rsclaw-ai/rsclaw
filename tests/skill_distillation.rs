@@ -9,8 +9,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use futures::future::BoxFuture;
-use rsclaw::provider::{LlmProvider, LlmRequest, LlmStream, StreamEvent};
-use rsclaw::skill::crystallizer::{distill_with_llm, extract_skill_slug};
+use rsclaw::{
+    provider::{LlmProvider, LlmRequest, LlmStream, StreamEvent},
+    skill::crystallizer::{distill_with_llm, extract_skill_slug},
+};
 
 // ---------------------------------------------------------------------------
 // MockProvider — returns a canned SKILL.md as a single TextDelta + Done.

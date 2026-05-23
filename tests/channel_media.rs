@@ -1,4 +1,5 @@
-//! Integration tests for media type detection and Office document text extraction.
+//! Integration tests for media type detection and Office document text
+//! extraction.
 
 use rsclaw::channel::{
     extract_office_text, is_audio_attachment, is_image_attachment, is_video_attachment,
@@ -29,7 +30,10 @@ fn image_detection_by_mime() {
         );
     }
     // Non-image MIME types.
-    assert!(!is_image_attachment("video/mp4", ""), "video/mp4 is not image");
+    assert!(
+        !is_image_attachment("video/mp4", ""),
+        "video/mp4 is not image"
+    );
     assert!(
         !is_image_attachment("application/pdf", ""),
         "application/pdf is not image"
@@ -117,7 +121,12 @@ fn audio_detection_by_extension() {
 
 #[test]
 fn video_detection_by_mime() {
-    let video_mimes = ["video/mp4", "video/webm", "video/quicktime", "video/x-msvideo"];
+    let video_mimes = [
+        "video/mp4",
+        "video/webm",
+        "video/quicktime",
+        "video/x-msvideo",
+    ];
     for mime in video_mimes {
         assert!(
             is_video_attachment(mime, ""),
@@ -152,8 +161,11 @@ fn create_minimal_docx(text: &str) -> Vec<u8> {
     {
         let cursor = std::io::Cursor::new(&mut buf);
         let mut zip = zip::ZipWriter::new(cursor);
-        zip.start_file("word/document.xml", zip::write::SimpleFileOptions::default())
-            .unwrap();
+        zip.start_file(
+            "word/document.xml",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
         use std::io::Write;
         write!(
             zip,
@@ -250,10 +262,7 @@ fn extract_pptx_text() {
 #[test]
 fn extract_unsupported_returns_none() {
     let result = extract_office_text("image.png", &[0x89, 0x50, 0x4e, 0x47]);
-    assert!(
-        result.is_none(),
-        "unsupported file type should return None"
-    );
+    assert!(result.is_none(), "unsupported file type should return None");
 }
 
 #[test]

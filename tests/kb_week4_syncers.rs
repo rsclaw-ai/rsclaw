@@ -1,11 +1,14 @@
 //! Week 4 syncer e2e: ManualUploadSyncer file → ingest → chunks landed.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use redb::ReadableTable;
-use rsclaw::kb::sync::{KbSourceSyncer, ManualUploadSyncer, SyncContext, SyncReason};
-use rsclaw::kb::worker::{DefaultDispatcher, HandlerCtx, WorkerConfig, WorkerPool};
-use rsclaw::kb::{KbEmbedder, KbIndex, KbPaths, KbStore, StubEmbedder};
-use std::sync::Arc;
+use rsclaw::kb::{
+    KbEmbedder, KbIndex, KbPaths, KbStore, StubEmbedder,
+    sync::{KbSourceSyncer, ManualUploadSyncer, SyncContext, SyncReason},
+    worker::{DefaultDispatcher, HandlerCtx, WorkerConfig, WorkerPool},
+};
 use tempfile::TempDir;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -65,9 +65,11 @@ impl FailoverManager {
             let (provider_name, model_id) = registry.resolve_model(model_str);
             req.model = model_id.to_owned();
 
-            let profiles = self.order.get(provider_name).cloned().unwrap_or_else(|| {
-                vec!["default".to_owned()]
-            });
+            let profiles = self
+                .order
+                .get(provider_name)
+                .cloned()
+                .unwrap_or_else(|| vec!["default".to_owned()]);
 
             for profile_id in &profiles {
                 if self.is_cooling_down(profile_id) {
@@ -155,7 +157,9 @@ impl FailoverManager {
             }
         }
 
-        Err(anyhow!("LLM service unavailable — provider rate limited or API key invalid. Please check your provider configuration or try again later."))
+        Err(anyhow!(
+            "LLM service unavailable — provider rate limited or API key invalid. Please check your provider configuration or try again later."
+        ))
     }
 
     fn is_cooling_down(&self, profile_id: &str) -> bool {
@@ -167,10 +171,14 @@ impl FailoverManager {
     fn set_cooldown(&mut self, profile_id: &str, delay: Duration) {
         self.cooldowns
             .insert(profile_id.to_owned(), Instant::now() + delay);
-        *self.failure_counts.entry(profile_id.to_owned()).or_insert(0) += 1;
+        *self
+            .failure_counts
+            .entry(profile_id.to_owned())
+            .or_insert(0) += 1;
     }
 
-    /// Returns the current consecutive failure count for a profile (0 = no recent failures).
+    /// Returns the current consecutive failure count for a profile (0 = no
+    /// recent failures).
     fn hit_count(&self, profile_id: &str) -> u32 {
         self.failure_counts.get(profile_id).copied().unwrap_or(0)
     }
@@ -180,7 +188,8 @@ impl FailoverManager {
 /// model's context window or the account tier's hard ceiling — distinct from a
 /// transient rate limit. Matches the common wording across backends:
 ///   - rsclaw:    `max_tokens=N exceeds tier "..." ceiling (M)`
-///   - OpenAI:    `maximum context length is N tokens` / `context_length_exceeded`
+///   - OpenAI:    `maximum context length is N tokens` /
+///     `context_length_exceeded`
 ///   - Anthropic: `max_tokens: N > M, which is the maximum ...`
 ///
 /// The remedy is to drop `max_tokens` and retry; cooling down or failing over
@@ -229,7 +238,9 @@ mod tests {
 
     #[test]
     fn openai_context_length_is_max_tokens_error() {
-        let e = anyhow!("This model's maximum context length is 16385 tokens, however you requested 30000");
+        let e = anyhow!(
+            "This model's maximum context length is 16385 tokens, however you requested 30000"
+        );
         assert!(is_max_tokens_error(&e));
         assert!(!is_rate_limit(&e));
     }

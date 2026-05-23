@@ -50,7 +50,8 @@ pub fn process_alive(pid: u32) -> bool {
     }
 }
 
-/// Send a termination signal to the process (SIGTERM on Unix, taskkill on Windows).
+/// Send a termination signal to the process (SIGTERM on Unix, taskkill on
+/// Windows).
 pub fn process_terminate(pid: u32) -> Result<()> {
     #[cfg(unix)]
     {

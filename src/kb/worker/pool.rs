@@ -4,13 +4,21 @@
 //! `AtomicBool` at the top of each iteration and on every wake from
 //! the idle sleep.
 
-use crate::kb::store::{jobs, KbStore};
-use crate::kb::worker::handlers::{DefaultDispatcher, HandlerCtx, JobHandler};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
 use anyhow::Result;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
+
+use crate::kb::{
+    store::{KbStore, jobs},
+    worker::handlers::{DefaultDispatcher, HandlerCtx, JobHandler},
+};
 
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
@@ -171,14 +179,17 @@ fn run_reclaim_once(store: &KbStore, max_attempts: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::kb::canonicalize::{canonicalize_by_mime, CanonicalizeInput};
-    use crate::kb::embedder::{KbEmbedder, StubEmbedder};
-    use crate::kb::jobs::JobStatus;
-    use crate::kb::paths::KbPaths;
-    use crate::kb::pipeline::{ingest_canonicalized, IngestInput};
-    use crate::kb::store::{chunks as chunks_store, jobs as jobs_store};
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::kb::{
+        canonicalize::{CanonicalizeInput, canonicalize_by_mime},
+        embedder::{KbEmbedder, StubEmbedder},
+        jobs::JobStatus,
+        paths::KbPaths,
+        pipeline::{IngestInput, ingest_canonicalized},
+        store::{chunks as chunks_store, jobs as jobs_store},
+    };
 
     fn fixture() -> (TempDir, HandlerCtx, WorkerConfig, String, String) {
         let tmp = TempDir::new().unwrap();
@@ -213,8 +224,16 @@ mod tests {
         .unwrap();
 
         let index = Arc::new(crate::kb::index::KbIndex::open(&paths).unwrap());
-        let ctx = HandlerCtx { store, paths, embedder, index };
-        let cfg = WorkerConfig { worker_id: "w-test".into(), ..WorkerConfig::default() };
+        let ctx = HandlerCtx {
+            store,
+            paths,
+            embedder,
+            index,
+        };
+        let cfg = WorkerConfig {
+            worker_id: "w-test".into(),
+            ..WorkerConfig::default()
+        };
         (tmp, ctx, cfg, out.doc_id, lsid)
     }
 
@@ -224,8 +243,16 @@ mod tests {
         let handler = DefaultDispatcher;
         assert!(WorkerPool::run_one_blocking(&ctx, &cfg, &handler).unwrap());
         let rtx = ctx.store.begin_read().unwrap();
-        assert!(!chunks_store::chunks_for_logical(&rtx, &lsid).unwrap().is_empty());
-        assert!(jobs_store::list_by_status(&rtx, JobStatus::Ready).unwrap().is_empty());
+        assert!(
+            !chunks_store::chunks_for_logical(&rtx, &lsid)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            jobs_store::list_by_status(&rtx, JobStatus::Ready)
+                .unwrap()
+                .is_empty()
+        );
         let done = jobs_store::list_by_status(&rtx, JobStatus::Done).unwrap();
         assert_eq!(done.len(), 1);
     }
@@ -278,11 +305,13 @@ mod tests {
         let rtx = ctx.store.begin_read().unwrap();
         let failed = jobs::list_by_status(&rtx, JobStatus::Failed).unwrap();
         assert_eq!(failed.len(), 1);
-        assert!(failed[0]
-            .last_error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("handler panicked"));
+        assert!(
+            failed[0]
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("handler panicked")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

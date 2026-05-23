@@ -1,4 +1,5 @@
-//! Web search result parsers — HTML scraping for DuckDuckGo, Bing, Baidu, Sogou.
+//! Web search result parsers — HTML scraping for DuckDuckGo, Bing, Baidu,
+//! Sogou.
 //!
 //! Extracted from `runtime.rs` to reduce file size.
 
@@ -14,43 +15,33 @@ static DDG_LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("ddg link regex")
 });
 static DDG_SNIPPET_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"<a\s+class="result__snippet"[^>]*>(.*?)</a>"#)
-        .expect("ddg snippet regex")
+    Regex::new(r#"<a\s+class="result__snippet"[^>]*>(.*?)</a>"#).expect("ddg snippet regex")
 });
 static BING_LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"<a[^>]*href="(https?://[^"]*)"[^>]*>(.*?)</a>"#)
-        .expect("bing link regex")
+    Regex::new(r#"<a[^>]*href="(https?://[^"]*)"[^>]*>(.*?)</a>"#).expect("bing link regex")
 });
-static BING_SNIPPET_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"<p[^>]*>(.*?)</p>"#).expect("bing snippet regex")
-});
+static BING_SNIPPET_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"<p[^>]*>(.*?)</p>"#).expect("bing snippet regex"));
 static BAIDU_LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"<h3[^>]*>\s*<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>"#)
-        .expect("baidu link regex")
+    Regex::new(r#"<h3[^>]*>\s*<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>"#).expect("baidu link regex")
 });
 static BAIDU_SNIPPET_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"<span[^>]*class="content-right[^"]*"[^>]*>(.*?)</span>"#)
         .expect("baidu snippet regex")
 });
 static SOGOU_LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"<h3[^>]*>\s*<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>"#)
-        .expect("sogou link regex")
+    Regex::new(r#"<h3[^>]*>\s*<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>"#).expect("sogou link regex")
 });
-static STRIP_TAGS_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"<[^>]+>").expect("strip tags regex")
-});
-static TITLE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?is)<title[^>]*>(.*?)</title>").expect("title regex")
-});
-static SCRIPT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?is)<script[^>]*>.*?</script>").expect("script regex")
-});
-static STYLE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?is)<style[^>]*>.*?</style>").expect("style regex")
-});
-static WHITESPACE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\s+").expect("whitespace regex")
-});
+static STRIP_TAGS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<[^>]+>").expect("strip tags regex"));
+static TITLE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?is)<title[^>]*>(.*?)</title>").expect("title regex"));
+static SCRIPT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?is)<script[^>]*>.*?</script>").expect("script regex"));
+static STYLE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?is)<style[^>]*>.*?</style>").expect("style regex"));
+static WHITESPACE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\s+").expect("whitespace regex"));
 
 /// Look up search engine URL template from defaults.toml.
 pub(crate) fn search_engine_url(name: &str) -> &'static str {
@@ -238,13 +229,20 @@ pub(crate) fn parse_sogou_results(html: &str, limit: usize) -> Vec<Value> {
 /// Detect if HTML response is a CAPTCHA/verification page.
 pub(crate) fn is_captcha_page(html: &str) -> bool {
     let lower = html.to_lowercase();
-    lower.contains("captcha") || lower.contains("验证码")
-        || lower.contains("人机验证") || lower.contains("verify you are human")
-        || lower.contains("robot") || lower.contains("unusual traffic")
-        || lower.contains("are you a robot") || lower.contains("security check")
-        || lower.contains("challenge-form") || lower.contains("cf-browser-verification")
-        || lower.contains("antibot") || lower.contains("recaptcha")
-        || lower.contains("hcaptcha") || lower.contains("turnstile")
+    lower.contains("captcha")
+        || lower.contains("验证码")
+        || lower.contains("人机验证")
+        || lower.contains("verify you are human")
+        || lower.contains("robot")
+        || lower.contains("unusual traffic")
+        || lower.contains("are you a robot")
+        || lower.contains("security check")
+        || lower.contains("challenge-form")
+        || lower.contains("cf-browser-verification")
+        || lower.contains("antibot")
+        || lower.contains("recaptcha")
+        || lower.contains("hcaptcha")
+        || lower.contains("turnstile")
 }
 
 /// Simple percent-decoding for URL extraction.
@@ -304,7 +302,8 @@ pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
 
 /// Extract `<title>` content from HTML.
 pub(crate) fn extract_html_title(html: &str) -> String {
-    TITLE_RE.captures(html)
+    TITLE_RE
+        .captures(html)
         .and_then(|c| c.get(1))
         .map(|m| decode_html_entities(m.as_str().trim()))
         .unwrap_or_default()
@@ -320,10 +319,7 @@ pub(crate) fn strip_html(html: &str) -> String {
     // Decode entities.
     let decoded = decode_html_entities(&no_tags);
     // Collapse whitespace.
-    WHITESPACE_RE
-        .replace_all(&decoded, " ")
-        .trim()
-        .to_owned()
+    WHITESPACE_RE.replace_all(&decoded, " ").trim().to_owned()
 }
 
 /// Structural HTML dehydration via lol-html (Cloudflare streaming rewriter).
@@ -335,7 +331,7 @@ pub(crate) fn strip_html(html: &str) -> String {
 ///
 /// Falls back to [`strip_html`] on parse errors.
 pub(crate) fn html_dehydrate(html: &str) -> String {
-    use lol_html::{element, rewrite_str, RewriteStrSettings};
+    use lol_html::{RewriteStrSettings, element, rewrite_str};
 
     let result = rewrite_str(
         html,
@@ -354,8 +350,7 @@ pub(crate) fn html_dehydrate(html: &str) -> String {
                 // Strip all attributes, keeping only semantically useful ones.
                 element!("*", |el| {
                     let tag = el.tag_name();
-                    let attrs: Vec<String> =
-                        el.attributes().iter().map(|a| a.name()).collect();
+                    let attrs: Vec<String> = el.attributes().iter().map(|a| a.name()).collect();
                     for attr in attrs {
                         let keep = match tag.as_str() {
                             "a" => attr == "href",

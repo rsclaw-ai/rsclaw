@@ -8,18 +8,17 @@
 //!   - `collaboration`  — Sequential / Parallel / Orchestrated collab modes
 
 pub mod bootstrap;
-pub mod evolution;
-pub mod install_hints;
-pub mod turn_metrics;
 pub mod collaboration;
 pub mod compaction;
 pub mod context_mgr;
 pub mod direct_apis;
-pub mod memory_extractor;
 pub mod doc;
+pub mod evolution;
 pub mod exec_pool;
+pub mod install_hints;
 pub mod loop_detection;
 pub mod memory;
+pub mod memory_extractor;
 pub mod permission;
 pub mod platform;
 pub mod preparse;
@@ -28,10 +27,9 @@ pub mod query_planner;
 pub mod registry;
 pub mod runtime;
 pub mod security;
+pub mod sft_exporter;
 pub mod spawner;
 pub mod tool_call_repair;
-pub mod sft_exporter;
-pub mod trace_capture;
 pub mod tools_acp;
 pub mod tools_agent;
 pub mod tools_artifact;
@@ -45,6 +43,8 @@ pub mod tools_session;
 pub mod tools_session_archive;
 pub mod tools_video;
 pub mod tools_web;
+pub mod trace_capture;
+pub mod turn_metrics;
 pub mod web_parsers;
 pub mod workspace;
 
@@ -56,8 +56,8 @@ pub use permission::{
     add_pending_permission, get_pending_permission, remove_pending_permission, resolve_permission,
 };
 pub use registry::{
-    AgentHandle, AgentKind, AgentMessage, AgentRegistry, AgentReply,
-    FileAttachment, ImageAttachment, PendingAnalysis, SessionTokens,
+    AgentHandle, AgentKind, AgentMessage, AgentRegistry, AgentReply, FileAttachment,
+    ImageAttachment, PendingAnalysis, SessionTokens,
 };
 pub use runtime::{AgentRuntime, LiveStatus};
 pub use spawner::AgentSpawner;

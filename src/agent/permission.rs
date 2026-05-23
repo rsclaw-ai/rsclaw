@@ -1,7 +1,8 @@
-use crate::acp::types::{PermissionOption, RequestPermissionOutcome};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
+
 use tokio::sync::Mutex;
+
+use crate::acp::types::{PermissionOption, RequestPermissionOutcome};
 
 #[derive(Clone)]
 pub struct PendingPermission {

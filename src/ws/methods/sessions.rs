@@ -264,11 +264,17 @@ pub async fn sessions_messages_subscribe(ctx: MethodCtx) -> MethodResult {
     // Reconnect-replay: any task for this session that completed while the
     // client was offline (Done && !notified) gets re-delivered now and the
     // notified flag is flipped so we don't double-send on the next subscribe.
-    if let Ok(pending) = ctx.state.store.db.list_tasks(
-        Some(crate::gateway::task_queue::TaskStatus::Done),
-    ) {
+    if let Ok(pending) = ctx
+        .state
+        .store
+        .db
+        .list_tasks(Some(crate::gateway::task_queue::TaskStatus::Done))
+    {
         let event_tx = ctx.conn.read().await.event_tx.clone();
-        for task in pending.into_iter().filter(|t| t.session_key == key && !t.notified) {
+        for task in pending
+            .into_iter()
+            .filter(|t| t.session_key == key && !t.notified)
+        {
             let Some(content) = task.last_reply.as_deref() else {
                 // No captured reply text — nothing useful to replay.
                 continue;

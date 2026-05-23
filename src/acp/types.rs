@@ -855,7 +855,8 @@ mod tests {
             },
         };
         let json = serde_json::to_string(&req).expect("serialize InitializeRequest");
-        let parsed: InitializeRequest = serde_json::from_str(&json).expect("deserialize InitializeRequest");
+        let parsed: InitializeRequest =
+            serde_json::from_str(&json).expect("deserialize InitializeRequest");
         assert_eq!(parsed.client_info.name, "test-client");
         assert_eq!(parsed.protocol_version, 1);
     }
@@ -872,7 +873,8 @@ mod tests {
             auth_methods: vec![],
         };
         let json = serde_json::to_string(&resp).expect("serialize InitializeResponse");
-        let parsed: InitializeResponse = serde_json::from_str(&json).expect("deserialize InitializeResponse");
+        let parsed: InitializeResponse =
+            serde_json::from_str(&json).expect("deserialize InitializeResponse");
         assert_eq!(parsed.agent_info.name, "rsclaw");
         assert_eq!(parsed.protocol_version, 1);
     }
@@ -885,7 +887,8 @@ mod tests {
             _meta: None,
         };
         let json = serde_json::to_string(&req).expect("serialize NewSessionRequest");
-        let parsed: NewSessionRequest = serde_json::from_str(&json).expect("deserialize NewSessionRequest");
+        let parsed: NewSessionRequest =
+            serde_json::from_str(&json).expect("deserialize NewSessionRequest");
         assert_eq!(parsed.cwd, "/project");
     }
 
@@ -947,7 +950,10 @@ mod tests {
         let json = serde_json::to_string(&method).expect("serialize AuthMethod");
         let parsed: AuthMethod = serde_json::from_str(&json).expect("deserialize AuthMethod");
         assert_eq!(parsed.id, "interactive");
-        assert_eq!(parsed.name.expect("name should be Some"), "Interactive Login");
+        assert_eq!(
+            parsed.name.expect("name should be Some"),
+            "Interactive Login"
+        );
     }
 
     #[test]
@@ -991,7 +997,8 @@ mod tests {
             path: "/etc/passwd".to_string(),
         };
         let json = serde_json::to_string(&req).expect("serialize ReadTextFileRequest");
-        let parsed: ReadTextFileRequest = serde_json::from_str(&json).expect("deserialize ReadTextFileRequest");
+        let parsed: ReadTextFileRequest =
+            serde_json::from_str(&json).expect("deserialize ReadTextFileRequest");
         assert_eq!(parsed.path, "/etc/passwd");
 
         let resp = ReadTextFileResponse {
@@ -1009,14 +1016,16 @@ mod tests {
             args: Some(vec!["-c".to_string(), "ls".to_string()]),
         };
         let json = serde_json::to_string(&req).expect("serialize CreateTerminalRequest");
-        let parsed: CreateTerminalRequest = serde_json::from_str(&json).expect("deserialize CreateTerminalRequest");
+        let parsed: CreateTerminalRequest =
+            serde_json::from_str(&json).expect("deserialize CreateTerminalRequest");
         assert!(parsed.args.is_some());
 
         let resp = CreateTerminalResponse {
             terminal_id: "term_1".to_string(),
         };
         let json = serde_json::to_string(&resp).expect("serialize CreateTerminalResponse");
-        let parsed: CreateTerminalResponse = serde_json::from_str(&json).expect("deserialize CreateTerminalResponse");
+        let parsed: CreateTerminalResponse =
+            serde_json::from_str(&json).expect("deserialize CreateTerminalResponse");
         assert_eq!(parsed.terminal_id, "term_1");
     }
 }

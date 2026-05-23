@@ -2,9 +2,11 @@
 
 #![allow(dead_code, unused_imports)]
 
-use serde_json::{json, Value};
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use serde_json::{Value, json};
+use wiremock::{
+    Mock, MockServer, ResponseTemplate,
+    matchers::{method, path},
+};
 
 // ---------------------------------------------------------------------------
 // Message builders

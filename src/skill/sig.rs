@@ -9,7 +9,7 @@
 //! but cannot forge a signature without the private key. The client verifies
 //! `meta.sig` against `HUB_PUBKEY` and refuses everything if it fails.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
@@ -23,7 +23,8 @@ fn b64(s: &str) -> Result<Vec<u8>> {
 }
 
 /// Canonical signed payload — MUST stay byte-identical to the publisher
-/// (`hub-rsclaw-dist.py`): `rsclaw-hub-meta\nv1\n{version}\n{skills}\n{plugins}\n{tools}\n`.
+/// (`hub-rsclaw-dist.py`):
+/// `rsclaw-hub-meta\nv1\n{version}\n{skills}\n{plugins}\n{tools}\n`.
 /// A golden-vector test pins this against a signature produced by that script.
 fn canonical_payload(version: &str, skills: &str, plugins: &str, tools: &str) -> Vec<u8> {
     format!("rsclaw-hub-meta\nv1\n{version}\n{skills}\n{plugins}\n{tools}\n").into_bytes()
@@ -103,6 +104,8 @@ mod tests {
 
     #[test]
     fn rejects_garbage_sig() {
-        assert!(verify_meta_sig("2026-01-01.000000", "AAAA", "BBBB", "CCCC", "not-base64!!").is_err());
+        assert!(
+            verify_meta_sig("2026-01-01.000000", "AAAA", "BBBB", "CCCC", "not-base64!!").is_err()
+        );
     }
 }

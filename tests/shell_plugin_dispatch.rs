@@ -2,8 +2,8 @@
 //! bidirectional protocol round-trips a tool_call request through the
 //! shell-bridge JSON-RPC layer.
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
+
 use tokio::sync::Mutex;
 
 #[tokio::test(flavor = "current_thread")]

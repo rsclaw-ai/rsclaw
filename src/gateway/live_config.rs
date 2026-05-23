@@ -62,11 +62,11 @@ impl LiveConfig {
     /// Behaviour:
     ///   - If the change is hot-safe (only fields whitelisted in
     ///     `strip_live_fields` differ — currently per-agent / default
-    ///     temperature) the new values are written into all live RwLocks and
-    ///     an empty list is returned.
+    ///     temperature) the new values are written into all live RwLocks and an
+    ///     empty list is returned.
     ///   - Otherwise the current live state is left untouched, the changed
-    ///     section names are returned (and broadcast via `restart_tx`), and
-    ///     the caller is expected to surface a restart banner.
+    ///     section names are returned (and broadcast via `restart_tx`), and the
+    ///     caller is expected to surface a restart banner.
     ///
     /// `is_hot_safe_only` / `diff_restart_sections` is the single source of
     /// truth — coarse field-by-field checks were removed in favour of a
@@ -196,12 +196,12 @@ pub fn diff_restart_sections(old: &RuntimeConfig, new: &RuntimeConfig) -> Vec<St
 }
 
 /// Strip every field that is either:
-///   * already reported granularly by `detect_restart_fields`
-///     (gateway.port / gateway.bind / gateway.bindAddress / gateway.reload),
-///     so the JSON diff doesn't re-emit a coarse `config.gateway` entry; or
+///   * already reported granularly by `detect_restart_fields` (gateway.port /
+///     gateway.bind / gateway.bindAddress / gateway.reload), so the JSON diff
+///     doesn't re-emit a coarse `config.gateway` entry; or
 ///   * actually read live by request handlers and therefore safe to change
-///     without restart (`gateway.auth.token`,
-///     `agents.defaults.temperature`, every `agents.list[i].temperature`).
+///     without restart (`gateway.auth.token`, `agents.defaults.temperature`,
+///     every `agents.list[i].temperature`).
 ///
 /// Fields not listed here remain in the diff, so changing them surfaces a
 /// restart banner — that is the conservative default for anything we haven't
@@ -273,8 +273,8 @@ fn strip_live_fields(v: &mut serde_json::Value) {
     // `RuntimeConfig`, while the raw `Config` keeps `tools` flat.
     //
     // `exec` and `upload` are intentionally *not* whitelisted:
-    //   - `upload` is read cold by the feishu channel at startup, so even if
-    //     the agent runtime hot-reads it, a restart is required for channels.
+    //   - `upload` is read cold by the feishu channel at startup, so even if the
+    //     agent runtime hot-reads it, a restart is required for channels.
     //   - `exec` migration was deferred — its read sites still go through
     //     `self.config.ext.tools.exec`, so changing it must trigger a restart.
     if let Some(tools) = v.get_mut("tools") {
@@ -669,12 +669,17 @@ mod tests {
                 password: None,
                 allow_tailscale: None,
                 allow_local: None,
-                token: Some(crate::config::schema::SecretOrString::Plain("rotated".into())),
+                token: Some(crate::config::schema::SecretOrString::Plain(
+                    "rotated".into(),
+                )),
             }),
             ..Default::default()
         });
         let sections = diff_restart_sections(&old, &new);
-        assert!(sections.is_empty(), "expected no banner sections, got {sections:?}");
+        assert!(
+            sections.is_empty(),
+            "expected no banner sections, got {sections:?}"
+        );
         assert!(is_hot_safe_only(&old, &new));
     }
 
@@ -772,10 +777,7 @@ mod tests {
             ..Default::default()
         });
         let sections = diff_restart_sections(&old, &new);
-        assert!(
-            sections.is_empty(),
-            "expected no banner, got {sections:?}"
-        );
+        assert!(sections.is_empty(), "expected no banner, got {sections:?}");
         assert!(is_hot_safe_only(&old, &new));
     }
 

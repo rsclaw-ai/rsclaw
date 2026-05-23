@@ -2,16 +2,22 @@ pub mod meditation;
 pub mod schedule;
 pub mod state;
 
-use anyhow::{anyhow, bail, Result};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+
+use anyhow::{Result, anyhow, bail};
 use chrono::NaiveTime;
 use chrono_tz::Tz;
-use std::time::Duration;
-use crate::agent::registry::{AgentMessage, AgentRegistry};
-use crate::config::loader::base_dir;
 use state::{HeartbeatState, HeartbeatStore};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use tracing::{info, warn};
+
+use crate::{
+    agent::registry::{AgentMessage, AgentRegistry},
+    config::loader::base_dir,
+};
 
 /// Type of heartbeat action.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -41,7 +47,8 @@ pub fn parse_heartbeat_md(raw: &str) -> Result<HeartbeatSpec> {
         .strip_prefix("---")
         .ok_or_else(|| anyhow!("HEARTBEAT.md must begin with a '---' frontmatter block"))?;
 
-    // The first character after "---" must be a newline (or the line ends immediately)
+    // The first character after "---" must be a newline (or the line ends
+    // immediately)
     let rest = if rest.starts_with('\n') {
         &rest[1..]
     } else if rest.starts_with("\r\n") {
@@ -121,7 +128,8 @@ pub fn parse_heartbeat_md(raw: &str) -> Result<HeartbeatSpec> {
 
 /// Parse a human-readable duration string into [`std::time::Duration`].
 ///
-/// Supported forms: `"5m"`, `"30m"`, `"1h"`, `"30s"`, bare integer (treated as minutes).
+/// Supported forms: `"5m"`, `"30m"`, `"1h"`, `"30s"`, bare integer (treated as
+/// minutes).
 fn parse_duration(s: &str) -> Duration {
     let s = s.trim();
     if let Some(mins) = s.strip_suffix('m') {
@@ -172,8 +180,9 @@ pub struct MeditationDeps {
     pub config: Arc<crate::config::runtime::RuntimeConfig>,
 }
 
-/// Heartbeat runner — scans agent workspaces and spawns per-agent heartbeat loops.
-/// Periodically rescans to discover new HEARTBEAT.md files from dynamically created agents.
+/// Heartbeat runner — scans agent workspaces and spawns per-agent heartbeat
+/// loops. Periodically rescans to discover new HEARTBEAT.md files from
+/// dynamically created agents.
 pub struct HeartbeatRunner {
     registry: Arc<AgentRegistry>,
     store: Arc<HeartbeatStore>,
@@ -247,13 +256,12 @@ impl HeartbeatRunner {
         });
     }
 
-    /// Scan all workspace directories for HEARTBEAT*.md and spawn loops for new ones.
+    /// Scan all workspace directories for HEARTBEAT*.md and spawn loops for new
+    /// ones.
     fn scan_and_spawn(self: &Arc<Self>) {
         let base = base_dir();
         // Collect workspace dirs: "workspace" + "workspace-*"
-        let mut dirs: Vec<(String, PathBuf)> = vec![
-            ("main".to_string(), base.join("workspace")),
-        ];
+        let mut dirs: Vec<(String, PathBuf)> = vec![("main".to_string(), base.join("workspace"))];
         if let Ok(entries) = std::fs::read_dir(&base) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
@@ -347,8 +355,13 @@ impl HeartbeatRunner {
             };
 
             // Check active hours — sleep until window if outside.
-            if let Some(sleep_dur) = schedule::check_active_hours(spec.active_hours, spec.timezone) {
-                info!(agent_id, secs = sleep_dur.as_secs(), "outside active_hours, sleeping");
+            if let Some(sleep_dur) = schedule::check_active_hours(spec.active_hours, spec.timezone)
+            {
+                info!(
+                    agent_id,
+                    secs = sleep_dur.as_secs(),
+                    "outside active_hours, sleeping"
+                );
                 tokio::time::sleep(sleep_dur).await;
                 continue;
             }
@@ -360,7 +373,8 @@ impl HeartbeatRunner {
             // Execute heartbeat action based on type.
             let result = match spec.spec_type {
                 HeartbeatType::Message => {
-                    self.send_heartbeat(agent_id, &state_key, &spec.content).await
+                    self.send_heartbeat(agent_id, &state_key, &spec.content)
+                        .await
                 }
                 HeartbeatType::Meditate => self.run_meditation(agent_id).await,
             };
@@ -385,7 +399,8 @@ impl HeartbeatRunner {
         }
     }
 
-    /// Read and parse HEARTBEAT.md. Returns None if file missing or unparseable.
+    /// Read and parse HEARTBEAT.md. Returns None if file missing or
+    /// unparseable.
     fn read_spec(&self, path: &Path) -> Option<HeartbeatSpec> {
         let raw = match std::fs::read_to_string(path) {
             Ok(s) => s,
@@ -485,7 +500,9 @@ impl HeartbeatRunner {
         // both unnecessary and broke heartbeat permanently — the
         // adjacent agent_loop builds `state_key = "{agent_id}:{file}"`,
         // which the old validator then rejected at every tick.
-        let handle = self.registry.get(agent_id)
+        let handle = self
+            .registry
+            .get(agent_id)
             .map_err(|e| anyhow!("agent not found: {e:#}"))?;
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -522,11 +539,11 @@ impl HeartbeatRunner {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::Duration;
+
+    use super::*;
 
     #[test]
     fn parse_basic_frontmatter() {
@@ -540,7 +557,8 @@ mod tests {
 
     #[test]
     fn parse_with_active_hours() {
-        let input = "---\nevery: 1h\nactive_hours: 09:15-15:05\ntimezone: Asia/Tokyo\n---\nBody text\n";
+        let input =
+            "---\nevery: 1h\nactive_hours: 09:15-15:05\ntimezone: Asia/Tokyo\n---\nBody text\n";
         let spec = parse_heartbeat_md(input).unwrap();
         assert_eq!(spec.every, Duration::from_secs(3600));
         let (s, e) = spec.active_hours.unwrap();

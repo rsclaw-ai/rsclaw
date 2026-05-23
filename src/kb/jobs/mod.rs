@@ -1,2 +1,2 @@
 pub mod types;
-pub use types::{status_priority_key, ClaimToken, Job, JobKind, JobStatus};
+pub use types::{ClaimToken, Job, JobKind, JobStatus, status_priority_key};

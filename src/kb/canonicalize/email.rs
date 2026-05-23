@@ -1,10 +1,10 @@
 //! Email canonicalizers.
 //!
 //! - `.eml` (message/rfc822): one message → one doc. Headers
-//!   (From/To/Cc/Subject/Date) become a leading block + `extra` metadata;
-//!   the body prefers the `text/plain` MIME part, falling back to the
-//!   `text/html` part rendered through the HTML canonicalizer. Attachments
-//!   are listed by name, never inlined (no base64 noise in the index).
+//!   (From/To/Cc/Subject/Date) become a leading block + `extra` metadata; the
+//!   body prefers the `text/plain` MIME part, falling back to the `text/html`
+//!   part rendered through the HTML canonicalizer. Attachments are listed by
+//!   name, never inlined (no base64 noise in the index).
 //! - `.mbox` (application/mbox): many messages → still ONE doc, each message
 //!   rendered as a `---`-separated section. (Per-message docs would need the
 //!   ingest path to emit N docs from one canonicalize call; deferred.)
@@ -12,10 +12,10 @@
 //! RFC2047 encoded-words (e.g. CJK subjects `=?UTF-8?B?...?=`) and
 //! transfer-encodings (base64 / quoted-printable) are decoded by `mailparse`.
 
+use mailparse::{MailHeaderMap, ParsedMail, parse_mail};
+
 use super::*;
-use crate::kb::canonicalize::html::HtmlCanonicalizer;
-use crate::kb::content_store::atomic::sha256_hex;
-use mailparse::{parse_mail, MailHeaderMap, ParsedMail};
+use crate::kb::{canonicalize::html::HtmlCanonicalizer, content_store::atomic::sha256_hex};
 
 /// `Content-Type` for a single RFC822 message (`.eml`).
 pub const EML_MIME: &str = "message/rfc822";
@@ -34,8 +34,7 @@ impl Canonicalizer for EmlCanonicalizer {
     }
 
     fn canonicalize(&self, input: CanonicalizeInput<'_>) -> Result<Option<CanonicalizedSource>> {
-        let parsed = parse_mail(input.bytes)
-            .map_err(|e| anyhow::anyhow!("parse eml: {e}"))?;
+        let parsed = parse_mail(input.bytes).map_err(|e| anyhow::anyhow!("parse eml: {e}"))?;
         let Some(rendered) = render_message(&parsed) else {
             return Ok(None);
         };
@@ -79,7 +78,9 @@ impl Canonicalizer for MboxCanonicalizer {
         let mut sections: Vec<String> = Vec::new();
         let mut count = 0usize;
         for raw in split_mbox(input.bytes) {
-            let Ok(parsed) = parse_mail(raw) else { continue };
+            let Ok(parsed) = parse_mail(raw) else {
+                continue;
+            };
             if let Some(r) = render_message(&parsed) {
                 count += 1;
                 sections.push(r.markdown);
@@ -233,7 +234,12 @@ fn attachment_name(part: &ParsedMail<'_>) -> Option<String> {
         // crude filename= extraction
         if let Some(idx) = disp_l.find("filename=") {
             let raw = disp[idx + "filename=".len()..].trim().trim_matches('"');
-            let name = raw.split(';').next().unwrap_or(raw).trim().trim_matches('"');
+            let name = raw
+                .split(';')
+                .next()
+                .unwrap_or(raw)
+                .trim()
+                .trim_matches('"');
             if !name.is_empty() {
                 return Some(name.to_string());
             }

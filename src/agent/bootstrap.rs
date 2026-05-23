@@ -322,12 +322,10 @@ alternative phrasings and edge cases.
 // seed logic walks each tree and writes a file only if the user's local
 // copy doesn't already exist (so hand-edits survive an upgrade).
 
-use include_dir::{include_dir, Dir};
+use include_dir::{Dir, include_dir};
 
-static SITE_RULES_TREE: Dir<'_> =
-    include_dir!("$CARGO_MANIFEST_DIR/tools/web_browser/site-rules");
-static APP_RULES_TREE: Dir<'_> =
-    include_dir!("$CARGO_MANIFEST_DIR/tools/computer_use/app-rules");
+static SITE_RULES_TREE: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/tools/web_browser/site-rules");
+static APP_RULES_TREE: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/tools/computer_use/app-rules");
 
 /// Walk an embedded `include_dir!` tree (recursively) and write each
 /// file to `dest/<relative path>`, creating intermediate dirs and
@@ -646,4 +644,3 @@ Example — authenticated POST:
 - Do NOT use `~/`, `~/Downloads/`, or absolute paths.
 - After downloading, use `send_file` to send the file to the user.
 "#;
-

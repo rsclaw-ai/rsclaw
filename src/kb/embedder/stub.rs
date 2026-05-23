@@ -2,9 +2,10 @@
 //! sha256(text), expands to `dimension()` f32 values normalised to
 //! the unit hypersphere (so cosine similarity tests are sensible).
 
-use super::KbEmbedder;
 use anyhow::Result;
 use sha2::{Digest, Sha256};
+
+use super::KbEmbedder;
 
 pub struct StubEmbedder {
     pub dimension: usize,

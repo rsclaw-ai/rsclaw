@@ -1,14 +1,17 @@
 //! Week 4 compactor integration: real ingest + worker drain + compactor
 //! tick + verify ledger advanced from IndexingComplete → CleanupPending.
 
-use anyhow::Result;
-use rsclaw::kb::compactor::run_compactor_tick;
-use rsclaw::kb::ledger::LedgerStatus;
-use rsclaw::kb::store::ledger;
-use rsclaw::kb::sync::{KbSourceSyncer, ManualUploadSyncer, SyncContext, SyncReason};
-use rsclaw::kb::worker::{DefaultDispatcher, HandlerCtx, WorkerConfig, WorkerPool};
-use rsclaw::kb::{KbEmbedder, KbIndex, KbPaths, KbStore, StubEmbedder};
 use std::sync::Arc;
+
+use anyhow::Result;
+use rsclaw::kb::{
+    KbEmbedder, KbIndex, KbPaths, KbStore, StubEmbedder,
+    compactor::run_compactor_tick,
+    ledger::LedgerStatus,
+    store::ledger,
+    sync::{KbSourceSyncer, ManualUploadSyncer, SyncContext, SyncReason},
+    worker::{DefaultDispatcher, HandlerCtx, WorkerConfig, WorkerPool},
+};
 use tempfile::TempDir;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -45,7 +48,11 @@ async fn compactor_advances_indexing_complete_ledger() -> Result<()> {
 
     let rtx = store.begin_read()?;
     let done_before = ledger::list_by_status(&rtx, LedgerStatus::IndexingComplete)?;
-    assert_eq!(done_before.len(), 1, "worker should have advanced the ledger");
+    assert_eq!(
+        done_before.len(),
+        1,
+        "worker should have advanced the ledger"
+    );
     drop(rtx);
 
     // Compactor tick should bump IndexingComplete → CleanupPending.

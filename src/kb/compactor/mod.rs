@@ -3,16 +3,20 @@
 //! referenced by the latest version. Each phase wraps state changes
 //! in single write transactions.
 
-use crate::kb::ledger::LedgerStatus;
-use crate::kb::model::KbDoc;
-use crate::kb::paths::KbPaths;
-use crate::kb::store::codec::decode;
-use crate::kb::store::schema::KB_DOCS;
-use crate::kb::store::{ledger, KbStore};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime},
+};
+
 use anyhow::Result;
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+
+use crate::kb::{
+    ledger::LedgerStatus,
+    model::KbDoc,
+    paths::KbPaths,
+    store::{KbStore, codec::decode, ledger, schema::KB_DOCS},
+};
 
 pub const DEFAULT_GRACE_SECS: i64 = 3600; // 1h
 pub const DEFAULT_RETENTION_SECS: i64 = 30 * 86400; // 30 days
@@ -24,11 +28,7 @@ pub struct CompactStats {
     pub ledger_advanced_to_done: usize,
 }
 
-pub fn run_compactor_tick(
-    store: &KbStore,
-    paths: &KbPaths,
-    now_ms: i64,
-) -> Result<CompactStats> {
+pub fn run_compactor_tick(store: &KbStore, paths: &KbPaths, now_ms: i64) -> Result<CompactStats> {
     let mut stats = CompactStats::default();
     let referenced = referenced_paths(store)?;
     let cutoff_secs = (now_ms / 1000) - DEFAULT_GRACE_SECS;
@@ -166,8 +166,9 @@ fn scan_and_delete_orphans(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
+
+    use super::*;
 
     #[test]
     fn empty_store_runs_clean() {

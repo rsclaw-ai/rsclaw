@@ -55,14 +55,22 @@ mod tests {
     fn similar_close_hash() {
         let a = simhash64("the quick brown fox jumps over the lazy dog");
         let b = simhash64("the quick brown fox jumps over a lazy dog");
-        assert!(hamming64(a, b) < 16, "expected close hashes, got {}", hamming64(a, b));
+        assert!(
+            hamming64(a, b) < 16,
+            "expected close hashes, got {}",
+            hamming64(a, b)
+        );
     }
 
     #[test]
     fn different_far_hash() {
         let a = simhash64("the quick brown fox");
         let b = simhash64("completely unrelated content here");
-        assert!(hamming64(a, b) > 16, "expected far hashes, got {}", hamming64(a, b));
+        assert!(
+            hamming64(a, b) > 16,
+            "expected far hashes, got {}",
+            hamming64(a, b)
+        );
     }
 
     #[test]

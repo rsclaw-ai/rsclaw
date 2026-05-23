@@ -3,14 +3,14 @@
 //!
 //! Different from `NativeOperator` in three ways:
 //!
-//!   1. Screenshot captures **only** the iPhone Mirroring window, not
-//!      the full Mac desktop. The model sees just the iPhone screen.
-//!   2. Coordinates from the model are in the iPhone's screen space
-//!      (e.g. 390×844 for iPhone 15). At execute time we translate to
-//!      absolute Mac screen coordinates by adding the window position.
-//!   3. The action space is iOS-flavoured — `tap` / `long_press` /
-//!      `swipe` / `press_home` / `press_back` / `type` instead of
-//!      desktop-style click/drag/hotkey.
+//!   1. Screenshot captures **only** the iPhone Mirroring window, not the full
+//!      Mac desktop. The model sees just the iPhone screen.
+//!   2. Coordinates from the model are in the iPhone's screen space (e.g.
+//!      390×844 for iPhone 15). At execute time we translate to absolute Mac
+//!      screen coordinates by adding the window position.
+//!   3. The action space is iOS-flavoured — `tap` / `long_press` / `swipe` /
+//!      `press_home` / `press_back` / `type` instead of desktop-style
+//!      click/drag/hotkey.
 //!
 //! Input synthesis still goes through `enigo` (the iPhone Mirroring
 //! window is just a macOS window from the OS's perspective). This
@@ -20,7 +20,7 @@
 
 use std::time::Duration;
 
-use anyhow::{anyhow, Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use enigo::{
     Axis, Button, Coordinate,
     Direction::{Click, Press, Release},
@@ -29,10 +29,10 @@ use enigo::{
 use image::{ImageFormat, RgbaImage};
 use tracing::{debug, warn};
 
-use crate::computer::action::{
-    Action, ActionSpec, ExecCtx, MouseButton, Screenshot, ScrollDir,
+use crate::computer::{
+    action::{Action, ActionSpec, ExecCtx, MouseButton, Screenshot, ScrollDir},
+    operator::{ActionFut, ActionOutput, Operator, ScreenshotFut},
 };
-use crate::computer::operator::{ActionFut, ActionOutput, Operator, ScreenshotFut};
 
 /// macOS-only operator that drives iPhone Mirroring. Stateless — every
 /// call resolves the iPhone Mirroring window fresh because the user
@@ -69,13 +69,8 @@ impl Operator for IphoneMirrorOperator {
                 "long_press(start_box='<box>x1,y1</box>')",
                 "# Press and hold ~1s",
             ),
-            ActionSpec::new(
-                "swipe(start_box='<box>x1,y1</box>', end_box='<box>x3,y3</box>')",
-            ),
-            ActionSpec::with_note(
-                "type(content='')",
-                "# Add \\n at end to submit",
-            ),
+            ActionSpec::new("swipe(start_box='<box>x1,y1</box>', end_box='<box>x3,y3</box>')"),
+            ActionSpec::with_note("type(content='')", "# Add \\n at end to submit"),
             ActionSpec::with_note(
                 "press_home()",
                 "# Equivalent to swiping up from the bottom edge",
@@ -166,8 +161,7 @@ impl Operator for IphoneMirrorOperator {
 
 #[cfg(target_os = "macos")]
 fn capture_iphone_window() -> Result<Screenshot> {
-    let windows =
-        xcap::Window::all().map_err(|e| anyhow!("xcap::Window::all failed: {e}"))?;
+    let windows = xcap::Window::all().map_err(|e| anyhow!("xcap::Window::all failed: {e}"))?;
     let window = windows
         .into_iter()
         .find(|w| {
@@ -212,8 +206,7 @@ fn capture_iphone_window() -> Result<Screenshot> {
 /// in-iPhone coordinates → absolute Mac coordinates for enigo input.
 #[cfg(target_os = "macos")]
 fn iphone_window_origin() -> Result<(i32, i32, u32, u32)> {
-    let windows =
-        xcap::Window::all().map_err(|e| anyhow!("xcap::Window::all failed: {e}"))?;
+    let windows = xcap::Window::all().map_err(|e| anyhow!("xcap::Window::all failed: {e}"))?;
     let window = windows
         .into_iter()
         .find(|w| {

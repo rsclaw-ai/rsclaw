@@ -2,11 +2,14 @@
 //! ingest_canonicalized. Used by `rsclaw kb add <path>` and the
 //! future UI drag-drop flow. No HTTP, no cursor.
 
-use super::{KbSourceSyncer, SyncContext, SyncError, SyncOutcome, SyncReason};
-use crate::kb::canonicalize::{canonicalize_by_mime, detect_mime, CanonicalizeInput};
-use crate::kb::model::KbSourceKind;
-use crate::kb::pipeline::{ingest_canonicalized, IngestInput};
 use std::path::PathBuf;
+
+use super::{KbSourceSyncer, SyncContext, SyncError, SyncOutcome, SyncReason};
+use crate::kb::{
+    canonicalize::{CanonicalizeInput, canonicalize_by_mime, detect_mime},
+    model::KbSourceKind,
+    pipeline::{IngestInput, ingest_canonicalized},
+};
 
 pub struct ManualUploadSyncer {
     pub source_id: String,
@@ -26,11 +29,7 @@ impl KbSourceSyncer for ManualUploadSyncer {
         None
     }
 
-    async fn sync(
-        &self,
-        ctx: &SyncContext,
-        _reason: SyncReason,
-    ) -> Result<SyncOutcome, SyncError> {
+    async fn sync(&self, ctx: &SyncContext, _reason: SyncReason) -> Result<SyncOutcome, SyncError> {
         let bytes = std::fs::read(&self.file_path)
             .map_err(|e| SyncError::Permanent(format!("read {}: {e}", self.file_path.display())))?;
         let filename = self

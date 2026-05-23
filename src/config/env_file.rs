@@ -14,9 +14,7 @@
 //! See `env_resolution.rs` for the reconcile pipeline that drives
 //! writes; this module is pure file IO.
 
-use std::collections::BTreeMap;
-use std::io::Write as _;
-use std::path::Path;
+use std::{collections::BTreeMap, io::Write as _, path::Path};
 
 use anyhow::{Context, Result};
 
@@ -28,8 +26,8 @@ pub fn read(path: &Path) -> Result<BTreeMap<String, String>> {
     if !path.exists() {
         return Ok(out);
     }
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     for (i, line) in content.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -61,11 +59,8 @@ pub fn read(path: &Path) -> Result<BTreeMap<String, String>> {
 /// parent dir if missing. Replaces an existing file via tmp+rename so
 /// concurrent gateway processes never see a half-written file.
 pub fn write(path: &Path, vars: &BTreeMap<String, String>) -> Result<()> {
-    let parent = path
-        .parent()
-        .context("env file has no parent directory")?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("create dir {}", parent.display()))?;
+    let parent = path.parent().context("env file has no parent directory")?;
+    std::fs::create_dir_all(parent).with_context(|| format!("create dir {}", parent.display()))?;
 
     // Unique tmp name per process avoids races between concurrent
     // gateway startups (e.g. supervisor restarts during a hot-reload).
@@ -95,7 +90,10 @@ pub fn write(path: &Path, vars: &BTreeMap<String, String>) -> Result<()> {
             f,
             "# NOT overwritten by your shell on startup. To pull a rotated value"
         )?;
-        writeln!(f, "# in from the shell, run `rsclaw env sync` (see docs/env.md).")?;
+        writeln!(
+            f,
+            "# in from the shell, run `rsclaw env sync` (see docs/env.md)."
+        )?;
         writeln!(f)?;
 
         for (k, v) in vars {
@@ -152,8 +150,11 @@ mod tests {
     fn read_skips_malformed_lines() {
         let tmp = tempfile::tempdir().expect("tmpdir");
         let path = tmp.path().join(".env");
-        std::fs::write(&path, "# comment\nGOOD=ok\nno_equals_sign\n=missing_key\nBAD KEY=x\nFOO=bar\n")
-            .expect("write");
+        std::fs::write(
+            &path,
+            "# comment\nGOOD=ok\nno_equals_sign\n=missing_key\nBAD KEY=x\nFOO=bar\n",
+        )
+        .expect("write");
 
         let got = read(&path).expect("read");
         assert_eq!(got.get("GOOD").map(String::as_str), Some("ok"));

@@ -73,8 +73,7 @@ impl SlackChannel {
         Self {
             bot_token: bot_token.into(),
             app_token,
-            api_base: api_base
-                .unwrap_or_else(|| SLACK_API_BASE.to_owned()),
+            api_base: api_base.unwrap_or_else(|| SLACK_API_BASE.to_owned()),
             client: crate::config::build_proxy_client()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -135,11 +134,11 @@ impl SlackChannel {
     }
 
     /// Upload a file or image via Slack's V2 external upload flow:
-    ///   1. POST `files.getUploadURLExternal` (form: filename, length) →
-    ///      `{ ok, upload_url, file_id }`
+    ///   1. POST `files.getUploadURLExternal` (form: filename, length) → `{ ok,
+    ///      upload_url, file_id }`
     ///   2. POST raw bytes to `upload_url` (no auth, content-type from mime)
-    ///   3. POST `files.completeUploadExternal` (json: files, channel_id) →
-    ///      `{ ok, files }`
+    ///   3. POST `files.completeUploadExternal` (json: files, channel_id) → `{
+    ///      ok, files }`
     /// V1 `files.upload` was disabled in March 2025 with
     /// `{"ok":false,"error":"method_deprecated"}`.
     async fn upload_v2(
@@ -159,10 +158,7 @@ impl SlackChannel {
             .send()
             .await
             .context("getUploadURLExternal request")?;
-        let body1: Value = step1
-            .json()
-            .await
-            .context("getUploadURLExternal parse")?;
+        let body1: Value = step1.json().await.context("getUploadURLExternal parse")?;
         if body1.get("ok").and_then(|v| v.as_bool()) != Some(true) {
             bail!(
                 "getUploadURLExternal: {}",
@@ -217,10 +213,7 @@ impl SlackChannel {
             .send()
             .await
             .context("completeUploadExternal request")?;
-        let body3: Value = step3
-            .json()
-            .await
-            .context("completeUploadExternal parse")?;
+        let body3: Value = step3.json().await.context("completeUploadExternal parse")?;
         if body3.get("ok").and_then(|v| v.as_bool()) != Some(true) {
             bail!(
                 "completeUploadExternal: {}",
@@ -277,8 +270,17 @@ impl SlackChannel {
         loop {
             let msg = match tokio::time::timeout(WS_IDLE_TIMEOUT, read.next()).await {
                 Ok(Some(msg)) => msg,
-                Ok(None) => { info!("Slack: WS stream ended"); break; }
-                Err(_) => { warn!("Slack: WS idle timeout ({}s), reconnecting", WS_IDLE_TIMEOUT.as_secs()); bail!("Slack: idle timeout"); }
+                Ok(None) => {
+                    info!("Slack: WS stream ended");
+                    break;
+                }
+                Err(_) => {
+                    warn!(
+                        "Slack: WS idle timeout ({}s), reconnecting",
+                        WS_IDLE_TIMEOUT.as_secs()
+                    );
+                    bail!("Slack: idle timeout");
+                }
             };
             let raw = match msg {
                 Ok(WsMessage::Text(s)) => s.to_string(),
@@ -331,8 +333,7 @@ impl SlackChannel {
                         // Slack marks bot-sent messages with either a
                         // `bot_id` field or a `subtype == "bot_message"`.
                         let is_bot_msg = event.get("bot_id").is_some()
-                            || event.get("subtype").and_then(|v| v.as_str())
-                                == Some("bot_message");
+                            || event.get("subtype").and_then(|v| v.as_str()) == Some("bot_message");
                         if is_bot_msg {
                             info!("Slack: skipping bot's own message");
                             continue;
@@ -346,7 +347,11 @@ impl SlackChannel {
                         // can't actually type, hence \help works as the
                         // discovery escape hatch).
                         if let Some(rest) = text.strip_prefix('\\') {
-                            if rest.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) {
+                            if rest
+                                .chars()
+                                .next()
+                                .is_some_and(|c| c.is_ascii_alphanumeric())
+                            {
                                 text = format!("/{rest}");
                             }
                         }
@@ -362,17 +367,23 @@ impl SlackChannel {
                         // files go into `file_attachments` for the same
                         // reason. Audio/video still get inline-transcribed.
                         let mut images: Vec<crate::agent::registry::ImageAttachment> = Vec::new();
-                        let mut file_attachments: Vec<crate::agent::registry::FileAttachment> = Vec::new();
+                        let mut file_attachments: Vec<crate::agent::registry::FileAttachment> =
+                            Vec::new();
                         if let Some(files) = event["files"].as_array() {
                             for file in files {
                                 let url = file["url_private_download"].as_str().unwrap_or("");
                                 let filename = file["name"].as_str().unwrap_or("file");
                                 let mimetype = file["mimetype"].as_str().unwrap_or("");
-                                if url.is_empty() { continue; }
+                                if url.is_empty() {
+                                    continue;
+                                }
 
-                                let download = self.client.get(url)
+                                let download = self
+                                    .client
+                                    .get(url)
                                     .bearer_auth(&self.bot_token)
-                                    .send().await;
+                                    .send()
+                                    .await;
                                 let bytes = match download {
                                     Ok(resp) if resp.status().is_success() => {
                                         resp.bytes().await.ok().map(|b| b.to_vec())
@@ -381,24 +392,45 @@ impl SlackChannel {
                                 };
 
                                 if let Some(bytes) = bytes {
-                                    if mimetype.starts_with("audio/") || mimetype.starts_with("video/") {
+                                    if mimetype.starts_with("audio/")
+                                        || mimetype.starts_with("video/")
+                                    {
                                         match crate::channel::transcription::transcribe_audio(
-                                            &self.client, &bytes, filename, mimetype,
-                                        ).await {
+                                            &self.client,
+                                            &bytes,
+                                            filename,
+                                            mimetype,
+                                        )
+                                        .await
+                                        {
                                             Ok(t) => {
-                                                info!("Slack: file transcribed ({} chars)", t.len());
-                                                if !text.is_empty() { text.push('\n'); }
+                                                info!(
+                                                    "Slack: file transcribed ({} chars)",
+                                                    t.len()
+                                                );
+                                                if !text.is_empty() {
+                                                    text.push('\n');
+                                                }
                                                 text.push_str(&t);
                                             }
                                             Err(_) => {
-                                                if !text.is_empty() { text.push('\n'); }
-                                                text.push_str(&format!("[{mimetype} file: {filename}]"));
+                                                if !text.is_empty() {
+                                                    text.push('\n');
+                                                }
+                                                text.push_str(&format!(
+                                                    "[{mimetype} file: {filename}]"
+                                                ));
                                             }
                                         }
                                     } else if mimetype.starts_with("image/") {
                                         use base64::Engine as _;
-                                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                                        let mime = if mimetype.is_empty() { "image/png" } else { mimetype };
+                                        let b64 = base64::engine::general_purpose::STANDARD
+                                            .encode(&bytes);
+                                        let mime = if mimetype.is_empty() {
+                                            "image/png"
+                                        } else {
+                                            mimetype
+                                        };
                                         images.push(crate::agent::registry::ImageAttachment {
                                             data: format!("data:{mime};base64,{b64}"),
                                             mime_type: mime.to_owned(),
@@ -406,26 +438,36 @@ impl SlackChannel {
                                         info!(size = bytes.len(), %filename, "Slack: image forwarded for vision");
                                     } else {
                                         let processed = slack_process_file(filename, &bytes);
-                                        file_attachments.push(crate::agent::registry::FileAttachment {
-                                            filename: filename.to_owned(),
-                                            data: bytes.clone(),
-                                            mime_type: if mimetype.is_empty() {
-                                                "application/octet-stream".to_owned()
-                                            } else {
-                                                mimetype.to_owned()
+                                        file_attachments.push(
+                                            crate::agent::registry::FileAttachment {
+                                                filename: filename.to_owned(),
+                                                data: bytes.clone(),
+                                                mime_type: if mimetype.is_empty() {
+                                                    "application/octet-stream".to_owned()
+                                                } else {
+                                                    mimetype.to_owned()
+                                                },
                                             },
-                                        });
-                                        if !text.is_empty() { text.push('\n'); }
+                                        );
+                                        if !text.is_empty() {
+                                            text.push('\n');
+                                        }
                                         text.push_str(&processed);
                                     }
                                 } else {
-                                    if !text.is_empty() { text.push('\n'); }
+                                    if !text.is_empty() {
+                                        text.push('\n');
+                                    }
                                     text.push_str(&format!("[file download failed: {filename}]"));
                                 }
                             }
                         }
 
-                        if !user.is_empty() && (!text.is_empty() || !images.is_empty() || !file_attachments.is_empty()) {
+                        if !user.is_empty()
+                            && (!text.is_empty()
+                                || !images.is_empty()
+                                || !file_attachments.is_empty())
+                        {
                             info!(
                                 user = %user,
                                 channel = %channel,
@@ -435,7 +477,14 @@ impl SlackChannel {
                                 files = file_attachments.len(),
                                 "Slack: dispatching message"
                             );
-                            (self.on_message)(user, text, channel, is_channel, images, file_attachments);
+                            (self.on_message)(
+                                user,
+                                text,
+                                channel,
+                                is_channel,
+                                images,
+                                file_attachments,
+                            );
                         } else {
                             warn!(
                                 user_empty = user.is_empty(),
@@ -520,8 +569,8 @@ impl Channel for SlackChannel {
                     continue;
                 }
 
-                let (mime, b64) = parse_data_url(image_data)
-                    .unwrap_or(("image/png", image_data.as_str()));
+                let (mime, b64) =
+                    parse_data_url(image_data).unwrap_or(("image/png", image_data.as_str()));
                 use base64::Engine;
                 let bytes = match base64::engine::general_purpose::STANDARD.decode(b64) {
                     Ok(b) if !b.is_empty() => b,
@@ -612,8 +661,8 @@ impl Channel for SlackChannel {
 
 fn slack_is_text_file(name: &str) -> bool {
     let exts = [
-        ".txt", ".md", ".csv", ".json", ".toml", ".yaml", ".yml", ".xml", ".html",
-        ".rs", ".py", ".js", ".ts", ".go", ".sh", ".log", ".conf", ".cfg", ".c", ".h", ".java",
+        ".txt", ".md", ".csv", ".json", ".toml", ".yaml", ".yml", ".xml", ".html", ".rs", ".py",
+        ".js", ".ts", ".go", ".sh", ".log", ".conf", ".cfg", ".c", ".h", ".java",
     ];
     exts.iter().any(|e| name.ends_with(e))
 }
@@ -622,7 +671,10 @@ fn slack_process_file(filename: &str, bytes: &[u8]) -> String {
     let lower = filename.to_lowercase();
     if lower.ends_with(".pdf") {
         if let Ok(text) = crate::agent::doc::safe_extract_pdf_from_mem(bytes) {
-            return format!("[PDF: {filename}]\n{}", crate::util::truncate_str(&text, 20000));
+            return format!(
+                "[PDF: {filename}]\n{}",
+                crate::util::truncate_str(&text, 20000)
+            );
         }
         // Fallback to pdftotext CLI
         let tmp = std::env::temp_dir().join(format!("rsclaw_slack_{filename}"));
@@ -634,7 +686,10 @@ fn slack_process_file(filename: &str, bytes: &[u8]) -> String {
             if let Ok(o) = output {
                 if o.status.success() {
                     let text = String::from_utf8_lossy(&o.stdout);
-                    return format!("[PDF: {filename}]\n{}", crate::util::truncate_str(&text, 20000));
+                    return format!(
+                        "[PDF: {filename}]\n{}",
+                        crate::util::truncate_str(&text, 20000)
+                    );
                 }
             }
             format!("[PDF: {filename} ({} bytes)]", bytes.len())
@@ -643,25 +698,43 @@ fn slack_process_file(filename: &str, bytes: &[u8]) -> String {
         }
     } else if lower.ends_with(".docx") || lower.ends_with(".xlsx") || lower.ends_with(".pptx") {
         if let Some(text) = crate::channel::extract_office_text(filename, bytes) {
-            let label = if lower.ends_with(".docx") { "Word" }
-                else if lower.ends_with(".xlsx") { "Excel" }
-                else { "PowerPoint" };
-            format!("[{label}: {filename}]\n{}", crate::util::truncate_str(&text, 20000))
+            let label = if lower.ends_with(".docx") {
+                "Word"
+            } else if lower.ends_with(".xlsx") {
+                "Excel"
+            } else {
+                "PowerPoint"
+            };
+            format!(
+                "[{label}: {filename}]\n{}",
+                crate::util::truncate_str(&text, 20000)
+            )
         } else {
-            let label = if lower.ends_with(".docx") { "Word" }
-                else if lower.ends_with(".xlsx") { "Excel" }
-                else { "PowerPoint" };
+            let label = if lower.ends_with(".docx") {
+                "Word"
+            } else if lower.ends_with(".xlsx") {
+                "Excel"
+            } else {
+                "PowerPoint"
+            };
             format!("[{label} file: {filename} ({} bytes)]", bytes.len())
         }
     } else if slack_is_text_file(&lower) {
         let text = String::from_utf8_lossy(bytes);
-        format!("[File: {filename}]\n```\n{}\n```", crate::util::truncate_str(&text, 20000))
+        format!(
+            "[File: {filename}]\n```\n{}\n```",
+            crate::util::truncate_str(&text, 20000)
+        )
     } else {
         let ws = crate::config::loader::base_dir().join("workspace/uploads");
         let _ = std::fs::create_dir_all(&ws);
         let dest = ws.join(filename);
         let _ = std::fs::write(&dest, bytes);
-        format!("[File saved: {filename} ({} bytes) at {}]", bytes.len(), dest.display())
+        format!(
+            "[File saved: {filename} ({} bytes) at {}]",
+            bytes.len(),
+            dest.display()
+        )
     }
 }
 

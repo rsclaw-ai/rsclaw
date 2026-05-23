@@ -26,7 +26,11 @@ pub async fn memory_search(ctx: MethodCtx) -> MethodResult {
     let model_dir = {
         let zh = base.join("models/bge-small-zh");
         let en = base.join("models/bge-small-en");
-        if zh.join("config.json").exists() { zh } else { en }
+        if zh.join("config.json").exists() {
+            zh
+        } else {
+            en
+        }
     };
     let tier = crate::sys::detect_memory_tier();
     let search_cfg = load_search_cfg();
@@ -82,7 +86,11 @@ pub async fn memory_store(ctx: MethodCtx) -> MethodResult {
     let model_dir = {
         let zh = base.join("models/bge-small-zh");
         let en = base.join("models/bge-small-en");
-        if zh.join("config.json").exists() { zh } else { en }
+        if zh.join("config.json").exists() {
+            zh
+        } else {
+            en
+        }
     };
     let tier = crate::sys::detect_memory_tier();
     let search_cfg = load_search_cfg();
@@ -109,7 +117,7 @@ pub async fn memory_store(ctx: MethodCtx) -> MethodResult {
         abstract_text: None,
         overview_text: None,
         tags: vec![],
-                pinned: false,
+        pinned: false,
     };
     mem.add(doc)
         .await
@@ -124,7 +132,11 @@ pub async fn memory_status(_ctx: MethodCtx) -> MethodResult {
     let model_dir = {
         let zh = base.join("models/bge-small-zh");
         let en = base.join("models/bge-small-en");
-        if zh.join("config.json").exists() { zh } else { en }
+        if zh.join("config.json").exists() {
+            zh
+        } else {
+            en
+        }
     };
     let tier = crate::sys::detect_memory_tier();
     let search_cfg = load_search_cfg();

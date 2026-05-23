@@ -62,10 +62,7 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
             if user_specified_key && api_key.as_deref().is_none_or(str::is_empty) {
                 let hint = match &unresolved_placeholder {
                     Some(s) if s.contains("${") => {
-                        let var_name = s
-                            .trim_start_matches("${")
-                            .trim_end_matches('}')
-                            .to_owned();
+                        let var_name = s.trim_start_matches("${").trim_end_matches('}').to_owned();
                         format!(
                             "set {var_name} in your shell (then `rsclaw env sync`) \
                              or edit {}/.env directly",
@@ -98,9 +95,9 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                     "zhipu" => Some("https://open.bigmodel.cn/api/paas/v4".to_owned()),
                     "minimax" => Some("https://api.minimaxi.com/v1".to_owned()),
                     "siliconflow" => Some("https://api.siliconflow.cn/v1".to_owned()),
-                    "groq"        => Some("https://api.groq.com/openai/v1".to_owned()),
-                    "openrouter"  => Some("https://openrouter.ai/api/v1".to_owned()),
-                    "gaterouter"  => Some("https://api.gaterouter.ai/openai/v1".to_owned()),
+                    "groq" => Some("https://api.groq.com/openai/v1".to_owned()),
+                    "openrouter" => Some("https://openrouter.ai/api/v1".to_owned()),
+                    "gaterouter" => Some("https://api.gaterouter.ai/openai/v1".to_owned()),
                     "grok" | "xai" => Some("https://api.x.ai/v1".to_owned()),
                     _ => None,
                 }
@@ -172,9 +169,8 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                         .or_else(|| std::env::var("RSCLAW_KEY").ok())
                         .or_else(|| std::env::var("RSCLAW_SERVER_KEY").ok())
                         .filter(|s| !s.is_empty());
-                    let url = base_url.unwrap_or_else(|| {
-                        crate::provider::rsclaw::RSCLAW_DEFAULT_BASE.to_owned()
-                    });
+                    let url = base_url
+                        .unwrap_or_else(|| crate::provider::rsclaw::RSCLAW_DEFAULT_BASE.to_owned());
                     let provider = crate::provider::rsclaw::RsclawProvider::new(url, key);
                     let provider = match provider_cfg.prefix_id.clone() {
                         Some(pid) => provider.with_prefix_id(pid),
@@ -430,9 +426,7 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
 /// rest. See the rsclaw block above for the concrete short-circuit
 /// scenario this prevents.
 fn nonempty_env(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .filter(|s| !s.trim().is_empty())
+    std::env::var(name).ok().filter(|s| !s.trim().is_empty())
 }
 
 #[cfg(test)]

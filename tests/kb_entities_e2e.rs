@@ -1,15 +1,18 @@
 //! Entity extraction e2e: ingest a doc with URLs/emails/hashtags →
 //! worker drains → kb_search_entities returns the extracted mentions.
 
-use anyhow::Result;
-use rsclaw::kb::entities::extract::canonical_id;
-use rsclaw::kb::model::EntityKind;
-use rsclaw::kb::sync::{KbSourceSyncer, ManualUploadSyncer, SyncContext, SyncReason};
-use rsclaw::kb::tools::{kb_search, kb_search_entities};
-use rsclaw::kb::worker::{DefaultDispatcher, HandlerCtx, WorkerConfig, WorkerPool};
-use rsclaw::kb::{CallerScope, KbEmbedder, KbIndex, KbPaths, KbStore, StubEmbedder};
-use rsclaw::kb::search::SearchCtx;
 use std::sync::Arc;
+
+use anyhow::Result;
+use rsclaw::kb::{
+    CallerScope, KbEmbedder, KbIndex, KbPaths, KbStore, StubEmbedder,
+    entities::extract::canonical_id,
+    model::EntityKind,
+    search::SearchCtx,
+    sync::{KbSourceSyncer, ManualUploadSyncer, SyncContext, SyncReason},
+    tools::{kb_search, kb_search_entities},
+    worker::{DefaultDispatcher, HandlerCtx, WorkerConfig, WorkerPool},
+};
 use tempfile::TempDir;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -49,7 +52,12 @@ async fn entities_extracted_and_queryable() -> Result<()> {
     };
     WorkerPool::run_one_blocking(&hctx, &WorkerConfig::default(), &DefaultDispatcher)?;
 
-    let ctx = SearchCtx { store, index, paths, embedder };
+    let ctx = SearchCtx {
+        store,
+        index,
+        paths,
+        embedder,
+    };
     let url_hits = kb_search_entities::run(
         &ctx,
         kb_search_entities::KbSearchEntitiesInput {
@@ -60,7 +68,10 @@ async fn entities_extracted_and_queryable() -> Result<()> {
         &CallerScope::default(),
     )?;
     assert!(
-        url_hits.matches.iter().any(|m| m.aliases.iter().any(|s| s.contains("example.com"))),
+        url_hits
+            .matches
+            .iter()
+            .any(|m| m.aliases.iter().any(|s| s.contains("example.com"))),
         "expected URL entity, got: {:?}",
         url_hits.matches
     );
@@ -159,7 +170,12 @@ async fn require_entities_filters_to_chunks_with_mention() -> Result<()> {
         WorkerPool::run_one_blocking(&hctx, &WorkerConfig::default(), &DefaultDispatcher)?;
     }
 
-    let ctx = SearchCtx { store, index, paths, embedder };
+    let ctx = SearchCtx {
+        store,
+        index,
+        paths,
+        embedder,
+    };
     let alice_id = canonical_id(EntityKind::Person, "alice");
 
     // Baseline: no require_entities → both docs match "project".
@@ -177,9 +193,15 @@ async fn require_entities_filters_to_chunks_with_mention() -> Result<()> {
         },
         &CallerScope::default(),
     )?;
-    let baseline_docs: std::collections::HashSet<String> =
-        baseline.results.iter().map(|h| h.doc_title.clone()).collect();
-    assert!(baseline_docs.len() >= 2, "expected ≥2 docs in baseline, got {baseline_docs:?}");
+    let baseline_docs: std::collections::HashSet<String> = baseline
+        .results
+        .iter()
+        .map(|h| h.doc_title.clone())
+        .collect();
+    assert!(
+        baseline_docs.len() >= 2,
+        "expected ≥2 docs in baseline, got {baseline_docs:?}"
+    );
 
     // With require_entities=alice → only doc A matches.
     let filtered = kb_search::run(

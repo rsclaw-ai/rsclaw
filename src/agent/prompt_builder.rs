@@ -5,9 +5,10 @@
 use std::sync::LazyLock;
 
 use super::workspace::WorkspaceContext;
-use crate::plugin::PluginRegistry;
-use crate::plugin::wasm_runtime::WasmPlugin;
-use crate::skill::SkillRegistry;
+use crate::{
+    plugin::{PluginRegistry, wasm_runtime::WasmPlugin},
+    skill::SkillRegistry,
+};
 
 /// Cached output of [`build_shared_system_prefix`]. The shared prefix is
 /// byte-stable across the gateway lifetime (no dynamic inputs — only
@@ -20,8 +21,8 @@ static SHARED_SYSTEM_PREFIX: LazyLock<String> = LazyLock::new(build_shared_syste
 /// Read-only commands that are always allowed for any agent (regardless of
 /// allowedCommands).
 pub(crate) const READONLY_COMMANDS: &[&str] = &[
-    "/help", "/version", "/status", "/health", "/uptime", "/models", "/btw", "/clear",
-    "/compact", "/history", "/cron", "/abort", "/loop", "/task",
+    "/help", "/version", "/status", "/health", "/uptime", "/models", "/btw", "/clear", "/compact",
+    "/history", "/cron", "/abort", "/loop", "/task",
 ];
 
 /// Format a Duration as human-readable string.
@@ -47,89 +48,261 @@ pub(crate) fn build_help_text_filtered(allowed: &str, lang: &str) -> String {
     let full = allowed == "*";
     let zh = lang == "zh";
     let has = |cmd: &str| -> bool {
-        if full { return true; }
+        if full {
+            return true;
+        }
         READONLY_COMMANDS.iter().any(|c| *c == cmd) || allowed.split('|').any(|a| a.trim() == cmd)
     };
 
-    let mut h = String::from(if zh { "可用命令：\n\n" } else { "Available commands:\n\n" });
+    let mut h = String::from(if zh {
+        "可用命令：\n\n"
+    } else {
+        "Available commands:\n\n"
+    });
 
     if has("/run") || has("/find") || has("/grep") {
         h.push_str(if zh { "终端：\n" } else { "Shell:\n" });
         if has("/run") {
             h.push_str(if zh { "  /run <命令>       执行终端命令\n  $ <命令>           执行终端命令（快捷方式）\n" } else { "  /run <cmd>        Execute a shell command\n  $ <cmd>           Execute a shell command (shortcut)\n" });
         }
-        if has("/find") { h.push_str(if zh { "  /find <模式>      按名称查找文件\n" } else { "  /find <pattern>   Find files by name\n" }); }
-        if has("/grep") { h.push_str(if zh { "  /grep <模式>      搜索文件内容\n" } else { "  /grep <pattern>   Search file contents\n" }); }
+        if has("/find") {
+            h.push_str(if zh {
+                "  /find <模式>      按名称查找文件\n"
+            } else {
+                "  /find <pattern>   Find files by name\n"
+            });
+        }
+        if has("/grep") {
+            h.push_str(if zh {
+                "  /grep <模式>      搜索文件内容\n"
+            } else {
+                "  /grep <pattern>   Search file contents\n"
+            });
+        }
         h.push('\n');
     }
 
     if has("/read") || has("/write") || has("/ls") {
         h.push_str(if zh { "文件：\n" } else { "Files:\n" });
-        if has("/read") { h.push_str(if zh { "  /read <路径>      读取文件\n" } else { "  /read <path>      Read a file\n" }); }
-        if has("/write") { h.push_str(if zh { "  /write <路径> <内容>  写入文件\n" } else { "  /write <path> <content>  Write to a file\n" }); }
-        if has("/ls") { h.push_str(if zh { "  /ls [路径]        列出目录\n" } else { "  /ls [path]        List directory\n" }); }
+        if has("/read") {
+            h.push_str(if zh {
+                "  /read <路径>      读取文件\n"
+            } else {
+                "  /read <path>      Read a file\n"
+            });
+        }
+        if has("/write") {
+            h.push_str(if zh {
+                "  /write <路径> <内容>  写入文件\n"
+            } else {
+                "  /write <path> <content>  Write to a file\n"
+            });
+        }
+        if has("/ls") {
+            h.push_str(if zh {
+                "  /ls [路径]        列出目录\n"
+            } else {
+                "  /ls [path]        List directory\n"
+            });
+        }
         h.push('\n');
     }
 
     if has("/search") || has("/fetch") || has("/screenshot") || has("/ss") {
-        h.push_str(if zh { "搜索与网页：\n" } else { "Search & Web:\n" });
-        if has("/search") { h.push_str(if zh { "  /search <关键词>  搜索网页\n" } else { "  /search <query>   Search the web\n" }); }
-        if has("/fetch") { h.push_str(if zh { "  /fetch <网址>     抓取网页内容\n" } else { "  /fetch <url>      Fetch a web page\n" }); }
-        if has("/screenshot") { h.push_str(if zh { "  /screenshot <网址> 网页截图\n" } else { "  /screenshot <url> Screenshot a web page\n" }); }
-        if has("/ss") { h.push_str(if zh { "  /ss               桌面截图\n" } else { "  /ss               Screenshot desktop\n" }); }
+        h.push_str(if zh {
+            "搜索与网页：\n"
+        } else {
+            "Search & Web:\n"
+        });
+        if has("/search") {
+            h.push_str(if zh {
+                "  /search <关键词>  搜索网页\n"
+            } else {
+                "  /search <query>   Search the web\n"
+            });
+        }
+        if has("/fetch") {
+            h.push_str(if zh {
+                "  /fetch <网址>     抓取网页内容\n"
+            } else {
+                "  /fetch <url>      Fetch a web page\n"
+            });
+        }
+        if has("/screenshot") {
+            h.push_str(if zh {
+                "  /screenshot <网址> 网页截图\n"
+            } else {
+                "  /screenshot <url> Screenshot a web page\n"
+            });
+        }
+        if has("/ss") {
+            h.push_str(if zh {
+                "  /ss               桌面截图\n"
+            } else {
+                "  /ss               Screenshot desktop\n"
+            });
+        }
         h.push('\n');
     }
 
     if has("/remember") || has("/recall") {
         h.push_str(if zh { "记忆：\n" } else { "Memory:\n" });
-        if has("/remember") { h.push_str(if zh { "  /remember <文本>  保存到记忆\n" } else { "  /remember <text>  Save to memory\n" }); }
-        if has("/recall") { h.push_str(if zh { "  /recall <关键词>  搜索记忆\n" } else { "  /recall <query>   Search memory\n" }); }
+        if has("/remember") {
+            h.push_str(if zh {
+                "  /remember <文本>  保存到记忆\n"
+            } else {
+                "  /remember <text>  Save to memory\n"
+            });
+        }
+        if has("/recall") {
+            h.push_str(if zh {
+                "  /recall <关键词>  搜索记忆\n"
+            } else {
+                "  /recall <query>   Search memory\n"
+            });
+        }
         h.push('\n');
     }
 
-    h.push_str(if zh { "快速提问：\n" } else { "Side Query:\n" });
-    h.push_str(if zh { "  /btw <问题>              快速查询（不调用工具，旁路）\n" } else { "  /btw <question>          Quick query (no tools, ephemeral, bypass)\n" });
+    h.push_str(if zh {
+        "快速提问：\n"
+    } else {
+        "Side Query:\n"
+    });
+    h.push_str(if zh {
+        "  /btw <问题>              快速查询（不调用工具，旁路）\n"
+    } else {
+        "  /btw <question>          Quick query (no tools, ephemeral, bypass)\n"
+    });
     h.push('\n');
 
     if full {
-        h.push_str(if zh { "工具（聚合）：\n" } else { "Tools (consolidated):\n" });
-        h.push_str(if zh { "  memory   搜索/获取/保存/删除长期记忆\n" } else { "  memory   search/get/put/delete long-term memory\n" });
-        h.push_str(if zh { "  session  发送/列表/历史/状态\n" } else { "  session  send/list/history/status for sessions\n" });
-        h.push_str(if zh { "  agent    创建/任务/列表/终止子智能体\n" } else { "  agent    spawn/task/list/kill sub-agents\n" });
-        h.push_str(if zh { "  channel  发送/回复/置顶/删除跨渠道消息\n" } else { "  channel  send/reply/pin/delete across channels\n" });
+        h.push_str(if zh {
+            "工具（聚合）：\n"
+        } else {
+            "Tools (consolidated):\n"
+        });
+        h.push_str(if zh {
+            "  memory   搜索/获取/保存/删除长期记忆\n"
+        } else {
+            "  memory   search/get/put/delete long-term memory\n"
+        });
+        h.push_str(if zh {
+            "  session  发送/列表/历史/状态\n"
+        } else {
+            "  session  send/list/history/status for sessions\n"
+        });
+        h.push_str(if zh {
+            "  agent    创建/任务/列表/终止子智能体\n"
+        } else {
+            "  agent    spawn/task/list/kill sub-agents\n"
+        });
+        h.push_str(if zh {
+            "  channel  发送/回复/置顶/删除跨渠道消息\n"
+        } else {
+            "  channel  send/reply/pin/delete across channels\n"
+        });
         h.push('\n');
     }
 
     h.push_str(if zh { "系统：\n" } else { "System:\n" });
-    h.push_str(if zh { "  /status           网关状态\n" } else { "  /status           Gateway status\n" });
-    h.push_str(if zh { "  /version          查看版本\n" } else { "  /version          Show version\n" });
-    h.push_str(if zh { "  /models           列出模型\n" } else { "  /models           List models\n" });
-    if has("/model") { h.push_str(if zh { "  /model <名称>     切换模型\n" } else { "  /model <name>     Switch model\n" }); }
-    h.push_str(if zh { "  /uptime           查看运行时长\n" } else { "  /uptime           Show uptime\n" });
+    h.push_str(if zh {
+        "  /status           网关状态\n"
+    } else {
+        "  /status           Gateway status\n"
+    });
+    h.push_str(if zh {
+        "  /version          查看版本\n"
+    } else {
+        "  /version          Show version\n"
+    });
+    h.push_str(if zh {
+        "  /models           列出模型\n"
+    } else {
+        "  /models           List models\n"
+    });
+    if has("/model") {
+        h.push_str(if zh {
+            "  /model <名称>     切换模型\n"
+        } else {
+            "  /model <name>     Switch model\n"
+        });
+    }
+    h.push_str(if zh {
+        "  /uptime           查看运行时长\n"
+    } else {
+        "  /uptime           Show uptime\n"
+    });
     h.push('\n');
 
     h.push_str(if zh { "会话：\n" } else { "Session:\n" });
-    h.push_str(if zh { "  /clear            清除会话\n" } else { "  /clear            Clear session\n" });
-    h.push_str(if zh { "  /compact          压缩会话并保存记忆\n" } else { "  /compact          Compact session & save to memory\n" });
-    h.push_str(if zh { "  /abort            终止当前任务\n" } else { "  /abort            Abort running task\n" });
-    h.push_str(if zh { "  /voice            语音回复模式\n" } else { "  /voice            Voice reply mode\n" });
-    h.push_str(if zh { "  /text             文字回复模式\n" } else { "  /text             Text reply mode\n" });
-    h.push_str(if zh { "  /history [n]      查看历史\n" } else { "  /history [n]      Show history\n" });
-    if has("/sessions") { h.push_str(if zh { "  /sessions         列出会话\n" } else { "  /sessions         List sessions\n" }); }
+    h.push_str(if zh {
+        "  /clear            清除会话\n"
+    } else {
+        "  /clear            Clear session\n"
+    });
+    h.push_str(if zh {
+        "  /compact          压缩会话并保存记忆\n"
+    } else {
+        "  /compact          Compact session & save to memory\n"
+    });
+    h.push_str(if zh {
+        "  /abort            终止当前任务\n"
+    } else {
+        "  /abort            Abort running task\n"
+    });
+    h.push_str(if zh {
+        "  /voice            语音回复模式\n"
+    } else {
+        "  /voice            Voice reply mode\n"
+    });
+    h.push_str(if zh {
+        "  /text             文字回复模式\n"
+    } else {
+        "  /text             Text reply mode\n"
+    });
+    h.push_str(if zh {
+        "  /history [n]      查看历史\n"
+    } else {
+        "  /history [n]      Show history\n"
+    });
+    if has("/sessions") {
+        h.push_str(if zh {
+            "  /sessions         列出会话\n"
+        } else {
+            "  /sessions         List sessions\n"
+        });
+    }
     h.push('\n');
 
     h.push_str(if zh { "定时任务：\n" } else { "Cron:\n" });
-    h.push_str(if zh { "  /cron list        列出定时任务\n" } else { "  /cron list        List cron jobs\n" });
-    h.push_str(if zh { "  /loop <间隔> <提示词>  循环执行（如 /loop 5m 检查邮件）\n" } else { "  /loop <interval> <prompt>  Recurring task (e.g. /loop 5m check mail)\n" });
+    h.push_str(if zh {
+        "  /cron list        列出定时任务\n"
+    } else {
+        "  /cron list        List cron jobs\n"
+    });
+    h.push_str(if zh {
+        "  /loop <间隔> <提示词>  循环执行（如 /loop 5m 检查邮件）\n"
+    } else {
+        "  /loop <interval> <prompt>  Recurring task (e.g. /loop 5m check mail)\n"
+    });
     h.push('\n');
 
-    h.push_str(if zh { "任务模式：\n" } else { "Task mode:\n" });
+    h.push_str(if zh {
+        "任务模式：\n"
+    } else {
+        "Task mode:\n"
+    });
     h.push_str(if zh { "  /task <描述>             多轮执行任务\n  /task -n <N> -t <时长> <描述>  指定轮数和超时\n  /task -h                 查看 /task 完整帮助\n" } else { "  /task <desc>              Run a multi-turn task\n  /task -n <N> -t <dur> <desc>  Specify max turns and timeout\n  /task -h                  Full /task help\n" });
     h.push('\n');
 
     if has("/send") {
         h.push_str(if zh { "消息：\n" } else { "Messaging:\n" });
-        h.push_str(if zh { "  /send <目标> <消息>  发送消息\n" } else { "  /send <target> <msg>  Send a message\n" });
+        h.push_str(if zh {
+            "  /send <目标> <消息>  发送消息\n"
+        } else {
+            "  /send <target> <msg>  Send a message\n"
+        });
         h.push('\n');
     }
 
@@ -140,7 +313,11 @@ pub(crate) fn build_help_text_filtered(allowed: &str, lang: &str) -> String {
     }
 
     if full {
-        h.push_str(if zh { "上传限制：\n" } else { "Upload & Limits:\n" });
+        h.push_str(if zh {
+            "上传限制：\n"
+        } else {
+            "Upload & Limits:\n"
+        });
         h.push_str(if zh {
             "  /get_upload_size           查看上传大小限制\n  /set_upload_size <MB>      设置大小限制\n  /get_upload_chars          查看文本字符限制\n  /set_upload_chars <N>      设置字符限制\n  /config_upload_size <MB>   持久化大小限制\n  /config_upload_chars <N>   持久化字符限制\n"
         } else {
@@ -149,7 +326,11 @@ pub(crate) fn build_help_text_filtered(allowed: &str, lang: &str) -> String {
         h.push('\n');
     }
 
-    h.push_str(if zh { "直接输入消息即可与AI对话。" } else { "Type any message without / to chat with the AI agent." });
+    h.push_str(if zh {
+        "直接输入消息即可与AI对话。"
+    } else {
+        "Type any message without / to chat with the AI agent."
+    });
     h
 }
 
@@ -197,10 +378,10 @@ pub(crate) fn build_date_context() -> String {
 /// Contains:
 /// - `<agent_loop>` (anti-hallucination + voice rules)
 /// - `[Output format rules]` + `[Data integrity rules]`
-/// - `## Tool Usage Guidelines` (file ops, completion discipline,
-///   delegation, GUI/desktop automation)
-/// - Tool guidance prompts from `EN_TOOL_*` constants (exec,
-///   web_search, web_fetch, web_browser, computer_use)
+/// - `## Tool Usage Guidelines` (file ops, completion discipline, delegation,
+///   GUI/desktop automation)
+/// - Tool guidance prompts from `EN_TOOL_*` constants (exec, web_search,
+///   web_fetch, web_browser, computer_use)
 /// - `## Self-Evolution & Skill Autonomy`
 ///
 /// Everything that varies per machine (platform info, language,
@@ -383,6 +564,7 @@ fn build_shared_system_prefix_uncached() -> String {
          - Save corrected/complete info to memory immediately so it survives compaction.\n\
          - Knowledge base: when the user asks about THEIR own material (uploaded docs, PDFs, URLs, files), use `knowledge_base` to search it and CITE the returned source_title. Prefer it over `web_search` for the user's material; if it returns nothing, say so — never fabricate a citation. (`memory` = what you learned; `knowledge_base` = the user's authoritative corpus.)\n\
          - Skills: prefer an installed skill (see '## Installed Skills') via `skill_use` over raw web/shell. If none matches and web tools can't solve it, `skill_search` for one (restaurants→meituan, stock/finance→hithink, etc.), `skill_install` it, then `skill_use`. `skill_list` shows what's installed; `skill_remove` uninstalls.\n\
+         - Plugins: installed plugins are accessed only through `plugin.info`, `plugin.search_tools`, `plugin.describe_tool`, and `plugin.invoke`. Never invent other `plugin.*` tool names. When the user explicitly asks for a plugin or names an installed plugin domain, use `plugin.info` or `plugin.search_tools` before `skill_list`.\n\
          \n\
          ### GUI / Desktop Automation (computer_use)\n\
          For any GUI or desktop automation task (WeChat, Finder, Safari, etc.):\n\
@@ -542,7 +724,9 @@ pub fn build_user_system(
 
     // ## Installed Plugins — rendered via the existing helper. Sort
     // happens inside that helper, byte-stable for given plugin set.
-    if let Some(plugins_block) = super::tools_builder::build_plugins_system(wasm_plugins, js_plugins) {
+    if let Some(plugins_block) =
+        super::tools_builder::build_plugins_system(wasm_plugins, js_plugins)
+    {
         parts.push(plugins_block);
     }
 
@@ -637,26 +821,64 @@ pub(crate) fn build_system_prompt(
 /// `user_tools` (the per-client subset). Also dumped in the
 /// `RSCLAW_DUMP_PROMPT` debug payload.
 pub const BUILTIN_TOOL_NAMES: &[&str] = &[
-    "memory","skill_use","task","task_finish","read_file","write_file",
-    "edit_file","send_file","shell","agent","ask_user","install_tool",
-    "list_dir","search_file","search_content","web_search","web_fetch",
-    "web_download","web_browser","computer_use","image_gen","video_gen",
-    "pdf","text_to_voice","send_message","cron","session","gateway",
-    "opencode","claudecode","codex","channel","anycli","clarify","pairing",
-    "create_docx","create_pdf","create_xlsx","create_pptx","doc",
+    "memory",
+    "skill_use",
+    "task",
+    "task_finish",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "send_file",
+    "shell",
+    "agent",
+    "ask_user",
+    "install_tool",
+    "list_dir",
+    "search_file",
+    "search_content",
+    "web_search",
+    "web_fetch",
+    "web_download",
+    "web_browser",
+    "computer_use",
+    "image_gen",
+    "video_gen",
+    "pdf",
+    "text_to_voice",
+    "send_message",
+    "cron",
+    "session",
+    "gateway",
+    "opencode",
+    "claudecode",
+    "codex",
+    "channel",
+    "anycli",
+    "clarify",
+    "pairing",
+    "create_docx",
+    "create_pdf",
+    "create_xlsx",
+    "create_pptx",
+    "doc",
     // Context-recovery tools: static, byte-identical for every client of
     // this prefix version, so they belong in the cacheable builtin prefix.
     // Previously misclassified as user_tools, which under prefix_id mode
     // (dynamic_prefix omitted) meant they were NEVER sent to the model —
     // so the model could never call read_session_archive despite the
     // summary/system-prompt telling it to.
-    "read_session_archive","read_artifact","knowledge_base",
+    "read_session_archive",
+    "read_artifact",
+    "knowledge_base",
     // A2A-only tool, but unconditionally registered in build_tool_list and
     // byte-identical across clients — same builtin class. Errors gracefully
     // if called on a non-A2A turn.
     "wait_input",
     // Self-service skill management (discover → install → use → remove).
-    "skill_list","skill_search","skill_install","skill_remove",
+    "skill_list",
+    "skill_search",
+    "skill_install",
+    "skill_remove",
 ];
 
 /// Build a minimal system prompt for internal sessions (heartbeat/cron/system).
@@ -685,8 +907,14 @@ pub(crate) fn memory_age_label(now_ts: i64, created_at: i64) -> String {
         7..=13 => "~1 week ago".to_owned(),
         14..=29 => format!("{} weeks ago", days / 7),
         30..=59 => "~1 month ago — may be outdated, verify before using".to_owned(),
-        60..=364 => format!("{} months ago — may be outdated, verify before using", days / 30),
+        60..=364 => format!(
+            "{} months ago — may be outdated, verify before using",
+            days / 30
+        ),
         365..=729 => "~1 year ago — likely outdated, verify before using".to_owned(),
-        _ => format!("~{} years ago — likely outdated, verify before using", days / 365),
+        _ => format!(
+            "~{} years ago — likely outdated, verify before using",
+            days / 365
+        ),
     }
 }

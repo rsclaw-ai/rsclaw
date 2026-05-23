@@ -5,9 +5,10 @@
 //! - Active-hours window checking (normal and overnight windows)
 //! - Restart-safe startup delay that respects the last-run timestamp
 
+use std::time::Duration;
+
 use chrono::{DateTime, NaiveTime, Timelike, Utc};
 use chrono_tz::Tz;
-use std::time::Duration;
 
 /// Return the back-off interval for the given number of consecutive failures.
 ///
@@ -24,11 +25,14 @@ pub fn backoff_interval(base: Duration, consecutive_failures: u32) -> Duration {
     base * (1u32 << exponent)
 }
 
-/// Check whether the current moment falls inside the configured active-hours window.
+/// Check whether the current moment falls inside the configured active-hours
+/// window.
 ///
 /// Returns:
-/// - `None`  — proceed immediately (no window configured, or we are inside the window)
-/// - `Some(sleep_duration)` — caller should sleep for this long before proceeding
+/// - `None`  — proceed immediately (no window configured, or we are inside the
+///   window)
+/// - `Some(sleep_duration)` — caller should sleep for this long before
+///   proceeding
 ///
 /// Supports both normal windows (e.g. 09:15–15:05) and overnight windows
 /// (e.g. 22:00–06:00 where end < start).
@@ -60,8 +64,7 @@ pub fn check_active_hours(
         delta.num_seconds()
     } else {
         // Window starts tomorrow
-        let secs_left_today =
-            86_400i64 - now_time.num_seconds_from_midnight() as i64;
+        let secs_left_today = 86_400i64 - now_time.num_seconds_from_midnight() as i64;
         let secs_from_midnight = window_start.num_seconds_from_midnight() as i64;
         secs_left_today + secs_from_midnight
     };
@@ -104,8 +107,9 @@ pub fn startup_delay(interval: Duration, last_run_at: Option<DateTime<Utc>>) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use chrono::Duration as CDuration;
+
+    use super::*;
 
     // --- backoff_interval ---------------------------------------------------
 

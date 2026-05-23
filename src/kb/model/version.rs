@@ -16,7 +16,10 @@ mod tests {
 
     #[test]
     fn serde_roundtrip() {
-        let v = VersionPointer { doc_id: "01HXY".into(), version: 3 };
+        let v = VersionPointer {
+            doc_id: "01HXY".into(),
+            version: 3,
+        };
         let s = serde_json::to_string(&v).unwrap();
         assert_eq!(serde_json::from_str::<VersionPointer>(&s).unwrap(), v);
     }

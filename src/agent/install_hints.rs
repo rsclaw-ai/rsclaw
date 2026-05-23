@@ -11,8 +11,7 @@
 //! either runs the install command we surfaced or doesn't; either way
 //! we do not ask again.
 
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tracing::warn;

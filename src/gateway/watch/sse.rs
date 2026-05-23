@@ -3,10 +3,11 @@
 //! See spec §"SseSource 实现策略". Heartbeat / ${VAR} substitution are added in
 //! Tasks 12/13/14. Reconnect + Last-Event-ID + `retry:` are wired in Task 11.
 
-use anyhow::{anyhow, Result};
+use std::time::Duration;
+
+use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use futures::StreamExt;
-use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 use super::source::{EventRecord, SseSource};
@@ -132,9 +133,11 @@ async fn run_sse_single_tracking(
 /// Spec rules implemented:
 /// - lines separated by `\n` or `\r\n`
 /// - `event: <type>` → set current event type (reset on each block)
-/// - `data: <text>` → append to data buffer, multiple data: lines joined by `\n`
+/// - `data: <text>` → append to data buffer, multiple data: lines joined by
+///   `\n`
 /// - `id: <id>` → record on the event
-/// - `retry: <ms>` → currently ignored at this layer (Task 11 plumbs it through)
+/// - `retry: <ms>` → currently ignored at this layer (Task 11 plumbs it
+///   through)
 /// - lines starting with `:` are comments (ignored)
 /// - blank line → flush the current event
 #[derive(Default)]
@@ -178,7 +181,8 @@ impl SseParser {
             return None;
         }
         if let Some(rest) = line.strip_prefix("data:") {
-            self.data_lines.push(rest.strip_prefix(' ').unwrap_or(rest).to_owned());
+            self.data_lines
+                .push(rest.strip_prefix(' ').unwrap_or(rest).to_owned());
             return None;
         }
         if let Some(rest) = line.strip_prefix("id:") {
@@ -241,14 +245,9 @@ pub(super) async fn run_sse(
     let mut backoff_ms: u64 = 2000;
 
     loop {
-        let outcome = run_sse_single_tracking(
-            &src,
-            &tx,
-            &mut stop,
-            &mut last_event_id,
-            &mut backoff_ms,
-        )
-        .await;
+        let outcome =
+            run_sse_single_tracking(&src, &tx, &mut stop, &mut last_event_id, &mut backoff_ms)
+                .await;
 
         match outcome {
             SseOutcome::Stopped => return,
@@ -302,7 +301,9 @@ mod tests {
     #[test]
     fn parses_event_type() {
         let mut p = SseParser::default();
-        let evs = p.feed(&Bytes::from_static(b"event: hit\ndata: {\"code\":\"600519\"}\n\n"));
+        let evs = p.feed(&Bytes::from_static(
+            b"event: hit\ndata: {\"code\":\"600519\"}\n\n",
+        ));
         assert_eq!(evs[0].event, "hit");
     }
 
@@ -320,7 +321,10 @@ mod tests {
         // The two data lines join with `\n` -> "line1\nline2" which is NOT valid JSON,
         // so we expect the _parse_error / _raw fallback.
         assert_eq!(evs.len(), 1);
-        assert_eq!(evs[0].data["_raw"], serde_json::Value::String("line1\nline2".into()));
+        assert_eq!(
+            evs[0].data["_raw"],
+            serde_json::Value::String("line1\nline2".into())
+        );
     }
 
     #[test]
@@ -328,7 +332,10 @@ mod tests {
         let mut p = SseParser::default();
         let evs = p.feed(&Bytes::from_static(b"data: not json\n\n"));
         assert!(evs[0].data.get("_parse_error").is_some());
-        assert_eq!(evs[0].data["_raw"], serde_json::Value::String("not json".into()));
+        assert_eq!(
+            evs[0].data["_raw"],
+            serde_json::Value::String("not json".into())
+        );
     }
 
     #[test]

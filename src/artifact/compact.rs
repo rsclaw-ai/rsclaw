@@ -7,10 +7,12 @@
 //! Compared with the per-tool rule library this replaces: simpler, lossless
 //! (full data preserved), schema-stable across tools, zero maintenance.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::artifact::store::ArtifactStore;
-use crate::artifact::text::{head_tail_with_marker, normalize_lines, strip_ansi};
+use crate::artifact::{
+    store::ArtifactStore,
+    text::{head_tail_with_marker, normalize_lines, strip_ansi},
+};
 
 /// Tool output below this many chars is returned verbatim — compaction noise
 /// (envelope fields, omission marker) costs more than the savings.
@@ -62,8 +64,8 @@ impl Default for PreviewBudget {
 ///
 /// Behavior:
 /// - tiny input (≤ `ARTIFACT_THRESHOLD_CHARS`): pass through, no artifact
-/// - large input: write full text to artifact (no on-disk size cap),
-///   return head+tail preview with a marker pointing at the artifact id
+/// - large input: write full text to artifact (no on-disk size cap), return
+///   head+tail preview with a marker pointing at the artifact id
 pub fn compact_text(
     store: &ArtifactStore,
     session_key: &str,
@@ -88,23 +90,18 @@ pub fn compact_text(
     // mangled by strip_ansi) made the replacement silently no-op and
     // the LLM never saw the read_artifact handle.
     let id_str = id.as_str().to_owned();
-    let kept = head_tail_with_marker(
-        &lines,
-        budget.head_lines,
-        budget.tail_lines,
-        |omitted| {
-            format!(
-                "... {omitted} lines omitted — call read_artifact(tool_result_id=\"{id_str}\") for full output ..."
-            )
-        },
-    );
+    let kept = head_tail_with_marker(&lines, budget.head_lines, budget.tail_lines, |omitted| {
+        format!(
+            "... {omitted} lines omitted — call read_artifact(tool_result_id=\"{id_str}\") for full output ..."
+        )
+    });
     let preview = kept.join("\n");
 
     // Char-cap fallback. Two cases this protects against:
-    //   1. input is one giant line (minified JSON, base64) — line-based
-    //      head/tail can't shrink it
-    //   2. lots of long unwrapped lines (e.g. WEB budget = 240 lines, but
-    //      a wrapped article may run 300 chars/line → 72k chars preview)
+    //   1. input is one giant line (minified JSON, base64) — line-based head/tail
+    //      can't shrink it
+    //   2. lots of long unwrapped lines (e.g. WEB budget = 240 lines, but a wrapped
+    //      article may run 300 chars/line → 72k chars preview)
     // Without this we'd exceed the LLM token budget per tool result.
     let preview = char_cap(&preview, budget.max_chars, id.as_str());
     (preview, Some(id.0))
@@ -124,7 +121,14 @@ fn char_cap(s: &str, max: usize, id: &str) -> String {
     let head_n = body * 7 / 10;
     let tail_n = body - head_n;
     let head: String = s.chars().take(head_n).collect();
-    let tail: String = s.chars().rev().take(tail_n).collect::<String>().chars().rev().collect();
+    let tail: String = s
+        .chars()
+        .rev()
+        .take(tail_n)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
     format!("{head}{marker}{tail}")
 }
 
@@ -144,7 +148,14 @@ pub fn compact_value(
     // Object root: compact each known-heavy field individually so the JSON
     // schema stays stable. Only fields we know are text-shaped.
     if let Value::Object(map) = &mut value {
-        let heavy_keys = ["stdout", "stderr", "text", "content", "messages_text", "output"];
+        let heavy_keys = [
+            "stdout",
+            "stderr",
+            "text",
+            "content",
+            "messages_text",
+            "output",
+        ];
         let mut any_compacted = false;
         let mut compacted_raw: usize = 0;
         let mut artifact_ids: Vec<(String, String)> = Vec::new();
@@ -180,10 +191,7 @@ pub fn compact_value(
                 for (field, id) in &artifact_ids {
                     by_field.insert(field.clone(), Value::String(id.clone()));
                 }
-                map.insert(
-                    "_tool_result_ids".to_string(),
-                    Value::Object(by_field),
-                );
+                map.insert("_tool_result_ids".to_string(), Value::Object(by_field));
             }
             map.insert("_truncated".to_string(), Value::Bool(true));
             map.insert(
@@ -223,8 +231,9 @@ pub fn compact_value(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::tempdir;
+
+    use super::*;
 
     fn store() -> (tempfile::TempDir, ArtifactStore) {
         let tmp = tempdir().unwrap();
@@ -243,7 +252,10 @@ mod tests {
     #[test]
     fn large_text_gets_artifact_and_preview() {
         let (_t, s) = store();
-        let big = (1..=500).map(|i| format!("line_{i}")).collect::<Vec<_>>().join("\n");
+        let big = (1..=500)
+            .map(|i| format!("line_{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let (preview, id) = compact_text(&s, "sess", &big, PreviewBudget::DEFAULT);
         let id = id.expect("artifact written");
         assert!(preview.contains("line_1"));
@@ -259,7 +271,10 @@ mod tests {
     fn web_budget_keeps_more_lines_than_default() {
         let (_t, s) = store();
         // 500 short lines: default keeps 40+20=60, web keeps 200+40=240.
-        let big = (1..=500).map(|i| format!("line_{i:03}")).collect::<Vec<_>>().join("\n");
+        let big = (1..=500)
+            .map(|i| format!("line_{i:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let (default_preview, _) = compact_text(&s, "sess", &big, PreviewBudget::DEFAULT);
         let (web_preview, _) = compact_text(&s, "sess", &big, PreviewBudget::WEB);
         let default_lines = default_preview.lines().count();

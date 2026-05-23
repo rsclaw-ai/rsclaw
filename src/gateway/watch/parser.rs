@@ -7,10 +7,12 @@
 //!
 //! Auto-detect (when kind is omitted):
 //!   - first token starts with `http://` or `https://` → sse
-//!   - first token is a path (`/`, `~/`, `./`, `../`, Windows `[A-Z]:[\\/]`) → file
-//!   - otherwise → error (caller must prefix with `shell` for raw shell commands)
+//!   - first token is a path (`/`, `~/`, `./`, `../`, Windows `[A-Z]:[\\/]`) →
+//!     file
+//!   - otherwise → error (caller must prefix with `shell` for raw shell
+//!     commands)
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedCommand {
@@ -21,20 +23,20 @@ pub enum ParsedCommand {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum StopTarget {
-    One(String),    // a watch id, e.g. "w_abc12345"
+    One(String), // a watch id, e.g. "w_abc12345"
     All,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WatchSpec {
     pub kind: SourceKind,
-    pub raw_source: String,                // the literal SOURCE_ARGS (un-normalized)
-    pub headers: Vec<(String, String)>,    // -H 'Name: value' pairs (SSE only)
-    pub grep: Option<String>,              // --grep <regex>
-    pub jq: Option<String>,                // --jq <expr>
-    pub rate_ms: u64,                      // --rate <ms>, default 2000, 0 = unlimited
+    pub raw_source: String, // the literal SOURCE_ARGS (un-normalized)
+    pub headers: Vec<(String, String)>, // -H 'Name: value' pairs (SSE only)
+    pub grep: Option<String>, // --grep <regex>
+    pub jq: Option<String>, // --jq <expr>
+    pub rate_ms: u64,       // --rate <ms>, default 2000, 0 = unlimited
     pub event_filter: Option<EventFilter>, // --event allow|deny list
-    pub template: Option<String>,          // --template <name>
+    pub template: Option<String>, // --template <name>
 }
 
 /// Allow- or deny-list of SSE event type names. A pure denylist (every
@@ -95,7 +97,8 @@ pub enum SourceKind {
     Shell,
 }
 
-/// Parse the body of a `/watch` command. The leading `/watch ` has already been stripped.
+/// Parse the body of a `/watch` command. The leading `/watch ` has already been
+/// stripped.
 ///
 /// Returns `Err` for malformed input (the caller formats it into a chat reply).
 pub fn parse(body: &str) -> Result<ParsedCommand> {
@@ -110,7 +113,9 @@ pub fn parse(body: &str) -> Result<ParsedCommand> {
     let normalized = body.replace('\u{2014}', "--").replace('\u{2013}', "-");
     let body = normalized.trim();
     if body.is_empty() {
-        return Err(anyhow!("usage: /watch <source> [flags] | /watch list | /watch stop <id|all>"));
+        return Err(anyhow!(
+            "usage: /watch <source> [flags] | /watch list | /watch stop <id|all>"
+        ));
     }
 
     // Management commands first — they are exact-prefix matches.
@@ -218,8 +223,15 @@ fn is_windows_drive_path(s: &str) -> bool {
 /// keeps `-f` as part of the shell command.
 fn split_source_and_flags(s: &str) -> (&str, &str) {
     const FLAG_HEADS: &[&str] = &[
-        " -H ", " --grep ", " --jq ", " --rate ", " --only ", " --tee ", " --event ",
-        " --template ", " -tpl ",
+        " -H ",
+        " --grep ",
+        " --jq ",
+        " --rate ",
+        " --only ",
+        " --tee ",
+        " --event ",
+        " --template ",
+        " -tpl ",
     ];
     let mut best_idx = s.len();
     for head in FLAG_HEADS {
@@ -261,15 +273,22 @@ fn apply_flags(spec: &mut WatchSpec, tail: &str) -> Result<()> {
         i += 1;
         match tok.as_str() {
             "-H" => {
-                let val = tokens.get(i).ok_or_else(|| anyhow!("-H needs a value"))?.clone();
+                let val = tokens
+                    .get(i)
+                    .ok_or_else(|| anyhow!("-H needs a value"))?
+                    .clone();
                 i += 1;
                 let (name, value) = val
                     .split_once(':')
                     .ok_or_else(|| anyhow!("-H value must be `Name: value`, got `{val}`"))?;
-                spec.headers.push((name.trim().to_owned(), value.trim().to_owned()));
+                spec.headers
+                    .push((name.trim().to_owned(), value.trim().to_owned()));
             }
             "--grep" => {
-                let val = tokens.get(i).ok_or_else(|| anyhow!("--grep needs a regex"))?.clone();
+                let val = tokens
+                    .get(i)
+                    .ok_or_else(|| anyhow!("--grep needs a regex"))?
+                    .clone();
                 i += 1;
                 // Validate regex compiles now so the user gets a clean error.
                 regex::Regex::new(&val).map_err(|e| anyhow!("invalid regex: {e}"))?;
@@ -307,13 +326,20 @@ fn apply_flags(spec: &mut WatchSpec, tail: &str) -> Result<()> {
                 spec.template = Some(val);
             }
             "--rate" => {
-                let val = tokens.get(i).ok_or_else(|| anyhow!("--rate needs a number"))?.clone();
+                let val = tokens
+                    .get(i)
+                    .ok_or_else(|| anyhow!("--rate needs a number"))?
+                    .clone();
                 i += 1;
-                spec.rate_ms = val.parse::<u64>().map_err(|_| anyhow!("--rate must be a number, got `{val}`"))?;
+                spec.rate_ms = val
+                    .parse::<u64>()
+                    .map_err(|_| anyhow!("--rate must be a number, got `{val}`"))?;
             }
             "--only" | "--tee" => {
                 // Stretch — accept but ignore in v1 so the command still parses.
-                tokens.get(i).ok_or_else(|| anyhow!("{tok} needs a value"))?;
+                tokens
+                    .get(i)
+                    .ok_or_else(|| anyhow!("{tok} needs a value"))?;
                 i += 1;
             }
             unknown => return Err(anyhow!("unknown flag: `{unknown}`")),
@@ -323,7 +349,8 @@ fn apply_flags(spec: &mut WatchSpec, tail: &str) -> Result<()> {
 }
 
 /// Split a flag tail into tokens, honoring single- and double-quoted strings.
-/// `-H 'Auth: Bearer x' --grep "ERR"` → ["-H", "Auth: Bearer x", "--grep", "ERR"]
+/// `-H 'Auth: Bearer x' --grep "ERR"` → ["-H", "Auth: Bearer x", "--grep",
+/// "ERR"]
 fn tokenize_flags(s: &str) -> Result<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
     let mut buf = String::new();
@@ -380,7 +407,10 @@ mod tests {
             parse("stop w_abc12345").unwrap(),
             ParsedCommand::Stop(StopTarget::One("w_abc12345".into()))
         );
-        assert_eq!(parse("stop all").unwrap(), ParsedCommand::Stop(StopTarget::All));
+        assert_eq!(
+            parse("stop all").unwrap(),
+            ParsedCommand::Stop(StopTarget::All)
+        );
         assert!(parse("stop").is_err());
     }
 
@@ -480,7 +510,10 @@ mod tests {
     fn flag_parsing_header_quoted() {
         let p = parse("https://x -H 'Authorization: Bearer abc def'").unwrap();
         if let ParsedCommand::Start(spec) = p {
-            assert_eq!(spec.headers, vec![("Authorization".to_owned(), "Bearer abc def".to_owned())]);
+            assert_eq!(
+                spec.headers,
+                vec![("Authorization".to_owned(), "Bearer abc def".to_owned())]
+            );
         }
     }
 
@@ -533,7 +566,10 @@ mod tests {
         if let ParsedCommand::Start(spec) = p {
             assert_eq!(
                 spec.event_filter,
-                Some(EventFilter::Allow(vec!["snapshot".to_owned(), "hit".to_owned()]))
+                Some(EventFilter::Allow(vec![
+                    "snapshot".to_owned(),
+                    "hit".to_owned()
+                ]))
             );
         }
     }
@@ -552,7 +588,10 @@ mod tests {
     #[test]
     fn flag_parsing_event_mixed_errors() {
         let err = parse("https://x --event 'snapshot,!heartbeat'").unwrap_err();
-        assert!(err.to_string().contains("mixes allow and deny"), "got: {err}");
+        assert!(
+            err.to_string().contains("mixes allow and deny"),
+            "got: {err}"
+        );
     }
 
     #[test]

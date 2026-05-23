@@ -3,18 +3,16 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use super::{
+    super::preparse::{btw_direct_call, is_fast_preparse, try_preparse_locally},
+    default_dm_scope,
+};
 use crate::{
     agent::{AgentMessage, AgentRegistry},
     channel::{Channel, OutboundMessage},
     config::runtime::RuntimeConfig,
     gateway::session::{MessageKind, SessionKeyParams, derive_session_key},
 };
-
-use super::super::preparse::{
-    btw_direct_call, is_fast_preparse, try_preparse_locally,
-};
-use super::default_dm_scope;
-
 
 // ---------------------------------------------------------------------------
 // WeChat Personal (via ilink)
@@ -38,7 +36,10 @@ fn spawn_wechat_user_worker(
         while let Some((text, images, file_attachments)) = rx.recv().await {
             // No debounce — task queue merge_into_pending
             // handles rapid consecutive messages automatically.
-            let handle = match reg.route_account("wechat", Some("default")).or_else(|_| reg.default_agent()) {
+            let handle = match reg
+                .route_account("wechat", Some("default"))
+                .or_else(|_| reg.default_agent())
+            {
                 Ok(h) => h,
                 Err(e) => {
                     error!("wechat route error: {e:#}");
@@ -62,12 +63,20 @@ fn spawn_wechat_user_worker(
                 reply_to: None,
                 timestamp: chrono::Utc::now().timestamp(),
                 images: images.iter().map(|i| i.data.clone()).collect(),
-                files: file_attachments.iter().filter_map(|f| {
-                    crate::gateway::task_queue::stage_file(&f.filename, &f.data, &f.mime_type).ok()
-                }).collect(),
+                files: file_attachments
+                    .iter()
+                    .filter_map(|f| {
+                        crate::gateway::task_queue::stage_file(&f.filename, &f.data, &f.mime_type)
+                            .ok()
+                    })
+                    .collect(),
                 account: None,
             };
-            if let Err(e) = tq.submit(&session_key, qmsg, crate::gateway::task_queue::Priority::User) {
+            if let Err(e) = tq.submit(
+                &session_key,
+                qmsg,
+                crate::gateway::task_queue::Priority::User,
+            ) {
                 error!(user = %user_id, "wechat: queue submit failed: {e:#}");
             }
         }
@@ -197,7 +206,9 @@ pub(crate) fn start_wechat_personal_if_configured(
 
         // Register WeChat channel sender for notification routing.
         {
-            let mut senders = channel_senders.write().expect("channel_senders lock poisoned");
+            let mut senders = channel_senders
+                .write()
+                .expect("channel_senders lock poisoned");
             senders.insert("wechat".to_string(), out_tx.clone());
         }
 
@@ -249,7 +260,8 @@ pub(crate) fn start_wechat_personal_if_configured(
                                         channel: None,
 
                                         account: None,
-                    files: vec![],                                    })
+                                        files: vec![],
+                                    })
                                     .await
                                 {
                                     tracing::warn!("failed to send message: {e}");
@@ -271,7 +283,8 @@ pub(crate) fn start_wechat_personal_if_configured(
                                         channel: None,
 
                                         account: None,
-                    files: vec![],                                    })
+                                        files: vec![],
+                                    })
                                     .await
                                 {
                                     tracing::warn!("failed to send message: {e}");
@@ -344,7 +357,8 @@ pub(crate) fn start_wechat_personal_if_configured(
                                         channel: None,
 
                                         account: None,
-                    files: vec![],                                    })
+                                        files: vec![],
+                                    })
                                     .await
                                 {
                                     tracing::warn!("failed to send message: {e}");
@@ -372,14 +386,20 @@ pub(crate) fn start_wechat_personal_if_configured(
                                 peer_id: from_user.clone(),
                                 dm_scope,
                             });
-                            if let Some(mut reply) = try_preparse_locally(&text, &handle, "wechat", &from_user, crate::gateway::preparse::PreparseOrigin::User).await {
+                            if let Some(mut reply) = try_preparse_locally(
+                                &text,
+                                &handle,
+                                "wechat",
+                                &from_user,
+                                crate::gateway::preparse::PreparseOrigin::User,
+                            )
+                            .await
+                            {
                                 reply.target_id = from_user.clone();
                                 reply.is_group = false;
                                 if !reply.text.is_empty() || !reply.images.is_empty() {
                                     if let Err(e) = tx.send(reply).await {
-
                                         tracing::warn!("failed to send message: {e}");
-
                                     }
                                 }
                                 return;
@@ -405,18 +425,23 @@ pub(crate) fn start_wechat_personal_if_configured(
                             if handle.tx.send(msg).await.is_err() {
                                 return;
                             }
-                            if let Ok(Ok(r)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
+                            if let Ok(Ok(r)) =
+                                tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx)
+                                    .await
+                            {
                                 if !r.is_empty {
-                                    if let Err(e) = tx.send(OutboundMessage {
-                                        target_id: from_user,
-                                        is_group: false,
-                                        text: r.text,
-                                        reply_to: None,
-                                        images: r.images,
-                                        files: r.files,
-                                        channel: None,
-                                        account: None,
-                                    }).await
+                                    if let Err(e) = tx
+                                        .send(OutboundMessage {
+                                            target_id: from_user,
+                                            is_group: false,
+                                            text: r.text,
+                                            reply_to: None,
+                                            images: r.images,
+                                            files: r.files,
+                                            channel: None,
+                                            account: None,
+                                        })
+                                        .await
                                     {
                                         tracing::warn!("failed to send message: {e}");
                                     }

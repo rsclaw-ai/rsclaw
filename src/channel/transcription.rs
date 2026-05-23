@@ -87,11 +87,8 @@ pub async fn transcribe_audio(
     {
         if let Ok(text) = result {
             let lang = crate::i18n::default_lang();
-            let hint = crate::i18n::t_fmt(
-                "install_hint_stt_sherpa",
-                lang,
-                &[("provider", &provider)],
-            );
+            let hint =
+                crate::i18n::t_fmt("install_hint_stt_sherpa", lang, &[("provider", &provider)]);
             return Ok(format!("{text}{hint}"));
         }
     }
@@ -185,8 +182,8 @@ fn detect_provider() -> String {
     }
 
     // 1. Sherpa-onnx (preferred — same engine as TTS, works offline,
-    //    Chinese-friendly with whisper-turbo). Detected by the presence
-    //    of an installed model dir + the `sherpa-onnx-offline` binary.
+    //    Chinese-friendly with whisper-turbo). Detected by the presence of an
+    //    installed model dir + the `sherpa-onnx-offline` binary.
     if find_sherpa_stt_setup().is_some() {
         return "sherpa".to_owned();
     }
@@ -259,7 +256,10 @@ async fn transcribe_macos(audio_bytes: &[u8], file_name: &str) -> Result<String>
             warn!("symphonia decode failed ({e:#}), trying afconvert");
             let convert_ok = tokio::process::Command::new("afconvert")
                 .args([
-                    "-f", "WAVE", "-d", "LEI16@16000",
+                    "-f",
+                    "WAVE",
+                    "-d",
+                    "LEI16@16000",
                     audio_path.to_str().unwrap_or(""),
                     wav_path.to_str().unwrap_or(""),
                 ])
@@ -963,16 +963,15 @@ fn decode_audio_to_pcm_ext(audio_bytes: &[u8], file_ext: Option<&str>) -> Result
         }
     }
     // Detect format hint for symphonia
-    let hint = file_ext
-        .or_else(|| {
-            if audio_bytes.len() >= 12 && audio_bytes[4..].windows(4).any(|w| w == b"ftyp") {
-                Some("mp4")
-            } else if audio_bytes.starts_with(b"\x1aE\xdf\xa3") {
-                Some("webm")
-            } else {
-                None
-            }
-        });
+    let hint = file_ext.or_else(|| {
+        if audio_bytes.len() >= 12 && audio_bytes[4..].windows(4).any(|w| w == b"ftyp") {
+            Some("mp4")
+        } else if audio_bytes.starts_with(b"\x1aE\xdf\xa3") {
+            Some("webm")
+        } else {
+            None
+        }
+    });
     // Try symphonia (MP3/AAC/WAV/FLAC/MP4/MKV)
     if let Ok(samples) = decode_audio_symphonia_with_hint(audio_bytes, hint) {
         return Ok(samples);
@@ -987,7 +986,8 @@ fn which_ffmpeg() -> String {
     crate::agent::platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned())
 }
 
-/// Fallback: use ffmpeg CLI to convert any audio/video to 16kHz mono WAV, then read PCM.
+/// Fallback: use ffmpeg CLI to convert any audio/video to 16kHz mono WAV, then
+/// read PCM.
 fn decode_audio_ffmpeg(audio_bytes: &[u8], ext: &str) -> Result<Vec<f32>> {
     let tmp_dir = std::env::temp_dir();
     let id = uuid::Uuid::new_v4();
@@ -999,16 +999,37 @@ fn decode_audio_ffmpeg(audio_bytes: &[u8], ext: &str) -> Result<Vec<f32>> {
     info!(input = %input_path.display(), ext = %ext, bytes = audio_bytes.len(), bin = %ffmpeg_bin, "ffmpeg fallback: converting");
     let output = std::process::Command::new(&ffmpeg_bin)
         .args([
-            "-i", input_path.to_str().unwrap_or(""),
-            "-ar", "16000", "-ac", "1", "-f", "wav",
-            "-y", wav_path.to_str().unwrap_or(""),
+            "-i",
+            input_path.to_str().unwrap_or(""),
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-f",
+            "wav",
+            "-y",
+            wav_path.to_str().unwrap_or(""),
         ])
         .output();
     let _ = std::fs::remove_file(&input_path);
-    let status = output.as_ref().map(|o| o.status).map_err(|e| anyhow::anyhow!("{e}"));
+    let status = output
+        .as_ref()
+        .map(|o| o.status)
+        .map_err(|e| anyhow::anyhow!("{e}"));
     if let Ok(ref o) = output {
         let stderr = String::from_utf8_lossy(&o.stderr);
-        warn!("ffmpeg exit={} stderr_tail: {}", o.status, stderr.chars().rev().take(300).collect::<String>().chars().rev().collect::<String>());
+        warn!(
+            "ffmpeg exit={} stderr_tail: {}",
+            o.status,
+            stderr
+                .chars()
+                .rev()
+                .take(300)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
+        );
     }
 
     match status {
@@ -1024,7 +1045,10 @@ fn decode_audio_ffmpeg(audio_bytes: &[u8], ext: &str) -> Result<Vec<f32>> {
                         s as f32 / 32768.0
                     })
                     .collect();
-                info!(samples = samples.len(), "ffmpeg fallback: decoded to 16kHz PCM");
+                info!(
+                    samples = samples.len(),
+                    "ffmpeg fallback: decoded to 16kHz PCM"
+                );
                 Ok(samples)
             } else {
                 anyhow::bail!("ffmpeg: WAV output too short")
@@ -1052,9 +1076,13 @@ fn decode_ogg_opus(audio_bytes: &[u8]) -> Result<Vec<f32>> {
             // First packet is the Opus header
             if packet.data.len() >= 12 && &packet.data[..8] == b"OpusHead" {
                 channels = packet.data[9] as usize;
-                if channels == 0 { channels = 1; }
-                decoder = Some(opus_decoder::OpusDecoder::new(48000, channels)
-                    .map_err(|e| anyhow::anyhow!("opus decoder init: {e}"))?);
+                if channels == 0 {
+                    channels = 1;
+                }
+                decoder = Some(
+                    opus_decoder::OpusDecoder::new(48000, channels)
+                        .map_err(|e| anyhow::anyhow!("opus decoder init: {e}"))?,
+                );
             }
             continue;
         }
@@ -1113,13 +1141,14 @@ fn decode_ogg_opus(audio_bytes: &[u8]) -> Result<Vec<f32>> {
 }
 
 /// Decode non-Opus audio (MP3, AAC, WAV, OGG Vorbis, FLAC) via symphonia.
-fn decode_audio_symphonia_with_hint(audio_bytes: &[u8], ext_hint: Option<&str>) -> Result<Vec<f32>> {
-    use symphonia::core::audio::SampleBuffer;
-    use symphonia::core::codecs::DecoderOptions;
-    use symphonia::core::formats::FormatOptions;
-    use symphonia::core::io::MediaSourceStream;
-    use symphonia::core::meta::MetadataOptions;
-    use symphonia::core::probe::Hint;
+fn decode_audio_symphonia_with_hint(
+    audio_bytes: &[u8],
+    ext_hint: Option<&str>,
+) -> Result<Vec<f32>> {
+    use symphonia::core::{
+        audio::SampleBuffer, codecs::DecoderOptions, formats::FormatOptions, io::MediaSourceStream,
+        meta::MetadataOptions, probe::Hint,
+    };
 
     let cursor = std::io::Cursor::new(audio_bytes.to_vec());
     let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
@@ -1217,8 +1246,13 @@ pub fn encode_audio_to_ogg_opus(audio_bytes: &[u8], file_ext: Option<&str>) -> R
     std::fs::write(&tmp_src, audio_bytes)?;
     let output = std::process::Command::new(which_ffmpeg())
         .args([
-            "-i", &tmp_src.to_string_lossy(),
-            "-y", "-c:a", "libopus", "-b:a", "48k",
+            "-i",
+            &tmp_src.to_string_lossy(),
+            "-y",
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "48k",
             &tmp_ogg.to_string_lossy().to_string(),
         ])
         .output()
@@ -1233,7 +1267,11 @@ pub fn encode_audio_to_ogg_opus(audio_bytes: &[u8], file_ext: Option<&str>) -> R
 
     let ogg_bytes = std::fs::read(&tmp_ogg)?;
     let _ = std::fs::remove_file(&tmp_ogg);
-    info!(src_len = audio_bytes.len(), ogg_len = ogg_bytes.len(), "audio encoded to ogg-opus via ffmpeg");
+    info!(
+        src_len = audio_bytes.len(),
+        ogg_len = ogg_bytes.len(),
+        "audio encoded to ogg-opus via ffmpeg"
+    );
     Ok(ogg_bytes)
 }
 
@@ -1297,13 +1335,14 @@ fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
 
 /// Symphonia decode returning (mono f32 samples, original sample rate).
 #[allow(dead_code)]
-fn decode_audio_symphonia_raw(audio_bytes: &[u8], ext_hint: Option<&str>) -> Result<(Vec<f32>, u32)> {
-    use symphonia::core::audio::SampleBuffer;
-    use symphonia::core::codecs::DecoderOptions;
-    use symphonia::core::formats::FormatOptions;
-    use symphonia::core::io::MediaSourceStream;
-    use symphonia::core::meta::MetadataOptions;
-    use symphonia::core::probe::Hint;
+fn decode_audio_symphonia_raw(
+    audio_bytes: &[u8],
+    ext_hint: Option<&str>,
+) -> Result<(Vec<f32>, u32)> {
+    use symphonia::core::{
+        audio::SampleBuffer, codecs::DecoderOptions, formats::FormatOptions, io::MediaSourceStream,
+        meta::MetadataOptions, probe::Hint,
+    };
 
     let cursor = std::io::Cursor::new(audio_bytes.to_vec());
     let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
@@ -1312,7 +1351,12 @@ fn decode_audio_symphonia_raw(audio_bytes: &[u8], ext_hint: Option<&str>) -> Res
         hint.with_extension(ext);
     }
     let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
         .context("failed to probe audio format")?;
     let mut format = probed.format;
     let track = format.default_track().context("no audio track found")?;
@@ -1352,14 +1396,31 @@ fn decode_audio_symphonia_raw(audio_bytes: &[u8], ext_hint: Option<&str>) -> Res
 
 /// ffmpeg decode to f32 PCM at a specific sample rate.
 #[allow(dead_code)]
-fn decode_audio_ffmpeg_at_rate(audio_bytes: &[u8], ext: &str, target_rate: u32) -> Result<Vec<f32>> {
-    let tmp_in = std::env::temp_dir().join(format!("rsclaw_in_{}.{ext}", chrono::Utc::now().timestamp_millis()));
-    let tmp_out = std::env::temp_dir().join(format!("rsclaw_out_{}.pcm", chrono::Utc::now().timestamp_millis()));
+fn decode_audio_ffmpeg_at_rate(
+    audio_bytes: &[u8],
+    ext: &str,
+    target_rate: u32,
+) -> Result<Vec<f32>> {
+    let tmp_in = std::env::temp_dir().join(format!(
+        "rsclaw_in_{}.{ext}",
+        chrono::Utc::now().timestamp_millis()
+    ));
+    let tmp_out = std::env::temp_dir().join(format!(
+        "rsclaw_out_{}.pcm",
+        chrono::Utc::now().timestamp_millis()
+    ));
     std::fs::write(&tmp_in, audio_bytes)?;
     let output = std::process::Command::new(which_ffmpeg())
         .args([
-            "-i", &tmp_in.to_string_lossy(),
-            "-y", "-f", "s16le", "-ar", &target_rate.to_string(), "-ac", "1",
+            "-i",
+            &tmp_in.to_string_lossy(),
+            "-y",
+            "-f",
+            "s16le",
+            "-ar",
+            &target_rate.to_string(),
+            "-ac",
+            "1",
             &tmp_out.to_string_lossy().to_string(),
         ])
         .output()
@@ -1415,12 +1476,14 @@ fn write_wav_from_pcm(samples: &[f32], sample_rate: u32) -> Vec<u8> {
 // Candle Whisper (pure Rust — placeholder, requires model download)
 // ---------------------------------------------------------------------------
 
-/// Transcribe using candle-transformers whisper model (pure Rust, zero external deps).
+/// Transcribe using candle-transformers whisper model (pure Rust, zero external
+/// deps).
 ///
 /// Requires whisper-tiny model files at `<base_dir>/models/whisper-tiny/`:
 ///   - config.json, tokenizer.json, model.safetensors
 ///
-/// Download: `huggingface-cli download openai/whisper-tiny --local-dir ~/.rsclaw/models/whisper-tiny`
+/// Download: `huggingface-cli download openai/whisper-tiny --local-dir
+/// ~/.rsclaw/models/whisper-tiny`
 async fn transcribe_candle(audio_bytes: &[u8]) -> Result<String> {
     let model_dir = crate::config::loader::base_dir().join("models/whisper-tiny");
     if !model_dir.join("config.json").exists() {
@@ -1433,8 +1496,8 @@ async fn transcribe_candle(audio_bytes: &[u8]) -> Result<String> {
     }
 
     // Decode audio to 16 kHz mono PCM
-    let pcm = decode_audio_to_pcm(audio_bytes)
-        .context("failed to decode audio for candle whisper")?;
+    let pcm =
+        decode_audio_to_pcm(audio_bytes).context("failed to decode audio for candle whisper")?;
 
     info!(samples = pcm.len(), "decoded audio for candle whisper");
 
@@ -1449,8 +1512,13 @@ async fn transcribe_candle(audio_bytes: &[u8]) -> Result<String> {
 
     if resolve_openai_key().is_some() {
         warn!("candle whisper not yet fully implemented, falling back to OpenAI");
-        return transcribe_openai(&reqwest::Client::new(), audio_bytes, "voice.ogg", "audio/ogg")
-            .await;
+        return transcribe_openai(
+            &reqwest::Client::new(),
+            audio_bytes,
+            "voice.ogg",
+            "audio/ogg",
+        )
+        .await;
     }
 
     anyhow::bail!(
@@ -1514,7 +1582,12 @@ fn find_sherpa_stt_setup() -> Option<SherpaSttSetup> {
     // explicitly so they want the better quality), then int8 paraformer
     // (best size/quality tradeoff for Chinese-only), then whisper-turbo
     // (multilingual), then whisper-tiny (lightweight fallback).
-    for dir_name in ["paraformer-zh-full", "paraformer-zh", "whisper-turbo", "whisper-tiny"] {
+    for dir_name in [
+        "paraformer-zh-full",
+        "paraformer-zh",
+        "whisper-turbo",
+        "whisper-tiny",
+    ] {
         let dir = models_root.join(dir_name);
         if !dir.is_dir() {
             continue;
@@ -1575,8 +1648,9 @@ fn find_sherpa_stt_setup() -> Option<SherpaSttSetup> {
 /// Decodes the input to 16 kHz mono WAV first, then shells out and parses
 /// the recognized text from stdout (sherpa prints `text: "..."`).
 async fn transcribe_sherpa(audio_bytes: &[u8], file_name: &str) -> Result<String> {
-    let setup = find_sherpa_stt_setup()
-        .context("sherpa-onnx STT not installed (need sherpa-onnx-offline + whisper-tiny/turbo model)")?;
+    let setup = find_sherpa_stt_setup().context(
+        "sherpa-onnx STT not installed (need sherpa-onnx-offline + whisper-tiny/turbo model)",
+    )?;
 
     // sherpa-onnx-offline accepts WAV; convert other formats to 16 kHz
     // mono WAV via the existing PCM helper.
@@ -1596,7 +1670,12 @@ async fn transcribe_sherpa(audio_bytes: &[u8], file_name: &str) -> Result<String
     // bails with "option format is --x=y" if flag and value are separate
     // argv slots). Build each option as a single string.
     let (bin, mut args): (&std::path::PathBuf, Vec<String>) = match &setup {
-        SherpaSttSetup::Whisper { bin, encoder, decoder, tokens } => (
+        SherpaSttSetup::Whisper {
+            bin,
+            encoder,
+            decoder,
+            tokens,
+        } => (
             bin,
             vec![
                 format!("--whisper-encoder={}", encoder.display()),
@@ -1615,7 +1694,10 @@ async fn transcribe_sherpa(audio_bytes: &[u8], file_name: &str) -> Result<String
     args.push(wav_path.to_string_lossy().into_owned());
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args(&args);
-    let output = cmd.output().await.context("sherpa-onnx-offline failed to launch")?;
+    let output = cmd
+        .output()
+        .await
+        .context("sherpa-onnx-offline failed to launch")?;
     let _ = std::fs::remove_file(&wav_path);
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1624,7 +1706,10 @@ async fn transcribe_sherpa(audio_bytes: &[u8], file_name: &str) -> Result<String
     let stdout = String::from_utf8_lossy(&output.stdout);
     let text = parse_sherpa_stt_output(&stdout);
     if text.is_empty() {
-        anyhow::bail!("sherpa-onnx-offline returned no recognized text:\n{}", stdout);
+        anyhow::bail!(
+            "sherpa-onnx-offline returned no recognized text:\n{}",
+            stdout
+        );
     }
     info!(chars = text.len(), "sherpa-onnx STT recognized");
     Ok(text)
@@ -1689,4 +1774,3 @@ fn base64_encode(data: &[u8]) -> String {
     }
     result
 }
-

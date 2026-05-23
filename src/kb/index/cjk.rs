@@ -12,8 +12,9 @@
 //! groups for Latin runs), so the tokenizer is safe to use for the
 //! whole corpus rather than only Chinese docs.
 
-use jieba_rs::{Jieba, TokenizeMode};
 use std::sync::Arc;
+
+use jieba_rs::{Jieba, TokenizeMode};
 use tantivy::tokenizer::{Token, TokenStream, Tokenizer};
 
 #[derive(Clone)]
@@ -166,9 +167,22 @@ mod tests {
         let mut stream = tk.token_stream(text);
         while stream.advance() {
             let t = stream.token();
-            assert!(t.offset_to <= text.len(), "offset_to {} > len {}", t.offset_to, text.len());
-            assert!(text.is_char_boundary(t.offset_from), "from not char boundary: {}", t.offset_from);
-            assert!(text.is_char_boundary(t.offset_to), "to not char boundary: {}", t.offset_to);
+            assert!(
+                t.offset_to <= text.len(),
+                "offset_to {} > len {}",
+                t.offset_to,
+                text.len()
+            );
+            assert!(
+                text.is_char_boundary(t.offset_from),
+                "from not char boundary: {}",
+                t.offset_from
+            );
+            assert!(
+                text.is_char_boundary(t.offset_to),
+                "to not char boundary: {}",
+                t.offset_to
+            );
             assert_eq!(
                 text[t.offset_from..t.offset_to].to_lowercase(),
                 t.text,
@@ -186,6 +200,9 @@ mod tests {
     #[test]
     fn whitespace_only() {
         let tokens = tokenize("   \n\t  ");
-        assert!(tokens.is_empty(), "whitespace should not produce tokens, got: {tokens:?}");
+        assert!(
+            tokens.is_empty(),
+            "whitespace should not produce tokens, got: {tokens:?}"
+        );
     }
 }

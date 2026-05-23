@@ -7,11 +7,18 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 
 use super::style::{banner, bold, dim, err_msg, green, item, kv, ok, warn_msg};
-use crate::cli::MigrateArgs;
-use crate::migrate::openclaw::{self, ImportStats};
-use crate::migrate::{MigrateMode, detect_openclaw_dir};
+use crate::{
+    cli::MigrateArgs,
+    migrate::{
+        MigrateMode, detect_openclaw_dir,
+        openclaw::{self, ImportStats},
+    },
+};
 
-const VERSION: &str = match option_env!("RSCLAW_BUILD_VERSION") { Some(v) => v, None => "dev" };
+const VERSION: &str = match option_env!("RSCLAW_BUILD_VERSION") {
+    Some(v) => v,
+    None => "dev",
+};
 
 pub async fn cmd_migrate(args: MigrateArgs) -> Result<()> {
     banner(&format!("rsclaw migrate v{VERSION}"));
@@ -155,7 +162,10 @@ fn show_scan_results(openclaw_dir: &PathBuf) -> Result<openclaw::OpenClawScanRes
     kv("  Sessions:", &bold(&scan.total_sessions.to_string()));
     kv("  JSONL files:", &scan.total_jsonl_files.to_string());
     kv("  Memory (JSONL):", &scan.total_memories.to_string());
-    kv("  Memory (MEMORY.md):", &scan.total_memory_md_files.to_string());
+    kv(
+        "  Memory (MEMORY.md):",
+        &scan.total_memory_md_files.to_string(),
+    );
     kv("  Memory (SQLite):", &scan.total_memory_dbs.to_string());
     kv("  Workspaces:", &scan.total_workspaces.to_string());
     kv("  Skills:", &scan.total_skills.to_string());
@@ -166,7 +176,10 @@ fn show_scan_results(openclaw_dir: &PathBuf) -> Result<openclaw::OpenClawScanRes
 }
 
 /// Public entry point for setup.rs to call the unified import logic.
-pub async fn import_data_from(openclaw_dir: &std::path::Path, rsclaw_dir: &std::path::Path) -> Result<()> {
+pub async fn import_data_from(
+    openclaw_dir: &std::path::Path,
+    rsclaw_dir: &std::path::Path,
+) -> Result<()> {
     import_data(&openclaw_dir.to_path_buf(), &rsclaw_dir.to_path_buf()).await
 }
 
@@ -345,8 +358,10 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
                             rsclaw_dir.join("workspace").to_string_lossy().into_owned(),
                         ),
                     );
-                    obj.insert("compaction".to_owned(),
-                        serde_json::json!({"mode": "layered"}));
+                    obj.insert(
+                        "compaction".to_owned(),
+                        serde_json::json!({"mode": "layered"}),
+                    );
                     // Write the resolved default model into defaults.model.primary.
                     if let Some(primary) = promoted_model.as_ref() {
                         let model_obj = obj
@@ -367,7 +382,10 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
                         rsclaw_dir.join("workspace").to_string_lossy().into_owned(),
                     ),
                 );
-                d.insert("compaction".to_owned(), serde_json::json!({"mode": "layered"}));
+                d.insert(
+                    "compaction".to_owned(),
+                    serde_json::json!({"mode": "layered"}),
+                );
                 d.insert(
                     "model".to_owned(),
                     serde_json::json!({ "primary": promoted_model.clone().unwrap() }),
@@ -381,16 +399,28 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
                 std::collections::HashMap::new();
             if let Some(bindings) = config.get("bindings").and_then(|v| v.as_array()) {
                 for binding in bindings {
-                    let agent_id = binding.get("agentId").and_then(|v| v.as_str()).unwrap_or("");
-                    let channel = binding.pointer("/match/channel").and_then(|v| v.as_str()).unwrap_or("");
-                    let account = binding.pointer("/match/accountId").and_then(|v| v.as_str()).unwrap_or("");
+                    let agent_id = binding
+                        .get("agentId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let channel = binding
+                        .pointer("/match/channel")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let account = binding
+                        .pointer("/match/accountId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     if !agent_id.is_empty() && !channel.is_empty() {
                         let ch_key = if account.is_empty() {
                             channel.to_owned()
                         } else {
                             format!("{channel}:{account}")
                         };
-                        agent_channels.entry(agent_id.to_owned()).or_default().push(ch_key);
+                        agent_channels
+                            .entry(agent_id.to_owned())
+                            .or_default()
+                            .push(ch_key);
                     }
                 }
             }
@@ -404,17 +434,20 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
                 .pointer("/list")
                 .and_then(|v| v.as_array())
                 .and_then(|arr| {
-                    arr.iter().position(|a| {
-                        a.get("default").and_then(|d| d.as_bool()).unwrap_or(false)
-                    })
-                    .or_else(|| if arr.is_empty() { None } else { Some(0) })
+                    arr.iter()
+                        .position(|a| a.get("default").and_then(|d| d.as_bool()).unwrap_or(false))
+                        .or_else(|| if arr.is_empty() { None } else { Some(0) })
                 });
 
             // Rewrite per-agent workspaces, strip agentDir, add channels from bindings.
-            if let Some(list) = agents_cfg.pointer_mut("/list").and_then(|v| v.as_array_mut()) {
+            if let Some(list) = agents_cfg
+                .pointer_mut("/list")
+                .and_then(|v| v.as_array_mut())
+            {
                 for (idx, agent) in list.iter_mut().enumerate() {
                     if let Some(obj) = agent.as_object_mut() {
-                        let agent_id = obj.get("id")
+                        let agent_id = obj
+                            .get("id")
                             .and_then(|v| v.as_str())
                             .unwrap_or("main")
                             .to_owned();
@@ -432,7 +465,8 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
                         }
                         // Inject channels from bindings.
                         if let Some(chs) = agent_channels.get(&agent_id) {
-                            let ch_values: Vec<serde_json::Value> = chs.iter()
+                            let ch_values: Vec<serde_json::Value> = chs
+                                .iter()
                                 .map(|c| serde_json::Value::String(c.clone()))
                                 .collect();
                             obj.insert("channels".to_owned(), serde_json::Value::Array(ch_values));
@@ -453,9 +487,8 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
         // Channels: only migrate supported channel configs, skip installs/plugins.
         if let Some(channels) = config.get("channels").and_then(|v| v.as_object()) {
             let supported = [
-                "telegram", "feishu", "dingtalk", "wechat", "wecom",
-                "discord", "slack", "whatsapp", "signal", "qq",
-                "line", "zalo", "matrix",
+                "telegram", "feishu", "dingtalk", "wechat", "wecom", "discord", "slack",
+                "whatsapp", "signal", "qq", "line", "zalo", "matrix",
             ];
             let mut ch_cfg = serde_json::Map::new();
             for (name, val) in channels {
@@ -533,7 +566,11 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
                         expanded
                     } else if let Some(dirname) = expanded.file_name() {
                         let remapped = openclaw_dir.join(dirname);
-                        if remapped.is_dir() { remapped } else { expanded }
+                        if remapped.is_dir() {
+                            remapped
+                        } else {
+                            expanded
+                        }
                     } else {
                         expanded
                     }
@@ -555,7 +592,9 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
             match openclaw::convert_heartbeat(&src_workspace, &dst_workspace) {
                 Ok(true) => stats.workspace_files += 1,
                 Err(e) => {
-                    warn_msg(&format!("failed to convert HEARTBEAT.md for {agent_id}: {e}"));
+                    warn_msg(&format!(
+                        "failed to convert HEARTBEAT.md for {agent_id}: {e}"
+                    ));
                     stats.errors += 1;
                 }
                 _ => {}
@@ -568,7 +607,11 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
     if let Ok(entries) = std::fs::read_dir(openclaw_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
             if path.is_dir() && name.starts_with("workspace-") {
                 let dst = rsclaw_dir.join(&name);
                 if !dst.exists() {
@@ -641,9 +684,10 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
     }
 
     // --- Migrate per-channel allowFrom credential files. OpenClaw stores
-    // approved peers in `<openclaw>/credentials/<channel>-<account>-allowFrom.json`;
-    // rsclaw uses the same format under `<rsclaw>/credentials/`, so a
-    // straight file copy lights up the existing trust list on first run.
+    // approved peers in
+    // `<openclaw>/credentials/<channel>-<account>-allowFrom.json`; rsclaw uses
+    // the same format under `<rsclaw>/credentials/`, so a straight file copy
+    // lights up the existing trust list on first run.
     let oc_creds = openclaw_dir.join("credentials");
     let rs_creds = rsclaw_dir.join("credentials");
     if oc_creds.is_dir() {
@@ -679,7 +723,10 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
                     continue;
                 }
                 match std::fs::copy(&src, &dst) {
-                    Ok(_) => item("*", &format!("allowFrom migrated: {name} ({count} entries)")),
+                    Ok(_) => item(
+                        "*",
+                        &format!("allowFrom migrated: {name} ({count} entries)"),
+                    ),
                     Err(e) => warn_msg(&format!("allowFrom copy failed for {name}: {e}")),
                 }
             }
@@ -706,8 +753,7 @@ fn import_memories_to_redb(
     let db_path = mem_dir.join("memory.redb");
     let db = redb::Database::create(&db_path)?;
 
-    let table_def: redb::TableDefinition<&str, &[u8]> =
-        redb::TableDefinition::new("memory_docs");
+    let table_def: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("memory_docs");
 
     // Ensure table exists.
     {
@@ -736,7 +782,7 @@ fn import_memories_to_redb(
             abstract_text: None,
             overview_text: None,
             tags: vec![],
-                pinned: false,
+            pinned: false,
         };
 
         let json_bytes = serde_json::to_vec(&doc)?;
@@ -754,13 +800,21 @@ fn import_memories_to_redb(
         stats.memories += 1;
     }
 
-    item("*", &format!("{} memory entries imported (embedding on next startup)", stats.memories));
+    item(
+        "*",
+        &format!(
+            "{} memory entries imported (embedding on next startup)",
+            stats.memories
+        ),
+    );
     Ok(())
 }
 
 fn md5_short(text: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use std::{
+        collections::hash_map::DefaultHasher,
+        hash::{Hash, Hasher},
+    };
     let mut hasher = DefaultHasher::new();
     text.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
@@ -777,7 +831,10 @@ fn print_import_stats(stats: &ImportStats) {
             bold(&stats.memories.to_string())
         ),
     );
-    kv("  Workspace files:", &bold(&stats.workspace_files.to_string()));
+    kv(
+        "  Workspace files:",
+        &bold(&stats.workspace_files.to_string()),
+    );
     kv("  Skills:", &bold(&stats.skills.to_string()));
     if stats.aliases > 0 {
         kv("  Session aliases:", &bold(&stats.aliases.to_string()));
@@ -805,30 +862,47 @@ mod tests {
             std::collections::HashMap::new();
         if let Some(bindings) = config.get("bindings").and_then(|v| v.as_array()) {
             for binding in bindings {
-                let agent_id = binding.get("agentId").and_then(|v| v.as_str()).unwrap_or("");
-                let channel = binding.pointer("/match/channel").and_then(|v| v.as_str()).unwrap_or("");
-                let account = binding.pointer("/match/accountId").and_then(|v| v.as_str()).unwrap_or("");
+                let agent_id = binding
+                    .get("agentId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let channel = binding
+                    .pointer("/match/channel")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let account = binding
+                    .pointer("/match/accountId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 if !agent_id.is_empty() && !channel.is_empty() {
                     let ch_key = if account.is_empty() {
                         channel.to_owned()
                     } else {
                         format!("{channel}:{account}")
                     };
-                    agent_channels.entry(agent_id.to_owned()).or_default().push(ch_key);
+                    agent_channels
+                        .entry(agent_id.to_owned())
+                        .or_default()
+                        .push(ch_key);
                 }
             }
         }
 
         // Inject channels from bindings into agents list.
-        if let Some(list) = agents_cfg.pointer_mut("/list").and_then(|v| v.as_array_mut()) {
+        if let Some(list) = agents_cfg
+            .pointer_mut("/list")
+            .and_then(|v| v.as_array_mut())
+        {
             for agent in list.iter_mut() {
                 if let Some(obj) = agent.as_object_mut() {
-                    let agent_id = obj.get("id")
+                    let agent_id = obj
+                        .get("id")
                         .and_then(|v| v.as_str())
                         .unwrap_or("main")
                         .to_owned();
                     if let Some(chs) = agent_channels.get(&agent_id) {
-                        let ch_values: Vec<serde_json::Value> = chs.iter()
+                        let ch_values: Vec<serde_json::Value> = chs
+                            .iter()
                             .map(|c| serde_json::Value::String(c.clone()))
                             .collect();
                         obj.insert("channels".to_owned(), serde_json::Value::Array(ch_values));
@@ -891,7 +965,10 @@ mod tests {
         let sales = &result["list"][1];
         let support = &result["list"][2];
         assert_eq!(sales["channels"], json!(["feishu:sales-bot"]));
-        assert_eq!(support["channels"], json!(["feishu:support-bot", "dingtalk"]));
+        assert_eq!(
+            support["channels"],
+            json!(["feishu:support-bot", "dingtalk"])
+        );
     }
 
     #[test]

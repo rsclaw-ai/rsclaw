@@ -12,16 +12,17 @@
 //!     <markdown body>
 //!
 //! Behavior:
-//!   - Discover `.md` files under the app-rules dir at process start
-//!     (and when explicitly reloaded). Hot-reload is NOT a goal — the
-//!     dir is meant to be edited offline.
-//!   - For each request, match user-instruction keywords against
-//!     `triggers` of every loaded rule (case-insensitive substring).
-//!   - Return matched bodies in declaration order so the prompt
-//!     injection is deterministic.
+//!   - Discover `.md` files under the app-rules dir at process start (and when
+//!     explicitly reloaded). Hot-reload is NOT a goal — the dir is meant to be
+//!     edited offline.
+//!   - For each request, match user-instruction keywords against `triggers` of
+//!     every loaded rule (case-insensitive substring).
+//!   - Return matched bodies in declaration order so the prompt injection is
+//!     deterministic.
+
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
 use tracing::warn;
 
 #[derive(Debug, Clone)]
@@ -61,7 +62,8 @@ impl AppRuleSet {
             }
             paths.push(path);
         }
-        // Sort for deterministic order across platforms (read_dir order is OS-dependent).
+        // Sort for deterministic order across platforms (read_dir order is
+        // OS-dependent).
         paths.sort();
 
         let mut rules = Vec::new();
@@ -112,8 +114,8 @@ impl AppRuleSet {
 /// Parse a single markdown file into an `AppRule`. Returns `Ok(None)` if
 /// the file lacks a frontmatter block.
 fn parse_file(path: &Path) -> Result<Option<AppRule>> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("read file {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("read file {}", path.display()))?;
     let Some((frontmatter, body)) = split_frontmatter(&text) else {
         return Ok(None);
     };
@@ -144,7 +146,10 @@ fn parse_file(path: &Path) -> Result<Option<AppRule>> {
     for t in fm_triggers {
         push_unique(t, &mut triggers);
     }
-    for alias in canonical_aliases(&name).iter().chain(canonical_aliases(&stem)) {
+    for alias in canonical_aliases(&name)
+        .iter()
+        .chain(canonical_aliases(&stem))
+    {
         push_unique(alias.to_string(), &mut triggers);
     }
 
@@ -166,7 +171,9 @@ fn split_frontmatter(text: &str) -> Option<(&str, &str)> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let rest = text.strip_prefix("---")?;
     // Must be followed by a newline (no inline content on the opening fence).
-    let rest = rest.strip_prefix('\n').or_else(|| rest.strip_prefix("\r\n"))?;
+    let rest = rest
+        .strip_prefix('\n')
+        .or_else(|| rest.strip_prefix("\r\n"))?;
     // Find the closing "---" on its own line.
     let mut search_from = 0usize;
     while let Some(idx) = rest[search_from..].find("---") {
@@ -267,9 +274,11 @@ fn canonical_aliases(name: &str) -> &'static [&'static str] {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::fs;
+
     use tempfile::tempdir;
+
+    use super::*;
 
     fn write(dir: &Path, name: &str, content: &str) -> PathBuf {
         let p = dir.join(name);
@@ -294,11 +303,26 @@ Body content here.\n";
         let r = &set.rules[0];
         assert_eq!(r.name, "wechat");
         let lower: Vec<String> = r.triggers.iter().map(|s| s.to_lowercase()).collect();
-        assert!(lower.iter().any(|s| s == "wechat"), "triggers: {:?}", r.triggers);
-        assert!(lower.iter().any(|s| s == "微信"), "triggers: {:?}", r.triggers);
-        assert!(lower.iter().any(|s| s == "weixin"), "triggers: {:?}", r.triggers);
+        assert!(
+            lower.iter().any(|s| s == "wechat"),
+            "triggers: {:?}",
+            r.triggers
+        );
+        assert!(
+            lower.iter().any(|s| s == "微信"),
+            "triggers: {:?}",
+            r.triggers
+        );
+        assert!(
+            lower.iter().any(|s| s == "weixin"),
+            "triggers: {:?}",
+            r.triggers
+        );
         assert!(r.body.contains("Body content here"));
-        assert_eq!(r.description.as_deref(), Some("WeChat (微信) desktop client automation"));
+        assert_eq!(
+            r.description.as_deref(),
+            Some("WeChat (微信) desktop client automation")
+        );
     }
 
     #[test]

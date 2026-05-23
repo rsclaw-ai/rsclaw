@@ -3,17 +3,16 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use super::{
+    super::preparse::{btw_direct_call, is_fast_preparse, try_preparse_locally},
+    default_dm_scope,
+};
 use crate::{
     agent::{AgentMessage, AgentRegistry},
     channel::{Channel, OutboundMessage},
     config::runtime::RuntimeConfig,
     gateway::session::{MessageKind, SessionKeyParams, derive_session_key},
 };
-
-use super::super::preparse::{
-    btw_direct_call, is_fast_preparse, try_preparse_locally,
-};
-use super::default_dm_scope;
 
 // ---------------------------------------------------------------------------
 // DingTalk (钉钉)
@@ -121,7 +120,9 @@ pub(crate) fn start_dingtalk_if_configured(
 
         // Register DingTalk channel sender for notification routing.
         {
-            let mut senders = channel_senders.write().expect("channel_senders lock poisoned");
+            let mut senders = channel_senders
+                .write()
+                .expect("channel_senders lock poisoned");
             senders.insert("dingtalk".to_string(), out_tx.clone());
             senders.insert(format!("dingtalk/{}", acct_name), out_tx.clone());
         }
@@ -176,9 +177,7 @@ pub(crate) fn start_dingtalk_if_configured(
                             }
                             crate::config::schema::GroupPolicy::Allowlist => {
                                 if !group_allow.iter().any(|g| *g == conversation_id) {
-                                    warn!(
-                                        "dingtalk group message rejected: not in groupAllowFrom"
-                                    );
+                                    warn!("dingtalk group message rejected: not in groupAllowFrom");
                                     return;
                                 }
                             }
@@ -209,7 +208,8 @@ pub(crate) fn start_dingtalk_if_configured(
                                         channel: None,
 
                                         account: None,
-                    files: vec![],                                    })
+                                        files: vec![],
+                                    })
                                     .await
                                 {
                                     tracing::warn!("failed to send message: {e}");
@@ -231,7 +231,8 @@ pub(crate) fn start_dingtalk_if_configured(
                                         channel: None,
 
                                         account: None,
-                    files: vec![],                                    })
+                                        files: vec![],
+                                    })
                                     .await
                                 {
                                     tracing::warn!("failed to send message: {e}");
@@ -275,13 +276,19 @@ pub(crate) fn start_dingtalk_if_configured(
                                             Ok(h) => h,
                                             Err(_) => match w_reg.route_account("dingtalk", None) {
                                                 Ok(h) => h,
-                                                Err(e) => { error!("dingtalk route error: {e:#}"); continue; }
+                                                Err(e) => {
+                                                    error!("dingtalk route error: {e:#}");
+                                                    continue;
+                                                }
                                             },
                                         }
                                     } else {
                                         match w_reg.route_account("dingtalk", None) {
                                             Ok(h) => h,
-                                            Err(e) => { error!("dingtalk route error: {e:#}"); continue; }
+                                            Err(e) => {
+                                                error!("dingtalk route error: {e:#}");
+                                                continue;
+                                            }
                                         }
                                     };
                                     let dm_scope = default_dm_scope(&w_cfg);
@@ -299,7 +306,11 @@ pub(crate) fn start_dingtalk_if_configured(
                                         peer_id: sender_id.clone(),
                                         dm_scope,
                                     });
-                                    let dt_target = if is_group { conversation_id.clone() } else { sender_id.clone() };
+                                    let dt_target = if is_group {
+                                        conversation_id.clone()
+                                    } else {
+                                        sender_id.clone()
+                                    };
                                     let qmsg = crate::gateway::task_queue::QueuedMessage {
                                         text,
                                         sender: sender_id.to_string(),
@@ -312,7 +323,11 @@ pub(crate) fn start_dingtalk_if_configured(
                                         files: vec![],
                                         account: None,
                                     };
-                                    if let Err(e) = w_tq.submit(&session_key, qmsg, crate::gateway::task_queue::Priority::User) {
+                                    if let Err(e) = w_tq.submit(
+                                        &session_key,
+                                        qmsg,
+                                        crate::gateway::task_queue::Priority::User,
+                                    ) {
                                         error!(user = %w_uid, "dingtalk: queue submit failed: {e:#}");
                                     }
                                 }
@@ -355,7 +370,8 @@ pub(crate) fn start_dingtalk_if_configured(
                                         channel: None,
 
                                         account: None,
-                    files: vec![],                                    })
+                                        files: vec![],
+                                    })
                                     .await
                                 {
                                     tracing::warn!("failed to send message: {e}");
@@ -402,14 +418,24 @@ pub(crate) fn start_dingtalk_if_configured(
                                 peer_id: sender_id.clone(),
                                 dm_scope,
                             });
-                            if let Some(mut reply) = try_preparse_locally(&text, &handle, "dingtalk", &sender_id, crate::gateway::preparse::PreparseOrigin::User).await {
-                                reply.target_id = if is_group { conversation_id.clone() } else { sender_id.clone() };
+                            if let Some(mut reply) = try_preparse_locally(
+                                &text,
+                                &handle,
+                                "dingtalk",
+                                &sender_id,
+                                crate::gateway::preparse::PreparseOrigin::User,
+                            )
+                            .await
+                            {
+                                reply.target_id = if is_group {
+                                    conversation_id.clone()
+                                } else {
+                                    sender_id.clone()
+                                };
                                 reply.is_group = is_group;
                                 if !reply.text.is_empty() || !reply.images.is_empty() {
                                     if let Err(e) = tx.send(reply).await {
-
                                         tracing::warn!("failed to send message: {e}");
-
                                     }
                                 }
                                 return;
@@ -435,19 +461,24 @@ pub(crate) fn start_dingtalk_if_configured(
                             if handle.tx.send(msg).await.is_err() {
                                 return;
                             }
-                            if let Ok(Ok(r)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
+                            if let Ok(Ok(r)) =
+                                tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx)
+                                    .await
+                            {
                                 if !r.is_empty {
                                     let target = if is_group { conversation_id } else { sender_id };
-                                    if let Err(e) = tx.send(OutboundMessage {
-                                        target_id: target,
-                                        is_group,
-                                        text: r.text,
-                                        reply_to: None,
-                                        images: r.images,
-                                        files: r.files,
-                                        channel: None,
-                                        account: None,
-                                    }).await
+                                    if let Err(e) = tx
+                                        .send(OutboundMessage {
+                                            target_id: target,
+                                            is_group,
+                                            text: r.text,
+                                            reply_to: None,
+                                            images: r.images,
+                                            files: r.files,
+                                            channel: None,
+                                            account: None,
+                                        })
+                                        .await
                                     {
                                         tracing::warn!("failed to send message: {e}");
                                     }

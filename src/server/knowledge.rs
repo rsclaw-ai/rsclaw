@@ -5,26 +5,23 @@
 //! (`KnowledgeService`). P1: collection metadata CRUD. Docs/search land in
 //! P2/P3.
 
+use std::{convert::Infallible, sync::Arc, time::Duration};
+
 use axum::{
     Json, Router,
     body::to_bytes,
     extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Request, State},
     http::{StatusCode, header},
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{get, post},
 };
+use futures::{Stream, StreamExt as _};
 use serde::{Deserialize, Serialize};
 
-use axum::response::sse::{Event, KeepAlive, Sse};
-use futures::{Stream, StreamExt as _};
-use std::convert::Infallible;
-use std::time::Duration;
-
-use std::sync::Arc;
-
-use crate::kb::model::KbCollection;
-use crate::kb::service::DocInfo;
-use crate::kb::{KnowledgeError, KnowledgeService};
+use crate::kb::{KnowledgeError, KnowledgeService, model::KbCollection, service::DocInfo};
 
 /// Routes nested under `/api/v1/knowledge`. State is the `KnowledgeService`
 /// alone (not the full `AppState`), so the handlers are testable in isolation.
@@ -469,10 +466,10 @@ const MAX_DIR_FILES: usize = 2000;
 /// Ingest every supported file under a local directory (recursive). Same
 /// loopback + allowlist gate as `from-path`; the directory itself must
 /// canonicalize under an allowed root. Returns a from-url-style summary
-/// `{ docsAdded, docsSkipped, truncated }`. Unsupported / oversized / unreadable
-/// files are skipped (counted), never fatal — one bad file can't abort the
-/// import. Hidden entries and symlinks are skipped (the latter avoids loops and
-/// allowlist escape).
+/// `{ docsAdded, docsSkipped, truncated }`. Unsupported / oversized /
+/// unreadable files are skipped (counted), never fatal — one bad file can't
+/// abort the import. Hidden entries and symlinks are skipped (the latter avoids
+/// loops and allowlist escape).
 async fn upload_from_dir(
     State(svc): State<Arc<KnowledgeService>>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
@@ -502,10 +499,9 @@ async fn upload_from_dir(
     let max_bytes = svc.max_doc_bytes();
     let svc2 = Arc::clone(&svc);
     let cid2 = cid.clone();
-    let summary = tokio::task::spawn_blocking(move || {
-        walk_and_ingest(&svc2, &cid2, &dir, &roots, max_bytes)
-    })
-    .await;
+    let summary =
+        tokio::task::spawn_blocking(move || walk_and_ingest(&svc2, &cid2, &dir, &roots, max_bytes))
+            .await;
 
     match summary {
         Ok((added, skipped, truncated)) => (
@@ -609,7 +605,11 @@ fn walk_and_ingest(
                     continue;
                 }
             };
-            let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+            let fname = p
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
             let mime = crate::kb::canonicalize::detect_mime(&bytes, Some(&fname));
             match svc.ingest(cid, fname.trim(), &bytes, Some(&mime)) {
                 Ok((_, true)) => skipped += 1, // dedupe: identical content already present
@@ -893,11 +893,14 @@ async fn embedders(State(svc): State<Arc<KnowledgeService>>) -> Response {
 
 #[cfg(test)]
 mod http_tests {
-    use super::*;
-    use axum::body::{Body, to_bytes};
-    use axum::http::{Request, StatusCode};
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
     use tempfile::TempDir;
-    use tower::ServiceExt; // oneshot
+    use tower::ServiceExt;
+
+    use super::*; // oneshot
 
     type App = Router;
 
@@ -1132,7 +1135,8 @@ mod http_tests {
         let base = std::env::temp_dir().join(format!("rsclaw_walk_{}", std::process::id()));
         let sub = base.join("sub");
         std::fs::create_dir_all(&sub).unwrap();
-        let write = |p: &std::path::Path, b: &[u8]| std::fs::File::create(p).unwrap().write_all(b).unwrap();
+        let write =
+            |p: &std::path::Path, b: &[u8]| std::fs::File::create(p).unwrap().write_all(b).unwrap();
         write(&base.join("a.md"), b"# hello");
         write(&base.join("b.txt"), b"plain text body");
         write(&sub.join("c.md"), b"# nested");
@@ -1140,8 +1144,13 @@ mod http_tests {
         write(&base.join(".hidden.md"), b"# secret"); // hidden → skipped entirely
 
         let roots = vec![std::fs::canonicalize(&base).unwrap()];
-        let (added, skipped, truncated) =
-            walk_and_ingest(&svc, &cid, &std::fs::canonicalize(&base).unwrap(), &roots, svc.max_doc_bytes());
+        let (added, skipped, truncated) = walk_and_ingest(
+            &svc,
+            &cid,
+            &std::fs::canonicalize(&base).unwrap(),
+            &roots,
+            svc.max_doc_bytes(),
+        );
 
         assert_eq!(added, 3, "a.md + b.txt + sub/c.md");
         assert!(skipped >= 1, "the unsupported file is counted as skipped");

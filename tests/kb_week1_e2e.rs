@@ -1,12 +1,13 @@
 //! Week 1 end-to-end: canonicalize → stage → chunk. No DB writes yet
 //! (Week 2 introduces ledger/outbox writes).
 
+use std::path::Path;
+
 use anyhow::Result;
 use rsclaw::kb::{
-    canonicalize_by_mime, chunk_markdown, detect_mime, read_doc_range, stage_doc,
     CanonicalizeInput, ChunkerInput, FrontMatter, KbPaths, LocatorKind, StageInput,
+    canonicalize_by_mime, chunk_markdown, detect_mime, read_doc_range, stage_doc,
 };
-use std::path::Path;
 use tempfile::TempDir;
 use ulid::Ulid;
 

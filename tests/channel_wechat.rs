@@ -2,8 +2,7 @@
 
 use std::sync::Arc;
 
-use rsclaw::channel::wechat::WeChatPersonalChannel;
-use rsclaw::channel::{Channel, OutboundMessage};
+use rsclaw::channel::{Channel, OutboundMessage, wechat::WeChatPersonalChannel};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{method, path},
@@ -74,7 +73,7 @@ async fn send_text_via_mock() {
             text: "Hello WeChat".to_owned(),
             reply_to: None,
             images: vec![],
-        ..Default::default()
+            ..Default::default()
         })
         .await;
 
@@ -99,8 +98,8 @@ async fn send_chunked_message() {
         .mount(&server)
         .await;
 
-    let ch = WeChatPersonalChannel::new("tok".to_owned(), noop_on_message())
-        .with_base_url(server.uri());
+    let ch =
+        WeChatPersonalChannel::new("tok".to_owned(), noop_on_message()).with_base_url(server.uri());
 
     // Build a message exceeding the default chunk limit
     let long_text = "W".repeat(10_000);
@@ -111,9 +110,13 @@ async fn send_chunked_message() {
             text: long_text,
             reply_to: None,
             images: vec![],
-        ..Default::default()
+            ..Default::default()
         })
         .await;
 
-    assert!(result.is_ok(), "chunked send should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "chunked send should succeed: {:?}",
+        result.err()
+    );
 }

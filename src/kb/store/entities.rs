@@ -11,11 +11,16 @@
 //! O(n) for MVP; a dedicated inverted index lands in Week 4 when
 //! entity extraction starts emitting non-trivial entity counts.
 
-use crate::kb::model::{EntityKind, KbEntity, KbEntityIndex};
-use crate::kb::store::codec::{decode, encode};
-use crate::kb::store::schema::{KB_ENTITIES, KB_ENTITY_INDEX};
 use anyhow::Result;
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
+
+use crate::kb::{
+    model::{EntityKind, KbEntity, KbEntityIndex},
+    store::{
+        codec::{decode, encode},
+        schema::{KB_ENTITIES, KB_ENTITY_INDEX},
+    },
+};
 
 pub fn put_entity(wtx: &WriteTransaction, e: &KbEntity) -> Result<()> {
     let bytes = encode(e)?;
@@ -76,10 +81,7 @@ pub fn put_index(wtx: &WriteTransaction, idx: &KbEntityIndex) -> Result<()> {
 }
 
 /// All chunks that mention `entity_id`.
-pub fn chunks_for_entity(
-    rtx: &ReadTransaction,
-    entity_id: &str,
-) -> Result<Vec<KbEntityIndex>> {
+pub fn chunks_for_entity(rtx: &ReadTransaction, entity_id: &str) -> Result<Vec<KbEntityIndex>> {
     let prefix = format!("{entity_id}\0");
     let end = format!("{entity_id}\u{1}");
     let tbl = rtx.open_table(KB_ENTITY_INDEX)?;
@@ -97,10 +99,11 @@ fn compose_idx_key(entity_id: &str, chunk_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use redb::ReadableDatabase;
-    use crate::kb::store::open_db;
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::kb::store::open_db;
 
     fn sample_entity(canonical_id: &str, surfaces: &[&str], kind: EntityKind) -> KbEntity {
         KbEntity {
@@ -126,7 +129,10 @@ mod tests {
         }
         let rtx = db.begin_read().unwrap();
         let e = get_entity(&rtx, "ent_mengniu").unwrap().unwrap();
-        assert_eq!(e.surface_forms, vec!["蒙牛".to_string(), "Mengniu".to_string()]);
+        assert_eq!(
+            e.surface_forms,
+            vec!["蒙牛".to_string(), "Mengniu".to_string()]
+        );
     }
 
     #[test]
@@ -155,8 +161,16 @@ mod tests {
         let db = open_db(&tmp.path().join("kb.redb")).unwrap();
         {
             let wtx = db.begin_write().unwrap();
-            put_entity(&wtx, &sample_entity("ent_brand", &["Apple"], EntityKind::Brand)).unwrap();
-            put_entity(&wtx, &sample_entity("ent_org", &["Apple Inc"], EntityKind::Org)).unwrap();
+            put_entity(
+                &wtx,
+                &sample_entity("ent_brand", &["Apple"], EntityKind::Brand),
+            )
+            .unwrap();
+            put_entity(
+                &wtx,
+                &sample_entity("ent_org", &["Apple Inc"], EntityKind::Org),
+            )
+            .unwrap();
             wtx.commit().unwrap();
         }
         let rtx = db.begin_read().unwrap();

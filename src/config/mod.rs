@@ -48,7 +48,6 @@ pub fn load_quiet() -> Result<RuntimeConfig> {
 }
 
 fn load_from_path(path: &std::path::Path) -> Result<RuntimeConfig> {
-
     let runtime = load_json5(&path)
         .with_context(|| format!("failed to load config: {}", path.display()))?
         .into_runtime()?;
@@ -85,10 +84,15 @@ pub fn resolve_proxy(config: &RuntimeConfig) -> Option<String> {
     // RSCLAW_PROXY env var takes priority.
     if let Ok(p) = std::env::var("RSCLAW_PROXY") {
         let p = p.trim().to_owned();
-        if !p.is_empty() { return Some(p); }
+        if !p.is_empty() {
+            return Some(p);
+        }
     }
     // Fallback to config file.
-    config.raw.gateway.as_ref()
+    config
+        .raw
+        .gateway
+        .as_ref()
         .and_then(|g| g.proxy.as_ref())
         .filter(|p| !p.is_empty())
         .cloned()
@@ -97,9 +101,14 @@ pub fn resolve_proxy(config: &RuntimeConfig) -> Option<String> {
 /// Resolve proxy allow list from env or config.
 fn resolve_proxy_allow(config: &RuntimeConfig) -> Option<String> {
     if let Ok(v) = std::env::var("RSCLAW_PROXY_ALLOW") {
-        if !v.trim().is_empty() { return Some(v.trim().to_owned()); }
+        if !v.trim().is_empty() {
+            return Some(v.trim().to_owned());
+        }
     }
-    config.raw.gateway.as_ref()
+    config
+        .raw
+        .gateway
+        .as_ref()
         .and_then(|g| g.proxy_allow.as_ref())
         .filter(|v| !v.is_empty())
         .cloned()
@@ -108,9 +117,14 @@ fn resolve_proxy_allow(config: &RuntimeConfig) -> Option<String> {
 /// Resolve proxy deny list from env or config.
 fn resolve_proxy_deny(config: &RuntimeConfig) -> Option<String> {
     if let Ok(v) = std::env::var("RSCLAW_PROXY_DENY") {
-        if !v.trim().is_empty() { return Some(v.trim().to_owned()); }
+        if !v.trim().is_empty() {
+            return Some(v.trim().to_owned());
+        }
     }
-    config.raw.gateway.as_ref()
+    config
+        .raw
+        .gateway
+        .as_ref()
         .and_then(|g| g.proxy_deny.as_ref())
         .filter(|v| !v.is_empty())
         .cloned()
@@ -120,7 +134,9 @@ fn resolve_proxy_deny(config: &RuntimeConfig) -> Option<String> {
 fn host_matches_pattern(host: &str, pattern: &str) -> bool {
     let host = host.to_lowercase();
     let pattern = pattern.trim().to_lowercase();
-    if pattern == "*" { return true; }
+    if pattern == "*" {
+        return true;
+    }
     if pattern.starts_with("*.") {
         let suffix = &pattern[1..]; // ".openai.com"
         host.ends_with(suffix) || host == pattern[2..]
@@ -131,7 +147,9 @@ fn host_matches_pattern(host: &str, pattern: &str) -> bool {
 
 /// Check if a host matches any pattern in a comma-separated list.
 fn host_matches_any(host: &str, patterns: &str) -> bool {
-    patterns.split(',').any(|p| host_matches_pattern(host, p.trim()))
+    patterns
+        .split(',')
+        .any(|p| host_matches_pattern(host, p.trim()))
 }
 
 /// Apply proxy settings. Uses HTTP_PROXY/HTTPS_PROXY env vars for simple cases,
@@ -171,7 +189,9 @@ pub fn apply_proxy_env(config: &RuntimeConfig) {
         // For channels that DO need the proxy (e.g. wechat CDN upload),
         // they should use build_proxy_client() or we inject the proxy at
         // the point of use.
-        unsafe { std::env::set_var("NO_PROXY", &deny_list); }
+        unsafe {
+            std::env::set_var("NO_PROXY", &deny_list);
+        }
         PROXY_ALLOW.get_or_init(|| allow.clone().unwrap_or_default());
         PROXY_DENY.get_or_init(|| deny_list.clone());
         PROXY_URL.get_or_init(|| proxy_url.clone());
@@ -222,7 +242,8 @@ pub fn build_proxy_client() -> reqwest::ClientBuilder {
 ///
 /// Shared helper used by heartbeat and cron modules to avoid duplication.
 pub fn system_tz() -> chrono_tz::Tz {
-    // Try TZ env var first (works on Linux/macOS with IANA names like "Asia/Shanghai")
+    // Try TZ env var first (works on Linux/macOS with IANA names like
+    // "Asia/Shanghai")
     if let Ok(tz_name) = std::env::var("TZ") {
         if let Ok(tz) = tz_name.parse() {
             return tz;
@@ -234,14 +255,17 @@ pub fn system_tz() -> chrono_tz::Tz {
         25200 => chrono_tz::Asia::Bangkok,     // +07:00
         28800 => chrono_tz::Asia::Shanghai,    // +08:00
         32400 => chrono_tz::Asia::Tokyo,       // +09:00
-        36000 => chrono_tz::Australia::Sydney,  // +10:00
+        36000 => chrono_tz::Australia::Sydney, // +10:00
         -18000 => chrono_tz::US::Eastern,      // -05:00
         -21600 => chrono_tz::US::Central,      // -06:00
         -25200 => chrono_tz::US::Mountain,     // -07:00
         -28800 => chrono_tz::US::Pacific,      // -08:00
         0 => chrono_tz::UTC,
         _ => {
-            tracing::warn!(offset_secs = local_offset, "unknown system timezone offset, using UTC. Set TZ env var for accuracy.");
+            tracing::warn!(
+                offset_secs = local_offset,
+                "unknown system timezone offset, using UTC. Set TZ env var for accuracy."
+            );
             chrono_tz::UTC
         }
     }

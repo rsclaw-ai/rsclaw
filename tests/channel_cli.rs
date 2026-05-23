@@ -2,8 +2,10 @@
 
 use std::sync::Arc;
 
-use rsclaw::channel::cli::{CliChannel, CLI_CHANNEL_NAME, CLI_PEER_ID};
-use rsclaw::channel::{Channel, OutboundMessage};
+use rsclaw::channel::{
+    Channel, OutboundMessage,
+    cli::{CLI_CHANNEL_NAME, CLI_PEER_ID, CliChannel},
+};
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -52,10 +54,14 @@ async fn send_ignores_images() {
             text: "text with image".to_owned(),
             reply_to: None,
             images: vec!["data:image/png;base64,iVBOR...".to_owned()],
-        ..Default::default()
+            ..Default::default()
         })
         .await;
-    assert!(result.is_ok(), "send with images should not error: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "send with images should not error: {:?}",
+        result.err()
+    );
 }
 
 /// Sending with reply_to set should still succeed.

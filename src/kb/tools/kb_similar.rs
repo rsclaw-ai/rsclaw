@@ -1,11 +1,16 @@
 //! kb_similar: vector neighbors of a chunk.
 
-use crate::kb::model::CallerScope;
-use crate::kb::search::filter::{is_latest_version, keep_doc, SearchFilter};
-use crate::kb::search::SearchCtx;
-use crate::kb::store::{chunks, docs};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+
+use crate::kb::{
+    model::CallerScope,
+    search::{
+        SearchCtx,
+        filter::{SearchFilter, is_latest_version, keep_doc},
+    },
+    store::{chunks, docs},
+};
 
 #[derive(Debug, Deserialize)]
 pub struct KbSimilarInput {
@@ -20,9 +25,15 @@ pub struct KbSimilarInput {
     pub exclude_neighbors: bool,
 }
 
-fn default_k() -> usize { 8 }
-fn default_scope() -> String { "any".into() }
-fn default_min_score() -> f32 { 0.0 }
+fn default_k() -> usize {
+    8
+}
+fn default_scope() -> String {
+    "any".into()
+}
+fn default_min_score() -> f32 {
+    0.0
+}
 
 #[derive(Debug, Serialize)]
 pub struct KbSimilarOutput {
@@ -36,11 +47,7 @@ pub struct NeighborHit {
     pub score: f32,
 }
 
-pub fn run(
-    ctx: &SearchCtx,
-    input: KbSimilarInput,
-    scope: &CallerScope,
-) -> Result<KbSimilarOutput> {
+pub fn run(ctx: &SearchCtx, input: KbSimilarInput, scope: &CallerScope) -> Result<KbSimilarOutput> {
     let rtx = ctx.store.begin_read()?;
     let seed = match chunks::get(&rtx, &input.chunk_id)? {
         Some(c) => c,
@@ -77,7 +84,11 @@ pub fn run(
         {
             continue;
         }
-        out.push(NeighborHit { chunk_id: cid, doc_id: c.doc_id, score });
+        out.push(NeighborHit {
+            chunk_id: cid,
+            doc_id: c.doc_id,
+            score,
+        });
         if out.len() == input.k {
             break;
         }

@@ -5,17 +5,18 @@
 //!
 //! See spec §1 model types + §I SourceIdentity.
 
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KbSourceKind {
     Doc,
-    Chat,   // v2
+    Chat, // v2
     Url,
-    Img,    // v2
-    Mail,   // v2
+    Img,  // v2
+    Mail, // v2
 }
 
 impl KbSourceKind {
@@ -70,10 +71,22 @@ impl KbSource {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MailSource {
-    EmlFile { path: PathBuf },
-    MboxFile { path: PathBuf },
-    Imap { account: String, folder: String, uid: u64 },
-    Gmail { account: String, thread_id: String, msg_id: String },
+    EmlFile {
+        path: PathBuf,
+    },
+    MboxFile {
+        path: PathBuf,
+    },
+    Imap {
+        account: String,
+        folder: String,
+        uid: u64,
+    },
+    Gmail {
+        account: String,
+        thread_id: String,
+        msg_id: String,
+    },
 }
 
 /// Idempotency key. Same content from the same source produces the
@@ -124,9 +137,17 @@ mod tests {
 
     #[test]
     fn source_to_kind() {
-        assert_eq!(KbSource::Doc { path: "/x".into() }.kind(), KbSourceKind::Doc);
         assert_eq!(
-            KbSource::Mail { source: MailSource::EmlFile { path: "/x.eml".into() } }.kind(),
+            KbSource::Doc { path: "/x".into() }.kind(),
+            KbSourceKind::Doc
+        );
+        assert_eq!(
+            KbSource::Mail {
+                source: MailSource::EmlFile {
+                    path: "/x.eml".into()
+                }
+            }
+            .kind(),
             KbSourceKind::Mail
         );
     }
@@ -134,22 +155,34 @@ mod tests {
     #[test]
     fn logical_source_id_namespaces() {
         assert_eq!(LogicalSourceId::for_file("abc").as_str(), "file:sha256:abc");
-        assert_eq!(LogicalSourceId::for_url("https://x").as_str(), "url:https://x");
+        assert_eq!(
+            LogicalSourceId::for_url("https://x").as_str(),
+            "url:https://x"
+        );
         assert_eq!(
             LogicalSourceId::for_chat_bucket("feishu:pm", 1234567890).as_str(),
             "chat:feishu:pm:1234567890"
         );
-        assert_eq!(LogicalSourceId::for_mail("<msg@host>").as_str(), "mail:<msg@host>");
+        assert_eq!(
+            LogicalSourceId::for_mail("<msg@host>").as_str(),
+            "mail:<msg@host>"
+        );
     }
 
     #[test]
     fn logical_source_id_distinguishes_namespaces() {
-        assert_ne!(LogicalSourceId::for_file("x"), LogicalSourceId::for_url("x"));
+        assert_ne!(
+            LogicalSourceId::for_file("x"),
+            LogicalSourceId::for_url("x")
+        );
     }
 
     #[test]
     fn source_serde_roundtrip() {
-        let s = KbSource::Url { url: "https://x".into(), fetched_at: 123 };
+        let s = KbSource::Url {
+            url: "https://x".into(),
+            fetched_at: 123,
+        };
         let json = serde_json::to_string(&s).unwrap();
         let back: KbSource = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);

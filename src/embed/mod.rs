@@ -6,15 +6,18 @@
 //! Backends (all behind the `Embedder` trait, hot-swappable):
 //!   - `FnvEmbedder`     — deterministic hash projection, no model.
 //!   - `LocalBgeEmbedder`— candle BGE (BERT) from a model dir.
-//!   - `OpenAiEmbedder`  — OpenAI-compatible `/v1/embeddings` REST; point `base_url` at a GPU fleet running Qwen3-Embedding for remote acceleration.
+//!   - `OpenAiEmbedder`  — OpenAI-compatible `/v1/embeddings` REST; point
+//!     `base_url` at a GPU fleet running Qwen3-Embedding for remote
+//!     acceleration.
 //!   - `OllamaEmbedder`  — Ollama local REST API.
 //!
 //! `agent::memory` re-exports these names for backward compatibility,
 //! so existing `crate::agent::memory::EmbedderBackend` paths keep
 //! working.
 
-use anyhow::{Context, Result};
 use std::path::Path;
+
+use anyhow::{Context, Result};
 use tracing::warn;
 
 /// Fallback embedding dimension when no model is loaded (FNV).
@@ -181,7 +184,12 @@ impl Embedder for LocalBgeEmbedder {
         // "index-select invalid index 512" panics.
         const MAX_SEQ: usize = 512;
         let ids: Vec<u32> = encoding.get_ids().iter().take(MAX_SEQ).copied().collect();
-        let type_ids: Vec<u32> = encoding.get_type_ids().iter().take(MAX_SEQ).copied().collect();
+        let type_ids: Vec<u32> = encoding
+            .get_type_ids()
+            .iter()
+            .take(MAX_SEQ)
+            .copied()
+            .collect();
         let len = ids.len();
 
         let make_tensor = |data: Vec<u32>| -> Result<Tensor, candle_core::Error> {
@@ -518,7 +526,10 @@ mod query_instruction_tests {
     #[test]
     fn some_wraps_in_qwen3_instruct_format() {
         assert_eq!(
-            format_query(Some("Given a query, retrieve relevant passages"), "梯度下降"),
+            format_query(
+                Some("Given a query, retrieve relevant passages"),
+                "梯度下降"
+            ),
             "Instruct: Given a query, retrieve relevant passages\nQuery: 梯度下降"
         );
     }
@@ -530,4 +541,3 @@ mod query_instruction_tests {
         assert_eq!(format_query(Some(""), "梯度下降"), "梯度下降");
     }
 }
-

@@ -68,10 +68,11 @@ impl super::runtime::AgentRuntime {
             .map(|s| s.to_owned());
 
         // Resolve provider — from image model config or current chat model
-        let resolve_model = user_image_model.clone().unwrap_or_else(|| self.resolve_model_name());
-        let (prov_name, user_model_id) = {
-            crate::provider::registry::ProviderRegistry::parse_model(&resolve_model)
-        };
+        let resolve_model = user_image_model
+            .clone()
+            .unwrap_or_else(|| self.resolve_model_name());
+        let (prov_name, user_model_id) =
+            { crate::provider::registry::ProviderRegistry::parse_model(&resolve_model) };
         let (base_url, _auth_style) = crate::provider::defaults::resolve_base_url(prov_name);
 
         let default_size = match prov_name {
@@ -106,7 +107,13 @@ impl super::runtime::AgentRuntime {
             (url, key, prov_name)
         } else {
             // Current provider doesn't support images — try doubao, qwen, openai
-            let fallback = [("doubao", "ARK_API_KEY"), ("qwen", "DASHSCOPE_API_KEY"), ("minimax", "MINIMAX_API_KEY"), ("gemini", "GEMINI_API_KEY"), ("openai", "OPENAI_API_KEY")];
+            let fallback = [
+                ("doubao", "ARK_API_KEY"),
+                ("qwen", "DASHSCOPE_API_KEY"),
+                ("minimax", "MINIMAX_API_KEY"),
+                ("gemini", "GEMINI_API_KEY"),
+                ("openai", "OPENAI_API_KEY"),
+            ];
             let mut found = None;
             for (fb_prov, fb_env) in fallback {
                 let fb_cfg = self
@@ -135,8 +142,15 @@ impl super::runtime::AgentRuntime {
             }));
         };
 
-        let image_model = args["model"].as_str()
-            .or_else(|| if !user_model_id.is_empty() { Some(user_model_id) } else { None })
+        let image_model = args["model"]
+            .as_str()
+            .or_else(|| {
+                if !user_model_id.is_empty() {
+                    Some(user_model_id)
+                } else {
+                    None
+                }
+            })
             .unwrap_or_else(|| match img_prov {
                 "doubao" | "bytedance" => "doubao-seedream-5-0-260128",
                 "openai" => "dall-e-3",
@@ -147,7 +161,11 @@ impl super::runtime::AgentRuntime {
             });
 
         // Resolve User-Agent: provider config -> gateway config -> default
-        let img_ua = self.config.model.models.as_ref()
+        let img_ua = self
+            .config
+            .model
+            .models
+            .as_ref()
             .and_then(|m| m.providers.get(img_prov))
             .and_then(|p| p.user_agent.as_deref())
             .or_else(|| self.config.gateway.user_agent.as_deref())
@@ -158,7 +176,13 @@ impl super::runtime::AgentRuntime {
             .build()
             .unwrap_or_default();
 
-        tracing::info!(provider = img_prov, model = image_model, size = size, ua = img_ua, "tool_image: generating");
+        tracing::info!(
+            provider = img_prov,
+            model = image_model,
+            size = size,
+            ua = img_ua,
+            "tool_image: generating"
+        );
 
         // Provider-specific API formats
         let is_qwen = img_prov == "qwen";
@@ -237,12 +261,23 @@ impl super::runtime::AgentRuntime {
                 if parts.len() == 2 {
                     let w = parts[0].parse::<u32>().unwrap_or(2048);
                     let h = parts[1].parse::<u32>().unwrap_or(2048);
-                    if w == h { "1:1" } else if w > h { "16:9" } else { "9:16" }
-                } else { "1:1" }
-            } else { "1:1" };
+                    if w == h {
+                        "1:1"
+                    } else if w > h {
+                        "16:9"
+                    } else {
+                        "9:16"
+                    }
+                } else {
+                    "1:1"
+                }
+            } else {
+                "1:1"
+            };
             let gemini_base = img_url.trim_end_matches('/');
             let url = format!("{gemini_base}/models/{image_model}:generateContent?key={api_key}");
-            let resp = client.post(&url)
+            let resp = client
+                .post(&url)
                 .json(&json!({
                     "contents": [{ "parts": [{ "text": prompt }] }],
                     "generationConfig": {
@@ -250,10 +285,14 @@ impl super::runtime::AgentRuntime {
                         "imageConfig": { "aspectRatio": aspect }
                     }
                 }))
-                .send().await
+                .send()
+                .await
                 .map_err(|e| anyhow!("image: gemini request failed: {e}"))?;
             let st = resp.status();
-            let body: Value = resp.json().await.map_err(|e| anyhow!("image: gemini parse error: {e}"))?;
+            let body: Value = resp
+                .json()
+                .await
+                .map_err(|e| anyhow!("image: gemini parse error: {e}"))?;
             (st, body)
         } else {
             let url = format!("{}/images/generations", img_url.trim_end_matches('/'));
@@ -284,12 +323,16 @@ impl super::runtime::AgentRuntime {
             // Gemini: candidates[0].content.parts[] — find the inlineData part
             #[allow(unused_imports)]
             use base64::Engine;
-            let parts = resp_body.pointer("/candidates/0/content/parts")
+            let parts = resp_body
+                .pointer("/candidates/0/content/parts")
                 .and_then(|v| v.as_array());
             if let Some(parts) = parts {
                 for part in parts {
                     if let Some(inline) = part.get("inlineData") {
-                        let mime = inline.get("mimeType").and_then(|v| v.as_str()).unwrap_or("image/png");
+                        let mime = inline
+                            .get("mimeType")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("image/png");
                         if let Some(b64_data) = inline.get("data").and_then(|v| v.as_str()) {
                             let bytes = base64::engine::general_purpose::STANDARD
                                 .decode(b64_data)
@@ -315,14 +358,26 @@ impl super::runtime::AgentRuntime {
                 .and_then(|v| v.as_str())
         } else if is_minimax {
             // minimax: data.image_urls[0] (url) or data.image_base64[0] (base64)
-            resp_body.pointer("/data/image_urls/0").and_then(|v| v.as_str())
-                .or_else(|| resp_body.pointer("/data/image_base64/0").and_then(|v| v.as_str()))
+            resp_body
+                .pointer("/data/image_urls/0")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    resp_body
+                        .pointer("/data/image_base64/0")
+                        .and_then(|v| v.as_str())
+                })
         } else {
             // OpenAI/Doubao/etc: prefer url, fall back to b64_json (b64_json is what
             // OpenAI's response_format=b64_json returns, and some compatible
             // providers return it even when url is requested).
-            resp_body.pointer("/data/0/url").and_then(|v| v.as_str())
-                .or_else(|| resp_body.pointer("/data/0/b64_json").and_then(|v| v.as_str()))
+            resp_body
+                .pointer("/data/0/url")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    resp_body
+                        .pointer("/data/0/b64_json")
+                        .and_then(|v| v.as_str())
+                })
         };
 
         let Some(img_ref) = img_ref else {
@@ -332,7 +387,8 @@ impl super::runtime::AgentRuntime {
         // Resolve `img_ref` → bytes + mime.  Three shapes are accepted:
         //   * `data:image/...;base64,<b64>`   inline data URL (Gemini-style)
         //   * `http(s)://...`                  download via reqwest
-        //   * `<raw base64>`                   minimax `image_base64`, OpenAI `b64_json`
+        //   * `<raw base64>`                   minimax `image_base64`, OpenAI
+        //     `b64_json`
         use base64::Engine as _;
         let (bytes, mime): (Vec<u8>, &str) = if let Some(rest) = img_ref.strip_prefix("data:") {
             // data:<mime>;base64,<b64>

@@ -4,12 +4,14 @@
 //! cleanup is cheap on session end. Global housekeeping pass enforces a
 //! 7-day TTL across all sessions.
 
-use std::fs;
-use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::{
+    fs,
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime},
+};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 pub const ARTIFACT_SUBDIR: &str = "artifacts";
@@ -92,13 +94,20 @@ impl ArtifactStore {
         // Sanitize session_key so a key with '/' or '..' can't escape.
         let safe: String = session_key
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         self.root.join(safe)
     }
 
     fn path_for(&self, session_key: &str, id: &ArtifactId) -> PathBuf {
-        self.session_dir(session_key).join(format!("{}.txt", id.as_str()))
+        self.session_dir(session_key)
+            .join(format!("{}.txt", id.as_str()))
     }
 
     /// Write `text` to a freshly-generated artifact under `session_key`.
@@ -149,14 +158,18 @@ impl ArtifactStore {
     /// Walk every session dir and delete artifacts older than [`GLOBAL_TTL`].
     /// Best-effort — errors are logged and skipped, never propagated.
     pub fn housekeep(&self) {
-        let Ok(sessions) = fs::read_dir(&self.root) else { return };
+        let Ok(sessions) = fs::read_dir(&self.root) else {
+            return;
+        };
         let cutoff = SystemTime::now() - GLOBAL_TTL;
         for s_entry in sessions.flatten() {
             let s_path = s_entry.path();
             if !s_path.is_dir() {
                 continue;
             }
-            let Ok(files) = fs::read_dir(&s_path) else { continue };
+            let Ok(files) = fs::read_dir(&s_path) else {
+                continue;
+            };
             let mut any_left = false;
             for f_entry in files.flatten() {
                 let f_path = f_entry.path();
@@ -210,8 +223,9 @@ impl Default for ArtifactStore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::tempdir;
+
+    use super::*;
 
     #[test]
     fn write_then_read_roundtrip() {
@@ -289,6 +303,9 @@ mod tests {
         }
         let dir = store.session_dir("sess-cap");
         let count = fs::read_dir(&dir).unwrap().count();
-        assert!(count <= SESSION_FILE_CAP, "got {count} files, cap is {SESSION_FILE_CAP}");
+        assert!(
+            count <= SESSION_FILE_CAP,
+            "got {count} files, cap is {SESSION_FILE_CAP}"
+        );
     }
 }

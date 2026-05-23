@@ -97,11 +97,12 @@ pub struct GatewayConfig {
     pub bind_address: Option<String>,
     pub auth: Option<GatewayAuth>,
     /// A2A endpoint (`/api/v1/a2a`) authentication. When any field here is
-    /// populated, the A2A middleware accepts these credentials. `gateway.auth.token`
-    /// is also accepted as a Bearer when set (single-token convenience).
-    /// Falls back to env vars `RSCLAW_A2A_BEARER_TOKENS` / `RSCLAW_A2A_API_KEYS`
-    /// for back-compat — env-set lists are merged into the accepted set.
-    /// When everything is empty, the middleware passes through (dev mode).
+    /// populated, the A2A middleware accepts these credentials.
+    /// `gateway.auth.token` is also accepted as a Bearer when set
+    /// (single-token convenience). Falls back to env vars
+    /// `RSCLAW_A2A_BEARER_TOKENS` / `RSCLAW_A2A_API_KEYS` for back-compat —
+    /// env-set lists are merged into the accepted set. When everything is
+    /// empty, the middleware passes through (dev mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub a2a: Option<GatewayA2a>,
     pub control_ui: Option<ControlUiConfig>,
@@ -116,7 +117,8 @@ pub struct GatewayConfig {
     /// Default response language (e.g. "Chinese", "English", "Japanese").
     pub language: Option<String>,
     /// Global default User-Agent for all LLM provider HTTP requests.
-    /// Provider-level user_agent overrides this. Default: "Mozilla/5.0 (compatible; rsclaw/1.0)".
+    /// Provider-level user_agent overrides this. Default: "Mozilla/5.0
+    /// (compatible; rsclaw/1.0)".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_agent: Option<String>,
     /// Global HTTP/SOCKS5 proxy URL (e.g. "http://127.0.0.1:7890", "socks5://proxy:1080").
@@ -295,7 +297,8 @@ pub struct A2aPeerConfig {
     /// plaintext config (parity with `gateway.a2a` secrets).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<SecretOrString>,
-    /// Remote agent ID to target. If omitted, uses the remote gateway's default agent.
+    /// Remote agent ID to target. If omitted, uses the remote gateway's default
+    /// agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_agent_id: Option<String>,
 }
@@ -339,7 +342,8 @@ pub struct AgentDefaults {
     pub image_gen: Option<Value>,
     pub repo_root: Option<String>,
     pub context_tokens: Option<u32>,
-    /// KV cache mode: 0 = off, 1 = full/append-only (default), 2 = delta/incremental.
+    /// KV cache mode: 0 = off, 1 = full/append-only (default), 2 =
+    /// delta/incremental.
     pub kv_cache_mode: Option<u8>,
     /// Maximum token budget for `/btw` side-channel quick queries
     /// (handled by `handle_side_query`). Default: 10000.
@@ -361,9 +365,11 @@ pub struct AgentDefaults {
     pub media: Option<Value>,
     pub embedded: Option<Value>,
     pub archive: Option<Value>,
-    /// Max tool-call iterations per turn. Simple tasks default to 10, complex (browser) to 100.
+    /// Max tool-call iterations per turn. Simple tasks default to 10, complex
+    /// (browser) to 100.
     pub max_iterations: Option<u32>,
-    /// Send intermediate text to user during multi-step tool calls. Default: true.
+    /// Send intermediate text to user during multi-step tool calls. Default:
+    /// true.
     pub intermediate_output: Option<bool>,
     /// OpenCode ACP configuration for default agent.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -410,17 +416,19 @@ pub struct AgentEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_commands: Option<String>,
     /// rsclaw extension: use OpenCode ACP client instead of LLM
-    /// When set, this agent spawns opencode acp subprocess and routes all prompts through it.
+    /// When set, this agent spawns opencode acp subprocess and routes all
+    /// prompts through it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opencode: Option<OpenCodeConfig>,
     /// rsclaw extension: use Claude Code ACP client instead of LLM
-    /// When set, this agent spawns claude-agent-acp subprocess and routes all prompts through it.
-    /// Uses the official Claude Agent SDK via ACP protocol.
+    /// When set, this agent spawns claude-agent-acp subprocess and routes all
+    /// prompts through it. Uses the official Claude Agent SDK via ACP
+    /// protocol.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claudecode: Option<ClaudeCodeConfig>,
     /// rsclaw extension: use Codex MCP client instead of LLM
-    /// When set, this agent spawns codex mcp-server subprocess and routes all prompts through it.
-    /// Uses OpenAI Codex CLI via MCP protocol.
+    /// When set, this agent spawns codex mcp-server subprocess and routes all
+    /// prompts through it. Uses OpenAI Codex CLI via MCP protocol.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codex: Option<CodexConfig>,
     /// OpenClaw-specific
@@ -447,7 +455,8 @@ pub struct OpenCodeConfig {
     /// Default model ID (e.g., "opencode/big-pickle", "alibaba/qwen3.5-plus")
     pub model: Option<String>,
     /// Timeout for initialization/session creation in seconds (default: 600).
-    /// OpenCode/ClaudeCode/Codex can take long to initialize as they load MCP servers.
+    /// OpenCode/ClaudeCode/Codex can take long to initialize as they load MCP
+    /// servers.
     pub init_timeout_seconds: Option<u64>,
 }
 
@@ -466,13 +475,15 @@ pub struct ClaudeCodeConfig {
     /// Claude model ID (e.g., "claude-sonnet-4-6", "claude-opus-4-6")
     pub model: Option<String>,
     /// Timeout for initialization/session creation in seconds (default: 600).
-    /// OpenCode/ClaudeCode/Codex can take long to initialize as they load MCP servers.
+    /// OpenCode/ClaudeCode/Codex can take long to initialize as they load MCP
+    /// servers.
     pub init_timeout_seconds: Option<u64>,
 }
 
 /// Codex MCP configuration for an agent.
 /// Uses Codex CLI's MCP server mode (codex mcp-server).
-/// Codex provides tools: `codex` (start session) and `codex-reply` (continue session).
+/// Codex provides tools: `codex` (start session) and `codex-reply` (continue
+/// session).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexConfig {
@@ -485,7 +496,8 @@ pub struct CodexConfig {
     /// OpenAI model ID (optional, uses Codex default)
     pub model: Option<String>,
     /// Timeout for initialization/session creation in seconds (default: 600).
-    /// OpenCode/ClaudeCode/Codex can take long to initialize as they load MCP servers.
+    /// OpenCode/ClaudeCode/Codex can take long to initialize as they load MCP
+    /// servers.
     pub init_timeout_seconds: Option<u64>,
 }
 
@@ -520,10 +532,12 @@ pub struct ModelConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
     /// Whether to send tool definitions to the model. Default: true.
-    /// Set to false for reasoning models (deepseek-r1, qwen-r1) that don't support tools.
+    /// Set to false for reasoning models (deepseek-r1, qwen-r1) that don't
+    /// support tools.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools_enabled: Option<bool>,
-    /// Tool set level: "minimal" (7 core), "standard" (12, default), "full" (all 32+).
+    /// Tool set level: "minimal" (7 core), "standard" (12, default), "full"
+    /// (all 32+).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub toolset: Option<String>,
     /// Extra tool names to include on top of the toolset level.
@@ -544,18 +558,19 @@ pub struct ModelConfig {
     /// image inputs. Resolution chain when vlm_drive / VlmDriver runs:
     ///   1. per-agent `model.vision`
     ///   2. `agents.defaults.model.vision`
-    ///   3. per-agent `model.primary`  ← fallback (assumes primary handles vision)
+    ///   3. per-agent `model.primary`  ← fallback (assumes primary handles
+    ///      vision)
     ///   4. `agents.defaults.model.primary`
     /// Vision-capability check (in priority order):
-    ///   1. The provider's `models[]` entry — if `input` lists `image`,
-    ///      treat as vision-capable. If `input` is declared but contains
-    ///      only `text`, surface a clear error.
+    ///   1. The provider's `models[]` entry — if `input` lists `image`, treat
+    ///      as vision-capable. If `input` is declared but contains only `text`,
+    ///      surface a clear error.
     ///   2. Otherwise the built-in `is_known_vision_model` allow-list.
-    ///      Defaulting to text-only is intentional: vision-capable
-    ///      models are still the minority, so an unknown model is more
-    ///      likely text-only than vision. Misclassifications can be
-    ///      fixed by either adding `input: ["text", "image"]` to the
-    ///      model's provider config or extending the allow-list.
+    ///      Defaulting to text-only is intentional: vision-capable models are
+    ///      still the minority, so an unknown model is more likely text-only
+    ///      than vision. Misclassifications can be fixed by either adding
+    ///      `input: ["text", "image"]` to the model's provider config or
+    ///      extending the allow-list.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vision: Option<String>,
 }
@@ -932,7 +947,8 @@ pub struct CustomChannelConfig {
     pub reply_url: Option<String>,
     /// HTTP method for reply (default: POST).
     pub reply_method: Option<String>,
-    /// Reply body template with {{sender}}, {{chat_id}}, {{reply}}, {{is_group}} placeholders.
+    /// Reply body template with {{sender}}, {{chat_id}}, {{reply}},
+    /// {{is_group}} placeholders.
     pub reply_template: Option<String>,
     /// Extra headers for reply HTTP call.
     pub reply_headers: Option<HashMap<String, String>>,
@@ -1105,7 +1121,8 @@ pub struct DiscordConfig {
     pub guilds: Option<HashMap<String, Value>>,
     pub accounts: Option<HashMap<String, Value>>,
     pub retry: Option<RetryConfig>,
-    /// Gateway WebSocket URL override (for testing). Defaults to wss://gateway.discord.gg/?v=10&encoding=json
+    /// Gateway WebSocket URL override (for testing). Defaults to
+    /// wss://gateway.discord.gg/?v=10&encoding=json
     pub gateway_url: Option<String>,
     /// HTTP API base URL override (for testing). Defaults to https://discord.com/api/v10
     pub api_base: Option<String>,
@@ -1161,7 +1178,8 @@ pub struct SignalConfig {
     pub phone: Option<String>,
     pub text_chunk_limit: Option<usize>,
     pub retry: Option<RetryConfig>,
-    /// Path to signal-cli binary (default: "signal-cli"). Can point to a mock script.
+    /// Path to signal-cli binary (default: "signal-cli"). Can point to a mock
+    /// script.
     pub cli_path: Option<String>,
     pub accounts: Option<HashMap<String, Value>>,
 }
@@ -1486,7 +1504,8 @@ pub struct SessionResultLimits {
     /// web_fetch result max chars in session (default: 5000)
     pub web_fetch: Option<usize>,
     /// web_browser snapshot/action max chars in session (default: 1500)
-    /// Browser snapshots are large but mostly ephemeral (refs expire after page change).
+    /// Browser snapshots are large but mostly ephemeral (refs expire after page
+    /// change).
     pub web_browser: Option<usize>,
     /// exec result max chars in session (default: 3000)
     pub exec: Option<usize>,
@@ -1518,7 +1537,8 @@ pub struct ExecToolConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WebSearchConfig {
-    /// Default search provider: "duckduckgo" | "google" | "bing" | "brave" | "serper"
+    /// Default search provider: "duckduckgo" | "google" | "bing" | "brave" |
+    /// "serper"
     pub provider: Option<String>,
     /// API keys (alternative to env vars)
     pub brave_api_key: Option<SecretOrString>,
@@ -1542,7 +1562,8 @@ pub struct WebFetchConfig {
     /// Custom User-Agent
     pub user_agent: Option<String>,
     /// Model for content summarization (e.g. "doubao-lite"). If set and
-    /// the agent passes a `prompt`, fetched content is summarized by this model.
+    /// the agent passes a `prompt`, fetched content is summarized by this
+    /// model.
     pub summary_model: Option<String>,
 }
 
@@ -1555,10 +1576,12 @@ pub struct WebBrowserConfig {
     /// Run browser with visible window (default: false = headless)
     pub headed: Option<bool>,
     /// Chrome profile to use. "default" = system default profile,
-    /// other string = named profile directory under ~/.rsclaw/browser-profiles/.
-    /// If not set, uses a temporary profile (no cookies/history).
+    /// other string = named profile directory under
+    /// ~/.rsclaw/browser-profiles/. If not set, uses a temporary profile
+    /// (no cookies/history).
     pub profile: Option<String>,
-    /// Ports to probe for existing Chrome with remote debugging (default: [9222, 9223]).
+    /// Ports to probe for existing Chrome with remote debugging (default:
+    /// [9222, 9223]).
     pub remote_debug_ports: Option<Vec<u16>>,
 }
 
@@ -1740,7 +1763,8 @@ pub struct EvolutionMeditationConfig {
 pub struct EvolutionWorkflowConfig {
     /// Master kill-switch. Off by default.
     pub enabled: Option<bool>,
-    /// Difficulty score threshold for distillation [0.0, 1.0]. Higher = stricter.
+    /// Difficulty score threshold for distillation [0.0, 1.0]. Higher =
+    /// stricter.
     pub score_threshold: Option<f32>,
     /// Floor on tool calls — turns simpler than this never crystallize.
     pub min_tool_calls: Option<usize>,
@@ -2014,7 +2038,8 @@ pub struct KbConfig {
     pub embed: Option<EmbedConfig>,
     /// DEPRECATED (unused): superseded by `embed`. Kept only so existing
     /// configs that still set it continue to parse (deny_unknown_fields). No
-    /// code reads it — embedder selection goes through `embed` / `memorySearch`.
+    /// code reads it — embedder selection goes through `embed` /
+    /// `memorySearch`.
     pub embedder: Option<String>,
     /// DEPRECATED (unused): superseded by `embed.local`. Kept for parse
     /// compatibility only; no code reads it.

@@ -4,15 +4,14 @@
 //!
 //!   1. Before VlmDriver enters its loop, it calls
 //!      `PermissionStore::check(...)`.
-//!   2. If a persistent grant exists for this (agent_id, app) pair,
-//!      return immediately.
-//!   3. Else the caller emits a `PermissionRequest` event on the
-//!      gateway's broadcast bus — the desktop UI subscribes via WS,
-//!      surfaces a modal, and posts back a `PermissionResponse` on a
-//!      new WS method which resolves a oneshot registered via
-//!      `register_pending_request`.
-//!   4. The driver awaits the oneshot, calls `record(...)`, and
-//!      proceeds (or aborts on `Deny`).
+//!   2. If a persistent grant exists for this (agent_id, app) pair, return
+//!      immediately.
+//!   3. Else the caller emits a `PermissionRequest` event on the gateway's
+//!      broadcast bus — the desktop UI subscribes via WS, surfaces a modal, and
+//!      posts back a `PermissionResponse` on a new WS method which resolves a
+//!      oneshot registered via `register_pending_request`.
+//!   4. The driver awaits the oneshot, calls `record(...)`, and proceeds (or
+//!      aborts on `Deny`).
 //!
 //! Bypass mode: a global `bypass_all` flag in the runtime config
 //! short-circuits the check (returns `AllowAlways` immediately). Used
@@ -24,10 +23,14 @@
 //! and `AllowOnce` (for the duration of the call) live in the
 //! in-memory session map.
 
-use std::collections::HashMap;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    collections::HashMap,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -198,7 +201,10 @@ impl RedbPermissionStore {
     pub fn set_bypass_all(&self, on: bool) {
         let prev = self.bypass_all.swap(on, Ordering::SeqCst);
         if prev != on {
-            warn!(bypass_all = on, "computer-use permission gate: bypass toggled");
+            warn!(
+                bypass_all = on,
+                "computer-use permission gate: bypass toggled"
+            );
         }
     }
 
@@ -305,10 +311,9 @@ impl PermissionStore for RedbPermissionStore {
                 return Ok(Some(PermissionDecision::AllowAlways));
             }
 
-            // 1. Session cache hit? Once-scoped entries are consumed
-            //    on read so the next call re-prompts as documented.
-            //    We take a write lock to support the consume path; the
-            //    extra contention is negligible at human-scale latency.
+            // 1. Session cache hit? Once-scoped entries are consumed on read so the next
+            //    call re-prompts as documented. We take a write lock to support the consume
+            //    path; the extra contention is negligible at human-scale latency.
             {
                 let mut sessions = self.sessions.write().await;
                 let key = (agent_id.to_owned(), app.to_owned());
@@ -352,7 +357,10 @@ impl PermissionStore for RedbPermissionStore {
                             granted_at: now,
                         },
                     );
-                    info!(agent_id, app, "permission: allow_once (cached, consume-on-read)");
+                    info!(
+                        agent_id,
+                        app, "permission: allow_once (cached, consume-on-read)"
+                    );
                 }
                 PermissionDecision::AllowSession => {
                     let mut sessions = self.sessions.write().await;

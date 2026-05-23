@@ -44,7 +44,10 @@ mod tests {
         for s in ["", "x", "longer string with spaces", "中文也行"] {
             let r = redact(s);
             assert_eq!(r.len(), 8, "input {s:?} → {r}");
-            assert!(r.chars().all(|c| c.is_ascii_hexdigit()), "input {s:?} → {r}");
+            assert!(
+                r.chars().all(|c| c.is_ascii_hexdigit()),
+                "input {s:?} → {r}"
+            );
         }
     }
 

@@ -5,15 +5,16 @@
 //! chunks (Hamming distance ≤ SIMHASH_DEDUP_THRESHOLD on the
 //! 64-bit SimHash) are dropped to avoid double-indexing.
 
-pub mod tokens;
 pub mod splitter;
+pub mod tokens;
 
-use crate::kb::canonicalize::md::heading_path_at;
-use crate::kb::model::{
-    chunk_id, hamming64, simhash64, ChunkStatus, KbChunk, KbLocator, LogicalSourceId,
-};
 use splitter::split_paragraphs;
 use tokens::approx_token_count;
+
+use crate::kb::{
+    canonicalize::md::heading_path_at,
+    model::{ChunkStatus, KbChunk, KbLocator, LogicalSourceId, chunk_id, hamming64, simhash64},
+};
 
 pub const DEFAULT_TARGET_TOKENS: u32 = 512;
 pub const DEFAULT_MIN_TOKENS: u32 = 50;
@@ -45,7 +46,14 @@ pub fn chunk_markdown(input: ChunkerInput<'_>) -> Vec<KbChunk> {
     for p in &paras {
         let tentative = approx_token_count(&buf) + approx_token_count(&p.text);
         if !buf.is_empty() && tentative > DEFAULT_TARGET_TOKENS {
-            flush(&mut chunks, &mut seq, &input, buf_start.unwrap(), buf_end, &buf);
+            flush(
+                &mut chunks,
+                &mut seq,
+                &input,
+                buf_start.unwrap(),
+                buf_end,
+                &buf,
+            );
             buf.clear();
             buf_start = None;
         }
@@ -58,13 +66,27 @@ pub fn chunk_markdown(input: ChunkerInput<'_>) -> Vec<KbChunk> {
         buf.push_str(&p.text);
         buf_end = p.end;
         if approx_token_count(&buf) >= DEFAULT_TARGET_TOKENS {
-            flush(&mut chunks, &mut seq, &input, buf_start.unwrap(), buf_end, &buf);
+            flush(
+                &mut chunks,
+                &mut seq,
+                &input,
+                buf_start.unwrap(),
+                buf_end,
+                &buf,
+            );
             buf.clear();
             buf_start = None;
         }
     }
     if !buf.is_empty() {
-        flush(&mut chunks, &mut seq, &input, buf_start.unwrap(), buf_end, &buf);
+        flush(
+            &mut chunks,
+            &mut seq,
+            &input,
+            buf_start.unwrap(),
+            buf_end,
+            &buf,
+        );
     }
     deduplicate(&mut chunks);
     chunks

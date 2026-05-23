@@ -15,9 +15,11 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::agent::memory::{MemDocTier, MemoryDoc, MemoryStore, add_off_lock};
-use crate::provider::registry::ProviderRegistry;
-use crate::skill::crystallizer::{acquire_distill_permit, distill_with_llm};
+use crate::{
+    agent::memory::{MemDocTier, MemoryDoc, MemoryStore, add_off_lock},
+    provider::registry::ProviderRegistry,
+    skill::crystallizer::{acquire_distill_permit, distill_with_llm},
+};
 
 /// Max L1 items written per turn — guards against a runaway model dumping
 /// dozens of "facts" from a single message.
@@ -47,20 +49,59 @@ pub(crate) fn salience_gate(text: &str) -> bool {
     let lower = t.to_lowercase();
     const SIGNALS: &[&str] = &[
         // Chinese self-description / preference / relationship / imperative-remember.
-        "我叫", "我是", "我的", "我家", "我住", "住在", "我用", "我习惯", "喜欢", "讨厌",
-        "我想要", "我希望", "我们公司", "我老婆", "我妻子", "我太太", "我老公", "我儿子",
-        "我女儿", "我爸", "我妈", "我生日", "记住", "记一下", "记下", "帮我记", "偏好",
-        "以后每次", "每次都",
+        "我叫",
+        "我是",
+        "我的",
+        "我家",
+        "我住",
+        "住在",
+        "我用",
+        "我习惯",
+        "喜欢",
+        "讨厌",
+        "我想要",
+        "我希望",
+        "我们公司",
+        "我老婆",
+        "我妻子",
+        "我太太",
+        "我老公",
+        "我儿子",
+        "我女儿",
+        "我爸",
+        "我妈",
+        "我生日",
+        "记住",
+        "记一下",
+        "记下",
+        "帮我记",
+        "偏好",
+        "以后每次",
+        "每次都",
         // English.
-        "my name", "my wife", "my husband", "i live", "i'm from", "i am ", "i'm ", "i like",
-        "i prefer", "i hate", "i use ", "i work", "call me", "remember that", "remember to",
+        "my name",
+        "my wife",
+        "my husband",
+        "i live",
+        "i'm from",
+        "i am ",
+        "i'm ",
+        "i like",
+        "i prefer",
+        "i hate",
+        "i use ",
+        "i work",
+        "call me",
+        "remember that",
+        "remember to",
     ];
     SIGNALS.iter().any(|s| lower.contains(s))
 }
 
 /// Allowed L1 kinds → (tier, importance, pinned). Mirrors §2/§3 of the redesign
-/// doc. An L1 `entity` (e.g. a name) is pinned Core like the deterministic ones;
-/// the rest are Working. `note` is intentionally absent — L1 never produces it.
+/// doc. An L1 `entity` (e.g. a name) is pinned Core like the deterministic
+/// ones; the rest are Working. `note` is intentionally absent — L1 never
+/// produces it.
 fn kind_policy(kind: &str) -> Option<(MemDocTier, f32, bool)> {
     match kind {
         "entity" => Some((MemDocTier::Core, 0.9, true)),
@@ -100,13 +141,42 @@ pub(crate) fn correction_gate(text: &str) -> bool {
     let lower = t.to_lowercase();
     const SIGNALS: &[&str] = &[
         // Chinese correction / "do it this way from now on".
-        "不对", "错了", "搞错", "弄错", "不是这", "不是我要", "我说的是", "应该是",
-        "应该用", "别这样", "别用", "不要这样", "重新", "纠正", "下次", "以后不要",
-        "以后别", "记住别", "不准",
+        "不对",
+        "错了",
+        "搞错",
+        "弄错",
+        "不是这",
+        "不是我要",
+        "我说的是",
+        "应该是",
+        "应该用",
+        "别这样",
+        "别用",
+        "不要这样",
+        "重新",
+        "纠正",
+        "下次",
+        "以后不要",
+        "以后别",
+        "记住别",
+        "不准",
         // English.
-        "that's wrong", "thats wrong", "not what i", "not correct", "incorrect",
-        "you should", "should have", "don't do", "do not do", "stop doing", "next time",
-        "actually i meant", "i meant", "not like that", "redo", "you misunderstood",
+        "that's wrong",
+        "thats wrong",
+        "not what i",
+        "not correct",
+        "incorrect",
+        "you should",
+        "should have",
+        "don't do",
+        "do not do",
+        "stop doing",
+        "next time",
+        "actually i meant",
+        "i meant",
+        "not like that",
+        "redo",
+        "you misunderstood",
     ];
     SIGNALS.iter().any(|s| lower.contains(s))
 }
@@ -135,7 +205,10 @@ pub(crate) async fn extract_l1(
     let provider_arc = match providers.get(provider_name) {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!(provider = provider_name, "L1 extract: provider not registered: {e:#}");
+            tracing::warn!(
+                provider = provider_name,
+                "L1 extract: provider not registered: {e:#}"
+            );
             return;
         }
     };
@@ -182,7 +255,11 @@ pub(crate) async fn extract_l1(
         if dup {
             continue;
         }
-        let tags = if pinned { vec!["pinned".to_owned()] } else { vec![] };
+        let tags = if pinned {
+            vec!["pinned".to_owned()]
+        } else {
+            vec![]
+        };
         let doc = MemoryDoc {
             id: uuid::Uuid::new_v4().to_string(),
             scope: scope.clone(),
@@ -234,7 +311,10 @@ pub(crate) async fn extract_lesson(
     let provider_arc = match providers.get(provider_name) {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!(provider = provider_name, "lesson extract: provider not registered: {e:#}");
+            tracing::warn!(
+                provider = provider_name,
+                "lesson extract: provider not registered: {e:#}"
+            );
             return;
         }
     };
@@ -334,7 +414,10 @@ pub(crate) async fn extract_failure_lesson(
     let provider_arc = match providers.get(provider_name) {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!(provider = provider_name, "failure extract: provider not registered: {e:#}");
+            tracing::warn!(
+                provider = provider_name,
+                "failure extract: provider not registered: {e:#}"
+            );
             return;
         }
     };
@@ -443,8 +526,16 @@ fn collect_value(v: &serde_json::Value, out: &mut Vec<Item>) {
             }
         }
         serde_json::Value::Object(obj) => {
-            let kind = obj.get("kind").and_then(|x| x.as_str()).unwrap_or("").to_owned();
-            let text = obj.get("text").and_then(|x| x.as_str()).unwrap_or("").to_owned();
+            let kind = obj
+                .get("kind")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_owned();
+            let text = obj
+                .get("text")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_owned();
             // Require a real numeric confidence in [0,1]. Missing/garbage
             // confidence → 0.0, which fails MIN_CONFIDENCE and is dropped, so
             // adversarial output can't slip in unscored items.
@@ -453,7 +544,11 @@ fn collect_value(v: &serde_json::Value, out: &mut Vec<Item>) {
                 _ => 0.0,
             };
             if !kind.is_empty() && !text.is_empty() {
-                out.push(Item { kind, text, confidence });
+                out.push(Item {
+                    kind,
+                    text,
+                    confidence,
+                });
             }
         }
         _ => {}
@@ -481,7 +576,10 @@ fn strip_fences(s: &str) -> String {
         }
     }
     let t = t.trim();
-    let t = t.strip_prefix("```json").or_else(|| t.strip_prefix("```")).unwrap_or(t);
+    let t = t
+        .strip_prefix("```json")
+        .or_else(|| t.strip_prefix("```"))
+        .unwrap_or(t);
     let t = t.strip_suffix("```").unwrap_or(t).trim();
     // Slice out the outermost JSON value, dropping leading/trailing prose
     // (and any unmatched-`<think>` remnant before the first bracket).
@@ -518,7 +616,8 @@ mod tests {
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].kind, "preference");
 
-        let fenced = "```json\n[{\"kind\":\"entity\",\"text\":\"用户叫东升\",\"confidence\":0.9}]\n```";
+        let fenced =
+            "```json\n[{\"kind\":\"entity\",\"text\":\"用户叫东升\",\"confidence\":0.9}]\n```";
         assert_eq!(parse_items(fenced).len(), 1);
 
         let lines = "{\"kind\":\"fact\",\"text\":\"a\",\"confidence\":0.7}\n{\"kind\":\"preference\",\"text\":\"b\",\"confidence\":0.6}";
@@ -561,7 +660,10 @@ mod tests {
     #[test]
     fn failure_kind_is_working_tier_decaying() {
         let (tier, importance, pinned) = kind_policy("failure").expect("failure allowed");
-        assert!(matches!(tier, MemDocTier::Working), "failures decay, not Core");
+        assert!(
+            matches!(tier, MemDocTier::Working),
+            "failures decay, not Core"
+        );
         assert!(importance < 0.7 && !pinned);
     }
 
@@ -569,7 +671,9 @@ mod tests {
     fn correction_gate_fires_on_corrections_not_chitchat() {
         assert!(correction_gate("不对，应该用 cargo test 不是 npm"));
         assert!(correction_gate("以后别用表格回答"));
-        assert!(correction_gate("that's wrong, you should use the debug build"));
+        assert!(correction_gate(
+            "that's wrong, you should use the debug build"
+        ));
         assert!(correction_gate("next time don't add comments"));
         // Plain task requests / questions / acks must not fire.
         assert!(!correction_gate("帮我查下天气"));

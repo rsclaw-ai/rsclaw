@@ -1,8 +1,9 @@
 //! Integration tests for HEARTBEAT.md parsing.
 
-use rsclaw::heartbeat::parse_heartbeat_md;
-use chrono::Timelike;
 use std::time::Duration;
+
+use chrono::Timelike;
+use rsclaw::heartbeat::parse_heartbeat_md;
 
 #[test]
 fn parse_openclaw_compatible_format() {

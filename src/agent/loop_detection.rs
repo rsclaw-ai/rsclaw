@@ -23,10 +23,12 @@ fn builtin_overrides() -> HashMap<String, (usize, usize)> {
     HashMap::new()
 }
 
-/// Hash tool name + params for loop detection (matches OpenClaw's hashToolCall).
+/// Hash tool name + params for loop detection (matches OpenClaw's
+/// hashToolCall).
 pub fn hash_tool_call(tool_name: &str, params: &serde_json::Value) -> String {
     let stable = stable_stringify(params);
-    // Use a simple hash (not SHA256) for speed - we only need uniqueness within a session
+    // Use a simple hash (not SHA256) for speed - we only need uniqueness within a
+    // session
     let hash = simple_hash(&stable);
     format!("{tool_name}:{hash}")
 }
@@ -39,7 +41,13 @@ fn stable_stringify(value: &serde_json::Value) -> String {
         serde_json::Value::Number(n) => n.to_string(),
         serde_json::Value::String(s) => format!("\"{}\"", escape_json_string(s)),
         serde_json::Value::Array(arr) => {
-            format!("[{}]", arr.iter().map(stable_stringify).collect::<Vec<_>>().join(","))
+            format!(
+                "[{}]",
+                arr.iter()
+                    .map(stable_stringify)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
         }
         serde_json::Value::Object(obj) => {
             let keys: Vec<_> = obj.keys().collect();
@@ -137,19 +145,21 @@ pub struct ToolCallRecord {
     pub result_hash: Option<String>,
 }
 
-/// Max consecutive failures with IDENTICAL error for the same tool before blocking.
-/// Gives LLM enough room for iterative debugging (5 "fix and retry" cycles) while
-/// still catching genuine dead-ends.
+/// Max consecutive failures with IDENTICAL error for the same tool before
+/// blocking. Gives LLM enough room for iterative debugging (5 "fix and retry"
+/// cycles) while still catching genuine dead-ends.
 const MAX_SAME_ERROR_STREAK: usize = 5;
 
-/// Fallback: max consecutive failures of ANY kind for the same tool before blocking.
-/// Covers superficially-varying errors that still mean "stuck". A bit more lenient
-/// than same-error since errors do genuinely differ during normal debugging.
+/// Fallback: max consecutive failures of ANY kind for the same tool before
+/// blocking. Covers superficially-varying errors that still mean "stuck". A bit
+/// more lenient than same-error since errors do genuinely differ during normal
+/// debugging.
 const MAX_ANY_FAILURE_STREAK: usize = 8;
 
 /// Normalize an error message so superficial differences (line:col, timestamps,
 /// line numbers) don't produce different hashes, WITHOUT collapsing short
-/// meaningful numbers like exit codes ("exit 1" vs "exit 127" must stay distinct).
+/// meaningful numbers like exit codes ("exit 1" vs "exit 127" must stay
+/// distinct).
 ///
 /// Rule: only digit-runs of length ≥ 3 are replaced with "N". Line/column
 /// numbers almost always hit that threshold once messages include ~3 digits
@@ -188,10 +198,12 @@ pub struct LoopDetector {
     /// History of tool call records with args_hash and result_hash.
     history: VecDeque<ToolCallRecord>,
     /// Per-tool streak of identical errors. Keyed by tool_name.
-    /// Value: (error_hash, count). Reset when a different error OR success appears.
+    /// Value: (error_hash, count). Reset when a different error OR success
+    /// appears.
     error_streak: HashMap<String, (String, usize)>,
-    /// Per-tool streak of ANY failures (regardless of error). Catches superficially
-    /// varying errors that still mean the same thing. Reset on success.
+    /// Per-tool streak of ANY failures (regardless of error). Catches
+    /// superficially varying errors that still mean the same thing. Reset
+    /// on success.
     any_failure_streak: HashMap<String, usize>,
 }
 
@@ -291,7 +303,11 @@ impl LoopDetector {
     ///
     /// Progress detection: same args + different results = making progress.
     /// Only count as "loop" when same args AND same results (no progress).
-    pub fn check_with_params(&mut self, tool_name: &str, params: &serde_json::Value) -> LoopCheckResult {
+    pub fn check_with_params(
+        &mut self,
+        tool_name: &str,
+        params: &serde_json::Value,
+    ) -> LoopCheckResult {
         let args_hash = hash_tool_call(tool_name, params);
 
         // Add to history (result_hash will be set later via record_result)
@@ -313,7 +329,8 @@ impl LoopDetector {
             .filter(|r| r.args_hash == args_hash)
             .collect();
 
-        // Check if there's progress: different result_hash values among same args calls.
+        // Check if there's progress: different result_hash values among same args
+        // calls.
         let result_hashes: Vec<_> = same_args_records
             .iter()
             .filter_map(|r| r.result_hash.as_ref())
@@ -326,9 +343,11 @@ impl LoopDetector {
         };
 
         // Count for loop detection:
-        // - If progress detected (different results), only count calls with no result_hash yet
-        //   (these are pending calls that haven't finished, might be making progress)
-        // - If no progress detected (same results or all pending), count all same args calls
+        // - If progress detected (different results), only count calls with no
+        //   result_hash yet (these are pending calls that haven't finished, might be
+        //   making progress)
+        // - If no progress detected (same results or all pending), count all same args
+        //   calls
         let count = if has_progress {
             // Making progress: only count pending calls (result_hash = None)
             same_args_records
@@ -402,12 +421,16 @@ impl LoopDetector {
         LoopCheckResult::Ok
     }
 
-    /// Record a tool call and check for loops (legacy API - only uses tool_name).
+    /// Record a tool call and check for loops (legacy API - only uses
+    /// tool_name).
     ///
-    /// This is a backwards-compat wrapper that constructs an empty params value.
-    /// Prefer `check_with_params` for proper argument hashing.
+    /// This is a backwards-compat wrapper that constructs an empty params
+    /// value. Prefer `check_with_params` for proper argument hashing.
     pub fn check(&mut self, tool_name: &str) -> LoopCheckResult {
-        self.check_with_params(tool_name, &serde_json::Value::Object(serde_json::Map::new()))
+        self.check_with_params(
+            tool_name,
+            &serde_json::Value::Object(serde_json::Map::new()),
+        )
     }
 
     /// Record the result hash for the most recent tool call.
@@ -431,7 +454,12 @@ impl LoopDetector {
                 .get("error")
                 .and_then(|v| v.as_str())
                 .map(String::from)
-                .or_else(|| result.get("stderr").and_then(|v| v.as_str()).map(String::from))
+                .or_else(|| {
+                    result
+                        .get("stderr")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
                 .unwrap_or_else(|| stable_stringify(result));
             let err_sig = normalize_error(&raw_sig);
             let err_hash = format!("{}", simple_hash(&err_sig));
@@ -449,7 +477,6 @@ impl LoopDetector {
                 .or_insert((err_hash, 1));
             // Increment any-failure streak too.
             *self.any_failure_streak.entry(name.clone()).or_insert(0) += 1;
-
         } else {
             // Success clears both streaks for this tool.
             self.error_streak.remove(&name);
@@ -505,10 +532,11 @@ mod tests {
     #[test]
     fn detects_warning_before_critical() {
         // With dual thresholds: warn=3, crit=5
-        // count >= warning_threshold triggers Warning, count >= critical triggers Critical
+        // count >= warning_threshold triggers Warning, count >= critical triggers
+        // Critical
         let mut d = LoopDetector::with_dual_thresholds(10, 3, 5);
-        assert!(is_ok(&d.check("read")));     // count=1
-        assert!(is_ok(&d.check("read")));     // count=2
+        assert!(is_ok(&d.check("read"))); // count=1
+        assert!(is_ok(&d.check("read"))); // count=2
         assert!(is_warning(&d.check("read"))); // count=3 >= warn(3)
         assert!(is_warning(&d.check("read"))); // count=4
         assert!(is_critical(&d.check("read"))); // count=5 >= crit(5)
@@ -518,8 +546,8 @@ mod tests {
     fn single_threshold_constructor_sets_critical_above() {
         // LoopDetector::new with threshold=3 sets warning=3, critical=4
         let mut d = LoopDetector::new(10, 3);
-        assert!(is_ok(&d.check("exec")));      // count=1
-        assert!(is_ok(&d.check("exec")));      // count=2
+        assert!(is_ok(&d.check("exec"))); // count=1
+        assert!(is_ok(&d.check("exec"))); // count=2
         assert!(is_warning(&d.check("exec"))); // count=3 >= warn(3)
         assert!(is_critical(&d.check("exec"))); // count=4 >= crit(4)
     }
@@ -619,10 +647,10 @@ mod tests {
         let mut d = LoopDetector::with_dual_thresholds(10, 3, 5);
         let params = serde_json::json!({"command": "ls -la"});
 
-        assert!(is_ok(&d.check_with_params("exec", &params)));       // count=1
-        assert!(is_ok(&d.check_with_params("exec", &params)));       // count=2
-        assert!(is_warning(&d.check_with_params("exec", &params)));  // count=3 >= warn(3)
-        assert!(is_warning(&d.check_with_params("exec", &params)));  // count=4
+        assert!(is_ok(&d.check_with_params("exec", &params))); // count=1
+        assert!(is_ok(&d.check_with_params("exec", &params))); // count=2
+        assert!(is_warning(&d.check_with_params("exec", &params))); // count=3 >= warn(3)
+        assert!(is_warning(&d.check_with_params("exec", &params))); // count=4
         assert!(is_critical(&d.check_with_params("exec", &params))); // count=5 >= crit(5)
     }
 
@@ -671,7 +699,8 @@ mod tests {
         assert!(is_ok(&d.check_with_params("exec", &params)));
         d.record_result(&serde_json::json!({"stdout": "file1.txt file2.txt file3.txt"}));
 
-        // Call 4: even after many calls with same params, different results mean progress
+        // Call 4: even after many calls with same params, different results mean
+        // progress
         assert!(is_ok(&d.check_with_params("exec", &params)));
         d.record_result(&serde_json::json!({"stdout": "file1.txt file2.txt file3.txt file4.txt"}));
 
@@ -686,10 +715,10 @@ mod tests {
         let params = serde_json::json!({"command": "ls"});
 
         // Call 1-2: same params, same result = stuck
-        assert!(is_ok(&d.check_with_params("exec", &params)));       // count=1
+        assert!(is_ok(&d.check_with_params("exec", &params))); // count=1
         d.record_result(&serde_json::json!({"stdout": "same_output"}));
 
-        assert!(is_ok(&d.check_with_params("exec", &params)));       // count=2
+        assert!(is_ok(&d.check_with_params("exec", &params))); // count=2
         d.record_result(&serde_json::json!({"stdout": "same_output"}));
 
         // Call 3: count=3 >= warn(3) = warning
@@ -746,9 +775,9 @@ mod tests {
         // Don't call record_result
 
         // Another call (previous still has result_hash=None)
-        assert!(is_ok(&d.check_with_params("exec", &params)));       // count=2
-        assert!(is_warning(&d.check_with_params("exec", &params)));  // count=3 >= warn(3)
-        assert!(is_warning(&d.check_with_params("exec", &params)));  // count=4
+        assert!(is_ok(&d.check_with_params("exec", &params))); // count=2
+        assert!(is_warning(&d.check_with_params("exec", &params))); // count=3 >= warn(3)
+        assert!(is_warning(&d.check_with_params("exec", &params))); // count=4
         assert!(is_critical(&d.check_with_params("exec", &params))); // count=5 >= crit(5)
     }
 }

@@ -9,18 +9,18 @@ use anyhow::{Context, Result};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
 
+use super::{
+    channels::{start_channels, start_custom_channels},
+    providers::build_providers,
+};
 use crate::{
     MemoryTier,
     agent::{
-        AgentMessage, AgentRegistry, AgentReply, AgentRuntime, AgentSpawner,
-        MemoryStore, PendingAnalysis,
+        AgentMessage, AgentRegistry, AgentReply, AgentRuntime, AgentSpawner, MemoryStore,
+        PendingAnalysis,
     },
     channel::OutboundMessage,
-    config::{
-        self,
-        runtime::RuntimeConfig,
-        schema::BindMode,
-    },
+    config::{self, runtime::RuntimeConfig, schema::BindMode},
     cron::CronRunner,
     gateway::{
         LiveConfig,
@@ -32,9 +32,6 @@ use crate::{
     skill::{SkillRegistry, load_skills},
     store::Store,
 };
-
-use super::channels::{start_channels, start_custom_channels};
-use super::providers::build_providers;
 
 // ---------------------------------------------------------------------------
 // Sync-only channel allow-list
@@ -94,14 +91,18 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 
     // 1b. Seed tool prompts if not present.
     {
-        let lang = config.raw.gateway.as_ref().and_then(|g| g.language.as_deref());
+        let lang = config
+            .raw
+            .gateway
+            .as_ref()
+            .and_then(|g| g.language.as_deref());
         if let Err(e) = crate::agent::bootstrap::seed_tools(&base_dir, lang) {
             warn!("failed to seed tool prompts: {e:#}");
         }
     }
 
-    // 2. Open store. If the database is locked by another instance, exit cleanly
-    //    so systemd won't keep restarting.
+    // 2. Open store. If the database is locked by another instance, exit cleanly so
+    //    systemd won't keep restarting.
     let store = match Store::open(&data_dir, tier) {
         Ok(s) => Arc::new(s),
         Err(e) => {
@@ -140,7 +141,11 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // the local cache now so the gate has data immediately, then refresh from
     // the hub in the background. Fail-closed — no cache + failed fetch = empty.
     let (al_s, al_p) = crate::skill::allowlist::load_cached();
-    info!(skills = al_s, plugins = al_p, "allowlist: loaded from cache");
+    info!(
+        skills = al_s,
+        plugins = al_p,
+        "allowlist: loaded from cache"
+    );
     tokio::spawn(async {
         if let Err(e) = crate::skill::allowlist::refresh().await {
             warn!("allowlist refresh failed (keeping cache; fail-closed): {e:#}");
@@ -236,7 +241,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             let bg_mem = Arc::clone(mem_arc);
             tokio::spawn(async move {
                 if let Err(e) = run_embedder_reembed(&bg_mem).await {
-                    warn!("background re-embed failed ({e:#}); search will be partial until next restart");
+                    warn!(
+                        "background re-embed failed ({e:#}); search will be partial until next restart"
+                    );
                 }
             });
         }
@@ -325,21 +332,17 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         .and_then(|t| t.computer_use.as_ref())
         .and_then(|cu| cu.bypass_all)
         .unwrap_or(false);
-    let computer_permission = Arc::new(
-        crate::computer::permission::RedbPermissionStore::new(
-            Arc::clone(&store.db),
-            bypass_all_default,
-        ),
-    );
-    let (computer_permission_tx, _) = broadcast::channel::<
-        crate::computer::permission::PermissionRequest,
-    >(64);
+    let computer_permission = Arc::new(crate::computer::permission::RedbPermissionStore::new(
+        Arc::clone(&store.db),
+        bypass_all_default,
+    ));
+    let (computer_permission_tx, _) =
+        broadcast::channel::<crate::computer::permission::PermissionRequest>(64);
     // Status events are higher-frequency than permission requests (one
     // per VLM step), so give a larger buffer. Subscribers that lag
     // simply drop events — status is best-effort UX, not load-bearing.
-    let (computer_status_tx, _) = broadcast::channel::<
-        crate::computer::status::ComputerUseStatus,
-    >(256);
+    let (computer_status_tx, _) =
+        broadcast::channel::<crate::computer::status::ComputerUseStatus>(256);
     let computer_runs: Arc<
         tokio::sync::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
     > = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
@@ -406,9 +409,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     super::task_queue::install_channel_senders(Arc::clone(&channel_senders));
 
     // Create task queue manager before channels so channels can submit to it.
-    let task_queue_mgr = Arc::new(
-        super::task_queue::TaskQueueManager::new(Arc::clone(&store.db)),
-    );
+    let task_queue_mgr = Arc::new(super::task_queue::TaskQueueManager::new(Arc::clone(
+        &store.db,
+    )));
     // Publish a global handle so the agent's `task` function-call tool can
     // submit follow-up tasks without threading the manager through every
     // tool-dispatch surface.
@@ -466,7 +469,8 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 if let Some(ref ch_name) = msg.channel {
                     // Get sender BEFORE any await — drop guard immediately after cloning sender
                     let tx = {
-                        let senders_guard = senders.read().expect("channel_senders RwLock poisoned");
+                        let senders_guard =
+                            senders.read().expect("channel_senders RwLock poisoned");
                         senders_guard.get(ch_name).cloned()
                     };
                     if let Some(tx) = tx {
@@ -573,8 +577,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                         // written into live locks); non-empty = a restart is
                         // recommended for the listed sections.
                         let new_owned = (*new_cfg).clone();
-                        let needs_restart =
-                            live_reload.apply(new_owned, &restart_tx).await;
+                        let needs_restart = live_reload.apply(new_owned, &restart_tx).await;
                         if needs_restart.is_empty() {
                             info!("config hot-reload applied (hot-safe fields only)");
                         } else {
@@ -604,9 +607,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                             &bridge_pending,
                             &bridge_shutdown,
                             crate::events::RestartRequest::new(
-                                crate::events::RestartReason::ConfigChanged {
-                                    sections: fields,
-                                },
+                                crate::events::RestartReason::ConfigChanged { sections: fields },
                                 crate::events::RestartUrgency::Required,
                                 crate::i18n::t("restart_required_config_changed", &lang),
                             ),
@@ -639,7 +640,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 
     // Register desktop channel — routes cron delivery to connected WS clients.
     {
-        let desktop_ch = Arc::new(crate::channel::desktop::DesktopChannel::new(Arc::clone(&ws_conns)));
+        let desktop_ch = Arc::new(crate::channel::desktop::DesktopChannel::new(Arc::clone(
+            &ws_conns,
+        )));
         // Bridge the notification_tx → DesktopChannel path so AgentRuntime
         // (which only has notification_tx, not ChannelManager) can route
         // short-delay reminders through the same broadcast path cron uses.
@@ -687,16 +690,19 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 
     // Start cron runner — jobs loaded from base_dir/cron.json5
     {
-        let cron_cfg = config.ops.cron.clone().unwrap_or_else(|| {
-            crate::config::schema::CronConfig {
-                enabled: Some(true),
-                max_concurrent_runs: None,
-                session_retention: None,
-                run_log: None,
-                jobs: None,
-                default_delivery: None,
-            }
-        });
+        let cron_cfg =
+            config
+                .ops
+                .cron
+                .clone()
+                .unwrap_or_else(|| crate::config::schema::CronConfig {
+                    enabled: Some(true),
+                    max_concurrent_runs: None,
+                    session_retention: None,
+                    run_log: None,
+                    jobs: None,
+                    default_delivery: None,
+                });
         let cron_enabled = cron_cfg.enabled.unwrap_or(true);
 
         // Load jobs from openclaw-compatible path
@@ -734,8 +740,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // all share the same instances so events flow end-to-end.
     let a2a_bus = crate::a2a::event::TaskEventBus::new();
     let a2a_task_store = {
-        let path = crate::config::loader::base_dir()
-            .join("var/data/a2a/tasks.redb");
+        let path = crate::config::loader::base_dir().join("var/data/a2a/tasks.redb");
         Arc::new(crate::a2a::store::TaskStore::open(&path).expect("open A2A task store"))
     };
     let a2a_push_dispatcher = Arc::new(crate::a2a::push::PushDispatcher::new(
@@ -805,7 +810,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            crate::browser::pool::BrowserPool::global().reap_if_idle().await;
+            crate::browser::pool::BrowserPool::global()
+                .reap_if_idle()
+                .await;
         }
     });
 
@@ -830,9 +837,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 
         if let Ok(resp) = resp {
             if let Ok(release) = resp.json::<serde_json::Value>().await {
-                let latest_raw = release["tag_name"]
-                    .as_str()
-                    .unwrap_or("");
+                let latest_raw = release["tag_name"].as_str().unwrap_or("");
                 let current_raw = option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev");
                 // Extract bare version: "2026.4.1 (abc123)" -> "2026.4.1",
                 // "2026.4.1-beta" -> "2026.4.1".
@@ -882,7 +887,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         tokio::spawn(async move {
             #[cfg(unix)]
             {
-                use tokio::signal::unix::{signal, SignalKind};
+                use tokio::signal::unix::{SignalKind, signal};
                 let mut sigterm = match signal(SignalKind::terminate()) {
                     Ok(s) => s,
                     Err(e) => {
@@ -948,14 +953,14 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 
     // At this point `axum::serve` has returned, which means the listener has
     // been dropped — so the port is free for whatever runs next. Two paths:
-    //   - clean shutdown (Ctrl-C, SIGTERM, /api/v1/shutdown): just clean up
-    //     the PID file and return.
-    //   - restart requested (/api/v1/restart, system.restart): wait for
-    //     non-HTTP inflight to drain, spawn the replacement, then exit.
-    //     We spawn HERE rather than in the restart handler to avoid the
-    //     race where the child's `bind()` runs before the parent's listener
-    //     drops; that race could cause `cmd_gateway` to see "port in use"
-    //     and exit cleanly, leaving the gateway dead.
+    //   - clean shutdown (Ctrl-C, SIGTERM, /api/v1/shutdown): just clean up the PID
+    //     file and return.
+    //   - restart requested (/api/v1/restart, system.restart): wait for non-HTTP
+    //     inflight to drain, spawn the replacement, then exit. We spawn HERE rather
+    //     than in the restart handler to avoid the race where the child's `bind()`
+    //     runs before the parent's listener drops; that race could cause
+    //     `cmd_gateway` to see "port in use" and exit cleanly, leaving the gateway
+    //     dead.
     if shutdown.is_restart_requested() {
         info!("restart requested - waiting for inflight drain (max 60s)");
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
@@ -1003,7 +1008,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         let mut i = 1; // skip argv[0]
         while i < original_args.len() {
             match original_args[i].as_str() {
-                "--dev" => { extra_args.push("--dev".to_owned()); }
+                "--dev" => {
+                    extra_args.push("--dev".to_owned());
+                }
                 "--profile" => {
                     extra_args.push("--profile".to_owned());
                     if let Some(val) = original_args.get(i + 1) {
@@ -1018,8 +1025,12 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                         i += 1;
                     }
                 }
-                s if s.starts_with("--profile=") => { extra_args.push(s.to_owned()); }
-                s if s.starts_with("--base-dir=") => { extra_args.push(s.to_owned()); }
+                s if s.starts_with("--profile=") => {
+                    extra_args.push(s.to_owned());
+                }
+                s if s.starts_with("--base-dir=") => {
+                    extra_args.push(s.to_owned());
+                }
                 _ => {}
             }
             i += 1;
@@ -1165,7 +1176,6 @@ fn try_service_self_restart() -> bool {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Agent task spawning
 // ---------------------------------------------------------------------------
@@ -1197,7 +1207,9 @@ fn registry_env_names(name: &str) -> Option<(&'static str, &'static str)> {
 /// any async runtime tasks spawn — matches the existing precedent in
 /// `apply_proxy_env` and `propagate_skill_registry_env`.
 fn propagate_user_env(config: &RuntimeConfig) {
-    let Some(env_map) = config.raw.env.as_ref() else { return };
+    let Some(env_map) = config.raw.env.as_ref() else {
+        return;
+    };
     apply_user_env_map(&env_map.0);
 }
 
@@ -1225,9 +1237,13 @@ fn apply_user_env_map(env_map: &std::collections::HashMap<String, String>) {
 /// async runtime tasks spawn — matches the existing precedent in
 /// `apply_proxy_env`.
 fn propagate_skill_registry_env(config: &RuntimeConfig) {
-    let Some(map) = config.raw.skill_registries.as_ref() else { return };
+    let Some(map) = config.raw.skill_registries.as_ref() else {
+        return;
+    };
     for (name, entry) in map {
-        let Some((api_key_var, base_url_var)) = registry_env_names(name) else { continue };
+        let Some((api_key_var, base_url_var)) = registry_env_names(name) else {
+            continue;
+        };
         if let Some(key_field) = entry.api_key.as_ref() {
             if let Some(val) = key_field.resolve_early().filter(|s| !s.is_empty()) {
                 if std::env::var(api_key_var).is_err() {
@@ -1366,8 +1382,15 @@ fn spawn_agent_tasks(
                 };
                 let result = runtime
                     .run_turn(
-                        &session_key, &text, &channel, &peer_id, &chat_id,
-                        extra_tools, images, files, turn_ctx,
+                        &session_key,
+                        &text,
+                        &channel,
+                        &peer_id,
+                        &chat_id,
+                        extra_tools,
+                        images,
+                        files,
+                        turn_ctx,
                     )
                     .await;
                 let turn_errored = result.is_err();
@@ -1590,7 +1613,8 @@ pub(crate) async fn handle_pending_analysis(
                 channel: None,
 
                 account: None,
-                    files: vec![],            })
+                files: vec![],
+            })
             .await;
         return;
     }
@@ -1606,7 +1630,8 @@ pub(crate) async fn handle_pending_analysis(
                     images: r.images,
                     files: r.files,
                     account: None,
-                    channel: None,                })
+                    channel: None,
+                })
                 .await;
         }
         Ok(Ok(_)) => {} // empty reply, nothing to send
@@ -1622,7 +1647,8 @@ pub(crate) async fn handle_pending_analysis(
                     channel: None,
 
                     account: None,
-                    files: vec![],                })
+                    files: vec![],
+                })
                 .await;
         }
         Err(_) => {
@@ -1637,7 +1663,8 @@ pub(crate) async fn handle_pending_analysis(
                     channel: None,
 
                     account: None,
-                    files: vec![],                })
+                    files: vec![],
+                })
                 .await;
         }
     }
@@ -1765,9 +1792,10 @@ fn pid_alive(pid: u32) -> bool {
     {
         // Open a handle with PROCESS_QUERY_LIMITED_INFORMATION — sufficient
         // to test existence. NULL handle == doesn't exist.
-        use winapi::um::handleapi::CloseHandle;
-        use winapi::um::processthreadsapi::OpenProcess;
-        use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
+        use winapi::um::{
+            handleapi::CloseHandle, processthreadsapi::OpenProcess,
+            winnt::PROCESS_QUERY_LIMITED_INFORMATION,
+        };
         unsafe {
             let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
             if h.is_null() {
@@ -1792,10 +1820,11 @@ fn pid_alive(pid: u32) -> bool {
 ///
 /// Algorithm:
 ///   1. If `model_dir/model.safetensors` exists → try `LocalBgeEmbedder::load`.
-///      Pass: return Ok. Fail: bail (don't auto-delete; might be a
-///      user-placed model or upgrade in flight).
-///   2. Otherwise, sync-download into `model_dir.with_extension("downloading")/`,
-///      validate by attempting to load it, then atomically rename into place.
+///      Pass: return Ok. Fail: bail (don't auto-delete; might be a user-placed
+///      model or upgrade in flight).
+///   2. Otherwise, sync-download into
+///      `model_dir.with_extension("downloading")/`, validate by attempting to
+///      load it, then atomically rename into place.
 ///   3. Any failure cleans up the tmp dir and bails.
 /// Sentinel filename + content schema for "rsclaw owns this model dir".
 /// Presence = managed (we may freely wipe / re-download on failure).
@@ -1867,10 +1896,7 @@ pub(crate) async fn ensure_bge_model_present(
                     }
                 }
             } else {
-                tracing::debug!(
-                    stale_pid = pid,
-                    "stale seed lock from dead PID, removing"
-                );
+                tracing::debug!(stale_pid = pid, "stale seed lock from dead PID, removing");
                 let _ = std::fs::remove_file(&seeding_lock);
             }
         } else {
@@ -1888,8 +1914,7 @@ pub(crate) async fn ensure_bge_model_present(
         // crash mid-extract, partial write to a full disk, etc.). For OUR
         // installs we can safely auto-recover by deleting and re-downloading.
         if dir_is_managed {
-            if let (Some(actual), Some(expected)) =
-                (weights_bytes, read_sentinel_bytes(model_dir))
+            if let (Some(actual), Some(expected)) = (weights_bytes, read_sentinel_bytes(model_dir))
             {
                 if actual != expected {
                     tracing::warn!(
@@ -1974,14 +1999,16 @@ pub(crate) async fn ensure_bge_model_present(
             }
         }
     }
-    std::fs::create_dir_all(&tmp_dir).with_context(|| {
-        format!("failed to create download dir {}", tmp_dir.display())
-    })?;
+    std::fs::create_dir_all(&tmp_dir)
+        .with_context(|| format!("failed to create download dir {}", tmp_dir.display()))?;
 
     let archive_name = url.rsplit('/').next().unwrap_or("bge-model.zip");
     let archive_path = tmp_dir.join(archive_name);
 
-    info!("BGE model not present; downloading from {url} -> {}", archive_path.display());
+    info!(
+        "BGE model not present; downloading from {url} -> {}",
+        archive_path.display()
+    );
     let client = reqwest::Client::new();
     let download_result =
         crate::cmd::tools::download_resumable(&client, &url, &archive_path, "BGE model").await;
@@ -1998,7 +2025,8 @@ pub(crate) async fn ensure_bge_model_present(
         );
     }
 
-    // Wipe any stale extracted files from a prior failed run before extracting fresh.
+    // Wipe any stale extracted files from a prior failed run before extracting
+    // fresh.
     for entry in std::fs::read_dir(&tmp_dir)?.flatten() {
         let p = entry.path();
         if p == archive_path {
@@ -2042,9 +2070,8 @@ pub(crate) async fn ensure_bge_model_present(
     let dir_is_managed = model_dir.exists() && model_dir.join(SENTINEL_FILE).exists();
     if !model_dir.exists() || dir_is_managed {
         if model_dir.exists() {
-            std::fs::remove_dir_all(model_dir).with_context(|| {
-                format!("failed to clear managed dir {}", model_dir.display())
-            })?;
+            std::fs::remove_dir_all(model_dir)
+                .with_context(|| format!("failed to clear managed dir {}", model_dir.display()))?;
         }
         std::fs::rename(&tmp_dir, model_dir).with_context(|| {
             format!(
@@ -2054,9 +2081,8 @@ pub(crate) async fn ensure_bge_model_present(
             )
         })?;
     } else {
-        std::fs::create_dir_all(model_dir).with_context(|| {
-            format!("failed to ensure install dir {}", model_dir.display())
-        })?;
+        std::fs::create_dir_all(model_dir)
+            .with_context(|| format!("failed to ensure install dir {}", model_dir.display()))?;
         for entry in std::fs::read_dir(&tmp_dir)?.flatten() {
             let src = entry.path();
             let Some(name) = src.file_name() else {
@@ -2153,14 +2179,18 @@ pub(crate) fn publish_restart(
 
 #[cfg(test)]
 mod user_env_tests {
-    use super::*;
     use std::collections::HashMap;
+
+    use super::*;
 
     #[test]
     fn sets_unset_variables() {
         unsafe { std::env::remove_var("RSCLAW_TEST_USER_ENV_NEW") };
         let mut map = HashMap::new();
-        map.insert("RSCLAW_TEST_USER_ENV_NEW".to_owned(), "from-config".to_owned());
+        map.insert(
+            "RSCLAW_TEST_USER_ENV_NEW".to_owned(),
+            "from-config".to_owned(),
+        );
         apply_user_env_map(&map);
         assert_eq!(
             std::env::var("RSCLAW_TEST_USER_ENV_NEW").as_deref(),
@@ -2173,7 +2203,10 @@ mod user_env_tests {
     fn preexisting_shell_value_wins() {
         unsafe { std::env::set_var("RSCLAW_TEST_USER_ENV_KEEP", "from-shell") };
         let mut map = HashMap::new();
-        map.insert("RSCLAW_TEST_USER_ENV_KEEP".to_owned(), "from-config".to_owned());
+        map.insert(
+            "RSCLAW_TEST_USER_ENV_KEEP".to_owned(),
+            "from-config".to_owned(),
+        );
         apply_user_env_map(&map);
         assert_eq!(
             std::env::var("RSCLAW_TEST_USER_ENV_KEEP").as_deref(),

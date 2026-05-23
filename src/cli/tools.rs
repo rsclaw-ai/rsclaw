@@ -2,7 +2,8 @@ use clap::Subcommand;
 
 #[derive(Subcommand, Debug)]
 pub enum ToolsCommand {
-    /// Install a tool (chrome, ffmpeg, node, python, opencode, claude-code, all).
+    /// Install a tool (chrome, ffmpeg, node, python, opencode, claude-code,
+    /// all).
     Install {
         /// Tool name: chrome, ffmpeg, node, python, opencode, claude-code, all
         name: String,

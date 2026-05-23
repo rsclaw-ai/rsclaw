@@ -4,12 +4,12 @@
 //!   agent → events ← server
 //!
 //! TODO: Current limitations and improvement plan:
-//! - AgentEvent is a flat struct; richer event types (tool calls, errors,
-//!   usage updates) require either new structs or an enum-based approach.
+//! - AgentEvent is a flat struct; richer event types (tool calls, errors, usage
+//!   updates) require either new structs or an enum-based approach.
 //! - The broadcast channel drops events when subscribers lag; consider a
 //!   bounded replay buffer or per-subscriber mpsc for guaranteed delivery.
-//! - No event filtering: every subscriber receives every agent's events.
-//!   Add topic-based or session-based filtering when load requires it.
+//! - No event filtering: every subscriber receives every agent's events. Add
+//!   topic-based or session-based filtering when load requires it.
 
 use serde::Serialize;
 
@@ -33,9 +33,11 @@ pub enum RestartReason {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RestartUrgency {
-    /// New behavior takes effect after restart, but the gateway works without it.
+    /// New behavior takes effect after restart, but the gateway works without
+    /// it.
     Recommended,
-    /// The gateway is already in a degraded state; restart is required to recover.
+    /// The gateway is already in a degraded state; restart is required to
+    /// recover.
     Required,
 }
 
@@ -124,8 +126,8 @@ pub struct AgentEvent {
     pub delta: String,
     /// `true` on the final "turn complete" event.
     pub done: bool,
-    /// File attachments produced this turn: (filename, mime_type, local_path_or_url).
-    /// Non-empty only on the final `done = true` event.
+    /// File attachments produced this turn: (filename, mime_type,
+    /// local_path_or_url). Non-empty only on the final `done = true` event.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<(String, String, String)>,
     /// Image attachments (base64 data URIs or local paths).

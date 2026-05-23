@@ -45,7 +45,10 @@ impl SendRetry {
     /// avoid synchronised retries across concurrent channels.
     fn delay(&self, attempt: u32) -> Duration {
         let factor = 1u64 << attempt.min(16);
-        let base = self.min_delay_ms.saturating_mul(factor).min(self.max_delay_ms);
+        let base = self
+            .min_delay_ms
+            .saturating_mul(factor)
+            .min(self.max_delay_ms);
         let jitter = (base as f64 * 0.2 * rand::random::<f64>()) as u64;
         Duration::from_millis(base + jitter)
     }
@@ -99,8 +102,9 @@ pub async fn send_with_retry(
         }
     }
 
-    Err(last_err
-        .unwrap_or_else(|| anyhow::anyhow!("{label}: send failed after {} attempts", retry.attempts)))
+    Err(last_err.unwrap_or_else(|| {
+        anyhow::anyhow!("{label}: send failed after {} attempts", retry.attempts)
+    }))
 }
 
 #[cfg(test)]

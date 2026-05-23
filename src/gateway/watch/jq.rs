@@ -8,11 +8,12 @@
 //! at process exit. Each arena is small (a typed_arena over `String`s
 //! holding the parsed jq source).
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use jaq_core::{
+    Compiler, Ctx, Vars,
     data::JustLut,
     load::{Arena, File, Loader},
-    unwrap_valr, Compiler, Ctx, Vars,
+    unwrap_valr,
 };
 use jaq_json::Val;
 
@@ -92,8 +93,8 @@ fn json_to_val(v: &serde_json::Value) -> Option<Val> {
 /// Format a jq output value for display.
 ///
 /// - String values (both UTF-8 and raw byte strings in jaq-json's model)
-///   unquote — so `--jq '"hello"'` shows `hello`, not `"hello"`. This is
-///   what users expect when they format with `"\(.code) \(.name)"`.
+///   unquote — so `--jq '"hello"'` shows `hello`, not `"hello"`. This is what
+///   users expect when they format with `"\(.code) \(.name)"`.
 /// - Everything else uses jaq's `Display` impl, which produces compact JSON.
 fn format_jq_output(v: &Val) -> String {
     match v {
@@ -104,8 +105,9 @@ fn format_jq_output(v: &Val) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     #[test]
     fn compiles_identity_filter() {
@@ -130,10 +132,9 @@ mod tests {
 
     #[test]
     fn select_and_array_iteration() {
-        let f = CompiledJq::compile(
-            r#".data | select(.count > 0) | .codes[] | "\(.code) \(.name)""#,
-        )
-        .unwrap();
+        let f =
+            CompiledJq::compile(r#".data | select(.count > 0) | .codes[] | "\(.code) \(.name)""#)
+                .unwrap();
         let input = json!({
             "event": "snapshot",
             "data": {
@@ -147,10 +148,7 @@ mod tests {
         let out = f.run(&input);
         assert_eq!(
             out,
-            vec![
-                "601225 陕西煤业".to_owned(),
-                "002327 富安娜".to_owned(),
-            ]
+            vec!["601225 陕西煤业".to_owned(), "002327 富安娜".to_owned(),]
         );
     }
 

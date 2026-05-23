@@ -70,9 +70,7 @@ impl ProviderRegistry {
     /// reason so callers and end users see the underlying cause.
     pub fn get(&self, name: &str) -> Result<Arc<dyn LlmProvider>> {
         if let Some(reason) = self.disabled.get(name) {
-            return Err(anyhow::anyhow!(
-                "provider '{name}' is disabled: {reason}"
-            ));
+            return Err(anyhow::anyhow!("provider '{name}' is disabled: {reason}"));
         }
         self.providers
             .get(name)

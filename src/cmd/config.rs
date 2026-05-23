@@ -1,9 +1,9 @@
 use anyhow::Result;
 
-use super::config_json::{
-    get_nested_value, load_config_json, remove_nested_value, set_nested_value,
+use super::{
+    config_json::{get_nested_value, load_config_json, remove_nested_value, set_nested_value},
+    style::*,
 };
-use super::style::*;
 use crate::{cli::ConfigCommand, config};
 
 pub async fn cmd_config(sub: ConfigCommand) -> Result<()> {

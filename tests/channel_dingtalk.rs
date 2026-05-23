@@ -2,8 +2,7 @@
 
 use std::sync::Arc;
 
-use rsclaw::channel::dingtalk::DingTalkChannel;
-use rsclaw::channel::{Channel, OutboundMessage};
+use rsclaw::channel::{Channel, OutboundMessage, dingtalk::DingTalkChannel};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{method, path},
@@ -30,14 +29,7 @@ fn noop_on_message() -> OnMessage {
 #[test]
 fn channel_name_is_dingtalk() {
     init_crypto();
-    let ch = DingTalkChannel::new(
-        "key",
-        "secret",
-        "robot_code",
-        None,
-        None,
-        noop_on_message(),
-    );
+    let ch = DingTalkChannel::new("key", "secret", "robot_code", None, None, noop_on_message());
     assert_eq!(ch.name(), "dingtalk");
 }
 
@@ -87,7 +79,7 @@ async fn token_refresh_and_send_to_user() {
             text: "Hello DingTalk".to_owned(),
             reply_to: None,
             images: vec![],
-        ..Default::default()
+            ..Default::default()
         })
         .await;
 
@@ -138,11 +130,15 @@ async fn send_chunked_20000() {
             text: long_text,
             reply_to: None,
             images: vec![],
-        ..Default::default()
+            ..Default::default()
         })
         .await;
 
-    assert!(result.is_ok(), "chunked send should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "chunked send should succeed: {:?}",
+        result.err()
+    );
 }
 
 /// Group messages should call groupMessages/send instead of batchSend.
@@ -184,9 +180,13 @@ async fn send_to_group() {
             text: "Group hello".to_owned(),
             reply_to: None,
             images: vec![],
-        ..Default::default()
+            ..Default::default()
         })
         .await;
 
-    assert!(result.is_ok(), "group send should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "group send should succeed: {:?}",
+        result.err()
+    );
 }

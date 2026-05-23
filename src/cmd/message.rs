@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 
-use crate::cli::message::*;
-use crate::config;
+use crate::{cli::message::*, config};
 
 /// Resolve gateway URL and auth token from config.
 fn gateway_client() -> Result<(reqwest::Client, String, String)> {
@@ -79,7 +78,9 @@ async fn get(endpoint: &str, query: &[(&str, &str)]) -> Result<()> {
 }
 
 fn unsupported(action: &str) {
-    eprintln!("[unsupported] `message {action}` is not implemented. Supported: send, read, broadcast");
+    eprintln!(
+        "[unsupported] `message {action}` is not implemented. Supported: send, read, broadcast"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -91,27 +92,103 @@ pub async fn cmd_message(sub: MessageCommand) -> Result<()> {
         MessageCommand::Send(args) => message_send(args).await,
         MessageCommand::Read(args) => message_read(args).await,
         MessageCommand::Broadcast(args) => message_broadcast(args).await,
-        MessageCommand::Edit(args) => { unsupported("edit"); let _ = args; Ok(()) }
-        MessageCommand::Delete(args) => { unsupported("delete"); let _ = args; Ok(()) }
-        MessageCommand::Pin(args) => { unsupported("pin"); let _ = args; Ok(()) }
-        MessageCommand::Unpin(args) => { unsupported("unpin"); let _ = args; Ok(()) }
-        MessageCommand::Pins(args) => { unsupported("pins"); let _ = args; Ok(()) }
-        MessageCommand::React(args) => { unsupported("react"); let _ = args; Ok(()) }
-        MessageCommand::Reactions(args) => { unsupported("reactions"); let _ = args; Ok(()) }
-        MessageCommand::Poll(args) => { unsupported("poll"); let _ = args; Ok(()) }
-        MessageCommand::Search(args) => { unsupported("search"); let _ = args; Ok(()) }
-        MessageCommand::Thread(sub) => { unsupported(&format!("thread {sub:?}")); Ok(()) }
-        MessageCommand::Voice(sub) => { unsupported(&format!("voice {sub:?}")); Ok(()) }
-        MessageCommand::Sticker(sub) => { unsupported(&format!("sticker {sub:?}")); Ok(()) }
-        MessageCommand::Emoji(sub) => { unsupported(&format!("emoji {sub:?}")); Ok(()) }
-        MessageCommand::Ban(args) => { unsupported("ban"); let _ = args; Ok(()) }
-        MessageCommand::Kick(args) => { unsupported("kick"); let _ = args; Ok(()) }
-        MessageCommand::Timeout(args) => { unsupported("timeout"); let _ = args; Ok(()) }
-        MessageCommand::Member(sub) => { unsupported(&format!("member {sub:?}")); Ok(()) }
-        MessageCommand::Role(sub) => { unsupported(&format!("role {sub:?}")); Ok(()) }
-        MessageCommand::Permissions(args) => { unsupported("permissions"); let _ = args; Ok(()) }
-        MessageCommand::Channel(sub) => { unsupported(&format!("channel {sub:?}")); Ok(()) }
-        MessageCommand::Event(sub) => { unsupported(&format!("event {sub:?}")); Ok(()) }
+        MessageCommand::Edit(args) => {
+            unsupported("edit");
+            let _ = args;
+            Ok(())
+        }
+        MessageCommand::Delete(args) => {
+            unsupported("delete");
+            let _ = args;
+            Ok(())
+        }
+        MessageCommand::Pin(args) => {
+            unsupported("pin");
+            let _ = args;
+            Ok(())
+        }
+        MessageCommand::Unpin(args) => {
+            unsupported("unpin");
+            let _ = args;
+            Ok(())
+        }
+        MessageCommand::Pins(args) => {
+            unsupported("pins");
+            let _ = args;
+            Ok(())
+        }
+        MessageCommand::React(args) => {
+            unsupported("react");
+            let _ = args;
+            Ok(())
+        }
+        MessageCommand::Reactions(args) => {
+            unsupported("reactions");
+            let _ = args;
+            Ok(())
+        }
+        MessageCommand::Poll(args) => {
+            unsupported("poll");
+            let _ = args;
+            Ok(())
+        }
+        MessageCommand::Search(args) => {
+            unsupported("search");
+            let _ = args;
+            Ok(())
+        }
+        MessageCommand::Thread(sub) => {
+            unsupported(&format!("thread {sub:?}"));
+            Ok(())
+        }
+        MessageCommand::Voice(sub) => {
+            unsupported(&format!("voice {sub:?}"));
+            Ok(())
+        }
+        MessageCommand::Sticker(sub) => {
+            unsupported(&format!("sticker {sub:?}"));
+            Ok(())
+        }
+        MessageCommand::Emoji(sub) => {
+            unsupported(&format!("emoji {sub:?}"));
+            Ok(())
+        }
+        MessageCommand::Ban(args) => {
+            unsupported("ban");
+            let _ = args;
+            Ok(())
+        }
+        MessageCommand::Kick(args) => {
+            unsupported("kick");
+            let _ = args;
+            Ok(())
+        }
+        MessageCommand::Timeout(args) => {
+            unsupported("timeout");
+            let _ = args;
+            Ok(())
+        }
+        MessageCommand::Member(sub) => {
+            unsupported(&format!("member {sub:?}"));
+            Ok(())
+        }
+        MessageCommand::Role(sub) => {
+            unsupported(&format!("role {sub:?}"));
+            Ok(())
+        }
+        MessageCommand::Permissions(args) => {
+            unsupported("permissions");
+            let _ = args;
+            Ok(())
+        }
+        MessageCommand::Channel(sub) => {
+            unsupported(&format!("channel {sub:?}"));
+            Ok(())
+        }
+        MessageCommand::Event(sub) => {
+            unsupported(&format!("event {sub:?}"));
+            Ok(())
+        }
     }
 }
 
@@ -138,10 +215,7 @@ async fn message_send(args: MessageSendArgs) -> Result<()> {
 
 async fn message_read(args: MessageReadArgs) -> Result<()> {
     let limit_str = args.limit.unwrap_or(20).to_string();
-    let mut query: Vec<(&str, &str)> = vec![
-        ("target", &args.target),
-        ("limit", &limit_str),
-    ];
+    let mut query: Vec<(&str, &str)> = vec![("target", &args.target), ("limit", &limit_str)];
     let ch;
     if let Some(ref c) = args.channel {
         ch = c.clone();

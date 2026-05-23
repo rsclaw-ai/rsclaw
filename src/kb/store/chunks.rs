@@ -1,10 +1,15 @@
 //! KbChunk accessors + secondary index by logical_source_id.
 
-use crate::kb::model::KbChunk;
-use crate::kb::store::codec::{decode, encode};
-use crate::kb::store::schema::{KB_CHUNKS, KB_CHUNK_BY_LOGICAL};
 use anyhow::Result;
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
+
+use crate::kb::{
+    model::KbChunk,
+    store::{
+        codec::{decode, encode},
+        schema::{KB_CHUNK_BY_LOGICAL, KB_CHUNKS},
+    },
+};
 
 const SEP: u8 = 0;
 
@@ -55,10 +60,7 @@ pub fn chunk_ids_for_logical(
 /// All chunks for a logical source, materialised. Convenience for tests
 /// + small docs; for large docs prefer `chunk_ids_for_logical` + per-id
 /// `get` so the caller can stream.
-pub fn chunks_for_logical(
-    rtx: &ReadTransaction,
-    logical_source_id: &str,
-) -> Result<Vec<KbChunk>> {
+pub fn chunks_for_logical(rtx: &ReadTransaction, logical_source_id: &str) -> Result<Vec<KbChunk>> {
     let ids = chunk_ids_for_logical(rtx, logical_source_id)?;
     let mut out = Vec::with_capacity(ids.len());
     for id in ids {
@@ -137,11 +139,14 @@ fn chunk_ids_for_logical_in_wtx(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use redb::ReadableDatabase;
-    use crate::kb::model::{chunk_id, ChunkStatus, KbLocator, LogicalSourceId};
-    use crate::kb::store::open_db;
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::kb::{
+        model::{ChunkStatus, KbLocator, LogicalSourceId, chunk_id},
+        store::open_db,
+    };
 
     fn sample(lsid: &LogicalSourceId, seq: u32, body: &str) -> KbChunk {
         KbChunk {
@@ -155,7 +160,10 @@ mod tests {
             indexed_text: body.into(),
             vector: vec![0.1, 0.2, 0.3],
             simhash: 0,
-            locator: KbLocator::Offset { start: 0, end: body.len() },
+            locator: KbLocator::Offset {
+                start: 0,
+                end: body.len(),
+            },
             status: ChunkStatus::Active,
             source_quality: 1.0,
             embedder_id: "stub".into(),

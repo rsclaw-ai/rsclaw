@@ -2,8 +2,7 @@
 
 use std::sync::Arc;
 
-use rsclaw::channel::{Channel, OutboundMessage};
-use rsclaw::channel::slack::SlackChannel;
+use rsclaw::channel::{Channel, OutboundMessage, slack::SlackChannel};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{method, path},
@@ -31,7 +30,12 @@ fn noop_on_message() -> OnMessage {
 
 fn make_channel(base_url: &str) -> SlackChannel {
     init_crypto();
-    SlackChannel::new("xoxb-test-token", None, Some(base_url.to_owned()), noop_on_message())
+    SlackChannel::new(
+        "xoxb-test-token",
+        None,
+        Some(base_url.to_owned()),
+        noop_on_message(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -51,10 +55,7 @@ async fn send_text_posts_to_chat_post_message() {
 
     Mock::given(method("POST"))
         .and(path("/chat.postMessage"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"ok": true})),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
         .expect(1)
         .mount(&server)
         .await;
@@ -66,7 +67,7 @@ async fn send_text_posts_to_chat_post_message() {
         text: "Hello, Slack!".to_owned(),
         reply_to: None,
         images: vec![],
-    ..Default::default()
+        ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed");
@@ -79,10 +80,7 @@ async fn send_chunked_3000() {
     // Text longer than 3000 chars should be split into 2 chunks.
     Mock::given(method("POST"))
         .and(path("/chat.postMessage"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"ok": true})),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
         .expect(2)
         .mount(&server)
         .await;
@@ -95,7 +93,7 @@ async fn send_chunked_3000() {
         text: long_text,
         reply_to: None,
         images: vec![],
-    ..Default::default()
+        ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed");
@@ -121,7 +119,7 @@ async fn slack_api_error_returns_err() {
         text: "Hello".to_owned(),
         reply_to: None,
         images: vec![],
-    ..Default::default()
+        ..Default::default()
     };
 
     let result = ch.send(msg).await;
@@ -134,11 +132,11 @@ async fn send_uses_bearer_auth() {
 
     Mock::given(method("POST"))
         .and(path("/chat.postMessage"))
-        .and(wiremock::matchers::header("authorization", "Bearer xoxb-test-token"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"ok": true})),
-        )
+        .and(wiremock::matchers::header(
+            "authorization",
+            "Bearer xoxb-test-token",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
         .expect(1)
         .mount(&server)
         .await;
@@ -150,8 +148,10 @@ async fn send_uses_bearer_auth() {
         text: "Auth check".to_owned(),
         reply_to: None,
         images: vec![],
-    ..Default::default()
+        ..Default::default()
     };
 
-    ch.send(msg).await.expect("send should succeed with bearer auth");
+    ch.send(msg)
+        .await
+        .expect("send should succeed with bearer auth");
 }

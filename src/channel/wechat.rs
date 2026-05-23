@@ -25,8 +25,10 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 use super::{Channel, OutboundMessage};
-use crate::channel::chunker::{ChunkConfig, chunk_text};
-use crate::channel::retry::{SendRetry, send_with_retry};
+use crate::channel::{
+    chunker::{ChunkConfig, chunk_text},
+    retry::{SendRetry, send_with_retry},
+};
 
 const ILINK_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
 const DEFAULT_BOT_TYPE: &str = "3";
@@ -36,11 +38,29 @@ const SEND_TIMEOUT_MS: u64 = 15_000;
 /// Build the common ilink API headers.
 fn ilink_headers(token: &str, body_len: usize) -> reqwest::header::HeaderMap {
     let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert("Content-Type", "application/json".parse().expect("valid hardcoded header value"));
-    headers.insert("AuthorizationType", "ilink_bot_token".parse().expect("valid hardcoded header value"));
-    headers.insert("Content-Length", body_len.to_string().parse().expect("valid Content-Length"));
+    headers.insert(
+        "Content-Type",
+        "application/json"
+            .parse()
+            .expect("valid hardcoded header value"),
+    );
+    headers.insert(
+        "AuthorizationType",
+        "ilink_bot_token"
+            .parse()
+            .expect("valid hardcoded header value"),
+    );
+    headers.insert(
+        "Content-Length",
+        body_len.to_string().parse().expect("valid Content-Length"),
+    );
     if !token.is_empty() {
-        headers.insert("Authorization", format!("Bearer {token}").parse().expect("valid Authorization header"));
+        headers.insert(
+            "Authorization",
+            format!("Bearer {token}")
+                .parse()
+                .expect("valid Authorization header"),
+        );
     }
     // X-WECHAT-UIN: random uint32 → decimal string → base64 (simple inline)
     let uin: u32 = rand::random();
@@ -66,7 +86,10 @@ fn ilink_headers(token: &str, body_len: usize) -> reqwest::header::HeaderMap {
             '='
         });
     }
-    headers.insert("X-WECHAT-UIN", b64.parse().expect("valid base64 header value"));
+    headers.insert(
+        "X-WECHAT-UIN",
+        b64.parse().expect("valid base64 header value"),
+    );
     headers
 }
 
@@ -148,7 +171,10 @@ const WECHAT_CDN_BASE: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
 #[derive(Debug)]
 enum MediaSource {
     Url(String),
-    Cdn { encrypt_query_param: String, aes_key: String },
+    Cdn {
+        encrypt_query_param: String,
+        aes_key: String,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -161,7 +187,8 @@ struct FileItem {
 #[derive(Debug, Clone, Deserialize)]
 struct ImageItem {
     image_url: Option<String>,
-    /// Top-level hex AES key (image-specific, takes priority over media.aes_key).
+    /// Top-level hex AES key (image-specific, takes priority over
+    /// media.aes_key).
     aeskey: Option<String>,
     /// ilink v2: nested media object with encrypt_query_param
     media: Option<MediaRef>,
@@ -182,7 +209,8 @@ struct SendMessageReq {
 }
 
 /// Response from ilink/bot/getuploadurl.
-/// API may return either `upload_param` (raw param) or `upload_full_url` (full CDN URL).
+/// API may return either `upload_param` (raw param) or `upload_full_url` (full
+/// CDN URL).
 #[derive(Debug, Deserialize)]
 struct GetUploadUrlResponse {
     upload_param: Option<String>,
@@ -230,7 +258,15 @@ pub struct WeChatPersonalChannel {
     bot_token: String,
     client: Client,
     #[allow(clippy::type_complexity)]
-    on_message: Arc<dyn Fn(String, String, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>) + Send + Sync>,
+    on_message: Arc<
+        dyn Fn(
+                String,
+                String,
+                Vec<crate::agent::registry::ImageAttachment>,
+                Vec<crate::agent::registry::FileAttachment>,
+            ) + Send
+            + Sync,
+    >,
 }
 
 /// Sentinel prefix used in the bail message produced by
@@ -241,7 +277,18 @@ const NOTIFY_REJECTED_PREFIX: &str = "WECHAT_NOTIFY_REJECTED:";
 
 impl WeChatPersonalChannel {
     /// Create from a saved bot_token (after QR login).
-    pub fn new(bot_token: String, on_message: Arc<dyn Fn(String, String, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>) + Send + Sync>) -> Self {
+    pub fn new(
+        bot_token: String,
+        on_message: Arc<
+            dyn Fn(
+                    String,
+                    String,
+                    Vec<crate::agent::registry::ImageAttachment>,
+                    Vec<crate::agent::registry::FileAttachment>,
+                ) + Send
+                + Sync,
+        >,
+    ) -> Self {
         Self {
             base_url: ILINK_BASE_URL.to_owned(),
             bot_token,
@@ -263,7 +310,8 @@ impl WeChatPersonalChannel {
     // QR code login (static — used before creating the channel)
     // -----------------------------------------------------------------------
 
-    /// Fetch a fresh login QR code from ilink. Returns (qrcode_url, qrcode_token).
+    /// Fetch a fresh login QR code from ilink. Returns (qrcode_url,
+    /// qrcode_token).
     ///
     /// The url is what the user must scan; the token is what callers poll
     /// `get_qrcode_status` with.
@@ -538,9 +586,10 @@ impl WeChatPersonalChannel {
                             let items = msg.item_list.as_deref().unwrap_or(&[]);
 
                             // 1. Text (type 1)
-                            if let Some(t) = items.iter().find_map(|i| {
-                                i.text_item.as_ref().and_then(|t| t.text.clone())
-                            }) {
+                            if let Some(t) = items
+                                .iter()
+                                .find_map(|i| i.text_item.as_ref().and_then(|t| t.text.clone()))
+                            {
                                 if !from.is_empty() && !t.is_empty() {
                                     info!(from = %from, text_len = t.len(), "wechat: text message");
                                     (self.on_message)(from.clone(), t, vec![], vec![]);
@@ -548,12 +597,16 @@ impl WeChatPersonalChannel {
                                 continue;
                             }
 
-                            // 2. Voice (type 3) -- prefer WeChat STT, else download+decode+transcribe
+                            // 2. Voice (type 3) -- prefer WeChat STT, else
+                            //    download+decode+transcribe
                             if let Some(v) = items.iter().find_map(|i| i.voice_item.as_ref()) {
                                 // WeChat's own speech-to-text
                                 if let Some(stt) = &v.text {
                                     if !stt.is_empty() {
-                                        info!(chars = stt.len(), "wechat: using WeChat voice-to-text");
+                                        info!(
+                                            chars = stt.len(),
+                                            "wechat: using WeChat voice-to-text"
+                                        );
                                         if !from.is_empty() {
                                             // Tag the text so the agent enables
                                             // voice-reply mode for this turn —
@@ -572,17 +625,35 @@ impl WeChatPersonalChannel {
                                     match audio {
                                         Ok(bytes) => {
                                             match crate::channel::transcription::transcribe_audio(
-                                                &self.client, &bytes, "voice.silk", "audio/silk",
-                                            ).await {
+                                                &self.client,
+                                                &bytes,
+                                                "voice.silk",
+                                                "audio/silk",
+                                            )
+                                            .await
+                                            {
                                                 Ok(t) if !t.is_empty() => {
-                                                    info!(chars = t.len(), "wechat: voice transcribed");
+                                                    info!(
+                                                        chars = t.len(),
+                                                        "wechat: voice transcribed"
+                                                    );
                                                     if !from.is_empty() {
-                                                        let tagged = format!("[__VOICE_INPUT__]\n{t}");
-                                                        (self.on_message)(from.clone(), tagged, vec![], vec![]);
+                                                        let tagged =
+                                                            format!("[__VOICE_INPUT__]\n{t}");
+                                                        (self.on_message)(
+                                                            from.clone(),
+                                                            tagged,
+                                                            vec![],
+                                                            vec![],
+                                                        );
                                                     }
                                                 }
-                                                Ok(_) => warn!("wechat: voice transcription returned empty"),
-                                                Err(e) => warn!("wechat: voice transcription failed: {e:#}"),
+                                                Ok(_) => warn!(
+                                                    "wechat: voice transcription returned empty"
+                                                ),
+                                                Err(e) => warn!(
+                                                    "wechat: voice transcription failed: {e:#}"
+                                                ),
                                             }
                                         }
                                         Err(e) => warn!("wechat: voice download failed: {e:#}"),
@@ -604,15 +675,25 @@ impl WeChatPersonalChannel {
                                 if let Some(src) = src {
                                     match self.download_media_source(&src).await {
                                         Ok(bytes) => {
-                                            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                            let b64 = base64::engine::general_purpose::STANDARD
+                                                .encode(&bytes);
                                             let data_url = format!("data:image/jpeg;base64,{b64}");
-                                            let images = vec![crate::agent::registry::ImageAttachment {
-                                                data: data_url,
-                                                mime_type: "image/jpeg".to_string(),
-                                            }];
+                                            let images =
+                                                vec![crate::agent::registry::ImageAttachment {
+                                                    data: data_url,
+                                                    mime_type: "image/jpeg".to_string(),
+                                                }];
                                             info!(size = bytes.len(), "wechat: image received");
                                             if !from.is_empty() {
-                                                (self.on_message)(from.clone(), crate::i18n::t("describe_image", crate::i18n::default_lang()), images, vec![]);
+                                                (self.on_message)(
+                                                    from.clone(),
+                                                    crate::i18n::t(
+                                                        "describe_image",
+                                                        crate::i18n::default_lang(),
+                                                    ),
+                                                    images,
+                                                    vec![],
+                                                );
                                             }
                                         }
                                         Err(e) => warn!("wechat: image download failed: {e:#}"),
@@ -627,15 +708,24 @@ impl WeChatPersonalChannel {
                                 if let Some(src) = src {
                                     match self.download_media_source(&src).await {
                                         Ok(bytes) => {
-                                            let fname = f.file_name.as_deref().unwrap_or("file.bin");
-                                            info!(size = bytes.len(), fname, "wechat: file received, routing to agent");
+                                            let fname =
+                                                f.file_name.as_deref().unwrap_or("file.bin");
+                                            info!(
+                                                size = bytes.len(),
+                                                fname, "wechat: file received, routing to agent"
+                                            );
                                             let fa = crate::agent::registry::FileAttachment {
                                                 filename: fname.to_owned(),
                                                 data: bytes,
                                                 mime_type: "application/octet-stream".to_owned(),
                                             };
                                             if !from.is_empty() {
-                                                (self.on_message)(from.clone(), String::new(), vec![], vec![fa]);
+                                                (self.on_message)(
+                                                    from.clone(),
+                                                    String::new(),
+                                                    vec![],
+                                                    vec![fa],
+                                                );
                                             }
                                         }
                                         Err(e) => warn!("wechat: file download failed: {e:#}"),
@@ -655,13 +745,18 @@ impl WeChatPersonalChannel {
                                         };
                                         match self.download_media_source(&src).await {
                                             Ok(bytes) => {
-                                                info!(size = bytes.len(), "wechat: video downloaded");
+                                                info!(
+                                                    size = bytes.len(),
+                                                    "wechat: video downloaded"
+                                                );
                                                 // Send as both ImageAttachment (for vision models
                                                 // that support video) and FileAttachment (for
                                                 // audio transcription fallback on other models).
                                                 use base64::Engine;
-                                                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                                                let data_uri = format!("data:video/mp4;base64,{b64}");
+                                                let b64 = base64::engine::general_purpose::STANDARD
+                                                    .encode(&bytes);
+                                                let data_uri =
+                                                    format!("data:video/mp4;base64,{b64}");
                                                 let img = crate::agent::registry::ImageAttachment {
                                                     data: data_uri,
                                                     mime_type: "video/mp4".to_owned(),
@@ -672,7 +767,15 @@ impl WeChatPersonalChannel {
                                                     mime_type: "video/mp4".to_owned(),
                                                 };
                                                 if !from.is_empty() {
-                                                    (self.on_message)(from.clone(), crate::i18n::t("describe_video", crate::i18n::default_lang()), vec![img], vec![fa]);
+                                                    (self.on_message)(
+                                                        from.clone(),
+                                                        crate::i18n::t(
+                                                            "describe_video",
+                                                            crate::i18n::default_lang(),
+                                                        ),
+                                                        vec![img],
+                                                        vec![fa],
+                                                    );
                                                 }
                                             }
                                             Err(e) => warn!("wechat: video download failed: {e:#}"),
@@ -682,7 +785,10 @@ impl WeChatPersonalChannel {
                                 continue;
                             }
 
-                            debug!("wechat: unhandled message item types: {:?}", items.iter().map(|i| i.item_type).collect::<Vec<_>>());
+                            debug!(
+                                "wechat: unhandled message item types: {:?}",
+                                items.iter().map(|i| i.item_type).collect::<Vec<_>>()
+                            );
                         }
                     }
                 }
@@ -739,8 +845,13 @@ impl WeChatPersonalChannel {
 
     /// Download media from WeChat CDN and decrypt with AES-128-ECB.
     ///
-    /// Flow: GET cdn_url?encrypted_query_param=... -> AES-128-ECB decrypt -> raw bytes
-    async fn download_cdn_media(&self, encrypt_query_param: &str, aes_key_b64: &str) -> Result<Vec<u8>> {
+    /// Flow: GET cdn_url?encrypted_query_param=... -> AES-128-ECB decrypt ->
+    /// raw bytes
+    async fn download_cdn_media(
+        &self,
+        encrypt_query_param: &str,
+        aes_key_b64: &str,
+    ) -> Result<Vec<u8>> {
         use aes::cipher::{BlockDecrypt, KeyInit};
 
         let url = format!(
@@ -772,7 +883,10 @@ impl WeChatPersonalChannel {
                 has_aes_key = !aes_key_b64.is_empty(),
                 "wechat: CDN download failed"
             );
-            bail!("CDN download failed: {status} {}", crate::util::truncate_str(&text, 200));
+            bail!(
+                "CDN download failed: {status} {}",
+                crate::util::truncate_str(&text, 200)
+            );
         }
 
         let encrypted = resp.bytes().await?;
@@ -783,7 +897,8 @@ impl WeChatPersonalChannel {
             return Ok(encrypted.to_vec());
         }
 
-        // Decode AES key: base64 -> try as hex string (voice/video) or raw 16 bytes (image)
+        // Decode AES key: base64 -> try as hex string (voice/video) or raw 16 bytes
+        // (image)
         let key_decoded = base64::engine::general_purpose::STANDARD
             .decode(aes_key_b64)
             .context("invalid base64 aes_key")?;
@@ -792,8 +907,7 @@ impl WeChatPersonalChannel {
             // It's a hex string of 16 bytes: "aabbccdd..." -> [0xaa, 0xbb, ...]
             (0..16)
                 .map(|i| {
-                    let hex = std::str::from_utf8(&key_decoded[i * 2..i * 2 + 2])
-                        .unwrap_or("00");
+                    let hex = std::str::from_utf8(&key_decoded[i * 2..i * 2 + 2]).unwrap_or("00");
                     u8::from_str_radix(hex, 16).unwrap_or(0)
                 })
                 .collect()
@@ -801,12 +915,14 @@ impl WeChatPersonalChannel {
             // Raw 16 bytes
             key_decoded
         } else {
-            bail!("unexpected aes_key length: {} (expected 16 or 32)", key_decoded.len());
+            bail!(
+                "unexpected aes_key length: {} (expected 16 or 32)",
+                key_decoded.len()
+            );
         };
 
         // AES-128-ECB decryption
-        let cipher = aes::Aes128::new_from_slice(&key_bytes)
-            .context("AES key init failed")?;
+        let cipher = aes::Aes128::new_from_slice(&key_bytes).context("AES key init failed")?;
 
         let mut data = encrypted.to_vec();
         // Pad to 16-byte boundary if needed
@@ -839,9 +955,10 @@ impl WeChatPersonalChannel {
             MediaSource::Url(url) => {
                 crate::channel::transcription::download_file(&self.client, url).await
             }
-            MediaSource::Cdn { encrypt_query_param, aes_key } => {
-                self.download_cdn_media(encrypt_query_param, aes_key).await
-            }
+            MediaSource::Cdn {
+                encrypt_query_param,
+                aes_key,
+            } => self.download_cdn_media(encrypt_query_param, aes_key).await,
         }
     }
 
@@ -849,7 +966,8 @@ impl WeChatPersonalChannel {
     // CDN upload (mirror of download_cdn_media)
     // -----------------------------------------------------------------------
 
-    /// AES-128-ECB encrypt with PKCS7 padding (mirror of decryption in download_cdn_media).
+    /// AES-128-ECB encrypt with PKCS7 padding (mirror of decryption in
+    /// download_cdn_media).
     fn aes_ecb_encrypt(plaintext: &[u8], key: &[u8; 16]) -> Vec<u8> {
         let cipher = aes::Aes128::new_from_slice(key).expect("valid 16-byte key");
         // PKCS7 padding
@@ -909,22 +1027,35 @@ impl WeChatPersonalChannel {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            bail!("getuploadurl failed: {status} {}", crate::util::truncate_str(&text, 300));
+            bail!(
+                "getuploadurl failed: {status} {}",
+                crate::util::truncate_str(&text, 300)
+            );
         }
 
-        debug!(response = crate::util::truncate_str(&text, 500), "wechat: getuploadurl response");
-        let parsed: GetUploadUrlResponse = serde_json::from_str(&text)
-            .with_context(|| format!("parse getuploadurl response: {}", crate::util::truncate_str(&text, 300)))?;
+        debug!(
+            response = crate::util::truncate_str(&text, 500),
+            "wechat: getuploadurl response"
+        );
+        let parsed: GetUploadUrlResponse = serde_json::from_str(&text).with_context(|| {
+            format!(
+                "parse getuploadurl response: {}",
+                crate::util::truncate_str(&text, 300)
+            )
+        })?;
         if parsed.upload_param.is_none() {
-            warn!(response = crate::util::truncate_str(&text, 500), "wechat: getuploadurl returned no upload_param");
+            warn!(
+                response = crate::util::truncate_str(&text, 500),
+                "wechat: getuploadurl returned no upload_param"
+            );
         }
         Ok(parsed)
     }
 
     /// Upload a buffer to the WeChat CDN with AES-128-ECB encryption.
     ///
-    /// Returns the CDN download `encrypted_query_param` from the `x-encrypted-param`
-    /// response header.
+    /// Returns the CDN download `encrypted_query_param` from the
+    /// `x-encrypted-param` response header.
     async fn upload_to_cdn_url(
         &self,
         plaintext: &[u8],
@@ -932,10 +1063,7 @@ impl WeChatPersonalChannel {
         aes_key: &[u8; 16],
     ) -> Result<String> {
         let ciphertext = Self::aes_ecb_encrypt(plaintext, aes_key);
-        debug!(
-            ciphertext_len = ciphertext.len(),
-            "wechat: CDN upload POST"
-        );
+        debug!(ciphertext_len = ciphertext.len(), "wechat: CDN upload POST");
 
         let mut last_err: Option<anyhow::Error> = None;
         for attempt in 1..=UPLOAD_MAX_RETRIES {
@@ -992,10 +1120,13 @@ impl WeChatPersonalChannel {
             return Ok(download_param);
         }
 
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("CDN upload failed after {UPLOAD_MAX_RETRIES} attempts")))
+        Err(last_err.unwrap_or_else(|| {
+            anyhow::anyhow!("CDN upload failed after {UPLOAD_MAX_RETRIES} attempts")
+        }))
     }
 
-    /// Full upload pipeline: read bytes -> hash -> gen keys -> getuploadurl -> CDN upload.
+    /// Full upload pipeline: read bytes -> hash -> gen keys -> getuploadurl ->
+    /// CDN upload.
     async fn upload_media(
         &self,
         plaintext: &[u8],
@@ -1021,32 +1152,41 @@ impl WeChatPersonalChannel {
 
         // Step 1: get upload_param from ilink API
         let upload_resp = self
-            .get_upload_url(&filekey, media_type, to_user_id, rawsize, &rawfilemd5, filesize, &aes_key_hex)
+            .get_upload_url(
+                &filekey,
+                media_type,
+                to_user_id,
+                rawsize,
+                &rawfilemd5,
+                filesize,
+                &aes_key_hex,
+            )
             .await?;
 
         // API may return upload_param (raw) or upload_full_url (full CDN URL).
-        let (cdn_upload_url, _upload_param_for_download) = if let Some(p) = upload_resp.upload_param.clone() {
-            // Build URL ourselves.
-            let url = format!(
-                "{}/upload?encrypted_query_param={}&filekey={}",
-                WECHAT_CDN_BASE,
-                percent_encode(&p),
-                percent_encode(&filekey),
-            );
-            (url, p)
-        } else if let Some(full_url) = upload_resp.upload_full_url {
-            // Use the full URL directly, add filekey if missing.
-            let url = if full_url.contains("filekey=") {
-                full_url.clone()
+        let (cdn_upload_url, _upload_param_for_download) =
+            if let Some(p) = upload_resp.upload_param.clone() {
+                // Build URL ourselves.
+                let url = format!(
+                    "{}/upload?encrypted_query_param={}&filekey={}",
+                    WECHAT_CDN_BASE,
+                    percent_encode(&p),
+                    percent_encode(&filekey),
+                );
+                (url, p)
+            } else if let Some(full_url) = upload_resp.upload_full_url {
+                // Use the full URL directly, add filekey if missing.
+                let url = if full_url.contains("filekey=") {
+                    full_url.clone()
+                } else {
+                    format!("{}&filekey={}", full_url, percent_encode(&filekey))
+                };
+                // Extract param for download_param response parsing.
+                let param = upload_resp.upload_param.unwrap_or_default();
+                (url, param)
             } else {
-                format!("{}&filekey={}", full_url, percent_encode(&filekey))
+                bail!("getuploadurl returned neither upload_param nor upload_full_url");
             };
-            // Extract param for download_param response parsing.
-            let param = upload_resp.upload_param.unwrap_or_default();
-            (url, param)
-        } else {
-            bail!("getuploadurl returned neither upload_param nor upload_full_url");
-        };
 
         // Step 2: AES encrypt + POST to CDN
         let download_param = self
@@ -1083,7 +1223,8 @@ impl WeChatPersonalChannel {
 
         // Convert hex aeskey string to base64 (encode the hex string as UTF-8 bytes,
         // NOT hex-decoded -- matches openclaw's Buffer.from(hexstr).toString("base64"))
-        let aes_key_b64 = base64::engine::general_purpose::STANDARD.encode(uploaded.aes_key_hex.as_bytes());
+        let aes_key_b64 =
+            base64::engine::general_purpose::STANDARD.encode(uploaded.aes_key_hex.as_bytes());
 
         let body = json!({
             "msg": {
@@ -1128,7 +1269,8 @@ impl WeChatPersonalChannel {
         Ok(())
     }
 
-    /// Parse a base64 data URI or raw URL image, upload to CDN, and send as image message.
+    /// Parse a base64 data URI or raw URL image, upload to CDN, and send as
+    /// image message.
     async fn send_outbound_image(&self, to_user_id: &str, image_data_uri: &str) -> Result<()> {
         // Decode base64 data URI: "data:image/png;base64,<data>"
         // Or download from a plain URL.
@@ -1166,7 +1308,8 @@ impl WeChatPersonalChannel {
         let client_id = uuid::Uuid::new_v4().to_string();
 
         // base64 encode the hex string (as openclaw voice/file aes_key format)
-        let aes_key_b64 = base64::engine::general_purpose::STANDARD.encode(uploaded.aes_key_hex.as_bytes());
+        let aes_key_b64 =
+            base64::engine::general_purpose::STANDARD.encode(uploaded.aes_key_hex.as_bytes());
 
         let body = json!({
             "msg": {
@@ -1212,9 +1355,9 @@ impl WeChatPersonalChannel {
         Ok(())
     }
 
-    /// Convert audio bytes (mp3/wav/ogg) to SILK v3 format for WeChat voice messages.
-    /// Uses ffmpeg to decode to raw PCM (s16le, mono, 24kHz), then silk-rs to encode.
-    /// Returns (silk_bytes, duration_ms).
+    /// Convert audio bytes (mp3/wav/ogg) to SILK v3 format for WeChat voice
+    /// messages. Uses ffmpeg to decode to raw PCM (s16le, mono, 24kHz),
+    /// then silk-rs to encode. Returns (silk_bytes, duration_ms).
     ///
     /// Currently unused — WeChat voice delivery is staged but not wired into
     /// the channel send path yet. See project_wechat_voice.md.
@@ -1232,11 +1375,19 @@ impl WeChatPersonalChannel {
         std::fs::write(&tmp_src, audio_bytes)?;
 
         // ffmpeg: decode to raw PCM s16le mono 24kHz
-        let ffmpeg_bin = crate::agent::platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned());
+        let ffmpeg_bin =
+            crate::agent::platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned());
         let output = std::process::Command::new(&ffmpeg_bin)
             .args([
-                "-i", &tmp_src.to_string_lossy(),
-                "-y", "-f", "s16le", "-ar", "24000", "-ac", "1",
+                "-i",
+                &tmp_src.to_string_lossy(),
+                "-y",
+                "-f",
+                "s16le",
+                "-ar",
+                "24000",
+                "-ac",
+                "1",
                 &tmp_pcm.to_string_lossy(),
             ])
             .output()
@@ -1264,12 +1415,18 @@ impl WeChatPersonalChannel {
         let duration_ms = (pcm_bytes.len() as u64 * 1000) / (24000 * 2);
         let duration_ms = duration_ms.max(1000);
 
-        info!(pcm_len = pcm_bytes.len(), silk_len = silk_bytes.len(), duration_ms, "wechat: converted audio to silk");
+        info!(
+            pcm_len = pcm_bytes.len(),
+            silk_len = silk_bytes.len(),
+            duration_ms,
+            "wechat: converted audio to silk"
+        );
         Ok((silk_bytes, duration_ms))
     }
 
     /// Send a voice message referencing a previously uploaded voice file.
-    /// Companion to `convert_to_silk` — wired in when WeChat voice delivery ships.
+    /// Companion to `convert_to_silk` — wired in when WeChat voice delivery
+    /// ships.
     #[allow(dead_code)]
     async fn send_voice_message(
         &self,
@@ -1281,7 +1438,8 @@ impl WeChatPersonalChannel {
         let client_id = uuid::Uuid::new_v4().to_string();
 
         // base64 encode the hex string (as openclaw voice/file aes_key format)
-        let aes_key_b64 = base64::engine::general_purpose::STANDARD.encode(uploaded.aes_key_hex.as_bytes());
+        let aes_key_b64 =
+            base64::engine::general_purpose::STANDARD.encode(uploaded.aes_key_hex.as_bytes());
 
         let body = json!({
             "msg": {
@@ -1337,7 +1495,8 @@ impl WeChatPersonalChannel {
         let client_id = uuid::Uuid::new_v4().to_string();
 
         // base64 encode the hex string (as openclaw media aes_key format)
-        let aes_key_b64 = base64::engine::general_purpose::STANDARD.encode(uploaded.aes_key_hex.as_bytes());
+        let aes_key_b64 =
+            base64::engine::general_purpose::STANDARD.encode(uploaded.aes_key_hex.as_bytes());
 
         let body = json!({
             "msg": {
@@ -1544,7 +1703,10 @@ impl Channel for WeChatPersonalChannel {
 
             // Upload and send each image
             for (i, image_data_uri) in msg.images.iter().enumerate() {
-                match self.send_outbound_image(&msg.target_id, image_data_uri).await {
+                match self
+                    .send_outbound_image(&msg.target_id, image_data_uri)
+                    .await
+                {
                     Ok(()) => info!(index = i, "wechat: image sent"),
                     Err(e) => warn!(index = i, "wechat: image send failed: {e:#}"),
                 }
@@ -1552,22 +1714,33 @@ impl Channel for WeChatPersonalChannel {
 
             // Send file attachments (audio files -> voice message, others -> file message)
             for (idx, (filename, mime, path_or_url)) in msg.files.iter().enumerate() {
-                let bytes = if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
-                    match self.client.get(path_or_url.as_str()).send().await {
-                        Ok(resp) if resp.status().is_success() => {
-                            match resp.bytes().await {
+                let bytes =
+                    if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
+                        match self.client.get(path_or_url.as_str()).send().await {
+                            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
                                 Ok(b) if !b.is_empty() => b.to_vec(),
-                                _ => { warn!(index = idx, "wechat: empty file download"); continue; }
+                                _ => {
+                                    warn!(index = idx, "wechat: empty file download");
+                                    continue;
+                                }
+                            },
+                            _ => {
+                                warn!(index = idx, "wechat: file download failed: {path_or_url}");
+                                continue;
                             }
                         }
-                        _ => { warn!(index = idx, "wechat: file download failed: {path_or_url}"); continue; }
-                    }
-                } else {
-                    match std::fs::read(path_or_url) {
-                        Ok(b) => b,
-                        Err(e) => { warn!(index = idx, "wechat: failed to read file {path_or_url}: {e}"); continue; }
-                    }
-                };
+                    } else {
+                        match std::fs::read(path_or_url) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                warn!(
+                                    index = idx,
+                                    "wechat: failed to read file {path_or_url}: {e}"
+                                );
+                                continue;
+                            }
+                        }
+                    };
 
                 // Audio files: WeChat ilink's silk + send_voice_message flow
                 // returns 200 OK at the API layer but the client doesn't
@@ -1585,28 +1758,27 @@ impl Channel for WeChatPersonalChannel {
                                 .upload_media(&mp4_bytes, &msg.target_id, UploadMediaType::Video)
                                 .await
                             {
-                                Ok(uploaded) => match self
-                                    .send_video_message(&msg.target_id, &uploaded)
-                                    .await
-                                {
-                                    Ok(()) => {
-                                        info!(
-                                            index = idx,
-                                            filename = %filename,
-                                            wav_bytes = bytes.len(),
-                                            mp4_bytes = mp4_bytes.len(),
-                                            "wechat: audio sent as video"
-                                        );
-                                        true
+                                Ok(uploaded) => {
+                                    match self.send_video_message(&msg.target_id, &uploaded).await {
+                                        Ok(()) => {
+                                            info!(
+                                                index = idx,
+                                                filename = %filename,
+                                                wav_bytes = bytes.len(),
+                                                mp4_bytes = mp4_bytes.len(),
+                                                "wechat: audio sent as video"
+                                            );
+                                            true
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                index = idx,
+                                                "wechat: send_video_message for audio failed (fall back to file): {e:#}"
+                                            );
+                                            false
+                                        }
                                     }
-                                    Err(e) => {
-                                        warn!(
-                                            index = idx,
-                                            "wechat: send_video_message for audio failed (fall back to file): {e:#}"
-                                        );
-                                        false
-                                    }
-                                },
+                                }
                                 Err(e) => {
                                     warn!(
                                         index = idx,
@@ -1638,7 +1810,10 @@ impl Channel for WeChatPersonalChannel {
                     || filename.ends_with(".mkv");
                 if is_video {
                     let mut sent = false;
-                    match self.upload_media(&bytes, &msg.target_id, UploadMediaType::Video).await {
+                    match self
+                        .upload_media(&bytes, &msg.target_id, UploadMediaType::Video)
+                        .await
+                    {
                         Ok(uploaded) => {
                             match self.send_video_message(&msg.target_id, &uploaded).await {
                                 Ok(()) => {
@@ -1669,17 +1844,27 @@ impl Channel for WeChatPersonalChannel {
                                 ("path", path_or_url.as_str()),
                             ],
                         );
-                        if let Err(send_err) = self.send_text(&msg.target_id, &fallback_text).await {
-                            warn!(index = idx, "wechat: video fallback text also failed: {send_err:#}");
+                        if let Err(send_err) = self.send_text(&msg.target_id, &fallback_text).await
+                        {
+                            warn!(
+                                index = idx,
+                                "wechat: video fallback text also failed: {send_err:#}"
+                            );
                         }
                     }
                     continue;
                 }
 
                 // Other files: upload as File type and send as file message
-                match self.upload_media(&bytes, &msg.target_id, UploadMediaType::File).await {
+                match self
+                    .upload_media(&bytes, &msg.target_id, UploadMediaType::File)
+                    .await
+                {
                     Ok(uploaded) => {
-                        if let Err(e) = self.send_file_message(&msg.target_id, filename, &uploaded).await {
+                        if let Err(e) = self
+                            .send_file_message(&msg.target_id, filename, &uploaded)
+                            .await
+                        {
                             warn!(index = idx, "wechat: send file message failed: {e:#}");
                         } else {
                             info!(index = idx, filename = %filename, "wechat: file sent");
@@ -1746,8 +1931,9 @@ fn base_info() -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::{Arc, Mutex};
+
+    use super::*;
 
     fn init_crypto() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -1756,9 +1942,14 @@ mod tests {
     /// Build a WeChatPersonalChannel pointing at the mock server.
     fn mock_channel(received: Arc<Mutex<Vec<String>>>) -> Arc<WeChatPersonalChannel> {
         let rx = Arc::clone(&received);
-        let on_message = Arc::new(move |_from: String, text: String, _images: Vec<crate::agent::registry::ImageAttachment>, _files: Vec<crate::agent::registry::FileAttachment>| {
-            rx.lock().unwrap().push(text);
-        });
+        let on_message = Arc::new(
+            move |_from: String,
+                  text: String,
+                  _images: Vec<crate::agent::registry::ImageAttachment>,
+                  _files: Vec<crate::agent::registry::FileAttachment>| {
+                rx.lock().unwrap().push(text);
+            },
+        );
         Arc::new(
             WeChatPersonalChannel::new("mock-token".to_owned(), on_message)
                 .with_base_url("http://127.0.0.1:19987"),
@@ -1769,11 +1960,8 @@ mod tests {
     #[test]
     fn with_base_url_overrides_default() {
         init_crypto();
-        let ch = WeChatPersonalChannel::new(
-            "tok".to_owned(),
-            Arc::new(|_, _, _, _| {}),
-        )
-        .with_base_url("http://127.0.0.1:19987");
+        let ch = WeChatPersonalChannel::new("tok".to_owned(), Arc::new(|_, _, _, _| {}))
+            .with_base_url("http://127.0.0.1:19987");
         assert_eq!(ch.base_url, "http://127.0.0.1:19987");
     }
 
@@ -1781,11 +1969,8 @@ mod tests {
     #[test]
     fn with_base_url_strips_trailing_slash() {
         init_crypto();
-        let ch = WeChatPersonalChannel::new(
-            "tok".to_owned(),
-            Arc::new(|_, _, _, _| {}),
-        )
-        .with_base_url("http://127.0.0.1:19987/");
+        let ch = WeChatPersonalChannel::new("tok".to_owned(), Arc::new(|_, _, _, _| {}))
+            .with_base_url("http://127.0.0.1:19987/");
         assert_eq!(ch.base_url, "http://127.0.0.1:19987");
     }
 
@@ -1817,14 +2002,15 @@ mod tests {
         assert_eq!(percent_encode(b64), "dGVzdA%3D%3D");
     }
 
-    /// AES-128-ECB encrypt then decrypt roundtrip must recover original plaintext.
+    /// AES-128-ECB encrypt then decrypt roundtrip must recover original
+    /// plaintext.
     #[test]
     fn aes_ecb_encrypt_decrypt_roundtrip() {
         use aes::cipher::{BlockDecrypt, KeyInit};
 
         let key: [u8; 16] = [
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-            0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+            0xEE, 0xFF,
         ];
         let plaintext = b"Hello, WeChat CDN AES-128-ECB test data!";
 
@@ -1879,8 +2065,8 @@ mod tests {
     }
 
     /// AES key parsing: hex string (32 chars) -> 16 raw bytes.
-    /// openclaw: parseAesKey decodes base64 -> if 32 ASCII hex chars -> parse hex -> 16 bytes.
-    /// rsclaw: download_cdn_media does the same.
+    /// openclaw: parseAesKey decodes base64 -> if 32 ASCII hex chars -> parse
+    /// hex -> 16 bytes. rsclaw: download_cdn_media does the same.
     #[test]
     fn aes_key_hex_to_bytes() {
         let hex_key = "00112233445566778899aabbccddeeff";
@@ -1913,7 +2099,9 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
         // Verify: base64-decode should give 16 raw bytes
-        let decoded = base64::engine::general_purpose::STANDARD.decode(&b64).unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&b64)
+            .unwrap();
         assert_eq!(decoded.len(), 16);
         assert_eq!(decoded, bytes);
 
@@ -1922,13 +2110,13 @@ mod tests {
     }
 
     /// base64(hex string) -> base64(raw bytes) key conversion.
-    /// openclaw parseAesKey: decode base64 -> if 32 hex chars -> parse to 16 bytes.
+    /// openclaw parseAesKey: decode base64 -> if 32 hex chars -> parse to 16
+    /// bytes.
     #[test]
     fn aes_key_base64_hex_roundtrip() {
         let hex_key = "aabbccdd11223344aabbccdd11223344";
         // base64 encode the hex string (as openclaw voice/file aes_key format)
-        let b64_of_hex = base64::engine::general_purpose::STANDARD
-            .encode(hex_key.as_bytes());
+        let b64_of_hex = base64::engine::general_purpose::STANDARD.encode(hex_key.as_bytes());
 
         // Decode base64 -> get 32-byte hex string
         let decoded = base64::engine::general_purpose::STANDARD
@@ -1946,7 +2134,8 @@ mod tests {
         assert_eq!(hex::encode(&key_bytes), hex_key);
     }
 
-    /// resolve_media_source_image: prefers image_url, then media with aeskey conversion.
+    /// resolve_media_source_image: prefers image_url, then media with aeskey
+    /// conversion.
     #[test]
     fn resolve_media_source_image_prefers_url() {
         let img = ImageItem {
@@ -1963,7 +2152,8 @@ mod tests {
         }
     }
 
-    /// resolve_media_source_image: with media.encrypt_query_param + aeskey hex conversion.
+    /// resolve_media_source_image: with media.encrypt_query_param + aeskey hex
+    /// conversion.
     #[test]
     fn resolve_media_source_image_cdn_with_hex_aeskey() {
         let hex_key = "aabbccdd11223344aabbccdd11223344";
@@ -1976,10 +2166,15 @@ mod tests {
             }),
         };
         match resolve_media_source_image(&img) {
-            Some(MediaSource::Cdn { encrypt_query_param, aes_key }) => {
+            Some(MediaSource::Cdn {
+                encrypt_query_param,
+                aes_key,
+            }) => {
                 assert_eq!(encrypt_query_param, "encrypted_param_value");
                 // aes_key should be base64 of the raw bytes parsed from hex
-                let decoded = base64::engine::general_purpose::STANDARD.decode(&aes_key).unwrap();
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(&aes_key)
+                    .unwrap();
                 assert_eq!(decoded.len(), 16);
                 assert_eq!(hex::encode(&decoded), hex_key);
             }
@@ -1987,7 +2182,8 @@ mod tests {
         }
     }
 
-    /// resolve_media_source_image: with media only (no aeskey), uses media.aes_key directly.
+    /// resolve_media_source_image: with media only (no aeskey), uses
+    /// media.aes_key directly.
     #[test]
     fn resolve_media_source_image_cdn_media_aes_key() {
         let img = ImageItem {
@@ -1999,7 +2195,10 @@ mod tests {
             }),
         };
         match resolve_media_source_image(&img) {
-            Some(MediaSource::Cdn { encrypt_query_param, aes_key }) => {
+            Some(MediaSource::Cdn {
+                encrypt_query_param,
+                aes_key,
+            }) => {
                 assert_eq!(encrypt_query_param, "param_xyz");
                 assert_eq!(aes_key, "base64_media_key");
             }
@@ -2040,7 +2239,8 @@ mod tests {
         );
     }
 
-    /// CDN download URL construction matches openclaw cdn-url.ts buildCdnDownloadUrl.
+    /// CDN download URL construction matches openclaw cdn-url.ts
+    /// buildCdnDownloadUrl.
     #[test]
     fn cdn_download_url_construction() {
         let param = "some+param/with=chars";
@@ -2055,7 +2255,8 @@ mod tests {
         );
     }
 
-    /// CDN upload URL construction matches openclaw cdn-url.ts buildCdnUploadUrl.
+    /// CDN upload URL construction matches openclaw cdn-url.ts
+    /// buildCdnUploadUrl.
     #[test]
     fn cdn_upload_url_construction() {
         let upload_param = "enc+param==";
@@ -2072,18 +2273,23 @@ mod tests {
         );
     }
 
-    /// Extract encrypted_query_param from upload_full_url for CDN URL construction.
+    /// Extract encrypted_query_param from upload_full_url for CDN URL
+    /// construction.
     #[test]
     fn cdn_url_from_upload_full_url_extract_param() {
         let full_url = "https://cdn.example.com/upload?encrypted_query_param=xyz%3D%3D&extra=1";
-        // When upload_full_url is provided, it is used directly (with filekey appended if missing)
+        // When upload_full_url is provided, it is used directly (with filekey appended
+        // if missing)
         let filekey = "myfilekey";
         let url = if full_url.contains("filekey=") {
             full_url.to_string()
         } else {
             format!("{}&filekey={}", full_url, percent_encode(filekey))
         };
-        assert_eq!(url, "https://cdn.example.com/upload?encrypted_query_param=xyz%3D%3D&extra=1&filekey=myfilekey");
+        assert_eq!(
+            url,
+            "https://cdn.example.com/upload?encrypted_query_param=xyz%3D%3D&extra=1&filekey=myfilekey"
+        );
 
         // When filekey is already present
         let full_url2 = "https://cdn.example.com/upload?encrypted_query_param=abc&filekey=existing";
@@ -2092,14 +2298,18 @@ mod tests {
         } else {
             format!("{}&filekey={}", full_url2, percent_encode(filekey))
         };
-        assert_eq!(url2, "https://cdn.example.com/upload?encrypted_query_param=abc&filekey=existing");
+        assert_eq!(
+            url2,
+            "https://cdn.example.com/upload?encrypted_query_param=abc&filekey=existing"
+        );
     }
 
     // -------------------------------------------------------------------
     // Integration tests (require mock_wechat.py on port 19987)
     // -------------------------------------------------------------------
 
-    /// Call getupdates against mock_wechat.py and expect 2 messages on first call.
+    /// Call getupdates against mock_wechat.py and expect 2 messages on first
+    /// call.
     ///
     /// Run: python3 /tmp/mock_wechat.py  (in a separate terminal)
     /// Then: cargo test -p rsclaw wechat::tests::mock_getupdates -- --ignored
@@ -2135,7 +2345,8 @@ mod tests {
     /// Call getupdates twice; second call should return empty msgs.
     ///
     /// Run: python3 /tmp/mock_wechat.py  (restart before test)
-    /// Then: cargo test -p rsclaw wechat::tests::mock_getupdates_empty_second -- --ignored
+    /// Then: cargo test -p rsclaw wechat::tests::mock_getupdates_empty_second
+    /// -- --ignored
     #[tokio::test]
     #[ignore]
     async fn mock_getupdates_empty_second_call() {
@@ -2157,11 +2368,8 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn mock_send_text() {
-        let ch = WeChatPersonalChannel::new(
-            "mock-token".to_owned(),
-            Arc::new(|_, _, _, _| {}),
-        )
-        .with_base_url("http://127.0.0.1:19987");
+        let ch = WeChatPersonalChannel::new("mock-token".to_owned(), Arc::new(|_, _, _, _| {}))
+            .with_base_url("http://127.0.0.1:19987");
 
         ch.send_text("user_abc", "Hello from rsclaw test")
             .await

@@ -14,8 +14,7 @@ use calamine::{Data, Reader, open_workbook_auto_from_rs};
 use super::*;
 use crate::kb::content_store::atomic::sha256_hex;
 
-pub const XLSX_MIME: &str =
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+pub const XLSX_MIME: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 pub const XLS_MIME: &str = "application/vnd.ms-excel";
 pub const ODS_MIME: &str = "application/vnd.oasis.opendocument.spreadsheet";
 
@@ -112,8 +111,9 @@ impl Canonicalizer for SpreadsheetCanonicalizer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rust_xlsxwriter::Workbook;
+
+    use super::*;
 
     fn input<'a>(bytes: &'a [u8], mime: &'a str) -> CanonicalizeInput<'a> {
         CanonicalizeInput {
@@ -146,7 +146,11 @@ mod tests {
             .canonicalize(input(&bytes, XLSX_MIME))
             .unwrap()
             .expect("some");
-        assert!(out.markdown.contains("姓名 | 分数"), "got: {}", out.markdown);
+        assert!(
+            out.markdown.contains("姓名 | 分数"),
+            "got: {}",
+            out.markdown
+        );
         assert!(out.markdown.contains("Alice | 95"), "got: {}", out.markdown);
         assert!(out.markdown.contains("Bob | 88"), "got: {}", out.markdown);
     }

@@ -2,17 +2,19 @@
 //!
 //! Phases (each returns its own count in [`MeditationReport`]):
 //! 1. Dedup: merge near-duplicate Core/Working memories (cosine sim > 0.92)
-//! 2. Crystallize: distill Core un-crystallized clusters into SKILL.md
-//!    files (only runs when crystallization deps are provided)
+//! 2. Crystallize: distill Core un-crystallized clusters into SKILL.md files
+//!    (only runs when crystallization deps are provided)
 //! 3. Cleanup: demote "crystallized"-tagged memories to Peripheral after
 //!    [`MeditationConfig::crystallized_ttl_days`]
 
-use anyhow::Result;
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
-use crate::agent::memory::{MemDocTier, MemoryStore};
-use crate::provider::registry::ProviderRegistry;
+use anyhow::Result;
+
+use crate::{
+    agent::memory::{MemDocTier, MemoryStore},
+    provider::registry::ProviderRegistry,
+};
 
 // ---------------------------------------------------------------------------
 // Config

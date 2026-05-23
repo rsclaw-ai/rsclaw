@@ -4,13 +4,17 @@
 //! replaces the chat-channel sink with stdout. Runs until Ctrl-C or the
 //! source emits a fatal lifecycle event.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::cli::WatchArgs;
-use crate::gateway::watch::filter::Filter;
-use crate::gateway::watch::parser::{self, ParsedCommand, SourceKind};
-use crate::gateway::watch::source::EventRecord;
+use crate::{
+    cli::WatchArgs,
+    gateway::watch::{
+        filter::Filter,
+        parser::{self, ParsedCommand, SourceKind},
+        source::EventRecord,
+    },
+};
 
 pub async fn cmd_watch(args: WatchArgs) -> Result<()> {
     // The chat-side parser expects the body as a single string (e.g.
@@ -49,8 +53,8 @@ pub async fn cmd_watch(args: WatchArgs) -> Result<()> {
     }
     let filter = Filter::from_spec(grep_eff.as_deref(), jq_eff.as_deref(), event_eff)
         .map_err(|e| anyhow!("invalid filter: {e}"))?;
-    let source_impl = crate::gateway::watch::build_source_impl(&spec)
-        .map_err(|e| anyhow!("{e}"))?;
+    let source_impl =
+        crate::gateway::watch::build_source_impl(&spec).map_err(|e| anyhow!("{e}"))?;
 
     let (src_tx, mut src_rx) = mpsc::channel::<EventRecord>(256);
     let (stop_tx, stop_rx) = oneshot::channel::<()>();

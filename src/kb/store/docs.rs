@@ -2,11 +2,16 @@
 //! (writes) or `&ReadTransaction` (reads) so the ingest pipeline can
 //! compose multiple table writes in one transaction.
 
-use crate::kb::model::{KbDoc, VersionPointer};
-use crate::kb::store::codec::{decode, encode};
-use crate::kb::store::schema::{KB_DOCS, KB_DOC_LATEST_VERSION};
 use anyhow::Result;
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
+
+use crate::kb::{
+    model::{KbDoc, VersionPointer},
+    store::{
+        codec::{decode, encode},
+        schema::{KB_DOC_LATEST_VERSION, KB_DOCS},
+    },
+};
 
 /// Insert or replace a doc. The caller is responsible for setting
 /// `version` correctly (use `next_version_for` before calling).
@@ -106,10 +111,7 @@ pub fn latest_version_in_wtx(
     }
 }
 
-pub fn next_version_for_in_wtx(
-    wtx: &WriteTransaction,
-    logical_source_id: &str,
-) -> Result<u32> {
+pub fn next_version_for_in_wtx(wtx: &WriteTransaction, logical_source_id: &str) -> Result<u32> {
     Ok(latest_version_in_wtx(wtx, logical_source_id)?
         .map(|p| p.version + 1)
         .unwrap_or(1))
@@ -135,11 +137,14 @@ pub fn find_by_logical_and_hash_in_wtx(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use redb::ReadableDatabase;
-    use crate::kb::model::{KbSource, KbSourceKind, KbStatus, KbVisibility};
-    use crate::kb::store::open_db;
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::kb::{
+        model::{KbSource, KbSourceKind, KbStatus, KbVisibility},
+        store::open_db,
+    };
 
     fn sample(id: &str, lsid: &str, raw_sha: &str, version: u32) -> KbDoc {
         KbDoc {
@@ -203,7 +208,10 @@ mod tests {
             set_latest_version(
                 &wtx,
                 "lsid",
-                &VersionPointer { doc_id: "d1".into(), version: 1 },
+                &VersionPointer {
+                    doc_id: "d1".into(),
+                    version: 1,
+                },
             )
             .unwrap();
             wtx.commit().unwrap();
@@ -222,18 +230,31 @@ mod tests {
             set_latest_version(
                 &wtx,
                 "lsid",
-                &VersionPointer { doc_id: "d1".into(), version: 1 },
+                &VersionPointer {
+                    doc_id: "d1".into(),
+                    version: 1,
+                },
             )
             .unwrap();
             wtx.commit().unwrap();
         }
         let rtx = db.begin_read().unwrap();
         assert_eq!(
-            find_by_logical_and_hash(&rtx, "lsid", "rawA").unwrap().as_deref(),
+            find_by_logical_and_hash(&rtx, "lsid", "rawA")
+                .unwrap()
+                .as_deref(),
             Some("d1")
         );
-        assert!(find_by_logical_and_hash(&rtx, "lsid", "rawB").unwrap().is_none());
-        assert!(find_by_logical_and_hash(&rtx, "other", "rawA").unwrap().is_none());
+        assert!(
+            find_by_logical_and_hash(&rtx, "lsid", "rawB")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            find_by_logical_and_hash(&rtx, "other", "rawA")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -249,7 +270,10 @@ mod tests {
             set_latest_version(
                 &wtx,
                 "lsid",
-                &VersionPointer { doc_id: "d1".into(), version: 1 },
+                &VersionPointer {
+                    doc_id: "d1".into(),
+                    version: 1,
+                },
             )
             .unwrap();
             wtx.commit().unwrap();
@@ -258,9 +282,15 @@ mod tests {
         assert_eq!(get_in_wtx(&wtx, "d1").unwrap().unwrap().raw_sha256, "rawA");
         assert_eq!(next_version_for_in_wtx(&wtx, "lsid").unwrap(), 2);
         assert_eq!(
-            find_by_logical_and_hash_in_wtx(&wtx, "lsid", "rawA").unwrap().as_deref(),
+            find_by_logical_and_hash_in_wtx(&wtx, "lsid", "rawA")
+                .unwrap()
+                .as_deref(),
             Some("d1"),
         );
-        assert!(find_by_logical_and_hash_in_wtx(&wtx, "lsid", "rawB").unwrap().is_none());
+        assert!(
+            find_by_logical_and_hash_in_wtx(&wtx, "lsid", "rawB")
+                .unwrap()
+                .is_none()
+        );
     }
 }

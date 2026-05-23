@@ -27,9 +27,11 @@
 //! Out of scope here (handled in later modules): PII scrubbing, quality
 //! gating, dedup. This module is a pure structural converter.
 
-use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::{
+    fs::File,
+    io::{BufWriter, Write},
+    path::Path,
+};
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -124,9 +126,10 @@ pub fn write_sharegpt_jsonl(path: &Path, traces: &[FullTrace]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
     use tempfile::NamedTempFile;
+
+    use super::*;
 
     fn full_fixture() -> FullTrace {
         let mut t = FullTrace::new(
@@ -171,7 +174,10 @@ mod tests {
             .find(|e| e["value"].as_str().is_some_and(|s| s.contains("<think>")))
             .expect("thinking entry");
         assert_eq!(thinking["from"], "gpt");
-        assert_eq!(thinking["value"], "<think>need to call weather tool</think>");
+        assert_eq!(
+            thinking["value"],
+            "<think>need to call weather tool</think>"
+        );
     }
 
     #[test]

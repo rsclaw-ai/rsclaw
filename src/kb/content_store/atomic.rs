@@ -2,16 +2,18 @@
 //!
 //! - `write_if_new` — truly atomic no-clobber write via
 //!   `NamedTempFile::persist_noclobber` (link-based on Unix).
-//! - `overwrite_atomic` — tempfile + rename for the explicit
-//!   "I really want to replace" path (used by compactor / GC, not
-//!   by the ingest path).
+//! - `overwrite_atomic` — tempfile + rename for the explicit "I really want to
+//!   replace" path (used by compactor / GC, not by the ingest path).
 //! - `sha256_hex` — hex-encoded sha256 for content addressing.
+
+use std::{
+    fs::OpenOptions,
+    io::{self, Write},
+    path::Path,
+};
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
-use std::fs::OpenOptions;
-use std::io::{self, Write};
-use std::path::Path;
 use tempfile::NamedTempFile;
 
 /// Atomic, no-clobber file write. Returns `Ok(true)` if the file was
@@ -28,8 +30,7 @@ pub fn write_if_new(path: &Path, bytes: &[u8]) -> Result<bool> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("mkdir -p {}", parent.display()))?;
+    std::fs::create_dir_all(parent).with_context(|| format!("mkdir -p {}", parent.display()))?;
 
     let mut tmp = NamedTempFile::new_in(parent)
         .with_context(|| format!("create tempfile in {}", parent.display()))?;
@@ -45,8 +46,10 @@ pub fn write_if_new(path: &Path, bytes: &[u8]) -> Result<bool> {
             Ok(true)
         }
         Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-        Err(e) => Err(anyhow::Error::from(e.error)
-            .context(format!("persist_noclobber → {}", path.display()))),
+        Err(e) => {
+            Err(anyhow::Error::from(e.error)
+                .context(format!("persist_noclobber → {}", path.display())))
+        }
     }
 }
 
@@ -91,8 +94,9 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
+
+    use super::*;
 
     #[test]
     fn write_if_new_creates() {
@@ -117,8 +121,7 @@ mod tests {
         // and then rename(tmp, path) over each other. With
         // persist_noclobber, exactly one wins and the other gets
         // Ok(false); the file always holds the winner's bytes.
-        use std::sync::Arc;
-        use std::thread;
+        use std::{sync::Arc, thread};
 
         for _ in 0..20 {
             let tmp = TempDir::new().unwrap();

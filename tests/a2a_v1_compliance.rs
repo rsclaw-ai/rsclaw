@@ -6,18 +6,22 @@ use serde_json::json;
 #[test]
 fn task_state_serializes_to_v1_screaming_snake() {
     let cases = [
-        (TaskState::Unspecified,    "\"TASK_STATE_UNSPECIFIED\""),
-        (TaskState::Submitted,      "\"TASK_STATE_SUBMITTED\""),
-        (TaskState::Working,        "\"TASK_STATE_WORKING\""),
-        (TaskState::Completed,      "\"TASK_STATE_COMPLETED\""),
-        (TaskState::Failed,         "\"TASK_STATE_FAILED\""),
-        (TaskState::Canceled,       "\"TASK_STATE_CANCELED\""),
-        (TaskState::InputRequired,  "\"TASK_STATE_INPUT_REQUIRED\""),
-        (TaskState::AuthRequired,   "\"TASK_STATE_AUTH_REQUIRED\""),
-        (TaskState::Rejected,       "\"TASK_STATE_REJECTED\""),
+        (TaskState::Unspecified, "\"TASK_STATE_UNSPECIFIED\""),
+        (TaskState::Submitted, "\"TASK_STATE_SUBMITTED\""),
+        (TaskState::Working, "\"TASK_STATE_WORKING\""),
+        (TaskState::Completed, "\"TASK_STATE_COMPLETED\""),
+        (TaskState::Failed, "\"TASK_STATE_FAILED\""),
+        (TaskState::Canceled, "\"TASK_STATE_CANCELED\""),
+        (TaskState::InputRequired, "\"TASK_STATE_INPUT_REQUIRED\""),
+        (TaskState::AuthRequired, "\"TASK_STATE_AUTH_REQUIRED\""),
+        (TaskState::Rejected, "\"TASK_STATE_REJECTED\""),
     ];
     for (state, expected) in cases {
-        assert_eq!(serde_json::to_string(&state).unwrap(), expected, "{state:?}");
+        assert_eq!(
+            serde_json::to_string(&state).unwrap(),
+            expected,
+            "{state:?}"
+        );
     }
 }
 
@@ -54,7 +58,9 @@ fn part_url_carries_reference() {
 
 #[test]
 fn part_data_carries_structured_json() {
-    let p = A2aPart::Data { data: json!({ "k": 1 }) };
+    let p = A2aPart::Data {
+        data: json!({ "k": 1 }),
+    };
     let v = serde_json::to_value(&p).unwrap();
     assert_eq!(v["type"], "data");
     assert_eq!(v["data"]["k"], 1);
@@ -88,7 +94,9 @@ fn agent_event_artifact_serializes_with_append_flag() {
         task_id: "t-1".into(),
         context_id: "ctx".into(),
         artifact_id: "a-1".into(),
-        parts: vec![A2aPart::Text { text: "chunk".into() }],
+        parts: vec![A2aPart::Text {
+            text: "chunk".into(),
+        }],
         append: true,
         last_chunk: false,
     };
@@ -148,8 +156,10 @@ async fn subscribe_receives_published_events() {
 
 #[test]
 fn task_store_put_get_roundtrip() {
-    use rsclaw::a2a::store::TaskStore;
-    use rsclaw::a2a::types::{A2aMessage, A2aTask, A2aTaskStatus};
+    use rsclaw::a2a::{
+        store::TaskStore,
+        types::{A2aMessage, A2aTask, A2aTaskStatus},
+    };
     use tempfile::tempdir;
 
     let dir = tempdir().unwrap();
@@ -188,8 +198,10 @@ fn task_store_put_get_roundtrip() {
 
 #[test]
 fn task_store_list_pagination() {
-    use rsclaw::a2a::store::TaskStore;
-    use rsclaw::a2a::types::{A2aTask, A2aTaskStatus};
+    use rsclaw::a2a::{
+        store::TaskStore,
+        types::{A2aTask, A2aTaskStatus},
+    };
     use tempfile::tempdir;
 
     let dir = tempdir().unwrap();
@@ -221,8 +233,7 @@ fn task_store_list_pagination() {
 
 #[test]
 fn push_config_crud() {
-    use rsclaw::a2a::store::TaskStore;
-    use rsclaw::a2a::types::PushNotificationConfig;
+    use rsclaw::a2a::{store::TaskStore, types::PushNotificationConfig};
     use tempfile::tempdir;
 
     let dir = tempdir().unwrap();
@@ -316,7 +327,11 @@ async fn turn_context_emit_working_publishes_status_update() {
     let ev = rx.recv().await.expect("event");
     match ev {
         rsclaw::a2a::event::AgentEvent::Status {
-            task_id, context_id, state, message, final_,
+            task_id,
+            context_id,
+            state,
+            message,
+            final_,
         } => {
             assert_eq!(task_id, "t-42");
             assert_eq!(context_id, "ctx-42");
@@ -432,7 +447,10 @@ async fn turn_context_request_input_returns_none_when_resume_tx_dropped() {
     });
 
     let got = tc.request_input("need more info", false).await;
-    assert!(got.is_none(), "expected None on dropped resume_tx, got {got:?}");
+    assert!(
+        got.is_none(),
+        "expected None on dropped resume_tx, got {got:?}"
+    );
     mock.await.unwrap();
 }
 

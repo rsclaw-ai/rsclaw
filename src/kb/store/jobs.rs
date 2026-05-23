@@ -1,19 +1,22 @@
 //! Job queue accessors. The queue is redb-native: four tables tracked
 //! atomically via single write transactions. See spec §J.
 //!
-//! Layout of the priority key: `{status_byte}{prio_byte}{created_at_be}{job_id}`.
-//! Lower byte values sort first → Ready=0 before Running=1; lower
-//! priority byte = higher actual priority. created_at big-endian
-//! makes older jobs sort before newer at same priority. job_id
-//! disambiguates the tail.
+//! Layout of the priority key:
+//! `{status_byte}{prio_byte}{created_at_be}{job_id}`. Lower byte values sort
+//! first → Ready=0 before Running=1; lower priority byte = higher actual
+//! priority. created_at big-endian makes older jobs sort before newer at same
+//! priority. job_id disambiguates the tail.
 
-use crate::kb::jobs::{status_priority_key, ClaimToken, Job, JobStatus};
-use crate::kb::store::codec::{decode, encode};
-use crate::kb::store::schema::{
-    KB_JOBS_BY_DEDUPE_ACTIVE, KB_JOBS_BY_ID, KB_JOBS_BY_STATUS_PRIO, KB_JOB_CLAIMS,
-};
 use anyhow::Result;
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
+
+use crate::kb::{
+    jobs::{ClaimToken, Job, JobStatus, status_priority_key},
+    store::{
+        codec::{decode, encode},
+        schema::{KB_JOB_CLAIMS, KB_JOBS_BY_DEDUPE_ACTIVE, KB_JOBS_BY_ID, KB_JOBS_BY_STATUS_PRIO},
+    },
+};
 
 /// Enqueue a new job. Idempotent on `dedupe_key`.
 pub fn enqueue(wtx: &WriteTransaction, job: &Job) -> Result<String> {
@@ -114,12 +117,7 @@ pub fn mark_done(wtx: &WriteTransaction, job_id: &str, token: &str) -> Result<()
 }
 
 /// Mark a job Failed. Same fencing semantics as `mark_done`.
-pub fn mark_failed(
-    wtx: &WriteTransaction,
-    job_id: &str,
-    token: &str,
-    error: &str,
-) -> Result<()> {
+pub fn mark_failed(wtx: &WriteTransaction, job_id: &str, token: &str, error: &str) -> Result<()> {
     verify_claim_token(wtx, job_id, token)?;
     let (mut job, old_key) = read_and_old_key(wtx, job_id)?;
     let dedupe_key = job.kind.dedupe_key();
@@ -246,11 +244,7 @@ fn read_and_old_key(wtx: &WriteTransaction, job_id: &str) -> Result<(Job, Vec<u8
     Ok((job, old_key))
 }
 
-fn write_status_transition(
-    wtx: &WriteTransaction,
-    new_job: &Job,
-    old_key: &[u8],
-) -> Result<()> {
+fn write_status_transition(wtx: &WriteTransaction, new_job: &Job, old_key: &[u8]) -> Result<()> {
     {
         let mut by_id = wtx.open_table(KB_JOBS_BY_ID)?;
         by_id.insert(new_job.id.as_str(), encode(new_job)?.as_slice())?;
@@ -273,11 +267,14 @@ fn job_id_from_priority_key(key: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use redb::ReadableDatabase;
-    use crate::kb::jobs::{Job, JobKind};
-    use crate::kb::store::open_db;
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::kb::{
+        jobs::{Job, JobKind},
+        store::open_db,
+    };
 
     fn fresh() -> (TempDir, redb::Database) {
         let tmp = TempDir::new().unwrap();
@@ -420,7 +417,10 @@ mod tests {
             wtx.commit().unwrap();
         }
         let rtx = db.begin_read().unwrap();
-        assert_eq!(get(&rtx, &job_id).unwrap().unwrap().status, JobStatus::Running);
+        assert_eq!(
+            get(&rtx, &job_id).unwrap().unwrap().status,
+            JobStatus::Running
+        );
         drop(rtx);
         {
             let wtx = db.begin_write().unwrap();

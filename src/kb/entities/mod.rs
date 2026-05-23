@@ -14,4 +14,4 @@
 
 pub mod extract;
 
-pub use extract::{extract_entities, ExtractedMention};
+pub use extract::{ExtractedMention, extract_entities};

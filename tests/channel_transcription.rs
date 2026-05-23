@@ -104,20 +104,30 @@ fn resolve_openai_key_respects_env() {
     let prev = std::env::var("OPENAI_API_KEY").ok();
 
     // Unset: should return None.
-    unsafe { std::env::remove_var("OPENAI_API_KEY"); }
+    unsafe {
+        std::env::remove_var("OPENAI_API_KEY");
+    }
     assert!(resolve_openai_key().is_none(), "should be None when unset");
 
     // Set: should return the value.
-    unsafe { std::env::set_var("OPENAI_API_KEY", "sk-test-key-12345"); }
+    unsafe {
+        std::env::set_var("OPENAI_API_KEY", "sk-test-key-12345");
+    }
     assert_eq!(resolve_openai_key().as_deref(), Some("sk-test-key-12345"));
 
     // Empty string: should return None.
-    unsafe { std::env::set_var("OPENAI_API_KEY", ""); }
+    unsafe {
+        std::env::set_var("OPENAI_API_KEY", "");
+    }
     assert!(resolve_openai_key().is_none(), "should be None when empty");
 
     // Restore.
     match prev {
-        Some(v) => unsafe { std::env::set_var("OPENAI_API_KEY", v); },
-        None => unsafe { std::env::remove_var("OPENAI_API_KEY"); },
+        Some(v) => unsafe {
+            std::env::set_var("OPENAI_API_KEY", v);
+        },
+        None => unsafe {
+            std::env::remove_var("OPENAI_API_KEY");
+        },
     }
 }

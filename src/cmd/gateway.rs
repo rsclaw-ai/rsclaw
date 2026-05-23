@@ -182,50 +182,54 @@ pub async fn cmd_gateway(sub: GatewayCommand) -> Result<()> {
         }
         GatewayCommand::Restart => {
             banner(&format!("rsclaw gateway {VERSION}"));
-            match gateway_signal_stop() {
-                Ok(()) => {
-                    println!("  {} Stopping...", dim("[..]"));
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                }
-                Err(_) => {
-                    println!("  {} No running gateway found, starting fresh", dim("[..]"));
-                }
-            }
+            let health = health_url();
+            let restart = restart_url();
+            let strategy = RestartStrategy::choose(gateway_health_reachable(&health).await);
 
-            // Prefer service manager for restart if installed.
-            if service_installed() {
-                if try_service_start() {
-                    std::thread::sleep(std::time::Duration::from_secs(2));
-                    if let Some(pid) = gateway_read_pid() {
-                        if process_alive(pid) {
-                            println!(
-                                "  {} Gateway restarted (via service, pid {pid})",
-                                green("[ok]")
-                            );
+            match strategy {
+                RestartStrategy::HttpGraceful => {
+                    println!("  {} Requesting graceful restart...", dim("[..]"));
+                    request_graceful_restart(&restart).await?;
+                    println!("  {} Waiting for gateway health...", dim("[..]"));
+                    wait_for_gateway_health(&health).await?;
+                    println!("  {} Gateway restarted", green("[ok]"));
+                    kv("URL:", &detect_url());
+                    println!();
+                    Ok(())
+                }
+                RestartStrategy::DirectStopStart => {
+                    match gateway_signal_stop() {
+                        Ok(()) => println!("  {} Stopped old gateway", dim("[..]")),
+                        Err(_) => {
+                            println!("  {} No running gateway found, starting fresh", dim("[..]"))
+                        }
+                    }
+
+                    // Prefer service manager for restart if installed.
+                    if service_installed() {
+                        if try_service_start() {
+                            wait_for_gateway_health(&health).await?;
+                            println!("  {} Gateway restarted via service", green("[ok]"));
                             kv("URL:", &detect_url());
                             println!();
                             return Ok(());
                         }
+                        eprintln!(
+                            "  {} Service start failed, falling back to direct start",
+                            yellow("[!]")
+                        );
                     }
-                    eprintln!(
-                        "  {} Service loaded but gateway not running, falling back to direct start",
-                        yellow("[!]")
-                    );
-                } else {
-                    eprintln!(
-                        "  {} Service start failed, falling back to direct start",
-                        yellow("[!]")
-                    );
+
+                    let child = spawn_gateway_bg()?;
+                    let pid = child.id();
+                    wait_for_gateway_health(&health).await?;
+                    println!("  {} Gateway restarted", green("[ok]"));
+                    kv("PID:", &format!("{pid}"));
+                    kv("URL:", &detect_url());
+                    println!();
+                    Ok(())
                 }
             }
-
-            let child = spawn_gateway_bg()?;
-            let pid = child.id();
-            println!("  {} Gateway restarted", green("[ok]"));
-            kv("PID:", &format!("{pid}"));
-            kv("URL:", &detect_url());
-            println!();
-            Ok(())
         }
         GatewayCommand::Status => gateway_print_status().await,
         GatewayCommand::Health => {
@@ -412,6 +416,175 @@ fn detect_port() -> u16 {
         .unwrap_or(18888)
 }
 
+/// Maximum time to wait for a gateway process to exit during CLI stop.
+pub const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const STOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+/// Maximum time to wait for the restarted gateway health endpoint.
+pub const START_HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(75);
+const START_HEALTH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Result of waiting for a gateway process to exit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopWaitOutcome {
+    pid: u32,
+    stopped: bool,
+}
+
+impl StopWaitOutcome {
+    /// Builds a wait outcome from sampled process liveness values.
+    pub fn from_alive_samples<I>(pid: u32, samples: I) -> Self
+    where
+        I: IntoIterator<Item = bool>,
+    {
+        let stopped = samples.into_iter().any(|alive| !alive);
+        Self { pid, stopped }
+    }
+
+    /// Returns true when the process disappeared before timeout.
+    pub fn is_stopped(&self) -> bool {
+        self.stopped
+    }
+
+    /// Returns the timeout error message for failed stop waits.
+    pub fn error_message(&self) -> Option<String> {
+        if self.stopped {
+            None
+        } else {
+            Some(format!(
+                "gateway process {} did not stop before timeout",
+                self.pid
+            ))
+        }
+    }
+}
+
+/// Result of waiting for the gateway health endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HealthWaitOutcome {
+    Healthy,
+    Timeout { url: String },
+}
+
+/// Converts health probe samples into a health wait outcome.
+pub fn health_wait_result<I>(probe_results: I, url: &str) -> HealthWaitOutcome
+where
+    I: IntoIterator<Item = bool>,
+{
+    if probe_results.into_iter().any(|ok| ok) {
+        HealthWaitOutcome::Healthy
+    } else {
+        HealthWaitOutcome::Timeout {
+            url: url.to_owned(),
+        }
+    }
+}
+
+/// Restart path selected by the CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartStrategy {
+    HttpGraceful,
+    DirectStopStart,
+}
+
+impl RestartStrategy {
+    /// Chooses graceful HTTP restart when the gateway is reachable.
+    pub fn choose(gateway_reachable: bool) -> Self {
+        if gateway_reachable {
+            Self::HttpGraceful
+        } else {
+            Self::DirectStopStart
+        }
+    }
+}
+
+fn health_url() -> String {
+    let port = detect_port();
+    format!("http://127.0.0.1:{port}/api/v1/health")
+}
+
+fn restart_url() -> String {
+    let port = detect_port();
+    format!("http://127.0.0.1:{port}/api/v1/restart")
+}
+
+fn gateway_auth_token() -> String {
+    config::load_quiet()
+        .ok()
+        .and_then(|c| c.gateway.auth_token)
+        .unwrap_or_default()
+}
+
+async fn gateway_health_reachable(url: &str) -> bool {
+    reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .map(|resp| resp.status().is_success())
+        .unwrap_or(false)
+}
+
+async fn request_graceful_restart(url: &str) -> Result<()> {
+    let token = gateway_auth_token();
+    let mut req = reqwest::Client::new().post(url);
+    if !token.is_empty() {
+        req = req.bearer_auth(token);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to request graceful restart at {url}: {e}"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("graceful restart request failed: {} {url}", resp.status());
+    }
+    Ok(())
+}
+
+/// Returns true when the PID file should be removed after a stop attempt.
+pub fn should_remove_pid_after_stop(outcome: &StopWaitOutcome) -> bool {
+    outcome.is_stopped()
+}
+
+async fn wait_for_gateway_health(url: &str) -> Result<()> {
+    let client = reqwest::Client::new();
+    let deadline = std::time::Instant::now() + START_HEALTH_TIMEOUT;
+    let mut samples = Vec::new();
+
+    loop {
+        let ok = match client.get(url).send().await {
+            Ok(resp) => resp.status().is_success(),
+            Err(_) => false,
+        };
+        samples.push(ok);
+        match health_wait_result(samples.iter().copied(), url) {
+            HealthWaitOutcome::Healthy => return Ok(()),
+            HealthWaitOutcome::Timeout { .. } => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "gateway did not become healthy at {url}; check {}",
+                crate::config::loader::log_file().display()
+            );
+        }
+        tokio::time::sleep(START_HEALTH_POLL_INTERVAL).await;
+    }
+}
+
+fn wait_for_process_exit(pid: u32) -> StopWaitOutcome {
+    let deadline = std::time::Instant::now() + STOP_TIMEOUT;
+    loop {
+        if !process_alive(pid) {
+            return StopWaitOutcome { pid, stopped: true };
+        }
+        if std::time::Instant::now() >= deadline {
+            return StopWaitOutcome {
+                pid,
+                stopped: false,
+            };
+        }
+        std::thread::sleep(STOP_POLL_INTERVAL);
+    }
+}
+
 /// Build the gateway URL from config (bind_address + port).
 fn detect_url() -> String {
     let cfg = config::load_quiet().ok();
@@ -432,8 +605,18 @@ fn detect_url() -> String {
 pub fn gateway_signal_stop() -> Result<()> {
     // Try service manager first (handles auto-restart properly).
     if try_service_stop() {
-        // Wait a moment for the service to fully stop.
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        if let Some(pid) = gateway_read_pid().or_else(find_gateway_pid) {
+            let outcome = wait_for_process_exit(pid);
+            if should_remove_pid_after_stop(&outcome) {
+                let _ = std::fs::remove_file(gateway_pid_file());
+                return Ok(());
+            }
+            anyhow::bail!(
+                outcome
+                    .error_message()
+                    .expect("timeout has an error message")
+            );
+        }
         let _ = std::fs::remove_file(gateway_pid_file());
         return Ok(());
     }
@@ -441,7 +624,7 @@ pub fn gateway_signal_stop() -> Result<()> {
     // Fallback: direct PID kill (for manual `gateway start` without service).
     // Try PID file first, then scan for running gateway processes.
     let pid = gateway_read_pid()
-        .or_else(|| find_gateway_pid())
+        .or_else(find_gateway_pid)
         .ok_or_else(|| {
             anyhow::anyhow!("gateway is not running (no PID file and no matching process)")
         })?;
@@ -450,16 +633,17 @@ pub fn gateway_signal_stop() -> Result<()> {
         anyhow::bail!("gateway process {pid} is not running");
     }
     crate::sys::process_terminate(pid)?;
-    // Wait for process to exit (up to 5 seconds).
-    for _ in 0..50 {
-        if !process_alive(pid) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    let outcome = wait_for_process_exit(pid);
+    if should_remove_pid_after_stop(&outcome) {
+        let _ = std::fs::remove_file(gateway_pid_file());
+        Ok(())
+    } else {
+        anyhow::bail!(
+            outcome
+                .error_message()
+                .expect("timeout has an error message")
+        );
     }
-    // Clean up PID file.
-    let _ = std::fs::remove_file(gateway_pid_file());
-    Ok(())
 }
 
 /// Check if gateway is installed as a system service.

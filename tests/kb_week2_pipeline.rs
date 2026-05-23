@@ -2,15 +2,13 @@
 //! asynchronously → chunks land in redb. Verifies the production
 //! async path (not just `run_one_blocking`).
 
+use std::{sync::Arc, time::Duration};
+
 use anyhow::Result;
 use rsclaw::kb::{
-    canonicalize_by_mime, ingest_canonicalized,
-    store::chunks,
     CanonicalizeInput, HandlerCtx, IngestInput, KbEmbedder, KbPaths, KbStore, StubEmbedder,
-    WorkerConfig, WorkerPool,
+    WorkerConfig, WorkerPool, canonicalize_by_mime, ingest_canonicalized, store::chunks,
 };
-use std::sync::Arc;
-use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::timeout;
 

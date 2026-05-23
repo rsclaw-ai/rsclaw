@@ -3,9 +3,10 @@
 //! before `<p>` / `<br>` / `<li>`, then strips any remaining tags
 //! and collapses whitespace.
 
+use lol_html::{HtmlRewriter, Settings, element};
+
 use super::*;
 use crate::kb::content_store::atomic::sha256_hex;
-use lol_html::{element, HtmlRewriter, Settings};
 
 pub struct HtmlCanonicalizer;
 

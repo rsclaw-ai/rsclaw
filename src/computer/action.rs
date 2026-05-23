@@ -36,11 +36,7 @@ pub enum Action {
     MouseMove { x: i32, y: i32 },
 
     /// Single click at (x, y).
-    Click {
-        x: i32,
-        y: i32,
-        button: MouseButton,
-    },
+    Click { x: i32, y: i32, button: MouseButton },
 
     /// Double-click at (x, y) (left button).
     DoubleClick { x: i32, y: i32 },

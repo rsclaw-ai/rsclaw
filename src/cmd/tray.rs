@@ -7,11 +7,7 @@ use anyhow::Result;
 #[cfg(feature = "tray")]
 pub fn cmd_tray() -> Result<()> {
     use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
-    use tray_icon::{
-        TrayIcon, TrayIconBuilder,
-        menu::MenuEvent as TrayMenuEvent,
-        Icon,
-    };
+    use tray_icon::{Icon, TrayIcon, TrayIconBuilder, menu::MenuEvent as TrayMenuEvent};
 
     let menu = Menu::new();
 
@@ -26,7 +22,10 @@ pub fn cmd_tray() -> Result<()> {
     let config_item = MenuItem::new("Open Config", true, None);
     let separator3 = PredefinedMenuItem::separator();
     let version_item = MenuItem::new(
-        format!("rsclaw v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")),
+        format!(
+            "rsclaw v{}",
+            option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
+        ),
         false,
         None,
     );
@@ -76,31 +75,43 @@ pub fn cmd_tray() -> Result<()> {
         if let Ok(event) = MenuEvent::receiver().try_recv() {
             let id = event.id;
             if id == start_id {
-                if let Err(e) = std::process::Command::new(std::env::current_exe().expect("failed to get current exe path"))
-                    .args(["gateway", "start"])
-                    .spawn() {
+                if let Err(e) = std::process::Command::new(
+                    std::env::current_exe().expect("failed to get current exe path"),
+                )
+                .args(["gateway", "start"])
+                .spawn()
+                {
                     eprintln!("failed to start gateway: {e}");
                 }
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 update_status(&status_item, &start_item, &stop_item, &restart_item);
             } else if id == stop_id {
-                if let Err(e) = std::process::Command::new(std::env::current_exe().expect("failed to get current exe path"))
-                    .args(["gateway", "stop"])
-                    .status() {
+                if let Err(e) = std::process::Command::new(
+                    std::env::current_exe().expect("failed to get current exe path"),
+                )
+                .args(["gateway", "stop"])
+                .status()
+                {
                     eprintln!("failed to stop gateway: {e}");
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));
                 update_status(&status_item, &start_item, &stop_item, &restart_item);
             } else if id == restart_id {
-                if let Err(e) = std::process::Command::new(std::env::current_exe().expect("failed to get current exe path"))
-                    .args(["gateway", "stop"])
-                    .status() {
+                if let Err(e) = std::process::Command::new(
+                    std::env::current_exe().expect("failed to get current exe path"),
+                )
+                .args(["gateway", "stop"])
+                .status()
+                {
                     eprintln!("failed to stop gateway: {e}");
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));
-                if let Err(e) = std::process::Command::new(std::env::current_exe().expect("failed to get current exe path"))
-                    .args(["gateway", "start"])
-                    .spawn() {
+                if let Err(e) = std::process::Command::new(
+                    std::env::current_exe().expect("failed to get current exe path"),
+                )
+                .args(["gateway", "start"])
+                .spawn()
+                {
                     eprintln!("failed to start gateway: {e}");
                 }
                 std::thread::sleep(std::time::Duration::from_secs(1));
@@ -170,7 +181,7 @@ fn load_icon() -> tray_icon::Icon {
             let dy = y as f32 - center;
             let idx = ((y * size + x) * 4) as usize;
             if dx * dx + dy * dy <= radius * radius {
-                rgba[idx] = 0xe8;     // R
+                rgba[idx] = 0xe8; // R
                 rgba[idx + 1] = 0x59; // G
                 rgba[idx + 2] = 0x0c; // B
                 rgba[idx + 3] = 0xff; // A
@@ -189,7 +200,10 @@ fn open_terminal_with(args: &[&str]) {
     {
         let cmd = format!("{} {}", exe.display(), args.join(" "));
         let _ = std::process::Command::new("osascript")
-            .args(["-e", &format!("tell application \"Terminal\" to do script \"{}\"", cmd)])
+            .args([
+                "-e",
+                &format!("tell application \"Terminal\" to do script \"{}\"", cmd),
+            ])
             .spawn();
     }
 
@@ -234,12 +248,16 @@ fn open_config() {
 
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("notepad").arg(&config_path).spawn();
+        let _ = std::process::Command::new("notepad")
+            .arg(&config_path)
+            .spawn();
     }
 
     #[cfg(target_os = "linux")]
     {
-        let _ = std::process::Command::new("xdg-open").arg(&config_path).spawn();
+        let _ = std::process::Command::new("xdg-open")
+            .arg(&config_path)
+            .spawn();
     }
 }
 

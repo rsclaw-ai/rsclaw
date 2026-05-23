@@ -357,7 +357,8 @@ impl DingTalkChannel {
         .await
     }
 
-    /// Download a media file (picture/video/file) via DingTalk robot messageFiles API.
+    /// Download a media file (picture/video/file) via DingTalk robot
+    /// messageFiles API.
     async fn download_media_file(&self, download_code: &str) -> Result<Vec<u8>> {
         let token = self.get_access_token().await?;
         let url = format!("{}/v1.0/robot/messageFiles/download", self.api_base);
@@ -990,22 +991,30 @@ impl Channel for DingTalkChannel {
 
             // Send file attachments
             for (filename, mime, path_or_url) in &msg.files {
-                let bytes = if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
-                    match self.client.get(path_or_url.as_str()).send().await {
-                        Ok(resp) if resp.status().is_success() => {
-                            match resp.bytes().await {
+                let bytes =
+                    if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
+                        match self.client.get(path_or_url.as_str()).send().await {
+                            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
                                 Ok(b) if !b.is_empty() => b.to_vec(),
-                                _ => { warn!("DingTalk: empty file download"); continue; }
+                                _ => {
+                                    warn!("DingTalk: empty file download");
+                                    continue;
+                                }
+                            },
+                            _ => {
+                                warn!("DingTalk: file download failed: {path_or_url}");
+                                continue;
                             }
                         }
-                        _ => { warn!("DingTalk: file download failed: {path_or_url}"); continue; }
-                    }
-                } else {
-                    match std::fs::read(path_or_url) {
-                        Ok(b) => b,
-                        Err(e) => { warn!("DingTalk: failed to read file {path_or_url}: {e}"); continue; }
-                    }
-                };
+                    } else {
+                        match std::fs::read(path_or_url) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                warn!("DingTalk: failed to read file {path_or_url}: {e}");
+                                continue;
+                            }
+                        }
+                    };
 
                 let token = self.get_access_token().await?;
                 let part = match reqwest::multipart::Part::bytes(bytes)
@@ -1013,18 +1022,27 @@ impl Channel for DingTalkChannel {
                     .mime_str(mime)
                 {
                     Ok(p) => p,
-                    Err(e) => { warn!("DingTalk: multipart error: {e}"); continue; }
+                    Err(e) => {
+                        warn!("DingTalk: multipart error: {e}");
+                        continue;
+                    }
                 };
                 // Detect media type for upload
-                let upload_type = if mime.starts_with("video/") { "video" }
-                    else if mime.starts_with("audio/") { "voice" }
-                    else if mime.starts_with("image/") { "image" }
-                    else { "file" };
+                let upload_type = if mime.starts_with("video/") {
+                    "video"
+                } else if mime.starts_with("audio/") {
+                    "voice"
+                } else if mime.starts_with("image/") {
+                    "image"
+                } else {
+                    "file"
+                };
                 let form = reqwest::multipart::Form::new()
                     .text("type", upload_type.to_owned())
                     .part("media", part);
                 let upload_url = format!("{}/media/upload", self.oapi_base);
-                let upload_resp = self.client
+                let upload_resp = self
+                    .client
                     .post(&upload_url)
                     .query(&[("access_token", token.as_str())])
                     .multipart(form)
@@ -1041,29 +1059,47 @@ impl Channel for DingTalkChannel {
                                 continue;
                             }
                         }
-                        Err(e) => { warn!("DingTalk: file upload parse error: {e}"); continue; }
+                        Err(e) => {
+                            warn!("DingTalk: file upload parse error: {e}");
+                            continue;
+                        }
                     },
-                    Err(e) => { warn!("DingTalk: file upload failed: {e}"); continue; }
+                    Err(e) => {
+                        warn!("DingTalk: file upload failed: {e}");
+                        continue;
+                    }
                 };
 
                 let token2 = self.get_access_token().await?;
                 // Build msgKey and msgParam based on media type
                 let (msg_key, msg_param) = if mime.starts_with("video/") {
-                    ("sampleVideo", json!({
-                        "videoMediaId": media_id,
-                        "videoType": filename.rsplit('.').next().unwrap_or("mp4"),
-                    }).to_string())
+                    (
+                        "sampleVideo",
+                        json!({
+                            "videoMediaId": media_id,
+                            "videoType": filename.rsplit('.').next().unwrap_or("mp4"),
+                        })
+                        .to_string(),
+                    )
                 } else if mime.starts_with("audio/") {
-                    ("sampleAudio", json!({
-                        "mediaId": media_id,
-                    }).to_string())
+                    (
+                        "sampleAudio",
+                        json!({
+                            "mediaId": media_id,
+                        })
+                        .to_string(),
+                    )
                 } else {
                     let file_ext = filename.rsplit('.').next().unwrap_or("").to_owned();
-                    ("sampleFile", json!({
-                        "mediaId": media_id,
-                        "fileName": filename,
-                        "fileType": file_ext,
-                    }).to_string())
+                    (
+                        "sampleFile",
+                        json!({
+                            "mediaId": media_id,
+                            "fileName": filename,
+                            "fileType": file_ext,
+                        })
+                        .to_string(),
+                    )
                 };
 
                 let send_result = if msg.is_group {
@@ -1080,7 +1116,10 @@ impl Channel for DingTalkChannel {
                         .await
                 } else {
                     self.client
-                        .post(format!("{}/v1.0/robot/oToMessages/batchSend", self.api_base))
+                        .post(format!(
+                            "{}/v1.0/robot/oToMessages/batchSend",
+                            self.api_base
+                        ))
                         .header("x-acs-dingtalk-access-token", &token2)
                         .json(&json!({
                             "robotCode": self.robot_code,

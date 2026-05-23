@@ -8,8 +8,9 @@
 
 use std::{collections::HashMap, process::Stdio, sync::Arc};
 
-/// Char-safe log preview — delegates to the shared [`crate::util::truncate_str`]
-/// so ACP request/response previews never split a CJK char.
+/// Char-safe log preview — delegates to the shared
+/// [`crate::util::truncate_str`] so ACP request/response previews never split a
+/// CJK char.
 fn preview(s: &str, max: usize) -> &str {
     crate::util::truncate_str(s, max)
 }
@@ -27,8 +28,8 @@ use crate::acp::{methods, notification::*, types::*};
 
 pub const ACP_TIMEOUT: Duration = Duration::from_secs(60);
 pub const LONG_TIMEOUT: Duration = Duration::from_secs(300);
-/// Default timeout for initialization/session creation - these can take longer as the agent
-/// may need to load MCP servers, check environment, etc.
+/// Default timeout for initialization/session creation - these can take longer
+/// as the agent may need to load MCP servers, check environment, etc.
 pub const DEFAULT_INIT_TIMEOUT: Duration = Duration::from_secs(600); // 10 minutes
 
 // ---------------------------------------------------------------------------
@@ -47,7 +48,11 @@ pub trait AcpCallbackHandler: Send + Sync {
     ) -> BoxFuture<'_, RequestPermissionOutcome>;
 
     /// Handle file read request from agent
-    fn handle_read_text_file(&self, session_id: &SessionId, path: &str) -> BoxFuture<'_, Result<String>>;
+    fn handle_read_text_file(
+        &self,
+        session_id: &SessionId,
+        path: &str,
+    ) -> BoxFuture<'_, Result<String>>;
 
     /// Handle file write request from agent
     fn handle_write_text_file(
@@ -73,7 +78,11 @@ pub trait AcpCallbackHandler: Send + Sync {
     ) -> BoxFuture<'_, Result<TerminalOutputResponse>>;
 
     /// Handle terminal kill request from agent
-    fn handle_terminal_kill(&self, session_id: &SessionId, terminal_id: &str) -> BoxFuture<'_, Result<()>>;
+    fn handle_terminal_kill(
+        &self,
+        session_id: &SessionId,
+        terminal_id: &str,
+    ) -> BoxFuture<'_, Result<()>>;
 
     /// Handle terminal release request from agent
     fn handle_terminal_release(
@@ -92,8 +101,9 @@ pub trait AcpCallbackHandler: Send + Sync {
 
 /// Default callback handler that auto-approves everything.
 // TODO(H-21): DefaultAcpHandler and DefaultAcpHandlerWithTerminal share nearly
-// identical handle_request_permission / handle_read_text_file / handle_write_text_file
-// implementations.  Extract a shared helper or blanket impl to reduce duplication.
+// identical handle_request_permission / handle_read_text_file /
+// handle_write_text_file implementations.  Extract a shared helper or blanket
+// impl to reduce duplication.
 pub struct DefaultAcpHandler;
 
 impl AcpCallbackHandler for DefaultAcpHandler {
@@ -110,7 +120,8 @@ impl AcpCallbackHandler for DefaultAcpHandler {
                 "handle_request_permission: received options"
             );
 
-            // Auto-approve any non-reject option (more lenient for different agent implementations)
+            // Auto-approve any non-reject option (more lenient for different agent
+            // implementations)
             for opt in options {
                 // Match any "allow" type option
                 if matches!(
@@ -126,7 +137,8 @@ impl AcpCallbackHandler for DefaultAcpHandler {
                         option_id: opt.option_id,
                     };
                 }
-                // Also approve if option_id contains "allow" or "accept" (fallback for non-standard formats)
+                // Also approve if option_id contains "allow" or "accept" (fallback for
+                // non-standard formats)
                 if opt.option_id.contains("allow") || opt.option_id.contains("accept") {
                     tracing::debug!(
                         option_id = %opt.option_id,
@@ -142,7 +154,11 @@ impl AcpCallbackHandler for DefaultAcpHandler {
         })
     }
 
-    fn handle_read_text_file(&self, _session_id: &SessionId, path: &str) -> BoxFuture<'_, Result<String>> {
+    fn handle_read_text_file(
+        &self,
+        _session_id: &SessionId,
+        path: &str,
+    ) -> BoxFuture<'_, Result<String>> {
         let path = path.to_owned();
         Box::pin(async move {
             tokio::fs::read_to_string(&path)
@@ -265,7 +281,8 @@ impl AcpCallbackHandler for DefaultAcpHandlerWithTerminal {
                 "handle_request_permission: received options"
             );
 
-            // Auto-approve any non-reject option (more lenient for different agent implementations)
+            // Auto-approve any non-reject option (more lenient for different agent
+            // implementations)
             for opt in options {
                 // Match any "allow" type option
                 if matches!(
@@ -281,7 +298,8 @@ impl AcpCallbackHandler for DefaultAcpHandlerWithTerminal {
                         option_id: opt.option_id,
                     };
                 }
-                // Also approve if option_id contains "allow" or "accept" (fallback for non-standard formats)
+                // Also approve if option_id contains "allow" or "accept" (fallback for
+                // non-standard formats)
                 if opt.option_id.contains("allow") || opt.option_id.contains("accept") {
                     tracing::debug!(
                         option_id = %opt.option_id,
@@ -297,7 +315,11 @@ impl AcpCallbackHandler for DefaultAcpHandlerWithTerminal {
         })
     }
 
-    fn handle_read_text_file(&self, _session_id: &SessionId, path: &str) -> BoxFuture<'_, Result<String>> {
+    fn handle_read_text_file(
+        &self,
+        _session_id: &SessionId,
+        path: &str,
+    ) -> BoxFuture<'_, Result<String>> {
         let path = path.to_owned();
         Box::pin(async move {
             tokio::fs::read_to_string(&path)
@@ -329,7 +351,11 @@ impl AcpCallbackHandler for DefaultAcpHandlerWithTerminal {
     ) -> BoxFuture<'_, Result<String>> {
         let command = command.map(|s| s.to_owned());
         Box::pin(async move {
-            let default_shell = if cfg!(target_os = "windows") { "powershell.exe" } else { "sh" };
+            let default_shell = if cfg!(target_os = "windows") {
+                "powershell.exe"
+            } else {
+                "sh"
+            };
             let shell = command.as_deref().unwrap_or(default_shell);
             let mut cmd = Command::new(shell);
             cmd.stdin(Stdio::piped())
@@ -341,8 +367,7 @@ impl AcpCallbackHandler for DefaultAcpHandlerWithTerminal {
                 const CREATE_NO_WINDOW: u32 = 0x08000000;
                 cmd.creation_flags(CREATE_NO_WINDOW);
             }
-            let child = cmd.spawn()
-                .context("Failed to spawn terminal process")?;
+            let child = cmd.spawn().context("Failed to spawn terminal process")?;
             let terminal_id = format!("terminal-{}", uuid::Uuid::new_v4());
 
             let mut state = self.state.lock().await;
@@ -395,7 +420,11 @@ impl AcpCallbackHandler for DefaultAcpHandlerWithTerminal {
         })
     }
 
-    fn handle_terminal_kill(&self, _session_id: &SessionId, terminal_id: &str) -> BoxFuture<'_, Result<()>> {
+    fn handle_terminal_kill(
+        &self,
+        _session_id: &SessionId,
+        terminal_id: &str,
+    ) -> BoxFuture<'_, Result<()>> {
         let terminal_id = terminal_id.to_owned();
         Box::pin(async move {
             let mut state = self.state.lock().await;
@@ -626,7 +655,8 @@ impl AcpClient {
                 handler_clone,
                 event_tx_clone,
                 notification_manager_clone,
-            ).await;
+            )
+            .await;
         });
 
         // Brief startup delay to allow subprocess to initialize
@@ -773,8 +803,11 @@ impl AcpClient {
                 "terminal": true
             }
         });
-        // Use configurable init_timeout for initialization (can take long to load MCP servers)
-        let resp = self.rpc_with_timeout(methods::INITIALIZE, params, self.init_timeout).await?;
+        // Use configurable init_timeout for initialization (can take long to load MCP
+        // servers)
+        let resp = self
+            .rpc_with_timeout(methods::INITIALIZE, params, self.init_timeout)
+            .await?;
         tracing::debug!(response = ?resp, "ACP initialize response");
         let result = resp
             .get("result")
@@ -816,8 +849,11 @@ impl AcpClient {
             tracing::warn!("create_session: no model provided, will use agent default");
         }
 
-        // Use configurable init_timeout for session creation (can take long to initialize)
-        let resp = self.rpc_with_timeout(methods::SESSION_NEW, params, self.init_timeout).await?;
+        // Use configurable init_timeout for session creation (can take long to
+        // initialize)
+        let resp = self
+            .rpc_with_timeout(methods::SESSION_NEW, params, self.init_timeout)
+            .await?;
         tracing::debug!(response = ?resp, "ACP session/new response");
         let result = resp
             .get("result")
@@ -905,7 +941,10 @@ impl AcpClient {
                     || e.to_string().contains("Channel closed")
                 {
                     let lang = crate::i18n::default_lang();
-                    anyhow::anyhow!("{}", crate::i18n::t_fmt("acp_timeout", lang, &[("name", "OpenCode")]))
+                    anyhow::anyhow!(
+                        "{}",
+                        crate::i18n::t_fmt("acp_timeout", lang, &[("name", "OpenCode")])
+                    )
                 } else {
                     e
                 }
@@ -1114,7 +1153,8 @@ impl AcpClient {
 
         tracing::debug!(method, id, request = %request, "ACP sending request");
 
-        // Send request while holding the lock, then release lock before waiting for response
+        // Send request while holding the lock, then release lock before waiting for
+        // response
         {
             let guard = self.cmd_tx.lock().await;
             let tx = guard.as_ref().context("Subprocess task died")?;
@@ -1166,7 +1206,8 @@ impl AcpClient {
             "ACP: sending request"
         );
 
-        // Send request while holding the lock, then release lock before waiting for response
+        // Send request while holding the lock, then release lock before waiting for
+        // response
         {
             let guard = self.cmd_tx.lock().await;
             let tx = guard.as_ref().context("Subprocess task died")?;
@@ -1178,7 +1219,12 @@ impl AcpClient {
             .context("Failed to send request")?;
         } // Lock released here
 
-        tracing::info!(method, id, "ACP: waiting for response (timeout {}s)", timeout_duration.as_secs());
+        tracing::info!(
+            method,
+            id,
+            "ACP: waiting for response (timeout {}s)",
+            timeout_duration.as_secs()
+        );
 
         let resp = timeout(timeout_duration, resp_rx.recv())
             .await
@@ -1192,7 +1238,6 @@ impl AcpClient {
             .map(|s| preview(&s, 200).to_string()), "ACP: received response");
         resp
     }
-
 
     /// RPC call without timeout - for long-running operations like
     /// session/prompt
@@ -1219,7 +1264,8 @@ impl AcpClient {
 
         tracing::debug!(method, id, request = %request, "ACP sending request (no timeout)");
 
-        // Send request while holding the lock, then release lock before waiting for response
+        // Send request while holding the lock, then release lock before waiting for
+        // response
         {
             let guard = self.cmd_tx.lock().await;
             let tx = guard.as_ref().context("Subprocess task died")?;
@@ -1533,7 +1579,11 @@ async fn handle_session_update(
                         let notif = Notification::new(
                             NotificationPriority::Medium,
                             &crate::i18n::t("acp_tool_start", _lang),
-                            &crate::i18n::t_fmt("acp_tool_executing", _lang, &[("title", title.as_deref().unwrap_or(""))]),
+                            &crate::i18n::t_fmt(
+                                "acp_tool_executing",
+                                _lang,
+                                &[("title", title.as_deref().unwrap_or(""))],
+                            ),
                         );
                         if let Ok(nm) = notification_manager.try_lock() {
                             nm.send(&notif.with_session_id(session_id.clone().unwrap_or_default()))
@@ -1557,7 +1607,11 @@ async fn handle_session_update(
                         let notif = Notification::new(
                             NotificationPriority::Medium,
                             &crate::i18n::t("acp_tool_done", _lang),
-                            &crate::i18n::t_fmt("acp_tool_completed", _lang, &[("title", title.as_deref().unwrap_or(""))]),
+                            &crate::i18n::t_fmt(
+                                "acp_tool_completed",
+                                _lang,
+                                &[("title", title.as_deref().unwrap_or(""))],
+                            ),
                         );
                         if let Ok(nm) = notification_manager.try_lock() {
                             nm.send(&notif.with_session_id(session_id.clone().unwrap_or_default()))
@@ -1578,10 +1632,11 @@ async fn handle_session_update(
                         let notif = Notification::new(
                             NotificationPriority::High,
                             &crate::i18n::t("acp_tool_failed", _lang),
-                            &crate::i18n::t_fmt("acp_tool_error", _lang, &[
-                                ("title", title.as_deref().unwrap_or("")),
-                                ("error", &error),
-                            ]),
+                            &crate::i18n::t_fmt(
+                                "acp_tool_error",
+                                _lang,
+                                &[("title", title.as_deref().unwrap_or("")), ("error", &error)],
+                            ),
                         )
                         .with_burn_after_read();
                         if let Ok(nm) = notification_manager.try_lock() {
@@ -1628,10 +1683,14 @@ async fn handle_session_update(
                 let notif = Notification::new(
                     NotificationPriority::High,
                     &crate::i18n::t("acp_session_created", _lang),
-                    &crate::i18n::t_fmt("acp_session_info", _lang, &[
-                        ("id", session_id.as_deref().unwrap_or("")),
-                        ("title", title.as_deref().unwrap_or("")),
-                    ]),
+                    &crate::i18n::t_fmt(
+                        "acp_session_info",
+                        _lang,
+                        &[
+                            ("id", session_id.as_deref().unwrap_or("")),
+                            ("title", title.as_deref().unwrap_or("")),
+                        ],
+                    ),
                 )
                 .with_burn_after_read();
                 if let Ok(nm) = notification_manager.try_lock() {

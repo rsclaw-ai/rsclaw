@@ -4,8 +4,9 @@
 //! `SourceImpl::run(tx, stop)` entry point. Each source's body is
 //! implemented in its own submodule (added in Tasks 8/9/10–14).
 
-use serde::Serialize;
 use std::path::PathBuf;
+
+use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
@@ -92,11 +93,9 @@ pub struct SseSource {
 
 impl SseSource {
     /// Build with `${VAR}` substitution applied to url + every header value.
-    /// Returns `WatchStartError::UnresolvedEnv(name)` on the first unset / empty var.
-    pub fn build(
-        url: &str,
-        headers: &[(String, String)],
-    ) -> Result<Self, WatchStartError> {
+    /// Returns `WatchStartError::UnresolvedEnv(name)` on the first unset /
+    /// empty var.
+    pub fn build(url: &str, headers: &[(String, String)]) -> Result<Self, WatchStartError> {
         let url = crate::gateway::watch::sse::substitute_env_vars(url)
             .map_err(|e| WatchStartError::UnresolvedEnv(e.to_string()))?;
         let mut subst_headers = Vec::with_capacity(headers.len());
@@ -105,7 +104,10 @@ impl SseSource {
                 .map_err(|e| WatchStartError::UnresolvedEnv(e.to_string()))?;
             subst_headers.push((k.clone(), v2));
         }
-        Ok(Self { url, headers: subst_headers })
+        Ok(Self {
+            url,
+            headers: subst_headers,
+        })
     }
 }
 
@@ -129,13 +131,11 @@ impl SourceImpl {
     }
 }
 
-async fn run_file(
-    src: FileSource,
-    tx: mpsc::Sender<EventRecord>,
-    mut stop: oneshot::Receiver<()>,
-) {
-    use tokio::fs::File;
-    use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader, SeekFrom};
+async fn run_file(src: FileSource, tx: mpsc::Sender<EventRecord>, mut stop: oneshot::Receiver<()>) {
+    use tokio::{
+        fs::File,
+        io::{AsyncBufReadExt, AsyncSeekExt, BufReader, SeekFrom},
+    };
 
     let open = File::open(&src.path).await;
     let file = match open {
@@ -171,7 +171,11 @@ async fn run_file(
                 Ok(0) => break,
                 Ok(_) => {
                     let stripped = line.trim_end_matches(&['\r', '\n'][..]).to_owned();
-                    if tx.send(EventRecord::from_line(stripped, now_ms())).await.is_err() {
+                    if tx
+                        .send(EventRecord::from_line(stripped, now_ms()))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -183,9 +187,8 @@ async fn run_file(
             let now_size = metadata.len();
             let pos = reader.get_mut().stream_position().await.unwrap_or(0);
             let new_inode = inode_from_metadata(&metadata);
-            let inode_changed = current_inode.is_some()
-                && new_inode.is_some()
-                && current_inode != new_inode;
+            let inode_changed =
+                current_inode.is_some() && new_inode.is_some() && current_inode != new_inode;
             if inode_changed || now_size < pos {
                 if let Ok(f) = File::open(&src.path).await {
                     current_inode = inode_from_metadata(&metadata);
@@ -201,8 +204,10 @@ async fn run_shell(
     tx: mpsc::Sender<EventRecord>,
     mut stop: oneshot::Receiver<()>,
 ) {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    use tokio::process::Command;
+    use tokio::{
+        io::{AsyncBufReadExt, BufReader},
+        process::Command,
+    };
 
     let (program, arg) = if cfg!(target_os = "windows") {
         ("powershell", "-Command")

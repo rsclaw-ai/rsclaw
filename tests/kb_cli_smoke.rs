@@ -7,8 +7,8 @@
 //! Tests run sequentially per crate, but each test gets its own
 //! `--base-dir` so they don't share state.
 
-use std::path::Path;
-use std::process::Command;
+use std::{path::Path, process::Command};
+
 use tempfile::TempDir;
 
 fn rsclaw() -> Command {
@@ -28,7 +28,15 @@ fn kb_help_lists_all_subcommands() {
     let (stdout, _stderr, code) = run(rsclaw().args(["kb", "--help"]));
     assert_eq!(code, 0);
     for sub in &[
-        "add", "ls", "rm", "search", "show", "visibility", "compact", "stats", "export",
+        "add",
+        "ls",
+        "rm",
+        "search",
+        "show",
+        "visibility",
+        "compact",
+        "stats",
+        "export",
     ] {
         assert!(
             stdout.contains(sub),
@@ -95,12 +103,8 @@ fn kb_ls_after_add_shows_doc() {
         "--tags",
         "lstest",
     ]));
-    let (stdout, _stderr, code) = run(rsclaw().args([
-        "--base-dir",
-        base.to_str().unwrap(),
-        "kb",
-        "ls",
-    ]));
+    let (stdout, _stderr, code) =
+        run(rsclaw().args(["--base-dir", base.to_str().unwrap(), "kb", "ls"]));
     assert_eq!(code, 0);
     assert!(
         stdout.contains("Demo") && stdout.contains("lstest"),
@@ -122,12 +126,8 @@ fn kb_stats_reports_json() {
         "add",
         fixture.to_str().unwrap(),
     ]));
-    let (stdout, _stderr, code) = run(rsclaw().args([
-        "--base-dir",
-        base.to_str().unwrap(),
-        "kb",
-        "stats",
-    ]));
+    let (stdout, _stderr, code) =
+        run(rsclaw().args(["--base-dir", base.to_str().unwrap(), "kb", "stats"]));
     assert_eq!(code, 0);
     // Look for the last line (JSON); upstream prefix line is the
     // "profile:" banner from rsclaw's --base-dir handling.
@@ -153,12 +153,7 @@ fn kb_rm_tombstones_then_search_hides_it() {
         "add",
         fixture.to_str().unwrap(),
     ]));
-    let (ls_stdout, _, _) = run(rsclaw().args([
-        "--base-dir",
-        base.to_str().unwrap(),
-        "kb",
-        "ls",
-    ]));
+    let (ls_stdout, _, _) = run(rsclaw().args(["--base-dir", base.to_str().unwrap(), "kb", "ls"]));
     let doc_id = ls_stdout
         .lines()
         .find_map(|l| {
@@ -208,12 +203,7 @@ fn kb_export_writes_body_to_path() {
         "add",
         fixture.to_str().unwrap(),
     ]));
-    let (ls_stdout, _, _) = run(rsclaw().args([
-        "--base-dir",
-        base.to_str().unwrap(),
-        "kb",
-        "ls",
-    ]));
+    let (ls_stdout, _, _) = run(rsclaw().args(["--base-dir", base.to_str().unwrap(), "kb", "ls"]));
     let doc_id = ls_stdout
         .lines()
         .find_map(|l| {
@@ -247,11 +237,7 @@ fn kb_add_recursive_ingests_directory() {
     let nested = tmp.path().join("notes/sub");
     std::fs::create_dir_all(&nested).unwrap();
     std::fs::write(nested.join("a.md"), "# A\n\ncats are nocturnal").unwrap();
-    std::fs::write(
-        tmp.path().join("notes/b.md"),
-        "# B\n\ndogs love walks",
-    )
-    .unwrap();
+    std::fs::write(tmp.path().join("notes/b.md"), "# B\n\ndogs love walks").unwrap();
     std::fs::write(tmp.path().join("notes/c.bin"), b"\x00\x01\x02").unwrap();
 
     let (stdout, stderr, code) = run(rsclaw().args([
@@ -338,7 +324,10 @@ fn kb_search_json_emits_full_output_struct() {
         parsed.get("entity_alignment").is_some(),
         "missing entity_alignment: {parsed}"
     );
-    assert!(parsed.get("warnings").is_some(), "missing warnings: {parsed}");
+    assert!(
+        parsed.get("warnings").is_some(),
+        "missing warnings: {parsed}"
+    );
 }
 
 #[test]
@@ -367,12 +356,7 @@ fn kb_visibility_private_hides_doc_from_default_scope() {
         "doc should be visible as Global before visibility flip: {before}"
     );
 
-    let (ls_stdout, _, _) = run(rsclaw().args([
-        "--base-dir",
-        base.to_str().unwrap(),
-        "kb",
-        "ls",
-    ]));
+    let (ls_stdout, _, _) = run(rsclaw().args(["--base-dir", base.to_str().unwrap(), "kb", "ls"]));
     let doc_id = ls_stdout
         .lines()
         .find_map(|l| {
@@ -418,7 +402,10 @@ fn rsclaw_prints_help_with_no_args() {
         .expect("spawn rsclaw");
     assert_eq!(out.status.code().unwrap_or(-1), 0);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("kb"), "kb subcommand not in --help: {stdout}");
+    assert!(
+        stdout.contains("kb"),
+        "kb subcommand not in --help: {stdout}"
+    );
 }
 
 #[allow(dead_code)]

@@ -119,10 +119,26 @@ fn skillhub_urls() -> SkillhubUrls {
         let defs: Defs = toml::from_str(&defaults_str).unwrap_or_default();
         if let Some(sh) = defs.skill_registries.get("skillhub") {
             SkillhubUrls {
-                index: sh.get("index_url").and_then(|v| v.as_str()).unwrap_or("").to_owned(),
-                download: sh.get("download_url").and_then(|v| v.as_str()).unwrap_or("").to_owned(),
-                search: sh.get("search_url").and_then(|v| v.as_str()).unwrap_or("").to_owned(),
-                primary_download: sh.get("primary_download_url").and_then(|v| v.as_str()).unwrap_or("").to_owned(),
+                index: sh
+                    .get("index_url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned(),
+                download: sh
+                    .get("download_url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned(),
+                search: sh
+                    .get("search_url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned(),
+                primary_download: sh
+                    .get("primary_download_url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned(),
             }
         } else {
             SkillhubUrls::default()
@@ -188,7 +204,9 @@ fn iwencai_urls() -> IwencaiUrls {
 /// path/query so per-endpoint paths in defaults.toml work unchanged.
 /// Plain string-splice to avoid pulling the `url` crate in just for this.
 fn rebase_url(url: &str, base: Option<&str>) -> String {
-    let Some(base) = base.map(|s| s.trim_end_matches('/')) else { return url.to_owned() };
+    let Some(base) = base.map(|s| s.trim_end_matches('/')) else {
+        return url.to_owned();
+    };
     let path_idx = match url.find("://") {
         Some(i) => match url[i + 3..].find('/') {
             Some(p) => i + 3 + p,
@@ -250,7 +268,8 @@ pub struct ClawhubClient {
     client: Client,
     base_url: String,
     token: Option<String>,
-    /// Gateway language setting — "cn" variants use skillhub instead of clawhub.
+    /// Gateway language setting — "cn" variants use skillhub instead of
+    /// clawhub.
     language: Option<String>,
 }
 
@@ -286,10 +305,13 @@ impl ClawhubClient {
 
     /// Returns true if the gateway is configured for Chinese locale.
     fn is_cn(&self) -> bool {
-        self.language.as_deref().map(|l| {
-            let l = l.to_lowercase();
-            l.starts_with("zh") || l.starts_with("cn") || l == "chinese"
-        }).unwrap_or(false)
+        self.language
+            .as_deref()
+            .map(|l| {
+                let l = l.to_lowercase();
+                l.starts_with("zh") || l.starts_with("cn") || l == "chinese"
+            })
+            .unwrap_or(false)
     }
 
     /// Fetch skill metadata by slug.
@@ -399,13 +421,14 @@ impl ClawhubClient {
         Ok(locked)
     }
 
-    /// Returns true if `dir_name` is already installed with a valid SKILL.md checksum.
+    /// Returns true if `dir_name` is already installed with a valid SKILL.md
+    /// checksum.
     pub fn check_installed(skills_dir: &Path, dir_name: &str) -> bool {
         Self::find_installed(skills_dir, dir_name).is_some()
     }
 
-    /// Check the lock file for an existing install and return it if the SKILL.md
-    /// checksum still matches (i.e. nothing changed on disk).
+    /// Check the lock file for an existing install and return it if the
+    /// SKILL.md checksum still matches (i.e. nothing changed on disk).
     fn find_installed(skills_dir: &Path, dir_name: &str) -> Option<LockedSkill> {
         let lock = LockFile::read(skills_dir).ok()?;
         // Match by dir name (last component of slug).
@@ -428,7 +451,8 @@ impl ClawhubClient {
     }
 
     /// Install with fallback: clawhub -> skillhub.
-    /// Also supports skills.sh `owner/repo@skill`, direct URLs, and GitHub repos.
+    /// Also supports skills.sh `owner/repo@skill`, direct URLs, and GitHub
+    /// repos.
     pub async fn install_with_fallback(
         &self,
         spec: &str,
@@ -445,7 +469,9 @@ impl ClawhubClient {
                 let parts: Vec<&str> = repo_part.splitn(2, '/').collect();
                 if parts.len() == 2 {
                     info!(spec, "resolving as skills.sh owner/repo@skill");
-                    return self.install_from_skillsh(parts[0], parts[1], skill_id, skills_dir).await;
+                    return self
+                        .install_from_skillsh(parts[0], parts[1], skill_id, skills_dir)
+                        .await;
                 }
             }
         }
@@ -490,10 +516,9 @@ impl ClawhubClient {
             }
         }
 
-        // 5. Fallback to iwencai (同花顺金融技能库). Plain GET → returns the
-        //    skill zip directly. No auth needed for download itself; the
-        //    installed skill reads `IWENCAI_API_KEY` at runtime when it
-        //    calls openapi.iwencai.com.
+        // 5. Fallback to iwencai (同花顺金融技能库). Plain GET → returns the skill zip
+        //    directly. No auth needed for download itself; the installed skill reads
+        //    `IWENCAI_API_KEY` at runtime when it calls openapi.iwencai.com.
         let iw = iwencai_urls();
         let iwencai_url = iw.install_template.replace("{slug}", slug);
         debug!(slug, url = %iwencai_url, "trying iwencai fallback");
@@ -514,7 +539,8 @@ impl ClawhubClient {
     /// Install a skill from skills.sh using their JSON file API.
     ///
     /// `GET https://skills.sh/api/download/<owner>/<repo>/<skill>`
-    /// returns `{ files: [{path, contents}], hash }` — files are written directly.
+    /// returns `{ files: [{path, contents}], hash }` — files are written
+    /// directly.
     async fn install_from_skillsh(
         &self,
         owner: &str,
@@ -551,7 +577,11 @@ impl ClawhubClient {
             if let Some(existing) = Self::find_installed(skills_dir, skill_id) {
                 let short_hash = &remote_hash[..8.min(remote_hash.len())];
                 if existing.version == short_hash {
-                    debug!(skill_id, version = short_hash, "already up to date, skipping");
+                    debug!(
+                        skill_id,
+                        version = short_hash,
+                        "already up to date, skipping"
+                    );
                     return Ok(existing);
                 }
                 debug!(skill_id, "remote hash differs, updating");
@@ -575,8 +605,7 @@ impl ClawhubClient {
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(&dest, contents)
-                .with_context(|| format!("write {}", dest.display()))?;
+            std::fs::write(&dest, contents).with_context(|| format!("write {}", dest.display()))?;
         }
 
         let skill_md = install_dir.join("SKILL.md");
@@ -615,15 +644,14 @@ impl ClawhubClient {
     async fn install_from_url(&self, url: &str, skills_dir: &Path) -> Result<LockedSkill> {
         // Derive dir name from URL.
         //   1) `?slug=` (skillhub) or `?name=` (iwencai) query param.
-        //   2) Last non-query path segment, but skip generic terminators
-        //      that aren't real skill names. Without the skip,
-        //      skillhub COS URLs like `.../skills/<slug>/files` produced
-        //      `~/.rsclaw/skills/files/` empty dirs because `files` was
-        //      taken as the slug; iwencai pre-fix had the same issue
-        //      with `square`/`download`.
+        //   2) Last non-query path segment, but skip generic terminators that aren't
+        //      real skill names. Without the skip, skillhub COS URLs like
+        //      `.../skills/<slug>/files` produced `~/.rsclaw/skills/files/` empty dirs
+        //      because `files` was taken as the slug; iwencai pre-fix had the same
+        //      issue with `square`/`download`.
         const GENERIC_TERMINATORS: &[&str] = &[
-            "files", "download", "archive", "latest", "main", "master",
-            "tarball", "zipball", "raw", "blob", "release",
+            "files", "download", "archive", "latest", "main", "master", "tarball", "zipball",
+            "raw", "blob", "release",
         ];
         let trim_endings = |s: &str| -> String {
             s.trim_end_matches(".tar.gz")
@@ -632,15 +660,10 @@ impl ClawhubClient {
                 .trim_end_matches(".tar")
                 .to_owned()
         };
-        let from_query = url
-            .split('?')
-            .nth(1)
-            .and_then(|qs| {
-                qs.split('&').find_map(|p| {
-                    p.strip_prefix("slug=")
-                        .or_else(|| p.strip_prefix("name="))
-                })
-            });
+        let from_query = url.split('?').nth(1).and_then(|qs| {
+            qs.split('&')
+                .find_map(|p| p.strip_prefix("slug=").or_else(|| p.strip_prefix("name=")))
+        });
         let dir_name = if let Some(s) = from_query {
             trim_endings(s)
         } else {
@@ -726,7 +749,9 @@ impl ClawhubClient {
         let iw = iwencai_urls();
         let registries: Vec<Registry> = if self.is_cn() {
             vec![
-                Registry::Skillsh { client: self.client.clone() },
+                Registry::Skillsh {
+                    client: self.client.clone(),
+                },
                 Registry::Skillhub {
                     client: self.client.clone(),
                     search_url: sh.search.clone(),
@@ -739,7 +764,9 @@ impl ClawhubClient {
             ]
         } else {
             vec![
-                Registry::Skillsh { client: self.client.clone() },
+                Registry::Skillsh {
+                    client: self.client.clone(),
+                },
                 Registry::Clawhub {
                     client: self.client.clone(),
                     api_base: self.base_url.clone(),
@@ -836,7 +863,6 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{digest:x}"))
 }
 
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -903,10 +929,7 @@ mod tests {
 
         // "pkg/" is the shared top-level dir that gets stripped, leaving
         // "../evil.txt" which would land in `outer/evil.txt` — outside dest.
-        let zip = make_zip(&[
-            ("pkg/SKILL.md", b"# legit"),
-            ("pkg/../evil.txt", b"pwned"),
-        ]);
+        let zip = make_zip(&[("pkg/SKILL.md", b"# legit"), ("pkg/../evil.txt", b"pwned")]);
 
         let _ = extract_zip(&zip, &dest);
 

@@ -4,10 +4,7 @@
 use anyhow::{Result, bail};
 use tracing::{debug, warn};
 
-use super::{
-    runtime::RuntimeConfig,
-    schema::DmScope,
-};
+use super::{runtime::RuntimeConfig, schema::DmScope};
 
 /// Validate the fully-loaded RuntimeConfig.
 /// Returns `Err` for hard errors (will prevent startup).
@@ -64,7 +61,10 @@ fn validate_agents(cfg: &RuntimeConfig) -> Result<()> {
     }
     for ext in &cfg.agents.a2a {
         if !seen.insert(ext.id.clone()) {
-            bail!("duplicate agent id (external conflicts with local): \"{}\"", ext.id);
+            bail!(
+                "duplicate agent id (external conflicts with local): \"{}\"",
+                ext.id
+            );
         }
     }
     Ok(())

@@ -1,9 +1,12 @@
-﻿use anyhow::Result;
+use anyhow::Result;
 
-use super::style::{bold, dim, green, red, yellow, banner};
+use super::style::{banner, bold, dim, green, red, yellow};
 use crate::{cli::DoctorArgs, config};
 
-const VERSION: &str = match option_env!("RSCLAW_BUILD_VERSION") { Some(v) => v, None => "dev" };
+const VERSION: &str = match option_env!("RSCLAW_BUILD_VERSION") {
+    Some(v) => v,
+    None => "dev",
+};
 
 // ---------------------------------------------------------------------------
 // Issue -- a detected problem with an optional auto-fix
@@ -52,7 +55,11 @@ pub async fn cmd_doctor(args: DoctorArgs) -> Result<()> {
     // -- 1. Config load -------------------------------------------------------
     let cfg = match config::load_quiet() {
         Ok(c) => {
-            println!("  {} config loaded \u{2014} {} agent(s)", green("[ok]"), c.agents.list.len());
+            println!(
+                "  {} config loaded \u{2014} {} agent(s)",
+                green("[ok]"),
+                c.agents.list.len()
+            );
             passed += 1;
             Some(c)
         }
@@ -151,7 +158,11 @@ pub async fn cmd_doctor(args: DoctorArgs) -> Result<()> {
                         },
                     ));
                 } else {
-                    println!("  {} config permissions {:04o}", green("[ok]"), mode & 0o777);
+                    println!(
+                        "  {} config permissions {:04o}",
+                        green("[ok]"),
+                        mode & 0o777
+                    );
                     passed += 1;
                 }
             }
@@ -162,7 +173,11 @@ pub async fn cmd_doctor(args: DoctorArgs) -> Result<()> {
             // Check that the config file is not in a world-readable location.
             if let Ok(meta) = std::fs::metadata(&cfg_path) {
                 if !meta.permissions().readonly() {
-                    println!("  {} config file exists: {}", green("[ok]"), cfg_path.display());
+                    println!(
+                        "  {} config file exists: {}",
+                        green("[ok]"),
+                        cfg_path.display()
+                    );
                     passed += 1;
                 }
             }
@@ -173,7 +188,11 @@ pub async fn cmd_doctor(args: DoctorArgs) -> Result<()> {
     if let Some(ref c) = cfg {
         // agents.list empty is fine 鈥?a default "main" agent is auto-synthesized.
         if !c.agents.list.is_empty() {
-            println!("  {} {} agent(s) configured", green("[ok]"), c.agents.list.len());
+            println!(
+                "  {} {} agent(s) configured",
+                green("[ok]"),
+                c.agents.list.len()
+            );
             passed += 1;
         }
 
@@ -232,15 +251,31 @@ pub async fn cmd_doctor(args: DoctorArgs) -> Result<()> {
         let (avail, total) = super::tools::tools_count();
         let summary = super::tools::tools_summary_line();
         if avail == total {
-            println!("  {} tools {}/{} — {}", green("[ok]"), avail, total, summary);
+            println!(
+                "  {} tools {}/{} — {}",
+                green("[ok]"),
+                avail,
+                total,
+                summary
+            );
             passed += 1;
         } else {
             let missing: Vec<&str> = super::tools::tools_missing();
-            println!("  {} tools {}/{} — {}", yellow("[warn]"), avail, total, summary);
+            println!(
+                "  {} tools {}/{} — {}",
+                yellow("[warn]"),
+                avail,
+                total,
+                summary
+            );
             issues.push(Issue::warn(format!(
                 "missing tools: {}. Install with `rsclaw tools install {}`",
                 missing.join(", "),
-                if missing.len() == 1 { missing[0].to_string() } else { "all".to_string() }
+                if missing.len() == 1 {
+                    missing[0].to_string()
+                } else {
+                    "all".to_string()
+                }
             )));
         }
     }
@@ -265,7 +300,12 @@ pub async fn cmd_doctor(args: DoctorArgs) -> Result<()> {
                     println!("  {} {} plugin(s) OK", green("[ok]"), plugins.len());
                     passed += 1;
                 } else {
-                    println!("  {} {} plugin(s), {} broken", yellow("[warn]"), plugins.len(), broken.len());
+                    println!(
+                        "  {} {} plugin(s), {} broken",
+                        yellow("[warn]"),
+                        plugins.len(),
+                        broken.len()
+                    );
                     for b in &broken {
                         issues.push(Issue::warn(format!("plugin {b}")));
                     }
@@ -342,16 +382,18 @@ pub async fn cmd_doctor(args: DoctorArgs) -> Result<()> {
 
     println!();
     if issues.is_empty() {
-        println!(
-            "  {}",
-            green(&format!("{passed} checks passed, 0 issues"))
-        );
+        println!("  {}", green(&format!("{passed} checks passed, 0 issues")));
         return Ok(());
     }
 
     for issue in &issues {
         if let Some(hint) = issue.fix_hint {
-            eprintln!("  {} {} {}", yellow("[warn]"), issue.message, dim(&format!("(fix: {hint})")));
+            eprintln!(
+                "  {} {} {}",
+                yellow("[warn]"),
+                issue.message,
+                dim(&format!("(fix: {hint})"))
+            );
         } else {
             eprintln!("  {} {}", yellow("[warn]"), issue.message);
         }
@@ -419,7 +461,8 @@ fn repair_config_json() -> Result<String> {
             ))
         }
         Err(e) => {
-            // Repaired version still broken -- try writing it anyway (might be closer to valid)
+            // Repaired version still broken -- try writing it anyway (might be closer to
+            // valid)
             std::fs::write(&cfg_path, &repaired)?;
             anyhow::bail!(
                 "partial repair applied but config still has errors: {e}. \
@@ -455,13 +498,19 @@ fn repair_json5_syntax(raw: &str) -> String {
         {
             let next_trimmed = lines[i + 1..]
                 .iter()
-                .find(|l| { let t = l.trim(); !t.is_empty() && !t.starts_with("//") })
+                .find(|l| {
+                    let t = l.trim();
+                    !t.is_empty() && !t.starts_with("//")
+                })
                 .map(|l| l.trim().to_owned());
 
             if let Some(ref nt) = next_trimmed {
                 let needs_comma = nt.starts_with('"')
                     || nt.starts_with('\'')
-                    || nt.chars().next().is_some_and(|c| c.is_alphanumeric() || c == '_');
+                    || nt
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_');
                 if needs_comma {
                     lines[i] = format!("{},", lines[i].trim_end());
                 }
@@ -487,7 +536,10 @@ fn fix_config_type_mismatches() -> Result<String> {
         return Ok("no mismatches found".to_string());
     }
     std::fs::write(&cfg_path, serde_json::to_string_pretty(&val)?)?;
-    Ok(format!("fixed {count} type mismatch(es) in {}", cfg_path.display()))
+    Ok(format!(
+        "fixed {count} type mismatch(es) in {}",
+        cfg_path.display()
+    ))
 }
 
 fn fix_types_recursive(val: &mut serde_json::Value) -> usize {

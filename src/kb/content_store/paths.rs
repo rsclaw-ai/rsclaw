@@ -4,8 +4,9 @@
 //! The `--<lsid8>` suffix is load-bearing — see `markdown_rel_path`
 //! for the idempotency + no-collision rationale.
 
-use crate::kb::model::KbSourceKind;
 use sha2::Digest;
+
+use crate::kb::model::KbSourceKind;
 
 /// Slugify a title for path use. Keeps alphanumerics + CJK, lowercases
 /// Latin, collapses runs of non-keepers into single dashes, trims
@@ -42,19 +43,19 @@ fn is_cjk(c: char) -> bool {
 ///
 /// Layout: `md/<kind>/<slug>--<lsid8>--<md8>.md` where:
 ///   - `lsid8` = first 8 hex chars of `sha256(logical_source_id)`.
-///   - `md8`  = first 8 hex chars of `body_sha256` (the canonical markdown body, post-canonicalize).
+///   - `md8`  = first 8 hex chars of `body_sha256` (the canonical markdown
+///     body, post-canonicalize).
 ///
 /// Path semantics:
-///   - Re-ingesting the same source with the same content → same
-///     `lsid8` AND same `md8` → same path → `write_if_new` returns
-///     `false` and stage_doc reuses the file (idempotent).
+///   - Re-ingesting the same source with the same content → same `lsid8` AND
+///     same `md8` → same path → `write_if_new` returns `false` and stage_doc
+///     reuses the file (idempotent).
 ///   - Same source with NEW content (v2 ingest under a stable
-///     `logical_source_id_seed`) → same `lsid8`, different `md8` →
-///     DIFFERENT path. Both versions coexist on disk; the old file
-///     becomes a Week 4 compactor candidate once retrieval points at
-///     the new version.
-///   - Two different sources that slugify to the same prefix →
-///     different `lsid8` → distinct files.
+///     `logical_source_id_seed`) → same `lsid8`, different `md8` → DIFFERENT
+///     path. Both versions coexist on disk; the old file becomes a Week 4
+///     compactor candidate once retrieval points at the new version.
+///   - Two different sources that slugify to the same prefix → different
+///     `lsid8` → distinct files.
 ///
 /// Suffix collision math: 32 bits each, combined 64 bits → birthday
 /// collision risk is ~1 in 2^32 at ~4B docs in the same kind.
@@ -123,11 +124,22 @@ mod tests {
         let p = markdown_rel_path(KbSourceKind::Doc, "蒙牛", "file:sha256:abc", body_sha);
         assert!(p.starts_with("md/doc/蒙牛--"), "got {p}");
         assert!(p.ends_with(".md"), "got {p}");
-        let suffix = p.trim_start_matches("md/doc/蒙牛--").trim_end_matches(".md");
+        let suffix = p
+            .trim_start_matches("md/doc/蒙牛--")
+            .trim_end_matches(".md");
         // Now `--{lsid8}--{md8}`, so 8 + 2 + 8 = 18 chars.
-        assert_eq!(suffix.len(), 18, "lsid+md suffix must be 18 chars, got {suffix}");
+        assert_eq!(
+            suffix.len(),
+            18,
+            "lsid+md suffix must be 18 chars, got {suffix}"
+        );
 
-        let q = markdown_rel_path(KbSourceKind::Url, "x", "url:https://example.com/p", body_sha);
+        let q = markdown_rel_path(
+            KbSourceKind::Url,
+            "x",
+            "url:https://example.com/p",
+            body_sha,
+        );
         assert!(q.starts_with("md/url/x--") && q.ends_with(".md"), "got {q}");
     }
 
@@ -144,7 +156,10 @@ mod tests {
         let body_sha = "deadbeef00000000000000000000000000000000000000000000000000000000";
         let a = markdown_rel_path(KbSourceKind::Doc, "report", "file:sha256:abc", body_sha);
         let b = markdown_rel_path(KbSourceKind::Doc, "report", "file:sha256:def", body_sha);
-        assert_ne!(a, b, "same slug + different lsid must map to different paths");
+        assert_ne!(
+            a, b,
+            "same slug + different lsid must map to different paths"
+        );
     }
 
     #[test]
@@ -156,7 +171,10 @@ mod tests {
         let body_b = "bbbbbbbb00000000000000000000000000000000000000000000000000000000";
         let a = markdown_rel_path(KbSourceKind::Doc, "report", "file:sha256:abc", body_a);
         let b = markdown_rel_path(KbSourceKind::Doc, "report", "file:sha256:abc", body_b);
-        assert_ne!(a, b, "same lsid + different body must map to different paths");
+        assert_ne!(
+            a, b,
+            "same lsid + different body must map to different paths"
+        );
     }
 
     #[test]

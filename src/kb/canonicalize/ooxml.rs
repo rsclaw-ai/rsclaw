@@ -10,9 +10,10 @@
 //! This loses fine layout (exact table grids, run formatting) but preserves
 //! all the text content, which is what the KB embeds and searches over.
 
+use std::io::{Cursor, Read};
+
 use super::*;
 use crate::kb::content_store::atomic::sha256_hex;
-use std::io::{Cursor, Read};
 
 /// Extract the inner text of every `<tag ...>...</tag>` occurrence in `xml`,
 /// in document order, with the basic XML entities decoded. Empty captures are
@@ -189,8 +190,9 @@ impl Canonicalizer for PptxCanonicalizer {
 
 #[cfg(test)]
 mod canon_tests {
-    use super::*;
     use std::io::Write;
+
+    use super::*;
 
     fn make_zip(parts: &[(&str, &str)]) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -207,7 +209,12 @@ mod canon_tests {
     }
 
     fn input<'a>(bytes: &'a [u8], mime: &'a str) -> CanonicalizeInput<'a> {
-        CanonicalizeInput { bytes, mime, hint_title: Some("t"), logical_source_id_seed: None }
+        CanonicalizeInput {
+            bytes,
+            mime,
+            hint_title: Some("t"),
+            logical_source_id_seed: None,
+        }
     }
 
     #[test]
@@ -229,15 +236,15 @@ mod canon_tests {
         // Insert slide2 before slide1 to prove numeric ordering, not zip order.
         let s2 = "<p:sld><a:t>第二页</a:t></p:sld>";
         let s1 = "<p:sld><a:t>第一页</a:t><a:t>标题</a:t></p:sld>";
-        let bytes = make_zip(&[
-            ("ppt/slides/slide2.xml", s2),
-            ("ppt/slides/slide1.xml", s1),
-        ]);
+        let bytes = make_zip(&[("ppt/slides/slide2.xml", s2), ("ppt/slides/slide1.xml", s1)]);
         let out = PptxCanonicalizer
             .canonicalize(input(&bytes, PPTX_MIME))
             .unwrap()
             .expect("some");
-        assert_eq!(out.markdown, "## Slide 1\n\n第一页\n标题\n\n## Slide 2\n\n第二页");
+        assert_eq!(
+            out.markdown,
+            "## Slide 1\n\n第一页\n标题\n\n## Slide 2\n\n第二页"
+        );
     }
 
     #[test]
@@ -248,8 +255,13 @@ mod canon_tests {
 
     #[test]
     fn docx_with_no_text_is_none() {
-        let bytes = make_zip(&[("word/document.xml", "<w:document><w:body></w:body></w:document>")]);
-        let out = DocxCanonicalizer.canonicalize(input(&bytes, DOCX_MIME)).unwrap();
+        let bytes = make_zip(&[(
+            "word/document.xml",
+            "<w:document><w:body></w:body></w:document>",
+        )]);
+        let out = DocxCanonicalizer
+            .canonicalize(input(&bytes, DOCX_MIME))
+            .unwrap();
         assert!(out.is_none());
     }
 }

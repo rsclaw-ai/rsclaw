@@ -129,7 +129,8 @@ impl PreParseEngine {
         ); // special handling
 
         // --- Search & web ---
-        // /search <query> [provider] — provider is optional last word matching known engines
+        // /search <query> [provider] — provider is optional last word matching known
+        // engines
         add_cmd(
             &mut commands,
             r"(?i)^/search\s+(.+)$",
@@ -182,7 +183,10 @@ impl PreParseEngine {
         add_direct(&mut commands, r"(?i)^/status$", |_| "__STATUS__".into());
         add_direct(&mut commands, r"(?i)^/health$", |_| "__HEALTH__".into());
         add_direct(&mut commands, r"(?i)^/version$", |_| {
-            format!("rsclaw v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"))
+            format!(
+                "rsclaw v{}",
+                option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
+            )
         });
         add_direct(&mut commands, r"(?i)^/uptime$", |_| "__UPTIME__".into());
         add_direct(&mut commands, r"(?i)^/models?$", |_| "__MODELS__".into());
@@ -486,9 +490,22 @@ fn build_args(template: &ArgTemplate, caps: &regex::Captures<'_>, _full_input: &
         }
         ArgTemplate::SearchQuery => {
             let input = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
-            let known = ["google", "bing", "baidu", "ddg", "duckduckgo", "sogou", "serper", "brave"];
+            let known = [
+                "google",
+                "bing",
+                "baidu",
+                "ddg",
+                "duckduckgo",
+                "sogou",
+                "serper",
+                "brave",
+            ];
             if let Some(last_space) = input.rfind(' ') {
-                let last_word = input.get(last_space + 1..).unwrap_or("").trim().to_lowercase();
+                let last_word = input
+                    .get(last_space + 1..)
+                    .unwrap_or("")
+                    .trim()
+                    .to_lowercase();
                 if known.contains(&last_word.as_str()) {
                     let provider = match last_word.as_str() {
                         "ddg" | "duckduckgo" => "duckduckgo-free",

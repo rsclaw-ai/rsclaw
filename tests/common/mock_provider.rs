@@ -5,8 +5,10 @@
 use anyhow::Result;
 use futures::StreamExt;
 use rsclaw::provider::{LlmStream, StreamEvent, TokenUsage};
-use wiremock::matchers::{header, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{
+    Mock, MockServer, ResponseTemplate,
+    matchers::{header, method, path},
+};
 
 // ---------------------------------------------------------------------------
 // Anthropic SSE helpers
@@ -192,7 +194,10 @@ pub async fn mount_openai_json(server: &MockServer, content: &str) {
 pub enum OllamaEvent {
     Content(String),
     Thinking(String),
-    ToolCall { name: String, arguments: serde_json::Value },
+    ToolCall {
+        name: String,
+        arguments: serde_json::Value,
+    },
     Done,
 }
 
@@ -243,8 +248,14 @@ pub async fn mount_ollama_native(server: &MockServer, events: &[OllamaEvent]) {
 
 pub enum GeminiEvent {
     Text(String),
-    FunctionCall { name: String, args: serde_json::Value },
-    Finish { prompt_tokens: u32, candidates_tokens: u32 },
+    FunctionCall {
+        name: String,
+        args: serde_json::Value,
+    },
+    Finish {
+        prompt_tokens: u32,
+        candidates_tokens: u32,
+    },
     Error(String),
 }
 
@@ -283,9 +294,7 @@ pub fn gemini_sse_body(events: &[GeminiEvent]) -> String {
 
 pub async fn mount_gemini_stream(server: &MockServer, model: &str, events: &[GeminiEvent]) {
     let body = gemini_sse_body(events);
-    let stream_path = format!(
-        "/v1beta/models/{model}:streamGenerateContent"
-    );
+    let stream_path = format!("/v1beta/models/{model}:streamGenerateContent");
     Mock::given(method("POST"))
         .and(path(stream_path))
         .respond_with(
@@ -324,7 +333,9 @@ pub fn assert_stream_text(events: &[StreamEvent], expected: &str) {
 
 /// Assert that there is at least one ToolCall event with the given name.
 pub fn assert_stream_tool_call(events: &[StreamEvent], expected_name: &str) {
-    let found = events.iter().any(|e| matches!(e, StreamEvent::ToolCall { name, .. } if name == expected_name));
+    let found = events
+        .iter()
+        .any(|e| matches!(e, StreamEvent::ToolCall { name, .. } if name == expected_name));
     assert!(
         found,
         "expected ToolCall with name '{expected_name}' but none found in {events:?}"

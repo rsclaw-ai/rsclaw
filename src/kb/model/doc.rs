@@ -3,8 +3,9 @@
 //!
 //! See spec §1 + §K PermissionScope.
 
-use crate::kb::model::{KbSource, KbSourceKind};
 use serde::{Deserialize, Serialize};
+
+use crate::kb::model::{KbSource, KbSourceKind};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -68,20 +69,20 @@ pub struct CallerScope {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct KbDoc {
-    pub id: String,                    // ULID, per-ingest instance
-    pub logical_source_id: String,     // idempotency key (§I)
+    pub id: String,                // ULID, per-ingest instance
+    pub logical_source_id: String, // idempotency key (§I)
     pub source: KbSource,
     pub source_kind: KbSourceKind,
     pub title: String,
     pub mime: String,
     pub raw_sha256: String,
-    pub markdown_path: String,         // relative to kb_root
+    pub markdown_path: String, // relative to kb_root
     pub markdown_sha256: String,
     pub raw_path: Option<String>,
     pub owner_user_id: Option<String>, // for Private visibility resolution
     pub created_at: i64,
     pub updated_at: i64,
-    pub version: u32,                  // increments per re-ingest (§I)
+    pub version: u32, // increments per re-ingest (§I)
     pub status: KbStatus,
     pub visibility: KbVisibility,
     pub tags: Vec<String>,
@@ -94,7 +95,8 @@ impl KbDoc {
     /// code MUST use this instead of calling `KbVisibility::visible_to`
     /// directly — passing the wrong owner is the most likely scope-leak.
     pub fn visible_to(&self, scope: &CallerScope) -> bool {
-        self.visibility.visible_to(scope, self.owner_user_id.as_deref())
+        self.visibility
+            .visible_to(scope, self.owner_user_id.as_deref())
     }
 }
 
@@ -104,10 +106,22 @@ mod tests {
 
     #[test]
     fn visibility_default_per_kind() {
-        assert!(matches!(KbVisibility::default_for(KbSourceKind::Doc), KbVisibility::Global));
-        assert!(matches!(KbVisibility::default_for(KbSourceKind::Url), KbVisibility::Global));
-        assert!(matches!(KbVisibility::default_for(KbSourceKind::Mail), KbVisibility::Private));
-        assert!(matches!(KbVisibility::default_for(KbSourceKind::Chat), KbVisibility::Private));
+        assert!(matches!(
+            KbVisibility::default_for(KbSourceKind::Doc),
+            KbVisibility::Global
+        ));
+        assert!(matches!(
+            KbVisibility::default_for(KbSourceKind::Url),
+            KbVisibility::Global
+        ));
+        assert!(matches!(
+            KbVisibility::default_for(KbSourceKind::Mail),
+            KbVisibility::Private
+        ));
+        assert!(matches!(
+            KbVisibility::default_for(KbSourceKind::Chat),
+            KbVisibility::Private
+        ));
     }
 
     #[test]
@@ -117,13 +131,21 @@ mod tests {
 
     #[test]
     fn visibility_agent_filters_by_agent_id() {
-        let v = KbVisibility::Agent { agent_id: "a1".into() };
+        let v = KbVisibility::Agent {
+            agent_id: "a1".into(),
+        };
         assert!(v.visible_to(
-            &CallerScope { agent_id: Some("a1".into()), ..Default::default() },
+            &CallerScope {
+                agent_id: Some("a1".into()),
+                ..Default::default()
+            },
             None
         ));
         assert!(!v.visible_to(
-            &CallerScope { agent_id: Some("a2".into()), ..Default::default() },
+            &CallerScope {
+                agent_id: Some("a2".into()),
+                ..Default::default()
+            },
             None
         ));
         assert!(!v.visible_to(&CallerScope::default(), None));
@@ -131,13 +153,21 @@ mod tests {
 
     #[test]
     fn visibility_channel_filters_by_channel_id() {
-        let v = KbVisibility::Channel { channel_id: "c1".into() };
+        let v = KbVisibility::Channel {
+            channel_id: "c1".into(),
+        };
         assert!(v.visible_to(
-            &CallerScope { channel_id: Some("c1".into()), ..Default::default() },
+            &CallerScope {
+                channel_id: Some("c1".into()),
+                ..Default::default()
+            },
             None
         ));
         assert!(!v.visible_to(
-            &CallerScope { channel_id: Some("c2".into()), ..Default::default() },
+            &CallerScope {
+                channel_id: Some("c2".into()),
+                ..Default::default()
+            },
             None
         ));
     }
@@ -146,20 +176,29 @@ mod tests {
     fn visibility_private_requires_matching_owner() {
         // owner=u1, caller=u1 → allowed
         assert!(KbVisibility::Private.visible_to(
-            &CallerScope { user_id: Some("u1".into()), ..Default::default() },
+            &CallerScope {
+                user_id: Some("u1".into()),
+                ..Default::default()
+            },
             Some("u1"),
         ));
         // owner=u1, caller=u2 → DENIED (regression test for the bug
         // where Private leaked to any authenticated caller)
         assert!(!KbVisibility::Private.visible_to(
-            &CallerScope { user_id: Some("u2".into()), ..Default::default() },
+            &CallerScope {
+                user_id: Some("u2".into()),
+                ..Default::default()
+            },
             Some("u1"),
         ));
         // No caller user_id → denied
         assert!(!KbVisibility::Private.visible_to(&CallerScope::default(), Some("u1")));
         // No owner → denied (defensive: a Private doc with no owner is unreachable)
         assert!(!KbVisibility::Private.visible_to(
-            &CallerScope { user_id: Some("u1".into()), ..Default::default() },
+            &CallerScope {
+                user_id: Some("u1".into()),
+                ..Default::default()
+            },
             None,
         ));
     }
@@ -169,15 +208,23 @@ mod tests {
         let mut d = sample_doc();
         d.visibility = KbVisibility::Private;
         d.owner_user_id = Some("u1".into());
-        assert!(d.visible_to(&CallerScope { user_id: Some("u1".into()), ..Default::default() }));
-        assert!(!d.visible_to(&CallerScope { user_id: Some("u2".into()), ..Default::default() }));
+        assert!(d.visible_to(&CallerScope {
+            user_id: Some("u1".into()),
+            ..Default::default()
+        }));
+        assert!(!d.visible_to(&CallerScope {
+            user_id: Some("u2".into()),
+            ..Default::default()
+        }));
     }
 
     fn sample_doc() -> KbDoc {
         KbDoc {
             id: "01HXY".into(),
             logical_source_id: "file:sha256:abc".into(),
-            source: KbSource::Doc { path: "/tmp/x".into() },
+            source: KbSource::Doc {
+                path: "/tmp/x".into(),
+            },
             source_kind: KbSourceKind::Doc,
             title: "T".into(),
             mime: "text/markdown".into(),

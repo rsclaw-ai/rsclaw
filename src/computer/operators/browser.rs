@@ -6,8 +6,10 @@
 //! the higher-impact one and this is just an adapter on top of code we
 //! already have in `tools_web` / browser pool.
 
-use crate::computer::action::{Action, ActionSpec, ExecCtx};
-use crate::computer::operator::{ActionFut, ActionOutput, Operator, ScreenshotFut};
+use crate::computer::{
+    action::{Action, ActionSpec, ExecCtx},
+    operator::{ActionFut, ActionOutput, Operator, ScreenshotFut},
+};
 
 pub struct BrowserOperator {
     // TODO: hold an Arc<BrowserSession> from src/browser
@@ -34,27 +36,19 @@ impl Operator for BrowserOperator {
         // Browser has no hotkey / drag — but supports navigation.
         vec![
             ActionSpec::new("click(start_box='<box>x1,y1</box>')"),
-            ActionSpec::with_note(
-                "type(content='')",
-                "# Add \\n at end of content to submit",
-            ),
+            ActionSpec::with_note("type(content='')", "# Add \\n at end of content to submit"),
             ActionSpec::new(
                 "scroll(start_box='<box>x1,y1</box>', direction='down or up or right or left')",
             ),
             ActionSpec::with_note("wait()", "# Sleep 2s and re-screenshot"),
             ActionSpec::with_note("navigate(url='')", "# Navigate to a URL"),
             ActionSpec::new("finished(content='xxx')"),
-            ActionSpec::with_note(
-                "call_user()",
-                "# Stuck or need help",
-            ),
+            ActionSpec::with_note("call_user()", "# Stuck or need help"),
         ]
     }
 
     fn screenshot(&self) -> ScreenshotFut<'_> {
-        Box::pin(async move {
-            anyhow::bail!("BrowserOperator::screenshot — not yet implemented")
-        })
+        Box::pin(async move { anyhow::bail!("BrowserOperator::screenshot — not yet implemented") })
     }
 
     fn execute<'a>(&'a self, _action: &'a Action, _ctx: &'a ExecCtx) -> ActionFut<'a> {

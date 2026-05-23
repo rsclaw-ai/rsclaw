@@ -8,21 +8,18 @@
 //! `dispatch_poll`, add the corresponding `submit_*` for the tool side,
 //! and add the URL → Done outcome mapping.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Result, anyhow};
 use serde_json::json;
 use tokio::sync::{Semaphore, broadcast};
 use tracing::{debug, error, info, warn};
 
-use super::external_jobs::{
-    ExternalJob, ExternalJobKind, ExternalJobStatus, PollOutcome,
+use super::{
+    external_jobs::{ExternalJob, ExternalJobKind, ExternalJobStatus, PollOutcome},
+    shutdown::ShutdownCoordinator,
 };
-use super::shutdown::ShutdownCoordinator;
-use crate::channel::OutboundMessage;
-use crate::config::runtime::RuntimeConfig;
-use crate::store::RedbStore;
+use crate::{channel::OutboundMessage, config::runtime::RuntimeConfig, store::RedbStore};
 
 /// Seconds between worker ticks when nothing is due — small enough that
 /// new jobs start polling promptly, large enough to keep redb scans cheap.
@@ -115,7 +112,10 @@ impl ExternalJobsWorker {
             // retention window get dropped.
             gc_counter = gc_counter.wrapping_add(1);
             if gc_counter % 12 == 0 {
-                if let Err(e) = self.store.cleanup_finished_external_jobs(FINISHED_RETENTION_SECS) {
+                if let Err(e) = self
+                    .store
+                    .cleanup_finished_external_jobs(FINISHED_RETENTION_SECS)
+                {
                     warn!("external jobs: cleanup_finished failed: {e:#}");
                 }
             }
@@ -321,9 +321,9 @@ impl ExternalJobsWorker {
                 poll_minimax(&self.client, &key, &job.external_task_id).await
             }
             "kling" => {
-                let (ak, sk) = self
-                    .resolve_kling_keys()
-                    .ok_or_else(|| anyhow!("kling: KLING_ACCESS_KEY / KLING_SECRET_KEY not configured"))?;
+                let (ak, sk) = self.resolve_kling_keys().ok_or_else(|| {
+                    anyhow!("kling: KLING_ACCESS_KEY / KLING_SECRET_KEY not configured")
+                })?;
                 poll_kling(&self.client, &ak, &sk, &job.external_task_id).await
             }
             other => Err(anyhow!("no async polling adapter for provider: {other}")),
@@ -464,7 +464,9 @@ async fn poll_seedance(
     task_id: &str,
 ) -> Result<PollOutcome> {
     let resp: serde_json::Value = client
-        .get(format!("{SEEDANCE_BASE}/contents/generations/tasks/{task_id}"))
+        .get(format!(
+            "{SEEDANCE_BASE}/contents/generations/tasks/{task_id}"
+        ))
         .bearer_auth(api_key)
         .send()
         .await
@@ -590,7 +592,9 @@ async fn poll_minimax(
                 .to_owned();
             Ok(PollOutcome::Done(url))
         }
-        "Fail" => Ok(PollOutcome::Failed(format!("minimax task {task_id} failed"))),
+        "Fail" => Ok(PollOutcome::Failed(format!(
+            "minimax task {task_id} failed"
+        ))),
         _ => Ok(PollOutcome::Pending),
     }
 }
@@ -685,8 +689,8 @@ fn kling_jwt(access_key: &str, secret_key: &str) -> Result<String> {
     use sha2::Sha256;
 
     let now = chrono::Utc::now().timestamp();
-    let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(r#"{"alg":"HS256","typ":"JWT"}"#);
+    let header =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256","typ":"JWT"}"#);
     let payload_json = format!(
         r#"{{"iss":"{access_key}","exp":{},"nbf":{}}}"#,
         now + 1800,
@@ -707,9 +711,10 @@ fn kling_jwt(access_key: &str, secret_key: &str) -> Result<String> {
 // Artifact download
 // ---------------------------------------------------------------------------
 
-/// Download the provider URL into `~/Downloads/rsclaw/<category>/dl_<X>_<ts><abc>.<ext>`
-/// using the same canonical naming as the synchronous tool path. Returns
-/// the absolute local path.
+/// Download the provider URL into
+/// `~/Downloads/rsclaw/<category>/dl_<X>_<ts><abc>.<ext>` using the same
+/// canonical naming as the synchronous tool path. Returns the absolute local
+/// path.
 async fn download_artifact(
     client: &reqwest::Client,
     url: &str,

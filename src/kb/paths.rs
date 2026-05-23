@@ -4,8 +4,9 @@
 //! `KbPaths::ensure_layout()` is idempotent so callers can run it
 //! freely at startup.
 
-use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
 
 #[derive(Debug, Clone)]
 pub struct KbPaths {
@@ -17,13 +18,27 @@ impl KbPaths {
         Self { root: root.into() }
     }
 
-    pub fn md_dir(&self) -> PathBuf { self.root.join("md") }
-    pub fn raw_dir(&self) -> PathBuf { self.root.join("raw") }
-    pub fn db_dir(&self) -> PathBuf { self.root.join("db") }
-    pub fn idx_dir(&self) -> PathBuf { self.root.join("idx") }
-    pub fn hnsw_dir(&self) -> PathBuf { self.root.join("hnsw") }
-    pub fn state_dir(&self) -> PathBuf { self.root.join("state") }
-    pub fn redb_file(&self) -> PathBuf { self.db_dir().join("kb.redb") }
+    pub fn md_dir(&self) -> PathBuf {
+        self.root.join("md")
+    }
+    pub fn raw_dir(&self) -> PathBuf {
+        self.root.join("raw")
+    }
+    pub fn db_dir(&self) -> PathBuf {
+        self.root.join("db")
+    }
+    pub fn idx_dir(&self) -> PathBuf {
+        self.root.join("idx")
+    }
+    pub fn hnsw_dir(&self) -> PathBuf {
+        self.root.join("hnsw")
+    }
+    pub fn state_dir(&self) -> PathBuf {
+        self.root.join("state")
+    }
+    pub fn redb_file(&self) -> PathBuf {
+        self.db_dir().join("kb.redb")
+    }
 
     /// Create all directories. Idempotent. Week 1 only provisions
     /// `md/doc` and `md/url`; v2 adds `md/{chat,img,mail}` when
@@ -52,15 +67,18 @@ fn ensure_dir(p: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
+
+    use super::*;
 
     #[test]
     fn ensure_layout_creates_subdirs() {
         let tmp = TempDir::new().unwrap();
         let p = KbPaths::new(tmp.path());
         p.ensure_layout().unwrap();
-        for d in ["md", "raw", "db", "idx", "hnsw", "state", "md/doc", "md/url"] {
+        for d in [
+            "md", "raw", "db", "idx", "hnsw", "state", "md/doc", "md/url",
+        ] {
             assert!(tmp.path().join(d).is_dir(), "missing {d}");
         }
     }

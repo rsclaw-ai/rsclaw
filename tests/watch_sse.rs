@@ -1,11 +1,13 @@
 //! Integration test for SseSource — single-connection happy path.
 
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot};
 
 use rsclaw::gateway::watch::source::{SourceImpl, SseSource};
+use tokio::{
+    io::AsyncWriteExt,
+    net::TcpListener,
+    sync::{mpsc, oneshot},
+};
 
 /// Boot a minimal HTTP/1.1 server that emits 3 SSE events then waits for stop.
 async fn boot_sse_server() -> (String, oneshot::Sender<()>) {
@@ -48,14 +50,26 @@ async fn sse_source_reads_three_events() {
 
     let (tx, mut rx) = mpsc::channel(16);
     let (stop_tx, stop_rx) = oneshot::channel();
-    let src = SourceImpl::Sse(SseSource { url, headers: vec![] });
+    let src = SourceImpl::Sse(SseSource {
+        url,
+        headers: vec![],
+    });
     let handle = tokio::spawn(async move { src.run(tx, stop_rx).await });
 
-    let e1 = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
+    let e1 = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(e1.event, "hit");
-    let e2 = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
+    let e2 = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(e2.event, "message");
-    let e3 = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
+    let e3 = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(e3.event_id.as_deref(), Some("42"));
 
     let _ = stop_tx.send(());
@@ -107,7 +121,10 @@ async fn sse_source_reconnects_after_disconnect() {
     let (url, kill) = boot_flaky_sse_server().await;
     let (tx, mut rx) = mpsc::channel(16);
     let (stop_tx, stop_rx) = oneshot::channel();
-    let src = SourceImpl::Sse(SseSource { url, headers: vec![] });
+    let src = SourceImpl::Sse(SseSource {
+        url,
+        headers: vec![],
+    });
     let handle = tokio::spawn(async move { src.run(tx, stop_rx).await });
 
     // Drain past lifecycle events (`_disconnect` is emitted between the
@@ -138,18 +155,29 @@ async fn sse_source_terminates_on_403() {
     tokio::spawn(async move {
         if let Ok((mut sock, _)) = listener.accept().await {
             let mut buf = [0u8; 1024];
-            let _ = tokio::time::timeout(Duration::from_millis(200),
-                tokio::io::AsyncReadExt::read(&mut sock, &mut buf)).await;
-            let _ = sock.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n").await;
+            let _ = tokio::time::timeout(
+                Duration::from_millis(200),
+                tokio::io::AsyncReadExt::read(&mut sock, &mut buf),
+            )
+            .await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                .await;
         }
     });
 
     let (tx, mut rx) = mpsc::channel(16);
     let (_stop_tx, stop_rx) = oneshot::channel();
-    let src = SourceImpl::Sse(SseSource { url, headers: vec![] });
+    let src = SourceImpl::Sse(SseSource {
+        url,
+        headers: vec![],
+    });
     let handle = tokio::spawn(async move { src.run(tx, stop_rx).await });
 
-    let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await.unwrap().unwrap();
+    let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(ev.event, "_error");
     assert_eq!(ev.data["fatal"], serde_json::Value::Bool(true));
     let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
@@ -185,11 +213,12 @@ async fn sse_source_sends_last_event_id_on_reconnect() {
                         saw_clone.store(true, std::sync::atomic::Ordering::SeqCst);
                     }
                 }
-                let header =
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+                let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
                 let _ = sock.write_all(header.as_bytes()).await;
                 if n == 0 {
-                    let _ = sock.write_all(b"id: 99\ndata: {\"x\":1}\nretry: 200\n\n").await;
+                    let _ = sock
+                        .write_all(b"id: 99\ndata: {\"x\":1}\nretry: 200\n\n")
+                        .await;
                     // Close abruptly to force reconnect.
                 } else {
                     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -200,7 +229,10 @@ async fn sse_source_sends_last_event_id_on_reconnect() {
 
     let (tx, mut rx) = mpsc::channel(16);
     let (stop_tx, stop_rx) = oneshot::channel();
-    let src = SourceImpl::Sse(SseSource { url, headers: vec![] });
+    let src = SourceImpl::Sse(SseSource {
+        url,
+        headers: vec![],
+    });
     let handle = tokio::spawn(async move { src.run(tx, stop_rx).await });
 
     // Receive the first event and wait long enough for the reconnect attempt.

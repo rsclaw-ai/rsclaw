@@ -6,7 +6,8 @@
 //!   3. Exit cleanly so the parent process can spawn the replacement.
 //!
 //! Subscribers:
-//!   - `axum::serve(...).with_graceful_shutdown(coord.notified())` — drains HTTP.
+//!   - `axum::serve(...).with_graceful_shutdown(coord.notified())` — drains
+//!     HTTP.
 //!   - `TaskQueueWorker::run()` — checks `draining` at top of loop.
 //!   - Channel handlers — same pattern, when refactored to honor it.
 //!

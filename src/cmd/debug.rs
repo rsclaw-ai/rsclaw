@@ -10,13 +10,6 @@
 use anyhow::{Context as _, Result};
 use serde_json::json;
 
-use crate::agent::prompt_builder::{build_shared_system_prefix, build_user_system};
-use crate::agent::tools_builder::build_tool_list;
-use crate::agent::workspace::WorkspaceContext;
-use crate::cli::{DebugCommand, DumpPromptSpecArgs};
-use crate::config;
-use crate::skill::loader::load_skills;
-
 /// 37 built-in tool names that compile into the RsClaw binary. Used
 /// by `dump-prompt-spec` to partition the merged tool list into the
 /// cacheable half (these names) and the per-user half (everything
@@ -30,6 +23,16 @@ use crate::skill::loader::load_skills;
 // task_finish/edit_file/ask_user), which would have produced a baseline
 // export that didn't match what the gateway actually classifies as builtin.
 use crate::agent::prompt_builder::BUILTIN_TOOL_NAMES as BUILTIN_TOOLS;
+use crate::{
+    agent::{
+        prompt_builder::{build_shared_system_prefix, build_user_system},
+        tools_builder::build_tool_list,
+        workspace::WorkspaceContext,
+    },
+    cli::{DebugCommand, DumpPromptSpecArgs},
+    config,
+    skill::loader::load_skills,
+};
 
 pub async fn cmd_debug(sub: DebugCommand) -> Result<()> {
     match sub {
@@ -38,12 +41,12 @@ pub async fn cmd_debug(sub: DebugCommand) -> Result<()> {
 }
 
 async fn dump_prompt_spec(args: DumpPromptSpecArgs) -> Result<()> {
-    // 1. Load config. `load_quiet` skips banner/log noise so this is
-    //    safe to pipe through `jq`.
+    // 1. Load config. `load_quiet` skips banner/log noise so this is safe to pipe
+    //    through `jq`.
     let config = config::load_quiet().context("failed to load rsclaw config")?;
 
-    // 2. Resolve the target agent id. Priority:
-    //    explicit --agent -> first entry flagged default=true -> "main".
+    // 2. Resolve the target agent id. Priority: explicit --agent -> first entry
+    //    flagged default=true -> "main".
     let agent_id = args
         .agent
         .or_else(|| {
@@ -63,15 +66,13 @@ async fn dump_prompt_spec(args: DumpPromptSpecArgs) -> Result<()> {
         .find(|e| e.id == agent_id)
         .with_context(|| format!("agent `{agent_id}` not found in config.agents.list"))?;
 
-    // 3. Workspace dir resolution mirrors what AgentRuntime does at
-    //    boot: explicit `agent.workspace` -> `<base>/workspace-<id>`.
+    // 3. Workspace dir resolution mirrors what AgentRuntime does at boot: explicit
+    //    `agent.workspace` -> `<base>/workspace-<id>`.
     let ws_dir = agent_cfg
         .workspace
         .as_deref()
         .map(config::loader::expand_tilde_path_pub)
-        .unwrap_or_else(|| {
-            config::loader::base_dir().join(format!("workspace-{agent_id}"))
-        });
+        .unwrap_or_else(|| config::loader::base_dir().join(format!("workspace-{agent_id}")));
     // SessionType / max_chars are runtime-tuned; for a CLI dump we
     // pick conservative defaults that won't blow up the JSON. The
     // exact number of files in the workspace segment doesn't have to
@@ -82,18 +83,22 @@ async fn dump_prompt_spec(args: DumpPromptSpecArgs) -> Result<()> {
         &ws_dir,
         crate::agent::workspace::SessionType::Normal,
         false,
-        4_000,   // max_chars_per_file
-        20_000,  // total_max_chars
+        4_000,  // max_chars_per_file
+        20_000, // total_max_chars
     );
 
-    // 4. Discover installed skills the same way the runtime does:
-    //    global skills under `<base>/skills/`, plus the per-agent
-    //    workspace's `skills/` subdirectory if present.
+    // 4. Discover installed skills the same way the runtime does: global skills
+    //    under `<base>/skills/`, plus the per-agent workspace's `skills/`
+    //    subdirectory if present.
     let skills_dir = config::loader::base_dir().join("skills");
     let workspace_skills = ws_dir.join("skills");
     let skills = load_skills(
         &skills_dir,
-        if workspace_skills.is_dir() { Some(&ws_dir) } else { None },
+        if workspace_skills.is_dir() {
+            Some(&ws_dir)
+        } else {
+            None
+        },
         config.raw.skills.as_ref(),
     )
     .unwrap_or_default();
@@ -106,19 +111,14 @@ async fn dump_prompt_spec(args: DumpPromptSpecArgs) -> Result<()> {
     let shared_prefix = build_shared_system_prefix();
     let user_system = build_user_system(&ws_ctx, &skills, &[], None, &config.raw);
 
-    // 6. Build the merged tool list, then split by name into the
-    //    cacheable built-ins vs the per-machine remainder.
-    //    `build_tool_list` only knows about a live AgentRegistry; we
-    //    don't have one here, so we let it generate the built-ins
+    // 6. Build the merged tool list, then split by name into the cacheable
+    //    built-ins vs the per-machine remainder. `build_tool_list` only knows about
+    //    a live AgentRegistry; we don't have one here, so we let it generate the
+    //    built-ins
     //    + remote-agent tools and tack the local sub-agent
     //    (`agent_<id>`) tools on ourselves to mirror what a running
     //    gateway would advertise.
-    let mut tool_defs = build_tool_list(
-        &skills,
-        None,
-        &agent_id,
-        &config.agents.a2a,
-    );
+    let mut tool_defs = build_tool_list(&skills, None, &agent_id, &config.agents.a2a);
     for entry in &config.agents.list {
         if entry.id == agent_id {
             continue;
@@ -155,9 +155,9 @@ async fn dump_prompt_spec(args: DumpPromptSpecArgs) -> Result<()> {
         }
     }
 
-    // 7. Emit. `--shared-only` strips per-user fields entirely so the
-    //    output is suitable for ingest into rsclaw-llm without any
-    //    machine-specific state leaking through.
+    // 7. Emit. `--shared-only` strips per-user fields entirely so the output is
+    //    suitable for ingest into rsclaw-llm without any machine-specific state
+    //    leaking through.
     //
     // `rsclaw_version` here is the BASELINE version (the `<ver>`
     // component of `RSCLAW_DEFAULT_PREFIX_ID`), NOT the Cargo crate
@@ -186,13 +186,11 @@ async fn dump_prompt_spec(args: DumpPromptSpecArgs) -> Result<()> {
             "user_tools": user_tools,
         })
     };
-    let s = serde_json::to_string_pretty(&payload)
-        .context("serialize prompt spec to JSON")?;
+    let s = serde_json::to_string_pretty(&payload).context("serialize prompt spec to JSON")?;
 
     match args.output {
         Some(path) => {
-            std::fs::write(&path, &s)
-                .with_context(|| format!("write {}", path.display()))?;
+            std::fs::write(&path, &s).with_context(|| format!("write {}", path.display()))?;
             eprintln!("wrote {} ({} bytes)", path.display(), s.len());
         }
         None => println!("{s}"),

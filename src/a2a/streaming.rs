@@ -21,8 +21,8 @@ use crate::{
     a2a::{
         event::AgentEvent,
         types::{
-            A2aArtifact, A2aMessage, A2aTask, A2aTaskStatus, JsonRpcRequest,
-            SendMessageParams, TaskState,
+            A2aArtifact, A2aMessage, A2aTask, A2aTaskStatus, JsonRpcRequest, SendMessageParams,
+            TaskState,
         },
     },
     agent::{AgentMessage, AgentReply},
@@ -182,7 +182,8 @@ async fn spawn_streaming_task(
     // message, so `@a2a_<kind>_...` references appear in the text and the
     // runtime's existing `resolve_file_refs` pipeline loads them as image
     // attachments / file references on the agent loop entry.
-    let workspace = crate::a2a::server::resolve_agent_workspace_pub(&state, agent_id.as_deref()).await;
+    let workspace =
+        crate::a2a::server::resolve_agent_workspace_pub(&state, agent_id.as_deref()).await;
     let ingested = crate::a2a::files::ingest_message_parts(&workspace, &params.message.parts).await;
     let text = ingested.text;
 
@@ -264,9 +265,7 @@ async fn spawn_streaming_task(
         while let Ok(ev) = persist_rx.recv().await {
             match ev {
                 AgentEvent::Artifact {
-                    artifact_id,
-                    parts,
-                    ..
+                    artifact_id, parts, ..
                 } => {
                     let _ = persist_store.append_artifact(
                         &persist_task_id,
@@ -286,18 +285,15 @@ async fn spawn_streaming_task(
                         // webhooks will fire for this task — clear its
                         // notification configs so they don't linger in
                         // the store. (No-op if there were no configs.)
-                        let _ = persist_store
-                            .delete_push_configs_for_task(&persist_task_id);
+                        let _ = persist_store.delete_push_configs_for_task(&persist_task_id);
                         break;
                     }
                 }
                 AgentEvent::InputRequired { .. } => {
-                    let _ = persist_store
-                        .set_status(&persist_task_id, TaskState::InputRequired);
+                    let _ = persist_store.set_status(&persist_task_id, TaskState::InputRequired);
                 }
                 AgentEvent::AuthRequired { .. } => {
-                    let _ = persist_store
-                        .set_status(&persist_task_id, TaskState::AuthRequired);
+                    let _ = persist_store.set_status(&persist_task_id, TaskState::AuthRequired);
                 }
             }
         }
@@ -389,8 +385,7 @@ async fn spawn_streaming_task(
     // semantics as the sync path. Helper handles registration + timeout
     // cleanup so a client that never sends the resume SendMessage
     // doesn't leak a suspended entry.
-    let (ireq_tx, ireq_rx) =
-        tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<String>>(4);
+    let (ireq_tx, ireq_rx) = tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<String>>(4);
     crate::a2a::server::spawn_input_request_listener(
         state.clone(),
         task_id.clone(),

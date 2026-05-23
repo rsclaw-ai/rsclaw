@@ -2,8 +2,7 @@
 
 use std::sync::Arc;
 
-use rsclaw::channel::{Channel, OutboundMessage};
-use rsclaw::channel::zalo::ZaloChannel;
+use rsclaw::channel::{Channel, OutboundMessage, zalo::ZaloChannel};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{method, path},
@@ -13,9 +12,8 @@ fn init_crypto() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
-type OnMessage = Arc<
-    dyn Fn(String, String, Vec<rsclaw::agent::registry::ImageAttachment>) + Send + Sync,
->;
+type OnMessage =
+    Arc<dyn Fn(String, String, Vec<rsclaw::agent::registry::ImageAttachment>) + Send + Sync>;
 
 fn noop_on_message() -> OnMessage {
     Arc::new(|_, _, _| {})
@@ -23,7 +21,11 @@ fn noop_on_message() -> OnMessage {
 
 fn make_channel(base_url: &str) -> ZaloChannel {
     init_crypto();
-    ZaloChannel::with_api_base("test-access-token", Some(base_url.to_owned()), noop_on_message())
+    ZaloChannel::with_api_base(
+        "test-access-token",
+        Some(base_url.to_owned()),
+        noop_on_message(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -108,7 +110,9 @@ async fn webhook_text_dispatches_to_callback() {
         "message": { "text": "xin chao", "msg_id": "m1" }
     }"#;
 
-    ch.handle_webhook(body).await.expect("webhook should succeed");
+    ch.handle_webhook(body)
+        .await
+        .expect("webhook should succeed");
 
     let msgs = received.lock().expect("lock");
     assert_eq!(msgs.len(), 1);
@@ -137,7 +141,9 @@ async fn webhook_empty_sender_is_ignored() {
         "message": { "text": "should be ignored", "msg_id": "m2" }
     }"#;
 
-    ch.handle_webhook(body).await.expect("webhook should succeed");
+    ch.handle_webhook(body)
+        .await
+        .expect("webhook should succeed");
 
     let msgs = received.lock().expect("lock");
     assert_eq!(msgs.len(), 0, "empty sender should be ignored");
@@ -149,7 +155,10 @@ async fn send_uses_access_token_header() {
 
     Mock::given(method("POST"))
         .and(path("/message/cs"))
-        .and(wiremock::matchers::header("access_token", "test-access-token"))
+        .and(wiremock::matchers::header(
+            "access_token",
+            "test-access-token",
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"error": 0})))
         .expect(1)
         .mount(&server)
@@ -165,7 +174,9 @@ async fn send_uses_access_token_header() {
         ..Default::default()
     };
 
-    ch.send(msg).await.expect("send should succeed with access_token header");
+    ch.send(msg)
+        .await
+        .expect("send should succeed with access_token header");
 }
 
 #[tokio::test]
@@ -268,7 +279,9 @@ async fn webhook_image_downloads_and_dispatches() {
         server.uri()
     );
 
-    ch.handle_webhook(&body).await.expect("webhook should succeed");
+    ch.handle_webhook(&body)
+        .await
+        .expect("webhook should succeed");
 
     let msgs = received.lock().expect("lock");
     assert_eq!(msgs.len(), 1, "image webhook should dispatch once");
@@ -316,7 +329,9 @@ async fn webhook_image_via_attachments_array() {
         server.uri()
     );
 
-    ch.handle_webhook(&body).await.expect("webhook should succeed");
+    ch.handle_webhook(&body)
+        .await
+        .expect("webhook should succeed");
 
     let msgs = received.lock().expect("lock");
     assert_eq!(msgs.len(), 1, "image-via-attachments should dispatch once");
@@ -343,7 +358,9 @@ async fn webhook_unknown_event_is_skipped() {
         "sender": { "id": "Z99999" }
     }"#;
 
-    ch.handle_webhook(body).await.expect("webhook should succeed");
+    ch.handle_webhook(body)
+        .await
+        .expect("webhook should succeed");
 
     let msgs = received.lock().expect("lock");
     assert_eq!(msgs.len(), 0, "unknown event should be skipped");

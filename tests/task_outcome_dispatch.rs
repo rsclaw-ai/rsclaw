@@ -16,17 +16,17 @@ use std::sync::Arc;
 use rsclaw::{
     MemoryTier,
     gateway::task_queue::{
-        decide_action, drain_pending_outcome, stage_pending_outcome, Completion,
-        DispatchAction, Priority, QueuedMessage, Recommend, StructuredOutcome,
-        TaskOutcome, TaskQueueManager, TaskStatus,
+        Completion, DispatchAction, Priority, QueuedMessage, Recommend, StructuredOutcome,
+        TaskOutcome, TaskQueueManager, TaskStatus, decide_action, drain_pending_outcome,
+        stage_pending_outcome,
     },
     store::redb_store::RedbStore,
 };
 
 fn open_manager() -> (Arc<TaskQueueManager>, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let store = RedbStore::open(&dir.path().join("queue.redb"), MemoryTier::Low)
-        .expect("open redb");
+    let store =
+        RedbStore::open(&dir.path().join("queue.redb"), MemoryTier::Low).expect("open redb");
     let manager = Arc::new(TaskQueueManager::new(Arc::new(store)));
     (manager, dir)
 }

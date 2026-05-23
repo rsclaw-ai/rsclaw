@@ -26,12 +26,7 @@ pub async fn cmd_skills(sub: SkillsCommand) -> Result<()> {
                 );
                 for s in skills {
                     let desc = s.description.as_deref().unwrap_or("-");
-                    println!(
-                        "{:<24} {:<8} {}",
-                        cyan(&s.name),
-                        s.tools.len(),
-                        desc
-                    );
+                    println!("{:<24} {:<8} {}", cyan(&s.name), s.tools.len(), desc);
                 }
             }
         }
@@ -39,19 +34,34 @@ pub async fn cmd_skills(sub: SkillsCommand) -> Result<()> {
             Some(s) => {
                 println!("{}", bold(&s.name));
                 println!();
-                println!("  {:<14} {}", dim("Version"), s.version.as_deref().unwrap_or("-"));
-                println!("  {:<14} {}", dim("Description"), s.description.as_deref().unwrap_or("-"));
+                println!(
+                    "  {:<14} {}",
+                    dim("Version"),
+                    s.version.as_deref().unwrap_or("-")
+                );
+                println!(
+                    "  {:<14} {}",
+                    dim("Description"),
+                    s.description.as_deref().unwrap_or("-")
+                );
                 if !s.tools.is_empty() {
                     println!();
                     println!("  {} ({})", bold("Tools"), s.tools.len());
                     for t in &s.tools {
-                        println!("    {} {}", cyan(&t.name), dim(&format!("-- {}", t.description)));
+                        println!(
+                            "    {} {}",
+                            cyan(&t.name),
+                            dim(&format!("-- {}", t.description))
+                        );
                     }
                 }
             }
             None => {
                 eprintln!("Skill '{}' not found locally.", skill);
-                eprintln!("Use `rsclaw skills search {}` to find it on the registry.", skill);
+                eprintln!(
+                    "Use `rsclaw skills search {}` to find it on the registry.",
+                    skill
+                );
                 std::process::exit(1);
             }
         },
@@ -77,9 +87,10 @@ pub async fn cmd_skills(sub: SkillsCommand) -> Result<()> {
         SkillsCommand::Install { name } => {
             let client = skill::clawhub::ClawhubClient::new().with_language(language.clone());
             // Check if already installed before printing "Installing".
-            let dir_name = name.rsplit_once('@').map(|(_, s)| s).unwrap_or(
-                name.rsplit('/').next().unwrap_or(&name)
-            );
+            let dir_name = name
+                .rsplit_once('@')
+                .map(|(_, s)| s)
+                .unwrap_or(name.rsplit('/').next().unwrap_or(&name));
             let already = skill::clawhub::ClawhubClient::check_installed(&global_dir, dir_name);
             if already {
                 print!("Checking '{}'... ", cyan(&name));
@@ -104,11 +115,18 @@ pub async fn cmd_skills(sub: SkillsCommand) -> Result<()> {
                 }
             };
             if already {
-                println!("{}", dim(&format!("already up to date (v{})", locked.version)));
+                println!(
+                    "{}",
+                    dim(&format!("already up to date (v{})", locked.version))
+                );
             } else {
                 println!(
                     "{}",
-                    green(&format!("v{} -> {}", locked.version, locked.install_dir.display()))
+                    green(&format!(
+                        "v{} -> {}",
+                        locked.version,
+                        locked.install_dir.display()
+                    ))
                 );
             }
         }
@@ -139,14 +157,17 @@ pub async fn cmd_skills(sub: SkillsCommand) -> Result<()> {
                             println!(
                                 "{:<36} {:>10} {:>8}  {:<12}  {}",
                                 bold("NAME"),
-                                bold("INSTALLS"), bold("STARS"),
+                                bold("INSTALLS"),
+                                bold("STARS"),
                                 bold("REGISTRY"),
                                 bold("DESCRIPTION"),
                             );
                         } else {
                             println!(
                                 "{:<36}  {:<12}  {}",
-                                bold("NAME"), bold("REGISTRY"), bold("DESCRIPTION"),
+                                bold("NAME"),
+                                bold("REGISTRY"),
+                                bold("DESCRIPTION"),
                             );
                         }
                         for r in &results {
@@ -158,17 +179,19 @@ pub async fn cmd_skills(sub: SkillsCommand) -> Result<()> {
                             };
                             let reg = r.registry.as_str();
                             if has_stats {
-                                let inst = r.installs.map(format_count).unwrap_or_else(|| "-".into());
+                                let inst =
+                                    r.installs.map(format_count).unwrap_or_else(|| "-".into());
                                 let stars = r.stars.map(format_count).unwrap_or_else(|| "-".into());
                                 println!(
                                     "{:<36} {:>10} {:>8}  {:<12}  {}",
-                                    cyan(&r.slug), inst, stars, dim(reg), desc,
+                                    cyan(&r.slug),
+                                    inst,
+                                    stars,
+                                    dim(reg),
+                                    desc,
                                 );
                             } else {
-                                println!(
-                                    "{:<36}  {:<12}  {}",
-                                    cyan(&r.slug), dim(reg), desc,
-                                );
+                                println!("{:<36}  {:<12}  {}", cyan(&r.slug), dim(reg), desc,);
                             }
                         }
                         println!();

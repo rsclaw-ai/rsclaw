@@ -8,8 +8,10 @@
 
 use std::{
     collections::HashMap,
-    sync::Arc,
-    sync::atomic::{AtomicBool, AtomicUsize},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize},
+    },
     time::Instant,
 };
 
@@ -32,7 +34,8 @@ pub enum AgentKind {
     Main,
     /// User-created persistent agent. Saved to config file, survives restarts.
     Named,
-    /// LLM-spawned temporary agent (`persistent: false`). Lives in memory, gone on restart.
+    /// LLM-spawned temporary agent (`persistent: false`). Lives in memory, gone
+    /// on restart.
     Sub,
     /// One-shot task agent. Automatically destroyed after completion.
     Task,
@@ -62,10 +65,12 @@ pub struct AgentHandle {
     pub started_at: Instant,
     /// Number of active sessions (updated after each turn for /status).
     pub session_count: Arc<AtomicUsize>,
-    /// Per-session context token stats, updated by normal conversation LLM calls only.
+    /// Per-session context token stats, updated by normal conversation LLM
+    /// calls only.
     pub session_tokens: Arc<std::sync::RwLock<HashMap<String, SessionTokens>>>,
-    /// Total context tokens of the most recent turn (sys + tools + msgs + scratchpad).
-    /// Updated by runtime for /status so the number matches what the LLM actually saw.
+    /// Total context tokens of the most recent turn (sys + tools + msgs +
+    /// scratchpad). Updated by runtime for /status so the number matches
+    /// what the LLM actually saw.
     pub last_ctx_tokens: Arc<AtomicUsize>,
     /// System prompt tokens of the most recent LLM call.
     pub last_sys_tokens: Arc<AtomicUsize>,
@@ -73,7 +78,8 @@ pub struct AgentHandle {
     pub last_tools_tokens: Arc<AtomicUsize>,
     /// Message-history tokens of the most recent LLM call.
     pub last_msg_tokens: Arc<AtomicUsize>,
-    /// Signal to clear all sessions (set by /clear bypass, consumed by runtime).
+    /// Signal to clear all sessions (set by /clear bypass, consumed by
+    /// runtime).
     pub clear_signal: Arc<AtomicBool>,
     /// Signal to start a new session (set by /new bypass, consumed by runtime).
     /// Unlike clear_signal, this increments the archive generation.
@@ -115,22 +121,36 @@ impl AgentHandle {
         }
     }
 
-    /// Unified status string used by all channels (desktop WS, feishu, telegram, etc.).
+    /// Unified status string used by all channels (desktop WS, feishu,
+    /// telegram, etc.).
     pub fn format_status(&self) -> String {
         use crate::agent::prompt_builder::format_duration;
 
-        let model = self.config.model.as_ref()
+        let model = self
+            .config
+            .model
+            .as_ref()
             .and_then(|m| m.primary.as_deref())
             .unwrap_or("default");
-        let sessions = self.session_count.load(std::sync::atomic::Ordering::Relaxed);
+        let sessions = self
+            .session_count
+            .load(std::sync::atomic::Ordering::Relaxed);
         let uptime = format_duration(self.started_at.elapsed());
-        let os = if cfg!(target_os = "macos") { "macOS" }
-            else if cfg!(target_os = "linux") {
-                if std::env::var("ANDROID_ROOT").is_ok() { "Android" } else { "Linux" }
+        let os = if cfg!(target_os = "macos") {
+            "macOS"
+        } else if cfg!(target_os = "linux") {
+            if std::env::var("ANDROID_ROOT").is_ok() {
+                "Android"
+            } else {
+                "Linux"
             }
-            else if cfg!(target_os = "windows") { "Windows" }
-            else if cfg!(target_os = "ios") { "iOS" }
-            else { "Unknown" };
+        } else if cfg!(target_os = "windows") {
+            "Windows"
+        } else if cfg!(target_os = "ios") {
+            "iOS"
+        } else {
+            "Unknown"
+        };
         // Resolution chain (already done at AgentHandle construction):
         //   1. agent.model.contextTokens
         //   2. agents.defaults.contextTokens
@@ -148,7 +168,11 @@ impl AgentHandle {
             } else {
                 for (key, t) in map.iter() {
                     let short_key = if key.len() > 20 { &key[..20] } else { key };
-                    let pct = if ctx_limit > 0 { t.total * 100 / ctx_limit } else { 0 };
+                    let pct = if ctx_limit > 0 {
+                        t.total * 100 / ctx_limit
+                    } else {
+                        0
+                    };
                     ctx_lines.push_str(&format!(
                         "Context [{short_key}]:\n\
                          \u{A0} system  ~{:.1}k\n\
@@ -206,8 +230,7 @@ pub struct TurnContext {
     pub context_id: Option<String>,
     pub event_tx: Option<tokio::sync::mpsc::Sender<crate::a2a::event::AgentEvent>>,
     pub cancel_token: Option<tokio_util::sync::CancellationToken>,
-    pub input_request_tx:
-        Option<tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<String>>>,
+    pub input_request_tx: Option<tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<String>>>,
 }
 
 impl TurnContext {
@@ -215,9 +238,7 @@ impl TurnContext {
     /// token was tripped for any other reason). Runtime polls this between
     /// iterations of the agent loop and at every tool-dispatch boundary.
     pub fn is_cancelled(&self) -> bool {
-        self.cancel_token
-            .as_ref()
-            .is_some_and(|t| t.is_cancelled())
+        self.cancel_token.as_ref().is_some_and(|t| t.is_cancelled())
     }
 
     /// Publish a `TASK_STATE_WORKING` status-update with a human-readable
@@ -287,8 +308,8 @@ pub struct AgentMessage {
     pub account: Option<String>,
     /// Peer / user ID (used for session isolation).
     pub peer_id: String,
-    /// Chat/conversation ID for replies (for platforms like Feishu where reply ID differs from user ID).
-    /// If empty, defaults to peer_id.
+    /// Chat/conversation ID for replies (for platforms like Feishu where reply
+    /// ID differs from user ID). If empty, defaults to peer_id.
     pub chat_id: String,
     /// One-shot sender for the agent's response.
     pub reply_tx: tokio::sync::oneshot::Sender<AgentReply>,
@@ -308,10 +329,9 @@ pub struct AgentMessage {
     /// channels pass `None`.
     pub cancel_token: Option<tokio_util::sync::CancellationToken>,
     /// Optional channel for the runtime to register a `SuspendedTask` resume
-    /// handle when it needs to ask the caller for more input (TASK_STATE_INPUT_REQUIRED).
-    /// Legacy channels pass `None`.
-    pub input_request_tx:
-        Option<tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<String>>>,
+    /// handle when it needs to ask the caller for more input
+    /// (TASK_STATE_INPUT_REQUIRED). Legacy channels pass `None`.
+    pub input_request_tx: Option<tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<String>>>,
     /// External tool definitions forwarded from the OAI /v1/chat/completions
     /// caller. These are merged into the agent's tool list for the turn.
     pub extra_tools: Vec<crate::provider::ToolDef>,
@@ -373,15 +393,22 @@ pub fn extract_file_refs(text: &str) -> (String, Vec<ImageAttachment>, Vec<FileA
                 .unwrap_or_else(|| path_str.to_owned());
             let mime = match lower.rsplit('.').next() {
                 Some("pdf") => "application/pdf",
-                Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                Some("docx") => {
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                }
                 Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                Some("pptx") => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                Some("txt" | "md" | "rs" | "py" | "js" | "ts" | "json" | "toml" | "yaml" | "yml") => "text/plain",
+                Some("pptx") => {
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                }
+                Some(
+                    "txt" | "md" | "rs" | "py" | "js" | "ts" | "json" | "toml" | "yaml" | "yml",
+                ) => "text/plain",
                 Some("mp4") => "video/mp4",
                 Some("mp3") => "audio/mpeg",
                 Some("wav") => "audio/wav",
                 _ => "application/octet-stream",
-            }.to_owned();
+            }
+            .to_owned();
             files.push(FileAttachment {
                 filename,
                 data,
@@ -441,12 +468,13 @@ pub struct AgentReply {
     /// Without this flag, WS subscribers (the desktop chat UI) wait forever
     /// for the terminator and the input freezes.
     pub needs_outer_done_emit: bool,
-    /// Why the turn ended. `Ok` = normal success (publish Artifact + Completed).
-    /// `Error(_)` = `run_turn` returned `Err` and the gateway wrapped it as
-    /// a text reply; A2A consumers should publish `Failed`, not `Completed`.
-    /// `Canceled` = `run_turn` returned `Err` because the A2A cancel_token
-    /// fired; the CancelTask dispatcher has already published `Canceled` and
-    /// closed the bus, so A2A consumers must NOT republish a terminal status.
+    /// Why the turn ended. `Ok` = normal success (publish Artifact +
+    /// Completed). `Error(_)` = `run_turn` returned `Err` and the gateway
+    /// wrapped it as a text reply; A2A consumers should publish `Failed`,
+    /// not `Completed`. `Canceled` = `run_turn` returned `Err` because the
+    /// A2A cancel_token fired; the CancelTask dispatcher has already
+    /// published `Canceled` and closed the bus, so A2A consumers must NOT
+    /// republish a terminal status.
     pub outcome: ReplyOutcome,
 }
 
@@ -552,7 +580,10 @@ impl AgentRegistry {
             .unwrap_or(DEFAULT_MAX_CONCURRENT) as usize;
 
         {
-            let mut inner = registry.inner.write().expect("agent registry lock poisoned");
+            let mut inner = registry
+                .inner
+                .write()
+                .expect("agent registry lock poisoned");
 
             for entry in &agent_list {
                 let (tx, rx) = mpsc::channel::<AgentMessage>(32);
@@ -662,7 +693,8 @@ impl AgentRegistry {
     /// Route a message to the correct agent for a specific channel account.
     ///
     /// Routing priority:
-    ///   1. Agents with `channels` containing `"channel:account"` (exact match).
+    ///   1. Agents with `channels` containing `"channel:account"` (exact
+    ///      match).
     ///   2. Agents with `channels` containing `"channel"` (bare channel match).
     ///   3. Default agent (fallback).
     pub fn route_account(&self, channel: &str, account: Option<&str>) -> Result<Arc<AgentHandle>> {
@@ -716,11 +748,19 @@ impl AgentRegistry {
     }
 
     pub fn len(&self) -> usize {
-        self.inner.read().expect("agent registry lock poisoned").agents.len()
+        self.inner
+            .read()
+            .expect("agent registry lock poisoned")
+            .agents
+            .len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.read().expect("agent registry lock poisoned").agents.is_empty()
+        self.inner
+            .read()
+            .expect("agent registry lock poisoned")
+            .agents
+            .is_empty()
     }
 
     pub fn all(&self) -> Vec<Arc<AgentHandle>> {
@@ -758,8 +798,8 @@ mod tests {
                 bind_address: None,
                 reload: ReloadMode::Hybrid,
                 auth_token: None,
-            a2a_principals: vec![],
-            a2a_max_body_bytes: 100 * 1024 * 1024,
+                a2a_principals: vec![],
+                a2a_max_body_bytes: 100 * 1024 * 1024,
                 allow_tailscale: false,
                 channel_health_check_minutes: 5,
                 channel_stale_event_threshold_minutes: 30,

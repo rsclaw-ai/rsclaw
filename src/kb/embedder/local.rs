@@ -10,10 +10,12 @@
 //! batching is a follow-up (the OpenAi `/v1/embeddings` endpoint
 //! accepts an array, so a batched remote path is a clean upgrade).
 
+use std::path::Path;
+
+use anyhow::{Context, Result};
+
 use super::KbEmbedder;
 use crate::embed::{Embedder, EmbedderBackend, LocalBgeEmbedder, OpenAiEmbedder};
-use anyhow::{Context, Result};
-use std::path::Path;
 
 pub struct LocalKbEmbedder {
     backend: EmbedderBackend,

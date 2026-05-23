@@ -5,13 +5,14 @@
 //! what gotchas to expect, how to recover. Complements the cluster-based
 //! `crystallizer` module which captures *facts* from repeated recall.
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result};
 
-use crate::agent::turn_metrics::TurnMetrics;
-use crate::provider::registry::ProviderRegistry;
+use crate::{agent::turn_metrics::TurnMetrics, provider::registry::ProviderRegistry};
 
 /// Build the LLM prompt for workflow distillation. Receives the raw turn
 /// transcript so the model can extract the steps, errors, and recovery

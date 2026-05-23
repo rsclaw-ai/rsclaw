@@ -3,8 +3,10 @@
 //! Tests public utility functions: `json_path_extract`, `parse_inbound`, and
 //! the template/env-var expansion logic (via `parse_inbound` + webhook flow).
 
-use rsclaw::channel::custom::{json_path_extract, parse_inbound};
-use rsclaw::config::schema::CustomChannelConfig;
+use rsclaw::{
+    channel::custom::{json_path_extract, parse_inbound},
+    config::schema::CustomChannelConfig,
+};
 use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
@@ -100,10 +102,7 @@ fn json_path_deep_nesting() {
 #[test]
 fn json_path_without_dollar_prefix() {
     let v: Value = json!({"x": 42});
-    assert_eq!(
-        json_path_extract(&v, "x"),
-        Some(&Value::Number(42.into()))
-    );
+    assert_eq!(json_path_extract(&v, "x"), Some(&Value::Number(42.into())));
 }
 
 /// Empty path returns the root value.
@@ -144,13 +143,7 @@ fn parse_inbound_basic() {
 /// Filter mismatch returns None.
 #[test]
 fn parse_inbound_filter_mismatch() {
-    let cfg = cfg_with_paths(
-        Some("$.event"),
-        Some("message"),
-        Some("$.text"),
-        None,
-        None,
-    );
+    let cfg = cfg_with_paths(Some("$.event"), Some("message"), Some("$.text"), None, None);
     let body = r#"{"event":"heartbeat","text":"ping"}"#;
     assert!(parse_inbound(&cfg, body).is_none());
 }

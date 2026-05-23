@@ -1,24 +1,36 @@
 //! cmd_kb: dispatches the `rsclaw kb ...` subcommands.
 
-use crate::cli::kb::KbCommand;
-use crate::kb::compactor::run_compactor_tick;
-use crate::kb::model::{CallerScope, KbStatus, KbVisibility};
-use crate::kb::store::{docs, KbStore};
-use crate::kb::sync::{KbSourceSyncer, ManualUploadSyncer, SyncContext, SyncReason, UrlSyncer};
-use crate::kb::tools::{kb_fetch, kb_list_docs, kb_search};
-use crate::kb::worker::{DefaultDispatcher, HandlerCtx, WorkerConfig, WorkerPool};
-use crate::kb::{KbEmbedder, KbIndex, KbPaths};
-use crate::kb::search::SearchCtx;
+use std::{path::PathBuf, sync::Arc};
+
 use anyhow::{Context, Result};
-use std::path::PathBuf;
-use std::sync::Arc;
+
+use crate::{
+    cli::kb::KbCommand,
+    kb::{
+        KbEmbedder, KbIndex, KbPaths,
+        compactor::run_compactor_tick,
+        model::{CallerScope, KbStatus, KbVisibility},
+        search::SearchCtx,
+        store::{KbStore, docs},
+        sync::{KbSourceSyncer, ManualUploadSyncer, SyncContext, SyncReason, UrlSyncer},
+        tools::{kb_fetch, kb_list_docs, kb_search},
+        worker::{DefaultDispatcher, HandlerCtx, WorkerConfig, WorkerPool},
+    },
+};
 
 pub async fn cmd_kb(cmd: KbCommand, kb_root: PathBuf) -> Result<()> {
     match cmd {
-        KbCommand::Add { path_or_url, tags, recursive, ext } => {
-            add(kb_root, path_or_url, tags, recursive, ext).await
-        }
-        KbCommand::Ls { tag, source_kind, limit } => ls(kb_root, tag, source_kind, limit),
+        KbCommand::Add {
+            path_or_url,
+            tags,
+            recursive,
+            ext,
+        } => add(kb_root, path_or_url, tags, recursive, ext).await,
+        KbCommand::Ls {
+            tag,
+            source_kind,
+            limit,
+        } => ls(kb_root, tag, source_kind, limit),
         KbCommand::Rm { doc_id, tag, yes } => rm(kb_root, doc_id, tag, yes),
         KbCommand::Search { query, k, json } => search(kb_root, query, k, json),
         KbCommand::Show { id } => show(kb_root, id),
@@ -26,9 +38,11 @@ pub async fn cmd_kb(cmd: KbCommand, kb_root: PathBuf) -> Result<()> {
         KbCommand::Compact => compact(kb_root),
         KbCommand::Stats => stats(kb_root),
         KbCommand::Export { doc_id, to } => export(kb_root, doc_id, to),
-        KbCommand::SyncAll { interval_min, max, dry_run } => {
-            sync_all(kb_root, interval_min, max, dry_run).await
-        }
+        KbCommand::SyncAll {
+            interval_min,
+            max,
+            dry_run,
+        } => sync_all(kb_root, interval_min, max, dry_run).await,
     }
 }
 
@@ -53,9 +67,13 @@ fn open_kb(kb_root: &PathBuf) -> Result<Handles> {
     let dim = embedder.dimension();
     let index =
         Arc::new(KbIndex::open_and_rebuild_with_dim(&paths, &store, dim).context("open index")?);
-    Ok(Handles { store, paths, index, embedder })
+    Ok(Handles {
+        store,
+        paths,
+        index,
+        embedder,
+    })
 }
-
 
 async fn add(
     kb_root: PathBuf,
@@ -72,8 +90,7 @@ async fn add(
         embedder: h.embedder.clone(),
     };
 
-    let is_url =
-        path_or_url.starts_with("http://") || path_or_url.starts_with("https://");
+    let is_url = path_or_url.starts_with("http://") || path_or_url.starts_with("https://");
     if is_url {
         let syncer = UrlSyncer {
             url: path_or_url.clone(),
@@ -183,12 +200,7 @@ fn drain_worker(h: &Handles) -> Result<()> {
     Ok(())
 }
 
-fn ls(
-    kb_root: PathBuf,
-    tag: Vec<String>,
-    source_kind: Option<String>,
-    limit: usize,
-) -> Result<()> {
+fn ls(kb_root: PathBuf, tag: Vec<String>, source_kind: Option<String>, limit: usize) -> Result<()> {
     let h = open_kb(&kb_root)?;
     let ctx = search_ctx(&h);
     let out = kb_list_docs::run(
@@ -225,12 +237,7 @@ fn ls(
     Ok(())
 }
 
-fn rm(
-    kb_root: PathBuf,
-    doc_id: Option<String>,
-    tag: Option<String>,
-    yes: bool,
-) -> Result<()> {
+fn rm(kb_root: PathBuf, doc_id: Option<String>, tag: Option<String>, yes: bool) -> Result<()> {
     let h = open_kb(&kb_root)?;
     if !yes {
         eprintln!("Refusing to tombstone without --yes (this is a destructive operation).");
@@ -248,8 +255,8 @@ fn rm(
 
 fn rm_by_id(h: &Handles, doc_id: String) -> Result<()> {
     let rtx = h.store.begin_read()?;
-    let mut d = docs::get(&rtx, &doc_id)?
-        .ok_or_else(|| anyhow::anyhow!("doc not found: {doc_id}"))?;
+    let mut d =
+        docs::get(&rtx, &doc_id)?.ok_or_else(|| anyhow::anyhow!("doc not found: {doc_id}"))?;
     drop(rtx);
     d.status = KbStatus::Tombstoned;
     let wtx = h.store.begin_write()?;
@@ -260,8 +267,9 @@ fn rm_by_id(h: &Handles, doc_id: String) -> Result<()> {
 }
 
 fn rm_by_tag(h: &Handles, tag: &str) -> Result<()> {
-    use crate::kb::store::codec::decode;
     use redb::ReadableTable;
+
+    use crate::kb::store::codec::decode;
     let rtx = h.store.begin_read()?;
     let mut to_tombstone: Vec<crate::kb::model::KbDoc> = Vec::new();
     {
@@ -377,8 +385,7 @@ fn show(kb_root: PathBuf, id: String) -> Result<()> {
     if !doc.tags.is_empty() {
         println!("tags:      {}", doc.tags.join(", "));
     }
-    let chunks_list =
-        crate::kb::store::chunks::chunks_for_logical(&rtx, &doc.logical_source_id)?;
+    let chunks_list = crate::kb::store::chunks::chunks_for_logical(&rtx, &doc.logical_source_id)?;
     let mut chunks_this_version: Vec<_> = chunks_list
         .into_iter()
         .filter(|c| c.doc_id == doc.id)
@@ -433,8 +440,8 @@ fn set_visibility(kb_root: PathBuf, doc_id: String, visibility: String) -> Resul
     let new_vis = parse_visibility(&visibility)
         .ok_or_else(|| anyhow::anyhow!("invalid visibility: {visibility}"))?;
     let rtx = h.store.begin_read()?;
-    let mut d = docs::get(&rtx, &doc_id)?
-        .ok_or_else(|| anyhow::anyhow!("doc not found: {doc_id}"))?;
+    let mut d =
+        docs::get(&rtx, &doc_id)?.ok_or_else(|| anyhow::anyhow!("doc not found: {doc_id}"))?;
     drop(rtx);
     d.visibility = new_vis;
     let wtx = h.store.begin_write()?;
@@ -450,9 +457,13 @@ fn parse_visibility(s: &str) -> Option<KbVisibility> {
         "private" => Some(KbVisibility::Private),
         _ => {
             if let Some(id) = s.strip_prefix("agent:") {
-                Some(KbVisibility::Agent { agent_id: id.to_string() })
+                Some(KbVisibility::Agent {
+                    agent_id: id.to_string(),
+                })
             } else if let Some(id) = s.strip_prefix("channel:") {
-                Some(KbVisibility::Channel { channel_id: id.to_string() })
+                Some(KbVisibility::Channel {
+                    channel_id: id.to_string(),
+                })
             } else {
                 None
             }
@@ -487,8 +498,9 @@ fn compact(kb_root: PathBuf) -> Result<()> {
 }
 
 fn stats(kb_root: PathBuf) -> Result<()> {
-    use crate::kb::store::codec::decode;
     use redb::ReadableTable;
+
+    use crate::kb::store::codec::decode;
     let h = open_kb(&kb_root)?;
     let rtx = h.store.begin_read()?;
     let mut counts = serde_json::Map::new();
@@ -505,7 +517,10 @@ fn stats(kb_root: PathBuf) -> Result<()> {
             _ => {}
         }
     }
-    counts.insert("docs_active".into(), serde_json::Value::Number(active.into()));
+    counts.insert(
+        "docs_active".into(),
+        serde_json::Value::Number(active.into()),
+    );
     counts.insert(
         "docs_tombstoned".into(),
         serde_json::Value::Number(tombstoned.into()),
@@ -517,10 +532,7 @@ fn stats(kb_root: PathBuf) -> Result<()> {
         ("kb_jobs_by_id", crate::kb::store::schema::KB_JOBS_BY_ID),
         ("kb_seen_items", crate::kb::store::schema::KB_SEEN_ITEMS),
         ("kb_entities", crate::kb::store::schema::KB_ENTITIES),
-        (
-            "kb_entity_index",
-            crate::kb::store::schema::KB_ENTITY_INDEX,
-        ),
+        ("kb_entity_index", crate::kb::store::schema::KB_ENTITY_INDEX),
     ] {
         let tbl = rtx.open_table(td)?;
         let n = tbl.iter()?.count();
@@ -564,18 +576,14 @@ fn total_size(root: &PathBuf) -> u64 {
 /// than `interval_min` minutes. Cap concurrency at `max`. Spec §S's
 /// long-term plan is a gateway-resident background task; until that
 /// lands users (or their cron job) can call this CLI directly.
-async fn sync_all(
-    kb_root: PathBuf,
-    interval_min: u64,
-    max: usize,
-    dry_run: bool,
-) -> Result<()> {
-    use crate::kb::canonicalize::canonicalize_url;
-    use crate::kb::store::codec::decode;
-    use crate::kb::store::schema::KB_DOCS;
-    use crate::kb::store::seen::get_sync_state;
-    use crate::kb::sync::{KbSourceSyncer, SyncContext, SyncReason, UrlSyncer};
+async fn sync_all(kb_root: PathBuf, interval_min: u64, max: usize, dry_run: bool) -> Result<()> {
     use redb::ReadableTable;
+
+    use crate::kb::{
+        canonicalize::canonicalize_url,
+        store::{codec::decode, schema::KB_DOCS, seen::get_sync_state},
+        sync::{KbSourceSyncer, SyncContext, SyncReason, UrlSyncer},
+    };
 
     let h = open_kb(&kb_root)?;
     let cutoff_ms = chrono::Utc::now().timestamp_millis() - (interval_min as i64) * 60_000;
@@ -663,8 +671,8 @@ async fn sync_all(
 fn export(kb_root: PathBuf, doc_id: String, to: PathBuf) -> Result<()> {
     let h = open_kb(&kb_root)?;
     let rtx = h.store.begin_read()?;
-    let doc = docs::get(&rtx, &doc_id)?
-        .ok_or_else(|| anyhow::anyhow!("doc not found: {doc_id}"))?;
+    let doc =
+        docs::get(&rtx, &doc_id)?.ok_or_else(|| anyhow::anyhow!("doc not found: {doc_id}"))?;
     if !doc.visible_to(&CallerScope::default()) {
         anyhow::bail!("doc not visible to current scope");
     }
@@ -673,11 +681,17 @@ fn export(kb_root: PathBuf, doc_id: String, to: PathBuf) -> Result<()> {
         .with_context(|| format!("read {}", abs.display()))?;
     if let Some(parent) = to.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("mkdir {}", parent.display()))?;
         }
     }
     std::fs::write(&to, &body).with_context(|| format!("write {}", to.display()))?;
-    println!("wrote {} ({} bytes) → {}", doc.title, body.len(), to.display());
+    println!(
+        "wrote {} ({} bytes) → {}",
+        doc.title,
+        body.len(),
+        to.display()
+    );
     Ok(())
 }
 

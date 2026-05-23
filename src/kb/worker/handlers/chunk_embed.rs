@@ -2,14 +2,17 @@
 //! chunks to redb, mark ledger IndexingComplete. Idempotent —
 //! deterministic chunk_ids mean re-running produces identical rows.
 
-use crate::kb::chunker::{chunk_markdown, ChunkerInput, LocatorKind};
-use crate::kb::content_store::read::read_doc_body;
-use crate::kb::entities::extract::{canonical_id, extract_entities};
-use crate::kb::ledger::LedgerStatus;
-use crate::kb::model::{KbChunk, KbEntity, KbEntityIndex, LogicalSourceId};
-use crate::kb::store::{chunks, docs, entities, ledger};
-use crate::kb::worker::handlers::HandlerCtx;
 use anyhow::{Context, Result};
+
+use crate::kb::{
+    chunker::{ChunkerInput, LocatorKind, chunk_markdown},
+    content_store::read::read_doc_body,
+    entities::extract::{canonical_id, extract_entities},
+    ledger::LedgerStatus,
+    model::{KbChunk, KbEntity, KbEntityIndex, LogicalSourceId},
+    store::{chunks, docs, entities, ledger},
+    worker::handlers::HandlerCtx,
+};
 
 pub fn run(ctx: &HandlerCtx, doc_id: &str, doc_version: u32) -> Result<()> {
     // 1. Load doc + body.
@@ -66,11 +69,8 @@ pub fn run(ctx: &HandlerCtx, doc_id: &str, doc_version: u32) -> Result<()> {
         let now_ms = chrono::Utc::now().timestamp_millis();
 
         // 4a. Drop chunks from prior doc_versions.
-        let removed = chunks::delete_for_doc_version_below(
-            &wtx,
-            &doc.logical_source_id,
-            doc.version,
-        )?;
+        let removed =
+            chunks::delete_for_doc_version_below(&wtx, &doc.logical_source_id, doc.version)?;
         if removed > 0 {
             tracing::info!(
                 doc = %crate::kb::redact(doc_id),
@@ -123,8 +123,8 @@ pub fn run(ctx: &HandlerCtx, doc_id: &str, doc_version: u32) -> Result<()> {
         wtx.commit()?;
     }
 
-    // 5. Update indexes (caches over redb; failures propagate so the
-    //    worker retries the job — chunks are already durable in redb).
+    // 5. Update indexes (caches over redb; failures propagate so the worker retries
+    //    the job — chunks are already durable in redb).
     for c in &chunks_with_vec {
         ctx.index.upsert_chunk(c)?;
     }
@@ -140,14 +140,18 @@ pub fn run(ctx: &HandlerCtx, doc_id: &str, doc_version: u32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::kb::canonicalize::{canonicalize_by_mime, CanonicalizeInput};
-    use crate::kb::embedder::{KbEmbedder, StubEmbedder};
-    use crate::kb::paths::KbPaths;
-    use crate::kb::pipeline::{ingest_canonicalized, IngestInput};
-    use crate::kb::store::KbStore;
     use std::sync::Arc;
+
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::kb::{
+        canonicalize::{CanonicalizeInput, canonicalize_by_mime},
+        embedder::{KbEmbedder, StubEmbedder},
+        paths::KbPaths,
+        pipeline::{IngestInput, ingest_canonicalized},
+        store::KbStore,
+    };
 
     fn fixture() -> (TempDir, HandlerCtx, String) {
         let tmp = TempDir::new().unwrap();
@@ -180,7 +184,12 @@ mod tests {
             },
         )
         .unwrap();
-        let ctx = HandlerCtx { store, paths, embedder, index };
+        let ctx = HandlerCtx {
+            store,
+            paths,
+            embedder,
+            index,
+        };
         (tmp, ctx, out.doc_id)
     }
 
@@ -255,8 +264,7 @@ mod tests {
 
     #[test]
     fn new_version_drops_old_chunks() {
-        use crate::kb::canonicalize::CanonicalizeInput;
-        use crate::kb::model::LogicalSourceId;
+        use crate::kb::{canonicalize::CanonicalizeInput, model::LogicalSourceId};
 
         let tmp = TempDir::new().unwrap();
         let store = Arc::new(KbStore::open(&tmp.path().join("kb.redb")).unwrap());
@@ -264,7 +272,12 @@ mod tests {
         paths.ensure_layout().unwrap();
         let embedder: Arc<dyn KbEmbedder> = Arc::new(StubEmbedder::default());
         let index = Arc::new(crate::kb::index::KbIndex::open(&paths).unwrap());
-        let ctx = HandlerCtx { store: store.clone(), paths: paths.clone(), embedder, index };
+        let ctx = HandlerCtx {
+            store: store.clone(),
+            paths: paths.clone(),
+            embedder,
+            index,
+        };
 
         let lsid = LogicalSourceId("file:custom:rotate".into());
         let mk = |bytes: &[u8]| {

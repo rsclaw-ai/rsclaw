@@ -4,10 +4,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use futures::future::BoxFuture;
-
 use rsclaw::{
-    channel::{Channel, ChannelManager, OutboundMessage},
     MemoryTier,
+    channel::{Channel, ChannelManager, OutboundMessage},
 };
 
 // ---------------------------------------------------------------------------

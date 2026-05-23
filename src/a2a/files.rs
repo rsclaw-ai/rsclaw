@@ -69,10 +69,7 @@ pub struct IngestedParts {
 /// is logged at WARN and that part is dropped — the rest of the message
 /// continues. A2A peers can retry by re-sending; failing the whole turn
 /// would be worse UX than degrading to text-only.
-pub async fn ingest_message_parts(
-    workspace: &Path,
-    parts: &[A2aPart],
-) -> IngestedParts {
+pub async fn ingest_message_parts(workspace: &Path, parts: &[A2aPart]) -> IngestedParts {
     let mut text_parts: Vec<String> = Vec::new();
     let mut ref_tokens: Vec<String> = Vec::new();
     let mut data_blocks: Vec<String> = Vec::new();
@@ -124,11 +121,7 @@ pub async fn ingest_message_parts(
 fn ingest_raw(workspace: &Path, bytes_b64: &str, mime_type: &str) -> Result<String> {
     // Tolerate `data:<mime>;base64,<payload>` prefixes — some clients
     // send the whole data URI in the `bytes` field.
-    let payload = bytes_b64
-        .split(',')
-        .next_back()
-        .unwrap_or(bytes_b64)
-        .trim();
+    let payload = bytes_b64.split(',').next_back().unwrap_or(bytes_b64).trim();
     let raw = base64::engine::general_purpose::STANDARD
         .decode(payload)
         .context("base64 decode")?;
@@ -212,12 +205,19 @@ pub fn emit_reply_parts(
         if src.starts_with("http://") || src.starts_with("https://") {
             parts.push(A2aPart::Url {
                 url: src.clone(),
-                mime_type: if mime.is_empty() { None } else { Some(mime.clone()) },
+                mime_type: if mime.is_empty() {
+                    None
+                } else {
+                    Some(mime.clone())
+                },
             });
             continue;
         }
         match emit_part_from_path(Path::new(src)) {
-            Ok(A2aPart::Raw { bytes, mime_type: _ }) if !mime.is_empty() => {
+            Ok(A2aPart::Raw {
+                bytes,
+                mime_type: _,
+            }) if !mime.is_empty() => {
                 // Prefer the runtime-declared mime over the extension-sniffed one.
                 parts.push(A2aPart::Raw {
                     bytes,
@@ -279,8 +279,9 @@ fn mime_for_path(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     #[test]
     fn a2a_filename_uses_a2a_prefix_and_correct_kind() {
@@ -308,7 +309,9 @@ mod tests {
     async fn ingest_message_parts_text_only_round_trips() {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path();
-        let parts = vec![A2aPart::Text { text: "hello world".into() }];
+        let parts = vec![A2aPart::Text {
+            text: "hello world".into(),
+        }];
         let got = ingest_message_parts(ws, &parts).await;
         assert_eq!(got.text, "hello world");
     }
@@ -320,7 +323,9 @@ mod tests {
         // 1x1 transparent PNG.
         let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
         let parts = vec![
-            A2aPart::Text { text: "see attached".into() },
+            A2aPart::Text {
+                text: "see attached".into(),
+            },
             A2aPart::Raw {
                 bytes: png_b64.into(),
                 mime_type: "image/png".into(),
@@ -333,7 +338,14 @@ mod tests {
         let dir = ws.join("a2a").join("images");
         let files: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
         assert_eq!(files.len(), 1);
-        assert!(files[0].as_ref().unwrap().file_name().to_string_lossy().ends_with(".png"));
+        assert!(
+            files[0]
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".png")
+        );
     }
 
     #[tokio::test]
@@ -341,8 +353,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path();
         let parts = vec![
-            A2aPart::Text { text: "see structured".into() },
-            A2aPart::Data { data: json!({ "k": "v" }) },
+            A2aPart::Text {
+                text: "see structured".into(),
+            },
+            A2aPart::Data {
+                data: json!({ "k": "v" }),
+            },
         ];
         let got = ingest_message_parts(ws, &parts).await;
         assert!(got.text.contains("see structured"));
@@ -359,7 +375,9 @@ mod tests {
         match part {
             A2aPart::Raw { bytes, mime_type } => {
                 assert_eq!(mime_type, "image/png");
-                let decoded = base64::engine::general_purpose::STANDARD.decode(&bytes).unwrap();
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(&bytes)
+                    .unwrap();
                 assert!(decoded.starts_with(b"\x89PNG"));
             }
             other => panic!("expected Raw, got {other:?}"),

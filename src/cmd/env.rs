@@ -7,8 +7,10 @@
 
 use anyhow::Result;
 
-use crate::cli::{EnvCommand, EnvSyncArgs};
-use crate::config::{env_file, env_resolution, loader};
+use crate::{
+    cli::{EnvCommand, EnvSyncArgs},
+    config::{env_file, env_resolution, loader},
+};
 
 pub async fn cmd_env(sub: EnvCommand) -> Result<()> {
     match sub {
@@ -94,9 +96,7 @@ async fn env_sync(args: EnvSyncArgs) -> Result<()> {
         for v in &still_missing {
             println!("    ? {v}");
         }
-        println!(
-            "\n    Set these in your shell (e.g. ~/.zshrc) and re-run, or edit"
-        );
+        println!("\n    Set these in your shell (e.g. ~/.zshrc) and re-run, or edit");
         println!("    {} directly.", env_path.display());
     }
     if !file_changed && still_missing.is_empty() {

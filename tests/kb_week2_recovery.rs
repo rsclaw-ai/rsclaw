@@ -1,14 +1,14 @@
 //! Crash recovery integration tests for the KB ingest + worker
 //! pipeline. See spec §J 崩溃恢复矩阵.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use rsclaw::kb::{
-    canonicalize_by_mime, ingest_canonicalized,
-    store::{chunks, jobs as jobs_store},
     CanonicalizeInput, DefaultDispatcher, HandlerCtx, IngestInput, KbEmbedder, KbPaths, KbStore,
-    StubEmbedder, WorkerConfig, WorkerPool,
+    StubEmbedder, WorkerConfig, WorkerPool, canonicalize_by_mime, ingest_canonicalized,
+    store::{chunks, jobs as jobs_store},
 };
-use std::sync::Arc;
 use tempfile::TempDir;
 
 fn pipeline_fixture() -> (TempDir, HandlerCtx, WorkerConfig, String, String) {
@@ -43,7 +43,12 @@ fn pipeline_fixture() -> (TempDir, HandlerCtx, WorkerConfig, String, String) {
     )
     .unwrap();
     let index = Arc::new(rsclaw::kb::KbIndex::open(&paths).unwrap());
-    let ctx = HandlerCtx { store, paths, embedder, index };
+    let ctx = HandlerCtx {
+        store,
+        paths,
+        embedder,
+        index,
+    };
     let cfg = WorkerConfig {
         worker_id: "w-recovery".into(),
         claim_ttl_ms: 50,
@@ -121,7 +126,12 @@ fn ingest_survives_process_restart() -> Result<()> {
     paths.ensure_layout()?;
     let embedder: Arc<dyn KbEmbedder> = Arc::new(StubEmbedder::default());
     let index = Arc::new(rsclaw::kb::KbIndex::open(&paths)?);
-    let ctx = HandlerCtx { store: store.clone(), paths, embedder, index };
+    let ctx = HandlerCtx {
+        store: store.clone(),
+        paths,
+        embedder,
+        index,
+    };
     let cfg = WorkerConfig::default();
     let handler = DefaultDispatcher;
     assert!(WorkerPool::run_one_blocking(&ctx, &cfg, &handler)?);

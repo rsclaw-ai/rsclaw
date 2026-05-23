@@ -14,8 +14,10 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tracing::{debug, info, warn};
 
 use super::{Channel, OutboundMessage};
-use crate::channel::retry::{SendRetry, send_with_retry};
-use crate::config::schema::CustomChannelConfig;
+use crate::{
+    channel::retry::{SendRetry, send_with_retry},
+    config::schema::CustomChannelConfig,
+};
 
 // ---------------------------------------------------------------------------
 // Simple JSON path extractor
@@ -61,7 +63,8 @@ pub fn json_path_extract<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
     Some(current)
 }
 
-/// Convert a JSON value to a plain string (unquoted for strings, raw for others).
+/// Convert a JSON value to a plain string (unquoted for strings, raw for
+/// others).
 fn value_as_string(val: &Value) -> String {
     match val {
         Value::String(s) => s.clone(),
@@ -74,7 +77,8 @@ fn value_as_string(val: &Value) -> String {
 // Template engine
 // ---------------------------------------------------------------------------
 
-/// Replace `{{sender}}`, `{{chat_id}}`, `{{reply}}`, `{{is_group}}` in a template.
+/// Replace `{{sender}}`, `{{chat_id}}`, `{{reply}}`, `{{is_group}}` in a
+/// template.
 fn render_template(
     template: &str,
     sender: &str,

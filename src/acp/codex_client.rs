@@ -5,19 +5,18 @@
 //! a simple interface for executing coding tasks.
 //!
 //! Codex MCP tools:
-//!   - `codex`: Start a new session (prompt, model, cwd, approval-policy, sandbox)
+//!   - `codex`: Start a new session (prompt, model, cwd, approval-policy,
+//!     sandbox)
 //!   - `codex-reply`: Continue a session (threadId, prompt)
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::config::schema::McpServerConfig;
-use crate::mcp::McpClient;
+use crate::{config::schema::McpServerConfig, mcp::McpClient};
 
 /// Codex MCP client - wraps `codex mcp-server` for coding task execution.
 #[derive(Clone)]
@@ -151,7 +150,8 @@ impl CodexClient {
     }
 
     /// Parse MCP CallToolResult to extract threadId and content.
-    /// Handles both structuredContent (Codex-specific) and standard MCP content array.
+    /// Handles both structuredContent (Codex-specific) and standard MCP content
+    /// array.
     fn parse_result(&self, result: &Value) -> Result<(Option<String>, String)> {
         // Codex MCP returns structuredContent with {threadId, content}
         if let Some(structured) = result.get("structuredContent") {

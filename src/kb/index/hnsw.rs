@@ -15,15 +15,17 @@
 //! graph but never resolves back to a chunk_id (orphaned). Rebuild
 //! from redb reaps the orphans.
 
-use crate::kb::store::KbStore;
+use std::{collections::HashMap, path::Path, sync::RwLock};
+
 use anyhow::{Context, Result};
-use hnsw_rs::api::AnnT;
-use hnsw_rs::hnswio::HnswIo;
-use hnsw_rs::prelude::{DistCosine, Hnsw};
+use hnsw_rs::{
+    api::AnnT,
+    hnswio::HnswIo,
+    prelude::{DistCosine, Hnsw},
+};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::Path;
-use std::sync::RwLock;
+
+use crate::kb::store::KbStore;
 
 /// Default vector dimension when none is supplied (matches
 /// `StubEmbedder`). Real embedders pass their own: bge-small-zh=512,
@@ -154,10 +156,12 @@ impl HnswCache {
         let mut chunk_to_id: HashMap<String, usize> = HashMap::new();
         let mut vectors: Vec<Vec<f32>> = Vec::new();
         {
-            use crate::kb::model::KbChunk;
-            use crate::kb::store::codec::decode;
-            use crate::kb::store::schema::KB_CHUNKS;
             use redb::ReadableTable;
+
+            use crate::kb::{
+                model::KbChunk,
+                store::{codec::decode, schema::KB_CHUNKS},
+            };
             let tbl = rtx.open_table(KB_CHUNKS)?;
             for entry in tbl.iter()? {
                 let (_, v) = entry?;
@@ -179,13 +183,14 @@ impl HnswCache {
             EF_CONSTRUCTION,
             DistCosine,
         );
-        let inserts: Vec<(&Vec<f32>, usize)> = vectors
-            .iter()
-            .enumerate()
-            .map(|(i, v)| (v, i))
-            .collect();
+        let inserts: Vec<(&Vec<f32>, usize)> =
+            vectors.iter().enumerate().map(|(i, v)| (v, i)).collect();
         hnsw.parallel_insert(&inserts);
-        let new_inner = HnswInner { hnsw, id_to_chunk, chunk_to_id };
+        let new_inner = HnswInner {
+            hnsw,
+            id_to_chunk,
+            chunk_to_id,
+        };
         let n = new_inner.id_to_chunk.len();
         *self.inner.write().unwrap() = new_inner;
         tracing::info!(n, "kb hnsw: rebuild complete");
@@ -245,8 +250,8 @@ impl HnswCache {
         if !meta_path.exists() {
             return Ok(false);
         }
-        let meta_bytes = std::fs::read(&meta_path)
-            .with_context(|| format!("read {}", meta_path.display()))?;
+        let meta_bytes =
+            std::fs::read(&meta_path).with_context(|| format!("read {}", meta_path.display()))?;
         let meta: HnswMeta = serde_json::from_slice(&meta_bytes)
             .with_context(|| format!("decode {}", meta_path.display()))?;
         if meta.schema_version != SNAPSHOT_SCHEMA_VERSION {
@@ -308,16 +313,19 @@ impl HnswCache {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::kb::canonicalize::{canonicalize_by_mime, CanonicalizeInput};
-    use crate::kb::embedder::{KbEmbedder, StubEmbedder};
-    use crate::kb::paths::KbPaths;
-    use crate::kb::pipeline::{ingest_canonicalized, IngestInput};
-    use crate::kb::store::KbStore;
-    use crate::kb::worker::handlers::HandlerCtx;
-    use crate::kb::worker::{DefaultDispatcher, WorkerConfig, WorkerPool};
     use std::sync::Arc;
+
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::kb::{
+        canonicalize::{CanonicalizeInput, canonicalize_by_mime},
+        embedder::{KbEmbedder, StubEmbedder},
+        paths::KbPaths,
+        pipeline::{IngestInput, ingest_canonicalized},
+        store::KbStore,
+        worker::{DefaultDispatcher, WorkerConfig, WorkerPool, handlers::HandlerCtx},
+    };
 
     fn fixture_with_chunks() -> (TempDir, Arc<KbStore>) {
         let tmp = TempDir::new().unwrap();
@@ -350,7 +358,12 @@ mod tests {
         )
         .unwrap();
         let index = Arc::new(crate::kb::index::KbIndex::open(&paths).unwrap());
-        let ctx = HandlerCtx { store: store.clone(), paths, embedder, index };
+        let ctx = HandlerCtx {
+            store: store.clone(),
+            paths,
+            embedder,
+            index,
+        };
         let cfg = WorkerConfig {
             worker_id: "w".into(),
             ..WorkerConfig::default()

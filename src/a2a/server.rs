@@ -9,21 +9,19 @@
 //! routes by method name.
 
 use axum::{Json, extract::State, response::IntoResponse};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 use tracing::info;
 use uuid::Uuid;
 
-use serde::Deserialize;
-
 use crate::{
     a2a::{
         errors as a2a_errors,
         types::{
-            A2aArtifact, A2aMessage, A2aTask, A2aTaskStatus, AgentCapabilities,
-            AgentCard, AgentExtension, AgentInterface, AgentProvider, AgentSkill,
-            JsonRpcRequest, JsonRpcResponse, PushNotificationConfig, SendMessageParams,
-            TaskState,
+            A2aArtifact, A2aMessage, A2aTask, A2aTaskStatus, AgentCapabilities, AgentCard,
+            AgentExtension, AgentInterface, AgentProvider, AgentSkill, JsonRpcRequest,
+            JsonRpcResponse, PushNotificationConfig, SendMessageParams, TaskState,
         },
     },
     agent::{AgentMessage, AgentReply},
@@ -163,7 +161,9 @@ pub async fn a2a_dispatch(
                 .await
                 .into_response()
         }
-        _ => a2a_rpc_handler_inner(state, caller, req).await.into_response(),
+        _ => a2a_rpc_handler_inner(state, caller, req)
+            .await
+            .into_response(),
     }
 }
 
@@ -255,7 +255,11 @@ async fn handle_send_message(
         match state.agents.default_agent() {
             Ok(h) => h,
             Err(e) => {
-                return Json(JsonRpcResponse::err(id, -32001, format!("no default agent: {e}")));
+                return Json(JsonRpcResponse::err(
+                    id,
+                    -32001,
+                    format!("no default agent: {e}"),
+                ));
             }
         }
     };
@@ -292,7 +296,11 @@ async fn handle_send_message(
         let wait = async {
             loop {
                 match bus_rx.recv().await {
-                    Ok(crate::a2a::event::AgentEvent::Status { state: s, final_: true, .. }) => {
+                    Ok(crate::a2a::event::AgentEvent::Status {
+                        state: s,
+                        final_: true,
+                        ..
+                    }) => {
                         return Some(s);
                     }
                     Ok(crate::a2a::event::AgentEvent::InputRequired { .. }) => {
@@ -303,7 +311,7 @@ async fn handle_send_message(
                     Ok(crate::a2a::event::AgentEvent::AuthRequired { .. }) => {
                         return Some(TaskState::AuthRequired);
                     }
-                    Ok(_) => continue, // intermediate Working / Artifact
+                    Ok(_) => continue,     // intermediate Working / Artifact
                     Err(_) => return None, // bus closed
                 }
             }
@@ -381,20 +389,24 @@ async fn handle_send_message(
 
     // Publish Submitted → Working status events on the bus so any SSE
     // subscriber (or push webhook listener) can observe progress.
-    state.task_event_bus.publish(crate::a2a::event::AgentEvent::Status {
-        task_id: task_id.clone(),
-        context_id: session_key.clone(),
-        state: TaskState::Submitted,
-        message: None,
-        final_: false,
-    });
-    state.task_event_bus.publish(crate::a2a::event::AgentEvent::Status {
-        task_id: task_id.clone(),
-        context_id: session_key.clone(),
-        state: TaskState::Working,
-        message: None,
-        final_: false,
-    });
+    state
+        .task_event_bus
+        .publish(crate::a2a::event::AgentEvent::Status {
+            task_id: task_id.clone(),
+            context_id: session_key.clone(),
+            state: TaskState::Submitted,
+            message: None,
+            final_: false,
+        });
+    state
+        .task_event_bus
+        .publish(crate::a2a::event::AgentEvent::Status {
+            task_id: task_id.clone(),
+            context_id: session_key.clone(),
+            state: TaskState::Working,
+            message: None,
+            final_: false,
+        });
 
     // Wire the INPUT_REQUIRED resume channel. If the runtime ever requests
     // additional input mid-turn, an entry lands in `state.suspended_tasks`;
@@ -402,21 +414,14 @@ async fn handle_send_message(
     // resume-path at the top of this handler. A per-suspension timeout
     // (RSCLAW_A2A_WAIT_INPUT_TIMEOUT_SECS, default 30 min) tears the
     // entry down so a never-resumed task doesn't leak forever.
-    let (ireq_tx, ireq_rx) =
-        tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<String>>(4);
-    spawn_input_request_listener(
-        state.clone(),
-        task_id.clone(),
-        session_key.clone(),
-        ireq_rx,
-    );
+    let (ireq_tx, ireq_rx) = tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<String>>(4);
+    spawn_input_request_listener(state.clone(), task_id.clone(), session_key.clone(), ireq_rx);
 
     // Bridge runtime → bus for mid-turn AgentEvents (Working progress with
     // tool names, InputRequired/AuthRequired, etc.). Streaming has the same
     // bridge; without it the sync path's bus only sees Submitted/Working/
     // Completed/Failed and push webhooks miss the per-tool progress.
-    let (event_tx, mut event_rx) =
-        tokio::sync::mpsc::channel::<crate::a2a::event::AgentEvent>(64);
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<crate::a2a::event::AgentEvent>(64);
     {
         let bus = state.task_event_bus.clone();
         tokio::spawn(async move {
@@ -485,8 +490,7 @@ async fn handle_send_message(
     // success and failure paths attach it to the persisted task's metadata
     // so A2A consumers can read the agent's own assessment (completion
     // level, blockers, follow-ups) without re-parsing the artifact text.
-    let pending_outcome =
-        crate::gateway::task_queue::drain_pending_outcome(&session_key);
+    let pending_outcome = crate::gateway::task_queue::drain_pending_outcome(&session_key);
 
     match reply.outcome {
         crate::agent::registry::ReplyOutcome::Ok => {
@@ -494,11 +498,8 @@ async fn handle_send_message(
             // single artifact. `emit_reply_parts` normalises data URIs and
             // disk paths to `A2aPart::Raw`, and lets `http(s)://...` file
             // entries pass through as `A2aPart::Url`.
-            let artifact_parts = crate::a2a::files::emit_reply_parts(
-                &reply.text,
-                &reply.images,
-                &reply.files,
-            );
+            let artifact_parts =
+                crate::a2a::files::emit_reply_parts(&reply.text, &reply.images, &reply.files);
             let artifact = A2aArtifact {
                 artifact_id: Uuid::new_v4().to_string(),
                 parts: artifact_parts,
@@ -515,21 +516,25 @@ async fn handle_send_message(
             let _ = state.task_store.delete_push_configs_for_task(&task_id);
             state.task_cancels.remove(&task_id);
 
-            state.task_event_bus.publish(crate::a2a::event::AgentEvent::Artifact {
-                task_id: task_id.clone(),
-                context_id: session_key.clone(),
-                artifact_id: artifact.artifact_id.clone(),
-                parts: artifact.parts.clone(),
-                append: false,
-                last_chunk: true,
-            });
-            state.task_event_bus.publish(crate::a2a::event::AgentEvent::Status {
-                task_id: task_id.clone(),
-                context_id: session_key.clone(),
-                state: TaskState::Completed,
-                message: None,
-                final_: true,
-            });
+            state
+                .task_event_bus
+                .publish(crate::a2a::event::AgentEvent::Artifact {
+                    task_id: task_id.clone(),
+                    context_id: session_key.clone(),
+                    artifact_id: artifact.artifact_id.clone(),
+                    parts: artifact.parts.clone(),
+                    append: false,
+                    last_chunk: true,
+                });
+            state
+                .task_event_bus
+                .publish(crate::a2a::event::AgentEvent::Status {
+                    task_id: task_id.clone(),
+                    context_id: session_key.clone(),
+                    state: TaskState::Completed,
+                    message: None,
+                    final_: true,
+                });
             state.task_event_bus.close(&task_id);
 
             let result = json!({
@@ -549,13 +554,15 @@ async fn handle_send_message(
             let _ = state.task_store.set_status(&task_id, TaskState::Failed);
             let _ = state.task_store.delete_push_configs_for_task(&task_id);
             state.task_cancels.remove(&task_id);
-            state.task_event_bus.publish(crate::a2a::event::AgentEvent::Status {
-                task_id: task_id.clone(),
-                context_id: session_key.clone(),
-                state: TaskState::Failed,
-                message: Some(crate::a2a::event::text_message(&reply.text)),
-                final_: true,
-            });
+            state
+                .task_event_bus
+                .publish(crate::a2a::event::AgentEvent::Status {
+                    task_id: task_id.clone(),
+                    context_id: session_key.clone(),
+                    state: TaskState::Failed,
+                    message: Some(crate::a2a::event::text_message(&reply.text)),
+                    final_: true,
+                });
             state.task_event_bus.close(&task_id);
             let result = json!({
                 "id": task_id,
@@ -574,12 +581,14 @@ async fn handle_send_message(
             // bus. Don't republish; just return the persisted task snapshot.
             state.task_cancels.remove(&task_id);
             let task_snapshot = state.task_store.get(&task_id).ok().flatten();
-            let result = serde_json::to_value(task_snapshot).unwrap_or_else(|_| json!({
-                "id": task_id,
-                "contextId": session_key,
-                "status": { "state": "TASK_STATE_CANCELED" },
-                "history": [history_msg],
-            }));
+            let result = serde_json::to_value(task_snapshot).unwrap_or_else(|_| {
+                json!({
+                    "id": task_id,
+                    "contextId": session_key,
+                    "status": { "state": "TASK_STATE_CANCELED" },
+                    "history": [history_msg],
+                })
+            });
             info!(task_id, agent = %handle.id, "A2A SendMessage canceled");
             Json(JsonRpcResponse::ok(id, result))
         }
@@ -730,13 +739,15 @@ async fn handle_cancel_task(
                 .flatten()
                 .and_then(|t| t.context_id)
                 .unwrap_or_default();
-            state.task_event_bus.publish(crate::a2a::event::AgentEvent::Status {
-                task_id: params.id.clone(),
-                context_id: ctx,
-                state: TaskState::Canceled,
-                message: None,
-                final_: true,
-            });
+            state
+                .task_event_bus
+                .publish(crate::a2a::event::AgentEvent::Status {
+                    task_id: params.id.clone(),
+                    context_id: ctx,
+                    state: TaskState::Canceled,
+                    message: None,
+                    final_: true,
+                });
             state.task_event_bus.close(&params.id);
             match state.task_store.get(&params.id) {
                 Ok(Some(task)) => Json(JsonRpcResponse::ok(
@@ -811,7 +822,10 @@ async fn handle_create_push_config(
     if params.push_notification_config.id.is_empty() {
         params.push_notification_config.id = Uuid::new_v4().to_string();
     }
-    match state.task_store.put_push_config(&params.push_notification_config) {
+    match state
+        .task_store
+        .put_push_config(&params.push_notification_config)
+    {
         Ok(_) => Json(JsonRpcResponse::ok(
             id,
             serde_json::to_value(&params.push_notification_config).unwrap_or(Value::Null),
@@ -1021,9 +1035,7 @@ pub(crate) fn spawn_input_request_listener(
                 // path, `.remove` returns None and we do nothing. Only if
                 // the suspension is still live do we tear it down.
                 if state_t.suspended_tasks.remove(&task_id_t).is_some() {
-                    let _ = state_t
-                        .task_store
-                        .set_status(&task_id_t, TaskState::Failed);
+                    let _ = state_t.task_store.set_status(&task_id_t, TaskState::Failed);
                     let _ = state_t.task_store.delete_push_configs_for_task(&task_id_t);
                     state_t.task_cancels.remove(&task_id_t);
                     state_t.task_event_bus.publish(
@@ -1049,10 +1061,7 @@ pub(crate) fn spawn_input_request_listener(
 /// gateway-default workspace → `<base_dir>/workspace`. Used by the A2A
 /// ingest path so received files land in the same bucket the runtime's
 /// `resolve_file_refs` will later look for `@a2a_<kind>_...` tokens in.
-async fn resolve_agent_workspace(
-    state: &AppState,
-    agent_id: Option<&str>,
-) -> std::path::PathBuf {
+async fn resolve_agent_workspace(state: &AppState, agent_id: Option<&str>) -> std::path::PathBuf {
     let per_agent = if let Some(aid) = agent_id {
         state
             .agents
@@ -1097,8 +1106,7 @@ fn finalize_failed_task(state: &AppState, task_id: &str, context_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::a2a::auth::A2aIdentity;
-    use crate::a2a::store::TaskStore;
+    use crate::a2a::{auth::A2aIdentity, store::TaskStore};
 
     fn ident(id: &str) -> Option<A2aIdentity> {
         Some(A2aIdentity {

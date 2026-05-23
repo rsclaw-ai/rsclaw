@@ -19,7 +19,7 @@
 //! Uses `serde_yaml_ng` (the repo's YAML dep) instead of the
 //! unmaintained `serde_yaml`.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -70,7 +70,11 @@ pub fn parse_doc_file(content: &str) -> Result<Parsed> {
     let body = std::str::from_utf8(&bytes[body_start..])
         .context("body utf8")?
         .to_string();
-    Ok(Parsed { front, body, body_offset: body_start })
+    Ok(Parsed {
+        front,
+        body,
+        body_offset: body_start,
+    })
 }
 
 #[cfg(test)]
@@ -121,7 +125,8 @@ mod tests {
     #[test]
     fn fm_serde_default_tags_and_meta() {
         // Older docs may not have tags/meta — defaults kick in.
-        let yaml = "---\ntitle: T\nsource_kind: doc\nlogical_source_id: x\ncreated_at: now\n---\n\nbody";
+        let yaml =
+            "---\ntitle: T\nsource_kind: doc\nlogical_source_id: x\ncreated_at: now\n---\n\nbody";
         let parsed = parse_doc_file(yaml).unwrap();
         assert!(parsed.front.tags.is_empty());
         assert!(parsed.front.meta.is_null());

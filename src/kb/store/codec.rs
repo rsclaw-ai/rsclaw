@@ -3,8 +3,7 @@
 //! without touching every table accessor.
 
 use anyhow::{Context, Result};
-use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
 
 pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     serde_json::to_vec(value).context("kb codec: encode")
@@ -16,8 +15,9 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde::Deserialize;
+
+    use super::*;
 
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
     struct X {
@@ -27,7 +27,10 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let x = X { a: 7, b: "hi".into() };
+        let x = X {
+            a: 7,
+            b: "hi".into(),
+        };
         let bytes = encode(&x).unwrap();
         assert_eq!(decode::<X>(&bytes).unwrap(), x);
     }

@@ -8,7 +8,9 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::info;
 
 use crate::{
-    agent::{AgentHandle, AgentKind, AgentMessage, AgentRegistry, AgentReply, AgentRuntime, MemoryStore},
+    agent::{
+        AgentHandle, AgentKind, AgentMessage, AgentRegistry, AgentReply, AgentRuntime, MemoryStore,
+    },
     config::{runtime::RuntimeConfig, schema::AgentEntry},
     events::AgentEvent,
     gateway::live_config::LiveConfig,

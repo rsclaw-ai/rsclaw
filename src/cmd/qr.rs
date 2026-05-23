@@ -1,7 +1,6 @@
 use anyhow::Result;
 
-use crate::cli::QrArgs;
-use crate::config;
+use crate::{cli::QrArgs, config};
 
 pub async fn cmd_qr(args: QrArgs) -> Result<()> {
     let cfg = config::load().ok();
@@ -16,10 +15,10 @@ pub async fn cmd_qr(args: QrArgs) -> Result<()> {
         args.url.clone().unwrap_or(default_url)
     };
 
-    let auth_token = args.token.clone().or_else(|| {
-        cfg.as_ref()
-            .and_then(|c| c.gateway.auth_token.clone())
-    });
+    let auth_token = args
+        .token
+        .clone()
+        .or_else(|| cfg.as_ref().and_then(|c| c.gateway.auth_token.clone()));
 
     // Build connection payload.
     let payload = if let Some(ref pw) = args.password {

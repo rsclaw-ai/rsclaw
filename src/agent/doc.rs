@@ -5,8 +5,10 @@
 //!   - create_word  (.docx) via docx-rs
 //!   - create_pdf   (.pdf)  via genpdf
 //!   - create_ppt   (.pptx) via zip + OOXML templates
-//!   - edit_excel   (.xlsx) read existing + merge changes via calamine + rust_xlsxwriter
-//!   - edit_word    (.docx) read existing + append/replace via zip XML manipulation
+//!   - edit_excel   (.xlsx) read existing + merge changes via calamine +
+//!     rust_xlsxwriter
+//!   - edit_word    (.docx) read existing + append/replace via zip XML
+//!     manipulation
 //!   - edit_pdf     (.pdf)  replace text / delete pages via lopdf
 //!   - read_doc     (.xlsx/.docx/.pdf) extract text content for inspection
 
@@ -25,7 +27,9 @@ pub fn safe_extract_pdf_text(path: &Path) -> Result<String> {
     match std::panic::catch_unwind(move || pdf_extract::extract_text(&path_owned)) {
         Ok(Ok(text)) => Ok(text),
         Ok(Err(e)) => Err(anyhow!("pdf extract error: {e}")),
-        Err(_) => Err(anyhow!("pdf extract panicked (likely malformed font encoding)")),
+        Err(_) => Err(anyhow!(
+            "pdf extract panicked (likely malformed font encoding)"
+        )),
     }
 }
 
@@ -35,7 +39,9 @@ pub fn safe_extract_pdf_from_mem(bytes: &[u8]) -> Result<String> {
     match std::panic::catch_unwind(move || pdf_extract::extract_text_from_mem(&bytes_owned)) {
         Ok(Ok(text)) => Ok(text),
         Ok(Err(e)) => Err(anyhow!("pdf extract error: {e}")),
-        Err(_) => Err(anyhow!("pdf extract panicked (likely malformed font encoding)")),
+        Err(_) => Err(anyhow!(
+            "pdf extract panicked (likely malformed font encoding)"
+        )),
     }
 }
 
@@ -43,7 +49,8 @@ pub fn safe_extract_pdf_from_mem(bytes: &[u8]) -> Result<String> {
 // Font discovery for PDF generation
 // ---------------------------------------------------------------------------
 
-/// Try common font directories and naming patterns to find a usable font family.
+/// Try common font directories and naming patterns to find a usable font
+/// family.
 fn find_font_family() -> Option<genpdf::fonts::FontFamily<genpdf::fonts::FontData>> {
     // Directories and font names to try, in order.
     let candidates: &[(&str, &str)] = &[
@@ -60,7 +67,8 @@ fn find_font_family() -> Option<genpdf::fonts::FontFamily<genpdf::fonts::FontDat
             return Some(f);
         }
     }
-    // macOS: load individual TTF files directly (genpdf fallback only, Chrome preferred).
+    // macOS: load individual TTF files directly (genpdf fallback only, Chrome
+    // preferred).
     let mac_fonts: &[&str] = &[
         "/System/Library/Fonts/Supplemental/Arial.ttf",
         "/System/Library/Fonts/Supplemental/Courier New.ttf",
@@ -68,7 +76,7 @@ fn find_font_family() -> Option<genpdf::fonts::FontFamily<genpdf::fonts::FontDat
     ];
     // Windows: CJK fonts for genpdf fallback
     let win_fonts: &[&str] = &[
-        "C:\\Windows\\Fonts\\simhei.ttf",   // SimHei (TTF, CJK)
+        "C:\\Windows\\Fonts\\simhei.ttf", // SimHei (TTF, CJK)
     ];
     for path in mac_fonts {
         if let Ok(data) = std::fs::read(path) {
@@ -206,7 +214,9 @@ fn create_excel(args: &Value, path: &Path) -> Result<Value> {
                         &header_fmt,
                     )?;
                     // Auto-width: set column width based on header length (min 10, max 30).
-                    let width = (h.as_str().unwrap_or("").len() as f64 * 1.5).max(10.0).min(30.0);
+                    let width = (h.as_str().unwrap_or("").len() as f64 * 1.5)
+                        .max(10.0)
+                        .min(30.0);
                     ws.set_column_width(col as u16, width)?;
                 }
             }
@@ -236,8 +246,9 @@ fn create_excel(args: &Value, path: &Path) -> Result<Value> {
                                     ws.write_string_with_format(
                                         row_idx,
                                         col_idx,
-                                        cell.as_str()
-                                            .unwrap_or(&cell.to_string().trim_matches('"').to_owned()),
+                                        cell.as_str().unwrap_or(
+                                            &cell.to_string().trim_matches('"').to_owned(),
+                                        ),
                                         fmt,
                                     )?;
                                 }
@@ -361,14 +372,16 @@ fn create_word(args: &Value, path: &Path) -> Result<Value> {
             });
             if is_list {
                 for line in &lines {
-                    let text = line.trim().trim_start_matches("- ").trim_start_matches("* ");
-                    let p = Paragraph::new()
-                        .add_run(
-                            Run::new()
-                                .add_text(format!("  \u{2022}  {text}"))
-                                .size(font_size)
-                                .fonts(RunFonts::new().east_asia(default_font)),
-                        );
+                    let text = line
+                        .trim()
+                        .trim_start_matches("- ")
+                        .trim_start_matches("* ");
+                    let p = Paragraph::new().add_run(
+                        Run::new()
+                            .add_text(format!("  \u{2022}  {text}"))
+                            .size(font_size)
+                            .fonts(RunFonts::new().east_asia(default_font)),
+                    );
                     docx = docx.add_paragraph(p);
                 }
             } else {
@@ -410,8 +423,8 @@ fn create_pdf(args: &Value, path: &Path) -> Result<Value> {
         }));
     }
 
-    // Strategy: generate HTML then convert to PDF via Chrome headless (best CJK support).
-    // Fallback to genpdf if Chrome is not available.
+    // Strategy: generate HTML then convert to PDF via Chrome headless (best CJK
+    // support). Fallback to genpdf if Chrome is not available.
     let html = build_html_for_pdf(title, content);
 
     // Try Chrome headless first (supports CJK natively via system fonts).
@@ -431,7 +444,11 @@ fn create_pdf(args: &Value, path: &Path) -> Result<Value> {
             .output();
         let _ = std::fs::remove_file(&tmp_html);
         match result {
-            Ok(output) if output.status.success() && path.exists() && path.metadata().map(|m| m.len() > 0).unwrap_or(false) => {
+            Ok(output)
+                if output.status.success()
+                    && path.exists()
+                    && path.metadata().map(|m| m.len() > 0).unwrap_or(false) =>
+            {
                 return Ok(json!({
                     "created": true,
                     "path": path.display().to_string(),
@@ -501,6 +518,7 @@ fn create_pdf(args: &Value, path: &Path) -> Result<Value> {
 
 fn create_ppt(args: &Value, path: &Path) -> Result<Value> {
     use std::io::Write;
+
     use zip::write::SimpleFileOptions;
 
     let slides = args["slides"].as_array();
@@ -519,8 +537,7 @@ fn create_ppt(args: &Value, path: &Path) -> Result<Value> {
 
     let file = std::fs::File::create(path)?;
     let mut zip = zip::ZipWriter::new(file);
-    let opts = SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+    let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
     // [Content_Types].xml
     let mut ct_overrides = String::new();
@@ -530,7 +547,9 @@ fn create_ppt(args: &Value, path: &Path) -> Result<Value> {
         ));
     }
     zip.start_file("[Content_Types].xml", opts)?;
-    write!(zip, r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    write!(
+        zip,
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
 <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
 <Default Extension="xml" ContentType="application/xml"/>
@@ -538,28 +557,39 @@ fn create_ppt(args: &Value, path: &Path) -> Result<Value> {
 <Override PartName="/ppt/slideMasters/slideMaster1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml"/>
 <Override PartName="/ppt/slideLayouts/slideLayout1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml"/>
 {ct_overrides}
-</Types>"#)?;
+</Types>"#
+    )?;
 
     // _rels/.rels
     zip.start_file("_rels/.rels", opts)?;
-    write!(zip, r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    write!(
+        zip,
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
 <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/>
-</Relationships>"#)?;
+</Relationships>"#
+    )?;
 
     // ppt/presentation.xml
     let mut slide_list = String::new();
     for i in 1..=slide_data.len() {
-        slide_list.push_str(&format!(r#"<p:sldId id="{}" r:id="rId{}"/>"#, 255 + i, i + 2));
+        slide_list.push_str(&format!(
+            r#"<p:sldId id="{}" r:id="rId{}"/>"#,
+            255 + i,
+            i + 2
+        ));
     }
     zip.start_file("ppt/presentation.xml", opts)?;
-    write!(zip, r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    write!(
+        zip,
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <p:presentation xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
 <p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rId1"/></p:sldMasterIdLst>
 <p:sldIdLst>{slide_list}</p:sldIdLst>
 <p:sldSz cx="12192000" cy="6858000"/>
 <p:notesSz cx="6858000" cy="9144000"/>
-</p:presentation>"#)?;
+</p:presentation>"#
+    )?;
 
     // ppt/_rels/presentation.xml.rels
     let mut pres_rels = String::new();
@@ -572,35 +602,50 @@ fn create_ppt(args: &Value, path: &Path) -> Result<Value> {
         ));
     }
     zip.start_file("ppt/_rels/presentation.xml.rels", opts)?;
-    write!(zip, r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{pres_rels}</Relationships>"#)?;
+    write!(
+        zip,
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{pres_rels}</Relationships>"#
+    )?;
 
     // Minimal slide master
     zip.start_file("ppt/slideMasters/slideMaster1.xml", opts)?;
-    write!(zip, r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    write!(
+        zip,
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <p:sldMaster xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
 <p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/></p:spTree></p:cSld>
 <p:sldLayoutIdLst><p:sldLayoutId id="2147483649" r:id="rId1"/></p:sldLayoutIdLst>
-</p:sldMaster>"#)?;
+</p:sldMaster>"#
+    )?;
 
     zip.start_file("ppt/slideMasters/_rels/slideMaster1.xml.rels", opts)?;
-    write!(zip, r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    write!(
+        zip,
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
 <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>
-</Relationships>"#)?;
+</Relationships>"#
+    )?;
 
     // Minimal slide layout
     zip.start_file("ppt/slideLayouts/slideLayout1.xml", opts)?;
-    write!(zip, r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    write!(
+        zip,
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <p:sldLayout xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" type="blank">
 <p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/></p:spTree></p:cSld>
-</p:sldLayout>"#)?;
+</p:sldLayout>"#
+    )?;
 
     zip.start_file("ppt/slideLayouts/_rels/slideLayout1.xml.rels", opts)?;
-    write!(zip, r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    write!(
+        zip,
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
 <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="../slideMasters/slideMaster1.xml"/>
-</Relationships>"#)?;
+</Relationships>"#
+    )?;
 
     // Individual slides
     for (i, (title, body)) in slide_data.iter().enumerate() {
@@ -609,7 +654,9 @@ fn create_ppt(args: &Value, path: &Path) -> Result<Value> {
         let body_esc = xml_escape(body);
 
         zip.start_file(format!("ppt/slides/slide{slide_num}.xml"), opts)?;
-        write!(zip, r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        write!(
+            zip,
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
 <p:cSld><p:spTree>
 <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>
@@ -620,16 +667,17 @@ fn create_ppt(args: &Value, path: &Path) -> Result<Value> {
 <p:spPr><a:xfrm><a:off x="838200" y="1825625"/><a:ext cx="10515600" cy="4351338"/></a:xfrm></p:spPr>
 <p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang="en-US" sz="1800" dirty="0"/><a:t>{body_esc}</a:t></a:r></a:p></p:txBody></p:sp>
 </p:spTree></p:cSld>
-</p:sld>"#)?;
-
-        zip.start_file(
-            format!("ppt/slides/_rels/slide{slide_num}.xml.rels"),
-            opts,
+</p:sld>"#
         )?;
-        write!(zip, r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+
+        zip.start_file(format!("ppt/slides/_rels/slide{slide_num}.xml.rels"), opts)?;
+        write!(
+            zip,
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
 <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>
-</Relationships>"#)?;
+</Relationships>"#
+        )?;
     }
 
     zip.finish()?;
@@ -646,7 +694,7 @@ fn create_ppt(args: &Value, path: &Path) -> Result<Value> {
 // ---------------------------------------------------------------------------
 
 fn edit_excel(args: &Value, path: &Path) -> Result<Value> {
-    use calamine::{Reader, open_workbook, Xlsx, Data};
+    use calamine::{Data, Reader, Xlsx, open_workbook};
     use rust_xlsxwriter::*;
 
     let mut wb_reader: Xlsx<_> = open_workbook(path)
@@ -684,7 +732,8 @@ fn edit_excel(args: &Value, path: &Path) -> Result<Value> {
     let mut workbook = Workbook::new();
     let header_fmt = Format::new().set_bold();
 
-    // Apply "sheets" param: if a sheet name matches existing, replace it; otherwise add new.
+    // Apply "sheets" param: if a sheet name matches existing, replace it; otherwise
+    // add new.
     let new_sheets = args["sheets"].as_array();
     let mut replaced: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -701,10 +750,8 @@ fn edit_excel(args: &Value, path: &Path) -> Result<Value> {
     if let Some(ar) = args["append_rows"].as_object() {
         let sheet_name = ar.get("sheet").and_then(|s| s.as_str()).unwrap_or("Sheet1");
         if let Some(rows) = ar.get("rows").and_then(|r| r.as_array()) {
-            let parsed: Vec<Vec<Value>> = rows
-                .iter()
-                .filter_map(|r| r.as_array().cloned())
-                .collect();
+            let parsed: Vec<Vec<Value>> =
+                rows.iter().filter_map(|r| r.as_array().cloned()).collect();
             appends.insert(sheet_name.to_owned(), parsed);
         }
     }
@@ -713,10 +760,8 @@ fn edit_excel(args: &Value, path: &Path) -> Result<Value> {
         for item in arr {
             let sheet_name = item["sheet"].as_str().unwrap_or("Sheet1");
             if let Some(rows) = item["rows"].as_array() {
-                let parsed: Vec<Vec<Value>> = rows
-                    .iter()
-                    .filter_map(|r| r.as_array().cloned())
-                    .collect();
+                let parsed: Vec<Vec<Value>> =
+                    rows.iter().filter_map(|r| r.as_array().cloned()).collect();
                 appends
                     .entry(sheet_name.to_owned())
                     .or_default()
@@ -797,11 +842,7 @@ fn edit_excel(args: &Value, path: &Path) -> Result<Value> {
                             let col_idx = c as u16;
                             match cell {
                                 Value::Number(n) => {
-                                    ws.write_number(
-                                        row_idx,
-                                        col_idx,
-                                        n.as_f64().unwrap_or(0.0),
-                                    )?;
+                                    ws.write_number(row_idx, col_idx, n.as_f64().unwrap_or(0.0))?;
                                 }
                                 Value::Bool(b) => {
                                     ws.write_boolean(row_idx, col_idx, *b)?;
@@ -810,8 +851,9 @@ fn edit_excel(args: &Value, path: &Path) -> Result<Value> {
                                     ws.write_string(
                                         row_idx,
                                         col_idx,
-                                        cell.as_str()
-                                            .unwrap_or(&cell.to_string().trim_matches('"').to_owned()),
+                                        cell.as_str().unwrap_or(
+                                            &cell.to_string().trim_matches('"').to_owned(),
+                                        ),
                                     )?;
                                 }
                             }
@@ -853,7 +895,8 @@ fn edit_word(args: &Value, path: &Path) -> Result<Value> {
         // Full replacement: just create a new doc with the given content.
         let title = args["title"].as_str().unwrap_or("");
         let mut new_args = args.clone();
-        new_args["content"] = Value::String(replace_text.expect("replace_text checked above").to_owned());
+        new_args["content"] =
+            Value::String(replace_text.expect("replace_text checked above").to_owned());
         if !title.is_empty() {
             new_args["title"] = Value::String(title.to_owned());
         }
@@ -871,8 +914,8 @@ fn edit_word(args: &Value, path: &Path) -> Result<Value> {
 
     let file = std::fs::File::open(path)
         .map_err(|e| anyhow!("edit_word: cannot open '{}': {e}", path.display()))?;
-    let mut archive = zip::ZipArchive::new(file)
-        .map_err(|e| anyhow!("edit_word: invalid docx zip: {e}"))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| anyhow!("edit_word: invalid docx zip: {e}"))?;
 
     // Read all entries into memory.
     let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
@@ -908,9 +951,7 @@ fn edit_word(args: &Value, path: &Path) -> Result<Value> {
                 r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:rPr><w:b/></w:rPr><w:t>{text}</w:t></w:r></w:p>"#
             ));
         } else {
-            new_paras.push_str(&format!(
-                r#"<w:p><w:r><w:t>{escaped}</w:t></w:r></w:p>"#
-            ));
+            new_paras.push_str(&format!(r#"<w:p><w:r><w:t>{escaped}</w:t></w:r></w:p>"#));
         }
     }
 
@@ -974,7 +1015,8 @@ fn edit_pdf(args: &Value, path: &Path) -> Result<Value> {
         let mut total_replaced = 0usize;
         let page_ids: Vec<_> = doc.page_iter().collect();
 
-        // Collect (stream_object_ids, modified_content) pairs first to avoid borrow conflicts.
+        // Collect (stream_object_ids, modified_content) pairs first to avoid borrow
+        // conflicts.
         let mut updates: Vec<(Vec<lopdf::ObjectId>, Vec<u8>)> = Vec::new();
 
         for page_id in &page_ids {
@@ -1080,10 +1122,7 @@ fn edit_pdf(args: &Value, path: &Path) -> Result<Value> {
     if let Some(content) = append_content {
         // lopdf does not easily support creating new rendered text pages,
         // so we create a separate file with the appended content.
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("doc");
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("doc");
         let parent = path.parent().unwrap_or(Path::new("."));
         let appended_path = parent.join(format!("{stem}_appended.pdf"));
 
@@ -1137,7 +1176,7 @@ fn read_doc(path: &Path) -> Result<Value> {
 }
 
 fn read_excel(path: &Path) -> Result<Value> {
-    use calamine::{Reader, open_workbook, Xlsx, Data};
+    use calamine::{Data, Reader, Xlsx, open_workbook};
 
     let mut wb: Xlsx<_> = open_workbook(path)
         .map_err(|e| anyhow!("read_doc: cannot open '{}': {e}", path.display()))?;
@@ -1186,8 +1225,8 @@ fn read_docx(path: &Path) -> Result<Value> {
 
     let file = std::fs::File::open(path)
         .map_err(|e| anyhow!("read_doc: cannot open '{}': {e}", path.display()))?;
-    let mut archive = zip::ZipArchive::new(file)
-        .map_err(|e| anyhow!("read_doc: invalid docx zip: {e}"))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| anyhow!("read_doc: invalid docx zip: {e}"))?;
 
     let mut xml = String::new();
     if let Ok(mut entry) = archive.by_name("word/document.xml") {
@@ -1209,10 +1248,14 @@ fn read_docx(path: &Path) -> Result<Value> {
             let mut para_content = String::new();
             // Extract <w:t> contents.
             let mut inner = para_xml;
-            while let Some(t_start) = inner.find("<w:t").map(|p| {
-                // Skip to after the closing > of <w:t> or <w:t ...>
-                inner[p..].find('>').map(|g| p + g + 1)
-            }).flatten() {
+            while let Some(t_start) = inner
+                .find("<w:t")
+                .map(|p| {
+                    // Skip to after the closing > of <w:t> or <w:t ...>
+                    inner[p..].find('>').map(|g| p + g + 1)
+                })
+                .flatten()
+            {
                 inner = &inner[t_start..];
                 if let Some(t_end) = inner.find("</w:t>") {
                     para_content.push_str(&inner[..t_end]);
@@ -1263,7 +1306,10 @@ fn read_pdf(path: &Path) -> Result<Value> {
 
 /// Build a simple HTML document for Chrome headless PDF rendering.
 fn build_html_for_pdf(title: &str, content: &str) -> String {
-    let escaped_title = content.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let escaped_title = content
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
     let _ = escaped_title; // suppress warning, we use xml_escape below
     let mut html = String::from(
         r#"<!DOCTYPE html><html><head><meta charset='utf-8'>
@@ -1316,12 +1362,20 @@ fn build_html_for_pdf(title: &str, content: &str) -> String {
             });
             let is_ol = lines.iter().all(|l| {
                 let t = l.trim();
-                t.len() > 2 && t.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) && (t.contains(". ") || t.contains(") "))
+                t.len() > 2
+                    && t.chars()
+                        .next()
+                        .map(|c| c.is_ascii_digit())
+                        .unwrap_or(false)
+                    && (t.contains(". ") || t.contains(") "))
             });
             if is_ul {
                 html.push_str("<ul>\n");
                 for line in &lines {
-                    let text = line.trim().trim_start_matches("- ").trim_start_matches("* ");
+                    let text = line
+                        .trim()
+                        .trim_start_matches("- ")
+                        .trim_start_matches("* ");
                     html.push_str(&format!("<li>{}</li>\n", xml_escape(text)));
                 }
                 html.push_str("</ul>\n");
@@ -1343,7 +1397,13 @@ fn build_html_for_pdf(title: &str, content: &str) -> String {
             } else {
                 // Regular paragraph with line breaks
                 html.push_str("<p>");
-                html.push_str(&lines.iter().map(|l| xml_escape(l)).collect::<Vec<_>>().join("<br>"));
+                html.push_str(
+                    &lines
+                        .iter()
+                        .map(|l| xml_escape(l))
+                        .collect::<Vec<_>>()
+                        .join("<br>"),
+                );
                 html.push_str("</p>\n");
             }
         }
@@ -1389,7 +1449,10 @@ mod tests {
         let text = read_result["text"].as_str().unwrap_or("");
         assert!(text.contains("135"), "docx missing '135': {text}");
         assert!(text.contains("168"), "docx missing '168': {text}");
-        assert!(text.contains("13800138000"), "docx missing phone number: {text}");
+        assert!(
+            text.contains("13800138000"),
+            "docx missing phone number: {text}"
+        );
 
         println!("DOCX output: {}", path.display());
     }
@@ -1409,7 +1472,10 @@ mod tests {
         let result = handle(&args, &path).await.expect("handle create_pdf");
         assert_eq!(result["created"], true, "create_pdf failed: {result}");
         assert!(path.exists(), "pdf file not created");
-        assert!(path.metadata().expect("pdf metadata").len() > 0, "pdf file is empty");
+        assert!(
+            path.metadata().expect("pdf metadata").len() > 0,
+            "pdf file is empty"
+        );
 
         // Read back via read_doc
         let read_args = json!({"action": "read_doc", "path": path.to_str().expect("path to str")});
@@ -1417,8 +1483,14 @@ mod tests {
         let text = read_result["text"].as_str().unwrap_or("");
         println!("PDF read_doc text: '{text}'");
         // PDF text extraction may have spacing differences, just check numbers exist
-        assert!(text.contains("135") || text.contains("1 3 5"), "pdf missing '135': {text}");
-        assert!(text.contains("13800138000") || text.contains("1380013800"), "pdf missing phone: {text}");
+        assert!(
+            text.contains("135") || text.contains("1 3 5"),
+            "pdf missing '135': {text}"
+        );
+        assert!(
+            text.contains("13800138000") || text.contains("1380013800"),
+            "pdf missing phone: {text}"
+        );
 
         println!("PDF output: {}", path.display());
     }
@@ -1442,7 +1514,10 @@ mod tests {
         let read_args = json!({"action": "read_doc", "path": path.to_str().expect("path to str")});
         let read_result = handle(&read_args, &path).await.expect("handle read_doc");
         let sheets_json = serde_json::to_string(&read_result["sheets"]).unwrap_or_default();
-        assert!(sheets_json.contains("13800138000"), "xlsx missing phone: {sheets_json}");
+        assert!(
+            sheets_json.contains("13800138000"),
+            "xlsx missing phone: {sheets_json}"
+        );
 
         // Don't clean up — let user inspect files
         println!("XLSX output: {}", path.display());
@@ -1455,8 +1530,13 @@ mod tests {
         let path = dir.join("empty.docx");
 
         let args = json!({"action": "create_word", "path": path.to_str().expect("path to str")});
-        let result = handle(&args, &path).await.expect("handle create_word empty");
-        assert!(result.get("error").is_some(), "empty content should return error: {result}");
+        let result = handle(&args, &path)
+            .await
+            .expect("handle create_word empty");
+        assert!(
+            result.get("error").is_some(),
+            "empty content should return error: {result}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

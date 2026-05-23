@@ -42,8 +42,8 @@ fn tier_promotion_via_high_access_alone() {
         vector: vec![],
         created_at: 0,
         accessed_at: 0,
-        access_count: 15,    // hits path 1
-        importance: 0.5,     // mediocre
+        access_count: 15, // hits path 1
+        importance: 0.5,  // mediocre
         tier: MemDocTier::Working,
         abstract_text: None,
         overview_text: None,
@@ -64,8 +64,8 @@ fn tier_promotion_via_high_importance_alone() {
         vector: vec![],
         created_at: 0,
         accessed_at: 0,
-        access_count: 2,     // rarely recalled
-        importance: 0.95,    // hits path 2
+        access_count: 2,  // rarely recalled
+        importance: 0.95, // hits path 2
         tier: MemDocTier::Working,
         abstract_text: None,
         overview_text: None,
@@ -86,8 +86,8 @@ fn tier_no_promotion_when_below_all_paths() {
         vector: vec![],
         created_at: 0,
         accessed_at: 0,
-        access_count: 4,     // <5 (fails path 3) and <15 (fails path 1)
-        importance: 0.85,    // <0.9 (fails path 2), >=0.8 but access too low for path 3
+        access_count: 4,  // <5 (fails path 3) and <15 (fails path 1)
+        importance: 0.85, // <0.9 (fails path 2), >=0.8 but access too low for path 3
         tier: MemDocTier::Working,
         abstract_text: None,
         overview_text: None,
@@ -124,7 +124,7 @@ fn tier_demotion_does_not_return_true() {
 // Heartbeat: meditate type parsing
 // ---------------------------------------------------------------------------
 
-use rsclaw::heartbeat::{parse_heartbeat_md, HeartbeatType};
+use rsclaw::heartbeat::{HeartbeatType, parse_heartbeat_md};
 
 #[test]
 fn parse_meditate_type() {
@@ -218,7 +218,8 @@ fn write_skill_creates_file() {
     let dir = std::env::temp_dir().join("rsclaw-test-skills");
     let _ = std::fs::remove_dir_all(&dir);
 
-    let content = "---\nname: test-skill\ndescription: A test\nversion: 1.0.0\n---\nStep 1: do something";
+    let content =
+        "---\nname: test-skill\ndescription: A test\nversion: 1.0.0\n---\nStep 1: do something";
     let path = write_skill(&dir, "test-skill", content).expect("write_skill");
 
     assert!(path.exists(), "SKILL.md should exist");

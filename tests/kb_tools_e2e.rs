@@ -3,13 +3,16 @@
 //! `tests/kb_week3_search.rs`; kb_search_entities is covered by
 //! `tests/kb_entities_e2e.rs`.)
 
-use anyhow::Result;
-use rsclaw::kb::search::SearchCtx;
-use rsclaw::kb::sync::{KbSourceSyncer, ManualUploadSyncer, SyncContext, SyncReason};
-use rsclaw::kb::tools::{kb_fetch, kb_list_docs, kb_similar};
-use rsclaw::kb::worker::{DefaultDispatcher, HandlerCtx, WorkerConfig, WorkerPool};
-use rsclaw::kb::{CallerScope, KbEmbedder, KbIndex, KbPaths, KbStore, StubEmbedder};
 use std::sync::Arc;
+
+use anyhow::Result;
+use rsclaw::kb::{
+    CallerScope, KbEmbedder, KbIndex, KbPaths, KbStore, StubEmbedder,
+    search::SearchCtx,
+    sync::{KbSourceSyncer, ManualUploadSyncer, SyncContext, SyncReason},
+    tools::{kb_fetch, kb_list_docs, kb_similar},
+    worker::{DefaultDispatcher, HandlerCtx, WorkerConfig, WorkerPool},
+};
 use tempfile::TempDir;
 
 struct Fixture {
@@ -51,7 +54,13 @@ fn fixture() -> Fixture {
     paths.ensure_layout().unwrap();
     let embedder: Arc<dyn KbEmbedder> = Arc::new(StubEmbedder::default());
     let index = Arc::new(KbIndex::open(&paths).unwrap());
-    Fixture { _tmp: tmp, store, index, paths, embedder }
+    Fixture {
+        _tmp: tmp,
+        store,
+        index,
+        paths,
+        embedder,
+    }
 }
 
 fn search_ctx(fx: &Fixture) -> SearchCtx {
@@ -77,9 +86,7 @@ fn first_chunk_id(fx: &Fixture, lsid: &str) -> String {
 fn doc_lsid(fx: &Fixture, idx: usize) -> String {
     use redb::ReadableTable;
     let rtx = fx.store.begin_read().unwrap();
-    let tbl = rtx
-        .open_table(rsclaw::kb::store::schema::KB_DOCS)
-        .unwrap();
+    let tbl = rtx.open_table(rsclaw::kb::store::schema::KB_DOCS).unwrap();
     let mut docs: Vec<rsclaw::kb::model::KbDoc> = Vec::new();
     for entry in tbl.iter().unwrap() {
         let (_, v) = entry.unwrap();
@@ -161,7 +168,13 @@ async fn kb_fetch_unknown_chunk_returns_none() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kb_similar_returns_other_docs_chunks() -> Result<()> {
     let fx = fixture();
-    ingest(&fx, "# Cats\n\ncats prowl rooftops at night.", "cats.md", vec![]).await;
+    ingest(
+        &fx,
+        "# Cats\n\ncats prowl rooftops at night.",
+        "cats.md",
+        vec![],
+    )
+    .await;
     ingest(
         &fx,
         "# Astronomy\n\nstars orbit galactic centres.",
@@ -265,8 +278,7 @@ async fn kb_list_docs_pagination_via_cursor() -> Result<()> {
     )?;
     assert_eq!(page2.docs.len(), 2);
     // Pages must not overlap.
-    let p1_ids: std::collections::HashSet<_> =
-        page1.docs.iter().map(|d| &d.doc_id).collect();
+    let p1_ids: std::collections::HashSet<_> = page1.docs.iter().map(|d| &d.doc_id).collect();
     for d in &page2.docs {
         assert!(
             !p1_ids.contains(&d.doc_id),

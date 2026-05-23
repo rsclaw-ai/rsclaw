@@ -2,8 +2,7 @@
 
 use std::sync::Arc;
 
-use rsclaw::channel::{Channel, OutboundMessage};
-use rsclaw::channel::line::LineChannel;
+use rsclaw::channel::{Channel, OutboundMessage, line::LineChannel};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{method, path},
@@ -13,9 +12,8 @@ fn init_crypto() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
-type OnMessage = Arc<
-    dyn Fn(String, String, bool, Vec<rsclaw::agent::registry::ImageAttachment>) + Send + Sync,
->;
+type OnMessage =
+    Arc<dyn Fn(String, String, bool, Vec<rsclaw::agent::registry::ImageAttachment>) + Send + Sync>;
 
 fn noop_on_message() -> OnMessage {
     Arc::new(|_, _, _, _| {})
@@ -55,7 +53,7 @@ async fn send_text_push() {
         text: "Hello, LINE!".to_owned(),
         reply_to: None,
         images: vec![],
-    ..Default::default()
+        ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed");
@@ -81,7 +79,7 @@ async fn send_chunked_5000() {
         text: long_text,
         reply_to: None,
         images: vec![],
-    ..Default::default()
+        ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed");
@@ -111,7 +109,9 @@ async fn webhook_text_dispatches_to_callback() {
         }]
     }"#;
 
-    ch.handle_webhook(body).await.expect("webhook should succeed");
+    ch.handle_webhook(body)
+        .await
+        .expect("webhook should succeed");
 
     let msgs = received.lock().expect("lock");
     assert_eq!(msgs.len(), 1);
@@ -144,7 +144,9 @@ async fn webhook_group_message() {
         }]
     }"#;
 
-    ch.handle_webhook(body).await.expect("webhook should succeed");
+    ch.handle_webhook(body)
+        .await
+        .expect("webhook should succeed");
 
     let msgs = received.lock().expect("lock");
     assert_eq!(msgs.len(), 1);
@@ -157,7 +159,10 @@ async fn send_push_uses_bearer_auth() {
 
     Mock::given(method("POST"))
         .and(path("/message/push"))
-        .and(wiremock::matchers::header("authorization", "Bearer test-token"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            "Bearer test-token",
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
         .expect(1)
         .mount(&server)
@@ -170,10 +175,12 @@ async fn send_push_uses_bearer_auth() {
         text: "Auth check".to_owned(),
         reply_to: None,
         images: vec![],
-    ..Default::default()
+        ..Default::default()
     };
 
-    ch.send(msg).await.expect("send should succeed with bearer auth");
+    ch.send(msg)
+        .await
+        .expect("send should succeed with bearer auth");
 }
 
 #[tokio::test]
@@ -193,7 +200,7 @@ async fn http_error_returns_err() {
         text: "Hello".to_owned(),
         reply_to: None,
         images: vec![],
-    ..Default::default()
+        ..Default::default()
     };
 
     let result = ch.send(msg).await;

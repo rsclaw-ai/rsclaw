@@ -18,31 +18,55 @@ pub async fn cmd_browser(sub: BrowserCommand) -> Result<()> {
 
     let (action, args) = match sub {
         BrowserCommand::Open { url } => ("open", json!({"url": url})),
-        BrowserCommand::Snapshot { interactive } => ("snapshot", json!({"interactive": interactive})),
+        BrowserCommand::Snapshot { interactive } => {
+            ("snapshot", json!({"interactive": interactive}))
+        }
         BrowserCommand::Click { eref } => ("click", json!({"ref": eref})),
         BrowserCommand::ClickAt { eref, x, y } => {
             let mut a = json!({});
-            if let Some(r) = eref { a["ref"] = json!(r); }
-            if let Some(xv) = x { a["x"] = json!(xv); }
-            if let Some(yv) = y { a["y"] = json!(yv); }
+            if let Some(r) = eref {
+                a["ref"] = json!(r);
+            }
+            if let Some(xv) = x {
+                a["x"] = json!(xv);
+            }
+            if let Some(yv) = y {
+                a["y"] = json!(yv);
+            }
             ("clickAt", a)
         }
         BrowserCommand::Fill { eref, text } => ("fill", json!({"ref": eref, "text": text})),
-        BrowserCommand::Pick { eref, query, timeout, index } => ("pick", json!({
-            "ref": eref, "query": query, "timeout_ms": timeout, "index": index
-        })),
+        BrowserCommand::Pick {
+            eref,
+            query,
+            timeout,
+            index,
+        } => (
+            "pick",
+            json!({
+                "ref": eref, "query": query, "timeout_ms": timeout, "index": index
+            }),
+        ),
         BrowserCommand::Press { key } => ("press", json!({"key": key})),
-        BrowserCommand::Scroll { direction, amount } => ("scroll", json!({"direction": direction, "amount": amount})),
+        BrowserCommand::Scroll { direction, amount } => {
+            ("scroll", json!({"direction": direction, "amount": amount}))
+        }
         BrowserCommand::Screenshot { path } => ("screenshot", json!({"path": path})),
         BrowserCommand::Text => ("get_text", json!({})),
         BrowserCommand::Url => ("get_url", json!({})),
         BrowserCommand::Title => ("get_title", json!({})),
         BrowserCommand::Content => ("content", json!({})),
         BrowserCommand::Console { limit } => ("console", json!({"limit": limit})),
-        BrowserCommand::Wait { target, timeout } => ("wait", json!({"target": target, "timeout": timeout})),
-        BrowserCommand::WaitForUrl { pattern, timeout } => ("waitforurl", json!({"url": pattern, "timeout": timeout})),
+        BrowserCommand::Wait { target, timeout } => {
+            ("wait", json!({"target": target, "timeout": timeout}))
+        }
+        BrowserCommand::WaitForUrl { pattern, timeout } => {
+            ("waitforurl", json!({"url": pattern, "timeout": timeout}))
+        }
         BrowserCommand::Evaluate { js } => ("evaluate", json!({"js": js})),
-        BrowserCommand::GetByText { text, exact } => ("getbytext", json!({"value": text, "exact": exact})),
+        BrowserCommand::GetByText { text, exact } => {
+            ("getbytext", json!({"value": text, "exact": exact}))
+        }
         BrowserCommand::GetByRole { role } => ("getbyrole", json!({"value": role})),
         BrowserCommand::GetByLabel { label } => ("getbylabel", json!({"value": label})),
         BrowserCommand::Back => ("back", json!({})),
@@ -70,7 +94,8 @@ pub async fn cmd_browser(sub: BrowserCommand) -> Result<()> {
             // Strip "data:image/png;base64," prefix.
             let b64 = data_uri.split(',').nth(1).unwrap_or(data_uri);
             use base64::Engine;
-            let bytes = base64::engine::general_purpose::STANDARD.decode(b64)
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(b64)
                 .map_err(|e| anyhow::anyhow!("failed to decode screenshot: {e}"))?;
             std::fs::write(&path, &bytes)?;
             println!("Screenshot saved to {path} ({} bytes)", bytes.len());

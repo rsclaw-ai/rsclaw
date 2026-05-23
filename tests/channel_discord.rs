@@ -2,8 +2,7 @@
 
 use std::sync::Arc;
 
-use rsclaw::channel::{Channel, OutboundMessage};
-use rsclaw::channel::discord::DiscordChannel;
+use rsclaw::channel::{Channel, OutboundMessage, discord::DiscordChannel};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{method, path_regex},
@@ -31,7 +30,13 @@ fn noop_on_message() -> OnMessage {
 
 fn make_channel(base_url: &str) -> DiscordChannel {
     init_crypto();
-    DiscordChannel::new("test-token", false, noop_on_message(), Some(base_url.to_owned()), None)
+    DiscordChannel::new(
+        "test-token",
+        false,
+        noop_on_message(),
+        Some(base_url.to_owned()),
+        None,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -51,10 +56,7 @@ async fn send_text_posts_to_channel_messages() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/channels/chan123/messages"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"id": "msg_1"})),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "msg_1"})))
         .expect(1)
         .mount(&server)
         .await;
@@ -66,7 +68,7 @@ async fn send_text_posts_to_channel_messages() {
         text: "Hello, Discord!".to_owned(),
         reply_to: None,
         images: vec![],
-    ..Default::default()
+        ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed");
@@ -79,10 +81,7 @@ async fn send_chunked_2000() {
     // A message longer than 2000 chars should be split into 2 chunks.
     Mock::given(method("POST"))
         .and(path_regex(r"/channels/chan123/messages"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"id": "msg_1"})),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "msg_1"})))
         .expect(2)
         .mount(&server)
         .await;
@@ -95,7 +94,7 @@ async fn send_chunked_2000() {
         text: long_text,
         reply_to: None,
         images: vec![],
-    ..Default::default()
+        ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed");
@@ -108,10 +107,7 @@ async fn send_image_uploads_multipart() {
     // Text chunk
     Mock::given(method("POST"))
         .and(path_regex(r"/channels/chan123/messages"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"id": "msg_1"})),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "msg_1"})))
         .mount(&server)
         .await;
 
@@ -128,7 +124,7 @@ async fn send_image_uploads_multipart() {
         text: "Image test".to_owned(),
         reply_to: None,
         images: vec![data_uri],
-    ..Default::default()
+        ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed");
@@ -151,7 +147,7 @@ async fn http_error_returns_err() {
         text: "Hello".to_owned(),
         reply_to: None,
         images: vec![],
-    ..Default::default()
+        ..Default::default()
     };
 
     let result = ch.send(msg).await;
@@ -164,11 +160,11 @@ async fn auth_header_includes_bot_prefix() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/channels/chan123/messages"))
-        .and(wiremock::matchers::header("authorization", "Bot test-token"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"id": "msg_1"})),
-        )
+        .and(wiremock::matchers::header(
+            "authorization",
+            "Bot test-token",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "msg_1"})))
         .expect(1)
         .mount(&server)
         .await;
@@ -180,8 +176,10 @@ async fn auth_header_includes_bot_prefix() {
         text: "Auth check".to_owned(),
         reply_to: None,
         images: vec![],
-    ..Default::default()
+        ..Default::default()
     };
 
-    ch.send(msg).await.expect("send should succeed with Bot auth header");
+    ch.send(msg)
+        .await
+        .expect("send should succeed with Bot auth header");
 }

@@ -5,16 +5,17 @@
 //!   - URLs (http/https/ftp): EntityKind::Url
 //!   - Emails: EntityKind::Email
 //!   - Hashtags (#word): EntityKind::Hashtag
-//!   - @-mentions (@handle): EntityKind::Person (best-effort; v2 NER
-//!     refines)
+//!   - @-mentions (@handle): EntityKind::Person (best-effort; v2 NER refines)
 //!
 //! Limits per chunk: ~64 mentions across all kinds (avoids
 //! pathological inputs blowing memory).
 
-use crate::kb::model::EntityKind;
+use std::collections::HashSet;
+
 use once_cell::sync::Lazy;
 use regex::Regex;
-use std::collections::HashSet;
+
+use crate::kb::model::EntityKind;
 
 const MAX_MENTIONS_PER_CHUNK: usize = 64;
 
@@ -46,8 +47,10 @@ static MENTION_RE: Lazy<Regex> = Lazy::new(|| {
 pub fn extract_entities(text: &str) -> Vec<ExtractedMention> {
     let mut out: Vec<ExtractedMention> = Vec::new();
     let mut seen: HashSet<(EntityKind, String)> = HashSet::new();
-    let push = |kind: EntityKind, surface: String, out: &mut Vec<ExtractedMention>,
-                    seen: &mut HashSet<(EntityKind, String)>| {
+    let push = |kind: EntityKind,
+                surface: String,
+                out: &mut Vec<ExtractedMention>,
+                seen: &mut HashSet<(EntityKind, String)>| {
         if out.len() >= MAX_MENTIONS_PER_CHUNK {
             return;
         }
@@ -61,7 +64,12 @@ pub fn extract_entities(text: &str) -> Vec<ExtractedMention> {
         push(EntityKind::Url, m.as_str().to_string(), &mut out, &mut seen);
     }
     for m in EMAIL_RE.find_iter(text) {
-        push(EntityKind::Email, m.as_str().to_lowercase(), &mut out, &mut seen);
+        push(
+            EntityKind::Email,
+            m.as_str().to_lowercase(),
+            &mut out,
+            &mut seen,
+        );
     }
     for m in HASHTAG_RE.find_iter(text) {
         // Drop the leading '#' so the surface is the tag body.
@@ -95,7 +103,12 @@ pub fn canonical_id(kind: EntityKind, surface: &str) -> String {
     h.update(kind_tag.as_bytes());
     h.update([0u8]);
     h.update(surface.to_lowercase().as_bytes());
-    let hex: String = h.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect();
+    let hex: String = h
+        .finalize()
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect();
     format!("ent_{kind_tag}_{hex}")
 }
 
@@ -103,36 +116,58 @@ pub fn canonical_id(kind: EntityKind, surface: &str) -> String {
 mod tests {
     use super::*;
 
-    fn find_kind<'a>(items: &'a [ExtractedMention], kind: EntityKind, surface: &str)
-        -> Option<&'a ExtractedMention>
-    {
-        items.iter().find(|m| m.kind == kind && m.surface == surface)
+    fn find_kind<'a>(
+        items: &'a [ExtractedMention],
+        kind: EntityKind,
+        surface: &str,
+    ) -> Option<&'a ExtractedMention> {
+        items
+            .iter()
+            .find(|m| m.kind == kind && m.surface == surface)
     }
 
     #[test]
     fn extracts_urls() {
         let r = extract_entities("see https://example.com/page?x=1 for more");
-        assert!(find_kind(&r, EntityKind::Url, "https://example.com/page?x=1").is_some(), "{r:?}");
+        assert!(
+            find_kind(&r, EntityKind::Url, "https://example.com/page?x=1").is_some(),
+            "{r:?}"
+        );
     }
 
     #[test]
     fn extracts_emails_lowercased() {
         let r = extract_entities("contact JANE@Example.COM about Q4");
-        assert!(find_kind(&r, EntityKind::Email, "jane@example.com").is_some(), "{r:?}");
+        assert!(
+            find_kind(&r, EntityKind::Email, "jane@example.com").is_some(),
+            "{r:?}"
+        );
     }
 
     #[test]
     fn extracts_hashtags_including_cjk() {
         let r = extract_entities("#rust and #编程 are great");
-        assert!(find_kind(&r, EntityKind::Hashtag, "rust").is_some(), "{r:?}");
-        assert!(find_kind(&r, EntityKind::Hashtag, "编程").is_some(), "{r:?}");
+        assert!(
+            find_kind(&r, EntityKind::Hashtag, "rust").is_some(),
+            "{r:?}"
+        );
+        assert!(
+            find_kind(&r, EntityKind::Hashtag, "编程").is_some(),
+            "{r:?}"
+        );
     }
 
     #[test]
     fn extracts_mentions() {
         let r = extract_entities("ask @alice or @bob_42");
-        assert!(find_kind(&r, EntityKind::Person, "alice").is_some(), "{r:?}");
-        assert!(find_kind(&r, EntityKind::Person, "bob_42").is_some(), "{r:?}");
+        assert!(
+            find_kind(&r, EntityKind::Person, "alice").is_some(),
+            "{r:?}"
+        );
+        assert!(
+            find_kind(&r, EntityKind::Person, "bob_42").is_some(),
+            "{r:?}"
+        );
     }
 
     #[test]

@@ -89,13 +89,17 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
         println!("  {} checking for updates...", dim("[..]"));
     }
 
-    // Try app.rsclaw.ai first (object or array), fallback GitHub releases list (array).
-    // A valid release must have tag_name and assets so we can download the binary.
+    // Try app.rsclaw.ai first (object or array), fallback GitHub releases list
+    // (array). A valid release must have tag_name and assets so we can download
+    // the binary.
     let release: serde_json::Value = {
         let mut data = None;
         let sources = [
             RSCLAW_VERSION_URL.to_owned(),
-            proxy_url(&format!("https://api.github.com/repos/{}/releases?per_page=10", "rsclaw-ai/rsclaw")),
+            proxy_url(&format!(
+                "https://api.github.com/repos/{}/releases?per_page=10",
+                "rsclaw-ai/rsclaw"
+            )),
         ];
         for url in &sources {
             if let Ok(resp) = client.get(url).send().await {
@@ -240,7 +244,11 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
     if !quiet {
         println!("  {} downloading {asset_name}...", dim("[..]"));
     }
-    let download = if url.contains("github.com") || url.contains("githubusercontent.com") { proxy_url(&url) } else { url.clone() };
+    let download = if url.contains("github.com") || url.contains("githubusercontent.com") {
+        proxy_url(&url)
+    } else {
+        url.clone()
+    };
     let downloaded = client.get(&download).send().await?.bytes().await?;
 
     if downloaded.is_empty() {
@@ -254,25 +262,31 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
     // hostile GITHUB_PROXY (or any MITM if TLS validation ever broke)
     // could substitute an arbitrary binary that we'd then chmod 755 over
     // the live executable. Verify before touching disk.
-    let sum_url = release["assets"]
-        .as_array()
-        .and_then(|arr| {
-            arr.iter().find_map(|a| {
-                let name = a["name"].as_str().unwrap_or("");
-                if name.eq_ignore_ascii_case("SHA256SUMS.txt") || name.eq_ignore_ascii_case("SHA256SUMS") {
-                    a["browser_download_url"].as_str().map(|s| s.to_owned())
-                } else {
-                    None
-                }
-            })
-        });
+    let sum_url = release["assets"].as_array().and_then(|arr| {
+        arr.iter().find_map(|a| {
+            let name = a["name"].as_str().unwrap_or("");
+            if name.eq_ignore_ascii_case("SHA256SUMS.txt")
+                || name.eq_ignore_ascii_case("SHA256SUMS")
+            {
+                a["browser_download_url"].as_str().map(|s| s.to_owned())
+            } else {
+                None
+            }
+        })
+    });
     if let Some(su) = sum_url {
         let su_dl = if su.contains("github.com") || su.contains("githubusercontent.com") {
             proxy_url(&su)
         } else {
             su.clone()
         };
-        let sums = client.get(&su_dl).send().await?.text().await.unwrap_or_default();
+        let sums = client
+            .get(&su_dl)
+            .send()
+            .await?
+            .text()
+            .await
+            .unwrap_or_default();
         let asset_filename = url.rsplit('/').next().unwrap_or("");
         let expected = sums.lines().find_map(|line| {
             let mut parts = line.split_whitespace();
@@ -329,7 +343,11 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
     // fallback ("could not extract, using raw download") wrote the
     // archive's gzipped/zipped bytes as the executable, then chmod +x'd
     // it — a pretty reliable way to brick the install.
-    let binary_name = if std::env::consts::OS == "windows" { "rsclaw.exe" } else { "rsclaw" };
+    let binary_name = if std::env::consts::OS == "windows" {
+        "rsclaw.exe"
+    } else {
+        "rsclaw"
+    };
     let url_lower = download.to_lowercase();
     let looks_archived = url_lower.ends_with(".tar.gz")
         || url_lower.ends_with(".tgz")
@@ -360,10 +378,7 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            &new_path,
-            std::fs::Permissions::from_mode(0o755),
-        )?;
+        std::fs::set_permissions(&new_path, std::fs::Permissions::from_mode(0o755))?;
     }
 
     // Move current → backup (so we have a rollback target) then rename
@@ -501,13 +516,20 @@ async fn update_status() -> Result<()> {
 
     let client = build_update_client(10)?;
 
-    kv("Current:", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"));
+    kv(
+        "Current:",
+        option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
+    );
 
-    // Try app.rsclaw.ai first (object or array), fallback GitHub releases list (array)
+    // Try app.rsclaw.ai first (object or array), fallback GitHub releases list
+    // (array)
     let mut latest_tag: Option<String> = None;
     let sources = [
         RSCLAW_VERSION_URL.to_owned(),
-        proxy_url(&format!("https://api.github.com/repos/{}/releases?per_page=10", "rsclaw-ai/rsclaw")),
+        proxy_url(&format!(
+            "https://api.github.com/repos/{}/releases?per_page=10",
+            "rsclaw-ai/rsclaw"
+        )),
     ];
     for url in &sources {
         if let Ok(resp) = client.get(url).send().await {
@@ -547,8 +569,9 @@ async fn update_status() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::version_cmp;
     use std::cmp::Ordering;
+
+    use super::version_cmp;
 
     #[test]
     fn newer_release_is_greater() {

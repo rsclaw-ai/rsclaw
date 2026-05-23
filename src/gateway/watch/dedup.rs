@@ -14,7 +14,11 @@ pub fn normalize_source(s: &str) -> String {
 /// Build the `(channel, peer, normalize(source))` triple used as the
 /// HashMap key in WatchRegistry.
 pub fn dedup_key(channel: &str, peer: &str, source: &str) -> DedupKey {
-    (channel.to_owned(), peer.to_owned(), normalize_source(source))
+    (
+        channel.to_owned(),
+        peer.to_owned(),
+        normalize_source(source),
+    )
 }
 
 #[cfg(test)]

@@ -2,10 +2,12 @@
 
 use std::sync::Arc;
 
-use rsclaw::channel::{Channel, OutboundMessage};
-use rsclaw::channel::whatsapp::{
-    WhatsAppChannel, WebhookPayload, WhatsAppEntry, WhatsAppChange,
-    WhatsAppValue, WhatsAppMessage, WhatsAppText,
+use rsclaw::channel::{
+    Channel, OutboundMessage,
+    whatsapp::{
+        WebhookPayload, WhatsAppChange, WhatsAppChannel, WhatsAppEntry, WhatsAppMessage,
+        WhatsAppText, WhatsAppValue,
+    },
 };
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -16,9 +18,8 @@ fn init_crypto() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
-type OnMessage = Arc<
-    dyn Fn(String, String, Vec<rsclaw::agent::registry::ImageAttachment>) + Send + Sync,
->;
+type OnMessage =
+    Arc<dyn Fn(String, String, Vec<rsclaw::agent::registry::ImageAttachment>) + Send + Sync>;
 
 fn noop_on_message() -> OnMessage {
     Arc::new(|_, _, _| {})
@@ -26,7 +27,12 @@ fn noop_on_message() -> OnMessage {
 
 fn make_channel(base_url: &str) -> WhatsAppChannel {
     init_crypto();
-    WhatsAppChannel::with_api_base("phone123", "access-tok", Some(base_url.to_owned()), noop_on_message())
+    WhatsAppChannel::with_api_base(
+        "phone123",
+        "access-tok",
+        Some(base_url.to_owned()),
+        noop_on_message(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -61,7 +67,7 @@ async fn send_text_posts_to_messages_endpoint() {
         text: "Hello, WhatsApp!".to_owned(),
         reply_to: None,
         images: vec![],
-    ..Default::default()
+        ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed");
@@ -90,7 +96,7 @@ async fn send_chunked_4000() {
         text: long_text,
         reply_to: None,
         images: vec![],
-    ..Default::default()
+        ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed");
@@ -114,8 +120,7 @@ async fn send_image_uploads_then_sends() {
     Mock::given(method("POST"))
         .and(path_regex(r"/phone123/media"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"id": "media_id_1"})),
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "media_id_1"})),
         )
         .mount(&server)
         .await;
@@ -133,7 +138,7 @@ async fn send_image_uploads_then_sends() {
         text: "Check this image".to_owned(),
         reply_to: None,
         images: vec![data_uri],
-    ..Default::default()
+        ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed");
@@ -368,7 +373,10 @@ async fn send_uses_bearer_auth_header() {
 
     Mock::given(method("POST"))
         .and(path_regex(r"/phone123/messages"))
-        .and(wiremock::matchers::header("authorization", "Bearer access-tok"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            "Bearer access-tok",
+        ))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(serde_json::json!({"messages": [{"id": "wamid.123"}]})),
@@ -384,10 +392,12 @@ async fn send_uses_bearer_auth_header() {
         text: "Auth check".to_owned(),
         reply_to: None,
         images: vec![],
-    ..Default::default()
+        ..Default::default()
     };
 
-    ch.send(msg).await.expect("send should succeed with bearer auth");
+    ch.send(msg)
+        .await
+        .expect("send should succeed with bearer auth");
 }
 
 #[tokio::test]
@@ -407,7 +417,7 @@ async fn http_error_returns_err() {
         text: "Hello".to_owned(),
         reply_to: None,
         images: vec![],
-    ..Default::default()
+        ..Default::default()
     };
 
     let result = ch.send(msg).await;

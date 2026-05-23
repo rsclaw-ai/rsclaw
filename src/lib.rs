@@ -59,7 +59,7 @@
     clippy::manual_div_ceil,
     clippy::manual_clamp,
     clippy::implicit_saturating_sub,
-    clippy::field_reassign_with_default,
+    clippy::field_reassign_with_default
 )]
 
 pub mod a2a;
@@ -72,8 +72,8 @@ pub mod cli;
 pub mod cmd;
 pub mod computer;
 pub mod config;
-pub mod desktop;
 pub mod cron;
+pub mod desktop;
 pub mod embed;
 pub mod events;
 pub mod gateway;

@@ -7,17 +7,16 @@ pub mod manual;
 pub mod state;
 pub mod url;
 
+use std::sync::Arc;
+
 pub use manual::ManualUploadSyncer;
+use serde::{Deserialize, Serialize};
 pub use state::SyncRegistry;
 pub use url::UrlSyncer;
 
-use crate::kb::embedder::KbEmbedder;
-use crate::kb::index::KbIndex;
-use crate::kb::model::KbSourceKind;
-use crate::kb::paths::KbPaths;
-use crate::kb::store::KbStore;
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use crate::kb::{
+    embedder::KbEmbedder, index::KbIndex, model::KbSourceKind, paths::KbPaths, store::KbStore,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncReason {
@@ -66,11 +65,7 @@ pub trait KbSourceSyncer: Send + Sync {
     fn sync_interval_secs(&self) -> Option<u64> {
         Some(20 * 60)
     }
-    async fn sync(
-        &self,
-        ctx: &SyncContext,
-        reason: SyncReason,
-    ) -> Result<SyncOutcome, SyncError>;
+    async fn sync(&self, ctx: &SyncContext, reason: SyncReason) -> Result<SyncOutcome, SyncError>;
     /// Called once when a syncer is enabled / registered. Default
     /// impl is a no-op; concrete syncers can use this for any
     /// one-shot setup (e.g. fetching feed metadata, registering a

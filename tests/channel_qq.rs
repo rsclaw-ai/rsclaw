@@ -2,8 +2,7 @@
 
 use std::sync::Arc;
 
-use rsclaw::channel::{Channel, OutboundMessage};
-use rsclaw::channel::qq::QQBotChannel;
+use rsclaw::channel::{Channel, OutboundMessage, qq::QQBotChannel};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{method, path, path_regex},

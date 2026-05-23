@@ -5,19 +5,20 @@
 //!      published into `restart_request_tx`.
 //!   2. A connection that arrives AFTER a request was latched into
 //!      `pending_restart` receives the latched event during handshake replay.
-//!   3. `ShutdownCoordinator::begin_drain()` flips the public `is_draining`
-//!      bit so callers can gate new work.
-//!   4. A config-file edit drives `FileWatcher` to emit `RequiresRestart`,
-//!      and the bridge that forwards it produces a `RestartRequest` whose
+//!   3. `ShutdownCoordinator::begin_drain()` flips the public `is_draining` bit
+//!      so callers can gate new work.
+//!   4. A config-file edit drives `FileWatcher` to emit `RequiresRestart`, and
+//!      the bridge that forwards it produces a `RestartRequest` whose
 //!      `reason.kind == "config_changed"` reaches a connected WS client.
-//!   5. A simulated BGE-download completion publishes a
-//!      `ModelDownloaded` `RestartRequest` and a fresh WS connection sees
-//!      the latched event during handshake replay.
+//!   5. A simulated BGE-download completion publishes a `ModelDownloaded`
+//!      `RestartRequest` and a fresh WS connection sees the latched event
+//!      during handshake replay.
 
 mod common;
 
 use std::time::Duration;
 
+use common::{free_addr, start_server_with_handles};
 use futures::{SinkExt, StreamExt};
 use rsclaw::{
     events::{RestartReason, RestartRequest, RestartUrgency},
@@ -26,8 +27,6 @@ use rsclaw::{
 use serde_json::json;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
-
-use common::{free_addr, start_server_with_handles};
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -44,9 +43,7 @@ const RECV_TIMEOUT: Duration = Duration::from_secs(3);
 /// left on the stream for the caller to read.
 async fn handshake(
     addr: std::net::SocketAddr,
-) -> tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-> {
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     let url = format!("ws://{addr}/");
     let (mut stream, _) = tokio_tungstenite::connect_async(&url)
         .await
@@ -122,11 +119,14 @@ async fn read_until_restart_required(
 ) -> serde_json::Value {
     let deadline = tokio::time::Instant::now() + RECV_TIMEOUT;
     loop {
-        let frame = timeout(deadline.saturating_duration_since(tokio::time::Instant::now()), stream.next())
-            .await
-            .expect("restart frame timeout")
-            .expect("restart stream end")
-            .expect("restart ws err");
+        let frame = timeout(
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            stream.next(),
+        )
+        .await
+        .expect("restart frame timeout")
+        .expect("restart stream end")
+        .expect("restart ws err");
         let text = match frame {
             Message::Text(t) => t.to_string(),
             Message::Ping(_) | Message::Pong(_) => continue,
@@ -153,9 +153,7 @@ fn assert_restart_payload_shape(value: &serde_json::Value, expected_kind: &str) 
     assert_eq!(value["type"], "event");
     assert_eq!(value["event"], "restart.required");
 
-    let payload = value
-        .get("payload")
-        .expect("frame missing payload");
+    let payload = value.get("payload").expect("frame missing payload");
     // RestartRequest uses default (snake_case) serde naming, unlike the
     // surrounding EventFrame which is camelCase.
     assert!(
@@ -163,10 +161,7 @@ fn assert_restart_payload_shape(value: &serde_json::Value, expected_kind: &str) 
         "at_ms missing or not u64: {payload}"
     );
     assert!(payload["urgency"].is_string(), "urgency missing: {payload}");
-    assert!(
-        payload["message"].is_string(),
-        "message missing: {payload}"
-    );
+    assert!(payload["message"].is_string(), "message missing: {payload}");
     assert!(
         payload["reason"].is_object(),
         "reason missing or not object: {payload}"

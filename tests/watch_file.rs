@@ -1,9 +1,9 @@
 //! Integration test for the FileSource event producer.
 
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
 
 use rsclaw::gateway::watch::source::{FileSource, SourceImpl};
+use tokio::sync::{mpsc, oneshot};
 
 #[tokio::test]
 async fn file_source_emits_appended_lines() {
@@ -18,7 +18,9 @@ async fn file_source_emits_appended_lines() {
     let handle = tokio::spawn(async move { src.run(tx, stop_rx).await });
 
     tokio::time::sleep(Duration::from_millis(300)).await;
-    tokio::fs::write(&path, "preexisting\nhello\nworld\n").await.unwrap();
+    tokio::fs::write(&path, "preexisting\nhello\nworld\n")
+        .await
+        .unwrap();
 
     let ev1 = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await

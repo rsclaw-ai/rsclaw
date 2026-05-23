@@ -1,8 +1,9 @@
 //! ACP integration tests
 
+use std::sync::Arc;
+
 use futures::future::BoxFuture;
 use rsclaw::acp::{AcpCallbackHandler, SessionEvent, types::*};
-use std::sync::Arc;
 use tokio::sync::Mutex;
 
 /// Mock handler for testing

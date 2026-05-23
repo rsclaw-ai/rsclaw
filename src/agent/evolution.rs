@@ -261,8 +261,8 @@ mod tests {
             enabled: None,
             preset: Some("test".to_owned()),
             cluster: Some(crate::config::schema::EvolutionClusterConfig {
-                min_size: Some(7),           // override even after preset
-                similarity_threshold: None,  // keep preset's 0.5
+                min_size: Some(7),          // override even after preset
+                similarity_threshold: None, // keep preset's 0.5
             }),
             promotion: None,
             meditation: None,

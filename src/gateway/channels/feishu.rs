@@ -3,17 +3,16 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use super::{
+    super::preparse::{btw_direct_call, is_fast_preparse, try_preparse_locally_with_account},
+    default_dm_scope,
+};
 use crate::{
     agent::{AgentMessage, AgentRegistry},
     channel::{Channel, OutboundMessage},
     config::runtime::RuntimeConfig,
     gateway::session::{MessageKind, SessionKeyParams, derive_session_key},
 };
-
-use super::super::preparse::{
-    btw_direct_call, is_fast_preparse, try_preparse_locally_with_account,
-};
-use super::default_dm_scope;
 
 // ---------------------------------------------------------------------------
 // Feishu (飞书)
@@ -22,8 +21,8 @@ use super::default_dm_scope;
 /// Pick the Feishu identifier the bot should send replies to.
 ///
 /// - Groups address by `chat_id` (`oc_xxx`).
-/// - P2P addresses by `open_id` (`ou_xxx` — the same value the runtime
-///   tracks as `sender_id` on inbound events).
+/// - P2P addresses by `open_id` (`ou_xxx` — the same value the runtime tracks
+///   as `sender_id` on inbound events).
 ///
 /// P2P over `chat_id` is technically accepted by the Feishu API but
 /// returns `230002` ("Bot/User can NOT be out of the chat") whenever
@@ -164,18 +163,24 @@ pub(crate) fn start_feishu_if_configured(
         let tq = Arc::clone(&task_queue);
         let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
 
-        // Register channel sender for notification routing (ACP tools like OpenCode, ClaudeCode).
-        // - "feishu/{account}" is the canonical key — multi-account-aware callers use it.
+        // Register channel sender for notification routing (ACP tools like OpenCode,
+        // ClaudeCode).
+        // - "feishu/{account}" is the canonical key — multi-account-aware callers use
+        //   it.
         // - bare "feishu" is registered ONLY by the first account so legacy single-
         //   account callers still find a sender. Without this guard each account
-        //   overwrote the bare key, leaving the last-registered account routing
-        //   replies for messages received via every other account → Feishu 230002
-        //   "Bot/User can NOT be out of the chat" because that bot wasn't actually
-        //   in the originating chat.
+        //   overwrote the bare key, leaving the last-registered account routing replies
+        //   for messages received via every other account → Feishu 230002 "Bot/User can
+        //   NOT be out of the chat" because that bot wasn't actually in the originating
+        //   chat.
         {
-            let mut senders = _channel_senders.write().expect("channel_senders lock poisoned");
+            let mut senders = _channel_senders
+                .write()
+                .expect("channel_senders lock poisoned");
             senders.insert(format!("feishu/{}", acct_name), out_tx.clone());
-            senders.entry("feishu".to_string()).or_insert_with(|| out_tx.clone());
+            senders
+                .entry("feishu".to_string())
+                .or_insert_with(|| out_tx.clone());
         }
 
         // Find binding for this account to determine which agent handles it.
@@ -267,7 +272,8 @@ pub(crate) fn start_feishu_if_configured(
                                         channel: None,
 
                                         account: None,
-                    files: vec![],                                    })
+                                        files: vec![],
+                                    })
                                     .await
                                 {
                                     tracing::warn!("failed to send message: {e}");
@@ -289,7 +295,8 @@ pub(crate) fn start_feishu_if_configured(
                                         channel: None,
 
                                         account: None,
-                    files: vec![],                                    })
+                                        files: vec![],
+                                    })
                                     .await
                                 {
                                     tracing::warn!("failed to send message: {e}");
@@ -314,20 +321,28 @@ pub(crate) fn start_feishu_if_configured(
                                 Err(_) => return,
                             }
                         };
-                        if let Some(mut reply) = try_preparse_locally_with_account(&text, &handle, "feishu", &sender_id, Some(&w_acct_outer), crate::gateway::preparse::PreparseOrigin::User).await {
+                        if let Some(mut reply) = try_preparse_locally_with_account(
+                            &text,
+                            &handle,
+                            "feishu",
+                            &sender_id,
+                            Some(&w_acct_outer),
+                            crate::gateway::preparse::PreparseOrigin::User,
+                        )
+                        .await
+                        {
                             reply.target_id = outbound_target.clone();
                             reply.is_group = is_group;
                             if !reply.text.is_empty() || !reply.images.is_empty() {
                                 if let Err(e) = tx.send(reply).await {
-
                                     tracing::warn!("failed to send message: {e}");
-
                                 }
                             }
                             return;
                         }
-                        // try_preparse_locally returned None (e.g. /clear sets abort
-                        // then falls through to agent queue for actual cleanup)
+                        // try_preparse_locally returned None (e.g. /clear sets
+                        // abort then falls through to
+                        // agent queue for actual cleanup)
                     }
                     // Get or create a per-user queue.
                     let user_tx = {
@@ -368,13 +383,19 @@ pub(crate) fn start_feishu_if_configured(
                                             Ok(h) => h,
                                             Err(_) => match w_reg.route_account("feishu", None) {
                                                 Ok(h) => h,
-                                                Err(e) => { error!("feishu route error: {e:#}"); continue; }
+                                                Err(e) => {
+                                                    error!("feishu route error: {e:#}");
+                                                    continue;
+                                                }
                                             },
                                         }
                                     } else {
                                         match w_reg.route_account("feishu", None) {
                                             Ok(h) => h,
-                                            Err(e) => { error!("feishu route error: {e:#}"); continue; }
+                                            Err(e) => {
+                                                error!("feishu route error: {e:#}");
+                                                continue;
+                                            }
                                         }
                                     };
                                     let dm_scope = default_dm_scope(&w_cfg);
@@ -392,8 +413,9 @@ pub(crate) fn start_feishu_if_configured(
                                         peer_id: sender_id.clone(),
                                         dm_scope,
                                     });
-                                    // Submit to persistent task queue (worker handles dispatch + reply).
-                                    // `account` carries the originating Feishu app name so the
+                                    // Submit to persistent task queue (worker handles dispatch +
+                                    // reply). `account` carries
+                                    // the originating Feishu app name so the
                                     // task worker can route the reply via the same app's API
                                     // token (multi-account routing fix for 230002).
                                     //
@@ -416,11 +438,23 @@ pub(crate) fn start_feishu_if_configured(
                                         reply_to: None,
                                         timestamp: chrono::Utc::now().timestamp(),
                                         images: images.iter().map(|i| i.data.clone()).collect(),
-                                        files: file_attachments.iter().filter_map(|f| {
-                                            crate::gateway::task_queue::stage_file(&f.filename, &f.data, &f.mime_type).ok()
-                                        }).collect(),
+                                        files: file_attachments
+                                            .iter()
+                                            .filter_map(|f| {
+                                                crate::gateway::task_queue::stage_file(
+                                                    &f.filename,
+                                                    &f.data,
+                                                    &f.mime_type,
+                                                )
+                                                .ok()
+                                            })
+                                            .collect(),
                                     };
-                                    if let Err(e) = w_tq.submit(&session_key, qmsg, crate::gateway::task_queue::Priority::User) {
+                                    if let Err(e) = w_tq.submit(
+                                        &session_key,
+                                        qmsg,
+                                        crate::gateway::task_queue::Priority::User,
+                                    ) {
                                         error!(user = %w_uid, "feishu: queue submit failed: {e:#}");
                                     }
                                 }
@@ -461,7 +495,8 @@ pub(crate) fn start_feishu_if_configured(
                                         channel: None,
 
                                         account: None,
-                    files: vec![],                                    })
+                                        files: vec![],
+                                    })
                                     .await
                                 {
                                     tracing::warn!("failed to send message: {e}");
@@ -510,14 +545,21 @@ pub(crate) fn start_feishu_if_configured(
                                 peer_id: sender_id.clone(),
                                 dm_scope,
                             });
-                            if let Some(mut reply) = try_preparse_locally_with_account(&text, &handle, "feishu", &sender_id, Some(&w_acct_for_preparse), crate::gateway::preparse::PreparseOrigin::User).await {
+                            if let Some(mut reply) = try_preparse_locally_with_account(
+                                &text,
+                                &handle,
+                                "feishu",
+                                &sender_id,
+                                Some(&w_acct_for_preparse),
+                                crate::gateway::preparse::PreparseOrigin::User,
+                            )
+                            .await
+                            {
                                 reply.target_id = outbound_target.clone();
                                 reply.is_group = is_group;
                                 if !reply.text.is_empty() || !reply.images.is_empty() {
                                     if let Err(e) = tx.send(reply).await {
-
                                         tracing::warn!("failed to send message: {e}");
-
                                     }
                                 }
                                 return;
@@ -543,18 +585,23 @@ pub(crate) fn start_feishu_if_configured(
                             if handle.tx.send(msg).await.is_err() {
                                 return;
                             }
-                            if let Ok(Ok(r)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
+                            if let Ok(Ok(r)) =
+                                tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx)
+                                    .await
+                            {
                                 if !r.is_empty {
-                                    if let Err(e) = tx.send(OutboundMessage {
-                                        target_id: outbound_target,
-                                        is_group,
-                                        text: r.text,
-                                        reply_to: None,
-                                        images: r.images,
-                                        files: r.files,
-                                        channel: None,
-                                        account: None,
-                                    }).await
+                                    if let Err(e) = tx
+                                        .send(OutboundMessage {
+                                            target_id: outbound_target,
+                                            is_group,
+                                            text: r.text,
+                                            reply_to: None,
+                                            images: r.images,
+                                            files: r.files,
+                                            channel: None,
+                                            account: None,
+                                        })
+                                        .await
                                     {
                                         tracing::warn!("failed to send message: {e}");
                                     }

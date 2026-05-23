@@ -10,15 +10,14 @@
 //!   contract used by chat history is preserved.
 //! - `mouse_*` / `click` / `drag` / `scroll` / `type` / `key` / `hold_key` /
 //!   `wait` → translated to [`Action`] and executed via [`NativeOperator`].
-//! - `triple_click` / `cursor_position` / `get_active_window` / `ui_tree`
-//!   → inline subprocess helpers; they're queries, not part of the
-//!   operator action space.
+//! - `triple_click` / `cursor_position` / `get_active_window` / `ui_tree` →
+//!   inline subprocess helpers; they're queries, not part of the operator
+//!   action space.
 //! - `list_app_rules` / `get_app_rule` → backed by [`AppRuleSet`].
 //! - `vlm_drive` → end-to-end VLM loop via [`VlmDriver`]; supports any
 //!   vision-capable LLM provider.
 
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, atomic::AtomicBool};
 
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
@@ -38,9 +37,7 @@ const ASYNC_VLM_DRIVE_HARD_TIMEOUT_SECS: u64 = 3600;
 /// the registry entry leaks on panic — harmless individually but the
 /// map grows unbounded over time on a long-running gateway.
 struct VlmDriveRunGuard {
-    reg: Option<
-        Arc<tokio::sync::RwLock<std::collections::HashMap<String, Arc<AtomicBool>>>>,
-    >,
+    reg: Option<Arc<tokio::sync::RwLock<std::collections::HashMap<String, Arc<AtomicBool>>>>>,
     run_id: String,
 }
 
@@ -102,18 +99,10 @@ impl super::runtime::AgentRuntime {
             }
 
             // ---- Operator-backed actions ---------------------------------
-            "mouse_move"
-            | "mouse_click"
-            | "left_click"
-            | "double_click"
-            | "right_click"
-            | "middle_click"
-            | "drag"
-            | "scroll"
-            | "type"
-            | "key"
-            | "hold_key"
-            | "wait" => dispatch_via_native_operator(action_str, &args).await,
+            "mouse_move" | "mouse_click" | "left_click" | "double_click" | "right_click"
+            | "middle_click" | "drag" | "scroll" | "type" | "key" | "hold_key" | "wait" => {
+                dispatch_via_native_operator(action_str, &args).await
+            }
 
             // ---- Inline query helpers ------------------------------------
             "triple_click" => triple_click(&args).await,
@@ -236,13 +225,16 @@ $bitmap.Dispose()
                 let mut cmd = tokio::process::Command::new("import");
                 cmd.args(["-window", "root"]);
                 if let Some((rx, ry, rw, rh)) = region {
-                    cmd.args(["-crop", &format!(
-                        "{w}x{h}+{x}+{y}",
-                        x = rx as i64,
-                        y = ry as i64,
-                        w = rw as i64,
-                        h = rh as i64
-                    )]);
+                    cmd.args([
+                        "-crop",
+                        &format!(
+                            "{w}x{h}+{x}+{y}",
+                            x = rx as i64,
+                            y = ry as i64,
+                            w = rw as i64,
+                            h = rh as i64
+                        ),
+                    ]);
                 }
                 cmd.arg(&tmp_path_str).output().await
             } else {
@@ -260,8 +252,10 @@ $bitmap.Dispose()
             .await
             .map_err(|e| anyhow!("computer_use: failed to read screenshot: {e}"))?;
         let (orig_w, orig_h) = if raw_bytes.len() >= 24 {
-            let w = u32::from_be_bytes([raw_bytes[16], raw_bytes[17], raw_bytes[18], raw_bytes[19]]);
-            let h = u32::from_be_bytes([raw_bytes[20], raw_bytes[21], raw_bytes[22], raw_bytes[23]]);
+            let w =
+                u32::from_be_bytes([raw_bytes[16], raw_bytes[17], raw_bytes[18], raw_bytes[19]]);
+            let h =
+                u32::from_be_bytes([raw_bytes[20], raw_bytes[21], raw_bytes[22], raw_bytes[23]]);
             (w, h)
         } else {
             (0, 0)
@@ -296,16 +290,24 @@ $bitmap.Dispose()
                 }
                 if keep_png {
                     sips_args.extend_from_slice(&[
-                        "-s", "format", "png",
+                        "-s",
+                        "format",
+                        "png",
                         &tmp_path_str,
-                        "--out", &out_str,
+                        "--out",
+                        &out_str,
                     ]);
                 } else {
                     sips_args.extend_from_slice(&[
-                        "-s", "format", "jpeg",
-                        "-s", "formatOptions", &quality_str,
+                        "-s",
+                        "format",
+                        "jpeg",
+                        "-s",
+                        "formatOptions",
+                        &quality_str,
                         &tmp_path_str,
-                        "--out", &out_str,
+                        "--out",
+                        &out_str,
                     ]);
                 }
                 tokio::process::Command::new("sips")
@@ -352,7 +354,11 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
             if need_resize {
                 convert_args.extend_from_slice(&["-resize", &resize_box]);
             }
-            let quality_str = if keep_png { "100".to_string() } else { jpg_quality.to_string() };
+            let quality_str = if keep_png {
+                "100".to_string()
+            } else {
+                jpg_quality.to_string()
+            };
             convert_args.extend_from_slice(&["-quality", &quality_str, &out_str]);
             tokio::process::Command::new("convert")
                 .args(&convert_args)
@@ -365,7 +371,11 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
         let (bytes, mime) = if converted {
             let b = tokio::fs::read(&out_path).await.unwrap_or(raw_bytes);
             let _ = tokio::fs::remove_file(&out_path).await;
-            if keep_png { (b, "image/png") } else { (b, "image/jpeg") }
+            if keep_png {
+                (b, "image/png")
+            } else {
+                (b, "image/jpeg")
+            }
         } else {
             (raw_bytes, "image/png")
         };
@@ -402,7 +412,11 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
             .await
             .map_err(|e| anyhow!("computer_use screenshot: write: {e}"))?;
 
-        let scale = if width > 0 && orig_w > width { orig_w as f64 / width as f64 } else { 1.0 };
+        let scale = if width > 0 && orig_w > width {
+            orig_w as f64 / width as f64
+        } else {
+            1.0
+        };
 
         Ok(json!({
             "action": "screenshot",
@@ -439,27 +453,26 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
         let async_mode = args["async"].as_bool().unwrap_or(false)
             || args["background"].as_bool().unwrap_or(false);
 
-        // 1. Resolve the vision model. Returns a clear, actionable error
-        //    when nothing usable is configured.
+        // 1. Resolve the vision model. Returns a clear, actionable error when nothing
+        //    usable is configured.
         let model_name = self
             .resolve_vision_model_name()
             .map_err(|msg| anyhow!("{msg}"))?;
         let (prov_name, _model_id) = self.providers.resolve_model(&model_name);
         let provider = self.providers.get(prov_name)?;
 
-        // 2. Load app-rules from the per-user data dir. Failures here are
-        //    non-fatal — the driver just won't have app-specific guidance.
+        // 2. Load app-rules from the per-user data dir. Failures here are non-fatal —
+        //    the driver just won't have app-specific guidance.
         let app_rules_dir = crate::config::loader::base_dir()
             .join("tools")
             .join("computer_use")
             .join("app-rules");
         let app_rules = AppRuleSet::load_dir(&app_rules_dir).unwrap_or_default();
 
-        // 3. Permission store. Use the gateway-shared instance when
-        //    available (so the WS handler's `resolve_pending_request`
-        //    can complete drivers' awaited oneshots). Outside the
-        //    gateway (tests / CLI) fall back to a per-call bypass-all
-        //    store.
+        // 3. Permission store. Use the gateway-shared instance when available (so the
+        //    WS handler's `resolve_pending_request` can complete drivers' awaited
+        //    oneshots). Outside the gateway (tests / CLI) fall back to a per-call
+        //    bypass-all store.
         let permission: Arc<RedbPermissionStore> = match &self.computer_permission {
             Some(p) => Arc::clone(p),
             None => Arc::new(RedbPermissionStore::new(self.store.db.clone(), true)),
@@ -469,25 +482,23 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
         // permission channel so the Tauri UI can show a modal. When
         // the channel is missing (CLI), permission_emit is None and
         // the driver behaves as if the user had answered AllowOnce.
-        let permission_emit: Option<
-            Arc<dyn Fn(PermissionRequest) + Send + Sync>,
-        > = self.computer_permission_tx.as_ref().map(|tx| {
-            let tx = tx.clone();
-            Arc::new(move |req: PermissionRequest| {
-                let _ = tx.send(req);
-            }) as Arc<dyn Fn(PermissionRequest) + Send + Sync>
-        });
+        let permission_emit: Option<Arc<dyn Fn(PermissionRequest) + Send + Sync>> =
+            self.computer_permission_tx.as_ref().map(|tx| {
+                let tx = tx.clone();
+                Arc::new(move |req: PermissionRequest| {
+                    let _ = tx.send(req);
+                }) as Arc<dyn Fn(PermissionRequest) + Send + Sync>
+            });
 
         // Status events feed the live status panel. Same `None`-as-no-op
         // pattern as permission_emit.
-        let status_emit: Option<
-            Arc<dyn Fn(ComputerUseStatus) + Send + Sync>,
-        > = self.computer_status_tx.as_ref().map(|tx| {
-            let tx = tx.clone();
-            Arc::new(move |ev: ComputerUseStatus| {
-                let _ = tx.send(ev);
-            }) as Arc<dyn Fn(ComputerUseStatus) + Send + Sync>
-        });
+        let status_emit: Option<Arc<dyn Fn(ComputerUseStatus) + Send + Sync>> =
+            self.computer_status_tx.as_ref().map(|tx| {
+                let tx = tx.clone();
+                Arc::new(move |ev: ComputerUseStatus| {
+                    let _ = tx.send(ev);
+                }) as Arc<dyn Fn(ComputerUseStatus) + Send + Sync>
+            });
 
         let abort = Arc::new(AtomicBool::new(false));
         let agent_id = self.handle.id.clone();
@@ -622,7 +633,9 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                         format!("[vlm_drive task {task_id_for_log}] aborted after {steps} steps")
                     }
                     DriverOutcome::PermissionDenied => {
-                        format!("[vlm_drive task {task_id_for_log}] permission denied — user declined")
+                        format!(
+                            "[vlm_drive task {task_id_for_log}] permission denied — user declined"
+                        )
                     }
                     DriverOutcome::OperatorError { message, steps } => {
                         format!(
@@ -674,9 +687,19 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                     if reply.text.is_empty() {
                         return;
                     }
-                    let Some(ref ntx) = notification_tx else { return };
-                    let target = if !chat_id.is_empty() { chat_id } else { peer_id };
-                    if target.is_empty() || channel.is_empty() || channel == "system" || channel == "cron" {
+                    let Some(ref ntx) = notification_tx else {
+                        return;
+                    };
+                    let target = if !chat_id.is_empty() {
+                        chat_id
+                    } else {
+                        peer_id
+                    };
+                    if target.is_empty()
+                        || channel.is_empty()
+                        || channel == "system"
+                        || channel == "cron"
+                    {
                         return;
                     }
                     let body = if channel == "ws" || channel == "desktop" {
@@ -711,9 +734,8 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
         }
 
         // ---------- SYNC PATH (legacy behaviour, default) ----------
-        // 4. Build the driver. NativeOperator is the default; Phase 2 will
-        //    branch on instruction keywords to swap in IphoneMirrorOperator
-        //    or AdbOperator.
+        // 4. Build the driver. NativeOperator is the default; Phase 2 will branch on
+        //    instruction keywords to swap in IphoneMirrorOperator or AdbOperator.
         let operator = NativeOperator::new();
 
         let run_id_for_dereg = run_id.clone();
@@ -775,8 +797,8 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
             }
         };
 
-        // 5. Translate the outcome to the legacy JSON shape so existing
-        //    callers (chat history rendering, agent loop) keep working.
+        // 5. Translate the outcome to the legacy JSON shape so existing callers (chat
+        //    history rendering, agent loop) keep working.
         Ok(match outcome {
             DriverOutcome::Finished { content, steps } => json!({
                 "action": "vlm_drive",
@@ -822,7 +844,6 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
             }),
         })
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -878,11 +899,19 @@ fn parse_native_action(action: &str, args: &Value) -> Result<Action> {
         }
         "right_click" => {
             let (x, y) = xy();
-            Ok(Action::Click { x, y, button: MouseButton::Right })
+            Ok(Action::Click {
+                x,
+                y,
+                button: MouseButton::Right,
+            })
         }
         "middle_click" => {
             let (x, y) = xy();
-            Ok(Action::Click { x, y, button: MouseButton::Middle })
+            Ok(Action::Click {
+                x,
+                y,
+                button: MouseButton::Middle,
+            })
         }
         "double_click" => {
             let (x, y) = xy();
@@ -892,7 +921,12 @@ fn parse_native_action(action: &str, args: &Value) -> Result<Action> {
             let (from_x, from_y) = xy();
             let to_x = args["to_x"].as_f64().unwrap_or(0.0) as i32;
             let to_y = args["to_y"].as_f64().unwrap_or(0.0) as i32;
-            Ok(Action::Drag { from_x, from_y, to_x, to_y })
+            Ok(Action::Drag {
+                from_x,
+                from_y,
+                to_x,
+                to_y,
+            })
         }
         "scroll" => {
             let (x, y) = xy();
@@ -903,7 +937,12 @@ fn parse_native_action(action: &str, args: &Value) -> Result<Action> {
                 _ => ScrollDir::Down,
             };
             let clicks = args["clicks"].as_i64().unwrap_or(3) as i32;
-            Ok(Action::Scroll { x, y, direction, clicks })
+            Ok(Action::Scroll {
+                x,
+                y,
+                direction,
+                clicks,
+            })
         }
         "type" => {
             let text = args["text"].as_str().unwrap_or("").to_owned();
@@ -920,7 +959,9 @@ fn parse_native_action(action: &str, args: &Value) -> Result<Action> {
         }
         "wait" => {
             let ms = args["ms"].as_u64().unwrap_or(500).min(60_000);
-            Ok(Action::Wait { seconds: (ms as f32) / 1000.0 })
+            Ok(Action::Wait {
+                seconds: (ms as f32) / 1000.0,
+            })
         }
         other => Err(anyhow!(
             "dispatch_via_native_operator: unrecognised action `{other}`"
@@ -936,7 +977,11 @@ async fn triple_click(args: &Value) -> Result<Value> {
     let is_windows = cfg!(target_os = "windows");
     let x = args["x"].as_f64().unwrap_or(0.0);
     let y = args["y"].as_f64().unwrap_or(0.0);
-    let scale = if is_macos { display_logical_scale() } else { 1.0 };
+    let scale = if is_macos {
+        display_logical_scale()
+    } else {
+        1.0
+    };
     let lx = (x / scale).round() as i64;
     let ly = (y / scale).round() as i64;
 
@@ -1046,7 +1091,11 @@ async fn active_window_title() -> Result<Value> {
         let win = output2
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default();
-        if win.is_empty() { app } else { format!("{app} — {win}") }
+        if win.is_empty() {
+            app
+        } else {
+            format!("{app} — {win}")
+        }
     } else if is_windows {
         let output = powershell_hidden()
             .args([
@@ -1273,8 +1322,8 @@ fn get_app_rule(args: &Value) -> Result<Value> {
             app_rules_dir.display()
         ));
     }
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| anyhow!("read app-rule {name}: {e}"))?;
+    let content =
+        std::fs::read_to_string(&path).map_err(|e| anyhow!("read app-rule {name}: {e}"))?;
     let body = if content.starts_with("---") {
         content.splitn(3, "---").nth(2).unwrap_or(&content).trim()
     } else {

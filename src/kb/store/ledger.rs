@@ -1,10 +1,15 @@
 //! IngestLedger accessors. See spec §J.
 
-use crate::kb::ledger::{IngestLedgerEntry, LedgerStatus};
-use crate::kb::store::codec::{decode, encode};
-use crate::kb::store::schema::KB_LEDGER;
 use anyhow::Result;
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
+
+use crate::kb::{
+    ledger::{IngestLedgerEntry, LedgerStatus},
+    store::{
+        codec::{decode, encode},
+        schema::KB_LEDGER,
+    },
+};
 
 pub fn put(wtx: &WriteTransaction, entry: &IngestLedgerEntry) -> Result<()> {
     let bytes = encode(entry)?;
@@ -90,11 +95,14 @@ pub fn find_pending_by_doc_in_wtx(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use redb::ReadableDatabase;
-    use crate::kb::ledger::{LedgerOp, LedgerStatus};
-    use crate::kb::store::open_db;
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::kb::{
+        ledger::{LedgerOp, LedgerStatus},
+        store::open_db,
+    };
 
     fn sample(id: &str, status: LedgerStatus) -> IngestLedgerEntry {
         IngestLedgerEntry {
@@ -188,7 +196,10 @@ mod tests {
             wtx.commit().unwrap();
         }
         let rtx = db.begin_read().unwrap();
-        assert_eq!(find_pending_by_doc(&rtx, "doc-a").unwrap().unwrap().id, "L1");
+        assert_eq!(
+            find_pending_by_doc(&rtx, "doc-a").unwrap().unwrap().id,
+            "L1"
+        );
         assert!(find_pending_by_doc(&rtx, "doc-b").unwrap().is_none());
         assert!(find_pending_by_doc(&rtx, "missing").unwrap().is_none());
     }

@@ -2,8 +2,7 @@
 
 use std::sync::Arc;
 
-use rsclaw::channel::{Channel, OutboundMessage};
-use rsclaw::channel::telegram::TelegramChannel;
+use rsclaw::channel::{Channel, OutboundMessage, telegram::TelegramChannel};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{method, path_regex},
@@ -67,7 +66,7 @@ async fn send_text_posts_to_send_message() {
         text: "Hello, Telegram!".to_owned(),
         reply_to: None,
         images: vec![],
-    ..Default::default()
+        ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed");
@@ -96,7 +95,7 @@ async fn send_chunked_4096() {
         text: long_text,
         reply_to: None,
         images: vec![],
-    ..Default::default()
+        ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed");
@@ -141,7 +140,7 @@ async fn send_image_multipart() {
         text: "Check this image".to_owned(),
         reply_to: None,
         images: vec![data_uri],
-    ..Default::default()
+        ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed");
@@ -164,7 +163,7 @@ async fn http_error_returns_err() {
         text: "Hello".to_owned(),
         reply_to: None,
         images: vec![],
-    ..Default::default()
+        ..Default::default()
     };
 
     let result = ch.send(msg).await;
@@ -192,7 +191,7 @@ async fn send_with_reply_to() {
         text: "Reply text".to_owned(),
         reply_to: Some("42".to_owned()),
         images: vec![],
-    ..Default::default()
+        ..Default::default()
     };
 
     ch.send(msg).await.expect("send should succeed");

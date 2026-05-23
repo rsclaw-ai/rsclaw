@@ -9,9 +9,7 @@
 use anyhow::Result;
 use regex::Regex;
 
-use crate::gateway::watch::jq::CompiledJq;
-use crate::gateway::watch::parser::EventFilter;
-use crate::gateway::watch::source::EventRecord;
+use crate::gateway::watch::{jq::CompiledJq, parser::EventFilter, source::EventRecord};
 
 pub struct Filter {
     event_filter: Option<EventFilter>,
@@ -89,10 +87,7 @@ fn event_as_json(ev: &EventRecord) -> serde_json::Value {
     if let Some(id) = &ev.event_id {
         obj.insert("id".into(), serde_json::Value::String(id.clone()));
     }
-    obj.insert(
-        "ts_ms".into(),
-        serde_json::Value::Number(ev.ts_ms.into()),
-    );
+    obj.insert("ts_ms".into(), serde_json::Value::Number(ev.ts_ms.into()));
     serde_json::Value::Object(obj)
 }
 
@@ -112,8 +107,9 @@ fn default_display(ev: &EventRecord) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     fn ev_line(s: &str) -> EventRecord {
         EventRecord {
@@ -145,7 +141,10 @@ mod tests {
     #[test]
     fn grep_matches_on_raw() {
         let f = Filter::from_spec(Some("ERR"), None, None).unwrap();
-        assert_eq!(f.apply(&ev_line("foo ERR bar")), vec!["foo ERR bar".to_owned()]);
+        assert_eq!(
+            f.apply(&ev_line("foo ERR bar")),
+            vec!["foo ERR bar".to_owned()]
+        );
         assert!(f.apply(&ev_line("normal line")).is_empty());
     }
 
@@ -182,12 +181,8 @@ mod tests {
 
     #[test]
     fn jq_expands_array() {
-        let f = Filter::from_spec(
-            None,
-            Some(r#".data.codes[] | "\(.code) \(.name)""#),
-            None,
-        )
-        .unwrap();
+        let f =
+            Filter::from_spec(None, Some(r#".data.codes[] | "\(.code) \(.name)""#), None).unwrap();
         let ev = ev_sse(
             "snapshot",
             json!({
@@ -207,8 +202,7 @@ mod tests {
     #[test]
     fn jq_select_drops_non_matching() {
         let f =
-            Filter::from_spec(None, Some(r#"select(.event == "hit") | .data.code"#), None)
-                .unwrap();
+            Filter::from_spec(None, Some(r#"select(.event == "hit") | .data.code"#), None).unwrap();
         assert!(f.apply(&ev_sse("heartbeat", json!({}))).is_empty());
         assert_eq!(
             f.apply(&ev_sse("hit", json!({"code": "600192"}))),

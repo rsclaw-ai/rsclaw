@@ -438,7 +438,8 @@ impl FeishuChannel {
                 Ok(r) => r,
                 Err(e) => {
                     // Transport-level failure (timeout, DNS, TLS) — retry.
-                    last_err = Some(anyhow::Error::new(e).context("feishu: request tenant_access_token"));
+                    last_err =
+                        Some(anyhow::Error::new(e).context("feishu: request tenant_access_token"));
                     continue;
                 }
             };
@@ -474,13 +475,13 @@ impl FeishuChannel {
         }
 
         // All retries exhausted.
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("feishu: token refresh failed after retries")))
+        Err(last_err
+            .unwrap_or_else(|| anyhow::anyhow!("feishu: token refresh failed after retries")))
     }
 
     /// Validate the token response and store it in the cache. Extracted
     /// so the retry loop above stays focused on transport recovery.
     async fn finalize_token(&self, token_resp: FeishuTokenResponse) -> Result<String> {
-
         if token_resp.code != 0 {
             anyhow::bail!(
                 "feishu: token error code={}: {}",
@@ -515,11 +516,19 @@ impl FeishuChannel {
     /// Send a single text chunk to a target as a card with markdown.
     async fn send_text_chunk(&self, target_id: &str, text: &str) -> Result<()> {
         let token = self.get_token().await?;
-        let id_type = if target_id.starts_with("ou_") { "open_id" }
-            else if target_id.starts_with("on_") { "union_id" }
-            else if target_id.starts_with("oc_") { "chat_id" }
-            else { "chat_id" };
-        let url = format!("{}/im/v1/messages?receive_id_type={id_type}", self.api_base());
+        let id_type = if target_id.starts_with("ou_") {
+            "open_id"
+        } else if target_id.starts_with("on_") {
+            "union_id"
+        } else if target_id.starts_with("oc_") {
+            "chat_id"
+        } else {
+            "chat_id"
+        };
+        let url = format!(
+            "{}/im/v1/messages?receive_id_type={id_type}",
+            self.api_base()
+        );
 
         let card_payload = build_feishu_card(text, &self.brand);
         let card_str =
@@ -662,8 +671,17 @@ impl FeishuChannel {
         loop {
             let msg = match tokio::time::timeout(WS_IDLE_TIMEOUT, read.next()).await {
                 Ok(Some(msg)) => msg,
-                Ok(None) => { info!("feishu: WS stream ended"); break; }
-                Err(_) => { warn!("feishu: WS idle timeout ({}s), reconnecting", WS_IDLE_TIMEOUT.as_secs()); break; }
+                Ok(None) => {
+                    info!("feishu: WS stream ended");
+                    break;
+                }
+                Err(_) => {
+                    warn!(
+                        "feishu: WS idle timeout ({}s), reconnecting",
+                        WS_IDLE_TIMEOUT.as_secs()
+                    );
+                    break;
+                }
             };
             match msg {
                 Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
@@ -1076,7 +1094,9 @@ impl FeishuChannel {
             }
         };
 
-        if (text.is_empty() && file_attachments.is_empty() && images.is_empty()) || sender_id.is_empty() {
+        if (text.is_empty() && file_attachments.is_empty() && images.is_empty())
+            || sender_id.is_empty()
+        {
             return Ok(None);
         }
 
@@ -1288,45 +1308,70 @@ impl Channel for FeishuChannel {
             // Send image attachments: upload to Feishu, then send image message.
             for image_data in &msg.images {
                 use base64::Engine;
-                let (mime, bytes) =
-                    if let Some(rest) = image_data.strip_prefix("data:image/png;base64,") {
-                        match base64::engine::general_purpose::STANDARD.decode(rest) {
-                            Ok(b) if !b.is_empty() => ("image/png", b),
-                            _ => { warn!("feishu: failed to decode base64 image"); continue; }
+                let (mime, bytes) = if let Some(rest) =
+                    image_data.strip_prefix("data:image/png;base64,")
+                {
+                    match base64::engine::general_purpose::STANDARD.decode(rest) {
+                        Ok(b) if !b.is_empty() => ("image/png", b),
+                        _ => {
+                            warn!("feishu: failed to decode base64 image");
+                            continue;
                         }
-                    } else if let Some(rest) = image_data.strip_prefix("data:image/jpeg;base64,") {
-                        match base64::engine::general_purpose::STANDARD.decode(rest) {
-                            Ok(b) if !b.is_empty() => ("image/jpeg", b),
-                            _ => { warn!("feishu: failed to decode base64 image"); continue; }
+                    }
+                } else if let Some(rest) = image_data.strip_prefix("data:image/jpeg;base64,") {
+                    match base64::engine::general_purpose::STANDARD.decode(rest) {
+                        Ok(b) if !b.is_empty() => ("image/jpeg", b),
+                        _ => {
+                            warn!("feishu: failed to decode base64 image");
+                            continue;
                         }
-                    } else if let Some(rest) = image_data.strip_prefix("data:image/webp;base64,") {
-                        match base64::engine::general_purpose::STANDARD.decode(rest) {
-                            Ok(b) if !b.is_empty() => ("image/webp", b),
-                            _ => { warn!("feishu: failed to decode base64 image"); continue; }
+                    }
+                } else if let Some(rest) = image_data.strip_prefix("data:image/webp;base64,") {
+                    match base64::engine::general_purpose::STANDARD.decode(rest) {
+                        Ok(b) if !b.is_empty() => ("image/webp", b),
+                        _ => {
+                            warn!("feishu: failed to decode base64 image");
+                            continue;
                         }
-                    } else if image_data.starts_with("http://") || image_data.starts_with("https://") {
-                        // URL image — download first
-                        match self.client.get(image_data.as_str()).send().await {
-                            Ok(resp) if resp.status().is_success() => {
-                                let ct = resp.headers().get("content-type")
-                                    .and_then(|v| v.to_str().ok())
-                                    .unwrap_or("image/png")
-                                    .to_owned();
-                                let mime = if ct.contains("jpeg") || ct.contains("jpg") { "image/jpeg" }
-                                    else if ct.contains("webp") { "image/webp" }
-                                    else { "image/png" };
-                                match resp.bytes().await {
-                                    Ok(b) if !b.is_empty() => (mime, b.to_vec()),
-                                    _ => { warn!("feishu: empty image download"); continue; }
+                    }
+                } else if image_data.starts_with("http://") || image_data.starts_with("https://") {
+                    // URL image — download first
+                    match self.client.get(image_data.as_str()).send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            let ct = resp
+                                .headers()
+                                .get("content-type")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("image/png")
+                                .to_owned();
+                            let mime = if ct.contains("jpeg") || ct.contains("jpg") {
+                                "image/jpeg"
+                            } else if ct.contains("webp") {
+                                "image/webp"
+                            } else {
+                                "image/png"
+                            };
+                            match resp.bytes().await {
+                                Ok(b) if !b.is_empty() => (mime, b.to_vec()),
+                                _ => {
+                                    warn!("feishu: empty image download");
+                                    continue;
                                 }
                             }
-                            Ok(resp) => { warn!(status = %resp.status(), "feishu: image download failed"); continue; }
-                            Err(e) => { warn!(error = %e, "feishu: image download error"); continue; }
                         }
-                    } else {
-                        warn!("feishu: unrecognised image data, skipping");
-                        continue;
-                    };
+                        Ok(resp) => {
+                            warn!(status = %resp.status(), "feishu: image download failed");
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "feishu: image download error");
+                            continue;
+                        }
+                    }
+                } else {
+                    warn!("feishu: unrecognised image data, skipping");
+                    continue;
+                };
 
                 let filename = if mime == "image/jpeg" {
                     "image.jpg"
@@ -1388,12 +1433,19 @@ impl Channel for FeishuChannel {
                 };
 
                 // Send image message using image_key.
-                let id_type = if msg.target_id.starts_with("ou_") { "open_id" }
-                    else if msg.target_id.starts_with("on_") { "union_id" }
-                    else if msg.target_id.starts_with("oc_") { "chat_id" }
-                    else { "chat_id" };
-                let send_url =
-                    format!("{}/im/v1/messages?receive_id_type={id_type}", self.api_base());
+                let id_type = if msg.target_id.starts_with("ou_") {
+                    "open_id"
+                } else if msg.target_id.starts_with("on_") {
+                    "union_id"
+                } else if msg.target_id.starts_with("oc_") {
+                    "chat_id"
+                } else {
+                    "chat_id"
+                };
+                let send_url = format!(
+                    "{}/im/v1/messages?receive_id_type={id_type}",
+                    self.api_base()
+                );
                 let token2 = match self.get_token().await {
                     Ok(t) => t,
                     Err(e) => {
@@ -1429,38 +1481,60 @@ impl Channel for FeishuChannel {
 
             // Send file attachments: upload to Feishu, then send file/media message.
             for (filename, mime, path_or_url) in &msg.files {
-                let bytes = if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
-                    match self.client.get(path_or_url.as_str()).send().await {
-                        Ok(resp) if resp.status().is_success() => {
-                            match resp.bytes().await {
+                let bytes =
+                    if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
+                        match self.client.get(path_or_url.as_str()).send().await {
+                            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
                                 Ok(b) if !b.is_empty() => b.to_vec(),
-                                _ => { warn!("feishu: empty file download"); continue; }
+                                _ => {
+                                    warn!("feishu: empty file download");
+                                    continue;
+                                }
+                            },
+                            _ => {
+                                warn!("feishu: file download failed: {path_or_url}");
+                                continue;
                             }
                         }
-                        _ => { warn!("feishu: file download failed: {path_or_url}"); continue; }
-                    }
-                } else {
-                    match std::fs::read(path_or_url) {
-                        Ok(b) => b,
-                        Err(e) => { warn!("feishu: failed to read file {path_or_url}: {e}"); continue; }
-                    }
-                };
+                    } else {
+                        match std::fs::read(path_or_url) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                warn!("feishu: failed to read file {path_or_url}: {e}");
+                                continue;
+                            }
+                        }
+                    };
 
                 let token = match self.get_token().await {
                     Ok(t) => t,
-                    Err(e) => { warn!("feishu: token error for file upload: {e}"); continue; }
+                    Err(e) => {
+                        warn!("feishu: token error for file upload: {e}");
+                        continue;
+                    }
                 };
 
                 // Feishu separates media (video/audio) from files (pdf/doc/xls).
                 let is_media = mime.starts_with("video/") || mime.starts_with("audio/");
 
                 // Feishu requires opus for audio. Convert mp3/wav/aiff to ogg-opus (pure Rust).
-                let (bytes, filename, mime_override) = if mime.starts_with("audio/") && !filename.ends_with(".ogg") && !filename.ends_with(".opus") {
+                let (bytes, filename, mime_override) = if mime.starts_with("audio/")
+                    && !filename.ends_with(".ogg")
+                    && !filename.ends_with(".opus")
+                {
                     let ext = filename.rsplit('.').next().unwrap_or("mp3");
-                    match crate::channel::transcription::encode_audio_to_ogg_opus(&bytes, Some(ext)) {
+                    match crate::channel::transcription::encode_audio_to_ogg_opus(&bytes, Some(ext))
+                    {
                         Ok(opus_bytes) => {
-                            let opus_name = filename.rsplit_once('.').map(|(n, _)| format!("{n}.ogg")).unwrap_or_else(|| format!("{filename}.ogg"));
-                            info!(src_len = bytes.len(), opus_len = opus_bytes.len(), "feishu: converted audio to ogg-opus");
+                            let opus_name = filename
+                                .rsplit_once('.')
+                                .map(|(n, _)| format!("{n}.ogg"))
+                                .unwrap_or_else(|| format!("{filename}.ogg"));
+                            info!(
+                                src_len = bytes.len(),
+                                opus_len = opus_bytes.len(),
+                                "feishu: converted audio to ogg-opus"
+                            );
                             (opus_bytes, opus_name, "audio/ogg")
                         }
                         Err(e) => {
@@ -1474,12 +1548,22 @@ impl Channel for FeishuChannel {
 
                 let file_type = if is_media {
                     // Feishu requires file_type "opus" for audio.
-                    if mime.starts_with("video/") { "mp4" } else { "opus" }
-                } else if mime.contains("pdf") { "pdf" }
-                    else if mime.contains("doc") { "doc" }
-                    else if mime.contains("sheet") || mime.contains("xls") { "xls" }
-                    else if mime.contains("ppt") || mime.contains("presentation") { "ppt" }
-                    else { "stream" };
+                    if mime.starts_with("video/") {
+                        "mp4"
+                    } else {
+                        "opus"
+                    }
+                } else if mime.contains("pdf") {
+                    "pdf"
+                } else if mime.contains("doc") {
+                    "doc"
+                } else if mime.contains("sheet") || mime.contains("xls") {
+                    "xls"
+                } else if mime.contains("ppt") || mime.contains("presentation") {
+                    "ppt"
+                } else {
+                    "stream"
+                };
 
                 // All files (including video/audio) upload to /im/v1/files.
                 // Video/audio use file_type "mp4"/"mp3" and send as msg_type "media".
@@ -1491,7 +1575,10 @@ impl Channel for FeishuChannel {
                     .mime_str(mime_override)
                 {
                     Ok(p) => p,
-                    Err(e) => { warn!("feishu: multipart error: {e}"); continue; }
+                    Err(e) => {
+                        warn!("feishu: multipart error: {e}");
+                        continue;
+                    }
                 };
                 let mut form = reqwest::multipart::Form::new()
                     .text("file_type", file_type.to_owned())
@@ -1512,7 +1599,8 @@ impl Channel for FeishuChannel {
                     info!(duration_ms = dur, "feishu: uploading media with duration");
                 }
 
-                let upload_resp = self.client
+                let upload_resp = self
+                    .client
                     .post(&upload_url)
                     .bearer_auth(&token)
                     .multipart(form)
@@ -1522,37 +1610,56 @@ impl Channel for FeishuChannel {
                 let file_key = match upload_resp {
                     Ok(r) => match r.json::<serde_json::Value>().await {
                         Ok(body) => {
-                            if let Some(k) = body.pointer("/data/file_key").and_then(|v| v.as_str()) {
+                            if let Some(k) = body.pointer("/data/file_key").and_then(|v| v.as_str())
+                            {
                                 k.to_owned()
                             } else {
                                 warn!("feishu: upload missing file_key: {body}");
                                 continue;
                             }
                         }
-                        Err(e) => { warn!("feishu: upload parse error: {e}"); continue; }
+                        Err(e) => {
+                            warn!("feishu: upload parse error: {e}");
+                            continue;
+                        }
                     },
-                    Err(e) => { warn!("feishu: upload failed: {e}"); continue; }
+                    Err(e) => {
+                        warn!("feishu: upload failed: {e}");
+                        continue;
+                    }
                 };
 
                 // Send: video/audio as "media", others as "file".
-                let id_type = if msg.target_id.starts_with("ou_") { "open_id" }
-                    else if msg.target_id.starts_with("on_") { "union_id" }
-                    else if msg.target_id.starts_with("oc_") { "chat_id" }
-                    else { "chat_id" };
-                let send_url = format!("{}/im/v1/messages?receive_id_type={id_type}", self.api_base());
+                let id_type = if msg.target_id.starts_with("ou_") {
+                    "open_id"
+                } else if msg.target_id.starts_with("on_") {
+                    "union_id"
+                } else if msg.target_id.starts_with("oc_") {
+                    "chat_id"
+                } else {
+                    "chat_id"
+                };
+                let send_url = format!(
+                    "{}/im/v1/messages?receive_id_type={id_type}",
+                    self.api_base()
+                );
                 let (msg_type, content) = if is_media {
                     if mime.starts_with("audio/") {
                         // Audio: send as "audio" msg_type with file_key + duration.
                         let dur_ms = audio_duration_ms(path_or_url).unwrap_or(1000);
                         // Feishu audio duration is in milliseconds as string.
-                        let s = serde_json::json!({"file_key": file_key, "duration": dur_ms}).to_string();
+                        let s = serde_json::json!({"file_key": file_key, "duration": dur_ms})
+                            .to_string();
                         info!(content = %s, duration_ms = dur_ms, "feishu: sending audio message");
                         ("audio", s)
                     } else {
                         // Video: send as "media" msg_type with file_key + file_name.
-                        let mut media_json = serde_json::json!({"file_key": file_key, "file_name": filename});
+                        let mut media_json =
+                            serde_json::json!({"file_key": file_key, "file_name": filename});
                         let api = self.api_base().to_owned();
-                        if let Some(cover_key) = extract_and_upload_cover(path_or_url, &self.client, &api, &token).await {
+                        if let Some(cover_key) =
+                            extract_and_upload_cover(path_or_url, &self.client, &api, &token).await
+                        {
                             media_json["image_key"] = serde_json::json!(cover_key);
                         }
                         let s = media_json.to_string();
@@ -1560,14 +1667,21 @@ impl Channel for FeishuChannel {
                         ("media", s)
                     }
                 } else {
-                    ("file", serde_json::json!({"file_key": file_key}).to_string())
+                    (
+                        "file",
+                        serde_json::json!({"file_key": file_key}).to_string(),
+                    )
                 };
 
                 let token2 = match self.get_token().await {
                     Ok(t) => t,
-                    Err(e) => { warn!("feishu: token error for file send: {e}"); continue; }
+                    Err(e) => {
+                        warn!("feishu: token error for file send: {e}");
+                        continue;
+                    }
                 };
-                match self.client
+                match self
+                    .client
                     .post(&send_url)
                     .bearer_auth(&token2)
                     .json(&serde_json::json!({
@@ -1586,7 +1700,9 @@ impl Channel for FeishuChannel {
                         let err = r.text().await.unwrap_or_default();
                         warn!("feishu: {msg_type} send failed {status}: {err}");
                     }
-                    Err(e) => { warn!("feishu: {msg_type} send error: {e}"); }
+                    Err(e) => {
+                        warn!("feishu: {msg_type} send error: {e}");
+                    }
                 }
             }
 
@@ -1663,11 +1779,19 @@ impl FeishuNotifier {
 
     async fn send_text(&self, text: &str) -> Result<()> {
         let token = self.get_token().await?;
-        let id_type = if self.target_chat_id.starts_with("ou_") { "open_id" }
-            else if self.target_chat_id.starts_with("on_") { "union_id" }
-            else if self.target_chat_id.starts_with("oc_") { "chat_id" }
-            else { "chat_id" };
-        let url = format!("{}/im/v1/messages?receive_id_type={id_type}", self.api_base());
+        let id_type = if self.target_chat_id.starts_with("ou_") {
+            "open_id"
+        } else if self.target_chat_id.starts_with("on_") {
+            "union_id"
+        } else if self.target_chat_id.starts_with("oc_") {
+            "chat_id"
+        } else {
+            "chat_id"
+        };
+        let url = format!(
+            "{}/im/v1/messages?receive_id_type={id_type}",
+            self.api_base()
+        );
 
         let card_payload = build_feishu_card(text, &self.brand);
         let card_str =
@@ -1728,8 +1852,9 @@ impl NotificationSink for FeishuNotifier {
     }
 }
 
-/// Extract a cover frame from video via ffmpeg, upload to Feishu images API, return image_key.
-/// Returns None if ffmpeg is not available or extraction fails.
+/// Extract a cover frame from video via ffmpeg, upload to Feishu images API,
+/// return image_key. Returns None if ffmpeg is not available or extraction
+/// fails.
 async fn extract_and_upload_cover(
     video_path: &str,
     client: &reqwest::Client,
@@ -1748,12 +1873,27 @@ async fn extract_and_upload_cover(
     // own tokio task — same pid, same temp dir).
     let cover_dir = std::env::temp_dir();
     let cover_path = cover_dir
-        .join(format!("rsclaw_cover_{}_{}.jpg", std::process::id(), uuid::Uuid::new_v4()))
+        .join(format!(
+            "rsclaw_cover_{}_{}.jpg",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
         .to_string_lossy()
         .into_owned();
     // Run ffmpeg to extract first frame at 1s.
     let output = std::process::Command::new(&ffmpeg_bin)
-        .args(["-y", "-i", video_path, "-ss", "00:00:01", "-frames:v", "1", "-q:v", "2", &cover_path])
+        .args([
+            "-y",
+            "-i",
+            video_path,
+            "-ss",
+            "00:00:01",
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+            &cover_path,
+        ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .output();
@@ -1761,7 +1901,18 @@ async fn extract_and_upload_cover(
     if !ok_first {
         // Retry at 0s (video might be shorter than 1s).
         let _ = std::process::Command::new(&ffmpeg_bin)
-            .args(["-y", "-i", video_path, "-ss", "00:00:00", "-frames:v", "1", "-q:v", "2", &cover_path])
+            .args([
+                "-y",
+                "-i",
+                video_path,
+                "-ss",
+                "00:00:00",
+                "-frames:v",
+                "1",
+                "-q:v",
+                "2",
+                &cover_path,
+            ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .output();
@@ -1782,23 +1933,27 @@ async fn extract_and_upload_cover(
     // Upload to Feishu images API.
     let part = reqwest::multipart::Part::bytes(cover_bytes)
         .file_name("cover.jpg")
-        .mime_str("image/jpeg").ok()?;
+        .mime_str("image/jpeg")
+        .ok()?;
     let form = reqwest::multipart::Form::new()
         .text("image_type", "message")
         .part("image", part);
     let upload_url = format!("{}/im/v1/images", api_base);
-    let resp = client.post(&upload_url)
+    let resp = client
+        .post(&upload_url)
         .bearer_auth(token)
         .multipart(form)
-        .send().await.ok()?;
+        .send()
+        .await
+        .ok()?;
     let body: serde_json::Value = resp.json().await.ok()?;
     let key = body.pointer("/data/image_key")?.as_str()?;
     tracing::info!(image_key = %key, "feishu: video cover uploaded");
     Some(key.to_owned())
 }
 
-/// Extract duration in milliseconds from an MP4 file by parsing the moov/mvhd atom.
-/// Returns None if the file is not MP4 or parsing fails.
+/// Extract duration in milliseconds from an MP4 file by parsing the moov/mvhd
+/// atom. Returns None if the file is not MP4 or parsing fails.
 fn mp4_duration_ms(path: &str) -> Option<u64> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(path).ok()?;
@@ -1807,7 +1962,9 @@ fn mp4_duration_ms(path: &str) -> Option<u64> {
 
     // Find moov atom.
     let moov_start = loop {
-        if pos >= file_len { return None; }
+        if pos >= file_len {
+            return None;
+        }
         f.seek(SeekFrom::Start(pos)).ok()?;
         let mut header = [0u8; 8];
         f.read_exact(&mut header).ok()?;
@@ -1816,7 +1973,9 @@ fn mp4_duration_ms(path: &str) -> Option<u64> {
         if tag == b"moov" {
             break pos;
         }
-        if size < 8 { return None; }
+        if size < 8 {
+            return None;
+        }
         pos += size;
     };
 
@@ -1834,10 +1993,12 @@ fn mp4_duration_ms(path: &str) -> Option<u64> {
     while scan < moov_end {
         f.seek(SeekFrom::Start(scan)).ok()?;
         f.read_exact(&mut moov_buf).ok()?;
-        let atom_size = u32::from_be_bytes([moov_buf[0], moov_buf[1], moov_buf[2], moov_buf[3]]) as u64;
+        let atom_size =
+            u32::from_be_bytes([moov_buf[0], moov_buf[1], moov_buf[2], moov_buf[3]]) as u64;
         if &moov_buf[4..8] == b"mvhd" {
-            // mvhd: version(1) + flags(3) + create(4) + modify(4) + timescale(4) + duration(4)
-            // version 1: create(8) + modify(8) + timescale(4) + duration(8)
+            // mvhd: version(1) + flags(3) + create(4) + modify(4) + timescale(4) +
+            // duration(4) version 1: create(8) + modify(8) + timescale(4) +
+            // duration(8)
             let mut ver = [0u8; 1];
             f.read_exact(&mut ver).ok()?;
             if ver[0] == 0 {
@@ -1854,14 +2015,18 @@ fn mp4_duration_ms(path: &str) -> Option<u64> {
                 f.seek(SeekFrom::Start(scan + 8 + 1 + 3)).ok()?;
                 f.read_exact(&mut buf).ok()?;
                 let timescale = u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]);
-                let duration = u64::from_be_bytes([buf[20], buf[21], buf[22], buf[23], buf[24], buf[25], buf[26], buf[27]]);
+                let duration = u64::from_be_bytes([
+                    buf[20], buf[21], buf[22], buf[23], buf[24], buf[25], buf[26], buf[27],
+                ]);
                 if timescale > 0 {
                     return Some(duration * 1000 / (timescale as u64));
                 }
             }
             return None;
         }
-        if atom_size < 8 { break; }
+        if atom_size < 8 {
+            break;
+        }
         scan += atom_size;
     }
     None
@@ -1872,8 +2037,15 @@ fn mp4_duration_ms(path: &str) -> Option<u64> {
 fn audio_duration_ms(path: &str) -> Option<u64> {
     // Try ffprobe first.
     let output = std::process::Command::new("ffprobe")
-        .args(["-v", "quiet", "-show_entries", "format=duration",
-               "-of", "default=noprint_wrappers=1:nokey=1", path])
+        .args([
+            "-v",
+            "quiet",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            path,
+        ])
         .output()
         .ok()?;
     if output.status.success() {

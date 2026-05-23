@@ -13,7 +13,7 @@ use std::{
 use anyhow::Result;
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 use tracing::{error, info, warn};
 
 use crate::{
@@ -267,9 +267,8 @@ pub fn decide_action(outcome: &TaskOutcome, turn: u32, max_turns: u32) -> Dispat
 // `OnceLock<Mutex<HashMap>>` is intentional — no DashMap dependency, and the
 // contention profile (one writer per turn per session) doesn't warrant it.
 
-static PENDING_OUTCOMES: std::sync::OnceLock<
-    std::sync::Mutex<HashMap<String, StructuredOutcome>>,
-> = std::sync::OnceLock::new();
+static PENDING_OUTCOMES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, StructuredOutcome>>> =
+    std::sync::OnceLock::new();
 
 fn pending_outcomes_map() -> &'static std::sync::Mutex<HashMap<String, StructuredOutcome>> {
     PENDING_OUTCOMES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
@@ -307,8 +306,8 @@ pub struct QueuedMessage {
     pub sender: String,
     pub channel: String,
     /// Multi-account tag (e.g. feishu account name) so a queued task's reply
-    /// is sent back via the same account that received it. None = single-account
-    /// channel; the bare `{channel}` sender is used.
+    /// is sent back via the same account that received it. None =
+    /// single-account channel; the bare `{channel}` sender is used.
     #[serde(default)]
     pub account: Option<String>,
     /// Platform-specific chat/conversation ID (e.g. Telegram chat_id).
@@ -442,10 +441,7 @@ fn parse_task_prefix(text: &mut String) -> (u32, u64) {
     // an em-dash on send. Normalize em/en/figure-dashes back so flag parsing
     // stays robust regardless of the source client.
     // EM / EN / FIGURE / HORIZONTAL dashes — all collapse to ASCII "--".
-    let normalized: String = text.replace(
-        ['\u{2014}', '\u{2013}', '\u{2012}', '\u{2015}'],
-        "--",
-    );
+    let normalized: String = text.replace(['\u{2014}', '\u{2013}', '\u{2012}', '\u{2015}'], "--");
     let trimmed = normalized.trim();
     if !trimmed.starts_with("/task ") && trimmed != "/task" {
         // No keyword auto-detection here — that path mistook short Chinese
@@ -628,7 +624,9 @@ fn task_ack_text(task_id: &str, max_turns: u32, ttl_secs: u64, lang: &str) -> St
 /// fast path; if the channel sender is missing or full, the ack is dropped
 /// and a warning is logged.
 fn send_task_ack(task: &QueuedTask, max_turns: u32, ttl_secs: u64) {
-    let Some(msg) = task.messages.first() else { return };
+    let Some(msg) = task.messages.first() else {
+        return;
+    };
     let Some(tx) = lookup_channel_sender_for(&msg.channel, msg.account.as_deref()) else {
         warn!(channel = %msg.channel, task_id = %task.id, "task_queue: channel sender not registered, ack dropped");
         return;
@@ -661,7 +659,8 @@ impl TaskQueueManager {
     /// Wait until a new task is submitted.
     ///
     /// Use inside `tokio::select!` with a fallback timeout so that the worker
-    /// also picks up tasks that were persisted before the current process started.
+    /// also picks up tasks that were persisted before the current process
+    /// started.
     pub async fn notified(&self) {
         self.notify.notified().await;
     }
@@ -809,10 +808,7 @@ impl TaskQueueManager {
     /// List Done tasks for a session whose final reply has not yet been
     /// confirmed delivered. Used by WS subscribe to replay completions that
     /// fired while the client was offline.
-    pub fn list_pending_notifications(
-        &self,
-        session_key: &str,
-    ) -> Result<Vec<QueuedTask>> {
+    pub fn list_pending_notifications(&self, session_key: &str) -> Result<Vec<QueuedTask>> {
         let mut all = self.store.list_tasks(Some(TaskStatus::Done))?;
         all.retain(|t| t.session_key == session_key && !t.notified);
         Ok(all)
@@ -828,10 +824,19 @@ impl TaskQueueManager {
     pub fn stats(&self) -> Result<QueueStats> {
         let all = self.store.list_tasks(None)?;
         Ok(QueueStats {
-            pending: all.iter().filter(|t| t.status == TaskStatus::Pending).count(),
-            running: all.iter().filter(|t| t.status == TaskStatus::Running).count(),
+            pending: all
+                .iter()
+                .filter(|t| t.status == TaskStatus::Pending)
+                .count(),
+            running: all
+                .iter()
+                .filter(|t| t.status == TaskStatus::Running)
+                .count(),
             done: all.iter().filter(|t| t.status == TaskStatus::Done).count(),
-            failed: all.iter().filter(|t| t.status == TaskStatus::Failed).count(),
+            failed: all
+                .iter()
+                .filter(|t| t.status == TaskStatus::Failed)
+                .count(),
             dead: all.iter().filter(|t| t.status == TaskStatus::Dead).count(),
         })
     }
@@ -843,8 +848,7 @@ impl TaskQueueManager {
 
 /// Return the staging directory for queue file attachments.
 fn staging_dir() -> std::path::PathBuf {
-    crate::config::loader::base_dir()
-        .join("var/data/queue/staging")
+    crate::config::loader::base_dir().join("var/data/queue/staging")
 }
 
 /// Write file bytes to the staging directory and return a [`QueuedFile`].
@@ -1027,7 +1031,9 @@ fn classify_outcome(reply: &crate::agent::AgentReply) -> TaskOutcome {
 fn continuation_prompt(outcome: &TaskOutcome, turn: u32) -> String {
     match outcome {
         TaskOutcome::Partial => {
-            format!("[auto-continue turn {turn}] Continue from where you left off. Complete the remaining work.")
+            format!(
+                "[auto-continue turn {turn}] Continue from where you left off. Complete the remaining work."
+            )
         }
         TaskOutcome::Stuck(reason) => {
             format!(
@@ -1171,7 +1177,10 @@ impl TaskQueueWorker {
         info!("task queue worker started");
         match self.manager.recover_orphan_tasks() {
             Ok(0) => {}
-            Ok(n) => info!(count = n, "task queue worker: revived orphan Running tasks → Pending"),
+            Ok(n) => info!(
+                count = n,
+                "task queue worker: revived orphan Running tasks → Pending"
+            ),
             Err(e) => error!("task queue worker: orphan recovery failed: {e:#}"),
         }
         // Idempotency-key retention: anything older than 24h is safe to
@@ -1258,7 +1267,10 @@ impl TaskQueueWorker {
                 Ok(h) => h,
                 Err(e) => {
                     error!(task_id = %task_id, "task queue worker: no agent for channel {channel_name}: {e:#}");
-                    if let Err(fe) = self.manager.fail(&task_id, &format!("{e:#}"), task.max_retries) {
+                    if let Err(fe) =
+                        self.manager
+                            .fail(&task_id, &format!("{e:#}"), task.max_retries)
+                    {
                         error!(task_id = %task_id, "task queue worker: fail() error: {fe:#}");
                     }
                     return;
@@ -1284,7 +1296,11 @@ impl TaskQueueWorker {
             .flat_map(|m| m.files.iter().map(unstage_file))
             .collect();
 
-        let target = if chat_id.is_empty() { peer_id.clone() } else { chat_id.clone() };
+        let target = if chat_id.is_empty() {
+            peer_id.clone()
+        } else {
+            chat_id.clone()
+        };
         // Resume from the persisted turn counter — non-zero only when this
         // task is being re-picked up after a crash (requeue_running_tasks
         // moved it back to Pending). Fresh tasks start at 0.
@@ -1326,7 +1342,10 @@ impl TaskQueueWorker {
 
             if handle.tx.send(msg).await.is_err() {
                 error!(task_id = %task_id, "task queue worker: agent channel closed");
-                if let Err(fe) = self.manager.fail(&task_id, "agent channel closed", task.max_retries) {
+                if let Err(fe) =
+                    self.manager
+                        .fail(&task_id, "agent channel closed", task.max_retries)
+                {
                     error!(task_id = %task_id, "task queue worker: fail() error: {fe:#}");
                 }
                 break;
@@ -1344,8 +1363,20 @@ impl TaskQueueWorker {
                 Ok(Ok(r)) => r,
                 Ok(Err(_)) => {
                     error!(task_id = %task_id, turn, "task queue worker: reply channel dropped");
-                    self.notify_user_failure(&channel_name, account.as_deref(), &target, is_group, reply_to.clone(), turn, "reply channel dropped").await;
-                    match self.manager.fail(&task_id, "reply channel dropped", task.max_retries) {
+                    self.notify_user_failure(
+                        &channel_name,
+                        account.as_deref(),
+                        &target,
+                        is_group,
+                        reply_to.clone(),
+                        turn,
+                        "reply channel dropped",
+                    )
+                    .await;
+                    match self
+                        .manager
+                        .fail(&task_id, "reply channel dropped", task.max_retries)
+                    {
                         Ok(TaskStatus::Dead) => cleanup_staged_files(&task),
                         Err(fe) => error!(task_id = %task_id, "fail() error: {fe:#}"),
                         _ => {}
@@ -1354,8 +1385,20 @@ impl TaskQueueWorker {
                 }
                 Err(_) => {
                     error!(task_id = %task_id, turn, "task queue worker: reply timeout (2700s)");
-                    self.notify_user_failure(&channel_name, account.as_deref(), &target, is_group, reply_to.clone(), turn, "reply timeout (45m)").await;
-                    match self.manager.fail(&task_id, "reply timeout", task.max_retries) {
+                    self.notify_user_failure(
+                        &channel_name,
+                        account.as_deref(),
+                        &target,
+                        is_group,
+                        reply_to.clone(),
+                        turn,
+                        "reply timeout (45m)",
+                    )
+                    .await;
+                    match self
+                        .manager
+                        .fail(&task_id, "reply timeout", task.max_retries)
+                    {
                         Ok(TaskStatus::Dead) => cleanup_staged_files(&task),
                         Err(fe) => error!(task_id = %task_id, "fail() error: {fe:#}"),
                         _ => {}
@@ -1385,9 +1428,8 @@ impl TaskQueueWorker {
             let pending = reply.pending_analysis;
 
             // Route reply to user (every turn, so they see progress).
-            let had_reply_payload = !reply.text.is_empty()
-                || !reply.images.is_empty()
-                || !reply.files.is_empty();
+            let had_reply_payload =
+                !reply.text.is_empty() || !reply.images.is_empty() || !reply.files.is_empty();
             if !reply.text.is_empty() {
                 if let Err(e) = self.manager.record_last_reply(&task_id, &reply.text) {
                     tracing::warn!(task_id = %task_id, "record_last_reply failed: {e:#}");
@@ -1630,10 +1672,7 @@ mod tests {
     // Structured outcome — schema + dispatch matrix
     // -----------------------------------------------------------------------
 
-    fn make_outcome(
-        completion: Completion,
-        recommend: Recommend,
-    ) -> StructuredOutcome {
+    fn make_outcome(completion: Completion, recommend: Recommend) -> StructuredOutcome {
         StructuredOutcome {
             completion,
             recommend,
@@ -1703,8 +1742,7 @@ mod tests {
 
     #[test]
     fn decide_action_structured_abandon_fails() {
-        let outcome =
-            TaskOutcome::Structured(make_outcome(Completion::Failed, Recommend::Abandon));
+        let outcome = TaskOutcome::Structured(make_outcome(Completion::Failed, Recommend::Abandon));
         assert_eq!(decide_action(&outcome, 1, 10), DispatchAction::Fail);
     }
 

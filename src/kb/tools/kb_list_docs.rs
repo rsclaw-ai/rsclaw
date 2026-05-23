@@ -1,12 +1,16 @@
 //! kb_list_docs: paginated listing of visible docs.
 
-use crate::kb::model::{CallerScope, KbSourceKind};
-use crate::kb::search::filter::{is_latest_version, keep_doc, SearchFilter};
-use crate::kb::search::SearchCtx;
-use crate::kb::store::codec::decode;
-use crate::kb::store::schema::KB_DOCS;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+
+use crate::kb::{
+    model::{CallerScope, KbSourceKind},
+    search::{
+        SearchCtx,
+        filter::{SearchFilter, is_latest_version, keep_doc},
+    },
+    store::{codec::decode, schema::KB_DOCS},
+};
 
 #[derive(Debug, Deserialize)]
 pub struct KbListDocsInput {
@@ -19,7 +23,9 @@ pub struct KbListDocsInput {
     pub cursor: Option<String>,
 }
 
-fn default_limit() -> usize { 50 }
+fn default_limit() -> usize {
+    50
+}
 
 #[derive(Debug, Serialize)]
 pub struct KbListDocsOutput {
@@ -82,5 +88,8 @@ pub fn run(
             version: d.version,
         });
     }
-    Ok(KbListDocsOutput { docs: out, next_cursor: next })
+    Ok(KbListDocsOutput {
+        docs: out,
+        next_cursor: next,
+    })
 }

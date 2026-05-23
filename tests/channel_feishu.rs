@@ -2,8 +2,7 @@
 
 use std::sync::Arc;
 
-use rsclaw::channel::feishu::FeishuChannel;
-use rsclaw::channel::{Channel, OutboundMessage};
+use rsclaw::channel::{Channel, OutboundMessage, feishu::FeishuChannel};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{body_string_contains, method, path},
@@ -102,7 +101,7 @@ async fn tenant_token_refresh_and_send_text() {
             text: "Hello Feishu".to_owned(),
             reply_to: None,
             images: vec![],
-        ..Default::default()
+            ..Default::default()
         })
         .await;
 
@@ -148,11 +147,15 @@ async fn send_chunked_4000() {
             text: long_text,
             reply_to: None,
             images: vec![],
-        ..Default::default()
+            ..Default::default()
         })
         .await;
 
-    assert!(result.is_ok(), "chunked send should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "chunked send should succeed: {:?}",
+        result.err()
+    );
 }
 
 /// A transient 5xx on the send endpoint is retried and then succeeds —
@@ -201,7 +204,11 @@ async fn send_retries_transient_5xx_then_succeeds() {
         })
         .await;
 
-    assert!(result.is_ok(), "send should recover after one 5xx: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "send should recover after one 5xx: {:?}",
+        result.err()
+    );
 }
 
 /// Every send carries a `uuid` so a post-commit reset retry is deduped by
@@ -241,7 +248,11 @@ async fn send_includes_uuid_for_idempotency() {
         })
         .await;
 
-    assert!(result.is_ok(), "send with uuid should match and succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "send with uuid should match and succeed: {:?}",
+        result.err()
+    );
 }
 
 /// A 4xx is a permanent error (bad token / recipient) — fail fast, do not
@@ -287,7 +298,10 @@ fn api_base_override_applied() {
     init_crypto();
     let mut ch = FeishuChannel::new("id", "secret", vec![], noop_on_message());
     ch.api_base_override = Some("http://localhost:9999".to_owned());
-    assert_eq!(ch.api_base_override.as_deref(), Some("http://localhost:9999"));
+    assert_eq!(
+        ch.api_base_override.as_deref(),
+        Some("http://localhost:9999")
+    );
 }
 
 /// WS URL override is honoured.

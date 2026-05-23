@@ -1,11 +1,11 @@
 //! Embedder trait + backends.
 //!
-//! - `StubEmbedder`: deterministic sha256 vectors (1024-dim), used by
-//!   tests so idempotency is trivial to assert.
-//! - `LocalKbEmbedder` (`local`): candle BGE adapter reusing the
-//!   model loader already shipped for memory search
-//!   (`crate::agent::memory::LocalBgeEmbedder`). Default in production
-//!   when a model is present (bge-small-zh = 512-dim).
+//! - `StubEmbedder`: deterministic sha256 vectors (1024-dim), used by tests so
+//!   idempotency is trivial to assert.
+//! - `LocalKbEmbedder` (`local`): candle BGE adapter reusing the model loader
+//!   already shipped for memory search
+//!   (`crate::agent::memory::LocalBgeEmbedder`). Default in production when a
+//!   model is present (bge-small-zh = 512-dim).
 //!
 //! Remote (OpenAI-compatible `/v1/embeddings` against the GPU fleet
 //! running Qwen3-Embedding) is the next backend — same trait, just an
@@ -15,7 +15,6 @@ pub mod local;
 pub mod stub;
 
 use anyhow::Result;
-
 pub use local::LocalKbEmbedder;
 pub use stub::StubEmbedder;
 
@@ -28,10 +27,11 @@ pub trait KbEmbedder: Send + Sync {
 /// Resolve the KB embedder for a `kb_root`. Precedence:
 ///   1. Effective embed config — `kb.embed` if set, else the shared
 ///      `memorySearch`. When its `provider = "openai"`, use a remote
-///      OpenAI-compatible embedder (e.g. the GPU-fleet Qwen3-Embedding).
-///      A `kb.embed` override lets KB use a different embedder than memory.
+///      OpenAI-compatible embedder (e.g. the GPU-fleet Qwen3-Embedding). A
+///      `kb.embed` override lets KB use a different embedder than memory.
 ///   2. Local BGE model — the `embed.local.modelRepo` dir if set, then the
-///      defaults under `<base_dir>/models/{bge-small-zh,bge-base-zh,bge-small-en}`.
+///      defaults under
+///      `<base_dir>/models/{bge-small-zh,bge-base-zh,bge-small-en}`.
 ///   3. StubEmbedder (deterministic) so a fresh install works out of the box.
 ///
 /// `kb.embed` reuses `memorySearch`'s exact shape (local or remote); a
@@ -64,7 +64,9 @@ pub fn resolve_embedder(kb_root: &std::path::Path) -> std::sync::Arc<dyn KbEmbed
                     .clone()
                     .unwrap_or_else(|| crate::embed::OPENAI_DEFAULT_BASE_URL.to_owned());
                 tracing::info!(model = %model, dim, base_url = %base_url, "kb: using remote OpenAI-compatible embedder");
-                return Arc::new(LocalKbEmbedder::remote_openai(base_url, model, api_key, dim));
+                return Arc::new(LocalKbEmbedder::remote_openai(
+                    base_url, model, api_key, dim,
+                ));
             }
             // "local"/unset → fall through to the local-model scan below.
             None | Some("local") => {}

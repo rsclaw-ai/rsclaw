@@ -1,12 +1,12 @@
 pub mod chunk_embed;
 
-use crate::kb::embedder::KbEmbedder;
-use crate::kb::index::KbIndex;
-use crate::kb::jobs::JobKind;
-use crate::kb::paths::KbPaths;
-use crate::kb::store::KbStore;
-use anyhow::Result;
 use std::sync::Arc;
+
+use anyhow::Result;
+
+use crate::kb::{
+    embedder::KbEmbedder, index::KbIndex, jobs::JobKind, paths::KbPaths, store::KbStore,
+};
 
 /// Job handler. One impl per `JobKind` variant. Handlers must be
 /// **idempotent** — the worker reclaim path will re-run them after
@@ -28,9 +28,10 @@ pub struct DefaultDispatcher;
 impl JobHandler for DefaultDispatcher {
     fn handle(&self, ctx: &HandlerCtx, kind: &JobKind) -> Result<()> {
         match kind {
-            JobKind::ChunkAndEmbed { doc_id, doc_version } => {
-                chunk_embed::run(ctx, doc_id, *doc_version)
-            }
+            JobKind::ChunkAndEmbed {
+                doc_id,
+                doc_version,
+            } => chunk_embed::run(ctx, doc_id, *doc_version),
             JobKind::RebuildHnsw => {
                 tracing::warn!("kb worker: RebuildHnsw handler not implemented in Week 2");
                 Ok(())

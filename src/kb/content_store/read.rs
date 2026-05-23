@@ -2,28 +2,24 @@
 //! the byte range it needs via `read_doc_range`, avoiding loading
 //! entire documents into memory just to serve one chunk's body.
 
-use crate::kb::content_store::atomic::sha256_hex;
-use crate::kb::content_store::compose::parse_doc_file;
-use anyhow::{anyhow, Context, Result};
 use std::path::Path;
 
+use anyhow::{Context, Result, anyhow};
+
+use crate::kb::content_store::{atomic::sha256_hex, compose::parse_doc_file};
+
 pub fn read_doc_body(abs: &Path) -> Result<String> {
-    let s = std::fs::read_to_string(abs)
-        .with_context(|| format!("read {}", abs.display()))?;
+    let s = std::fs::read_to_string(abs).with_context(|| format!("read {}", abs.display()))?;
     Ok(parse_doc_file(&s)?.body)
 }
 
 pub fn read_doc_range(abs: &Path, start: u64, end_excl: u64) -> Result<String> {
-    let s = std::fs::read_to_string(abs)
-        .with_context(|| format!("read {}", abs.display()))?;
+    let s = std::fs::read_to_string(abs).with_context(|| format!("read {}", abs.display()))?;
     let parsed = parse_doc_file(&s)?;
     let bytes = parsed.body.as_bytes();
     let (s_, e_) = (start as usize, end_excl as usize);
     if e_ > bytes.len() || s_ > e_ {
-        return Err(anyhow!(
-            "range {s_}..{e_} oob (body len {})",
-            bytes.len()
-        ));
+        return Err(anyhow!("range {s_}..{e_} oob (body len {})", bytes.len()));
     }
     Ok(std::str::from_utf8(&bytes[s_..e_])?.to_string())
 }
@@ -42,10 +38,13 @@ pub fn verify_doc_sha(abs: &Path, expected: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::kb::content_store::atomic::write_if_new;
-    use crate::kb::content_store::compose::{compose_doc_file, FrontMatter};
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::kb::content_store::{
+        atomic::write_if_new,
+        compose::{FrontMatter, compose_doc_file},
+    };
 
     fn fm() -> FrontMatter {
         FrontMatter {

@@ -148,8 +148,9 @@ impl FullTrace {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     fn fixture() -> FullTrace {
         FullTrace::new("t1", "claude-opus-4-7", "you are rsclaw", json!([]))
@@ -195,7 +196,9 @@ mod tests {
         let mut t = fixture();
         t.push_tool_result("c1", "permission denied", true);
         match &t.steps[0] {
-            TraceStep::ToolResult { is_error, content, .. } => {
+            TraceStep::ToolResult {
+                is_error, content, ..
+            } => {
                 assert!(*is_error);
                 assert_eq!(content, "permission denied");
             }

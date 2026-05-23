@@ -1,10 +1,13 @@
 //! SeenItems + SyncState accessors. See spec §S.
 
-use crate::kb::store::codec::{decode, encode};
-use crate::kb::store::schema::{KB_SEEN_ITEMS, KB_SYNC_STATE};
 use anyhow::Result;
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 use serde::{Deserialize, Serialize};
+
+use crate::kb::store::{
+    codec::{decode, encode},
+    schema::{KB_SEEN_ITEMS, KB_SYNC_STATE},
+};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SeenRecord {
@@ -70,11 +73,7 @@ fn compose_seen_key(source_id: &str, item_id: &str) -> String {
     format!("{source_id}{SEP}{item_id}")
 }
 
-pub fn put_sync_state(
-    wtx: &WriteTransaction,
-    source_id: &str,
-    state: &SyncState,
-) -> Result<()> {
+pub fn put_sync_state(wtx: &WriteTransaction, source_id: &str, state: &SyncState) -> Result<()> {
     let bytes = encode(state)?;
     let mut tbl = wtx.open_table(KB_SYNC_STATE)?;
     tbl.insert(source_id, bytes.as_slice())?;
@@ -91,10 +90,11 @@ pub fn get_sync_state(rtx: &ReadTransaction, source_id: &str) -> Result<Option<S
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use redb::ReadableDatabase;
-    use crate::kb::store::open_db;
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::kb::store::open_db;
 
     #[test]
     fn mark_then_query() {
@@ -157,7 +157,10 @@ mod tests {
             put_sync_state(
                 &wtx,
                 "src1",
-                &SyncState { cursor: "etag:abc".into(), last_sync_at: 123 },
+                &SyncState {
+                    cursor: "etag:abc".into(),
+                    last_sync_at: 123,
+                },
             )
             .unwrap();
             wtx.commit().unwrap();

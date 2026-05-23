@@ -7,28 +7,36 @@
 //! embedder. P1 covers collection metadata CRUD; docs + search grow the
 //! service in P2/P3.
 
-use crate::kb::canonicalize::{CanonicalizeInput, canonicalize_by_mime, detect_mime};
-use crate::kb::content_store::read::read_doc_body;
-use crate::kb::embedder::resolve_embedder;
-use crate::kb::jobs::{Job, JobKind, JobStatus};
-use crate::kb::model::{
-    COLLECTION_TAG_PREFIX, CallerScope, ChunkStatus, KbChunk, KbCollection, KbDoc, KbStatus,
-    collection_tag,
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
 };
-use crate::kb::pipeline::{IngestInput, ingest_canonicalized};
-use crate::kb::search::SearchCtx;
-use crate::kb::store::codec::decode;
-use crate::kb::store::schema::{KB_CHUNKS, KB_DOCS};
-use crate::kb::store::{collections, docs};
-use crate::kb::tools::kb_search::{self, KbSearchFilter, KbSearchInput};
-use crate::kb::worker::{DefaultDispatcher, HandlerCtx, WorkerConfig, WorkerPool};
-use crate::kb::{KbEmbedder, KbIndex, KbPaths, KbStore};
+
 use redb::ReadableTable;
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::broadcast;
+
+use crate::kb::{
+    KbEmbedder, KbIndex, KbPaths, KbStore,
+    canonicalize::{CanonicalizeInput, canonicalize_by_mime, detect_mime},
+    content_store::read::read_doc_body,
+    embedder::resolve_embedder,
+    jobs::{Job, JobKind, JobStatus},
+    model::{
+        COLLECTION_TAG_PREFIX, CallerScope, ChunkStatus, KbChunk, KbCollection, KbDoc, KbStatus,
+        collection_tag,
+    },
+    pipeline::{IngestInput, ingest_canonicalized},
+    search::SearchCtx,
+    store::{
+        codec::decode,
+        collections, docs,
+        schema::{KB_CHUNKS, KB_DOCS},
+    },
+    tools::kb_search::{self, KbSearchFilter, KbSearchInput},
+    worker::{DefaultDispatcher, HandlerCtx, WorkerConfig, WorkerPool},
+};
 
 /// Service-level errors the HTTP layer maps to status codes + error envelope.
 #[derive(Debug, thiserror::Error)]
@@ -118,7 +126,8 @@ pub struct KnowledgeService {
     max_doc_bytes: usize,
     /// Canonicalized allowed roots for the loopback-only `/docs/from-path`
     /// ingest endpoint (`kb.allowedUploadRoots`, default ~/Documents,
-    /// ~/Downloads, ~/Desktop). A from-path target must live under one of these.
+    /// ~/Downloads, ~/Desktop). A from-path target must live under one of
+    /// these.
     allowed_upload_roots: Vec<PathBuf>,
 }
 
@@ -204,7 +213,8 @@ impl KnowledgeService {
     }
 
     /// Canonicalized allowed roots for `/docs/from-path` (see
-    /// `kb.allowedUploadRoots`). A from-path target must live under one of these.
+    /// `kb.allowedUploadRoots`). A from-path target must live under one of
+    /// these.
     pub fn allowed_upload_roots(&self) -> &[PathBuf] {
         &self.allowed_upload_roots
     }
@@ -779,8 +789,9 @@ fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
+
+    use super::*;
 
     fn svc() -> (TempDir, KnowledgeService) {
         let tmp = TempDir::new().unwrap();

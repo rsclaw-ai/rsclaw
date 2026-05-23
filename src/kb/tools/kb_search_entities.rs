@@ -1,10 +1,13 @@
 //! kb_search_entities: surface → entity_id lookup.
 
-use crate::kb::model::{CallerScope, EntityKind};
-use crate::kb::search::SearchCtx;
-use crate::kb::store::entities;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+
+use crate::kb::{
+    model::{CallerScope, EntityKind},
+    search::SearchCtx,
+    store::entities,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct KbSearchEntitiesInput {
@@ -14,7 +17,9 @@ pub struct KbSearchEntitiesInput {
     pub limit: usize,
 }
 
-fn default_limit() -> usize { 20 }
+fn default_limit() -> usize {
+    20
+}
 
 #[derive(Debug, Serialize)]
 pub struct KbSearchEntitiesOutput {
@@ -35,8 +40,7 @@ pub fn run(
     _scope: &CallerScope,
 ) -> Result<KbSearchEntitiesOutput> {
     let rtx = ctx.store.begin_read()?;
-    let kind_filter: Option<EntityKind> =
-        input.kind.as_deref().and_then(|s| parse_entity_kind(s));
+    let kind_filter: Option<EntityKind> = input.kind.as_deref().and_then(|s| parse_entity_kind(s));
     let rows = entities::find_by_surface(&rtx, &input.query, kind_filter, input.limit)?;
     let out: Vec<EntityMatch> = rows
         .into_iter()

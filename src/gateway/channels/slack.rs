@@ -3,18 +3,16 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use super::{
+    super::preparse::{btw_direct_call, is_fast_preparse, try_preparse_locally},
+    default_dm_scope,
+};
 use crate::{
     agent::{AgentMessage, AgentRegistry},
     channel::{Channel, OutboundMessage},
     config::runtime::RuntimeConfig,
     gateway::session::{MessageKind, SessionKeyParams, derive_session_key},
 };
-
-use super::super::preparse::{
-    btw_direct_call, is_fast_preparse,
-    try_preparse_locally,
-};
-use super::default_dm_scope;
 
 pub(crate) fn start_slack_if_configured(
     config: &RuntimeConfig,
@@ -119,7 +117,9 @@ pub(crate) fn start_slack_if_configured(
 
         // Register Slack channel sender for notification routing.
         {
-            let mut senders = channel_senders.write().expect("channel_senders lock poisoned");
+            let mut senders = channel_senders
+                .write()
+                .expect("channel_senders lock poisoned");
             senders.insert("slack".to_string(), out_tx.clone());
             senders.insert(format!("slack/{}", acct_name), out_tx.clone());
         }
@@ -207,7 +207,8 @@ pub(crate) fn start_slack_if_configured(
                                         channel: None,
 
                                         account: None,
-                    files: vec![],                                    })
+                                        files: vec![],
+                                    })
                                     .await
                                 {
                                     tracing::warn!("failed to send message: {e}");
@@ -229,7 +230,8 @@ pub(crate) fn start_slack_if_configured(
                                         channel: None,
 
                                         account: None,
-                    files: vec![],                                    })
+                                        files: vec![],
+                                    })
                                     .await
                                 {
                                     tracing::warn!("failed to send message: {e}");
@@ -257,8 +259,15 @@ pub(crate) fn start_slack_if_configured(
                             let w_tq = Arc::clone(&tq);
                             let w_uid = peer_id.clone();
                             tokio::spawn(async move {
-                                while let Some((text, peer_id, channel_id, is_channel, bound, images, file_attachments)) =
-                                    urx.recv().await
+                                while let Some((
+                                    text,
+                                    peer_id,
+                                    channel_id,
+                                    is_channel,
+                                    bound,
+                                    images,
+                                    file_attachments,
+                                )) = urx.recv().await
                                 {
                                     // No debounce -- task queue merge_into_pending
                                     // handles rapid consecutive messages automatically.
@@ -267,13 +276,19 @@ pub(crate) fn start_slack_if_configured(
                                             Ok(h) => h,
                                             Err(_) => match w_reg.route("slack") {
                                                 Ok(h) => h,
-                                                Err(e) => { error!("slack route: {e:#}"); continue; }
+                                                Err(e) => {
+                                                    error!("slack route: {e:#}");
+                                                    continue;
+                                                }
                                             },
                                         }
                                     } else {
                                         match w_reg.route("slack") {
                                             Ok(h) => h,
-                                            Err(e) => { error!("slack route: {e:#}"); continue; }
+                                            Err(e) => {
+                                                error!("slack route: {e:#}");
+                                                continue;
+                                            }
                                         }
                                     };
                                     let dm_scope = default_dm_scope(&w_cfg);
@@ -300,12 +315,24 @@ pub(crate) fn start_slack_if_configured(
                                         reply_to: None,
                                         timestamp: chrono::Utc::now().timestamp(),
                                         images: images.iter().map(|i| i.data.clone()).collect(),
-                                        files: file_attachments.iter().filter_map(|f| {
-                                            crate::gateway::task_queue::stage_file(&f.filename, &f.data, &f.mime_type).ok()
-                                        }).collect(),
+                                        files: file_attachments
+                                            .iter()
+                                            .filter_map(|f| {
+                                                crate::gateway::task_queue::stage_file(
+                                                    &f.filename,
+                                                    &f.data,
+                                                    &f.mime_type,
+                                                )
+                                                .ok()
+                                            })
+                                            .collect(),
                                         account: None,
                                     };
-                                    if let Err(e) = w_tq.submit(&session_key, qmsg, crate::gateway::task_queue::Priority::User) {
+                                    if let Err(e) = w_tq.submit(
+                                        &session_key,
+                                        qmsg,
+                                        crate::gateway::task_queue::Priority::User,
+                                    ) {
                                         error!(user = %w_uid, "slack: queue submit failed: {e:#}");
                                     }
                                 }
@@ -346,7 +373,8 @@ pub(crate) fn start_slack_if_configured(
                                         channel: None,
 
                                         account: None,
-                    files: vec![],                                    })
+                                        files: vec![],
+                                    })
                                     .await
                                 {
                                     tracing::warn!("failed to send message: {e}");
@@ -393,14 +421,20 @@ pub(crate) fn start_slack_if_configured(
                                 peer_id: peer_id.clone(),
                                 dm_scope,
                             });
-                            if let Some(mut reply) = try_preparse_locally(&text, &handle, "slack", &peer_id, crate::gateway::preparse::PreparseOrigin::User).await {
+                            if let Some(mut reply) = try_preparse_locally(
+                                &text,
+                                &handle,
+                                "slack",
+                                &peer_id,
+                                crate::gateway::preparse::PreparseOrigin::User,
+                            )
+                            .await
+                            {
                                 reply.target_id = channel_id;
                                 reply.is_group = is_channel;
                                 if !reply.text.is_empty() || !reply.images.is_empty() {
                                     if let Err(e) = tx.send(reply).await {
-
                                         tracing::warn!("failed to send message: {e}");
-
                                     }
                                 }
                                 return;
@@ -426,18 +460,23 @@ pub(crate) fn start_slack_if_configured(
                             if handle.tx.send(msg).await.is_err() {
                                 return;
                             }
-                            if let Ok(Ok(r)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
+                            if let Ok(Ok(r)) =
+                                tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx)
+                                    .await
+                            {
                                 if !r.is_empty {
-                                    if let Err(e) = tx.send(OutboundMessage {
-                                        target_id: channel_id,
-                                        is_group: is_channel,
-                                        text: r.text,
-                                        reply_to: None,
-                                        images: r.images,
-                                        files: r.files,
-                                        channel: None,
-                                        account: None,
-                                    }).await
+                                    if let Err(e) = tx
+                                        .send(OutboundMessage {
+                                            target_id: channel_id,
+                                            is_group: is_channel,
+                                            text: r.text,
+                                            reply_to: None,
+                                            images: r.images,
+                                            files: r.files,
+                                            channel: None,
+                                            account: None,
+                                        })
+                                        .await
                                     {
                                         tracing::warn!("failed to send message: {e}");
                                     }

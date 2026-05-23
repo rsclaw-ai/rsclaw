@@ -4,17 +4,20 @@
 //! These methods live in a separate `impl AgentRuntime` block which Rust
 //! allows across multiple files within the same crate.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Result, anyhow};
-use serde_json::Value;
 use futures::future::BoxFuture;
+use serde_json::Value;
 
-use super::registry::{AgentMessage, AgentReply};
-use super::runtime::{AgentRuntime, RunContext, expand_tilde};
-use crate::acp::notification::{Notification, NotificationPriority, NotificationSink};
-use crate::channel::OutboundMessage;
+use super::{
+    registry::{AgentMessage, AgentReply},
+    runtime::{AgentRuntime, RunContext, expand_tilde},
+};
+use crate::{
+    acp::notification::{Notification, NotificationPriority, NotificationSink},
+    channel::OutboundMessage,
+};
 
 /// Deliver an async ACP result to WS/desktop clients in real time.
 ///
@@ -58,8 +61,16 @@ struct ChannelNotifier {
 }
 
 impl ChannelNotifier {
-    fn new(tx: tokio::sync::broadcast::Sender<OutboundMessage>, target_id: String, channel: String) -> Self {
-        Self { tx, target_id, channel }
+    fn new(
+        tx: tokio::sync::broadcast::Sender<OutboundMessage>,
+        target_id: String,
+        channel: String,
+    ) -> Self {
+        Self {
+            tx,
+            target_id,
+            channel,
+        }
     }
 }
 
@@ -75,11 +86,7 @@ impl NotificationSink for ChannelNotifier {
     }
 
     fn send(&self, notification: &Notification) -> BoxFuture<'_, Result<()>> {
-        let text = format!(
-            "**{}**\n\n{}",
-            notification.title,
-            notification.body
-        );
+        let text = format!("**{}**\n\n{}", notification.title, notification.body);
         let msg = OutboundMessage {
             target_id: self.target_id.clone(),
             is_group: false,
@@ -92,7 +99,9 @@ impl NotificationSink for ChannelNotifier {
         };
         let tx = self.tx.clone();
         Box::pin(async move {
-            tx.send(msg).map(|_| ()).map_err(|e| anyhow!("channel notification failed: {}", e))
+            tx.send(msg)
+                .map(|_| ())
+                .map_err(|e| anyhow!("channel notification failed: {}", e))
         })
     }
 }
@@ -168,7 +177,8 @@ impl AgentRuntime {
             .map(expand_tilde)
             .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
         // Convert to Windows native path string (avoid MSYS2/Git Bash Unix-style paths)
-        // Don't use canonicalize() — it returns \\?\ prefix which breaks JSON serialization
+        // Don't use canonicalize() — it returns \\?\ prefix which breaks JSON
+        // serialization
         let cwd_str = if cfg!(target_os = "windows") {
             let abs_path = if cwd.is_absolute() {
                 cwd.clone()
@@ -194,11 +204,17 @@ impl AgentRuntime {
             &command,
             &args,
             Arc::new(crate::acp::client::DefaultAcpHandler),
-            Arc::new(tokio::sync::Mutex::new(crate::acp::notification::NotificationManager::new())),
+            Arc::new(tokio::sync::Mutex::new(
+                crate::acp::notification::NotificationManager::new(),
+            )),
             init_timeout_secs,
-        ).await?;
+        )
+        .await?;
         client
-            .initialize("rsclaw", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"))
+            .initialize(
+                "rsclaw",
+                option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
+            )
             .await?;
 
         // Create session with model from config or environment
@@ -209,7 +225,9 @@ impl AgentRuntime {
             .as_ref()
             .and_then(|c| c.model.clone())
             .or_else(|| std::env::var("OPENCODE_MODEL").ok());
-        let session_resp = client.create_session(&cwd_str, model.as_deref(), None).await?;
+        let session_resp = client
+            .create_session(&cwd_str, model.as_deref(), None)
+            .await?;
 
         tracing::info!(
             session_id = %session_resp.session_id,
@@ -230,7 +248,11 @@ impl AgentRuntime {
 
         tracing::info!(task = %task, "tool_opencode: starting");
 
-        let lang = self.config.raw.gateway.as_ref()
+        let lang = self
+            .config
+            .raw
+            .gateway
+            .as_ref()
             .and_then(|g| g.language.as_deref())
             .map(crate::i18n::resolve_lang)
             .unwrap_or("en");
@@ -249,7 +271,11 @@ impl AgentRuntime {
                     let _ = tx.send(crate::channel::OutboundMessage {
                         target_id: target_id.clone(),
                         is_group: false,
-                        text: crate::i18n::t_fmt("acp_start_failed", lang, &[("name", "OpenCode"), ("error", &e.to_string())]),
+                        text: crate::i18n::t_fmt(
+                            "acp_start_failed",
+                            lang,
+                            &[("name", "OpenCode"), ("error", &e.to_string())],
+                        ),
                         reply_to: None,
                         images: vec![],
                         files: vec![],
@@ -263,7 +289,11 @@ impl AgentRuntime {
 
         // Add notification sink to client for real-time progress updates
         if let Some(ref tx) = notif_tx {
-            let sink = Arc::new(ChannelNotifier::new(tx.clone(), target_id.clone(), channel_name.clone()));
+            let sink = Arc::new(ChannelNotifier::new(
+                tx.clone(),
+                target_id.clone(),
+                channel_name.clone(),
+            ));
             client.add_notification_sink(sink);
             tracing::info!("tool_opencode: added notification sink for {}", target_id);
         }
@@ -274,7 +304,10 @@ impl AgentRuntime {
         let task_str = task.to_string();
 
         // Send initial notification
-        tracing::info!("tool_opencode: sending initial notification to {}", target_id);
+        tracing::info!(
+            "tool_opencode: sending initial notification to {}",
+            target_id
+        );
         if let Some(ref tx) = notif_tx {
             let _ = tx.send(crate::channel::OutboundMessage {
                 target_id: target_id.clone(),
@@ -311,12 +344,14 @@ impl AgentRuntime {
             let events = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
             let events_clone = Arc::clone(&events);
 
-            // Event collection task - collects events for final summary, NO intermediate notifications
+            // Event collection task - collects events for final summary, NO intermediate
+            // notifications
             let _event_collector = tokio::spawn(async move {
                 loop {
                     match event_rx.recv().await {
                         Ok(event) => {
-                            // Only collect tool call events for summary, skip thoughts (AgentThoughtChunk)
+                            // Only collect tool call events for summary, skip thoughts
+                            // (AgentThoughtChunk)
                             let event_str = match &event {
                                 crate::acp::client::SessionEvent::ToolCallStarted {
                                     title, ..
@@ -354,9 +389,7 @@ impl AgentRuntime {
                                     tracing::info!("OpenCode event: {}", s);
                                     s
                                 }
-                                crate::acp::client::SessionEvent::AgentMessageChunk {
-                                    content,
-                                } => {
+                                crate::acp::client::SessionEvent::AgentMessageChunk { content } => {
                                     // Log message chunks for visibility
                                     tracing::debug!("OpenCode message: {}", content);
                                     String::new()
@@ -382,7 +415,8 @@ impl AgentRuntime {
             // far. The events collected during execution are already in
             // `events`.
 
-            // Process the result — collect summary + files for both notification and agent re-inject.
+            // Process the result — collect summary + files for both notification and agent
+            // re-inject.
             let mut result_summary = String::new();
             let mut result_files: Vec<(String, String, String)> = vec![];
             match send_result {
@@ -428,15 +462,21 @@ impl AgentRuntime {
                         crate::acp::types::StopReason::Incomplete => "❓",
                     };
 
-                    // Scan result_content for downloadable file paths (e.g. mp4 downloaded by opencode).
+                    // Scan result_content for downloadable file paths (e.g. mp4 downloaded by
+                    // opencode).
                     let notif_files: Vec<(String, String, String)> = {
-                        let sendable_exts = [".mp4", ".mp3", ".zip", ".pdf", ".xlsx", ".docx", ".pptx", ".csv", ".tar.gz"];
+                        let sendable_exts = [
+                            ".mp4", ".mp3", ".zip", ".pdf", ".xlsx", ".docx", ".pptx", ".csv",
+                            ".tar.gz",
+                        ];
                         let mut found = Vec::new();
                         for token in result_content.split_whitespace() {
                             let trimmed = token.trim_matches(|c: char| "\"'.,;:()[]{}".contains(c));
-                            // Strip any leading non-path characters (e.g. Chinese prefix like "路径：")
-                            // by finding the first '/' or '~' in the token.
-                            let trimmed = if let Some(pos) = trimmed.find(|c| c == '/' || c == '~') {
+                            // Strip any leading non-path characters (e.g. Chinese prefix like
+                            // "路径：") by finding the first '/' or '~'
+                            // in the token.
+                            let trimmed = if let Some(pos) = trimmed.find(|c| c == '/' || c == '~')
+                            {
                                 &trimmed[pos..]
                             } else {
                                 trimmed
@@ -447,17 +487,36 @@ impl AgentRuntime {
                                 if path.exists() {
                                     if let Ok(meta) = path.metadata() {
                                         if meta.len() <= 50_000_000 {
-                                            let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                                            let mime = if lower.ends_with(".mp4") { "video/mp4" }
-                                                else if lower.ends_with(".mp3") { "audio/mpeg" }
-                                                else if lower.ends_with(".pdf") { "application/pdf" }
-                                                else if lower.ends_with(".zip") || lower.ends_with(".tar.gz") { "application/zip" }
-                                                else if lower.ends_with(".xlsx") { "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }
-                                                else if lower.ends_with(".docx") { "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
-                                                else if lower.ends_with(".pptx") { "application/vnd.openxmlformats-officedocument.presentationml.presentation" }
-                                                else { "text/csv" };
+                                            let filename = path
+                                                .file_name()
+                                                .unwrap_or_default()
+                                                .to_string_lossy()
+                                                .to_string();
+                                            let mime = if lower.ends_with(".mp4") {
+                                                "video/mp4"
+                                            } else if lower.ends_with(".mp3") {
+                                                "audio/mpeg"
+                                            } else if lower.ends_with(".pdf") {
+                                                "application/pdf"
+                                            } else if lower.ends_with(".zip")
+                                                || lower.ends_with(".tar.gz")
+                                            {
+                                                "application/zip"
+                                            } else if lower.ends_with(".xlsx") {
+                                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                            } else if lower.ends_with(".docx") {
+                                                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                                            } else if lower.ends_with(".pptx") {
+                                                "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                                            } else {
+                                                "text/csv"
+                                            };
                                             let path_str = path.to_string_lossy().to_string();
-                                            if !found.iter().any(|(_, _, p): &(String, String, String)| p == &path_str) {
+                                            if !found.iter().any(
+                                                |(_, _, p): &(String, String, String)| {
+                                                    p == &path_str
+                                                },
+                                            ) {
                                                 tracing::info!(path = %path_str, "tool_opencode: attaching file to notification");
                                                 found.push((filename, mime.to_owned(), path_str));
                                             }
@@ -477,23 +536,41 @@ impl AgentRuntime {
                                 .nth(2000)
                                 .map(|(i, _)| i)
                                 .unwrap_or(result_content.len());
-                            crate::i18n::t_fmt("acp_truncated", lang_bg, &[("content", &result_content[..cutoff])])
+                            crate::i18n::t_fmt(
+                                "acp_truncated",
+                                lang_bg,
+                                &[("content", &result_content[..cutoff])],
+                            )
                         } else {
                             result_content
                         };
-                        crate::i18n::t_fmt("acp_done_result", lang_bg, &[
-                            ("status", status_icon), ("name", "OpenCode"),
-                            ("count", &tool_count.to_string()), ("result", &truncated),
-                        ])
+                        crate::i18n::t_fmt(
+                            "acp_done_result",
+                            lang_bg,
+                            &[
+                                ("status", status_icon),
+                                ("name", "OpenCode"),
+                                ("count", &tool_count.to_string()),
+                                ("result", &truncated),
+                            ],
+                        )
                     } else if tool_count > 0 {
-                        crate::i18n::t_fmt("acp_done_summary", lang_bg, &[
-                            ("status", status_icon), ("name", "OpenCode"),
-                            ("count", &tool_count.to_string()), ("summary", &events_list.join("\n")),
-                        ])
+                        crate::i18n::t_fmt(
+                            "acp_done_summary",
+                            lang_bg,
+                            &[
+                                ("status", status_icon),
+                                ("name", "OpenCode"),
+                                ("count", &tool_count.to_string()),
+                                ("summary", &events_list.join("\n")),
+                            ],
+                        )
                     } else {
-                        crate::i18n::t_fmt("acp_done_empty", lang_bg, &[
-                            ("status", status_icon), ("name", "OpenCode"),
-                        ])
+                        crate::i18n::t_fmt(
+                            "acp_done_empty",
+                            lang_bg,
+                            &[("status", status_icon), ("name", "OpenCode")],
+                        )
                     };
 
                     // Store for agent re-inject after notification.
@@ -520,10 +597,16 @@ impl AgentRuntime {
                             account: None,
                         }) {
                             Ok(_) => {
-                                tracing::info!("tool_opencode: notification sent successfully to {}", target_id_bg);
+                                tracing::info!(
+                                    "tool_opencode: notification sent successfully to {}",
+                                    target_id_bg
+                                );
                             }
                             Err(e) => {
-                                tracing::error!("tool_opencode: failed to send notification: {}", e);
+                                tracing::error!(
+                                    "tool_opencode: failed to send notification: {}",
+                                    e
+                                );
                             }
                         }
                     } else {
@@ -533,13 +616,24 @@ impl AgentRuntime {
                 Err(e) => {
                     tracing::error!("tool_opencode: send_prompt failed: {}", e);
                     // Carry the error to the desktop event below as well.
-                    result_summary = crate::i18n::t_fmt("acp_error", lang_bg, &[("name", "OpenCode"), ("error", &e.to_string())]);
+                    result_summary = crate::i18n::t_fmt(
+                        "acp_error",
+                        lang_bg,
+                        &[("name", "OpenCode"), ("error", &e.to_string())],
+                    );
                     if let Some(ref tx) = notif_tx_bg {
-                        tracing::info!("tool_opencode: sending error notification to {}", target_id_bg);
+                        tracing::info!(
+                            "tool_opencode: sending error notification to {}",
+                            target_id_bg
+                        );
                         let _ = tx.send(crate::channel::OutboundMessage {
                             target_id: target_id_bg.clone(),
                             is_group: false,
-                            text: crate::i18n::t_fmt("acp_error", lang_bg, &[("name", "OpenCode"), ("error", &e.to_string())]),
+                            text: crate::i18n::t_fmt(
+                                "acp_error",
+                                lang_bg,
+                                &[("name", "OpenCode"), ("error", &e.to_string())],
+                            ),
                             reply_to: None,
                             images: vec![],
                             files: vec![],
@@ -572,10 +666,19 @@ impl AgentRuntime {
             // carried the summary + files.
             let file_paths: Vec<String> = result_files.iter().map(|(_, _, p)| p.clone()).collect();
             let inject_text = if file_paths.is_empty() {
-                format!("[OpenCode completed] {}", if result_summary.is_empty() { "Task finished.".to_owned() } else { result_summary })
+                format!(
+                    "[OpenCode completed] {}",
+                    if result_summary.is_empty() {
+                        "Task finished.".to_owned()
+                    } else {
+                        result_summary
+                    }
+                )
             } else {
-                format!("[OpenCode completed] Files ready: {}. Please send them to the user with send_file.",
-                    file_paths.join(", "))
+                format!(
+                    "[OpenCode completed] Files ready: {}. Please send them to the user with send_file.",
+                    file_paths.join(", ")
+                )
             };
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<AgentReply>();
             let followup_session = format!("{self_session}:acp-followup");
@@ -600,10 +703,14 @@ impl AgentRuntime {
                 tracing::warn!("tool_opencode: failed to inject result back to agent inbox");
             } else {
                 tracing::info!("tool_opencode: result injected back to agent, waiting for reply");
-                // Wait for agent's reply and forward it (text + files) to user via notification.
+                // Wait for agent's reply and forward it (text + files) to user via
+                // notification.
                 match tokio::time::timeout(Duration::from_secs(300), reply_rx).await {
                     Ok(Ok(reply)) => {
-                        if !reply.text.is_empty() || !reply.files.is_empty() || !reply.images.is_empty() {
+                        if !reply.text.is_empty()
+                            || !reply.files.is_empty()
+                            || !reply.images.is_empty()
+                        {
                             if let Some(ref tx) = notif_tx_bg {
                                 let _ = tx.send(crate::channel::OutboundMessage {
                                     target_id: target_id_bg.clone(),
@@ -760,7 +867,8 @@ impl AgentRuntime {
             .map(expand_tilde)
             .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
         // Convert to Windows native path string (avoid MSYS2/Git Bash Unix-style paths)
-        // Don't use canonicalize() — it returns \\?\ prefix which breaks JSON serialization
+        // Don't use canonicalize() — it returns \\?\ prefix which breaks JSON
+        // serialization
         let cwd_str = if cfg!(target_os = "windows") {
             let abs_path = if cwd.is_absolute() {
                 cwd.clone()
@@ -787,11 +895,17 @@ impl AgentRuntime {
             &command,
             &args_ref,
             Arc::new(crate::acp::client::DefaultAcpHandler),
-            Arc::new(tokio::sync::Mutex::new(crate::acp::notification::NotificationManager::new())),
+            Arc::new(tokio::sync::Mutex::new(
+                crate::acp::notification::NotificationManager::new(),
+            )),
             init_timeout_secs,
-        ).await?;
+        )
+        .await?;
         client
-            .initialize("rsclaw", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"))
+            .initialize(
+                "rsclaw",
+                option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
+            )
             .await?;
 
         // Create session with model if configured
@@ -808,14 +922,17 @@ impl AgentRuntime {
             claudecode_config = ?self.handle.config.claudecode,
             "Claude Code: model configuration"
         );
-        let session_resp = client.create_session(&cwd_str, model.as_deref(), None).await?;
+        let session_resp = client
+            .create_session(&cwd_str, model.as_deref(), None)
+            .await?;
 
         tracing::info!(
             session_id = %session_resp.session_id,
             "Claude Code session created"
         );
 
-        // Set model explicitly after session creation (modelId in session/new doesn't switch model)
+        // Set model explicitly after session creation (modelId in session/new doesn't
+        // switch model)
         if let Some(ref m) = model {
             tracing::info!(model = %m, "Claude Code: setting model after session creation");
             client.set_model(m).await?;
@@ -834,7 +951,11 @@ impl AgentRuntime {
 
         tracing::info!(task = %task, "tool_claudecode: starting");
 
-        let lang = self.config.raw.gateway.as_ref()
+        let lang = self
+            .config
+            .raw
+            .gateway
+            .as_ref()
             .and_then(|g| g.language.as_deref())
             .map(crate::i18n::resolve_lang)
             .unwrap_or("en");
@@ -853,7 +974,11 @@ impl AgentRuntime {
                     let _ = tx.send(crate::channel::OutboundMessage {
                         target_id: target_id.clone(),
                         is_group: false,
-                        text: crate::i18n::t_fmt("acp_start_failed", lang, &[("name", "Claude Code"), ("error", &e.to_string())]),
+                        text: crate::i18n::t_fmt(
+                            "acp_start_failed",
+                            lang,
+                            &[("name", "Claude Code"), ("error", &e.to_string())],
+                        ),
                         reply_to: None,
                         images: vec![],
                         files: vec![],
@@ -867,7 +992,11 @@ impl AgentRuntime {
 
         // Add notification sink to client for real-time progress updates
         if let Some(ref tx) = notif_tx {
-            let sink = Arc::new(ChannelNotifier::new(tx.clone(), target_id.clone(), channel_name.clone()));
+            let sink = Arc::new(ChannelNotifier::new(
+                tx.clone(),
+                target_id.clone(),
+                channel_name.clone(),
+            ));
             client.add_notification_sink(sink);
             tracing::info!("tool_claudecode: added notification sink for {}", target_id);
         }
@@ -878,7 +1007,10 @@ impl AgentRuntime {
         let task_str = task.to_string();
 
         // Send initial notification
-        tracing::info!("tool_claudecode: sending initial notification to {}", target_id);
+        tracing::info!(
+            "tool_claudecode: sending initial notification to {}",
+            target_id
+        );
         if let Some(ref tx) = notif_tx {
             let _ = tx.send(crate::channel::OutboundMessage {
                 target_id: target_id.clone(),
@@ -909,12 +1041,14 @@ impl AgentRuntime {
             let events = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
             let events_clone = Arc::clone(&events);
 
-            // Event collection task - collects events for final summary, NO intermediate notifications
+            // Event collection task - collects events for final summary, NO intermediate
+            // notifications
             let _event_collector = tokio::spawn(async move {
                 loop {
                     match event_rx.recv().await {
                         Ok(event) => {
-                            // Only collect tool call events for summary, skip thoughts (AgentThoughtChunk)
+                            // Only collect tool call events for summary, skip thoughts
+                            // (AgentThoughtChunk)
                             let event_str = match &event {
                                 crate::acp::client::SessionEvent::ToolCallStarted {
                                     title, ..
@@ -952,9 +1086,7 @@ impl AgentRuntime {
                                     tracing::info!("OpenCode event: {}", s);
                                     s
                                 }
-                                crate::acp::client::SessionEvent::AgentMessageChunk {
-                                    content,
-                                } => {
+                                crate::acp::client::SessionEvent::AgentMessageChunk { content } => {
                                     // Log message chunks for visibility
                                     tracing::debug!("OpenCode message: {}", content);
                                     String::new()
@@ -1022,13 +1154,18 @@ impl AgentRuntime {
 
                     // Scan result_content for downloadable file paths.
                     let notif_files: Vec<(String, String, String)> = {
-                        let sendable_exts = [".mp4", ".mp3", ".zip", ".pdf", ".xlsx", ".docx", ".pptx", ".csv", ".tar.gz"];
+                        let sendable_exts = [
+                            ".mp4", ".mp3", ".zip", ".pdf", ".xlsx", ".docx", ".pptx", ".csv",
+                            ".tar.gz",
+                        ];
                         let mut found = Vec::new();
                         for token in result_content.split_whitespace() {
                             let trimmed = token.trim_matches(|c: char| "\"'.,;:()[]{}".contains(c));
-                            // Strip any leading non-path characters (e.g. Chinese prefix like "路径：")
-                            // by finding the first '/' or '~' in the token.
-                            let trimmed = if let Some(pos) = trimmed.find(|c| c == '/' || c == '~') {
+                            // Strip any leading non-path characters (e.g. Chinese prefix like
+                            // "路径：") by finding the first '/' or '~'
+                            // in the token.
+                            let trimmed = if let Some(pos) = trimmed.find(|c| c == '/' || c == '~')
+                            {
                                 &trimmed[pos..]
                             } else {
                                 trimmed
@@ -1039,17 +1176,36 @@ impl AgentRuntime {
                                 if path.exists() {
                                     if let Ok(meta) = path.metadata() {
                                         if meta.len() <= 50_000_000 {
-                                            let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                                            let mime = if lower.ends_with(".mp4") { "video/mp4" }
-                                                else if lower.ends_with(".mp3") { "audio/mpeg" }
-                                                else if lower.ends_with(".pdf") { "application/pdf" }
-                                                else if lower.ends_with(".zip") || lower.ends_with(".tar.gz") { "application/zip" }
-                                                else if lower.ends_with(".xlsx") { "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }
-                                                else if lower.ends_with(".docx") { "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }
-                                                else if lower.ends_with(".pptx") { "application/vnd.openxmlformats-officedocument.presentationml.presentation" }
-                                                else { "text/csv" };
+                                            let filename = path
+                                                .file_name()
+                                                .unwrap_or_default()
+                                                .to_string_lossy()
+                                                .to_string();
+                                            let mime = if lower.ends_with(".mp4") {
+                                                "video/mp4"
+                                            } else if lower.ends_with(".mp3") {
+                                                "audio/mpeg"
+                                            } else if lower.ends_with(".pdf") {
+                                                "application/pdf"
+                                            } else if lower.ends_with(".zip")
+                                                || lower.ends_with(".tar.gz")
+                                            {
+                                                "application/zip"
+                                            } else if lower.ends_with(".xlsx") {
+                                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                            } else if lower.ends_with(".docx") {
+                                                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                                            } else if lower.ends_with(".pptx") {
+                                                "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                                            } else {
+                                                "text/csv"
+                                            };
                                             let path_str = path.to_string_lossy().to_string();
-                                            if !found.iter().any(|(_, _, p): &(String, String, String)| p == &path_str) {
+                                            if !found.iter().any(
+                                                |(_, _, p): &(String, String, String)| {
+                                                    p == &path_str
+                                                },
+                                            ) {
                                                 tracing::info!(path = %path_str, "tool_claudecode: attaching file to notification");
                                                 found.push((filename, mime.to_owned(), path_str));
                                             }
@@ -1069,23 +1225,41 @@ impl AgentRuntime {
                                 .nth(2000)
                                 .map(|(i, _)| i)
                                 .unwrap_or(result_content.len());
-                            crate::i18n::t_fmt("acp_truncated", lang_bg, &[("content", &result_content[..cutoff])])
+                            crate::i18n::t_fmt(
+                                "acp_truncated",
+                                lang_bg,
+                                &[("content", &result_content[..cutoff])],
+                            )
                         } else {
                             result_content
                         };
-                        crate::i18n::t_fmt("acp_done_result", lang_bg, &[
-                            ("status", status_icon), ("name", "Claude Code"),
-                            ("count", &tool_count.to_string()), ("result", &truncated),
-                        ])
+                        crate::i18n::t_fmt(
+                            "acp_done_result",
+                            lang_bg,
+                            &[
+                                ("status", status_icon),
+                                ("name", "Claude Code"),
+                                ("count", &tool_count.to_string()),
+                                ("result", &truncated),
+                            ],
+                        )
                     } else if tool_count > 0 {
-                        crate::i18n::t_fmt("acp_done_summary", lang_bg, &[
-                            ("status", status_icon), ("name", "Claude Code"),
-                            ("count", &tool_count.to_string()), ("summary", &events_list.join("\n")),
-                        ])
+                        crate::i18n::t_fmt(
+                            "acp_done_summary",
+                            lang_bg,
+                            &[
+                                ("status", status_icon),
+                                ("name", "Claude Code"),
+                                ("count", &tool_count.to_string()),
+                                ("summary", &events_list.join("\n")),
+                            ],
+                        )
                     } else {
-                        crate::i18n::t_fmt("acp_done_empty", lang_bg, &[
-                            ("status", status_icon), ("name", "Claude Code"),
-                        ])
+                        crate::i18n::t_fmt(
+                            "acp_done_empty",
+                            lang_bg,
+                            &[("status", status_icon), ("name", "Claude Code")],
+                        )
                     };
 
                     // Clone for the real-time WS/desktop event below (summary +
@@ -1095,7 +1269,8 @@ impl AgentRuntime {
                     // Send notification to user
                     tracing::info!(
                         "tool_claudecode: sending completion notification, summary_len={}, files={}",
-                        summary.len(), notif_files.len()
+                        summary.len(),
+                        notif_files.len()
                     );
                     if let Some(ref tx) = notif_tx_bg {
                         match tx.send(crate::channel::OutboundMessage {
@@ -1109,26 +1284,55 @@ impl AgentRuntime {
                             account: None,
                         }) {
                             Ok(_) => {
-                                tracing::info!("tool_claudecode: notification sent successfully to {}", target_id_bg)
+                                tracing::info!(
+                                    "tool_claudecode: notification sent successfully to {}",
+                                    target_id_bg
+                                )
                             }
                             Err(e) => {
-                                tracing::error!("tool_claudecode: failed to send notification: {}", e)
+                                tracing::error!(
+                                    "tool_claudecode: failed to send notification: {}",
+                                    e
+                                )
                             }
                         }
                     } else {
                         tracing::warn!("tool_claudecode: no notification channel available");
                     }
-                    emit_acp_result_event(&self_event_bus, &self_session, &self_agent_id, event_text, event_files);
+                    emit_acp_result_event(
+                        &self_event_bus,
+                        &self_session,
+                        &self_agent_id,
+                        event_text,
+                        event_files,
+                    );
                 }
                 Err(e) => {
                     tracing::error!("tool_claudecode: send_prompt failed: {}", e);
-                    emit_acp_result_event(&self_event_bus, &self_session, &self_agent_id, crate::i18n::t_fmt("acp_error", lang_bg, &[("name", "Claude Code"), ("error", &e.to_string())]), vec![]);
+                    emit_acp_result_event(
+                        &self_event_bus,
+                        &self_session,
+                        &self_agent_id,
+                        crate::i18n::t_fmt(
+                            "acp_error",
+                            lang_bg,
+                            &[("name", "Claude Code"), ("error", &e.to_string())],
+                        ),
+                        vec![],
+                    );
                     if let Some(ref tx) = notif_tx_bg {
-                        tracing::info!("tool_claudecode: sending error notification to {}", target_id_bg);
+                        tracing::info!(
+                            "tool_claudecode: sending error notification to {}",
+                            target_id_bg
+                        );
                         let _ = tx.send(crate::channel::OutboundMessage {
                             target_id: target_id_bg.clone(),
                             is_group: false,
-                            text: crate::i18n::t_fmt("acp_error", lang_bg, &[("name", "Claude Code"), ("error", &e.to_string())]),
+                            text: crate::i18n::t_fmt(
+                                "acp_error",
+                                lang_bg,
+                                &[("name", "Claude Code"), ("error", &e.to_string())],
+                            ),
                             reply_to: None,
                             images: vec![],
                             files: vec![],
@@ -1167,7 +1371,11 @@ impl AgentRuntime {
             .codex
             .as_ref()
             .and_then(|c| c.command.clone())
-            .or_else(|| which::which("codex").map(|p| p.to_string_lossy().to_string()).ok())
+            .or_else(|| {
+                which::which("codex")
+                    .map(|p| p.to_string_lossy().to_string())
+                    .ok()
+            })
             .or_else(|| std::env::var("CODEX_PATH").ok())
             .unwrap_or_else(|| "codex".to_string());
 
@@ -1208,7 +1416,11 @@ impl AgentRuntime {
 
         tracing::info!(task = %task, "tool_codex: starting");
 
-        let lang = self.config.raw.gateway.as_ref()
+        let lang = self
+            .config
+            .raw
+            .gateway
+            .as_ref()
             .and_then(|g| g.language.as_deref())
             .map(crate::i18n::resolve_lang)
             .unwrap_or("en");
@@ -1227,7 +1439,11 @@ impl AgentRuntime {
                     let _ = tx.send(crate::channel::OutboundMessage {
                         target_id: target_id.clone(),
                         is_group: false,
-                        text: crate::i18n::t_fmt("acp_start_failed", lang, &[("name", "Codex"), ("error", &e.to_string())]),
+                        text: crate::i18n::t_fmt(
+                            "acp_start_failed",
+                            lang,
+                            &[("name", "Codex"), ("error", &e.to_string())],
+                        ),
                         reply_to: None,
                         images: vec![],
                         files: vec![],
@@ -1284,18 +1500,32 @@ impl AgentRuntime {
                             .nth(2000)
                             .map(|(i, _)| i)
                             .unwrap_or(content.len());
-                        crate::i18n::t_fmt("acp_truncated", lang_bg, &[("content", &content[..cutoff])])
+                        crate::i18n::t_fmt(
+                            "acp_truncated",
+                            lang_bg,
+                            &[("content", &content[..cutoff])],
+                        )
                     } else {
                         content.clone()
                     };
 
                     let summary = if content.is_empty() {
-                        crate::i18n::t_fmt("acp_done_empty", lang_bg, &[("status", "✅"), ("name", "Codex")])
+                        crate::i18n::t_fmt(
+                            "acp_done_empty",
+                            lang_bg,
+                            &[("status", "✅"), ("name", "Codex")],
+                        )
                     } else {
-                        crate::i18n::t_fmt("acp_done_result", lang_bg, &[
-                            ("status", "✅"), ("name", "Codex"),
-                            ("count", "0"), ("result", &truncated),
-                        ])
+                        crate::i18n::t_fmt(
+                            "acp_done_result",
+                            lang_bg,
+                            &[
+                                ("status", "✅"),
+                                ("name", "Codex"),
+                                ("count", "0"),
+                                ("result", &truncated),
+                            ],
+                        )
                     };
 
                     // Send notification to user
@@ -1313,16 +1543,36 @@ impl AgentRuntime {
                         });
                     }
                     // Real-time delivery to WS/desktop.
-                    emit_acp_result_event(&self_event_bus, &self_session, &self_agent_id, event_text, vec![]);
+                    emit_acp_result_event(
+                        &self_event_bus,
+                        &self_session,
+                        &self_agent_id,
+                        event_text,
+                        vec![],
+                    );
                 }
                 Err(e) => {
                     tracing::error!("tool_codex: execute failed: {}", e);
-                    emit_acp_result_event(&self_event_bus, &self_session, &self_agent_id, crate::i18n::t_fmt("acp_error", lang_bg, &[("name", "Codex"), ("error", &e.to_string())]), vec![]);
+                    emit_acp_result_event(
+                        &self_event_bus,
+                        &self_session,
+                        &self_agent_id,
+                        crate::i18n::t_fmt(
+                            "acp_error",
+                            lang_bg,
+                            &[("name", "Codex"), ("error", &e.to_string())],
+                        ),
+                        vec![],
+                    );
                     if let Some(ref tx) = notif_tx_bg {
                         let _ = tx.send(crate::channel::OutboundMessage {
                             target_id: target_id_bg.clone(),
                             is_group: false,
-                            text: crate::i18n::t_fmt("acp_error", lang_bg, &[("name", "Codex"), ("error", &e.to_string())]),
+                            text: crate::i18n::t_fmt(
+                                "acp_error",
+                                lang_bg,
+                                &[("name", "Codex"), ("error", &e.to_string())],
+                            ),
                             reply_to: None,
                             images: vec![],
                             files: vec![],

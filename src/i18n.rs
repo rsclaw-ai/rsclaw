@@ -5,8 +5,10 @@
 //!
 //! Supported languages: en, zh, th, vi, ja, es, ko, ru, fr, de, json.
 
-use std::collections::HashMap;
-use std::sync::{LazyLock, OnceLock};
+use std::{
+    collections::HashMap,
+    sync::{LazyLock, OnceLock},
+};
 
 // ---------------------------------------------------------------------------
 // Global default language (set once at gateway startup)
@@ -1984,7 +1986,6 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "ru" => "{count} файлов рабочего пространства в {path}",
     );
 
-
     // --- Processing indicator (timeout-triggered) ---
     msg!("processing",
         "en" => "Processing, please wait...",
@@ -2353,8 +2354,15 @@ pub fn t(key: &str, lang: &str) -> String {
 /// Example: `t_fmt("file_saved", "zh", &[("count", "3")])`
 pub fn t_fmt(key: &str, lang: &str, args: &[(&str, &str)]) -> String {
     if lang == "json" {
-        let pairs: Vec<String> = args.iter().map(|(k, v)| format!("\"{}\":\"{}\"", k, v)).collect();
-        let extra = if pairs.is_empty() { String::new() } else { format!(",{}", pairs.join(",")) };
+        let pairs: Vec<String> = args
+            .iter()
+            .map(|(k, v)| format!("\"{}\":\"{}\"", k, v))
+            .collect();
+        let extra = if pairs.is_empty() {
+            String::new()
+        } else {
+            format!(",{}", pairs.join(","))
+        };
         return format!("{{\"key\":\"{key}\"{extra},\"status\":\"ok\"}}");
     }
     let mut text = t(key, lang);

@@ -7,7 +7,11 @@
 /// 2. Block path traversal (../)
 /// 3. Block sensitive filenames
 /// 4. Scan ALL file content for dangerous commands (not just scripts)
-pub(crate) fn check_write_safety(path: &str, full: &std::path::Path, content: &str) -> anyhow::Result<()> {
+pub(crate) fn check_write_safety(
+    path: &str,
+    full: &std::path::Path,
+    content: &str,
+) -> anyhow::Result<()> {
     // 1. Block absolute paths — write must be relative to workspace
     if path.starts_with('/') || path.starts_with('\\') || path.contains(":\\") {
         anyhow::bail!(

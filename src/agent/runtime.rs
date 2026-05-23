@@ -5422,8 +5422,8 @@ impl AgentRuntime {
                 .unwrap_or(true);
             if intermediate_enabled
                 && !is_streaming_channel
-                && !text_buf.is_empty()
                 && !tool_calls.is_empty()
+                && let Some(intermediate_text) = intermediate_notification_text(&text_buf)
             {
                 if let Some(ref ntx) = self.notification_tx {
                     let notif_target = if !ctx.chat_id.is_empty() {
@@ -5434,7 +5434,7 @@ impl AgentRuntime {
                     let _ = ntx.send(crate::channel::OutboundMessage {
                         target_id: notif_target,
                         is_group: false,
-                        text: text_buf.clone(),
+                        text: intermediate_text.to_owned(),
                         reply_to: None,
                         images: vec![],
                         files: vec![],
@@ -5442,7 +5442,7 @@ impl AgentRuntime {
                         account: None,
                     });
                     tracing::debug!(
-                        text_len = text_buf.len(),
+                        text_len = intermediate_text.len(),
                         "agent_loop: sent intermediate text to user"
                     );
                 }
@@ -6626,6 +6626,58 @@ impl AgentRuntime {
         score
     }
 
+    pub(crate) async fn tool_plugin_info(&self, args: Value) -> Result<Value> {
+        let plugin_filter = args["plugin"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let mut by_plugin =
+            std::collections::BTreeMap::<String, (&'static str, Vec<PluginToolInfo>)>::new();
+        for tool in self.collect_plugin_tools() {
+            if plugin_filter.is_none_or(|p| tool.plugin == p) {
+                by_plugin
+                    .entry(tool.plugin.clone())
+                    .or_insert((tool.runtime, Vec::new()))
+                    .1
+                    .push(tool);
+            }
+        }
+
+        let plugins = by_plugin
+            .into_iter()
+            .map(|(plugin, (runtime, mut tools))| {
+                tools.sort_by(|a, b| a.tool.cmp(&b.tool));
+                let common_tools = tools
+                    .iter()
+                    .take(12)
+                    .map(|tool| {
+                        json!({
+                            "tool": tool.tool,
+                            "name": format!("{}.{}", plugin, tool.tool),
+                            "description": crate::util::truncate_str(&tool.description, 180),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                json!({
+                    "plugin": plugin,
+                    "runtime": runtime,
+                    "tool_count": tools.len(),
+                    "common_tools": common_tools,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Ok(json!({
+            "plugin": plugin_filter,
+            "plugins": plugins,
+            "next_steps": [
+                "Use plugin.search_tools to find task-specific tools.",
+                "Use plugin.describe_tool to inspect exact input schema.",
+                "Use plugin.invoke to execute a plugin tool."
+            ]
+        }))
+    }
+
     pub(crate) async fn tool_plugin_search_tools(&self, args: Value) -> Result<Value> {
         let query = args["query"].as_str().unwrap_or("").trim();
         if query.is_empty() {
@@ -6983,6 +7035,7 @@ impl AgentRuntime {
             "skill_search" => return self.tool_skill_search(args).await,
             "skill_install" => return self.tool_skill_install(args).await,
             "skill_remove" => return self.tool_skill_remove(args).await,
+            "plugin.info" | "plugin_info" => return self.tool_plugin_info(args).await,
             "plugin.search_tools" | "plugin_search_tools" => {
                 return self.tool_plugin_search_tools(args).await;
             }
@@ -8858,6 +8911,15 @@ pub(crate) async fn persist_agent_to_config(
     Ok(())
 }
 
+fn intermediate_notification_text(text: &str) -> Option<&str> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -9103,6 +9165,22 @@ mod tests {
         assert!(!is_internal_session("agent:main:telegram:direct:u1"));
         assert!(!is_internal_session("hook:abcd"));
         assert!(!is_internal_session("session:my-named"));
+    }
+
+    #[test]
+    fn intermediate_notification_text_rejects_whitespace_only_text() {
+        assert_eq!(intermediate_notification_text("\n"), None);
+        assert_eq!(intermediate_notification_text(" \t\n"), None);
+    }
+
+    #[test]
+    fn intermediate_notification_text_preserves_real_text_without_mutating_source() {
+        let source = "\n正在查看屏幕。\n";
+        assert_eq!(
+            intermediate_notification_text(source),
+            Some("正在查看屏幕。")
+        );
+        assert_eq!(source, "\n正在查看屏幕。\n");
     }
 
     #[test]

@@ -57,8 +57,7 @@ impl PushDispatcher {
             loop {
                 match rx.recv().await {
                     Ok(ev) => {
-                        let is_final =
-                            matches!(&ev, AgentEvent::Status { final_: true, .. });
+                        let is_final = matches!(&ev, AgentEvent::Status { final_: true, .. });
                         if let Err(e) = me.dispatch(&task_id, &ev).await {
                             warn!(err = %e, "push dispatch failed");
                         }
@@ -96,7 +95,9 @@ impl PushDispatcher {
                         info!(task_id, url = %cfg.url, "push delivered");
                         break;
                     }
-                    Ok(r) => warn!(task_id, url = %cfg.url, status = %r.status(), attempt, "push non-2xx"),
+                    Ok(r) => {
+                        warn!(task_id, url = %cfg.url, status = %r.status(), attempt, "push non-2xx")
+                    }
                     Err(e) => warn!(task_id, url = %cfg.url, attempt, err = %e, "push failed"),
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(2u64.pow(attempt))).await;

@@ -1,6 +1,6 @@
-use anyhow::{bail, Result};
-use std::path::PathBuf;
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
+
+use anyhow::{Result, bail};
 
 use super::style::*;
 use crate::cli::ToolsCommand;
@@ -72,7 +72,11 @@ const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "sherpa-onnx",
         display: "sherpa-onnx (STT + TTS engine)",
-        detect_cmd: &["sherpa-onnx-offline-tts", "sherpa-onnx-offline", "sherpa-onnx"],
+        detect_cmd: &[
+            "sherpa-onnx-offline-tts",
+            "sherpa-onnx-offline",
+            "sherpa-onnx",
+        ],
         local_bin: "sherpa-onnx",
         optional: false,
     },
@@ -112,7 +116,10 @@ fn manifest_cache_path(tools_dir: &std::path::Path) -> PathBuf {
 /// Persist a fetched manifest so the available-tools list survives offline.
 fn write_manifest_cache(tools_dir: &std::path::Path, manifest: &serde_json::Value) -> Result<()> {
     std::fs::create_dir_all(tools_dir)?;
-    std::fs::write(manifest_cache_path(tools_dir), serde_json::to_vec_pretty(manifest)?)?;
+    std::fs::write(
+        manifest_cache_path(tools_dir),
+        serde_json::to_vec_pretty(manifest)?,
+    )?;
     Ok(())
 }
 
@@ -135,12 +142,21 @@ fn write_version_marker(tools_dir: &std::path::Path, subdir: &str, version: &str
 fn installed_version(tools_dir: &std::path::Path, subdir: &str) -> Option<String> {
     let s = std::fs::read_to_string(tools_dir.join(subdir).join(".version")).ok()?;
     let s = s.trim();
-    if s.is_empty() { None } else { Some(s.to_owned()) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_owned())
+    }
 }
 
 /// Version string for a tool from a manifest, if present.
 fn manifest_tool_version(manifest: &serde_json::Value, tool: &str) -> Option<String> {
-    manifest.get("tools")?.get(tool)?.get("version")?.as_str().map(|s| s.to_owned())
+    manifest
+        .get("tools")?
+        .get(tool)?
+        .get("version")?
+        .as_str()
+        .map(|s| s.to_owned())
 }
 
 /// All installable tool names: cached-manifest keys ∪ compiled-in baseline.
@@ -161,7 +177,8 @@ pub(crate) fn available_tools(cache: Option<&serde_json::Value>) -> Vec<String> 
 }
 
 /// Installed tools (those whose local_bin exists) paired with their marker
-/// version (None when the marker is missing — e.g. installed by an older build).
+/// version (None when the marker is missing — e.g. installed by an older
+/// build).
 pub(crate) fn installed_tools(tools_dir: &std::path::Path) -> Vec<(String, Option<String>)> {
     // Marker + presence both key off `local_bin` (the install subdir) so the
     // marker sits alongside the binary. name == local_bin for current tools.
@@ -186,7 +203,8 @@ pub struct ToolCatalogEntry {
 }
 
 /// Assemble the tools catalog: available (cache ∪ baseline) + installed status.
-/// Description comes from the compiled-in `TOOLS` label; version from the cache.
+/// Description comes from the compiled-in `TOOLS` label; version from the
+/// cache.
 pub fn tools_catalog() -> Vec<ToolCatalogEntry> {
     let dir = tools_dir();
     let cache = load_manifest_cache(&dir);
@@ -217,7 +235,8 @@ pub fn tools_catalog() -> Vec<ToolCatalogEntry> {
         .collect()
 }
 
-/// Lazy-populate the tools manifest cache (no-op if present). For the catalog API.
+/// Lazy-populate the tools manifest cache (no-op if present). For the catalog
+/// API.
 pub async fn ensure_manifest_cached() {
     fetch_manifest_if_missing().await;
 }
@@ -257,7 +276,8 @@ pub fn tools_dir_pub() -> PathBuf {
     tools_dir()
 }
 
-/// Public accessor for the cached manifest (used by the agent prompt/tool builders).
+/// Public accessor for the cached manifest (used by the agent prompt/tool
+/// builders).
 pub fn load_manifest_cache_pub(tools_dir: &std::path::Path) -> Option<serde_json::Value> {
     load_manifest_cache(tools_dir)
 }
@@ -294,8 +314,9 @@ fn tool_status(def: &ToolDef) -> &'static str {
 // Public: tools summary for `rsclaw status`
 // ---------------------------------------------------------------------------
 
-/// Returns a one-line tools summary, e.g. "chrome ✓  ffmpeg ✓  node ✓  python ✓  sherpa-onnx ✗"
-/// Optional tools that are missing render as "·" so they don't look like a failure.
+/// Returns a one-line tools summary, e.g. "chrome ✓  ffmpeg ✓  node ✓  python ✓
+/// sherpa-onnx ✗" Optional tools that are missing render as "·" so they don't
+/// look like a failure.
 pub fn tools_summary_line() -> String {
     TOOLS
         .iter()
@@ -321,9 +342,11 @@ pub fn tools_count() -> (usize, usize) {
     (available, total)
 }
 
-/// Returns names of missing required tools (optional tools never reported missing).
+/// Returns names of missing required tools (optional tools never reported
+/// missing).
 pub fn tools_missing() -> Vec<&'static str> {
-    TOOLS.iter()
+    TOOLS
+        .iter()
         .filter(|d| !d.optional && tool_status(d) == "missing")
         .map(|d| d.name)
         .collect()
@@ -335,8 +358,14 @@ pub fn tools_missing() -> Vec<&'static str> {
 
 pub async fn cmd_tools(sub: ToolsCommand) -> Result<()> {
     match sub {
-        ToolsCommand::List => { cmd_list(); Ok(()) }
-        ToolsCommand::Status => { cmd_status(); Ok(()) }
+        ToolsCommand::List => {
+            cmd_list();
+            Ok(())
+        }
+        ToolsCommand::Status => {
+            cmd_status();
+            Ok(())
+        }
         ToolsCommand::Install { name, force } => cmd_install(&name, force).await,
     }
 }
@@ -383,7 +412,13 @@ fn cmd_status() {
             ("missing", true) => (dim("·"), dim("not installed (optional)")),
             _ => (red("✗"), red("not found")),
         };
-        println!("  {} {:<14} {}  {}", icon, bold(def.name), label, dim(def.display));
+        println!(
+            "  {} {:<14} {}  {}",
+            icon,
+            bold(def.name),
+            label,
+            dim(def.display)
+        );
     }
 
     // Hint only when REQUIRED tools are missing (optional ones never warn).
@@ -403,12 +438,18 @@ fn cmd_status() {
 fn find_node_binary(tools_dir: &std::path::Path) -> Option<String> {
     // Check local tools dir first.
     let local = tools_dir.join("node").join("bin").join("node");
-    if local.exists() { return Some(local.to_string_lossy().to_string()); }
+    if local.exists() {
+        return Some(local.to_string_lossy().to_string());
+    }
     // Windows variant.
     let local_win = tools_dir.join("node").join("node.exe");
-    if local_win.exists() { return Some(local_win.to_string_lossy().to_string()); }
+    if local_win.exists() {
+        return Some(local_win.to_string_lossy().to_string());
+    }
     // System PATH.
-    which::which("node").ok().map(|p| p.to_string_lossy().to_string())
+    which::which("node")
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
 }
 
 fn resolve_tool_name(name: &str) -> &str {
@@ -431,11 +472,7 @@ pub async fn cmd_install(name: &str, force: bool) -> Result<()> {
         if !TOOLS.iter().any(|d| d.name == name) {
             bail!(
                 "Unknown tool: {name}. Available: {}",
-                TOOLS
-                    .iter()
-                    .map(|d| d.name)
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                TOOLS.iter().map(|d| d.name).collect::<Vec<_>>().join(", ")
             );
         }
         vec![name]
@@ -454,8 +491,14 @@ pub async fn cmd_install(name: &str, force: bool) -> Result<()> {
         Err(e) => {
             err_msg(&format!("Cannot reach hub: {e}"));
             println!();
-            println!("  Please download manually from: {}", bold("https://gitfast.io"));
-            println!("  Then extract to: {}", bold(&tools_dir().display().to_string()));
+            println!(
+                "  Please download manually from: {}",
+                bold("https://gitfast.io")
+            );
+            println!(
+                "  Then extract to: {}",
+                bold(&tools_dir().display().to_string())
+            );
             return Ok(());
         }
     };
@@ -496,11 +539,21 @@ pub async fn cmd_install(name: &str, force: bool) -> Result<()> {
 
         // Skip if already available (unless --force)
         if !force && is_tool_in_path(def) {
-            println!("  {} {} {}", green("✓"), bold(def.name), dim("(already in system PATH, skipping)"));
+            println!(
+                "  {} {} {}",
+                green("✓"),
+                bold(def.name),
+                dim("(already in system PATH, skipping)")
+            );
             continue;
         }
         if !force && is_tool_installed_locally(def) {
-            println!("  {} {} {}", green("✓"), bold(def.name), dim("(already installed, skipping)"));
+            println!(
+                "  {} {} {}",
+                green("✓"),
+                bold(def.name),
+                dim("(already installed, skipping)")
+            );
             continue;
         }
 
@@ -519,19 +572,33 @@ pub async fn cmd_install(name: &str, force: bool) -> Result<()> {
             // breaks when spawned from a Windows-native subprocess (it
             // emits Unix-style paths like /d/Program Files/...). Use the
             // .cmd form on Windows; other platforms keep the bare name.
-            let npm_basename = if cfg!(target_os = "windows") { "npm.cmd" } else { "npm" };
-            let npm_bin = node_bin.as_deref().map(|n| {
-                let p = std::path::Path::new(n).parent().unwrap_or(std::path::Path::new(""));
-                p.join(npm_basename).to_string_lossy().to_string()
-            }).unwrap_or_else(|| npm_basename.to_owned());
+            let npm_basename = if cfg!(target_os = "windows") {
+                "npm.cmd"
+            } else {
+                "npm"
+            };
+            let npm_bin = node_bin
+                .as_deref()
+                .map(|n| {
+                    let p = std::path::Path::new(n)
+                        .parent()
+                        .unwrap_or(std::path::Path::new(""));
+                    p.join(npm_basename).to_string_lossy().to_string()
+                })
+                .unwrap_or_else(|| npm_basename.to_owned());
             let status = std::process::Command::new(&npm_bin)
                 .args(["install", "--prefix", &dest_dir.to_string_lossy(), pkg])
                 .status();
             match status {
-                Ok(s) if s.success() => ok(&format!("{} installed to {}", def.name, dest_dir.display())),
+                Ok(s) if s.success() => {
+                    ok(&format!("{} installed to {}", def.name, dest_dir.display()))
+                }
                 Ok(s) => err_msg(&format!("{}: npm install exited with {s}", def.name)),
                 Err(e) => {
-                    err_msg(&format!("{}: npm not found ({e}). Install node first: rsclaw tools install node", def.name));
+                    err_msg(&format!(
+                        "{}: npm not found ({e}). Install node first: rsclaw tools install node",
+                        def.name
+                    ));
                 }
             }
             continue;
@@ -605,7 +672,11 @@ fn tool_platform<'a>(
     tool: &str,
     platform: &str,
 ) -> Option<&'a serde_json::Value> {
-    manifest.get("tools")?.get(tool)?.get("platforms")?.get(platform)
+    manifest
+        .get("tools")?
+        .get(tool)?
+        .get("platforms")?
+        .get(platform)
 }
 
 fn resolve_download_url(
@@ -630,7 +701,8 @@ fn sha256_file_hex(path: &std::path::Path) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(&data)))
 }
 
-/// Download an archive and extract to dest. Public so `cmd/models.rs` can reuse.
+/// Download an archive and extract to dest. Public so `cmd/models.rs` can
+/// reuse.
 pub async fn download_and_extract_public(
     client: &reqwest::Client,
     url: &str,
@@ -695,9 +767,9 @@ pub async fn download_resumable(
     out_path: &std::path::Path,
     label: &str,
 ) -> Result<u64> {
+    use futures::StreamExt;
     use indicatif::{ProgressBar, ProgressStyle};
     use tokio::io::AsyncWriteExt;
-    use futures::StreamExt;
 
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -720,7 +792,10 @@ pub async fn download_resumable(
     let stashed: Option<(u64, String)> = if already > 0 {
         std::fs::read_to_string(&meta_path)
             .ok()
-            .and_then(|s| s.split_once('\t').map(|(a, b)| (a.to_owned(), b.to_owned())))
+            .and_then(|s| {
+                s.split_once('\t')
+                    .map(|(a, b)| (a.to_owned(), b.to_owned()))
+            })
             .and_then(|(len_s, tok)| len_s.parse::<u64>().ok().map(|n| (n, tok)))
     } else {
         None
@@ -786,10 +861,10 @@ pub async fn download_resumable(
 
     // Restart conditions, all of which mean the partial we have on disk is
     // unsafe to append to:
-    //   1. server's total differs from the size we stashed last time (file
-    //      changed upstream)
-    //   2. local partial is somehow larger than the upstream total (truncate
-    //      / dd / FS quota glitch extended it past the real size)
+    //   1. server's total differs from the size we stashed last time (file changed
+    //      upstream)
+    //   2. local partial is somehow larger than the upstream total (truncate / dd /
+    //      FS quota glitch extended it past the real size)
     let restart_due_to_size_mismatch = resume
         && match (stashed.as_ref().map(|(n, _)| *n), total_size) {
             (Some(stash_total), Some(now_total)) => stash_total != now_total,
@@ -883,10 +958,7 @@ pub async fn download_resumable(
 /// Extract a zip archive to `dest`, stripping the top-level directory.
 /// Public so the gateway can extract a pre-downloaded archive without
 /// re-downloading.
-pub fn extract_zip_public(
-    archive_path: &std::path::Path,
-    dest: &std::path::Path,
-) -> Result<()> {
+pub fn extract_zip_public(archive_path: &std::path::Path, dest: &std::path::Path) -> Result<()> {
     extract_zip(archive_path, dest)
 }
 
@@ -989,8 +1061,9 @@ fn extract_tar<R: std::io::Read>(reader: R, dest: &std::path::Path) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     #[test]
     fn manifest_cache_round_trip() {

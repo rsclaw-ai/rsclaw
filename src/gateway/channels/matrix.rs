@@ -3,17 +3,16 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use super::{
+    super::preparse::{btw_direct_call, is_fast_preparse, try_preparse_locally},
+    default_dm_scope,
+};
 use crate::{
     agent::{AgentMessage, AgentRegistry},
     channel::{Channel, OutboundMessage},
     config::runtime::RuntimeConfig,
     gateway::session::{MessageKind, SessionKeyParams, derive_session_key},
 };
-
-use super::super::preparse::{
-    btw_direct_call, is_fast_preparse, try_preparse_locally,
-};
-use super::default_dm_scope;
 
 pub(crate) fn start_matrix_if_configured(
     config: &RuntimeConfig,
@@ -116,7 +115,9 @@ pub(crate) fn start_matrix_if_configured(
 
         // Register Matrix channel sender for notification routing.
         {
-            let mut senders = channel_senders.write().expect("channel_senders lock poisoned");
+            let mut senders = channel_senders
+                .write()
+                .expect("channel_senders lock poisoned");
             senders.insert("matrix".to_string(), out_tx.clone());
             senders.insert(format!("matrix/{}", acct_name), out_tx.clone());
         }
@@ -193,7 +194,8 @@ pub(crate) fn start_matrix_if_configured(
                                         channel: None,
 
                                         account: None,
-                    files: vec![],                                    })
+                                        files: vec![],
+                                    })
                                     .await
                                 {
                                     tracing::warn!("failed to send message: {e}");
@@ -215,7 +217,8 @@ pub(crate) fn start_matrix_if_configured(
                                         channel: None,
 
                                         account: None,
-                    files: vec![],                                    })
+                                        files: vec![],
+                                    })
                                     .await
                                 {
                                     tracing::warn!("failed to send message: {e}");
@@ -248,9 +251,15 @@ pub(crate) fn start_matrix_if_configured(
                                 {
                                     // No debounce — task queue merge_into_pending
                                     // handles rapid consecutive messages automatically.
-                                    let handle = match w_reg.route("matrix").or_else(|_| w_reg.default_agent()) {
+                                    let handle = match w_reg
+                                        .route("matrix")
+                                        .or_else(|_| w_reg.default_agent())
+                                    {
                                         Ok(h) => h,
-                                        Err(e) => { error!("matrix route error: {e:#}"); continue; }
+                                        Err(e) => {
+                                            error!("matrix route error: {e:#}");
+                                            continue;
+                                        }
                                     };
                                     let dm_scope = default_dm_scope(&w_cfg);
                                     let session_key = derive_session_key(&SessionKeyParams {
@@ -276,12 +285,24 @@ pub(crate) fn start_matrix_if_configured(
                                         reply_to: None,
                                         timestamp: chrono::Utc::now().timestamp(),
                                         images: images.iter().map(|i| i.data.clone()).collect(),
-                                        files: files.iter().filter_map(|f| {
-                                            crate::gateway::task_queue::stage_file(&f.filename, &f.data, &f.mime_type).ok()
-                                        }).collect(),
+                                        files: files
+                                            .iter()
+                                            .filter_map(|f| {
+                                                crate::gateway::task_queue::stage_file(
+                                                    &f.filename,
+                                                    &f.data,
+                                                    &f.mime_type,
+                                                )
+                                                .ok()
+                                            })
+                                            .collect(),
                                         account: None,
                                     };
-                                    if let Err(e) = w_tq.submit(&session_key, qmsg, crate::gateway::task_queue::Priority::User) {
+                                    if let Err(e) = w_tq.submit(
+                                        &session_key,
+                                        qmsg,
+                                        crate::gateway::task_queue::Priority::User,
+                                    ) {
                                         error!(user = %w_uid, "matrix: queue submit failed: {e:#}");
                                     }
                                 }
@@ -323,7 +344,8 @@ pub(crate) fn start_matrix_if_configured(
                                         channel: None,
 
                                         account: None,
-                    files: vec![],                                    })
+                                        files: vec![],
+                                    })
                                     .await
                                 {
                                     tracing::warn!("failed to send message: {e}");
@@ -360,14 +382,20 @@ pub(crate) fn start_matrix_if_configured(
                                 peer_id: sender.clone(),
                                 dm_scope,
                             });
-                            if let Some(mut reply) = try_preparse_locally(&text, &handle, "matrix", &sender, crate::gateway::preparse::PreparseOrigin::User).await {
+                            if let Some(mut reply) = try_preparse_locally(
+                                &text,
+                                &handle,
+                                "matrix",
+                                &sender,
+                                crate::gateway::preparse::PreparseOrigin::User,
+                            )
+                            .await
+                            {
                                 reply.target_id = room_id.clone();
                                 reply.is_group = is_group;
                                 if !reply.text.is_empty() || !reply.images.is_empty() {
                                     if let Err(e) = tx.send(reply).await {
-
                                         tracing::warn!("failed to send message: {e}");
-
                                     }
                                 }
                                 return;
@@ -393,18 +421,23 @@ pub(crate) fn start_matrix_if_configured(
                             if handle.tx.send(msg).await.is_err() {
                                 return;
                             }
-                            if let Ok(Ok(r)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
+                            if let Ok(Ok(r)) =
+                                tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx)
+                                    .await
+                            {
                                 if !r.is_empty {
-                                    if let Err(e) = tx.send(OutboundMessage {
-                                        target_id: room_id,
-                                        is_group,
-                                        text: r.text,
-                                        reply_to: None,
-                                        images: r.images,
-                                        files: r.files,
-                                        channel: None,
-                                        account: None,
-                                    }).await
+                                    if let Err(e) = tx
+                                        .send(OutboundMessage {
+                                            target_id: room_id,
+                                            is_group,
+                                            text: r.text,
+                                            reply_to: None,
+                                            images: r.images,
+                                            files: r.files,
+                                            channel: None,
+                                            account: None,
+                                        })
+                                        .await
                                     {
                                         tracing::warn!("failed to send message: {e}");
                                     }

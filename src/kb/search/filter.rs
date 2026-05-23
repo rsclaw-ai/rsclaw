@@ -3,11 +3,15 @@
 //! All visibility/status/version logic lives here so retrieval can't
 //! accidentally bypass it.
 
-use crate::kb::model::{CallerScope, KbDoc, KbStatus};
-use crate::kb::store::docs;
+use std::collections::HashSet;
+
 use anyhow::Result;
 use redb::ReadTransaction;
-use std::collections::HashSet;
+
+use crate::kb::{
+    model::{CallerScope, KbDoc, KbStatus},
+    store::docs,
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct SearchFilter {
@@ -53,12 +57,15 @@ pub fn is_latest_version(rtx: &ReadTransaction, doc: &KbDoc) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use redb::ReadableDatabase;
-    use crate::kb::model::{KbSource, KbSourceKind, KbStatus, KbVisibility, VersionPointer};
-    use crate::kb::store::open_db;
     use serde_json::Value;
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::kb::{
+        model::{KbSource, KbSourceKind, KbStatus, KbVisibility, VersionPointer},
+        store::open_db,
+    };
 
     fn sample(id: &str, vis: KbVisibility, status: KbStatus, tags: Vec<String>) -> KbDoc {
         KbDoc {
@@ -99,7 +106,12 @@ mod tests {
 
     #[test]
     fn keep_doc_tag_filter() {
-        let d = sample("d1", KbVisibility::Global, KbStatus::Active, vec!["work".into()]);
+        let d = sample(
+            "d1",
+            KbVisibility::Global,
+            KbStatus::Active,
+            vec!["work".into()],
+        );
         let mut f = SearchFilter::default();
         f.tags = vec!["work".into()];
         assert!(keep_doc(&d, &CallerScope::default(), &f));
@@ -121,8 +133,14 @@ mod tests {
     fn keep_doc_private_requires_owner() {
         let mut d = sample("d1", KbVisibility::Private, KbStatus::Active, vec![]);
         d.owner_user_id = Some("u1".into());
-        let scope_match = CallerScope { user_id: Some("u1".into()), ..Default::default() };
-        let scope_other = CallerScope { user_id: Some("u2".into()), ..Default::default() };
+        let scope_match = CallerScope {
+            user_id: Some("u1".into()),
+            ..Default::default()
+        };
+        let scope_other = CallerScope {
+            user_id: Some("u2".into()),
+            ..Default::default()
+        };
         assert!(keep_doc(&d, &scope_match, &SearchFilter::default()));
         assert!(!keep_doc(&d, &scope_other, &SearchFilter::default()));
     }
@@ -136,7 +154,10 @@ mod tests {
             crate::kb::store::docs::set_latest_version(
                 &wtx,
                 "lsid",
-                &VersionPointer { doc_id: "v2".into(), version: 2 },
+                &VersionPointer {
+                    doc_id: "v2".into(),
+                    version: 2,
+                },
             )
             .unwrap();
             wtx.commit().unwrap();

@@ -4,7 +4,7 @@
 //! boundary conditions, and Unicode handling.
 
 use rsclaw::channel::chunker::{
-    chunk_text, platform_chunk_limit, BreakPreference, ChunkConfig, DEFAULT_CHUNK_LIMIT,
+    BreakPreference, ChunkConfig, DEFAULT_CHUNK_LIMIT, chunk_text, platform_chunk_limit,
 };
 
 fn cfg(max: usize) -> ChunkConfig {

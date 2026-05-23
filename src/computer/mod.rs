@@ -48,7 +48,7 @@ pub mod status;
 pub use action::{Action, ActionSpec, ExecCtx, MouseButton, ParsedAction, Screenshot, ScrollDir};
 pub use driver::{DriverOutcome, VlmDriver};
 pub use operator::Operator;
-pub use parser::{parse_vlm_response, CoordFormat};
+pub use parser::{CoordFormat, parse_vlm_response};
 
 /// Build the platform-default operator for the running OS. Browser /
 /// ADB operators are constructed explicitly elsewhere (they need

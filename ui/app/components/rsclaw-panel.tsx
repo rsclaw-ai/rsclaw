@@ -64,6 +64,12 @@ import {
 } from "../lib/provider-defaults";
 import { isTauri, invoke as tauriInvokeV2 } from "../utils/tauri";
 
+export function normalizeInstallSpec(spec: string): string {
+  const trimmed = spec.trim();
+  if (trimmed.startsWith("@/")) return trimmed.slice(1);
+  return trimmed;
+}
+
 // ── Types ──────────────────────────────────────────────
 interface ChannelInfo {
   type: string;
@@ -5122,7 +5128,7 @@ function PluginsTab() {
   useEffect(() => { fetchPlugins(); }, [fetchPlugins]);
 
   const doInstall = useCallback(async (spec: string) => {
-    const trimmed = spec.trim();
+    const trimmed = normalizeInstallSpec(spec);
     if (!trimmed) return;
     if (!isTauri) { toast.error(zh ? "安装插件需要桌面版" : "Installing plugins requires the desktop app"); return; }
     setInstalling(trimmed);

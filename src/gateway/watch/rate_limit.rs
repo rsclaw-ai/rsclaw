@@ -8,15 +8,18 @@
 pub enum DeliveryMsg {
     Single(String),
     /// N>=1 events were dropped from chat (rate-limited); show the last one.
-    Batch { last: String, dropped: usize },
+    Batch {
+        last: String,
+        dropped: usize,
+    },
 }
 
 #[derive(Debug)]
 pub struct RateLimiter {
     window_ms: u64,
-    max_per_window: usize,  // 0 means unlimited
+    max_per_window: usize, // 0 means unlimited
     buffer: Vec<String>,
-    last_emit_ms: Option<u64>,  // None = no emit yet (window is open)
+    last_emit_ms: Option<u64>, // None = no emit yet (window is open)
     last_seen_ms: u64,
 }
 
@@ -80,7 +83,10 @@ mod tests {
     #[test]
     fn first_message_in_window_is_single() {
         let mut r = RateLimiter::new(2000);
-        assert_eq!(r.admit("a".into(), 0), Some(DeliveryMsg::Single("a".into())));
+        assert_eq!(
+            r.admit("a".into(), 0),
+            Some(DeliveryMsg::Single("a".into()))
+        );
     }
 
     #[test]
@@ -94,12 +100,18 @@ mod tests {
     #[test]
     fn flush_after_window_emits_batch() {
         let mut r = RateLimiter::new(2000);
-        r.admit("a".into(), 0);          // → Single("a")
-        r.admit("b".into(), 500);        // → None (buffered)
-        r.admit("c".into(), 1500);       // → None (buffered)
+        r.admit("a".into(), 0); // → Single("a")
+        r.admit("b".into(), 500); // → None (buffered)
+        r.admit("c".into(), 1500); // → None (buffered)
         let flushed = r.flush_pending(2000);
         // Last buffered = "c", dropped = 1 (just "b").
-        assert_eq!(flushed, Some(DeliveryMsg::Batch { last: "c".into(), dropped: 1 }));
+        assert_eq!(
+            flushed,
+            Some(DeliveryMsg::Batch {
+                last: "c".into(),
+                dropped: 1
+            })
+        );
     }
 
     #[test]
@@ -120,16 +132,28 @@ mod tests {
     #[test]
     fn rate_zero_disables_limit() {
         let mut r = RateLimiter::new(0);
-        assert_eq!(r.admit("a".into(), 0), Some(DeliveryMsg::Single("a".into())));
-        assert_eq!(r.admit("b".into(), 1), Some(DeliveryMsg::Single("b".into())));
-        assert_eq!(r.admit("c".into(), 2), Some(DeliveryMsg::Single("c".into())));
+        assert_eq!(
+            r.admit("a".into(), 0),
+            Some(DeliveryMsg::Single("a".into()))
+        );
+        assert_eq!(
+            r.admit("b".into(), 1),
+            Some(DeliveryMsg::Single("b".into()))
+        );
+        assert_eq!(
+            r.admit("c".into(), 2),
+            Some(DeliveryMsg::Single("c".into()))
+        );
         assert_eq!(r.flush_pending(3), None);
     }
 
     #[test]
     fn second_window_emits_single_again() {
         let mut r = RateLimiter::new(2000);
-        assert!(matches!(r.admit("a".into(), 0), Some(DeliveryMsg::Single(_))));
+        assert!(matches!(
+            r.admit("a".into(), 0),
+            Some(DeliveryMsg::Single(_))
+        ));
         r.admit("b".into(), 500);
         let _ = r.flush_pending(2000);
         // Flush emitted at t=2000; next window opens at t=4000.

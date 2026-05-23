@@ -3,23 +3,19 @@
 //! Wayland (xcap handles portal under Wayland).
 //!
 //! Behaviour notes:
-//!   - `enigo::Enigo` is not `Send` on all platforms (Windows in
-//!     particular) and input synthesis is fundamentally blocking, so
-//!     every action runs inside `tokio::task::spawn_blocking` with a
-//!     fresh `Enigo` per call. The operator itself is a unit struct
-//!     that is trivially `Send + Sync`.
-//!   - Coordinates from the model are in **physical** pixels (raw
-//!     screenshot space). On macOS Retina, `enigo` expects logical
-//!     coordinates, so we divide by `ctx.scale_factor`. On Windows /
-//!     Linux X11 the API takes physical pixels and we pass through
-//!     unchanged.
-//!   - `activate_app` shells out per platform to bring **all** windows
-//!     of the target app to the front. The objc2-app-kit /
-//!     EnumWindows / xdotool routes are listed as TODOs for a v2 that
-//!     wants zero shell-out overhead.
+//!   - `enigo::Enigo` is not `Send` on all platforms (Windows in particular)
+//!     and input synthesis is fundamentally blocking, so every action runs
+//!     inside `tokio::task::spawn_blocking` with a fresh `Enigo` per call. The
+//!     operator itself is a unit struct that is trivially `Send + Sync`.
+//!   - Coordinates from the model are in **physical** pixels (raw screenshot
+//!     space). On macOS Retina, `enigo` expects logical coordinates, so we
+//!     divide by `ctx.scale_factor`. On Windows / Linux X11 the API takes
+//!     physical pixels and we pass through unchanged.
+//!   - `activate_app` shells out per platform to bring **all** windows of the
+//!     target app to the front. The objc2-app-kit / EnumWindows / xdotool
+//!     routes are listed as TODOs for a v2 that wants zero shell-out overhead.
 
-use std::process::Command;
-use std::time::Duration;
+use std::{process::Command, time::Duration};
 
 use anyhow::{Context as _, Result, anyhow};
 use enigo::{
@@ -31,10 +27,10 @@ use image::{ImageFormat, RgbaImage};
 use tracing::{debug, warn};
 use xcap::Monitor;
 
-use crate::computer::action::{
-    Action, ActionSpec, ExecCtx, MouseButton, Screenshot, ScrollDir,
+use crate::computer::{
+    action::{Action, ActionSpec, ExecCtx, MouseButton, Screenshot, ScrollDir},
+    operator::{ActionFut, ActionOutput, Operator, ScreenshotFut},
 };
-use crate::computer::operator::{ActionFut, ActionOutput, Operator, ScreenshotFut};
 
 /// Native desktop operator. Unit struct: holds no state because every
 /// platform call needs a fresh `Enigo` on the calling OS thread anyway
@@ -69,17 +65,9 @@ impl Operator for NativeOperator {
             ActionSpec::new("click(start_box='<box>x1,y1</box>')"),
             ActionSpec::new("left_double(start_box='<box>x1,y1</box>')"),
             ActionSpec::new("right_single(start_box='<box>x1,y1</box>')"),
-            ActionSpec::new(
-                "drag(start_box='<box>x1,y1</box>', end_box='<box>x3,y3</box>')",
-            ),
-            ActionSpec::with_note(
-                "hotkey(key='')",
-                "# Lowercase, space-separated, max 4 keys",
-            ),
-            ActionSpec::with_note(
-                "type(content='')",
-                "# Add \\n at end of content to submit",
-            ),
+            ActionSpec::new("drag(start_box='<box>x1,y1</box>', end_box='<box>x3,y3</box>')"),
+            ActionSpec::with_note("hotkey(key='')", "# Lowercase, space-separated, max 4 keys"),
+            ActionSpec::with_note("type(content='')", "# Add \\n at end of content to submit"),
             ActionSpec::new(
                 "scroll(start_box='<box>x1,y1</box>', direction='down or up or right or left')",
             ),
@@ -149,8 +137,7 @@ impl Operator for NativeOperator {
 
 /// Capture the primary monitor and encode as PNG.
 fn capture_primary_screen() -> Result<Screenshot> {
-    let monitors =
-        Monitor::all().map_err(|e| anyhow!("xcap::Monitor::all failed: {e}"))?;
+    let monitors = Monitor::all().map_err(|e| anyhow!("xcap::Monitor::all failed: {e}"))?;
     if monitors.is_empty() {
         return Err(anyhow!("no monitors detected"));
     }
@@ -228,8 +215,7 @@ fn execute_blocking(action: &Action, ctx: &ExecCtx) -> Result<ActionOutput> {
             // to the agent loop with concrete remediation steps.
             let err_str = e.to_string();
             let hint = if cfg!(target_os = "macos")
-                && (err_str.contains("permission")
-                    || err_str.contains("simulate input"))
+                && (err_str.contains("permission") || err_str.contains("simulate input"))
             {
                 " (macOS: open System Settings -> Privacy & Security -> \
                  Accessibility AND Input Monitoring, then add the \
@@ -240,9 +226,7 @@ fn execute_blocking(action: &Action, ctx: &ExecCtx) -> Result<ActionOutput> {
                 ""
             };
             warn!(error = %e, hint, "failed to construct Enigo");
-            return Ok(ActionOutput::err(format!(
-                "enigo init failed: {e}{hint}"
-            )));
+            return Ok(ActionOutput::err(format!("enigo init failed: {e}{hint}")));
         }
     };
 
@@ -253,10 +237,7 @@ fn execute_blocking(action: &Action, ctx: &ExecCtx) -> Result<ActionOutput> {
         }
         Action::Click { x, y, button } => {
             let (lx, ly) = scale_for_input(*x, *y, ctx.scale_factor);
-            if let Err(msg) = ok_or_msg(
-                enigo.move_mouse(lx, ly, Coordinate::Abs),
-                "move_mouse",
-            ) {
+            if let Err(msg) = ok_or_msg(enigo.move_mouse(lx, ly, Coordinate::Abs), "move_mouse") {
                 return Ok(ActionOutput::err(msg));
             }
             let btn = map_button(*button);
@@ -264,10 +245,7 @@ fn execute_blocking(action: &Action, ctx: &ExecCtx) -> Result<ActionOutput> {
         }
         Action::DoubleClick { x, y } => {
             let (lx, ly) = scale_for_input(*x, *y, ctx.scale_factor);
-            if let Err(msg) = ok_or_msg(
-                enigo.move_mouse(lx, ly, Coordinate::Abs),
-                "move_mouse",
-            ) {
+            if let Err(msg) = ok_or_msg(enigo.move_mouse(lx, ly, Coordinate::Abs), "move_mouse") {
                 return Ok(ActionOutput::err(msg));
             }
             if let Err(msg) = ok_or_msg(enigo.button(Button::Left, Click), "button") {
@@ -283,19 +261,13 @@ fn execute_blocking(action: &Action, ctx: &ExecCtx) -> Result<ActionOutput> {
         } => {
             let (fx, fy) = scale_for_input(*from_x, *from_y, ctx.scale_factor);
             let (tx, ty) = scale_for_input(*to_x, *to_y, ctx.scale_factor);
-            if let Err(msg) = ok_or_msg(
-                enigo.move_mouse(fx, fy, Coordinate::Abs),
-                "move_mouse",
-            ) {
+            if let Err(msg) = ok_or_msg(enigo.move_mouse(fx, fy, Coordinate::Abs), "move_mouse") {
                 return Ok(ActionOutput::err(msg));
             }
             if let Err(msg) = ok_or_msg(enigo.button(Button::Left, Press), "button press") {
                 return Ok(ActionOutput::err(msg));
             }
-            if let Err(msg) = ok_or_msg(
-                enigo.move_mouse(tx, ty, Coordinate::Abs),
-                "drag move",
-            ) {
+            if let Err(msg) = ok_or_msg(enigo.move_mouse(tx, ty, Coordinate::Abs), "drag move") {
                 // Best-effort release before bailing.
                 let _ = enigo.button(Button::Left, Release);
                 return Ok(ActionOutput::err(msg));
@@ -310,10 +282,7 @@ fn execute_blocking(action: &Action, ctx: &ExecCtx) -> Result<ActionOutput> {
         } => {
             let (lx, ly) = scale_for_input(*x, *y, ctx.scale_factor);
             // Move first so the scroll lands at the requested point.
-            if let Err(msg) = ok_or_msg(
-                enigo.move_mouse(lx, ly, Coordinate::Abs),
-                "move_mouse",
-            ) {
+            if let Err(msg) = ok_or_msg(enigo.move_mouse(lx, ly, Coordinate::Abs), "move_mouse") {
                 return Ok(ActionOutput::err(msg));
             }
             let (axis, length) = scroll_amount(*direction, *clicks);
@@ -358,7 +327,8 @@ fn execute_blocking(action: &Action, ctx: &ExecCtx) -> Result<ActionOutput> {
 /// On Windows and Linux X11 the input APIs are physical. We branch at
 /// runtime via `cfg!` so a single source file covers all platforms.
 fn scale_for_input(x: i32, y: i32, scale_factor: f32) -> (i32, i32) {
-    if cfg!(target_os = "macos") && scale_factor > 0.0 && (scale_factor - 1.0).abs() > f32::EPSILON {
+    if cfg!(target_os = "macos") && scale_factor > 0.0 && (scale_factor - 1.0).abs() > f32::EPSILON
+    {
         let lx = (x as f32 / scale_factor).round() as i32;
         let ly = (y as f32 / scale_factor).round() as i32;
         (lx, ly)
@@ -554,7 +524,10 @@ fn activate_app_blocking(app: &str) -> ActionOutput {
         // TODO(v2): swap osascript for objc2-app-kit
         // `NSRunningApplication.activate(options: .activateAllWindows)` to
         // remove the spawn-osascript latency (~50-100ms per call).
-        let script = format!(r#"tell application "{}" to activate"#, app.replace('"', r#"\""#));
+        let script = format!(
+            r#"tell application "{}" to activate"#,
+            app.replace('"', r#"\""#)
+        );
         match Command::new("osascript").arg("-e").arg(&script).output() {
             Ok(out) if out.status.success() => ActionOutput::ok(),
             Ok(out) => {
@@ -570,12 +543,11 @@ fn activate_app_blocking(app: &str) -> ActionOutput {
         // SetForegroundWindow to bring secondary windows too.
         // Two layers of escaping inside one literal:
         //   - PowerShell single-quoted strings: `'` is doubled.
-        //   - `-like` glob pattern: `*` and `?` are wildcards; escape with
-        //     PowerShell's backtick so an app name literally containing
-        //     them matches only that character. Without this, an app named
-        //     `Microsoft Edge*` (or VLM hallucinating a trailing `*`) would
-        //     match every process — bringing a random app forward instead
-        //     of the requested one. R3 review I5.
+        //   - `-like` glob pattern: `*` and `?` are wildcards; escape with PowerShell's
+        //     backtick so an app name literally containing them matches only that
+        //     character. Without this, an app named `Microsoft Edge*` (or VLM
+        //     hallucinating a trailing `*`) would match every process — bringing a
+        //     random app forward instead of the requested one. R3 review I5.
         let escaped = app
             .replace('`', "``")
             .replace('*', "`*")
@@ -611,9 +583,7 @@ fn activate_app_blocking(app: &str) -> ActionOutput {
         match xdotool {
             Ok(s) if s.success() => ActionOutput::ok(),
             Ok(s) => ActionOutput::err(format!("xdotool exit status: {s}")),
-            Err(e) => ActionOutput::err(format!(
-                "neither wmctrl nor xdotool worked: {e}"
-            )),
+            Err(e) => ActionOutput::err(format!("neither wmctrl nor xdotool worked: {e}")),
         }
     } else {
         ActionOutput::err("activate_app: unsupported platform")

@@ -7,7 +7,10 @@ use crate::{cli::CronCommand, config};
 pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
     match sub {
         CronCommand::List | CronCommand::Status => {
-            banner(&format!("rsclaw cron v{}", option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")));
+            banner(&format!(
+                "rsclaw cron v{}",
+                option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
+            ));
             let (jobs, parse_ok) = crate::cron::load_cron_jobs();
             if !parse_ok {
                 warn_msg("cron.json5 has syntax errors - fix the file before modifying jobs");
@@ -24,7 +27,11 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
                 );
                 for j in &jobs {
                     let enabled = j.enabled;
-                    let agent = if j.agent_id.is_empty() { "(default)" } else { &j.agent_id };
+                    let agent = if j.agent_id.is_empty() {
+                        "(default)"
+                    } else {
+                        &j.agent_id
+                    };
                     let status = if enabled {
                         green("enabled")
                     } else {
@@ -159,9 +166,15 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
             // Open the jobs.json file in editor
             let jobs_file = config::loader::base_dir().join("cron.json5");
             let editor = std::env::var("EDITOR").unwrap_or_else(|_| {
-                if cfg!(windows) { "notepad".to_owned() } else { "vi".to_owned() }
+                if cfg!(windows) {
+                    "notepad".to_owned()
+                } else {
+                    "vi".to_owned()
+                }
             });
-            let status = std::process::Command::new(&editor).arg(&jobs_file).status()?;
+            let status = std::process::Command::new(&editor)
+                .arg(&jobs_file)
+                .status()?;
             if !status.success() {
                 anyhow::bail!("editor exited with {status}");
             }

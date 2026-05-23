@@ -4,58 +4,44 @@
 //! to agent runtimes with per-user queuing, DM/group policy enforcement,
 //! preparse bypass, and `/btw` direct-call support.
 
-mod discord;
-mod slack;
-mod whatsapp;
-mod line;
-mod zalo;
-mod signal;
-mod wechat;
-mod feishu;
-mod dingtalk;
-mod qq;
-mod matrix;
-mod wecom;
 mod custom;
-
-pub(crate) use custom::start_custom_channels;
-
-use self::discord::start_discord_if_configured;
-use self::slack::start_slack_if_configured;
-use self::whatsapp::start_whatsapp_if_configured;
-use self::line::start_line_if_configured;
-use self::zalo::start_zalo_if_configured;
-use self::signal::start_signal_if_configured;
-use self::wechat::start_wechat_personal_if_configured;
-use self::feishu::start_feishu_if_configured;
-use self::dingtalk::start_dingtalk_if_configured;
-use self::qq::start_qq_if_configured;
-use self::matrix::start_matrix_if_configured;
-use self::wecom::start_wecom_if_configured;
+mod dingtalk;
+mod discord;
+mod feishu;
+mod line;
+mod matrix;
+mod qq;
+mod signal;
+mod slack;
+mod wechat;
+mod wecom;
+mod whatsapp;
+mod zalo;
 
 use std::sync::Arc;
 
+pub(crate) use custom::start_custom_channels;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use self::{
+    dingtalk::start_dingtalk_if_configured, discord::start_discord_if_configured,
+    feishu::start_feishu_if_configured, line::start_line_if_configured,
+    matrix::start_matrix_if_configured, qq::start_qq_if_configured,
+    signal::start_signal_if_configured, slack::start_slack_if_configured,
+    wechat::start_wechat_personal_if_configured, wecom::start_wecom_if_configured,
+    whatsapp::start_whatsapp_if_configured, zalo::start_zalo_if_configured,
+};
+use super::{
+    preparse::{btw_direct_call, is_fast_preparse, try_preparse_locally},
+    startup::handle_pending_analysis,
+};
 use crate::{
     agent::{AgentMessage, AgentRegistry},
-    channel::{
-        Channel, OutboundMessage,
-        cli::CliChannel,
-        telegram::TelegramChannel,
-    },
-    config::{
-        runtime::RuntimeConfig,
-        schema::DmScope,
-    },
+    channel::{Channel, OutboundMessage, cli::CliChannel, telegram::TelegramChannel},
+    config::{runtime::RuntimeConfig, schema::DmScope},
     gateway::session::{MessageKind, SessionKeyParams, derive_session_key},
 };
-
-use super::preparse::{
-    btw_direct_call, is_fast_preparse, try_preparse_locally,
-};
-use super::startup::handle_pending_analysis;
 
 pub(crate) fn default_dm_scope(config: &RuntimeConfig) -> DmScope {
     config
@@ -92,7 +78,9 @@ pub(crate) fn start_channels(
 
         // Register CLI channel sender for notification routing.
         {
-            let mut senders = channel_senders.write().expect("channel_senders lock poisoned");
+            let mut senders = channel_senders
+                .write()
+                .expect("channel_senders lock poisoned");
             senders.insert("cli".to_string(), out_tx.clone());
         }
 
@@ -137,7 +125,9 @@ pub(crate) fn start_channels(
                 if handle.tx.send(msg).await.is_err() {
                     return;
                 }
-                if let Ok(Ok(reply)) = tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
+                if let Ok(Ok(reply)) =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await
+                {
                     let pending = reply.pending_analysis;
                     if !reply.is_empty {
                         if let Err(e) = tx
@@ -268,9 +258,12 @@ pub(crate) fn start_channels(
             let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
 
             // Register Telegram channel sender for notification routing.
-            // Both bare "telegram" (for task queue routing) and "telegram/{account}" (multi-account).
+            // Both bare "telegram" (for task queue routing) and "telegram/{account}"
+            // (multi-account).
             {
-                let mut senders = channel_senders.write().expect("channel_senders lock poisoned");
+                let mut senders = channel_senders
+                    .write()
+                    .expect("channel_senders lock poisoned");
                 senders.insert("telegram".to_string(), out_tx.clone());
                 senders.insert(format!("telegram/{}", acct_name), out_tx.clone());
             }

@@ -4947,10 +4947,7 @@ data: {"type":"block_stop","index":0}
             metadata: crate::provider::RecallMetadata::default(),
         });
         let delta = TurnDelta::from_request(&req).unwrap();
-        let recall = req
-            .recall
-            .as_ref()
-            .filter(|r| !r.context.trim().is_empty());
+        let recall = req.recall.as_ref().filter(|r| !r.context.trim().is_empty());
         let body = serde_json::to_value(&TurnReq {
             delta: &delta,
             recall_context: recall.map(|r| r.context.as_str()),

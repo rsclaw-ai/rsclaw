@@ -2,15 +2,17 @@
 //! search::pipeline. CallerScope is injected by the agent runtime;
 //! agent tool calls cannot supply it.
 
-use crate::kb::entities::extract::{canonical_id, extract_entities};
-use crate::kb::model::{CallerScope, KbSourceKind};
-use crate::kb::search::{
-    Diversity, RetrievalHit, SearchCtx, SearchFilter, SearchMode, SearchRequest,
-};
-use crate::kb::store::entities;
+use std::collections::HashSet;
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+
+use crate::kb::{
+    entities::extract::{canonical_id, extract_entities},
+    model::{CallerScope, KbSourceKind},
+    search::{Diversity, RetrievalHit, SearchCtx, SearchFilter, SearchMode, SearchRequest},
+    store::entities,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct KbSearchInput {
@@ -33,8 +35,12 @@ pub struct KbSearchInput {
     pub query_instruction: Option<String>,
 }
 
-fn default_k() -> usize { 8 }
-fn default_mmr_lambda() -> f32 { 0.5 }
+fn default_k() -> usize {
+    8
+}
+fn default_mmr_lambda() -> f32 {
+    0.5
+}
 
 #[derive(Debug, Default, Deserialize)]
 pub struct KbSearchFilter {
@@ -110,8 +116,7 @@ pub fn run(ctx: &SearchCtx, input: KbSearchInput, scope: &CallerScope) -> Result
     let query_mentions = extract_entities(&req.query);
     if !query_mentions.is_empty() {
         let rtx = ctx.store.begin_read()?;
-        let result_chunk_ids: HashSet<&str> =
-            results.iter().map(|h| h.chunk_id.as_str()).collect();
+        let result_chunk_ids: HashSet<&str> = results.iter().map(|h| h.chunk_id.as_str()).collect();
         for m in query_mentions {
             let cid = canonical_id(m.kind, &m.surface);
             let chunk_edges = match entities::chunks_for_entity(&rtx, &cid) {

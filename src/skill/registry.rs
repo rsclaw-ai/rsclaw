@@ -45,17 +45,13 @@ pub enum Registry {
         search_url: String,
         index_url: String,
     },
-    /// skills.sh community directory — always searched, 91K+ skills ranked by installs.
-    Skillsh {
-        client: Client,
-    },
+    /// skills.sh community directory — always searched, 91K+ skills ranked by
+    /// installs.
+    Skillsh { client: Client },
     /// iWenCai SkillHub (同花顺金融技能库). The upstream gateway returns the
     /// full skill list at one endpoint; we filter client-side because there
     /// is no public keyword-search API.
-    Iwencai {
-        client: Client,
-        list_url: String,
-    },
+    Iwencai { client: Client, list_url: String },
 }
 
 impl Registry {
@@ -72,18 +68,18 @@ impl Registry {
     /// Search this registry for skills matching `query`.
     pub async fn search(&self, query: &str) -> Vec<SearchResult> {
         match self {
-            Registry::Clawhub { client, api_base, token } => {
-                search_clawhub(client, api_base, token.as_deref(), query).await
-            }
-            Registry::Skillhub { client, search_url, index_url } => {
-                search_skillhub(client, search_url, index_url, query).await
-            }
-            Registry::Skillsh { client } => {
-                search_skillsh(client, query).await
-            }
-            Registry::Iwencai { client, list_url } => {
-                search_iwencai(client, list_url, query).await
-            }
+            Registry::Clawhub {
+                client,
+                api_base,
+                token,
+            } => search_clawhub(client, api_base, token.as_deref(), query).await,
+            Registry::Skillhub {
+                client,
+                search_url,
+                index_url,
+            } => search_skillhub(client, search_url, index_url, query).await,
+            Registry::Skillsh { client } => search_skillsh(client, query).await,
+            Registry::Iwencai { client, list_url } => search_iwencai(client, list_url, query).await,
         }
     }
 }
@@ -94,17 +90,26 @@ impl Registry {
 
 /// Search all `registries` concurrently, merge results, and sort by installs.
 ///
-/// Deduplication uses the normalized slug (e.g. `"owner/repo@skill"` → `"skill"`).
-/// When the same skill appears in multiple registries the variant with the higher
-/// install count wins; missing fields are filled in from the other entry.
+/// Deduplication uses the normalized slug (e.g. `"owner/repo@skill"` →
+/// `"skill"`). When the same skill appears in multiple registries the variant
+/// with the higher install count wins; missing fields are filled in from the
+/// other entry.
 pub async fn search_concurrent(registries: &[Registry], query: &str) -> Vec<SearchResult> {
     // Fire all searches in parallel.
     let futures: Vec<_> = registries.iter().map(|r| r.search(query)).collect();
     let all_results: Vec<Vec<SearchResult>> = futures::future::join_all(futures).await;
 
     debug!(
-        registries = registries.iter().map(|r| r.name()).collect::<Vec<_>>().join(", "),
-        counts = all_results.iter().map(|v| v.len().to_string()).collect::<Vec<_>>().join("+"),
+        registries = registries
+            .iter()
+            .map(|r| r.name())
+            .collect::<Vec<_>>()
+            .join(", "),
+        counts = all_results
+            .iter()
+            .map(|v| v.len().to_string())
+            .collect::<Vec<_>>()
+            .join("+"),
         "concurrent search complete"
     );
 
@@ -160,9 +165,15 @@ async fn search_clawhub(
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
-    let Ok(resp) = req.send().await else { return vec![] };
-    if !resp.status().is_success() { return vec![]; }
-    let Ok(body) = resp.json::<serde_json::Value>().await else { return vec![] };
+    let Ok(resp) = req.send().await else {
+        return vec![];
+    };
+    if !resp.status().is_success() {
+        return vec![];
+    }
+    let Ok(body) = resp.json::<serde_json::Value>().await else {
+        return vec![];
+    };
     parse_standard_response(&body, "clawhub.ai")
 }
 
@@ -179,9 +190,15 @@ async fn search_skillhub(
         search_url,
         url_encode(query)
     );
-    let Ok(resp) = client.get(&url).send().await else { return vec![] };
-    if !resp.status().is_success() { return vec![]; }
-    let Ok(body) = resp.json::<serde_json::Value>().await else { return vec![] };
+    let Ok(resp) = client.get(&url).send().await else {
+        return vec![];
+    };
+    if !resp.status().is_success() {
+        return vec![];
+    }
+    let Ok(body) = resp.json::<serde_json::Value>().await else {
+        return vec![];
+    };
 
     // Unwrap {code:0, data:{skills:[...]}} envelope.
     let arr = body
@@ -213,8 +230,8 @@ async fn search_skillhub(
 
 /// Search iwencai's skill square. The upstream endpoint
 /// `GET /skills/square?pageSize=N&page=1` returns the entire catalogue as
-/// `{ data: { records: [{name, cn_name, description, download_count, ...}] } }`.
-/// There is no `keyword=` parameter — we paginate-and-filter client-side.
+/// `{ data: { records: [{name, cn_name, description, download_count, ...}] }
+/// }`. There is no `keyword=` parameter — we paginate-and-filter client-side.
 /// An empty query returns the full first page so callers like the agent's
 /// "show me everything" flow work without special-casing.
 async fn search_iwencai(client: &Client, list_url: &str, query: &str) -> Vec<SearchResult> {
@@ -227,9 +244,15 @@ async fn search_iwencai(client: &Client, list_url: &str, query: &str) -> Vec<Sea
     } else {
         format!("{list_url}?size=100&page=1")
     };
-    let Ok(resp) = client.get(&url).send().await else { return vec![] };
-    if !resp.status().is_success() { return vec![]; }
-    let Ok(body) = resp.json::<serde_json::Value>().await else { return vec![] };
+    let Ok(resp) = client.get(&url).send().await else {
+        return vec![];
+    };
+    if !resp.status().is_success() {
+        return vec![];
+    }
+    let Ok(body) = resp.json::<serde_json::Value>().await else {
+        return vec![];
+    };
 
     let q = query.trim().to_lowercase();
     let arr = body
@@ -246,8 +269,12 @@ async fn search_iwencai(client: &Client, list_url: &str, query: &str) -> Vec<Sea
             // this filter ~67 of 89 skills are 同花顺 devops/scaffolding
             // that nobody outside the company should be installing.
             let name = item["name"].as_str().unwrap_or("");
-            if !name.starts_with("hithink-") { return false; }
-            if q.is_empty() { return true; }
+            if !name.starts_with("hithink-") {
+                return false;
+            }
+            if q.is_empty() {
+                return true;
+            }
             let q_lc = q.as_str();
             let cn_name = item["cn_name"].as_str().unwrap_or("").to_lowercase();
             let desc = item["description"].as_str().unwrap_or("").to_lowercase();
@@ -277,10 +304,19 @@ async fn search_iwencai(client: &Client, list_url: &str, query: &str) -> Vec<Sea
 }
 
 async fn search_skillsh(client: &Client, query: &str) -> Vec<SearchResult> {
-    let url = format!("https://skills.sh/api/search?q={}&limit=20", url_encode(query));
-    let Ok(resp) = client.get(&url).send().await else { return vec![] };
-    if !resp.status().is_success() { return vec![]; }
-    let Ok(body) = resp.json::<serde_json::Value>().await else { return vec![] };
+    let url = format!(
+        "https://skills.sh/api/search?q={}&limit=20",
+        url_encode(query)
+    );
+    let Ok(resp) = client.get(&url).send().await else {
+        return vec![];
+    };
+    if !resp.status().is_success() {
+        return vec![];
+    }
+    let Ok(body) = resp.json::<serde_json::Value>().await else {
+        return vec![];
+    };
 
     body.get("skills")
         .and_then(|v| v.as_array())
@@ -289,7 +325,8 @@ async fn search_skillsh(client: &Client, query: &str) -> Vec<SearchResult> {
                 .map(|item| {
                     // skills.sh: {id, skillId, name, installs, source: "owner/repo"}
                     let source = item["source"].as_str().unwrap_or("");
-                    let skill_id = item["skillId"].as_str()
+                    let skill_id = item["skillId"]
+                        .as_str()
                         .or_else(|| item["name"].as_str())
                         .unwrap_or("unknown");
                     let slug = if source.is_empty() {
@@ -300,7 +337,8 @@ async fn search_skillsh(client: &Client, query: &str) -> Vec<SearchResult> {
                     SearchResult {
                         slug,
                         version: None,
-                        description: item["description"].as_str()
+                        description: item["description"]
+                            .as_str()
                             .or_else(|| item["summary"].as_str())
                             .map(|s| s.to_owned()),
                         downloads: None,
@@ -328,19 +366,24 @@ fn parse_standard_response(body: &serde_json::Value, registry: &str) -> Vec<Sear
 
 fn to_result(item: &serde_json::Value, registry: &str) -> SearchResult {
     SearchResult {
-        slug: item["slug"].as_str()
+        slug: item["slug"]
+            .as_str()
             .or_else(|| item["name"].as_str())
             .unwrap_or("unknown")
             .to_owned(),
         version: item["version"].as_str().map(|s| s.to_owned()),
-        description: item["summary"].as_str()
+        description: item["summary"]
+            .as_str()
             .or_else(|| item["description"].as_str())
             .map(|s| s.to_owned()),
-        downloads: item["downloads"].as_u64()
+        downloads: item["downloads"]
+            .as_u64()
             .or_else(|| item["download_count"].as_u64()),
-        installs: item["installs"].as_u64()
+        installs: item["installs"]
+            .as_u64()
             .or_else(|| item["install_count"].as_u64()),
-        stars: item["stars"].as_u64()
+        stars: item["stars"]
+            .as_u64()
             .or_else(|| item["favorites"].as_u64())
             .or_else(|| item["star_count"].as_u64()),
         registry: registry.to_owned(),
@@ -361,7 +404,8 @@ fn popularity_score(r: &SearchResult) -> u64 {
 
 /// Normalize slug to a short name for deduplication.
 ///
-/// `"owner/repo@skill"` → `"skill"`, `"owner/repo"` → `"repo"`, `"skill"` → `"skill"`
+/// `"owner/repo@skill"` → `"skill"`, `"owner/repo"` → `"repo"`, `"skill"` →
+/// `"skill"`
 pub fn normalize_slug(slug: &str) -> String {
     if let Some((_, after)) = slug.rsplit_once('@') {
         return after.to_lowercase();
@@ -369,7 +413,8 @@ pub fn normalize_slug(slug: &str) -> String {
     slug.rsplit('/').next().unwrap_or(slug).to_lowercase()
 }
 
-/// Percent-encode a string for use in URL query parameters (RFC 3986 unreserved set).
+/// Percent-encode a string for use in URL query parameters (RFC 3986 unreserved
+/// set).
 pub(crate) fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 3);
     for byte in s.bytes() {

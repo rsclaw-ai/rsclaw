@@ -9,9 +9,11 @@
 //!   - Total character limit:    `bootstrap_total_max_chars` (default 150 000).
 //!   - Load order follows AGENTS.md §20 "System Prompt assembly".
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    time::SystemTime,
+};
 
 use chrono::Local;
 use tracing::debug;
@@ -484,7 +486,9 @@ mod tests {
         // the temp directory, preventing fallback to the real workspace.
         let orig = std::env::var("RSCLAW_BASE_DIR").ok();
         // SAFETY: test is single-threaded for this env var access.
-        unsafe { std::env::set_var("RSCLAW_BASE_DIR", tmp.path()); }
+        unsafe {
+            std::env::set_var("RSCLAW_BASE_DIR", tmp.path());
+        }
 
         let ctx = WorkspaceContext::load(
             &ws,

@@ -3,9 +3,10 @@
 //! produces identical chunk_ids and the indexing/upsert path is
 //! naturally idempotent. See spec §I + §2 chunker.
 
-use crate::kb::model::{KbLocator, LogicalSourceId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use crate::kb::model::{KbLocator, LogicalSourceId};
 
 /// Deterministic chunk id.
 ///
@@ -41,20 +42,20 @@ pub enum ChunkStatus {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct KbChunk {
-    pub id: String,                   // 32-hex deterministic
-    pub doc_id: String,               // ULID, links to current KbDoc instance
-    pub logical_source_id: String,    // links across versions, used for dedup
-    pub doc_version: u32,             // matches KbDoc.version
+    pub id: String,                // 32-hex deterministic
+    pub doc_id: String,            // ULID, links to current KbDoc instance
+    pub logical_source_id: String, // links across versions, used for dedup
+    pub doc_version: u32,          // matches KbDoc.version
     pub seq: u32,
     pub heading_path: Vec<String>,
-    pub byte_offset: (u64, u64),      // start..end within the doc body
-    pub indexed_text: String,         // heading_path > ... \n\n body
-    pub vector: Vec<f32>,             // empty in Week 1; Week 2 embedder fills
+    pub byte_offset: (u64, u64), // start..end within the doc body
+    pub indexed_text: String,    // heading_path > ... \n\n body
+    pub vector: Vec<f32>,        // empty in Week 1; Week 2 embedder fills
     pub simhash: u64,
     pub locator: KbLocator,
     pub status: ChunkStatus,
     pub source_quality: f32,
-    pub embedder_id: String,          // empty in Week 1
+    pub embedder_id: String, // empty in Week 1
 }
 
 #[cfg(test)]

@@ -1,7 +1,8 @@
+use std::path::PathBuf;
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 /// Per-agent heartbeat run state — one entry per agent_id.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,12 +82,10 @@ impl HeartbeatStore {
             None => all.push(state),
         }
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("creating heartbeat state dir {}", parent.display())
-            })?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating heartbeat state dir {}", parent.display()))?;
         }
-        let data = serde_json::to_string_pretty(&all)
-            .context("serializing heartbeat states")?;
+        let data = serde_json::to_string_pretty(&all).context("serializing heartbeat states")?;
         std::fs::write(&self.path, data)
             .with_context(|| format!("writing heartbeat state file {}", self.path.display()))?;
         Ok(())
@@ -95,8 +94,9 @@ impl HeartbeatStore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::tempdir;
+
+    use super::*;
 
     #[test]
     fn state_record_success_resets_failures() {
