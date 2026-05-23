@@ -61,6 +61,16 @@ pub struct AgentHandle {
     /// Per-session abort flags: session_key -> atomic abort flag.
     /// Uses std::sync::RwLock (not tokio) so it can be accessed in Drop impls.
     pub abort_flags: Arc<std::sync::RwLock<HashMap<String, Arc<AtomicBool>>>>,
+    /// Per-session plugin activation overrides:
+    /// `session_key → { plugin_name → PluginOverride }`. Mutated by the
+    /// `/plugin` slash command (host-side, never enters conversation
+    /// history). Resolved at tool-list build time to decide which
+    /// `<plugin>.<tool>` ToolDefs get injected into the LLM's tools array
+    /// so small models can call high-frequency plugin tools directly
+    /// without the plugin.search_tools → plugin.invoke two-step.
+    pub plugin_overrides: Arc<
+        std::sync::RwLock<HashMap<String, HashMap<String, crate::agent::runtime::PluginOverride>>>,
+    >,
     /// When this agent handle was created (for /status uptime).
     pub started_at: Instant,
     /// Number of active sessions (updated after each turn for /status).
@@ -616,6 +626,7 @@ impl AgentRegistry {
                     ),
                     providers: Arc::clone(&providers),
                     abort_flags: Arc::new(std::sync::RwLock::new(HashMap::new())),
+                    plugin_overrides: Arc::new(std::sync::RwLock::new(HashMap::new())),
                     started_at: Instant::now(),
                     session_count: Arc::new(AtomicUsize::new(0)),
                     session_tokens: Arc::new(std::sync::RwLock::new(HashMap::new())),

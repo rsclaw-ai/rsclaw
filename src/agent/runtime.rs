@@ -166,6 +166,40 @@ const SESSION_IDLE_TTL_SECS: u64 = 7 * 24 * 3600;
 /// Eviction only triggers when the session count exceeds this threshold.
 const MAX_SESSIONS_PER_AGENT: usize = 10_000;
 
+/// Per-session plugin activation override. Stored on `AgentHandle` so the
+/// `/plugin` slash command (which only has `&AgentHandle`) can mutate it.
+/// Resolved at tool-list build time to decide which plugin tools become
+/// directly-callable `<plugin>.<tool>` ToolDefs in the LLM's tools array.
+///
+/// **Defaults (no entry in `plugin_overrides`) = today's behavior:** no
+/// injection, model must use `plugin.search_tools` + `plugin.invoke`.
+/// Setting one of the variants below opts a single (session, plugin) into
+/// an upgraded exposure.
+#[derive(Debug, Clone, Default)]
+pub struct PluginOverride {
+    /// Plugin is hidden entirely in this session (catalog + tools).
+    pub disabled: bool,
+    /// Inject every tool this plugin exposes (resolved at expand time,
+    /// capped by `MAX_INJECT_TOOLS`). When `true`, `inject` is ignored.
+    pub inject_all: bool,
+    /// Inject this specific tool list as `<plugin>.<tool>` ToolDefs.
+    pub inject: Vec<String>,
+}
+
+/// Result of resolving a plugin override to its inject set. The `All`
+/// variant defers expansion to the caller (which has access to the live
+/// plugin tool list) instead of cloning the full name list through the
+/// override store on every set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PluginInjectResolution {
+    /// Nothing to inject (default state, or plugin disabled).
+    None,
+    /// Inject every tool the plugin currently exposes.
+    All,
+    /// Inject exactly these tool names.
+    Names(Vec<String>),
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PluginToolInfo {
     pub(crate) plugin: String,
@@ -6680,6 +6714,47 @@ impl AgentRuntime {
         score
     }
 
+    /// Pure resolver — what `<plugin>.<tool>` ToolDefs should we inject for
+    /// this (session, plugin)? Returns either `Vec::new()` (default / disabled)
+    /// or the explicit tool name list. `None` means "expand to all plugin
+    /// tools at the call site" (the caller has the plugin metadata).
+    ///
+    /// Separated from the live-lookup path so unit tests can drive it
+    /// without locking the `AgentHandle`'s RwLock.
+    pub(crate) fn resolve_plugin_inject_pure(
+        per_plugin: &std::collections::HashMap<String, PluginOverride>,
+        plugin: &str,
+    ) -> PluginInjectResolution {
+        match per_plugin.get(plugin) {
+            Some(o) if o.disabled => PluginInjectResolution::None,
+            Some(o) if o.inject_all => PluginInjectResolution::All,
+            Some(o) => PluginInjectResolution::Names(o.inject.clone()),
+            None => PluginInjectResolution::None,
+        }
+    }
+
+    /// Set or update a plugin override for a session. Called by the `/plugin`
+    /// slash command handler via `&AgentHandle`.
+    pub fn set_plugin_override(
+        handle: &crate::agent::AgentHandle,
+        session_key: &str,
+        plugin: &str,
+        override_: PluginOverride,
+    ) {
+        if let Ok(mut g) = handle.plugin_overrides.write() {
+            g.entry(session_key.to_owned())
+                .or_default()
+                .insert(plugin.to_owned(), override_);
+        }
+    }
+
+    /// Remove all plugin overrides for a session (e.g. `/plugin reset`).
+    pub fn clear_plugin_overrides(handle: &crate::agent::AgentHandle, session_key: &str) {
+        if let Ok(mut g) = handle.plugin_overrides.write() {
+            g.remove(session_key);
+        }
+    }
+
     pub(crate) async fn tool_plugin_info(&self, args: Value) -> Result<Value> {
         let plugin_filter = args["plugin"]
             .as_str()
@@ -9717,6 +9792,66 @@ mod tests {
         );
         assert_eq!(result["tools"].as_array().unwrap().len(), 1);
         assert_eq!(result["next_offset"], Value::Null);
+    }
+
+    // ---------------------------------------------------------------------
+    // PluginOverride resolver tests (Task 2)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn resolve_inject_returns_none_when_no_override() {
+        let overrides: std::collections::HashMap<String, PluginOverride> = Default::default();
+        let r = AgentRuntime::resolve_plugin_inject_pure(&overrides, "douyin");
+        assert_eq!(r, PluginInjectResolution::None);
+    }
+
+    #[test]
+    fn resolve_inject_returns_names_when_explicit() {
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            "douyin".to_owned(),
+            PluginOverride {
+                disabled: false,
+                inject_all: false,
+                inject: vec!["publish".into(), "list".into()],
+            },
+        );
+        let r = AgentRuntime::resolve_plugin_inject_pure(&overrides, "douyin");
+        assert_eq!(
+            r,
+            PluginInjectResolution::Names(vec!["publish".into(), "list".into()])
+        );
+    }
+
+    #[test]
+    fn resolve_inject_returns_all_when_inject_all() {
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            "douyin".to_owned(),
+            PluginOverride {
+                disabled: false,
+                inject_all: true,
+                inject: vec![],
+            },
+        );
+        let r = AgentRuntime::resolve_plugin_inject_pure(&overrides, "douyin");
+        assert_eq!(r, PluginInjectResolution::All);
+    }
+
+    #[test]
+    fn resolve_inject_returns_none_when_disabled() {
+        // disabled wins over inject / inject_all.
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            "douyin".to_owned(),
+            PluginOverride {
+                disabled: true,
+                inject_all: true,
+                inject: vec!["publish".into()],
+            },
+        );
+        let r = AgentRuntime::resolve_plugin_inject_pure(&overrides, "douyin");
+        assert_eq!(r, PluginInjectResolution::None);
     }
 
     #[test]
