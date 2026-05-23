@@ -480,17 +480,19 @@ fn build_shared_system_prefix_uncached() -> String {
          over a generic browser/web flow. When a WASM and JS plugin both fit, \
          choose WASM.\n\
          - **Built-in tools** (`computer_use`, `web_browser`, `web_fetch`, \
-         `shell`, `read_file`, …) are first-class for what they do. Use the \
-         built-in that is the right tool for the job; a plugin or skill does \
-         NOT outrank a built-in that already fits.\n\n\
+         `shell`, `read_file`, …) are the fallback. Use them only when \
+         no plugin or skill covers the domain. A plugin or skill that \
+         matches the user's intent ALWAYS outranks any built-in tool, \
+         even if the built-in has an app-rule or site-rule for the same \
+         target.\n\n\
          Common failure mode (avoid):\n\
          > User asks about flights → you call web_fetch(ctrip.com) →\n\
          > result is brittle / blocked / wrong data.\n\
          > A flyai skill with `intents: [flight_search]` was sitting right\n\
          > above and you ignored it.\n\n\
-         If you catch yourself reaching for web_fetch / web_browser /\n\
-         shell on a domain a plugin or skill description covers, STOP\n\
-         and use the plugin/skill instead.\n\n\
+         If you catch yourself reaching for computer_use / web_fetch /\n\
+         web_browser / shell on a domain a plugin or skill description \
+         covers, STOP and use the plugin/skill instead.\n\n\
          ### How to use plugins\n\
          Installed plugins are listed in the \"## Installed Plugins\" section \
          below, each with its common tools.\n\
