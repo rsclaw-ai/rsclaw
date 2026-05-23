@@ -64,7 +64,7 @@ pub struct PluginManifest {
     /// via plugin.search_tools). Empty → renderer shows the first few + count.
     #[serde(default, rename = "commonTools")]
     pub common_tools: Vec<String>,
-    /// Runtime: "js" | "node" | "bun" | "deno" | "wasm". Defaults to "js".
+    /// Runtime: "js" | "node" | "bun" | "deno" | "wasm". Defaults to "node".
     #[serde(default = "default_runtime")]
     pub runtime: String,
     /// Entry point relative to the plugin directory.
@@ -152,7 +152,7 @@ pub struct PluginToolDef {
 }
 
 fn default_runtime() -> String {
-    "js".to_owned()
+    "node".to_owned()
 }
 
 impl PluginManifest {
