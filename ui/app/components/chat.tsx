@@ -78,6 +78,7 @@ import {
   selectOrCopy,
 } from "../utils";
 
+import { parseScreenshotMessage } from "../lib/message-attachments";
 import { uploadImage as uploadImageRemote } from "@/app/utils/chat";
 
 import dynamic from "next/dynamic";
@@ -2215,6 +2216,7 @@ function _Chat() {
                         rsImages: [] as string[],
                       }
                     : extractRsFiles(msgContentOnly);
+                  const screenshotMessage = isUser ? null : parseScreenshotMessage(rsExtract.cleanContent);
 
                   return (
                     <Fragment key={message.id}>
@@ -2429,7 +2431,7 @@ function _Chat() {
                               </>
                             ) : (() => {
                               const chunks = parseAssistantChunks(rsExtract.cleanContent);
-                              if (chunks.length === 0) {
+                              if (chunks.length === 0 || screenshotMessage) {
                                 return (
                                   <Markdown
                                     key={message.streaming ? "loading" : "done"}
@@ -2522,12 +2524,15 @@ function _Chat() {
                               /\.(mp4|webm|mov|m4v|mkv)$/i.test(path);
                             const videoFiles = rsFiles.filter(([, mime, path]) => isVideo(mime, path));
                             const otherFiles = rsFiles.filter(([, mime, path]) => !isVideo(mime, path));
-                            return (rsFiles.length > 0 || rsImages.length > 0) ? (
+                            const allPathImages = screenshotMessage
+                              ? [screenshotMessage.imagePath, ...pathImages]
+                              : pathImages;
+                            return (rsFiles.length > 0 || rsImages.length > 0 || screenshotMessage) ? (
                               <>
                                 {dataImages.map((src, idx) => (
                                   <img key={`di-${idx}`} className={styles["chat-message-item-image"]} src={src} alt="" onClick={() => showImageModal(src)} />
                                 ))}
-                                {pathImages.map((path, idx) => {
+                                {allPathImages.map((path, idx) => {
                                   const src = convertFileSrc(path);
                                   return (
                                     <img

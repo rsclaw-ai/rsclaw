@@ -63,12 +63,7 @@ import {
   API_TYPE_NEEDS_KEY,
 } from "../lib/provider-defaults";
 import { isTauri, invoke as tauriInvokeV2 } from "../utils/tauri";
-
-export function normalizeInstallSpec(spec: string): string {
-  const trimmed = spec.trim();
-  if (trimmed.startsWith("@/")) return trimmed.slice(1);
-  return trimmed;
-}
+import { normalizeInstallSpec, recommendedPluginsForRuntime } from "../lib/install-spec";
 
 // ── Types ──────────────────────────────────────────────
 interface ChannelInfo {
@@ -4857,10 +4852,19 @@ function SkillsTab() {
   // Hub recommended catalog (GET /api/v1/hub/skills). Shown below the
   // installed list when the user isn't actively searching clawhub.
   const [hubSkills, setHubSkills] = useState<HubSkillEntry[]>([]);
+  const [hubSkillsErrored, setHubSkillsErrored] = useState(false);
 
-  useEffect(() => {
-    getHubSkills().then(setHubSkills).catch(() => setHubSkills([]));
+  const fetchHubSkills = useCallback(async () => {
+    setHubSkillsErrored(false);
+    try {
+      setHubSkills(await getHubSkills());
+    } catch {
+      setHubSkills([]);
+      setHubSkillsErrored(true);
+    }
   }, []);
+
+  useEffect(() => { void fetchHubSkills(); }, [fetchHubSkills]);
 
   const fetchSkills = useCallback(async () => {
     // Skill management (list/install/uninstall) is desktop-only \u2014 it
@@ -5006,7 +5010,14 @@ function SkillsTab() {
             is browsing clawhub search results to avoid a cluttered double
             list. Install resolves the slug via `rsclaw skills install`
             (clawhub fallback). */}
-        {searchResults.length === 0 && !searching && hubSkills.length > 0 && (
+        {searchResults.length === 0 && !searching && hubSkillsErrored && (
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 12, padding: "28px 0", color: V2.t3 }}>
+            <div style={{ fontSize: 12 }}>{zh ? "无法加载推荐技能（hub 接口不可用）" : "Couldn't load recommended skills (hub endpoint unavailable)"}</div>
+            <button onClick={() => void fetchHubSkills()} style={{ padding: "6px 14px", borderRadius: 7, border: `1px solid ${V2.gbrd}`, background: V2.glo, color: V2.green, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "重试" : "Retry"}</button>
+          </div>
+        )}
+
+        {searchResults.length === 0 && !searching && !hubSkillsErrored && hubSkills.length > 0 && (
           <>
             <div style={{ fontSize: 11, fontWeight: 600, color: V2.t2, letterSpacing: 0.5, textTransform: "uppercase", marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
               {zh ? "\u63A8\u8350\u5B89\u88C5" : "Recommended"} <span style={{ fontSize: 9, padding: "1px 7px", borderRadius: 3, background: V2.bg4, color: V2.t2 }}>{hubSkills.length}</span>
@@ -5108,10 +5119,19 @@ function PluginsTab() {
   const [detail, setDetail] = useState<PluginInfo | null>(null);
   // Hub recommended catalog (GET /api/v1/hub/plugins).
   const [hubPlugins, setHubPlugins] = useState<HubPluginEntry[]>([]);
+  const [hubPluginsErrored, setHubPluginsErrored] = useState(false);
 
-  useEffect(() => {
-    getHubPlugins().then(setHubPlugins).catch(() => setHubPlugins([]));
+  const fetchHubPlugins = useCallback(async () => {
+    setHubPluginsErrored(false);
+    try {
+      setHubPlugins(await getHubPlugins());
+    } catch {
+      setHubPlugins([]);
+      setHubPluginsErrored(true);
+    }
   }, []);
+
+  useEffect(() => { void fetchHubPlugins(); }, [fetchHubPlugins]);
 
   const fetchPlugins = useCallback(async () => {
     // Desktop-only, same rationale as skills: list/install/uninstall run
@@ -5224,6 +5244,7 @@ function PluginsTab() {
 
   const isInstalled = (name: string) => installed.some((p) => p.name === name);
   const installedFiltered = installed.filter((p) => p.runtime === runtime);
+  const recommendedPlugins = recommendedPluginsForRuntime(hubPlugins, runtime);
 
   const subTabBtn = (key: PluginRuntime, label: string) => (
     <button key={key} onClick={() => setRuntime(key)}
@@ -5318,36 +5339,37 @@ function PluginsTab() {
           </div>
         )}
 
-        {/* Hub recommended — GET /api/v1/hub/plugins. Shown flat (hub
-            entries carry no wasm/js runtime, so we don't split by the
-            sub-tab). Install passes the slug to `plugins install`; this
-            only works once the backend resolves slugs via the allowlist
-            (the AllowEntry has a download url that isn't exposed in the
-            catalog yet) — until then non-installed entries surface a
-            clear install error. */}
-        {hubPlugins.length > 0 && (
+        {/* Hub recommended — GET /api/v1/hub/plugins. Installed entries are
+            omitted because they already appear in the installed section; when
+            the hub includes runtime metadata, recommendations stay in the
+            matching WASM/JS tab. */}
+        {hubPluginsErrored && (
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 12, padding: "28px 0", color: V2.t3 }}>
+            <div style={{ fontSize: 12 }}>{zh ? "无法加载推荐插件（hub 接口不可用）" : "Couldn't load recommended plugins (hub endpoint unavailable)"}</div>
+            <button onClick={() => void fetchHubPlugins()} style={{ padding: "6px 14px", borderRadius: 7, border: `1px solid ${V2.gbrd}`, background: V2.glo, color: V2.green, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "重试" : "Retry"}</button>
+          </div>
+        )}
+
+        {recommendedPlugins.length > 0 && !hubPluginsErrored && (
           <>
             <div style={{ fontSize: 11, fontWeight: 600, color: V2.t2, letterSpacing: 0.5, textTransform: "uppercase", marginBottom: 10, marginTop: 4, display: "flex", alignItems: "center", gap: 8 }}>
-              {zh ? "推荐安装" : "Recommended"} <span style={{ fontSize: 9, padding: "1px 7px", borderRadius: 3, background: V2.bg4, color: V2.t2 }}>{hubPlugins.length}</span>
+              {zh ? "推荐安装" : "Recommended"} <span style={{ fontSize: 9, padding: "1px 7px", borderRadius: 3, background: V2.bg4, color: V2.t2 }}>{recommendedPlugins.length}</span>
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-              {hubPlugins.map((p) => (
-                <div key={p.slug} style={{ background: V2.bg2, border: `1px solid ${p.installed ? "rgba(45,212,160,.15)" : V2.bd}`, borderRadius: 11, padding: "14px 16px", display: "flex", flexDirection: "column", gap: 10 }}>
+              {recommendedPlugins.map((p) => (
+                <div key={p.slug} style={{ background: V2.bg2, border: `1px solid ${V2.bd}`, borderRadius: 11, padding: "14px 16px", display: "flex", flexDirection: "column", gap: 10 }}>
                   <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontSize: 13, fontWeight: 600, color: V2.t0 }}>{p.slug}</div>
                       <div style={{ fontSize: 10, fontFamily: V2.mono, color: V2.t3, marginTop: 1 }}>{p.version || "-"}</div>
                     </div>
-                    {p.installed && <div style={{ fontSize: 10, color: V2.green, fontFamily: V2.mono, display: "flex", alignItems: "center", gap: 4 }}>{"●"} {zh ? "已安装" : "Installed"}</div>}
                   </div>
                   {p.description && <div style={{ fontSize: 11, color: V2.t2, lineHeight: 1.55, display: "-webkit-box", WebkitLineClamp: 3, WebkitBoxOrient: "vertical", overflow: "hidden" }}>{p.description}</div>}
                   <div style={{ display: "flex", justifyContent: "flex-end" }}>
-                    {p.installed
-                      ? <span style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${V2.bd2}`, color: V2.t2, fontSize: 11 }}>{"✓"}</span>
-                      : <button onClick={() => doInstall(p.slug)} disabled={installing === p.slug}
-                          style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${installing === p.slug ? V2.obrd : V2.gbrd}`, background: installing === p.slug ? V2.olo : V2.glo, color: installing === p.slug ? V2.or : V2.green, fontSize: 11, fontWeight: 600, cursor: installing === p.slug ? "not-allowed" : "pointer" }}>
-                          {installing === p.slug ? (zh ? "安装中..." : "Installing...") : (zh ? "安装" : "Install")}
-                        </button>}
+                    <button onClick={() => doInstall(p.slug)} disabled={installing === p.slug}
+                      style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${installing === p.slug ? V2.obrd : V2.gbrd}`, background: installing === p.slug ? V2.olo : V2.glo, color: installing === p.slug ? V2.or : V2.green, fontSize: 11, fontWeight: 600, cursor: installing === p.slug ? "not-allowed" : "pointer" }}>
+                      {installing === p.slug ? (zh ? "安装中..." : "Installing...") : (zh ? "安装" : "Install")}
+                    </button>
                   </div>
                 </div>
               ))}
