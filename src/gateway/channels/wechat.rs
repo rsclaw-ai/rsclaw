@@ -96,6 +96,7 @@ pub(crate) fn start_wechat_personal_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
     task_queue: Arc<crate::gateway::task_queue::TaskQueueManager>,
+    shutdown: crate::gateway::ShutdownCoordinator,
 ) {
     // Check if wechat channel is enabled in config
     let enabled = config
@@ -201,6 +202,7 @@ pub(crate) fn start_wechat_personal_if_configured(
         let reg = Arc::clone(&registry);
         let cfg = config.clone();
         let tq = Arc::clone(&task_queue);
+        let shutdown_for_messages = shutdown.clone();
 
         let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
 
@@ -235,7 +237,12 @@ pub(crate) fn start_wechat_personal_if_configured(
                 let tq = Arc::clone(&tq);
                 let queues = Arc::clone(&user_queues);
                 let enforcer = Arc::clone(&enforcer);
+                let shutdown = shutdown_for_messages.clone();
                 tokio::spawn(async move {
+                    if shutdown.is_draining() {
+                        debug!(peer_id = %from_user, "wechat: dropping inbound message during drain");
+                        return;
+                    }
                     // DM policy check (WeChat is DM-only).
                     {
                         use crate::channel::PolicyResult;
@@ -470,22 +477,40 @@ pub(crate) fn start_wechat_personal_if_configured(
             tracing::warn!("failed to register channel: {e}");
         }
         let wc_send = Arc::clone(&wc);
+        let shutdown_for_outbound = shutdown.clone();
 
         tokio::spawn(async move {
             debug!("wechat: outbound sender task started");
-            while let Some(msg) = out_rx.recv().await {
-                debug!(target = %msg.target_id, text_len = msg.text.len(), "wechat: sending reply");
-                if let Err(e) = wc_send.send(msg).await {
-                    error!("wechat send error: {e:#}");
-                } else {
-                    debug!("wechat: reply sent successfully");
+            loop {
+                tokio::select! {
+                    () = shutdown_for_outbound.notified() => {
+                        info!("wechat: drain signaled, stopping outbound sender");
+                        break;
+                    }
+                    msg = out_rx.recv() => {
+                        let Some(msg) = msg else { break };
+                        debug!(target = %msg.target_id, text_len = msg.text.len(), "wechat: sending reply");
+                        if let Err(e) = wc_send.send(msg).await {
+                            error!("wechat send error: {e:#}");
+                        } else {
+                            debug!("wechat: reply sent successfully");
+                        }
+                    }
                 }
             }
         });
 
+        let shutdown_for_poll = shutdown.clone();
         tokio::spawn(async move {
-            if let Err(e) = wc.run().await {
-                error!("wechat channel error: {e:#}");
+            tokio::select! {
+                res = wc.run() => {
+                    if let Err(e) = res {
+                        error!("wechat channel error: {e:#}");
+                    }
+                }
+                () = shutdown_for_poll.notified() => {
+                    info!("wechat: drain signaled, stopping long-poll loop");
+                }
             }
         });
 

@@ -430,6 +430,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         Arc::clone(&store.db),
         Arc::clone(&channel_senders),
         Arc::clone(&task_queue_mgr),
+        shutdown.clone(),
     );
 
     // Spawn task queue worker — processes queued tasks in priority order.

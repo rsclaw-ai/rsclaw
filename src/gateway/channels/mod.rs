@@ -69,6 +69,7 @@ pub(crate) fn start_channels(
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
     task_queue: Arc<crate::gateway::task_queue::TaskQueueManager>,
+    shutdown: crate::gateway::ShutdownCoordinator,
 ) {
     // CLI channel — always started in local mode.
     {
@@ -670,6 +671,7 @@ pub(crate) fn start_channels(
         Arc::clone(&redb_store),
         Arc::clone(&channel_senders),
         Arc::clone(&task_queue),
+        shutdown.clone(),
     );
     start_feishu_if_configured(
         config,
