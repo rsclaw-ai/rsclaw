@@ -8,9 +8,8 @@
 //     can hover for tooltips later if we add them).
 //   - The orange glow lives on a separate child element so we can
 //     animate it independently of the pill's fade-in.
-//   - All colors are hex literals scoped to this file rather than CSS
-//     vars because the overlay needs to look the same in both light and
-//     dark themes — it's a status warning, not a chrome element.
+//   - Colors are centralized in this file's palette variables so the
+//     status warning looks the same in both light and dark themes.
 
 // Tier palette. Running = brand orange (matches the icon and the
 // user's "桌面四周出现橙色阴影" mental model). The three outcome
@@ -20,18 +19,51 @@
 $brand: #f97316;
 $brand-glow: rgba(249, 115, 22, 0.55);
 $brand-glow-soft: rgba(249, 115, 22, 0.18);
+$brand-fill: rgba(249, 115, 22, 0.1);
+$brand-outer: rgba(249, 115, 22, 0.24);
+$brand-pulse-rest: rgba(249, 115, 22, 0.22);
+$brand-pulse-peak: rgba(249, 115, 22, 0.28);
+$brand-pill-glow: rgba(249, 115, 22, 0.42);
 
 $ok: #2dd4a0;
 $ok-glow: rgba(45, 212, 160, 0.5);
 $ok-glow-soft: rgba(45, 212, 160, 0.18);
+$ok-fill: rgba(45, 212, 160, 0.08);
+$ok-outer: rgba(45, 212, 160, 0.22);
+$ok-dot-ring: rgba(45, 212, 160, 0.25);
+$ok-badge-bg: rgba(45, 212, 160, 0.16);
+$ok-badge-border: rgba(45, 212, 160, 0.4);
 
 $attn: #f59e0b;
 $attn-glow: rgba(245, 158, 11, 0.55);
 $attn-glow-soft: rgba(245, 158, 11, 0.18);
+$attn-fill: rgba(245, 158, 11, 0.09);
+$attn-outer: rgba(245, 158, 11, 0.22);
+$attn-dot-ring: rgba(245, 158, 11, 0.25);
+$attn-badge-bg: rgba(245, 158, 11, 0.16);
+$attn-badge-border: rgba(245, 158, 11, 0.4);
 
 $bad: #ef4444;
 $bad-glow: rgba(239, 68, 68, 0.55);
 $bad-glow-soft: rgba(239, 68, 68, 0.18);
+$bad-fill: rgba(239, 68, 68, 0.09);
+$bad-outer: rgba(239, 68, 68, 0.22);
+$bad-dot-ring: rgba(239, 68, 68, 0.25);
+$bad-badge-bg: rgba(239, 68, 68, 0.16);
+$bad-badge-border: rgba(239, 68, 68, 0.4);
+$bad-hover-border: rgba(239, 68, 68, 0.5);
+$bad-active-bg: rgba(239, 68, 68, 0.24);
+$bad-text: #fca5a5;
+
+$pill-bg: rgba(15, 17, 22, 0.86);
+$pill-shadow: rgba(0, 0, 0, 0.28);
+$text-strong: #f5f5f7;
+$text-muted: rgba(245, 245, 247, 0.6);
+$text-action: rgba(245, 245, 247, 0.85);
+$text-stop: rgba(245, 245, 247, 0.9);
+$text-disabled: rgba(245, 245, 247, 0.5);
+$stop-border: rgba(255, 255, 255, 0.18);
+$stop-bg: rgba(255, 255, 255, 0.04);
 
 .overlay {
   position: fixed;
@@ -56,13 +88,13 @@ $bad-glow-soft: rgba(239, 68, 68, 0.18);
   inset: 10px;
   pointer-events: none;
   border-radius: 32px;
-  background: rgba(249, 115, 22, 0.1);
+  background: $brand-fill;
   backdrop-filter: saturate(125%);
   -webkit-backdrop-filter: saturate(125%);
   box-shadow:
     inset 0 0 72px 22px $brand-glow,
     inset 0 0 230px 78px $brand-glow-soft,
-    0 0 34px 8px rgba(249, 115, 22, 0.24);
+    0 0 34px 8px $brand-outer;
   animation: cu-glow-pulse 2.4s ease-in-out infinite;
 }
 
@@ -71,29 +103,29 @@ $bad-glow-soft: rgba(239, 68, 68, 0.18);
 // so the user notices the transition.
 .overlay[data-status="ok"] .glow {
   animation: none;
-  background: rgba(45, 212, 160, 0.08);
+  background: $ok-fill;
   box-shadow:
     inset 0 0 72px 22px $ok-glow,
     inset 0 0 230px 78px $ok-glow-soft,
-    0 0 34px 8px rgba(45, 212, 160, 0.22);
+    0 0 34px 8px $ok-outer;
 }
 
 .overlay[data-status="attention"] .glow {
   animation: none;
-  background: rgba(245, 158, 11, 0.09);
+  background: $attn-fill;
   box-shadow:
     inset 0 0 72px 22px $attn-glow,
     inset 0 0 230px 78px $attn-glow-soft,
-    0 0 34px 8px rgba(245, 158, 11, 0.22);
+    0 0 34px 8px $attn-outer;
 }
 
 .overlay[data-status="bad"] .glow {
   animation: none;
-  background: rgba(239, 68, 68, 0.09);
+  background: $bad-fill;
   box-shadow:
     inset 0 0 72px 22px $bad-glow,
     inset 0 0 230px 78px $bad-glow-soft,
-    0 0 34px 8px rgba(239, 68, 68, 0.22);
+    0 0 34px 8px $bad-outer;
 }
 
 @keyframes cu-glow-pulse {
@@ -101,13 +133,13 @@ $bad-glow-soft: rgba(239, 68, 68, 0.18);
     box-shadow:
       inset 0 0 64px 18px $brand-glow,
       inset 0 0 200px 68px $brand-glow-soft,
-      0 0 30px 6px rgba(249, 115, 22, 0.22);
+      0 0 30px 6px $brand-pulse-rest;
   }
   50% {
     box-shadow:
       inset 0 0 92px 28px $brand-glow,
       inset 0 0 260px 92px $brand-glow-soft,
-      0 0 42px 10px rgba(249, 115, 22, 0.28);
+      0 0 42px 10px $brand-pulse-peak;
   }
 }
 
@@ -127,35 +159,35 @@ $bad-glow-soft: rgba(239, 68, 68, 0.18);
   max-width: min(560px, calc(100vw - 80px));
   padding: 14px 18px;
 
-  background: rgba(15, 17, 22, 0.86);
+  background: $pill-bg;
   backdrop-filter: blur(18px) saturate(140%);
   -webkit-backdrop-filter: blur(18px) saturate(140%);
   border: 0;
   border-radius: 16px;
   box-shadow:
-    0 16px 40px rgba(0, 0, 0, 0.28),
-    0 0 52px rgba(249, 115, 22, 0.42);
+    0 16px 40px $pill-shadow,
+    0 0 52px $brand-pill-glow;
 
-  color: #f5f5f7;
+  color: $text-strong;
   animation: cu-pill-in 0.32s cubic-bezier(0.2, 0.8, 0.2, 1.05);
   transition: box-shadow 0.3s ease;
 }
 
 .overlay[data-status="ok"] .pill {
   box-shadow:
-    0 16px 40px rgba(0, 0, 0, 0.28),
+    0 16px 40px $pill-shadow,
     0 0 52px $ok-glow;
 }
 
 .overlay[data-status="attention"] .pill {
   box-shadow:
-    0 16px 40px rgba(0, 0, 0, 0.28),
+    0 16px 40px $pill-shadow,
     0 0 52px $attn-glow;
 }
 
 .overlay[data-status="bad"] .pill {
   box-shadow:
-    0 16px 40px rgba(0, 0, 0, 0.28),
+    0 16px 40px $pill-shadow,
     0 0 52px $bad-glow;
 }
 
@@ -194,25 +226,25 @@ $bad-glow-soft: rgba(239, 68, 68, 0.18);
   width: 12px;
   height: 12px;
   border-radius: 50%;
-  background: #2dd4a0;
-  border: 2px solid rgba(15, 17, 22, 0.86);
-  box-shadow: 0 0 0 4px rgba(45, 212, 160, 0.25);
+  background: $ok;
+  border: 2px solid $pill-bg;
+  box-shadow: 0 0 0 4px $ok-dot-ring;
   animation: cu-dot-blink 1.4s ease-in-out infinite;
 }
 
 .overlay[data-status="ok"] .dot {
   background: $ok;
-  box-shadow: 0 0 0 4px rgba(45, 212, 160, 0.25);
+  box-shadow: 0 0 0 4px $ok-dot-ring;
 }
 
 .overlay[data-status="attention"] .dot {
   background: $attn;
-  box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.25);
+  box-shadow: 0 0 0 4px $attn-dot-ring;
 }
 
 .overlay[data-status="bad"] .dot {
   background: $bad;
-  box-shadow: 0 0 0 4px rgba(239, 68, 68, 0.25);
+  box-shadow: 0 0 0 4px $bad-dot-ring;
 }
 
 @keyframes cu-dot-blink {
@@ -232,7 +264,7 @@ $bad-glow-soft: rgba(239, 68, 68, 0.18);
   font-size: 14px;
   font-weight: 600;
   line-height: 1.3;
-  color: #f5f5f7;
+  color: $text-strong;
   letter-spacing: 0.01em;
 }
 
@@ -242,7 +274,7 @@ $bad-glow-soft: rgba(239, 68, 68, 0.18);
   gap: 6px;
   font-size: 11px;
   line-height: 1.3;
-  color: rgba(245, 245, 247, 0.6);
+  color: $text-muted;
   font-variant-numeric: tabular-nums;
 }
 
@@ -263,7 +295,7 @@ $bad-glow-soft: rgba(239, 68, 68, 0.18);
   margin-top: 4px;
   font-size: 12px;
   line-height: 1.45;
-  color: rgba(245, 245, 247, 0.85);
+  color: $text-action;
   font-family: var(--font-family-mono, ui-monospace, monospace);
   // Truncate to two lines — long bash output etc. would otherwise
   // make the pill grow tall and ugly.
@@ -287,21 +319,21 @@ $bad-glow-soft: rgba(239, 68, 68, 0.18);
 }
 
 .outcomeOk {
-  background: rgba(45, 212, 160, 0.16);
+  background: $ok-badge-bg;
   color: $ok;
-  border: 1px solid rgba(45, 212, 160, 0.4);
+  border: 1px solid $ok-badge-border;
 }
 
 .outcomeAttention {
-  background: rgba(245, 158, 11, 0.16);
+  background: $attn-badge-bg;
   color: $attn;
-  border: 1px solid rgba(245, 158, 11, 0.4);
+  border: 1px solid $attn-badge-border;
 }
 
 .outcomeBad {
-  background: rgba(239, 68, 68, 0.16);
-  color: #fca5a5;
-  border: 1px solid rgba(239, 68, 68, 0.4);
+  background: $bad-badge-bg;
+  color: $bad-text;
+  border: 1px solid $bad-badge-border;
 }
 
 // ---------- Stop button (visible while a run is active) ----------
@@ -317,9 +349,9 @@ $bad-glow-soft: rgba(239, 68, 68, 0.18);
   gap: 6px;
   padding: 6px 12px;
   border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.18);
-  background: rgba(255, 255, 255, 0.04);
-  color: rgba(245, 245, 247, 0.9);
+  border: 1px solid $stop-border;
+  background: $stop-bg;
+  color: $text-stop;
   font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.01em;
@@ -332,17 +364,17 @@ $bad-glow-soft: rgba(239, 68, 68, 0.18);
   }
 
   &:hover:not(:disabled) {
-    background: rgba(239, 68, 68, 0.16);
-    border-color: rgba(239, 68, 68, 0.5);
-    color: #fca5a5;
+    background: $bad-badge-bg;
+    border-color: $bad-hover-border;
+    color: $bad-text;
 
     svg {
-      color: #fca5a5;
+      color: $bad-text;
     }
   }
 
   &:active:not(:disabled) {
-    background: rgba(239, 68, 68, 0.24);
+    background: $bad-active-bg;
   }
 
   &:disabled {
@@ -350,7 +382,7 @@ $bad-glow-soft: rgba(239, 68, 68, 0.18);
     cursor: progress;
 
     svg {
-      color: rgba(245, 245, 247, 0.5);
+      color: $text-disabled;
     }
   }
 }
