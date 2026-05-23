@@ -272,7 +272,8 @@ async fn install_wasm_file(src: &std::path::Path) -> Result<()> {
     // Load the wasm to read its embedded manifest (name, version, description,
     // tools).
     println!("  {} loading WASM manifest...", dim("*"));
-    let wasm_config = wasmtime::Config::new();
+    let mut wasm_config = wasmtime::Config::new();
+    wasm_config.async_support(true);
     let engine = wasmtime::Engine::new(&wasm_config)
         .map_err(|e| anyhow::anyhow!("create wasmtime engine: {e}"))?;
 

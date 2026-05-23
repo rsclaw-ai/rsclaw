@@ -136,6 +136,7 @@ pub async fn load_all_plugins(
     // Shared wasmtime engine for all WASM plugins.
     let wasm_engine = if manifests.iter().any(|m| m.is_wasm()) {
         let mut wasm_config = wasmtime::Config::new();
+        wasm_config.async_support(true);
         // Enable epoch interruption so we can bound wasm-CPU time per call
         // (caps runaway loops without affecting awaits on host async calls).
         wasm_config.epoch_interruption(true);
