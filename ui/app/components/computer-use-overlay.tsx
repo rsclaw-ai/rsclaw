@@ -74,10 +74,14 @@ function tierForOutcome(kind: OutcomeKind): Tier {
 }
 
 /** Shrunken window geometry while a run is active. */
-const SHRUNK_WIDTH = 360;
-const SHRUNK_HEIGHT = 520;
+const SHRUNK_WIDTH = 460;
+// Keep the control surface compact so RsClaw's own chat composer is
+// not visible to the computer-use model while it is operating another app.
+const SHRUNK_HEIGHT = 190;
+const DEFAULT_MIN_WIDTH = 320;
+const DEFAULT_MIN_HEIGHT = 400;
 /** Inset from screen edges when pinning to the right. */
-const SHRUNK_MARGIN = 20;
+const SHRUNK_MARGIN = 16;
 
 function outcomeLabel(kind: string, zh: boolean): string {
   if (zh) {
@@ -134,12 +138,14 @@ async function shrinkWindow(): Promise<WindowSnapshot | null> {
       y: pos.y,
     };
 
+    const { LogicalSize } = winApi;
+    await win.setMinSize(new LogicalSize(DEFAULT_MIN_WIDTH, SHRUNK_HEIGHT));
+
     // Compute target position from the monitor's work area, in
     // logical pixels.
     const monitor = await winApi.currentMonitor();
     if (!monitor) {
       // No monitor info — just resize without moving.
-      const { LogicalSize } = winApi;
       await win.setSize(new LogicalSize(SHRUNK_WIDTH, SHRUNK_HEIGHT));
       return snapshot;
     }
@@ -152,13 +158,21 @@ async function shrinkWindow(): Promise<WindowSnapshot | null> {
     const targetX = monitorX + monitorWidth - SHRUNK_WIDTH - SHRUNK_MARGIN;
     const targetY = monitorY + SHRUNK_MARGIN;
 
-    const { LogicalSize, LogicalPosition } = winApi;
+    const { LogicalPosition } = winApi;
     await win.setSize(new LogicalSize(SHRUNK_WIDTH, SHRUNK_HEIGHT));
     await win.setPosition(new LogicalPosition(targetX, targetY));
 
     return snapshot;
   } catch (e) {
     console.error("[computer-use-overlay] shrinkWindow failed:", e);
+    try {
+      const winApi = await import("@tauri-apps/api/window");
+      await winApi
+        .getCurrentWindow()
+        .setMinSize(new winApi.LogicalSize(DEFAULT_MIN_WIDTH, DEFAULT_MIN_HEIGHT));
+    } catch {
+      /* swallow */
+    }
     return null;
   }
 }
@@ -173,9 +187,10 @@ async function restoreWindow(snap: WindowSnapshot): Promise<void> {
   try {
     const winApi = await import("@tauri-apps/api/window");
     const win = winApi.getCurrentWindow();
-    const { PhysicalSize, PhysicalPosition } = winApi;
+    const { PhysicalSize, PhysicalPosition, LogicalSize } = winApi;
     await win.setSize(new PhysicalSize(snap.width, snap.height));
     await win.setPosition(new PhysicalPosition(snap.x, snap.y));
+    await win.setMinSize(new LogicalSize(DEFAULT_MIN_WIDTH, DEFAULT_MIN_HEIGHT));
   } catch {
     /* swallow */
   }

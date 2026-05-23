@@ -15,6 +15,7 @@
     "core:window:allow-unminimize",
     "core:window:allow-set-icon",
     "core:window:allow-set-ignore-cursor-events",
+    "core:window:allow-set-min-size",
     "core:window:allow-set-resizable",
     "core:window:allow-start-dragging",
     "core:window:allow-set-focus",

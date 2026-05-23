@@ -612,7 +612,7 @@ fn get_version() -> Result<String, String> {
 /// main UI bundle.
 const GLOW_OVERLAY_HTML: &str = r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>RsClaw Activity</title><style>
 html,body{margin:0;padding:0;width:100vw;height:100vh;background:transparent;overflow:hidden;pointer-events:none;-webkit-user-select:none;user-select:none}
-.glow{position:fixed;inset:0;pointer-events:none;box-shadow:inset 0 0 0 3px rgba(255,150,40,0.92),inset 0 0 55px 12px rgba(255,140,0,0.85),inset 0 0 170px 55px rgba(255,115,0,0.45);animation:pulse 2s ease-in-out infinite}
+.glow{position:fixed;inset:10px;pointer-events:none;border-radius:32px;background:rgba(249,115,22,0.10);-webkit-backdrop-filter:saturate(125%);backdrop-filter:saturate(125%);box-shadow:inset 0 0 72px 22px rgba(255,140,0,0.78),inset 0 0 230px 78px rgba(255,115,0,0.38),0 0 34px 8px rgba(255,140,0,0.24);animation:pulse 2s ease-in-out infinite}
 @keyframes pulse{0%,100%{opacity:0.65}50%{opacity:1}}
 </style></head><body><div class="glow"></div></body></html>"#;
 

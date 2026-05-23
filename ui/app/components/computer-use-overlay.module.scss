@@ -20,22 +20,18 @@
 $brand: #f97316;
 $brand-glow: rgba(249, 115, 22, 0.55);
 $brand-glow-soft: rgba(249, 115, 22, 0.18);
-$brand-edge: rgba(249, 115, 22, 0.92);
 
 $ok: #2dd4a0;
 $ok-glow: rgba(45, 212, 160, 0.5);
 $ok-glow-soft: rgba(45, 212, 160, 0.18);
-$ok-edge: rgba(45, 212, 160, 0.92);
 
 $attn: #f59e0b;
 $attn-glow: rgba(245, 158, 11, 0.55);
 $attn-glow-soft: rgba(245, 158, 11, 0.18);
-$attn-edge: rgba(245, 158, 11, 0.92);
 
 $bad: #ef4444;
 $bad-glow: rgba(239, 68, 68, 0.55);
 $bad-glow-soft: rgba(239, 68, 68, 0.18);
-$bad-edge: rgba(239, 68, 68, 0.92);
 
 .overlay {
   position: fixed;
@@ -57,11 +53,16 @@ $bad-edge: rgba(239, 68, 68, 0.92);
 // the user sees a heartbeat rather than a static frame.
 .glow {
   position: absolute;
-  inset: 0;
+  inset: 10px;
   pointer-events: none;
+  border-radius: 32px;
+  background: rgba(249, 115, 22, 0.1);
+  backdrop-filter: saturate(125%);
+  -webkit-backdrop-filter: saturate(125%);
   box-shadow:
-    inset 0 0 80px 8px $brand-glow,
-    inset 0 0 200px 60px $brand-glow-soft;
+    inset 0 0 72px 22px $brand-glow,
+    inset 0 0 230px 78px $brand-glow-soft,
+    0 0 34px 8px rgba(249, 115, 22, 0.24);
   animation: cu-glow-pulse 2.4s ease-in-out infinite;
 }
 
@@ -70,35 +71,43 @@ $bad-edge: rgba(239, 68, 68, 0.92);
 // so the user notices the transition.
 .overlay[data-status="ok"] .glow {
   animation: none;
+  background: rgba(45, 212, 160, 0.08);
   box-shadow:
-    inset 0 0 80px 8px $ok-glow,
-    inset 0 0 200px 60px $ok-glow-soft;
+    inset 0 0 72px 22px $ok-glow,
+    inset 0 0 230px 78px $ok-glow-soft,
+    0 0 34px 8px rgba(45, 212, 160, 0.22);
 }
 
 .overlay[data-status="attention"] .glow {
   animation: none;
+  background: rgba(245, 158, 11, 0.09);
   box-shadow:
-    inset 0 0 80px 8px $attn-glow,
-    inset 0 0 200px 60px $attn-glow-soft;
+    inset 0 0 72px 22px $attn-glow,
+    inset 0 0 230px 78px $attn-glow-soft,
+    0 0 34px 8px rgba(245, 158, 11, 0.22);
 }
 
 .overlay[data-status="bad"] .glow {
   animation: none;
+  background: rgba(239, 68, 68, 0.09);
   box-shadow:
-    inset 0 0 80px 8px $bad-glow,
-    inset 0 0 200px 60px $bad-glow-soft;
+    inset 0 0 72px 22px $bad-glow,
+    inset 0 0 230px 78px $bad-glow-soft,
+    0 0 34px 8px rgba(239, 68, 68, 0.22);
 }
 
 @keyframes cu-glow-pulse {
   0%, 100% {
     box-shadow:
-      inset 0 0 70px 6px $brand-glow,
-      inset 0 0 180px 50px $brand-glow-soft;
+      inset 0 0 64px 18px $brand-glow,
+      inset 0 0 200px 68px $brand-glow-soft,
+      0 0 30px 6px rgba(249, 115, 22, 0.22);
   }
   50% {
     box-shadow:
-      inset 0 0 110px 14px $brand-glow,
-      inset 0 0 240px 80px $brand-glow-soft;
+      inset 0 0 92px 28px $brand-glow,
+      inset 0 0 260px 92px $brand-glow-soft,
+      0 0 42px 10px rgba(249, 115, 22, 0.28);
   }
 }
 
@@ -121,12 +130,11 @@ $bad-edge: rgba(239, 68, 68, 0.92);
   background: rgba(15, 17, 22, 0.86);
   backdrop-filter: blur(18px) saturate(140%);
   -webkit-backdrop-filter: blur(18px) saturate(140%);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 0;
   border-radius: 16px;
   box-shadow:
-    0 0 0 1px $brand-edge,
-    0 12px 40px rgba(0, 0, 0, 0.55),
-    0 0 60px $brand-glow;
+    0 16px 40px rgba(0, 0, 0, 0.28),
+    0 0 52px rgba(249, 115, 22, 0.42);
 
   color: #f5f5f7;
   animation: cu-pill-in 0.32s cubic-bezier(0.2, 0.8, 0.2, 1.05);
@@ -135,23 +143,20 @@ $bad-edge: rgba(239, 68, 68, 0.92);
 
 .overlay[data-status="ok"] .pill {
   box-shadow:
-    0 0 0 1px $ok-edge,
-    0 12px 40px rgba(0, 0, 0, 0.55),
-    0 0 60px $ok-glow;
+    0 16px 40px rgba(0, 0, 0, 0.28),
+    0 0 52px $ok-glow;
 }
 
 .overlay[data-status="attention"] .pill {
   box-shadow:
-    0 0 0 1px $attn-edge,
-    0 12px 40px rgba(0, 0, 0, 0.55),
-    0 0 60px $attn-glow;
+    0 16px 40px rgba(0, 0, 0, 0.28),
+    0 0 52px $attn-glow;
 }
 
 .overlay[data-status="bad"] .pill {
   box-shadow:
-    0 0 0 1px $bad-edge,
-    0 12px 40px rgba(0, 0, 0, 0.55),
-    0 0 60px $bad-glow;
+    0 16px 40px rgba(0, 0, 0, 0.28),
+    0 0 52px $bad-glow;
 }
 
 @keyframes cu-pill-in {
