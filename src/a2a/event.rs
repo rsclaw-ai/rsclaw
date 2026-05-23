@@ -72,6 +72,14 @@ impl AgentEvent {
         }
     }
 
+    pub fn is_final(&self) -> bool {
+        match self {
+            Self::Status { final_, .. } => *final_,
+            Self::InputRequired { .. } | Self::AuthRequired { .. } => false,
+            Self::Artifact { last_chunk, .. } => *last_chunk,
+        }
+    }
+
     /// Serialize to the v1.0 wire event JSON payload that goes inside the
     /// JSON-RPC `result` field of a streaming response.
     pub fn to_wire_event(&self) -> Value {

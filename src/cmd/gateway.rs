@@ -509,13 +509,23 @@ pub enum RestartFallbackDecision {
     Abort { reason: String },
 }
 
+/// Substring that `gateway_signal_stop` uses when no gateway process is found.
+/// Matched in `restart_fallback_after_stop_result` to distinguish
+/// "gateway never started" from "gateway failed to stop".
+const GATEWAY_NOT_RUNNING_MSG: &str = "gateway is not running";
+
 /// Decides whether direct restart fallback may start a new gateway.
 pub fn restart_fallback_after_stop_result(
     stop_result: std::result::Result<(), &str>,
 ) -> RestartFallbackDecision {
     match stop_result {
         Ok(()) => RestartFallbackDecision::StartFresh,
-        Err(message) if message.contains("not running") => RestartFallbackDecision::StartFresh,
+        Err(message)
+            if message.starts_with(GATEWAY_NOT_RUNNING_MSG)
+                || message.contains("is not running") =>
+        {
+            RestartFallbackDecision::StartFresh
+        }
         Err(message) => RestartFallbackDecision::Abort {
             reason: message.to_owned(),
         },

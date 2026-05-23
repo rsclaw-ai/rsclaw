@@ -18,7 +18,7 @@ use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -36,6 +36,11 @@ const ROUTE_TTL_MS: u64 = 30_000;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HelloCapabilities {
+    pub streaming_relay: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RelayFrame {
     Hello {
@@ -45,6 +50,8 @@ pub enum RelayFrame {
         node_version: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_card: Option<AgentCard>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capabilities: Option<HelloCapabilities>,
     },
     RouteLease {
         node_id: String,
@@ -105,6 +112,13 @@ pub struct RelayHub {
     connections: DashMap<String, Connection>,
     routes: DashMap<String, RouteEntry>,
     pending: DashMap<String, oneshot::Sender<JsonRpcResponse>>,
+    /// Streaming relay entries: request_id → broadcast sender for wire events.
+    /// Inserted by `invoke_streaming`; removed when the spoke sends its
+    /// terminal `RelayFrame::Response` for the streaming request.
+    stream_pending: DashMap<String, broadcast::Sender<Value>>,
+    /// Spoke-side map of relay request_id → local task_id, so a `Cancel`
+    /// frame can find the local `CancellationToken` in `task_cancels`.
+    spoke_stream_tasks: DashMap<String, String>,
 }
 
 impl RelayHub {
@@ -188,7 +202,7 @@ impl RelayHub {
             method: method.to_owned(),
             params,
             principal: principal.to_owned(),
-            deadline_ms: REQUEST_TIMEOUT.as_millis().min(u64::MAX as u128) as u64,
+            deadline_ms: REQUEST_TIMEOUT.as_millis() as u64,
         };
         let msg = AxumWsMessage::Text(serde_json::to_string(&frame)?.into());
         if let Err(e) = conn.tx.send(msg) {
@@ -239,6 +253,59 @@ impl RelayHub {
         if let Some((_, tx)) = self.pending.remove(request_id) {
             let _ = tx.send(response);
         }
+    }
+
+    /// Send a streaming Request to the spoke that owns `target` and return a
+    /// broadcast receiver that will receive wire-event `Value`s as
+    /// `RelayFrame::Event` frames arrive from the spoke.
+    pub async fn invoke_streaming(
+        &self,
+        target: &str,
+        method: &str,
+        params: Value,
+        principal: &str,
+    ) -> Result<broadcast::Receiver<Value>> {
+        let route = self
+            .route_for(target)
+            .ok_or_else(|| anyhow!("no live relay route for {target}"))?;
+        let conn = self
+            .connections
+            .get(&route.node_id)
+            .ok_or_else(|| anyhow!("node '{}' is not connected", route.node_id))?;
+        let request_id = format!("relay:stream:{}", Uuid::new_v4());
+        let (event_tx, event_rx) = broadcast::channel(128);
+        self.stream_pending.insert(request_id.clone(), event_tx);
+        let frame = RelayFrame::Request {
+            request_id: request_id.clone(),
+            target: target.to_owned(),
+            method: method.to_owned(),
+            params,
+            principal: principal.to_owned(),
+            deadline_ms: REQUEST_TIMEOUT.as_millis() as u64,
+        };
+        let msg = AxumWsMessage::Text(serde_json::to_string(&frame)?.into());
+        if let Err(e) = conn.tx.send(msg) {
+            self.stream_pending.remove(&request_id);
+            anyhow::bail!("relay send to node '{}' failed: {e}", route.node_id);
+        }
+        Ok(event_rx)
+    }
+
+    /// Remove and drop the stream entry for `request_id`. Returns `true` if
+    /// a streaming entry existed (and was cleaned up). Dropping the
+    /// broadcast sender signals Closed to all receivers, which terminates
+    /// the SSE stream.
+    fn complete_streaming(&self, request_id: &str) -> bool {
+        self.stream_pending.remove(request_id).is_some()
+    }
+
+    /// Route a wire-event `Value` to the stream subscriber for `request_id`,
+    /// if one exists. Returns the number of active receivers.
+    fn forward_stream_event(&self, request_id: &str, value: Value) -> usize {
+        self.stream_pending
+            .get(request_id)
+            .map(|tx| tx.send(value).unwrap_or(0))
+            .unwrap_or(0)
     }
 }
 
@@ -341,6 +408,7 @@ async fn handle_hub_socket(socket: WebSocket, state: AppState, node: A2aRelayNod
         .unwrap_or(0);
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<AxumWsMessage>();
+    let ping_tx = tx.clone();
     state
         .relay_hub
         .register_connection(&node.node_id, tx, epoch);
@@ -350,6 +418,23 @@ async fn handle_hub_socket(socket: WebSocket, state: AppState, node: A2aRelayNod
         while let Some(msg) = rx.recv().await {
             if sink.send(msg).await.is_err() {
                 break;
+            }
+        }
+    });
+
+    let ping = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            interval.tick().await;
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let frame = RelayFrame::Ping { ts };
+            if let Ok(msg) = serde_json::to_string(&frame) {
+                if ping_tx.send(AxumWsMessage::Text(msg.into())).is_err() {
+                    break;
+                }
             }
         }
     });
@@ -369,16 +454,27 @@ async fn handle_hub_socket(socket: WebSocket, state: AppState, node: A2aRelayNod
 
     state.relay_hub.unregister_connection(&node.node_id, epoch);
     writer.abort();
+    ping.abort();
     info!(node = %node.node_id, "a2a relay node disconnected");
 }
 
 async fn handle_hub_frame(state: &AppState, node: &A2aRelayNodeRuntime, frame: RelayFrame) {
     match frame {
         RelayFrame::Hello {
-            protocol, node_id, ..
+            protocol,
+            node_id,
+            capabilities,
+            ..
         } => {
             if protocol != RELAY_PROTOCOL || node_id != node.node_id {
                 warn!(node = %node.node_id, protocol, claimed = %node_id, "relay hello mismatch");
+            }
+            if let Some(caps) = capabilities {
+                info!(
+                    node = %node.node_id,
+                    streaming_relay = caps.streaming_relay,
+                    "relay node capabilities"
+                );
             }
         }
         RelayFrame::RouteLease {
@@ -407,10 +503,57 @@ async fn handle_hub_frame(state: &AppState, node: &A2aRelayNodeRuntime, frame: R
         RelayFrame::Response {
             request_id,
             response,
-        } => state.relay_hub.complete_pending(&request_id, response),
+        } => {
+            // Streaming responses are signalled via Event frames; when the
+            // spoke finishes it sends a Response to clean up the stream entry.
+            if !state.relay_hub.complete_streaming(&request_id) {
+                state.relay_hub.complete_pending(&request_id, response);
+            }
+        }
+        RelayFrame::Event {
+            request_id,
+            result,
+            ..
+        } => {
+            if state.relay_hub.forward_stream_event(&request_id, result) == 0 {
+                debug!(request_id, "relay event for unknown stream");
+            }
+        }
+        RelayFrame::Cancel { request_id, .. } => {
+            // Forward the cancel to the spoke that owns this streaming request.
+            let frame = RelayFrame::Cancel {
+                request_id: request_id.clone(),
+                task_id: None,
+            };
+            let msg = match serde_json::to_string(&frame) {
+                Ok(s) => AxumWsMessage::Text(s.into()),
+                Err(e) => {
+                    warn!(error = %e, "failed to serialize cancel frame");
+                    return;
+                }
+            };
+            // Send to every connected node — the spoke that owns the stream
+            // will recognise the request_id and cancel its local task.
+            for conn in state.relay_hub.connections.iter() {
+                let _ = conn.tx.send(msg.clone());
+            }
+            // Drop the stream entry if present.
+            state.relay_hub.complete_streaming(&request_id);
+        }
         RelayFrame::Pong { .. } => {}
         other => debug!(node = %node.node_id, frame = ?other, "hub ignored relay frame"),
     }
+}
+
+/// Extract a relay target from A2A request params, checking `metadata.agentId`
+/// for a `node/agent` slash pattern.
+pub fn relay_target_from_params(params: &Value) -> Option<String> {
+    params
+        .get("metadata")
+        .and_then(|m| m.get("agentId"))
+        .and_then(|v| v.as_str())
+        .filter(|target| target.contains('/'))
+        .map(str::to_owned)
 }
 
 pub fn relay_target_from_request(req: &JsonRpcRequest) -> Option<String> {
@@ -420,12 +563,7 @@ pub fn relay_target_from_request(req: &JsonRpcRequest) -> Option<String> {
     ) {
         return None;
     }
-    req.params
-        .get("metadata")
-        .and_then(|m| m.get("agentId"))
-        .and_then(|v| v.as_str())
-        .filter(|target| target.contains('/'))
-        .map(str::to_owned)
+    relay_target_from_params(&req.params)
 }
 
 pub async fn try_forward_jsonrpc(
@@ -460,7 +598,7 @@ pub async fn try_forward_jsonrpc(
     }
 }
 
-fn rewrite_target_agent_for_spoke(params: &mut Value, target: &str) {
+pub(crate) fn rewrite_target_agent_for_spoke(params: &mut Value, target: &str) {
     let Some((_, agent)) = target.split_once('/') else {
         return;
     };
@@ -475,11 +613,16 @@ pub fn start_spoke_if_configured(state: AppState) {
     }
     let relay = state.config.gateway.a2a_relay.clone();
     tokio::spawn(async move {
+        let mut delay = Duration::from_secs(1);
+        const MAX_DELAY: Duration = Duration::from_secs(120);
         loop {
             if let Err(e) = run_spoke_once(state.clone(), relay.clone()).await {
-                warn!(error = %e, "a2a relay spoke disconnected");
+                warn!(error = %e, delay_secs = delay.as_secs(), "a2a relay spoke disconnected, retrying");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(MAX_DELAY);
+            } else {
+                delay = Duration::from_secs(1);
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
 }
@@ -509,8 +652,22 @@ async fn run_spoke_once(state: AppState, relay: A2aRelayRuntime) -> Result<()> {
     info!(node = %node_id, hub = %hub_url, "a2a relay spoke connected");
 
     let (mut write, mut read) = stream.split();
-    send_spoke_frame(&mut write, &spoke_hello(&state, node_id)).await?;
-    send_spoke_frame(&mut write, &spoke_route_lease(&state, node_id, 1)).await?;
+    let (spoke_tx, mut spoke_rx) = mpsc::unbounded_channel::<RelayFrame>();
+    let writer = tokio::spawn(async move {
+        while let Some(frame) = spoke_rx.recv().await {
+            if let Err(e) = send_spoke_frame(&mut write, &frame).await {
+                warn!(error = %e, "spoke write error");
+                break;
+            }
+        }
+    });
+
+    spoke_tx
+        .send(spoke_hello(&state, node_id))
+        .map_err(|_| anyhow!("spoke writer closed"))?;
+    spoke_tx
+        .send(spoke_route_lease(&state, node_id, 1))
+        .map_err(|_| anyhow!("spoke writer closed"))?;
 
     while let Some(msg) = read.next().await {
         let msg = msg?;
@@ -527,24 +684,44 @@ async fn run_spoke_once(state: AppState, relay: A2aRelayRuntime) -> Result<()> {
                 principal,
                 ..
             } => {
-                let response =
-                    handle_spoke_request(&state, node_id, &target, &method, params, principal)
-                        .await;
-                send_spoke_frame(
-                    &mut write,
-                    &RelayFrame::Response {
+                let response = handle_spoke_request(
+                    &state,
+                    node_id,
+                    &request_id,
+                    &target,
+                    &method,
+                    params,
+                    principal,
+                    spoke_tx.clone(),
+                )
+                .await;
+                if let Some(response) = response {
+                    let _ = spoke_tx.send(RelayFrame::Response {
                         request_id,
                         response,
-                    },
-                )
-                .await?;
+                    });
+                }
+                // If response is None, the streaming handler sent events via
+                // spoke_tx and will send the terminal Response itself.
             }
             RelayFrame::Ping { ts } => {
-                send_spoke_frame(&mut write, &RelayFrame::Pong { ts }).await?
+                let _ = spoke_tx.send(RelayFrame::Pong { ts });
+            }
+            RelayFrame::Cancel { request_id, .. } => {
+                // Cancel the streaming task if it exists locally. `task_cancels`
+                // is keyed by local task_id, so resolve via the spoke-side map.
+                if let Some((_, task_id)) =
+                    state.relay_hub.spoke_stream_tasks.remove(&request_id)
+                    && let Some((_, token)) = state.task_cancels.remove(&task_id)
+                {
+                    token.cancel();
+                }
             }
             _ => {}
         }
     }
+
+    writer.abort();
     Ok(())
 }
 
@@ -554,6 +731,9 @@ fn spoke_hello(state: &AppState, node_id: &str) -> RelayFrame {
         node_id: node_id.to_owned(),
         node_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
         agent_card: Some(crate::a2a::server::build_agent_card(state, false)),
+        capabilities: Some(HelloCapabilities {
+            streaming_relay: true,
+        }),
     }
 }
 
@@ -588,22 +768,81 @@ where
 async fn handle_spoke_request(
     state: &AppState,
     node_id: &str,
+    request_id: &str,
     target: &str,
     method: &str,
     params: Value,
     principal: String,
-) -> JsonRpcResponse {
+    spoke_tx: mpsc::UnboundedSender<RelayFrame>,
+) -> Option<JsonRpcResponse> {
     let Some(local_agent) = local_agent_from_ref(target, node_id) else {
-        return JsonRpcResponse::err(
+        return Some(JsonRpcResponse::err(
             Value::Null,
             -32003,
             format!("target not hosted here: {target}"),
-        );
+        ));
     };
     let mut params = params;
     if let Some(metadata) = params.get_mut("metadata").and_then(|m| m.as_object_mut()) {
         metadata.insert("agentId".to_owned(), Value::String(local_agent));
     }
+
+    // Streaming methods: spawn the task locally and forward events via relay.
+    if method == "SendStreamingMessage" || method == "SubscribeToTask" {
+        let caller = Some(A2aIdentity {
+            id: principal,
+            scopes: Vec::new(),
+        });
+        let (task_id, event_rx) =
+            crate::a2a::streaming::spawn_streaming_task(state.clone(), caller, params).await;
+        let request_id_for_relay = request_id.to_owned();
+        state
+            .relay_hub
+            .spoke_stream_tasks
+            .insert(request_id_for_relay.clone(), task_id.clone());
+        let relay_hub = state.relay_hub.clone();
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            use tokio_stream::wrappers::BroadcastStream;
+
+            let mut seq = 0u64;
+            let mut stream = BroadcastStream::new(event_rx);
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(event) => {
+                        let wire = event.to_wire_event();
+                        if spoke_tx
+                            .send(RelayFrame::Event {
+                                request_id: request_id_for_relay.clone(),
+                                seq,
+                                result: wire,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                        seq += 1;
+                        if event.is_final() {
+                            break;
+                        }
+                    }
+                    Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                        warn!(lagged = n, "spoke relay event lagged");
+                    }
+                }
+            }
+            relay_hub.spoke_stream_tasks.remove(&request_id_for_relay);
+            let _ = spoke_tx.send(RelayFrame::Response {
+                request_id: request_id_for_relay,
+                response: JsonRpcResponse::ok(
+                    Value::String(task_id),
+                    serde_json::json!({"ok": true}),
+                ),
+            });
+        });
+        return None;
+    }
+
     let req = JsonRpcRequest {
         jsonrpc: "2.0".to_owned(),
         id: Value::String(format!("spoke:{}", Uuid::new_v4())),
@@ -614,9 +853,11 @@ async fn handle_spoke_request(
         id: principal,
         scopes: Vec::new(),
     });
-    crate::a2a::server::a2a_rpc_handler_inner(state.clone(), caller, req)
-        .await
-        .0
+    Some(
+        crate::a2a::server::a2a_rpc_handler_inner(state.clone(), caller, req)
+            .await
+            .0,
+    )
 }
 
 #[cfg(test)]
