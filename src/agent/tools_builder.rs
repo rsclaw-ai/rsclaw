@@ -428,10 +428,15 @@ pub fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "skill_list".to_owned(),
-        description: "List the skills currently installed locally (name + description). \
-            Use to see what's available before reaching for skill_search/web."
-            .to_owned(),
-        parameters: json!({ "type": "object", "properties": {} }),
+        description: "List installed local skills with pagination. Use query first to filter by skill name/description, then use limit/offset for more results. Do not use shell to run `rsclaw skills list`; this tool is the authoritative installed-skill listing.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Optional case-insensitive filter matched against skill name and description."},
+                "limit": {"type": "integer", "description": "Maximum skills to return. Default 50, maximum 100."},
+                "offset": {"type": "integer", "description": "Zero-based offset for pagination."}
+            }
+        }),
     });
     tools.extend(build_plugin_meta_tool_defs());
     tools.push(ToolDef {
@@ -1970,6 +1975,27 @@ mod plugin_catalog_tests {
     use crate::{
         agent::registry::AgentRegistry, config::schema::A2aPeerConfig, skill::SkillRegistry,
     };
+
+    #[test]
+    fn skill_list_schema_supports_filter_and_pagination() {
+        let tools = build_tool_list(
+            &SkillRegistry::default(),
+            None::<&AgentRegistry>,
+            "main",
+            &[] as &[A2aPeerConfig],
+        );
+        let skill_list = tools
+            .iter()
+            .find(|tool| tool.name == "skill_list")
+            .expect("skill_list tool");
+
+        assert!(skill_list.parameters["properties"].get("query").is_some());
+        assert!(skill_list.parameters["properties"].get("limit").is_some());
+        assert!(skill_list.parameters["properties"].get("offset").is_some());
+        assert!(skill_list.description.contains("query"));
+        assert!(skill_list.description.contains("offset"));
+        assert!(skill_list.description.contains("Do not use shell"));
+    }
 
     #[test]
     fn plugin_meta_tools_are_advertised_as_consolidated_entrypoints() {

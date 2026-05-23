@@ -502,6 +502,7 @@ fn build_shared_system_prefix_uncached() -> String {
          3. `plugin.invoke` with `{plugin, tool, arguments}`. If a WASM and JS \
          plugin expose the same capability, choose WASM.\n\n\
          ### How to invoke an installed skill\n\
+         Use `skill_list` with `query` first when you need to find an installed skill. Use `limit`/`offset` to page through more results. Do not use `shell` to run `rsclaw skills list`; `skill_list` is the authoritative installed-skill listing.\n\n\
          When a task matches a skill description listed under \"## Installed Skills\":\n\
          1. Pick the skill whose description matches the user's intent.\n\
          2. Call the `skill_use` function tool with `name=<slug>` — returns \
@@ -933,5 +934,14 @@ mod tests {
         assert!(prompt.contains("plugin.describe_tool"));
         assert!(prompt.contains("plugin.invoke"));
         assert!(prompt.contains("Never invent other `plugin.*` tool names"));
+    }
+
+    #[test]
+    fn shared_prompt_guides_skill_list_pagination() {
+        let prompt = build_shared_system_prefix_uncached();
+
+        assert!(prompt.contains("Use `skill_list` with `query` first"));
+        assert!(prompt.contains("Use `limit`/`offset` to page"));
+        assert!(prompt.contains("Do not use `shell` to run `rsclaw skills list`"));
     }
 }

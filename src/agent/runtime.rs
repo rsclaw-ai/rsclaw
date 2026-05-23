@@ -22,6 +22,7 @@ use std::{
     time::Duration,
 };
 
+use crate::skill::SkillManifest;
 use anyhow::{Result, anyhow};
 use futures::StreamExt;
 use serde_json::{Value, json};
@@ -31,6 +32,63 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+fn paginate_skill_list<'a, I>(skills: I, args: &Value) -> Value
+where
+    I: IntoIterator<Item = &'a SkillManifest>,
+{
+    let query = args["query"].as_str().map(str::trim).filter(|s| !s.is_empty());
+    let query_lower = query.map(|q| q.to_lowercase());
+    let limit = args["limit"]
+        .as_u64()
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(50)
+        .clamp(1, 100);
+    let offset = args["offset"]
+        .as_u64()
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(0);
+
+    let mut all = skills.into_iter().collect::<Vec<_>>();
+    let total = all.len();
+    all.retain(|s| {
+        let Some(query) = query_lower.as_deref() else {
+            return true;
+        };
+        s.name.to_lowercase().contains(query)
+            || s.description
+                .as_deref()
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains(query)
+    });
+    all.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let matched = all.len();
+    let skills = all
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|s| {
+            json!({
+                "name": s.name,
+                "description": s.description.clone().unwrap_or_default(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let next_offset = offset + skills.len();
+    let has_more = next_offset < matched;
+
+    json!({
+        "count": total,
+        "matched": matched,
+        "offset": offset,
+        "limit": limit,
+        "has_more": has_more,
+        "next_offset": has_more.then_some(next_offset),
+        "skills": skills,
+    })
+}
 
 // ---------------------------------------------------------------------------
 // LiveStatus — shared agent status for /btw parallel queries
@@ -7031,7 +7089,7 @@ impl AgentRuntime {
             "edit_file" | "edit" => return self.tool_edit(args).await,
             "shell" | "execute_command" | "exec" => return self.tool_exec(ctx, _id, args).await,
             "skill_use" => return self.tool_use_skill(args),
-            "skill_list" => return self.tool_skill_list(),
+            "skill_list" => return self.tool_skill_list(args),
             "skill_search" => return self.tool_skill_search(args).await,
             "skill_install" => return self.tool_skill_install(args).await,
             "skill_remove" => return self.tool_skill_remove(args).await,
@@ -7861,18 +7919,8 @@ impl AgentRuntime {
     }
 
     /// `skill_list` — list locally-installed skills (name + description).
-    pub(crate) fn tool_skill_list(&self) -> Result<Value> {
-        let skills: Vec<Value> = self
-            .skills
-            .all()
-            .map(|s| {
-                json!({
-                    "name": s.name,
-                    "description": s.description.clone().unwrap_or_default(),
-                })
-            })
-            .collect();
-        Ok(json!({ "count": skills.len(), "skills": skills }))
+    pub(crate) fn tool_skill_list(&self, args: Value) -> Result<Value> {
+        Ok(paginate_skill_list(self.skills.all(), &args))
     }
 
     /// `skill_search` — search the remote skill registries (clawhub / skillhub
@@ -8932,6 +8980,55 @@ mod tests {
         provider::{Message, MessageContent, Role},
         skill::SkillRegistry,
     };
+
+    #[test]
+    fn skill_list_filters_and_paginates_results() {
+        let mut skills = SkillRegistry::new();
+        skills.insert(crate::skill::SkillManifest {
+            name: "douyin-publish".to_owned(),
+            description: Some("Publish videos to Douyin".to_owned()),
+            version: None,
+            requires_rsclaw: None,
+            tools: vec![],
+            extra: Default::default(),
+            dir: Default::default(),
+            prompt: String::new(),
+        });
+        skills.insert(crate::skill::SkillManifest {
+            name: "weather".to_owned(),
+            description: Some("Forecast lookup".to_owned()),
+            version: None,
+            requires_rsclaw: None,
+            tools: vec![],
+            extra: Default::default(),
+            dir: Default::default(),
+            prompt: String::new(),
+        });
+        skills.insert(crate::skill::SkillManifest {
+            name: "douyin-comments".to_owned(),
+            description: Some("Read Douyin comments".to_owned()),
+            version: None,
+            requires_rsclaw: None,
+            tools: vec![],
+            extra: Default::default(),
+            dir: Default::default(),
+            prompt: String::new(),
+        });
+        let result = paginate_skill_list(
+            skills.all(),
+            &json!({"query": "douyin", "limit": 1, "offset": 1}),
+        );
+
+        assert_eq!(result["count"], 3);
+        assert_eq!(result["matched"], 2);
+        assert_eq!(result["offset"], 1);
+        assert_eq!(result["limit"], 1);
+        assert_eq!(result["has_more"], false);
+        assert_eq!(result["next_offset"], Value::Null);
+        let skills = result["skills"].as_array().unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0]["name"], "douyin-publish");
+    }
 
     #[test]
     fn resolve_or_create_collection_creates_then_reuses_by_name() {
