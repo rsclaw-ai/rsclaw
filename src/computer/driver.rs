@@ -352,10 +352,7 @@ impl VlmDriver<'_> {
                 // Terminal actions short-circuit the whole loop.
                 match pa.action_type.as_str() {
                     "finished" => {
-                        let content = pa
-                            .raw_args
-                            .get("content")
-                            .cloned()
+                        let content = terminal_action_text(&pa, &["content"])
                             .unwrap_or_else(|| pa.thought.clone());
                         let verified = verify_finished_claim(
                             self.provider.as_ref(),
@@ -391,10 +388,7 @@ impl VlmDriver<'_> {
                         continue;
                     }
                     "call_user" => {
-                        let reason = pa
-                            .raw_args
-                            .get("content")
-                            .cloned()
+                        let reason = terminal_action_text(&pa, &["reason", "content"])
                             .unwrap_or_else(|| pa.thought.clone());
                         info!(steps, "VlmDriver: call_user");
                         let step = Step {
@@ -706,6 +700,13 @@ fn summarize_parsed(p: &ParsedAction) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("{}({pretty_args})", p.action_type)
+}
+
+fn terminal_action_text(p: &ParsedAction, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| p.raw_args.get(*key))
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
 }
 
 async fn verify_finished_claim(
@@ -1111,6 +1112,26 @@ mod tests {
             Action::Type { text } => assert_eq!(text, "hello world"),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn terminal_action_text_prefers_reason_for_call_user() {
+        let p = pa("call_user", &[("reason", "login required")]);
+
+        assert_eq!(
+            terminal_action_text(&p, &["reason", "content"]).as_deref(),
+            Some("login required")
+        );
+    }
+
+    #[test]
+    fn terminal_action_text_keeps_content_for_finished() {
+        let p = pa("finished", &[("content", "sent")]);
+
+        assert_eq!(
+            terminal_action_text(&p, &["content"]).as_deref(),
+            Some("sent")
+        );
     }
 
     #[test]

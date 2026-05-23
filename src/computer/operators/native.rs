@@ -634,9 +634,13 @@ end tell"#
                 }
                 Ok(open_out) => {
                     let open_stderr = String::from_utf8_lossy(&open_out.stderr).trim().to_owned();
-                    Err(format!("osascript failed: {stderr}; open -a failed: {open_stderr}"))
+                    Err(format!(
+                        "osascript failed: {stderr}; open -a failed: {open_stderr}"
+                    ))
                 }
-                Err(e) => Err(format!("osascript failed: {stderr}; open -a spawn failed: {e}")),
+                Err(e) => Err(format!(
+                    "osascript failed: {stderr}; open -a spawn failed: {e}"
+                )),
             }
         }
         Err(e) => Err(format!("osascript spawn failed: {e}")),
