@@ -58,7 +58,7 @@
     ],
     "longDescription": "RsClaw AI Agent Engine - manage intelligent agents, model routing, and multi-channel messaging.",
     "macOS": {
-      "entitlements": null,
+      "entitlements": "entitlements.plist",
       "exceptionDomain": "",
       "frameworks": [],
       "providerShortName": "K87X8CQ78Y",
