@@ -55,9 +55,17 @@ pub async fn handle_streaming_rpc(
                 .invoke_streaming(target, &req.method, params, principal)
                 .await
             {
-                Ok(event_rx) => {
+                Ok((request_id, node_id, event_rx)) => {
+                    let guard = crate::a2a::relay::RelayStreamGuard::new(
+                        state.relay_hub.clone(),
+                        node_id,
+                        request_id,
+                    );
                     let stream = tokio_stream::wrappers::BroadcastStream::new(event_rx)
                         .filter_map(move |result| {
+                            // Force capture so guard.Drop fires when the SSE
+                            // stream is dropped (consumer disconnect).
+                            let _ = &guard;
                             let req_id = req_id.clone();
                             async move {
                                 match result {

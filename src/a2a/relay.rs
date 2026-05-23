@@ -255,16 +255,19 @@ impl RelayHub {
         }
     }
 
-    /// Send a streaming Request to the spoke that owns `target` and return a
-    /// broadcast receiver that will receive wire-event `Value`s as
-    /// `RelayFrame::Event` frames arrive from the spoke.
+    /// Send a streaming Request to the spoke that owns `target`. Returns the
+    /// relay `request_id`, the routed `node_id`, and a broadcast receiver
+    /// that will receive wire-event `Value`s as `RelayFrame::Event` frames
+    /// arrive from the spoke. The caller is responsible for cleanup via
+    /// `RelayStreamGuard` so that SSE consumer disconnects propagate a
+    /// Cancel frame to the spoke.
     pub async fn invoke_streaming(
         &self,
         target: &str,
         method: &str,
         params: Value,
         principal: &str,
-    ) -> Result<broadcast::Receiver<Value>> {
+    ) -> Result<(String, String, broadcast::Receiver<Value>)> {
         let route = self
             .route_for(target)
             .ok_or_else(|| anyhow!("no live relay route for {target}"))?;
@@ -288,7 +291,24 @@ impl RelayHub {
             self.stream_pending.remove(&request_id);
             anyhow::bail!("relay send to node '{}' failed: {e}", route.node_id);
         }
-        Ok(event_rx)
+        Ok((request_id, route.node_id, event_rx))
+    }
+
+    /// Send a `Cancel` frame for `request_id` to the spoke at `node_id`.
+    /// Used by `RelayStreamGuard` when the hub-side SSE consumer disconnects
+    /// before the spoke sends its terminal Response. No-op if the node is
+    /// no longer connected.
+    fn send_cancel_to(&self, node_id: &str, request_id: &str) {
+        let Some(conn) = self.connections.get(node_id) else {
+            return;
+        };
+        let frame = RelayFrame::Cancel {
+            request_id: request_id.to_owned(),
+            task_id: None,
+        };
+        if let Ok(s) = serde_json::to_string(&frame) {
+            let _ = conn.tx.send(AxumWsMessage::Text(s.into()));
+        }
     }
 
     /// Remove and drop the stream entry for `request_id`. Returns `true` if
@@ -306,6 +326,44 @@ impl RelayHub {
             .get(request_id)
             .map(|tx| tx.send(value).unwrap_or(0))
             .unwrap_or(0)
+    }
+}
+
+/// Lifecycle guard for hub-side relay streams. Held by the SSE response so
+/// that when the consumer disconnects (the stream is dropped), we forward a
+/// `Cancel` frame to the spoke and drop the `stream_pending` entry. If the
+/// stream finished normally the spoke already removed `stream_pending` via
+/// its terminal `Response`, so the Drop is a no-op.
+pub struct RelayStreamGuard {
+    relay_hub: std::sync::Arc<RelayHub>,
+    node_id: String,
+    request_id: String,
+}
+
+impl RelayStreamGuard {
+    pub fn new(
+        relay_hub: std::sync::Arc<RelayHub>,
+        node_id: String,
+        request_id: String,
+    ) -> Self {
+        Self {
+            relay_hub,
+            node_id,
+            request_id,
+        }
+    }
+}
+
+impl Drop for RelayStreamGuard {
+    fn drop(&mut self) {
+        // complete_streaming returns true only if the entry was still
+        // present — i.e. the spoke had not yet sent its terminal Response.
+        // That's exactly the SSE-disconnected-early case, so cancel the
+        // remote task.
+        if self.relay_hub.complete_streaming(&self.request_id) {
+            self.relay_hub
+                .send_cancel_to(&self.node_id, &self.request_id);
+        }
     }
 }
 
@@ -518,27 +576,6 @@ async fn handle_hub_frame(state: &AppState, node: &A2aRelayNodeRuntime, frame: R
             if state.relay_hub.forward_stream_event(&request_id, result) == 0 {
                 debug!(request_id, "relay event for unknown stream");
             }
-        }
-        RelayFrame::Cancel { request_id, .. } => {
-            // Forward the cancel to the spoke that owns this streaming request.
-            let frame = RelayFrame::Cancel {
-                request_id: request_id.clone(),
-                task_id: None,
-            };
-            let msg = match serde_json::to_string(&frame) {
-                Ok(s) => AxumWsMessage::Text(s.into()),
-                Err(e) => {
-                    warn!(error = %e, "failed to serialize cancel frame");
-                    return;
-                }
-            };
-            // Send to every connected node — the spoke that owns the stream
-            // will recognise the request_id and cancel its local task.
-            for conn in state.relay_hub.connections.iter() {
-                let _ = conn.tx.send(msg.clone());
-            }
-            // Drop the stream entry if present.
-            state.relay_hub.complete_streaming(&request_id);
         }
         RelayFrame::Pong { .. } => {}
         other => debug!(node = %node.node_id, frame = ?other, "hub ignored relay frame"),
@@ -959,5 +996,78 @@ mod tests {
 
         let response = invoke.await.unwrap().unwrap();
         assert_eq!(response.result.unwrap()["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn drop_guard_sends_cancel_when_stream_drops_early() {
+        let hub = std::sync::Arc::new(RelayHub::new());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        hub.register_connection("a3", tx, 1);
+        hub.apply_route_lease("a3", &["a3/main".to_owned()], 10_000, 1)
+            .unwrap();
+
+        let (request_id, node_id, _event_rx) = hub
+            .invoke_streaming(
+                "a3/main",
+                "SendStreamingMessage",
+                serde_json::json!({"metadata": {"agentId": "main"}}),
+                "node:a1",
+            )
+            .await
+            .unwrap();
+        assert_eq!(node_id, "a3");
+
+        // Drain the Request frame.
+        let _req = rx.recv().await.unwrap();
+
+        // Simulate SSE consumer disconnect: drop the guard.
+        let guard = RelayStreamGuard::new(hub.clone(), node_id, request_id.clone());
+        drop(guard);
+
+        let msg = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("cancel frame should arrive")
+            .unwrap();
+        let AxumWsMessage::Text(text) = msg else {
+            panic!("expected text relay frame");
+        };
+        let frame: RelayFrame = serde_json::from_str(&text).unwrap();
+        match frame {
+            RelayFrame::Cancel { request_id: rid, .. } => assert_eq!(rid, request_id),
+            other => panic!("expected Cancel, got {other:?}"),
+        }
+
+        // stream_pending entry should be cleaned up.
+        assert!(!hub.stream_pending.contains_key(&request_id));
+    }
+
+    #[tokio::test]
+    async fn drop_guard_no_cancel_after_normal_completion() {
+        let hub = std::sync::Arc::new(RelayHub::new());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        hub.register_connection("a3", tx, 1);
+        hub.apply_route_lease("a3", &["a3/main".to_owned()], 10_000, 1)
+            .unwrap();
+
+        let (request_id, node_id, _event_rx) = hub
+            .invoke_streaming(
+                "a3/main",
+                "SendStreamingMessage",
+                serde_json::json!({"metadata": {"agentId": "main"}}),
+                "node:a1",
+            )
+            .await
+            .unwrap();
+        let _req = rx.recv().await.unwrap();
+
+        // Simulate the spoke finishing: terminal Response removes stream_pending.
+        assert!(hub.complete_streaming(&request_id));
+
+        // Now drop the guard — should be a no-op (no Cancel frame emitted).
+        let guard = RelayStreamGuard::new(hub.clone(), node_id, request_id.clone());
+        drop(guard);
+
+        let no_msg = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
+        assert!(no_msg.is_err(), "no Cancel frame expected after normal completion");
     }
 }
