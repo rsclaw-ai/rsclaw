@@ -3579,7 +3579,7 @@ impl AgentRuntime {
             if !candidates.is_empty() {
                 let mem_clone = Arc::clone(mem);
                 let providers = Arc::clone(&self.providers);
-                let primary_model = self.resolve_model_name();
+                let model = self.resolve_flash_model_name();
                 // Crystallized skills go to the global skill directory so the
                 // existing load_skills() call sites pick them up on next reload.
                 let skills_dir = crate::skill::default_global_skills_dir()
@@ -3592,7 +3592,7 @@ impl AgentRuntime {
                             &doc_id,
                             &scope,
                             &providers,
-                            &primary_model,
+                            &model,
                             &skills_dir,
                         )
                         .await
@@ -3667,11 +3667,11 @@ impl AgentRuntime {
             if crate::agent::memory_extractor::salience_gate(text) {
                 let mem_clone = Arc::clone(mem);
                 let providers = Arc::clone(&self.providers);
-                // Use the primary model: the flash endpoint (/fastshot) returns
-                // empty output for these structured-extraction prompts. Bounded
-                // by the salience/correction gates + the cap-4 in-flight limit,
-                // so the cost stays contained. Revisit flash if /fastshot is fixed.
-                let model = self.resolve_model_name();
+                // Use the flash model for structured extraction — the prompt
+                // is a templated JSON-array instruction that doesn't need
+                // primary-tier reasoning. Falls back to primary when no flash
+                // model is configured.
+                let model = self.resolve_flash_model_name();
                 let scope = doc_scope.clone();
                 let user_text = text.to_owned();
                 tokio::spawn(async move {
@@ -3690,11 +3690,7 @@ impl AgentRuntime {
             if crate::agent::memory_extractor::correction_gate(text) {
                 let mem_clone = Arc::clone(mem);
                 let providers = Arc::clone(&self.providers);
-                // Use the primary model: the flash endpoint (/fastshot) returns
-                // empty output for these structured-extraction prompts. Bounded
-                // by the salience/correction gates + the cap-4 in-flight limit,
-                // so the cost stays contained. Revisit flash if /fastshot is fixed.
-                let model = self.resolve_model_name();
+                let model = self.resolve_flash_model_name();
                 let scope = doc_scope.clone();
                 let user_text = text.to_owned();
                 tokio::spawn(async move {
@@ -3713,7 +3709,7 @@ impl AgentRuntime {
             if let Some(failure_trace) = ctx.loop_failure.clone() {
                 let mem_clone = Arc::clone(mem);
                 let providers = Arc::clone(&self.providers);
-                let model = self.resolve_model_name();
+                let model = self.resolve_flash_model_name();
                 let scope = doc_scope.clone();
                 let user_text = text.to_owned();
                 tokio::spawn(async move {
@@ -3998,7 +3994,7 @@ impl AgentRuntime {
         // Snapshot the data the background task needs — agent_loop's stack
         // frame goes away as soon as we return.
         let providers = Arc::clone(&self.providers);
-        let primary_model = self.resolve_model_name();
+        let model = self.resolve_flash_model_name();
         let skills_dir = crate::skill::default_global_skills_dir()
             .unwrap_or_else(|| crate::config::loader::base_dir().join("skills"));
         let user_text = ctx.user_text.clone();
@@ -4019,7 +4015,7 @@ impl AgentRuntime {
                 &metrics,
                 signature,
                 &providers,
-                &primary_model,
+                &model,
                 &skills_dir,
             )
             .await

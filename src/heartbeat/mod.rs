@@ -450,7 +450,7 @@ impl HeartbeatRunner {
                     return Ok(());
                 }
             };
-            let primary_model = crate::agent::runtime::resolve_primary_model_for(
+            let primary_model = crate::agent::runtime::resolve_flash_model_for(
                 &handle.config,
                 &deps.config.agents.defaults,
             )

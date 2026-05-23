@@ -212,8 +212,10 @@ pub fn build_distill_prompt(cluster: &[MemoryDoc]) -> String {
 
     prompt.push_str(
         "=== END OF MEMORIES ===\n\n\
-         Produce ONLY the SKILL.md content — frontmatter + body. \
-         No explanation, no commentary outside the file.",
+         Your response MUST start with exactly `---` on its own line — the frontmatter \
+         fence. If you do not start with `---`, the output will be rejected. \
+         Produce ONLY the SKILL.md content (frontmatter + body). \
+         No explanation, no commentary, no code fences surrounding the output.",
     );
 
     prompt
@@ -418,6 +420,50 @@ pub fn validate_skill_md(content: &str) -> Result<(String, String)> {
     Ok((name, description))
 }
 
+/// Check that the SKILL.md body is substantial enough to be useful, and
+/// hasn't accidentally leaked prompt instructions verbatim.
+pub(crate) fn validate_skill_body(content: &str) -> Result<()> {
+    // Find the closing frontmatter fence and extract everything after it.
+    let trimmed = content.trim_start();
+    let rest = trimmed
+        .strip_prefix("---\n")
+        .or_else(|| trimmed.strip_prefix("---\r\n"))
+        .ok_or_else(|| anyhow!("SKILL.md must start with '---' frontmatter fence"))?;
+    let Some(close_at) = rest.find("\n---") else {
+        bail!("SKILL.md frontmatter has no closing '---'");
+    };
+    let body = rest[(close_at + 4)..].trim();
+
+    // Must have at least 5 substantive lines.
+    if body.lines().count() < 5 {
+        bail!(
+            "SKILL.md body too short ({} lines, need >= 5)",
+            body.lines().count()
+        );
+    }
+
+    // Guard against prompt-instruction leakage: the model regurgitating
+    // the prompt itself instead of synthesizing content.
+    if body.contains("skill-engineering expert")
+        || body.contains("=== MEMORY DOCUMENTS ===")
+        || body.contains("=== END OF MEMORIES ===")
+    {
+        bail!("SKILL.md body contains leaked prompt text");
+    }
+
+    Ok(())
+}
+
+/// Combined format + content validation. Returns `Ok(())` when the SKILL.md
+/// passes both `validate_skill_md` (frontmatter) and `validate_skill_body`
+/// (content quality). The name+description from `validate_skill_md` is
+/// discarded — callers that need them call `validate_skill_md` directly.
+pub(crate) fn validate_skill_md_and_body(content: &str) -> Result<()> {
+    validate_skill_md(content)?;
+    validate_skill_body(content)?;
+    Ok(())
+}
+
 /// Crystallize a single seed memory: find its cluster, distill, validate,
 /// write, and tag. Encapsulates the full pipeline so the runtime online
 /// path (Loop B) and the meditation periodic phase can share one
@@ -493,7 +539,9 @@ pub async fn crystallize_one(
             return Ok(None);
         }
     };
-    let skill_md = match distill_with_llm(&prompt, provider_arc, model_id.to_owned()).await {
+    let skill_md = match distill_with_llm(&prompt, Arc::clone(&provider_arc), model_id.to_owned())
+        .await
+    {
         Ok(md) => md,
         Err(e) => {
             tracing::warn!("crystallization: LLM distillation failed: {e:#}");
@@ -501,11 +549,45 @@ pub async fn crystallize_one(
         }
     };
 
-    // 6. Validate before writing.
-    if let Err(e) = validate_skill_md(&skill_md) {
-        tracing::warn!("crystallization: invalid SKILL.md output: {e:#}");
-        return Ok(None);
-    }
+    // 6. Validate before writing. On validation failure, retry once with
+    // a fix-up prompt to catch near-misses (missing '---' fence, YAML syntax
+    // error, too-short output, prompt leakage).
+    let skill_md = match validate_skill_md_and_body(&skill_md) {
+        Ok(_) => skill_md,
+        Err(first_err) => {
+            tracing::warn!(
+                n = ids.len(),
+                "crystallization: first attempt failed ({first_err:#}), retrying"
+            );
+            let fixup_prompt = format!(
+                "Your previous output was rejected because: {first_err}\n\n\
+                 Fix the issue and output the complete SKILL.md again. \
+                 Make sure: (1) the first line is exactly `---`, \
+                 (2) the YAML frontmatter has `name:` and `description:` fields, \
+                 (3) the body has at least 5 substantive lines, and \
+                 (4) the output contains no prompt instructions, only the skill content.\n\n\
+                 Original task:\n{prompt}"
+            );
+            match distill_with_llm(&fixup_prompt, Arc::clone(&provider_arc), model_id.to_owned())
+                .await
+            {
+                Ok(second_md) => match validate_skill_md_and_body(&second_md) {
+                    Ok(_) => second_md,
+                    Err(second_err) => {
+                        tracing::warn!(
+                            n = ids.len(),
+                            "crystallization: retry also failed ({second_err:#}), giving up"
+                        );
+                        return Ok(None);
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("crystallization: retry LLM call failed: {e:#}");
+                    return Ok(None);
+                }
+            }
+        }
+    };
 
     // 7. Derive slug + write.
     let fallback = format!("memory-{}", &doc_id[..8.min(doc_id.len())]);
