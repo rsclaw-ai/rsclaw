@@ -358,13 +358,54 @@ fn scroll_amount(dir: ScrollDir, clicks: i32) -> (Axis, i32) {
     }
 }
 
-/// Type literal text. If the text ends with `\n`, strip the newline
-/// and submit via `Return` to mirror NutJSOperator semantics.
+/// Decode the common JSON / Python-string escape sequences a VLM is likely
+/// to emit inside a `type(content='…')` call. The VLM action parser
+/// (`computer/parser.rs:303`) intentionally preserves backslash escapes
+/// verbatim — the "operator decides what to do with the literal \n" —
+/// which means without this pass `type(content='hi\n')` lands as the
+/// six chars `h i \ n` typed into whatever app is focused (e.g. WeChat
+/// shows literal `hi\n` instead of sending "hi" + Enter).
+///
+/// Recognised escapes: `\n` `\t` `\r` `\\` `\'` `\"` `\0`. Unknown
+/// escape (`\x`) is preserved verbatim so a content string containing
+/// a real backslash doesn't get silently mangled.
+fn decode_string_escapes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            Some('\'') => out.push('\''),
+            Some('"') => out.push('"'),
+            Some('0') => out.push('\0'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Type literal text. If the text ends with `\n` (real or escaped), strip
+/// the newline and submit via `Return` to mirror NutJSOperator semantics.
+/// Decodes common backslash escapes first so `type(content='hi\n')` from
+/// the VLM doesn't land as a literal `hi\n` in the focused window.
 fn type_text(enigo: &mut Enigo, text: &str) -> Result<ActionOutput> {
-    let (body, submit) = if let Some(stripped) = text.strip_suffix('\n') {
-        (stripped, true)
+    let decoded = decode_string_escapes(text);
+    let submit = decoded.ends_with('\n');
+    let body: &str = if submit {
+        decoded.strip_suffix('\n').unwrap_or(&decoded)
     } else {
-        (text, false)
+        &decoded
     };
 
     if !body.is_empty() {
@@ -522,7 +563,8 @@ async fn activate_app(app: &str) -> Result<ActionOutput> {
 }
 
 fn activate_app_blocking(app: &str) -> ActionOutput {
-    if cfg!(target_os = "macos") {
+    #[cfg(target_os = "macos")]
+    {
         let mut errors = Vec::new();
         for candidate in macos_app_candidates(app) {
             match activate_macos_app(&candidate) {
@@ -530,8 +572,15 @@ fn activate_app_blocking(app: &str) -> ActionOutput {
                 Err(e) => errors.push(format!("{candidate}: {e}")),
             }
         }
-        ActionOutput::err(format!("activate_app failed: {}", errors.join("; ")))
-    } else if cfg!(target_os = "windows") {
+        return ActionOutput::err(format!("activate_app failed: {}", errors.join("; ")));
+    }
+    #[cfg(not(target_os = "macos"))]
+    activate_app_blocking_non_macos(app)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn activate_app_blocking_non_macos(app: &str) -> ActionOutput {
+    if cfg!(target_os = "windows") {
         // PowerShell pipeline: enumerate every process whose name
         // matches and hand its main window to SetForegroundWindow.
         // TODO(v2): replace with `windows` crate EnumWindows + per-PID
@@ -554,9 +603,15 @@ fn activate_app_blocking(app: &str) -> ActionOutput {
             r#"Add-Type -Name W -Namespace N -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);'; Get-Process | Where-Object {{$_.ProcessName -like '*{}*'}} | ForEach-Object {{ if ($_.MainWindowHandle -ne 0) {{ [N.W]::SetForegroundWindow($_.MainWindowHandle) }} }}"#,
             escaped
         );
-        match Command::new("powershell")
-            .args(["-NoProfile", "-Command", &ps])
-            .output()
+        #[allow(unused_mut)]
+        let mut ps_cmd = Command::new("powershell");
+        ps_cmd.args(["-NoProfile", "-Command", &ps]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            ps_cmd.creation_flags(0x08000000);
+        }
+        match ps_cmd.output()
         {
             Ok(out) if out.status.success() => ActionOutput::ok(),
             Ok(out) => {
@@ -712,5 +767,27 @@ mod tests {
         assert_eq!(scroll_amount(ScrollDir::Down, 3), (Axis::Vertical, 3));
         assert_eq!(scroll_amount(ScrollDir::Left, 2), (Axis::Horizontal, -2));
         assert_eq!(scroll_amount(ScrollDir::Right, 2), (Axis::Horizontal, 2));
+    }
+
+    #[test]
+    fn decode_string_escapes_handles_common_sequences() {
+        // The VLM parser preserves \n etc. verbatim — type_text must decode
+        // before driving enigo, else WeChat etc. shows literal `hi\n`.
+        assert_eq!(decode_string_escapes(r"hi\n"), "hi\n");
+        assert_eq!(decode_string_escapes(r"tab\there"), "tab\there");
+        assert_eq!(decode_string_escapes(r"crlf\r\n"), "crlf\r\n");
+        assert_eq!(decode_string_escapes(r"quote\'mark"), "quote'mark");
+        assert_eq!(decode_string_escapes(r#"dquote\""#), "dquote\"");
+        assert_eq!(decode_string_escapes(r"slash\\path"), r"slash\path");
+        // Unknown escape preserved verbatim (don't silently mangle a
+        // legitimate backslash followed by an unrecognised char).
+        assert_eq!(decode_string_escapes(r"unknown\x"), r"unknown\x");
+        // Trailing lone backslash also preserved.
+        assert_eq!(decode_string_escapes(r"trail\"), r"trail\");
+        // Plain text unchanged.
+        assert_eq!(
+            decode_string_escapes("正式版即将上线，敬请期待。"),
+            "正式版即将上线，敬请期待。"
+        );
     }
 }
