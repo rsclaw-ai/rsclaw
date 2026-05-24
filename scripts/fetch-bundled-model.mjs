@@ -58,9 +58,16 @@ try {
   const buf = Buffer.from(await resp.arrayBuffer());
   fs.writeFileSync(zipPath, buf);
 
-  // bsdtar (the `tar` shipped with Windows 10+, macOS, and most Linux distros)
-  // handles zip via libarchive. Avoids depending on `unzip` on Windows.
-  execSync(`tar -xf "${zipPath}" -C "${extractDir}"`, { stdio: 'inherit' });
+  // Extract zip: prefer PowerShell Expand-Archive on Windows (tar is unreliable),
+  // fall back to bsdtar on macOS/Linux.
+  if (process.platform === 'win32') {
+    execSync(
+      `powershell -NoProfile -Command "Expand-Archive -Path '${zipPath}' -DestinationPath '${extractDir}' -Force"`,
+      { stdio: 'inherit' }
+    );
+  } else {
+    execSync(`tar -xf "${zipPath}" -C "${extractDir}"`, { stdio: 'inherit' });
+  }
 
   const findFile = (dir, name) => {
     for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {

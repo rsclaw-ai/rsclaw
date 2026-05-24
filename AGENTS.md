@@ -229,6 +229,11 @@ it work") require constant clarification.
 - Config fields: camelCase in JSON5, snake_case in Rust via #[serde(rename_all = "camelCase")].
 - Secrets: SecretOrString — plain string or { source: "env", id: "VAR_NAME" }.
 - Channel handler order: group policy → DM policy (pairing/allowlist) → per-user queue → agent dispatch.
+- Windows command spawns MUST use `creation_flags(0x08000000)` (CREATE_NO_WINDOW) to
+  prevent console windows from flashing. For `std::process::Command`, wrap with a
+  `hide_window()` helper or add a `#[cfg(windows)]` block. Exceptions: `cmd /C start`,
+  `explorer`, and other intentionally visible windows must be explicitly justified.
+  In Tauri code (`ui/src-tauri/`), always use the existing `hide_window()` helper.
 - New WebSocket events MUST be registered in events.rs before use.
 - Never modify Cargo.lock unless explicitly upgrading a dependency.
 - NEVER add `Co-Authored-By:` lines to commits (memory rule).

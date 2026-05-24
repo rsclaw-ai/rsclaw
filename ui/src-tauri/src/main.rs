@@ -1492,23 +1492,52 @@ fn uninstall_plugin(name: String) -> Result<String, String> {
 /// Install an external tool binary (chrome/ffmpeg/node/python/opencode/
 /// claude-code/...) via sidecar. There is no uninstall — tools are host
 /// binaries; removal is manual. `force` reinstalls even if present.
+///
+/// Fire-and-forget: spawns `rsclaw tools install <name> [--force]` detached
+/// and returns immediately. The frontend polls `get_tool_install_status`
+/// against `~/.rsclaw/tools/<name>/` to detect completion. We deliberately
+/// don't `.output()` here — the CLI downloads can take 10s–10min and a
+/// blocking Tauri command leaves the UI with no progress feedback and looks
+/// hung (which is the regression this commit fixes).
 #[tauri::command]
 fn install_tool(name: String, force: Option<bool>) -> Result<String, String> {
-    let out = if force.unwrap_or(false) {
-        run_rsclaw_command(&["tools", "install", &name, "--force"])
-    } else {
-        run_rsclaw_command(&["tools", "install", &name])
-    }?;
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
 
-    if name != "all" && !is_local_tool_installed(&name) {
-        return Err(format!(
-            "{} install command finished, but no local tool binary was detected under {}",
-            name,
-            rsclaw_base_dir().join("tools").display()
-        ));
+    let sidecar = exe_dir.as_ref().map(|dir| {
+        dir.join(if cfg!(target_os = "windows") {
+            "rsclaw.exe"
+        } else {
+            "rsclaw"
+        })
+    });
+
+    let mut args: Vec<&str> = vec!["tools", "install", &name];
+    if force.unwrap_or(false) {
+        args.push("--force");
     }
 
-    Ok(out)
+    let spawn_result = match sidecar.as_ref().filter(|p| p.exists()) {
+        Some(path) => hide_window(
+            std::process::Command::new(path)
+                .args(&args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        )
+        .spawn(),
+        None => hide_window(
+            std::process::Command::new("rsclaw")
+                .args(&args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        )
+        .spawn(),
+    };
+
+    spawn_result
+        .map(|_| format!("install of {name} started in background"))
+        .map_err(|e| format!("failed to spawn rsclaw tools install: {e}"))
 }
 
 #[tauri::command]

@@ -134,15 +134,13 @@ function StatusPage() {
   const logBoxRef = useRef<HTMLDivElement>(null);
 
   const fetchData = useCallback(async () => {
+    // `/api/v1/health` is intentionally minimal — it only confirms reachability
+    // (returns `{status:"ok"}`) and is unauthenticated, so it deliberately does
+    // NOT leak version/port/uptime (CVE-fingerprinting hardening, R4 review I2).
+    // All rich fields live on the auth-gated `/api/v1/status`.
     try {
-      const healthData = await getHealth();
-      setHealth({
-        running: true,
-        version: healthData.version || "unknown",
-        port: healthData.port || 18888,
-        uptime: healthData.uptime || "",
-        memory: healthData.memory || "",
-      });
+      await getHealth();
+      setHealth((h) => ({ ...h, running: true }));
     } catch {
       setHealth({ running: false });
     }
@@ -152,9 +150,14 @@ function StatusPage() {
       setAgents(statusData.agents || []);
       setChannels(statusData.channels || []);
       setSessions(statusData.sessions || 0);
-      if (statusData.memory) {
-        setHealth((h) => ({ ...h, memory: statusData.memory }));
-      }
+      setHealth((h) => ({
+        ...h,
+        running: true,
+        version: statusData.version || "unknown",
+        port: statusData.port || 18888,
+        uptime: statusData.uptime || "",
+        memory: statusData.memory || h.memory || "",
+      }));
     } catch {
       // status endpoint may not be available
     }
@@ -3252,6 +3255,22 @@ function TauriConfigPageInner() {
             </div>
             <div style={fieldRow}>
               <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u89C6\u89C9\u6A21\u578B" : "Vision Model"}</div>
+                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.vision ({zh ? "\u7559\u7A7A\u5219\u4F7F\u7528\u4E3B\u6A21\u578B\uFF1Bcomputer_use \u4F1A\u4F18\u5148\u4F7F\u7528\u6B64\u6A21\u578B" : "empty \u2192 use main model; computer_use prefers this"})</div>
+              </div>
+              <input
+                style={{ ...fInput, minWidth: 300 }}
+                type="text"
+                placeholder={zh ? "\u4F8B\u5982 qwen/qwen-3-vl-plus" : "e.g. qwen/qwen-3-vl-plus"}
+                value={getVal("agents.defaults.model.vision", "")}
+                onChange={(e) => {
+                  const v = (e.target.value || "").trim();
+                  updateConfig("agents.defaults.model.vision", v || undefined);
+                }}
+              />
+            </div>
+            <div style={fieldRow}>
+              <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5907\u7528\u6A21\u578B" : "Fallback Models"} <span style={{ color: V.t3, fontWeight: 400 }}>{zh ? "(\u9017\u53F7\u5206\u9694)" : "(comma separated)"}</span></div>
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.fallbacks</div>
               </div>
@@ -4059,65 +4078,35 @@ function TauriConfigPageInner() {
 
         {/* ══ A2A TAB ══ */}
         {/* gateway.a2a = inbound auth for /api/v1/a2a (this instance accepts).
-            agents.a2a   = outbound peers exposed as agent_<id> tools.
-            authTokens / apiKeys allow plain strings or { source:"env", id:"NAME" }
-            refs. We edit strings as <input type=password>; object refs render
-            read-only with a "convert to string" affordance so we never silently
-            drop a user-authored env binding. */}
+            agents.a2a   = outbound peers exposed as agent_<id> tools. */}
         {activeTab === "a2a" && (() => {
-          // Normalize a single auth entry into { kind, display, raw }. We round-trip
-          // env-ref objects through `raw` so save preserves them untouched.
-          const describeSecret = (v: any): { kind: "string" | "envRef" | "other"; display: string; isEnv: boolean } => {
-            if (typeof v === "string") return { kind: "string", display: v, isEnv: false };
-            if (v && typeof v === "object" && v.source === "env" && typeof v.id === "string") {
-              return { kind: "envRef", display: `\${${v.id}}`, isEnv: true };
-            }
-            return { kind: "other", display: JSON.stringify(v), isEnv: false };
+          // ── Clients (gateway.a2a.clients[]) — preferred named credentials ──
+          const clients: any[] = getVal("gateway.a2a.clients", []) as any[];
+          const clientArr = Array.isArray(clients) ? clients : [];
+          const setClientField = (i: number, field: string, value: any) => {
+            updateConfig("gateway.a2a.clients", clientArr.map((c, idx) => idx === i ? { ...c, [field]: value } : c));
+          };
+          const removeClient = (i: number) => updateConfig("gateway.a2a.clients", clientArr.filter((_, idx) => idx !== i));
+          const addClient = () => {
+            const existing = new Set(clientArr.map((c) => c?.id).filter(Boolean));
+            let n = 1;
+            while (existing.has(`client-${n}`)) n++;
+            updateConfig("gateway.a2a.clients", [...clientArr, { id: `client-${n}`, secret: "" }]);
           };
 
-          const renderSecretList = (path: string, labelCN: string, labelEN: string, hint: string, placeholder: string) => {
-            const list: any[] = getVal(path, []) as any[];
-            const arr = Array.isArray(list) ? list : [];
-            const setAt = (i: number, v: any) => updateConfig(path, arr.map((x, idx) => idx === i ? v : x));
-            const removeAt = (i: number) => updateConfig(path, arr.filter((_, idx) => idx !== i));
-            const append = () => updateConfig(path, [...arr, ""]);
-            return (
-              <div style={fcard}>
-                <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "11px 15px", background: V.bg3, borderBottom: `1px solid ${V.bd}` }}>
-                  <div style={{ flex: 1 }}>
-                    <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? labelCN : labelEN}</div>
-                    <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>{path}</div>
-                  </div>
-                  <button onClick={append} style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${V.gbrd}`, background: V.glo, color: V.green, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
-                    {zh ? "+ 添加" : "+ Add"}
-                  </button>
-                </div>
-                {arr.length === 0 ? (
-                  <div style={{ ...fieldRow, borderBottom: "none", color: V.t3, fontSize: 11 }}>{hint}</div>
-                ) : arr.map((entry, i) => {
-                  const desc = describeSecret(entry);
-                  const isLast = i === arr.length - 1;
-                  if (desc.kind === "string") {
-                    return (
-                      <div key={i} style={{ ...fieldRow, borderBottom: isLast ? "none" : "1px solid rgba(255,255,255,.03)" }}>
-                        <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, width: 22 }}>{`[${i}]`}</div>
-                        <input style={{ ...fInput, flex: 1, minWidth: 200 }} type="password" value={entry} placeholder={placeholder} onChange={(e) => setAt(i, e.target.value)} />
-                        <button onClick={() => removeAt(i)} style={{ padding: "5px 10px", borderRadius: 7, border: `1px solid ${V.rbrd}`, background: V.rlo, color: V.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "删除" : "Remove"}</button>
-                      </div>
-                    );
-                  }
-                  // envRef or other: render the literal display; the user can convert to a string to edit.
-                  return (
-                    <div key={i} style={{ ...fieldRow, borderBottom: isLast ? "none" : "1px solid rgba(255,255,255,.03)" }}>
-                      <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, width: 22 }}>{`[${i}]`}</div>
-                      <div style={{ flex: 1, fontFamily: V.mono, fontSize: 11, color: V.t2, padding: "7px 10px", background: V.bg4, border: `1px dashed ${V.bd2}`, borderRadius: 7 }}>{desc.display}</div>
-                      <button onClick={() => setAt(i, desc.isEnv ? desc.display : "")} style={{ padding: "5px 10px", borderRadius: 7, border: `1px solid ${V.bd2}`, background: V.bg4, color: V.t2, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "转为字符串" : "To string"}</button>
-                      <button onClick={() => removeAt(i)} style={{ padding: "5px 10px", borderRadius: 7, border: `1px solid ${V.rbrd}`, background: V.rlo, color: V.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "删除" : "Remove"}</button>
-                    </div>
-                  );
-                })}
-              </div>
-            );
+          // ── Relay (gateway.a2a.relay) ──
+          const relayMode = (getVal("gateway.a2a.relay.mode", "") as string) || "disabled";
+          const relayNodes: any[] = getVal("gateway.a2a.relay.nodes", []) as any[];
+          const relayNodeArr = Array.isArray(relayNodes) ? relayNodes : [];
+          const setRelayNodeField = (i: number, field: string, value: any) => {
+            updateConfig("gateway.a2a.relay.nodes", relayNodeArr.map((n, idx) => idx === i ? { ...n, [field]: value } : n));
+          };
+          const removeRelayNode = (i: number) => updateConfig("gateway.a2a.relay.nodes", relayNodeArr.filter((_, idx) => idx !== i));
+          const addRelayNode = () => {
+            const existing = new Set(relayNodeArr.map((n) => n?.nodeId).filter(Boolean));
+            let n = 1;
+            while (existing.has(`node-${n}`)) n++;
+            updateConfig("gateway.a2a.relay.nodes", [...relayNodeArr, { nodeId: `node-${n}`, token: "" }]);
           };
 
           // ── Peers (agents.a2a[]) ──
@@ -4154,20 +4143,45 @@ function TauriConfigPageInner() {
 
             {/* ── Inbound ── */}
             {secHead(zh ? "入站（gateway.a2a）" : "INBOUND (gateway.a2a)")}
-            {renderSecretList(
-              "gateway.a2a.authTokens",
-              "Bearer Tokens",
-              "Bearer Tokens",
-              zh ? "尚未设置；/api/v1/a2a 将拒绝所有 Bearer 请求（除非匹配 gateway.auth.token）" : "Not set; /api/v1/a2a will reject Bearer requests (unless matching gateway.auth.token).",
-              "${RSCLAW_A2A_BEARER}"
-            )}
-            {renderSecretList(
-              "gateway.a2a.apiKeys",
-              "API Keys (X-API-Key)",
-              "API Keys (X-API-Key)",
-              zh ? "尚未设置；/api/v1/a2a 不会接受 X-API-Key 请求" : "Not set; /api/v1/a2a will reject X-API-Key requests.",
-              "${RSCLAW_A2A_APIKEY}"
-            )}
+
+            {/* Named credentials — preferred. Each secret authenticates as its
+                `id` (the request principal). Accepted on Bearer or X-API-Key. */}
+            <div style={fcard}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "11px 15px", background: V.bg3, borderBottom: `1px solid ${V.bd}` }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "命名客户端凭据（推荐）" : "Named Client Credentials (preferred)"}</div>
+                  <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>gateway.a2a.clients</div>
+                  <div style={{ fontSize: 10, color: V.t3, marginTop: 2, lineHeight: 1.5 }}>{zh ? "每条 secret 验证后归属于其 id（请求主体）。Bearer 或 X-API-Key 都接受。" : "Each secret authenticates as its `id` (the request principal). Accepted on Bearer or X-API-Key."}</div>
+                </div>
+                <button onClick={addClient} style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${V.gbrd}`, background: V.glo, color: V.green, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
+                  {zh ? "+ 添加" : "+ Add"}
+                </button>
+              </div>
+              {clientArr.length === 0 ? (
+                <div style={{ ...fieldRow, borderBottom: "none", color: V.t3, fontSize: 11 }}>
+                  {zh ? "尚未配置任何命名凭据。" : "No named credentials configured."}
+                </div>
+              ) : clientArr.map((c, i) => {
+                const secret = c?.secret;
+                const secretIsString = typeof secret === "string" || secret === undefined || secret === null;
+                const isLast = i === clientArr.length - 1;
+                return (
+                  <div key={`client-${i}`} style={{ padding: "10px 15px", borderBottom: isLast ? "none" : `1px solid rgba(255,255,255,.03)`, display: "flex", flexDirection: "column", gap: 8 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, width: 28 }}>{`[${i}]`}</div>
+                      <input style={{ ...fInput, width: 200 }} type="text" placeholder={zh ? "id 例如 partner-acme" : "id e.g. partner-acme"} value={c?.id || ""} onChange={(e) => setClientField(i, "id", e.target.value)} />
+                      {secretIsString ? (
+                        <input style={{ ...fInput, flex: 1, minWidth: 200 }} type="password" placeholder="${RSCLAW_PARTNER_SECRET}" value={secret || ""} onChange={(e) => setClientField(i, "secret", e.target.value)} />
+                      ) : (
+                        <div style={{ flex: 1, fontFamily: V.mono, fontSize: 11, color: V.t2, padding: "7px 10px", background: V.bg4, border: `1px dashed ${V.bd2}`, borderRadius: 7 }}>{JSON.stringify(secret)}</div>
+                      )}
+                      <button onClick={() => removeClient(i)} style={{ padding: "5px 10px", borderRadius: 7, border: `1px solid ${V.rbrd}`, background: V.rlo, color: V.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "删除" : "Remove"}</button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
             <div style={fcard}>
               <div style={{ ...fieldRow, borderBottom: "none" }}>
                 <div style={{ flex: 1 }}>
@@ -4180,6 +4194,160 @@ function TauriConfigPageInner() {
                   onChange={(e) => updateConfig("gateway.a2a.maxBodyMb", parseInt(e.target.value) || 100)} />
               </div>
             </div>
+
+            {/* ── Relay overlay (gateway.a2a.relay) ──
+                Private rsclaw transport for outbound-only nodes that can't host
+                an inbound HTTP listener. Standard /api/v1/a2a remains
+                independent — relay credentials live in this block only. */}
+            {secHead(zh ? "私有中继（gateway.a2a.relay）" : "PRIVATE RELAY (gateway.a2a.relay)")}
+            <div style={{ padding: "0 0 14px", fontSize: 11, color: V.t2, lineHeight: 1.55 }}>
+              {zh
+                ? "rsclaw 私有 Hub/Spoke 覆盖网络。Hub 节点承载入站连接，Spoke 通过出站 WebSocket 连到 Hub 后可被路由到。标准 A2A（HTTP/SSE）依然走 /api/v1/a2a，与此独立。"
+                : "rsclaw private hub-and-spoke overlay. Hub nodes accept inbound connections; spokes dial out over WebSocket to be reachable. Standard A2A (HTTP/SSE) on /api/v1/a2a is independent."}
+            </div>
+            <div style={fcard}>
+              <div style={fieldRow}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "模式" : "Mode"}</div>
+                  <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>gateway.a2a.relay.mode</div>
+                </div>
+                <select style={{ ...fSelect, minWidth: 180 }} value={relayMode}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    updateConfig("gateway.a2a.relay.mode", v === "disabled" ? undefined : v);
+                  }}>
+                  <option value="disabled">disabled {zh ? "— 关闭中继" : "— relay off"}</option>
+                  <option value="hub">hub {zh ? "— 承载 spoke 连接" : "— accept spokes"}</option>
+                  <option value="spoke">spoke {zh ? "— 主动连到 hub" : "— dial hub"}</option>
+                </select>
+              </div>
+
+              {relayMode === "hub" && (
+                <>
+                  <div style={fieldRow}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>Relay ID</div>
+                      <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>gateway.a2a.relay.relayId{zh ? "（必填）" : " (required)"}</div>
+                    </div>
+                    <input style={{ ...fInput, minWidth: 240 }} type="text" placeholder="my-hub-1"
+                      value={getVal("gateway.a2a.relay.relayId", "")}
+                      onChange={(e) => updateConfig("gateway.a2a.relay.relayId", e.target.value || undefined)} />
+                  </div>
+                  <div style={fieldRow}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "公网 URL" : "Public URL"}</div>
+                      <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>gateway.a2a.relay.publicUrl</div>
+                    </div>
+                    <input style={{ ...fInput, minWidth: 300 }} type="text" placeholder="https://hub.example.com"
+                      value={getVal("gateway.a2a.relay.publicUrl", "")}
+                      onChange={(e) => updateConfig("gateway.a2a.relay.publicUrl", e.target.value || undefined)} />
+                  </div>
+                </>
+              )}
+
+              {relayMode === "spoke" && (
+                <>
+                  <div style={fieldRow}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>Node ID</div>
+                      <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>gateway.a2a.relay.nodeId</div>
+                    </div>
+                    <input style={{ ...fInput, minWidth: 240 }} type="text" placeholder="my-spoke-1"
+                      value={getVal("gateway.a2a.relay.nodeId", "")}
+                      onChange={(e) => updateConfig("gateway.a2a.relay.nodeId", e.target.value || undefined)} />
+                  </div>
+                  <div style={fieldRow}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>Hub URL</div>
+                      <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>gateway.a2a.relay.hubUrl{zh ? "（单 hub）" : " (single hub)"}</div>
+                    </div>
+                    <input style={{ ...fInput, minWidth: 300 }} type="text" placeholder="wss://hub.example.com/relay"
+                      value={getVal("gateway.a2a.relay.hubUrl", "")}
+                      onChange={(e) => updateConfig("gateway.a2a.relay.hubUrl", e.target.value || undefined)} />
+                  </div>
+                  <div style={fieldRow}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "多 Hub" : "Multi-Hub"}</div>
+                      <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>gateway.a2a.relay.relays {zh ? "（逗号分隔，覆盖单 hubUrl）" : "(comma-separated, overrides hubUrl)"}</div>
+                    </div>
+                    <input style={{ ...fInput, minWidth: 300 }} type="text" placeholder="wss://h1/relay, wss://h2/relay"
+                      value={(getVal("gateway.a2a.relay.relays", []) as string[] | string || []).toString?.() || ""}
+                      onChange={(e) => {
+                        const arr = e.target.value.split(",").map((s) => s.trim()).filter(Boolean);
+                        updateConfig("gateway.a2a.relay.relays", arr.length > 0 ? arr : undefined);
+                      }} />
+                  </div>
+                  <div style={fieldRow}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "策略" : "Strategy"}</div>
+                      <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>gateway.a2a.relay.strategy</div>
+                    </div>
+                    <select style={{ ...fSelect, minWidth: 200 }}
+                      value={(getVal("gateway.a2a.relay.strategy", "") as string) || "primary_standby"}
+                      onChange={(e) => updateConfig("gateway.a2a.relay.strategy", e.target.value || undefined)}>
+                      <option value="primary_standby">primary_standby {zh ? "— 主备" : ""}</option>
+                      <option value="multi_home">multi_home {zh ? "— 多归" : ""}</option>
+                    </select>
+                  </div>
+                  <div style={{ ...fieldRow, borderBottom: "none" }}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "Hub 令牌" : "Hub Token"}</div>
+                      <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>gateway.a2a.relay.token</div>
+                    </div>
+                    <input style={{ ...fInput, minWidth: 240 }} type="password" placeholder="${RSCLAW_RELAY_TOKEN}"
+                      value={(getVal("gateway.a2a.relay.token", "") as string) || ""}
+                      onChange={(e) => updateConfig("gateway.a2a.relay.token", e.target.value || undefined)} />
+                  </div>
+                </>
+              )}
+            </div>
+
+            {/* Hub-side node registry — only meaningful when this gateway IS a hub.
+                Each entry registers a spoke's nodeId + the token it presents. */}
+            {relayMode === "hub" && (
+              <div style={{ ...fcard, marginTop: 12 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "11px 15px", background: V.bg3, borderBottom: `1px solid ${V.bd}` }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "已注册 Spoke 节点" : "Registered Spokes"}</div>
+                    <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>gateway.a2a.relay.nodes</div>
+                  </div>
+                  <button onClick={addRelayNode} style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${V.gbrd}`, background: V.glo, color: V.green, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
+                    {zh ? "+ 添加" : "+ Add"}
+                  </button>
+                </div>
+                {relayNodeArr.length === 0 ? (
+                  <div style={{ ...fieldRow, borderBottom: "none", color: V.t3, fontSize: 11 }}>
+                    {zh ? "尚未注册任何 spoke 节点。" : "No spokes registered yet."}
+                  </div>
+                ) : relayNodeArr.map((n, i) => {
+                  const isLast = i === relayNodeArr.length - 1;
+                  const scopesArr: string[] = Array.isArray(n?.scopes) ? n.scopes : [];
+                  return (
+                    <div key={`relay-node-${i}`} style={{ padding: "10px 15px", borderBottom: isLast ? "none" : `1px solid rgba(255,255,255,.03)`, display: "flex", flexDirection: "column", gap: 6 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, width: 28 }}>{`[${i}]`}</div>
+                        <input style={{ ...fInput, width: 200 }} type="text" placeholder={zh ? "node id" : "node id"} value={n?.nodeId || ""} onChange={(e) => setRelayNodeField(i, "nodeId", e.target.value)} />
+                        <input style={{ ...fInput, flex: 1, minWidth: 200 }} type="password" placeholder="${RSCLAW_NODE_TOKEN}" value={typeof n?.token === "string" ? n.token : ""} onChange={(e) => setRelayNodeField(i, "token", e.target.value)} />
+                        <button onClick={() => removeRelayNode(i)} style={{ padding: "5px 10px", borderRadius: 7, border: `1px solid ${V.rbrd}`, background: V.rlo, color: V.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "删除" : "Remove"}</button>
+                      </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, paddingLeft: 36 }}>
+                        <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, minWidth: 50 }}>scopes</div>
+                        <input
+                          style={{ ...fInput, flex: 1, fontSize: 11, fontFamily: V.mono }}
+                          type="text"
+                          placeholder={zh ? "留空 = 默认（仅本节点）；如 a2a:invoke:a3/*, relay:connect:hub-1" : "empty = default (this node only); e.g. a2a:invoke:a3/*, relay:connect:hub-1"}
+                          value={scopesArr.join(", ")}
+                          onChange={(e) => {
+                            const arr = e.target.value.split(",").map((s) => s.trim()).filter(Boolean);
+                            setRelayNodeField(i, "scopes", arr.length > 0 ? arr : undefined);
+                          }}
+                        />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
 
             {/* ── Outbound peers ── */}
             <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12, marginTop: 22 }}>
@@ -4221,7 +4389,7 @@ function TauriConfigPageInner() {
                   <div style={fieldRow}>
                     <div style={{ flex: 1 }}>
                       <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "认证 Token" : "Auth Token"}</div>
-                      <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>{zh ? "对应对端 gateway.a2a.authTokens 中的某一条" : "Must match one of the peer's gateway.a2a.authTokens"}</div>
+                      <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>{zh ? "对应对端 gateway.a2a.clients[].secret 中的某一条" : "Must match one of the peer's gateway.a2a.clients[].secret"}</div>
                     </div>
                     {authIsString ? (
                       <input style={{ ...fInput, minWidth: 240 }} type="password" value={authVal || ""} placeholder="${RSCLAW_A2A_TOKEN}" onChange={(e) => setPeerField(i, "authToken", e.target.value)} />
@@ -5476,15 +5644,31 @@ function ToolsTab() {
     }
     setInstalling(name);
     try {
+      // The Rust side now spawns rsclaw detached and returns immediately —
+      // so this await resolves in <100ms. Real completion = the binary
+      // appearing under ~/.rsclaw/tools/<name>/. Poll get_tool_install_status
+      // (which probes that path) until it goes true or we hit a long
+      // timeout. ffmpeg/node/python: ~10-30s. chrome: a few minutes.
       await tauriInvokeV2("install_tool", { name, force: true });
-      const status = (await tauriInvokeV2("get_tool_install_status", { name })) as {
-        installed?: boolean;
-      };
-      if (!status?.installed) {
+      const POLL_INTERVAL_MS = 1500;
+      const TIMEOUT_MS = 10 * 60 * 1000;
+      const startedAt = Date.now();
+      let installed = false;
+      while (Date.now() - startedAt < TIMEOUT_MS) {
+        await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+        const status = (await tauriInvokeV2("get_tool_install_status", { name })) as {
+          installed?: boolean;
+        };
+        if (status?.installed) {
+          installed = true;
+          break;
+        }
+      }
+      if (!installed) {
         throw new Error(
           zh
-            ? "安装命令已结束，但没有检测到本地工具文件"
-            : "Install command finished, but no local tool binary was detected",
+            ? "安装超时（10 分钟未检测到本地文件，请检查网络或日志）"
+            : "Install timed out (10min with no local binary detected — check network / logs)",
         );
       }
       await fetchTools().catch(() => {});
