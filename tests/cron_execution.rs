@@ -74,6 +74,7 @@ fn runtime_with_agent(agent_id: &str) -> RuntimeConfig {
             reload: ReloadMode::Hybrid,
             auth_token: None,
             a2a_principals: vec![],
+            a2a_relay: Default::default(),
             a2a_max_body_bytes: 100 * 1024 * 1024,
             auth_token_configured: false,
             auth_token_is_plaintext: false,

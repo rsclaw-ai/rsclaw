@@ -2431,7 +2431,7 @@ function _Chat() {
                               </>
                             ) : (() => {
                               const chunks = parseAssistantChunks(rsExtract.cleanContent);
-                              if (chunks.length === 0 || screenshotMessage) {
+                              if (chunks.length === 0) {
                                 return (
                                   <Markdown
                                     key={message.streaming ? "loading" : "done"}

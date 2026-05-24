@@ -58,6 +58,7 @@ pub fn minimal_config(port: u16) -> RuntimeConfig {
             reload: ReloadMode::Hybrid,
             auth_token: None,
             a2a_principals: vec![],
+            a2a_relay: Default::default(),
             a2a_max_body_bytes: 100 * 1024 * 1024,
             auth_token_configured: false,
             auth_token_is_plaintext: false,
@@ -201,6 +202,7 @@ pub async fn start_server_with_handles(addr: SocketAddr) -> ServerHandles {
             let store = Arc::new(rsclaw::a2a::store::TaskStore::open(&path).expect("a2a store"));
             Arc::new(rsclaw::a2a::push::PushDispatcher::new(store, bus))
         },
+        relay_hub: Arc::new(rsclaw::a2a::relay::RelayHub::new()),
         knowledge: None,
         memory: None,
     };

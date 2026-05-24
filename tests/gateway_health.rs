@@ -42,6 +42,7 @@ fn minimal_config(port: u16) -> RuntimeConfig {
             reload: ReloadMode::Hybrid,
             auth_token: None,
             a2a_principals: vec![],
+            a2a_relay: Default::default(),
             a2a_max_body_bytes: 100 * 1024 * 1024,
             auth_token_configured: false,
             auth_token_is_plaintext: false,
@@ -158,6 +159,7 @@ async fn start_server(addr: SocketAddr) {
             let store = Arc::new(rsclaw::a2a::store::TaskStore::open(&path).expect("a2a store"));
             Arc::new(rsclaw::a2a::push::PushDispatcher::new(store, bus))
         },
+        relay_hub: Arc::new(rsclaw::a2a::relay::RelayHub::new()),
         knowledge: None,
         memory: None,
     };
@@ -275,6 +277,7 @@ async fn bare_health_alias_returns_200_without_auth() {
             let store = Arc::new(rsclaw::a2a::store::TaskStore::open(&path).expect("a2a store"));
             Arc::new(rsclaw::a2a::push::PushDispatcher::new(store, bus))
         },
+        relay_hub: Arc::new(rsclaw::a2a::relay::RelayHub::new()),
         knowledge: None,
         memory: None,
     };
@@ -409,6 +412,7 @@ async fn auth_token_gates_non_health_endpoints() {
             let store = Arc::new(rsclaw::a2a::store::TaskStore::open(&path).expect("a2a store"));
             Arc::new(rsclaw::a2a::push::PushDispatcher::new(store, bus))
         },
+        relay_hub: Arc::new(rsclaw::a2a::relay::RelayHub::new()),
         knowledge: None,
         memory: None,
     };

@@ -223,6 +223,52 @@ pub struct GatewayA2a {
     /// 413's any non-trivial file attachment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_body_mb: Option<u32>,
+    /// Private rsclaw relay overlay. Standard A2A remains HTTP/SSE; this
+    /// config controls the rsclaw-only WS hub/spoke transport used for
+    /// outbound-only private nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<A2aRelayConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum A2aRelayMode {
+    Disabled,
+    Hub,
+    Spoke,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum A2aRelayStrategy {
+    PrimaryStandby,
+    MultiHome,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct A2aRelayConfig {
+    pub mode: Option<A2aRelayMode>,
+    pub relay_id: Option<String>,
+    pub public_url: Option<String>,
+    pub node_id: Option<String>,
+    pub hub_url: Option<String>,
+    pub relays: Option<Vec<String>>,
+    pub strategy: Option<A2aRelayStrategy>,
+    pub token: Option<SecretOrString>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nodes: Option<Vec<A2aRelayNodeConfig>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct A2aRelayNodeConfig {
+    pub node_id: String,
+    pub token: SecretOrString,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roles: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

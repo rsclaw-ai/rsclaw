@@ -417,7 +417,7 @@ impl AgentRuntime {
 
             // Process the result — collect summary + files for both notification and agent
             // re-inject.
-            let mut result_summary = String::new();
+            let result_summary: String;
             let mut result_files: Vec<(String, String, String)> = vec![];
             match send_result {
                 Ok(resp) => {

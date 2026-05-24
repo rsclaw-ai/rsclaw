@@ -32,6 +32,8 @@ use crate::computer::{
     operator::{ActionFut, ActionOutput, Operator, ScreenshotFut},
 };
 
+const ACTIVATE_DELAY_MS: u64 = 400;
+
 /// Native desktop operator. Unit struct: holds no state because every
 /// platform call needs a fresh `Enigo` on the calling OS thread anyway
 /// (Windows `Enigo` is not `Send`).
@@ -591,7 +593,10 @@ fn macos_app_candidates(app: &str) -> Vec<String> {
         candidates.push(trimmed.to_owned());
     }
     match trimmed.to_ascii_lowercase().as_str() {
-        "wechat" => candidates.push("微信".to_owned()),
+        "wechat" => {
+            candidates.push("WeChat".to_owned());
+            candidates.push("微信".to_owned());
+        }
         "weixin" => {
             candidates.push("WeChat".to_owned());
             candidates.push("微信".to_owned());
@@ -629,7 +634,7 @@ end tell"#
             let open = Command::new("open").args(["-a", app]).output();
             match open {
                 Ok(open_out) if open_out.status.success() => {
-                    std::thread::sleep(Duration::from_millis(400));
+                    std::thread::sleep(Duration::from_millis(ACTIVATE_DELAY_MS));
                     Ok(())
                 }
                 Ok(open_out) => {

@@ -9,8 +9,8 @@
 
 use std::convert::Infallible;
 
-use axum::response::sse::{Event, KeepAlive, Sse};
-use futures::stream::{Stream, StreamExt};
+use axum::response::{IntoResponse, Response, sse::{Event, KeepAlive, Sse}};
+use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
@@ -20,6 +20,7 @@ use uuid::Uuid;
 use crate::{
     a2a::{
         event::AgentEvent,
+        relay::relay_target_from_params,
         types::{
             A2aArtifact, A2aMessage, A2aTask, A2aTaskStatus, JsonRpcRequest, SendMessageParams,
             TaskState,
@@ -35,8 +36,71 @@ pub async fn handle_streaming_rpc(
     state: AppState,
     caller: Option<crate::a2a::auth::A2aIdentity>,
     req: JsonRpcRequest,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+) -> Response {
     let req_id = req.id.clone();
+
+    // Relay forwarding: if the request targets a spoke node, route through the
+    // relay hub instead of creating a local streaming task. Targets may be
+    // explicit (metadata.agentId) or implicit via a known task_id route.
+    let relay_target = relay_target_from_params(&req.params).or_else(|| {
+        crate::a2a::relay::task_id_from_params(&req.params)
+            .and_then(|tid| state.relay_hub.route_for_task(tid))
+    });
+    if let Some(ref target) = relay_target {
+        if state.relay_hub.route_for(target).is_some() {
+            let principal = caller
+                .as_ref()
+                .map(|id| id.id.as_str())
+                .unwrap_or("anonymous-dev");
+            let mut params = req.params.clone();
+            crate::a2a::relay::rewrite_target_agent_for_spoke(&mut params, target);
+            match state
+                .relay_hub
+                .invoke_streaming(target, &req.method, params, principal)
+                .await
+            {
+                Ok((request_id, node_id, event_rx)) => {
+                    let guard = crate::a2a::relay::RelayStreamGuard::new(
+                        state.relay_hub.clone(),
+                        node_id,
+                        request_id,
+                    );
+                    let stream = tokio_stream::wrappers::BroadcastStream::new(event_rx)
+                        .filter_map(move |result| {
+                            // Force capture so guard.Drop fires when the SSE
+                            // stream is dropped (consumer disconnect).
+                            let _ = &guard;
+                            let req_id = req_id.clone();
+                            async move {
+                                match result {
+                                    Ok(value) => {
+                                        let payload = json!({
+                                            "jsonrpc": "2.0",
+                                            "id": req_id,
+                                            "result": value,
+                                        });
+                                        Some(Ok::<_, Infallible>(
+                                            Event::default()
+                                                .json_data(payload)
+                                                .unwrap_or_default(),
+                                        ))
+                                    }
+                                    Err(BroadcastStreamRecvError::Lagged(n)) => {
+                                        warn!(lagged = n, "SSE relay consumer lagged");
+                                        None
+                                    }
+                                }
+                            }
+                        });
+                    return Sse::new(stream).keep_alive(KeepAlive::new()).into_response();
+                }
+                Err(e) => {
+                    warn!(error = %e, "relay streaming failed, falling back");
+                }
+            }
+        }
+    }
+
     let (task_id, rx) = match req.method.as_str() {
         "SendStreamingMessage" => spawn_streaming_task(state.clone(), caller, req.params).await,
         "SubscribeToTask" => {
@@ -116,13 +180,13 @@ pub async fn handle_streaming_rpc(
         }
     });
 
-    Sse::new(stream).keep_alive(KeepAlive::new())
+    Sse::new(stream).keep_alive(KeepAlive::new()).into_response()
 }
 
 /// Spawn an agent task and return `(task_id, subscriber)`. The subscriber is
 /// taken BEFORE any events are published to the bus so the SSE consumer
 /// observes the full Submitted → Working → Completed sequence.
-async fn spawn_streaming_task(
+pub(crate) async fn spawn_streaming_task(
     state: AppState,
     caller: Option<crate::a2a::auth::A2aIdentity>,
     params: Value,

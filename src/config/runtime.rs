@@ -17,10 +17,10 @@
 use anyhow::Result;
 
 use super::schema::{
-    A2aPeerConfig, AgentDefaults, AgentEntry, AuthConfig, BindMode, BindingConfig, ChannelsConfig,
-    Config, CronConfig, DmScope, GatewayMode, HooksConfig, LoggingConfig, ModelsConfig,
-    PluginsConfig, ReloadMode, SandboxConfig, SecretOrString, SecretsConfig, SessionConfig,
-    SkillsConfig, ToolsConfig,
+    A2aPeerConfig, A2aRelayMode, A2aRelayStrategy, AgentDefaults, AgentEntry, AuthConfig, BindMode,
+    BindingConfig, ChannelsConfig, Config, CronConfig, DmScope, GatewayMode, HooksConfig,
+    LoggingConfig, ModelsConfig, PluginsConfig, ReloadMode, SandboxConfig, SecretOrString,
+    SecretsConfig, SessionConfig, SkillsConfig, ToolsConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -36,6 +36,70 @@ pub struct A2aPrincipal {
     pub id: String,
     pub secret: String,
     pub scopes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum A2aRelayModeRuntime {
+    Disabled,
+    Hub,
+    Spoke,
+}
+
+impl Default for A2aRelayModeRuntime {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
+impl From<A2aRelayMode> for A2aRelayModeRuntime {
+    fn from(value: A2aRelayMode) -> Self {
+        match value {
+            A2aRelayMode::Disabled => Self::Disabled,
+            A2aRelayMode::Hub => Self::Hub,
+            A2aRelayMode::Spoke => Self::Spoke,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum A2aRelayStrategyRuntime {
+    PrimaryStandby,
+    MultiHome,
+}
+
+impl Default for A2aRelayStrategyRuntime {
+    fn default() -> Self {
+        Self::PrimaryStandby
+    }
+}
+
+impl From<A2aRelayStrategy> for A2aRelayStrategyRuntime {
+    fn from(value: A2aRelayStrategy) -> Self {
+        match value {
+            A2aRelayStrategy::PrimaryStandby => Self::PrimaryStandby,
+            A2aRelayStrategy::MultiHome => Self::MultiHome,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct A2aRelayNodeRuntime {
+    pub node_id: String,
+    pub token: String,
+    pub roles: Vec<String>,
+    pub scopes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct A2aRelayRuntime {
+    pub mode: A2aRelayModeRuntime,
+    pub relay_id: String,
+    pub public_url: Option<String>,
+    pub node_id: Option<String>,
+    pub hub_urls: Vec<String>,
+    pub strategy: A2aRelayStrategyRuntime,
+    pub token: Option<String>,
+    pub nodes: Vec<A2aRelayNodeRuntime>,
 }
 
 /// Network / auth / channel-health knobs.  Swappable without restart.
@@ -55,6 +119,9 @@ pub struct GatewayRuntime {
     /// secret matches on either the Bearer or X-API-Key header. Empty Vec =
     /// the middleware passes through (dev mode).
     pub a2a_principals: Vec<A2aPrincipal>,
+    /// Private rsclaw A2A relay overlay configuration. Standard `/api/v1/a2a`
+    /// auth remains in `a2a_principals`; relay credentials are separate.
+    pub a2a_relay: A2aRelayRuntime,
     /// Max body size in bytes for `/api/v1/a2a`. Resolved from
     /// `gateway.a2a.maxBodyMb` × 1 MiB. Default 100 MiB. Wired as
     /// `DefaultBodyLimit::max(...)` on the route — axum's stock 2 MiB
@@ -241,6 +308,61 @@ impl IntoRuntime for Config {
         }
         let a2a_max_body_bytes: u64 =
             gw.a2a.as_ref().and_then(|a| a.max_body_mb).unwrap_or(100) as u64 * 1024 * 1024;
+        let a2a_relay = gw
+            .a2a
+            .as_ref()
+            .and_then(|a| a.relay.as_ref())
+            .map(|relay| {
+                let mode = relay
+                    .mode
+                    .clone()
+                    .map(A2aRelayModeRuntime::from)
+                    .unwrap_or_default();
+                let relay_id = relay
+                    .relay_id
+                    .clone()
+                    .or_else(|| relay.node_id.clone())
+                    .unwrap_or_else(|| "main".to_owned());
+                let mut hub_urls = Vec::new();
+                if let Some(url) = relay.hub_url.clone() {
+                    hub_urls.push(url);
+                }
+                if let Some(urls) = relay.relays.clone() {
+                    hub_urls.extend(urls);
+                }
+                let nodes = relay
+                    .nodes
+                    .as_ref()
+                    .map(|nodes| {
+                        nodes
+                            .iter()
+                            .filter_map(|node| {
+                                node.token.resolve_early().map(|token| A2aRelayNodeRuntime {
+                                    node_id: node.node_id.clone(),
+                                    token,
+                                    roles: node.roles.clone().unwrap_or_default(),
+                                    scopes: node.scopes.clone().unwrap_or_default(),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                A2aRelayRuntime {
+                    mode,
+                    relay_id,
+                    public_url: relay.public_url.clone(),
+                    node_id: relay.node_id.clone(),
+                    hub_urls,
+                    strategy: relay
+                        .strategy
+                        .clone()
+                        .map(A2aRelayStrategyRuntime::from)
+                        .unwrap_or_default(),
+                    token: relay.token.as_ref().and_then(|token| token.resolve_early()),
+                    nodes,
+                }
+            })
+            .unwrap_or_default();
 
         Ok(RuntimeConfig {
             gateway: GatewayRuntime {
@@ -251,6 +373,7 @@ impl IntoRuntime for Config {
                 reload: gw.reload.unwrap_or(ReloadMode::Hybrid),
                 auth_token,
                 a2a_principals,
+                a2a_relay,
                 a2a_max_body_bytes,
                 auth_token_configured,
                 auth_token_is_plaintext,

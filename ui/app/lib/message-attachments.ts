@@ -10,9 +10,11 @@ export interface ScreenshotMessage {
 }
 
 export function parseScreenshotMessage(content: string): ScreenshotMessage | null {
+  const trimmed = content.trim();
+  if (!trimmed.startsWith("{")) return null;
   let data: unknown;
   try {
-    data = JSON.parse(content.trim());
+    data = JSON.parse(trimmed);
   } catch {
     return null;
   }

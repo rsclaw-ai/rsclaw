@@ -758,6 +758,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         Arc::clone(&a2a_task_store),
         a2a_bus.clone(),
     ));
+    let a2a_relay_hub = Arc::new(crate::a2a::relay::RelayHub::new());
 
     // User-managed RAG knowledge base. Open once; spawn the async indexing
     // worker that drains embed jobs in the background. A failure here (corrupt
@@ -810,9 +811,11 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         suspended_tasks: Arc::new(dashmap::DashMap::new()),
         task_store: a2a_task_store,
         push_dispatcher: a2a_push_dispatcher,
+        relay_hub: a2a_relay_hub,
         knowledge: knowledge_svc,
         memory: memory.clone(),
     };
+    crate::a2a::relay::start_spoke_if_configured(state.clone());
     crate::ws::tick::start_tick_loop(Arc::clone(&state.ws_conns));
 
     // Start browser pool idle reaper (checks every 60s).

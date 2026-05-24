@@ -173,6 +173,11 @@ pub async fn a2a_rpc_handler_inner(
     req: JsonRpcRequest,
 ) -> Json<JsonRpcResponse> {
     let id = req.id.clone();
+    if let Some(response) =
+        crate::a2a::relay::try_forward_jsonrpc(&state, caller.as_ref(), &req).await
+    {
+        return Json(response);
+    }
     match req.method.as_str() {
         "SendMessage" => handle_send_message(state, caller, id, req.params).await,
         "GetExtendedAgentCard" => Json(JsonRpcResponse::ok(
