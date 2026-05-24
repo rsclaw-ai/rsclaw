@@ -51,61 +51,37 @@ pub fn safe_extract_pdf_from_mem(bytes: &[u8]) -> Result<String> {
 
 /// Try common font directories and naming patterns to find a usable font
 /// family.
-fn find_font_family() -> Option<genpdf::fonts::FontFamily<genpdf::fonts::FontData>> {
-    // Directories and font names to try, in order.
-    let candidates: &[(&str, &str)] = &[
-        // Linux
-        ("/usr/share/fonts/truetype/liberation", "LiberationSans"),
-        ("/usr/share/fonts/truetype/dejavu", "DejaVuSans"),
-        // macOS Supplemental (TTF, genpdf-compatible naming with space→hyphen)
-        // genpdf looks for {Name}-Regular.ttf so we need to create symlinks or
-        // load manually. Instead, try directories where fonts follow the pattern.
-        ("/usr/share/fonts", "LiberationSans"),
+/// Locate a CJK-capable TTF/OTF font on disk. We try plain TTF/OTF first
+/// (krilla loads them directly) before any `.ttc` collection so we don't
+/// have to deal with face-index plumbing. Returns the raw bytes ready to
+/// hand to `krilla::text::Font::new`.
+fn find_cjk_font() -> Option<Vec<u8>> {
+    let candidates: &[&str] = &[
+        // macOS — plain OTF, full Han coverage
+        "/Library/Fonts/AdobeSongStd-Light.otf",
+        "/Library/Fonts/AdobeHeitiStd-Regular.otf",
+        "/Library/Fonts/AdobeFangsongStd-Regular.otf",
+        "/Library/Fonts/AdobeFanHeitiStd-Bold.otf",
+        // macOS — TTC collections (krilla::Font::new takes an index; face 0
+        // is the default member which is usually fine for our use case).
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/Supplemental/Songti.ttc",
+        // Linux — Noto CJK is the de-facto default on most distros.
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+        // Windows — CJK system fonts
+        "C:\\Windows\\Fonts\\msyh.ttc",   // Microsoft YaHei (TTC)
+        "C:\\Windows\\Fonts\\simsun.ttc", // SimSun
+        "C:\\Windows\\Fonts\\simhei.ttf", // SimHei (plain TTF)
     ];
-    for (dir, name) in candidates {
-        if let Ok(f) = genpdf::fonts::from_files(dir, name, None) {
-            return Some(f);
+    for path in candidates {
+        if let Ok(bytes) = std::fs::read(path) {
+            return Some(bytes);
         }
-    }
-    // macOS: load individual TTF files directly (genpdf fallback only, Chrome
-    // preferred).
-    let mac_fonts: &[&str] = &[
-        "/System/Library/Fonts/Supplemental/Arial.ttf",
-        "/System/Library/Fonts/Supplemental/Courier New.ttf",
-        "/System/Library/Fonts/Geneva.ttf",
-    ];
-    // Windows: CJK fonts for genpdf fallback
-    let win_fonts: &[&str] = &[
-        "C:\\Windows\\Fonts\\simhei.ttf", // SimHei (TTF, CJK)
-    ];
-    for path in mac_fonts {
-        if let Ok(data) = std::fs::read(path) {
-            if let Ok(fd) = genpdf::fonts::FontData::new(data, None) {
-                return Some(genpdf::fonts::FontFamily {
-                    regular: fd.clone(),
-                    bold: fd.clone(),
-                    italic: fd.clone(),
-                    bold_italic: fd,
-                });
-            }
-        }
-    }
-    // Windows: try CJK fonts first
-    for path in win_fonts {
-        if let Ok(data) = std::fs::read(path) {
-            if let Ok(fd) = genpdf::fonts::FontData::new(data, None) {
-                return Some(genpdf::fonts::FontFamily {
-                    regular: fd.clone(),
-                    bold: fd.clone(),
-                    italic: fd.clone(),
-                    bold_italic: fd,
-                });
-            }
-        }
-    }
-    // Windows: Latin fallback
-    if let Ok(f) = genpdf::fonts::from_files("C:\\Windows\\Fonts", "arial", None) {
-        return Some(f);
     }
     None
 }
@@ -413,6 +389,13 @@ fn create_word(args: &Value, path: &Path) -> Result<Value> {
 // ---------------------------------------------------------------------------
 
 fn create_pdf(args: &Value, path: &Path) -> Result<Value> {
+    use krilla::{
+        Document,
+        geom::Point,
+        page::PageSettings,
+        text::{Font, TextDirection},
+    };
+
     let title = args["title"].as_str().unwrap_or("");
     let content = args["content"].as_str().unwrap_or("");
 
@@ -423,64 +406,64 @@ fn create_pdf(args: &Value, path: &Path) -> Result<Value> {
         }));
     }
 
-    // Strategy: generate HTML then convert to PDF via Chrome headless (best CJK
-    // support). Fallback to genpdf if Chrome is not available.
-    let html = build_html_for_pdf(title, content);
+    let font_bytes = find_cjk_font().context(
+        "no CJK-capable font found. Install Noto Sans CJK (Linux), \
+         or ensure /Library/Fonts contains Adobe* OTF / PingFang / STHeiti (macOS), \
+         or msyh.ttc / simsun.ttc / simhei.ttf (Windows)",
+    )?;
+    let font = Font::new(font_bytes.into(), 0)
+        .ok_or_else(|| anyhow!("failed to parse the located CJK font"))?;
 
-    // Try Chrome headless first (supports CJK natively via system fonts).
-    if let Some(chrome) = crate::agent::platform::detect_chrome() {
-        let tmp_html = path.with_extension("_tmp.html");
-        std::fs::write(&tmp_html, &html)?;
-        let result = std::process::Command::new(&chrome)
-            .args([
-                "--headless=new",
-                "--disable-gpu",
-                "--no-sandbox",
-                "--no-pdf-header-footer",
-                "--print-to-pdf-no-header",
-                &format!("--print-to-pdf={}", path.display()),
-                &format!("file://{}", tmp_html.display()),
-            ])
-            .output();
-        let _ = std::fs::remove_file(&tmp_html);
-        match result {
-            Ok(output)
-                if output.status.success()
-                    && path.exists()
-                    && path.metadata().map(|m| m.len() > 0).unwrap_or(false) =>
-            {
-                return Ok(json!({
-                    "created": true,
-                    "path": path.display().to_string(),
-                    "format": "pdf",
-                    "engine": "chrome",
-                }));
+    // Page geometry: A4 (595 × 842 pt). krilla uses top-left origin —
+    // Y grows downward — so we lay out title near the top then walk down.
+    const PAGE_W: f32 = 595.0;
+    const PAGE_H: f32 = 842.0;
+    const MARGIN: f32 = 60.0;
+    const TITLE_SIZE: f32 = 22.0;
+    const BODY_SIZE: f32 = 12.0;
+    const LINE_HEIGHT: f32 = 18.0;
+    const TITLE_GAP: f32 = 28.0;
+    const BLOCK_GAP: f32 = 10.0;
+    const HEADING_PREFIX: char = '#';
+
+    let mut document = Document::new();
+    let page_size =
+        PageSettings::from_wh(PAGE_W, PAGE_H).ok_or_else(|| anyhow!("invalid page size"))?;
+    let mut page = document.start_page_with(page_size.clone());
+    let mut surface = page.surface();
+    let mut y = MARGIN;
+
+    // Helper: start a fresh page when the cursor walked past the bottom margin.
+    // krilla can't mutate `surface` and `page` across closure boundaries
+    // cleanly, so we inline the check at each draw site below.
+    macro_rules! ensure_page {
+        ($needed:expr) => {
+            if y + $needed > PAGE_H - MARGIN {
+                surface.finish();
+                page.finish();
+                page = document.start_page_with(page_size.clone());
+                surface = page.surface();
+                y = MARGIN;
             }
-            Ok(output) => {
-                tracing::warn!(
-                    stderr = %String::from_utf8_lossy(&output.stderr),
-                    "create_pdf: Chrome headless failed, falling back to genpdf"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(%e, "create_pdf: Chrome not available, falling back to genpdf");
-            }
-        }
+        };
     }
 
-    // Fallback: genpdf (no CJK support on most systems).
-    let font = find_font_family().context("no usable fonts found for PDF generation")?;
-    let mut doc = genpdf::Document::new(font);
-    doc.set_title(title);
-
     if !title.is_empty() {
-        let mut t = genpdf::elements::Paragraph::new(title);
-        t.set_alignment(genpdf::Alignment::Center);
-        doc.push(genpdf::elements::StyledElement::new(
-            t,
-            genpdf::style::Effect::Bold,
-        ));
-        doc.push(genpdf::elements::Break::new(1));
+        ensure_page!(TITLE_SIZE);
+        // Naive centering: estimate width as TITLE_SIZE * char_count * 0.55.
+        // Good enough for CJK + ASCII titles — exact centering would need
+        // text shaping which we skip to stay light.
+        let est_width = title.chars().count() as f32 * TITLE_SIZE * 0.55;
+        let x = ((PAGE_W - est_width) / 2.0).max(MARGIN);
+        surface.draw_text(
+            Point::from_xy(x, y + TITLE_SIZE),
+            font.clone(),
+            TITLE_SIZE,
+            title,
+            false,
+            TextDirection::Auto,
+        );
+        y += TITLE_SIZE + TITLE_GAP;
     }
 
     for block in content.split("\n\n") {
@@ -488,27 +471,39 @@ fn create_pdf(args: &Value, path: &Path) -> Result<Value> {
         if block.is_empty() {
             continue;
         }
-        if block.starts_with('#') {
-            let text = block.trim_start_matches('#').trim();
-            let mut p = genpdf::elements::Paragraph::new(text);
-            p.set_alignment(genpdf::Alignment::Left);
-            doc.push(genpdf::elements::StyledElement::new(
-                p,
-                genpdf::style::Effect::Bold,
-            ));
+        let (text, size) = if let Some(stripped) = block.strip_prefix(HEADING_PREFIX) {
+            (stripped.trim_start_matches(HEADING_PREFIX).trim(), BODY_SIZE + 2.0)
         } else {
-            doc.push(genpdf::elements::Paragraph::new(block));
+            (block, BODY_SIZE)
+        };
+        for line in text.lines() {
+            ensure_page!(LINE_HEIGHT);
+            surface.draw_text(
+                Point::from_xy(MARGIN, y + size),
+                font.clone(),
+                size,
+                line,
+                false,
+                TextDirection::Auto,
+            );
+            y += LINE_HEIGHT;
         }
+        y += BLOCK_GAP;
     }
 
-    doc.render_to_file(path)
-        .map_err(|e| anyhow!("pdf render failed: {e}"))?;
+    surface.finish();
+    page.finish();
+
+    let bytes = document
+        .finish()
+        .map_err(|e| anyhow!("krilla finalize failed: {e:?}"))?;
+    std::fs::write(path, &bytes)?;
+
     Ok(json!({
         "created": true,
         "path": path.display().to_string(),
         "format": "pdf",
-        "engine": "genpdf",
-        "warning": "genpdf has limited CJK support. Install Chrome for better PDF rendering.",
+        "engine": "krilla",
     }))
 }
 
@@ -1302,114 +1297,6 @@ fn read_pdf(path: &Path) -> Result<Value> {
         "text": text,
         "length": text.len(),
     }))
-}
-
-/// Build a simple HTML document for Chrome headless PDF rendering.
-fn build_html_for_pdf(title: &str, content: &str) -> String {
-    let escaped_title = content
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
-    let _ = escaped_title; // suppress warning, we use xml_escape below
-    let mut html = String::from(
-        r#"<!DOCTYPE html><html><head><meta charset='utf-8'>
-<style>
-  @page { margin: 2cm 2.5cm; size: A4; }
-  @page { @top-left { content: none; } @top-right { content: none; } @bottom-left { content: none; } @bottom-right { content: none; } }
-  body {
-    font-family: -apple-system, "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", system-ui, sans-serif;
-    font-size: 13px; line-height: 1.9; color: #333;
-  }
-  h1 { text-align: center; font-size: 22px; font-weight: 600; margin: 0 0 24px; color: #1a1a1a; }
-  h2 { font-size: 17px; font-weight: 600; margin: 20px 0 10px; color: #1a1a1a; border-bottom: 1px solid #e0e0e0; padding-bottom: 4px; }
-  h3 { font-size: 15px; font-weight: 600; margin: 16px 0 8px; color: #333; }
-  p  { margin: 8px 0; text-align: justify; }
-  ul, ol { margin: 8px 0 8px 20px; }
-  li { margin: 4px 0; }
-  table { border-collapse: collapse; width: 100%; margin: 12px 0; }
-  th { background: #f5f5f5; font-weight: 600; text-align: left; padding: 8px 12px; border: 1px solid #ddd; }
-  td { padding: 8px 12px; border: 1px solid #ddd; }
-  tr:nth-child(even) td { background: #fafafa; }
-  code { background: #f4f4f4; padding: 2px 5px; border-radius: 3px; font-size: 12px; }
-  pre { background: #f4f4f4; padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 12px; }
-  hr { border: none; border-top: 1px solid #e0e0e0; margin: 16px 0; }
-</style></head><body>
-"#,
-    );
-    if !title.is_empty() {
-        html.push_str(&format!("<h1>{}</h1>\n", xml_escape(title)));
-    }
-    for block in content.split("\n\n") {
-        let block = block.trim();
-        if block.is_empty() {
-            continue;
-        }
-        // Headings
-        if block.starts_with("### ") {
-            html.push_str(&format!("<h3>{}</h3>\n", xml_escape(&block[4..])));
-        } else if block.starts_with("## ") {
-            html.push_str(&format!("<h2>{}</h2>\n", xml_escape(&block[3..])));
-        } else if block.starts_with("# ") {
-            html.push_str(&format!("<h1>{}</h1>\n", xml_escape(&block[2..])));
-        } else if block.starts_with("---") {
-            html.push_str("<hr>\n");
-        } else {
-            // Check if block is a list (all lines start with - or * or 1.)
-            let lines: Vec<&str> = block.lines().collect();
-            let is_ul = lines.iter().all(|l| {
-                let t = l.trim();
-                t.starts_with("- ") || t.starts_with("* ")
-            });
-            let is_ol = lines.iter().all(|l| {
-                let t = l.trim();
-                t.len() > 2
-                    && t.chars()
-                        .next()
-                        .map(|c| c.is_ascii_digit())
-                        .unwrap_or(false)
-                    && (t.contains(". ") || t.contains(") "))
-            });
-            if is_ul {
-                html.push_str("<ul>\n");
-                for line in &lines {
-                    let text = line
-                        .trim()
-                        .trim_start_matches("- ")
-                        .trim_start_matches("* ");
-                    html.push_str(&format!("<li>{}</li>\n", xml_escape(text)));
-                }
-                html.push_str("</ul>\n");
-            } else if is_ol {
-                html.push_str("<ol>\n");
-                for line in &lines {
-                    let text = line.trim();
-                    // Strip "1. " or "1) " prefix
-                    let text = if let Some(pos) = text.find(". ") {
-                        &text[pos + 2..]
-                    } else if let Some(pos) = text.find(") ") {
-                        &text[pos + 2..]
-                    } else {
-                        text
-                    };
-                    html.push_str(&format!("<li>{}</li>\n", xml_escape(text)));
-                }
-                html.push_str("</ol>\n");
-            } else {
-                // Regular paragraph with line breaks
-                html.push_str("<p>");
-                html.push_str(
-                    &lines
-                        .iter()
-                        .map(|l| xml_escape(l))
-                        .collect::<Vec<_>>()
-                        .join("<br>"),
-                );
-                html.push_str("</p>\n");
-            }
-        }
-    }
-    html.push_str("</body></html>");
-    html
 }
 
 /// Escape XML special characters.
