@@ -55,7 +55,18 @@ pub(crate) enum PluginAction {
     Inject(Vec<String>),
 }
 
-/// Parse a `/plugin ...` line. None on malformed input.
+/// Parse a `/plugin ...` line. `None` on malformed input or explicit help
+/// request — the caller falls through to `plugin_help_text()`.
+///
+/// Recognized aliases (so muscle memory works):
+/// - `/plugin`, `/plugin list`, `/plugin ls` → Status (list overrides)
+/// - `/plugin info <name>`, `/plugin show <name>`, `/plugin <name>` → Info
+/// - `/plugin info` (no name), `/plugin help`, `/plugin -h`, `/plugin --help`
+///   → None (caller shows help)
+///
+/// Tradeoff: this reserves the words `list`/`ls`/`info`/`show`/`help`/`reset`
+/// as command keywords, so a plugin literally named one of those can't be
+/// inspected via `/plugin <name>` — use `/plugin info <name>` instead.
 pub(crate) fn parse_plugin_command(line: &str) -> Option<PluginCommand> {
     let line = line.trim();
     if line == "/plugin" {
@@ -65,15 +76,35 @@ pub(crate) fn parse_plugin_command(line: &str) -> Option<PluginCommand> {
     if rest.is_empty() {
         return Some(PluginCommand::Status);
     }
+    // Explicit help — return None so caller prints plugin_help_text.
+    if matches!(rest, "help" | "-h" | "--help" | "?") {
+        return None;
+    }
+    // List aliases — same as bare /plugin.
+    if matches!(rest, "list" | "ls") {
+        return Some(PluginCommand::Status);
+    }
     if rest == "reset" {
         return Some(PluginCommand::Reset);
     }
     let mut parts = rest.splitn(2, char::is_whitespace);
-    let plugin = parts.next()?.trim().to_owned();
-    if plugin.is_empty() {
+    let head = parts.next()?.trim().to_owned();
+    if head.is_empty() {
         return None;
     }
-    let Some(action_raw) = parts.next().map(str::trim).filter(|s| !s.is_empty()) else {
+    let tail = parts.next().map(str::trim).filter(|s| !s.is_empty());
+    // `info <name>` / `show <name>` → explicit Info form.
+    if matches!(head.as_str(), "info" | "show") {
+        return match tail {
+            Some(name) => Some(PluginCommand::Info {
+                plugin: name.to_owned(),
+            }),
+            None => None, // /plugin info (no name) → help text
+        };
+    }
+    // First token is the plugin name. No second token → Info shorthand.
+    let plugin = head;
+    let Some(action_raw) = tail else {
         return Some(PluginCommand::Info { plugin });
     };
     let action = match action_raw {
@@ -97,17 +128,20 @@ pub(crate) fn parse_plugin_command(line: &str) -> Option<PluginCommand> {
 
 /// Help text for `/plugin`.
 pub(crate) fn plugin_help_text() -> String {
-    "/plugin                       — list session plugin overrides\n\
-     /plugin <name>                — show one plugin's state\n\
+    "/plugin [list|ls]             — list session plugin overrides\n\
+     /plugin info <name>           — show one plugin's state\n\
+     /plugin <name>                — shorthand for `info <name>`\n\
      /plugin <name> off            — hide plugin in this session\n\
      /plugin <name> on             — back to default (catalog only)\n\
      /plugin <name> all            — inject ALL plugin tools (cap 20)\n\
      /plugin <name> t1,t2,t3       — inject specific tools as <plugin>.<tool>\n\
-     /plugin reset                 — clear every session override\n\n\
+     /plugin reset                 — clear every session override\n\
+     /plugin help                  — this help\n\n\
      Session overrides upgrade plugin exposure from \"catalog only\" \
      (model must use plugin.search_tools + plugin.invoke) to real \
      <plugin>.<tool> ToolDefs the model can call directly. Useful for \
-     small fleet models. Resets when the session restarts.".to_owned()
+     small fleet models. Resets when the session restarts."
+        .to_owned()
 }
 
 /// Derive the session_key the agent runtime will use to look up overrides.
@@ -1394,6 +1428,35 @@ mod tests {
     fn parse_plugin_command_rejects_malformed() {
         assert_eq!(parse_plugin_command("/plugin douyin ,,, "), None);
         assert_eq!(parse_plugin_command("not-a-plugin-cmd"), None);
+    }
+
+    #[test]
+    fn parse_plugin_command_list_aliases() {
+        assert_eq!(parse_plugin_command("/plugin list"), Some(PluginCommand::Status));
+        assert_eq!(parse_plugin_command("/plugin ls"), Some(PluginCommand::Status));
+    }
+
+    #[test]
+    fn parse_plugin_command_info_aliases() {
+        let expected = Some(PluginCommand::Info {
+            plugin: "douyin".to_owned(),
+        });
+        assert_eq!(parse_plugin_command("/plugin info douyin"), expected);
+        assert_eq!(parse_plugin_command("/plugin show douyin"), expected);
+        // Shorthand still works.
+        assert_eq!(parse_plugin_command("/plugin douyin"), expected);
+    }
+
+    #[test]
+    fn parse_plugin_command_help_returns_none() {
+        // `None` here means "caller falls through to plugin_help_text()".
+        assert_eq!(parse_plugin_command("/plugin help"), None);
+        assert_eq!(parse_plugin_command("/plugin -h"), None);
+        assert_eq!(parse_plugin_command("/plugin --help"), None);
+        assert_eq!(parse_plugin_command("/plugin ?"), None);
+        // `/plugin info` with no name → also help (no plugin to show).
+        assert_eq!(parse_plugin_command("/plugin info"), None);
+        assert_eq!(parse_plugin_command("/plugin show"), None);
     }
 
     #[test]
