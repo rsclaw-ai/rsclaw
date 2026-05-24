@@ -8518,6 +8518,29 @@ pub(crate) fn expand_tilde(p: &str) -> std::path::PathBuf {
     }
 }
 
+/// Single source of truth for the per-agent default workspace path used by
+/// file tools (`list_dir`, `search_file`, `search_content`, `read_file`,
+/// `write_file`, `edit_file`, `shell`) when the caller didn't pass an
+/// explicit `path`. Resolution order:
+///
+///   1. The agent's own `config.workspace` override (per-agent dir)
+///   2. The global `agents.defaults.workspace` (gateway-wide default)
+///   3. `<base_dir>/workspace` (built-in fallback — the `main` agent uses this)
+///
+/// Always returns an absolute `PathBuf` (tilde-expanded). Critically NEVER
+/// returns `.` or the gateway's CWD — a regression there would make every
+/// agent's file ops escape its workspace.
+pub(crate) fn resolve_default_workspace(
+    agent_workspace: Option<&str>,
+    defaults_workspace: Option<&str>,
+    base_dir: &std::path::Path,
+) -> std::path::PathBuf {
+    agent_workspace
+        .or(defaults_workspace)
+        .map(expand_tilde)
+        .unwrap_or_else(|| base_dir.join("workspace"))
+}
+
 /// Canonicalize a path received from an external source (tool output, plugin
 /// result, LLM-generated argument). Performs:
 ///   1. `~/...` expansion via [`expand_tilde`]
@@ -9208,6 +9231,61 @@ mod tests {
         provider::{Message, MessageContent, Role},
         skill::SkillRegistry,
     };
+
+    // ---------------------------------------------------------------
+    // resolve_default_workspace — locks in the rule that file tools
+    // (list_dir, search_file, search_content, read, write, edit, shell)
+    // default to the agent's workspace, NEVER to "." / CWD / $HOME.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn workspace_per_agent_override_beats_default_and_fallback() {
+        let base = std::path::Path::new("/tmp/some-base");
+        let got = resolve_default_workspace(Some("/agents/me"), Some("/agents/all"), base);
+        assert_eq!(got, std::path::PathBuf::from("/agents/me"));
+    }
+
+    #[test]
+    fn workspace_global_default_used_when_no_per_agent_override() {
+        let base = std::path::Path::new("/tmp/some-base");
+        let got = resolve_default_workspace(None, Some("/agents/all"), base);
+        assert_eq!(got, std::path::PathBuf::from("/agents/all"));
+    }
+
+    #[test]
+    fn workspace_falls_back_to_base_dir_join_workspace() {
+        let base = std::path::Path::new("/tmp/some-base");
+        let got = resolve_default_workspace(None, None, base);
+        // The `main` agent in production hits this branch — it has no
+        // per-agent override and the defaults.workspace isn't set, so
+        // every file tool resolves to <base_dir>/workspace.
+        assert_eq!(got, std::path::PathBuf::from("/tmp/some-base/workspace"));
+    }
+
+    #[test]
+    fn workspace_tilde_is_expanded() {
+        let base = std::path::Path::new("/tmp/some-base");
+        let got = resolve_default_workspace(Some("~/myws"), None, base);
+        let home = dirs_next::home_dir().expect("home dir for test");
+        assert_eq!(got, home.join("myws"));
+        assert!(
+            got.is_absolute(),
+            "expanded ~ must produce an absolute path, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_never_returns_dot_or_cwd_when_unset() {
+        // Regression guard: an earlier implementation called
+        // `.to_str().unwrap_or(".")` on the fallback PathBuf — a path with
+        // non-UTF-8 bytes would silently degrade to "." (the gateway's CWD)
+        // and let every file tool escape the workspace. The helper must
+        // never produce "." or a relative path.
+        let base = std::path::Path::new("/some/abs/base");
+        let got = resolve_default_workspace(None, None, base);
+        assert_ne!(got, std::path::PathBuf::from("."));
+        assert!(got.is_absolute(), "default workspace must be absolute, got {got:?}");
+    }
 
     #[test]
     fn skill_list_filters_and_paginates_results() {

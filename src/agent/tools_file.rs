@@ -9,7 +9,7 @@ use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 
 use super::{
-    runtime::{canonicalize_external_path, expand_tilde},
+    runtime::{canonicalize_external_path, expand_tilde, resolve_default_workspace},
     security::{check_file_content_safety, check_read_safety, check_write_safety},
 };
 
@@ -194,19 +194,26 @@ mod shell_sanitize_tests {
 }
 
 impl super::runtime::AgentRuntime {
+    /// Default workspace path for this agent, used when a file tool was
+    /// invoked without an explicit `path`. See [`resolve_default_workspace`]
+    /// for the resolution rules — the wrapper just plumbs the runtime's
+    /// fields in.
+    pub(crate) fn default_workspace(&self) -> std::path::PathBuf {
+        resolve_default_workspace(
+            self.handle.config.workspace.as_deref(),
+            self.config.agents.defaults.workspace.as_deref(),
+            &crate::config::loader::base_dir(),
+        )
+    }
+
     /// List files and directories in a path (structured alternative to `exec
     /// ls`).
     pub(crate) async fn tool_list_dir(&self, args: Value) -> Result<Value> {
-        let fallback_ws = crate::config::loader::base_dir().join("workspace");
-        let default_ws = self
-            .handle
-            .config
-            .workspace
-            .as_deref()
-            .or(self.config.agents.defaults.workspace.as_deref())
-            .unwrap_or(fallback_ws.to_str().unwrap_or("."));
-        let path_str = args["path"].as_str().unwrap_or(default_ws);
-        let path = expand_tilde(path_str);
+        let default_ws = self.default_workspace();
+        let path = args["path"]
+            .as_str()
+            .map(expand_tilde)
+            .unwrap_or(default_ws);
         let recursive = args["recursive"].as_bool().unwrap_or(false);
         let pattern = args["pattern"].as_str().unwrap_or("*");
 
@@ -258,16 +265,11 @@ impl super::runtime::AgentRuntime {
     /// Search for files by name pattern (structured alternative to `exec
     /// find`).
     pub(crate) async fn tool_search_file(&self, args: Value) -> Result<Value> {
-        let fallback_ws = crate::config::loader::base_dir().join("workspace");
-        let default_ws = self
-            .handle
-            .config
-            .workspace
-            .as_deref()
-            .or(self.config.agents.defaults.workspace.as_deref())
-            .unwrap_or(fallback_ws.to_str().unwrap_or("."));
-        let root = args["path"].as_str().unwrap_or(default_ws);
-        let root_path = expand_tilde(root);
+        let default_ws = self.default_workspace();
+        let root_path = args["path"]
+            .as_str()
+            .map(expand_tilde)
+            .unwrap_or(default_ws);
         let pattern = args["pattern"]
             .as_str()
             .ok_or_else(|| anyhow!("search_file: `pattern` required"))?;
@@ -325,16 +327,11 @@ impl super::runtime::AgentRuntime {
     /// on Windows when `rg` is not installed; `output_mode` and `multiline`
     /// are ignored on that path.
     pub(crate) async fn tool_search_content(&self, args: Value) -> Result<Value> {
-        let fallback_ws = crate::config::loader::base_dir().join("workspace");
-        let default_ws = self
-            .handle
-            .config
-            .workspace
-            .as_deref()
-            .or(self.config.agents.defaults.workspace.as_deref())
-            .unwrap_or(fallback_ws.to_str().unwrap_or("."));
-        let root = args["path"].as_str().unwrap_or(default_ws);
-        let root_path = expand_tilde(root);
+        let default_ws = self.default_workspace();
+        let root_path = args["path"]
+            .as_str()
+            .map(expand_tilde)
+            .unwrap_or(default_ws);
         let pattern = args["pattern"]
             .as_str()
             .ok_or_else(|| anyhow!("search_content: `pattern` required"))?;
@@ -451,14 +448,7 @@ impl super::runtime::AgentRuntime {
             .or_else(|| args["filename"].as_str())
             .or_else(|| args["file"].as_str())
             .ok_or_else(|| anyhow!("read: `path` required"))?;
-        let workspace = self
-            .handle
-            .config
-            .workspace
-            .as_deref()
-            .or(self.config.agents.defaults.workspace.as_deref())
-            .map(expand_tilde)
-            .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
+        let workspace = self.default_workspace();
 
         let full = canonicalize_external_path(path, &workspace);
 
@@ -565,14 +555,7 @@ impl super::runtime::AgentRuntime {
 
         let path = path.unwrap().to_owned();
         let content = content.unwrap().to_owned();
-        let workspace = self
-            .handle
-            .config
-            .workspace
-            .as_deref()
-            .or(self.config.agents.defaults.workspace.as_deref())
-            .map(expand_tilde)
-            .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
+        let workspace = self.default_workspace();
 
         let full = canonicalize_external_path(&path, &workspace);
 
@@ -722,14 +705,7 @@ impl super::runtime::AgentRuntime {
             ("sh", vec!["-c"])
         };
 
-        let workspace = self
-            .handle
-            .config
-            .workspace
-            .as_deref()
-            .or(self.config.agents.defaults.workspace.as_deref())
-            .map(expand_tilde)
-            .unwrap_or_else(|| crate::config::loader::base_dir().join("workspace"));
+        let workspace = self.default_workspace();
 
         // Interpreter file scan + sandbox (only when safety enabled)
         if safety_enabled {
@@ -1015,15 +991,7 @@ impl super::runtime::AgentRuntime {
             bail!("edit_file: `old_string` and `new_string` are identical — no change requested");
         }
 
-        let fallback_ws = crate::config::loader::base_dir().join("workspace");
-        let workspace = self
-            .handle
-            .config
-            .workspace
-            .as_deref()
-            .or(self.config.agents.defaults.workspace.as_deref())
-            .map(expand_tilde)
-            .unwrap_or(fallback_ws);
+        let workspace = self.default_workspace();
         let full = canonicalize_external_path(path, &workspace);
 
         let safety_enabled = self
