@@ -112,13 +112,21 @@ pub struct RelayHub {
     connections: DashMap<String, Connection>,
     routes: DashMap<String, RouteEntry>,
     pending: DashMap<String, oneshot::Sender<JsonRpcResponse>>,
-    /// Streaming relay entries: request_id → broadcast sender for wire events.
-    /// Inserted by `invoke_streaming`; removed when the spoke sends its
-    /// terminal `RelayFrame::Response` for the streaming request.
-    stream_pending: DashMap<String, broadcast::Sender<Value>>,
+    /// Streaming relay entries: request_id → (broadcast sender, agent_ref).
+    /// The agent_ref is kept so we can record `task_id → agent_ref` once
+    /// the first event arrives carrying a taskId. Inserted by
+    /// `invoke_streaming`; removed when the spoke sends its terminal
+    /// `RelayFrame::Response` for the streaming request.
+    stream_pending: DashMap<String, (broadcast::Sender<Value>, String)>,
     /// Spoke-side map of relay request_id → local task_id, so a `Cancel`
     /// frame can find the local `CancellationToken` in `task_cancels`.
     spoke_stream_tasks: DashMap<String, String>,
+    /// Hub-side cache of task_id → agent_ref ("node/agent"), populated by
+    /// sniffing responses and streaming events as they pass through the
+    /// hub. Lets follow-up task-bound RPCs (GetTask, CancelTask, push
+    /// config ops, SubscribeToTask) route to the right spoke even when
+    /// the client only knows the task_id.
+    task_routes: DashMap<String, String>,
 }
 
 impl RelayHub {
@@ -277,7 +285,8 @@ impl RelayHub {
             .ok_or_else(|| anyhow!("node '{}' is not connected", route.node_id))?;
         let request_id = format!("relay:stream:{}", Uuid::new_v4());
         let (event_tx, event_rx) = broadcast::channel(128);
-        self.stream_pending.insert(request_id.clone(), event_tx);
+        self.stream_pending
+            .insert(request_id.clone(), (event_tx, target.to_owned()));
         let frame = RelayFrame::Request {
             request_id: request_id.clone(),
             target: target.to_owned(),
@@ -320,12 +329,30 @@ impl RelayHub {
     }
 
     /// Route a wire-event `Value` to the stream subscriber for `request_id`,
-    /// if one exists. Returns the number of active receivers.
+    /// if one exists. Returns the number of active receivers. Also sniffs
+    /// the wire event's `taskId` and records the task→agent route.
     fn forward_stream_event(&self, request_id: &str, value: Value) -> usize {
-        self.stream_pending
-            .get(request_id)
-            .map(|tx| tx.send(value).unwrap_or(0))
-            .unwrap_or(0)
+        let Some(entry) = self.stream_pending.get(request_id) else {
+            return 0;
+        };
+        if let Some(task_id) = value.get("taskId").and_then(|v| v.as_str()) {
+            self.task_routes
+                .insert(task_id.to_owned(), entry.1.clone());
+        }
+        entry.0.send(value).unwrap_or(0)
+    }
+
+    /// Record `task_id → agent_ref` so a follow-up RPC (GetTask, CancelTask,
+    /// SubscribeToTask, push config ops) carrying only the task_id can be
+    /// routed to the spoke that owns the task.
+    pub fn record_task_route(&self, task_id: &str, agent_ref: &str) {
+        self.task_routes
+            .insert(task_id.to_owned(), agent_ref.to_owned());
+    }
+
+    /// Look up the agent_ref ("node/agent") that owns `task_id`, if known.
+    pub fn route_for_task(&self, task_id: &str) -> Option<String> {
+        self.task_routes.get(task_id).map(|e| e.clone())
     }
 }
 
@@ -593,14 +620,42 @@ pub fn relay_target_from_params(params: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-pub fn relay_target_from_request(req: &JsonRpcRequest) -> Option<String> {
-    if !matches!(
-        req.method.as_str(),
-        "SendMessage" | "GetTask" | "CancelTask"
-    ) {
+/// Methods whose JSON-RPC params identify a target spoke either explicitly
+/// via `metadata.agentId` or implicitly via a `task_id` (resolved through
+/// the hub's task_routes cache, which is populated by sniffing responses
+/// and streaming events).
+const FORWARDABLE_METHODS: &[&str] = &[
+    "SendMessage",
+    "GetTask",
+    "CancelTask",
+    "CreateTaskPushNotificationConfig",
+    "GetTaskPushNotificationConfig",
+    "ListTaskPushNotificationConfigs",
+    "DeleteTaskPushNotificationConfig",
+];
+
+/// Extract a task_id from a JSON-RPC params object. A2A task-bound RPCs use
+/// either `params.id` (GetTask/CancelTask/SubscribeToTask) or `params.taskId`
+/// (push notification config ops).
+pub fn task_id_from_params(params: &Value) -> Option<&str> {
+    params
+        .get("id")
+        .and_then(|v| v.as_str())
+        .or_else(|| params.get("taskId").and_then(|v| v.as_str()))
+}
+
+pub fn relay_target_from_request(
+    hub: &RelayHub,
+    req: &JsonRpcRequest,
+) -> Option<String> {
+    if !FORWARDABLE_METHODS.contains(&req.method.as_str()) {
         return None;
     }
-    relay_target_from_params(&req.params)
+    if let Some(target) = relay_target_from_params(&req.params) {
+        return Some(target);
+    }
+    // Fall back to implicit routing by task_id.
+    task_id_from_params(&req.params).and_then(|tid| hub.route_for_task(tid))
 }
 
 pub async fn try_forward_jsonrpc(
@@ -608,7 +663,7 @@ pub async fn try_forward_jsonrpc(
     caller: Option<&A2aIdentity>,
     req: &JsonRpcRequest,
 ) -> Option<JsonRpcResponse> {
-    let target = relay_target_from_request(req)?;
+    let target = relay_target_from_request(&state.relay_hub, req)?;
     if state.relay_hub.route_for(&target).is_none() {
         return None;
     }
@@ -629,6 +684,16 @@ pub async fn try_forward_jsonrpc(
     {
         Ok(mut response) => {
             response.id = req.id.clone();
+            // Sniff task_id from the response so follow-up RPCs that only
+            // carry a task_id can be routed back to this spoke.
+            if let Some(task_id) = response
+                .result
+                .as_ref()
+                .and_then(|r| r.get("id"))
+                .and_then(|v| v.as_str())
+            {
+                state.relay_hub.record_task_route(task_id, &target);
+            }
             Some(response)
         }
         Err(e) => Some(JsonRpcResponse::err(req.id.clone(), -32004, e.to_string())),
@@ -1039,6 +1104,61 @@ mod tests {
 
         // stream_pending entry should be cleaned up.
         assert!(!hub.stream_pending.contains_key(&request_id));
+    }
+
+    #[test]
+    fn relay_target_falls_back_to_task_id_route() {
+        let hub = RelayHub::new();
+        hub.record_task_route("task-abc", "a3/main");
+
+        // No metadata.agentId, only `id` (task_id) — should still route.
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_owned(),
+            id: Value::Null,
+            method: "GetTask".to_owned(),
+            params: serde_json::json!({"id": "task-abc"}),
+        };
+        assert_eq!(relay_target_from_request(&hub, &req).as_deref(), Some("a3/main"));
+
+        // Push config method uses `taskId` (camelCase).
+        let push_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_owned(),
+            id: Value::Null,
+            method: "GetTaskPushNotificationConfig".to_owned(),
+            params: serde_json::json!({"taskId": "task-abc", "pushNotificationConfigId": "p1"}),
+        };
+        assert_eq!(
+            relay_target_from_request(&hub, &push_req).as_deref(),
+            Some("a3/main")
+        );
+
+        // Unforwardable method must not route even if task_id matches.
+        let bad_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_owned(),
+            id: Value::Null,
+            method: "ListTasks".to_owned(),
+            params: serde_json::json!({"id": "task-abc"}),
+        };
+        assert!(relay_target_from_request(&hub, &bad_req).is_none());
+    }
+
+    #[test]
+    fn forward_stream_event_records_task_route() {
+        let hub = RelayHub::new();
+        let (event_tx, _event_rx) = broadcast::channel::<Value>(4);
+        hub.stream_pending
+            .insert("req-1".to_owned(), (event_tx, "a3/main".to_owned()));
+
+        let wire = serde_json::json!({
+            "kind": "status-update",
+            "taskId": "task-xyz",
+            "contextId": "ctx-1",
+            "status": {"state": "submitted"},
+            "final": false,
+        });
+        hub.forward_stream_event("req-1", wire);
+
+        assert_eq!(hub.route_for_task("task-xyz").as_deref(), Some("a3/main"));
     }
 
     #[tokio::test]

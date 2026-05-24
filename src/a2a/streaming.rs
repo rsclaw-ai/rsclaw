@@ -40,8 +40,12 @@ pub async fn handle_streaming_rpc(
     let req_id = req.id.clone();
 
     // Relay forwarding: if the request targets a spoke node, route through the
-    // relay hub instead of creating a local streaming task.
-    let relay_target = relay_target_from_params(&req.params);
+    // relay hub instead of creating a local streaming task. Targets may be
+    // explicit (metadata.agentId) or implicit via a known task_id route.
+    let relay_target = relay_target_from_params(&req.params).or_else(|| {
+        crate::a2a::relay::task_id_from_params(&req.params)
+            .and_then(|tid| state.relay_hub.route_for_task(tid))
+    });
     if let Some(ref target) = relay_target {
         if state.relay_hub.route_for(target).is_some() {
             let principal = caller
