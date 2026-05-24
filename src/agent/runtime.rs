@@ -7119,9 +7119,24 @@ impl AgentRuntime {
         &self,
         ctx: &RunContext,
         _id: &str,
-        name: &str,
+        raw_name: &str,
         args: Value,
     ) -> Result<Value> {
+        // Tolerate `plugin=search_tools` (instead of `plugin.search_tools`) —
+        // observed from rsclaw-agent-v1 on the 4070 fleet, model treats the
+        // namespace separator as `key=value`. We do NOT alias `plugin.list`
+        // → `plugin.info` because the semantics differ: `plugin.info` lists
+        // installed plugins, while a model emitting `plugin.list` more
+        // commonly wants to enumerate one plugin's tools (which is
+        // `plugin.search_tools {plugin: …}` in browse mode). Let the
+        // "unknown tool" error surface so the model re-reads the catalog
+        // and self-corrects (logs show it does).
+        let normalized: String = if raw_name.contains('=') && !raw_name.contains('.') {
+            raw_name.replacen('=', ".", 1)
+        } else {
+            raw_name.to_owned()
+        };
+        let name = normalized.as_str();
         // 2. Built-in tools (checked before A2A prefix so reserved names are not
         //    hijacked).
         match name {
@@ -8749,10 +8764,16 @@ fn format_tool_result(val: &serde_json::Value) -> String {
     else if let Some(results) = val.get("results").and_then(|v| v.as_array()) {
         let mut out = String::new();
         for (i, r) in results.iter().enumerate() {
+            // Title fallback chain widened: skill_search returns
+            // {slug, description, installs, registry} (no `title`), so
+            // every result was rendering as "(no title)". Try the common
+            // identifier fields any result-shaped payload exposes.
             let title = r
                 .get("title")
                 .or_else(|| r.get("summary"))
                 .or_else(|| r.get("content"))
+                .or_else(|| r.get("slug"))
+                .or_else(|| r.get("name"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("(no title)");
             let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("");
