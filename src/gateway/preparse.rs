@@ -7,9 +7,14 @@ use futures::StreamExt as _;
 use tracing::warn;
 
 use crate::{
-    agent::LiveStatus,
+    agent::{
+        LiveStatus,
+        runtime::{AgentRuntime, PluginOverride},
+    },
     channel::OutboundMessage,
     config::runtime::RuntimeConfig,
+    config::schema::DmScope,
+    gateway::session::{MessageKind, SessionKeyParams, derive_session_key},
     provider::{
         AgentEndpoint, LlmRequest, Message, MessageContent, Role, StreamEvent,
         failover::FailoverManager, registry::ProviderRegistry,
@@ -22,6 +27,106 @@ use crate::{
 pub enum PreparseOrigin {
     User,
     Cron,
+}
+
+/// Parsed form of a `/plugin ...` command line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PluginCommand {
+    /// `/plugin` — list every plugin override in this session.
+    Status,
+    /// `/plugin <name>` — show one plugin's current override.
+    Info { plugin: String },
+    /// `/plugin <name> off|on|all|<comma-tools>` — set session override.
+    SetState { plugin: String, action: PluginAction },
+    /// `/plugin reset` — clear every override for this session.
+    Reset,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PluginAction {
+    /// Hide the plugin entirely (catalog + tools).
+    Off,
+    /// Inject every tool this plugin exposes (subject to MAX_INJECT_TOOLS).
+    All,
+    /// Clear inject set — back to default (catalog only, model must use
+    /// plugin.search_tools + plugin.invoke).
+    Default,
+    /// Inject the listed tools as `<plugin>.<tool>` ToolDefs.
+    Inject(Vec<String>),
+}
+
+/// Parse a `/plugin ...` line. None on malformed input.
+pub(crate) fn parse_plugin_command(line: &str) -> Option<PluginCommand> {
+    let line = line.trim();
+    if line == "/plugin" {
+        return Some(PluginCommand::Status);
+    }
+    let rest = line.strip_prefix("/plugin ")?.trim();
+    if rest.is_empty() {
+        return Some(PluginCommand::Status);
+    }
+    if rest == "reset" {
+        return Some(PluginCommand::Reset);
+    }
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let plugin = parts.next()?.trim().to_owned();
+    if plugin.is_empty() {
+        return None;
+    }
+    let Some(action_raw) = parts.next().map(str::trim).filter(|s| !s.is_empty()) else {
+        return Some(PluginCommand::Info { plugin });
+    };
+    let action = match action_raw {
+        "off" => PluginAction::Off,
+        "on" | "default" => PluginAction::Default,
+        "all" => PluginAction::All,
+        other => {
+            let tools: Vec<String> = other
+                .split(',')
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if tools.is_empty() {
+                return None;
+            }
+            PluginAction::Inject(tools)
+        }
+    };
+    Some(PluginCommand::SetState { plugin, action })
+}
+
+/// Help text for `/plugin`.
+pub(crate) fn plugin_help_text() -> String {
+    "/plugin                       — list session plugin overrides\n\
+     /plugin <name>                — show one plugin's state\n\
+     /plugin <name> off            — hide plugin in this session\n\
+     /plugin <name> on             — back to default (catalog only)\n\
+     /plugin <name> all            — inject ALL plugin tools (cap 20)\n\
+     /plugin <name> t1,t2,t3       — inject specific tools as <plugin>.<tool>\n\
+     /plugin reset                 — clear every session override\n\n\
+     Session overrides upgrade plugin exposure from \"catalog only\" \
+     (model must use plugin.search_tools + plugin.invoke) to real \
+     <plugin>.<tool> ToolDefs the model can call directly. Useful for \
+     small fleet models. Resets when the session restarts.".to_owned()
+}
+
+/// Derive the session_key the agent runtime will use to look up overrides.
+/// v1 hardcodes dmScope=PerChannelPeer (the default and most common case);
+/// users on other dmScope settings will not see /plugin overrides apply
+/// until v2 surfaces dmScope to preparse.
+fn preparse_session_key(
+    handle: &crate::agent::AgentHandle,
+    channel: &str,
+    peer_id: &str,
+    account: Option<&str>,
+) -> String {
+    derive_session_key(&SessionKeyParams {
+        agent_id: handle.id.clone(),
+        channel: channel.to_owned(),
+        peer_id: peer_id.to_owned(),
+        kind: MessageKind::DirectMessage { account_id: account.map(str::to_owned) },
+        dm_scope: DmScope::PerChannelPeer,
+    })
 }
 
 /// Handle certain fast preparse commands locally — without going through the
@@ -623,6 +728,98 @@ $g.Dispose();$b.Dispose()"#
             "Model switched to: {model} (runtime only, use configure to persist)"
         )));
     }
+    // /plugin — session-scoped plugin activation control. See plugin_help_text.
+    if lower == "/plugin" || lower.starts_with("/plugin ") {
+        let Some(cmd) = parse_plugin_command(t) else {
+            return Some(txt(plugin_help_text()));
+        };
+        let session_key = preparse_session_key(handle, channel, peer_id, account);
+        let reply = match cmd {
+            PluginCommand::Reset => {
+                AgentRuntime::clear_plugin_overrides(handle, &session_key);
+                "cleared all plugin overrides for this session".to_owned()
+            }
+            PluginCommand::Status => {
+                let snapshot = handle
+                    .plugin_overrides
+                    .read()
+                    .ok()
+                    .and_then(|g| g.get(&session_key).cloned())
+                    .unwrap_or_default();
+                if snapshot.is_empty() {
+                    "no plugin overrides (all plugins at default — catalog only)\n\
+                     Use `/plugin <name> all` or `/plugin <name> t1,t2` to inject \
+                     real ToolDefs for small models."
+                        .to_owned()
+                } else {
+                    let mut lines = vec!["session plugin overrides:".to_owned()];
+                    let mut entries: Vec<(&String, &PluginOverride)> = snapshot.iter().collect();
+                    entries.sort_by(|a, b| a.0.cmp(b.0));
+                    for (p, o) in entries {
+                        if o.disabled {
+                            lines.push(format!("  {p}: OFF"));
+                        } else if o.inject_all {
+                            lines.push(format!("  {p}: inject ALL"));
+                        } else if o.inject.is_empty() {
+                            lines.push(format!("  {p}: default"));
+                        } else {
+                            lines.push(format!("  {p}: inject [{}]", o.inject.join(", ")));
+                        }
+                    }
+                    lines.join("\n")
+                }
+            }
+            PluginCommand::Info { plugin } => {
+                let snapshot = handle
+                    .plugin_overrides
+                    .read()
+                    .ok()
+                    .and_then(|g| g.get(&session_key).and_then(|m| m.get(&plugin)).cloned());
+                match snapshot {
+                    Some(o) if o.disabled => format!("{plugin}: OFF"),
+                    Some(o) if o.inject_all => format!("{plugin}: inject ALL"),
+                    Some(o) if o.inject.is_empty() => {
+                        format!("{plugin}: default (catalog only)")
+                    }
+                    Some(o) => format!("{plugin}: inject [{}]", o.inject.join(", ")),
+                    None => format!("{plugin}: default (no override)"),
+                }
+            }
+            PluginCommand::SetState { plugin, action } => {
+                let new_override = match action {
+                    PluginAction::Off => PluginOverride {
+                        disabled: true,
+                        inject_all: false,
+                        inject: vec![],
+                    },
+                    PluginAction::Default => PluginOverride::default(),
+                    PluginAction::All => PluginOverride {
+                        disabled: false,
+                        inject_all: true,
+                        inject: vec![],
+                    },
+                    PluginAction::Inject(tools) => PluginOverride {
+                        disabled: false,
+                        inject_all: false,
+                        inject: tools,
+                    },
+                };
+                let summary = if new_override.disabled {
+                    format!("{plugin}: OFF")
+                } else if new_override.inject_all {
+                    format!("{plugin}: inject ALL (capped at MAX_INJECT_TOOLS=20)")
+                } else if new_override.inject.is_empty() {
+                    format!("{plugin}: default")
+                } else {
+                    format!("{plugin}: inject [{}]", new_override.inject.join(", "))
+                };
+                AgentRuntime::set_plugin_override(handle, &session_key, &plugin, new_override);
+                summary
+            }
+        };
+        return Some(txt(reply));
+    }
+
     // /run <cmd>, /sh <cmd>, /exec <cmd>, ! <cmd>, $ <cmd> — shell execution
     let shell_cmd: Option<&str> =
         if lower.starts_with("/run ") || lower.starts_with("/sh ") || lower.starts_with("/exec ") {
@@ -693,7 +890,7 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
         lower.as_str(),
         "/ls" | "/status" | "/version" | "/help" | "/?" | "/health" | "/uptime"
             | "/model" | "/models" | "/cron" | "/clear" | "/new" | "/abort" | "/sessions"
-            | "/loop" | "/task" | "/watch"
+            | "/loop" | "/task" | "/watch" | "/plugin"
     )
     // Commands with optional/required args
     || lower.starts_with("/ls ")
@@ -704,6 +901,7 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
     || lower.starts_with("/recall ")
     || lower.starts_with("/cron ")
     || lower.starts_with("/skill ")
+    || lower.starts_with("/plugin ")
     || lower.starts_with("/model ")
     || lower.starts_with("/run ")
     || lower.starts_with("/sh ")
@@ -1119,5 +1317,90 @@ mod tests {
         // Real /task usage must NOT bypass the queue — task_queue owns that flow.
         assert!(!is_fast_preparse("/task fix the bug"));
         assert!(!is_fast_preparse("/task --turns 20 do something"));
+    }
+
+    // -----------------------------------------------------------------
+    // /plugin slash command parser tests (Task 4)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_plugin_command_status_bare() {
+        assert_eq!(parse_plugin_command("/plugin"), Some(PluginCommand::Status));
+        assert_eq!(parse_plugin_command("/plugin "), Some(PluginCommand::Status));
+    }
+
+    #[test]
+    fn parse_plugin_command_info_single_arg() {
+        assert_eq!(
+            parse_plugin_command("/plugin douyin"),
+            Some(PluginCommand::Info {
+                plugin: "douyin".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_plugin_command_off() {
+        assert_eq!(
+            parse_plugin_command("/plugin douyin off"),
+            Some(PluginCommand::SetState {
+                plugin: "douyin".to_owned(),
+                action: PluginAction::Off
+            })
+        );
+    }
+
+    #[test]
+    fn parse_plugin_command_on_or_default() {
+        let expected = Some(PluginCommand::SetState {
+            plugin: "douyin".to_owned(),
+            action: PluginAction::Default,
+        });
+        assert_eq!(parse_plugin_command("/plugin douyin on"), expected);
+        assert_eq!(parse_plugin_command("/plugin douyin default"), expected);
+    }
+
+    #[test]
+    fn parse_plugin_command_all() {
+        assert_eq!(
+            parse_plugin_command("/plugin douyin all"),
+            Some(PluginCommand::SetState {
+                plugin: "douyin".to_owned(),
+                action: PluginAction::All
+            })
+        );
+    }
+
+    #[test]
+    fn parse_plugin_command_inject_list() {
+        assert_eq!(
+            parse_plugin_command("/plugin douyin publish_video,check_comments"),
+            Some(PluginCommand::SetState {
+                plugin: "douyin".to_owned(),
+                action: PluginAction::Inject(vec![
+                    "publish_video".into(),
+                    "check_comments".into()
+                ]),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_plugin_command_reset() {
+        assert_eq!(parse_plugin_command("/plugin reset"), Some(PluginCommand::Reset));
+    }
+
+    #[test]
+    fn parse_plugin_command_rejects_malformed() {
+        assert_eq!(parse_plugin_command("/plugin douyin ,,, "), None);
+        assert_eq!(parse_plugin_command("not-a-plugin-cmd"), None);
+    }
+
+    #[test]
+    fn is_fast_preparse_recognizes_plugin() {
+        assert!(is_fast_preparse("/plugin"));
+        assert!(is_fast_preparse("/plugin douyin"));
+        assert!(is_fast_preparse("/plugin douyin off"));
+        assert!(is_fast_preparse("/plugin reset"));
     }
 }
