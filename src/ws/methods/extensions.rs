@@ -3,12 +3,6 @@ use crate::ws::{
     types::ErrorShape,
 };
 
-fn load_search_cfg() -> Option<crate::config::schema::MemorySearchConfig> {
-    crate::config::load()
-        .ok()
-        .and_then(|c| c.raw.memory_search.clone())
-}
-
 pub async fn memory_search(ctx: MethodCtx) -> MethodResult {
     let params = ctx
         .req
@@ -21,29 +15,15 @@ pub async fn memory_search(ctx: MethodCtx) -> MethodResult {
     let scope = params["scope"].as_str();
     let top_k = params["limit"].as_u64().unwrap_or(10) as usize;
 
-    let base = crate::config::loader::base_dir();
-    let data_dir = base.join("var/data");
-    let model_dir = {
-        let zh = base.join("models/bge-small-zh");
-        let en = base.join("models/bge-small-en");
-        if zh.join("config.json").exists() {
-            zh
-        } else {
-            en
-        }
+    // Use the shared MemoryStore from AppState so hybrid search hits the
+    // BM25 index the gateway already maintains, and so we never compete
+    // for the redb lock by opening a second handle.
+    let Some(mem_arc) = ctx.state.memory.clone() else {
+        return Err(ErrorShape::internal("memory store not available"));
     };
-    let tier = crate::sys::detect_memory_tier();
-    let search_cfg = load_search_cfg();
-    let mut mem = crate::agent::memory::MemoryStore::open(
-        &data_dir,
-        Some(&model_dir),
-        tier,
-        search_cfg.as_ref(),
-    )
-    .await
-    .map_err(|e| ErrorShape::internal(e.to_string()))?;
+    let mut mem = mem_arc.lock().await;
     let results = mem
-        .search(query, scope, top_k)
+        .search_hybrid(query, scope, top_k)
         .await
         .map_err(|e| ErrorShape::internal(e.to_string()))?;
 
@@ -81,27 +61,9 @@ pub async fn memory_store(ctx: MethodCtx) -> MethodResult {
         .map(|s| s.to_owned())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    let base = crate::config::loader::base_dir();
-    let data_dir = base.join("var/data");
-    let model_dir = {
-        let zh = base.join("models/bge-small-zh");
-        let en = base.join("models/bge-small-en");
-        if zh.join("config.json").exists() {
-            zh
-        } else {
-            en
-        }
+    let Some(mem_arc) = ctx.state.memory.clone() else {
+        return Err(ErrorShape::internal("memory store not available"));
     };
-    let tier = crate::sys::detect_memory_tier();
-    let search_cfg = load_search_cfg();
-    let mut mem = crate::agent::memory::MemoryStore::open(
-        &data_dir,
-        Some(&model_dir),
-        tier,
-        search_cfg.as_ref(),
-    )
-    .await
-    .map_err(|e| ErrorShape::internal(e.to_string()))?;
 
     let doc = crate::agent::memory::MemoryDoc {
         id: id.clone(),
@@ -119,35 +81,21 @@ pub async fn memory_store(ctx: MethodCtx) -> MethodResult {
         tags: vec![],
         pinned: false,
     };
-    mem.add(doc)
+    // `add_off_lock` embeds outside the lock then briefly re-acquires it to
+    // commit — better than `add()` for the shared gateway store. The shared
+    // store has its BM25 index wired so the dual-write happens automatically.
+    crate::agent::memory::add_off_lock(&mem_arc, doc)
         .await
         .map_err(|e| ErrorShape::internal(e.to_string()))?;
 
     Ok(serde_json::json!({ "id": id, "stored": true }))
 }
 
-pub async fn memory_status(_ctx: MethodCtx) -> MethodResult {
-    let base = crate::config::loader::base_dir();
-    let data_dir = base.join("var/data");
-    let model_dir = {
-        let zh = base.join("models/bge-small-zh");
-        let en = base.join("models/bge-small-en");
-        if zh.join("config.json").exists() {
-            zh
-        } else {
-            en
-        }
+pub async fn memory_status(ctx: MethodCtx) -> MethodResult {
+    let Some(mem_arc) = ctx.state.memory.clone() else {
+        return Err(ErrorShape::internal("memory store not available"));
     };
-    let tier = crate::sys::detect_memory_tier();
-    let search_cfg = load_search_cfg();
-    let mem = crate::agent::memory::MemoryStore::open(
-        &data_dir,
-        Some(&model_dir),
-        tier,
-        search_cfg.as_ref(),
-    )
-    .await
-    .map_err(|e| ErrorShape::internal(e.to_string()))?;
+    let mem = mem_arc.lock().await;
     let count = mem
         .count()
         .await

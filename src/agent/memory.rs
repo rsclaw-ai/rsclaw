@@ -341,6 +341,11 @@ pub struct MemoryStore {
     /// Asymmetric query instruction (`memorySearch.queryInstruction`), applied
     /// to search queries only. None = symmetric (current behaviour).
     query_instruction: Option<String>,
+    /// Shared BM25 index. When set, every `add_pre_embedded` / `delete` /
+    /// `merge` also writes/removes from BM25 so extractor + WS + CLI memories
+    /// land in keyword search, not just vector. `None` means BM25 is unwired
+    /// (CLI one-shots that didn't open a `Store`).
+    search: Option<Arc<crate::store::SearchIndex>>,
 }
 
 impl MemoryStore {
@@ -480,9 +485,47 @@ impl MemoryStore {
             swap: None,
             pending_migration: skipped,
             query_instruction: search_cfg.and_then(|c| c.query_instruction.clone()),
+            search: None,
         };
 
         Ok(store)
+    }
+
+    /// Wire a shared BM25 index into this store. Subsequent writes
+    /// (`add_pre_embedded`, `delete`) keep BM25 in sync; `search_hybrid`
+    /// fuses BM25 + vector hits. Gateway startup attaches `Store::search`
+    /// here and then calls `reindex_bm25` once so existing docs land too.
+    pub fn set_search_index(&mut self, search: Arc<crate::store::SearchIndex>) {
+        self.search = Some(search);
+    }
+
+    /// Re-index every non-tombstoned doc into the attached BM25 index.
+    /// Called once at startup after `set_search_index` so memories written
+    /// before BM25 was wired (or by an older binary) become keyword-searchable.
+    /// Cheap to call again — `SearchIndex::index_document` deletes-then-adds
+    /// by id, so duplicates can't pile up. Returns the number of docs indexed.
+    pub fn reindex_bm25(&self) -> Result<usize> {
+        let Some(ref search) = self.search else {
+            return Ok(0);
+        };
+        let mut n = 0usize;
+        for doc in &self.docs {
+            if doc.id.is_empty() {
+                continue;
+            }
+            if let Err(e) = search.index_memory_doc(&doc.id, &doc.scope, &doc.kind, &doc.text) {
+                warn!(id = %doc.id, "reindex_bm25: skip doc: {e:#}");
+                continue;
+            }
+            n += 1;
+        }
+        if n > 0 {
+            search
+                .commit()
+                .context("reindex_bm25: commit tantivy writer")?;
+        }
+        info!(indexed = n, "memory: BM25 reindex complete");
+        Ok(n)
     }
 
     /// Number of docs whose stored vector dimension doesn't match the
@@ -604,6 +647,10 @@ impl MemoryStore {
             };
             persisted.vector.clear();
             self.persist_memory_doc(&persisted)?;
+            // Keep BM25 in sync with the merged text — `existing.text` is
+            // unchanged here, but tier/tags moved so we re-index to make sure
+            // the BM25 doc reflects current scope/kind metadata.
+            self.bm25_index_doc(&self.docs[idx]);
             debug!(
                 id = %self.docs[idx].id,
                 kind = %self.docs[idx].kind,
@@ -670,9 +717,31 @@ impl MemoryStore {
         }
 
         self.docs.push(doc);
+        // Dual-write to BM25 so extractor / WS / CLI inserts are visible to
+        // keyword search, not only vector. Failure is non-fatal — we still
+        // have the vector index — so just warn and continue.
+        if let Some(stored) = self.docs.last() {
+            self.bm25_index_doc(stored);
+        }
 
         debug!(idx, "memory doc stored");
         Ok(())
+    }
+
+    /// Best-effort BM25 dual-write. Logs and swallows errors — the vector
+    /// path is authoritative; BM25 is a secondary lane.
+    fn bm25_index_doc(&self, doc: &MemoryDoc) {
+        let Some(ref search) = self.search else {
+            return;
+        };
+        if doc.id.is_empty() {
+            return;
+        }
+        if let Err(e) = search.index_memory_doc(&doc.id, &doc.scope, &doc.kind, &doc.text) {
+            warn!(id = %doc.id, "BM25 dual-write failed: {e:#}");
+        } else if let Err(e) = search.commit() {
+            warn!(id = %doc.id, "BM25 commit failed after add: {e:#}");
+        }
     }
 
     pub async fn delete(&mut self, id: &str) -> Result<()> {
@@ -691,6 +760,16 @@ impl MemoryStore {
         if let Some(doc) = self.docs.iter_mut().find(|d| d.id == id) {
             doc.id.clear();
             doc.text.clear();
+        }
+
+        // Remove from BM25 too so deleted docs don't leak into keyword search.
+        if let Some(ref search) = self.search {
+            if let Err(e) = search
+                .delete_document(id)
+                .and_then(|_| search.commit())
+            {
+                warn!(id, "BM25 delete failed: {e:#}");
+            }
         }
 
         Ok(())
@@ -740,6 +819,40 @@ impl MemoryStore {
         }
 
         Ok(results)
+    }
+
+    /// Hybrid search: vector + BM25, fused via reciprocal rank fusion.
+    /// Falls back to plain vector search when no BM25 index is wired (CLI
+    /// one-shots). Use this from WS / CLI / any caller that wants the same
+    /// recall the agent tool gets — vector alone misses case-sensitive
+    /// English keywords on the FNV fallback embedder and on docs the
+    /// extractor wrote before this commit.
+    pub async fn search_hybrid(
+        &mut self,
+        query: &str,
+        scope: Option<&str>,
+        top_k: usize,
+    ) -> Result<Vec<MemoryDoc>> {
+        let vec_docs = self.search(query, scope, top_k.saturating_mul(3).max(top_k)).await?;
+        let Some(ref search) = self.search else {
+            return Ok(vec_docs.into_iter().take(top_k).collect());
+        };
+        let bm25_hits = match search.search(
+            query,
+            scope,
+            top_k.saturating_mul(4).max(16),
+        ) {
+            Ok(hits) => hits,
+            Err(e) => {
+                debug!(query, "BM25 search skipped: {e:#}");
+                Vec::new()
+            }
+        };
+        let bm25_docs: Vec<MemoryDoc> = bm25_hits
+            .into_iter()
+            .filter_map(|hit| self.get_sync(&hit.id).cloned())
+            .collect();
+        Ok(rrf_fuse_memory(vec_docs, bm25_docs, top_k))
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<MemoryDoc>> {
@@ -1159,6 +1272,52 @@ fn serialize_doc(doc: &MemoryDoc) -> Result<Vec<u8>> {
 /// Use this from any path that holds an `Arc<Mutex<MemoryStore>>` shared
 /// across tasks. Single-owner stores (CLI tools that opened a fresh store
 /// for one shot) can keep using `MemoryStore::add` directly.
+/// Merge vector and BM25 hits using Reciprocal Rank Fusion (k=60), then
+/// apply a tier/pinned/importance quality multiplier and recency decay so
+/// pinned + Core docs beat low-value notes when both are plausible matches.
+/// Public so the agent tool can keep using a single canonical fuser.
+pub fn rrf_fuse_memory(
+    vec_hits: Vec<MemoryDoc>,
+    bm25_hits: Vec<MemoryDoc>,
+    top_k: usize,
+) -> Vec<MemoryDoc> {
+    use std::collections::HashMap;
+
+    const K: f32 = 60.0;
+    let mut scores: HashMap<String, (f32, MemoryDoc)> = HashMap::new();
+
+    for (rank, doc) in vec_hits.into_iter().enumerate() {
+        let rrf = 1.0 / (K + (rank + 1) as f32);
+        scores
+            .entry(doc.id.clone())
+            .and_modify(|(s, _)| *s += rrf)
+            .or_insert((rrf, doc));
+    }
+    for (rank, doc) in bm25_hits.into_iter().enumerate() {
+        let rrf = 1.0 / (K + (rank + 1) as f32);
+        scores
+            .entry(doc.id.clone())
+            .and_modify(|(s, _)| *s += rrf)
+            .or_insert((rrf, doc));
+    }
+
+    let mut ranked: Vec<(f32, MemoryDoc)> = scores
+        .into_values()
+        .map(|(score, doc)| {
+            let quality = if doc.pinned { 1.25 } else { 1.0 }
+                * match doc.tier {
+                    MemDocTier::Core => 1.15,
+                    MemDocTier::Working => 1.0,
+                    MemDocTier::Peripheral => 0.8,
+                }
+                * (0.75 + doc.importance.clamp(0.01, 1.0) * 0.5);
+            (score * doc.decay_multiplier() * quality, doc)
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.into_iter().take(top_k).map(|(_, doc)| doc).collect()
+}
+
 pub async fn add_off_lock(
     mem_arc: &Arc<tokio::sync::Mutex<MemoryStore>>,
     doc: MemoryDoc,
@@ -1613,6 +1772,82 @@ mod swap_tests {
             store.pending_migration_count(),
             2,
             "expected 2 docs flagged for migration after dim change 16 -> 384"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_dual_writes_to_bm25_and_hybrid_search_finds_keyword() {
+        let (mut store, tmp) = open_temp_store().await;
+        let search_dir = tmp.path().join("bm25");
+        let search = Arc::new(
+            crate::store::SearchIndex::open(&search_dir, MemoryTier::Low).expect("search open"),
+        );
+        store.set_search_index(Arc::clone(&search));
+
+        // A keyword that should never match by FNV vector — different first
+        // byte means a different vector seed — but is a clear BM25 hit.
+        let mut d = doc("d-keyword", "the supercalifragilistic widget");
+        d.scope = "test".into();
+        store.add(d).await.expect("add with dual-write");
+
+        // Vector-only search seeded by a different first byte will miss.
+        // Hybrid search should pull it in through the BM25 lane.
+        let hits = store
+            .search_hybrid("supercalifragilistic", Some("test"), 5)
+            .await
+            .expect("search_hybrid");
+        assert!(
+            hits.iter().any(|d| d.id == "d-keyword"),
+            "hybrid search should surface the BM25 hit even when vectors miss"
+        );
+    }
+
+    #[tokio::test]
+    async fn reindex_bm25_backfills_existing_docs() {
+        let (mut store, tmp) = open_temp_store().await;
+        // Insert docs BEFORE wiring BM25 — simulates upgrade from a binary
+        // that only wrote to redb+HNSW.
+        store.add(doc("legacy", "ancient sentinel token")).await.unwrap();
+
+        let search = Arc::new(
+            crate::store::SearchIndex::open(&tmp.path().join("bm25"), MemoryTier::Low)
+                .expect("search open"),
+        );
+        store.set_search_index(Arc::clone(&search));
+        let n = store.reindex_bm25().expect("reindex");
+        assert_eq!(n, 1);
+
+        let hits = search
+            .search("sentinel", Some("test"), 5)
+            .expect("bm25 search");
+        assert!(hits.iter().any(|h| h.id == "legacy"));
+    }
+
+    #[tokio::test]
+    async fn delete_also_removes_from_bm25() {
+        let (mut store, tmp) = open_temp_store().await;
+        let search = Arc::new(
+            crate::store::SearchIndex::open(&tmp.path().join("bm25"), MemoryTier::Low)
+                .expect("search open"),
+        );
+        store.set_search_index(Arc::clone(&search));
+        store.add(doc("d-del", "vanishing keyword")).await.unwrap();
+
+        assert!(
+            !search
+                .search("vanishing", Some("test"), 5)
+                .unwrap()
+                .is_empty()
+        );
+
+        store.delete("d-del").await.expect("delete");
+
+        let after = search
+            .search("vanishing", Some("test"), 5)
+            .expect("search after delete");
+        assert!(
+            after.iter().all(|h| h.id != "d-del"),
+            "BM25 should not return deleted doc"
         );
     }
 }

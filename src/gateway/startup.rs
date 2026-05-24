@@ -211,7 +211,17 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // (agent tasks, heartbeat, AppState ~795) — clones are cheap refcount bumps
     // and order-independent. Never move it; the final owner is `AppState.memory`.
     let memory = match MemoryStore::open(&data_dir, Some(&model_dir), tier, search_cfg).await {
-        Ok(m) => {
+        Ok(mut m) => {
+            // Wire the shared BM25 index so every extractor / WS / CLI write
+            // dual-writes into tantivy and `search_hybrid` can fuse keyword
+            // hits with vector hits. Then reindex existing docs so memories
+            // written before this code shipped are also keyword-searchable.
+            m.set_search_index(Arc::clone(&store.search));
+            match m.reindex_bm25() {
+                Ok(n) if n > 0 => info!(indexed = n, "memory: BM25 backfill complete"),
+                Ok(_) => {}
+                Err(e) => warn!("memory: BM25 reindex failed (vector still works): {e:#}"),
+            }
             info!("memory store opened");
             Some(Arc::new(tokio::sync::Mutex::new(m)))
         }

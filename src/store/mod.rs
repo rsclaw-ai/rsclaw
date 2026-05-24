@@ -20,9 +20,13 @@ use tracing::info;
 use crate::MemoryTier;
 
 /// Unified storage facade — combines hot KV (redb) and BM25 FTS (tantivy).
+///
+/// `search` is held behind `Arc` so the BM25 index can be shared with the
+/// vector `MemoryStore` (which dual-writes into it on every add/delete so
+/// extractor / WS / CLI writes are not invisible to BM25 search).
 pub struct Store {
     pub db: Arc<RedbStore>,
-    pub search: SearchIndex,
+    pub search: Arc<SearchIndex>,
 }
 
 impl Store {
@@ -39,7 +43,7 @@ impl Store {
         std::fs::create_dir_all(&search_dir)?;
 
         let db = Arc::new(RedbStore::open(&redb_dir.join("data.redb"), tier)?);
-        let search = SearchIndex::open(&search_dir, tier)?;
+        let search = Arc::new(SearchIndex::open(&search_dir, tier)?);
 
         info!(
             db_size = ?redb_dir, search_size = ?search_dir, tier = ?tier,

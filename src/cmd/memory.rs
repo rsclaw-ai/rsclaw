@@ -44,7 +44,9 @@ pub async fn cmd_memory(sub: MemoryCommand) -> Result<()> {
             let mut mem =
                 agent::memory::MemoryStore::open_readonly(&data_dir, Some(&model_dir), search_cfg)
                     .await?;
-            let results = mem.search(&args.query, None, args.max_results).await?;
+            let results = mem
+                .search_hybrid(&args.query, None, args.max_results)
+                .await?;
             if results.is_empty() {
                 warn_msg("no results");
             } else {
