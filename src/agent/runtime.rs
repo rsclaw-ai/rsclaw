@@ -3134,6 +3134,14 @@ impl AgentRuntime {
             if let Some(ref mcp) = self.mcp {
                 all.extend(mcp.all_tool_defs().await);
             }
+            // Plugin overrides (per-session, set by `/plugin` slash command):
+            // expand the inject set into real `<plugin>.<tool>` ToolDefs so
+            // small models call them directly without the search_tools →
+            // invoke two-step. Default (no override) = empty Vec = today's
+            // behavior, KV cache stable. Dispatch routing for `<plugin>.<tool>`
+            // already exists at the `name.split_once('.')` arm in
+            // dispatch_tool (~runtime.rs:7199).
+            all.extend(self.expand_plugin_tool_defs(session_key));
 
             // Apply toolset level + custom tools list
             // Default agent uses "full", others use "standard". Fall back to
@@ -6714,6 +6722,92 @@ impl AgentRuntime {
         score
     }
 
+    /// Build `<plugin>.<tool>` ToolDefs for every plugin with a non-empty
+    /// inject set in this session. Capped at `cap` (v1 hard limit; v2
+    /// replaces this with a token-budget guard).
+    ///
+    /// Dispatch routing for `<plugin>.<tool>` names already exists at the
+    /// fall-through in `dispatch_tool` (the `name.split_once('.')` arm),
+    /// so calling these injected ToolDefs Just Works — no dispatcher change.
+    pub(crate) fn expand_plugin_tool_defs_pure(
+        wasm_plugins: &[crate::plugin::wasm_runtime::WasmPlugin],
+        js_plugins: Option<&crate::plugin::PluginRegistry>,
+        per_plugin: &std::collections::HashMap<String, PluginOverride>,
+        cap: usize,
+    ) -> Vec<crate::provider::ToolDef> {
+        use crate::provider::ToolDef;
+        let mut out: Vec<ToolDef> = Vec::with_capacity(cap.min(64));
+        // WASM plugins first (priority over JS — matches dispatch_tool's
+        // wasm-wins ordering at section 4 / runtime.rs:7199).
+        for wp in wasm_plugins {
+            let names = match Self::resolve_plugin_inject_pure(per_plugin, &wp.name) {
+                PluginInjectResolution::None => continue,
+                PluginInjectResolution::All => wp.tools.iter().map(|t| t.name.clone()).collect(),
+                PluginInjectResolution::Names(v) => v,
+            };
+            for name in &names {
+                if let Some(t) = wp.tools.iter().find(|t| &t.name == name) {
+                    out.push(ToolDef {
+                        name: format!("{}.{}", wp.name, t.name),
+                        description: t.description.clone(),
+                        parameters: t.parameters.clone(),
+                    });
+                    if out.len() >= cap {
+                        return out;
+                    }
+                }
+            }
+        }
+        if let Some(reg) = js_plugins {
+            for (plugin_name, plugin) in reg.js_plugins_iter() {
+                let names = match Self::resolve_plugin_inject_pure(per_plugin, plugin_name) {
+                    PluginInjectResolution::None => continue,
+                    PluginInjectResolution::All => {
+                        plugin.manifest.tools.iter().map(|t| t.name.clone()).collect()
+                    }
+                    PluginInjectResolution::Names(v) => v,
+                };
+                for name in &names {
+                    if let Some(t) = plugin.manifest.tools.iter().find(|t| &t.name == name) {
+                        out.push(ToolDef {
+                            name: format!("{plugin_name}.{}", t.name),
+                            description: t.description.clone(),
+                            parameters: t.input_schema.clone().unwrap_or_else(|| {
+                                json!({"type": "object", "properties": {}})
+                            }),
+                        });
+                        if out.len() >= cap {
+                            return out;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Live-runtime convenience: pulls plugins from `self`, snapshots the
+    /// session's override map, then defers to `expand_plugin_tool_defs_pure`.
+    pub(crate) fn expand_plugin_tool_defs(&self, session_key: &str) -> Vec<crate::provider::ToolDef> {
+        /// Max plugin tools injected per turn (v1 hard cap; v2 swaps for
+        /// token-budget). Keeps small-model tool-list under control even
+        /// if the user `/plugin xxx all`s a 200-tool plugin.
+        const MAX_INJECT_TOOLS: usize = 20;
+        let snapshot = match self.handle.plugin_overrides.read() {
+            Ok(g) => g.get(session_key).cloned().unwrap_or_default(),
+            Err(_) => return Vec::new(),
+        };
+        if snapshot.is_empty() {
+            return Vec::new();
+        }
+        Self::expand_plugin_tool_defs_pure(
+            &self.wasm_plugins,
+            self.plugins.as_deref(),
+            &snapshot,
+            MAX_INJECT_TOOLS,
+        )
+    }
+
     /// Pure resolver — what `<plugin>.<tool>` ToolDefs should we inject for
     /// this (session, plugin)? Returns either `Vec::new()` (default / disabled)
     /// or the explicit tool name list. `None` means "expand to all plugin
@@ -9797,6 +9891,13 @@ mod tests {
     // ---------------------------------------------------------------------
     // PluginOverride resolver tests (Task 2)
     // ---------------------------------------------------------------------
+
+    // expand_plugin_tool_defs orchestration covered by integration testing
+    // via the /plugin slash command (Task 4 + manual smoke). Unit-testing it
+    // requires constructing a real WasmPlugin (Engine + Component + Linker),
+    // which is infeasible in a lib test. The logic that *can* fail in
+    // isolation — override resolution — is covered by the resolver tests
+    // below.
 
     #[test]
     fn resolve_inject_returns_none_when_no_override() {
