@@ -335,11 +335,18 @@ impl Drop for ChromeProcess {
             if let Some(pid) = self.child.id() {
                 // Use taskkill to kill the entire process tree on Windows.
                 // /T = kill process and all child processes, /F = force kill.
-                let _ = std::process::Command::new("taskkill")
+                #[allow(unused_mut)]
+                let mut taskk = std::process::Command::new("taskkill");
+                taskk
                     .args(["/T", "/F", "/PID", &pid.to_string()])
                     .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn();
+                    .stderr(std::process::Stdio::null());
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    taskk.creation_flags(0x08000000);
+                }
+                let _ = taskk.spawn();
             }
         }
 

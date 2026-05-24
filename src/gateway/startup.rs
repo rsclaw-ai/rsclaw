@@ -1172,8 +1172,10 @@ fn try_service_self_restart() -> bool {
         //   sc failure rsclaw reset=86400 actions=restart/5000
         // so SCM auto-respawns us. If FailureActions isn't configured, this
         // path stops us and leaves it to a human / monitoring system.
+        use std::os::windows::process::CommandExt;
         let status = std::process::Command::new("sc")
             .args(["stop", "rsclaw"])
+            .creation_flags(0x08000000)
             .status();
         if matches!(status, Ok(s) if s.success()) {
             info!("sc stop dispatched; SCM FailureActions will respawn if configured");

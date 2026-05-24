@@ -313,7 +313,14 @@ fn detect_lan_ips() -> Vec<String> {
 
     if cfg!(windows) {
         // Windows: parse ipconfig output
-        if let Ok(output) = std::process::Command::new("ipconfig").output() {
+        #[allow(unused_mut)]
+        let mut ipc = std::process::Command::new("ipconfig");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            ipc.creation_flags(0x08000000);
+        }
+        if let Ok(output) = ipc.output() {
             let text = String::from_utf8_lossy(&output.stdout);
             for line in text.lines() {
                 let trimmed = line.trim();

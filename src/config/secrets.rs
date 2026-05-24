@@ -165,6 +165,7 @@ fn resolve_exec(r: &SecretRef, context: &str, config: &RuntimeConfig) -> Result<
         )
     })?;
 
+    #[allow(unused_mut)]
     let mut cmd = std::process::Command::new(command);
 
     // Prepend the provider-level args (e.g. ["read", "--account",
@@ -175,6 +176,12 @@ fn resolve_exec(r: &SecretRef, context: &str, config: &RuntimeConfig) -> Result<
 
     // Append the SecretRef id as the final argument.
     cmd.arg(&r.id);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
 
     let output = cmd.output().with_context(|| {
         format!(

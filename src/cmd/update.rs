@@ -411,10 +411,15 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
                 if let Ok(pid) = pid_str.trim().parse::<i32>() {
                     let _ = crate::sys::process_terminate(pid as u32);
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    let _ = std::process::Command::new(&current_exe)
-                        .arg("gateway")
-                        .arg("start")
-                        .spawn();
+                    #[allow(unused_mut)]
+                    let mut upd = std::process::Command::new(&current_exe);
+                    upd.arg("gateway").arg("start");
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::process::CommandExt;
+                        upd.creation_flags(0x08000000);
+                    }
+                    let _ = upd.spawn();
                     if !quiet {
                         println!("  {} gateway restarted", green("[ok]"));
                     }

@@ -221,6 +221,11 @@ async fn run_shell(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,

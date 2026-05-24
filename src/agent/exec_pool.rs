@@ -79,17 +79,24 @@ impl ExecPool {
             // - kill_on_drop ensures process is killed if future is dropped during timeout
             // - stdin null prevents interactive prompts from blocking (e.g. PowerShell
             //   waiting for input)
+            #[allow(unused_mut)]
+            let mut exec_cmd = tokio::process::Command::new(shell);
+            exec_cmd
+                .args(&shell_args)
+                .arg(&cmd)
+                .current_dir(&cw)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                exec_cmd.creation_flags(0x08000000);
+            }
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(timeout_secs),
-                tokio::process::Command::new(shell)
-                    .args(&shell_args)
-                    .arg(&cmd)
-                    .current_dir(&cw)
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .kill_on_drop(true)
-                    .output(),
+                exec_cmd.output(),
             )
             .await;
 

@@ -37,9 +37,15 @@ pub fn process_alive(pid: u32) -> bool {
     #[cfg(windows)]
     {
         use std::process::Command;
-        Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-            .output()
+        #[allow(unused_mut)]
+        let mut taskl = Command::new("tasklist");
+        taskl.args(["/FI", &format!("PID eq {pid}"), "/NH"]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            taskl.creation_flags(0x08000000);
+        }
+        taskl.output()
             .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
             .unwrap_or(false)
     }
@@ -65,9 +71,15 @@ pub fn process_terminate(pid: u32) -> Result<()> {
         use std::process::Command;
         // Use /F (force) and /T (tree) -- without /F, taskkill only sends
         // WM_CLOSE which has no effect on windowless background processes.
-        let status = Command::new("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
-            .status()?;
+        #[allow(unused_mut)]
+        let mut taskk = Command::new("taskkill");
+        taskk.args(["/F", "/T", "/PID", &pid.to_string()]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            taskk.creation_flags(0x08000000);
+        }
+        let status = taskk.status()?;
         if !status.success() {
             anyhow::bail!("taskkill failed for process {pid}");
         }

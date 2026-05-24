@@ -2100,6 +2100,11 @@ async fn run_exec_command(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
 
     // Use oneshot channel to receive result from background task
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();

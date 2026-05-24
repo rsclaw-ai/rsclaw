@@ -267,7 +267,7 @@ fn parse_key(name: &str) -> Option<Key> {
 
 /// Fallback to Core Graphics window list when AppleScript/System Events
 /// can't enumerate windows (common with sandboxed apps like WeChat).
-#[cfg(target_os = "macos")]
+/// Only works on macOS; returns an error on other platforms.
 fn cgwindow_fallback(owner_name: &str) -> Result<String, String> {
     let owner_escaped = owner_name.replace('"', r#"\""#).replace('\'', "'\"'\"'");
     let py = format!(
@@ -310,13 +310,6 @@ else:
         )),
         Err(e) => Err(format!("cgwindow_fallback: python3 spawn failed: {e}")),
     }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn cgwindow_fallback(owner_name: &str) -> Result<String, String> {
-    Err(format!(
-        "cgwindow_fallback: {owner_name} is only available on macOS"
-    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -393,7 +386,15 @@ end tell"#,
                     r#"Add-Type -Name W -Namespace N -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);'; Get-Process | Where-Object {{$_.ProcessName -like '*{}*'}} | ForEach-Object {{ if ($_.MainWindowHandle -ne 0) {{ [N.W]::SetForegroundWindow($_.MainWindowHandle) }} }}"#,
                     escaped
                 );
-                match Command::new("powershell").args(["-NoProfile", "-Command", &ps]).output() {
+                #[allow(unused_mut)]
+                let mut ps_cmd = Command::new("powershell");
+                ps_cmd.args(["-NoProfile", "-Command", &ps]);
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    ps_cmd.creation_flags(0x08000000);
+                }
+                match ps_cmd.output() {
                     Ok(out) if out.status.success() => Ok("ok".to_string()),
                     Ok(out) => Err(format!("powershell failed: {}", String::from_utf8_lossy(&out.stderr))),
                     Err(e) => Err(format!("powershell spawn failed: {e}")),
@@ -772,9 +773,15 @@ print('ok')
                 }
             } else if cfg!(target_os = "windows") {
                 let ps = format!("Set-Clipboard -Value '{}'", text.replace('\'', "''"));
-                match Command::new("powershell")
-                    .args(["-NoProfile", "-Command", &ps])
-                    .output()
+                #[allow(unused_mut)]
+                let mut ps_cmd = Command::new("powershell");
+                ps_cmd.args(["-NoProfile", "-Command", &ps]);
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    ps_cmd.creation_flags(0x08000000);
+                }
+                match ps_cmd.output()
                 {
                     Ok(out) if out.status.success() => Ok("ok".to_string()),
                     Ok(out) => Err(format!(
@@ -826,9 +833,15 @@ print('ok')
                     Err(e) => Err(format!("no clipboard tool available: {e}")),
                 }
             } else if cfg!(target_os = "windows") {
-                match Command::new("powershell")
-                    .args(["-NoProfile", "-Command", "Get-Clipboard"])
-                    .output()
+                #[allow(unused_mut)]
+                let mut ps_cmd = Command::new("powershell");
+                ps_cmd.args(["-NoProfile", "-Command", "Get-Clipboard"]);
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    ps_cmd.creation_flags(0x08000000);
+                }
+                match ps_cmd.output()
                 {
                     Ok(out) if out.status.success() => {
                         Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
@@ -886,9 +899,15 @@ print('ok')
                 }
             } else if cfg!(target_os = "windows") {
                 let ps = format!("Set-Clipboard -Path '{}'", file_path.replace('\'', "''"));
-                match Command::new("powershell")
-                    .args(["-NoProfile", "-Command", &ps])
-                    .output()
+                #[allow(unused_mut)]
+                let mut ps_cmd = Command::new("powershell");
+                ps_cmd.args(["-NoProfile", "-Command", &ps]);
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    ps_cmd.creation_flags(0x08000000);
+                }
+                match ps_cmd.output()
                 {
                     Ok(out) if out.status.success() => Ok("ok".to_string()),
                     Ok(out) => Err(format!(

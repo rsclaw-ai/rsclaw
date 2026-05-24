@@ -265,8 +265,15 @@ pub(crate) async fn ensure_ffmpeg() -> Result<String> {
 
 /// Run a subprocess and return an error if it fails.
 pub(crate) async fn run_subprocess(cmd: &str, args: &[&str]) -> Result<()> {
-    let output = tokio::process::Command::new(cmd)
-        .args(args)
+    #[allow(unused_mut)]
+    let mut sub = tokio::process::Command::new(cmd);
+    sub.args(args);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        sub.creation_flags(0x08000000);
+    }
+    let output = sub
         .output()
         .await
         .map_err(|e| anyhow::anyhow!("{cmd}: {e}"))?;
@@ -485,12 +492,18 @@ fn probe_powershell_edition() -> Option<PowerShellEdition> {
         return None;
     };
 
-    let output = std::process::Command::new(bin)
+    #[allow(unused_mut)]
+    let mut probe = std::process::Command::new(bin);
+    probe
         .args(["-NoProfile", "-Command", "$PSVersionTable.PSVersion.Major"])
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        probe.creation_flags(0x08000000);
+    }
+    let output = probe.output().ok()?;
     if !output.status.success() {
         return None;
     }

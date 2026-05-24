@@ -390,9 +390,15 @@ fn find_gateway_pid() -> Option<u32> {
     #[cfg(windows)]
     {
         // netstat to find PID listening on gateway port.
-        let output = std::process::Command::new("netstat")
-            .args(["-ano"])
-            .output()
+        #[allow(unused_mut)]
+        let mut ns = std::process::Command::new("netstat");
+        ns.args(["-ano"]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            ns.creation_flags(0x08000000);
+        }
+        let output = ns.output()
             .ok();
         if let Some(output) = output {
             let text = String::from_utf8_lossy(&output.stdout);
@@ -718,9 +724,15 @@ fn service_installed() -> bool {
     #[cfg(target_os = "windows")]
     {
         // sc query returns non-zero if service doesn't exist.
-        if let Ok(o) = std::process::Command::new("sc")
-            .args(["query", "rsclaw"])
-            .output()
+        #[allow(unused_mut)]
+        let mut sc_cmd = std::process::Command::new("sc");
+        sc_cmd.args(["query", "rsclaw"]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            sc_cmd.creation_flags(0x08000000);
+        }
+        if let Ok(o) = sc_cmd.output()
         {
             // If output contains "SERVICE_NAME" then the service exists.
             if String::from_utf8_lossy(&o.stdout).contains("SERVICE_NAME") {
@@ -773,11 +785,12 @@ fn try_service_start() -> bool {
 
     #[cfg(target_os = "windows")]
     {
-        let status = std::process::Command::new("sc")
-            .args(["start", "rsclaw"])
-            .status();
-        return status.map(|s| s.success()).unwrap_or(false);
-    }
+    let status = std::process::Command::new("sc")
+        .args(["start", "rsclaw"])
+        .creation_flags(0x08000000)
+        .status();
+    return status.map(|s| s.success()).unwrap_or(false);
+}
 
     #[allow(unreachable_code)]
     false
@@ -836,14 +849,17 @@ fn try_service_stop() -> bool {
 
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
         let is_active = std::process::Command::new("sc")
             .args(["query", "rsclaw"])
+            .creation_flags(0x08000000)
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).contains("RUNNING"))
             .unwrap_or(false);
         if is_active {
             let status = std::process::Command::new("sc")
                 .args(["stop", "rsclaw"])
+                .creation_flags(0x08000000)
                 .status();
             return status.map(|s| s.success()).unwrap_or(false);
         }
@@ -1060,6 +1076,7 @@ async fn cmd_gateway_install() -> Result<()> {
     // The service runs `rsclaw gateway run` in the background.
     // sc.exe requires "key= value" format (space after =, value as next arg).
     let bin_path = format!("\"{}\" gateway run", binary_str);
+    use std::os::windows::process::CommandExt;
     let status = std::process::Command::new("sc")
         .args([
             "create",
@@ -1071,6 +1088,7 @@ async fn cmd_gateway_install() -> Result<()> {
             "DisplayName=",
             "RsClaw AI Gateway",
         ])
+        .creation_flags(0x08000000)
         .status()?;
     if !status.success() {
         eprintln!("  [!] sc create failed. Try running as Administrator.");
@@ -1081,6 +1099,7 @@ async fn cmd_gateway_install() -> Result<()> {
     // Start the service.
     let _ = std::process::Command::new("sc")
         .args(["start", "rsclaw"])
+        .creation_flags(0x08000000)
         .status();
     println!("  [ok] Service installed and started");
     Ok(())
@@ -1088,14 +1107,17 @@ async fn cmd_gateway_install() -> Result<()> {
 
 #[cfg(target_os = "windows")]
 async fn cmd_gateway_uninstall() -> Result<()> {
+    use std::os::windows::process::CommandExt;
     // Stop first.
     let _ = std::process::Command::new("sc")
         .args(["stop", "rsclaw"])
+        .creation_flags(0x08000000)
         .status();
     std::thread::sleep(std::time::Duration::from_secs(2));
 
     let status = std::process::Command::new("sc")
         .args(["delete", "rsclaw"])
+        .creation_flags(0x08000000)
         .status()?;
     if !status.success() {
         eprintln!("  [!] sc delete failed. Try running as Administrator.");
