@@ -169,14 +169,13 @@ pub fn build_distill_prompt(cluster: &[MemoryDoc]) -> String {
          \
          ## SKILL.md Standard\n\
          \
-         **Frontmatter** (required fields):\n\
+         **Frontmatter** (required fields). Keep `description` on a SINGLE \
+         LINE wrapped in double quotes — DO NOT use `>` or `|` block scalars, \
+         and DO NOT split the value across multiple lines.\n\
          ```yaml\n\
          ---\n\
          name: skill-name-in-kebab-case\n\
-         description: >\n\
-           What the skill does AND when to invoke it. Be slightly pushy so the\n\
-           agent does not undertrigger. Example: \"How to do X. Use this skill\n\
-           whenever the user asks about X, Y, or Z, even if not phrased explicitly.\"\n\
+         description: \"What the skill does AND when to invoke it. Be slightly pushy so the agent does not undertrigger. Example: How to do X. Use this skill whenever the user asks about X, Y, or Z, even if not phrased explicitly.\"\n\
          ---\n\
          ```\n\n\
          \
@@ -464,6 +463,156 @@ pub(crate) fn validate_skill_md_and_body(content: &str) -> Result<()> {
     Ok(())
 }
 
+/// Auto-repair common LLM frontmatter mistakes before validation. The
+/// distill model (flash) is unreliable at YAML, so we try to make
+/// near-misses parse instead of throwing them out:
+///
+/// 1. Strip wrapping markdown code fences (```yaml / ```markdown / ```).
+/// 2. If frontmatter opens with `---` but never closes, insert `---` at
+///    the first blank line after the opening fence.
+/// 3. Fold an unquoted multi-line `description:` value into a single
+///    quoted line so YAML stops treating the continuation as new keys.
+///
+/// Returns the repaired content. Idempotent — applying it to already-valid
+/// SKILL.md content is a no-op.
+pub(crate) fn repair_skill_md(content: &str) -> String {
+    let stripped = strip_wrapping_code_fences(content);
+    let with_close = ensure_frontmatter_close(&stripped);
+    fold_unquoted_description(&with_close)
+}
+
+fn strip_wrapping_code_fences(content: &str) -> String {
+    let trimmed = content.trim();
+    let Some(first_fence) = trimmed.strip_prefix("```") else {
+        return content.to_owned();
+    };
+    // After the opening ``` may come a language tag (yaml, markdown, md) and
+    // then a newline. Skip everything up to and including the first newline.
+    let inner = match first_fence.find('\n') {
+        Some(n) => &first_fence[n + 1..],
+        None => first_fence,
+    };
+    let inner = inner.trim_end();
+    let stripped = inner.strip_suffix("```").unwrap_or(inner);
+    stripped.trim().to_owned()
+}
+
+fn ensure_frontmatter_close(content: &str) -> String {
+    let trimmed = content.trim_start();
+    let Some(rest) = trimmed
+        .strip_prefix("---\n")
+        .or_else(|| trimmed.strip_prefix("---\r\n"))
+    else {
+        return content.to_owned();
+    };
+    if rest.contains("\n---") {
+        return content.to_owned();
+    }
+    // No closing fence. Pick the first blank line as the split point — the
+    // model usually leaves a blank between frontmatter and body. Fall back to
+    // inserting a fence after the first run of `key: value` lines.
+    let split_at = rest
+        .find("\n\n")
+        .or_else(|| first_non_yaml_key_offset(rest))
+        .unwrap_or(rest.len());
+    let (front, body) = rest.split_at(split_at);
+    let body = body.trim_start_matches('\n');
+    format!("---\n{}\n---\n\n{}", front.trim_end(), body)
+}
+
+fn first_non_yaml_key_offset(rest: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    for line in rest.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\r', '\n']);
+        if !body.trim().is_empty()
+            && !body
+                .chars()
+                .take_while(|c| !c.is_whitespace())
+                .last()
+                .map(|c| c == ':' || body.contains(':'))
+                .unwrap_or(false)
+        {
+            return Some(offset);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+fn fold_unquoted_description(content: &str) -> String {
+    // Only repairs when the frontmatter has a `description:` whose value
+    // continues on the next line(s) without quoting or a `>` / `|` block
+    // scalar. Leaves valid YAML (including legitimate `description: >`
+    // blocks) untouched.
+    let trimmed = content.trim_start();
+    let Some(rest) = trimmed
+        .strip_prefix("---\n")
+        .or_else(|| trimmed.strip_prefix("---\r\n"))
+    else {
+        return content.to_owned();
+    };
+    let Some(close_idx) = rest.find("\n---") else {
+        return content.to_owned();
+    };
+    let frontmatter = &rest[..close_idx];
+    let after_frontmatter = &rest[close_idx..];
+
+    let mut lines: Vec<&str> = frontmatter.split('\n').collect();
+    let Some(desc_idx) = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("description:"))
+    else {
+        return content.to_owned();
+    };
+    let desc_line = lines[desc_idx];
+    let after_colon = desc_line.splitn(2, ':').nth(1).unwrap_or("").trim();
+    if matches!(after_colon.chars().next(), Some('>') | Some('|') | Some('"') | Some('\''))
+    {
+        return content.to_owned();
+    }
+    // Collect continuation lines: everything until the next top-level
+    // `key:` line, end of frontmatter, or a blank line.
+    let mut take = 0usize;
+    for line in lines.iter().skip(desc_idx + 1) {
+        let t = line.trim();
+        if t.is_empty() {
+            break;
+        }
+        // A new YAML key at column 0: `key:` with no leading whitespace.
+        if !line.starts_with(char::is_whitespace) && t.contains(':') {
+            break;
+        }
+        take += 1;
+    }
+    if take == 0 {
+        return content.to_owned();
+    }
+    let continuation = lines[desc_idx + 1..desc_idx + 1 + take]
+        .iter()
+        .map(|s| s.trim())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut folded = String::new();
+    if !after_colon.is_empty() {
+        folded.push_str(after_colon);
+        folded.push(' ');
+    }
+    folded.push_str(&continuation);
+    let folded_escaped = folded.replace('"', "\\\"");
+    lines[desc_idx] = ""; // placeholder, replaced below
+    let owned_desc = format!("description: \"{folded_escaped}\"");
+    let mut rebuilt: Vec<String> = lines.iter().map(|s| (*s).to_owned()).collect();
+    rebuilt[desc_idx] = owned_desc;
+    for i in (desc_idx + 1..desc_idx + 1 + take).rev() {
+        rebuilt.remove(i);
+    }
+    let mut out = String::with_capacity(content.len());
+    out.push_str("---\n");
+    out.push_str(&rebuilt.join("\n"));
+    out.push_str(after_frontmatter);
+    out
+}
+
 /// Crystallize a single seed memory: find its cluster, distill, validate,
 /// write, and tag. Encapsulates the full pipeline so the runtime online
 /// path (Loop B) and the meditation periodic phase can share one
@@ -549,11 +698,13 @@ pub async fn crystallize_one(
         }
     };
 
-    // 6. Validate before writing. On validation failure, retry once with
-    // a fix-up prompt to catch near-misses (missing '---' fence, YAML syntax
-    // error, too-short output, prompt leakage).
-    let skill_md = match validate_skill_md_and_body(&skill_md) {
-        Ok(_) => skill_md,
+    // 6. Validate before writing. Auto-repair common LLM frontmatter
+    // mistakes (wrapping ``` fences, missing closing `---`, unquoted
+    // multi-line description) first, then retry the LLM once with a fix-up
+    // prompt only if the repaired output is still malformed.
+    let repaired = repair_skill_md(&skill_md);
+    let skill_md = match validate_skill_md_and_body(&repaired) {
+        Ok(_) => repaired,
         Err(first_err) => {
             tracing::warn!(
                 n = ids.len(),
@@ -563,24 +714,30 @@ pub async fn crystallize_one(
                 "Your previous output was rejected because: {first_err}\n\n\
                  Fix the issue and output the complete SKILL.md again. \
                  Make sure: (1) the first line is exactly `---`, \
-                 (2) the YAML frontmatter has `name:` and `description:` fields, \
-                 (3) the body has at least 5 substantive lines, and \
-                 (4) the output contains no prompt instructions, only the skill content.\n\n\
+                 (2) the YAML frontmatter has `name:` and `description:` fields \
+                 (description MUST be a single line, no `>` or `|` block scalars, \
+                 escape any embedded quotes), \
+                 (3) close the frontmatter with another `---` line, \
+                 (4) the body has at least 5 substantive lines, and \
+                 (5) the output contains no prompt instructions, only the skill content.\n\n\
                  Original task:\n{prompt}"
             );
             match distill_with_llm(&fixup_prompt, Arc::clone(&provider_arc), model_id.to_owned())
                 .await
             {
-                Ok(second_md) => match validate_skill_md_and_body(&second_md) {
-                    Ok(_) => second_md,
-                    Err(second_err) => {
-                        tracing::warn!(
-                            n = ids.len(),
-                            "crystallization: retry also failed ({second_err:#}), giving up"
-                        );
-                        return Ok(None);
+                Ok(second_md) => {
+                    let second_repaired = repair_skill_md(&second_md);
+                    match validate_skill_md_and_body(&second_repaired) {
+                        Ok(_) => second_repaired,
+                        Err(second_err) => {
+                            tracing::warn!(
+                                n = ids.len(),
+                                "crystallization: retry also failed ({second_err:#}), giving up"
+                            );
+                            return Ok(None);
+                        }
                     }
-                },
+                }
                 Err(e) => {
                     tracing::warn!("crystallization: retry LLM call failed: {e:#}");
                     return Ok(None);
@@ -740,6 +897,39 @@ mod tests {
     fn validate_rejects_empty_description() {
         let md = "---\nname: foo\ndescription: \"  \"\n---\nbody";
         assert!(validate_skill_md(md).is_err());
+    }
+
+    #[test]
+    fn repair_strips_wrapping_yaml_code_fence() {
+        let raw = "```yaml\n---\nname: foo\ndescription: bar\n---\nbody one\nbody two\nbody three\nbody four\nbody five\n```";
+        let repaired = repair_skill_md(raw);
+        validate_skill_md_and_body(&repaired).expect("repaired wrapped fence should validate");
+    }
+
+    #[test]
+    fn repair_inserts_missing_close_at_first_blank_line() {
+        let raw = "---\nname: foo\ndescription: bar\n\nbody one\nbody two\nbody three\nbody four\nbody five\n";
+        let repaired = repair_skill_md(raw);
+        let (n, d) = validate_skill_md(&repaired).expect("repaired close should validate");
+        assert_eq!(n, "foo");
+        assert_eq!(d, "bar");
+        validate_skill_body(&repaired).expect("body should be intact");
+    }
+
+    #[test]
+    fn repair_folds_multiline_unquoted_description() {
+        let raw = "---\nname: foo\ndescription: line one continuing\nonto a second line\nand a third\n---\nbody one\nbody two\nbody three\nbody four\nbody five\n";
+        let repaired = repair_skill_md(raw);
+        let (_, d) = validate_skill_md(&repaired).expect("folded description should validate");
+        assert!(d.contains("line one continuing"));
+        assert!(d.contains("onto a second line"));
+        assert!(d.contains("and a third"));
+    }
+
+    #[test]
+    fn repair_is_noop_on_valid_input() {
+        let md = "---\nname: foo\ndescription: bar\n---\nline 1\nline 2\nline 3\nline 4\nline 5\n";
+        assert_eq!(repair_skill_md(md), md);
     }
 
     #[test]

@@ -152,18 +152,24 @@ pub async fn crystallize_workflow(
         }
     };
 
-    // Validate with retry — same pattern as crystallize_one.
-    let skill_md = match crate::skill::crystallizer::validate_skill_md_and_body(&skill_md) {
-        Ok(()) => skill_md,
+    // Validate with retry — same pattern as crystallize_one. Run the
+    // auto-repair first so common LLM mistakes (wrapping ``` fence, missing
+    // closing `---`, unquoted multi-line description) don't cost an extra
+    // LLM round-trip.
+    let repaired = crate::skill::crystallizer::repair_skill_md(&skill_md);
+    let skill_md = match crate::skill::crystallizer::validate_skill_md_and_body(&repaired) {
+        Ok(()) => repaired,
         Err(first_err) => {
             tracing::warn!("workflow distill: first attempt failed ({first_err:#}), retrying");
             let fixup_prompt = format!(
                 "Your previous output was rejected because: {first_err}\n\n\
                  Fix the issue and output the complete SKILL.md again. \
                  Make sure: (1) the first line is exactly `---`, \
-                 (2) the YAML frontmatter has `name:` and `description:` fields, \
-                 (3) the body has at least 5 substantive lines, and \
-                 (4) the output contains no prompt instructions, only the skill content.\n\n\
+                 (2) the YAML frontmatter has `name:` and `description:` fields \
+                 (description MUST be a single line, no `>` or `|` block scalars), \
+                 (3) close the frontmatter with another `---` line, \
+                 (4) the body has at least 5 substantive lines, and \
+                 (5) the output contains no prompt instructions, only the skill content.\n\n\
                  Original task:\n{prompt}"
             );
             match crate::skill::crystallizer::distill_with_llm(
@@ -174,8 +180,9 @@ pub async fn crystallize_workflow(
             .await
             {
                 Ok(second_md) => {
-                    match crate::skill::crystallizer::validate_skill_md_and_body(&second_md) {
-                        Ok(()) => second_md,
+                    let second_repaired = crate::skill::crystallizer::repair_skill_md(&second_md);
+                    match crate::skill::crystallizer::validate_skill_md_and_body(&second_repaired) {
+                        Ok(()) => second_repaired,
                         Err(second_err) => {
                             tracing::warn!(
                                 "workflow distill: retry also failed ({second_err:#}), giving up"
