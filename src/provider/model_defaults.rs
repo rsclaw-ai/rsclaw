@@ -162,9 +162,11 @@ pub fn get_model_defaults(provider: &str, model_id: &str) -> Option<ModelDefault
             context_window: 8192,
         }),
 
-        // 字节豆包
+        // 字节豆包 — doubao-seed-2.0-pro 实测支持 16k output; 4k 默认会让
+        // 中等大小的 write_file (≥100 行 JS / 带 CJK 注释) 流式截断。bump 到
+        // 16k 让常见代码生成任务一次跑完。
         "doubao" | "bytedance" => Some(ModelDefaults {
-            max_tokens: 4096,
+            max_tokens: 16384,
             context_window: 32_768,
         }),
 

@@ -4703,10 +4703,23 @@ impl AgentRuntime {
                     .and_then(|m| m.max_tokens)
                     .map(|v| v as u32);
 
+                // 4. Built-in catalog (src/provider/model_defaults.rs) —
+                //    sane per-model defaults so a fresh install doesn't
+                //    inherit whatever the upstream server picks (doubao =
+                //    4k → truncates mid-write_file). Only applied when
+                //    none of the explicit config layers set anything;
+                //    user overrides still win.
                 from_agent
                     .or(from_defaults)
                     .or(from_provider)
-                    .or(Some(0))
+                    .filter(|&m| m > 0)
+                    .or_else(|| {
+                        Some(crate::provider::model_defaults::resolve_max_tokens(
+                            provider_name,
+                            model_id,
+                            None,
+                        ))
+                    })
                     .filter(|&m| m > 0)
             };
 
