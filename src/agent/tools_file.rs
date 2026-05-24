@@ -212,6 +212,7 @@ impl super::runtime::AgentRuntime {
         let default_ws = self.default_workspace();
         let path = args["path"]
             .as_str()
+            .filter(|s| !s.trim().is_empty())
             .map(expand_tilde)
             .unwrap_or(default_ws);
         let recursive = args["recursive"].as_bool().unwrap_or(false);
@@ -268,6 +269,7 @@ impl super::runtime::AgentRuntime {
         let default_ws = self.default_workspace();
         let root_path = args["path"]
             .as_str()
+            .filter(|s| !s.trim().is_empty())
             .map(expand_tilde)
             .unwrap_or(default_ws);
         let pattern = args["pattern"]
@@ -330,6 +332,7 @@ impl super::runtime::AgentRuntime {
         let default_ws = self.default_workspace();
         let root_path = args["path"]
             .as_str()
+            .filter(|s| !s.trim().is_empty())
             .map(expand_tilde)
             .unwrap_or(default_ws);
         let pattern = args["pattern"]
