@@ -771,6 +771,29 @@ async fn run_spoke_once(state: AppState, relay: A2aRelayRuntime) -> Result<()> {
         .send(spoke_route_lease(&state, node_id, 1))
         .map_err(|_| anyhow!("spoke writer closed"))?;
 
+    // Periodically re-publish the RouteLease so the hub never sees a
+    // route silently expire. ROUTE_TTL_MS is the hub-side eviction
+    // threshold; sending at one third of it gives ample headroom under
+    // packet loss and clock skew. epoch is monotonic so the hub keeps
+    // accepting fresher leases over stale duplicates.
+    let renew_tx = spoke_tx.clone();
+    let renew_state = state.clone();
+    let renew_node_id = node_id.to_owned();
+    let renewer = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(ROUTE_TTL_MS / 3));
+        // Skip the immediate tick — we already sent epoch 1 above.
+        interval.tick().await;
+        let mut epoch: u64 = 2;
+        loop {
+            interval.tick().await;
+            let frame = spoke_route_lease(&renew_state, &renew_node_id, epoch);
+            if renew_tx.send(frame).is_err() {
+                break;
+            }
+            epoch = epoch.saturating_add(1);
+        }
+    });
+
     while let Some(msg) = read.next().await {
         let msg = msg?;
         let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
@@ -824,6 +847,7 @@ async fn run_spoke_once(state: AppState, relay: A2aRelayRuntime) -> Result<()> {
     }
 
     writer.abort();
+    renewer.abort();
     Ok(())
 }
 
