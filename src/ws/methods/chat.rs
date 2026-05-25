@@ -5,6 +5,8 @@ use std::sync::{
 
 use crate::{
     agent::AgentMessage,
+    events::AgentEvent,
+    gateway::preparse::{PreparseOrigin, try_preparse_locally},
     ws::{
         dispatch::{MethodCtx, MethodResult},
         types::{ErrorShape, EventFrame},
@@ -62,6 +64,95 @@ pub async fn chat_send(ctx: MethodCtx) -> MethodResult {
     let conn = ctx.conn.clone();
     let sk = session_key.clone();
     let rid = run_id.clone();
+
+    // Slash-command preparse bypass — channels (telegram/discord/etc.) and
+    // cron already short-circuit `/abort /clear /new /status /ls /cat /ss
+    // /loop /watch /task /model /plugin …` here so they never enter the
+    // agent's mpsc. The WS path skipped this layer, so desktop / web users
+    // saw their slash commands stuck behind whatever long turn the agent
+    // was streaming — `/abort` typed mid-turn fired against an
+    // already-finished session, `/status` hung.
+    //
+    // We run the same preparse pipeline on WS-origin text. On match, the
+    // reply is published directly to event_bus as two AgentEvents (delta
+    // then done) that the relay spawn below picks up and forwards to the
+    // client as standard `chat` frames — identical wire format to a real
+    // agent reply, so the frontend renders it the same way.
+    if let Some(reply) =
+        try_preparse_locally(&text, &agent, "ws", "ws-client", PreparseOrigin::User).await
+    {
+        // Synthesize delta + done. We publish before returning so the relay
+        // task (spawned below) is already subscribed when these arrive.
+        let _ = ctx.state.event_bus.send(AgentEvent {
+            session_id: session_key.clone(),
+            agent_id: agent.id.clone(),
+            delta: reply.text.clone(),
+            done: false,
+            files: vec![],
+            images: vec![],
+            tool_log: vec![],
+            question: None,
+        });
+        let _ = ctx.state.event_bus.send(AgentEvent {
+            session_id: session_key.clone(),
+            agent_id: agent.id.clone(),
+            delta: String::new(),
+            done: true,
+            files: vec![],
+            images: reply.images,
+            tool_log: vec![],
+            question: None,
+        });
+
+        // Same relay spawn shape as the agent-dispatch path — the events
+        // we just published are visible to it via the `rx` subscription
+        // taken above.
+        let inflight_guard = ctx.state.shutdown.begin_work();
+        tokio::spawn(async move {
+            let _inflight_guard = inflight_guard;
+            use futures::StreamExt;
+            let mut stream = tokio_stream::wrappers::BroadcastStream::new(rx);
+            while let Some(Ok(event)) = stream.next().await {
+                if event.session_id != sk {
+                    continue;
+                }
+                let conn_seq = conn.write().await.next_seq();
+                let payload = if event.done {
+                    serde_json::json!({
+                        "runId": rid,
+                        "sessionKey": sk,
+                        "type": "done",
+                        "role": "assistant",
+                        "files": event.files,
+                        "images": event.images,
+                        "toolLog": event.tool_log,
+                    })
+                } else {
+                    serde_json::json!({
+                        "runId": rid,
+                        "sessionKey": sk,
+                        "type": "text_delta",
+                        "delta": event.delta,
+                        "role": "assistant",
+                    })
+                };
+                let frame = EventFrame::new("chat", payload, conn_seq);
+                let json = serde_json::to_string(&frame).unwrap_or_default();
+                if event_tx.send(json).await.is_err() {
+                    break;
+                }
+                if event.done {
+                    break;
+                }
+            }
+        });
+
+        return Ok(serde_json::json!({
+            "runId": run_id,
+            "sessionKey": session_key,
+            "status": "preparse",
+        }));
+    }
 
     // Dispatch message to agent.
     let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
