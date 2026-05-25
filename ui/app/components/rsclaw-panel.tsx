@@ -2610,6 +2610,64 @@ function parseLocal(input: string): string[] {
     .filter((s) => s.length > 0);
 }
 
+/**
+ * Comma-separated string-list input with local draft state + debounce.
+ *
+ * Plain `value={arr.join(", ")}` + onChange split-and-write strips the
+ * comma between renders — the user can't even *type* a separator.
+ * Local draft holds the raw text while the user is typing; we only
+ * parse + bubble out the result after 200ms of quiet, identical to the
+ * ModelChainInput pattern.
+ *
+ * `onChange(arr)` gets undefined when the parsed list is empty so the
+ * caller can `deleteConfig` instead of writing an empty array.
+ */
+function CommaListInput({
+  value,
+  onChange,
+  placeholder,
+  style,
+}: {
+  value: string[];
+  onChange: (next: string[] | undefined) => void;
+  placeholder?: string;
+  style?: React.CSSProperties;
+}) {
+  const storedKey = value.join("|");
+  const [draft, setDraft] = useState(value.join(", "));
+  const lastWritten = useRef(storedKey);
+
+  useEffect(() => {
+    if (storedKey !== lastWritten.current) {
+      setDraft(value.join(", "));
+      lastWritten.current = storedKey;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [storedKey]);
+
+  useEffect(() => {
+    const parsed = parseLocal(draft);
+    const key = parsed.join("|");
+    if (key === lastWritten.current) return;
+    const id = setTimeout(() => {
+      onChange(parsed.length > 0 ? parsed : undefined);
+      lastWritten.current = key;
+    }, 200);
+    return () => clearTimeout(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draft]);
+
+  return (
+    <input
+      type="text"
+      placeholder={placeholder}
+      value={draft}
+      onChange={(e) => setDraft(e.target.value)}
+      style={style}
+    />
+  );
+}
+
 /** Map a (model_id, health entry) pair to dot color, tooltip, click affordance.
  *  Health entry missing = the runtime hasn't called this model yet, render gray. */
 function dotFor(
@@ -4490,30 +4548,21 @@ function TauriConfigPageInner() {
                 const scopesArr: string[] = Array.isArray(c?.scopes) ? c.scopes : [];
                 const isLast = i === clientArr.length - 1;
                 return (
-                  <div key={`client-${i}`} style={{ padding: "10px 15px", borderBottom: isLast ? "none" : `1px solid rgba(255,255,255,.03)`, display: "flex", flexDirection: "column", gap: 6 }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, width: 28 }}>{`[${i}]`}</div>
-                      <input style={{ ...fInput, width: 200 }} type="text" placeholder={zh ? "id 例如 partner-acme" : "id e.g. partner-acme"} value={c?.id || ""} onChange={(e) => setClientField(i, "id", e.target.value)} />
-                      {secretIsString ? (
-                        <input style={{ ...fInput, flex: 1, minWidth: 200 }} type="password" placeholder="${RSCLAW_PARTNER_SECRET}" value={secret || ""} onChange={(e) => setClientField(i, "secret", e.target.value)} />
-                      ) : (
-                        <div style={{ flex: 1, fontFamily: V.mono, fontSize: 11, color: V.t2, padding: "7px 10px", background: V.bg4, border: `1px dashed ${V.bd2}`, borderRadius: 7 }}>{JSON.stringify(secret)}</div>
-                      )}
-                      <button onClick={() => removeClient(i)} style={{ padding: "5px 10px", borderRadius: 7, border: `1px solid ${V.rbrd}`, background: V.rlo, color: V.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "删除" : "Remove"}</button>
-                    </div>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8, paddingLeft: 36 }}>
-                      <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, minWidth: 50 }}>scopes</div>
-                      <input
-                        style={{ ...fInput, flex: 1, fontSize: 11, fontFamily: V.mono }}
-                        type="text"
-                        placeholder={zh ? "留空 = 不限；逗号分隔，如 a2a:invoke:*, a2a:cancel:*" : "empty = unrestricted; comma-separated, e.g. a2a:invoke:*, a2a:cancel:*"}
-                        value={scopesArr.join(", ")}
-                        onChange={(e) => {
-                          const arr = e.target.value.split(/[,，]/).map((s) => s.trim()).filter(Boolean);
-                          setClientField(i, "scopes", arr.length > 0 ? arr : undefined);
-                        }}
-                      />
-                    </div>
+                  <div key={`client-${i}`} style={{ padding: "10px 15px", borderBottom: isLast ? "none" : `1px solid rgba(255,255,255,.03)`, display: "flex", alignItems: "center", gap: 8 }}>
+                    <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, width: 28 }}>{`[${i}]`}</div>
+                    <input style={{ ...fInput, width: 160 }} type="text" placeholder={zh ? "id" : "id"} value={c?.id || ""} onChange={(e) => setClientField(i, "id", e.target.value)} />
+                    {secretIsString ? (
+                      <input style={{ ...fInput, flex: 1, minWidth: 160 }} type="password" placeholder="${RSCLAW_PARTNER_SECRET}" value={secret || ""} onChange={(e) => setClientField(i, "secret", e.target.value)} />
+                    ) : (
+                      <div style={{ flex: 1, fontFamily: V.mono, fontSize: 11, color: V.t2, padding: "7px 10px", background: V.bg4, border: `1px dashed ${V.bd2}`, borderRadius: 7 }}>{JSON.stringify(secret)}</div>
+                    )}
+                    <CommaListInput
+                      value={scopesArr}
+                      onChange={(next) => setClientField(i, "scopes", next)}
+                      placeholder={zh ? "scopes 如 a2a:invoke:*, *" : "scopes e.g. a2a:invoke:*, *"}
+                      style={{ ...fInput, flex: 1, minWidth: 180, fontSize: 11, fontFamily: V.mono }}
+                    />
+                    <button onClick={() => removeClient(i)} style={{ padding: "5px 10px", borderRadius: 7, border: `1px solid ${V.rbrd}`, background: V.rlo, color: V.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "删除" : "Remove"}</button>
                   </div>
                 );
               })}
@@ -4660,26 +4709,17 @@ function TauriConfigPageInner() {
                   const isLast = i === relayNodeArr.length - 1;
                   const scopesArr: string[] = Array.isArray(n?.scopes) ? n.scopes : [];
                   return (
-                    <div key={`relay-node-${i}`} style={{ padding: "10px 15px", borderBottom: isLast ? "none" : `1px solid rgba(255,255,255,.03)`, display: "flex", flexDirection: "column", gap: 6 }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                        <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, width: 28 }}>{`[${i}]`}</div>
-                        <input style={{ ...fInput, width: 200 }} type="text" placeholder={zh ? "node id" : "node id"} value={n?.nodeId || ""} onChange={(e) => setRelayNodeField(i, "nodeId", e.target.value)} />
-                        <input style={{ ...fInput, flex: 1, minWidth: 200 }} type="password" placeholder="${RSCLAW_NODE_TOKEN}" value={typeof n?.token === "string" ? n.token : ""} onChange={(e) => setRelayNodeField(i, "token", e.target.value)} />
-                        <button onClick={() => removeRelayNode(i)} style={{ padding: "5px 10px", borderRadius: 7, border: `1px solid ${V.rbrd}`, background: V.rlo, color: V.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "删除" : "Remove"}</button>
-                      </div>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8, paddingLeft: 36 }}>
-                        <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, minWidth: 50 }}>scopes</div>
-                        <input
-                          style={{ ...fInput, flex: 1, fontSize: 11, fontFamily: V.mono }}
-                          type="text"
-                          placeholder={zh ? "留空 = 默认（仅本节点）；如 a2a:invoke:a3/*, relay:connect:hub-1" : "empty = default (this node only); e.g. a2a:invoke:a3/*, relay:connect:hub-1"}
-                          value={scopesArr.join(", ")}
-                          onChange={(e) => {
-                            const arr = e.target.value.split(",").map((s) => s.trim()).filter(Boolean);
-                            setRelayNodeField(i, "scopes", arr.length > 0 ? arr : undefined);
-                          }}
-                        />
-                      </div>
+                    <div key={`relay-node-${i}`} style={{ padding: "10px 15px", borderBottom: isLast ? "none" : `1px solid rgba(255,255,255,.03)`, display: "flex", alignItems: "center", gap: 8 }}>
+                      <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, width: 28 }}>{`[${i}]`}</div>
+                      <input style={{ ...fInput, width: 160 }} type="text" placeholder={zh ? "node id" : "node id"} value={n?.nodeId || ""} onChange={(e) => setRelayNodeField(i, "nodeId", e.target.value)} />
+                      <input style={{ ...fInput, flex: 1, minWidth: 160 }} type="password" placeholder="${RSCLAW_NODE_TOKEN}" value={typeof n?.token === "string" ? n.token : ""} onChange={(e) => setRelayNodeField(i, "token", e.target.value)} />
+                      <CommaListInput
+                        value={scopesArr}
+                        onChange={(next) => setRelayNodeField(i, "scopes", next)}
+                        placeholder={zh ? "scopes 留空=默认" : "scopes (empty=default)"}
+                        style={{ ...fInput, flex: 1, minWidth: 180, fontSize: 11, fontFamily: V.mono }}
+                      />
+                      <button onClick={() => removeRelayNode(i)} style={{ padding: "5px 10px", borderRadius: 7, border: `1px solid ${V.rbrd}`, background: V.rlo, color: V.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "删除" : "Remove"}</button>
                     </div>
                   );
                 })}
