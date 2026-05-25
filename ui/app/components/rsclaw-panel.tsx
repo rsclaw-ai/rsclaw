@@ -2543,7 +2543,7 @@ function ModelChainInput({
         </div>
         <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>{hint}</div>
       </div>
-      <div style={{ minWidth: 300, display: "flex", flexDirection: "column", gap: 6 }}>
+      <div style={{ width: 300, minWidth: 300, display: "flex", flexDirection: "column", gap: 6 }}>
         <input
           style={{ ...fInput, width: "100%" }}
           type="text"
@@ -3668,7 +3668,7 @@ function TauriConfigPageInner() {
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5907\u7528\u6A21\u578B" : "Fallback Models"} <span style={{ color: V.t3, fontWeight: 400 }}>{zh ? "(\u9017\u53F7\u5206\u9694)" : "(comma separated)"}</span></div>
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.fallbacks</div>
               </div>
-              <input style={{ ...fInput, minWidth: 300 }} placeholder={zh ? "\u5982: qwen/qwen-plus, openai/gpt-4o" : "e.g. qwen/qwen-plus, openai/gpt-4o"} value={(getVal("agents.defaults.model.fallbacks", "") || []).join?.(", ") || getVal("agents.defaults.model.fallbacks", "")} onChange={(e) => {
+              <input style={{ ...fInput, width: 300, minWidth: 300 }} placeholder={zh ? "\u5982: qwen/qwen-plus, openai/gpt-4o" : "e.g. qwen/qwen-plus, openai/gpt-4o"} value={(getVal("agents.defaults.model.fallbacks", "") || []).join?.(", ") || getVal("agents.defaults.model.fallbacks", "")} onChange={(e) => {
                 const val = e.target.value;
                 const arr = val.split(",").map((s: string) => s.trim()).filter(Boolean);
                 updateConfig("agents.defaults.model.fallbacks", arr.length > 0 ? arr : undefined);
@@ -3707,7 +3707,7 @@ function TauriConfigPageInner() {
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5DE5\u5177\u96C6" : "Toolset"}</div>
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.toolset</div>
               </div>
-              <select style={{ ...fSelect, minWidth: 240 }} value={getVal("agents.defaults.model.toolset", "full")} onChange={(e) => updateConfig("agents.defaults.model.toolset", e.target.value)}>
+              <select style={{ ...fSelect, width: 300, minWidth: 300 }} value={getVal("agents.defaults.model.toolset", "full")} onChange={(e) => updateConfig("agents.defaults.model.toolset", e.target.value)}>
                 <option value="minimal">minimal {zh ? "\u2014 6 \u4E2A\u6838\u5FC3\u5DE5\u5177" : "-- 6 core tools"}</option>
                 <option value="standard">standard {zh ? "\u2014 12 \u4E2A\u5DE5\u5177" : "-- 12 tools"}</option>
                 <option value="full">full {zh ? "\u2014 \u5168\u90E8\u5DE5\u5177" : "-- all tools"}</option>
@@ -4312,25 +4312,26 @@ function TauriConfigPageInner() {
             </div>
           </div>
 
-          {/* File upload */}
+          {/* File upload \u2014 both inputs sized identically + right-flush.
+              Previously row 1 had the input + a "MB" span in a sub-flex,
+              which pushed the input ~26px left of row 2's input. Unit
+              now lives in the label so both inputs share the same right
+              edge. */}
           {secHead(zh ? "\u6587\u4EF6\u4E0A\u4F20" : "FILE UPLOAD")}
           <div style={fcard}>
             <div style={fieldRow}>
               <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u6700\u5927\u6587\u4EF6\u5927\u5C0F" : "Max File Size"}</div>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u6700\u5927\u6587\u4EF6\u5927\u5C0F (MB)" : "Max File Size (MB)"}</div>
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>tools.upload.maxFileSize</div>
               </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                <input style={{ ...fInput, minWidth: 80 }} type="number" value={getVal("tools.upload.maxFileSize", 50)} onChange={(e) => updateConfig("tools.upload.maxFileSize", parseInt(e.target.value) || 50)} />
-                <span style={{ fontSize: 11, color: V.t2 }}>MB</span>
-              </div>
+              <input style={{ ...fInput, width: 160, minWidth: 160, textAlign: "right" }} type="number" value={getVal("tools.upload.maxFileSize", 50)} onChange={(e) => updateConfig("tools.upload.maxFileSize", parseInt(e.target.value) || 50)} />
             </div>
             <div style={{ ...fieldRow, borderBottom: "none" }}>
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u6587\u672C\u6700\u5927\u5B57\u7B26\u6570" : "Max Text Chars"}</div>
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>tools.upload.maxTextChars</div>
               </div>
-              <input style={{ ...fInput, minWidth: 140 }} type="number" value={getVal("tools.upload.maxTextChars", 20000)} onChange={(e) => updateConfig("tools.upload.maxTextChars", parseInt(e.target.value) || 20000)} />
+              <input style={{ ...fInput, width: 160, minWidth: 160, textAlign: "right" }} type="number" value={getVal("tools.upload.maxTextChars", 20000)} onChange={(e) => updateConfig("tools.upload.maxTextChars", parseInt(e.target.value) || 20000)} />
             </div>
           </div>
 
