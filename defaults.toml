@@ -20,6 +20,7 @@ label      = "RsClaw (recommended)"
 env_var    = "RSCLAW_API_KEY"
 model      = "rsclaw/rsclaw-agent-v1"
 base_url   = "https://api.rsclaw.ai/v1/agent"
+api_type   = "rsclaw"
 needs_key  = true
 
 [[providers]]
@@ -28,6 +29,7 @@ label      = "Doubao (ByteDance)"
 env_var    = "ARK_API_KEY"
 model      = "doubao/doubao-seed-2.0-pro"
 base_url   = "https://ark.cn-beijing.volces.com/api/v3"
+api_type   = "openai-responses"
 needs_key  = true
 
 [[providers]]
@@ -93,6 +95,7 @@ label      = "Anthropic (Claude)"
 env_var    = "ANTHROPIC_API_KEY"
 model      = "anthropic/claude-sonnet-4-6"
 base_url   = "https://api.anthropic.com/v1"
+api_type   = "anthropic"
 needs_key  = true
 
 [[providers]]
@@ -109,6 +112,7 @@ label      = "Google Gemini"
 env_var    = "GEMINI_API_KEY"
 model      = "gemini/gemini-2.5-flash"
 base_url   = "https://generativelanguage.googleapis.com/v1beta"
+api_type   = "gemini"
 needs_key  = true
 
 [[providers]]
@@ -141,6 +145,7 @@ label      = "Ollama (local)"
 env_var    = ""
 model      = "ollama/llama3.3"
 base_url   = "http://127.0.0.1:11434"
+api_type   = "ollama"
 needs_key  = false
 
 [[providers]]

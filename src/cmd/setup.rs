@@ -428,6 +428,21 @@ struct ProviderDef {
     user_agent: String,
     #[serde(default)]
     needs_key: bool,
+    /// API protocol identifier. Mirrors `ApiFormat` serde names:
+    /// `openai` (alias for `openai-completions`), `openai-responses`,
+    /// `anthropic`, `gemini`, `ollama`, `rsclaw`. When omitted in
+    /// `defaults.toml`, falls back to `"openai"` via `default_api_type`
+    /// — matching the gateway's `_ => OpenAiCompletions` catch-all in
+    /// `providers.rs:113-128`. Providers whose runtime protocol differs
+    /// (rsclaw, anthropic, gemini, ollama, doubao) MUST set this
+    /// explicitly so the wizard's picker default lines up with what the
+    /// gateway will actually run.
+    #[serde(default = "default_api_type")]
+    api_type: String,
+}
+
+fn default_api_type() -> String {
+    "openai".to_owned()
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1093,16 +1108,13 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                     "gemini",
                     "ollama",
                 ];
-                // Doubao defaults the cursor to OpenAI Responses (its
-                // native protocol for the Seed-1.6+ family with tool
-                // calling). Custom/codingplan keep the historical OpenAI
-                // Chat default.
+                // Preferred default comes from defaults.toml's per-provider
+                // `api_type` field (parsed into `ProviderDef.api_type`,
+                // falling back to "openai" when unset). This keeps the
+                // wizard's picker default lined up with the gateway's
+                // name-based ApiFormat inference (providers.rs:113-128).
                 let prov = &defs.providers[provider_idx];
-                let preferred_default = if prov.name == "doubao" {
-                    "openai-responses"
-                } else {
-                    "openai"
-                };
+                let preferred_default = prov.api_type.as_str();
                 let probe = if api_type.is_empty() {
                     preferred_default
                 } else {
@@ -2122,9 +2134,14 @@ async fn configure_model(
             "gemini",
             "ollama",
         ];
+        // Fallback default comes from defaults.toml's `api_type` (per
+        // ProviderDef). This stays in sync with the gateway's name-based
+        // ApiFormat inference (providers.rs:113-128) — doubao →
+        // openai-responses, custom/codingplan → openai (the default).
+        let fallback_default = provider.api_type.as_str();
         let current_api = get_nested_value(val, &format!("models.providers.{}.api", provider.name))
             .and_then(|v| v.as_str().map(|s| s.to_owned()))
-            .unwrap_or_else(|| "openai".to_string());
+            .unwrap_or_else(|| fallback_default.to_string());
         let current_idx = api_values
             .iter()
             .position(|v| *v == current_api)
@@ -2247,7 +2264,25 @@ async fn configure_model(
         || provider.name == "gemini"
     {
         step("*", &crate::i18n::t("cli_testing_connectivity", lang));
-        match test_provider_connectivity(&test_url, test_key.as_deref(), &provider.name).await {
+        // Resolve effective api_type: user's pick this turn > existing
+        // config value > provider default. Without this, doubao probes
+        // would always hit `/v1/models` (404 on ARK CodingPlan) even when
+        // the user just picked OpenAI Chat in the picker above.
+        let effective_api_type: Option<String> = if !new_api_type.is_empty() {
+            Some(new_api_type.clone())
+        } else {
+            get_nested_value(val, &format!("models.providers.{}.api", provider.name))
+                .and_then(|v| v.as_str().map(|s| s.to_owned()))
+        };
+        match test_provider_connectivity(
+            &test_url,
+            test_key.as_deref(),
+            &provider.name,
+            effective_api_type.as_deref(),
+            Some(&new_model),
+        )
+        .await
+        {
             Ok(()) => step("*", &crate::i18n::t("cli_connection_ok", lang)),
             Err(e) => {
                 println!(
@@ -3250,6 +3285,8 @@ async fn test_provider_connectivity(
     base_url: &str,
     api_key: Option<&str>,
     provider_name: &str,
+    api_type: Option<&str>,
+    model: Option<&str>,
 ) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -3265,31 +3302,133 @@ async fn test_provider_connectivity(
         return probe_rsclaw_connectivity(&client, base_url, api_key).await;
     }
 
-    let url = match provider_name {
-        "anthropic" => "https://api.anthropic.com/v1/models".to_owned(),
-        "gemini" => return Ok(()), // Gemini uses query param auth, skip
-        _ => {
-            let base = if base_url.is_empty() {
-                "https://api.openai.com"
+    // Gemini: query-param auth, skip live probe
+    if provider_name == "gemini" {
+        return Ok(());
+    }
+
+    // Resolve effective api protocol. Providers that opt into `api_type`
+    // (custom/codingplan/doubao) carry the user's pick; others fall back
+    // to the provider's well-known protocol.
+    let effective_api = api_type
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| match provider_name {
+            "anthropic" => "anthropic",
+            "doubao" | "bytedance" => "openai-responses",
+            "ollama" => "ollama",
+            _ => "openai-completions",
+        });
+
+    // Pick a probe model. Real model name avoids "model not found" 400s
+    // for providers that hard-validate. Bare placeholder ("test") still
+    // returns 400 which we interpret as "endpoint reachable".
+    let probe_model = model
+        .map(|m| m.rsplit_once('/').map(|(_, m)| m).unwrap_or(m))
+        .unwrap_or("test");
+
+    // Build per-protocol probe URL + body + auth headers. Probes are
+    // POSTs to the real inference endpoint, not `/v1/models`, because
+    // some endpoints (e.g. Volcengine ARK CodingPlan at `/api/coding/v3`)
+    // expose only the inference path and 404 on listing routes.
+    let base_trimmed = base_url.trim_end_matches('/');
+    let (url, body, auth) = match effective_api {
+        "openai-responses" => {
+            let base = if base_trimmed.is_empty() {
+                "https://api.openai.com/v1"
             } else {
-                base_url
+                base_trimmed
             };
-            if base.ends_with("/v1") || base.contains("/v1/") {
-                format!("{}/models", base.trim_end_matches('/'))
+            (
+                format!("{base}/responses"),
+                serde_json::json!({
+                    "model": probe_model,
+                    "input": "hi",
+                    "max_output_tokens": 1,
+                    "stream": false,
+                }),
+                "bearer",
+            )
+        }
+        "anthropic" | "anthropic-messages" => {
+            let base = if base_trimmed.is_empty() {
+                "https://api.anthropic.com/v1"
             } else {
-                format!("{}/v1/models", base.trim_end_matches('/'))
-            }
+                base_trimmed
+            };
+            // CodingPlan endpoints sit at `/api/coding/v1` and expect the
+            // same `/messages` path. Standard Anthropic also uses
+            // `/v1/messages`; append `/messages` if the base already
+            // carries `/v1`, otherwise append `/v1/messages`.
+            let url = if base.ends_with("/v1") || base.contains("/v1/") {
+                format!("{base}/messages")
+            } else {
+                format!("{base}/v1/messages")
+            };
+            (
+                url,
+                serde_json::json!({
+                    "model": probe_model,
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "hi"}],
+                }),
+                "x-api-key",
+            )
+        }
+        "ollama" => {
+            // Ollama exposes /api/tags for listing — cheap GET probe.
+            let base = if base_trimmed.is_empty() {
+                "http://localhost:11434"
+            } else {
+                base_trimmed
+            };
+            let url = format!("{base}/api/tags");
+            let resp = client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("connection failed: {e}"))?;
+            let status = resp.status();
+            return if status.is_success() {
+                Ok(())
+            } else {
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("{status}: {}", crate::util::truncate_str(&body, 200))
+            };
+        }
+        _ => {
+            // openai-completions / unknown: POST /chat/completions
+            let base = if base_trimmed.is_empty() {
+                "https://api.openai.com/v1"
+            } else {
+                base_trimmed
+            };
+            (
+                format!("{base}/chat/completions"),
+                serde_json::json!({
+                    "model": probe_model,
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": false,
+                }),
+                "bearer",
+            )
         }
     };
 
-    let mut req = client.get(&url);
+    let mut req = client.post(&url).json(&body);
     if let Some(key) = api_key {
-        if provider_name == "anthropic" {
-            req = req
-                .header("x-api-key", key)
-                .header("anthropic-version", "2023-06-01");
-        } else {
-            req = req.header("authorization", format!("Bearer {key}"));
+        match auth {
+            "x-api-key" => {
+                // Send BOTH headers: standard Anthropic uses x-api-key,
+                // Volcengine ARK CodingPlan (Anthropic-compat) uses Bearer.
+                req = req
+                    .header("x-api-key", key)
+                    .header("anthropic-version", "2023-06-01")
+                    .header("authorization", format!("Bearer {key}"));
+            }
+            _ => {
+                req = req.header("authorization", format!("Bearer {key}"));
+            }
         }
     }
 
@@ -3298,16 +3437,25 @@ async fn test_provider_connectivity(
         .await
         .map_err(|e| anyhow::anyhow!("connection failed: {e}"))?;
     let status = resp.status();
-    if status.is_success() || status.as_u16() == 401 {
-        // 401 = auth error but connection works; 200 = all good
-        if status.as_u16() == 401 {
-            anyhow::bail!("connected but API key is invalid (401)");
-        }
-        Ok(())
-    } else {
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("{status}: {}", crate::util::truncate_str(&body, 200));
+    let code = status.as_u16();
+
+    // 2xx → all good.
+    // 400/422 → endpoint reachable, request shape rejected (bad model,
+    // missing field) — still counts as "connectivity OK".
+    // 401/403 → endpoint reachable, auth rejected — surface the auth error.
+    // 404/5xx → endpoint NOT reachable at this URL/protocol combo.
+    if status.is_success() {
+        return Ok(());
     }
+    if code == 400 || code == 422 {
+        return Ok(());
+    }
+    let body = resp.text().await.unwrap_or_default();
+    let snippet = crate::util::truncate_str(&body, 200);
+    if code == 401 || code == 403 {
+        anyhow::bail!("{status} (auth): {snippet}");
+    }
+    anyhow::bail!("{status}: {snippet}");
 }
 
 /// RsClaw-specific connectivity probe. Hits `GET /v1/agent/models`,

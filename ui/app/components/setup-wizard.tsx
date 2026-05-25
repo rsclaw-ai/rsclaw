@@ -179,6 +179,19 @@ export function SetupWizardPage() {
           ...(config.baseUrl ? { baseUrl: config.baseUrl } : {}),
           enabled: true,
         };
+      } else if (config.provider === "doubao") {
+        // doubao supports per-provider api protocol override (CodingPlan
+        // endpoint speaks Anthropic, regular Ark speaks OpenAI). Always
+        // write the `api` field — without it the gateway falls back to
+        // hardcoded `OpenAiResponses` (providers.rs:118) and a user who
+        // configured a CodingPlan baseUrl sees a 404 on `/responses`.
+        // Default mirrors gateway: "openai-responses".
+        providerConfig.doubao = {
+          api: config.apiType || "openai-responses",
+          ...(config.baseUrl ? { baseUrl: config.baseUrl } : {}),
+          ...(config.apiKey ? { apiKey: config.apiKey } : {}),
+          enabled: true,
+        };
       } else if (config.apiKey) {
         providerConfig[config.provider] = { apiKey: config.apiKey, enabled: true };
       }
@@ -252,6 +265,12 @@ export function SetupWizardPage() {
                       updates.baseUrl = "http://localhost:11434";
                     } else if (provider.id === "custom") {
                       updates.apiType = "openai";
+                      updates.baseUrl = "";
+                    } else if (provider.id === "doubao") {
+                      // doubao default protocol = openai-responses (matches
+                      // gateway/providers.rs:118). User can still override in
+                      // rsclaw-panel (Settings → Providers → doubao).
+                      updates.apiType = "openai-responses";
                       updates.baseUrl = "";
                     } else {
                       updates.baseUrl = "";
