@@ -69,6 +69,22 @@ fn main() -> Result<()> {
 const BASE_PORT: u16 = 18888;
 const DEV_PORT: u16 = 18889;
 
+/// Best-effort read of `gateway.port` from `<base_dir>/rsclaw.json5`.
+/// Returns None when the file doesn't exist, doesn't parse, or doesn't set
+/// the field — caller falls back to the auto-computed offset. Intentionally
+/// uses raw JSON5 here (not the schema deserializer) so a malformed
+/// unrelated config field never blocks port resolution.
+fn read_config_port(base_dir: &std::path::Path) -> Option<u16> {
+    let path = base_dir.join("rsclaw.json5");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let value: serde_json::Value = json5::from_str(&text).ok()?;
+    value
+        .get("gateway")
+        .and_then(|g| g.get("port"))
+        .and_then(|p| p.as_u64())
+        .and_then(|p| u16::try_from(p).ok())
+}
+
 fn resolve_instance(cli: &Cli) -> (std::path::PathBuf, u16) {
     let home = dirs_next::home_dir().unwrap_or_default();
 
@@ -129,12 +145,21 @@ async fn run() -> Result<()> {
     init_tracing(&cli);
 
     // Apply --base-dir / --dev / --profile instance isolation (AGENTS.md §26).
-    let (base_dir, port) = resolve_instance(&cli);
+    let (base_dir, auto_port) = resolve_instance(&cli);
     if cli.base_dir.is_some() || cli.dev || cli.profile.is_some() {
         let label = cli
             .base_dir
             .as_deref()
             .unwrap_or_else(|| cli.profile.as_deref().unwrap_or("dev"));
+        // Config wins: if the profile's rsclaw.json5 explicitly sets
+        // gateway.port, that's the authoritative port for both the
+        // gateway process and any CLI subcommand (channels pair, agents
+        // bind, etc.) that talks to it via 127.0.0.1:<port>. The
+        // auto-computed offset is only the FALLBACK for profiles that
+        // never customized their port. Without this, binding a port in
+        // config silently lost to the CLI flag and CLI tools dialed the
+        // wrong port — reported as 'pair errors with port 18888'.
+        let port = read_config_port(&base_dir).unwrap_or(auto_port);
         println!(
             "profile: {label}  base: {}  port: {port}",
             base_dir.display()
