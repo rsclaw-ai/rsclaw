@@ -289,37 +289,42 @@ impl KnowledgeService {
     /// Spawn a background thread that drains KB jobs forever, so document
     /// indexing runs asynchronously after upload. Idempotent per service
     /// instance is the caller's responsibility (call once at startup).
+    ///
+    /// The loop body is wrapped in `catch_unwind` so a panic in any
+    /// non-essential call (reclaim_stale, emit_ready_transitions) does not
+    /// kill the thread permanently — the inner state is reset and the loop
+    /// restarts after a backoff.
     pub fn spawn_worker(self: &Arc<Self>) {
         let this = Arc::clone(self);
         std::thread::Builder::new()
             .name("kb-knowledge-worker".into())
             .spawn(move || {
-                // Seed with already-ready docs so we don't replay a burst of
-                // status events for the existing corpus on startup.
-                let mut emitted: HashSet<String> = this.ready_doc_ids().unwrap_or_default();
-                // Recover jobs stranded by a crash/restart mid-claim. The
-                // claim TTL is 60s; check a bit more often than that.
-                let reclaim_every = Duration::from_secs(30);
-                let mut next_reclaim = std::time::Instant::now() + reclaim_every;
+                // Outer recovery loop: if the inner loop panics, restart it
+                // with fresh state after a backoff.
                 loop {
-                    if std::time::Instant::now() >= next_reclaim {
-                        match this.reclaim_stale() {
-                            Ok(n) if n > 0 => {
-                                tracing::info!("kb knowledge worker: reclaimed {n} stale jobs")
-                            }
-                            Ok(_) => {}
-                            Err(e) => tracing::warn!("kb knowledge worker reclaim: {e:#}"),
-                        }
-                        next_reclaim = std::time::Instant::now() + reclaim_every;
-                    }
-                    match this.drain_once() {
-                        // A job finished — emit status_changed=ready for any doc
-                        // that just gained its first indexed chunk.
-                        Ok(true) => this.emit_ready_transitions(&mut emitted),
-                        Ok(false) => std::thread::sleep(Duration::from_millis(500)),
-                        Err(e) => {
-                            tracing::warn!("kb knowledge worker: {e:#}");
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        Self::worker_inner(&this);
+                    }));
+                    match outcome {
+                        Ok(()) => {
+                            // Normal exit should never happen; log and restart.
+                            tracing::error!(
+                                "kb knowledge worker: inner loop exited unexpectedly; restarting"
+                            );
                             std::thread::sleep(Duration::from_secs(2));
+                        }
+                        Err(panic) => {
+                            let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                                s.to_string()
+                            } else if let Some(s) = panic.downcast_ref::<String>() {
+                                s.clone()
+                            } else {
+                                "unknown panic".to_string()
+                            };
+                            tracing::error!(
+                                "kb knowledge worker: thread panicked ({msg}); restarting in 5s"
+                            );
+                            std::thread::sleep(Duration::from_secs(5));
                         }
                     }
                 }
@@ -327,10 +332,45 @@ impl KnowledgeService {
             .expect("spawn kb knowledge worker thread");
     }
 
-    /// Ingest a document into a collection. Stores + tags it and enqueues the
-    /// embed job (drained by the background worker). Returns `(doc_id, noop)`;
-    /// `noop` means identical content was already present. `mime` overrides
-    /// MIME detection (the JSON upload path passes it explicitly).
+    /// Inner worker loop. Extracted as a plain fn so `spawn_worker`'s
+    /// `catch_unwind` boundary is clear — no mutable captures.
+    fn worker_inner(this: &Arc<Self>) {
+        // Seed with already-ready docs so we don't replay a burst of
+        // status events for the existing corpus on startup.
+        let mut emitted: HashSet<String> = this.ready_doc_ids().unwrap_or_default();
+        // Recover jobs stranded by a crash/restart mid-claim. The
+        // claim TTL is 60s; check a bit more often than that.
+        let reclaim_every = Duration::from_secs(30);
+        let mut next_reclaim = std::time::Instant::now() + reclaim_every;
+        loop {
+            if std::time::Instant::now() >= next_reclaim {
+                match this.reclaim_stale() {
+                    Ok(n) if n > 0 => {
+                        tracing::info!("kb knowledge worker: reclaimed {n} stale jobs")
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("kb knowledge worker reclaim: {e:#}"),
+                }
+                next_reclaim = std::time::Instant::now() + reclaim_every;
+            }
+            match this.drain_once() {
+                // A job finished — emit status_changed=ready for any doc
+                // that just gained its first indexed chunk.
+                Ok(true) => this.emit_ready_transitions(&mut emitted),
+                Ok(false) => std::thread::sleep(Duration::from_millis(500)),
+                Err(e) => {
+                    tracing::warn!("kb knowledge worker: {e:#}");
+                    std::thread::sleep(Duration::from_secs(2));
+                }
+            }
+        }
+    }
+
+    /// Ingest a document into a collection. Stores + tags it, enqueues the
+    /// embed job, and drains it synchronously so the caller can search
+    /// immediately after. Returns `(doc_id, noop)`; `noop` means identical
+    /// content was already present. `mime` overrides MIME detection (the
+    /// JSON upload path passes it explicitly).
     pub fn ingest(
         &self,
         collection_id: &str,
@@ -373,6 +413,14 @@ impl KnowledgeService {
                 paths: &self.paths,
             },
         )?;
+        if !out.noop {
+            // Drain the ChunkAndEmbed job synchronously so a subsequent
+            // search (agent turn, REST API call) finds the chunks already
+            // in HNSW + Tantivy. Multiple callers (agent thread, bg
+            // worker) may race on claim_next, but the first to claim
+            // processes it; the other sees "no job" and returns.
+            let _ = self.drain_once();
+        }
         Ok((out.doc_id, out.noop))
     }
 
@@ -814,14 +862,43 @@ mod tests {
     fn doc_status_failed_when_index_job_exhausted() {
         let (_t, s) = svc();
         let c = s.create_collection("kb", None, None).unwrap();
-        let (doc_id, _) = s
-            .ingest(
-                &c.id,
-                "a.md",
-                b"# A\n\nbody one here",
-                Some("text/markdown"),
-            )
-            .unwrap();
+
+        // Use ingest_canonicalized directly so the job stays pending
+        // (s.ingest() now drains synchronously).
+        use crate::kb::{
+            canonicalize::{CanonicalizeInput, canonicalize_by_mime},
+            paths::KbPaths,
+            pipeline::{IngestInput, ingest_canonicalized},
+        };
+        let mut canon = canonicalize_by_mime(CanonicalizeInput {
+            bytes: b"# A\n\nbody one here",
+            mime: "text/markdown",
+            hint_title: Some("a.md"),
+            logical_source_id_seed: None,
+        })
+        .unwrap()
+        .unwrap();
+        canon
+            .metadata
+            .tags
+            .push(crate::kb::model::collection_tag(&c.id));
+        let paths = KbPaths::new(s.kb_root().to_path_buf());
+        let out = ingest_canonicalized(
+            s.store(),
+            IngestInput {
+                canon: &canon,
+                raw_bytes: b"# A\n\nbody one here",
+                raw_ext: "md",
+                visibility: None,
+                owner_user_id: None,
+                seen_key: None,
+                source: None,
+                paths: &paths,
+            },
+        )
+        .unwrap();
+        let doc_id = out.doc_id;
+
         // Before the worker runs: still indexing.
         assert_eq!(s.get_doc(&c.id, &doc_id).unwrap().status(), "indexing");
         // Simulate the worker giving up: claim the enqueued ChunkAndEmbed job
@@ -867,17 +944,39 @@ mod tests {
     #[test]
     fn ingest_enqueues_and_worker_drains() {
         let (_t, s) = svc();
-        let c = s.create_collection("kb", None, None).unwrap();
-        let (doc_id, noop) = s
-            .ingest(
-                &c.id,
-                "note.md",
-                b"# Title\n\nquantum entanglement is a phenomenon of two particles.",
-                Some("text/markdown"),
-            )
-            .unwrap();
-        assert!(!noop);
-        assert!(doc_id.starts_with("doc_") || !doc_id.is_empty());
+
+        // Use ingest_canonicalized directly (s.ingest() now drains
+        // synchronously) so we can verify drain_once processes the job.
+        use crate::kb::{
+            canonicalize::{CanonicalizeInput, canonicalize_by_mime},
+            paths::KbPaths,
+            pipeline::{IngestInput, ingest_canonicalized},
+        };
+        let canon = canonicalize_by_mime(CanonicalizeInput {
+            bytes: b"# Title\n\nquantum entanglement is a phenomenon of two particles.",
+            mime: "text/markdown",
+            hint_title: Some("note.md"),
+            logical_source_id_seed: None,
+        })
+        .unwrap()
+        .unwrap();
+        let paths = KbPaths::new(s.kb_root().to_path_buf());
+        let out = ingest_canonicalized(
+            s.store(),
+            IngestInput {
+                canon: &canon,
+                raw_bytes: b"# Title\n\nquantum entanglement is a phenomenon of two particles.",
+                raw_ext: "md",
+                visibility: None,
+                owner_user_id: None,
+                seen_key: None,
+                source: None,
+                paths: &paths,
+            },
+        )
+        .unwrap();
+        assert!(!out.noop);
+
         // Drain the enqueued embed job(s).
         let mut drained = 0;
         while s.drain_once().unwrap() {

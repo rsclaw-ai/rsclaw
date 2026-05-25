@@ -366,6 +366,15 @@ pub struct A2aPeerConfig {
     /// agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_agent_id: Option<String>,
+    /// Human-written capability blurb shown to the LLM as the tool's
+    /// description. Without this, the auto-generated description is just
+    /// "Send a task to remote agent 'X'" — opaque, and 9B-class models
+    /// won't route to the peer because they can't tell what it does. Put
+    /// trigger keywords here: 生图/生视频/数字人/对口型/TTS/抖音 ...
+    /// Falls back to "Send a task to remote agent '<id>' at <url>" when
+    /// unset (back-compat with older configs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -605,10 +614,26 @@ pub struct ModelConfig {
     /// (all 32+).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub toolset: Option<String>,
-    /// Extra tool names to include on top of the toolset level.
-    /// Also used as a whitelist when toolset is not set.
+    /// Tool whitelist for this agent. When set, the LLM sees ONLY these
+    /// tool names (the `toolset` preset becomes the fallback baseline,
+    /// not an additive base). Use for hub-router agents and any setup
+    /// where you want explicit control over what the model can call.
+    /// Examples: `["agent_spoke_aihub", "memory", "clarify"]`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
+    /// Promote selected plugin tools to native ToolDefs visible to the
+    /// LLM as `<plugin>.<tool>`. Bypasses the plugin.search_tools →
+    /// plugin.describe_tool → plugin.invoke 3-step dance that small
+    /// (9B-class) models can't reliably follow. Each entry is
+    /// `"<plugin>.<tool>"`, e.g. `["douyin.publish", "douyin.get_comments"]`.
+    /// The injected ToolDef carries the plugin's manifest description +
+    /// input_schema, so the provider's tool-schema enforcement validates
+    /// arguments. Pair with `tools: [...]` to whitelist them in the
+    /// allowlist enforcement layer. Per-agent always-on equivalent of
+    /// the per-session `/plugin` slash command. Honors MAX_INJECT_TOOLS
+    /// (20) hard cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_tools: Option<Vec<String>>,
     /// Context window size in tokens. Used to calculate history budget.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u32>,

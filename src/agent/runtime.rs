@@ -3142,6 +3142,15 @@ impl AgentRuntime {
             // already exists at the `name.split_once('.')` arm in
             // dispatch_tool (~runtime.rs:7199).
             all.extend(self.expand_plugin_tool_defs(session_key));
+            // Config-declared plugin tool promotion: per-agent always-on
+            // equivalent of `/plugin`. Operator writes
+            //   model.plugin_tools = ["douyin.publish"]
+            // and the LLM sees a native ToolDef rather than having to
+            // chain plugin.search_tools → plugin.describe_tool →
+            // plugin.invoke. Reuses the same expand_plugin_tool_defs_pure
+            // path as `/plugin` so dispatch routing + arg validation
+            // behavior is identical.
+            all.extend(self.expand_config_plugin_tools());
 
             // Apply toolset level + custom tools list
             // Default agent uses "full", others use "standard". Fall back to
@@ -6797,6 +6806,52 @@ impl AgentRuntime {
             }
         }
         out
+    }
+
+    /// Expand the agent's CONFIG-declared `model.plugin_tools` list into
+    /// native `<plugin>.<tool>` ToolDefs. Always-on, not session-scoped.
+    /// Reuses `expand_plugin_tool_defs_pure` by synthesizing a one-shot
+    /// override map keyed by plugin name — so dispatch routing, the
+    /// MAX_INJECT_TOOLS cap, and wasm-wins ordering all match the
+    /// `/plugin` session-override path.
+    pub(crate) fn expand_config_plugin_tools(&self) -> Vec<crate::provider::ToolDef> {
+        const MAX_INJECT_TOOLS: usize = 20;
+        let Some(model_cfg) = self.handle.config.model.as_ref() else {
+            return Vec::new();
+        };
+        let Some(list) = model_cfg.plugin_tools.as_ref() else {
+            return Vec::new();
+        };
+        if list.is_empty() {
+            return Vec::new();
+        }
+        let mut map: std::collections::HashMap<String, PluginOverride> =
+            std::collections::HashMap::new();
+        for entry in list {
+            // Accept both `plugin.tool` (preferred) and `plugin/tool` for
+            // operators who muscle-memory from skill paths.
+            let Some((plugin, tool)) = entry
+                .split_once('.')
+                .or_else(|| entry.split_once('/'))
+            else {
+                tracing::warn!(
+                    agent = %self.handle.id,
+                    entry = %entry,
+                    "plugin_tools entry must be '<plugin>.<tool>'; skipping"
+                );
+                continue;
+            };
+            map.entry(plugin.to_owned())
+                .or_default()
+                .inject
+                .push(tool.to_owned());
+        }
+        Self::expand_plugin_tool_defs_pure(
+            &self.wasm_plugins,
+            self.plugins.as_deref(),
+            &map,
+            MAX_INJECT_TOOLS,
+        )
     }
 
     /// Live-runtime convenience: pulls plugins from `self`, snapshots the

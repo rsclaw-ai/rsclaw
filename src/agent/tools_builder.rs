@@ -326,20 +326,20 @@ pub(crate) fn toolset_allowed_names(
         _ => Some(STANDARD),
     };
 
+    // Semantics: `toolset` is the preset (used when nothing more specific is
+    // set). `tools` is the explicit specification (overrides the preset).
+    // Previously the two were merged — which broke hub-router agents that
+    // set `toolset: minimal` + `tools: [agent_spoke_*]` expecting only the
+    // peers but actually got minimal's shell + read_file + ... too, and 9B
+    // models then narrated `pip install` instead of routing. Override is the
+    // intuitive contract.
     match (base, custom_tools) {
         (None, None) => None, // full, no custom -> no filtering
-        (None, Some(extra)) => {
-            // full + custom whitelist -> use custom as whitelist
+        (_, Some(extra)) => {
+            // tools specified — exclusive whitelist, regardless of toolset.
             Some(extra.iter().cloned().collect())
         }
         (Some(base_list), None) => Some(base_list.iter().map(|s| s.to_string()).collect()),
-        (Some(base_list), Some(extra)) => {
-            // Merge: toolset base + custom extras, deduplicated
-            let mut set: std::collections::HashSet<String> =
-                base_list.iter().map(|s| s.to_string()).collect();
-            set.extend(extra.iter().cloned());
-            Some(set)
-        }
     }
 }
 
@@ -1819,18 +1819,25 @@ pub fn build_tool_list(
         }
     }
 
-    // External remote agent A2A tools (remote gateways).
+    // External remote agent A2A tools (remote gateways). Honor a
+    // per-peer `description` so operators can spell out the peer's
+    // capabilities + trigger keywords; small models (Qwen3.5-9B-class)
+    // otherwise can't tell what `agent_spoke_aihub` does from the
+    // generic auto-generated blurb and will refuse to route there.
     tracing::debug!(count = a2a_peers.len(), "build_tool_list: external agents");
     for ext in a2a_peers {
         if ext.id == caller_id {
             continue;
         }
-        tools.push(ToolDef {
-            name: format!("agent_{}", ext.id),
-            description: format!(
+        let description = ext.description.clone().unwrap_or_else(|| {
+            format!(
                 "Send a task to remote agent '{}' at {}. Returns the agent's reply.",
                 ext.id, ext.url
-            ),
+            )
+        });
+        tools.push(ToolDef {
+            name: format!("agent_{}", ext.id),
+            description,
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -2011,6 +2018,42 @@ mod plugin_catalog_tests {
         assert!(names.contains("plugin.search_tools"));
         assert!(names.contains("plugin.describe_tool"));
         assert!(names.contains("plugin.invoke"));
+    }
+
+    #[test]
+    fn custom_tools_override_toolset_preset() {
+        // Hub-router semantic: `toolset: "minimal"` + explicit `tools: [...]`
+        // must yield ONLY the explicit list, never the minimal base. Pre-fix
+        // this merged base ∪ custom, exposing `shell` to a router agent and
+        // making 9B models hallucinate `pip install` instead of routing.
+        let custom = vec!["agent_spoke_aihub".to_string(), "memory".to_string()];
+        let names = toolset_allowed_names("minimal", Some(&custom))
+            .expect("explicit custom must produce whitelist");
+        assert_eq!(names.len(), 2, "must NOT include minimal base");
+        assert!(names.contains("agent_spoke_aihub"));
+        assert!(names.contains("memory"));
+        assert!(!names.contains("shell"), "shell from minimal must be excluded");
+        assert!(!names.contains("read_file"), "read_file from minimal must be excluded");
+    }
+
+    #[test]
+    fn custom_tools_override_works_for_every_preset() {
+        let custom = vec!["only_me".to_string()];
+        for preset in ["minimal", "web", "code", "standard", "full"] {
+            let names = toolset_allowed_names(preset, Some(&custom))
+                .expect("override produces whitelist");
+            assert_eq!(names.len(), 1, "preset={preset}");
+            assert!(names.contains("only_me"), "preset={preset}");
+        }
+    }
+
+    #[test]
+    fn preset_alone_still_returns_preset_base() {
+        // Regression guard: when `tools` is None, the preset behavior is
+        // unchanged.
+        let names = toolset_allowed_names("minimal", None).expect("base");
+        assert!(names.contains("shell"));
+        assert!(names.contains("read_file"));
     }
 
     #[test]
