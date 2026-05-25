@@ -84,6 +84,13 @@ impl FailoverManager {
                         break;
                     }
                 };
+                // Snapshot the api protocol the resolved provider speaks
+                // (`openai` / `openai-responses` / `anthropic` / `gemini` /
+                // `rsclaw` / `ollama`) so every log line below can surface
+                // it. Without this, `provider="doubao"` alone hides whether
+                // the actual call went via Responses or Anthropic, which is
+                // the exact ambiguity that masked the recent ARK 404.
+                let provider_api = provider.name();
 
                 // One profile attempt, with a single in-place retry if the
                 // request is rejected for exceeding the model/tier output-token
@@ -99,6 +106,7 @@ impl FailoverManager {
                             self.failure_counts.remove(profile_id);
                             info!(
                                 provider = provider_name,
+                                api = provider_api,
                                 model = model_id,
                                 profile = profile_id,
                                 "LLM call succeeded"
@@ -113,6 +121,7 @@ impl FailoverManager {
                             if req.max_tokens.is_some() && !dropped_max_tokens {
                                 warn!(
                                     provider = provider_name,
+                                    api = provider_api,
                                     profile = profile_id,
                                     error = %e,
                                     "max_tokens exceeds model/tier ceiling — dropping max_tokens and retrying once"
@@ -139,6 +148,7 @@ impl FailoverManager {
                                 .min(MAX_COOLDOWN);
                             warn!(
                                 provider = provider_name,
+                                api = provider_api,
                                 profile = profile_id,
                                 error = %e,
                                 ?delay,
