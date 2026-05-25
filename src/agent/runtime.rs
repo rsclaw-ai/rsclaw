@@ -1289,6 +1289,67 @@ impl AgentRuntime {
     ///   4. `agents.defaults.model`     (global default)
     /// So if no flash model is configured anywhere, we fall back to whatever
     /// the agent is already using — no regression.
+    /// Split the resolved flash chain into (head, tail). Drop-in for
+    /// flash LlmRequest builders: `let (model, fallback_models) =
+    /// self.resolve_flash_chain_split();`. Empty head when no flash
+    /// model is configured anywhere — matches `resolve_flash_model_name`
+    /// returning `""` in the same case.
+    pub(crate) fn resolve_flash_chain_split(&self) -> (String, Vec<String>) {
+        let mut chain = self.resolve_flash_chain();
+        if chain.is_empty() {
+            return (String::new(), Vec::new());
+        }
+        let head = chain.remove(0);
+        (head, chain)
+    }
+
+    /// Return the resolved flash chain — head first, fallbacks following.
+    /// Callers building an `LlmRequest` can pass `chain[1..]` as
+    /// `fallback_models` to enable per-call chain retry through the
+    /// FailoverManager (head is still passed as `req.model`).
+    pub(crate) fn resolve_flash_chain(&self) -> Vec<String> {
+        let per_agent = &self.handle.config;
+        let defaults = &self.config.agents.defaults;
+        let mut out: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let push = |v: Vec<&str>, out: &mut Vec<String>, seen: &mut std::collections::HashSet<String>| {
+            for m in v {
+                let t = m.trim();
+                if !t.is_empty() && seen.insert(t.to_owned()) {
+                    out.push(t.to_owned());
+                }
+            }
+        };
+        if let Some(m) = per_agent.model.as_ref() {
+            push(m.flash_chain(), &mut out, &mut seen);
+        }
+        if let Some(fm) = per_agent.flash_model.as_ref() {
+            push(fm.primary_chain(), &mut out, &mut seen);
+        }
+        if let Some(m) = defaults.model.as_ref() {
+            push(m.flash_chain(), &mut out, &mut seen);
+        }
+        if let Some(fm) = defaults.flash_model.as_ref() {
+            push(fm.primary_chain(), &mut out, &mut seen);
+        }
+        if out.is_empty() {
+            // RsClaw fleet inference fallback (same logic as
+            // resolve_flash_model_for): if primary head is rsclaw, the
+            // fleet's RSCLAW_DEFAULT_FLASH is the flash model.
+            let primary = per_agent
+                .model
+                .as_ref()
+                .and_then(|m| m.primary_head())
+                .or_else(|| defaults.model.as_ref().and_then(|m| m.primary_head()));
+            if let Some(p) = primary {
+                if p.starts_with("rsclaw/") {
+                    out.push(crate::provider::rsclaw::RSCLAW_DEFAULT_FLASH.to_owned());
+                }
+            }
+        }
+        out
+    }
+
     pub(crate) fn resolve_flash_model_name(&self) -> String {
         resolve_flash_model_for(&self.handle.config, &self.config.agents.defaults)
             .unwrap_or_else(|| self.resolve_model_name())
@@ -1546,9 +1607,12 @@ impl AgentRuntime {
         // never competes with the primary agent's session slots.
         // Non-rsclaw providers (OpenAI, Anthropic, etc.) ignore the
         // endpoint field and just see a normal chat completion.
-        let model = self.resolve_flash_model_name();
+        // Chain-aware: when `agents.defaults.model.flash` is a multi-entry
+        // chain, the tail rides as `fallback_models` so the same per-model
+        // health gating kicks in for fastshot calls.
+        let (model, flash_fallbacks) = self.resolve_flash_chain_split();
         let req = LlmRequest {
-            fallback_models: Vec::new(),
+            fallback_models: flash_fallbacks,
             model,
             messages: vec![Message {
                 role: Role::User,
