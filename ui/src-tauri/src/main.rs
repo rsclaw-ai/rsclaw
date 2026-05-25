@@ -1558,10 +1558,6 @@ fn resolve_tool_name(name: &str) -> &str {
     }
 }
 
-fn is_local_tool_installed(name: &str) -> bool {
-    local_tool_binary_path(name).is_some()
-}
-
 fn local_tool_binary_path(name: &str) -> Option<std::path::PathBuf> {
     let name = resolve_tool_name(name);
     let dir = rsclaw_base_dir().join("tools").join(name);
@@ -2069,8 +2065,12 @@ fn main() {
     {
         std::thread::spawn(|| {
             unsafe {
-                libc::signal(libc::SIGTERM, handle_sigterm as usize);
-                libc::signal(libc::SIGINT, handle_sigterm as usize);
+                // Rust 2024 forbids direct fn-item → usize. libc::signal wants
+                // a usize sighandler — go fn → *const () → usize per the lint
+                // suggestion. Same numeric value, just makes the conversion
+                // explicit.
+                libc::signal(libc::SIGTERM, handle_sigterm as *const () as usize);
+                libc::signal(libc::SIGINT, handle_sigterm as *const () as usize);
             }
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(200));
