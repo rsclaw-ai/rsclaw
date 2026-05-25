@@ -24,7 +24,7 @@ use tracing::{info, warn};
 
 use super::{
     LlmRequest, LlmStream, RetryConfig, backoff_delay,
-    health::{ChainHealth, ErrorKind, ModelStatus, classify_error},
+    health::{ErrorKind, ProviderHealthRegistry, classify_error},
     registry::ProviderRegistry,
 };
 
@@ -49,11 +49,10 @@ pub struct FailoverManager {
     fallbacks: Vec<String>,
     /// retry / back-off configuration (agents.md §22)
     retry: RetryConfig,
-    /// Per-model health table — lazily populated on first call to each
-    /// model id. Entries persist for the lifetime of the manager
-    /// (per-AgentRuntime). State (Healthy/Cooling/Disabled) governs
-    /// whether the chain skips this entry.
-    model_health: ChainHealth,
+    /// Shared per-model health table — same `Arc` is held by `AppState`,
+    /// so `/api/v1/models/health` reads what this loop writes. Lazy init
+    /// happens in `build_chain` → `model_health.ensure(...)`.
+    model_health: ProviderHealthRegistry,
 }
 
 impl FailoverManager {
@@ -61,6 +60,7 @@ impl FailoverManager {
         order: HashMap<String, Vec<String>>,
         api_keys: HashMap<String, String>,
         fallbacks: Vec<String>,
+        model_health: ProviderHealthRegistry,
     ) -> Self {
         Self {
             order,
@@ -69,37 +69,7 @@ impl FailoverManager {
             cooldowns: HashMap::new(),
             failure_counts: HashMap::new(),
             retry: RetryConfig::default(),
-            model_health: ChainHealth::default(),
-        }
-    }
-
-    /// Snapshot of per-model health — used by `/api/v1/models/health`
-    /// endpoint and `rsclaw models health` CLI.
-    pub fn health_snapshot(&self) -> Vec<(String, ModelStatus, Option<String>, u32)> {
-        self.model_health.snapshot()
-    }
-
-    /// Manually reset a model's health back to Healthy. Used by the
-    /// `/api/v1/models/health/reset` endpoint after the operator has
-    /// fixed the underlying problem (recharged balance, rotated key).
-    pub fn reset_model_health(&mut self, model: &str) -> bool {
-        if let Some(h) = self.model_health.get_mut(model) {
-            h.reset();
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Ensure each model in `chain` has a `ModelHealth` entry. Lazy init —
-    /// keeps the table size bounded to "models we've actually seen".
-    fn ensure_health_entries(&mut self, chain: &[String]) {
-        for model in chain {
-            if self.model_health.get_mut(model).is_none() {
-                self.model_health
-                    .entries
-                    .push(super::health::ModelHealth::new(model.clone()));
-            }
+            model_health,
         }
     }
 
@@ -135,22 +105,17 @@ impl FailoverManager {
         if chain.is_empty() {
             return Err(anyhow!("LLM request has no model resolved"));
         }
-        self.ensure_health_entries(&chain);
+        self.model_health.ensure(&chain);
 
         let mut last_error: Option<anyhow::Error> = None;
 
         for model_str in &chain {
             // ── Chain-level health gate ───────────────────────────────────
-            // Skip entries the health table has marked Disabled or whose
-            // Cooling window hasn't expired. The single-model back-compat
-            // path (chain.len() == 1) always passes this when health is
-            // pristine — preserving "not worse than before" behaviour.
-            let callable = self
-                .model_health
-                .get_mut(model_str)
-                .map(|h| h.is_callable())
-                .unwrap_or(true);
-            if !callable {
+            // Skip entries the shared health table has marked Disabled or
+            // whose Cooling window hasn't expired. The single-model
+            // back-compat path (chain.len() == 1) always passes this when
+            // health is pristine — preserving "not worse than before".
+            if !self.model_health.is_callable(model_str) {
                 continue;
             }
 
@@ -169,9 +134,7 @@ impl FailoverManager {
 
             match outcome {
                 ChainStep::Success(stream) => {
-                    if let Some(h) = self.model_health.get_mut(model_str) {
-                        h.record_success();
-                    }
+                    self.model_health.record_success(model_str);
                     return Ok(stream);
                 }
                 ChainStep::PropagateError(e) => return Err(e),
@@ -179,15 +142,12 @@ impl FailoverManager {
                     let kind = classify_error(&e);
                     let body = format!("{e:#}");
                     let truncated = crate::util::truncate_str(&body, 200).to_owned();
-                    if let Some(h) = self.model_health.get_mut(model_str) {
-                        h.record_failure(kind.clone(), truncated, Instant::now());
-                        info!(
-                            model = %model_str,
-                            kind = ?kind,
-                            status = ?h.status,
-                            "model marked unavailable, advancing chain"
-                        );
-                    }
+                    self.model_health.record_failure(model_str, kind.clone(), truncated);
+                    info!(
+                        model = %model_str,
+                        kind = ?kind,
+                        "model marked unavailable, advancing chain"
+                    );
                     last_error = Some(e);
                     continue;
                 }

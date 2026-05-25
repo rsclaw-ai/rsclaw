@@ -188,6 +188,10 @@ pub struct AppState {
     /// here — it is a singleton, not per-agent, so it does not hang off an
     /// `AgentHandle`. `None` when memory is disabled.
     pub memory: Option<Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>>,
+    /// Shared per-model health table — read by `/api/v1/models/health`,
+    /// written by every `FailoverManager` in the gateway. See
+    /// `provider::health::ProviderHealthRegistry`.
+    pub model_health: crate::provider::health::ProviderHealthRegistry,
 }
 
 // AgentEvent is defined in crate::events to avoid circular deps with agent.
@@ -292,6 +296,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/logs", get(get_logs))
         .route("/providers/test", post(test_provider))
         .route("/providers/models", post(list_provider_models))
+        .route("/models/health", get(models_health))
+        .route("/models/health/reset", post(models_health_reset))
         .route("/doctor", get(run_doctor))
         .route("/doctor/fix", post(run_doctor_fix))
         .route("/channels/wechat/qr-login", post(wechat_qr_start))
@@ -2939,6 +2945,49 @@ fn extract_model_ids(body: &serde_json::Value) -> Vec<String> {
             .collect()
     } else {
         vec![]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Model health (chain failover state)
+// ---------------------------------------------------------------------------
+
+/// GET /api/v1/models/health
+///
+/// Returns the per-model health snapshot for every model the gateway has
+/// observed in a failover chain. Drives the UI's "● green / ● yellow /
+/// ● red" status dots next to each model id in `agents.defaults.model.*`.
+async fn models_health(State(state): State<AppState>) -> Response {
+    let models = state.model_health.snapshot();
+    Json(serde_json::json!({ "models": models })).into_response()
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ModelHealthResetRequest {
+    model: String,
+}
+
+/// POST /api/v1/models/health/reset
+///
+/// Manually clear a model's Disabled/Cooling state — used after the
+/// operator has fixed the underlying problem (recharged the doubao
+/// balance, rotated the OpenAI key, etc.). Returns 404 when the model
+/// id isn't known to the health table (typo or never called yet).
+async fn models_health_reset(
+    State(state): State<AppState>,
+    Json(req): Json<ModelHealthResetRequest>,
+) -> Response {
+    if state.model_health.reset(&req.model) {
+        Json(serde_json::json!({ "ok": true, "reset": req.model })).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "model not found in health table",
+            })),
+        )
+            .into_response()
     }
 }
 

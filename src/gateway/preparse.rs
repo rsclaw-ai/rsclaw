@@ -1264,7 +1264,15 @@ pub(crate) async fn btw_direct_call(
         .as_ref()
         .and_then(|a| a.order.clone())
         .unwrap_or_default();
-    let mut failover = FailoverManager::new(auth_order, std::collections::HashMap::new(), vec![]);
+    // /btw uses an ephemeral failover with a fresh health table — its calls
+    // are one-shot bypass queries that shouldn't poison the agent's
+    // long-lived chain state.
+    let mut failover = FailoverManager::new(
+        auth_order,
+        std::collections::HashMap::new(),
+        vec![],
+        crate::provider::health::ProviderHealthRegistry::new(),
+    );
 
     let mut stream = match failover.call(req, providers).await {
         Ok(s) => s,

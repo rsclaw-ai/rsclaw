@@ -17,7 +17,10 @@
 //! - Restart resets all state (no on-disk persistence). Simple and avoids
 //!   the redb dance for what's essentially short-term volatile data.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::{Arc, RwLock},
+    time::{Duration, Instant},
+};
 
 /// Classification of an LLM call failure — drives the state transition.
 /// `Transient` keeps the model in the rotation (cooldown then retry);
@@ -194,6 +197,168 @@ impl ChainHealth {
     /// `fallbacks` list) or bail.
     pub fn all_unavailable(&self) -> bool {
         !self.entries.is_empty() && self.entries.iter().all(|e| !e.is_callable())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared registry — bridges FailoverManager (writer) ↔ HTTP layer (reader)
+// ---------------------------------------------------------------------------
+
+/// Cheaply-cloneable wrapper around a shared `ChainHealth` table. One
+/// instance is created at gateway startup and cloned into every
+/// `FailoverManager` and into `AppState`, so the HTTP layer
+/// (`/api/v1/models/health`) sees the same view the failover loops are
+/// writing to in real time.
+#[derive(Clone, Default)]
+pub struct ProviderHealthRegistry {
+    inner: Arc<RwLock<ChainHealth>>,
+}
+
+impl ProviderHealthRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ensure each model id has a `ModelHealth` entry (Healthy by default).
+    /// Called by FailoverManager at the start of each `call` so health
+    /// rows track only models the runtime actually attempts.
+    pub fn ensure(&self, models: &[String]) {
+        let mut g = match self.inner.write() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        for m in models {
+            if g.get_mut(m).is_none() {
+                g.entries.push(ModelHealth::new(m.clone()));
+            }
+        }
+    }
+
+    /// Whether the chain may call this model right now (Healthy or
+    /// Cooling-expired). Missing model → callable (lazy init in `ensure`).
+    pub fn is_callable(&self, model: &str) -> bool {
+        let g = match self.inner.read() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        g.entries
+            .iter()
+            .find(|e| e.model == model)
+            .map(|e| e.is_callable())
+            .unwrap_or(true)
+    }
+
+    /// Record a successful call — flips entry to Healthy + clears counters.
+    pub fn record_success(&self, model: &str) {
+        let mut g = match self.inner.write() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if let Some(h) = g.get_mut(model) {
+            h.record_success();
+        }
+    }
+
+    /// Record a failure — applies the kind's transition (Cooling /
+    /// Disabled) and stores the truncated error body for telemetry.
+    pub fn record_failure(&self, model: &str, kind: ErrorKind, body: String) {
+        let mut g = match self.inner.write() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if let Some(h) = g.get_mut(model) {
+            h.record_failure(kind, body, Instant::now());
+        }
+    }
+
+    /// Manually clear a model's Disabled/Cooling state. Returns true if
+    /// the model was in the table, false if unknown.
+    pub fn reset(&self, model: &str) -> bool {
+        let mut g = match self.inner.write() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if let Some(h) = g.get_mut(model) {
+            h.reset();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Read-only snapshot for /api/v1/models/health.
+    pub fn snapshot(&self) -> Vec<HealthEntrySnapshot> {
+        let g = match self.inner.read() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let now = Instant::now();
+        g.entries
+            .iter()
+            .map(|e| HealthEntrySnapshot {
+                model: e.model.clone(),
+                status: status_label(&e.status),
+                reason: reason_for(&e.status),
+                cooldown_seconds: cooldown_seconds(&e.status, now),
+                last_error: e.last_error.clone(),
+                consecutive_failures: e.consecutive_failures,
+            })
+            .collect()
+    }
+
+    /// Snapshot of every model id known to the table — for diagnostics.
+    pub fn model_ids(&self) -> Vec<String> {
+        let g = match self.inner.read() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        g.entries.iter().map(|e| e.model.clone()).collect()
+    }
+}
+
+/// Wire-format entry for the `/api/v1/models/health` endpoint. Matches
+/// the contract the UI brief specifies (status string, optional reason,
+/// optional cooldown_seconds).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HealthEntrySnapshot {
+    pub model: String,
+    /// "Healthy" | "Cooling" | "Disabled"
+    pub status: &'static str,
+    /// Disabled only — one of "Balance"/"Auth"/"ModelMissing"/etc. (the
+    /// ErrorKind debug label). Null for Healthy/Cooling.
+    pub reason: Option<String>,
+    /// Cooling only — seconds until the entry becomes callable again.
+    /// Null for Healthy/Disabled.
+    pub cooldown_seconds: Option<u64>,
+    pub last_error: Option<String>,
+    pub consecutive_failures: u32,
+}
+
+fn status_label(s: &ModelStatus) -> &'static str {
+    match s {
+        ModelStatus::Healthy => "Healthy",
+        ModelStatus::Cooling { .. } => "Cooling",
+        ModelStatus::Disabled { .. } => "Disabled",
+    }
+}
+
+fn reason_for(s: &ModelStatus) -> Option<String> {
+    match s {
+        ModelStatus::Disabled { reason } => Some(reason.clone()),
+        _ => None,
+    }
+}
+
+fn cooldown_seconds(s: &ModelStatus, now: Instant) -> Option<u64> {
+    match s {
+        ModelStatus::Cooling { until } => {
+            if *until > now {
+                Some((*until - now).as_secs())
+            } else {
+                Some(0)
+            }
+        }
+        _ => None,
     }
 }
 

@@ -32,6 +32,11 @@ pub struct AgentSpawner {
     pub memory: Option<Arc<tokio::sync::Mutex<MemoryStore>>>,
     pub event_tx: broadcast::Sender<AgentEvent>,
     pub plugins: Option<Arc<PluginRegistry>>,
+    /// Per-model health table — same `Arc` is held by gateway state &
+    /// every spawned runtime's FailoverManager. Sharing means dynamically
+    /// spawned sub-agents see the same Disabled/Cooling decisions as the
+    /// main loop, so a balance-out doubao trips the chain once globally.
+    pub model_health: crate::provider::health::ProviderHealthRegistry,
     me: OnceLock<Weak<AgentSpawner>>,
 }
 
@@ -49,6 +54,7 @@ impl AgentSpawner {
         memory: Option<Arc<tokio::sync::Mutex<MemoryStore>>>,
         event_tx: broadcast::Sender<AgentEvent>,
         plugins: Option<Arc<PluginRegistry>>,
+        model_health: crate::provider::health::ProviderHealthRegistry,
     ) -> Arc<Self> {
         let s = Arc::new(Self {
             registry,
@@ -60,6 +66,7 @@ impl AgentSpawner {
             memory,
             event_tx,
             plugins,
+            model_health,
             me: OnceLock::new(),
         });
         s.me.set(Arc::downgrade(&s)).ok();
@@ -143,6 +150,7 @@ impl AgentSpawner {
             self.plugins.clone(),
             None, // MCP registry not propagated to dynamically spawned agents
             None, // notification_tx not available for dynamically spawned agents
+            self.model_health.clone(),
         );
 
         // Capture for i18n lookup on the error reply path inside the

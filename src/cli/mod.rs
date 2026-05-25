@@ -63,7 +63,8 @@ pub use memory::{MemoryCommand, MemoryIndexArgs, MemorySearchArgs, MemoryStatusA
 pub use message::MessageCommand;
 pub use migrate::MigrateArgs;
 pub use models::{
-    AliasesCommand, AuthOrderCommand, FallbacksCommand, ModelsAuthCommand, ModelsCommand,
+    AliasesCommand, AuthOrderCommand, FallbacksCommand, HealthCommand, ModelsAuthCommand,
+    ModelsCommand,
 };
 pub use ops::{
     BackupCommand, BackupCreateArgs, HealthArgs, LogsArgs, ResetArgs, StatusArgs, TuiArgs,

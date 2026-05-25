@@ -693,6 +693,7 @@ impl AgentRuntime {
         plugins: Option<Arc<PluginRegistry>>,
         mcp: Option<Arc<crate::mcp::McpRegistry>>,
         notification_tx: Option<tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>>,
+        model_health: crate::provider::health::ProviderHealthRegistry,
     ) -> Self {
         // Populate auth.order so FailoverManager uses the configured profile
         // priority per provider (AGENTS.md §12).
@@ -706,6 +707,7 @@ impl AgentRuntime {
             auth_order,
             std::collections::HashMap::new(),
             fallback_models,
+            model_health,
         );
         let session_aliases = store.db.load_all_aliases().unwrap_or_default();
         let live_status = Arc::clone(&handle.live_status);

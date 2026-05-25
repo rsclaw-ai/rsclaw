@@ -18,6 +18,10 @@ pub enum ModelsCommand {
     Scan,
     #[command(subcommand)]
     Auth(ModelsAuthCommand),
+    /// Inspect or reset per-model chain failover health
+    /// (Healthy / Cooling / Disabled).
+    #[command(subcommand)]
+    Health(HealthCommand),
     /// Download ML models from gitfast.org.
     Download {
         /// Model to download (default: bge). Available: bge, bge-base-zh,
@@ -50,6 +54,18 @@ pub enum ModelsAuthCommand {
     PasteToken,
     #[command(subcommand)]
     Order(AuthOrderCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HealthCommand {
+    /// List every model the gateway's failover loops have observed,
+    /// with its current status (Healthy / Cooling / Disabled) + last
+    /// error snippet. Equivalent to `GET /api/v1/models/health`.
+    List,
+    /// Clear a Disabled/Cooling state for a single model so the next
+    /// chain iteration retries it. Use after recharging the provider
+    /// balance, rotating an API key, or correcting a misspelt model id.
+    Reset { model: String },
 }
 
 #[derive(Subcommand, Debug)]
