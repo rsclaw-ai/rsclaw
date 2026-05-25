@@ -4468,9 +4468,9 @@ function TauriConfigPageInner() {
             <div style={fcard}>
               <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "11px 15px", background: V.bg3, borderBottom: `1px solid ${V.bd}` }}>
                 <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "命名客户端凭据（推荐）" : "Named Client Credentials (preferred)"}</div>
+                  <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "客户端凭据" : "Client Credentials"}</div>
                   <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>gateway.a2a.clients</div>
-                  <div style={{ fontSize: 10, color: V.t3, marginTop: 2, lineHeight: 1.5 }}>{zh ? "每条 secret 验证后归属于其 id（请求主体）。Bearer 或 X-API-Key 都接受。" : "Each secret authenticates as its `id` (the request principal). Accepted on Bearer or X-API-Key."}</div>
+                  <div style={{ fontSize: 10, color: V.t3, marginTop: 2, lineHeight: 1.5 }}>{zh ? "每条 secret 验证后归属于其 id（请求主体）。Bearer 或 X-API-Key 都接受。scopes 留空 = 无限制。" : "Each secret authenticates as its `id` (the request principal). Accepted on Bearer or X-API-Key. Empty scopes = unrestricted."}</div>
                 </div>
                 <button onClick={addClient} style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${V.gbrd}`, background: V.glo, color: V.green, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
                   {zh ? "+ 添加" : "+ Add"}
@@ -4483,9 +4483,10 @@ function TauriConfigPageInner() {
               ) : clientArr.map((c, i) => {
                 const secret = c?.secret;
                 const secretIsString = typeof secret === "string" || secret === undefined || secret === null;
+                const scopesArr: string[] = Array.isArray(c?.scopes) ? c.scopes : [];
                 const isLast = i === clientArr.length - 1;
                 return (
-                  <div key={`client-${i}`} style={{ padding: "10px 15px", borderBottom: isLast ? "none" : `1px solid rgba(255,255,255,.03)`, display: "flex", flexDirection: "column", gap: 8 }}>
+                  <div key={`client-${i}`} style={{ padding: "10px 15px", borderBottom: isLast ? "none" : `1px solid rgba(255,255,255,.03)`, display: "flex", flexDirection: "column", gap: 6 }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                       <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, width: 28 }}>{`[${i}]`}</div>
                       <input style={{ ...fInput, width: 200 }} type="text" placeholder={zh ? "id 例如 partner-acme" : "id e.g. partner-acme"} value={c?.id || ""} onChange={(e) => setClientField(i, "id", e.target.value)} />
@@ -4495,6 +4496,19 @@ function TauriConfigPageInner() {
                         <div style={{ flex: 1, fontFamily: V.mono, fontSize: 11, color: V.t2, padding: "7px 10px", background: V.bg4, border: `1px dashed ${V.bd2}`, borderRadius: 7 }}>{JSON.stringify(secret)}</div>
                       )}
                       <button onClick={() => removeClient(i)} style={{ padding: "5px 10px", borderRadius: 7, border: `1px solid ${V.rbrd}`, background: V.rlo, color: V.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "删除" : "Remove"}</button>
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, paddingLeft: 36 }}>
+                      <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, minWidth: 50 }}>scopes</div>
+                      <input
+                        style={{ ...fInput, flex: 1, fontSize: 11, fontFamily: V.mono }}
+                        type="text"
+                        placeholder={zh ? "留空 = 不限；逗号分隔，如 a2a:invoke:*, a2a:cancel:*" : "empty = unrestricted; comma-separated, e.g. a2a:invoke:*, a2a:cancel:*"}
+                        value={scopesArr.join(", ")}
+                        onChange={(e) => {
+                          const arr = e.target.value.split(/[,，]/).map((s) => s.trim()).filter(Boolean);
+                          setClientField(i, "scopes", arr.length > 0 ? arr : undefined);
+                        }}
+                      />
                     </div>
                   </div>
                 );
