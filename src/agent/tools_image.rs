@@ -67,10 +67,25 @@ impl super::runtime::AgentRuntime {
             })
             .map(|s| s.to_owned());
 
-        // Resolve provider — from image model config or current chat model
+        // Cost gate: image generation hits a paid third-party API on every
+        // call (doubao seedream / dall-e / qwen / minimax / gemini imagen
+        // pricing all per-image). Refuse to auto-fall back to the chat
+        // model or to whichever provider happens to have a key — the user
+        // must opt in by setting `agents.defaults.model.image` (or the
+        // per-agent override). Otherwise the LLM can quietly burn money
+        // when the user said "画一张图" without realising image_gen routes
+        // somewhere they didn't pick. Message is localised — this string
+        // ends up surfaced through the channel directly to the end user.
+        if user_image_model.is_none() {
+            return Ok(json!({
+                "error": crate::i18n::t("image_gen_no_model", crate::i18n::default_lang())
+            }));
+        }
+
+        // Resolve provider — from image model config (guarded above)
         let resolve_model = user_image_model
             .clone()
-            .unwrap_or_else(|| self.resolve_model_name());
+            .expect("user_image_model checked non-None above");
         let (prov_name, user_model_id) =
             { crate::provider::registry::ProviderRegistry::parse_model(&resolve_model) };
         let (base_url, _auth_style) = crate::provider::defaults::resolve_base_url(prov_name);

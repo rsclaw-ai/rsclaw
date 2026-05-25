@@ -47,6 +47,20 @@ impl super::runtime::AgentRuntime {
             })
             .map(|s| s.to_owned());
 
+        // Cost gate: a single Seedance / MiniMax Hailuo / Kling clip costs
+        // 0.1–1+ USD and runs minutes long. The previous "pick whichever
+        // provider has a key" auto-fallback (below) could quietly route a
+        // casual "做个视频" through Kling at peak rates without the user
+        // realising. Force explicit opt-in via `agents.defaults.model.video`
+        // — once set, the provider is derived from the model id and stays
+        // stable across calls. Message is localised — surfaced through
+        // the channel directly to the end user.
+        if user_video_model.is_none() {
+            return Ok(json!({
+                "error": crate::i18n::t("video_gen_no_model", crate::i18n::default_lang())
+            }));
+        }
+
         // Allow caller to override model hint.
         let model_hint = args["model"].as_str().map(|s| s.to_lowercase());
 
