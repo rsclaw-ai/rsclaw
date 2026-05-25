@@ -5,6 +5,19 @@ use anyhow::Result;
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "tray")]
+fn tray_cmd() -> std::process::Command {
+    let mut cmd = std::process::Command::new(
+        std::env::current_exe().expect("failed to get current exe path"),
+    );
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    cmd
+}
+
+#[cfg(feature = "tray")]
 pub fn cmd_tray() -> Result<()> {
     use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
     use tray_icon::{Icon, TrayIcon, TrayIconBuilder, menu::MenuEvent as TrayMenuEvent};
@@ -75,42 +88,23 @@ pub fn cmd_tray() -> Result<()> {
         if let Ok(event) = MenuEvent::receiver().try_recv() {
             let id = event.id;
             if id == start_id {
-                if let Err(e) = std::process::Command::new(
-                    std::env::current_exe().expect("failed to get current exe path"),
-                )
-                .args(["gateway", "start"])
-                .spawn()
-                {
+                if let Err(e) = tray_cmd().args(["gateway", "start"]).spawn() {
                     eprintln!("failed to start gateway: {e}");
                 }
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 update_status(&status_item, &start_item, &stop_item, &restart_item);
             } else if id == stop_id {
-                if let Err(e) = std::process::Command::new(
-                    std::env::current_exe().expect("failed to get current exe path"),
-                )
-                .args(["gateway", "stop"])
-                .status()
-                {
+                if let Err(e) = tray_cmd().args(["gateway", "stop"]).status() {
                     eprintln!("failed to stop gateway: {e}");
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));
                 update_status(&status_item, &start_item, &stop_item, &restart_item);
             } else if id == restart_id {
-                if let Err(e) = std::process::Command::new(
-                    std::env::current_exe().expect("failed to get current exe path"),
-                )
-                .args(["gateway", "stop"])
-                .status()
-                {
+                if let Err(e) = tray_cmd().args(["gateway", "stop"]).status() {
                     eprintln!("failed to stop gateway: {e}");
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));
-                if let Err(e) = std::process::Command::new(
-                    std::env::current_exe().expect("failed to get current exe path"),
-                )
-                .args(["gateway", "start"])
-                .spawn()
+                if let Err(e) = tray_cmd().args(["gateway", "start"]).spawn()
                 {
                     eprintln!("failed to start gateway: {e}");
                 }
