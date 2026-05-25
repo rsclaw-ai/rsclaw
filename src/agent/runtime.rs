@@ -7128,6 +7128,26 @@ impl AgentRuntime {
         Ok(json!({"error": format!("plugin runtime not loaded: {plugin_name}")}))
     }
 
+    /// The exact whitelist `dispatch_tool` should enforce, matching what
+    /// `build_tool_list` exposes to the LLM. Returns None when the agent's
+    /// config doesn't constrain its toolset (the default-everything case),
+    /// in which case the dispatcher accepts any name the match arms below
+    /// recognize. Returns Some(set) only when the agent explicitly sets
+    /// `model.toolset` or `model.tools[]`, so deliberately-scoped agents
+    /// like the hub router can refuse hallucinated tool names.
+    fn allowed_tools_for_dispatch(&self) -> Option<std::collections::HashSet<String>> {
+        let model_cfg = self.handle.config.model.as_ref()?;
+        let explicit_toolset = model_cfg.toolset.as_deref();
+        let custom_tools = model_cfg.tools.as_ref();
+        if explicit_toolset.is_none() && custom_tools.is_none() {
+            return None;
+        }
+        crate::agent::tools_builder::toolset_allowed_names(
+            explicit_toolset.unwrap_or("standard"),
+            custom_tools,
+        )
+    }
+
     async fn dispatch_tool(
         &self,
         ctx: &RunContext,
@@ -7150,6 +7170,30 @@ impl AgentRuntime {
             raw_name.to_owned()
         };
         let name = normalized.as_str();
+
+        // Whitelist enforcement: build_tool_list hides tools outside the
+        // configured `toolset` / `tools[]` from the LLM, but the dispatcher
+        // was matching every tool name unconditionally. A small model that
+        // hallucinated a familiar name (`video_gen`, `web_browser`, …) would
+        // still bypass the gate and trigger the real implementation. For the
+        // hub-router pattern (toolset: "minimal", tools: ["agent_spoke_mac",
+        // ...]) this meant the model occasionally chose a hub-side tool
+        // instead of routing to the spoke. Enforce here whenever the agent
+        // config explicitly limits its toolset.
+        if let Some(allowed) = self.allowed_tools_for_dispatch() {
+            if !allowed.contains(name) {
+                return Err(anyhow!(
+                    "tool '{name}' is not in this agent's whitelist — \
+                     hallucinated tool names are blocked. Available: {}",
+                    {
+                        let mut v: Vec<&str> = allowed.iter().map(String::as_str).collect();
+                        v.sort();
+                        v.join(", ")
+                    }
+                ));
+            }
+        }
+
         // 2. Built-in tools (checked before A2A prefix so reserved names are not
         //    hijacked).
         match name {
@@ -8619,9 +8663,15 @@ async fn extract_file_text(filename: &str, bytes: &[u8]) -> Option<String> {
         // Fallback to pdftotext CLI
         let tmp = std::env::temp_dir().join(format!("rsclaw_extract_{}", uuid::Uuid::new_v4()));
         std::fs::write(&tmp, bytes).ok()?;
-        let output = std::process::Command::new("pdftotext")
-            .args([tmp.to_str().unwrap_or(""), "-"])
-            .output();
+        #[allow(unused_mut)]
+        let mut pdf_cmd = std::process::Command::new("pdftotext");
+        pdf_cmd.args([tmp.to_str().unwrap_or(""), "-"]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            pdf_cmd.creation_flags(0x08000000);
+        }
+        let output = pdf_cmd.output();
         let _ = std::fs::remove_file(&tmp);
         output
             .ok()
