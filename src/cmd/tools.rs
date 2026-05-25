@@ -637,9 +637,15 @@ pub async fn cmd_install(name: &str, force: bool) -> Result<()> {
                     p.join(npm_basename).to_string_lossy().to_string()
                 })
                 .unwrap_or_else(|| npm_basename.to_owned());
-            let status = std::process::Command::new(&npm_bin)
-                .args(["install", "--prefix", &dest_dir.to_string_lossy(), pkg])
-                .status();
+            #[allow(unused_mut)]
+            let mut npm_cmd = std::process::Command::new(&npm_bin);
+            npm_cmd.args(["install", "--prefix", &dest_dir.to_string_lossy(), pkg]);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                npm_cmd.creation_flags(0x08000000);
+            }
+            let status = npm_cmd.status();
             match status {
                 Ok(s) if s.success() => {
                     if !is_tool_installed_locally(def) {

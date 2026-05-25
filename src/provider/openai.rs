@@ -20,6 +20,59 @@ pub(crate) const OPENAI_API_BASE: &str = "https://api.openai.com/v1";
 #[allow(dead_code)]
 const DEFAULT_MAX_TOKENS: u32 = 65536;
 
+/// OpenAI requires tool/function names to match `^[a-zA-Z0-9_-]+$`. Plugin
+/// tool names follow the convention `<plugin>.<tool>` (e.g.
+/// `wechat.send_text`) and contain dots that trip the upstream validator
+/// with a 400 `invalid_request_error`. Sanitize on the way out and
+/// restore on the way back so the agent runtime keeps its original
+/// `plugin.tool` namespacing while OpenAI sees a clean identifier.
+///
+/// Encoding: `.` → `__` (double underscore). Plugin / tool names are
+/// themselves `[a-zA-Z0-9_]+`, so `__` never appears in originals — the
+/// restore step splits on the FIRST occurrence to recover the dot. Any
+/// other forbidden char (whitespace, `:`, `/`, non-ASCII) is replaced
+/// with a single `_` (lossy, but those names shouldn't appear in
+/// practice; this just keeps the 400 from coming back).
+fn sanitize_tool_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 2);
+    for c in name.chars() {
+        match c {
+            '.' => out.push_str("__"),
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' => out.push(c),
+            _ => out.push('_'),
+        }
+    }
+    out
+}
+
+/// Reverse of [`sanitize_tool_name`] — restore the dot in a plugin tool
+/// name received from OpenAI's `tool_calls` / `function_call` payload.
+/// Only the first `__` is treated as a dot (plugin tool names have at
+/// most one dot); subsequent `__` are left as-is. Names with no `__`
+/// (built-in tools) pass through unchanged.
+fn restore_tool_name(name: &str) -> String {
+    if let Some(idx) = name.find("__") {
+        let mut s = String::with_capacity(name.len() - 1);
+        s.push_str(&name[..idx]);
+        s.push('.');
+        s.push_str(&name[idx + 2..]);
+        s
+    } else {
+        name.to_owned()
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn tool_name_roundtrip() {
+    assert_eq!(sanitize_tool_name("read_file"), "read_file");
+    assert_eq!(sanitize_tool_name("wechat.send_text"), "wechat__send_text");
+    assert_eq!(restore_tool_name("wechat__send_text"), "wechat.send_text");
+    assert_eq!(restore_tool_name("read_file"), "read_file");
+    // forbidden char fallback
+    assert_eq!(sanitize_tool_name("ns:tool"), "ns_tool");
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OpenAiMode {
     Chat,      // /chat/completions (default)
@@ -811,7 +864,7 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
                 json!({
                     "type": "function",
                     "function": {
-                        "name":        t.name,
+                        "name":        sanitize_tool_name(&t.name),
                         "description": t.description,
                         "parameters":  t.parameters,
                     }
@@ -1078,7 +1131,7 @@ fn serialize_message(msg: &Message, thinking_enabled: bool) -> Value {
                             "id": id,
                             "type": "function",
                             "function": {
-                                "name": name,
+                                "name": sanitize_tool_name(name),
                                 "arguments": input.to_string()
                             }
                         }));
@@ -1141,7 +1194,7 @@ fn serialize_part(part: &ContentPart) -> Value {
         ContentPart::ToolUse { id, name, input } => json!({
             "type": "function",
             "id":   id,
-            "function": { "name": name, "arguments": input.to_string() }
+            "function": { "name": sanitize_tool_name(name), "arguments": input.to_string() }
         }),
         ContentPart::ToolResult {
             tool_use_id,
@@ -1399,7 +1452,11 @@ fn parse_event(data: &str) -> Vec<StreamEvent> {
     {
         let func = &tc["function"];
         let id = tc["id"].as_str().unwrap_or("").to_owned();
-        let name = func["name"].as_str().unwrap_or("").to_owned();
+        // Reverse `wechat__send_text` → `wechat.send_text` so the agent
+        // runtime dispatches via the original plugin tool name. Names
+        // arrive in a single chunk (OpenAI doesn't split tool names
+        // across SSE events), so the restore is unambiguous here.
+        let name = restore_tool_name(func["name"].as_str().unwrap_or(""));
         let args_str = func["arguments"].as_str().unwrap_or("");
         // Streaming arguments arrive as partial JSON fragments. Keep
         // as raw string — never parse fragments, because
@@ -1492,7 +1549,7 @@ fn build_responses_body(req: &LlmRequest, file_id_map: &HashMap<String, String>)
             .map(|t| {
                 json!({
                     "type": "function",
-                    "name": t.name,
+                    "name": sanitize_tool_name(&t.name),
                     "description": t.description,
                     "parameters": t.parameters,
                 })
@@ -1555,7 +1612,7 @@ fn serialize_input_items(msg: &Message, file_id_map: &HashMap<String, String>) -
                                 result.push(json!({
                                     "type": "function_call",
                                     "call_id": id,
-                                    "name": name,
+                                    "name": sanitize_tool_name(name),
                                     "arguments": input.to_string(),
                                     "status": "completed",
                                 }));
@@ -1784,7 +1841,9 @@ fn parse_responses_event(data: &str, event_type: Option<&str>) -> Option<StreamE
                     .or_else(|| item["id"].as_str())
                     .unwrap_or("")
                     .to_owned();
-                let name = item["name"].as_str().unwrap_or("").to_owned();
+                // Reverse `wechat__send_text` → `wechat.send_text` for
+                // plugin tool dispatch. See `sanitize_tool_name`.
+                let name = restore_tool_name(item["name"].as_str().unwrap_or(""));
                 let args_str = item["arguments"].as_str().unwrap_or("{}");
                 let input = serde_json::from_str(args_str)
                     .unwrap_or_else(|_| Value::String(args_str.to_owned()));
@@ -1836,7 +1895,7 @@ fn parse_completions_fallback(v: &Value) -> Option<StreamEvent> {
     {
         let func = &tc["function"];
         let id = tc["id"].as_str().unwrap_or("").to_owned();
-        let name = func["name"].as_str().unwrap_or("").to_owned();
+        let name = restore_tool_name(func["name"].as_str().unwrap_or(""));
         let args_str = func["arguments"].as_str().unwrap_or("");
         let input = if args_str.is_empty() {
             Value::Object(Default::default())

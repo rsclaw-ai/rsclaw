@@ -2891,7 +2891,14 @@ fn build_provider_models_request(
         default_auth
     };
 
-    // Build models URL — Gemini needs ?key= query param
+    // Build models URL — Gemini needs ?key= query param.
+    //
+    // Critical: route by `effective_type` (the resolved api protocol),
+    // not `req.provider`. doubao+anthropic must hit Anthropic's listing
+    // path; doubao+openai-completions must hit /v1/models. Using
+    // `req.provider` here would force `models_url("doubao", ...)` for
+    // every doubao request and 404 on CodingPlan endpoints that only
+    // expose `/messages` / `/chat/completions`.
     let is_ollama = effective_type == "ollama";
     let is_gemini = effective_type == "gemini";
     let url = if is_ollama {
@@ -2900,7 +2907,7 @@ fn build_provider_models_request(
         let trimmed = base_url.trim_end_matches('/');
         format!("{trimmed}/models?key={}", api_key)
     } else {
-        prov_defaults::models_url(&req.provider, &base_url)
+        prov_defaults::models_url(effective_type, &base_url)
     };
 
     let mut request = client.get(&url);
@@ -2991,6 +2998,107 @@ async fn models_health_reset(
     }
 }
 
+/// Protocol-aware fallback probe used when GET `/models` 404s. Posts a
+/// minimal request to the inference endpoint that matches the resolved
+/// api protocol; 2xx/400/422 → endpoint reachable (auth + URL fine,
+/// request shape rejected is acceptable). Returns `Ok(false)` on
+/// 401/403/404/5xx and `Err` on transport failure.
+///
+/// Duplicates a small slice of base_url/auth resolution from
+/// `build_provider_models_request` to keep this isolated; the original
+/// function still owns the GET `/models` path.
+async fn probe_inference_for_request(
+    client: &reqwest::Client,
+    req: &TestProviderRequest,
+) -> Result<bool, reqwest::Error> {
+    use crate::provider::defaults as prov_defaults;
+
+    let api_key = crate::config::loader::expand_env_vars(&req.api_key);
+    let base_url_in: Option<String> = req
+        .base_url
+        .as_deref()
+        .map(crate::config::loader::expand_env_vars);
+
+    let is_custom_like = req.provider == "custom" || req.provider == "codingplan";
+    let supports_api_type = is_custom_like || req.provider == "doubao";
+    let effective_type = if supports_api_type && req.api_type.is_some() {
+        req.api_type.as_deref().unwrap_or("openai")
+    } else {
+        req.provider.as_str()
+    };
+
+    let (default_url, _) = if is_custom_like {
+        let at = req.api_type.as_deref().unwrap_or("openai");
+        prov_defaults::resolve_base_url(at)
+    } else {
+        prov_defaults::resolve_base_url(&req.provider)
+    };
+
+    let base = base_url_in
+        .filter(|u| !u.is_empty())
+        .unwrap_or(default_url);
+    if base.is_empty() {
+        // Nothing to probe against — caller already failed.
+        return Ok(false);
+    }
+    let base = base.trim_end_matches('/').to_owned();
+
+    let (url, body, auth) = match effective_type {
+        "openai-responses" => (
+            format!("{base}/responses"),
+            serde_json::json!({"model": "test", "input": "hi", "max_output_tokens": 1, "stream": false}),
+            "bearer",
+        ),
+        "anthropic" | "anthropic-messages" => {
+            // CodingPlan sits at `/api/coding/v1`; standard Anthropic at
+            // `/v1`. If base already has `/v1`, append `/messages`.
+            let url = if base.ends_with("/v1") || base.contains("/v1/") {
+                format!("{base}/messages")
+            } else {
+                format!("{base}/v1/messages")
+            };
+            (
+                url,
+                serde_json::json!({"model": "test", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}),
+                "x-api-key",
+            )
+        }
+        "ollama" => {
+            // ollama can't 404 on /models (different listing path was
+            // already used) — fallback is meaningless here.
+            return Ok(false);
+        }
+        "gemini" => {
+            // Gemini uses query-param auth, no inference probe needed.
+            return Ok(false);
+        }
+        _ => (
+            format!("{base}/chat/completions"),
+            serde_json::json!({"model": "test", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}], "stream": false}),
+            "bearer",
+        ),
+    };
+
+    let mut request = client.post(&url).json(&body);
+    if !api_key.is_empty() {
+        match auth {
+            "x-api-key" => {
+                request = request
+                    .header("x-api-key", &api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .header("Authorization", format!("Bearer {api_key}"));
+            }
+            _ => {
+                request = request.header("Authorization", format!("Bearer {api_key}"));
+            }
+        }
+    }
+
+    let resp = request.send().await?;
+    let code = resp.status().as_u16();
+    Ok(resp.status().is_success() || code == 400 || code == 422)
+}
+
 /// POST /api/v1/providers/test - validate an API key against a provider
 async fn test_provider(Json(req): Json<TestProviderRequest>) -> Response {
     // Minimax doesn't support /models — return built-in list
@@ -3020,6 +3128,16 @@ async fn test_provider(Json(req): Json<TestProviderRequest>) -> Response {
         }
         Ok(resp) => {
             let status = resp.status().as_u16();
+            // Protocol-aware fallback: ARK CodingPlan endpoints
+            // (`/api/coding/v3`, `/api/coding/v1`) expose only the
+            // inference path and 404 on `/models`. Confirm reachability
+            // with a minimal POST probe instead of declaring the key bad.
+            if status == 404
+                && let Ok(true) = probe_inference_for_request(&client, &req).await
+            {
+                return Json(serde_json::json!({"ok": true, "status": 200, "fallback": "probe"}))
+                    .into_response();
+            }
             let body = resp.text().await.unwrap_or_default();
             (StatusCode::OK, Json(serde_json::json!({
                 "ok": false,
@@ -3068,11 +3186,22 @@ async fn list_provider_models(Json(req): Json<TestProviderRequest>) -> Response 
             let models = extract_model_ids(&body);
             Json(serde_json::json!({"models": models})).into_response()
         }
-        Ok(resp) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"models": [], "error": format!("HTTP {}", resp.status())})),
-        )
-            .into_response(),
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            // Same fallback as `test_provider`: 404 from `/models` on an
+            // endpoint that only has the inference route → POST probe
+            // and return empty models. UI displays the MODELS preset.
+            if status == 404
+                && let Ok(true) = probe_inference_for_request(&client, &req).await
+            {
+                return Json(serde_json::json!({"models": [], "fallback": "probe"})).into_response();
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"models": [], "error": format!("HTTP {status}")})),
+            )
+                .into_response()
+        }
         Err(e) => (
             StatusCode::OK,
             Json(serde_json::json!({"models": [], "error": e.to_string()})),

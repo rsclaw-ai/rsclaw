@@ -122,6 +122,7 @@ pub(crate) fn detect_chrome() -> Option<String> {
 
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
         // Registry (most reliable for system + per-user installs).
         for key_path in &[
             r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
@@ -130,6 +131,7 @@ pub(crate) fn detect_chrome() -> Option<String> {
             for hive in &["HKLM", "HKCU"] {
                 if let Ok(output) = std::process::Command::new("reg")
                     .args(["query", &format!(r"{hive}\{key_path}"), "/ve"])
+                    .creation_flags(0x08000000)
                     .output()
                 {
                     let stdout = String::from_utf8_lossy(&output.stdout);

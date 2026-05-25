@@ -508,6 +508,12 @@ async fn handle_hub_socket(socket: WebSocket, state: AppState, node: A2aRelayNod
     });
 
     let ping = tokio::spawn(async move {
+        // Two-tier heartbeat: WS-protocol-level Ping frame + app-level JSON
+        // Ping. The protocol frame is what NAT/firewall/edge proxies count
+        // as keep-alive — app-level JSON wrapped in a Text frame doesn't
+        // always reset their idle counter. Long jimeng/douyin runs were
+        // dropping after ~9min because a residential NAT entry expired
+        // even though the agent was actively working.
         let mut interval = tokio::time::interval(Duration::from_secs(15));
         loop {
             interval.tick().await;
@@ -515,6 +521,13 @@ async fn handle_hub_socket(socket: WebSocket, state: AppState, node: A2aRelayNod
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
+            // 1. WS-level Ping — empty payload is sufficient.
+            if ping_tx.send(AxumWsMessage::Ping(Vec::new().into())).is_err() {
+                break;
+            }
+            // 2. App-level JSON Ping — kept for backwards compatibility
+            // with spoke side that may match on RelayFrame::Ping for RTT
+            // bookkeeping.
             let frame = RelayFrame::Ping { ts };
             if let Ok(msg) = serde_json::to_string(&frame) {
                 if ping_tx.send(AxumWsMessage::Text(msg.into())).is_err() {
@@ -754,11 +767,43 @@ async fn run_spoke_once(state: AppState, relay: A2aRelayRuntime) -> Result<()> {
     info!(node = %node_id, hub = %hub_url, "a2a relay spoke connected");
 
     let (mut write, mut read) = stream.split();
-    let (spoke_tx, mut spoke_rx) = mpsc::unbounded_channel::<RelayFrame>();
+    // Channel item: either a RelayFrame (encoded as JSON Text by the
+    // writer) or a raw WS-protocol Ping for low-level keep-alive.
+    // NAT/firewall middle boxes count WS-protocol Ping frames as
+    // activity while app-level JSON Text often doesn't reset their idle
+    // counter — observed when long jimeng/douyin runs were getting
+    // dropped after ~9min mid-pipeline.
+    enum SpokeWriteItem {
+        Frame(RelayFrame),
+        WsPing,
+    }
+    let (write_tx, mut write_rx) = mpsc::unbounded_channel::<SpokeWriteItem>();
     let writer = tokio::spawn(async move {
-        while let Some(frame) = spoke_rx.recv().await {
-            if let Err(e) = send_spoke_frame(&mut write, &frame).await {
+        while let Some(item) = write_rx.recv().await {
+            let result = match item {
+                SpokeWriteItem::Frame(frame) => send_spoke_frame(&mut write, &frame).await,
+                SpokeWriteItem::WsPing => write
+                    .send(tokio_tungstenite::tungstenite::Message::Ping(
+                        Vec::new().into(),
+                    ))
+                    .await
+                    .map_err(anyhow::Error::from),
+            };
+            if let Err(e) = result {
                 warn!(error = %e, "spoke write error");
+                break;
+            }
+        }
+    });
+
+    // Adapter: every other component in this function — including
+    // handle_spoke_request which takes a Sender<RelayFrame> — just sends
+    // RelayFrame. A small forwarder converts those to SpokeWriteItem::Frame.
+    let (spoke_tx, mut frame_rx) = mpsc::unbounded_channel::<RelayFrame>();
+    let frame_adapter_tx = write_tx.clone();
+    let frame_adapter = tokio::spawn(async move {
+        while let Some(frame) = frame_rx.recv().await {
+            if frame_adapter_tx.send(SpokeWriteItem::Frame(frame)).is_err() {
                 break;
             }
         }
@@ -770,6 +815,19 @@ async fn run_spoke_once(state: AppState, relay: A2aRelayRuntime) -> Result<()> {
     spoke_tx
         .send(spoke_route_lease(&state, node_id, 1))
         .map_err(|_| anyhow!("spoke writer closed"))?;
+
+    // WS-level Ping every 15s so NAT/firewall idle counters reset.
+    let ping_tx = write_tx.clone();
+    let pinger = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        interval.tick().await; // skip immediate tick
+        loop {
+            interval.tick().await;
+            if ping_tx.send(SpokeWriteItem::WsPing).is_err() {
+                break;
+            }
+        }
+    });
 
     // Periodically re-publish the RouteLease so the hub never sees a
     // route silently expire. ROUTE_TTL_MS is the hub-side eviction
@@ -848,6 +906,8 @@ async fn run_spoke_once(state: AppState, relay: A2aRelayRuntime) -> Result<()> {
 
     writer.abort();
     renewer.abort();
+    pinger.abort();
+    frame_adapter.abort();
     Ok(())
 }
 

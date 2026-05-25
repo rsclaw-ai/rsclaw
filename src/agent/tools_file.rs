@@ -479,16 +479,20 @@ impl super::runtime::AgentRuntime {
                 Err(e) => {
                     // Fallback to pdftotext CLI
                     tracing::warn!("pdf-extract failed ({e}), trying pdftotext CLI");
-                    let output = tokio::process::Command::new("pdftotext")
-                        .args([full.to_str().unwrap_or(""), "-"])
-                        .output()
-                        .await
-                        .map_err(|e2| {
-                            anyhow!(
-                                "read `{}`: pdf extraction failed: {e}, pdftotext: {e2}",
-                                full.display()
-                            )
-                        })?;
+                    #[allow(unused_mut)]
+                    let mut pdf_cmd = tokio::process::Command::new("pdftotext");
+                    pdf_cmd.args([full.to_str().unwrap_or(""), "-"]);
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::process::CommandExt;
+                        pdf_cmd.creation_flags(0x08000000);
+                    }
+                    let output = pdf_cmd.output().await.map_err(|e2| {
+                        anyhow!(
+                            "read `{}`: pdf extraction failed: {e}, pdftotext: {e2}",
+                            full.display()
+                        )
+                    })?;
                     if !output.status.success() {
                         anyhow::bail!("read `{}`: pdf extraction failed: {e}", full.display());
                     }
@@ -1051,10 +1055,18 @@ impl super::runtime::AgentRuntime {
 /// Check whether `ripgrep` (`rg`) is on PATH. Re-checked per call (~20 ms);
 /// the cost is dwarfed by the actual search and avoids a global mutable.
 async fn has_ripgrep() -> bool {
-    tokio::process::Command::new("rg")
+    #[allow(unused_mut)]
+    let mut rg_cmd = tokio::process::Command::new("rg");
+    rg_cmd
         .arg("--version")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        rg_cmd.creation_flags(0x08000000);
+    }
+    rg_cmd
         .status()
         .await
         .map(|s| s.success())
@@ -1072,6 +1084,11 @@ async fn run_ripgrep(
     max_results: usize,
 ) -> Result<Value> {
     let mut cmd = tokio::process::Command::new("rg");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
 
     match output_mode {
         "files_with_matches" => {

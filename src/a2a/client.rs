@@ -22,8 +22,17 @@ impl Default for A2aClient {
 impl A2aClient {
     pub fn new() -> Self {
         Self {
+            // reqwest's `.timeout()` is end-to-end (covers the full body
+            // stream), so a 120s ceiling killed any A2A streaming request
+            // longer than two minutes mid-SSE — observed when a hub agent
+            // delegated a slow tool chain (jimeng image→video gen,
+            // multi-step plugin pipelines) to a remote spoke. Body
+            // streams must run as long as the spoke is still emitting
+            // events. Cap only the CONNECT phase here and let
+            // application-layer timeouts (runtime DEFAULT_TIMEOUT_SECONDS,
+            // turn cancel tokens) bound long-lived calls.
             client: Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
+                .connect_timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("reqwest client"),
         }

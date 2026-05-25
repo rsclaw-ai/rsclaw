@@ -620,10 +620,15 @@ $synth.Speak('{}')
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!("pdf-extract failed ({e}), trying pdftotext CLI");
-                let output = tokio::process::Command::new("pdftotext")
-                    .args([local_path.to_str().unwrap_or(""), "-"])
-                    .output()
-                    .await
+                #[allow(unused_mut)]
+                let mut pdf_cmd = tokio::process::Command::new("pdftotext");
+                pdf_cmd.args([local_path.to_str().unwrap_or(""), "-"]);
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    pdf_cmd.creation_flags(0x08000000);
+                }
+                let output = pdf_cmd.output().await
                     .map_err(|e2| anyhow!("pdf: extraction failed: {e}, pdftotext: {e2}"))?;
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
