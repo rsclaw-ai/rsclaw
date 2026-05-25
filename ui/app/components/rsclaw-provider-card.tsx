@@ -28,6 +28,7 @@ import {
   onKeyInstalled,
   openRsclawConsole,
   readAccountState,
+  setRsclawAsPrimary,
   type RsclawAccountState,
 } from "../lib/rsclaw-console";
 import { getLang } from "../locales";
@@ -43,10 +44,13 @@ export function RsclawProviderCard() {
   const t = zh
     ? {
         connected: "已连接",
+        connectedNotPrimary: "已连接 · 非默认",
         disconnected: "未连接",
         tagline: "增量协议 · 业内首发 · 专为智能体优化",
         openConsole: "打开 console →",
         oneClick: "一键配置 →",
+        setPrimary: "设为默认 →",
+        settingPrimary: "切换中…",
         opening: "打开中…",
         advanced: "高级",
         advancedDisconnected: "或者手动粘贴 key",
@@ -61,10 +65,13 @@ export function RsclawProviderCard() {
       }
     : {
         connected: "Connected",
+        connectedNotPrimary: "Connected · not default",
         disconnected: "Not connected",
         tagline: "Incremental protocol · Industry-first · Tuned for agents",
         openConsole: "Open console →",
         oneClick: "One-click setup →",
+        setPrimary: "Set as default →",
+        settingPrimary: "Switching…",
         opening: "Opening…",
         advanced: "Advanced",
         advancedDisconnected: "Or paste a key manually",
@@ -152,6 +159,22 @@ export function RsclawProviderCard() {
     }
   }, [busy, manualKey, refresh, t.invalidKey]);
 
+  const handleSetPrimary = useCallback(async () => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await setRsclawAsPrimary();
+      if (!res.ok) {
+        setError(res.error || "set primary failed");
+        return;
+      }
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, refresh]);
+
   const handleDisconnect = useCallback(async () => {
     if (busy) return;
     setBusy(true);
@@ -204,7 +227,11 @@ export function RsclawProviderCard() {
               : "rgba(152,150,164,0.06)",
           }}
         >
-          {state.connected ? `✓ ${t.connected}` : t.disconnected}
+          {state.connected
+            ? state.isPrimary === false
+              ? `✓ ${t.connectedNotPrimary}`
+              : `✓ ${t.connected}`
+            : t.disconnected}
         </span>
       </div>
 
@@ -214,20 +241,47 @@ export function RsclawProviderCard() {
       )}
       <div style={taglineStyle}>{t.tagline}</div>
 
-      {/* ── Primary action ── */}
+      {/* ── Primary action ──
+          When connected but primary is pointing elsewhere, the "set as
+          default" CTA jumps to the front. The user explicitly told us
+          they wanted rsclaw (clicked Connect / pasted a key) at some
+          point, then drifted off to another provider — they need a
+          one-click way back without disconnect+reconnect, which would
+          wipe the saved key. */}
       <div style={actionsRowStyle}>
-        <button
-          type="button"
-          onClick={() => void handleConnect()}
-          disabled={busy}
-          style={state.connected ? primaryBtnStyle : ctaBtnStyle}
-        >
-          {busy
-            ? t.opening
-            : state.connected
-              ? t.openConsole
-              : t.oneClick}
-        </button>
+        {state.connected && state.isPrimary === false ? (
+          <>
+            <button
+              type="button"
+              onClick={() => void handleSetPrimary()}
+              disabled={busy}
+              style={ctaBtnStyle}
+            >
+              {busy ? t.settingPrimary : t.setPrimary}
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleConnect()}
+              disabled={busy}
+              style={primaryBtnStyle}
+            >
+              {busy ? t.opening : t.openConsole}
+            </button>
+          </>
+        ) : (
+          <button
+            type="button"
+            onClick={() => void handleConnect()}
+            disabled={busy}
+            style={state.connected ? primaryBtnStyle : ctaBtnStyle}
+          >
+            {busy
+              ? t.opening
+              : state.connected
+                ? t.openConsole
+                : t.oneClick}
+          </button>
+        )}
       </div>
 
       {/* ── Advanced disclosure ── */}

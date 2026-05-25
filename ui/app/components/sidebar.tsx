@@ -31,6 +31,11 @@ import { isTauri, invoke as tauriInvokeV2 } from "../utils/tauri";
 import { SidebarAccountChip } from "./sidebar-account-chip";
 import { toast } from "../lib/toast";
 import { getAgents, getHealth } from "../lib/rsclaw-api";
+import {
+  isGatewayRestarting,
+  setGatewayRestarting,
+  subscribeGatewayRestart,
+} from "../lib/gateway-restart-signal";
 import { useRestartBanner } from "../hooks/useRestartBanner";
 
 /** Seconds before an auto-restart fires once a `restart.required` event arrives. */
@@ -157,6 +162,20 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
   const [status, setStatus] = React.useState<"online" | "offline" | "checking" | "starting" | "failed">("checking");
   const [confirmAction, setConfirmAction] = React.useState<"start"|"restart"|"stop"|null>(null);
   const [starting, setStarting] = React.useState(false);
+  // Mirror of the module-level gateway-restart-signal. Set true while the
+  // panel's executeAction("restart") flow is in flight so the sidebar's
+  // health poller doesn't independently flip to "checking"/"offline"
+  // during the stop+start gap and produce a visible flicker.
+  const [globalRestarting, setGlobalRestarting] = React.useState(false);
+  const globalRestartingRef = React.useRef(false);
+  React.useEffect(() => {
+    setGlobalRestarting(isGatewayRestarting());
+    globalRestartingRef.current = isGatewayRestarting();
+    return subscribeGatewayRestart((v) => {
+      setGlobalRestarting(v);
+      globalRestartingRef.current = v;
+    });
+  }, []);
   const [errorMsg, setErrorMsg] = React.useState("");
   const failCount = React.useRef(0);
   const autoStarted = React.useRef(false);
@@ -246,6 +265,10 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
     setStarting(true);
     setStatus("starting");
     setErrorMsg("");
+    // Broadcast the restart so any other status indicator (the panel banner)
+    // also pauses its poller and stays on the restart label instead of
+    // briefly flipping to offline.
+    setGatewayRestarting(true);
     // Clear the pending-restart banner state so the inline countdown stops
     // regardless of whether this restart was user-clicked or auto-fired.
     restartReq.dismiss();
@@ -258,16 +281,24 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
       }
       setTimeout(() => {
         getHealth()
-          .then(() => { setStatus("online"); setStarting(false); failCount.current = 0; setErrorMsg(""); })
+          .then(() => {
+            setStatus("online");
+            setStarting(false);
+            failCount.current = 0;
+            setErrorMsg("");
+            setGatewayRestarting(false);
+          })
           .catch(() => {
             failCount.current++;
             setStarting(false);
             setStatus("failed");
+            setGatewayRestarting(false);
           });
       }, 1000);
     } catch {
       setStarting(false);
       setStatus("failed");
+      setGatewayRestarting(false);
     }
   };
   doRestartRef.current = doRestart;
@@ -304,6 +335,12 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
 
   React.useEffect(() => {
     const check = () => {
+      // Suppress this poll entirely while a panel-initiated restart is in
+      // flight. The panel owns the lifecycle (stop_gateway → wait →
+      // start_gateway → poll health) and clears the signal when done. If
+      // we let this 5s tick race against it, we briefly flip the chip to
+      // "checking" / "offline" — that's the flicker the user sees.
+      if (globalRestartingRef.current) return;
       getHealth()
         .then(() => {
           setStatus("online");
@@ -312,6 +349,7 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
         })
         .catch(() => {
           if (starting) return; // don't overwrite "starting" state
+          if (globalRestartingRef.current) return; // late-resolving from before the signal flipped
 
           const tauriInvoke = isTauri ? tauriInvokeV2 : null;
           const userStopped = getUserStopped();
@@ -388,16 +426,20 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
   const isOnline = status === "online";
   const isFailed = status === "failed";
   const isChecking = status === "checking";
-  const isStarting = status === "starting" || starting;
+  // `globalRestarting` overrides the locally-derived status \u2014 a panel restart
+  // owns the transition and we paint over whatever the 5s poller last saw.
+  const isStarting = globalRestarting || status === "starting" || starting;
   // While a restart is pending, override the running indicator with an amber
   // dot + countdown label. The button row stays visible so the user can click
   // Restart to fire it immediately (bypassing the usual confirm modal).
-  const restartPending = restartReq.visible && isOnline && !isStarting;
+  const restartPending = restartReq.visible && isOnline && !isStarting && !globalRestarting;
   const color = restartPending ? "#f5a623"
+    : globalRestarting ? "#f5a623"
     : isOnline ? "#2dd4a0"
     : (isStarting || isChecking) ? "#f5a623"
     : isFailed ? "#d95f5f" : "#d95f5f";
   const label = restartPending ? Locale.RsClawPanel.RestartPending.Label(restartSecondsLeft)
+    : globalRestarting ? (zh ? "\u91CD\u542F\u4E2D..." : "Restarting...")
     : isOnline ? Locale.RsClawPanel.Running
     : isStarting ? (zh ? "\u542F\u52A8\u4E2D..." : "Starting...")
     : isChecking ? (zh ? "\u68C0\u67E5\u4E2D..." : "Checking...")

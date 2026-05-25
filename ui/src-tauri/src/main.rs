@@ -1778,6 +1778,28 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
         }
         Ok(resp) => {
             let status = resp.status().as_u16();
+            // Protocol-aware fallback: when `/models` 404s (Volcengine ARK
+            // CodingPlan paths like `/api/coding/v3` or `/api/coding/v1`
+            // expose only the inference endpoint, no listing route), POST
+            // a minimal probe to the actual inference path. If that
+            // succeeds (2xx/400/422 = endpoint reachable, args/model
+            // rejected is still "key works"), report ok with an empty
+            // model list — the UI falls back to MODELS[provId] presets.
+            if status == 404
+                && (effective_api_type == "openai"
+                    || effective_api_type == "openai-completions"
+                    || effective_api_type == "openai-responses"
+                    || effective_api_type == "anthropic"
+                    || effective_api_type == "anthropic-messages")
+            {
+                if let Ok(probe_ok) =
+                    probe_inference_endpoint(&client, effective_base, effective_api_type, &api_key, auth_style).await
+                {
+                    if probe_ok {
+                        return Ok(serde_json::json!({"ok": true, "models": []}));
+                    }
+                }
+            }
             let body = resp.text().await.unwrap_or_default();
             let msg = if status == 401 || status == 403 {
                 "Invalid API key".to_owned()
@@ -1788,6 +1810,65 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
         }
         Err(e) => Ok(serde_json::json!({"ok": false, "error": e.to_string()})),
     }
+}
+
+/// POST a minimal request to the inference endpoint matching the api
+/// protocol. Used as a fallback when `/models` 404s — confirms the URL
+/// and key reach a live endpoint even when the upstream has no listing
+/// route (e.g. Volcengine ARK CodingPlan `/api/coding/v3`).
+///
+/// Returns `Ok(true)` on 2xx / 400 / 422 (endpoint live, request shape
+/// rejected is fine), `Ok(false)` on 401 / 403 / 404 / 5xx, and `Err`
+/// on transport failure.
+async fn probe_inference_endpoint(
+    client: &reqwest::Client,
+    base: &str,
+    api_type: &str,
+    api_key: &str,
+    auth_style: &str,
+) -> Result<bool, reqwest::Error> {
+    let (url, body) = match api_type {
+        "openai-responses" => (
+            format!("{base}/responses"),
+            serde_json::json!({"model": "test", "input": "hi", "max_output_tokens": 1, "stream": false}),
+        ),
+        "anthropic" | "anthropic-messages" => {
+            // CodingPlan endpoints sit at `/api/coding/v1`; standard
+            // Anthropic at `/v1`. If base already carries `/v1`, append
+            // `/messages`, else append `/v1/messages`.
+            let url = if base.ends_with("/v1") || base.contains("/v1/") {
+                format!("{base}/messages")
+            } else {
+                format!("{base}/v1/messages")
+            };
+            (
+                url,
+                serde_json::json!({"model": "test", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}),
+            )
+        }
+        _ => (
+            format!("{base}/chat/completions"),
+            serde_json::json!({"model": "test", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}], "stream": false}),
+        ),
+    };
+
+    let mut req = client.post(&url).json(&body);
+    match auth_style {
+        "bearer" => {
+            req = req.header("Authorization", format!("Bearer {api_key}"));
+        }
+        "x-api-key" => {
+            req = req
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("Authorization", format!("Bearer {api_key}"));
+        }
+        _ => {}
+    }
+
+    let resp = req.send().await?;
+    let code = resp.status().as_u16();
+    Ok(resp.status().is_success() || code == 400 || code == 422)
 }
 
 /// Run OpenClaw migration.
