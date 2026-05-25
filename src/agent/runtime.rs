@@ -1301,6 +1301,47 @@ impl AgentRuntime {
     ///   4. `agents.defaults.model`     (global default)
     /// So if no flash model is configured anywhere, we fall back to whatever
     /// the agent is already using — no regression.
+    /// Resolved vision chain in preference order — analog to
+    /// `resolve_vision_model_name` but returns the full ordered list of
+    /// candidates instead of just the head. Lookup:
+    ///   1. per-agent `model.vision` chain
+    ///   2. `defaults.model.vision` chain
+    /// If both are empty, falls back to primary chain (matches the
+    /// legacy `FallbackToPrimary` semantics — drivers want SOMETHING
+    /// vision-capable, and the agent's primary is the best guess).
+    pub(crate) fn resolve_vision_chain(&self) -> Vec<String> {
+        let per_agent = &self.handle.config;
+        let defaults = &self.config.agents.defaults;
+        let mut out: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let push = |chain: Vec<&str>,
+                    out: &mut Vec<String>,
+                    seen: &mut std::collections::HashSet<String>| {
+            for m in chain {
+                let t = m.trim();
+                if !t.is_empty() && seen.insert(t.to_owned()) {
+                    out.push(t.to_owned());
+                }
+            }
+        };
+        if let Some(m) = per_agent.model.as_ref() {
+            push(m.vision_chain(), &mut out, &mut seen);
+        }
+        if let Some(m) = defaults.model.as_ref() {
+            push(m.vision_chain(), &mut out, &mut seen);
+        }
+        if out.is_empty() {
+            // FallbackToPrimary: no explicit vision config, try primary.
+            if let Some(m) = per_agent.model.as_ref() {
+                push(m.primary_chain(), &mut out, &mut seen);
+            }
+            if let Some(m) = defaults.model.as_ref() {
+                push(m.primary_chain(), &mut out, &mut seen);
+            }
+        }
+        out
+    }
+
     /// Split the resolved flash chain into (head, tail). Drop-in for
     /// flash LlmRequest builders: `let (model, fallback_models) =
     /// self.resolve_flash_chain_split();`. Empty head when no flash

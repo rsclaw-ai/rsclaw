@@ -65,7 +65,7 @@ use crate::computer::{
     operator::Operator as _,
     operators::native::NativeOperator,
     parser::CoordFormat,
-    permission::{PermissionRequest, RedbPermissionStore},
+    permission::{PermissionRequest, PermissionStore, RedbPermissionStore},
     status::ComputerUseStatus,
 };
 
@@ -453,11 +453,21 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
         let async_mode = args["async"].as_bool().unwrap_or(false)
             || args["background"].as_bool().unwrap_or(false);
 
-        // 1. Resolve the vision model. Returns a clear, actionable error when nothing
-        //    usable is configured.
-        let model_name = self
-            .resolve_vision_model_name()
-            .map_err(|msg| anyhow!("{msg}"))?;
+        // 1. Resolve the vision chain. Single string config → 1-element chain
+        //    (back-compat). Multi-entry config → ordered candidates we'll
+        //    try on first failure (sync path only — async path uses head
+        //    for simplicity; see below). The head is also the "primary"
+        //    we kick the driver off with.
+        let vision_chain = self.resolve_vision_chain();
+        let model_name = vision_chain
+            .first()
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(self
+                    .resolve_vision_model_name()
+                    .err()
+                    .unwrap_or_else(|| "no vision model configured".to_owned()))
+            })?;
         let (prov_name, _model_id) = self.providers.resolve_model(&model_name);
         let provider = self.providers.get(prov_name)?;
 
@@ -739,61 +749,141 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
         let operator = NativeOperator::new();
 
         let run_id_for_dereg = run_id.clone();
-        let driver = VlmDriver {
-            operator: &operator,
-            provider,
-            model_name: model_name.clone(),
-            coord_format: CoordFormat::Auto,
-            max_loop: max_steps,
-            abort: abort.clone(),
-            app_rules: &app_rules,
-            permission,
-            agent_id,
-            app: app_label,
-            permission_emit,
-            // Gateway-side: see async-path comment above. R3 review I4.
-            headless_auto_allow: false,
-            status_emit,
-            run_id,
-        };
-
         // Hard timeout safety net. The agent runtime processes one
         // message at a time per agent; a runaway vlm_drive loop here
         // blocks heartbeats and other channels until it returns. Cap
         // the whole driver run at 4 minutes so the heartbeat (300s
         // timeout) never fires while we're inside.
-        // The async path above is the proper fix; this safety net
-        // covers the (legacy) sync path.
         const VLM_DRIVE_HARD_TIMEOUT_SECS: u64 = 240;
-        let driver_result = tokio::time::timeout(
-            std::time::Duration::from_secs(VLM_DRIVE_HARD_TIMEOUT_SECS),
-            driver.run(instruction),
-        )
-        .await;
-        // Driver has exited (or hard-timed out) — drop the abort-flag
+
+        // ── Chain-aware sync path ────────────────────────────────────
+        // For each vision model in the chain, build a fresh driver and
+        // try to run the instruction. On the FIRST hard error from the
+        // driver (LLM call refused / classified into a failover bucket)
+        // mark the model in the shared health table and advance to the
+        // next chain entry. On success / soft outcomes (PermissionDenied,
+        // OperatorError, MaxLoop — these are app-level, not provider-
+        // level) accept the result and stop.
+        //
+        // Note: VlmDriver is reconstructed from scratch each iteration,
+        // which means the model's existing progress (cursor pos, opened
+        // windows) carries forward but the model has no memory of what
+        // the previous one was trying. Acceptable trade-off — sticking
+        // with a borked model burns more LLM cost than starting over
+        // with a working one.
+        let mut last_error: Option<anyhow::Error> = None;
+        let mut outcome_opt: Option<DriverOutcome> = None;
+        for (idx, attempt_model) in vision_chain.iter().enumerate() {
+            // Health gate.
+            if !self.model_health.is_callable(attempt_model) {
+                tracing::info!(
+                    model = %attempt_model,
+                    "vlm_drive: skipping (model marked Disabled or Cooling)"
+                );
+                continue;
+            }
+            // Re-resolve provider per chain entry (different model id
+            // may live under a different provider — e.g. doubao vs kimi).
+            let (attempt_prov_name, _) = self.providers.resolve_model(attempt_model);
+            let attempt_provider = match self.providers.get(attempt_prov_name) {
+                Ok(p) => p,
+                Err(e) => {
+                    last_error = Some(anyhow!("provider not found for {attempt_model}: {e}"));
+                    continue;
+                }
+            };
+            let attempt_run_id = if idx == 0 {
+                run_id.clone()
+            } else {
+                // Mint a fresh run_id for retries so status events
+                // correlate properly per attempt.
+                format!("vlm_drive-{}-retry{idx}", uuid::Uuid::new_v4().simple())
+            };
+            let attempt_driver = VlmDriver {
+                operator: &operator,
+                provider: attempt_provider,
+                model_name: attempt_model.clone(),
+                coord_format: CoordFormat::Auto,
+                max_loop: max_steps,
+                abort: abort.clone(),
+                app_rules: &app_rules,
+                permission: Arc::clone(&permission) as Arc<dyn PermissionStore>,
+                agent_id: agent_id.clone(),
+                app: app_label.clone(),
+                permission_emit: permission_emit.clone(),
+                headless_auto_allow: false,
+                status_emit: status_emit.clone(),
+                run_id: attempt_run_id,
+            };
+            let attempt_result = tokio::time::timeout(
+                std::time::Duration::from_secs(VLM_DRIVE_HARD_TIMEOUT_SECS),
+                attempt_driver.run(instruction),
+            )
+            .await;
+            match attempt_result {
+                Ok(Ok(o)) => {
+                    self.model_health.record_success(attempt_model);
+                    outcome_opt = Some(o);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    let kind = crate::provider::health::classify_error(&e);
+                    let body = format!("{e:#}");
+                    let truncated = crate::util::truncate_str(&body, 200).to_owned();
+                    self.model_health.ensure(&[attempt_model.clone()]);
+                    self.model_health.record_failure(
+                        attempt_model,
+                        kind.clone(),
+                        truncated,
+                    );
+                    tracing::warn!(
+                        model = %attempt_model,
+                        kind = ?kind,
+                        error = %e,
+                        "vlm_drive: model failed — advancing chain"
+                    );
+                    last_error = Some(e);
+                    continue;
+                }
+                Err(_) => {
+                    // Hard timeout — abort and bail. Don't retry; the
+                    // user wants progress, not another 4-minute spin.
+                    abort.store(true, std::sync::atomic::Ordering::SeqCst);
+                    tracing::warn!(
+                        instruction,
+                        model = %attempt_model,
+                        timeout_secs = VLM_DRIVE_HARD_TIMEOUT_SECS,
+                        "vlm_drive hard timeout exceeded; aborting driver"
+                    );
+                    outcome_opt = Some(DriverOutcome::OperatorError {
+                        message: format!(
+                            "vlm_drive exceeded the {VLM_DRIVE_HARD_TIMEOUT_SECS}s hard timeout. \
+                             For long-running tasks, pass `async: true` to run \
+                             in the background instead."
+                        ),
+                        steps: max_steps,
+                    });
+                    break;
+                }
+            }
+        }
+        // Driver has exited (or chain exhausted) — drop the abort-flag
         // registry entry. Done here, before unwrapping the result, so
         // the entry never outlives the driver regardless of which exit
         // path fires.
         if let Some(reg) = self.computer_runs.as_ref() {
             reg.write().await.remove(&run_id_for_dereg);
         }
-        let outcome = match driver_result {
-            Ok(res) => res?,
-            Err(_) => {
-                abort.store(true, std::sync::atomic::Ordering::SeqCst);
-                tracing::warn!(
-                    instruction,
-                    timeout_secs = VLM_DRIVE_HARD_TIMEOUT_SECS,
-                    "vlm_drive hard timeout exceeded; aborting driver"
-                );
-                DriverOutcome::OperatorError {
-                    message: format!(
-                        "vlm_drive exceeded the {VLM_DRIVE_HARD_TIMEOUT_SECS}s hard timeout. \
-                         For long-running tasks, pass `async: true` to run \
-                         in the background instead."
-                    ),
-                    steps: max_steps,
-                }
+        let outcome = match outcome_opt {
+            Some(o) => o,
+            None => {
+                return Err(anyhow!(
+                    "vlm_drive: vision chain exhausted ({} model(s)). Last error: {}",
+                    vision_chain.len(),
+                    last_error
+                        .map(|e| format!("{e:#}"))
+                        .unwrap_or_else(|| "no callable models".to_owned())
+                ));
             }
         };
 
