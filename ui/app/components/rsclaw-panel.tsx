@@ -3715,7 +3715,7 @@ function TauriConfigPageInner() {
             </div>
           </div>
 
-          {secHead(zh ? "LLM \u63D0\u4F9B\u5546" : "LLM PROVIDERS")}
+          {secHead(zh ? "\u5927\u6A21\u578B\u63D0\u4F9B\u5546" : "MODEL PROVIDERS")}
           <div style={{ fontSize: 11, color: V.t3, marginBottom: 12 }}>{zh ? "\u9009\u4E2D\u63D0\u4F9B\u5546\u586B\u5165 Key\uFF0C\u6D4B\u8BD5\u8FDE\u63A5\u6210\u529F\u540E\u4ECE API \u83B7\u53D6\u53EF\u7528\u6A21\u578B\u5217\u8868\uFF0C\u9009\u62E9\u9ED8\u8BA4\u6A21\u578B\u3002" : "Enter API Key per provider, test connection, then select a default model."}</div>
 
           {/* rsclaw account card \u2014 sits above the regular BYOK
