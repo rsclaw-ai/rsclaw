@@ -196,6 +196,17 @@ mod tests {
         assert_eq!(derive_public_key_b64(&priv_b64).unwrap(), pub_b64);
     }
 
+    /// Tooling helper for relay setup. Print a fresh keypair so an
+    /// operator can `cargo test --lib relay_identity::tests::print_keypair
+    /// -- --ignored --nocapture`. Not a real test; never fails.
+    #[test]
+    #[ignore]
+    fn print_keypair() {
+        let (priv_b64, pub_b64) = generate_keypair_b64();
+        println!("RELAY_PRIV_B64={priv_b64}");
+        println!("RELAY_PUB_B64={pub_b64}");
+    }
+
     #[test]
     fn canonical_payload_is_stable() {
         // Pin the exact byte layout — any change here invalidates every
