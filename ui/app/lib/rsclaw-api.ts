@@ -323,4 +323,43 @@ export async function getHubPlugins(): Promise<HubPluginEntry[]> {
   }).then((r) => r.json());
 }
 
+// ---------------------------------------------------------------------------
+// Model health (chain-failover state)
+// ---------------------------------------------------------------------------
+// Surface the per-model status the gateway's FailoverManager tracks so the
+// model-config UI can show ● green / ● yellow / ● red dots next to every
+// entry in a chain. Lazy-populated server-side: a model id only shows up in
+// the snapshot after the runtime has tried to call it at least once. Models
+// configured but never invoked are absent from `models[]` — UI defaults the
+// dot to gray for those.
+
+export interface ModelHealthEntry {
+  model: string;
+  /** "Healthy" | "Cooling" | "Disabled" — exact strings the dot maps from. */
+  status: string;
+  /** Disabled only. Examples: "Balance" / "Auth" / "ModelMissing" /
+   *  "RateLimit" / "Transient" / "Unknown". Null otherwise. */
+  reason: string | null;
+  /** Cooling only — seconds until the entry becomes callable again. */
+  cooldown_seconds: number | null;
+  /** Last failure body (≤200 chars), for the dot's tooltip. May be null. */
+  last_error: string | null;
+  consecutive_failures: number;
+}
+
+export async function getModelHealth(): Promise<{ models: ModelHealthEntry[] }> {
+  return gatewayFetch("/api/v1/models/health", {
+    signal: AbortSignal.timeout(5000),
+  }).then((r) => r.json());
+}
+
+export async function resetModelHealth(
+  model: string,
+): Promise<{ ok: boolean; reset?: string; error?: string }> {
+  return gatewayFetch("/api/v1/models/health/reset", {
+    method: "POST",
+    body: JSON.stringify({ model }),
+  }).then((r) => r.json());
+}
+
 export { GATEWAY_URL, AUTH_TOKEN };

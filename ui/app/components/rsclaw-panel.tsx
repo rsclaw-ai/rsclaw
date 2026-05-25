@@ -11,6 +11,11 @@ import { RsclawProviderCard } from "./rsclaw-provider-card";
 import { Popover } from "./ui-lib";
 import { toast } from "../lib/toast";
 import { setGatewayRestarting } from "../lib/gateway-restart-signal";
+import {
+  useModelHealth,
+  resetAndRefreshModelHealth,
+} from "../lib/use-model-health";
+import type { ModelHealthEntry } from "../lib/rsclaw-api";
 import { EmojiAvatar, AvatarPicker } from "./emoji";
 import { IconButton } from "./button";
 import ReturnIcon from "../icons/return.svg";
@@ -2447,6 +2452,208 @@ function DoctorPage() {
 // ── Tauri Config Page (simple raw editor, no structured form) ────
 // ══════════════════════════════════════════════════════════
 
+/**
+ * Unified comma-separated input + per-model status dots for one
+ * `ModelConfig` field (primary / flash / vision / image / video).
+ *
+ * Backend accepts `Option<StringOrVec>` — caller's `readChain` /
+ * `writeChain` paper over the on-disk single-string vs array forms
+ * so the component itself only sees `string[]`.
+ *
+ * Why module-level: redefining this inside the parent component on
+ * every render would change React's component identity each pass and
+ * make the input's draft state remount + lose focus mid-type. Lots of
+ * props is the lesser evil.
+ */
+type ModelChainInputProps = {
+  path: string;
+  labelZh: string;
+  labelEn: string;
+  /** Mono hint under the label. Usually the config dot-path + a parenthetical. */
+  hint: string;
+  /** Input placeholder — example chain in user-friendly form. */
+  placeholder: string;
+  readChain: (path: string) => string[];
+  writeChain: (path: string, models: string[]) => void;
+  healthMap: Record<string, ModelHealthEntry>;
+  // Styling tokens borrowed from the parent panel's scope.
+  V: Record<string, string>;
+  fInput: React.CSSProperties;
+  fieldRow: React.CSSProperties;
+  zh: boolean;
+  /** Optional bottom-border override (last row in card). */
+  borderBottomNone?: boolean;
+};
+
+function ModelChainInput({
+  path,
+  labelZh,
+  labelEn,
+  hint,
+  placeholder,
+  readChain,
+  writeChain,
+  healthMap,
+  V,
+  fInput,
+  fieldRow,
+  zh,
+  borderBottomNone,
+}: ModelChainInputProps) {
+  const stored = readChain(path);
+  const storedKey = stored.join("|");
+
+  const [draft, setDraft] = useState(stored.join(", "));
+  const lastWritten = useRef(storedKey);
+
+  // When the underlying config changes from outside this input (config
+  // reload, a sibling field edit that touched the same object, etc.),
+  // resync the draft. Keyed on the joined chain so deps stay stable.
+  useEffect(() => {
+    if (storedKey !== lastWritten.current) {
+      setDraft(stored.join(", "));
+      lastWritten.current = storedKey;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [storedKey]);
+
+  // Debounced writeback. 200ms is short enough that pressing Save right
+  // after typing still picks up the latest value, long enough that we
+  // don't thrash setConfig on every keystroke.
+  useEffect(() => {
+    const parsed = parseLocal(draft);
+    const key = parsed.join("|");
+    if (key === lastWritten.current) return;
+    const id = setTimeout(() => {
+      writeChain(path, parsed);
+      lastWritten.current = key;
+    }, 200);
+    return () => clearTimeout(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draft, path]);
+
+  return (
+    <div style={{ ...fieldRow, ...(borderBottomNone ? { borderBottom: "none" } : {}) }}>
+      <div style={{ flex: 1 }}>
+        <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>
+          {zh ? labelZh : labelEn}{" "}
+          <span style={{ color: V.t3, fontWeight: 400, fontSize: 10 }}>
+            {zh ? "(逗号分隔多个,首选→兜底)" : "(comma-separated: preferred → fallback)"}
+          </span>
+        </div>
+        <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>{hint}</div>
+      </div>
+      <div style={{ minWidth: 300, display: "flex", flexDirection: "column", gap: 6 }}>
+        <input
+          style={{ ...fInput, width: "100%" }}
+          type="text"
+          placeholder={placeholder}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+        />
+        {stored.length > 0 && (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {stored.map((id) => {
+              const dot = dotFor(id, healthMap[id], zh);
+              return (
+                <span
+                  key={id}
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 5,
+                    padding: "2px 7px 2px 5px",
+                    borderRadius: 5,
+                    background: V.bg4,
+                    border: `1px solid ${V.bd2}`,
+                    fontFamily: V.mono,
+                    fontSize: 10,
+                    color: V.t2,
+                  }}
+                >
+                  <span
+                    title={dot.tooltip}
+                    onClick={
+                      dot.clickable
+                        ? (e) => {
+                            e.stopPropagation();
+                            void resetAndRefreshModelHealth(id);
+                          }
+                        : undefined
+                    }
+                    style={{
+                      width: 8,
+                      height: 8,
+                      borderRadius: 4,
+                      background: dot.color,
+                      cursor: dot.clickable ? "pointer" : "default",
+                      flexShrink: 0,
+                    }}
+                  />
+                  {id}
+                </span>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Local copy of the parseChain logic so this component doesn't depend on the
+ *  parent's helper closure — the props already plumb readChain/writeChain. */
+function parseLocal(input: string): string[] {
+  return input
+    .split(/[,，]/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+/** Map a (model_id, health entry) pair to dot color, tooltip, click affordance.
+ *  Health entry missing = the runtime hasn't called this model yet, render gray. */
+function dotFor(
+  model: string,
+  entry: ModelHealthEntry | undefined,
+  zh: boolean,
+): { color: string; tooltip: string; clickable: boolean } {
+  if (!entry) {
+    return {
+      color: "#5a5868",
+      tooltip: zh ? `${model}\n尚未调用` : `${model}\nNot yet called`,
+      clickable: false,
+    };
+  }
+  if (entry.status === "Healthy") {
+    return {
+      color: "#2dd4a0",
+      tooltip: `${model}\n${zh ? "健康" : "Healthy"}`,
+      clickable: false,
+    };
+  }
+  if (entry.status === "Cooling") {
+    const secs = entry.cooldown_seconds ?? 0;
+    const err = entry.last_error ? `\n${entry.last_error}` : "";
+    return {
+      color: "#fbbf24",
+      tooltip: zh
+        ? `${model}\n冷却中 — ${secs}s 后重试${err}`
+        : `${model}\nCooling — retry in ${secs}s${err}`,
+      clickable: false,
+    };
+  }
+  // Disabled
+  const reason = entry.reason || (zh ? "未知" : "Unknown");
+  const err = entry.last_error ? `\n${entry.last_error}` : "";
+  return {
+    color: "#d95f5f",
+    tooltip: zh
+      ? `${model}\n已禁用：${reason}${err}\n点击重置`
+      : `${model}\nDisabled: ${reason}${err}\nClick to reset`,
+    clickable: true,
+  };
+}
+
 function TauriConfigPageInner() {
   const zh = getLang() === "cn";
   const [raw, setRaw] = useState("");
@@ -2464,7 +2671,10 @@ function TauriConfigPageInner() {
   const [provErr, setProvErr] = useState<Record<string, string>>({});
   const [provModels, setProvModels] = useState<Record<string, { id: string; tag: string }[]>>({});
   const [provSelModel, setProvSelModel] = useState<Record<string, string>>({});
-  const [imgDropOpen, setImgDropOpen] = useState(false);
+  // Shared model-health snapshot for the chain-input status dots. One
+  // poller per panel, refreshed every 5s; gateway down = empty cache,
+  // dots render gray.
+  const healthMap = useModelHealth();
 
   // Channel state: open cards, login tab per channel, open accounts, account tab
   const [openChs, setOpenChs] = useState<Set<string>>(new Set());
@@ -2583,9 +2793,13 @@ function TauriConfigPageInner() {
       if (!hasKey) continue;
       // Check if provider has a selected default model in config
       let selModel = "";
-      // Check agents.defaults.model.primary first
-      const primary = config?.agents?.defaults?.model?.primary || "";
-      if (primary.startsWith(provId + "/")) {
+      // Check agents.defaults.model.primary first. The field is now
+      // StringOrVec — accept both shapes and take the chain head.
+      const primaryRaw = config?.agents?.defaults?.model?.primary;
+      const primary = Array.isArray(primaryRaw)
+        ? (primaryRaw[0] || "")
+        : (primaryRaw || "");
+      if (typeof primary === "string" && primary.startsWith(provId + "/")) {
         selModel = primary.split("/").slice(1).join("/");
       }
       // Also check agents.defaults.models (alias table)
@@ -2666,6 +2880,33 @@ function TauriConfigPageInner() {
     setConfig(newConfig);
     setRaw(JSON.stringify(newConfig, null, 2));
     setDirty(true);
+  };
+
+  // ── Model-chain field helpers ──
+  // Backend `ModelConfig.{primary,flash,vision,image,video}` are
+  // `Option<StringOrVec>` — either a bare string or an ordered chain.
+  // The UI edits a single comma-separated input; these helpers paper
+  // over the two on-disk shapes so we round-trip clean JSON5:
+  //   1 entry  → string (file stays terse)
+  //   2+       → array
+  //   empty    → field deleted
+  const parseChain = (input: string): string[] =>
+    input
+      .split(/[,，]/) // accept both CJK and ASCII commas
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+
+  const readChain = (dotPath: string): string[] => {
+    const v = getVal(dotPath, undefined);
+    if (Array.isArray(v)) return v.filter((s) => typeof s === "string" && s.trim()).map((s) => String(s).trim());
+    if (typeof v === "string" && v.trim()) return [v.trim()];
+    return [];
+  };
+
+  const writeChain = (dotPath: string, models: string[]) => {
+    if (models.length === 0) deleteConfig(dotPath);
+    else if (models.length === 1) updateConfig(dotPath, models[0]);
+    else updateConfig(dotPath, models);
   };
 
   const handleSave = async () => {
@@ -3322,45 +3563,48 @@ function TauriConfigPageInner() {
           {/* Default model — most important, show first */}
           {secHead(zh ? "\u9ED8\u8BA4\u667A\u80FD\u4F53\u6A21\u578B" : "DEFAULT AGENT MODEL")}
           <div style={{ ...fcard, marginBottom: 20 }}>
-            <div style={fieldRow}>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u4E3B\u6A21\u578B" : "Primary Model"}</div>
-                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.primary</div>
-              </div>
-              <input style={{ ...fInput, minWidth: 300 }} value={getVal("agents.defaults.model.primary", "")} onChange={(e) => updateConfig("agents.defaults.model.primary", e.target.value)} />
-            </div>
-            <div style={fieldRow}>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5FEB\u901F\u6A21\u578B" : "Flash Model"}</div>
-                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.flash ({zh ? "\u7559\u7A7A\u5219\u4F7F\u7528\u4E3B\u6A21\u578B" : "empty \u2192 use main model"})</div>
-              </div>
-              <input
-                style={{ ...fInput, minWidth: 300 }}
-                type="text"
-                placeholder={zh ? "\u4F8B\u5982 custom/qwen-turbo" : "e.g. custom/qwen-turbo"}
-                value={getVal("agents.defaults.model.flash", "")}
-                onChange={(e) => {
-                  const v = (e.target.value || "").trim();
-                  updateConfig("agents.defaults.model.flash", v || undefined);
-                }}
-              />
-            </div>
-            <div style={fieldRow}>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u89C6\u89C9\u6A21\u578B" : "Vision Model"}</div>
-                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.vision ({zh ? "\u7559\u7A7A\u5219\u4F7F\u7528\u4E3B\u6A21\u578B\uFF1Bcomputer_use \u4F1A\u4F18\u5148\u4F7F\u7528\u6B64\u6A21\u578B" : "empty \u2192 use main model; computer_use prefers this"})</div>
-              </div>
-              <input
-                style={{ ...fInput, minWidth: 300 }}
-                type="text"
-                placeholder={zh ? "\u4F8B\u5982 qwen/qwen-3-vl-plus" : "e.g. qwen/qwen-3-vl-plus"}
-                value={getVal("agents.defaults.model.vision", "")}
-                onChange={(e) => {
-                  const v = (e.target.value || "").trim();
-                  updateConfig("agents.defaults.model.vision", v || undefined);
-                }}
-              />
-            </div>
+            <ModelChainInput
+              path="agents.defaults.model.primary"
+              labelZh={"\u4E3B\u6A21\u578B"}
+              labelEn="Primary Model"
+              hint="agents.defaults.model.primary"
+              placeholder="rsclaw/rsclaw-agent-v1, doubao/seed-2.0-pro"
+              readChain={readChain}
+              writeChain={writeChain}
+              healthMap={healthMap}
+              V={V}
+              fInput={{ ...fInput, minWidth: 300 }}
+              fieldRow={fieldRow}
+              zh={zh}
+            />
+            <ModelChainInput
+              path="agents.defaults.model.flash"
+              labelZh={"\u5FEB\u901F\u6A21\u578B"}
+              labelEn="Flash Model"
+              hint={`agents.defaults.model.flash (${zh ? "\u7559\u7A7A\u5219\u4F7F\u7528\u4E3B\u6A21\u578B" : "empty \u2192 use main model"})`}
+              placeholder="doubao/seed-2.0-lite, qwen/qwen-turbo"
+              readChain={readChain}
+              writeChain={writeChain}
+              healthMap={healthMap}
+              V={V}
+              fInput={{ ...fInput, minWidth: 300 }}
+              fieldRow={fieldRow}
+              zh={zh}
+            />
+            <ModelChainInput
+              path="agents.defaults.model.vision"
+              labelZh={"\u89C6\u89C9\u6A21\u578B"}
+              labelEn="Vision Model"
+              hint={`agents.defaults.model.vision (${zh ? "\u7559\u7A7A\u2192\u4E3B\u6A21\u578B\uFF1Bcomputer_use \u4F18\u5148" : "empty \u2192 primary; computer_use prefers this"})`}
+              placeholder="qwen/qwen-3-vl-plus, doubao/seed-2.0-pro"
+              readChain={readChain}
+              writeChain={writeChain}
+              healthMap={healthMap}
+              V={V}
+              fInput={{ ...fInput, minWidth: 300 }}
+              fieldRow={fieldRow}
+              zh={zh}
+            />
             <div style={fieldRow}>
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5907\u7528\u6A21\u578B" : "Fallback Models"} <span style={{ color: V.t3, fontWeight: 400 }}>{zh ? "(\u9017\u53F7\u5206\u9694)" : "(comma separated)"}</span></div>
@@ -3372,51 +3616,34 @@ function TauriConfigPageInner() {
                 updateConfig("agents.defaults.model.fallbacks", arr.length > 0 ? arr : undefined);
               }} />
             </div>
-            <div style={fieldRow}>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u751F\u56FE\u6A21\u578B" : "Image Model"} <span style={{ color: V.t3, fontWeight: 400 }}>{zh ? "(\u7A7A=\u81EA\u52A8)" : "(empty=auto)"}</span></div>
-                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.image</div>
-              </div>
-              <div style={{ position: "relative", minWidth: 300 }}>
-                <input
-                  id="img-model-input"
-                  style={{ ...fInput, width: "100%" }}
-                  placeholder={zh ? "\u70B9\u51FB\u9009\u62E9\u6216\u8F93\u5165\u6A21\u578B" : "Select or type a model"}
-                  value={getVal("agents.defaults.model.image", "")}
-                  onFocus={() => setImgDropOpen(true)}
-                  onBlur={() => setTimeout(() => setImgDropOpen(false), 180)}
-                  onChange={(e) => updateConfig("agents.defaults.model.image", e.target.value)}
-                />
-                {imgDropOpen && (() => {
-                  const IMAGE_MODELS: { label: string; value: string }[] = [
-                    { label: "minimax/image-01", value: "minimax/image-01" },
-                    { label: "qwen/qwen-image-2.0-pro", value: "qwen/qwen-image-2.0-pro" },
-                    { label: "qwen/wan2.6-t2i", value: "qwen/wan2.6-t2i" },
-                    { label: "doubao/doubao-seedream-5-0-260128", value: "doubao/doubao-seedream-5-0-260128" },
-                    { label: "gemini/nano-banana-pro", value: "gemini/gemini-3-pro-image-preview" },
-                    { label: "gemini/nano-banana-2", value: "gemini/gemini-3.1-flash-image-preview" },
-                  ];
-                  const curVal = getVal("agents.defaults.model.image", "");
-                  const el = document.getElementById("img-model-input");
-                  const rect = el?.getBoundingClientRect();
-                  return rect ? (
-                    <div style={{ position: "fixed", top: rect.bottom + 4, left: rect.left, width: rect.width, background: V.bg3, border: `1px solid ${V.bd2}`, borderRadius: 8, overflow: "hidden", zIndex: 9999, boxShadow: "0 8px 24px rgba(0,0,0,.5)" }}>
-                      {IMAGE_MODELS.map((m) => (
-                        <div
-                          key={m.value}
-                          onMouseDown={(e) => { e.preventDefault(); updateConfig("agents.defaults.model.image", m.value); setImgDropOpen(false); }}
-                          style={{ padding: "8px 12px", fontSize: 12, fontFamily: V.mono, color: curVal === m.value ? V.or : V.t1, cursor: "pointer", borderBottom: `1px solid ${V.bd}`, background: curVal === m.value ? V.olo : "transparent" }}
-                          onMouseEnter={(e) => (e.currentTarget.style.background = curVal === m.value ? V.olo : V.bg4)}
-                          onMouseLeave={(e) => (e.currentTarget.style.background = curVal === m.value ? V.olo : "transparent")}
-                        >
-                          {m.label}{m.label !== m.value && <span style={{ color: V.t3, fontSize: 10, marginLeft: 6 }}>→ {m.value}</span>}
-                        </div>
-                      ))}
-                    </div>
-                  ) : null;
-                })()}
-              </div>
-            </div>
+            <ModelChainInput
+              path="agents.defaults.model.image"
+              labelZh={"\u56FE\u7247\u751F\u6210\u6A21\u578B"}
+              labelEn="Image Generation Model"
+              hint={`agents.defaults.model.image (${zh ? "\u7A7A=\u7981\u7528" : "empty = disabled"})`}
+              placeholder="doubao/doubao-seedream-5-0-260128, minimax/image-01"
+              readChain={readChain}
+              writeChain={writeChain}
+              healthMap={healthMap}
+              V={V}
+              fInput={{ ...fInput, minWidth: 300 }}
+              fieldRow={fieldRow}
+              zh={zh}
+            />
+            <ModelChainInput
+              path="agents.defaults.model.video"
+              labelZh={"\u89C6\u9891\u751F\u6210\u6A21\u578B"}
+              labelEn="Video Generation Model"
+              hint={`agents.defaults.model.video (${zh ? "\u7A7A=\u7981\u7528;\u6BCF\u6BB5\u4ED8\u8D39\u4E14\u8017\u65F6" : "empty = disabled; each clip is paid and slow"})`}
+              placeholder="doubao/doubao-seedance-2-0-260128, minimax/video-01-director"
+              readChain={readChain}
+              writeChain={writeChain}
+              healthMap={healthMap}
+              V={V}
+              fInput={{ ...fInput, minWidth: 300 }}
+              fieldRow={fieldRow}
+              zh={zh}
+            />
             <div style={{ ...fieldRow, borderBottom: "none" }}>
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5DE5\u5177\u96C6" : "Toolset"}</div>
