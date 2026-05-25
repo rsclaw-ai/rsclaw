@@ -1452,9 +1452,28 @@ function _Chat() {
       matchCommand.invoke();
       return;
     }
+    // Slash commands skip the pending queue.
+    //
+    // The queue was added to serialize normal chat turns so the user
+    // could keep typing while a previous turn is still streaming. But
+    // `/abort`, `/status`, `/btw`, `/clear`, `/version` etc. don't want
+    // that — they're either:
+    //   - Interrupts (/abort) that are useless if they wait behind the
+    //     turn they're trying to interrupt.
+    //   - Read-only probes (/status, /btw, /history, /models) that have
+    //     no session-state side effects.
+    //   - Session-mutating commands handled via backend bypass flags
+    //     (/clear, /new) that explicitly want to reach the agent
+    //     mid-turn.
+    //
+    // Dispatching slash commands immediately doesn't break the chat
+    // serialization model — the backend agent loop still owns ordering
+    // (mpsc queue + atomic signal flags for interrupt-class commands).
+    // Frontend just stops adding its own gating layer on top.
+    const isSlashCmd = userInput.trim().startsWith("/");
     // Agent is busy (previous turn not finished and not interrupted) — stage
     // this input for flush after the current turn completes or is aborted.
-    if (isStreaming) {
+    if (isStreaming && !isSlashCmd) {
       setPendingQueue((q) => [
         ...q,
         {
