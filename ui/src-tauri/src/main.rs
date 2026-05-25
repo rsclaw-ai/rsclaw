@@ -1708,6 +1708,7 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
         "openrouter"  => "https://openrouter.ai/api/v1",
         "gaterouter"  => "https://api.gaterouter.ai/openai/v1",
         "ollama"      => "http://localhost:11434",
+        "rsclaw"      => "https://api.rsclaw.ai/v1/agent",
         "custom" | "codingplan" => "",
         _ => return Ok(serde_json::json!({"ok": false, "error": "unknown provider"})),
     };
@@ -1728,11 +1729,50 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
         .timeout(std::time::Duration::from_secs(15))
         .build().unwrap_or_default();
 
-    // Minimax doesn't support /models — return built-in list
+    // Providers without a public model-listing endpoint return a curated
+    // built-in list. Without this the UI hits `/models`, sees a 404 (or
+    // a 200 with no `data` array), and shows "未获取到模型, 请手动输入"
+    // even when the key is fine.
+    //
+    // - Minimax — no `/models` route exists upstream.
+    // - Volcengine ARK (doubao) — `/v3/models` 404s; only the inference
+    //   endpoint is public. Inference fallback below confirms the key
+    //   but can't enumerate models.
+    // - rsclaw — cloud-managed via `api.rsclaw.ai/v1/agent`, custom path
+    //   shape (no `/models`). Fleet versioning ties the list to
+    //   `RSCLAW_DEFAULT_*` constants in `src/provider/rsclaw.rs` —
+    //   keep this list in sync when those bump.
     if provider == "minimax" {
         return Ok(serde_json::json!({
             "ok": true,
             "models": ["MiniMax-M2.7","MiniMax-M2.7-highspeed","MiniMax-M2.5","MiniMax-M2.5-highspeed","MiniMax-M2.1","MiniMax-M2.1-highspeed","MiniMax-M2"]
+        }));
+    }
+    if provider == "rsclaw" {
+        return Ok(serde_json::json!({
+            "ok": true,
+            "models": [
+                "rsclaw-agent-v1",
+                "rsclaw-flash-v1",
+                "rsclaw-vision-v1",
+            ]
+        }));
+    }
+    if provider == "doubao" && api_type.is_none() {
+        // Default doubao (ark v3, OpenAI-shape). When the user pinned an
+        // explicit api_type (e.g. anthropic via CodingPlan) drop through
+        // to the live probe — that path needs the real endpoint check.
+        return Ok(serde_json::json!({
+            "ok": true,
+            "models": [
+                "doubao-seed-2.0-pro",
+                "doubao-seed-2.0-lite",
+                "doubao-seed-2.0-flash",
+                "doubao-seed-1.6-vision-thinking",
+                "doubao-seed-1.5-vision-pro",
+                "doubao-seedream-5-0-260128",
+                "doubao-seedance-2-0-260128",
+            ]
         }));
     }
 
