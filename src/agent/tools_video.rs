@@ -61,6 +61,16 @@ impl super::runtime::AgentRuntime {
             }));
         }
 
+        // Submit-only failover policy: when `agents.defaults.model.video` is
+        // an ordered chain (`StringOrVec`), the runtime uses only the HEAD
+        // here. The chain's `[1..]` tail is intentionally NOT consulted on
+        // poll failure — once a submit succeeds, doubao/minimax/kling have
+        // already billed for the job and the polling loop is just watching
+        // for the artifact. Switching providers mid-poll would double-bill
+        // the user for a video they may still receive. If the head's
+        // submit fails (4xx/5xx), the caller should see the error and
+        // either retry manually or rely on chain-level health Disabling
+        // future calls. Per-chain submit retry is on the post-MVP backlog.
         // Allow caller to override model hint.
         let model_hint = args["model"].as_str().map(|s| s.to_lowercase());
 

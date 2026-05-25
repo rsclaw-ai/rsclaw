@@ -386,7 +386,11 @@ pub fn cooling_backoff(consecutive: u32, kind: ErrorKind) -> Duration {
         // Disabling kinds never get here (early-returned in record_failure).
         ErrorKind::Auth | ErrorKind::Balance | ErrorKind::ModelMissing => 60u64,
     };
-    let exponent = consecutive.saturating_sub(1).min(6); // cap doubling at 64×
+    // Cap exponent at 16 so MAX_COOLDOWN (1h) is the binding constraint
+    // rather than the doubling — 30s × 2^16 ≈ 22d, easily clamped to 1h.
+    // A tighter cap would prevent ever reaching MAX_COOLDOWN with the
+    // smaller bases.
+    let exponent = consecutive.saturating_sub(1).min(16);
     let secs = base.saturating_mul(1u64 << exponent);
     Duration::from_secs(secs).min(MAX_COOLDOWN)
 }
@@ -421,6 +425,7 @@ pub fn classify_str(s: &str) -> ErrorKind {
     if lower.contains("insufficient_quota")
         || lower.contains("insufficient quota")
         || lower.contains("credit_balance_too_low")
+        || (lower.contains("credit balance") && lower.contains("too low"))
         || lower.contains("accountoverdue")
         || lower.contains("balance_not_enough")
         || lower.contains("balance not enough")
