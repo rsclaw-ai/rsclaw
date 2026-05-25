@@ -1022,6 +1022,7 @@ impl AgentRuntime {
         };
 
         let req = LlmRequest {
+            fallback_models: Vec::new(),
             model: model.to_owned(),
             messages,
             tools,
@@ -1142,6 +1143,7 @@ impl AgentRuntime {
         };
 
         let req = LlmRequest {
+            fallback_models: Vec::new(),
             model: model.to_owned(),
             messages: vec![Message {
                 role: Role::User,
@@ -1206,6 +1208,7 @@ impl AgentRuntime {
             history
         };
         let req = LlmRequest {
+            fallback_models: Vec::new(),
             model: model.to_owned(),
             messages: vec![Message {
                 role: Role::User,

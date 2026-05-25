@@ -56,14 +56,14 @@ impl super::runtime::AgentRuntime {
             .config
             .model
             .as_ref()
-            .and_then(|m| m.image.as_deref())
+            .and_then(|m| m.image_head())
             .or_else(|| {
                 self.config
                     .agents
                     .defaults
                     .model
                     .as_ref()
-                    .and_then(|m| m.image.as_deref())
+                    .and_then(|m| m.image_head())
             })
             .map(|s| s.to_owned());
 

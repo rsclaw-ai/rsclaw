@@ -560,21 +560,102 @@ pub struct AgentCommand {
     pub args: Option<Value>,
 }
 
+/// A model field that accepts either a single id ("doubao/seed-2.0-pro") or
+/// an ordered list (["rsclaw/agent-v1", "doubao/seed-2.0-pro", …]). The first
+/// element is the preferred model; subsequent entries are tried in order on
+/// transient failure (rate limit, 5xx, timeout). On permanent failure (auth,
+/// balance, model-not-found) the entry is marked Disabled and skipped — see
+/// `provider::health` for the state machine. Empty chains are treated as
+/// "unset".
+///
+/// Serde is untagged with `String` first so a bare string ("doubao/x") wins
+/// over the array variant. JSON5 round-trip preserves the original form —
+/// users writing `primary: "doubao/x"` see `primary: "doubao/x"` after save.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum StringOrVec {
+    Single(String),
+    Multi(Vec<String>),
+}
+
+impl StringOrVec {
+    /// First non-empty model id in the chain, or `None` if empty.
+    pub fn head(&self) -> Option<&str> {
+        match self {
+            Self::Single(s) => {
+                let t = s.trim();
+                if t.is_empty() { None } else { Some(t) }
+            }
+            Self::Multi(v) => v.iter().map(|s| s.trim()).find(|s| !s.is_empty()),
+        }
+    }
+
+    /// Full chain as borrowed slice; trimmed; empties filtered.
+    pub fn chain(&self) -> Vec<&str> {
+        match self {
+            Self::Single(s) => {
+                let t = s.trim();
+                if t.is_empty() { vec![] } else { vec![t] }
+            }
+            Self::Multi(v) => v.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect(),
+        }
+    }
+
+    /// Owned chain — handy for failover construction.
+    pub fn to_chain(&self) -> Vec<String> {
+        self.chain().into_iter().map(String::from).collect()
+    }
+
+    /// Construct from a single id — convenience for default-builder code.
+    pub fn single(s: impl Into<String>) -> Self {
+        Self::Single(s.into())
+    }
+}
+
+impl From<&str> for StringOrVec {
+    fn from(s: &str) -> Self {
+        Self::Single(s.to_owned())
+    }
+}
+
+impl From<String> for StringOrVec {
+    fn from(s: String) -> Self {
+        Self::Single(s)
+    }
+}
+
+impl From<Vec<String>> for StringOrVec {
+    fn from(v: Vec<String>) -> Self {
+        Self::Multi(v)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelConfig {
+    /// Preferred chat / agent model. May be a single id or an ordered chain
+    /// (see [`StringOrVec`]); chain order is "try in order, demote failing
+    /// entries". On full chain exhaustion the primary path falls through to
+    /// the legacy `fallbacks` list below — this extra escape is primary-only.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub primary: Option<String>,
+    pub primary: Option<StringOrVec>,
+    /// Emergency tail appended to `primary` chain after the array is
+    /// exhausted. Kept as `Vec<String>` (not `StringOrVec`) because the
+    /// fallback list is semantically distinct: these models should only kick
+    /// in when everything in `primary` is unreachable, never as the user's
+    /// active routing preference.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallbacks: Option<Vec<String>>,
-    /// Text-to-image model, e.g. "doubao/doubao-seedream-5-0-260128".
+    /// Text-to-image model chain, e.g.
+    /// `["doubao/doubao-seedream-5-0-260128", "openai/dall-e-3"]`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub image: Option<String>,
+    pub image: Option<StringOrVec>,
+    /// Text-to-video model chain, e.g. `"doubao/doubao-seedance-2-0-260128"`
+    /// or an array across Seedance / Hailuo / Kling. Note: only retried on
+    /// **submit** failure — once a clip is submitted the polling loop sticks
+    /// with that provider to avoid double-billing.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub image_fallbacks: Option<Vec<String>>,
-    /// Text-to-video model, e.g. "doubao/seedance-1-0-lite-t2v-250428".
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub video: Option<String>,
+    pub video: Option<StringOrVec>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
     /// Whether to send tool definitions to the model. Default: true.
@@ -596,17 +677,17 @@ pub struct ModelConfig {
     /// Maximum tokens for LLM response. Default: 2048.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
-    /// Cheap/fast model for internal sub-tasks (query planning, intent
+    /// Cheap/fast model chain for internal sub-tasks (query planning, intent
     /// classification, summarization). Falls back to `primary` when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub flash: Option<String>,
-    /// Vision model used by the GUI agent (`computer_use`) — must support
-    /// image inputs. Resolution chain when vlm_drive / VlmDriver runs:
-    ///   1. per-agent `model.vision`
-    ///   2. `agents.defaults.model.vision`
-    ///   3. per-agent `model.primary`  ← fallback (assumes primary handles
-    ///      vision)
-    ///   4. `agents.defaults.model.primary`
+    pub flash: Option<StringOrVec>,
+    /// Vision model chain used by the GUI agent (`computer_use`) — must
+    /// support image inputs. Resolution chain when vlm_drive / VlmDriver
+    /// runs:
+    ///   1. per-agent `model.vision` (chain — try each)
+    ///   2. `agents.defaults.model.vision` (chain — try each)
+    ///   3. per-agent `model.primary` head (assumes primary handles vision)
+    ///   4. `agents.defaults.model.primary` head
     /// Vision-capability check (in priority order):
     ///   1. The provider's `models[]` entry — if `input` lists `image`, treat
     ///      as vision-capable. If `input` is declared but contains only `text`,
@@ -618,7 +699,61 @@ pub struct ModelConfig {
     ///      `input: ["text", "image"]` to the model's provider config or
     ///      extending the allow-list.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub vision: Option<String>,
+    pub vision: Option<StringOrVec>,
+}
+
+impl ModelConfig {
+    /// First model id in the `primary` chain (the most-preferred one), or
+    /// `None` if unset or empty. Drop-in replacement for the previous
+    /// `cfg.primary.as_deref()`.
+    pub fn primary_head(&self) -> Option<&str> {
+        self.primary.as_ref().and_then(StringOrVec::head)
+    }
+
+    /// Full primary chain as borrowed slice. Length 0 = unset.
+    pub fn primary_chain(&self) -> Vec<&str> {
+        self.primary.as_ref().map(StringOrVec::chain).unwrap_or_default()
+    }
+
+    /// First model id in the `flash` chain.
+    pub fn flash_head(&self) -> Option<&str> {
+        self.flash.as_ref().and_then(StringOrVec::head)
+    }
+
+    /// Full flash chain.
+    pub fn flash_chain(&self) -> Vec<&str> {
+        self.flash.as_ref().map(StringOrVec::chain).unwrap_or_default()
+    }
+
+    /// First model id in the `vision` chain.
+    pub fn vision_head(&self) -> Option<&str> {
+        self.vision.as_ref().and_then(StringOrVec::head)
+    }
+
+    /// Full vision chain.
+    pub fn vision_chain(&self) -> Vec<&str> {
+        self.vision.as_ref().map(StringOrVec::chain).unwrap_or_default()
+    }
+
+    /// First model id in the `image` chain.
+    pub fn image_head(&self) -> Option<&str> {
+        self.image.as_ref().and_then(StringOrVec::head)
+    }
+
+    /// Full image chain.
+    pub fn image_chain(&self) -> Vec<&str> {
+        self.image.as_ref().map(StringOrVec::chain).unwrap_or_default()
+    }
+
+    /// First model id in the `video` chain.
+    pub fn video_head(&self) -> Option<&str> {
+        self.video.as_ref().and_then(StringOrVec::head)
+    }
+
+    /// Full video chain.
+    pub fn video_chain(&self) -> Vec<&str> {
+        self.video.as_ref().map(StringOrVec::chain).unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

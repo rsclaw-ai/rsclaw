@@ -362,6 +362,7 @@ mod tests {
 
     fn make_request() -> LlmRequest {
         LlmRequest {
+            fallback_models: Vec::new(),
             model: "gemini-2.0-flash".to_owned(),
             ..Default::default()
         }
@@ -370,6 +371,7 @@ mod tests {
     #[test]
     fn request_serializes_contents() {
         let req = LlmRequest {
+            fallback_models: Vec::new(),
             messages: vec![
                 Message {
                     role: Role::User,
@@ -394,6 +396,7 @@ mod tests {
     #[test]
     fn system_instruction_present() {
         let req = LlmRequest {
+            fallback_models: Vec::new(),
             system: Some("be helpful".to_owned()),
             ..make_request()
         };
@@ -405,6 +408,7 @@ mod tests {
     #[test]
     fn temperature_in_generation_config() {
         let req = LlmRequest {
+            fallback_models: Vec::new(),
             temperature: Some(0.5),
             ..make_request()
         };
@@ -416,6 +420,7 @@ mod tests {
     #[test]
     fn tools_serialize_as_function_declarations() {
         let req = LlmRequest {
+            fallback_models: Vec::new(),
             tools: vec![super::super::ToolDef {
                 name: "search".to_owned(),
                 description: "Search the web".to_owned(),

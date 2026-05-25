@@ -270,7 +270,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         .as_ref()
         .and_then(|a| a.defaults.as_ref())
         .and_then(|d| d.model.as_ref())
-        .and_then(|m| m.vision.clone());
+        .and_then(|m| m.vision_head().map(String::from));
 
     let mut plugin_registry = load_all_plugins(
         &plugins_dir,

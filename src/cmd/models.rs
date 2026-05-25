@@ -7,10 +7,7 @@ use super::{
     style::*,
 };
 use crate::{
-    cli::{
-        AliasesCommand, AuthOrderCommand, FallbacksCommand, ImageFallbacksCommand,
-        ModelsAuthCommand, ModelsCommand,
-    },
+    cli::{AliasesCommand, AuthOrderCommand, FallbacksCommand, ModelsAuthCommand, ModelsCommand},
     config,
 };
 
@@ -47,7 +44,7 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
                 .defaults
                 .model
                 .as_ref()
-                .and_then(|m| m.primary.as_deref())
+                .and_then(|m| m.primary_head())
                 .unwrap_or("anthropic/claude-sonnet-4-5");
             println!();
             kv("default", &bold(default_model));
@@ -191,67 +188,6 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
                 )?;
                 std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
                 ok("fallbacks cleared");
-            }
-        },
-        ModelsCommand::ImageFallbacks(sub) => match sub {
-            ImageFallbacksCommand::List => {
-                banner(&format!(
-                    "rsclaw image fallbacks v{}",
-                    option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
-                ));
-                let config = config::load()?;
-                let fallbacks = config
-                    .agents
-                    .defaults
-                    .model
-                    .as_ref()
-                    .and_then(|m| m.image_fallbacks.as_deref())
-                    .unwrap_or(&[]);
-                if fallbacks.is_empty() {
-                    warn_msg("no image fallback models configured");
-                } else {
-                    for (i, f) in fallbacks.iter().enumerate() {
-                        println!("  {}. {}", dim(&(i + 1).to_string()), cyan(f));
-                    }
-                }
-            }
-            ImageFallbacksCommand::Add { model } => {
-                let (path, mut val) = load_config_json()?;
-                let arr = val
-                    .pointer_mut("/agents/defaults/model/imageFallbacks")
-                    .and_then(|v| v.as_array_mut());
-                if let Some(arr) = arr {
-                    arr.push(model.clone().into());
-                } else {
-                    set_nested_value(
-                        &mut val,
-                        "agents.defaults.model.imageFallbacks",
-                        serde_json::json!([model]),
-                    )?;
-                }
-                std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
-                ok(&format!("added image fallback '{}'", cyan(&model)));
-            }
-            ImageFallbacksCommand::Remove { model } => {
-                let (path, mut val) = load_config_json()?;
-                if let Some(arr) = val
-                    .pointer_mut("/agents/defaults/model/imageFallbacks")
-                    .and_then(|v| v.as_array_mut())
-                {
-                    arr.retain(|v| v.as_str() != Some(&model));
-                }
-                std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
-                ok(&format!("removed image fallback '{}'", cyan(&model)));
-            }
-            ImageFallbacksCommand::Clear => {
-                let (path, mut val) = load_config_json()?;
-                set_nested_value(
-                    &mut val,
-                    "agents.defaults.model.imageFallbacks",
-                    serde_json::json!([]),
-                )?;
-                std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
-                ok("image fallbacks cleared");
             }
         },
         ModelsCommand::Auth(sub) => match sub {

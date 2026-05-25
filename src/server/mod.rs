@@ -742,7 +742,7 @@ async fn list_agents(State(state): State<AppState>) -> impl IntoResponse {
         .into_iter()
         .map(|h| AgentStatusResponse {
             id: h.id.clone(),
-            model: h.config.model.as_ref().and_then(|m| m.primary.clone()),
+            model: h.config.model.as_ref().and_then(|m| m.primary_head().map(String::from)),
             default: h.config.default == Some(true),
         })
         .collect();
@@ -899,7 +899,7 @@ async fn agent_status(State(state): State<AppState>, Path(id): Path<String>) -> 
     match state.agents.get(&id) {
         Ok(h) => Json(AgentStatusResponse {
             id: h.id.clone(),
-            model: h.config.model.as_ref().and_then(|m| m.primary.clone()),
+            model: h.config.model.as_ref().and_then(|m| m.primary_head().map(String::from)),
             default: h.config.default == Some(true),
         })
         .into_response(),
@@ -2559,7 +2559,7 @@ async fn openai_list_models(State(state): State<AppState>) -> impl IntoResponse 
                 .config
                 .model
                 .as_ref()
-                .and_then(|m| m.primary.as_deref())
+                .and_then(|m| m.primary_head())
                 .unwrap_or(&h.id)
                 .to_owned();
             serde_json::json!({

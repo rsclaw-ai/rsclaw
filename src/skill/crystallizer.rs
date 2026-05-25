@@ -323,6 +323,7 @@ pub async fn distill_with_llm(
     model: String,
 ) -> Result<String> {
     let req = LlmRequest {
+            fallback_models: Vec::new(),
         model,
         messages: vec![Message {
             role: Role::User,

@@ -90,10 +90,9 @@ impl AgentRuntime {
                 &crate::config::loader::base_dir().join(format!("workspace-{id}")),
             )),
             model: Some(ModelConfig {
-                primary: Some(model),
+                primary: Some(model.into()),
                 fallbacks: None,
                 image: None,
-                image_fallbacks: None,
                 video: None,
                 thinking: None,
                 tools_enabled: None,
@@ -208,10 +207,9 @@ impl AgentRuntime {
             default: Some(false),
             workspace: Some(crate::config::loader::path_to_forward_slash(&ws_path)),
             model: Some(ModelConfig {
-                primary: Some(model),
+                primary: Some(model.into()),
                 fallbacks: None,
                 image: None,
-                image_fallbacks: None,
                 video: None,
                 thinking: None,
                 tools_enabled: None,
@@ -548,7 +546,7 @@ impl AgentRuntime {
                     json!({
                         "id": h.id,
                         "model": h.config.model.as_ref()
-                            .and_then(|m| m.primary.as_deref())
+                            .and_then(|m| m.primary_head())
                             .unwrap_or("unknown"),
                     })
                 })

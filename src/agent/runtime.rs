@@ -798,14 +798,14 @@ impl AgentRuntime {
             .config
             .model
             .as_ref()
-            .and_then(|m| m.primary.as_deref())
+            .and_then(|m| m.primary_head())
             .or_else(|| {
                 self.config
                     .agents
                     .defaults
                     .model
                     .as_ref()
-                    .and_then(|m| m.primary.as_deref())
+                    .and_then(|m| m.primary_head())
             })
             .unwrap_or("rsclaw/rsclaw-agent-v1")
             .to_owned()
@@ -826,8 +826,8 @@ pub fn resolve_primary_model_for(
     per_agent
         .model
         .as_ref()
-        .and_then(|m| m.primary.as_deref())
-        .or_else(|| defaults.model.as_ref().and_then(|m| m.primary.as_deref()))
+        .and_then(|m| m.primary_head())
+        .or_else(|| defaults.model.as_ref().and_then(|m| m.primary_head()))
         .map(str::to_owned)
 }
 
@@ -853,19 +853,19 @@ pub fn resolve_flash_model_for(
     let explicit = per_agent
         .model
         .as_ref()
-        .and_then(|m| m.flash.as_deref())
+        .and_then(|m| m.flash_head())
         .or_else(|| {
             per_agent
                 .flash_model
                 .as_ref()
-                .and_then(|m| m.primary.as_deref())
+                .and_then(|m| m.primary_head())
         })
-        .or_else(|| defaults.model.as_ref().and_then(|m| m.flash.as_deref()))
+        .or_else(|| defaults.model.as_ref().and_then(|m| m.flash_head()))
         .or_else(|| {
             defaults
                 .flash_model
                 .as_ref()
-                .and_then(|m| m.primary.as_deref())
+                .and_then(|m| m.primary_head())
         })
         .map(str::to_owned);
     if explicit.is_some() {
@@ -876,8 +876,8 @@ pub fn resolve_flash_model_for(
     let primary = per_agent
         .model
         .as_ref()
-        .and_then(|m| m.primary.as_deref())
-        .or_else(|| defaults.model.as_ref().and_then(|m| m.primary.as_deref()));
+        .and_then(|m| m.primary_head())
+        .or_else(|| defaults.model.as_ref().and_then(|m| m.primary_head()));
     if let Some(p) = primary {
         if p.starts_with("rsclaw/") {
             return Some(crate::provider::rsclaw::RSCLAW_DEFAULT_FLASH.to_owned());
@@ -922,7 +922,7 @@ pub fn resolve_vision_model_for(
     if let Some(name) = per_agent
         .model
         .as_ref()
-        .and_then(|m| m.vision.as_deref())
+        .and_then(|m| m.vision_head())
         .map(str::to_owned)
     {
         return VisionResolution::Configured(name);
@@ -930,7 +930,7 @@ pub fn resolve_vision_model_for(
     if let Some(name) = defaults
         .model
         .as_ref()
-        .and_then(|m| m.vision.as_deref())
+        .and_then(|m| m.vision_head())
         .map(str::to_owned)
     {
         return VisionResolution::Configured(name);
@@ -949,8 +949,8 @@ pub fn resolve_vision_model_for(
     let primary = per_agent
         .model
         .as_ref()
-        .and_then(|m| m.primary.as_deref())
-        .or_else(|| defaults.model.as_ref().and_then(|m| m.primary.as_deref()));
+        .and_then(|m| m.primary_head())
+        .or_else(|| defaults.model.as_ref().and_then(|m| m.primary_head()));
     if let Some(p) = primary {
         if p.starts_with("rsclaw/") {
             return VisionResolution::Configured(
@@ -962,7 +962,7 @@ pub fn resolve_vision_model_for(
     if let Some(name) = per_agent
         .model
         .as_ref()
-        .and_then(|m| m.primary.as_deref())
+        .and_then(|m| m.primary_head())
         .map(str::to_owned)
     {
         return VisionResolution::FallbackToPrimary(name);
@@ -970,7 +970,7 @@ pub fn resolve_vision_model_for(
     if let Some(name) = defaults
         .model
         .as_ref()
-        .and_then(|m| m.primary.as_deref())
+        .and_then(|m| m.primary_head())
         .map(str::to_owned)
     {
         return VisionResolution::FallbackToPrimary(name);
@@ -1420,6 +1420,7 @@ impl AgentRuntime {
 
         let model = self.resolve_model_name();
         let req = LlmRequest {
+            fallback_models: Vec::new(),
             model,
             messages,
             tools: vec![], // NO tools -- read-only side query
@@ -1545,6 +1546,7 @@ impl AgentRuntime {
         // endpoint field and just see a normal chat completion.
         let model = self.resolve_flash_model_name();
         let req = LlmRequest {
+            fallback_models: Vec::new(),
             model,
             messages: vec![Message {
                 role: Role::User,
@@ -1752,7 +1754,14 @@ impl AgentRuntime {
                 .compaction
                 .as_ref()
                 .and_then(|c| c.model.clone())
-                .or_else(|| self.handle.config.model.as_ref()?.primary.clone())
+                .or_else(|| {
+                    self.handle
+                        .config
+                        .model
+                        .as_ref()?
+                        .primary_head()
+                        .map(String::from)
+                })
                 .unwrap_or_else(|| "default".to_owned());
             self.save_session_summaries_to_memory(&compaction_model)
                 .await;
@@ -3070,17 +3079,45 @@ impl AgentRuntime {
             agent_cfg
                 .model
                 .as_ref()
-                .and_then(|m| m.primary.as_deref())
+                .and_then(|m| m.primary_head())
                 .or_else(|| {
                     self.config
                         .agents
                         .defaults
                         .model
                         .as_ref()
-                        .and_then(|m| m.primary.as_deref())
+                        .and_then(|m| m.primary_head())
                 })
                 .unwrap_or("rsclaw/rsclaw-agent-v1")
                 .to_owned()
+        };
+        // Resolve the rest of the primary chain (everything after the head)
+        // for failover. Empty when primary is a single string or when this
+        // is an internal flash call — both cases preserve the legacy
+        // single-model + global-fallback behaviour. The chain falls back
+        // through the standard layered config: per-agent > defaults.
+        let primary_chain_tail: Vec<String> = if is_internal {
+            Vec::new()
+        } else {
+            let chain = agent_cfg
+                .model
+                .as_ref()
+                .map(|m| m.primary_chain())
+                .filter(|c| !c.is_empty())
+                .unwrap_or_else(|| {
+                    self.config
+                        .agents
+                        .defaults
+                        .model
+                        .as_ref()
+                        .map(|m| m.primary_chain())
+                        .unwrap_or_default()
+                });
+            chain
+                .into_iter()
+                .skip(1)
+                .map(String::from)
+                .collect()
         };
         let (model_provider, _) = self.providers.resolve_model(&model);
 
@@ -3542,6 +3579,7 @@ impl AgentRuntime {
             self.agent_loop(
                 &mut ctx,
                 &model,
+                primary_chain_tail.clone(),
                 &system_prompt,
                 tools,
                 extra_tools,
@@ -4081,10 +4119,15 @@ impl AgentRuntime {
     // Core agent loop
     // -----------------------------------------------------------------------
 
+    /// `primary_chain_tail` is the rest of the primary chain after `model`
+    /// (the head). Empty for single-model configs — preserves legacy
+    /// single-model + global-fallback behaviour. The FailoverManager
+    /// reads `LlmRequest.fallback_models` populated from this list.
     async fn agent_loop(
         &mut self,
         ctx: &mut RunContext,
         model: &str,
+        primary_chain_tail: Vec<String>,
         system_prompt: &str,
         tools: Vec<ToolDef>,
         extra_tools: Vec<ToolDef>,
@@ -4858,6 +4901,7 @@ impl AgentRuntime {
             };
 
             let req = LlmRequest {
+                fallback_models: primary_chain_tail.clone(),
                 model: model.to_owned(),
                 messages,
                 tools: tools.clone(),

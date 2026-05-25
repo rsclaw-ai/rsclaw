@@ -194,13 +194,13 @@ pub async fn cmd_status(args: StatusArgs) -> Result<()> {
                     let model = first
                         .model
                         .as_ref()
-                        .and_then(|m| m.primary.as_deref())
+                        .and_then(|m| m.primary_head())
                         .or_else(|| {
                             cfg.agents
                                 .defaults
                                 .model
                                 .as_ref()
-                                .and_then(|m| m.primary.as_deref())
+                                .and_then(|m| m.primary_head())
                         })
                         .unwrap_or("--");
                     if agent_count == 1 {
@@ -218,7 +218,7 @@ pub async fn cmd_status(args: StatusArgs) -> Result<()> {
                         .defaults
                         .model
                         .as_ref()
-                        .and_then(|m| m.primary.as_deref())
+                        .and_then(|m| m.primary_head())
                         .unwrap_or("--");
                     kv("Agent:", &format!("main (default, model: {})", model));
                 }
@@ -282,7 +282,7 @@ impl TuiState {
                         let model = a
                             .model
                             .as_ref()
-                            .and_then(|m| m.primary.as_deref())
+                            .and_then(|m| m.primary_head())
                             .unwrap_or("--")
                             .to_string();
                         (a.id.clone(), model, "--".to_string())

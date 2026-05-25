@@ -1,7 +1,18 @@
 //! Provider failover manager.
 //!
-//! Implements the full retry/failover flow documented in AGENTS.md §12:
-//!   auth.order[provider] → profile cooldown → cross-provider fallback
+//! Two layers of retry, composed:
+//!   1. **Model chain** (this file): iterate `[req.model, ...req.fallback_models,
+//!      ...self.fallbacks]` dedup'd; skip entries whose per-model health is
+//!      Cooling-not-expired or Disabled (see `provider::health`).
+//!   2. **Profile cooldown** (per chain entry): within a single model the
+//!      manager rotates through configured profile ids (different API keys
+//!      for the same provider — `auth.order[provider]`). 429/auth blips on
+//!      one key flip to the next.
+//!
+//! On any call's outcome the manager updates **both** layers:
+//!   - profile cooldown for transient 429 / auth flaps on a specific key
+//!   - per-model health for chain-level decisions (Disabled on
+//!     balance/key/model-missing; Cooling on transient/rate-limit)
 
 use std::{
     collections::HashMap,
@@ -11,7 +22,11 @@ use std::{
 use anyhow::{Result, anyhow};
 use tracing::{info, warn};
 
-use super::{LlmRequest, LlmStream, RetryConfig, backoff_delay, registry::ProviderRegistry};
+use super::{
+    LlmRequest, LlmStream, RetryConfig, backoff_delay,
+    health::{ChainHealth, ErrorKind, ModelStatus, classify_error},
+    registry::ProviderRegistry,
+};
 
 /// Minimum back-off for a rate-limited profile.
 const MIN_COOLDOWN: Duration = Duration::from_secs(5);
@@ -28,10 +43,17 @@ pub struct FailoverManager {
     /// profile_id → api_key
     #[allow(dead_code)]
     api_keys: HashMap<String, String>,
-    /// fallback model list (provider/model strings)
+    /// Global emergency fallback model list (last resort after per-call
+    /// `req.fallback_models`). Kept separate so callers without a chain
+    /// still benefit from the gateway-wide safety net.
     fallbacks: Vec<String>,
     /// retry / back-off configuration (agents.md §22)
     retry: RetryConfig,
+    /// Per-model health table — lazily populated on first call to each
+    /// model id. Entries persist for the lifetime of the manager
+    /// (per-AgentRuntime). State (Healthy/Cooling/Disabled) governs
+    /// whether the chain skips this entry.
+    model_health: ChainHealth,
 }
 
 impl FailoverManager {
@@ -47,21 +69,91 @@ impl FailoverManager {
             cooldowns: HashMap::new(),
             failure_counts: HashMap::new(),
             retry: RetryConfig::default(),
+            model_health: ChainHealth::default(),
         }
     }
 
-    /// Execute an LLM request with full provider/profile failover.
+    /// Snapshot of per-model health — used by `/api/v1/models/health`
+    /// endpoint and `rsclaw models health` CLI.
+    pub fn health_snapshot(&self) -> Vec<(String, ModelStatus, Option<String>, u32)> {
+        self.model_health.snapshot()
+    }
+
+    /// Manually reset a model's health back to Healthy. Used by the
+    /// `/api/v1/models/health/reset` endpoint after the operator has
+    /// fixed the underlying problem (recharged balance, rotated key).
+    pub fn reset_model_health(&mut self, model: &str) -> bool {
+        if let Some(h) = self.model_health.get_mut(model) {
+            h.reset();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Ensure each model in `chain` has a `ModelHealth` entry. Lazy init —
+    /// keeps the table size bounded to "models we've actually seen".
+    fn ensure_health_entries(&mut self, chain: &[String]) {
+        for model in chain {
+            if self.model_health.get_mut(model).is_none() {
+                self.model_health
+                    .entries
+                    .push(super::health::ModelHealth::new(model.clone()));
+            }
+        }
+    }
+
+    /// Build the full ordered chain from `req.model + req.fallback_models +
+    /// self.fallbacks`, deduplicated. Empties dropped.
+    fn build_chain(&self, req: &LlmRequest) -> Vec<String> {
+        let mut out: Vec<String> =
+            Vec::with_capacity(1 + req.fallback_models.len() + self.fallbacks.len());
+        let mut seen = std::collections::HashSet::new();
+        let mut push = |s: &str, out: &mut Vec<String>| {
+            let t = s.trim();
+            if !t.is_empty() && seen.insert(t.to_owned()) {
+                out.push(t.to_owned());
+            }
+        };
+        push(&req.model, &mut out);
+        for m in &req.fallback_models {
+            push(m, &mut out);
+        }
+        for m in &self.fallbacks {
+            push(m, &mut out);
+        }
+        out
+    }
+
+    /// Execute an LLM request with model-chain + per-profile failover.
     pub async fn call(
         &mut self,
         mut req: LlmRequest,
         registry: &ProviderRegistry,
     ) -> Result<LlmStream> {
-        let primary = req.model.clone();
-        let models: Vec<String> = std::iter::once(primary)
-            .chain(self.fallbacks.clone())
-            .collect();
+        let chain = self.build_chain(&req);
+        if chain.is_empty() {
+            return Err(anyhow!("LLM request has no model resolved"));
+        }
+        self.ensure_health_entries(&chain);
 
-        for model_str in &models {
+        let mut last_error: Option<anyhow::Error> = None;
+
+        for model_str in &chain {
+            // ── Chain-level health gate ───────────────────────────────────
+            // Skip entries the health table has marked Disabled or whose
+            // Cooling window hasn't expired. The single-model back-compat
+            // path (chain.len() == 1) always passes this when health is
+            // pristine — preserving "not worse than before" behaviour.
+            let callable = self
+                .model_health
+                .get_mut(model_str)
+                .map(|h| h.is_callable())
+                .unwrap_or(true);
+            if !callable {
+                continue;
+            }
+
             let (provider_name, model_id) = registry.resolve_model(model_str);
             req.model = model_id.to_owned();
 
@@ -71,95 +163,163 @@ impl FailoverManager {
                 .cloned()
                 .unwrap_or_else(|| vec!["default".to_owned()]);
 
-            for profile_id in &profiles {
-                if self.is_cooling_down(profile_id) {
-                    warn!(profile = profile_id, "profile is cooling down, skipping");
+            let outcome = self
+                .try_model_with_profiles(provider_name, model_id, &profiles, &mut req, registry)
+                .await;
+
+            match outcome {
+                ChainStep::Success(stream) => {
+                    if let Some(h) = self.model_health.get_mut(model_str) {
+                        h.record_success();
+                    }
+                    return Ok(stream);
+                }
+                ChainStep::PropagateError(e) => return Err(e),
+                ChainStep::TryNextModel(e) => {
+                    let kind = classify_error(&e);
+                    let body = format!("{e:#}");
+                    let truncated = crate::util::truncate_str(&body, 200).to_owned();
+                    if let Some(h) = self.model_health.get_mut(model_str) {
+                        h.record_failure(kind.clone(), truncated, Instant::now());
+                        info!(
+                            model = %model_str,
+                            kind = ?kind,
+                            status = ?h.status,
+                            "model marked unavailable, advancing chain"
+                        );
+                    }
+                    last_error = Some(e);
                     continue;
                 }
+                ChainStep::AllProfilesCooling => {
+                    continue;
+                }
+            }
+        }
 
-                let provider = match registry.get(provider_name) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        warn!(provider = provider_name, "provider not found: {e}");
-                        break;
+        Err(match last_error {
+            Some(e) => anyhow!(
+                "LLM chain exhausted ({} models tried). Last error: {e:#}",
+                chain.len()
+            ),
+            None => anyhow!(
+                "LLM chain exhausted ({} models, all cooling). Wait for cooldown, reset health, or check provider status.",
+                chain.len()
+            ),
+        })
+    }
+
+    /// Inner profile loop for a single chain entry. Returns a `ChainStep`
+    /// telling the outer loop whether to propagate, advance, or stop.
+    async fn try_model_with_profiles(
+        &mut self,
+        provider_name: &str,
+        model_id: &str,
+        profiles: &[String],
+        req: &mut LlmRequest,
+        registry: &ProviderRegistry,
+    ) -> ChainStep {
+        let mut any_profile_called = false;
+        let mut last_err: Option<anyhow::Error> = None;
+
+        for profile_id in profiles {
+            if self.is_cooling_down(profile_id) {
+                warn!(profile = profile_id, "profile is cooling down, skipping");
+                continue;
+            }
+
+            let provider = match registry.get(provider_name) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(provider = provider_name, "provider not found: {e}");
+                    return ChainStep::TryNextModel(anyhow!(
+                        "provider '{provider_name}' not found: {e}"
+                    ));
+                }
+            };
+            let provider_api = provider.name();
+
+            any_profile_called = true;
+            let mut dropped_max_tokens = false;
+            loop {
+                match provider.stream(req.clone()).await {
+                    Ok(stream) => {
+                        self.failure_counts.remove(profile_id);
+                        info!(
+                            provider = provider_name,
+                            api = provider_api,
+                            model = model_id,
+                            profile = profile_id,
+                            "LLM call succeeded"
+                        );
+                        return ChainStep::Success(stream);
                     }
-                };
-
-                // One profile attempt, with a single in-place retry if the
-                // request is rejected for exceeding the model/tier output-token
-                // ceiling. We drop `max_tokens` and let the server fall back to
-                // its own model maximum — this is provider-agnostic (no need to
-                // parse each backend's ceiling wording) and resolves in one shot
-                // (vs. halving, which may take several rounds to get under the
-                // limit).
-                let mut dropped_max_tokens = false;
-                loop {
-                    match provider.stream(req.clone()).await {
-                        Ok(stream) => {
-                            self.failure_counts.remove(profile_id);
-                            info!(
-                                provider = provider_name,
-                                model = model_id,
-                                profile = profile_id,
-                                "LLM call succeeded"
-                            );
-                            return Ok(stream);
-                        }
-                        // Output-token-limit rejection: not a rate limit and not
-                        // an auth problem — cooling down or failing over won't
-                        // help because every backend will reject the same
-                        // oversized `max_tokens`. Try once more without it.
-                        Err(e) if is_max_tokens_error(&e) => {
-                            if req.max_tokens.is_some() && !dropped_max_tokens {
-                                warn!(
-                                    provider = provider_name,
-                                    profile = profile_id,
-                                    error = %e,
-                                    "max_tokens exceeds model/tier ceiling — dropping max_tokens and retrying once"
-                                );
-                                req.max_tokens = None;
-                                dropped_max_tokens = true;
-                                continue;
-                            }
-                            // Already retried without max_tokens (or there was
-                            // none to drop) and it still failed — surface a
-                            // clear, actionable error instead of a misleading
-                            // "rate limited" message. Do NOT cool down.
-                            return Err(anyhow!(
-                                "LLM request rejected: output token limit exceeded. \
-                                 The configured max_tokens is above this model/tier's ceiling \
-                                 and retrying without it still failed. Lower max_tokens in your \
-                                 config (model.max_tokens / agents.defaults). Underlying error: {e}"
-                            ));
-                        }
-                        Err(e) if is_rate_limit(&e) || is_auth_error(&e) => {
-                            let attempt = self.hit_count(profile_id);
-                            let delay = backoff_delay(attempt, &self.retry)
-                                .max(MIN_COOLDOWN)
-                                .min(MAX_COOLDOWN);
+                    Err(e) if is_max_tokens_error(&e) => {
+                        if req.max_tokens.is_some() && !dropped_max_tokens {
                             warn!(
                                 provider = provider_name,
+                                api = provider_api,
                                 profile = profile_id,
                                 error = %e,
-                                ?delay,
-                                attempt,
-                                "rate limit / auth error — cooling down profile"
+                                "max_tokens exceeds model/tier ceiling — dropping max_tokens and retrying once"
                             );
-                            self.set_cooldown(profile_id, delay);
-                            break; // continue to next profile
+                            req.max_tokens = None;
+                            dropped_max_tokens = true;
+                            continue;
                         }
-                        Err(e) => {
-                            // Non-retryable error — propagate immediately.
-                            return Err(e);
+                        return ChainStep::PropagateError(anyhow!(
+                            "LLM request rejected: output token limit exceeded. \
+                             The configured max_tokens is above this model/tier's ceiling \
+                             and retrying without it still failed. Lower max_tokens in your \
+                             config (model.max_tokens / agents.defaults). Underlying error: {e}"
+                        ));
+                    }
+                    Err(e) if is_rate_limit(&e) || is_auth_error(&e) => {
+                        let attempt = self.hit_count(profile_id);
+                        let delay = backoff_delay(attempt, &self.retry)
+                            .max(MIN_COOLDOWN)
+                            .min(MAX_COOLDOWN);
+                        warn!(
+                            provider = provider_name,
+                            api = provider_api,
+                            profile = profile_id,
+                            error = %e,
+                            ?delay,
+                            attempt,
+                            "rate limit / auth error — cooling down profile"
+                        );
+                        self.set_cooldown(profile_id, delay);
+                        last_err = Some(e);
+                        break; // try next profile
+                    }
+                    Err(e) => {
+                        // Classify to decide: bubble or advance chain.
+                        let kind = classify_error(&e);
+                        match kind {
+                            ErrorKind::Balance
+                            | ErrorKind::ModelMissing
+                            | ErrorKind::Auth
+                            | ErrorKind::RateLimit
+                            | ErrorKind::Transient
+                            | ErrorKind::Unknown => {
+                                return ChainStep::TryNextModel(e);
+                            }
+                            ErrorKind::BadRequest => {
+                                return ChainStep::PropagateError(e);
+                            }
                         }
                     }
                 }
             }
         }
 
-        Err(anyhow!(
-            "LLM service unavailable — provider rate limited or API key invalid. Please check your provider configuration or try again later."
-        ))
+        if !any_profile_called {
+            return ChainStep::AllProfilesCooling;
+        }
+        match last_err {
+            Some(e) => ChainStep::TryNextModel(e),
+            None => ChainStep::AllProfilesCooling,
+        }
     }
 
     fn is_cooling_down(&self, profile_id: &str) -> bool {
@@ -177,23 +337,22 @@ impl FailoverManager {
             .or_insert(0) += 1;
     }
 
-    /// Returns the current consecutive failure count for a profile (0 = no
-    /// recent failures).
     fn hit_count(&self, profile_id: &str) -> u32 {
         self.failure_counts.get(profile_id).copied().unwrap_or(0)
     }
 }
 
+/// Outcome of the inner per-profile loop, telling the outer chain loop
+/// what to do next.
+enum ChainStep {
+    Success(LlmStream),
+    PropagateError(anyhow::Error),
+    TryNextModel(anyhow::Error),
+    AllProfilesCooling,
+}
+
 /// Detects rejection caused by the request's output-token budget exceeding the
-/// model's context window or the account tier's hard ceiling — distinct from a
-/// transient rate limit. Matches the common wording across backends:
-///   - rsclaw:    `max_tokens=N exceeds tier "..." ceiling (M)`
-///   - OpenAI:    `maximum context length is N tokens` /
-///     `context_length_exceeded`
-///   - Anthropic: `max_tokens: N > M, which is the maximum ...`
-///
-/// The remedy is to drop `max_tokens` and retry; cooling down or failing over
-/// does not help because every backend rejects the same oversized value.
+/// model's context window or the account tier's hard ceiling.
 fn is_max_tokens_error(e: &anyhow::Error) -> bool {
     let msg = e.to_string().to_lowercase();
     msg.contains("max_tokens")

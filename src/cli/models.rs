@@ -14,8 +14,6 @@ pub enum ModelsCommand {
     Aliases(AliasesCommand),
     #[command(subcommand)]
     Fallbacks(FallbacksCommand),
-    #[command(subcommand, name = "image-fallbacks")]
-    ImageFallbacks(ImageFallbacksCommand),
     /// Scan local Ollama/LMStudio models.
     Scan,
     #[command(subcommand)]
@@ -39,14 +37,6 @@ pub enum AliasesCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum FallbacksCommand {
-    List,
-    Add { model: String },
-    Remove { model: String },
-    Clear,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum ImageFallbacksCommand {
     List,
     Add { model: String },
     Remove { model: String },

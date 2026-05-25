@@ -247,6 +247,7 @@ impl VlmDriver<'_> {
             }];
 
             let req = LlmRequest {
+            fallback_models: Vec::new(),
                 model: self.model_name.clone(),
                 messages,
                 tools: Vec::new(),
@@ -739,6 +740,7 @@ async fn verify_finished_claim(
     };
 
     let req = LlmRequest {
+            fallback_models: Vec::new(),
         model: model_name.to_owned(),
         messages: vec![Message {
             role: Role::User,

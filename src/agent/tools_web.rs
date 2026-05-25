@@ -1331,6 +1331,7 @@ impl AgentRuntime {
         }];
 
         let req = crate::provider::LlmRequest {
+            fallback_models: Vec::new(),
             model: model_id.to_owned(),
             messages,
             tools: vec![],

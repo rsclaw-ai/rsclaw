@@ -746,7 +746,7 @@ $g.Dispose();$b.Dispose()"#
             .config
             .model
             .as_ref()
-            .and_then(|m| m.primary.as_deref())
+            .and_then(|m| m.primary_head())
             .unwrap_or("default");
         let mut lines = vec![format!("Current model: {model}")];
         lines.push(String::new());
@@ -1226,7 +1226,7 @@ pub(crate) async fn btw_direct_call(
         .defaults
         .model
         .as_ref()
-        .and_then(|m| m.primary.as_deref())
+        .and_then(|m| m.primary_head())
         .unwrap_or("rsclaw/rsclaw-agent-v1");
 
     let system = format!(
@@ -1236,6 +1236,7 @@ pub(crate) async fn btw_direct_call(
     );
 
     let req = LlmRequest {
+            fallback_models: Vec::new(),
         model: model.to_owned(),
         messages: vec![Message {
             role: Role::User,

@@ -80,7 +80,7 @@ pub async fn models_list(ctx: MethodCtx) -> MethodResult {
         .defaults
         .model
         .as_ref()
-        .and_then(|m| m.primary.as_deref());
+        .and_then(|m| m.primary_head());
 
     let mut seen = std::collections::HashSet::new();
     let mut models = Vec::new();
@@ -90,7 +90,7 @@ pub async fn models_list(ctx: MethodCtx) -> MethodResult {
             .config
             .model
             .as_ref()
-            .and_then(|m| m.primary.as_deref())
+            .and_then(|m| m.primary_head())
             .or(default_model)
             .unwrap_or("unknown");
         if seen.insert(model_id.to_owned()) {
