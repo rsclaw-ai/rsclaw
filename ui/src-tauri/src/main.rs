@@ -908,29 +908,39 @@ async fn rsclaw_console_install_key(
     app.emit("rsclaw:console-install-key", data)
         .map_err(|e| format!("emit install-key event: {e}"))?;
 
-    // Close the console webview right here on the Rust side. Previously
-    // we left this to a frontend `closeRsclawConsole()` call in the
-    // main window's install listener, but that path was flaky in
-    // practice — the close apparently never fired even when the
-    // install event reached the card. Closing from the same Tauri
-    // command the webview calls in to is the simplest reliable
-    // sequencing: emit-then-close, synchronous, no JS round-trip.
-    if let Some(console) = app.get_webview_window("rsclaw-console") {
-        let _ = console.close();
-    }
+    // Defer window-close + main-window focus to a background task. The
+    // webview-side caller (`window.__RSCLAW_DESKTOP__.installKey(...)`)
+    // is awaiting this command's reply — calling `console.close()` here
+    // synchronously means we're closing the window that's still in the
+    // middle of waiting on us. On macOS Tauri 2 that triple-step (close
+    // child → unminimize/show/set_focus parent in the same tick) has
+    // shown up in crash reports as a renderer SIGABRT. Spawning lets
+    // this command return Ok first; the close runs on the next tick
+    // after the webview has already taken our reply.
+    let app_clone = app.clone();
+    std::thread::spawn(move || {
+        // Tiny pause so the current command finishes returning to JS
+        // before we start tearing down its window.
+        std::thread::sleep(std::time::Duration::from_millis(50));
 
-    // Surface the main window — the user just installed a key inside
-    // the console webview, but the main RsClaw window (where the
-    // onboarding card lives) might be backgrounded behind other apps.
-    // Pop it to the front so the "Connected" state is actually seen.
-    // All operations are best-effort: failures here shouldn't block
-    // the install path (the key is already written to config by the
-    // listener that fires off the emit above).
-    if let Some(main) = app.get_webview_window("main") {
-        let _ = main.unminimize();
-        let _ = main.show();
-        let _ = main.set_focus();
-    }
+        if let Some(console) = app_clone.get_webview_window("rsclaw-console") {
+            if let Err(e) = console.close() {
+                eprintln!("[console] close failed: {e}");
+            }
+        }
+
+        // Surface the main window — the user just installed a key
+        // inside the console webview, but the main RsClaw window might
+        // be backgrounded behind other apps. Pop it to the front so
+        // the "Connected" state is actually seen. Best-effort; failures
+        // shouldn't block the install path.
+        if let Some(main) = app_clone.get_webview_window("main") {
+            let _ = main.unminimize();
+            let _ = main.show();
+            let _ = main.set_focus();
+        }
+    });
+
     Ok(())
 }
 
