@@ -264,6 +264,11 @@ export type RsclawAccountState = {
   name?: string;
   /** Plan label (e.g. "free", "pro"). */
   tier?: string;
+  /** True when `agents.defaults.model.primary` currently points at an
+   *  `rsclaw/...` model. False after the user manually picked another
+   *  provider's model — the card shows a "set as default" affordance to
+   *  flip primary back without losing the saved key. */
+  isPrimary?: boolean;
 };
 
 /** Read the current account state from `rsclaw.json5`. */
@@ -281,13 +286,54 @@ export async function readAccountState(): Promise<RsclawAccountState> {
     if (!rsclaw || typeof rsclaw.apiKey !== "string" || !rsclaw.apiKey.trim()) {
       return { connected: false };
     }
+    const primary = parsed?.agents?.defaults?.model?.primary;
+    const isPrimary =
+      typeof primary === "string" && primary.startsWith("rsclaw/");
     return {
       connected: true,
       name: typeof rsclaw._name === "string" ? rsclaw._name : undefined,
       tier: typeof rsclaw._tier === "string" ? rsclaw._tier : undefined,
+      isPrimary,
     };
   } catch {
     return { connected: false };
+  }
+}
+
+/**
+ * Flip `agents.defaults.model.primary` back to `rsclaw/rsclaw-agent-v1`
+ * without disturbing anything else in the config. Used when the user has
+ * already connected an rsclaw key but then switched primary to another
+ * provider — the rsclaw card surfaces a "set as default" action that
+ * calls this rather than going through the full applyInstalledKey path
+ * (which would also re-write apiKey / metadata).
+ */
+export async function setRsclawAsPrimary(): Promise<{
+  ok: boolean;
+  error?: string;
+}> {
+  try {
+    let raw = "";
+    if (isTauri) {
+      raw = (await invoke("read_config_file")) as string;
+    } else {
+      const cfg = await getConfig();
+      raw = cfg.raw || "";
+    }
+    const parsed = JSON5.parse(raw || "{}");
+    if (!parsed.agents) parsed.agents = {};
+    if (!parsed.agents.defaults) parsed.agents.defaults = {};
+    if (!parsed.agents.defaults.model) parsed.agents.defaults.model = {};
+    parsed.agents.defaults.model.primary = "rsclaw/rsclaw-agent-v1";
+    const next = JSON.stringify(parsed, null, 2);
+    if (isTauri) {
+      await invoke("write_config", { content: next });
+    } else {
+      await saveConfig({ raw: next });
+    }
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
 }
 

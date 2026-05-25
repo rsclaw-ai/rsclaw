@@ -10,6 +10,7 @@ import { Json5Editor } from "./json5-editor";
 import { RsclawProviderCard } from "./rsclaw-provider-card";
 import { Popover } from "./ui-lib";
 import { toast } from "../lib/toast";
+import { setGatewayRestarting } from "../lib/gateway-restart-signal";
 import { EmojiAvatar, AvatarPicker } from "./emoji";
 import { IconButton } from "./button";
 import ReturnIcon from "../icons/return.svg";
@@ -131,6 +132,11 @@ function StatusPage() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [logPaused, setLogPaused] = useState(false);
   const [sessions, setSessions] = useState(0);
+  // Sticky restart flag — while true, the status banner shows "Restarting"
+  // instead of flashing offline → running. Cleared when the gateway answers
+  // a successful health check, or when the restart timeout fires.
+  const [restarting, setRestarting] = useState(false);
+  const restartingRef = useRef(false);
   const logBoxRef = useRef<HTMLDivElement>(null);
 
   const fetchData = useCallback(async () => {
@@ -142,7 +148,12 @@ function StatusPage() {
       await getHealth();
       setHealth((h) => ({ ...h, running: true }));
     } catch {
-      setHealth({ running: false });
+      // Swallow the "running: false" flip while a restart is in flight.
+      // The bounce will resolve when the new gateway answers; until then
+      // the banner keeps reading "Restarting" instead of strobing offline.
+      if (!restartingRef.current) {
+        setHealth({ running: false });
+      }
     }
 
     try {
@@ -209,10 +220,52 @@ function StatusPage() {
           tauriInvoke("set_gateway_user_stopped", { stopped: true }).catch(() => {});
           await tauriInvoke("stop_gateway");
         } else if (action === "restart") {
+          // Hold the banner on "Restarting" through the whole stop+start
+          // window so the LED doesn't strobe offline → running. The flag
+          // is mirrored on a ref because fetchData (the polling effect)
+          // captures restarting via closure and we need an up-to-date
+          // read inside its catch branch. The shared signal additionally
+          // suppresses the sidebar chip's independent 5s poll, which
+          // would otherwise flip to offline during the stop+start gap.
+          restartingRef.current = true;
+          setRestarting(true);
+          setGatewayRestarting(true);
           tauriInvoke("set_gateway_user_stopped", { stopped: false }).catch(() => {});
           await tauriInvoke("stop_gateway");
           await new Promise((r) => setTimeout(r, 1500));
           await tauriInvoke("start_gateway");
+          // Poll health until the new gateway answers. 30s is plenty for
+          // a normal start (~2-4s); anything longer = something is wrong
+          // and the user needs to know rather than seeing a stuck banner.
+          const RESTART_TIMEOUT_MS = 30_000;
+          const startedAt = Date.now();
+          let healthy = false;
+          while (Date.now() - startedAt < RESTART_TIMEOUT_MS) {
+            await new Promise((r) => setTimeout(r, 1000));
+            try {
+              await getHealth();
+              healthy = true;
+              break;
+            } catch {
+              /* keep waiting */
+            }
+          }
+          restartingRef.current = false;
+          setRestarting(false);
+          setGatewayRestarting(false);
+          if (!healthy) {
+            toast.fromError(
+              getLang() === "cn" ? "重启失败" : "Restart failed",
+              getLang() === "cn"
+                ? "30 秒内网关未恢复响应，检查日志"
+                : "Gateway did not come back within 30s — check the logs",
+            );
+            setHealth({ running: false });
+            return; // skip the generic success toast below
+          }
+          fetchData();
+          toast.success(Locale.RsClawPanel.Status.RestartTitle);
+          return;
         } else if (action === "start") {
           const { setUserStopped } = await import("./sidebar");
           setUserStopped(false);
@@ -229,6 +282,8 @@ function StatusPage() {
         : Locale.RsClawPanel.Status.StartTitle;
       toast.success(msg);
     } catch (e) {
+      restartingRef.current = false;
+      setRestarting(false);
       toast.fromError("", e);
     } finally {
       setActionLoading(false);
@@ -253,29 +308,35 @@ function StatusPage() {
 
   return (
     <div>
-      {/* Status Banner */}
+      {/* Status Banner.
+          Banner shows three states, NOT two: restarting → running → offline.
+          We deliberately treat restarting as "on" for the LED so it doesn't
+          strobe to red during the stop+start gap (a 1.5–4s gap that
+          previously flashed offline before recovering). */}
       <div className={styles["status-banner"]}>
         <div
-          className={`${styles["status-led"]} ${health.running ? styles["on"] : styles["off"]}`}
+          className={`${styles["status-led"]} ${health.running || restarting ? styles["on"] : styles["off"]}`}
         />
         <div className={styles["status-info"]}>
           <div className={styles["status-name"]}>{Locale.RsClawPanel.Status.GatewayName}</div>
           <div className={styles["status-addr"]}>
-            {health.running
-              ? `rsclaw gateway ${health.version || "?"} · localhost:${health.port || 18888} · ${Locale.RsClawPanel.Status.Uptime} ${health.uptime || "N/A"}`
-              : Locale.RsClawPanel.Status.NotResponding}
+            {restarting
+              ? `${Locale.RsClawPanel.Status.Restarting}…`
+              : health.running
+                ? `rsclaw gateway ${health.version || "?"} · localhost:${health.port || 18888} · ${Locale.RsClawPanel.Status.Uptime} ${health.uptime || "N/A"}`
+                : Locale.RsClawPanel.Status.NotResponding}
           </div>
         </div>
         <>
-          {!health.running && (
+          {!health.running && !restarting && (
             <button className={styles["btn"]} onClick={() => setModalAction("start")}>
               {Locale.RsClawPanel.Status.Start}
             </button>
           )}
-          <button className={styles["btn"]} onClick={() => setModalAction("restart")}>
+          <button className={styles["btn"]} disabled={restarting} onClick={() => setModalAction("restart")}>
             {Locale.RsClawPanel.Status.Restart}
           </button>
-          <button className={`${styles["btn"]} ${styles["danger"]}`} onClick={() => setModalAction("stop")}>
+          <button className={`${styles["btn"]} ${styles["danger"]}`} disabled={restarting} onClick={() => setModalAction("stop")}>
             {Locale.RsClawPanel.Status.Stop}
           </button>
         </>
@@ -2551,6 +2612,26 @@ function TauriConfigPageInner() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [config?.models?.providers ? JSON.stringify(Object.keys(config.models.providers)) : ""]);
 
+  // ── Auto-fill missing api field for doubao on load ──
+  // Gateway hardcoded default for `doubao` is OpenAiResponses
+  // (gateway/providers.rs:118). When the config file was written by an
+  // older onboarding flow that didn't persist the api field, the UI
+  // picker would fall back to "openai" while the gateway actually ran
+  // "openai-responses" — invisible drift, user sees a 404 on /responses.
+  // Persist the default so config = UI = gateway behavior.
+  useEffect(() => {
+    if (loading) return;
+    const doubao = config?.models?.providers?.doubao;
+    if (!doubao || typeof doubao !== "object") return;
+    if (doubao.api || doubao.api_type) return;
+    const newConfig = JSON.parse(JSON.stringify(config));
+    newConfig.models.providers.doubao.api = "openai-responses";
+    setConfig(newConfig);
+    setRaw(JSON.stringify(newConfig, null, 2));
+    setDirty(true);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loading, config?.models?.providers?.doubao ? "y" : "n"]);
+
   // ── Helpers ──
   const updateConfig = (dotPath: string, value: any) => {
     const parts = dotPath.split(".");
@@ -2808,8 +2889,19 @@ function TauriConfigPageInner() {
           setProvTest((prev) => ({ ...prev, [provId]: "ok" }));
           setProvModels((prev) => ({ ...prev, [provId]: [...presets, ...apiEntries] }));
           toast.success(zh ? `${provId} \u8FDE\u63A5\u6210\u529F (${apiModels.length} \u4E2A\u6A21\u578B)` : `${provId} connected (${apiModels.length} models)`);
+        } else if ((MODELS[provId] || []).length > 0) {
+          // Upstream is reachable (ok=true) but returned no listing \u2014 happens
+          // when the backend has no `/models` route (Volcengine ARK CodingPlan
+          // at `/api/coding/v3`, the Tauri/HTTP probe-fallback path returns
+          // ok+empty). Fall back to the local MODELS preset so the user can
+          // still pick a model. Same surface as the listed path: tag-decorated
+          // entries from the preset table.
+          const presets = (MODELS[provId] || []).map((m) => ({ id: m.id, tag: zh ? m.tag : m.tagEn }));
+          setProvTest((prev) => ({ ...prev, [provId]: "ok" }));
+          setProvModels((prev) => ({ ...prev, [provId]: presets }));
+          toast.success(zh ? `${provId} \u5DF2\u8FDE\u63A5 (${presets.length} \u4E2A\u9884\u8BBE\u6A21\u578B)` : `${provId} connected (${presets.length} preset models)`);
         } else {
-          // API key works but no models returned
+          // API key works but no models returned and no presets to fall back on
           setProvTest((prev) => ({ ...prev, [provId]: "err" }));
           setProvErr((prev) => ({ ...prev, [provId]: zh ? "API Key \u6709\u6548\u4F46\u672A\u83B7\u53D6\u5230\u6A21\u578B\u5217\u8868" : "API Key valid but no models returned" }));
         }
@@ -3568,7 +3660,7 @@ function TauriConfigPageInner() {
                                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginBottom: 6 }}>API Type</div>
                                 <select
                                   style={{ width: "100%", background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 7, padding: "8px 10px", color: V.t0, fontFamily: V.mono, fontSize: 11.5, outline: "none", cursor: "pointer", marginBottom: 8 }}
-                                  value={getVal(`models.providers.${p.id}.api`, "openai")}
+                                  value={getVal(`models.providers.${p.id}.api`, "openai-responses")}
                                   onChange={(e) => {
                                     updateConfig(`models.providers.${p.id}.api`, e.target.value);
                                     setProvTest((prev) => ({ ...prev, [p.id]: "idle" }));
