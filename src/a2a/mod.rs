@@ -9,6 +9,7 @@ pub mod event;
 pub mod files;
 pub mod push;
 pub mod relay;
+pub mod relay_identity;
 pub mod server;
 pub mod store;
 pub mod streaming;

@@ -85,7 +85,12 @@ impl From<A2aRelayStrategy> for A2aRelayStrategyRuntime {
 #[derive(Debug, Clone, Default)]
 pub struct A2aRelayNodeRuntime {
     pub node_id: String,
+    /// Bearer token. Empty string means "token auth disabled" — the node
+    /// MUST authenticate via Ed25519 challenge-response (`public_key` set).
     pub token: String,
+    /// Base64 Ed25519 public key (raw 32 bytes). When set, the hub
+    /// requires a successful challenge-response signature from this node.
+    pub public_key: Option<String>,
     pub roles: Vec<String>,
     pub scopes: Vec<String>,
 }
@@ -99,6 +104,12 @@ pub struct A2aRelayRuntime {
     pub hub_urls: Vec<String>,
     pub strategy: A2aRelayStrategyRuntime,
     pub token: Option<String>,
+    /// Spoke-side Ed25519 private key (raw base64, 32 bytes). Resolved at
+    /// startup from `relay.privateKey` or read from `relay.privateKeyFile`.
+    /// When present, spoke uses keypair handshake.
+    pub private_key: Option<String>,
+    /// Hub-side revocation list — node_ids whose connections are refused.
+    pub revoked_nodes: Vec<String>,
     pub nodes: Vec<A2aRelayNodeRuntime>,
 }
 
@@ -337,9 +348,27 @@ impl IntoRuntime for Config {
                         nodes
                             .iter()
                             .filter_map(|node| {
-                                node.token.resolve_early().map(|token| A2aRelayNodeRuntime {
+                                // A node is valid if it has either a token OR
+                                // a public_key. Both is also fine (defense in
+                                // depth). Neither = drop, with a warning so
+                                // operators see the typo early.
+                                let token = node
+                                    .token
+                                    .as_ref()
+                                    .and_then(|t| t.resolve_early())
+                                    .unwrap_or_default();
+                                let public_key = node.public_key.clone();
+                                if token.is_empty() && public_key.is_none() {
+                                    tracing::warn!(
+                                        node = %node.node_id,
+                                        "a2a relay node has neither token nor publicKey; skipping"
+                                    );
+                                    return None;
+                                }
+                                Some(A2aRelayNodeRuntime {
                                     node_id: node.node_id.clone(),
                                     token,
+                                    public_key,
                                     roles: node.roles.clone().unwrap_or_default(),
                                     scopes: node.scopes.clone().unwrap_or_default(),
                                 })
@@ -347,6 +376,28 @@ impl IntoRuntime for Config {
                             .collect()
                     })
                     .unwrap_or_default();
+                // Spoke private key: prefer inline `privateKey`, else read
+                // `privateKeyFile`. File read errors are warned, not fatal —
+                // gateway still starts so the operator can fix and reload.
+                let private_key = relay
+                    .private_key
+                    .as_ref()
+                    .and_then(|k| k.resolve_early())
+                    .or_else(|| {
+                        relay.private_key_file.as_ref().and_then(|path| {
+                            match std::fs::read_to_string(path) {
+                                Ok(content) => Some(content.trim().to_owned()),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        path = %path,
+                                        error = %e,
+                                        "a2a relay privateKeyFile read failed"
+                                    );
+                                    None
+                                }
+                            }
+                        })
+                    });
                 A2aRelayRuntime {
                     mode,
                     relay_id,
@@ -359,6 +410,8 @@ impl IntoRuntime for Config {
                         .map(A2aRelayStrategyRuntime::from)
                         .unwrap_or_default(),
                     token: relay.token.as_ref().and_then(|token| token.resolve_early()),
+                    private_key,
+                    revoked_nodes: relay.revoked_nodes.clone().unwrap_or_default(),
                     nodes,
                 }
             })

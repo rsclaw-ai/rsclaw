@@ -3,10 +3,12 @@
 //! Public A2A remains JSON-RPC over HTTP/SSE. This module is the private
 //! outbound-WS transport that lets NAT/private nodes attach to a hub.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use axum::{
+    Json,
     extract::{
         Query, State,
         ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
@@ -25,15 +27,25 @@ use uuid::Uuid;
 use crate::{
     a2a::{
         auth::A2aIdentity,
+        relay_identity,
         types::{AgentCard, JsonRpcRequest, JsonRpcResponse},
     },
-    config::runtime::{A2aRelayModeRuntime, A2aRelayNodeRuntime, A2aRelayRuntime},
+    config::runtime::{
+        A2aRelayModeRuntime, A2aRelayNodeRuntime, A2aRelayRuntime, A2aRelayStrategyRuntime,
+    },
     server::{AppState, constant_time_eq},
 };
 
 const RELAY_PROTOCOL: &str = "rsclaw.a2a.relay.v1";
 const ROUTE_TTL_MS: u64 = 30_000;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Max time we wait for the spoke to complete keypair auth after WS upgrade
+/// before dropping the connection. Long enough to absorb cross-continent
+/// RTT, short enough to free slots fast under attack.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Backoff cap when failing over between relays. Same envelope as the
+/// per-relay reconnect backoff but applied across the entire list.
+const FAILOVER_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelloCapabilities {
@@ -52,6 +64,23 @@ pub enum RelayFrame {
         agent_card: Option<AgentCard>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         capabilities: Option<HelloCapabilities>,
+        /// Spoke-generated nonce for the Ed25519 handshake. Only present
+        /// when the spoke is operating in keypair mode. Hubs that don't
+        /// require keypair auth ignore this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nonce_node: Option<String>,
+    },
+    /// Hub → spoke: present the relay's nonce; spoke must reply with `Auth`
+    /// signed over the canonical handshake payload (see relay_identity).
+    Challenge {
+        relay_id: String,
+        nonce_relay: String,
+    },
+    /// Spoke → hub: signed handshake response. Hub verifies against the
+    /// configured `public_key` for this node_id. On failure the hub closes
+    /// the connection.
+    Auth {
+        signature: String,
     },
     RouteLease {
         node_id: String,
@@ -107,11 +136,52 @@ pub struct RouteEntry {
     pub expires_at: std::time::Instant,
 }
 
+/// Production-grade metrics exposed via `GET /v1/a2a/relay/stats`. All
+/// counters are monotonic except `connected_nodes`/`route_count` which are
+/// read live from the corresponding DashMaps. Names match the spec.
+#[derive(Default, Debug)]
+pub struct RelayMetrics {
+    pub request_count: AtomicU64,
+    pub request_latency_ms_total: AtomicU64,
+    pub ws_reconnects: AtomicU64,
+    pub auth_failures: AtomicU64,
+    pub acl_denials: AtomicU64,
+    pub route_expirations: AtomicU64,
+    pub failovers: AtomicU64,
+    /// Number of in-flight streams forcibly failed because the underlying
+    /// spoke connection dropped. Separate from `auth_failures` so an
+    /// operator can tell "network blip" from "credential rejection".
+    pub inflight_losses: AtomicU64,
+}
+
+impl RelayMetrics {
+    pub fn snapshot(&self, connected_nodes: u64, route_count: u64) -> serde_json::Value {
+        let req = self.request_count.load(Ordering::Relaxed);
+        let lat = self.request_latency_ms_total.load(Ordering::Relaxed);
+        let avg = if req > 0 { lat / req } else { 0 };
+        serde_json::json!({
+            "connected_nodes": connected_nodes,
+            "route_count": route_count,
+            "request_count": req,
+            "request_latency_ms_avg": avg,
+            "ws_reconnects": self.ws_reconnects.load(Ordering::Relaxed),
+            "auth_failures": self.auth_failures.load(Ordering::Relaxed),
+            "acl_denials": self.acl_denials.load(Ordering::Relaxed),
+            "route_expirations": self.route_expirations.load(Ordering::Relaxed),
+            "failovers": self.failovers.load(Ordering::Relaxed),
+            "inflight_losses": self.inflight_losses.load(Ordering::Relaxed),
+        })
+    }
+}
+
 #[derive(Default)]
 pub struct RelayHub {
     connections: DashMap<String, Connection>,
     routes: DashMap<String, RouteEntry>,
-    pending: DashMap<String, oneshot::Sender<JsonRpcResponse>>,
+    /// request_id → (waiter, target_node_id). We carry node_id so that
+    /// when a connection drops we can resolve only its pending waiters
+    /// instead of nuking every in-flight JSON-RPC call.
+    pending: DashMap<String, (oneshot::Sender<JsonRpcResponse>, String)>,
     /// Streaming relay entries: request_id → (broadcast sender, agent_ref).
     /// The agent_ref is kept so we can record `task_id → agent_ref` once
     /// the first event arrives carrying a taskId. Inserted by
@@ -127,11 +197,44 @@ pub struct RelayHub {
     /// config ops, SubscribeToTask) route to the right spoke even when
     /// the client only knows the task_id.
     task_routes: DashMap<String, String>,
+    pub metrics: RelayMetrics,
+}
+
+/// Structured audit event. Emitted via `tracing` with `target =
+/// "a2a.audit"` so operators can pipe to a sink (loki, jq, etc.) with a
+/// simple filter. Spec mandates these fields; missing optionals show as
+/// empty strings to keep the schema stable.
+pub fn audit_relay(
+    decision: &str,
+    principal: &str,
+    action: &str,
+    resource: &str,
+    relay_id: &str,
+    node_id: &str,
+    matched_scope: Option<&str>,
+    reason: Option<&str>,
+) {
+    tracing::info!(
+        target: "a2a.audit",
+        decision,
+        principal,
+        action,
+        resource,
+        relay_id,
+        node_id,
+        matched_scope = matched_scope.unwrap_or(""),
+        reason = reason.unwrap_or(""),
+        "a2a relay audit"
+    );
 }
 
 impl RelayHub {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn connection_count(&self) -> usize {
+        self.connections.len()
     }
 
     pub fn connected_nodes(&self) -> Vec<String> {
@@ -149,9 +252,16 @@ impl RelayHub {
         if entry.expires_at <= std::time::Instant::now() {
             drop(entry);
             self.routes.remove(agent_ref);
+            self.metrics
+                .route_expirations
+                .fetch_add(1, Ordering::Relaxed);
             return None;
         }
         Some(entry.clone())
+    }
+
+    pub fn route_count(&self) -> usize {
+        self.routes.len()
     }
 
     pub fn apply_route_lease(
@@ -203,7 +313,9 @@ impl RelayHub {
             .ok_or_else(|| anyhow!("node '{}' is not connected", route.node_id))?;
         let request_id = format!("relay:{}", Uuid::new_v4());
         let (tx, rx) = oneshot::channel();
-        self.pending.insert(request_id.clone(), tx);
+        let node_id = route.node_id.clone();
+        self.pending
+            .insert(request_id.clone(), (tx, node_id.clone()));
         let frame = RelayFrame::Request {
             request_id: request_id.clone(),
             target: target.to_owned(),
@@ -215,17 +327,24 @@ impl RelayHub {
         let msg = AxumWsMessage::Text(serde_json::to_string(&frame)?.into());
         if let Err(e) = conn.tx.send(msg) {
             self.pending.remove(&request_id);
-            anyhow::bail!("relay send to node '{}' failed: {e}", route.node_id);
+            anyhow::bail!("relay send to node '{}' failed: {e}", node_id);
         }
         drop(conn);
-        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+        let started = std::time::Instant::now();
+        self.metrics.request_count.fetch_add(1, Ordering::Relaxed);
+        let result = match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(_)) => Err(anyhow!("relay response channel closed")),
             Err(_) => {
                 self.pending.remove(&request_id);
                 Err(anyhow!("relay request timed out"))
             }
-        }
+        };
+        let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        self.metrics
+            .request_latency_ms_total
+            .fetch_add(elapsed_ms, Ordering::Relaxed);
+        result
     }
 
     fn register_connection(
@@ -255,10 +374,66 @@ impl RelayHub {
         for key in stale {
             self.routes.remove(&key);
         }
+        // Surface in-flight losses: every streaming request whose target
+        // lives on this node must be told the relay died so the SSE
+        // consumer doesn't hang forever. We synthesize a terminal
+        // status-update with state="failed" — clients already handle
+        // final=true cleanly. Without this, A2A clients would keep the
+        // SSE stream open until our REQUEST_TIMEOUT (120s) fired with no
+        // useful diagnostic.
+        let lost: Vec<String> = self
+            .stream_pending
+            .iter()
+            .filter(|entry| entry.value().1.starts_with(&prefix))
+            .map(|entry| entry.key().clone())
+            .collect();
+        for request_id in lost {
+            // We may not know the task_id for streams that haven't yet
+            // emitted their first event with a taskId attached. Leaving
+            // it empty is fine — A2A clients key off `final: true` +
+            // `status.state` to terminate the stream.
+            let synthetic = serde_json::json!({
+                "kind": "status-update",
+                "taskId": "",
+                "contextId": "",
+                "status": {
+                    "state": "failed",
+                    "message": {
+                        "role": "agent",
+                        "messageId": format!("relay-loss-{}", Uuid::new_v4()),
+                        "parts": [{
+                            "kind": "text",
+                            "text": format!("relay route lost: node '{node_id}' disconnected"),
+                        }],
+                    }
+                },
+                "final": true,
+            });
+            self.forward_stream_event(&request_id, synthetic);
+            self.stream_pending.remove(&request_id);
+            self.metrics.inflight_losses.fetch_add(1, Ordering::Relaxed);
+        }
+        // Resolve only pending waiters bound to this node so we don't
+        // wait REQUEST_TIMEOUT for a corpse. Other nodes' pending RPCs
+        // are left untouched.
+        let pending_keys: Vec<String> = self
+            .pending
+            .iter()
+            .filter_map(|e| (e.value().1 == node_id).then(|| e.key().clone()))
+            .collect();
+        for k in pending_keys {
+            if let Some((_, (tx, _))) = self.pending.remove(&k) {
+                let _ = tx.send(JsonRpcResponse::err(
+                    Value::Null,
+                    -32004,
+                    format!("relay node '{node_id}' disconnected"),
+                ));
+            }
+        }
     }
 
     fn complete_pending(&self, request_id: &str, response: JsonRpcResponse) {
-        if let Some((_, tx)) = self.pending.remove(request_id) {
+        if let Some((_, (tx, _node))) = self.pending.remove(request_id) {
             let _ = tx.send(response);
         }
     }
@@ -437,14 +612,25 @@ fn default_node_scopes(node_id: &str, relay_id: &str) -> Vec<String> {
     ]
 }
 
-fn resolve_node(
-    relay: &A2aRelayRuntime,
-    node_id: &str,
-    token: &str,
-) -> Option<A2aRelayNodeRuntime> {
-    relay.nodes.iter().find_map(|node| {
-        (node.node_id == node_id && constant_time_eq(&node.token, token)).then(|| node.clone())
-    })
+/// Resolve a relay node by `node_id`. Token verification is the caller's
+/// responsibility — callers must check whether the node requires token
+/// auth (no public_key) or keypair auth (public_key set), and validate
+/// the token only in the former case. Returns None if `node_id` is
+/// unknown OR present on the revocation list.
+fn resolve_node(relay: &A2aRelayRuntime, node_id: &str) -> Option<A2aRelayNodeRuntime> {
+    if relay.revoked_nodes.iter().any(|n| n == node_id) {
+        return None;
+    }
+    relay
+        .nodes
+        .iter()
+        .find_map(|node| (node.node_id == node_id).then(|| node.clone()))
+}
+
+/// Verify the bearer token presented for a token-only node. constant_time
+/// to defeat timing oracles.
+fn verify_node_token(node: &A2aRelayNodeRuntime, token: &str) -> bool {
+    !node.token.is_empty() && constant_time_eq(&node.token, token)
 }
 
 #[derive(Debug, Deserialize)]
@@ -464,16 +650,85 @@ pub async fn relay_ws_handler(
     if relay.mode != A2aRelayModeRuntime::Hub {
         return axum::http::StatusCode::NOT_FOUND.into_response();
     }
-    let Some(token) = query.token.as_deref().or_else(|| bearer_token(&headers)) else {
+    let Some(mut node) = resolve_node(relay, &query.node_id) else {
+        state
+            .relay_hub
+            .metrics
+            .auth_failures
+            .fetch_add(1, Ordering::Relaxed);
+        audit_relay(
+            "deny",
+            &format!("node:{}", query.node_id),
+            "connect",
+            &format!("relay:{}", relay.relay_id),
+            &relay.relay_id,
+            &query.node_id,
+            None,
+            Some("unknown or revoked node"),
+        );
         return axum::http::StatusCode::UNAUTHORIZED.into_response();
     };
-    let Some(mut node) = resolve_node(relay, &query.node_id, token) else {
-        return axum::http::StatusCode::UNAUTHORIZED.into_response();
-    };
+    // Token verification: only required when node is not keypair-only.
+    // Keypair nodes must still pass challenge-response in handle_hub_socket
+    // before they are registered.
+    if node.public_key.is_none() {
+        let presented = query.token.as_deref().or_else(|| bearer_token(&headers));
+        let Some(token) = presented else {
+            state
+                .relay_hub
+                .metrics
+                .auth_failures
+                .fetch_add(1, Ordering::Relaxed);
+            audit_relay(
+                "deny",
+                &format!("node:{}", node.node_id),
+                "connect",
+                &format!("relay:{}", relay.relay_id),
+                &relay.relay_id,
+                &node.node_id,
+                None,
+                Some("no token presented and no public_key configured"),
+            );
+            return axum::http::StatusCode::UNAUTHORIZED.into_response();
+        };
+        if !verify_node_token(&node, token) {
+            state
+                .relay_hub
+                .metrics
+                .auth_failures
+                .fetch_add(1, Ordering::Relaxed);
+            audit_relay(
+                "deny",
+                &format!("node:{}", node.node_id),
+                "connect",
+                &format!("relay:{}", relay.relay_id),
+                &relay.relay_id,
+                &node.node_id,
+                None,
+                Some("token mismatch"),
+            );
+            return axum::http::StatusCode::UNAUTHORIZED.into_response();
+        }
+    }
     if node.scopes.is_empty() {
         node.scopes = default_node_scopes(&node.node_id, &relay.relay_id);
     }
     if !scope_allows(&node.scopes, "relay", "connect", &relay.relay_id) {
+        state
+            .relay_hub
+            .metrics
+            .acl_denials
+            .fetch_add(1, Ordering::Relaxed);
+        audit_relay(
+            "deny",
+            &format!("node:{}", node.node_id),
+            "connect",
+            &format!("relay:{}", relay.relay_id),
+            &relay.relay_id,
+            &node.node_id,
+            None,
+            Some("relay:connect scope missing"),
+        );
         return axum::http::StatusCode::FORBIDDEN.into_response();
     }
     ws.on_upgrade(move |socket| handle_hub_socket(socket, state, node))
@@ -486,12 +741,132 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .and_then(|v| v.strip_prefix("Bearer "))
 }
 
+/// Perform the Ed25519 challenge-response handshake. Returns Ok only if
+/// the spoke produced a valid signature over the canonical payload bound
+/// to both nonces. Anything else (timeout, malformed frame, bad sig,
+/// premature close) returns Err with a short reason for audit.
+async fn hub_keypair_handshake<S, R>(
+    sink: &mut S,
+    stream: &mut R,
+    node: &A2aRelayNodeRuntime,
+    public_key_b64: &str,
+    relay_id: &str,
+) -> std::result::Result<(), String>
+where
+    S: futures::Sink<AxumWsMessage> + Unpin,
+    R: futures::Stream<Item = std::result::Result<AxumWsMessage, axum::Error>> + Unpin,
+{
+    // Step 1: read Hello + extract nonce_node.
+    let hello = match tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.next()).await {
+        Ok(Some(Ok(AxumWsMessage::Text(text)))) => text,
+        Ok(Some(Ok(_))) => return Err("first frame was not Text".to_owned()),
+        Ok(Some(Err(e))) => return Err(format!("ws error: {e}")),
+        Ok(None) => return Err("stream closed before Hello".to_owned()),
+        Err(_) => return Err("Hello timed out".to_owned()),
+    };
+    let nonce_node = match serde_json::from_str::<RelayFrame>(&hello) {
+        Ok(RelayFrame::Hello {
+            nonce_node: Some(n),
+            node_id,
+            ..
+        }) => {
+            if node_id != node.node_id {
+                return Err(format!("hello node_id mismatch: claimed {node_id}"));
+            }
+            n
+        }
+        Ok(RelayFrame::Hello { nonce_node: None, .. }) => {
+            return Err("hello missing nonce_node (keypair mode required)".to_owned());
+        }
+        Ok(_) => return Err("first frame was not Hello".to_owned()),
+        Err(e) => return Err(format!("invalid Hello frame: {e}")),
+    };
+
+    // Step 2: send Challenge with hub nonce.
+    let nonce_relay = relay_identity::fresh_nonce_b64();
+    let challenge = RelayFrame::Challenge {
+        relay_id: relay_id.to_owned(),
+        nonce_relay: nonce_relay.clone(),
+    };
+    let payload = serde_json::to_string(&challenge)
+        .map_err(|e| format!("serialize Challenge: {e}"))?;
+    if sink.send(AxumWsMessage::Text(payload.into())).await.is_err() {
+        return Err("send Challenge failed".to_owned());
+    }
+
+    // Step 3: read Auth + verify signature.
+    let auth_text = match tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.next()).await {
+        Ok(Some(Ok(AxumWsMessage::Text(text)))) => text,
+        Ok(Some(Ok(_))) => return Err("second frame was not Text".to_owned()),
+        Ok(Some(Err(e))) => return Err(format!("ws error: {e}")),
+        Ok(None) => return Err("stream closed before Auth".to_owned()),
+        Err(_) => return Err("Auth timed out".to_owned()),
+    };
+    let signature = match serde_json::from_str::<RelayFrame>(&auth_text) {
+        Ok(RelayFrame::Auth { signature }) => signature,
+        Ok(_) => return Err("second frame was not Auth".to_owned()),
+        Err(e) => return Err(format!("invalid Auth frame: {e}")),
+    };
+    relay_identity::verify_handshake(
+        public_key_b64,
+        &node.node_id,
+        relay_id,
+        &nonce_node,
+        &nonce_relay,
+        &signature,
+    )
+    .map_err(|e| e.to_string())
+}
+
 async fn handle_hub_socket(socket: WebSocket, state: AppState, node: A2aRelayNodeRuntime) {
     let epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
         .unwrap_or(0);
     let (mut sink, mut stream) = socket.split();
+
+    // Keypair handshake. Performed BEFORE register_connection so a node
+    // that fails challenge-response never appears in `connections`
+    // (cannot receive requests, cannot evict an existing well-behaved
+    // session by same node_id).
+    if let Some(public_key_b64) = node.public_key.as_deref() {
+        let relay_id = state.config.gateway.a2a_relay.relay_id.clone();
+        match hub_keypair_handshake(&mut sink, &mut stream, &node, public_key_b64, &relay_id).await
+        {
+            Ok(()) => {
+                audit_relay(
+                    "allow",
+                    &format!("node:{}", node.node_id),
+                    "connect",
+                    &format!("relay:{}", relay_id),
+                    &relay_id,
+                    &node.node_id,
+                    Some("ed25519_handshake"),
+                    None,
+                );
+            }
+            Err(reason) => {
+                state
+                    .relay_hub
+                    .metrics
+                    .auth_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                audit_relay(
+                    "deny",
+                    &format!("node:{}", node.node_id),
+                    "connect",
+                    &format!("relay:{}", relay_id),
+                    &relay_id,
+                    &node.node_id,
+                    None,
+                    Some(&format!("keypair handshake failed: {reason}")),
+                );
+                let _ = sink.send(AxumWsMessage::Close(None)).await;
+                return;
+            }
+        }
+    }
+
     let (tx, mut rx) = mpsc::unbounded_channel::<AxumWsMessage>();
     let ping_tx = tx.clone();
     state
@@ -581,13 +956,44 @@ async fn handle_hub_frame(state: &AppState, node: &A2aRelayNodeRuntime, frame: R
             ttl_ms,
             epoch,
         } => {
+            let relay_id = state.config.gateway.a2a_relay.relay_id.as_str();
             if node_id != node.node_id {
                 warn!(node = %node.node_id, claimed = %node_id, "relay route lease node mismatch");
+                state
+                    .relay_hub
+                    .metrics
+                    .acl_denials
+                    .fetch_add(1, Ordering::Relaxed);
+                audit_relay(
+                    "deny",
+                    &format!("node:{}", node.node_id),
+                    "advertise",
+                    &format!("node:{node_id}"),
+                    relay_id,
+                    &node.node_id,
+                    None,
+                    Some("route lease node mismatch"),
+                );
                 return;
             }
             for agent in &agents {
                 if !scope_allows(&node.scopes, "relay", "advertise", agent) {
                     warn!(node = %node.node_id, agent, "relay advertise denied");
+                    state
+                        .relay_hub
+                        .metrics
+                        .acl_denials
+                        .fetch_add(1, Ordering::Relaxed);
+                    audit_relay(
+                        "deny",
+                        &format!("node:{}", node.node_id),
+                        "advertise",
+                        &format!("agent:{agent}"),
+                        relay_id,
+                        &node.node_id,
+                        None,
+                        Some("relay:advertise scope missing"),
+                    );
                     return;
                 }
             }
@@ -597,6 +1003,11 @@ async fn handle_hub_frame(state: &AppState, node: &A2aRelayNodeRuntime, frame: R
             {
                 warn!(node = %node.node_id, error = %e, "relay route lease rejected");
             }
+        }
+        RelayFrame::Auth { .. } | RelayFrame::Challenge { .. } => {
+            // Handshake frames are consumed in hub_keypair_handshake. A
+            // duplicate here is harmless — log and ignore.
+            debug!(node = %node.node_id, "handshake frame after registration; ignored");
         }
         RelayFrame::Response {
             request_id,
@@ -680,14 +1091,45 @@ pub async fn try_forward_jsonrpc(
     if state.relay_hub.route_for(&target).is_none() {
         return None;
     }
+    let relay_id = state.config.gateway.a2a_relay.relay_id.as_str();
+    let principal_id = caller.map(|id| id.id.as_str()).unwrap_or("anonymous-dev");
     if !can_invoke(caller, &target) {
+        state
+            .relay_hub
+            .metrics
+            .acl_denials
+            .fetch_add(1, Ordering::Relaxed);
+        let target_node = target.split('/').next().unwrap_or("");
+        audit_relay(
+            "deny",
+            principal_id,
+            "invoke",
+            &format!("agent:{target}"),
+            relay_id,
+            target_node,
+            None,
+            Some("a2a:invoke scope missing"),
+        );
         return Some(JsonRpcResponse::err(
             req.id.clone(),
             -32003,
             format!("not authorized to invoke {target}"),
         ));
     }
-    let principal = caller.map(|id| id.id.as_str()).unwrap_or("anonymous-dev");
+    // Cross-node allow — log so operators can answer "why could caller X
+    // invoke agent Y" after the fact (spec audit requirement).
+    let target_node = target.split('/').next().unwrap_or("");
+    audit_relay(
+        "allow",
+        principal_id,
+        "invoke",
+        &format!("agent:{target}"),
+        relay_id,
+        target_node,
+        None,
+        Some("cross_node"),
+    );
+    let principal = principal_id;
     let mut params = req.params.clone();
     rewrite_target_agent_for_spoke(&mut params, &target);
     match state
@@ -722,49 +1164,130 @@ pub(crate) fn rewrite_target_agent_for_spoke(params: &mut Value, target: &str) {
     }
 }
 
+/// `GET /v1/a2a/relay/stats` — snapshot of relay metrics. Returns the
+/// 10 spec-mandated counters plus a list of connected node_ids. Safe
+/// to expose on the gateway operator surface (no secrets).
+pub async fn relay_stats_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let nodes = state.relay_hub.connected_nodes();
+    let snapshot = state
+        .relay_hub
+        .metrics
+        .snapshot(nodes.len() as u64, state.relay_hub.route_count() as u64);
+    Json(serde_json::json!({
+        "relay_id": state.config.gateway.a2a_relay.relay_id,
+        "mode": match state.config.gateway.a2a_relay.mode {
+            A2aRelayModeRuntime::Disabled => "disabled",
+            A2aRelayModeRuntime::Hub => "hub",
+            A2aRelayModeRuntime::Spoke => "spoke",
+        },
+        "connected_node_ids": nodes,
+        "metrics": snapshot,
+    }))
+}
+
 pub fn start_spoke_if_configured(state: AppState) {
     if state.config.gateway.a2a_relay.mode != A2aRelayModeRuntime::Spoke {
         return;
     }
     let relay = state.config.gateway.a2a_relay.clone();
+    if relay.hub_urls.is_empty() {
+        warn!("a2a relay spoke mode set but no hub URLs configured");
+        return;
+    }
     tokio::spawn(async move {
-        let mut delay = Duration::from_secs(1);
-        const MAX_DELAY: Duration = Duration::from_secs(120);
+        // Primary-standby failover: walk the hub_urls list in order.
+        // Index 0 is the primary; we fall back to higher indices on
+        // connect/heartbeat failure and reset back to 0 after a
+        // successful long-lived connection ends cleanly. `multi_home`
+        // isn't implemented here yet — it falls through to the same
+        // single-active-connection loop (Phase 3 will add concurrent
+        // connections + duplicate suppression).
+        let strategy = relay.strategy.clone();
+        if strategy == A2aRelayStrategyRuntime::MultiHome {
+            warn!("a2a relay strategy=multi_home not yet supported, using primary_standby");
+        }
+        let urls = relay.hub_urls.clone();
+        let mut idx: usize = 0;
+        let mut per_relay_delay = Duration::from_secs(1);
         loop {
-            if let Err(e) = run_spoke_once(state.clone(), relay.clone()).await {
-                warn!(error = %e, delay_secs = delay.as_secs(), "a2a relay spoke disconnected, retrying");
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(MAX_DELAY);
-            } else {
-                delay = Duration::from_secs(1);
+            let hub_url = &urls[idx];
+            let connect_start = std::time::Instant::now();
+            match run_spoke_once(state.clone(), &relay, hub_url).await {
+                Ok(()) => {
+                    // Clean disconnect — server-initiated close or
+                    // protocol exhaustion. Reset to primary and to fast
+                    // backoff so the next outage doesn't compound prior
+                    // exponential growth.
+                    idx = 0;
+                    per_relay_delay = Duration::from_secs(1);
+                    info!(hub = %hub_url, "a2a relay spoke session ended cleanly, returning to primary");
+                }
+                Err(e) => {
+                    let was_long_lived = connect_start.elapsed() > Duration::from_secs(60);
+                    warn!(
+                        error = %e,
+                        hub = %hub_url,
+                        idx,
+                        "a2a relay spoke disconnected"
+                    );
+                    state
+                        .relay_hub
+                        .metrics
+                        .ws_reconnects
+                        .fetch_add(1, Ordering::Relaxed);
+                    if was_long_lived {
+                        // Lost a stable session — try same relay first
+                        // (likely transient network blip). Reset backoff
+                        // since this isn't a retry storm.
+                        per_relay_delay = Duration::from_secs(1);
+                    } else {
+                        // Failed to establish or session died fast —
+                        // back off and rotate to the next relay.
+                        if urls.len() > 1 {
+                            idx = (idx + 1) % urls.len();
+                            state
+                                .relay_hub
+                                .metrics
+                                .failovers
+                                .fetch_add(1, Ordering::Relaxed);
+                            info!(next_hub = %urls[idx], "a2a relay failing over");
+                        }
+                        per_relay_delay = (per_relay_delay * 2).min(FAILOVER_BACKOFF_MAX);
+                    }
+                    tokio::time::sleep(per_relay_delay).await;
+                }
             }
         }
     });
 }
 
-async fn run_spoke_once(state: AppState, relay: A2aRelayRuntime) -> Result<()> {
+async fn run_spoke_once(state: AppState, relay: &A2aRelayRuntime, hub_url: &str) -> Result<()> {
     let node_id = relay
         .node_id
         .as_deref()
         .ok_or_else(|| anyhow!("a2a relay spoke node_id is required"))?;
-    let token = relay
-        .token
-        .as_deref()
-        .ok_or_else(|| anyhow!("a2a relay spoke token is required"))?;
-    let hub_url = relay
-        .hub_urls
-        .first()
-        .ok_or_else(|| anyhow!("a2a relay spoke hub_url is required"))?;
+    // Token is optional when keypair is configured. The hub-side
+    // resolve_node tolerates a missing token if `public_key` is set.
+    let token = relay.token.as_deref();
+    let signing_key = match relay.private_key.as_deref() {
+        Some(pk) => Some(
+            relay_identity::signing_key_from_b64(pk)
+                .context("parse spoke private_key (base64)")?,
+        ),
+        None => None,
+    };
+    if token.is_none() && signing_key.is_none() {
+        anyhow::bail!("a2a relay spoke requires either token or private_key");
+    }
     let sep = if hub_url.contains('?') { '&' } else { '?' };
-    let url = format!(
-        "{hub_url}{sep}node_id={}&token={}",
-        urlencoding::encode(node_id),
-        urlencoding::encode(token)
-    );
+    let mut url = format!("{hub_url}{sep}node_id={}", urlencoding::encode(node_id));
+    if let Some(t) = token {
+        url.push_str(&format!("&token={}", urlencoding::encode(t)));
+    }
     let (stream, _) = tokio_tungstenite::connect_async(&url)
         .await
         .with_context(|| format!("connect relay hub {hub_url}"))?;
-    info!(node = %node_id, hub = %hub_url, "a2a relay spoke connected");
+    info!(node = %node_id, hub = %hub_url, keypair = signing_key.is_some(), "a2a relay spoke connected");
 
     let (mut write, mut read) = stream.split();
     // Channel item: either a RelayFrame (encoded as JSON Text by the
@@ -809,12 +1332,18 @@ async fn run_spoke_once(state: AppState, relay: A2aRelayRuntime) -> Result<()> {
         }
     });
 
+    let nonce_node = signing_key.as_ref().map(|_| relay_identity::fresh_nonce_b64());
     spoke_tx
-        .send(spoke_hello(&state, node_id))
+        .send(spoke_hello(&state, node_id, nonce_node.clone()))
         .map_err(|_| anyhow!("spoke writer closed"))?;
-    spoke_tx
-        .send(spoke_route_lease(&state, node_id, 1))
-        .map_err(|_| anyhow!("spoke writer closed"))?;
+    // RouteLease is sent AFTER the Auth round-trip when in keypair mode
+    // so the hub doesn't drop us mid-handshake. Token-mode spokes send
+    // it immediately because there's no handshake.
+    if signing_key.is_none() {
+        spoke_tx
+            .send(spoke_route_lease(&state, node_id, 1))
+            .map_err(|_| anyhow!("spoke writer closed"))?;
+    }
 
     // WS-level Ping every 15s so NAT/firewall idle counters reset.
     let ping_tx = write_tx.clone();
@@ -859,6 +1388,25 @@ async fn run_spoke_once(state: AppState, relay: A2aRelayRuntime) -> Result<()> {
         };
         let frame: RelayFrame = serde_json::from_str(&text)?;
         match frame {
+            RelayFrame::Challenge {
+                relay_id,
+                nonce_relay,
+            } => {
+                let Some(sk) = signing_key.as_ref() else {
+                    anyhow::bail!("hub sent Challenge but spoke has no private_key");
+                };
+                let Some(nn) = nonce_node.as_deref() else {
+                    anyhow::bail!("Challenge received without our nonce_node — protocol drift");
+                };
+                let sig = relay_identity::sign_handshake(sk, node_id, &relay_id, nn, &nonce_relay);
+                spoke_tx
+                    .send(RelayFrame::Auth { signature: sig })
+                    .map_err(|_| anyhow!("spoke writer closed"))?;
+                // Now safe to publish routes — handshake done.
+                spoke_tx
+                    .send(spoke_route_lease(&state, node_id, 1))
+                    .map_err(|_| anyhow!("spoke writer closed"))?;
+            }
             RelayFrame::Request {
                 request_id,
                 target,
@@ -904,6 +1452,23 @@ async fn run_spoke_once(state: AppState, relay: A2aRelayRuntime) -> Result<()> {
         }
     }
 
+    // WS drop reached: cancel every local streaming task we were
+    // proxying so workers stop burning tokens for a stream that will
+    // never reach the client. After reconnect, the hub will route new
+    // requests through fresh task_ids; old request_ids are irrelevant.
+    let request_ids: Vec<String> = state
+        .relay_hub
+        .spoke_stream_tasks
+        .iter()
+        .map(|e| e.key().clone())
+        .collect();
+    for rid in request_ids {
+        if let Some((_, task_id)) = state.relay_hub.spoke_stream_tasks.remove(&rid)
+            && let Some((_, token)) = state.task_cancels.remove(&task_id)
+        {
+            token.cancel();
+        }
+    }
     writer.abort();
     renewer.abort();
     pinger.abort();
@@ -911,7 +1476,7 @@ async fn run_spoke_once(state: AppState, relay: A2aRelayRuntime) -> Result<()> {
     Ok(())
 }
 
-fn spoke_hello(state: &AppState, node_id: &str) -> RelayFrame {
+fn spoke_hello(state: &AppState, node_id: &str, nonce_node: Option<String>) -> RelayFrame {
     RelayFrame::Hello {
         protocol: RELAY_PROTOCOL.to_owned(),
         node_id: node_id.to_owned(),
@@ -920,6 +1485,7 @@ fn spoke_hello(state: &AppState, node_id: &str) -> RelayFrame {
         capabilities: Some(HelloCapabilities {
             streaming_relay: true,
         }),
+        nonce_node,
     }
 }
 
@@ -1243,6 +1809,165 @@ mod tests {
         hub.forward_stream_event("req-1", wire);
 
         assert_eq!(hub.route_for_task("task-xyz").as_deref(), Some("a3/main"));
+    }
+
+    #[tokio::test]
+    async fn unregister_surfaces_inflight_stream_as_failed() {
+        // The whole point of in-flight loss surfacing: if a spoke
+        // disconnects mid-stream, the SSE consumer must receive a
+        // terminal status-update with state=failed instead of hanging
+        // until REQUEST_TIMEOUT.
+        let hub = std::sync::Arc::new(RelayHub::new());
+        let (tx, mut _rx) = mpsc::unbounded_channel();
+        hub.register_connection("home-mac", tx, 1);
+        hub.apply_route_lease("home-mac", &["home-mac/main".to_owned()], 10_000, 1)
+            .unwrap();
+
+        let (_request_id, _node_id, mut event_rx) = hub
+            .invoke_streaming(
+                "home-mac/main",
+                "SendStreamingMessage",
+                serde_json::json!({"metadata": {"agentId": "main"}}),
+                "node:hub",
+            )
+            .await
+            .unwrap();
+
+        // Drop the connection (simulates spoke WS death).
+        hub.unregister_connection("home-mac", 1);
+
+        let event = tokio::time::timeout(Duration::from_millis(200), event_rx.recv())
+            .await
+            .expect("synthetic failure event must arrive")
+            .expect("recv ok");
+        assert_eq!(event["kind"], "status-update");
+        assert_eq!(event["status"]["state"], "failed");
+        assert_eq!(event["final"], true);
+        assert_eq!(
+            hub.metrics.inflight_losses.load(Ordering::Relaxed),
+            1,
+            "inflight_losses metric must increment"
+        );
+    }
+
+    #[tokio::test]
+    async fn unregister_resolves_pending_jsonrpc_for_owning_node_only() {
+        // Lose connection to node A — A's pending RPC must fail; B's
+        // must stay untouched.
+        let hub = std::sync::Arc::new(RelayHub::new());
+        let (tx_a, mut rx_a) = mpsc::unbounded_channel();
+        let (tx_b, mut _rx_b) = mpsc::unbounded_channel();
+        hub.register_connection("a", tx_a, 1);
+        hub.register_connection("b", tx_b, 1);
+        hub.apply_route_lease("a", &["a/main".to_owned()], 10_000, 1)
+            .unwrap();
+        hub.apply_route_lease("b", &["b/main".to_owned()], 10_000, 1)
+            .unwrap();
+
+        let a_hub = hub.clone();
+        let a_call = tokio::spawn(async move {
+            a_hub
+                .invoke_jsonrpc(
+                    "a/main",
+                    "SendMessage",
+                    serde_json::json!({"metadata": {"agentId": "main"}}),
+                    "test",
+                )
+                .await
+        });
+        // Drain a's request frame to ensure pending is populated.
+        let _ = tokio::time::timeout(Duration::from_millis(200), rx_a.recv())
+            .await
+            .expect("a should have received request frame");
+
+        // Kill a — pending should be drained.
+        hub.unregister_connection("a", 1);
+
+        let response = tokio::time::timeout(Duration::from_millis(500), a_call)
+            .await
+            .expect("a's call must unblock fast")
+            .unwrap()
+            .unwrap();
+        assert!(response.error.is_some(), "must surface as JSON-RPC error");
+        assert!(response.error.unwrap().message.contains("disconnected"));
+    }
+
+    #[test]
+    fn revoked_node_is_not_resolvable() {
+        let relay = A2aRelayRuntime {
+            mode: A2aRelayModeRuntime::Hub,
+            relay_id: "main".to_owned(),
+            revoked_nodes: vec!["bad-node".to_owned()],
+            nodes: vec![A2aRelayNodeRuntime {
+                node_id: "bad-node".to_owned(),
+                token: "anything".to_owned(),
+                public_key: None,
+                roles: vec![],
+                scopes: vec![],
+            }],
+            ..Default::default()
+        };
+        assert!(resolve_node(&relay, "bad-node").is_none());
+    }
+
+    #[test]
+    fn keypair_node_skips_token_verification_at_resolve_time() {
+        // The hub-side resolve_node only returns the node skeleton;
+        // token verification happens separately and is skipped when
+        // public_key is set.
+        let relay = A2aRelayRuntime {
+            mode: A2aRelayModeRuntime::Hub,
+            relay_id: "main".to_owned(),
+            nodes: vec![A2aRelayNodeRuntime {
+                node_id: "kp-node".to_owned(),
+                token: String::new(),
+                public_key: Some("dummy".to_owned()),
+                roles: vec![],
+                scopes: vec![],
+            }],
+            ..Default::default()
+        };
+        let node = resolve_node(&relay, "kp-node").expect("found");
+        assert!(node.public_key.is_some());
+        // verify_node_token would refuse an empty token — that's why
+        // the hub branches on public_key.is_some() to skip it.
+        assert!(!verify_node_token(&node, ""));
+    }
+
+    #[test]
+    fn metrics_snapshot_includes_all_spec_counters() {
+        let metrics = RelayMetrics::default();
+        metrics.request_count.store(42, Ordering::Relaxed);
+        metrics
+            .request_latency_ms_total
+            .store(4200, Ordering::Relaxed);
+        metrics.acl_denials.store(7, Ordering::Relaxed);
+        let v = metrics.snapshot(3, 5);
+        assert_eq!(v["connected_nodes"], 3);
+        assert_eq!(v["route_count"], 5);
+        assert_eq!(v["request_count"], 42);
+        assert_eq!(v["request_latency_ms_avg"], 100);
+        assert_eq!(v["acl_denials"], 7);
+        // All 10 spec counters must be present.
+        for key in [
+            "ws_reconnects",
+            "auth_failures",
+            "route_expirations",
+            "failovers",
+            "inflight_losses",
+        ] {
+            assert!(v.get(key).is_some(), "missing counter: {key}");
+        }
+    }
+
+    #[test]
+    fn route_expiration_increments_metric() {
+        let hub = RelayHub::new();
+        // 1ms TTL — already expired by the time route_for runs.
+        hub.apply_route_lease("a", &["a/main".to_owned()], 1, 1).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(hub.route_for("a/main").is_none());
+        assert_eq!(hub.metrics.route_expirations.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

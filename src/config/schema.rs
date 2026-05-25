@@ -256,6 +256,19 @@ pub struct A2aRelayConfig {
     pub relays: Option<Vec<String>>,
     pub strategy: Option<A2aRelayStrategy>,
     pub token: Option<SecretOrString>,
+    /// Spoke-side Ed25519 private key (base64 raw 32-byte). If set, spoke
+    /// uses keypair handshake instead of (or in addition to) the bearer
+    /// token. Prefer `private_key_file` for production.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<SecretOrString>,
+    /// Path to a file containing the base64 Ed25519 private key. Read at
+    /// startup; never logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key_file: Option<String>,
+    /// List of revoked node_ids (hub-side). Connections from these nodes
+    /// are refused regardless of token/keypair. Hot-reloadable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_nodes: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nodes: Option<Vec<A2aRelayNodeConfig>>,
 }
@@ -264,7 +277,13 @@ pub struct A2aRelayConfig {
 #[serde(rename_all = "camelCase")]
 pub struct A2aRelayNodeConfig {
     pub node_id: String,
-    pub token: SecretOrString,
+    /// Bearer token. Optional when `public_key` is set; required otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<SecretOrString>,
+    /// Base64 Ed25519 public key (raw 32 bytes). When set, this node MUST
+    /// pass challenge-response auth even if it also presents a token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roles: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

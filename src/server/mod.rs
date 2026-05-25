@@ -327,6 +327,10 @@ pub fn build_router(state: AppState) -> Router {
                 )),
         )
         .route("/a2a/relay/ws", get(crate::a2a::relay::relay_ws_handler))
+        .route(
+            "/a2a/relay/stats",
+            get(crate::a2a::relay::relay_stats_handler),
+        )
         .route("/tools/execute", post(execute_tool))
         .route("/hub/catalog", get(hub_catalog))
         .route("/hub/skills", get(hub_skills))
