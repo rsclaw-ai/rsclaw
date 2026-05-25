@@ -589,6 +589,11 @@ pub struct AgentRuntime {
     pub providers: Arc<ProviderRegistry>,
     /// Per-runtime failover manager tracking per-profile cooldowns.
     pub(crate) failover: FailoverManager,
+    /// Shared per-model health table. Same `Arc` as the FailoverManager's
+    /// — exposed here so tools that bypass FailoverManager (image_gen,
+    /// video_gen — they POST directly to provider-specific HTTP
+    /// endpoints) can still consult `is_callable` and record outcomes.
+    pub(crate) model_health: crate::provider::health::ProviderHealthRegistry,
     pub skills: Arc<SkillRegistry>,
     pub store: Arc<Store>,
     pub memory: Option<Arc<Mutex<MemoryStore>>>,
@@ -703,6 +708,12 @@ impl AgentRuntime {
             .as_ref()
             .and_then(|a| a.order.clone())
             .unwrap_or_default();
+        // Clone the shared health registry for direct tool access. tools
+        // like `image_gen` / `video_gen` build raw HTTP requests outside
+        // the FailoverManager flow but still want chain-level gating —
+        // they consult `self.model_health` directly. Same `Arc` so
+        // FailoverManager and the tools see one source of truth.
+        let model_health_for_tools = model_health.clone();
         let failover = FailoverManager::new(
             auth_order,
             std::collections::HashMap::new(),
@@ -719,6 +730,7 @@ impl AgentRuntime {
             live,
             providers,
             failover,
+            model_health: model_health_for_tools,
             skills,
             store,
             memory,
