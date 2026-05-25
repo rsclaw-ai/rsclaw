@@ -4410,7 +4410,11 @@ function TauriConfigPageInner() {
             const existing = new Set(clientArr.map((c) => c?.id).filter(Boolean));
             let n = 1;
             while (existing.has(`client-${n}`)) n++;
-            updateConfig("gateway.a2a.clients", [...clientArr, { id: `client-${n}`, secret: "" }]);
+            // Seed scopes with ["*"] — explicit "all methods" wildcard rather
+            // than relying on absent-field semantics. Lets the operator see
+            // and tighten the grant from the get-go instead of discovering
+            // later that the empty field meant "unrestricted".
+            updateConfig("gateway.a2a.clients", [...clientArr, { id: `client-${n}`, secret: "", scopes: ["*"] }]);
           };
 
           // ── Relay (gateway.a2a.relay) ──
