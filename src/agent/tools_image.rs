@@ -50,42 +50,112 @@ impl super::runtime::AgentRuntime {
             .as_str()
             .ok_or_else(|| anyhow!("image: `prompt` required"))?;
 
-        // Check user-configured image model: agents.defaults.model.image
-        let user_image_model = self
+        // Resolve configured image chain (head + optional fallbacks). Image
+        // generation is paid per call, but unlike video there's no polling
+        // phase — the response is the artifact. So retry semantics are
+        // simpler: pre-2xx failures (network, 4xx, 5xx) haven't been
+        // billed, safe to advance the chain. A 2xx that fails to parse
+        // means the provider charged but didn't deliver — surface the
+        // error rather than double-bill (matches video's submit-only
+        // rule for the same reason).
+        let image_chain: Vec<String> = self
             .handle
             .config
             .model
             .as_ref()
-            .and_then(|m| m.image_head())
-            .or_else(|| {
+            .map(|m| m.image_chain())
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| {
                 self.config
                     .agents
                     .defaults
                     .model
                     .as_ref()
-                    .and_then(|m| m.image_head())
+                    .map(|m| m.image_chain())
+                    .unwrap_or_default()
             })
-            .map(|s| s.to_owned());
+            .into_iter()
+            .map(|s| s.to_owned())
+            .collect();
 
         // Cost gate: image generation hits a paid third-party API on every
-        // call (doubao seedream / dall-e / qwen / minimax / gemini imagen
-        // pricing all per-image). Refuse to auto-fall back to the chat
-        // model or to whichever provider happens to have a key — the user
-        // must opt in by setting `agents.defaults.model.image` (or the
-        // per-agent override). Otherwise the LLM can quietly burn money
-        // when the user said "画一张图" without realising image_gen routes
-        // somewhere they didn't pick. Message is localised — this string
-        // ends up surfaced through the channel directly to the end user.
-        if user_image_model.is_none() {
+        // call (doubao seedream / dall-e / qwen / minimax / gemini imagen).
+        // Refuse to auto-fall back — the user must opt in by setting
+        // `agents.defaults.model.image`. Message is localised — surfaced
+        // through the channel directly to the end user.
+        if image_chain.is_empty() {
             return Ok(json!({
                 "error": crate::i18n::t("image_gen_no_model", crate::i18n::default_lang())
             }));
         }
 
-        // Resolve provider — from image model config (guarded above)
-        let resolve_model = user_image_model
-            .clone()
-            .expect("user_image_model checked non-None above");
+        // args["model"] override → exactly one attempt (no chain retry —
+        // explicit user intent).
+        let attempt_models: Vec<String> = if let Some(m) = args
+            .get("model")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            vec![m.to_owned()]
+        } else {
+            image_chain.clone()
+        };
+
+        // ── Pre-submit chain retry ──────────────────────────────────────
+        let mut last_error: Option<anyhow::Error> = None;
+        for chain_model in &attempt_models {
+            if !self.model_health.is_callable(chain_model) {
+                tracing::info!(
+                    model = %chain_model,
+                    "tool_image: skipping (model marked Disabled or Cooling)"
+                );
+                continue;
+            }
+            match self.try_image_for_model(prompt, chain_model, &args).await {
+                Ok(v) => {
+                    self.model_health.record_success(chain_model);
+                    return Ok(v);
+                }
+                Err(e) => {
+                    let kind = crate::provider::health::classify_error(&e);
+                    let body = format!("{e:#}");
+                    let truncated = crate::util::truncate_str(&body, 200).to_owned();
+                    self.model_health.ensure(&[chain_model.clone()]);
+                    self.model_health.record_failure(chain_model, kind.clone(), truncated);
+                    tracing::warn!(
+                        model = %chain_model,
+                        kind = ?kind,
+                        error = %e,
+                        "tool_image: failed — advancing chain"
+                    );
+                    last_error = Some(e);
+                    continue;
+                }
+            }
+        }
+
+        Err(anyhow!(
+            "image_gen: all {} model(s) failed. Last error: {}",
+            attempt_models.len(),
+            last_error
+                .map(|e| format!("{e:#}"))
+                .unwrap_or_else(|| "no callable models".to_owned())
+        ))
+    }
+
+    /// One attempt for a single configured image model id. Called per
+    /// chain entry by `tool_image`. Returns the same JSON shape the
+    /// caller-visible tool result expects (image_path / mime /
+    /// revised_prompt). All HTTP and parse errors bubble up as `Err` so
+    /// `tool_image` can classify them and decide whether to advance the
+    /// chain or surface to the user.
+    async fn try_image_for_model(
+        &self,
+        prompt: &str,
+        user_model: &str,
+        args: &Value,
+    ) -> Result<Value> {
+        let resolve_model = user_model.to_owned();
         let (prov_name, user_model_id) =
             { crate::provider::registry::ProviderRegistry::parse_model(&resolve_model) };
         let (base_url, _auth_style) = crate::provider::defaults::resolve_base_url(prov_name);
