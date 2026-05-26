@@ -768,6 +768,23 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     ));
     let a2a_relay_hub = Arc::new(crate::a2a::relay::RelayHub::new());
 
+    // Production safety net: a relay hub with no inbound A2A auth is a
+    // pass-through that lets any HTTP caller invoke any spoke agent.
+    // That's the "dev pass-through" by design, but it's easy to deploy
+    // by accident. Surface a single loud warning so an operator can fix
+    // it before the box is reachable from anywhere it shouldn't be.
+    if config.gateway.a2a_relay.mode == crate::config::runtime::A2aRelayModeRuntime::Hub
+        && config.gateway.auth_token.is_none()
+        && config.gateway.a2a_principals.is_empty()
+    {
+        warn!(
+            relay_id = %config.gateway.a2a_relay.relay_id,
+            "a2a relay is running in Hub mode without inbound auth — any HTTP client \
+             can invoke any connected spoke agent. Set `gateway.auth.token` or define \
+             `gateway.a2a.clients` before exposing this gateway to a network."
+        );
+    }
+
     // User-managed RAG knowledge base. Open once; spawn the async indexing
     // worker that drains embed jobs in the background. A failure here (corrupt
     // store, bad permissions, full disk) disables KB but must not abort the
@@ -826,6 +843,25 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     };
     crate::a2a::relay::start_spoke_if_configured(state.clone());
     crate::ws::tick::start_tick_loop(Arc::clone(&state.ws_conns));
+
+    // Relay stream deadline sweeper. The hub-side `stream_pending`
+    // map has no end-to-end timeout (reqwest's was removed in b94c40f
+    // to support long video-gen flows). Without this loop a stuck
+    // spoke + healthy WS + slow consumer could pin entries forever.
+    {
+        let relay_hub = Arc::clone(&state.relay_hub);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let swept = relay_hub.sweep_expired_streams();
+                if swept > 0 {
+                    tracing::info!(swept, "relay stream deadline sweeper");
+                }
+            }
+        });
+    }
 
     // Start browser pool idle reaper (checks every 60s).
     tokio::spawn(async {

@@ -4533,7 +4533,7 @@ function TauriConfigPageInner() {
                 <div style={{ flex: 1 }}>
                   <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "客户端凭据" : "Client Credentials"}</div>
                   <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>gateway.a2a.clients</div>
-                  <div style={{ fontSize: 10, color: V.t3, marginTop: 2, lineHeight: 1.5 }}>{zh ? "每条 secret 验证后归属于其 id（请求主体）。Bearer 或 X-API-Key 都接受。scopes 留空 = 无限制。" : "Each secret authenticates as its `id` (the request principal). Accepted on Bearer or X-API-Key. Empty scopes = unrestricted."}</div>
+                  <div style={{ fontSize: 10, color: V.t3, marginTop: 2, lineHeight: 1.5 }}>{zh ? "每条 secret 验证后归属于其 id（请求主体）。Bearer 或 X-API-Key 都接受。scopes 留空 = 无任何权限（请显式声明，如 a2a:invoke:* 或 *）。" : "Each secret authenticates as its `id` (the request principal). Accepted on Bearer or X-API-Key. Empty scopes = no permissions — declare them explicitly (e.g. a2a:invoke:* or *)."}</div>
                 </div>
                 <button onClick={addClient} style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${V.gbrd}`, background: V.glo, color: V.green, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
                   {zh ? "+ 添加" : "+ Add"}
@@ -4560,7 +4560,7 @@ function TauriConfigPageInner() {
                     <CommaListInput
                       value={scopesArr}
                       onChange={(next) => setClientField(i, "scopes", next)}
-                      placeholder={zh ? "scopes 如 a2a:invoke:*, *" : "scopes e.g. a2a:invoke:*, *"}
+                      placeholder={zh ? "scopes 必填（如 *, a2a:invoke:*）" : "scopes required (e.g. *, a2a:invoke:*)"}
                       style={{ ...fInput, flex: 1, minWidth: 180, fontSize: 11, fontFamily: V.mono }}
                     />
                     <button onClick={() => removeClient(i)} style={{ padding: "5px 10px", borderRadius: 7, border: `1px solid ${V.rbrd}`, background: V.rlo, color: V.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "删除" : "Remove"}</button>
@@ -4717,7 +4717,7 @@ function TauriConfigPageInner() {
                       <CommaListInput
                         value={scopesArr}
                         onChange={(next) => setRelayNodeField(i, "scopes", next)}
-                        placeholder={zh ? "scopes 留空=默认" : "scopes (empty=default)"}
+                        placeholder={zh ? "scopes 留空 = 节点默认 (relay:connect/advertise/receive)" : "scopes (empty = node defaults: relay:connect/advertise/receive)"}
                         style={{ ...fInput, flex: 1, minWidth: 180, fontSize: 11, fontFamily: V.mono }}
                       />
                       <button onClick={() => removeRelayNode(i)} style={{ padding: "5px 10px", borderRadius: 7, border: `1px solid ${V.rbrd}`, background: V.rlo, color: V.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "删除" : "Remove"}</button>

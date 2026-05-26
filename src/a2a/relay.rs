@@ -41,6 +41,16 @@ use crate::{
 const RELAY_PROTOCOL: &str = "rsclaw.a2a.relay.v1";
 const ROUTE_TTL_MS: u64 = 30_000;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Absolute upper bound on a single relay-forwarded SSE stream. Above
+/// this the hub synthesises a terminal `state=failed` event, drops the
+/// `stream_pending` entry, and sends a `Cancel` to the spoke. Needed
+/// because we removed reqwest's end-to-end timeout for long
+/// image/video generation flows (see commit b94c40f) — a misbehaving
+/// spoke that never sends a terminal Response, plus a happy SSE
+/// consumer + WS heartbeat, would otherwise pin the entry forever.
+/// 30 min comfortably covers jimeng video generation (~10 min) without
+/// punishing legitimate long polls.
+const STREAM_MAX_LIFETIME: Duration = Duration::from_secs(1800);
 /// Max time we wait for the spoke to complete keypair auth after WS upgrade
 /// before dropping the connection. Long enough to absorb cross-continent
 /// RTT, short enough to free slots fast under attack.
@@ -131,6 +141,14 @@ struct Connection {
 }
 
 #[derive(Debug, Clone)]
+struct StreamPending {
+    tx: broadcast::Sender<Value>,
+    agent_ref: String,
+    node_id: String,
+    deadline: std::time::Instant,
+}
+
+#[derive(Debug, Clone)]
 pub struct RouteEntry {
     pub agent_ref: String,
     pub node_id: String,
@@ -184,12 +202,15 @@ pub struct RelayHub {
     /// when a connection drops we can resolve only its pending waiters
     /// instead of nuking every in-flight JSON-RPC call.
     pending: DashMap<String, (oneshot::Sender<JsonRpcResponse>, String)>,
-    /// Streaming relay entries: request_id → (broadcast sender, agent_ref).
-    /// The agent_ref is kept so we can record `task_id → agent_ref` once
-    /// the first event arrives carrying a taskId. Inserted by
+    /// Streaming relay entries: request_id → StreamPending. `agent_ref`
+    /// drives `task_id → agent_ref` recording once the first event with a
+    /// taskId arrives. `node_id` lets the deadline sweeper send `Cancel`
+    /// to the right spoke. `deadline` bounds the entry's lifetime — see
+    /// `STREAM_MAX_LIFETIME` and `sweep_expired_streams`. Inserted by
     /// `invoke_streaming`; removed when the spoke sends its terminal
-    /// `RelayFrame::Response` for the streaming request.
-    stream_pending: DashMap<String, (broadcast::Sender<Value>, String)>,
+    /// `RelayFrame::Response`, the SSE consumer disconnects, or the
+    /// sweeper fires.
+    stream_pending: DashMap<String, StreamPending>,
     /// Spoke-side map of relay request_id → local task_id, so a `Cancel`
     /// frame can find the local `CancellationToken` in `task_cancels`.
     spoke_stream_tasks: DashMap<String, String>,
@@ -386,7 +407,7 @@ impl RelayHub {
         let lost: Vec<String> = self
             .stream_pending
             .iter()
-            .filter(|entry| entry.value().1.starts_with(&prefix))
+            .filter(|entry| entry.value().agent_ref.starts_with(&prefix))
             .map(|entry| entry.key().clone())
             .collect();
         for request_id in lost {
@@ -462,8 +483,15 @@ impl RelayHub {
             .ok_or_else(|| anyhow!("node '{}' is not connected", route.node_id))?;
         let request_id = format!("relay:stream:{}", Uuid::new_v4());
         let (event_tx, event_rx) = broadcast::channel(128);
-        self.stream_pending
-            .insert(request_id.clone(), (event_tx, target.to_owned()));
+        self.stream_pending.insert(
+            request_id.clone(),
+            StreamPending {
+                tx: event_tx,
+                agent_ref: target.to_owned(),
+                node_id: route.node_id.clone(),
+                deadline: std::time::Instant::now() + STREAM_MAX_LIFETIME,
+            },
+        );
         let frame = RelayFrame::Request {
             request_id: request_id.clone(),
             target: target.to_owned(),
@@ -513,9 +541,57 @@ impl RelayHub {
             return 0;
         };
         if let Some(task_id) = value.get("taskId").and_then(|v| v.as_str()) {
-            self.task_routes.insert(task_id.to_owned(), entry.1.clone());
+            self.task_routes
+                .insert(task_id.to_owned(), entry.agent_ref.clone());
         }
-        entry.0.send(value).unwrap_or(0)
+        entry.tx.send(value).unwrap_or(0)
+    }
+
+    /// Walk `stream_pending` and force-terminate any entry past its
+    /// deadline. Emits a synthetic terminal status-update so SSE consumers
+    /// observe a clean failure (rather than hanging until the WS dies),
+    /// then drops the entry and sends `Cancel` to the spoke. Called from
+    /// the gateway-wide sweeper loop in `startup.rs`.
+    pub fn sweep_expired_streams(&self) -> usize {
+        let now = std::time::Instant::now();
+        let expired: Vec<(String, String)> = self
+            .stream_pending
+            .iter()
+            .filter(|e| e.value().deadline <= now)
+            .map(|e| (e.key().clone(), e.value().node_id.clone()))
+            .collect();
+        for (request_id, node_id) in &expired {
+            let synthetic = serde_json::json!({
+                "kind": "status-update",
+                "taskId": "",
+                "contextId": "",
+                "status": {
+                    "state": "failed",
+                    "message": {
+                        "role": "agent",
+                        "messageId": format!("relay-deadline-{}", Uuid::new_v4()),
+                        "parts": [{
+                            "kind": "text",
+                            "text": format!(
+                                "relay stream exceeded {}s lifetime cap; aborting",
+                                STREAM_MAX_LIFETIME.as_secs()
+                            ),
+                        }],
+                    }
+                },
+                "final": true,
+            });
+            self.forward_stream_event(request_id, synthetic);
+            self.stream_pending.remove(request_id);
+            self.send_cancel_to(node_id, request_id);
+            self.metrics.inflight_losses.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                request_id = %request_id,
+                node_id = %node_id,
+                "relay stream hit deadline — synthetic failure emitted"
+            );
+        }
+        expired.len()
     }
 
     /// Record `task_id → agent_ref` so a follow-up RPC (GetTask, CancelTask,
@@ -1807,8 +1883,15 @@ mod tests {
     fn forward_stream_event_records_task_route() {
         let hub = RelayHub::new();
         let (event_tx, _event_rx) = broadcast::channel::<Value>(4);
-        hub.stream_pending
-            .insert("req-1".to_owned(), (event_tx, "a3/main".to_owned()));
+        hub.stream_pending.insert(
+            "req-1".to_owned(),
+            StreamPending {
+                tx: event_tx,
+                agent_ref: "a3/main".to_owned(),
+                node_id: "a3".to_owned(),
+                deadline: std::time::Instant::now() + Duration::from_secs(60),
+            },
+        );
 
         let wire = serde_json::json!({
             "kind": "status-update",
