@@ -19,7 +19,6 @@ pub mod install_hints;
 pub mod loop_detection;
 pub mod memory;
 pub mod memory_extractor;
-pub mod permission;
 pub mod platform;
 pub mod preparse;
 pub mod prompt_builder;
@@ -30,7 +29,6 @@ pub mod security;
 pub mod sft_exporter;
 pub mod spawner;
 pub mod tool_call_repair;
-pub mod tools_acp;
 pub(crate) mod tools_cap;
 pub mod tools_agent;
 pub mod tools_artifact;
@@ -53,9 +51,6 @@ pub use bootstrap::{seed_tools, seed_workspace, seed_workspace_with_lang};
 pub use collaboration::CollabMode;
 pub use loop_detection::LoopDetector;
 pub use memory::{MemoryDoc, MemoryStore};
-pub use permission::{
-    add_pending_permission, get_pending_permission, remove_pending_permission, resolve_permission,
-};
 pub use registry::{
     AgentHandle, AgentKind, AgentMessage, AgentRegistry, AgentReply, FileAttachment,
     ImageAttachment, PendingAnalysis, SessionTokens,

@@ -686,9 +686,6 @@ pub struct AgentRuntime {
     pub(crate) cached_tools: Vec<crate::provider::ToolDef>,
     pub(crate) notification_tx:
         Option<tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>>,
-    pub(crate) opencode_client: Arc<tokio::sync::OnceCell<crate::acp::client::AcpClient>>,
-    pub(crate) claudecode_client: Arc<tokio::sync::OnceCell<crate::acp::client::AcpClient>>,
-    pub(crate) codex_client: Arc<tokio::sync::OnceCell<crate::acp::CodexClient>>,
     /// In-memory session alias cache: alias_key → canonical session_key.
     /// Loaded from redb on first use, avoids repeated DB lookups.
     session_aliases: std::collections::HashMap<String, String>,
@@ -784,9 +781,6 @@ impl AgentRuntime {
             pending_task_results: Arc::new(std::sync::Mutex::new(Vec::new())),
             voice_mode_sessions: std::collections::HashSet::new(),
             notification_tx,
-            opencode_client: Arc::new(tokio::sync::OnceCell::new()),
-            claudecode_client: Arc::new(tokio::sync::OnceCell::new()),
-            codex_client: Arc::new(tokio::sync::OnceCell::new()),
             session_aliases,
             exec_pool,
             cap_manager,
@@ -829,8 +823,6 @@ impl AgentRuntime {
 
         rt
     }
-
-    // OpenCode / Claude Code ACP integration -> moved to tools_acp.rs
 
     /// Resolve the current model name from agent config with fallback.
     pub(crate) fn resolve_model_name(&self) -> String {
