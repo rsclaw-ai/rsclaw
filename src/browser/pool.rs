@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, warn};
 
-use super::{ACTIVE_INSTANCES, CdpClient, ChromeProcess, can_launch_chrome};
+use super::{CdpClient, ChromeProcess, can_launch_chrome};
 use crate::agent::platform::detect_chrome;
 
 /// Maximum concurrent tabs per Chrome instance.
@@ -197,7 +197,13 @@ impl BrowserPool {
         if let Some(ref mut pooled) = *guard {
             if pooled.process.child.try_wait().is_ok_and(|s| s.is_some()) {
                 warn!("pool: Chrome process exited, will restart");
-                ACTIVE_INSTANCES.fetch_sub(1, Ordering::Relaxed);
+                // Drop on ChromeProcess (browser/mod.rs:372) already calls
+                // `ACTIVE_INSTANCES.fetch_sub(1)`. Setting `*guard = None`
+                // here moves the ChromeProcess out of the Option and runs
+                // that Drop exactly once — we must NOT subtract again, or
+                // the counter underflows from 0 to u32::MAX and every
+                // subsequent `can_launch_chrome` check refuses (observed
+                // as "Chrome instance limit reached (4294967295/4)").
                 *guard = None;
             } else {
                 return Ok(pooled.port);
