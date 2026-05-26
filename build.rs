@@ -13,6 +13,25 @@ fn main() {
     // Defensive: strip a leading 'v' so CI mistakes don't produce vv2026.5.1.
     let version = version.trim_start_matches('v');
     println!("cargo:rustc-env=RSCLAW_BUILD_VERSION={version}");
+
+    // Short commit hash (6 chars). CI can override; locally we shell out
+    // to git. `cargo:rerun-if-changed=.git/HEAD` makes cargo rebuild when
+    // HEAD moves so `rsclaw -v` reflects the current commit, not a stale
+    // one cached from the previous build.
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/refs/heads");
+    if std::env::var("RSCLAW_BUILD_COMMIT").is_err() {
+        let commit = std::process::Command::new("git")
+            .args(["rev-parse", "--short=6", "HEAD"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unknown".to_owned());
+        println!("cargo:rustc-env=RSCLAW_BUILD_COMMIT={commit}");
+    }
+
     if std::env::var("RSCLAW_BUILD_DATE").is_err() {
         // Simple date without external crates
         let output = std::process::Command::new("date").arg("+%Y-%m-%d").output();

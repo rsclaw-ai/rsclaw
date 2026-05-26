@@ -132,10 +132,13 @@ async fn run() -> Result<()> {
     // Handle -v and -version before clap (clap handles --version and -V)
     let raw_args: Vec<String> = std::env::args().collect();
     if raw_args.len() == 2 && (raw_args[1] == "-v" || raw_args[1] == "-version") {
-        println!(
-            "rsclaw v{}",
-            option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
-        );
+        let version = option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev");
+        match option_env!("RSCLAW_BUILD_COMMIT") {
+            Some(commit) if !commit.is_empty() && commit != "unknown" => {
+                println!("rsclaw v{version} ({commit})")
+            }
+            _ => println!("rsclaw v{version}"),
+        }
         return Ok(());
     }
 
