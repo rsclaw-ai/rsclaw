@@ -31,6 +31,7 @@ pub mod sft_exporter;
 pub mod spawner;
 pub mod tool_call_repair;
 pub mod tools_acp;
+pub(crate) mod tools_cap;
 pub mod tools_agent;
 pub mod tools_artifact;
 pub mod tools_builder;

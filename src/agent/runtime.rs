@@ -701,6 +701,9 @@ pub struct AgentRuntime {
     /// Background exec pool — runs long commands without blocking the agent
     /// loop.
     pub(crate) exec_pool: Arc<super::exec_pool::ExecPool>,
+    /// Coding-agent proxy (Claude Code, Opencode, Codex, Amp). `None` until
+    /// Task 9 wires up construction; `None` outside the gateway.
+    pub(crate) cap_manager: Option<std::sync::Arc<crate::cap::CapAgentManager>>,
 }
 
 impl AgentRuntime {
@@ -785,6 +788,7 @@ impl AgentRuntime {
             codex_client: Arc::new(tokio::sync::OnceCell::new()),
             session_aliases,
             exec_pool,
+            cap_manager: None,
         };
 
         // Purge any internal-session history left over in redb from older
