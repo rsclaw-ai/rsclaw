@@ -3203,6 +3203,7 @@ impl AgentRuntime {
                     &self.wasm_plugins,
                     self.plugins.as_deref(),
                     &self.config.raw,
+                    self.cap_manager.is_some(),
                 );
                 // DEBUG: dump full system prompt to file for inspection
                 if std::env::var("RSCLAW_DUMP_PROMPT").is_ok() {

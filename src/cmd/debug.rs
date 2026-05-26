@@ -109,7 +109,9 @@ async fn dump_prompt_spec(args: DumpPromptSpecArgs) -> Result<()> {
     // than a divergent live state. Skills load from disk via the
     // SkillRegistry above; that's enough for the prompt-spec dump.
     let shared_prefix = build_shared_system_prefix();
-    let user_system = build_user_system(&ws_ctx, &skills, &[], None, &config.raw);
+    // Debug dump is a no-runtime path — `cap_available = true` so the
+    // dumped prompt-spec shows what the live agent sees.
+    let user_system = build_user_system(&ws_ctx, &skills, &[], None, &config.raw, true);
 
     // 6. Build the merged tool list, then split by name into the cacheable
     //    built-ins vs the per-machine remainder. `build_tool_list` only knows about
