@@ -7804,9 +7804,7 @@ impl AgentRuntime {
                 a["action"] = serde_json::json!("create_ppt");
                 return self.tool_doc(a).await;
             }
-            "opencode" => return self.tool_opencode(ctx, args).await,
-            "claudecode" => return self.tool_claudecode(ctx, args).await,
-            "codex" => return self.tool_codex(ctx, args).await,
+            "cap" => return self.tool_cap(args).await,
             _ => {}
         }
 
