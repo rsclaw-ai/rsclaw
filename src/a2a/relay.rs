@@ -3,8 +3,10 @@
 //! Public A2A remains JSON-RPC over HTTP/SSE. This module is the private
 //! outbound-WS transport that lets NAT/private nodes attach to a hub.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow};
 use axum::{
@@ -511,8 +513,7 @@ impl RelayHub {
             return 0;
         };
         if let Some(task_id) = value.get("taskId").and_then(|v| v.as_str()) {
-            self.task_routes
-                .insert(task_id.to_owned(), entry.1.clone());
+            self.task_routes.insert(task_id.to_owned(), entry.1.clone());
         }
         entry.0.send(value).unwrap_or(0)
     }
@@ -543,11 +544,7 @@ pub struct RelayStreamGuard {
 }
 
 impl RelayStreamGuard {
-    pub fn new(
-        relay_hub: std::sync::Arc<RelayHub>,
-        node_id: String,
-        request_id: String,
-    ) -> Self {
+    pub fn new(relay_hub: std::sync::Arc<RelayHub>, node_id: String, request_id: String) -> Self {
         Self {
             relay_hub,
             node_id,
@@ -633,6 +630,13 @@ fn verify_node_token(node: &A2aRelayNodeRuntime, token: &str) -> bool {
     !node.token.is_empty() && constant_time_eq(&node.token, token)
 }
 
+fn relay_connect_token_allows(node: &A2aRelayNodeRuntime, presented: Option<&str>) -> bool {
+    if node.token.is_empty() {
+        return node.public_key.is_some();
+    }
+    presented.is_some_and(|token| verify_node_token(node, token))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RelayWsQuery {
     node_id: String,
@@ -668,47 +672,31 @@ pub async fn relay_ws_handler(
         );
         return axum::http::StatusCode::UNAUTHORIZED.into_response();
     };
-    // Token verification: only required when node is not keypair-only.
-    // Keypair nodes must still pass challenge-response in handle_hub_socket
-    // before they are registered.
-    if node.public_key.is_none() {
-        let presented = query.token.as_deref().or_else(|| bearer_token(&headers));
-        let Some(token) = presented else {
-            state
-                .relay_hub
-                .metrics
-                .auth_failures
-                .fetch_add(1, Ordering::Relaxed);
-            audit_relay(
-                "deny",
-                &format!("node:{}", node.node_id),
-                "connect",
-                &format!("relay:{}", relay.relay_id),
-                &relay.relay_id,
-                &node.node_id,
-                None,
-                Some("no token presented and no public_key configured"),
-            );
-            return axum::http::StatusCode::UNAUTHORIZED.into_response();
+    let presented = query.token.as_deref().or_else(|| bearer_token(&headers));
+    if !relay_connect_token_allows(&node, presented) {
+        state
+            .relay_hub
+            .metrics
+            .auth_failures
+            .fetch_add(1, Ordering::Relaxed);
+        let reason = if node.token.is_empty() {
+            "no token configured; keypair handshake required"
+        } else if presented.is_none() {
+            "no token presented"
+        } else {
+            "token mismatch"
         };
-        if !verify_node_token(&node, token) {
-            state
-                .relay_hub
-                .metrics
-                .auth_failures
-                .fetch_add(1, Ordering::Relaxed);
-            audit_relay(
-                "deny",
-                &format!("node:{}", node.node_id),
-                "connect",
-                &format!("relay:{}", relay.relay_id),
-                &relay.relay_id,
-                &node.node_id,
-                None,
-                Some("token mismatch"),
-            );
-            return axum::http::StatusCode::UNAUTHORIZED.into_response();
-        }
+        audit_relay(
+            "deny",
+            &format!("node:{}", node.node_id),
+            "connect",
+            &format!("relay:{}", relay.relay_id),
+            &relay.relay_id,
+            &node.node_id,
+            None,
+            Some(reason),
+        );
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
     }
     if node.scopes.is_empty() {
         node.scopes = default_node_scopes(&node.node_id, &relay.relay_id);
@@ -775,7 +763,9 @@ where
             }
             n
         }
-        Ok(RelayFrame::Hello { nonce_node: None, .. }) => {
+        Ok(RelayFrame::Hello {
+            nonce_node: None, ..
+        }) => {
             return Err("hello missing nonce_node (keypair mode required)".to_owned());
         }
         Ok(_) => return Err("first frame was not Hello".to_owned()),
@@ -788,9 +778,13 @@ where
         relay_id: relay_id.to_owned(),
         nonce_relay: nonce_relay.clone(),
     };
-    let payload = serde_json::to_string(&challenge)
-        .map_err(|e| format!("serialize Challenge: {e}"))?;
-    if sink.send(AxumWsMessage::Text(payload.into())).await.is_err() {
+    let payload =
+        serde_json::to_string(&challenge).map_err(|e| format!("serialize Challenge: {e}"))?;
+    if sink
+        .send(AxumWsMessage::Text(payload.into()))
+        .await
+        .is_err()
+    {
         return Err("send Challenge failed".to_owned());
     }
 
@@ -897,7 +891,10 @@ async fn handle_hub_socket(socket: WebSocket, state: AppState, node: A2aRelayNod
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
             // 1. WS-level Ping — empty payload is sufficient.
-            if ping_tx.send(AxumWsMessage::Ping(Vec::new().into())).is_err() {
+            if ping_tx
+                .send(AxumWsMessage::Ping(Vec::new().into()))
+                .is_err()
+            {
                 break;
             }
             // 2. App-level JSON Ping — kept for backwards compatibility
@@ -1020,9 +1017,7 @@ async fn handle_hub_frame(state: &AppState, node: &A2aRelayNodeRuntime, frame: R
             }
         }
         RelayFrame::Event {
-            request_id,
-            result,
-            ..
+            request_id, result, ..
         } => {
             if state.relay_hub.forward_stream_event(&request_id, result) == 0 {
                 debug!(request_id, "relay event for unknown stream");
@@ -1068,10 +1063,7 @@ pub fn task_id_from_params(params: &Value) -> Option<&str> {
         .or_else(|| params.get("taskId").and_then(|v| v.as_str()))
 }
 
-pub fn relay_target_from_request(
-    hub: &RelayHub,
-    req: &JsonRpcRequest,
-) -> Option<String> {
+pub fn relay_target_from_request(hub: &RelayHub, req: &JsonRpcRequest) -> Option<String> {
     if !FORWARDABLE_METHODS.contains(&req.method.as_str()) {
         return None;
     }
@@ -1271,8 +1263,7 @@ async fn run_spoke_once(state: AppState, relay: &A2aRelayRuntime, hub_url: &str)
     let token = relay.token.as_deref();
     let signing_key = match relay.private_key.as_deref() {
         Some(pk) => Some(
-            relay_identity::signing_key_from_b64(pk)
-                .context("parse spoke private_key (base64)")?,
+            relay_identity::signing_key_from_b64(pk).context("parse spoke private_key (base64)")?,
         ),
         None => None,
     };
@@ -1332,7 +1323,9 @@ async fn run_spoke_once(state: AppState, relay: &A2aRelayRuntime, hub_url: &str)
         }
     });
 
-    let nonce_node = signing_key.as_ref().map(|_| relay_identity::fresh_nonce_b64());
+    let nonce_node = signing_key
+        .as_ref()
+        .map(|_| relay_identity::fresh_nonce_b64());
     spoke_tx
         .send(spoke_hello(&state, node_id, nonce_node.clone()))
         .map_err(|_| anyhow!("spoke writer closed"))?;
@@ -1441,8 +1434,7 @@ async fn run_spoke_once(state: AppState, relay: &A2aRelayRuntime, hub_url: &str)
             RelayFrame::Cancel { request_id, .. } => {
                 // Cancel the streaming task if it exists locally. `task_cancels`
                 // is keyed by local task_id, so resolve via the spoke-side map.
-                if let Some((_, task_id)) =
-                    state.relay_hub.spoke_stream_tasks.remove(&request_id)
+                if let Some((_, task_id)) = state.relay_hub.spoke_stream_tasks.remove(&request_id)
                     && let Some((_, token)) = state.task_cancels.remove(&task_id)
                 {
                     token.cancel();
@@ -1661,6 +1653,20 @@ mod tests {
         assert!(!can_invoke(Some(&id), "a3/coder"));
     }
 
+    #[test]
+    fn keypair_node_with_token_still_requires_matching_token() {
+        let node = A2aRelayNodeRuntime {
+            node_id: "a1".to_owned(),
+            token: "secret".to_owned(),
+            public_key: Some("pk".to_owned()),
+            roles: Vec::new(),
+            scopes: Vec::new(),
+        };
+        assert!(relay_connect_token_allows(&node, Some("secret")));
+        assert!(!relay_connect_token_allows(&node, None));
+        assert!(!relay_connect_token_allows(&node, Some("wrong")));
+    }
+
     #[tokio::test]
     async fn hub_invocation_sends_request_and_returns_response() {
         let hub = std::sync::Arc::new(RelayHub::new());
@@ -1748,7 +1754,9 @@ mod tests {
         };
         let frame: RelayFrame = serde_json::from_str(&text).unwrap();
         match frame {
-            RelayFrame::Cancel { request_id: rid, .. } => assert_eq!(rid, request_id),
+            RelayFrame::Cancel {
+                request_id: rid, ..
+            } => assert_eq!(rid, request_id),
             other => panic!("expected Cancel, got {other:?}"),
         }
 
@@ -1768,7 +1776,10 @@ mod tests {
             method: "GetTask".to_owned(),
             params: serde_json::json!({"id": "task-abc"}),
         };
-        assert_eq!(relay_target_from_request(&hub, &req).as_deref(), Some("a3/main"));
+        assert_eq!(
+            relay_target_from_request(&hub, &req).as_deref(),
+            Some("a3/main")
+        );
 
         // Push config method uses `taskId` (camelCase).
         let push_req = JsonRpcRequest {
@@ -1964,7 +1975,8 @@ mod tests {
     fn route_expiration_increments_metric() {
         let hub = RelayHub::new();
         // 1ms TTL — already expired by the time route_for runs.
-        hub.apply_route_lease("a", &["a/main".to_owned()], 1, 1).unwrap();
+        hub.apply_route_lease("a", &["a/main".to_owned()], 1, 1)
+            .unwrap();
         std::thread::sleep(Duration::from_millis(10));
         assert!(hub.route_for("a/main").is_none());
         assert_eq!(hub.metrics.route_expirations.load(Ordering::Relaxed), 1);
@@ -1997,6 +2009,9 @@ mod tests {
         drop(guard);
 
         let no_msg = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
-        assert!(no_msg.is_err(), "no Cancel frame expected after normal completion");
+        assert!(
+            no_msg.is_err(),
+            "no Cancel frame expected after normal completion"
+        );
     }
 }

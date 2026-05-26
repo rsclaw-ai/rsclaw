@@ -7,9 +7,12 @@
 //! Each event is wrapped in a JSON-RPC frame `{"jsonrpc","id","result":<wire>}`
 //! and emitted as one SSE `data:` line.
 
-use std::convert::Infallible;
+use std::{convert::Infallible, sync::atomic::Ordering};
 
-use axum::response::{IntoResponse, Response, sse::{Event, KeepAlive, Sse}};
+use axum::response::{
+    IntoResponse, Response,
+    sse::{Event, KeepAlive, Sse},
+};
 use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
@@ -20,7 +23,7 @@ use uuid::Uuid;
 use crate::{
     a2a::{
         event::AgentEvent,
-        relay::relay_target_from_params,
+        relay::{audit_relay, relay_target_from_params},
         types::{
             A2aArtifact, A2aMessage, A2aTask, A2aTaskStatus, JsonRpcRequest, SendMessageParams,
             TaskState,
@@ -52,6 +55,30 @@ pub async fn handle_streaming_rpc(
                 .as_ref()
                 .map(|id| id.id.as_str())
                 .unwrap_or("anonymous-dev");
+            if !crate::a2a::relay::can_invoke(caller.as_ref(), target) {
+                state
+                    .relay_hub
+                    .metrics
+                    .acl_denials
+                    .fetch_add(1, Ordering::Relaxed);
+                let relay_id = state.config.gateway.a2a_relay.relay_id.as_str();
+                let target_node = target.split('/').next().unwrap_or("");
+                audit_relay(
+                    "deny",
+                    principal,
+                    "invoke",
+                    &format!("agent:{target}"),
+                    relay_id,
+                    target_node,
+                    None,
+                    Some("a2a:invoke scope missing"),
+                );
+                return sse_jsonrpc_error(
+                    Some(req_id),
+                    -32003,
+                    format!("not authorized to invoke {target}"),
+                );
+            }
             let mut params = req.params.clone();
             crate::a2a::relay::rewrite_target_agent_for_spoke(&mut params, target);
             match state
@@ -65,8 +92,8 @@ pub async fn handle_streaming_rpc(
                         node_id,
                         request_id,
                     );
-                    let stream = tokio_stream::wrappers::BroadcastStream::new(event_rx)
-                        .filter_map(move |result| {
+                    let stream = tokio_stream::wrappers::BroadcastStream::new(event_rx).filter_map(
+                        move |result| {
                             // Force capture so guard.Drop fires when the SSE
                             // stream is dropped (consumer disconnect).
                             let _ = &guard;
@@ -80,9 +107,7 @@ pub async fn handle_streaming_rpc(
                                             "result": value,
                                         });
                                         Some(Ok::<_, Infallible>(
-                                            Event::default()
-                                                .json_data(payload)
-                                                .unwrap_or_default(),
+                                            Event::default().json_data(payload).unwrap_or_default(),
                                         ))
                                     }
                                     Err(BroadcastStreamRecvError::Lagged(n)) => {
@@ -91,8 +116,11 @@ pub async fn handle_streaming_rpc(
                                     }
                                 }
                             }
-                        });
-                    return Sse::new(stream).keep_alive(KeepAlive::new()).into_response();
+                        },
+                    );
+                    return Sse::new(stream)
+                        .keep_alive(KeepAlive::new())
+                        .into_response();
                 }
                 Err(e) => {
                     warn!(error = %e, "relay streaming failed, falling back");
@@ -180,7 +208,24 @@ pub async fn handle_streaming_rpc(
         }
     });
 
-    Sse::new(stream).keep_alive(KeepAlive::new()).into_response()
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new())
+        .into_response()
+}
+
+fn sse_jsonrpc_error(id: Option<Value>, code: i64, message: String) -> Response {
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message,
+        },
+    });
+    let stream = tokio_stream::once(Ok::<_, Infallible>(
+        Event::default().json_data(payload).unwrap_or_default(),
+    ));
+    Sse::new(stream).into_response()
 }
 
 /// Spawn an agent task and return `(task_id, subscriber)`. The subscriber is
