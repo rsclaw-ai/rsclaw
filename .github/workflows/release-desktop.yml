@@ -86,6 +86,12 @@ jobs:
           toolchain: "1.91"
           targets: ${{ matrix.target }}
 
+      # 兜底:dtolnay/rust-toolchain@master 的 `targets:` 在某些 runner
+      # image 上偶发不真正下载 target (E0463 can't find crate for `core`)。
+      - name: Ensure rust target installed
+        shell: bash
+        run: rustup target add ${{ matrix.target }} || true
+
       - uses: Swatinem/rust-cache@v2
         with:
           key: desktop-${{ matrix.target }}

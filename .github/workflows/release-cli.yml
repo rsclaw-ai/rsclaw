@@ -53,6 +53,13 @@ jobs:
           toolchain: "1.91"
           targets: ${{ matrix.target }}
 
+      # dtolnay/rust-toolchain@master 的 `targets:` 在某些 runner image
+      # 上偶发不真正下载 target (观察到 macos-14 x86_64-apple-darwin 缺
+      # core/std,E0463)。这一步做兜底,缺则装,装过则 no-op。
+      - name: Ensure rust target installed
+        shell: bash
+        run: rustup target add ${{ matrix.target }} || true
+
       - uses: Swatinem/rust-cache@v2
         with:
           key: cli-${{ matrix.target }}
