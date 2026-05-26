@@ -369,7 +369,7 @@ impl super::runtime::AgentRuntime {
             }
             cmd.arg("--")
                 .arg(pattern)
-                .arg(root_path.to_str().unwrap_or("."));
+                .arg(root_path.as_os_str());
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::null());
             tokio::time::timeout(Duration::from_secs(15), cmd.output())

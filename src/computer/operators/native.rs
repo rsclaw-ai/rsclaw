@@ -366,30 +366,90 @@ fn scroll_amount(dir: ScrollDir, clicks: i32) -> (Axis, i32) {
 /// six chars `h i \ n` typed into whatever app is focused (e.g. WeChat
 /// shows literal `hi\n` instead of sending "hi" + Enter).
 ///
-/// Recognised escapes: `\n` `\t` `\r` `\\` `\'` `\"` `\0`. Unknown
-/// escape (`\x`) is preserved verbatim so a content string containing
-/// a real backslash doesn't get silently mangled.
+/// Recognised escapes: `\n` `\t` `\r` `\\` `\'` `\"` `\0`, plus
+/// `\xHH` (two hex digits) and `\uXXXX` (four hex digits, Unicode
+/// code point). Unknown or malformed escapes (e.g. `\q`, `\u12`)
+/// are preserved verbatim so a content string containing a real
+/// backslash doesn't get silently mangled.
 fn decode_string_escapes(s: &str) -> String {
+    let cv: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
+    let mut i = 0;
+    while i < cv.len() {
+        let c = cv[i];
+        if c != '\\' || i + 1 >= cv.len() {
             out.push(c);
+            i += 1;
             continue;
         }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('r') => out.push('\r'),
-            Some('\\') => out.push('\\'),
-            Some('\'') => out.push('\''),
-            Some('"') => out.push('"'),
-            Some('0') => out.push('\0'),
-            Some(other) => {
+        let next = cv[i + 1];
+        match next {
+            'n' => {
+                out.push('\n');
+                i += 2;
+            }
+            't' => {
+                out.push('\t');
+                i += 2;
+            }
+            'r' => {
+                out.push('\r');
+                i += 2;
+            }
+            '\\' => {
+                out.push('\\');
+                i += 2;
+            }
+            '\'' => {
+                out.push('\'');
+                i += 2;
+            }
+            '"' => {
+                out.push('"');
+                i += 2;
+            }
+            '0' => {
+                out.push('\0');
+                i += 2;
+            }
+            'x' if i + 3 < cv.len()
+                && cv[i + 2].is_ascii_hexdigit()
+                && cv[i + 3].is_ascii_hexdigit() =>
+            {
+                // `\xHH` — two hex digits, 0x00..=0xFF.
+                let v = (cv[i + 2].to_digit(16).unwrap() << 4) | cv[i + 3].to_digit(16).unwrap();
+                if let Some(ch) = char::from_u32(v) {
+                    out.push(ch);
+                    i += 4;
+                } else {
+                    out.push('\\');
+                    out.push('x');
+                    i += 2;
+                }
+            }
+            'u' if i + 5 < cv.len()
+                && cv[i + 2..=i + 5].iter().all(char::is_ascii_hexdigit) =>
+            {
+                // `\uXXXX` — four hex digits. The VLM occasionally
+                // emits Unicode escapes for CJK input.
+                let v = (cv[i + 2].to_digit(16).unwrap() << 12)
+                    | (cv[i + 3].to_digit(16).unwrap() << 8)
+                    | (cv[i + 4].to_digit(16).unwrap() << 4)
+                    | cv[i + 5].to_digit(16).unwrap();
+                if let Some(ch) = char::from_u32(v) {
+                    out.push(ch);
+                    i += 6;
+                } else {
+                    out.push('\\');
+                    out.push('u');
+                    i += 2;
+                }
+            }
+            other => {
                 out.push('\\');
                 out.push(other);
+                i += 2;
             }
-            None => out.push('\\'),
         }
     }
     out
@@ -789,5 +849,33 @@ mod tests {
             decode_string_escapes("正式版即将上线，敬请期待。"),
             "正式版即将上线，敬请期待。"
         );
+    }
+
+    #[test]
+    fn decode_string_escapes_handles_hex_and_unicode() {
+        // `\xHH` — two hex digits → byte cast to char (0..=0xFF).
+        assert_eq!(decode_string_escapes(r"a\x41b"), "aAb");
+        assert_eq!(decode_string_escapes(r"\x00end"), "\0end");
+        // `\uXXXX` — four hex digits → Unicode code point. VLMs sometimes
+        // emit Unicode escapes for CJK content. Build the input string
+        // programmatically so the source file doesn't need to spell out
+        // the raw `\u...` escape syntax inline (which gets confused
+        // through editors that auto-process the sequence).
+        let cjk_input = format!("hi {}u4e2d!", '\\');
+        assert_eq!(
+            decode_string_escapes(&cjk_input),
+            format!("hi {}!", '\u{4e2d}')
+        );
+        let acc_input = format!("{}u00e9clair", '\\');
+        assert_eq!(
+            decode_string_escapes(&acc_input),
+            format!("{}clair", '\u{00e9}')
+        );
+        // Truncated / malformed forms preserve verbatim.
+        assert_eq!(decode_string_escapes(r"\xZZ"), r"\xZZ");
+        assert_eq!(decode_string_escapes(r"\u12"), r"\u12");
+        // Surrogate code points (0xD800..=0xDFFF) are invalid Unicode
+        // scalars and must NOT panic — fall through verbatim.
+        assert_eq!(decode_string_escapes(r"\ud800"), r"\ud800");
     }
 }

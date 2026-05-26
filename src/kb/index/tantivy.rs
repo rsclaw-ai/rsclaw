@@ -86,7 +86,7 @@ impl TantivyIndex {
     /// Replace any existing entry for `chunk_id`, then add the new one.
     /// Caller must call `commit()` to flush.
     pub fn upsert(&self, chunk_id: &str, doc_id: &str, indexed_text: &str) -> Result<()> {
-        let w = self.writer.lock().unwrap();
+        let w = self.writer.lock().unwrap_or_else(|p| p.into_inner());
         let term = Term::from_field_text(self.schema.chunk_id, chunk_id);
         w.delete_term(term);
         let d: TantivyDocument = doc!(
@@ -99,7 +99,7 @@ impl TantivyIndex {
     }
 
     pub fn commit(&self) -> Result<()> {
-        let mut w = self.writer.lock().unwrap();
+        let mut w = self.writer.lock().unwrap_or_else(|p| p.into_inner());
         w.commit()?;
         drop(w);
         // Force reader reload so subsequent searches see the new docs
@@ -136,7 +136,7 @@ impl TantivyIndex {
     /// `KbChunk`.
     pub fn rebuild(&self, store: &KbStore) -> Result<()> {
         {
-            let mut w = self.writer.lock().unwrap();
+            let mut w = self.writer.lock().unwrap_or_else(|p| p.into_inner());
             w.delete_all_documents()?;
             w.commit()?;
         }

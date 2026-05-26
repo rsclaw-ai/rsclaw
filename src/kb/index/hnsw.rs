@@ -114,7 +114,7 @@ impl HnswCache {
     /// sorted by descending score. `score` is `1 - cosine_distance`
     /// so higher = more similar.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(String, f32)> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
         if inner.id_to_chunk.is_empty() || query.len() != self.dimension {
             return Vec::new();
         }
@@ -139,7 +139,7 @@ impl HnswCache {
                 vector.len()
             ));
         }
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         let new_id = inner.id_to_chunk.len();
         inner.id_to_chunk.push(chunk_id.to_string());
         inner.chunk_to_id.insert(chunk_id.to_string(), new_id);
@@ -192,14 +192,14 @@ impl HnswCache {
             chunk_to_id,
         };
         let n = new_inner.id_to_chunk.len();
-        *self.inner.write().unwrap() = new_inner;
+        *self.inner.write().unwrap_or_else(|p| p.into_inner()) = new_inner;
         tracing::info!(n, "kb hnsw: rebuild complete");
         Ok(())
     }
 
     /// Number of vectors currently in the cache. Test/debug helper.
     pub fn len(&self) -> usize {
-        self.inner.read().unwrap().id_to_chunk.len()
+        self.inner.read().unwrap_or_else(|p| p.into_inner()).id_to_chunk.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -213,7 +213,7 @@ impl HnswCache {
     pub fn snapshot(&self, dir: &Path) -> Result<()> {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("create_dir_all {}", dir.display()))?;
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
         // hnsw_rs's `file_dump` panics if there are zero data points,
         // so skip it for the empty case — we still write meta so
         // `restore` can detect an intentional empty snapshot.
@@ -271,7 +271,7 @@ impl HnswCache {
         let n = meta.id_to_chunk.len();
         if n == 0 {
             // Empty snapshot: clear inner state, skip hnsw load.
-            let mut inner = self.inner.write().unwrap();
+            let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
             *inner = HnswInner::empty();
             tracing::info!(dir = %dir.display(), "kb hnsw: restored empty snapshot");
             return Ok(true);
@@ -305,7 +305,7 @@ impl HnswCache {
             id_to_chunk: meta.id_to_chunk,
             chunk_to_id,
         };
-        *self.inner.write().unwrap() = new_inner;
+        *self.inner.write().unwrap_or_else(|p| p.into_inner()) = new_inner;
         tracing::info!(n, dir = %dir.display(), "kb hnsw: snapshot restored");
         Ok(true)
     }
