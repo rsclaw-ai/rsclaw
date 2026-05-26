@@ -4551,7 +4551,7 @@ function TauriConfigPageInner() {
                 return (
                   <div key={`client-${i}`} style={{ padding: "10px 15px", borderBottom: isLast ? "none" : `1px solid rgba(255,255,255,.03)`, display: "flex", alignItems: "center", gap: 8 }}>
                     <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, width: 28 }}>{`[${i}]`}</div>
-                    <input style={{ ...fInput, width: 160 }} type="text" placeholder={zh ? "id" : "id"} value={c?.id || ""} onChange={(e) => setClientField(i, "id", e.target.value)} />
+                    <input style={{ ...fInput, width: 80, minWidth: 80 }} type="text" placeholder={zh ? "id" : "id"} value={c?.id || ""} onChange={(e) => setClientField(i, "id", e.target.value)} />
                     {secretIsString ? (
                       <input style={{ ...fInput, flex: 1, minWidth: 160 }} type="password" placeholder="${RSCLAW_PARTNER_SECRET}" value={secret || ""} onChange={(e) => setClientField(i, "secret", e.target.value)} />
                     ) : (
@@ -4712,7 +4712,7 @@ function TauriConfigPageInner() {
                   return (
                     <div key={`relay-node-${i}`} style={{ padding: "10px 15px", borderBottom: isLast ? "none" : `1px solid rgba(255,255,255,.03)`, display: "flex", alignItems: "center", gap: 8 }}>
                       <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, width: 28 }}>{`[${i}]`}</div>
-                      <input style={{ ...fInput, width: 160 }} type="text" placeholder={zh ? "node id" : "node id"} value={n?.nodeId || ""} onChange={(e) => setRelayNodeField(i, "nodeId", e.target.value)} />
+                      <input style={{ ...fInput, width: 80, minWidth: 80 }} type="text" placeholder={zh ? "node id" : "node id"} value={n?.nodeId || ""} onChange={(e) => setRelayNodeField(i, "nodeId", e.target.value)} />
                       <input style={{ ...fInput, flex: 1, minWidth: 160 }} type="password" placeholder="${RSCLAW_NODE_TOKEN}" value={typeof n?.token === "string" ? n.token : ""} onChange={(e) => setRelayNodeField(i, "token", e.target.value)} />
                       <CommaListInput
                         value={scopesArr}
