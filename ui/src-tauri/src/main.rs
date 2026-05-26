@@ -908,29 +908,39 @@ async fn rsclaw_console_install_key(
     app.emit("rsclaw:console-install-key", data)
         .map_err(|e| format!("emit install-key event: {e}"))?;
 
-    // Close the console webview right here on the Rust side. Previously
-    // we left this to a frontend `closeRsclawConsole()` call in the
-    // main window's install listener, but that path was flaky in
-    // practice — the close apparently never fired even when the
-    // install event reached the card. Closing from the same Tauri
-    // command the webview calls in to is the simplest reliable
-    // sequencing: emit-then-close, synchronous, no JS round-trip.
-    if let Some(console) = app.get_webview_window("rsclaw-console") {
-        let _ = console.close();
-    }
+    // Defer window-close + main-window focus to a background task. The
+    // webview-side caller (`window.__RSCLAW_DESKTOP__.installKey(...)`)
+    // is awaiting this command's reply — calling `console.close()` here
+    // synchronously means we're closing the window that's still in the
+    // middle of waiting on us. On macOS Tauri 2 that triple-step (close
+    // child → unminimize/show/set_focus parent in the same tick) has
+    // shown up in crash reports as a renderer SIGABRT. Spawning lets
+    // this command return Ok first; the close runs on the next tick
+    // after the webview has already taken our reply.
+    let app_clone = app.clone();
+    std::thread::spawn(move || {
+        // Tiny pause so the current command finishes returning to JS
+        // before we start tearing down its window.
+        std::thread::sleep(std::time::Duration::from_millis(50));
 
-    // Surface the main window — the user just installed a key inside
-    // the console webview, but the main RsClaw window (where the
-    // onboarding card lives) might be backgrounded behind other apps.
-    // Pop it to the front so the "Connected" state is actually seen.
-    // All operations are best-effort: failures here shouldn't block
-    // the install path (the key is already written to config by the
-    // listener that fires off the emit above).
-    if let Some(main) = app.get_webview_window("main") {
-        let _ = main.unminimize();
-        let _ = main.show();
-        let _ = main.set_focus();
-    }
+        if let Some(console) = app_clone.get_webview_window("rsclaw-console") {
+            if let Err(e) = console.close() {
+                eprintln!("[console] close failed: {e}");
+            }
+        }
+
+        // Surface the main window — the user just installed a key
+        // inside the console webview, but the main RsClaw window might
+        // be backgrounded behind other apps. Pop it to the front so
+        // the "Connected" state is actually seen. Best-effort; failures
+        // shouldn't block the install path.
+        if let Some(main) = app_clone.get_webview_window("main") {
+            let _ = main.unminimize();
+            let _ = main.show();
+            let _ = main.set_focus();
+        }
+    });
+
     Ok(())
 }
 
@@ -1558,10 +1568,6 @@ fn resolve_tool_name(name: &str) -> &str {
     }
 }
 
-fn is_local_tool_installed(name: &str) -> bool {
-    local_tool_binary_path(name).is_some()
-}
-
 fn local_tool_binary_path(name: &str) -> Option<std::path::PathBuf> {
     let name = resolve_tool_name(name);
     let dir = rsclaw_base_dir().join("tools").join(name);
@@ -1702,6 +1708,7 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
         "openrouter"  => "https://openrouter.ai/api/v1",
         "gaterouter"  => "https://api.gaterouter.ai/openai/v1",
         "ollama"      => "http://localhost:11434",
+        "rsclaw"      => "https://api.rsclaw.ai/v1/agent",
         "custom" | "codingplan" => "",
         _ => return Ok(serde_json::json!({"ok": false, "error": "unknown provider"})),
     };
@@ -1722,11 +1729,50 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
         .timeout(std::time::Duration::from_secs(15))
         .build().unwrap_or_default();
 
-    // Minimax doesn't support /models — return built-in list
+    // Providers without a public model-listing endpoint return a curated
+    // built-in list. Without this the UI hits `/models`, sees a 404 (or
+    // a 200 with no `data` array), and shows "未获取到模型, 请手动输入"
+    // even when the key is fine.
+    //
+    // - Minimax — no `/models` route exists upstream.
+    // - Volcengine ARK (doubao) — `/v3/models` 404s; only the inference
+    //   endpoint is public. Inference fallback below confirms the key
+    //   but can't enumerate models.
+    // - rsclaw — cloud-managed via `api.rsclaw.ai/v1/agent`, custom path
+    //   shape (no `/models`). Fleet versioning ties the list to
+    //   `RSCLAW_DEFAULT_*` constants in `src/provider/rsclaw.rs` —
+    //   keep this list in sync when those bump.
     if provider == "minimax" {
         return Ok(serde_json::json!({
             "ok": true,
             "models": ["MiniMax-M2.7","MiniMax-M2.7-highspeed","MiniMax-M2.5","MiniMax-M2.5-highspeed","MiniMax-M2.1","MiniMax-M2.1-highspeed","MiniMax-M2"]
+        }));
+    }
+    if provider == "rsclaw" {
+        return Ok(serde_json::json!({
+            "ok": true,
+            "models": [
+                "rsclaw-agent-v1",
+                "rsclaw-flash-v1",
+                "rsclaw-vision-v1",
+            ]
+        }));
+    }
+    if provider == "doubao" && api_type.is_none() {
+        // Default doubao (ark v3, OpenAI-shape). When the user pinned an
+        // explicit api_type (e.g. anthropic via CodingPlan) drop through
+        // to the live probe — that path needs the real endpoint check.
+        return Ok(serde_json::json!({
+            "ok": true,
+            "models": [
+                "doubao-seed-2.0-pro",
+                "doubao-seed-2.0-lite",
+                "doubao-seed-2.0-flash",
+                "doubao-seed-1.6-vision-thinking",
+                "doubao-seed-1.5-vision-pro",
+                "doubao-seedream-5-0-260128",
+                "doubao-seedance-2-0-260128",
+            ]
         }));
     }
 
@@ -2069,8 +2115,12 @@ fn main() {
     {
         std::thread::spawn(|| {
             unsafe {
-                libc::signal(libc::SIGTERM, handle_sigterm as usize);
-                libc::signal(libc::SIGINT, handle_sigterm as usize);
+                // Rust 2024 forbids direct fn-item → usize. libc::signal wants
+                // a usize sighandler — go fn → *const () → usize per the lint
+                // suggestion. Same numeric value, just makes the conversion
+                // explicit.
+                libc::signal(libc::SIGTERM, handle_sigterm as *const () as usize);
+                libc::signal(libc::SIGINT, handle_sigterm as *const () as usize);
             }
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(200));

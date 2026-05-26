@@ -2001,6 +2001,7 @@ mod tests {
 
     fn make_request() -> LlmRequest {
         LlmRequest {
+            fallback_models: Vec::new(),
             model: "gpt-4o".to_owned(),
             ..Default::default()
         }
@@ -2016,6 +2017,7 @@ mod tests {
     #[test]
     fn message_role_user() {
         let req = LlmRequest {
+            fallback_models: Vec::new(),
             messages: vec![Message {
                 role: Role::User,
                 content: MessageContent::Text("hello".to_owned()),
@@ -2212,6 +2214,7 @@ mod tests {
 
         fn make_responses_request() -> LlmRequest {
             LlmRequest {
+                fallback_models: Vec::new(),
                 model: "doubao-seed-2-0-pro-260215".to_owned(),
                 ..Default::default()
             }
@@ -2220,6 +2223,7 @@ mod tests {
         #[test]
         fn request_uses_input_not_messages() {
             let req = LlmRequest {
+            fallback_models: Vec::new(),
                 messages: vec![Message {
                     role: Role::User,
                     content: MessageContent::Text("hello".to_owned()),
@@ -2238,6 +2242,7 @@ mod tests {
         #[test]
         fn system_goes_to_instructions() {
             let req = LlmRequest {
+            fallback_models: Vec::new(),
                 system: Some("be helpful".to_owned()),
                 ..make_responses_request()
             };
@@ -2248,6 +2253,7 @@ mod tests {
         #[test]
         fn content_parts_use_input_text() {
             let req = LlmRequest {
+            fallback_models: Vec::new(),
                 messages: vec![Message {
                     role: Role::User,
                     content: MessageContent::Text("hello".to_owned()),
@@ -2264,6 +2270,7 @@ mod tests {
         #[test]
         fn image_uses_input_image() {
             let req = LlmRequest {
+            fallback_models: Vec::new(),
                 messages: vec![Message {
                     role: Role::User,
                     content: MessageContent::Parts(vec![ContentPart::Image {

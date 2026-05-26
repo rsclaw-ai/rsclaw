@@ -748,7 +748,7 @@ $g.Dispose();$b.Dispose()"#
             .config
             .model
             .as_ref()
-            .and_then(|m| m.primary.as_deref())
+            .and_then(|m| m.primary_head())
             .unwrap_or("default");
         let mut lines = vec![format!("Current model: {model}")];
         lines.push(String::new());
@@ -1228,7 +1228,7 @@ pub(crate) async fn btw_direct_call(
         .defaults
         .model
         .as_ref()
-        .and_then(|m| m.primary.as_deref())
+        .and_then(|m| m.primary_head())
         .unwrap_or("rsclaw/rsclaw-agent-v1");
 
     let system = format!(
@@ -1238,6 +1238,7 @@ pub(crate) async fn btw_direct_call(
     );
 
     let req = LlmRequest {
+            fallback_models: Vec::new(),
         model: model.to_owned(),
         messages: vec![Message {
             role: Role::User,
@@ -1265,7 +1266,15 @@ pub(crate) async fn btw_direct_call(
         .as_ref()
         .and_then(|a| a.order.clone())
         .unwrap_or_default();
-    let mut failover = FailoverManager::new(auth_order, std::collections::HashMap::new(), vec![]);
+    // /btw uses an ephemeral failover with a fresh health table — its calls
+    // are one-shot bypass queries that shouldn't poison the agent's
+    // long-lived chain state.
+    let mut failover = FailoverManager::new(
+        auth_order,
+        std::collections::HashMap::new(),
+        vec![],
+        crate::provider::health::ProviderHealthRegistry::new(),
+    );
 
     let mut stream = match failover.call(req, providers).await {
         Ok(s) => s,

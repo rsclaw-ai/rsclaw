@@ -610,6 +610,11 @@ pub struct AgentRuntime {
     pub providers: Arc<ProviderRegistry>,
     /// Per-runtime failover manager tracking per-profile cooldowns.
     pub(crate) failover: FailoverManager,
+    /// Shared per-model health table. Same `Arc` as the FailoverManager's
+    /// — exposed here so tools that bypass FailoverManager (image_gen,
+    /// video_gen — they POST directly to provider-specific HTTP
+    /// endpoints) can still consult `is_callable` and record outcomes.
+    pub(crate) model_health: crate::provider::health::ProviderHealthRegistry,
     pub skills: Arc<SkillRegistry>,
     pub store: Arc<Store>,
     pub memory: Option<Arc<Mutex<MemoryStore>>>,
@@ -714,6 +719,7 @@ impl AgentRuntime {
         plugins: Option<Arc<PluginRegistry>>,
         mcp: Option<Arc<crate::mcp::McpRegistry>>,
         notification_tx: Option<tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>>,
+        model_health: crate::provider::health::ProviderHealthRegistry,
     ) -> Self {
         // Populate auth.order so FailoverManager uses the configured profile
         // priority per provider (AGENTS.md §12).
@@ -723,10 +729,17 @@ impl AgentRuntime {
             .as_ref()
             .and_then(|a| a.order.clone())
             .unwrap_or_default();
+        // Clone the shared health registry for direct tool access. tools
+        // like `image_gen` / `video_gen` build raw HTTP requests outside
+        // the FailoverManager flow but still want chain-level gating —
+        // they consult `self.model_health` directly. Same `Arc` so
+        // FailoverManager and the tools see one source of truth.
+        let model_health_for_tools = model_health.clone();
         let failover = FailoverManager::new(
             auth_order,
             std::collections::HashMap::new(),
             fallback_models,
+            model_health,
         );
         let session_aliases = store.db.load_all_aliases().unwrap_or_default();
         let live_status = Arc::clone(&handle.live_status);
@@ -738,6 +751,7 @@ impl AgentRuntime {
             live,
             providers,
             failover,
+            model_health: model_health_for_tools,
             skills,
             store,
             memory,
@@ -819,14 +833,14 @@ impl AgentRuntime {
             .config
             .model
             .as_ref()
-            .and_then(|m| m.primary.as_deref())
+            .and_then(|m| m.primary_head())
             .or_else(|| {
                 self.config
                     .agents
                     .defaults
                     .model
                     .as_ref()
-                    .and_then(|m| m.primary.as_deref())
+                    .and_then(|m| m.primary_head())
             })
             .unwrap_or("rsclaw/rsclaw-agent-v1")
             .to_owned()
@@ -847,8 +861,8 @@ pub fn resolve_primary_model_for(
     per_agent
         .model
         .as_ref()
-        .and_then(|m| m.primary.as_deref())
-        .or_else(|| defaults.model.as_ref().and_then(|m| m.primary.as_deref()))
+        .and_then(|m| m.primary_head())
+        .or_else(|| defaults.model.as_ref().and_then(|m| m.primary_head()))
         .map(str::to_owned)
 }
 
@@ -874,19 +888,19 @@ pub fn resolve_flash_model_for(
     let explicit = per_agent
         .model
         .as_ref()
-        .and_then(|m| m.flash.as_deref())
+        .and_then(|m| m.flash_head())
         .or_else(|| {
             per_agent
                 .flash_model
                 .as_ref()
-                .and_then(|m| m.primary.as_deref())
+                .and_then(|m| m.primary_head())
         })
-        .or_else(|| defaults.model.as_ref().and_then(|m| m.flash.as_deref()))
+        .or_else(|| defaults.model.as_ref().and_then(|m| m.flash_head()))
         .or_else(|| {
             defaults
                 .flash_model
                 .as_ref()
-                .and_then(|m| m.primary.as_deref())
+                .and_then(|m| m.primary_head())
         })
         .map(str::to_owned);
     if explicit.is_some() {
@@ -897,8 +911,8 @@ pub fn resolve_flash_model_for(
     let primary = per_agent
         .model
         .as_ref()
-        .and_then(|m| m.primary.as_deref())
-        .or_else(|| defaults.model.as_ref().and_then(|m| m.primary.as_deref()));
+        .and_then(|m| m.primary_head())
+        .or_else(|| defaults.model.as_ref().and_then(|m| m.primary_head()));
     if let Some(p) = primary {
         if p.starts_with("rsclaw/") {
             return Some(crate::provider::rsclaw::RSCLAW_DEFAULT_FLASH.to_owned());
@@ -943,7 +957,7 @@ pub fn resolve_vision_model_for(
     if let Some(name) = per_agent
         .model
         .as_ref()
-        .and_then(|m| m.vision.as_deref())
+        .and_then(|m| m.vision_head())
         .map(str::to_owned)
     {
         return VisionResolution::Configured(name);
@@ -951,7 +965,7 @@ pub fn resolve_vision_model_for(
     if let Some(name) = defaults
         .model
         .as_ref()
-        .and_then(|m| m.vision.as_deref())
+        .and_then(|m| m.vision_head())
         .map(str::to_owned)
     {
         return VisionResolution::Configured(name);
@@ -970,8 +984,8 @@ pub fn resolve_vision_model_for(
     let primary = per_agent
         .model
         .as_ref()
-        .and_then(|m| m.primary.as_deref())
-        .or_else(|| defaults.model.as_ref().and_then(|m| m.primary.as_deref()));
+        .and_then(|m| m.primary_head())
+        .or_else(|| defaults.model.as_ref().and_then(|m| m.primary_head()));
     if let Some(p) = primary {
         if p.starts_with("rsclaw/") {
             return VisionResolution::Configured(
@@ -983,7 +997,7 @@ pub fn resolve_vision_model_for(
     if let Some(name) = per_agent
         .model
         .as_ref()
-        .and_then(|m| m.primary.as_deref())
+        .and_then(|m| m.primary_head())
         .map(str::to_owned)
     {
         return VisionResolution::FallbackToPrimary(name);
@@ -991,7 +1005,7 @@ pub fn resolve_vision_model_for(
     if let Some(name) = defaults
         .model
         .as_ref()
-        .and_then(|m| m.primary.as_deref())
+        .and_then(|m| m.primary_head())
         .map(str::to_owned)
     {
         return VisionResolution::FallbackToPrimary(name);
@@ -1308,6 +1322,139 @@ impl AgentRuntime {
     ///   4. `agents.defaults.model`     (global default)
     /// So if no flash model is configured anywhere, we fall back to whatever
     /// the agent is already using — no regression.
+    /// Resolved vision chain in preference order — analog to
+    /// `resolve_vision_model_name` but returns the full ordered list of
+    /// candidates instead of just the head. Lookup:
+    ///   1. per-agent `model.vision` chain
+    ///   2. `defaults.model.vision` chain
+    /// If both are empty, falls back to primary chain (matches the
+    /// legacy `FallbackToPrimary` semantics — drivers want SOMETHING
+    /// vision-capable, and the agent's primary is the best guess).
+    pub(crate) fn resolve_vision_chain(&self) -> Vec<String> {
+        let per_agent = &self.handle.config;
+        let defaults = &self.config.agents.defaults;
+        let mut out: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let push = |chain: Vec<&str>,
+                    out: &mut Vec<String>,
+                    seen: &mut std::collections::HashSet<String>| {
+            for m in chain {
+                let t = m.trim();
+                if !t.is_empty() && seen.insert(t.to_owned()) {
+                    out.push(t.to_owned());
+                }
+            }
+        };
+        if let Some(m) = per_agent.model.as_ref() {
+            push(m.vision_chain(), &mut out, &mut seen);
+        }
+        if let Some(m) = defaults.model.as_ref() {
+            push(m.vision_chain(), &mut out, &mut seen);
+        }
+        if out.is_empty() {
+            // FallbackToPrimary: no explicit vision config, try primary
+            // — but ONLY entries known to support vision. Without this
+            // filter, the driver would silently route screenshots to a
+            // text-only primary (e.g. deepseek/qwen-coder) and get a
+            // provider error instead of the actionable
+            // "configure agents.defaults.model.vision" message.
+            let primary_filtered = |chain: Vec<&str>,
+                                    out: &mut Vec<String>,
+                                    seen: &mut std::collections::HashSet<String>| {
+                for m in chain {
+                    let t = m.trim();
+                    if t.is_empty() || !seen.insert(t.to_owned()) {
+                        continue;
+                    }
+                    if is_known_vision_model(t) {
+                        out.push(t.to_owned());
+                    }
+                }
+            };
+            if let Some(m) = per_agent.model.as_ref() {
+                primary_filtered(m.primary_chain(), &mut out, &mut seen);
+            }
+            if let Some(m) = defaults.model.as_ref() {
+                primary_filtered(m.primary_chain(), &mut out, &mut seen);
+            }
+        }
+        out
+    }
+
+    /// Split the resolved flash chain into (head, tail). Drop-in for
+    /// flash LlmRequest builders: `let (model, fallback_models) =
+    /// self.resolve_flash_chain_split();`. Empty head when no flash
+    /// model is configured anywhere — matches `resolve_flash_model_name`
+    /// returning `""` in the same case.
+    pub(crate) fn resolve_flash_chain_split(&self) -> (String, Vec<String>) {
+        let mut chain = self.resolve_flash_chain();
+        if chain.is_empty() {
+            return (String::new(), Vec::new());
+        }
+        let head = chain.remove(0);
+        (head, chain)
+    }
+
+    /// Return the resolved flash chain — head first, fallbacks following.
+    /// Callers building an `LlmRequest` can pass `chain[1..]` as
+    /// `fallback_models` to enable per-call chain retry through the
+    /// FailoverManager (head is still passed as `req.model`).
+    pub(crate) fn resolve_flash_chain(&self) -> Vec<String> {
+        let per_agent = &self.handle.config;
+        let defaults = &self.config.agents.defaults;
+        let mut out: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let push = |v: Vec<&str>, out: &mut Vec<String>, seen: &mut std::collections::HashSet<String>| {
+            for m in v {
+                let t = m.trim();
+                if !t.is_empty() && seen.insert(t.to_owned()) {
+                    out.push(t.to_owned());
+                }
+            }
+        };
+        if let Some(m) = per_agent.model.as_ref() {
+            push(m.flash_chain(), &mut out, &mut seen);
+        }
+        if let Some(fm) = per_agent.flash_model.as_ref() {
+            push(fm.primary_chain(), &mut out, &mut seen);
+        }
+        if let Some(m) = defaults.model.as_ref() {
+            push(m.flash_chain(), &mut out, &mut seen);
+        }
+        if let Some(fm) = defaults.flash_model.as_ref() {
+            push(fm.primary_chain(), &mut out, &mut seen);
+        }
+        if out.is_empty() {
+            // RsClaw fleet inference fallback (same logic as
+            // resolve_flash_model_for): if primary head is rsclaw, the
+            // fleet's RSCLAW_DEFAULT_FLASH is the flash model.
+            let primary_head = per_agent
+                .model
+                .as_ref()
+                .and_then(|m| m.primary_head())
+                .or_else(|| defaults.model.as_ref().and_then(|m| m.primary_head()));
+            if let Some(p) = primary_head {
+                if p.starts_with("rsclaw/") {
+                    out.push(crate::provider::rsclaw::RSCLAW_DEFAULT_FLASH.to_owned());
+                }
+            }
+        }
+        // Final fallback: the primary chain. Matches the legacy
+        // `resolve_flash_model_name()` semantics that fell back to
+        // `resolve_model_name()` (primary head) when no flash was
+        // configured. Now extended to inherit the entire primary chain,
+        // so flash sub-tasks gracefully share the user's failover plan.
+        if out.is_empty() {
+            if let Some(m) = per_agent.model.as_ref() {
+                push(m.primary_chain(), &mut out, &mut seen);
+            }
+            if let Some(m) = defaults.model.as_ref() {
+                push(m.primary_chain(), &mut out, &mut seen);
+            }
+        }
+        out
+    }
+
     pub(crate) fn resolve_flash_model_name(&self) -> String {
         resolve_flash_model_for(&self.handle.config, &self.config.agents.defaults)
             .unwrap_or_else(|| self.resolve_model_name())
@@ -1441,6 +1588,7 @@ impl AgentRuntime {
 
         let model = self.resolve_model_name();
         let req = LlmRequest {
+            fallback_models: Vec::new(),
             model,
             messages,
             tools: vec![], // NO tools -- read-only side query
@@ -1564,8 +1712,12 @@ impl AgentRuntime {
         // never competes with the primary agent's session slots.
         // Non-rsclaw providers (OpenAI, Anthropic, etc.) ignore the
         // endpoint field and just see a normal chat completion.
-        let model = self.resolve_flash_model_name();
+        // Chain-aware: when `agents.defaults.model.flash` is a multi-entry
+        // chain, the tail rides as `fallback_models` so the same per-model
+        // health gating kicks in for fastshot calls.
+        let (model, flash_fallbacks) = self.resolve_flash_chain_split();
         let req = LlmRequest {
+            fallback_models: flash_fallbacks,
             model,
             messages: vec![Message {
                 role: Role::User,
@@ -1773,7 +1925,14 @@ impl AgentRuntime {
                 .compaction
                 .as_ref()
                 .and_then(|c| c.model.clone())
-                .or_else(|| self.handle.config.model.as_ref()?.primary.clone())
+                .or_else(|| {
+                    self.handle
+                        .config
+                        .model
+                        .as_ref()?
+                        .primary_head()
+                        .map(String::from)
+                })
                 .unwrap_or_else(|| "default".to_owned());
             self.save_session_summaries_to_memory(&compaction_model)
                 .await;
@@ -3091,17 +3250,45 @@ impl AgentRuntime {
             agent_cfg
                 .model
                 .as_ref()
-                .and_then(|m| m.primary.as_deref())
+                .and_then(|m| m.primary_head())
                 .or_else(|| {
                     self.config
                         .agents
                         .defaults
                         .model
                         .as_ref()
-                        .and_then(|m| m.primary.as_deref())
+                        .and_then(|m| m.primary_head())
                 })
                 .unwrap_or("rsclaw/rsclaw-agent-v1")
                 .to_owned()
+        };
+        // Resolve the rest of the primary chain (everything after the head)
+        // for failover. Empty when primary is a single string or when this
+        // is an internal flash call — both cases preserve the legacy
+        // single-model + global-fallback behaviour. The chain falls back
+        // through the standard layered config: per-agent > defaults.
+        let primary_chain_tail: Vec<String> = if is_internal {
+            Vec::new()
+        } else {
+            let chain = agent_cfg
+                .model
+                .as_ref()
+                .map(|m| m.primary_chain())
+                .filter(|c| !c.is_empty())
+                .unwrap_or_else(|| {
+                    self.config
+                        .agents
+                        .defaults
+                        .model
+                        .as_ref()
+                        .map(|m| m.primary_chain())
+                        .unwrap_or_default()
+                });
+            chain
+                .into_iter()
+                .skip(1)
+                .map(String::from)
+                .collect()
         };
         let (model_provider, _) = self.providers.resolve_model(&model);
 
@@ -3562,6 +3749,7 @@ impl AgentRuntime {
             self.agent_loop(
                 &mut ctx,
                 &model,
+                primary_chain_tail.clone(),
                 &system_prompt,
                 tools,
                 extra_tools,
@@ -4101,10 +4289,15 @@ impl AgentRuntime {
     // Core agent loop
     // -----------------------------------------------------------------------
 
+    /// `primary_chain_tail` is the rest of the primary chain after `model`
+    /// (the head). Empty for single-model configs — preserves legacy
+    /// single-model + global-fallback behaviour. The FailoverManager
+    /// reads `LlmRequest.fallback_models` populated from this list.
     async fn agent_loop(
         &mut self,
         ctx: &mut RunContext,
         model: &str,
+        primary_chain_tail: Vec<String>,
         system_prompt: &str,
         tools: Vec<ToolDef>,
         extra_tools: Vec<ToolDef>,
@@ -4903,6 +5096,7 @@ impl AgentRuntime {
             };
 
             let req = LlmRequest {
+                fallback_models: primary_chain_tail.clone(),
                 model: model.to_owned(),
                 messages,
                 tools: tools.clone(),

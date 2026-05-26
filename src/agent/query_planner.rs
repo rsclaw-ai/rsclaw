@@ -400,6 +400,7 @@ async fn try_plan(
     }];
 
     let req = LlmRequest {
+            fallback_models: Vec::new(),
         model: model_id.to_owned(),
         messages,
         tools: vec![],

@@ -16,7 +16,7 @@ pub async fn agents_list(ctx: MethodCtx) -> MethodResult {
                 .config
                 .model
                 .as_ref()
-                .and_then(|m| m.primary.as_deref())
+                .and_then(|m| m.primary_head())
                 .unwrap_or("unknown");
 
             let toolset = h
@@ -61,7 +61,7 @@ pub async fn agent_identity_get(ctx: MethodCtx) -> MethodResult {
         .config
         .model
         .as_ref()
-        .and_then(|m| m.primary.as_deref())
+        .and_then(|m| m.primary_head())
         .unwrap_or("unknown");
 
     Ok(serde_json::json!({

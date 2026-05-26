@@ -162,6 +162,7 @@ async fn start_server(addr: SocketAddr) {
         relay_hub: Arc::new(rsclaw::a2a::relay::RelayHub::new()),
         knowledge: None,
         memory: None,
+        model_health: rsclaw::provider::health::ProviderHealthRegistry::new(),
     };
 
     // Leak the tempdir so the store stays valid for the lifetime of the server.
@@ -280,6 +281,7 @@ async fn bare_health_alias_returns_200_without_auth() {
         relay_hub: Arc::new(rsclaw::a2a::relay::RelayHub::new()),
         knowledge: None,
         memory: None,
+        model_health: rsclaw::provider::health::ProviderHealthRegistry::new(),
     };
     std::mem::forget(data_dir);
     tokio::spawn(async move { serve(state, addr).await.expect("serve") });
@@ -415,6 +417,7 @@ async fn auth_token_gates_non_health_endpoints() {
         relay_hub: Arc::new(rsclaw::a2a::relay::RelayHub::new()),
         knowledge: None,
         memory: None,
+        model_health: rsclaw::provider::health::ProviderHealthRegistry::new(),
     };
     std::mem::forget(data_dir);
     tokio::spawn(async move { serve(state, addr).await.expect("serve") });

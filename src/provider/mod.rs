@@ -8,6 +8,7 @@ pub mod anthropic;
 pub mod defaults;
 pub mod failover;
 pub mod gemini;
+pub mod health;
 pub mod model_defaults;
 pub mod openai;
 pub mod registry;
@@ -286,6 +287,16 @@ pub enum AgentEndpoint {
 #[derive(Debug, Clone, Default)]
 pub struct LlmRequest {
     pub model: String,
+    /// Per-call fallback chain (tried after `model` and before the
+    /// gateway-wide emergency `fallbacks` list). Populated by callers that
+    /// resolve a multi-model chain from `ModelConfig.primary_chain()`
+    /// (typically the agent main loop). One-off callers (compaction
+    /// summary, flash sub-tasks) leave it empty and rely on the
+    /// single-model + global-fallback behaviour. Order is significant —
+    /// the FailoverManager tries each in turn on transient failure and
+    /// skips entries the per-model health table has marked Disabled or
+    /// Cooling.
+    pub fallback_models: Vec<String>,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDef>,
     pub system: Option<String>,

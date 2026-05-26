@@ -270,7 +270,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         .as_ref()
         .and_then(|a| a.defaults.as_ref())
         .and_then(|d| d.model.as_ref())
-        .and_then(|m| m.vision.clone());
+        .and_then(|m| m.vision_head().map(String::from));
 
     let mut plugin_registry = load_all_plugins(
         &plugins_dir,
@@ -310,6 +310,12 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // that AgentRuntime reads for live-mutable fields (temperature, etc.).
     let live = Arc::new(LiveConfig::new((*config).clone()));
 
+    // Shared per-model health table — one Arc cloned into AppState (for
+    // the /api/v1/models/health endpoint) AND into every FailoverManager
+    // via the spawner, so writes from the runtime are visible to the
+    // HTTP layer in real time.
+    let model_health = crate::provider::health::ProviderHealthRegistry::new();
+
     // Create AgentSpawner — enables agent-to-agent dynamic spawning.
     let spawner = AgentSpawner::new_arc(
         Arc::clone(&registry),
@@ -321,6 +327,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         memory.clone(),
         event_tx.clone(),
         Some(Arc::clone(&plugins)),
+        model_health.clone(),
     );
 
     // Spawn MCP servers and discover tools (before agent tasks so tools are
@@ -376,6 +383,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         computer_permission_tx.clone(),
         computer_status_tx.clone(),
         Arc::clone(&computer_runs),
+        model_health.clone(),
     );
 
     // Set i18n default language from gateway config.
@@ -814,6 +822,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         relay_hub: a2a_relay_hub,
         knowledge: knowledge_svc,
         memory: memory.clone(),
+        model_health: model_health.clone(),
     };
     crate::a2a::relay::start_spoke_if_configured(state.clone());
     crate::ws::tick::start_tick_loop(Arc::clone(&state.ws_conns));
@@ -1301,6 +1310,7 @@ fn spawn_agent_tasks(
     computer_runs: Arc<
         tokio::sync::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
     >,
+    model_health: crate::provider::health::ProviderHealthRegistry,
 ) {
     for (agent_id, mut rx) in receivers {
         let handle = match registry.get(&agent_id) {
@@ -1342,6 +1352,7 @@ fn spawn_agent_tasks(
             plugins.clone(),
             mcp.clone(),
             notification_tx.clone(),
+            model_health.clone(),
         );
 
         // Inject WASM plugins into the agent runtime.

@@ -2278,23 +2278,54 @@ async fn configure_model(
             get_nested_value(val, &format!("models.providers.{}.api", provider.name))
                 .and_then(|v| v.as_str().map(|s| s.to_owned()))
         };
-        match test_provider_connectivity(
-            &test_url,
-            test_key.as_deref(),
-            &provider.name,
-            effective_api_type.as_deref(),
-            Some(&new_model),
-        )
-        .await
-        {
-            Ok(()) => step("*", &crate::i18n::t("cli_connection_ok", lang)),
-            Err(e) => {
-                println!(
-                    "  [!] {}",
-                    crate::i18n::t_fmt("cli_connection_failed", lang, &[("err", &e.to_string())])
-                );
-                println!("      {}", crate::i18n::t("cli_fix_later", lang));
+        // Chain-aware probe: when the wizard's "Default model" prompt
+        // received a comma-separated list (`a, b, c` — the same format the
+        // desktop UI accepts), test each model in turn so the user finds
+        // typos before saving. CJK fullwidth commas accepted too. Single-
+        // model entry stays a single probe — back-compat with pre-chain
+        // configure runs.
+        let probe_models: Vec<String> = new_model
+            .split(|c| c == ',' || c == '\u{FF0C}')
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut any_failed = false;
+        for probe_model in &probe_models {
+            match test_provider_connectivity(
+                &test_url,
+                test_key.as_deref(),
+                &provider.name,
+                effective_api_type.as_deref(),
+                Some(probe_model),
+            )
+            .await
+            {
+                Ok(()) => {
+                    if probe_models.len() == 1 {
+                        step("*", &crate::i18n::t("cli_connection_ok", lang));
+                    } else {
+                        println!("  [ok] {probe_model}");
+                    }
+                }
+                Err(e) => {
+                    any_failed = true;
+                    if probe_models.len() == 1 {
+                        println!(
+                            "  [!] {}",
+                            crate::i18n::t_fmt(
+                                "cli_connection_failed",
+                                lang,
+                                &[("err", &e.to_string())],
+                            )
+                        );
+                    } else {
+                        println!("  [!] {probe_model}: {e}");
+                    }
+                }
             }
+        }
+        if any_failed {
+            println!("      {}", crate::i18n::t("cli_fix_later", lang));
         }
     }
 
@@ -2355,14 +2386,33 @@ async fn configure_model(
         set_nested_value(val, &ua_path, serde_json::json!(new_user_agent))?;
     }
 
-    // Ensure model has provider/ prefix
-    let final_model = if new_model.contains('/') {
-        new_model.clone()
-    } else {
-        format!("{}/{new_model}", provider.name)
+    // Ensure each entry has a provider/ prefix; build either a single
+    // string (1 model) or a JSON array (chain). Comma-separated wizard
+    // input expands into a `StringOrVec::Multi` — matches what the UI
+    // writes and what `ModelConfig.primary_chain()` consumes.
+    let model_entries: Vec<String> = new_model
+        .split(|c| c == ',' || c == '\u{FF0C}')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            if s.contains('/') {
+                s.to_owned()
+            } else {
+                format!("{}/{s}", provider.name)
+            }
+        })
+        .collect();
+    let final_model_value: serde_json::Value = match model_entries.len() {
+        0 => serde_json::Value::Null,
+        1 => serde_json::json!(model_entries[0]),
+        _ => serde_json::json!(model_entries),
     };
+    // Legacy comparison key — first entry only. Keeps the "did the user
+    // actually change the model?" branch wire-compatible with single-
+    // string current_model.
+    let final_model_head = model_entries.first().cloned().unwrap_or_default();
 
-    if final_model != current_model {
+    if !final_model_head.is_empty() && final_model_head != current_model {
         // Source of truth lives at agents.defaults.model.primary. If the
         // user's config still carries a per-agent override on list[0]
         // (legacy structure or explicit override), keep it in sync with the
@@ -2376,27 +2426,25 @@ async fn configure_model(
             && let Some(agent) = arr.first_mut()
             && let Some(m) = agent.get_mut("model").and_then(|m| m.as_object_mut())
         {
-            m.insert("primary".to_string(), serde_json::json!(final_model));
+            m.insert("primary".to_string(), final_model_value.clone());
         }
 
         // Fleet-level default — single source of truth.
         ensure_json_path(val, &["agents"]);
         ensure_json_path(val, &["agents", "defaults"]);
         ensure_json_path(val, &["agents", "defaults", "model"]);
-        set_nested_value(
-            val,
-            "agents.defaults.model.primary",
-            serde_json::json!(final_model),
-        )?;
+        set_nested_value(val, "agents.defaults.model.primary", final_model_value)?;
 
-        // Save to per-provider models map (openclaw compat: agents.defaults.models)
+        // Save to per-provider models map (openclaw compat:
+        // agents.defaults.models). Keyed by head model only — the alias
+        // table is a flat name → provider map, not a chain holder.
         ensure_json_path(val, &["agents", "defaults", "models"]);
         if let Some(models_obj) = val
             .pointer_mut("/agents/defaults/models")
             .and_then(|v| v.as_object_mut())
         {
             models_obj.insert(
-                final_model.clone(),
+                final_model_head.clone(),
                 serde_json::json!({ "alias": provider.name }),
             );
         }
@@ -2404,7 +2452,7 @@ async fn configure_model(
 
     // Update ec so subsequent sections see updated state
     ec.provider_idx = provider_idx;
-    ec.model = final_model;
+    ec.model = final_model_head;
 
     Ok(())
 }

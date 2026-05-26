@@ -312,6 +312,32 @@ pub(crate) fn build_help_text_filtered(allowed: &str, lang: &str) -> String {
         h.push('\n');
     }
 
+    if has("/plugin") {
+        h.push_str(if zh { "插件：\n" } else { "Plugin:\n" });
+        if zh {
+            h.push_str(
+                "  /plugin                       列出当前会话的插件覆盖\n  \
+                 /plugin <名称>                查看某个插件的状态\n  \
+                 /plugin <名称> on             启用：通过 search_tools + invoke 调用\n  \
+                 /plugin <名称> all            直接注入该插件的全部工具（受总数上限）\n  \
+                 /plugin <名称> <工具1,工具2>  只注入指定工具为顶层工具\n  \
+                 /plugin <名称> off            完全屏蔽该插件\n  \
+                 /plugin reset                 清空本会话所有覆盖\n",
+            );
+        } else {
+            h.push_str(
+                "  /plugin                         List session plugin overrides\n  \
+                 /plugin <name>                  Show one plugin's current override\n  \
+                 /plugin <name> on               Enable via search_tools + invoke\n  \
+                 /plugin <name> all              Inject every tool from <name> (capped)\n  \
+                 /plugin <name> <tool1,tool2>    Inject only the named tools as top-level\n  \
+                 /plugin <name> off              Hide this plugin entirely\n  \
+                 /plugin reset                   Clear every override in this session\n",
+            );
+        }
+        h.push('\n');
+    }
+
     if full {
         h.push_str(if zh {
             "上传限制：\n"

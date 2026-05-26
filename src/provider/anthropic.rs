@@ -559,6 +559,7 @@ mod tests {
 
     fn make_request() -> LlmRequest {
         LlmRequest {
+            fallback_models: Vec::new(),
             model: "claude-3-5-sonnet-20241022".to_owned(),
             ..Default::default()
         }
@@ -567,6 +568,7 @@ mod tests {
     #[test]
     fn request_serializes_messages() {
         let req = LlmRequest {
+            fallback_models: Vec::new(),
             messages: vec![
                 Message {
                     role: Role::User,
@@ -591,6 +593,7 @@ mod tests {
     #[test]
     fn system_field_present() {
         let req = LlmRequest {
+            fallback_models: Vec::new(),
             system: Some("hello".to_owned()),
             ..make_request()
         };
@@ -613,6 +616,7 @@ mod tests {
     fn cache_control_system_and_anchors() {
         // 2+1 anchor strategy: system + first user message + last message.
         let req = LlmRequest {
+            fallback_models: Vec::new(),
             system: Some("system prompt".to_owned()),
             messages: vec![
                 Message {
@@ -696,6 +700,7 @@ mod tests {
     #[test]
     fn cache_control_fewer_than_3_messages() {
         let req = LlmRequest {
+            fallback_models: Vec::new(),
             messages: vec![Message {
                 role: Role::User,
                 content: MessageContent::Text("only one".to_owned()),
@@ -719,6 +724,7 @@ mod tests {
     #[test]
     fn temperature_serializes() {
         let req = LlmRequest {
+            fallback_models: Vec::new(),
             temperature: Some(0.7),
             ..make_request()
         };

@@ -4319,6 +4319,7 @@ data: {"type":"block_stop","index":0}
 
     fn req_with(messages: Vec<Message>, mode: u8, key: Option<&str>) -> LlmRequest {
         LlmRequest {
+            fallback_models: Vec::new(),
             model: "2026.5.15".into(),
             messages,
             system: Some("you are an agent".into()),
@@ -5691,6 +5692,7 @@ data: {"type":"block_stop","index":0}
         kv_cache_mode: u8,
     ) -> LlmRequest {
         LlmRequest {
+            fallback_models: Vec::new(),
             model: model.into(),
             endpoint,
             kv_cache_mode,

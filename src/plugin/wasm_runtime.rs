@@ -1148,6 +1148,7 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
         }];
 
         let req = crate::provider::LlmRequest {
+            fallback_models: Vec::new(),
             model: format!("{provider_name}/{model_id}"),
             messages,
             tools: Vec::new(),

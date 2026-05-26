@@ -142,7 +142,7 @@ impl AgentHandle {
             .config
             .model
             .as_ref()
-            .and_then(|m| m.primary.as_deref())
+            .and_then(|m| m.primary_head())
             .unwrap_or("default");
         let sessions = self
             .session_count

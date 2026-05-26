@@ -11,6 +11,11 @@ import { RsclawProviderCard } from "./rsclaw-provider-card";
 import { Popover } from "./ui-lib";
 import { toast } from "../lib/toast";
 import { setGatewayRestarting } from "../lib/gateway-restart-signal";
+import {
+  useModelHealth,
+  resetAndRefreshModelHealth,
+} from "../lib/use-model-health";
+import type { ModelHealthEntry } from "../lib/rsclaw-api";
 import { EmojiAvatar, AvatarPicker } from "./emoji";
 import { IconButton } from "./button";
 import ReturnIcon from "../icons/return.svg";
@@ -2447,6 +2452,266 @@ function DoctorPage() {
 // ── Tauri Config Page (simple raw editor, no structured form) ────
 // ══════════════════════════════════════════════════════════
 
+/**
+ * Unified comma-separated input + per-model status dots for one
+ * `ModelConfig` field (primary / flash / vision / image / video).
+ *
+ * Backend accepts `Option<StringOrVec>` — caller's `readChain` /
+ * `writeChain` paper over the on-disk single-string vs array forms
+ * so the component itself only sees `string[]`.
+ *
+ * Why module-level: redefining this inside the parent component on
+ * every render would change React's component identity each pass and
+ * make the input's draft state remount + lose focus mid-type. Lots of
+ * props is the lesser evil.
+ */
+type ModelChainInputProps = {
+  path: string;
+  labelZh: string;
+  labelEn: string;
+  /** Mono hint under the label. Usually the config dot-path + a parenthetical. */
+  hint: string;
+  /** Input placeholder — example chain in user-friendly form. */
+  placeholder: string;
+  readChain: (path: string) => string[];
+  writeChain: (path: string, models: string[]) => void;
+  healthMap: Record<string, ModelHealthEntry>;
+  // Styling tokens borrowed from the parent panel's scope.
+  V: Record<string, string>;
+  fInput: React.CSSProperties;
+  fieldRow: React.CSSProperties;
+  zh: boolean;
+  /** Optional bottom-border override (last row in card). */
+  borderBottomNone?: boolean;
+};
+
+function ModelChainInput({
+  path,
+  labelZh,
+  labelEn,
+  hint,
+  placeholder,
+  readChain,
+  writeChain,
+  healthMap,
+  V,
+  fInput,
+  fieldRow,
+  zh,
+  borderBottomNone,
+}: ModelChainInputProps) {
+  const stored = readChain(path);
+  const storedKey = stored.join("|");
+
+  const [draft, setDraft] = useState(stored.join(", "));
+  const lastWritten = useRef(storedKey);
+
+  // When the underlying config changes from outside this input (config
+  // reload, a sibling field edit that touched the same object, etc.),
+  // resync the draft. Keyed on the joined chain so deps stay stable.
+  useEffect(() => {
+    if (storedKey !== lastWritten.current) {
+      setDraft(stored.join(", "));
+      lastWritten.current = storedKey;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [storedKey]);
+
+  // Debounced writeback. 200ms is short enough that pressing Save right
+  // after typing still picks up the latest value, long enough that we
+  // don't thrash setConfig on every keystroke.
+  useEffect(() => {
+    const parsed = parseLocal(draft);
+    const key = parsed.join("|");
+    if (key === lastWritten.current) return;
+    const id = setTimeout(() => {
+      writeChain(path, parsed);
+      lastWritten.current = key;
+    }, 200);
+    return () => clearTimeout(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draft, path]);
+
+  return (
+    <div style={{ ...fieldRow, ...(borderBottomNone ? { borderBottom: "none" } : {}) }}>
+      <div style={{ flex: 1 }}>
+        <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>
+          {zh ? labelZh : labelEn}{" "}
+          <span style={{ color: V.t3, fontWeight: 400, fontSize: 10 }}>
+            {zh ? "(逗号分隔多个,首选→兜底)" : "(comma-separated: preferred → fallback)"}
+          </span>
+        </div>
+        <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>{hint}</div>
+      </div>
+      <div style={{ width: 300, minWidth: 300, display: "flex", flexDirection: "column", gap: 6 }}>
+        <input
+          style={{ ...fInput, width: "100%" }}
+          type="text"
+          placeholder={placeholder}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+        />
+        {stored.length > 0 && (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {stored.map((id) => {
+              const dot = dotFor(id, healthMap[id], zh);
+              return (
+                <span
+                  key={id}
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 5,
+                    padding: "2px 7px 2px 5px",
+                    borderRadius: 5,
+                    background: V.bg4,
+                    border: `1px solid ${V.bd2}`,
+                    fontFamily: V.mono,
+                    fontSize: 10,
+                    color: V.t2,
+                  }}
+                >
+                  <span
+                    title={dot.tooltip}
+                    onClick={
+                      dot.clickable
+                        ? (e) => {
+                            e.stopPropagation();
+                            void resetAndRefreshModelHealth(id);
+                          }
+                        : undefined
+                    }
+                    style={{
+                      width: 8,
+                      height: 8,
+                      borderRadius: 4,
+                      background: dot.color,
+                      cursor: dot.clickable ? "pointer" : "default",
+                      flexShrink: 0,
+                    }}
+                  />
+                  {id}
+                </span>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Local copy of the parseChain logic so this component doesn't depend on the
+ *  parent's helper closure — the props already plumb readChain/writeChain. */
+function parseLocal(input: string): string[] {
+  return input
+    .split(/[,，]/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+/**
+ * Comma-separated string-list input with local draft state + debounce.
+ *
+ * Plain `value={arr.join(", ")}` + onChange split-and-write strips the
+ * comma between renders — the user can't even *type* a separator.
+ * Local draft holds the raw text while the user is typing; we only
+ * parse + bubble out the result after 200ms of quiet, identical to the
+ * ModelChainInput pattern.
+ *
+ * `onChange(arr)` gets undefined when the parsed list is empty so the
+ * caller can `deleteConfig` instead of writing an empty array.
+ */
+function CommaListInput({
+  value,
+  onChange,
+  placeholder,
+  style,
+}: {
+  value: string[];
+  onChange: (next: string[] | undefined) => void;
+  placeholder?: string;
+  style?: React.CSSProperties;
+}) {
+  const storedKey = value.join("|");
+  const [draft, setDraft] = useState(value.join(", "));
+  const lastWritten = useRef(storedKey);
+
+  useEffect(() => {
+    if (storedKey !== lastWritten.current) {
+      setDraft(value.join(", "));
+      lastWritten.current = storedKey;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [storedKey]);
+
+  useEffect(() => {
+    const parsed = parseLocal(draft);
+    const key = parsed.join("|");
+    if (key === lastWritten.current) return;
+    const id = setTimeout(() => {
+      onChange(parsed.length > 0 ? parsed : undefined);
+      lastWritten.current = key;
+    }, 200);
+    return () => clearTimeout(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draft]);
+
+  return (
+    <input
+      type="text"
+      placeholder={placeholder}
+      value={draft}
+      onChange={(e) => setDraft(e.target.value)}
+      style={style}
+    />
+  );
+}
+
+/** Map a (model_id, health entry) pair to dot color, tooltip, click affordance.
+ *  Health entry missing = the runtime hasn't called this model yet, render gray. */
+function dotFor(
+  model: string,
+  entry: ModelHealthEntry | undefined,
+  zh: boolean,
+): { color: string; tooltip: string; clickable: boolean } {
+  if (!entry) {
+    return {
+      color: "#5a5868",
+      tooltip: zh ? `${model}\n尚未调用` : `${model}\nNot yet called`,
+      clickable: false,
+    };
+  }
+  if (entry.status === "Healthy") {
+    return {
+      color: "#2dd4a0",
+      tooltip: `${model}\n${zh ? "健康" : "Healthy"}`,
+      clickable: false,
+    };
+  }
+  if (entry.status === "Cooling") {
+    const secs = entry.cooldown_seconds ?? 0;
+    const err = entry.last_error ? `\n${entry.last_error}` : "";
+    return {
+      color: "#fbbf24",
+      tooltip: zh
+        ? `${model}\n冷却中 — ${secs}s 后重试${err}`
+        : `${model}\nCooling — retry in ${secs}s${err}`,
+      clickable: false,
+    };
+  }
+  // Disabled
+  const reason = entry.reason || (zh ? "未知" : "Unknown");
+  const err = entry.last_error ? `\n${entry.last_error}` : "";
+  return {
+    color: "#d95f5f",
+    tooltip: zh
+      ? `${model}\n已禁用：${reason}${err}\n点击重置`
+      : `${model}\nDisabled: ${reason}${err}\nClick to reset`,
+    clickable: true,
+  };
+}
+
 function TauriConfigPageInner() {
   const zh = getLang() === "cn";
   const [raw, setRaw] = useState("");
@@ -2464,7 +2729,10 @@ function TauriConfigPageInner() {
   const [provErr, setProvErr] = useState<Record<string, string>>({});
   const [provModels, setProvModels] = useState<Record<string, { id: string; tag: string }[]>>({});
   const [provSelModel, setProvSelModel] = useState<Record<string, string>>({});
-  const [imgDropOpen, setImgDropOpen] = useState(false);
+  // Shared model-health snapshot for the chain-input status dots. One
+  // poller per panel, refreshed every 5s; gateway down = empty cache,
+  // dots render gray.
+  const healthMap = useModelHealth();
 
   // Channel state: open cards, login tab per channel, open accounts, account tab
   const [openChs, setOpenChs] = useState<Set<string>>(new Set());
@@ -2583,9 +2851,13 @@ function TauriConfigPageInner() {
       if (!hasKey) continue;
       // Check if provider has a selected default model in config
       let selModel = "";
-      // Check agents.defaults.model.primary first
-      const primary = config?.agents?.defaults?.model?.primary || "";
-      if (primary.startsWith(provId + "/")) {
+      // Check agents.defaults.model.primary first. The field is now
+      // StringOrVec — accept both shapes and take the chain head.
+      const primaryRaw = config?.agents?.defaults?.model?.primary;
+      const primary = Array.isArray(primaryRaw)
+        ? (primaryRaw[0] || "")
+        : (primaryRaw || "");
+      if (typeof primary === "string" && primary.startsWith(provId + "/")) {
         selModel = primary.split("/").slice(1).join("/");
       }
       // Also check agents.defaults.models (alias table)
@@ -2666,6 +2938,33 @@ function TauriConfigPageInner() {
     setConfig(newConfig);
     setRaw(JSON.stringify(newConfig, null, 2));
     setDirty(true);
+  };
+
+  // ── Model-chain field helpers ──
+  // Backend `ModelConfig.{primary,flash,vision,image,video}` are
+  // `Option<StringOrVec>` — either a bare string or an ordered chain.
+  // The UI edits a single comma-separated input; these helpers paper
+  // over the two on-disk shapes so we round-trip clean JSON5:
+  //   1 entry  → string (file stays terse)
+  //   2+       → array
+  //   empty    → field deleted
+  const parseChain = (input: string): string[] =>
+    input
+      .split(/[,，]/) // accept both CJK and ASCII commas
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+
+  const readChain = (dotPath: string): string[] => {
+    const v = getVal(dotPath, undefined);
+    if (Array.isArray(v)) return v.filter((s) => typeof s === "string" && s.trim()).map((s) => String(s).trim());
+    if (typeof v === "string" && v.trim()) return [v.trim()];
+    return [];
+  };
+
+  const writeChain = (dotPath: string, models: string[]) => {
+    if (models.length === 0) deleteConfig(dotPath);
+    else if (models.length === 1) updateConfig(dotPath, models[0]);
+    else updateConfig(dotPath, models);
   };
 
   const handleSave = async () => {
@@ -3322,107 +3621,93 @@ function TauriConfigPageInner() {
           {/* Default model — most important, show first */}
           {secHead(zh ? "\u9ED8\u8BA4\u667A\u80FD\u4F53\u6A21\u578B" : "DEFAULT AGENT MODEL")}
           <div style={{ ...fcard, marginBottom: 20 }}>
-            <div style={fieldRow}>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u4E3B\u6A21\u578B" : "Primary Model"}</div>
-                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.primary</div>
-              </div>
-              <input style={{ ...fInput, minWidth: 300 }} value={getVal("agents.defaults.model.primary", "")} onChange={(e) => updateConfig("agents.defaults.model.primary", e.target.value)} />
-            </div>
-            <div style={fieldRow}>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5FEB\u901F\u6A21\u578B" : "Flash Model"}</div>
-                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.flash ({zh ? "\u7559\u7A7A\u5219\u4F7F\u7528\u4E3B\u6A21\u578B" : "empty \u2192 use main model"})</div>
-              </div>
-              <input
-                style={{ ...fInput, minWidth: 300 }}
-                type="text"
-                placeholder={zh ? "\u4F8B\u5982 custom/qwen-turbo" : "e.g. custom/qwen-turbo"}
-                value={getVal("agents.defaults.model.flash", "")}
-                onChange={(e) => {
-                  const v = (e.target.value || "").trim();
-                  updateConfig("agents.defaults.model.flash", v || undefined);
-                }}
-              />
-            </div>
-            <div style={fieldRow}>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u89C6\u89C9\u6A21\u578B" : "Vision Model"}</div>
-                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.vision ({zh ? "\u7559\u7A7A\u5219\u4F7F\u7528\u4E3B\u6A21\u578B\uFF1Bcomputer_use \u4F1A\u4F18\u5148\u4F7F\u7528\u6B64\u6A21\u578B" : "empty \u2192 use main model; computer_use prefers this"})</div>
-              </div>
-              <input
-                style={{ ...fInput, minWidth: 300 }}
-                type="text"
-                placeholder={zh ? "\u4F8B\u5982 qwen/qwen-3-vl-plus" : "e.g. qwen/qwen-3-vl-plus"}
-                value={getVal("agents.defaults.model.vision", "")}
-                onChange={(e) => {
-                  const v = (e.target.value || "").trim();
-                  updateConfig("agents.defaults.model.vision", v || undefined);
-                }}
-              />
-            </div>
+            <ModelChainInput
+              path="agents.defaults.model.primary"
+              labelZh={"\u4E3B\u6A21\u578B"}
+              labelEn="Primary Model"
+              hint="agents.defaults.model.primary"
+              placeholder="rsclaw/rsclaw-agent-v1, doubao/seed-2.0-pro"
+              readChain={readChain}
+              writeChain={writeChain}
+              healthMap={healthMap}
+              V={V}
+              fInput={{ ...fInput, minWidth: 300 }}
+              fieldRow={fieldRow}
+              zh={zh}
+            />
+            <ModelChainInput
+              path="agents.defaults.model.flash"
+              labelZh={"\u5FEB\u901F\u6A21\u578B"}
+              labelEn="Flash Model"
+              hint={`agents.defaults.model.flash (${zh ? "\u7559\u7A7A\u5219\u4F7F\u7528\u4E3B\u6A21\u578B" : "empty \u2192 use main model"})`}
+              placeholder="doubao/seed-2.0-lite, qwen/qwen-turbo"
+              readChain={readChain}
+              writeChain={writeChain}
+              healthMap={healthMap}
+              V={V}
+              fInput={{ ...fInput, minWidth: 300 }}
+              fieldRow={fieldRow}
+              zh={zh}
+            />
+            <ModelChainInput
+              path="agents.defaults.model.vision"
+              labelZh={"\u89C6\u89C9\u6A21\u578B"}
+              labelEn="Vision Model"
+              hint={`agents.defaults.model.vision (${zh ? "\u7559\u7A7A\u2192\u4E3B\u6A21\u578B\uFF1Bcomputer_use \u4F18\u5148" : "empty \u2192 primary; computer_use prefers this"})`}
+              placeholder="qwen/qwen-3-vl-plus, doubao/seed-2.0-pro"
+              readChain={readChain}
+              writeChain={writeChain}
+              healthMap={healthMap}
+              V={V}
+              fInput={{ ...fInput, minWidth: 300 }}
+              fieldRow={fieldRow}
+              zh={zh}
+            />
             <div style={fieldRow}>
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5907\u7528\u6A21\u578B" : "Fallback Models"} <span style={{ color: V.t3, fontWeight: 400 }}>{zh ? "(\u9017\u53F7\u5206\u9694)" : "(comma separated)"}</span></div>
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.fallbacks</div>
               </div>
-              <input style={{ ...fInput, minWidth: 300 }} placeholder={zh ? "\u5982: qwen/qwen-plus, openai/gpt-4o" : "e.g. qwen/qwen-plus, openai/gpt-4o"} value={(getVal("agents.defaults.model.fallbacks", "") || []).join?.(", ") || getVal("agents.defaults.model.fallbacks", "")} onChange={(e) => {
+              <input style={{ ...fInput, width: 300, minWidth: 300 }} placeholder={zh ? "\u5982: qwen/qwen-plus, openai/gpt-4o" : "e.g. qwen/qwen-plus, openai/gpt-4o"} value={(getVal("agents.defaults.model.fallbacks", "") || []).join?.(", ") || getVal("agents.defaults.model.fallbacks", "")} onChange={(e) => {
                 const val = e.target.value;
                 const arr = val.split(",").map((s: string) => s.trim()).filter(Boolean);
                 updateConfig("agents.defaults.model.fallbacks", arr.length > 0 ? arr : undefined);
               }} />
             </div>
-            <div style={fieldRow}>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u751F\u56FE\u6A21\u578B" : "Image Model"} <span style={{ color: V.t3, fontWeight: 400 }}>{zh ? "(\u7A7A=\u81EA\u52A8)" : "(empty=auto)"}</span></div>
-                <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.image</div>
-              </div>
-              <div style={{ position: "relative", minWidth: 300 }}>
-                <input
-                  id="img-model-input"
-                  style={{ ...fInput, width: "100%" }}
-                  placeholder={zh ? "\u70B9\u51FB\u9009\u62E9\u6216\u8F93\u5165\u6A21\u578B" : "Select or type a model"}
-                  value={getVal("agents.defaults.model.image", "")}
-                  onFocus={() => setImgDropOpen(true)}
-                  onBlur={() => setTimeout(() => setImgDropOpen(false), 180)}
-                  onChange={(e) => updateConfig("agents.defaults.model.image", e.target.value)}
-                />
-                {imgDropOpen && (() => {
-                  const IMAGE_MODELS: { label: string; value: string }[] = [
-                    { label: "minimax/image-01", value: "minimax/image-01" },
-                    { label: "qwen/qwen-image-2.0-pro", value: "qwen/qwen-image-2.0-pro" },
-                    { label: "qwen/wan2.6-t2i", value: "qwen/wan2.6-t2i" },
-                    { label: "doubao/doubao-seedream-5-0-260128", value: "doubao/doubao-seedream-5-0-260128" },
-                    { label: "gemini/nano-banana-pro", value: "gemini/gemini-3-pro-image-preview" },
-                    { label: "gemini/nano-banana-2", value: "gemini/gemini-3.1-flash-image-preview" },
-                  ];
-                  const curVal = getVal("agents.defaults.model.image", "");
-                  const el = document.getElementById("img-model-input");
-                  const rect = el?.getBoundingClientRect();
-                  return rect ? (
-                    <div style={{ position: "fixed", top: rect.bottom + 4, left: rect.left, width: rect.width, background: V.bg3, border: `1px solid ${V.bd2}`, borderRadius: 8, overflow: "hidden", zIndex: 9999, boxShadow: "0 8px 24px rgba(0,0,0,.5)" }}>
-                      {IMAGE_MODELS.map((m) => (
-                        <div
-                          key={m.value}
-                          onMouseDown={(e) => { e.preventDefault(); updateConfig("agents.defaults.model.image", m.value); setImgDropOpen(false); }}
-                          style={{ padding: "8px 12px", fontSize: 12, fontFamily: V.mono, color: curVal === m.value ? V.or : V.t1, cursor: "pointer", borderBottom: `1px solid ${V.bd}`, background: curVal === m.value ? V.olo : "transparent" }}
-                          onMouseEnter={(e) => (e.currentTarget.style.background = curVal === m.value ? V.olo : V.bg4)}
-                          onMouseLeave={(e) => (e.currentTarget.style.background = curVal === m.value ? V.olo : "transparent")}
-                        >
-                          {m.label}{m.label !== m.value && <span style={{ color: V.t3, fontSize: 10, marginLeft: 6 }}>→ {m.value}</span>}
-                        </div>
-                      ))}
-                    </div>
-                  ) : null;
-                })()}
-              </div>
-            </div>
+            <ModelChainInput
+              path="agents.defaults.model.image"
+              labelZh={"\u56FE\u7247\u751F\u6210\u6A21\u578B"}
+              labelEn="Image Generation Model"
+              hint={`agents.defaults.model.image (${zh ? "\u7A7A=\u7981\u7528" : "empty = disabled"})`}
+              placeholder="doubao/doubao-seedream-5-0-260128, minimax/image-01"
+              readChain={readChain}
+              writeChain={writeChain}
+              healthMap={healthMap}
+              V={V}
+              fInput={{ ...fInput, minWidth: 300 }}
+              fieldRow={fieldRow}
+              zh={zh}
+            />
+            <ModelChainInput
+              path="agents.defaults.model.video"
+              labelZh={"\u89C6\u9891\u751F\u6210\u6A21\u578B"}
+              labelEn="Video Generation Model"
+              hint={`agents.defaults.model.video (${zh ? "\u7A7A=\u7981\u7528;\u6BCF\u6BB5\u4ED8\u8D39\u4E14\u8017\u65F6" : "empty = disabled; each clip is paid and slow"})`}
+              placeholder="doubao/doubao-seedance-2-0-260128, minimax/video-01-director"
+              readChain={readChain}
+              writeChain={writeChain}
+              healthMap={healthMap}
+              V={V}
+              fInput={{ ...fInput, minWidth: 300 }}
+              fieldRow={fieldRow}
+              zh={zh}
+            />
             <div style={{ ...fieldRow, borderBottom: "none" }}>
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u5DE5\u5177\u96C6" : "Toolset"}</div>
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.model.toolset</div>
               </div>
-              <select style={{ ...fSelect, minWidth: 240 }} value={getVal("agents.defaults.model.toolset", "full")} onChange={(e) => updateConfig("agents.defaults.model.toolset", e.target.value)}>
+              <select style={{ ...fSelect, width: 300, minWidth: 300 }} value={getVal("agents.defaults.model.toolset", "full")} onChange={(e) => updateConfig("agents.defaults.model.toolset", e.target.value)}>
                 <option value="minimal">minimal {zh ? "\u2014 6 \u4E2A\u6838\u5FC3\u5DE5\u5177" : "-- 6 core tools"}</option>
                 <option value="standard">standard {zh ? "\u2014 12 \u4E2A\u5DE5\u5177" : "-- 12 tools"}</option>
                 <option value="full">full {zh ? "\u2014 \u5168\u90E8\u5DE5\u5177" : "-- all tools"}</option>
@@ -3430,7 +3715,7 @@ function TauriConfigPageInner() {
             </div>
           </div>
 
-          {secHead(zh ? "LLM \u63D0\u4F9B\u5546" : "LLM PROVIDERS")}
+          {secHead(zh ? "\u5927\u6A21\u578B\u63D0\u4F9B\u5546" : "MODEL PROVIDERS")}
           <div style={{ fontSize: 11, color: V.t3, marginBottom: 12 }}>{zh ? "\u9009\u4E2D\u63D0\u4F9B\u5546\u586B\u5165 Key\uFF0C\u6D4B\u8BD5\u8FDE\u63A5\u6210\u529F\u540E\u4ECE API \u83B7\u53D6\u53EF\u7528\u6A21\u578B\u5217\u8868\uFF0C\u9009\u62E9\u9ED8\u8BA4\u6A21\u578B\u3002" : "Enter API Key per provider, test connection, then select a default model."}</div>
 
           {/* rsclaw account card \u2014 sits above the regular BYOK
@@ -4027,25 +4312,26 @@ function TauriConfigPageInner() {
             </div>
           </div>
 
-          {/* File upload */}
+          {/* File upload \u2014 both inputs sized identically + right-flush.
+              Previously row 1 had the input + a "MB" span in a sub-flex,
+              which pushed the input ~26px left of row 2's input. Unit
+              now lives in the label so both inputs share the same right
+              edge. */}
           {secHead(zh ? "\u6587\u4EF6\u4E0A\u4F20" : "FILE UPLOAD")}
           <div style={fcard}>
             <div style={fieldRow}>
               <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u6700\u5927\u6587\u4EF6\u5927\u5C0F" : "Max File Size"}</div>
+                <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u6700\u5927\u6587\u4EF6\u5927\u5C0F (MB)" : "Max File Size (MB)"}</div>
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>tools.upload.maxFileSize</div>
               </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                <input style={{ ...fInput, minWidth: 80 }} type="number" value={getVal("tools.upload.maxFileSize", 50)} onChange={(e) => updateConfig("tools.upload.maxFileSize", parseInt(e.target.value) || 50)} />
-                <span style={{ fontSize: 11, color: V.t2 }}>MB</span>
-              </div>
+              <input style={{ ...fInput, width: 160, minWidth: 160, textAlign: "right" }} type="number" value={getVal("tools.upload.maxFileSize", 50)} onChange={(e) => updateConfig("tools.upload.maxFileSize", parseInt(e.target.value) || 50)} />
             </div>
             <div style={{ ...fieldRow, borderBottom: "none" }}>
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u6587\u672C\u6700\u5927\u5B57\u7B26\u6570" : "Max Text Chars"}</div>
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>tools.upload.maxTextChars</div>
               </div>
-              <input style={{ ...fInput, minWidth: 140 }} type="number" value={getVal("tools.upload.maxTextChars", 20000)} onChange={(e) => updateConfig("tools.upload.maxTextChars", parseInt(e.target.value) || 20000)} />
+              <input style={{ ...fInput, width: 160, minWidth: 160, textAlign: "right" }} type="number" value={getVal("tools.upload.maxTextChars", 20000)} onChange={(e) => updateConfig("tools.upload.maxTextChars", parseInt(e.target.value) || 20000)} />
             </div>
           </div>
 
@@ -4183,7 +4469,11 @@ function TauriConfigPageInner() {
             const existing = new Set(clientArr.map((c) => c?.id).filter(Boolean));
             let n = 1;
             while (existing.has(`client-${n}`)) n++;
-            updateConfig("gateway.a2a.clients", [...clientArr, { id: `client-${n}`, secret: "" }]);
+            // Seed scopes with ["*"] — explicit "all methods" wildcard rather
+            // than relying on absent-field semantics. Lets the operator see
+            // and tighten the grant from the get-go instead of discovering
+            // later that the empty field meant "unrestricted".
+            updateConfig("gateway.a2a.clients", [...clientArr, { id: `client-${n}`, secret: "", scopes: ["*"] }]);
           };
 
           // ── Relay (gateway.a2a.relay) ──
@@ -4241,9 +4531,9 @@ function TauriConfigPageInner() {
             <div style={fcard}>
               <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "11px 15px", background: V.bg3, borderBottom: `1px solid ${V.bd}` }}>
                 <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "命名客户端凭据（推荐）" : "Named Client Credentials (preferred)"}</div>
+                  <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "客户端凭据" : "Client Credentials"}</div>
                   <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>gateway.a2a.clients</div>
-                  <div style={{ fontSize: 10, color: V.t3, marginTop: 2, lineHeight: 1.5 }}>{zh ? "每条 secret 验证后归属于其 id（请求主体）。Bearer 或 X-API-Key 都接受。" : "Each secret authenticates as its `id` (the request principal). Accepted on Bearer or X-API-Key."}</div>
+                  <div style={{ fontSize: 10, color: V.t3, marginTop: 2, lineHeight: 1.5 }}>{zh ? "每条 secret 验证后归属于其 id（请求主体）。Bearer 或 X-API-Key 都接受。scopes 留空 = 无限制。" : "Each secret authenticates as its `id` (the request principal). Accepted on Bearer or X-API-Key. Empty scopes = unrestricted."}</div>
                 </div>
                 <button onClick={addClient} style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${V.gbrd}`, background: V.glo, color: V.green, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
                   {zh ? "+ 添加" : "+ Add"}
@@ -4256,19 +4546,24 @@ function TauriConfigPageInner() {
               ) : clientArr.map((c, i) => {
                 const secret = c?.secret;
                 const secretIsString = typeof secret === "string" || secret === undefined || secret === null;
+                const scopesArr: string[] = Array.isArray(c?.scopes) ? c.scopes : [];
                 const isLast = i === clientArr.length - 1;
                 return (
-                  <div key={`client-${i}`} style={{ padding: "10px 15px", borderBottom: isLast ? "none" : `1px solid rgba(255,255,255,.03)`, display: "flex", flexDirection: "column", gap: 8 }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, width: 28 }}>{`[${i}]`}</div>
-                      <input style={{ ...fInput, width: 200 }} type="text" placeholder={zh ? "id 例如 partner-acme" : "id e.g. partner-acme"} value={c?.id || ""} onChange={(e) => setClientField(i, "id", e.target.value)} />
-                      {secretIsString ? (
-                        <input style={{ ...fInput, flex: 1, minWidth: 200 }} type="password" placeholder="${RSCLAW_PARTNER_SECRET}" value={secret || ""} onChange={(e) => setClientField(i, "secret", e.target.value)} />
-                      ) : (
-                        <div style={{ flex: 1, fontFamily: V.mono, fontSize: 11, color: V.t2, padding: "7px 10px", background: V.bg4, border: `1px dashed ${V.bd2}`, borderRadius: 7 }}>{JSON.stringify(secret)}</div>
-                      )}
-                      <button onClick={() => removeClient(i)} style={{ padding: "5px 10px", borderRadius: 7, border: `1px solid ${V.rbrd}`, background: V.rlo, color: V.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "删除" : "Remove"}</button>
-                    </div>
+                  <div key={`client-${i}`} style={{ padding: "10px 15px", borderBottom: isLast ? "none" : `1px solid rgba(255,255,255,.03)`, display: "flex", alignItems: "center", gap: 8 }}>
+                    <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, width: 28 }}>{`[${i}]`}</div>
+                    <input style={{ ...fInput, width: 160 }} type="text" placeholder={zh ? "id" : "id"} value={c?.id || ""} onChange={(e) => setClientField(i, "id", e.target.value)} />
+                    {secretIsString ? (
+                      <input style={{ ...fInput, flex: 1, minWidth: 160 }} type="password" placeholder="${RSCLAW_PARTNER_SECRET}" value={secret || ""} onChange={(e) => setClientField(i, "secret", e.target.value)} />
+                    ) : (
+                      <div style={{ flex: 1, fontFamily: V.mono, fontSize: 11, color: V.t2, padding: "7px 10px", background: V.bg4, border: `1px dashed ${V.bd2}`, borderRadius: 7 }}>{JSON.stringify(secret)}</div>
+                    )}
+                    <CommaListInput
+                      value={scopesArr}
+                      onChange={(next) => setClientField(i, "scopes", next)}
+                      placeholder={zh ? "scopes 如 a2a:invoke:*, *" : "scopes e.g. a2a:invoke:*, *"}
+                      style={{ ...fInput, flex: 1, minWidth: 180, fontSize: 11, fontFamily: V.mono }}
+                    />
+                    <button onClick={() => removeClient(i)} style={{ padding: "5px 10px", borderRadius: 7, border: `1px solid ${V.rbrd}`, background: V.rlo, color: V.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "删除" : "Remove"}</button>
                   </div>
                 );
               })}
@@ -4415,26 +4710,17 @@ function TauriConfigPageInner() {
                   const isLast = i === relayNodeArr.length - 1;
                   const scopesArr: string[] = Array.isArray(n?.scopes) ? n.scopes : [];
                   return (
-                    <div key={`relay-node-${i}`} style={{ padding: "10px 15px", borderBottom: isLast ? "none" : `1px solid rgba(255,255,255,.03)`, display: "flex", flexDirection: "column", gap: 6 }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                        <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, width: 28 }}>{`[${i}]`}</div>
-                        <input style={{ ...fInput, width: 200 }} type="text" placeholder={zh ? "node id" : "node id"} value={n?.nodeId || ""} onChange={(e) => setRelayNodeField(i, "nodeId", e.target.value)} />
-                        <input style={{ ...fInput, flex: 1, minWidth: 200 }} type="password" placeholder="${RSCLAW_NODE_TOKEN}" value={typeof n?.token === "string" ? n.token : ""} onChange={(e) => setRelayNodeField(i, "token", e.target.value)} />
-                        <button onClick={() => removeRelayNode(i)} style={{ padding: "5px 10px", borderRadius: 7, border: `1px solid ${V.rbrd}`, background: V.rlo, color: V.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "删除" : "Remove"}</button>
-                      </div>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8, paddingLeft: 36 }}>
-                        <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, minWidth: 50 }}>scopes</div>
-                        <input
-                          style={{ ...fInput, flex: 1, fontSize: 11, fontFamily: V.mono }}
-                          type="text"
-                          placeholder={zh ? "留空 = 默认（仅本节点）；如 a2a:invoke:a3/*, relay:connect:hub-1" : "empty = default (this node only); e.g. a2a:invoke:a3/*, relay:connect:hub-1"}
-                          value={scopesArr.join(", ")}
-                          onChange={(e) => {
-                            const arr = e.target.value.split(",").map((s) => s.trim()).filter(Boolean);
-                            setRelayNodeField(i, "scopes", arr.length > 0 ? arr : undefined);
-                          }}
-                        />
-                      </div>
+                    <div key={`relay-node-${i}`} style={{ padding: "10px 15px", borderBottom: isLast ? "none" : `1px solid rgba(255,255,255,.03)`, display: "flex", alignItems: "center", gap: 8 }}>
+                      <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, width: 28 }}>{`[${i}]`}</div>
+                      <input style={{ ...fInput, width: 160 }} type="text" placeholder={zh ? "node id" : "node id"} value={n?.nodeId || ""} onChange={(e) => setRelayNodeField(i, "nodeId", e.target.value)} />
+                      <input style={{ ...fInput, flex: 1, minWidth: 160 }} type="password" placeholder="${RSCLAW_NODE_TOKEN}" value={typeof n?.token === "string" ? n.token : ""} onChange={(e) => setRelayNodeField(i, "token", e.target.value)} />
+                      <CommaListInput
+                        value={scopesArr}
+                        onChange={(next) => setRelayNodeField(i, "scopes", next)}
+                        placeholder={zh ? "scopes 留空=默认" : "scopes (empty=default)"}
+                        style={{ ...fInput, flex: 1, minWidth: 180, fontSize: 11, fontFamily: V.mono }}
+                      />
+                      <button onClick={() => removeRelayNode(i)} style={{ padding: "5px 10px", borderRadius: 7, border: `1px solid ${V.rbrd}`, background: V.rlo, color: V.red, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "删除" : "Remove"}</button>
                     </div>
                   );
                 })}

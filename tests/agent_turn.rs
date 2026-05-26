@@ -206,6 +206,7 @@ async fn start_echo_server(addr: SocketAddr) {
         relay_hub: Arc::new(rsclaw::a2a::relay::RelayHub::new()),
         knowledge: None,
         memory: None,
+        model_health: rsclaw::provider::health::ProviderHealthRegistry::new(),
     };
 
     // Leak the tempdir so the store stays valid for the server's lifetime.

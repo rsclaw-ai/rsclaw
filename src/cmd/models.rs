@@ -8,11 +8,24 @@ use super::{
 };
 use crate::{
     cli::{
-        AliasesCommand, AuthOrderCommand, FallbacksCommand, ImageFallbacksCommand,
-        ModelsAuthCommand, ModelsCommand,
+        AliasesCommand, AuthOrderCommand, FallbacksCommand, HealthCommand, ModelsAuthCommand,
+        ModelsCommand,
     },
     config,
 };
+
+/// Resolve the gateway base URL from `rsclaw.json5` → `gateway.port`,
+/// falling back to 18888. Mirrors the helper in `cmd/sessions.rs`; kept
+/// inline because `cmd/models.rs` already owns its own HTTP for
+/// `models scan`.
+fn gateway_base() -> String {
+    let base = crate::config::loader::base_dir();
+    let port = crate::config::loader::load_json5(&base.join("rsclaw.json5"))
+        .ok()
+        .and_then(|c| c.gateway.as_ref()?.port)
+        .unwrap_or(18888);
+    format!("http://127.0.0.1:{port}")
+}
 
 pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
     match sub {
@@ -47,7 +60,7 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
                 .defaults
                 .model
                 .as_ref()
-                .and_then(|m| m.primary.as_deref())
+                .and_then(|m| m.primary_head())
                 .unwrap_or("anthropic/claude-sonnet-4-5");
             println!();
             kv("default", &bold(default_model));
@@ -193,65 +206,91 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
                 ok("fallbacks cleared");
             }
         },
-        ModelsCommand::ImageFallbacks(sub) => match sub {
-            ImageFallbacksCommand::List => {
+        ModelsCommand::Health(sub) => match sub {
+            HealthCommand::List => {
                 banner(&format!(
-                    "rsclaw image fallbacks v{}",
+                    "rsclaw models health v{}",
                     option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
                 ));
-                let config = config::load()?;
-                let fallbacks = config
-                    .agents
-                    .defaults
-                    .model
-                    .as_ref()
-                    .and_then(|m| m.image_fallbacks.as_deref())
-                    .unwrap_or(&[]);
-                if fallbacks.is_empty() {
-                    warn_msg("no image fallback models configured");
-                } else {
-                    for (i, f) in fallbacks.iter().enumerate() {
-                        println!("  {}. {}", dim(&(i + 1).to_string()), cyan(f));
+                let url = format!("{}/api/v1/models/health", gateway_base());
+                let resp = reqwest::Client::new()
+                    .get(&url)
+                    .timeout(std::time::Duration::from_secs(5))
+                    .send()
+                    .await;
+                match resp {
+                    Ok(r) if r.status().is_success() => {
+                        let body: serde_json::Value = r.json().await.unwrap_or_default();
+                        let models = body["models"].as_array().cloned().unwrap_or_default();
+                        if models.is_empty() {
+                            warn_msg(
+                                "no models have been called yet — start the gateway, send a message, then re-check",
+                            );
+                        } else {
+                            println!(
+                                "  {:<40} {:<10} {:<10} {}",
+                                bold("MODEL"),
+                                bold("STATUS"),
+                                bold("FAILS"),
+                                bold("DETAIL"),
+                            );
+                            for m in &models {
+                                let model = m["model"].as_str().unwrap_or("?");
+                                let status = m["status"].as_str().unwrap_or("?");
+                                let fails = m["consecutive_failures"].as_u64().unwrap_or(0);
+                                let detail = match status {
+                                    "Healthy" => String::new(),
+                                    "Cooling" => {
+                                        let secs = m["cooldown_seconds"].as_u64().unwrap_or(0);
+                                        format!("retry in {secs}s")
+                                    }
+                                    "Disabled" => m["reason"]
+                                        .as_str()
+                                        .map(|r| format!("reason: {r}"))
+                                        .unwrap_or_default(),
+                                    _ => String::new(),
+                                };
+                                let status_colored = match status {
+                                    "Healthy" => green(status),
+                                    "Cooling" => yellow(status),
+                                    "Disabled" => red(status),
+                                    _ => dim(status),
+                                };
+                                println!(
+                                    "  {:<40} {:<10} {:<10} {}",
+                                    cyan(model),
+                                    status_colored,
+                                    fails,
+                                    dim(&detail),
+                                );
+                            }
+                        }
                     }
+                    Ok(r) => err_msg(&format!("gateway returned {}", r.status())),
+                    Err(e) => err_msg(&format!("gateway not reachable: {e}")),
                 }
             }
-            ImageFallbacksCommand::Add { model } => {
-                let (path, mut val) = load_config_json()?;
-                let arr = val
-                    .pointer_mut("/agents/defaults/model/imageFallbacks")
-                    .and_then(|v| v.as_array_mut());
-                if let Some(arr) = arr {
-                    arr.push(model.clone().into());
-                } else {
-                    set_nested_value(
-                        &mut val,
-                        "agents.defaults.model.imageFallbacks",
-                        serde_json::json!([model]),
-                    )?;
+            HealthCommand::Reset { model } => {
+                let url = format!("{}/api/v1/models/health/reset", gateway_base());
+                let resp = reqwest::Client::new()
+                    .post(&url)
+                    .json(&serde_json::json!({ "model": &model }))
+                    .timeout(std::time::Duration::from_secs(5))
+                    .send()
+                    .await;
+                match resp {
+                    Ok(r) if r.status().is_success() => {
+                        ok(&format!("reset '{}' — next chain iteration will retry it", cyan(&model)));
+                    }
+                    Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+                        warn_msg(&format!(
+                            "model '{}' not in health table — never called or already reset",
+                            model
+                        ));
+                    }
+                    Ok(r) => err_msg(&format!("gateway returned {}", r.status())),
+                    Err(e) => err_msg(&format!("gateway not reachable: {e}")),
                 }
-                std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
-                ok(&format!("added image fallback '{}'", cyan(&model)));
-            }
-            ImageFallbacksCommand::Remove { model } => {
-                let (path, mut val) = load_config_json()?;
-                if let Some(arr) = val
-                    .pointer_mut("/agents/defaults/model/imageFallbacks")
-                    .and_then(|v| v.as_array_mut())
-                {
-                    arr.retain(|v| v.as_str() != Some(&model));
-                }
-                std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
-                ok(&format!("removed image fallback '{}'", cyan(&model)));
-            }
-            ImageFallbacksCommand::Clear => {
-                let (path, mut val) = load_config_json()?;
-                set_nested_value(
-                    &mut val,
-                    "agents.defaults.model.imageFallbacks",
-                    serde_json::json!([]),
-                )?;
-                std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
-                ok("image fallbacks cleared");
             }
         },
         ModelsCommand::Auth(sub) => match sub {

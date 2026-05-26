@@ -35,7 +35,7 @@ pub async fn cmd_agents(sub: AgentsCommand) -> Result<()> {
                 let model = a
                     .model
                     .as_ref()
-                    .and_then(|m| m.primary.as_deref())
+                    .and_then(|m| m.primary_head())
                     .unwrap_or("(default)");
                 println!(
                     "  {:<16} {:<24} {:<10} {}",

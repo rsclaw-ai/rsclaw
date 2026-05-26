@@ -749,6 +749,7 @@ pub(crate) async fn extract_entities_via_llm(
     );
 
     let req = LlmRequest {
+            fallback_models: Vec::new(),
         model: model.to_owned(),
         messages: vec![Message {
             role: Role::User,
@@ -896,6 +897,7 @@ pub(crate) async fn describe_image_via_llm(
     providers: &Arc<ProviderRegistry>,
 ) -> Option<String> {
     let req = LlmRequest {
+            fallback_models: Vec::new(),
         model: model.to_owned(),
         messages: vec![Message {
             role: Role::User,

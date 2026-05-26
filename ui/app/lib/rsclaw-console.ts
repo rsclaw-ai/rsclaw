@@ -286,9 +286,13 @@ export async function readAccountState(): Promise<RsclawAccountState> {
     if (!rsclaw || typeof rsclaw.apiKey !== "string" || !rsclaw.apiKey.trim()) {
       return { connected: false };
     }
-    const primary = parsed?.agents?.defaults?.model?.primary;
-    const isPrimary =
-      typeof primary === "string" && primary.startsWith("rsclaw/");
+    // `primary` is StringOrVec on the backend — accept both forms and
+    // count it as "rsclaw primary" if the chain *head* points at rsclaw.
+    const primaryRaw = parsed?.agents?.defaults?.model?.primary;
+    const primaryHead = Array.isArray(primaryRaw)
+      ? (typeof primaryRaw[0] === "string" ? primaryRaw[0] : "")
+      : (typeof primaryRaw === "string" ? primaryRaw : "");
+    const isPrimary = primaryHead.startsWith("rsclaw/");
     return {
       connected: true,
       name: typeof rsclaw._name === "string" ? rsclaw._name : undefined,

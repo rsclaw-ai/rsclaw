@@ -9,6 +9,13 @@ default-run = "rsclaw-ui"
 edition = "2024"
 rust-version = "1.91"
 
+# Silence the noisy `unexpected cfg condition value: cargo-clippy` warnings
+# that bubble up from `objc 0.2.x`'s `msg_send!` macro expansion. The macro
+# lives in a third-party crate and isn't fixable here; declaring the cfg
+# value as known is the recommended workaround per rustc's diagnostic.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [build-dependencies]

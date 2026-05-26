@@ -201,10 +201,10 @@ pub async fn cmd_doctor(args: DoctorArgs) -> Result<()> {
             .defaults
             .model
             .as_ref()
-            .and_then(|m| m.primary.as_ref())
+            .and_then(|m| m.primary_head())
             .is_some();
         for a in &c.agents.list {
-            let has_model = a.model.as_ref().and_then(|m| m.primary.as_ref()).is_some();
+            let has_model = a.model.as_ref().and_then(|m| m.primary_head()).is_some();
             if !has_model && !has_default_model {
                 issues.push(Issue::warn(format!(
                     "agent '{}' has no model \u{2014} set agents.defaults.model.primary or agent-level model",
