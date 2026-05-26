@@ -496,54 +496,50 @@ fn build_shared_system_prefix_uncached() -> String {
     );
 
     parts.push(
-        "## CAPABILITY PRIORITY (read before every action)\n\
-         \n\
-         For every user request, choose the capability that best FITS the \
-         task — do not rank by source type:\n\
-         - **Plugins** (\"## Installed Plugins\") and **skills** (\"## Installed \
-         Skills\") cover specific domains (flights, stocks, a marketplace, …). \
-         If a plugin or skill description matches the user's intent, prefer it \
-         over a generic browser/web flow. When a WASM and JS plugin both fit, \
-         choose WASM.\n\
-         - **Built-in tools** (`computer_use`, `web_browser`, `web_fetch`, \
-         `shell`, `read_file`, …) are the fallback. Use them only when \
-         no plugin or skill covers the domain. A plugin or skill that \
-         matches the user's intent ALWAYS outranks any built-in tool, \
-         even if the built-in has an app-rule or site-rule for the same \
-         target.\n\n\
-         Common failure mode (avoid):\n\
-         > User asks about flights → you call web_fetch(ctrip.com) →\n\
-         > result is brittle / blocked / wrong data.\n\
-         > A flyai skill with `intents: [flight_search]` was sitting right\n\
-         > above and you ignored it.\n\n\
-         If you catch yourself reaching for computer_use / web_fetch /\n\
-         web_browser / shell on a domain a plugin or skill description \
-         covers, STOP and use the plugin/skill instead.\n\n\
-         ### How to use plugins\n\
-         Installed plugins are listed in the \"## Installed Plugins\" section \
-         below, each with its common tools. A \"## Active Plugin Tools\" \
-         section MAY appear (set by `/plugin <name> all` or by agent config) \
-         — its tools come with full input_schema, ready to call directly.\n\
-         1. If a listed tool fits (common or active), call `plugin_describe` \
-         {plugin, tool} for exact arguments when not already shown, then \
-         `plugin_invoke`.\n\
-         2. If no listed tool fits, call `plugin_search` with the plugin \
-         name (from the list) and the user's intent to find one, then \
-         describe/invoke.\n\
-         3. `plugin_invoke` with `{plugin, tool, arguments}`. If a WASM and JS \
-         plugin expose the same capability, choose WASM.\n\n\
-         ### How to invoke an installed skill\n\
-         Use `skill_list` with `query` first when you need to find an installed skill. Use `limit`/`offset` to page through more results. Do not use `shell` to run `rsclaw skills list`; `skill_list` is the authoritative installed-skill listing.\n\n\
-         When a task matches a skill description listed under \"## Installed Skills\":\n\
-         1. Pick the skill whose description matches the user's intent.\n\
-         2. Call the `skill_use` function tool with `name=<slug>` — returns \
-         the full SKILL.md body.\n\
-         3. If SKILL.md mentions `references/<command>.md`, read_file that too.\n\
-         4. Then invoke the CLI with the exact flags from SKILL.md via \
-         `shell`.\n\n\
-         Prefer `skill_use` over manually `read_file`-ing SKILL.md so the \
-         discovery shows up cleanly in tool history. Guessing CLI flags from \
-         the description alone is the #1 failure mode."
+        "## CAPABILITY PRIORITY (read before every action)\n\n\
+         You have THREE tool sources in THREE separate namespaces. \
+         **NEVER mix them.** Confusing them is the #1 failure mode.\n\n\
+         ### Namespace A — Skill\n\
+         Slug like `meituan-travel`, `douyin-publish`. Discovered via \
+         `skill_list(query)` or `skill_search`. Listed under \"## Installed Skills\".\n\
+         **Invoke ONLY with `skill_use(name=<slug>)`** → returns the \
+         SKILL.md, follow its CLI instructions via `shell`.\n\
+         Never call `plugin_*` on a skill slug.\n\n\
+         ### Namespace B — Plugin\n\
+         Slug like `douyin`, `jimeng`, `wechat`. Discovered via `plugin_list` \
+         or `plugin_search`. Listed under \"## Installed Plugins\".\n\
+         **Invoke in one of two ways:**\n\
+         1. **Direct ToolDef (preferred when available)** — high-frequency \
+         tools are exposed in your tool list as `<plugin>__<tool>` (double \
+         underscore, e.g. `douyin__publish`, `jimeng__image_txt2img`, \
+         `wechat__send_text`). Call them like any other function tool. \
+         The `__` IS part of the name — don't split or replace with dot.\n\
+         2. **Long-tail via `plugin_invoke`** — for tools NOT in your direct \
+         list: `plugin_describe(plugin, tool)` to fetch schema, then \
+         `plugin_invoke(plugin, tool, arguments)` to execute.\n\
+         Never call `skill_*` on a plugin slug. Never wrap a direct \
+         `<plugin>__<tool>` call in `plugin_invoke`.\n\n\
+         ### Namespace C — Built-in\n\
+         `computer_use`, `web_search`, `web_fetch`, `web_browser`, `web_download`, \
+         `shell`, `read_file`, `write_file`, `memory`, `agent`, etc. \
+         **Fallback ONLY.** Use only when neither a skill nor a plugin \
+         covers the user's intent.\n\n\
+         ### Decision flow for every user message\n\
+         1. Look at \"## Installed Plugins\" and \"## Installed Skills\" sections \
+         below. Does any plugin/skill description fit the user's intent?\n\
+         2. If yes → use that namespace (A or B). When BOTH a skill and \
+         plugin match, prefer the plugin (more structured + WASM beats JS).\n\
+         3. If no → call `skill_list(query=keyword)` AND `plugin_list` to \
+         search both before falling back.\n\
+         4. Built-ins (C) only after (1)–(3) come up empty.\n\n\
+         ### Hard anti-patterns (do NOT do these)\n\
+         - Found `meituan-travel` via `skill_list` → WRONG: called `plugin_search` for it. RIGHT: `skill_use(name=\"meituan-travel\")` — it's a skill, not a plugin.\n\
+         - Found `douyin` via `plugin_list` → WRONG: called `skill_use(\"douyin\")`. RIGHT: `douyin__check_login` direct, or `plugin_invoke`. Plugins are NOT skills.\n\
+         - Saw `douyin__publish` in your tool list → WRONG: wrapped it in `plugin_invoke(plugin=\"douyin\", tool=\"publish\")`. RIGHT: just call `douyin__publish(...)` directly.\n\
+         - User asked about flights → WRONG: jumped to `web_fetch(ctrip.com)`. RIGHT: first `skill_list(query=\"flight\")` + `plugin_list` — a domain skill/plugin is likely there.\n\
+         - Tool returned `Permission denied / Allowed:[a,b,c]` → WRONG: retried the same denied tool. RIGHT: pick one from the Allowed list and continue.\n\n\
+         If a tool you tried isn't available, do NOT explain limitations to \
+         the user — keep trying alternative tools or namespaces until one works."
             .to_owned(),
     );
 
@@ -596,7 +592,7 @@ fn build_shared_system_prefix_uncached() -> String {
          - Save corrected/complete info to memory immediately so it survives compaction.\n\
          - Knowledge base: when the user asks about THEIR own material (uploaded docs, PDFs, URLs, files), use `knowledge_base` to search it and CITE the returned source_title. Prefer it over `web_search` for the user's material; if it returns nothing, say so — never fabricate a citation. (`memory` = what you learned; `knowledge_base` = the user's authoritative corpus.)\n\
          - Skills: prefer an installed skill (see '## Installed Skills') via `skill_use` over raw web/shell. If none matches and web tools can't solve it, `skill_search` for one (restaurants→meituan, stock/finance→hithink, etc.), `skill_install` it, then `skill_use`. `skill_list` shows what's installed; `skill_remove` uninstalls.\n\
-         - Plugins: installed plugins are accessed only through `plugin_list`, `plugin_search`, `plugin_describe`, and `plugin_invoke`. Never invent other `plugin_*` tool names. When the user explicitly asks for a plugin or names an installed plugin domain, use `plugin_list` or `plugin_search` before `skill_list`.\n\
+         - Plugins/skills: see CAPABILITY PRIORITY section above — direct `<plugin>__<tool>` for plugin headlines, `plugin_invoke` for plugin long-tail, `skill_use` for skills. Never mix the two namespaces (`plugin_*` for plugins only, `skill_*` for skills only).\n\
          \n\
          ### GUI / Desktop Automation (computer_use)\n\
          For any GUI or desktop automation task (WeChat, Finder, Safari, etc.):\n\
@@ -972,15 +968,31 @@ mod tests {
         assert!(prompt.contains("plugin_search"));
         assert!(prompt.contains("plugin_describe"));
         assert!(prompt.contains("plugin_invoke"));
-        assert!(prompt.contains("Never invent other `plugin_*` tool names"));
+        // Namespace-discipline guidance — see CAPABILITY PRIORITY section.
+        assert!(prompt.contains("Never call `plugin_*` on a skill slug"));
+        assert!(prompt.contains("Never call `skill_*` on a plugin slug"));
     }
 
     #[test]
     fn shared_prompt_guides_skill_list_pagination() {
         let prompt = build_shared_system_prefix_uncached();
 
-        assert!(prompt.contains("Use `skill_list` with `query` first"));
-        assert!(prompt.contains("Use `limit`/`offset` to page"));
-        assert!(prompt.contains("Do not use `shell` to run `rsclaw skills list`"));
+        // Skill is its own namespace and `skill_use` is the only invocation entry.
+        assert!(prompt.contains("skill_use(name=<slug>"));
+        assert!(prompt.contains("skill_list(query"));
+        // Reference an anti-pattern that should still discourage shelling out.
+        assert!(prompt.contains("Found `meituan-travel` via `skill_list`"));
+    }
+
+    #[test]
+    fn shared_prompt_calls_out_namespace_anti_patterns() {
+        // Smoking-gun regression test for the bad2.png case where the model
+        // found `meituan-travel` via skill_list and then called plugin_search.
+        // The CAPABILITY PRIORITY section must call this out by name so the
+        // model has an explicit anchor for the right move.
+        let prompt = build_shared_system_prefix_uncached();
+        assert!(prompt.contains("Hard anti-patterns"));
+        assert!(prompt.contains("`meituan-travel`"));
+        assert!(prompt.contains("WRONG"));
     }
 }

@@ -115,6 +115,12 @@ pub struct WasmToolDef {
     pub description: String,
     /// JSON Schema for the tool's input parameters.
     pub parameters: serde_json::Value,
+    /// Plugin-author-declared "expose as real ToolDef by default" flag,
+    /// mirroring `PluginToolDef.headline` from the JSON5 manifest. Read
+    /// by `select_user_tools_pure` when computing the per-turn
+    /// `dynamic_prefix.user_tools` set.
+    #[serde(default)]
+    pub headline: bool,
 }
 
 /// Routing context for `host::notify` — when supplied by the agent
@@ -1273,6 +1279,7 @@ pub async fn load_wasm_plugin(
             name: t.name.clone(),
             description: t.description.clone(),
             parameters: t.input_schema.clone().unwrap_or(json!({"type": "object"})),
+            headline: t.headline,
         })
         .collect();
 

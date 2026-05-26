@@ -185,11 +185,20 @@ const MAX_SESSIONS_PER_AGENT: usize = 10_000;
 pub struct PluginOverride {
     /// Plugin is hidden entirely in this session (catalog + tools).
     pub disabled: bool,
-    /// Inject every tool this plugin exposes (resolved at expand time,
-    /// capped by `MAX_INJECT_TOOLS`). When `true`, `inject` is ignored.
+    /// Inject every tool this plugin exposes — REPLACES the
+    /// headline-based default. Capped by `user_tools_cap`.
     pub inject_all: bool,
-    /// Inject this specific tool list as `<plugin>.<tool>` ToolDefs.
+    /// REPLACE the headline-based default with this exact list. Empty
+    /// means "use the default" (headlines + agent-level pins).
     pub inject: Vec<String>,
+    /// ADD these tool names on top of whatever the base set resolves
+    /// to (headline default, `inject`, or `inject_all`). Slash command
+    /// `/plugin pin <plugin>__<tool>` writes here.
+    pub pin: Vec<String>,
+    /// REMOVE these tool names from the resolved base set. Wins over
+    /// `pin` if both reference the same name (unpin is final).
+    /// `/plugin unpin <plugin>__<tool>` writes here.
+    pub unpin: Vec<String>,
 }
 
 /// Result of resolving a plugin override to its inject set. The `All`
@@ -204,6 +213,77 @@ pub(crate) enum PluginInjectResolution {
     All,
     /// Inject exactly these tool names.
     Names(Vec<String>),
+}
+
+/// Default cap on plugin tools exposed in `dynamic_prefix.user_tools`
+/// per turn when `model.user_tools_cap` is unset. Sized to fit ~10
+/// headlines × 3 active plugins without overflowing a 64k-context
+/// small model's prompt budget; larger models override upward.
+pub(crate) const DEFAULT_USER_TOOLS_CAP: usize = 30;
+
+/// Wire name separator between plugin namespace and tool name. Chosen
+/// as double-underscore because OpenAI's tool-name regex
+/// `^[a-zA-Z0-9_-]+$` rejects the dot (`.`) the legacy code used,
+/// while every modern provider including rsclaw-llm accepts `_`.
+/// Legacy `<plugin>.<tool>` is still accepted on inbound tool calls
+/// so old transcripts replay.
+pub(crate) const PLUGIN_TOOL_SEP: &str = "__";
+
+/// A plugin tool that's been selected for inclusion in
+/// `dynamic_prefix.user_tools`. Owns its data so the caller doesn't
+/// need to hold a borrow on the plugin registry while building the
+/// final ToolDef array.
+#[derive(Debug, Clone)]
+pub(crate) struct PluginUserToolSelection {
+    pub plugin_name: String,
+    pub tool_name: String,
+    pub description: String,
+    pub input_schema: Value,
+}
+
+impl PluginUserToolSelection {
+    /// Render the wire-facing tool name as `<plugin><sep><tool>`.
+    pub(crate) fn wire_name(&self) -> String {
+        format!("{}{}{}", self.plugin_name, PLUGIN_TOOL_SEP, self.tool_name)
+    }
+}
+
+/// Parse a qualified tool reference. Accepts the new `<plugin>__<tool>`
+/// canonical form, the legacy `<plugin>.<tool>` form (still emitted by
+/// old `model.plugin_tools` configs), and `<plugin>/<tool>` (operator
+/// muscle memory from skill paths). Returns `None` when the entry has
+/// no recognized separator — caller logs and skips.
+pub(crate) fn parse_qualified_tool(entry: &str) -> Option<(String, String)> {
+    let entry = entry.trim();
+    if let Some((p, t)) = entry.split_once(PLUGIN_TOOL_SEP) {
+        return Some((p.trim().to_owned(), t.trim().to_owned()));
+    }
+    if let Some((p, t)) = entry.split_once('.') {
+        return Some((p.trim().to_owned(), t.trim().to_owned()));
+    }
+    if let Some((p, t)) = entry.split_once('/') {
+        return Some((p.trim().to_owned(), t.trim().to_owned()));
+    }
+    None
+}
+
+/// Group a flat list of qualified tool references (`<plugin>__<tool>`,
+/// or legacy `<plugin>.<tool>`) into a per-plugin lookup. Used by
+/// `select_user_tools_pure` so pin/unpin checks are O(active tools)
+/// instead of O(config_entries × active_tools). Entries without a
+/// recognized separator are silently dropped — the caller already
+/// logged on a prior pass that produced this list.
+pub(crate) fn bucket_qualified_names(
+    entries: &[String],
+) -> std::collections::HashMap<String, std::collections::HashSet<String>> {
+    let mut out: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for entry in entries {
+        if let Some((plugin, tool)) = parse_qualified_tool(entry) {
+            out.entry(plugin).or_default().insert(tool);
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -302,6 +382,7 @@ fn is_minimal_context_session(session_key: &str) -> bool {
 /// upstream tool registry — not normalized here because this block lives
 /// in `user_system` (NOT hashed), so cross-session byte-divergence has
 /// no KV-cache impact.
+#[allow(dead_code)]
 fn format_active_plugin_tool_line(name: &str, description: &str, schema: &Value) -> String {
     let one_line_desc = description.trim().replace('\n', " ");
     let schema_compact = serde_json::to_string(schema)
@@ -3336,18 +3417,52 @@ impl AgentRuntime {
                 &self.config.agents.a2a,
             );
             all.extend(extra_tools.iter().cloned());
-            // Plugin catalogs are exposed through compact meta tools
-            // (`plugin_search`, `plugin_describe`, `plugin_invoke`) instead
-            // of exporting every concrete plugin tool into provider tools.
-            // The `/plugin` slash command and `model.plugin_tools` config
-            // upgrade exposure by injecting an "## Active Plugin Tools"
-            // block (with full input_schema) into `user_system` text at
-            // prompt-build time — see `render_session_plugin_tools_text`
-            // and `render_config_plugin_tools_text`. Schema lives in
-            // user_system (NOT in tools[]), so per-session activation
-            // doesn't split the shared prefix KV bucket.
+            // Plugin tools: `plugin_search`/`plugin_describe`/`plugin_invoke`
+            // builtin meta-tools remain the long-tail discovery path. On top
+            // of that, headline-marked tools (plus `model.plugin_tools` pins
+            // and session `/plugin pin` overrides, minus
+            // `plugin_tools_unpin` / `/plugin unpin`) are auto-promoted into
+            // `dynamic_prefix.user_tools` as real namespaced ToolDefs
+            // (`<plugin>__<tool>`). This sits in the per-session user_tools
+            // cache segment (v1.9 rsclaw protocol), so per-client variance
+            // doesn't dirty the base prefix.
             if let Some(ref mcp) = self.mcp {
                 all.extend(mcp.all_tool_defs().await);
+            }
+            // user_tools_cap default — 30 fits ~10 headlines × 3 plugins
+            // without overflowing a 64k-context small model.
+            let cap = model_cfg
+                .and_then(|m| m.user_tools_cap)
+                .unwrap_or(DEFAULT_USER_TOOLS_CAP);
+            let empty_vec: Vec<String> = Vec::new();
+            let config_pin = model_cfg
+                .and_then(|m| m.plugin_tools.as_ref())
+                .unwrap_or(&empty_vec);
+            let config_unpin = model_cfg
+                .and_then(|m| m.plugin_tools_unpin.as_ref())
+                .unwrap_or(&empty_vec);
+            let session_overrides = self
+                .handle
+                .plugin_overrides
+                .read()
+                .ok()
+                .and_then(|g| g.get(session_key).cloned())
+                .unwrap_or_default();
+            let selections = Self::select_user_tools_pure(
+                &self.wasm_plugins,
+                self.plugins.as_deref(),
+                &session_overrides,
+                config_pin,
+                config_unpin,
+                cap,
+            );
+            for sel in selections {
+                let wire_name = sel.wire_name();
+                all.push(crate::provider::ToolDef {
+                    name: wire_name,
+                    description: sel.description.clone(),
+                    parameters: sel.input_schema.clone(),
+                });
             }
 
             // Apply toolset level + custom tools list
@@ -4881,26 +4996,18 @@ impl AgentRuntime {
                     }
                 }
             }
-            let mut effective_system = system_prompt.to_owned();
-            // Per-session "## Active Plugin Tools" block: rendered from agent
-            // config (`model.plugin_tools`, always-on) and session overrides
-            // (`/plugin` slash command). Appended AFTER the cached system
-            // prompt — and AFTER the shared-prefix boundary at the
-            // (system_shared, user_system) split below — so the block lands
-            // in `dynamic_prefix.user_system` and does NOT participate in
-            // the worker's content-addressed prefix hash. Different sessions
-            // with different active plugins share the same prefix bucket.
-            let mut plugin_tail_parts: Vec<String> = Vec::new();
-            if let Some(t) = self.render_config_plugin_tools_text() {
-                plugin_tail_parts.push(t);
-            }
-            if let Some(t) = self.render_session_plugin_tools_text(&ctx.session_key) {
-                plugin_tail_parts.push(t);
-            }
-            if !plugin_tail_parts.is_empty() {
-                effective_system.push_str("\n\n");
-                effective_system.push_str(&plugin_tail_parts.join("\n\n"));
-            }
+            let effective_system = system_prompt.to_owned();
+            // Per-session "## Active Plugin Tools" block is GONE as of v1.9
+            // — those tools are now real ToolDefs in
+            // `dynamic_prefix.user_tools` (assembled in the
+            // `select_user_tools_pure` call upstream during `req.tools`
+            // construction). user_tools sits in its own segment of the
+            // worker prefix cache that doesn't dirty the base prefix, so
+            // we don't need to push schemas into the (still-cacheable)
+            // user_system text to keep cross-client cache sharing. The
+            // long tail (non-headline, non-pinned tools — 200+ for
+            // douyin) remains accessible via the `plugin_invoke`
+            // meta-tool with zero standing prompt cost.
 
             // Resolve max_tokens with priority: config > built-in defaults > 0.
             // Sentinel semantics: 0 (or unset) means "no client-side cap" — we
@@ -6975,24 +7082,17 @@ impl AgentRuntime {
 
     /// Render an "## Active Plugin Tools" markdown block listing every
     /// `<plugin>.<tool>` selected by `per_plugin`, with the full
-    /// `description` and `input_schema`. The block is meant to be appended
-    /// to `user_system` so it does NOT enter the shared `(system, tools)`
-    /// prefix hash — different sessions can have different active sets
-    /// without splitting the worker's prefix LRU.
+    /// `description` and `input_schema`.
     ///
-    /// Returns `None` when no plugin is opted in (caller should skip the
-    /// header entirely so default-state sessions emit no extra bytes).
-    ///
-    /// Capped at `cap` total tools (v1 hard limit; v2 swaps for a token
-    /// budget). Cap is shared across wasm + js to bound prompt growth even
-    /// when a user `/plugin xxx all`s a 200-tool plugin.
-    ///
-    /// Dispatch routing for `<plugin>.<tool>` calls already exists at the
-    /// fall-through in `dispatch_tool` (the `name.split_once('.')` arm),
-    /// so a model that emits `douyin.publish` after reading this block
-    /// resolves correctly. `plugin_invoke` is the recommended entry
-    /// point — it carries the same args shape but doesn't require the
-    /// dispatch fallback.
+    /// **Superseded by `select_user_tools_pure` as of v1.9** — plugin
+    /// tools now flow into `dynamic_prefix.user_tools` as real
+    /// structured ToolDefs (their own cache segment), so re-rendering
+    /// the same data as `user_system` text would be duplicate work
+    /// and waste prompt tokens. Kept for future debug-mode use
+    /// (e.g. `/plugin describe <plugin> --text`) and to keep the
+    /// resolver primitives importable from tests; not on any live
+    /// turn-build path.
+    #[allow(dead_code)]
     pub(crate) fn render_active_plugin_tools_text_pure(
         wasm_plugins: &[crate::plugin::wasm_runtime::WasmPlugin],
         js_plugins: Option<&crate::plugin::PluginRegistry>,
@@ -7086,9 +7186,15 @@ impl AgentRuntime {
     }
 
     /// Render the active-plugins block for this agent's CONFIG-declared
-    /// `model.plugin_tools` list (always-on, agent-level). Wraps
-    /// `render_active_plugin_tools_text_pure` by synthesizing a one-shot
-    /// override map keyed by plugin name.
+    /// `model.plugin_tools` list (always-on, agent-level).
+    ///
+    /// **Dead since v1.9**: superseded by `select_user_tools_pure`,
+    /// which feeds the same tools into `dynamic_prefix.user_tools` as
+    /// real ToolDefs instead of `user_system` text. Kept under
+    /// `#[allow(dead_code)]` so a future debug command (`/plugin
+    /// inspect`) can call the rendering primitive without us having
+    /// to rewrite the wrapper.
+    #[allow(dead_code)]
     pub(crate) fn render_config_plugin_tools_text(&self) -> Option<String> {
         const MAX_INJECT_TOOLS: usize = 20;
         let model_cfg = self.handle.config.model.as_ref()?;
@@ -7125,6 +7231,12 @@ impl AgentRuntime {
 
     /// Render the active-plugins block for the per-session `/plugin`
     /// slash command overrides. Returns `None` when no override is set.
+    ///
+    /// **Dead since v1.9**: see `render_active_plugin_tools_text_pure`
+    /// docstring for the migration story. The slash-command-driven
+    /// overrides now flow through `select_user_tools_pure` and land
+    /// in `dynamic_prefix.user_tools`.
+    #[allow(dead_code)]
     pub(crate) fn render_session_plugin_tools_text(&self, session_key: &str) -> Option<String> {
         /// Max plugin tools injected per turn (v1 hard cap; v2 swaps for
         /// token-budget). Keeps small-model prompt size under control even
@@ -7164,6 +7276,160 @@ impl AgentRuntime {
         }
     }
 
+    /// Compute the set of plugin tools to expose as real ToolDefs in
+    /// `dynamic_prefix.user_tools` for this turn.
+    ///
+    /// Selection layers (later layers win):
+    /// 1. **headline default** — `headline: true` in the plugin's
+    ///    `plugin.json5` is the plugin-author-declared baseline. If
+    ///    the session override has `inject_all: true` this is replaced
+    ///    by the plugin's full tool list; if it has a non-empty
+    ///    `inject`, this is replaced by that list.
+    /// 2. **per-agent pin** — names in `config_pin` (sourced from
+    ///    `model.plugin_tools`) get added on top of the base, even
+    ///    when not `headline`-marked.
+    /// 3. **session pin** — `PluginOverride.pin` adds for one session
+    ///    (slash command `/plugin pin <plugin>__<tool>`).
+    /// 4. **per-agent unpin** — `config_unpin` (`model.plugin_tools_unpin`)
+    ///    removes names from the resolved base, even headlines.
+    /// 5. **session unpin** — `PluginOverride.unpin` removes for one
+    ///    session (`/plugin unpin <plugin>__<tool>`).
+    ///
+    /// Cap is applied last, plugin-by-plugin in declared order
+    /// (WASM first, then JS — matches dispatch priority). Excess
+    /// tools stay reachable via the `plugin_invoke` meta-tool at
+    /// zero prompt-token cost.
+    ///
+    /// Pure / no I/O — driven entirely by inputs so unit tests can
+    /// exercise it without the runtime state.
+    pub(crate) fn select_user_tools_pure(
+        wasm_plugins: &[crate::plugin::wasm_runtime::WasmPlugin],
+        js_plugins: Option<&crate::plugin::PluginRegistry>,
+        per_plugin: &std::collections::HashMap<String, PluginOverride>,
+        config_pin: &[String],
+        config_unpin: &[String],
+        cap: usize,
+    ) -> Vec<PluginUserToolSelection> {
+        // Bucket config-level pin/unpin by plugin so per-plugin lookup
+        // is O(active tools) instead of O(config_entries × active_tools).
+        let config_pin_by_plugin = bucket_qualified_names(config_pin);
+        let config_unpin_by_plugin = bucket_qualified_names(config_unpin);
+
+        let mut selected: Vec<PluginUserToolSelection> = Vec::new();
+
+        // Inner helper closure: collect from one plugin's tool list,
+        // honoring all five selection layers.
+        let mut take_from_plugin = |plugin_name: &str,
+                                    tool_iter: Vec<(String, String, Value, bool)>|
+         -> bool {
+            // Returns `false` when cap was reached and the caller
+            // should stop iterating further plugins.
+            let session = per_plugin.get(plugin_name);
+            if session.map(|o| o.disabled).unwrap_or(false) {
+                return true;
+            }
+
+            // Build the candidate set as an ordered name list so the
+            // wire output is stable across runs (HashMap iteration is
+            // not). Walk the plugin's declared tools in manifest order
+            // and decide inclusion.
+            let base_names: std::collections::BTreeSet<String> =
+                if session.map(|o| o.inject_all).unwrap_or(false) {
+                    tool_iter.iter().map(|(n, _, _, _)| n.clone()).collect()
+                } else if let Some(o) = session.filter(|o| !o.inject.is_empty()) {
+                    o.inject.iter().cloned().collect()
+                } else {
+                    tool_iter
+                        .iter()
+                        .filter(|(_, _, _, hl)| *hl)
+                        .map(|(n, _, _, _)| n.clone())
+                        .collect()
+                };
+
+            // pin: add (config + session)
+            let mut effective = base_names;
+            if let Some(set) = config_pin_by_plugin.get(plugin_name) {
+                for name in set {
+                    effective.insert(name.clone());
+                }
+            }
+            if let Some(o) = session {
+                for name in &o.pin {
+                    effective.insert(name.clone());
+                }
+            }
+
+            // unpin: subtract (config + session). Subtract LAST so
+            // unpin always wins a tie with pin.
+            if let Some(set) = config_unpin_by_plugin.get(plugin_name) {
+                for name in set {
+                    effective.remove(name);
+                }
+            }
+            if let Some(o) = session {
+                for name in &o.unpin {
+                    effective.remove(name);
+                }
+            }
+
+            // Emit in manifest order so the wire bytes are stable.
+            for (name, description, input_schema, _) in tool_iter {
+                if !effective.contains(&name) {
+                    continue;
+                }
+                if selected.len() >= cap {
+                    return false;
+                }
+                selected.push(PluginUserToolSelection {
+                    plugin_name: plugin_name.to_owned(),
+                    tool_name: name,
+                    description,
+                    input_schema,
+                });
+            }
+            true
+        };
+
+        // WASM first (matches dispatch_tool's wasm-wins ordering).
+        for wp in wasm_plugins {
+            let tools: Vec<(String, String, Value, bool)> = wp
+                .tools
+                .iter()
+                .map(|t| {
+                    (
+                        t.name.clone(),
+                        t.description.clone(),
+                        t.parameters.clone(),
+                        t.headline,
+                    )
+                })
+                .collect();
+            if !take_from_plugin(&wp.name, tools) {
+                return selected;
+            }
+        }
+        if let Some(reg) = js_plugins {
+            for (plugin_name, plugin) in reg.js_plugins_iter() {
+                let tools: Vec<(String, String, Value, bool)> = plugin
+                    .manifest
+                    .tools
+                    .iter()
+                    .map(|t| {
+                        let schema = t
+                            .input_schema
+                            .clone()
+                            .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+                        (t.name.clone(), t.description.clone(), schema, t.headline)
+                    })
+                    .collect();
+                if !take_from_plugin(plugin_name, tools) {
+                    return selected;
+                }
+            }
+        }
+        selected
+    }
+
     /// Set or update a plugin override for a session. Called by the `/plugin`
     /// slash command handler via `&AgentHandle`.
     pub fn set_plugin_override(
@@ -7183,6 +7449,26 @@ impl AgentRuntime {
     pub fn clear_plugin_overrides(handle: &crate::agent::AgentHandle, session_key: &str) {
         if let Ok(mut g) = handle.plugin_overrides.write() {
             g.remove(session_key);
+        }
+    }
+
+    /// In-place mutate the session override for `(session_key, plugin)`,
+    /// creating a default entry if none exists. Used by additive
+    /// commands (`/plugin pin` and `/plugin unpin`) that modify a single
+    /// field without replacing the whole override the way
+    /// `set_plugin_override` does. Holds the write lock across the
+    /// closure — keep the closure cheap.
+    pub fn mutate_plugin_override<F>(
+        handle: &crate::agent::AgentHandle,
+        session_key: &str,
+        plugin: &str,
+        mutate: F,
+    ) where
+        F: FnOnce(&mut PluginOverride),
+    {
+        if let Ok(mut g) = handle.plugin_overrides.write() {
+            let plugin_map = g.entry(session_key.to_owned()).or_default();
+            mutate(plugin_map.entry(plugin.to_owned()).or_default());
         }
     }
 
@@ -7835,9 +8121,15 @@ impl AgentRuntime {
             return Err(anyhow!("MCP tool `{name}` not found"));
         }
 
-        // 4. Plugin tool: `<plugin>.<tool>` (must precede skill match because plugins
-        //    win the priority ladder). Wasm wins on collision.
-        if let Some((plugin_name, tool_name)) = name.split_once('.') {
+        // 4. Plugin tool. Canonical wire form is `<plugin>__<tool>` (v1.9+,
+        //    OpenAI-name-compatible). Legacy `<plugin>.<tool>` from older
+        //    transcripts is still accepted by trying the new separator
+        //    first and falling back. Wasm wins on collision; must precede
+        //    skill match because plugins are higher in the priority ladder.
+        if let Some((plugin_name, tool_name)) = name
+            .split_once(PLUGIN_TOOL_SEP)
+            .or_else(|| name.split_once('.'))
+        {
             if let Some(wp) = self.wasm_plugins.iter().find(|p| p.name == plugin_name) {
                 let notify_ctx = self.notification_tx.as_ref().map(|tx| {
                     crate::plugin::wasm_runtime::WasmNotifyCtx {
@@ -10435,9 +10727,8 @@ mod tests {
         overrides.insert(
             "douyin".to_owned(),
             PluginOverride {
-                disabled: false,
-                inject_all: false,
                 inject: vec!["publish".into(), "list".into()],
+                ..Default::default()
             },
         );
         let r = AgentRuntime::resolve_plugin_inject_pure(&overrides, "douyin");
@@ -10453,9 +10744,8 @@ mod tests {
         overrides.insert(
             "douyin".to_owned(),
             PluginOverride {
-                disabled: false,
                 inject_all: true,
-                inject: vec![],
+                ..Default::default()
             },
         );
         let r = AgentRuntime::resolve_plugin_inject_pure(&overrides, "douyin");
@@ -10472,10 +10762,80 @@ mod tests {
                 disabled: true,
                 inject_all: true,
                 inject: vec!["publish".into()],
+                ..Default::default()
             },
         );
         let r = AgentRuntime::resolve_plugin_inject_pure(&overrides, "douyin");
         assert_eq!(r, PluginInjectResolution::None);
+    }
+
+    // ---------------------------------------------------------------------
+    // Qualified tool name parsing (`<plugin>__<tool>` and legacy forms)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn parse_qualified_tool_canonical_double_underscore() {
+        let r = super::parse_qualified_tool("douyin__publish");
+        assert_eq!(r, Some(("douyin".into(), "publish".into())));
+    }
+
+    #[test]
+    fn parse_qualified_tool_legacy_dot_separator() {
+        // Old `model.plugin_tools` configs used the dotted form;
+        // accept it for backward compat.
+        let r = super::parse_qualified_tool("douyin.publish");
+        assert_eq!(r, Some(("douyin".into(), "publish".into())));
+    }
+
+    #[test]
+    fn parse_qualified_tool_legacy_slash_separator() {
+        // Operators muscle-memory from skill paths sometimes use /.
+        let r = super::parse_qualified_tool("douyin/publish");
+        assert_eq!(r, Some(("douyin".into(), "publish".into())));
+    }
+
+    #[test]
+    fn parse_qualified_tool_double_underscore_wins_over_dot() {
+        // When both separators are present in a tool name we prefer
+        // the canonical form so a tool literally named `foo.bar`
+        // inside plugin `p` (`p__foo.bar`) resolves correctly.
+        let r = super::parse_qualified_tool("p__foo.bar");
+        assert_eq!(r, Some(("p".into(), "foo.bar".into())));
+    }
+
+    #[test]
+    fn parse_qualified_tool_returns_none_without_separator() {
+        assert_eq!(super::parse_qualified_tool("publish"), None);
+        assert_eq!(super::parse_qualified_tool(""), None);
+    }
+
+    #[test]
+    fn bucket_qualified_names_groups_by_plugin() {
+        let entries = vec![
+            "douyin__publish".to_owned(),
+            "douyin.list_my_videos".to_owned(), // legacy form, same plugin
+            "jimeng__image_txt2img".to_owned(),
+            "garbage_no_separator".to_owned(), // dropped silently
+        ];
+        let buckets = super::bucket_qualified_names(&entries);
+        assert_eq!(buckets.len(), 2);
+        let douyin = buckets.get("douyin").expect("douyin bucket present");
+        assert_eq!(douyin.len(), 2);
+        assert!(douyin.contains("publish"));
+        assert!(douyin.contains("list_my_videos"));
+        let jimeng = buckets.get("jimeng").expect("jimeng bucket present");
+        assert!(jimeng.contains("image_txt2img"));
+    }
+
+    #[test]
+    fn plugin_user_tool_selection_wire_name_uses_double_underscore() {
+        let sel = super::PluginUserToolSelection {
+            plugin_name: "douyin".into(),
+            tool_name: "publish".into(),
+            description: String::new(),
+            input_schema: json!({}),
+        };
+        assert_eq!(sel.wire_name(), "douyin__publish");
     }
 
     #[test]

@@ -702,20 +702,47 @@ pub struct ModelConfig {
     /// Examples: `["agent_spoke_aihub", "memory", "clarify"]`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
-    /// Promote selected plugin tools by rendering an "## Active Plugin
-    /// Tools" block (full input_schema) into the agent's user_system
-    /// text. Bypasses the plugin_search → plugin_describe → plugin_invoke
-    /// 3-step dance that small (9B-class) models can't reliably follow.
-    /// Each entry is `"<plugin>.<tool>"`, e.g.
-    /// `["douyin.publish", "douyin.get_comments"]`. Model invokes the
-    /// listed tools via `plugin_invoke` with `{plugin, tool, arguments}`
-    /// — host-side `validate_plugin_arguments` enforces required fields.
-    /// Per-agent always-on equivalent of the per-session `/plugin` slash
-    /// command. Honors MAX_INJECT_TOOLS (20) hard cap. Block lives in
-    /// user_system (not in tools[]), so it doesn't break the cross-client
-    /// prefix KV cache hash.
+    /// Per-agent always-on PIN list for plugin tools. Each entry is
+    /// `"<plugin>__<tool>"` (or legacy `"<plugin>.<tool>"`, auto-converted).
+    /// Additive on top of the plugin author's `headline: true` defaults —
+    /// promotes a non-headline tool to a real ToolDef in
+    /// `dynamic_prefix.user_tools` so the model can call it directly
+    /// (without going through the `plugin_search` → `plugin_describe`
+    /// → `plugin_invoke` 3-step dance that small (9B-class) models
+    /// struggle with).
+    ///
+    /// Pre-v1.9 semantics rendered these as text inside `user_system`
+    /// and capped at MAX_INJECT_TOOLS=20. As of v1.9 the worker exposes
+    /// a `user_tools` cache segment that does not dirty the base
+    /// prefix, so these now land as structured ToolDefs alongside the
+    /// builtin set; the cap is shifted to `user_tools_cap` (default 30)
+    /// and applies to the combined headline+pin set across active
+    /// plugins.
+    ///
+    /// Operator-level analog of the per-session `/plugin pin <name>`
+    /// slash command (which writes to `PluginOverride.pin`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plugin_tools: Option<Vec<String>>,
+    /// Per-agent UNPIN list — subtractive override that removes
+    /// headline-tagged or otherwise-defaulted plugin tools from
+    /// `user_tools` for this agent. Use to suppress destructive or
+    /// agent-irrelevant tools that the plugin author marked
+    /// `headline: true` (e.g. an analytics agent doesn't need
+    /// `douyin__delete_video`). Entries are `"<plugin>__<tool>"`
+    /// (or legacy dot form).
+    ///
+    /// Operator-level analog of `/plugin unpin <name>`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_tools_unpin: Option<Vec<String>>,
+    /// Maximum number of plugin tools to expose simultaneously in
+    /// `dynamic_prefix.user_tools` for this agent. Defaults to 30 when
+    /// unset — generous enough to fit ~10 headlines × 3 active plugins
+    /// without blowing a 64k-context small model's prompt budget.
+    /// Override upward for larger models (e.g. 100 for doubao-pro)
+    /// or downward for ultra-small ones. Excess tools fall back to
+    /// `plugin_invoke` lookup at zero prompt cost.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_tools_cap: Option<usize>,
     /// Context window size in tokens. Used to calculate history budget.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u32>,

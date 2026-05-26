@@ -151,6 +151,27 @@ pub struct PluginToolDef {
     pub name: String,
     pub description: String,
     pub input_schema: Option<Value>,
+    /// Plugin-author-declared default exposure. When `true`, this tool
+    /// is auto-promoted into `req.tools` (real ToolDef in
+    /// `dynamic_prefix.user_tools`) for every agent that activates this
+    /// plugin — bypassing the `plugin_search` → `plugin_describe` →
+    /// `plugin_invoke` three-step dance that small (9B-class) models
+    /// can't reliably navigate. Non-headline tools stay accessible
+    /// through the existing `plugin_invoke` meta-tool but consume zero
+    /// prompt tokens until called.
+    ///
+    /// Choose ~5–15 of the plugin's most-used tools. The cap on
+    /// concurrently-exposed plugin tools per turn is set by
+    /// `model.user_tools_cap` (default 30 in v1.9); excess headlines
+    /// across active plugins are truncated round-robin. Operators can
+    /// override at deployment time via `model.plugin_tools`
+    /// (additive pin) and `model.plugin_tools_unpin` (subtractive),
+    /// or at runtime via `/plugin pin <name>` / `/plugin unpin <name>`.
+    ///
+    /// Defaults to `false` so an unspecified tool stays in the long
+    /// tail — a missing `headline:` key never changes behavior.
+    #[serde(default)]
+    pub headline: bool,
 }
 
 fn default_runtime() -> String {
