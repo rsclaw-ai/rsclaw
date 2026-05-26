@@ -127,10 +127,44 @@ impl CapAgentManager {
 }
 
 async fn spawn_driver(kind: AgentKind, cwd: &std::path::Path) -> Result<Box<dyn Driver>> {
-    // Real driver construction goes in Task 6. Placeholder here so the
-    // module is wirable end-to-end in tests via fn-injection.
-    let _ = (kind, cwd);
-    Err(anyhow!("spawn_driver: real drivers wired in Task 6"))
+    use cap_rs::driver::stream_json::ClaudeCodeDriver;
+
+    let driver: Box<dyn Driver> = match kind {
+        AgentKind::Claudecode => Box::new(
+            ClaudeCodeDriver::builder(cwd)
+                .dangerously_skip_permissions(true)
+                .spawn()
+                .await
+                .map_err(|e| anyhow!("cap claudecode spawn: {e}"))?,
+        ),
+        AgentKind::Openclaude => Box::new(
+            ClaudeCodeDriver::builder(cwd)
+                .bin("openclaude")
+                .dangerously_skip_permissions(true)
+                .spawn()
+                .await
+                .map_err(|e| anyhow!("cap openclaude spawn: {e}"))?,
+        ),
+        AgentKind::Opencode => Box::new(
+            ClaudeCodeDriver::opencode_builder(cwd)
+                .spawn()
+                .await
+                .map_err(|e| anyhow!("cap opencode spawn: {e}"))?,
+        ),
+        AgentKind::Codex => {
+            // Transitional path until cap-rs ships a stream-json driver
+            // for codex; swap to ClaudeCodeDriver::codex_builder when
+            // available. Box<dyn Driver> is the same shape.
+            use cap_rs::driver::codex_mcp::CodexMcpDriver;
+            Box::new(
+                CodexMcpDriver::builder(cwd)
+                    .spawn()
+                    .await
+                    .map_err(|e| anyhow!("cap codex spawn: {e}"))?,
+            )
+        }
+    };
+    Ok(driver)
 }
 
 async fn actor_loop(
