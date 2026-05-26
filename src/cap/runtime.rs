@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
-use cap_rs::core::{AgentEvent, ClientFrame, Content, RiskLevel};
+use cap_rs::core::{AgentEvent, ClientFrame, Content};
 use cap_rs::driver::Driver;
 use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 
@@ -464,7 +464,7 @@ async fn run_turn(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use cap_rs::core::{StopReason, TextChannel, Usage};
+    use cap_rs::core::{RiskLevel, StopReason, TextChannel, Usage};
     use cap_rs::driver::DriverError;
     use std::collections::VecDeque;
 
