@@ -112,44 +112,28 @@ impl super::runtime::AgentRuntime {
             .and_then(|m| m.providers.get(prov_name))
             .and_then(|p| p.base_url.clone());
 
-        // Providers with image generation support
+        // Providers with image generation support. The explicit image model is
+        // the cost gate: do not silently fall back to another paid provider
+        // just because an API key happens to be configured.
         let image_providers = ["doubao", "bytedance", "openai", "qwen", "minimax", "gemini"];
         let (img_url, img_key, img_prov) = if image_providers.contains(&prov_name) {
             let url = cfg_url.unwrap_or(base_url);
-            let key = cfg_key
-                .or_else(|| std::env::var(format!("{}_API_KEY", prov_name.to_uppercase())).ok())
-                .or_else(|| std::env::var("OPENAI_API_KEY").ok());
+            let env_key = match prov_name {
+                "doubao" | "bytedance" => std::env::var("ARK_API_KEY").ok(),
+                "qwen" => std::env::var("DASHSCOPE_API_KEY").ok(),
+                "minimax" => std::env::var("MINIMAX_API_KEY").ok(),
+                "gemini" => std::env::var("GEMINI_API_KEY").ok(),
+                "openai" => std::env::var("OPENAI_API_KEY").ok(),
+                _ => None,
+            };
+            let key = cfg_key.or(env_key);
             (url, key, prov_name)
         } else {
-            // Current provider doesn't support images — try doubao, qwen, openai
-            let fallback = [
-                ("doubao", "ARK_API_KEY"),
-                ("qwen", "DASHSCOPE_API_KEY"),
-                ("minimax", "MINIMAX_API_KEY"),
-                ("gemini", "GEMINI_API_KEY"),
-                ("openai", "OPENAI_API_KEY"),
-            ];
-            let mut found = None;
-            for (fb_prov, fb_env) in fallback {
-                let fb_cfg = self
-                    .config
-                    .model
-                    .models
-                    .as_ref()
-                    .and_then(|m| m.providers.get(fb_prov));
-                let fb_key = fb_cfg
-                    .and_then(|p| p.api_key.as_ref())
-                    .and_then(|k| k.as_plain().map(str::to_owned))
-                    .or_else(|| std::env::var(fb_env).ok());
-                if let Some(key) = fb_key {
-                    let fb_url = fb_cfg
-                        .and_then(|p| p.base_url.clone())
-                        .unwrap_or_else(|| crate::provider::defaults::resolve_base_url(fb_prov).0);
-                    found = Some((fb_url, Some(key), fb_prov));
-                    break;
-                }
-            }
-            found.unwrap_or_else(|| (cfg_url.unwrap_or(base_url), None, prov_name))
+            return Ok(json!({
+                "error": format!(
+                    "Configured image model provider `{prov_name}` does not support image generation. Configure agents.defaults.model.image with one of: doubao, qwen, minimax, gemini, openai."
+                )
+            }));
         };
         let Some(api_key) = img_key else {
             return Ok(json!({

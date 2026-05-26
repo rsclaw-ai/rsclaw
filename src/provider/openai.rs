@@ -19,6 +19,7 @@ use super::{
 pub(crate) const OPENAI_API_BASE: &str = "https://api.openai.com/v1";
 #[allow(dead_code)]
 const DEFAULT_MAX_TOKENS: u32 = 65536;
+const TOOL_NAME_PREFIX: &str = "rc_";
 
 /// OpenAI requires tool/function names to match `^[a-zA-Z0-9_-]+$`. Plugin
 /// tool names follow the convention `<plugin>.<tool>` (e.g.
@@ -27,19 +28,30 @@ const DEFAULT_MAX_TOKENS: u32 = 65536;
 /// restore on the way back so the agent runtime keeps its original
 /// `plugin.tool` namespacing while OpenAI sees a clean identifier.
 ///
-/// Encoding: `.` → `__` (double underscore). Plugin / tool names are
-/// themselves `[a-zA-Z0-9_]+`, so `__` never appears in originals — the
-/// restore step splits on the FIRST occurrence to recover the dot. Any
-/// other forbidden char (whitespace, `:`, `/`, non-ASCII) is replaced
-/// with a single `_` (lossy, but those names shouldn't appear in
-/// practice; this just keeps the 400 from coming back).
+/// Encoding is reversible and stays inside OpenAI's
+/// `^[a-zA-Z0-9_-]+$` name pattern:
+///
+///   - `_` → `_u_`
+///   - `.` → `_d_`
+///   - other non-pattern UTF-8 bytes → `_xHH_`
+///
+/// Escaping `_` matters because raw `__` is a valid original tool name
+/// segment. A non-bijective mapping can dispatch OpenAI's tool call to a
+/// different local tool than the one advertised. The `rc_` prefix marks
+/// names that used this encoding; unprefixed legacy/raw names pass through.
 fn sanitize_tool_name(name: &str) -> String {
-    let mut out = String::with_capacity(name.len() + 2);
+    let mut out = String::with_capacity(name.len() + TOOL_NAME_PREFIX.len() + 2);
+    out.push_str(TOOL_NAME_PREFIX);
     for c in name.chars() {
         match c {
-            '.' => out.push_str("__"),
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' => out.push(c),
-            _ => out.push('_'),
+            '_' => out.push_str("_u_"),
+            '.' => out.push_str("_d_"),
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' => out.push(c),
+            _ => {
+                for b in c.to_string().as_bytes() {
+                    out.push_str(&format!("_x{b:02X}_"));
+                }
+            }
         }
     }
     out
@@ -47,30 +59,72 @@ fn sanitize_tool_name(name: &str) -> String {
 
 /// Reverse of [`sanitize_tool_name`] — restore the dot in a plugin tool
 /// name received from OpenAI's `tool_calls` / `function_call` payload.
-/// Only the first `__` is treated as a dot (plugin tool names have at
-/// most one dot); subsequent `__` are left as-is. Names with no `__`
-/// (built-in tools) pass through unchanged.
+/// Names with no valid escape sequences pass through unchanged, which keeps
+/// compatibility with old transcripts and providers that returned a raw
+/// built-in name.
 fn restore_tool_name(name: &str) -> String {
-    if let Some(idx) = name.find("__") {
-        let mut s = String::with_capacity(name.len() - 1);
-        s.push_str(&name[..idx]);
-        s.push('.');
-        s.push_str(&name[idx + 2..]);
-        s
-    } else {
-        name.to_owned()
+    let Some(encoded) = name.strip_prefix(TOOL_NAME_PREFIX) else {
+        return name.to_owned();
+    };
+    let bytes = encoded.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'_'
+            && let Some(end_rel) = bytes[i + 1..].iter().position(|b| *b == b'_')
+        {
+            let end = i + 1 + end_rel;
+            let code = &encoded[i + 1..end];
+            match code {
+                "u" => {
+                    out.push(b'_');
+                    i = end + 1;
+                    continue;
+                }
+                "d" => {
+                    out.push(b'.');
+                    i = end + 1;
+                    continue;
+                }
+                _ if code.len() == 3 && code.starts_with('x') => {
+                    if let Ok(value) = u8::from_str_radix(&code[1..], 16) {
+                        out.push(value);
+                        i = end + 1;
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
     }
+    String::from_utf8(out).unwrap_or_else(|_| name.to_owned())
 }
 
 #[cfg(test)]
 #[test]
 fn tool_name_roundtrip() {
-    assert_eq!(sanitize_tool_name("read_file"), "read_file");
-    assert_eq!(sanitize_tool_name("wechat.send_text"), "wechat__send_text");
-    assert_eq!(restore_tool_name("wechat__send_text"), "wechat.send_text");
+    assert_eq!(sanitize_tool_name("read_file"), "rc_read_u_file");
+    assert_eq!(
+        sanitize_tool_name("wechat.send_text"),
+        "rc_wechat_d_send_u_text"
+    );
+    assert_eq!(
+        restore_tool_name("rc_wechat_d_send_u_text"),
+        "wechat.send_text"
+    );
     assert_eq!(restore_tool_name("read_file"), "read_file");
     // forbidden char fallback
-    assert_eq!(sanitize_tool_name("ns:tool"), "ns_tool");
+    assert_eq!(sanitize_tool_name("ns:tool"), "rc_ns_x3A_tool");
+}
+
+#[cfg(test)]
+#[test]
+fn tool_name_roundtrip_preserves_double_underscore() {
+    let original = "plugin__alpha.send__text";
+    let wire = sanitize_tool_name(original);
+    assert_eq!(restore_tool_name(&wire), original);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

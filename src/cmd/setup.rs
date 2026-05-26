@@ -445,6 +445,10 @@ fn default_api_type() -> String {
     "openai".to_owned()
 }
 
+fn initial_onboard_api_type() -> String {
+    String::new()
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 struct ChannelFieldDef {
     key: String,
@@ -1029,7 +1033,7 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
     let mut bind_mode = ec.bind_idx;
     let mut channel_configs: Vec<(String, Vec<(String, String)>)> = Vec::new();
     let mut custom_bind: Option<String> = None;
-    let mut api_type = String::from("openai"); // API protocol type for custom/codingplan
+    let mut api_type = initial_onboard_api_type(); // API protocol type for custom/codingplan/doubao
     let mut user_agent = String::new(); // custom User-Agent header
 
     const STEP_AGENT: usize = 0;
@@ -3598,6 +3602,11 @@ mod account_helper_tests {
     fn account_names_empty_when_no_channels() {
         let v = json!({});
         assert!(account_names(&v, "feishu").is_empty());
+    }
+
+    #[test]
+    fn onboard_api_type_starts_unset_so_provider_default_wins() {
+        assert_eq!(initial_onboard_api_type(), "");
     }
 
     #[test]
