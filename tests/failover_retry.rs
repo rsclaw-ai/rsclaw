@@ -159,7 +159,7 @@ async fn test_failover_on_429() {
     // Fallback model points to the "fallback" provider.
     let fallbacks = vec!["fallback/gpt-4o-mini".to_owned()];
 
-    let mut mgr = FailoverManager::new(order, api_keys, fallbacks);
+    let mut mgr = FailoverManager::new(order, api_keys, fallbacks, rsclaw::provider::health::ProviderHealthRegistry::new());
 
     let req = simple_request("primary/claude-3-sonnet");
     let result = mgr.call(req, &registry).await;
@@ -233,7 +233,7 @@ async fn test_cooldown_respected() {
     // No fallbacks — all providers exhaust immediately.
     let fallbacks = vec![];
 
-    let mut mgr = FailoverManager::new(order, api_keys, fallbacks);
+    let mut mgr = FailoverManager::new(order, api_keys, fallbacks, rsclaw::provider::health::ProviderHealthRegistry::new());
 
     // First call: should fail (rate-limited) and put "prof-a" into cooldown.
     let req1 = simple_request("only/model-x");
@@ -273,7 +273,7 @@ async fn test_all_providers_exhausted() {
     let api_keys: HashMap<String, String> = HashMap::new();
     let fallbacks = vec!["p2/gpt-fallback".to_owned()];
 
-    let mut mgr = FailoverManager::new(order, api_keys, fallbacks);
+    let mut mgr = FailoverManager::new(order, api_keys, fallbacks, rsclaw::provider::health::ProviderHealthRegistry::new());
 
     let req = simple_request("p1/claude");
     let err = mgr
@@ -289,10 +289,13 @@ async fn test_all_providers_exhausted() {
 }
 
 // ---------------------------------------------------------------------------
-// test_non_retryable_error_propagated
+// test_transient_error_advances_chain
 //
-// A 500 error (not rate-limit, not auth) should propagate immediately without
-// trying fallbacks.
+// Post-model-chain refactor: a 500 / 503 / transient classifies as
+// `ErrorKind::Transient` via `classify_error`, so the chain advances to the
+// fallback model and that succeeds. (Was previously a "non-retryable
+// propagates" test — flipped intentionally to match the new chain semantics
+// the model-chain feature ships with.)
 // ---------------------------------------------------------------------------
 
 /// A provider that returns a non-retryable 500 error.
@@ -319,7 +322,7 @@ impl LlmProvider for ServerErrorProvider {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn test_non_retryable_error_propagated() {
+async fn test_transient_error_advances_chain() {
     let mut registry = ProviderRegistry::new();
     registry.register("primary", Arc::new(ServerErrorProvider::new("primary")));
     registry.register("fallback", Arc::new(AlwaysOkProvider::new("fallback")));
@@ -330,20 +333,19 @@ async fn test_non_retryable_error_propagated() {
     let api_keys: HashMap<String, String> = HashMap::new();
     let fallbacks = vec!["fallback/model".to_owned()];
 
-    let mut mgr = FailoverManager::new(order, api_keys, fallbacks);
+    let mut mgr = FailoverManager::new(order, api_keys, fallbacks, rsclaw::provider::health::ProviderHealthRegistry::new());
 
     let req = simple_request("primary/model");
     let result = mgr.call(req, &registry).await;
 
-    // 500 is not retryable -- it should propagate immediately without fallback
+    // Chain advances on transient (5xx) → fallback succeeds → Ok.
+    // The primary's failure is recorded in the shared health table
+    // (Cooling-with-backoff) so subsequent calls skip it until cooldown
+    // expires, which is the whole point of the chain feature.
     assert!(
-        result.is_err(),
-        "500 error should propagate, not fall through to fallback"
-    );
-    let err_msg = result.err().expect("expected error").to_string();
-    assert!(
-        err_msg.contains("500"),
-        "error should contain 500: {err_msg}"
+        result.is_ok(),
+        "Transient 500 should advance to fallback chain, not propagate: {:?}",
+        result.err()
     );
 }
 
@@ -369,7 +371,7 @@ async fn test_multiple_profiles_tried_in_order() {
     let api_keys: HashMap<String, String> = HashMap::new();
     let fallbacks = vec![];
 
-    let mut mgr = FailoverManager::new(order, api_keys, fallbacks);
+    let mut mgr = FailoverManager::new(order, api_keys, fallbacks, rsclaw::provider::health::ProviderHealthRegistry::new());
 
     let req = simple_request("multi/model");
     let result = mgr.call(req, &registry).await;
@@ -465,7 +467,7 @@ async fn test_error_classification_rate_limit_variants() {
 
         let api_keys: HashMap<String, String> = HashMap::new();
         let fallbacks = vec!["fallback/m".to_owned()];
-        let mut mgr = FailoverManager::new(order, api_keys, fallbacks);
+        let mut mgr = FailoverManager::new(order, api_keys, fallbacks, rsclaw::provider::health::ProviderHealthRegistry::new());
 
         let req = simple_request(&format!("{provider_name}/model"));
         let result = mgr.call(req, &registry).await;
@@ -516,7 +518,7 @@ async fn test_error_classification_auth_variants() {
 
         let api_keys: HashMap<String, String> = HashMap::new();
         let fallbacks = vec!["fallback/m".to_owned()];
-        let mut mgr = FailoverManager::new(order, api_keys, fallbacks);
+        let mut mgr = FailoverManager::new(order, api_keys, fallbacks, rsclaw::provider::health::ProviderHealthRegistry::new());
 
         let req = simple_request(&format!("{provider_name}/model"));
         let result = mgr.call(req, &registry).await;
@@ -547,7 +549,7 @@ async fn test_empty_fallback_list() {
     let api_keys: HashMap<String, String> = HashMap::new();
     let fallbacks = vec![]; // no fallbacks
 
-    let mut mgr = FailoverManager::new(order, api_keys, fallbacks);
+    let mut mgr = FailoverManager::new(order, api_keys, fallbacks, rsclaw::provider::health::ProviderHealthRegistry::new());
 
     let req = simple_request("primary/model");
     let result = mgr.call(req, &registry).await;

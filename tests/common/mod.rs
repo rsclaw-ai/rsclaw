@@ -205,6 +205,7 @@ pub async fn start_server_with_handles(addr: SocketAddr) -> ServerHandles {
         relay_hub: Arc::new(rsclaw::a2a::relay::RelayHub::new()),
         knowledge: None,
         memory: None,
+        model_health: rsclaw::provider::health::ProviderHealthRegistry::new(),
     };
 
     // Leak tempdir — store must stay live for the lifetime of the server task.

@@ -249,6 +249,7 @@ async fn request_body_maps_messages() {
         .await;
 
     let req = LlmRequest {
+        fallback_models: Vec::new(),
         model: "claude-3-5-sonnet".to_owned(),
         messages: vec![
             Message {

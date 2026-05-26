@@ -1331,12 +1331,30 @@ impl AgentRuntime {
             push(m.vision_chain(), &mut out, &mut seen);
         }
         if out.is_empty() {
-            // FallbackToPrimary: no explicit vision config, try primary.
+            // FallbackToPrimary: no explicit vision config, try primary
+            // — but ONLY entries known to support vision. Without this
+            // filter, the driver would silently route screenshots to a
+            // text-only primary (e.g. deepseek/qwen-coder) and get a
+            // provider error instead of the actionable
+            // "configure agents.defaults.model.vision" message.
+            let primary_filtered = |chain: Vec<&str>,
+                                    out: &mut Vec<String>,
+                                    seen: &mut std::collections::HashSet<String>| {
+                for m in chain {
+                    let t = m.trim();
+                    if t.is_empty() || !seen.insert(t.to_owned()) {
+                        continue;
+                    }
+                    if is_known_vision_model(t) {
+                        out.push(t.to_owned());
+                    }
+                }
+            };
             if let Some(m) = per_agent.model.as_ref() {
-                push(m.primary_chain(), &mut out, &mut seen);
+                primary_filtered(m.primary_chain(), &mut out, &mut seen);
             }
             if let Some(m) = defaults.model.as_ref() {
-                push(m.primary_chain(), &mut out, &mut seen);
+                primary_filtered(m.primary_chain(), &mut out, &mut seen);
             }
         }
         out
@@ -1389,15 +1407,28 @@ impl AgentRuntime {
             // RsClaw fleet inference fallback (same logic as
             // resolve_flash_model_for): if primary head is rsclaw, the
             // fleet's RSCLAW_DEFAULT_FLASH is the flash model.
-            let primary = per_agent
+            let primary_head = per_agent
                 .model
                 .as_ref()
                 .and_then(|m| m.primary_head())
                 .or_else(|| defaults.model.as_ref().and_then(|m| m.primary_head()));
-            if let Some(p) = primary {
+            if let Some(p) = primary_head {
                 if p.starts_with("rsclaw/") {
                     out.push(crate::provider::rsclaw::RSCLAW_DEFAULT_FLASH.to_owned());
                 }
+            }
+        }
+        // Final fallback: the primary chain. Matches the legacy
+        // `resolve_flash_model_name()` semantics that fell back to
+        // `resolve_model_name()` (primary head) when no flash was
+        // configured. Now extended to inherit the entire primary chain,
+        // so flash sub-tasks gracefully share the user's failover plan.
+        if out.is_empty() {
+            if let Some(m) = per_agent.model.as_ref() {
+                push(m.primary_chain(), &mut out, &mut seen);
+            }
+            if let Some(m) = defaults.model.as_ref() {
+                push(m.primary_chain(), &mut out, &mut seen);
             }
         }
         out

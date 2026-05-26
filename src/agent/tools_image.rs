@@ -222,9 +222,14 @@ impl super::runtime::AgentRuntime {
             found.unwrap_or_else(|| (cfg_url.unwrap_or(base_url), None, prov_name))
         };
         let Some(api_key) = img_key else {
-            return Ok(json!({
-                "error": "AI image generation requires doubao, qwen, minimax, gemini, or openai provider with API key. No image-capable provider configured."
-            }));
+            // Return as Err so the outer chain loop classifies + advances
+            // to the next configured image model. Without this, a
+            // missing-key entry would short-circuit as Ok and silently
+            // skip the user's configured fallbacks.
+            return Err(anyhow!(
+                "image_gen: no API key for {} (set provider config or env var, or configure a working fallback)",
+                img_prov
+            ));
         };
 
         let image_model = args["model"]
