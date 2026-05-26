@@ -204,6 +204,29 @@ fn backup_and_upgrade(path: &Path, legacy_version: u8) -> Result<()> {
 }
 
 fn run_legacy_redb_upgrade_child(path: &Path) -> Result<()> {
+    // Under `cargo test`, `current_exe()` resolves to the test binary
+    // `target/debug/deps/rsclaw-<hash>` — which does NOT contain
+    // `src/main.rs` (cargo generates its own test harness entrypoint),
+    // so the spawned child has no dispatch for
+    // `LEGACY_REDB_UPGRADE_HELPER_ENV` and ignores it. The child then
+    // runs the FULL test suite, which re-triggers the upgrade test,
+    // which spawns ANOTHER child, and so on — an exponential fork
+    // bomb that fills the macOS process table and crashes the host
+    // before SIGTERM can reap it (observed 2026-05-26, ~hundreds of
+    // `rsclaw-<hash>` processes from a single `cargo test --lib`).
+    //
+    // Production builds (`cargo build`, `cargo brd`) link `main.rs`
+    // and DO honor the env var — the v2-redb-library isolation that
+    // the spawn gives us (loading the old library only in a transient
+    // child so it never coexists with the v3 library in the parent's
+    // address space) is real and worth keeping.
+    //
+    // So: in test builds, just do the upgrade in-process. We forfeit
+    // the library-isolation guarantee, but tests run in controlled
+    // environments where mixing v2 + v3 redb symbols isn't a concern.
+    if cfg!(test) {
+        return run_legacy_redb_upgrade_helper(path);
+    }
     let exe = std::env::current_exe().context("resolve current executable for redb upgrade")?;
     let status = std::process::Command::new(exe)
         .env(LEGACY_REDB_UPGRADE_HELPER_ENV, path)
