@@ -40,6 +40,19 @@ pub(crate) enum PluginCommand {
     SetState { plugin: String, action: PluginAction },
     /// `/plugin reset` — clear every override for this session.
     Reset,
+    /// `/plugin pin <plugin>__<tool>` (or legacy `<plugin>.<tool>`) —
+    /// add this tool to the session's pin set so it shows up in
+    /// `dynamic_prefix.user_tools` as a real ToolDef, on top of
+    /// headline defaults. Writes `PluginOverride.pin`.
+    Pin { plugin: String, tool: String },
+    /// `/plugin unpin <plugin>__<tool>` — remove from `user_tools`
+    /// for this session even if the plugin author marked it
+    /// `headline: true`. Writes `PluginOverride.unpin`.
+    Unpin { plugin: String, tool: String },
+    /// `/plugin headlines <plugin>` — show which tools in `<plugin>`
+    /// are auto-promoted to `user_tools` by default (i.e. carry
+    /// `headline: true` in the plugin's manifest).
+    Headlines { plugin: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +115,26 @@ pub(crate) fn parse_plugin_command(line: &str) -> Option<PluginCommand> {
             None => None, // /plugin info (no name) → help text
         };
     }
+    // `pin <plugin>__<tool>` / `unpin <plugin>__<tool>` — accepts the
+    // canonical `__` form, plus legacy `.` / `/` so muscle memory works.
+    if matches!(head.as_str(), "pin" | "unpin") {
+        let Some(qualified) = tail else {
+            return None; // `/plugin pin` with no arg → help text
+        };
+        let Some((plugin, tool)) = crate::agent::runtime::parse_qualified_tool(qualified) else {
+            return None;
+        };
+        return Some(match head.as_str() {
+            "pin" => PluginCommand::Pin { plugin, tool },
+            _ => PluginCommand::Unpin { plugin, tool },
+        });
+    }
+    // `headlines <plugin>` — list which tools are auto-promoted.
+    if head == "headlines" {
+        return tail.map(|n| PluginCommand::Headlines {
+            plugin: n.to_owned(),
+        });
+    }
     // First token is the plugin name. No second token → Info shorthand.
     let plugin = head;
     let Some(action_raw) = tail else {
@@ -126,17 +159,68 @@ pub(crate) fn parse_plugin_command(line: &str) -> Option<PluginCommand> {
     Some(PluginCommand::SetState { plugin, action })
 }
 
+/// `/plugin headlines <plugin>` dispatcher — reads the plugin's
+/// manifest from disk and lists tools where `headline: true`. Goes
+/// straight to `~/.rsclaw/plugins/<plugin>/plugin.json5` rather than
+/// through the running `AgentRuntime` because preparse handlers don't
+/// hold a reference to the plugin registry and adding one would mean
+/// threading an `Arc<RuntimePluginSnapshot>` through every call site
+/// of `bypass_run_command` just for this read-only inspection
+/// command. The on-disk manifest is also the source of truth — if it
+/// disagrees with what the runtime loaded, the on-disk view is what
+/// the next process restart will pick up, which is what an operator
+/// inspecting headlines actually wants to see.
+fn render_headlines_for_plugin(plugin: &str) -> String {
+    let plugin_dir = crate::config::loader::base_dir()
+        .join("plugins")
+        .join(plugin);
+    if !plugin_dir.exists() {
+        return format!("plugin `{plugin}` not installed (no dir at ~/.rsclaw/plugins/{plugin})");
+    }
+    let manifest = match crate::plugin::manifest::load_manifest(&plugin_dir) {
+        Ok(m) => m,
+        Err(e) => return format!("failed to load `{plugin}` manifest: {e}"),
+    };
+    let headlines: Vec<&str> = manifest
+        .tools
+        .iter()
+        .filter(|t| t.headline)
+        .map(|t| t.name.as_str())
+        .collect();
+    if headlines.is_empty() {
+        return format!(
+            "{plugin}: no headline-marked tools (manifest defaults all {} tools to long-tail; \
+             promote a tool by adding `headline: true` to its entry in plugin.json5, \
+             or override per-agent with `model.plugin_tools`)",
+            manifest.tools.len()
+        );
+    }
+    let mut lines = vec![format!(
+        "{plugin}: {} headline tool(s) (auto-promoted to user_tools by default; \
+         {} long-tail tool(s) accessible via plugin_invoke):",
+        headlines.len(),
+        manifest.tools.len() - headlines.len()
+    )];
+    for name in headlines {
+        lines.push(format!("  {plugin}__{name}"));
+    }
+    lines.join("\n")
+}
+
 /// Help text for `/plugin`.
 pub(crate) fn plugin_help_text() -> String {
-    "/plugin [list|ls]             — list session plugin overrides\n\
-     /plugin info <name>           — show one plugin's state\n\
-     /plugin <name>                — shorthand for `info <name>`\n\
-     /plugin <name> off            — hide plugin in this session\n\
-     /plugin <name> on             — back to default (catalog only)\n\
-     /plugin <name> all            — inject ALL plugin tools (cap 20)\n\
-     /plugin <name> t1,t2,t3       — inject specific tools as <plugin>.<tool>\n\
-     /plugin reset                 — clear every session override\n\
-     /plugin help                  — this help\n\n\
+    "/plugin [list|ls]               — list session plugin overrides\n\
+     /plugin info <name>             — show one plugin's state\n\
+     /plugin <name>                  — shorthand for `info <name>`\n\
+     /plugin <name> off              — hide plugin in this session\n\
+     /plugin <name> on               — back to default (headline only)\n\
+     /plugin <name> all              — inject ALL plugin tools (cap by user_tools_cap)\n\
+     /plugin <name> t1,t2,t3         — replace defaults with this exact set\n\
+     /plugin pin <plugin>__<tool>    — add this tool to user_tools (on top of headlines)\n\
+     /plugin unpin <plugin>__<tool>  — remove this tool from user_tools (even if headline)\n\
+     /plugin headlines <name>        — list which tools are auto-promoted by default\n\
+     /plugin reset                   — clear every session override\n\
+     /plugin help                    — this help\n\n\
      Session overrides upgrade plugin exposure from \"catalog only\" \
      (model must use plugin_search + plugin_invoke) to an \"## Active \
      Plugin Tools\" block injected into per-session system text, with \
@@ -825,25 +909,22 @@ $g.Dispose();$b.Dispose()"#
                 let new_override = match action {
                     PluginAction::Off => PluginOverride {
                         disabled: true,
-                        inject_all: false,
-                        inject: vec![],
+                        ..Default::default()
                     },
                     PluginAction::Default => PluginOverride::default(),
                     PluginAction::All => PluginOverride {
-                        disabled: false,
                         inject_all: true,
-                        inject: vec![],
+                        ..Default::default()
                     },
                     PluginAction::Inject(tools) => PluginOverride {
-                        disabled: false,
-                        inject_all: false,
                         inject: tools,
+                        ..Default::default()
                     },
                 };
                 let summary = if new_override.disabled {
                     format!("{plugin}: OFF")
                 } else if new_override.inject_all {
-                    format!("{plugin}: inject ALL (capped at MAX_INJECT_TOOLS=20)")
+                    format!("{plugin}: inject ALL (capped at user_tools_cap)")
                 } else if new_override.inject.is_empty() {
                     format!("{plugin}: default")
                 } else {
@@ -852,6 +933,30 @@ $g.Dispose();$b.Dispose()"#
                 AgentRuntime::set_plugin_override(handle, &session_key, &plugin, new_override);
                 summary
             }
+            PluginCommand::Pin { plugin, tool } => {
+                // Additive: add `tool` to the session override's `pin` set
+                // (and remove from `unpin` if it was there). The session
+                // override may not exist yet — start from default.
+                AgentRuntime::mutate_plugin_override(handle, &session_key, &plugin, |o| {
+                    o.unpin.retain(|t| t != &tool);
+                    if !o.pin.iter().any(|t| t == &tool) {
+                        o.pin.push(tool.clone());
+                    }
+                });
+                format!("{plugin}__{tool}: pinned to user_tools")
+            }
+            PluginCommand::Unpin { plugin, tool } => {
+                // Additive: add `tool` to the session override's `unpin` set
+                // (and remove from `pin` if it was there).
+                AgentRuntime::mutate_plugin_override(handle, &session_key, &plugin, |o| {
+                    o.pin.retain(|t| t != &tool);
+                    if !o.unpin.iter().any(|t| t == &tool) {
+                        o.unpin.push(tool.clone());
+                    }
+                });
+                format!("{plugin}__{tool}: unpinned from user_tools")
+            }
+            PluginCommand::Headlines { plugin } => render_headlines_for_plugin(&plugin),
         };
         return Some(txt(reply));
     }
@@ -1476,5 +1581,60 @@ mod tests {
         assert!(is_fast_preparse("/plugin douyin"));
         assert!(is_fast_preparse("/plugin douyin off"));
         assert!(is_fast_preparse("/plugin reset"));
+    }
+
+    #[test]
+    fn parse_plugin_command_pin_canonical_form() {
+        assert_eq!(
+            parse_plugin_command("/plugin pin douyin__publish"),
+            Some(PluginCommand::Pin {
+                plugin: "douyin".to_owned(),
+                tool: "publish".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_plugin_command_pin_legacy_dot_form() {
+        // Backward compat with the old `model.plugin_tools` config format.
+        assert_eq!(
+            parse_plugin_command("/plugin pin douyin.publish"),
+            Some(PluginCommand::Pin {
+                plugin: "douyin".to_owned(),
+                tool: "publish".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_plugin_command_unpin() {
+        assert_eq!(
+            parse_plugin_command("/plugin unpin douyin__delete_video"),
+            Some(PluginCommand::Unpin {
+                plugin: "douyin".to_owned(),
+                tool: "delete_video".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_plugin_command_pin_unpin_require_argument() {
+        // `/plugin pin` / `/plugin unpin` with no qualified tool → help.
+        assert_eq!(parse_plugin_command("/plugin pin"), None);
+        assert_eq!(parse_plugin_command("/plugin unpin"), None);
+        // Argument without a separator is malformed.
+        assert_eq!(parse_plugin_command("/plugin pin publish"), None);
+    }
+
+    #[test]
+    fn parse_plugin_command_headlines() {
+        assert_eq!(
+            parse_plugin_command("/plugin headlines douyin"),
+            Some(PluginCommand::Headlines {
+                plugin: "douyin".to_owned()
+            })
+        );
+        // No plugin → help.
+        assert_eq!(parse_plugin_command("/plugin headlines"), None);
     }
 }
