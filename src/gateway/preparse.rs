@@ -49,7 +49,7 @@ pub(crate) enum PluginAction {
     /// Inject every tool this plugin exposes (subject to MAX_INJECT_TOOLS).
     All,
     /// Clear inject set — back to default (catalog only, model must use
-    /// plugin.search_tools + plugin.invoke).
+    /// plugin_search + plugin_invoke).
     Default,
     /// Inject the listed tools as `<plugin>.<tool>` ToolDefs.
     Inject(Vec<String>),
@@ -138,9 +138,11 @@ pub(crate) fn plugin_help_text() -> String {
      /plugin reset                 — clear every session override\n\
      /plugin help                  — this help\n\n\
      Session overrides upgrade plugin exposure from \"catalog only\" \
-     (model must use plugin.search_tools + plugin.invoke) to real \
-     <plugin>.<tool> ToolDefs the model can call directly. Useful for \
-     small fleet models. Resets when the session restarts."
+     (model must use plugin_search + plugin_invoke) to an \"## Active \
+     Plugin Tools\" block injected into per-session system text, with \
+     full input_schema. Schema lives in user_system (not in tools[]), \
+     so KV cache stays shared across sessions. Useful for small fleet \
+     models. Resets when the session restarts."
         .to_owned()
 }
 

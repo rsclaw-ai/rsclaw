@@ -495,13 +495,16 @@ fn build_shared_system_prefix_uncached() -> String {
          covers, STOP and use the plugin/skill instead.\n\n\
          ### How to use plugins\n\
          Installed plugins are listed in the \"## Installed Plugins\" section \
-         below, each with its common tools.\n\
-         1. If a listed tool fits, call `plugin.describe_tool` {plugin, tool} \
-         for exact arguments (when needed), then `plugin.invoke`.\n\
-         2. If no listed tool fits, call `plugin.search_tools` with the plugin \
+         below, each with its common tools. A \"## Active Plugin Tools\" \
+         section MAY appear (set by `/plugin <name> all` or by agent config) \
+         — its tools come with full input_schema, ready to call directly.\n\
+         1. If a listed tool fits (common or active), call `plugin_describe` \
+         {plugin, tool} for exact arguments when not already shown, then \
+         `plugin_invoke`.\n\
+         2. If no listed tool fits, call `plugin_search` with the plugin \
          name (from the list) and the user's intent to find one, then \
          describe/invoke.\n\
-         3. `plugin.invoke` with `{plugin, tool, arguments}`. If a WASM and JS \
+         3. `plugin_invoke` with `{plugin, tool, arguments}`. If a WASM and JS \
          plugin expose the same capability, choose WASM.\n\n\
          ### How to invoke an installed skill\n\
          Use `skill_list` with `query` first when you need to find an installed skill. Use `limit`/`offset` to page through more results. Do not use `shell` to run `rsclaw skills list`; `skill_list` is the authoritative installed-skill listing.\n\n\
@@ -567,7 +570,7 @@ fn build_shared_system_prefix_uncached() -> String {
          - Save corrected/complete info to memory immediately so it survives compaction.\n\
          - Knowledge base: when the user asks about THEIR own material (uploaded docs, PDFs, URLs, files), use `knowledge_base` to search it and CITE the returned source_title. Prefer it over `web_search` for the user's material; if it returns nothing, say so — never fabricate a citation. (`memory` = what you learned; `knowledge_base` = the user's authoritative corpus.)\n\
          - Skills: prefer an installed skill (see '## Installed Skills') via `skill_use` over raw web/shell. If none matches and web tools can't solve it, `skill_search` for one (restaurants→meituan, stock/finance→hithink, etc.), `skill_install` it, then `skill_use`. `skill_list` shows what's installed; `skill_remove` uninstalls.\n\
-         - Plugins: installed plugins are accessed only through `plugin.info`, `plugin.search_tools`, `plugin.describe_tool`, and `plugin.invoke`. Never invent other `plugin.*` tool names. When the user explicitly asks for a plugin or names an installed plugin domain, use `plugin.info` or `plugin.search_tools` before `skill_list`.\n\
+         - Plugins: installed plugins are accessed only through `plugin_list`, `plugin_search`, `plugin_describe`, and `plugin_invoke`. Never invent other `plugin_*` tool names. When the user explicitly asks for a plugin or names an installed plugin domain, use `plugin_list` or `plugin_search` before `skill_list`.\n\
          \n\
          ### GUI / Desktop Automation (computer_use)\n\
          For any GUI or desktop automation task (WeChat, Finder, Safari, etc.):\n\
@@ -882,6 +885,14 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "skill_search",
     "skill_install",
     "skill_remove",
+    // Plugin meta tools (the 4 dispatchers): byte-identical for every client
+    // of this version, so they belong in the cacheable builtin prefix. Live
+    // per-plugin tool schemas are NOT registered here — they're rendered as
+    // text into user_system (KV-cache friendly) by `render_active_plugin_tools_text`.
+    "plugin_list",
+    "plugin_search",
+    "plugin_describe",
+    "plugin_invoke",
 ];
 
 /// Build a minimal system prompt for internal sessions (heartbeat/cron/system).
@@ -931,11 +942,11 @@ mod tests {
     fn shared_prompt_names_only_supported_plugin_tools() {
         let prompt = build_shared_system_prefix_uncached();
 
-        assert!(prompt.contains("plugin.info"));
-        assert!(prompt.contains("plugin.search_tools"));
-        assert!(prompt.contains("plugin.describe_tool"));
-        assert!(prompt.contains("plugin.invoke"));
-        assert!(prompt.contains("Never invent other `plugin.*` tool names"));
+        assert!(prompt.contains("plugin_list"));
+        assert!(prompt.contains("plugin_search"));
+        assert!(prompt.contains("plugin_describe"));
+        assert!(prompt.contains("plugin_invoke"));
+        assert!(prompt.contains("Never invent other `plugin_*` tool names"));
     }
 
     #[test]

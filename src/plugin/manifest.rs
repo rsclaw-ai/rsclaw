@@ -62,7 +62,7 @@ pub struct PluginManifest {
     #[serde(default)]
     pub summary: Option<String>,
     /// Tool names to surface as "common" in the catalog (the rest are found
-    /// via plugin.search_tools). Empty → renderer shows the first few + count.
+    /// via plugin_search). Empty → renderer shows the first few + count.
     #[serde(default, rename = "commonTools")]
     pub common_tools: Vec<String>,
     /// Runtime: "node" | "bun" | "deno" | "wasm". Defaults to "node".

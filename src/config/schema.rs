@@ -621,17 +621,18 @@ pub struct ModelConfig {
     /// Examples: `["agent_spoke_aihub", "memory", "clarify"]`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
-    /// Promote selected plugin tools to native ToolDefs visible to the
-    /// LLM as `<plugin>.<tool>`. Bypasses the plugin.search_tools →
-    /// plugin.describe_tool → plugin.invoke 3-step dance that small
-    /// (9B-class) models can't reliably follow. Each entry is
-    /// `"<plugin>.<tool>"`, e.g. `["douyin.publish", "douyin.get_comments"]`.
-    /// The injected ToolDef carries the plugin's manifest description +
-    /// input_schema, so the provider's tool-schema enforcement validates
-    /// arguments. Pair with `tools: [...]` to whitelist them in the
-    /// allowlist enforcement layer. Per-agent always-on equivalent of
-    /// the per-session `/plugin` slash command. Honors MAX_INJECT_TOOLS
-    /// (20) hard cap.
+    /// Promote selected plugin tools by rendering an "## Active Plugin
+    /// Tools" block (full input_schema) into the agent's user_system
+    /// text. Bypasses the plugin_search → plugin_describe → plugin_invoke
+    /// 3-step dance that small (9B-class) models can't reliably follow.
+    /// Each entry is `"<plugin>.<tool>"`, e.g.
+    /// `["douyin.publish", "douyin.get_comments"]`. Model invokes the
+    /// listed tools via `plugin_invoke` with `{plugin, tool, arguments}`
+    /// — host-side `validate_plugin_arguments` enforces required fields.
+    /// Per-agent always-on equivalent of the per-session `/plugin` slash
+    /// command. Honors MAX_INJECT_TOOLS (20) hard cap. Block lives in
+    /// user_system (not in tools[]), so it doesn't break the cross-client
+    /// prefix KV cache hash.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plugin_tools: Option<Vec<String>>,
     /// Context window size in tokens. Used to calculate history budget.

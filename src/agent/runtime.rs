@@ -22,7 +22,6 @@ use std::{
     time::Duration,
 };
 
-use crate::skill::SkillManifest;
 use anyhow::{Result, anyhow};
 use futures::StreamExt;
 use serde_json::{Value, json};
@@ -33,11 +32,16 @@ use tokio::{
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::skill::SkillManifest;
+
 fn paginate_skill_list<'a, I>(skills: I, args: &Value) -> Value
 where
     I: IntoIterator<Item = &'a SkillManifest>,
 {
-    let query = args["query"].as_str().map(str::trim).filter(|s| !s.is_empty());
+    let query = args["query"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let query_lower = query.map(|q| q.to_lowercase());
     let limit = args["limit"]
         .as_u64()
@@ -168,11 +172,13 @@ const MAX_SESSIONS_PER_AGENT: usize = 10_000;
 
 /// Per-session plugin activation override. Stored on `AgentHandle` so the
 /// `/plugin` slash command (which only has `&AgentHandle`) can mutate it.
-/// Resolved at tool-list build time to decide which plugin tools become
-/// directly-callable `<plugin>.<tool>` ToolDefs in the LLM's tools array.
+/// Resolved at system-prompt build time to render an "## Active Plugin
+/// Tools" block (full input_schema) into user_system. The block lives in
+/// the per-session segment of the prompt, so it doesn't break the shared
+/// prefix KV cache hash.
 ///
 /// **Defaults (no entry in `plugin_overrides`) = today's behavior:** no
-/// injection, model must use `plugin.search_tools` + `plugin.invoke`.
+/// active block emitted, model must use `plugin_search` + `plugin_invoke`.
 /// Setting one of the variants below opts a single (session, plugin) into
 /// an upgraded exposure.
 #[derive(Debug, Clone, Default)]
@@ -286,6 +292,21 @@ fn is_internal_session(session_key: &str) -> bool {
 /// ephemeral.
 fn is_minimal_context_session(session_key: &str) -> bool {
     session_key.starts_with("heartbeat:") || session_key.starts_with("system:")
+}
+
+/// Format one active-plugin-tool line for the "## Active Plugin Tools"
+/// block. Schema is serialized compactly via `serde_json` so a 20-tool
+/// block stays under ~3-4 KB. The schema JSON object's keys are emitted
+/// in `serde_json` declaration order (the crate is compiled with
+/// `preserve_order`), so byte-stability for a given input is up to the
+/// upstream tool registry — not normalized here because this block lives
+/// in `user_system` (NOT hashed), so cross-session byte-divergence has
+/// no KV-cache impact.
+fn format_active_plugin_tool_line(name: &str, description: &str, schema: &Value) -> String {
+    let one_line_desc = description.trim().replace('\n', " ");
+    let schema_compact = serde_json::to_string(schema)
+        .unwrap_or_else(|_| r#"{"type":"object","properties":{}}"#.to_owned());
+    format!("- **{name}** — {one_line_desc}\n  input_schema: {schema_compact}")
 }
 
 /// Convert an image reference (file path or data URL) into a `data:` URL
@@ -3129,28 +3150,18 @@ impl AgentRuntime {
             );
             all.extend(extra_tools.iter().cloned());
             // Plugin catalogs are exposed through compact meta tools
-            // (`plugin.search_tools`, `plugin.describe_tool`, `plugin.invoke`)
-            // instead of exporting every concrete plugin tool into provider tools.
+            // (`plugin_search`, `plugin_describe`, `plugin_invoke`) instead
+            // of exporting every concrete plugin tool into provider tools.
+            // The `/plugin` slash command and `model.plugin_tools` config
+            // upgrade exposure by injecting an "## Active Plugin Tools"
+            // block (with full input_schema) into `user_system` text at
+            // prompt-build time — see `render_session_plugin_tools_text`
+            // and `render_config_plugin_tools_text`. Schema lives in
+            // user_system (NOT in tools[]), so per-session activation
+            // doesn't split the shared prefix KV bucket.
             if let Some(ref mcp) = self.mcp {
                 all.extend(mcp.all_tool_defs().await);
             }
-            // Plugin overrides (per-session, set by `/plugin` slash command):
-            // expand the inject set into real `<plugin>.<tool>` ToolDefs so
-            // small models call them directly without the search_tools →
-            // invoke two-step. Default (no override) = empty Vec = today's
-            // behavior, KV cache stable. Dispatch routing for `<plugin>.<tool>`
-            // already exists at the `name.split_once('.')` arm in
-            // dispatch_tool (~runtime.rs:7199).
-            all.extend(self.expand_plugin_tool_defs(session_key));
-            // Config-declared plugin tool promotion: per-agent always-on
-            // equivalent of `/plugin`. Operator writes
-            //   model.plugin_tools = ["douyin.publish"]
-            // and the LLM sees a native ToolDef rather than having to
-            // chain plugin.search_tools → plugin.describe_tool →
-            // plugin.invoke. Reuses the same expand_plugin_tool_defs_pure
-            // path as `/plugin` so dispatch routing + arg validation
-            // behavior is identical.
-            all.extend(self.expand_config_plugin_tools());
 
             // Apply toolset level + custom tools list
             // Default agent uses "full", others use "standard". Fall back to
@@ -4677,7 +4688,26 @@ impl AgentRuntime {
                     }
                 }
             }
-            let effective_system = system_prompt.to_owned();
+            let mut effective_system = system_prompt.to_owned();
+            // Per-session "## Active Plugin Tools" block: rendered from agent
+            // config (`model.plugin_tools`, always-on) and session overrides
+            // (`/plugin` slash command). Appended AFTER the cached system
+            // prompt — and AFTER the shared-prefix boundary at the
+            // (system_shared, user_system) split below — so the block lands
+            // in `dynamic_prefix.user_system` and does NOT participate in
+            // the worker's content-addressed prefix hash. Different sessions
+            // with different active plugins share the same prefix bucket.
+            let mut plugin_tail_parts: Vec<String> = Vec::new();
+            if let Some(t) = self.render_config_plugin_tools_text() {
+                plugin_tail_parts.push(t);
+            }
+            if let Some(t) = self.render_session_plugin_tools_text(&ctx.session_key) {
+                plugin_tail_parts.push(t);
+            }
+            if !plugin_tail_parts.is_empty() {
+                effective_system.push_str("\n\n");
+                effective_system.push_str(&plugin_tail_parts.join("\n\n"));
+            }
 
             // Resolve max_tokens with priority: config > built-in defaults > 0.
             // Sentinel semantics: 0 (or unset) means "no client-side cap" — we
@@ -4712,24 +4742,17 @@ impl AgentRuntime {
                     .and_then(|m| m.max_tokens)
                     .map(|v| v as u32);
 
-                // 4. Built-in catalog (src/provider/model_defaults.rs) —
-                //    sane per-model defaults so a fresh install doesn't
-                //    inherit whatever the upstream server picks (doubao =
-                //    4k → truncates mid-write_file). Only applied when
-                //    none of the explicit config layers set anything;
-                //    user overrides still win.
-                from_agent
-                    .or(from_defaults)
-                    .or(from_provider)
-                    .filter(|&m| m > 0)
-                    .or_else(|| {
-                        Some(crate::provider::model_defaults::resolve_max_tokens(
-                            provider_name,
-                            model_id,
-                            None,
-                        ))
-                    })
-                    .filter(|&m| m > 0)
+                // 4. Built-in catalog (src/provider/model_defaults.rs) — sane per-model
+                //    defaults so a fresh install doesn't inherit whatever the upstream server
+                //    picks (doubao = 4k → truncates mid-write_file). Only applied when none of
+                //    the explicit config layers set anything; user overrides still win.
+                resolve_request_max_tokens(
+                    from_agent,
+                    from_defaults,
+                    from_provider,
+                    provider_name,
+                    model_id,
+                )
             };
 
             if let Some(configured) = configured_max_tokens {
@@ -6744,95 +6767,135 @@ impl AgentRuntime {
         score
     }
 
-    /// Build `<plugin>.<tool>` ToolDefs for every plugin with a non-empty
-    /// inject set in this session. Capped at `cap` (v1 hard limit; v2
-    /// replaces this with a token-budget guard).
+    /// Render an "## Active Plugin Tools" markdown block listing every
+    /// `<plugin>.<tool>` selected by `per_plugin`, with the full
+    /// `description` and `input_schema`. The block is meant to be appended
+    /// to `user_system` so it does NOT enter the shared `(system, tools)`
+    /// prefix hash — different sessions can have different active sets
+    /// without splitting the worker's prefix LRU.
     ///
-    /// Dispatch routing for `<plugin>.<tool>` names already exists at the
+    /// Returns `None` when no plugin is opted in (caller should skip the
+    /// header entirely so default-state sessions emit no extra bytes).
+    ///
+    /// Capped at `cap` total tools (v1 hard limit; v2 swaps for a token
+    /// budget). Cap is shared across wasm + js to bound prompt growth even
+    /// when a user `/plugin xxx all`s a 200-tool plugin.
+    ///
+    /// Dispatch routing for `<plugin>.<tool>` calls already exists at the
     /// fall-through in `dispatch_tool` (the `name.split_once('.')` arm),
-    /// so calling these injected ToolDefs Just Works — no dispatcher change.
-    pub(crate) fn expand_plugin_tool_defs_pure(
+    /// so a model that emits `douyin.publish` after reading this block
+    /// resolves correctly. `plugin_invoke` is the recommended entry
+    /// point — it carries the same args shape but doesn't require the
+    /// dispatch fallback.
+    pub(crate) fn render_active_plugin_tools_text_pure(
         wasm_plugins: &[crate::plugin::wasm_runtime::WasmPlugin],
         js_plugins: Option<&crate::plugin::PluginRegistry>,
         per_plugin: &std::collections::HashMap<String, PluginOverride>,
         cap: usize,
-    ) -> Vec<crate::provider::ToolDef> {
-        use crate::provider::ToolDef;
-        let mut out: Vec<ToolDef> = Vec::with_capacity(cap.min(64));
-        // WASM plugins first (priority over JS — matches dispatch_tool's
-        // wasm-wins ordering at section 4 / runtime.rs:7199).
+    ) -> Option<String> {
+        if per_plugin.is_empty() {
+            return None;
+        }
+        let mut blocks: Vec<String> = Vec::new();
+        let mut emitted: usize = 0;
+        // WASM first (priority over JS — matches dispatch_tool's
+        // wasm-wins ordering for the `<plugin>.<tool>` namespace).
         for wp in wasm_plugins {
+            if emitted >= cap {
+                break;
+            }
             let names = match Self::resolve_plugin_inject_pure(per_plugin, &wp.name) {
                 PluginInjectResolution::None => continue,
                 PluginInjectResolution::All => wp.tools.iter().map(|t| t.name.clone()).collect(),
                 PluginInjectResolution::Names(v) => v,
             };
+            let mut lines: Vec<String> = Vec::new();
             for name in &names {
-                if let Some(t) = wp.tools.iter().find(|t| &t.name == name) {
-                    out.push(ToolDef {
-                        name: format!("{}.{}", wp.name, t.name),
-                        description: t.description.clone(),
-                        parameters: t.parameters.clone(),
-                    });
-                    if out.len() >= cap {
-                        return out;
-                    }
+                if emitted >= cap {
+                    break;
                 }
+                if let Some(t) = wp.tools.iter().find(|t| &t.name == name) {
+                    lines.push(format_active_plugin_tool_line(
+                        &t.name,
+                        &t.description,
+                        &t.parameters,
+                    ));
+                    emitted += 1;
+                }
+            }
+            if !lines.is_empty() {
+                blocks.push(format!("### {} (wasm)\n{}", wp.name, lines.join("\n")));
             }
         }
         if let Some(reg) = js_plugins {
             for (plugin_name, plugin) in reg.js_plugins_iter() {
+                if emitted >= cap {
+                    break;
+                }
                 let names = match Self::resolve_plugin_inject_pure(per_plugin, plugin_name) {
                     PluginInjectResolution::None => continue,
-                    PluginInjectResolution::All => {
-                        plugin.manifest.tools.iter().map(|t| t.name.clone()).collect()
-                    }
+                    PluginInjectResolution::All => plugin
+                        .manifest
+                        .tools
+                        .iter()
+                        .map(|t| t.name.clone())
+                        .collect(),
                     PluginInjectResolution::Names(v) => v,
                 };
+                let mut lines: Vec<String> = Vec::new();
                 for name in &names {
-                    if let Some(t) = plugin.manifest.tools.iter().find(|t| &t.name == name) {
-                        out.push(ToolDef {
-                            name: format!("{plugin_name}.{}", t.name),
-                            description: t.description.clone(),
-                            parameters: t.input_schema.clone().unwrap_or_else(|| {
-                                json!({"type": "object", "properties": {}})
-                            }),
-                        });
-                        if out.len() >= cap {
-                            return out;
-                        }
+                    if emitted >= cap {
+                        break;
                     }
+                    if let Some(t) = plugin.manifest.tools.iter().find(|t| &t.name == name) {
+                        let schema = t
+                            .input_schema
+                            .clone()
+                            .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+                        lines.push(format_active_plugin_tool_line(
+                            &t.name,
+                            &t.description,
+                            &schema,
+                        ));
+                        emitted += 1;
+                    }
+                }
+                if !lines.is_empty() {
+                    blocks.push(format!("### {plugin_name} (js)\n{}", lines.join("\n")));
                 }
             }
         }
-        out
+        if blocks.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "## Active Plugin Tools\n\
+             These plugin tools are activated for this session. Call each via \
+             `plugin_invoke {{plugin, tool, arguments}}` — `arguments` MUST match \
+             the `input_schema` below. The host validates required fields before \
+             dispatch.\n\n\
+             {}",
+            blocks.join("\n\n"),
+        ))
     }
 
-    /// Expand the agent's CONFIG-declared `model.plugin_tools` list into
-    /// native `<plugin>.<tool>` ToolDefs. Always-on, not session-scoped.
-    /// Reuses `expand_plugin_tool_defs_pure` by synthesizing a one-shot
-    /// override map keyed by plugin name — so dispatch routing, the
-    /// MAX_INJECT_TOOLS cap, and wasm-wins ordering all match the
-    /// `/plugin` session-override path.
-    pub(crate) fn expand_config_plugin_tools(&self) -> Vec<crate::provider::ToolDef> {
+    /// Render the active-plugins block for this agent's CONFIG-declared
+    /// `model.plugin_tools` list (always-on, agent-level). Wraps
+    /// `render_active_plugin_tools_text_pure` by synthesizing a one-shot
+    /// override map keyed by plugin name.
+    pub(crate) fn render_config_plugin_tools_text(&self) -> Option<String> {
         const MAX_INJECT_TOOLS: usize = 20;
-        let Some(model_cfg) = self.handle.config.model.as_ref() else {
-            return Vec::new();
-        };
-        let Some(list) = model_cfg.plugin_tools.as_ref() else {
-            return Vec::new();
-        };
+        let model_cfg = self.handle.config.model.as_ref()?;
+        let list = model_cfg.plugin_tools.as_ref()?;
         if list.is_empty() {
-            return Vec::new();
+            return None;
         }
         let mut map: std::collections::HashMap<String, PluginOverride> =
             std::collections::HashMap::new();
         for entry in list {
             // Accept both `plugin.tool` (preferred) and `plugin/tool` for
             // operators who muscle-memory from skill paths.
-            let Some((plugin, tool)) = entry
-                .split_once('.')
-                .or_else(|| entry.split_once('/'))
+            let Some((plugin, tool)) = entry.split_once('.').or_else(|| entry.split_once('/'))
             else {
                 tracing::warn!(
                     agent = %self.handle.id,
@@ -6846,7 +6909,7 @@ impl AgentRuntime {
                 .inject
                 .push(tool.to_owned());
         }
-        Self::expand_plugin_tool_defs_pure(
+        Self::render_active_plugin_tools_text_pure(
             &self.wasm_plugins,
             self.plugins.as_deref(),
             &map,
@@ -6854,21 +6917,21 @@ impl AgentRuntime {
         )
     }
 
-    /// Live-runtime convenience: pulls plugins from `self`, snapshots the
-    /// session's override map, then defers to `expand_plugin_tool_defs_pure`.
-    pub(crate) fn expand_plugin_tool_defs(&self, session_key: &str) -> Vec<crate::provider::ToolDef> {
+    /// Render the active-plugins block for the per-session `/plugin`
+    /// slash command overrides. Returns `None` when no override is set.
+    pub(crate) fn render_session_plugin_tools_text(&self, session_key: &str) -> Option<String> {
         /// Max plugin tools injected per turn (v1 hard cap; v2 swaps for
-        /// token-budget). Keeps small-model tool-list under control even
-        /// if the user `/plugin xxx all`s a 200-tool plugin.
+        /// token-budget). Keeps small-model prompt size under control even
+        /// when the user `/plugin xxx all`s a 200-tool plugin.
         const MAX_INJECT_TOOLS: usize = 20;
         let snapshot = match self.handle.plugin_overrides.read() {
             Ok(g) => g.get(session_key).cloned().unwrap_or_default(),
-            Err(_) => return Vec::new(),
+            Err(_) => return None,
         };
         if snapshot.is_empty() {
-            return Vec::new();
+            return None;
         }
-        Self::expand_plugin_tool_defs_pure(
+        Self::render_active_plugin_tools_text_pure(
             &self.wasm_plugins,
             self.plugins.as_deref(),
             &snapshot,
@@ -6962,9 +7025,9 @@ impl AgentRuntime {
             "plugin": plugin_filter,
             "plugins": plugins,
             "next_steps": [
-                "Use plugin.search_tools to find task-specific tools.",
-                "Use plugin.describe_tool to inspect exact input schema.",
-                "Use plugin.invoke to execute a plugin tool."
+                "Use plugin_search to find task-specific tools.",
+                "Use plugin_describe to inspect exact input schema.",
+                "Use plugin_invoke to execute a plugin tool."
             ]
         }))
     }
@@ -6980,9 +7043,10 @@ impl AgentRuntime {
     /// list as input so unit tests can drive it without constructing a full
     /// `AgentRuntime`. Two modes:
     /// - **search**: non-empty `query` → score + rank + paginate.
-    /// - **browse**: empty `query` + non-empty `plugin` → list-all alphabetical,
-    ///   paginated via `offset`/`limit`. Lets the model walk a giant plugin
-    ///   (e.g. douyin's 208 tools) without inventing a new meta-tool.
+    /// - **browse**: empty `query` + non-empty `plugin` → list-all
+    ///   alphabetical, paginated via `offset`/`limit`. Lets the model walk a
+    ///   giant plugin (e.g. douyin's 208 tools) without inventing a new
+    ///   meta-tool.
     pub(crate) fn search_plugin_tools_pure(all_tools: Vec<PluginToolInfo>, args: &Value) -> Value {
         let query = args["query"].as_str().unwrap_or("").trim();
         let plugin_filter = args["plugin"]
@@ -6994,15 +7058,17 @@ impl AgentRuntime {
 
         if query.is_empty() && plugin_filter.is_none() {
             return json!({
-                "error": "plugin.search_tools requires either `query` (search) or `plugin` (browse).",
+                "error": "plugin_search requires either `query` (search) or `plugin` (browse).",
                 "hint": "Examples: {plugin:\"douyin\",query:\"publish video\"} or {plugin:\"douyin\"} to list all tools."
             });
         }
 
         if query.is_empty() {
             let plugin = plugin_filter.unwrap();
-            let mut tools: Vec<PluginToolInfo> =
-                all_tools.into_iter().filter(|t| t.plugin == plugin).collect();
+            let mut tools: Vec<PluginToolInfo> = all_tools
+                .into_iter()
+                .filter(|t| t.plugin == plugin)
+                .collect();
             tools.sort_by(|a, b| a.tool.cmp(&b.tool));
             let total = tools.len();
             let page: Vec<Value> = tools
@@ -7077,12 +7143,12 @@ impl AgentRuntime {
         let plugin = args["plugin"].as_str().unwrap_or("").trim();
         let tool = args["tool"].as_str().unwrap_or("").trim();
         if plugin.is_empty() || tool.is_empty() {
-            return Ok(json!({"error": "plugin.describe_tool requires plugin and tool"}));
+            return Ok(json!({"error": "plugin_describe requires plugin and tool"}));
         }
         let Some(info) = self.find_plugin_tool(plugin, tool) else {
             return Ok(json!({
                 "error": format!("plugin tool not found: {plugin}.{tool}"),
-                "hint": "Use plugin.search_tools to discover installed plugin tools."
+                "hint": "Use plugin_search to discover installed plugin tools."
             }));
         };
         Ok(json!({
@@ -7101,7 +7167,7 @@ impl AgentRuntime {
     ) -> std::result::Result<(), Value> {
         if !args.is_object() {
             return Err(json!({
-                "error": "plugin.invoke arguments must be an object",
+                "error": "plugin_invoke arguments must be an object",
                 "plugin": tool.plugin,
                 "tool": tool.tool,
                 "schema_hint": Self::compact_input_schema(&tool.input_schema),
@@ -7115,7 +7181,7 @@ impl AgentRuntime {
                 .collect();
             if !missing.is_empty() {
                 return Err(json!({
-                    "error": "plugin.invoke missing required arguments",
+                    "error": "plugin_invoke missing required arguments",
                     "plugin": tool.plugin,
                     "tool": tool.tool,
                     "missing": missing,
@@ -7131,12 +7197,12 @@ impl AgentRuntime {
         let tool_name = args["tool"].as_str().unwrap_or("").trim();
         let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
         if plugin_name.is_empty() || tool_name.is_empty() {
-            return Ok(json!({"error": "plugin.invoke requires plugin, tool, and arguments"}));
+            return Ok(json!({"error": "plugin_invoke requires plugin, tool, and arguments"}));
         }
         let Some(info) = self.find_plugin_tool(plugin_name, tool_name) else {
             return Ok(json!({
                 "error": format!("plugin tool not found: {plugin_name}.{tool_name}"),
-                "hint": "Use plugin.search_tools to discover installed plugin tools."
+                "hint": "Use plugin_search to discover installed plugin tools."
             }));
         };
         if let Err(err) = Self::validate_plugin_arguments(&info, &arguments) {
@@ -7210,15 +7276,17 @@ impl AgentRuntime {
         raw_name: &str,
         args: Value,
     ) -> Result<Value> {
-        // Tolerate `plugin=search_tools` (instead of `plugin.search_tools`) —
-        // observed from rsclaw-agent-v1 on the 4070 fleet, model treats the
-        // namespace separator as `key=value`. We do NOT alias `plugin.list`
-        // → `plugin.info` because the semantics differ: `plugin.info` lists
-        // installed plugins, while a model emitting `plugin.list` more
-        // commonly wants to enumerate one plugin's tools (which is
-        // `plugin.search_tools {plugin: …}` in browse mode). Let the
-        // "unknown tool" error surface so the model re-reads the catalog
-        // and self-corrects (logs show it does).
+        // Tolerate `plugin=search_tools` (instead of the canonical
+        // `plugin_search`) — observed from rsclaw-agent-v1 on the 4070
+        // fleet, model treats the namespace separator as `key=value`.
+        // Rewriting `=` to `.` lets the dispatch's legacy-dotted aliases
+        // (kept below for backward compat) still resolve. We do NOT alias
+        // `plugin.list` → `plugin_list` because the semantics differ:
+        // `plugin_list` enumerates installed plugins, while a model
+        // emitting `plugin.list` more commonly wants to enumerate one
+        // plugin's tools (which is `plugin_search {plugin: …}` in browse
+        // mode). Let the "unknown tool" error surface so the model
+        // re-reads the catalog and self-corrects (logs show it does).
         let normalized: String = if raw_name.contains('=') && !raw_name.contains('.') {
             raw_name.replacen('=', ".", 1)
         } else {
@@ -7448,14 +7516,20 @@ impl AgentRuntime {
             "skill_search" => return self.tool_skill_search(args).await,
             "skill_install" => return self.tool_skill_install(args).await,
             "skill_remove" => return self.tool_skill_remove(args).await,
-            "plugin.info" | "plugin_info" => return self.tool_plugin_info(args).await,
-            "plugin.search_tools" | "plugin_search_tools" => {
+            // Canonical (current): underscored, vendor-regex-compliant.
+            // Legacy aliases kept for sessions whose model emits the old
+            // dotted form from cache — dispatch still routes correctly,
+            // but the names are NO LONGER advertised in tools / prompts.
+            "plugin_list" | "plugin.info" | "plugin_info" => {
+                return self.tool_plugin_info(args).await;
+            }
+            "plugin_search" | "plugin.search_tools" | "plugin_search_tools" => {
                 return self.tool_plugin_search_tools(args).await;
             }
-            "plugin.describe_tool" | "plugin_describe_tool" => {
+            "plugin_describe" | "plugin.describe_tool" | "plugin_describe_tool" => {
                 return self.tool_plugin_describe_tool(args).await;
             }
-            "plugin.invoke" | "plugin_invoke" => return self.tool_plugin_invoke(ctx, args).await,
+            "plugin_invoke" | "plugin.invoke" => return self.tool_plugin_invoke(ctx, args).await,
             "task" => return self.tool_task(ctx, args).await,
             "task_finish" => return self.tool_task_finish(ctx, args).await,
             "ask_user" => return self.tool_ask_user(ctx, args).await,
@@ -8668,6 +8742,23 @@ pub(crate) fn resolve_default_workspace(
         .unwrap_or_else(|| base_dir.join("workspace"))
 }
 
+fn resolve_request_max_tokens(
+    from_agent: Option<u32>,
+    from_defaults: Option<u32>,
+    from_provider: Option<u32>,
+    provider_name: &str,
+    model_id: &str,
+) -> Option<u32> {
+    for configured in [from_agent, from_defaults, from_provider] {
+        if let Some(value) = configured {
+            return (value > 0).then_some(value);
+        }
+    }
+    let resolved =
+        crate::provider::model_defaults::resolve_max_tokens(provider_name, model_id, None);
+    (resolved > 0).then_some(resolved)
+}
+
 /// Canonicalize a path received from an external source (tool output, plugin
 /// result, LLM-generated argument). Performs:
 ///   1. `~/...` expansion via [`expand_tilde`]
@@ -9423,7 +9514,16 @@ mod tests {
         let base = std::path::Path::new("/some/abs/base");
         let got = resolve_default_workspace(None, None, base);
         assert_ne!(got, std::path::PathBuf::from("."));
-        assert!(got.is_absolute(), "default workspace must be absolute, got {got:?}");
+        assert!(
+            got.is_absolute(),
+            "default workspace must be absolute, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_zero_max_tokens_omits_wire_cap() {
+        let got = resolve_request_max_tokens(Some(0), None, None, "doubao", "doubao-seed-2.0-pro");
+        assert_eq!(got, None);
     }
 
     #[test]
@@ -10032,7 +10132,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // plugin.search_tools pure-helper tests (Task 1)
+    // plugin_search pure-helper tests (Task 1)
     // ---------------------------------------------------------------------
 
     fn pti(plugin: &str, tool: &str, desc: &str) -> PluginToolInfo {
@@ -10109,8 +10209,8 @@ mod tests {
     // PluginOverride resolver tests (Task 2)
     // ---------------------------------------------------------------------
 
-    // expand_plugin_tool_defs orchestration covered by integration testing
-    // via the /plugin slash command (Task 4 + manual smoke). Unit-testing it
+    // render_active_plugin_tools_text orchestration is covered by
+    // integration testing via the /plugin slash command. Unit-testing it
     // requires constructing a real WasmPlugin (Engine + Component + Linker),
     // which is infeasible in a lib test. The logic that *can* fail in
     // isolation — override resolution — is covered by the resolver tests
@@ -10179,10 +10279,8 @@ mod tests {
             pti("demo", "edit_video", "Edit a video"),
             pti("demo", "add_account", "Manage account"),
         ];
-        let result = AgentRuntime::search_plugin_tools_pure(
-            tools,
-            &json!({"query": "video", "limit": 5}),
-        );
+        let result =
+            AgentRuntime::search_plugin_tools_pure(tools, &json!({"query": "video", "limit": 5}));
         assert_eq!(result["mode"], "search");
         let names: Vec<&str> = result["tools"]
             .as_array()

@@ -64,10 +64,12 @@ pub struct AgentHandle {
     /// Per-session plugin activation overrides:
     /// `session_key → { plugin_name → PluginOverride }`. Mutated by the
     /// `/plugin` slash command (host-side, never enters conversation
-    /// history). Resolved at tool-list build time to decide which
-    /// `<plugin>.<tool>` ToolDefs get injected into the LLM's tools array
-    /// so small models can call high-frequency plugin tools directly
-    /// without the plugin.search_tools → plugin.invoke two-step.
+    /// history). Resolved at system-prompt build time to render an
+    /// "## Active Plugin Tools" block into user_system, exposing the
+    /// full input_schema for the selected plugin tools so small models
+    /// can call them directly without the plugin_search → plugin_invoke
+    /// two-step. The block lives in user_system (not in tools[]), so the
+    /// shared prefix KV cache stays intact across overrides.
     pub plugin_overrides: Arc<
         std::sync::RwLock<HashMap<String, HashMap<String, crate::agent::runtime::PluginOverride>>>,
     >,

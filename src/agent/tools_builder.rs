@@ -16,8 +16,8 @@ use crate::{
 pub(crate) fn build_plugin_meta_tool_defs() -> Vec<ToolDef> {
     vec![
         ToolDef {
-            name: "plugin.info".to_owned(),
-            description: "Read-only catalog of installed plugins and their common tools. Use this when the user asks what plugins are available or when you need plugin overview before choosing plugin.search_tools, plugin.describe_tool, or plugin.invoke. This tool does not execute plugin actions.".to_owned(),
+            name: "plugin_list".to_owned(),
+            description: "Read-only catalog of installed plugins and their common tools. Use this when the user asks what plugins are available or when you need plugin overview before choosing plugin_search, plugin_describe, or plugin_invoke. This tool does not execute plugin actions.".to_owned(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -26,8 +26,8 @@ pub(crate) fn build_plugin_meta_tool_defs() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "plugin.search_tools".to_owned(),
-            description: "Search or browse installed plugin tool catalogs. With non-empty `query`: ranks tools by intent match (use before plugin.invoke when you need a capability but don't know the exact tool name). With empty `query` and `plugin` set: lists ALL tools in that plugin alphabetically (paginate via `offset`/`limit`).".to_owned(),
+            name: "plugin_search".to_owned(),
+            description: "Search or browse installed plugin tool catalogs. With non-empty `query`: ranks tools by intent match (use before plugin_invoke when you need a capability but don't know the exact tool name). With empty `query` and `plugin` set: lists ALL tools in that plugin alphabetically (paginate via `offset`/`limit`).".to_owned(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -39,8 +39,8 @@ pub(crate) fn build_plugin_meta_tool_defs() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "plugin.describe_tool".to_owned(),
-            description: "Return the full manifest description and input schema for one installed plugin tool. Use after plugin.search_tools when you need exact argument details.".to_owned(),
+            name: "plugin_describe".to_owned(),
+            description: "Return the full manifest description and input schema for one installed plugin tool. Use after plugin_search when you need exact argument details.".to_owned(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -51,14 +51,14 @@ pub(crate) fn build_plugin_meta_tool_defs() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
-            name: "plugin.invoke".to_owned(),
-            description: "Call an installed plugin tool after discovering it with plugin.search_tools or plugin.describe_tool. The host validates the tool exists and checks required arguments against the plugin manifest before dispatch.".to_owned(),
+            name: "plugin_invoke".to_owned(),
+            description: "Call an installed plugin tool after discovering it with plugin_search or plugin_describe. The host validates the tool exists and checks required arguments against the plugin manifest before dispatch.".to_owned(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "plugin": {"type": "string", "description": "Installed plugin name, e.g. douyin."},
                     "tool": {"type": "string", "description": "Tool name inside the plugin, without plugin prefix, e.g. publish."},
-                    "arguments": {"type": "object", "description": "Arguments for the plugin tool. Must match the schema returned by plugin.search_tools or plugin.describe_tool."}
+                    "arguments": {"type": "object", "description": "Arguments for the plugin tool. Must match the schema returned by plugin_search or plugin_describe."}
                 },
                 "required": ["plugin", "tool", "arguments"]
             }),
@@ -69,7 +69,7 @@ pub(crate) fn build_plugin_meta_tool_defs() -> Vec<ToolDef> {
 /// Render a plugin's tools as `- name: one-line purpose` lines for the catalog.
 /// Tools named in `common` come first (in `common` order); the rest follow
 /// sorted by name. Output is capped at `cap`; the remainder is summarised with
-/// a pointer to plugin.search_tools. Byte-stable for a given input (KV-cache
+/// a pointer to plugin_search. Byte-stable for a given input (KV-cache
 /// hygiene in the per-machine layer). `tools` is (name, description) pairs.
 fn plugin_tool_list(tools: &[(&str, &str)], common: &[String], cap: usize) -> String {
     if tools.is_empty() {
@@ -108,7 +108,7 @@ fn plugin_tool_list(tools: &[(&str, &str)], common: &[String], cap: usize) -> St
         let n = total - cap;
         let noun = if n == 1 { "tool" } else { "tools" };
         lines.push(format!(
-            "- …{n} more {noun} — plugin.search_tools to find them"
+            "- …{n} more {noun} — plugin_search to find them"
         ));
     }
     lines.join("\n")
@@ -135,8 +135,8 @@ fn render_plugin_catalog_block(
     };
     format!(
         "{heading}\n\
-         Common tools (call via plugin.invoke {{plugin:\"{name}\", tool, arguments}}; \
-         use plugin.search_tools {{plugin:\"{name}\", query}} for others):\n\
+         Common tools (call via plugin_invoke {{plugin:\"{name}\", tool, arguments}}; \
+         use plugin_search {{plugin:\"{name}\", query}} for others):\n\
          {list}"
     )
 }
@@ -225,7 +225,7 @@ pub(crate) fn build_plugins_system(
     Some(format!(
         "## Installed Plugins\n\
          Each plugin bundles many tools. The common ones are listed below; \
-         call them with `plugin.invoke`, and use `plugin.search_tools` \
+         call them with `plugin_invoke`, and use `plugin_search` \
          {{plugin, query}} to find any not listed. Prefer a plugin over a \
          generic browser flow when it covers the task.\n\n\
          {}",
@@ -253,16 +253,16 @@ pub(crate) fn toolset_allowed_names(
         "clarify",
         "anycli",
         "skill_use",
-        "plugin.info",
-        "plugin.search_tools",
-        "plugin.describe_tool",
-        "plugin.invoke",
+        "plugin_list",
+        "plugin_search",
+        "plugin_describe",
+        "plugin_invoke",
     ];
     const WEB: &[&str] = &[
-        "plugin.info",
-        "plugin.search_tools",
-        "plugin.describe_tool",
-        "plugin.invoke",
+        "plugin_list",
+        "plugin_search",
+        "plugin_describe",
+        "plugin_invoke",
         "web_search",
         "web_fetch",
         "web_download",
@@ -274,10 +274,10 @@ pub(crate) fn toolset_allowed_names(
         "skill_use",
     ];
     const CODE: &[&str] = &[
-        "plugin.info",
-        "plugin.search_tools",
-        "plugin.describe_tool",
-        "plugin.invoke",
+        "plugin_list",
+        "plugin_search",
+        "plugin_describe",
+        "plugin_invoke",
         "shell",
         "read_file",
         "write_file",
@@ -311,10 +311,10 @@ pub(crate) fn toolset_allowed_names(
         "skill_install",
         "skill_remove",
         "task",
-        "plugin.info",
-        "plugin.search_tools",
-        "plugin.describe_tool",
-        "plugin.invoke",
+        "plugin_list",
+        "plugin_search",
+        "plugin_describe",
+        "plugin_invoke",
     ];
 
     let base: Option<&[&str]> = match toolset {
@@ -2014,10 +2014,10 @@ mod plugin_catalog_tests {
         );
         let names: std::collections::HashSet<_> = tools.iter().map(|t| t.name.as_str()).collect();
 
-        assert!(names.contains("plugin.info"));
-        assert!(names.contains("plugin.search_tools"));
-        assert!(names.contains("plugin.describe_tool"));
-        assert!(names.contains("plugin.invoke"));
+        assert!(names.contains("plugin_list"));
+        assert!(names.contains("plugin_search"));
+        assert!(names.contains("plugin_describe"));
+        assert!(names.contains("plugin_invoke"));
     }
 
     #[test]
@@ -2061,10 +2061,10 @@ mod plugin_catalog_tests {
         for toolset in ["minimal", "web", "code", "standard"] {
             let names = toolset_allowed_names(toolset, None).expect("filtered toolset");
 
-            assert!(names.contains("plugin.info"), "{toolset}");
-            assert!(names.contains("plugin.search_tools"), "{toolset}");
-            assert!(names.contains("plugin.describe_tool"), "{toolset}");
-            assert!(names.contains("plugin.invoke"), "{toolset}");
+            assert!(names.contains("plugin_list"), "{toolset}");
+            assert!(names.contains("plugin_search"), "{toolset}");
+            assert!(names.contains("plugin_describe"), "{toolset}");
+            assert!(names.contains("plugin_invoke"), "{toolset}");
         }
     }
 
@@ -2082,7 +2082,7 @@ mod plugin_catalog_tests {
         // Common first, in commonTools order; then others by name; capped at 3.
         assert_eq!(
             out,
-            "- publish: Publish a video\n- list: List items\n- alpha: a\n- …1 more tool — plugin.search_tools to find them"
+            "- publish: Publish a video\n- list: List items\n- alpha: a\n- …1 more tool — plugin_search to find them"
         );
 
         // No common declared → first N by name + overflow.
@@ -2090,7 +2090,7 @@ mod plugin_catalog_tests {
         let out2 = plugin_tool_list(&tools, &none, 2);
         assert_eq!(
             out2,
-            "- alpha: a\n- list: List items\n- …2 more tools — plugin.search_tools to find them"
+            "- alpha: a\n- list: List items\n- …2 more tools — plugin_search to find them"
         );
 
         // Empty.
@@ -2103,7 +2103,7 @@ mod plugin_catalog_tests {
         let block = render_plugin_catalog_block("douyin", "0.1.0", "Douyin ops", &tools, &[], 5);
         assert!(block.contains("### douyin — Douyin ops"));
         assert!(block.contains("- publish: Publish a video"));
-        assert!(block.contains("plugin.search_tools"));
+        assert!(block.contains("plugin_search"));
 
         // Empty blurb → no dangling em-dash.
         let bare = render_plugin_catalog_block("p", "1.0", "", &tools, &[], 5);
