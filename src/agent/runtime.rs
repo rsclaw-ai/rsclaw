@@ -5605,7 +5605,7 @@ impl AgentRuntime {
                     if let crate::provider::MessageContent::Parts(parts) = &msg.content {
                         parts.iter().any(|p| {
                             matches!(p, crate::provider::ContentPart::ToolUse { name, .. }
-                                if name == "opencode" || name == "claudecode" || name == "codex"
+                                if name == "cap"
                                     || name == "web_search" || name == "shell" || name == "execute_command")
                         })
                     } else {
@@ -5998,8 +5998,7 @@ impl AgentRuntime {
                 if matches!(
                     tool_name.as_str(),
                     "web_browser"
-                        | "opencode"
-                        | "claudecode"
+                        | "cap"
                         | "agent"
                         | "search_content"
                         | "search_file"
