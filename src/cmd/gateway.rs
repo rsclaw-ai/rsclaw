@@ -785,12 +785,13 @@ fn try_service_start() -> bool {
 
     #[cfg(target_os = "windows")]
     {
-    let status = std::process::Command::new("sc")
-        .args(["start", "rsclaw"])
-        .creation_flags(0x08000000)
-        .status();
-    return status.map(|s| s.success()).unwrap_or(false);
-}
+        use std::os::windows::process::CommandExt;
+        let status = std::process::Command::new("sc")
+            .args(["start", "rsclaw"])
+            .creation_flags(0x08000000)
+            .status();
+        return status.map(|s| s.success()).unwrap_or(false);
+    }
 
     #[allow(unreachable_code)]
     false
