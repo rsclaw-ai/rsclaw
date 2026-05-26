@@ -69,6 +69,10 @@ import {
   API_TYPE_NEEDS_KEY,
 } from "../lib/provider-defaults";
 import { isTauri, invoke as tauriInvokeV2 } from "../utils/tauri";
+import {
+  startToolInstall,
+  useInstallingTools,
+} from "../lib/tool-install-tracker";
 import { normalizeInstallSpec, recommendedPluginsForRuntime } from "../lib/install-spec";
 
 // ── Types ──────────────────────────────────────────────
@@ -5993,7 +5997,10 @@ function ToolsTab() {
   const zh = getLang() === "cn";
   const [tools, setTools] = useState<HubToolEntry[]>([]);
   const [loading, setLoading] = useState(true);
-  const [installing, setInstalling] = useState<string | null>(null);
+  // Pulled from a module-level tracker so spinner state survives tab
+  // switches — re-mounting ToolsTab while an install is in flight keeps
+  // showing "安装中" instead of resetting to "安装".
+  const installing = useInstallingTools();
   const [errored, setErrored] = useState(false);
 
   const V2 = { bg2: "#141618", bg3: "#1a1c22", bg4: "#1f2126", bd: "rgba(255,255,255,.055)", bd2: "rgba(255,255,255,.09)", t0: "#eceaf4", t1: "#9896a4", t2: "#7e7c8c", t3: "#5a5868", or: "#f97316", olo: "rgba(249,115,22,.09)", obrd: "rgba(249,115,22,.2)", green: "#2dd4a0", glo: "rgba(45,212,160,.07)", gbrd: "rgba(45,212,160,.18)", mono: "'JetBrains Mono', monospace" };
@@ -6015,47 +6022,16 @@ function ToolsTab() {
 
   useEffect(() => { void fetchTools().catch(() => {}); }, [fetchTools]);
 
-  const doInstall = async (name: string) => {
+  const doInstall = (name: string) => {
     if (!isTauri) {
       toast.error(zh ? "安装工具需要桌面版" : "Installing tools requires the desktop app");
       return;
     }
-    setInstalling(name);
-    try {
-      // The Rust side now spawns rsclaw detached and returns immediately —
-      // so this await resolves in <100ms. Real completion = the binary
-      // appearing under ~/.rsclaw/tools/<name>/. Poll get_tool_install_status
-      // (which probes that path) until it goes true or we hit a long
-      // timeout. ffmpeg/node/python: ~10-30s. chrome: a few minutes.
-      await tauriInvokeV2("install_tool", { name, force: true });
-      const POLL_INTERVAL_MS = 1500;
-      const TIMEOUT_MS = 10 * 60 * 1000;
-      const startedAt = Date.now();
-      let installed = false;
-      while (Date.now() - startedAt < TIMEOUT_MS) {
-        await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-        const status = (await tauriInvokeV2("get_tool_install_status", { name })) as {
-          installed?: boolean;
-        };
-        if (status?.installed) {
-          installed = true;
-          break;
-        }
-      }
-      if (!installed) {
-        throw new Error(
-          zh
-            ? "安装超时（10 分钟未检测到本地文件，请检查网络或日志）"
-            : "Install timed out (10min with no local binary detected — check network / logs)",
-        );
-      }
-      await fetchTools().catch(() => {});
-      toast.success(zh ? `${name} 安装完成` : `${name} installed`);
-    } catch (e: any) {
-      const msg = typeof e === "string" ? e : e?.message || "";
-      toast.fromError(zh ? "安装失败" : "Install failed", msg);
-    }
-    setInstalling(null);
+    // Tracker is fire-and-forget — it owns the polling loop + toast
+    // notifications. We just hand it a refresh callback so the tool list
+    // re-fetches on success. Doesn't await — letting the user navigate
+    // away while it runs is the whole point.
+    void startToolInstall(name, async () => { await fetchTools().catch(() => {}); });
   };
 
   return (
@@ -6089,17 +6065,20 @@ function ToolsTab() {
                 </div>
                 {tool.description && <div style={{ fontSize: 11, color: V2.t2, lineHeight: 1.55 }}>{tool.description}</div>}
                 <div style={{ display: "flex", justifyContent: "flex-end" }}>
-                  {tool.installed ? (
-                    <button onClick={() => void doInstall(tool.name)} disabled={installing === tool.name}
-                      style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${V2.bd2}`, background: V2.bg4, color: V2.t1, fontSize: 11, cursor: installing === tool.name ? "not-allowed" : "pointer" }}>
-                      {installing === tool.name ? (zh ? "更新中..." : "Updating...") : (zh ? "重新安装" : "Reinstall")}
-                    </button>
-                  ) : (
-                    <button onClick={() => void doInstall(tool.name)} disabled={installing === tool.name}
-                      style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${installing === tool.name ? V2.obrd : V2.gbrd}`, background: installing === tool.name ? V2.olo : V2.glo, color: installing === tool.name ? V2.or : V2.green, fontSize: 11, fontWeight: 600, cursor: installing === tool.name ? "not-allowed" : "pointer" }}>
-                      {installing === tool.name ? (zh ? "安装中..." : "Installing...") : (zh ? "安装" : "Install")}
-                    </button>
-                  )}
+                  {(() => {
+                    const isInstalling = installing.has(tool.name);
+                    return tool.installed ? (
+                      <button onClick={() => doInstall(tool.name)} disabled={isInstalling}
+                        style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${V2.bd2}`, background: V2.bg4, color: V2.t1, fontSize: 11, cursor: isInstalling ? "not-allowed" : "pointer" }}>
+                        {isInstalling ? (zh ? "更新中..." : "Updating...") : (zh ? "重新安装" : "Reinstall")}
+                      </button>
+                    ) : (
+                      <button onClick={() => doInstall(tool.name)} disabled={isInstalling}
+                        style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${isInstalling ? V2.obrd : V2.gbrd}`, background: isInstalling ? V2.olo : V2.glo, color: isInstalling ? V2.or : V2.green, fontSize: 11, fontWeight: 600, cursor: isInstalling ? "not-allowed" : "pointer" }}>
+                        {isInstalling ? (zh ? "安装中..." : "Installing...") : (zh ? "安装" : "Install")}
+                      </button>
+                    );
+                  })()}
                 </div>
               </div>
             ))}
