@@ -20,7 +20,7 @@ Most AI agents forget everything between sessions. Every new conversation starts
 
 **RsClaw doesn't forget.**
 
-Built from scratch in Rust, RsClaw (Crab AI / 螃蟹 AI) persists every interaction through a three-layer memory store (redb + tantivy + hnsw_rs), learns from your usage patterns, and ships as a single 15MB binary running on ~20MB RAM. Four agent lifetime modes (Main/Named/Sub/Task), four execution backends (Native Rust/Claude Code/OpenCode/ACP), 13 messaging channels, 15 LLM providers, A2A cross-machine orchestration — all without a line of Node.js. Drop-in OpenClaw replacement.
+Built from scratch in Rust, RsClaw (Crab AI / 螃蟹 AI) persists every interaction through a three-layer memory store (redb + tantivy + hnsw_rs), learns from your usage patterns, and ships as a single 15MB binary running on ~20MB RAM. Four agent lifetime modes (Main/Named/Sub/Task), cap-protocol coding-agent integration (Claude Code/OpenClaude/OpenCode/Codex via `tool_cap`), 13 messaging channels, 15 LLM providers, A2A cross-machine orchestration — all without a line of Node.js. Drop-in OpenClaw replacement.
 
 💬 [Join Community](https://rsclaw.ai/en/community) — WeChat / Feishu / QQ / Telegram
 
@@ -185,17 +185,18 @@ Each agent can use a different execution backend:
 | Backend | Description |
 |---------|-------------|
 | **Native Rust** | Built-in LLM runtime (default, fastest) |
-| **Claude Code** | Claude Agent SDK via ACP protocol |
-| **OpenCode** | Open-source coding agent |
-| **ACP** | Any Agent Client Protocol compliant agent |
+| **Coding agent** | External CLI agent via cap-protocol (`tool_cap`) |
+| **A2A** | Remote agent via Google A2A v1.0 |
+
+The LLM picks a coding agent via `tool_cap(agent, task, cwd?, model?)` where
+`agent` is one of `claudecode | openclaude | opencode | codex`.
 
 ```json5
 {
   agents: {
     list: [
       { id: "main", default: true, model: { primary: "qwen-plus" } },
-      { id: "coder", model: { primary: "deepseek-chat", toolset: "code" },
-        claudecode: { command: "claude-agent-acp" } },  // uses Claude Code backend
+      { id: "coder", model: { primary: "deepseek-chat", toolset: "code" } },
     ],
     a2a: [
       { id: "gpu-worker", url: "http://gpu-server:18888", token: "${TOKEN}" },
@@ -215,6 +216,17 @@ Permission model:
 ### A2A Protocol
 
 Implements [Google A2A v1.0](https://a2a-protocol.org/) for cross-network agent collaboration. Auto-discovery via `/.well-known/agent.json`, JSON-RPC 2.0 task dispatch, streaming support.
+
+### Coding Agent Integration
+
+rsclaw drives external CLI coding agents through [cap-protocol](https://github.com/rsclaw-ai/cap-protocol). The LLM uses a single tool `tool_cap(agent, task, cwd?, model?)` where `agent` is one of `claudecode | openclaude | opencode | codex`. No configuration needed — just have the relevant binary on `$PATH` (or set its env override).
+
+| Agent | Binary | Env override |
+|-------|--------|-------------|
+| claudecode | `claude` | `CLAUDE_BIN` |
+| openclaude | `openclaude` | `OPENCLAUDE_BIN` |
+| opencode | `opencode` | `OPENCODE_BIN` |
+| codex | `codex` | *(none yet; must be on `$PATH`)* |
 
 ### Security
 
@@ -541,7 +553,7 @@ src/
   store/       redb + tantivy + hnsw_rs
   browser/     Chrome CDP automation
   a2a/         Google A2A v1.0
-  acp/         ACP protocol
+  cap/         cap-protocol coding-agent driver
   ws/          WebSocket v3
 ```
 

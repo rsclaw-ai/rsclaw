@@ -2014,7 +2014,7 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
     );
 
     // -----------------------------------------------------------------------
-    // ACP tool messages (OpenCode / Claude Code)
+    // cap-protocol tool messages (coding agents: claudecode / openclaude / opencode / codex)
     // -----------------------------------------------------------------------
 
     msg!("acp_start_failed",
