@@ -170,33 +170,50 @@ export function MemoryPage() {
             value={stats.by_tier?.core || 0}
             accent={TIER_COLOR.core}
             tooltip={zh ? "核心层：高频访问 / 高重要度，衰减最慢。系统自动按 importance + access_count + 时间评分" : "Core tier: high-frequency / high-importance, slowest decay. Auto-classified by importance × access_count × age."}
-            onClick={() => setTierFilter(tierFilter === "core" ? "all" : "core")}
-            active={tierFilter === "core"}
+            onClick={() => {
+              // Single-select chip group: picking a tier clears 永久 so
+              // only one filter is active at a time. Same dance below for
+              // Working / Peripheral / Permanent.
+              setPinnedOnly(false);
+              setTierFilter(tierFilter === "core" ? "all" : "core");
+            }}
+            active={tierFilter === "core" && !pinnedOnly}
           />
           <StatPill
             label={zh ? "工作" : "Working"}
             value={stats.by_tier?.working || 0}
             accent={TIER_COLOR.working}
             tooltip={zh ? "工作层：近期活跃但尚未沉淀的记忆，标准衰减速度" : "Working tier: recently active but not yet consolidated. Standard decay rate."}
-            onClick={() => setTierFilter(tierFilter === "working" ? "all" : "working")}
-            active={tierFilter === "working"}
+            onClick={() => {
+              setPinnedOnly(false);
+              setTierFilter(tierFilter === "working" ? "all" : "working");
+            }}
+            active={tierFilter === "working" && !pinnedOnly}
           />
           <StatPill
             label={zh ? "外围" : "Peripheral"}
             value={stats.by_tier?.peripheral || 0}
             accent={TIER_COLOR.peripheral}
             tooltip={zh ? "外围层：低频 / 低重要度，衰减最快，可能被清理" : "Peripheral tier: low-frequency / low-importance, fastest decay, candidate for cleanup."}
-            onClick={() => setTierFilter(tierFilter === "peripheral" ? "all" : "peripheral")}
-            active={tierFilter === "peripheral"}
+            onClick={() => {
+              setPinnedOnly(false);
+              setTierFilter(tierFilter === "peripheral" ? "all" : "peripheral");
+            }}
+            active={tierFilter === "peripheral" && !pinnedOnly}
           />
           <StatPill
             label={zh ? "永久 📌" : "Permanent 📌"}
             value={stats.pinned}
             accent="#f97316"
             tooltip={zh
-              ? "永久记忆：关键事实（电话/姓名/订单号等）永不衰减、永远锁在核心层。横切维度，会与核心/工作/外围重叠计数。"
-              : "Permanent: critical facts (names, phone numbers, IDs, etc.) — never decay, locked in Core tier. Orthogonal to tier; counted alongside Core/Working/Peripheral."}
-            onClick={() => setPinnedOnly((v) => !v)}
+              ? "永久记忆：关键事实（电话/姓名/订单号等）永不衰减、永远锁在核心层。点击仅查看已置顶的条目。"
+              : "Permanent: critical facts (names, phone numbers, IDs, etc.) — never decay, locked in Core tier. Click to filter by pinned only."}
+            onClick={() => {
+              // Picking 永久 supersedes any tier filter — chip group acts
+              // as a single-select so only one is highlighted at a time.
+              setTierFilter("all");
+              setPinnedOnly((v) => !v);
+            }}
             active={pinnedOnly}
           />
           {(tierFilter !== "all" || pinnedOnly) && (
