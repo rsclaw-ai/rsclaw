@@ -1555,8 +1555,7 @@ pub fn build_tool_list(
                     "description": "claudecode — Anthropic Claude Code (general-purpose, strongest tool use). openclaude — OpenClaude (Claude-compatible OSS fork). opencode — OpenCode (TUI-native, fast iteration). codex — OpenAI Codex (reasoning-heavy, slower)."
                 },
                 "task":  { "type": "string", "description": "Task prompt for the agent." },
-                "cwd":   { "type": "string", "description": "Optional working directory; defaults to the agent workspace." },
-                "model": { "type": "string", "description": "Optional model override (claude/openclaude/opencode only — codex ignores)." }
+                "cwd":   { "type": "string", "description": "Optional working directory; defaults to the agent workspace." }
             },
             "required": ["agent", "task"]
         }),

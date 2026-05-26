@@ -1725,32 +1725,11 @@ impl Channel for FeishuChannel {
 }
 
 // ---------------------------------------------------------------------------
-// FeishuNotifier notification types (moved here from deleted src/acp/notification.rs)
+// FeishuNotifier notification types — canonical definitions live in
+// crate::cap::notification; re-exported here for backward-compat.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NotificationPriority {
-    Low = 0,
-    Medium = 1,
-    High = 2,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Notification {
-    pub session_id: Option<String>,
-    pub priority: NotificationPriority,
-    pub title: String,
-    pub body: String,
-    pub burn_after_read: bool,
-}
-
-pub trait NotificationSink: Send + Sync {
-    fn name(&self) -> &str;
-    fn priority_filter(&self) -> NotificationPriority;
-    fn send(&self, notification: &Notification) -> BoxFuture<'_, anyhow::Result<()>>;
-}
+pub use crate::cap::notification::{Notification, NotificationPriority, NotificationSink};
 
 // ---------------------------------------------------------------------------
 // FeishuNotifier implementation

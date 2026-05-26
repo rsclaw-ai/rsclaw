@@ -9,6 +9,7 @@ use tokio::sync::broadcast;
 /// and the future P2 conversation mode (live user-channel sink).
 #[allow(dead_code)]
 pub(crate) struct Sinks<'a> {
+    pub notification: Option<&'a dyn crate::cap::notification::NotificationSink>,
     pub agent_event: Option<&'a broadcast::Sender<crate::events::AgentEvent>>,
     pub reply: Option<&'a mut String>,
     pub session_id: &'a str,
@@ -84,6 +85,7 @@ mod tests {
         let mut reply = String::new();
         let (tx, mut rx) = broadcast::channel(8);
         let mut sinks = Sinks {
+            notification: None,
             agent_event: Some(&tx),
             reply: Some(&mut reply),
             session_id: "sess",
@@ -102,6 +104,7 @@ mod tests {
     #[test]
     fn done_returns_true() {
         let mut sinks = Sinks {
+            notification: None,
             agent_event: None,
             reply: None,
             session_id: "sess",
@@ -122,6 +125,7 @@ mod tests {
     fn thought_is_swallowed_not_relayed() {
         let mut reply = String::new();
         let mut sinks = Sinks {
+            notification: None,
             agent_event: None,
             reply: Some(&mut reply),
             session_id: "sess",

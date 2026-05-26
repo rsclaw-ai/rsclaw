@@ -197,7 +197,13 @@ async fn actor_loop(
                     &mut reply_buf,
                 )
                 .await;
+                let is_err = outcome.is_err();
                 let _ = reply.send(outcome.map(|()| Reply { text: reply_buf }));
+                if is_err {
+                    // Driver died or refused — exit the actor so the slot clears
+                    // and the next dispatch respawns from scratch.
+                    break;
+                }
             }
         }
     }
@@ -224,7 +230,18 @@ async fn run_turn(
             }
             continue;
         }
+        if let AgentEvent::AskUser { ask_id, .. } = &event {
+            let resp = ClientFrame::AskUserAnswer {
+                ask_id: ask_id.clone(),
+                value: serde_json::json!("cancelled"),
+            };
+            if let Err(e) = driver.send(resp).await {
+                return Err(anyhow!("cap ask_user cancel: {e}"));
+            }
+            continue;
+        }
         let mut sinks = bridge::Sinks {
+            notification: None,
             agent_event: Some(bus),
             reply: Some(reply_buf),
             session_id,
@@ -303,6 +320,28 @@ mod tests {
                 intent: serde_json::json!({}),
                 scope: cap_rs::core::PermissionScope::Execute,
                 risk_level: RiskLevel::Low,
+            },
+            text("ok"),
+            done(),
+        ]);
+        let (bus, _rx) = broadcast::channel(8);
+        let mut reply = String::new();
+        run_turn(&mut driver, &bus, "sess", "claudecode", &mut reply)
+            .await
+            .unwrap();
+        assert_eq!(reply, "ok");
+    }
+
+    #[tokio::test]
+    async fn run_turn_cancels_ask_user() {
+        use cap_rs::core::AskKind;
+        let mut driver = FakeDriver::new(vec![
+            AgentEvent::AskUser {
+                ask_id: "q1".into(),
+                prompt: "Continue?".into(),
+                ask_kind: AskKind::YesNo,
+                options: vec![],
+                timeout_seconds: None,
             },
             text("ok"),
             done(),
