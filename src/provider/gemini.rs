@@ -157,7 +157,11 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
         gen_cfg.insert("temperature".to_owned(), super::json_f32(t));
     }
 
-    // Tools.
+    // Tools. Gemini's function-name regex is
+    // `^[a-zA-Z][a-zA-Z0-9_.-]{0,63}$`, which allows `.` — so plugin
+    // tools like `wechat.send_text` pass through unchanged. No
+    // `sanitize_tool_name` wrapper needed (cf. openai.rs / anthropic.rs
+    // which both reject `.` and require the `rc_` wire encoding).
     if !req.tools.is_empty() {
         let functions: Vec<Value> = req
             .tools

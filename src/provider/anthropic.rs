@@ -154,12 +154,16 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
     }
 
     if !req.tools.is_empty() {
+        // Anthropic enforces the same `^[a-zA-Z0-9_-]{1,64}$` pattern
+        // as OpenAI on tool names, so plugin tools like `wechat.send_text`
+        // need the same wire encoding. Restore happens in the agent
+        // runtime after accumulating streamed name fragments.
         let tools: Vec<Value> = req
             .tools
             .iter()
             .map(|t| {
                 json!({
-                    "name":         t.name,
+                    "name":         crate::provider::openai::sanitize_tool_name(&t.name),
                     "description":  t.description,
                     "input_schema": t.parameters,
                 })
@@ -284,7 +288,10 @@ fn serialize_part(part: &ContentPart) -> Value {
         ContentPart::ToolUse { id, name, input } => json!({
             "type": "tool_use",
             "id":    id,
-            "name":  name,
+            // Echo the wire-encoded name so Anthropic accepts the
+            // history block. The runtime stores names in their
+            // original (restored) form, so re-sanitize on serialize.
+            "name":  crate::provider::openai::sanitize_tool_name(name),
             "input": input,
         }),
         ContentPart::ToolResult {

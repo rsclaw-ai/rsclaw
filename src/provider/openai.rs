@@ -39,7 +39,7 @@ const TOOL_NAME_PREFIX: &str = "rc_";
 /// segment. A non-bijective mapping can dispatch OpenAI's tool call to a
 /// different local tool than the one advertised. The `rc_` prefix marks
 /// names that used this encoding; unprefixed legacy/raw names pass through.
-fn sanitize_tool_name(name: &str) -> String {
+pub(crate) fn sanitize_tool_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len() + TOOL_NAME_PREFIX.len() + 2);
     out.push_str(TOOL_NAME_PREFIX);
     for c in name.chars() {
@@ -62,7 +62,11 @@ fn sanitize_tool_name(name: &str) -> String {
 /// Names with no valid escape sequences pass through unchanged, which keeps
 /// compatibility with old transcripts and providers that returned a raw
 /// built-in name.
-fn restore_tool_name(name: &str) -> String {
+///
+/// Idempotent: calling it on a name without the `rc_` prefix returns the
+/// input unchanged. That makes it safe to call from a provider-agnostic
+/// dispatch site once the streamed name is fully accumulated.
+pub(crate) fn restore_tool_name(name: &str) -> String {
     let Some(encoded) = name.strip_prefix(TOOL_NAME_PREFIX) else {
         return name.to_owned();
     };
@@ -1506,11 +1510,13 @@ fn parse_event(data: &str) -> Vec<StreamEvent> {
     {
         let func = &tc["function"];
         let id = tc["id"].as_str().unwrap_or("").to_owned();
-        // Reverse `wechat__send_text` → `wechat.send_text` so the agent
-        // runtime dispatches via the original plugin tool name. Names
-        // arrive in a single chunk (OpenAI doesn't split tool names
-        // across SSE events), so the restore is unambiguous here.
-        let name = restore_tool_name(func["name"].as_str().unwrap_or(""));
+        // Emit the wire-encoded `rc_...` name as-is. The agent runtime
+        // accumulates name fragments across SSE chunks and calls
+        // `restore_tool_name` once after the stream completes — that's
+        // the only point where we know the full encoded name is
+        // available, so it's the only point where the reverse mapping
+        // is unambiguous.
+        let name = func["name"].as_str().unwrap_or("").to_owned();
         let args_str = func["arguments"].as_str().unwrap_or("");
         // Streaming arguments arrive as partial JSON fragments. Keep
         // as raw string — never parse fragments, because
@@ -1949,7 +1955,11 @@ fn parse_completions_fallback(v: &Value) -> Option<StreamEvent> {
     {
         let func = &tc["function"];
         let id = tc["id"].as_str().unwrap_or("").to_owned();
-        let name = restore_tool_name(func["name"].as_str().unwrap_or(""));
+        // Wire-encoded name; restore happens once after accumulation
+        // in the agent runtime (see runtime.rs). Don't restore here:
+        // a name split across SSE chunks would be partially decoded
+        // and produce a wrong dispatch target.
+        let name = func["name"].as_str().unwrap_or("").to_owned();
         let args_str = func["arguments"].as_str().unwrap_or("");
         let input = if args_str.is_empty() {
             Value::Object(Default::default())

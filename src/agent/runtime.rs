@@ -5517,6 +5517,18 @@ impl AgentRuntime {
             // Drop tool calls with empty names (incomplete streaming)
             tool_calls.retain(|(_, name, _)| !name.is_empty());
 
+            // Restore provider-encoded tool names *after* all SSE
+            // fragments are accumulated. OpenAI rejects function names
+            // outside `^[a-zA-Z0-9_-]+$`, so plugin tools like
+            // `wechat.send_text` are wire-encoded to `rc_wechat_d_...`
+            // before the request; we reverse the encoding here, when
+            // the full name is finally known. `restore_tool_name` is
+            // idempotent for non-`rc_` names so it's safe to apply
+            // regardless of which provider produced the chunks.
+            for (_, name, _) in tool_calls.iter_mut() {
+                *name = crate::provider::openai::restore_tool_name(name);
+            }
+
             // Rescue tool calls from text output — some small models (qwen3.5:9b)
             // emit tool calls as XML text instead of proper function_call format.
             // Detect <tool_call>/<function=...> patterns and parse them.
