@@ -1147,11 +1147,12 @@ impl RsclawProvider {
     }
 
     async fn open(&self, split: &SplitRequest<'_>) -> Result<CreateSessionResp> {
-        let (prefix_id, dynamic_prefix) = prefix_fields(
+        let (prefix_id, dynamic_prefix, top_level_user_tools) = prefix_fields(
             &split.prefix_id,
             DynamicPrefixWire {
                 system: split.dynamic_system,
                 tools: &split.dynamic_tools,
+                user_tools: &split.dynamic_user_tools,
                 user_system: split.dynamic_user_system,
             },
         );
@@ -1159,6 +1160,7 @@ impl RsclawProvider {
             prefix_id,
             model: &split.model,
             dynamic_prefix,
+            user_tools: top_level_user_tools,
             options: Some(split.options.clone()),
         };
         // 180s caps the worst-case prefix-decode time for a fresh
@@ -1214,11 +1216,12 @@ impl RsclawProvider {
             &user_system_owned
         };
         let history: Vec<Value> = serialize_replay_history(&filtered);
-        let (prefix_id, dynamic_prefix) = prefix_fields(
+        let (prefix_id, dynamic_prefix, top_level_user_tools) = prefix_fields(
             &split.prefix_id,
             DynamicPrefixWire {
                 system: split.dynamic_system,
                 tools: &split.dynamic_tools,
+                user_tools: &split.dynamic_user_tools,
                 user_system,
             },
         );
@@ -1226,6 +1229,7 @@ impl RsclawProvider {
             prefix_id,
             model: &split.model,
             dynamic_prefix,
+            user_tools: top_level_user_tools,
             history,
             options: Some(split.options.clone()),
         };
@@ -1573,32 +1577,42 @@ enum TurnOutcome {
 // Wire types — mirror rsclaw-protocol.md §2
 // ---------------------------------------------------------------------------
 
-/// Wire shape of `dynamic_prefix` per protocol §2.1.2 (post-2026-05-16
-/// rename: the per-session non-hashed segment is named `user_system`,
-/// not `user_suffix`). Both `system` and `tools` participate in the
-/// worker's content-addressed LRU hash; `user_system` does NOT — it's
-/// stored as a per-session prefix layer between `base` (builtin tools
-/// + base_system) and `session_tail` (history + delta).
+/// Wire shape of `dynamic_prefix` per protocol §2.1.2 (v1.9 segment-aware:
+/// base `system`+`tools` participate in the worker's content-addressed
+/// LRU hash; `user_tools` and `user_system` do NOT — they form a
+/// per-session segment layered on top of the base. Render order on the
+/// worker side is `shared/system + base tools + user_tools + user_system
+/// + turns` inside a single Qwen `<tools>` block).
 #[derive(Debug, Serialize)]
 struct DynamicPrefixWire<'a> {
     #[serde(skip_serializing_if = "str::is_empty")]
     system: &'a str,
-    /// All tools — builtin first, then per-client. rsclaw-server's
-    /// post-rename contract does NOT carry a separate top-level
-    /// `user_tools` field (its `backend/rsclaw_llm.rs` tests assert
-    /// `body.get("user_tools").is_none()`), so the split is encoded
-    /// purely as an ORDERING within this array. Builtins-first means
-    /// the chat-template-rendered byte prefix is stable across every
-    /// client of this RsClaw version, giving the worker's suffix-stable
-    /// LCP trim something to share between clients whose only
-    /// difference is per-machine MCP / plugin tools.
+    /// Shared/base tools — byte-stable across every client of this
+    /// RsClaw version. Participates in `base_hash16` so per-client
+    /// variance MUST go in `user_tools` instead, or the base cache
+    /// fragments to 1-pool-per-client.
     tools: &'a [Value],
+    /// Per-session private tools: plugins, MCP, workspace-specific. Not
+    /// part of `base_hash16`; folded into the user-segment cache key so
+    /// changes here only invalidate the segment, not the base prefix.
+    /// Skipped from the wire when empty so degenerate sessions match
+    /// the v1.7 byte shape that didn't carry the field at all.
+    #[serde(skip_serializing_if = "slice_ref_is_empty")]
+    user_tools: &'a [Value],
     /// Per-session text that does NOT participate in the worker's
     /// system+tools hash. Maps to the worker's `user_system` KV cache
     /// layer. Server treats this as opaque text to prefill after the
     /// base layer and before session_tail.
     #[serde(skip_serializing_if = "str::is_empty")]
     user_system: &'a str,
+}
+
+/// `skip_serializing_if` predicate for `&[T]` fields. Serde hands the
+/// predicate `&FieldType`, so for a `&'a [Value]` field the parameter
+/// is `&&'a [Value]`. The double-ref is what derives the explicit
+/// helper instead of using `<[Value]>::is_empty` inline.
+fn slice_ref_is_empty<T>(s: &&[T]) -> bool {
+    s.is_empty()
 }
 
 #[derive(Debug, Serialize)]
@@ -1622,6 +1636,16 @@ struct CreateSessionReq<'a> {
     /// when `prefix_id` is present (static-registry fork).
     #[serde(skip_serializing_if = "Option::is_none")]
     dynamic_prefix: Option<DynamicPrefixWire<'a>>,
+    /// Protocol §2.1.1 registry-path field: per-session private tools
+    /// (plugins, MCP, workspace) sent at the TOP level alongside
+    /// `prefix_id`. The dynamic path carries the same payload inside
+    /// `dynamic_prefix.user_tools` instead — exactly one of the two
+    /// positions is populated per request (the other is empty and
+    /// skipped from the wire body). Built that way so the worker's
+    /// `tool_name_collision` check (§2.1.4) runs over the same
+    /// (base, user) pair regardless of which path the client took.
+    #[serde(skip_serializing_if = "slice_ref_is_empty")]
+    user_tools: &'a [Value],
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<TurnOptions>,
 }
@@ -1640,23 +1664,47 @@ struct ReplayReq<'a> {
     /// Sent only when `prefix_id` is empty. See `CreateSessionReq`.
     #[serde(skip_serializing_if = "Option::is_none")]
     dynamic_prefix: Option<DynamicPrefixWire<'a>>,
+    /// Same registry-path field as `CreateSessionReq.user_tools` — see
+    /// the comment there for the position-selection rule.
+    #[serde(skip_serializing_if = "slice_ref_is_empty")]
+    user_tools: &'a [Value],
     history: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<TurnOptions>,
 }
 
-/// Split the `(prefix_id, dynamic_prefix)` pair into the mutually-exclusive
-/// wire form: a non-empty `prefix_id` forks from the worker's static
-/// registry (dynamic_prefix omitted); an empty `prefix_id` selects the
-/// dynamic-LRU path (prefix_id omitted, dynamic_prefix carried).
+/// Split the `(prefix_id, dynamic_prefix, dynamic_user_tools)` triple into
+/// the protocol's mutually-exclusive wire shape:
+/// - **Registry path** (`prefix_id` non-empty, §2.1.1): emit `prefix_id`,
+///   omit `dynamic_prefix`, surface `user_tools` at the TOP level so the
+///   worker pairs them with the registered base.
+/// - **Dynamic path** (`prefix_id` empty, §2.1.2): omit `prefix_id`, emit
+///   `dynamic_prefix` carrying the full base+user payload. Top-level
+///   `user_tools` is empty (its values live inside `dynamic_prefix.user_tools`).
+///
+/// In both cases the same `dynamic.user_tools` slice is the source of
+/// truth; this helper just routes it to the correct wire position so the
+/// caller doesn't replicate the conditional at every callsite.
 fn prefix_fields<'a>(
     prefix_id: &'a str,
     dynamic: DynamicPrefixWire<'a>,
-) -> (Option<&'a str>, Option<DynamicPrefixWire<'a>>) {
+) -> (
+    Option<&'a str>,
+    Option<DynamicPrefixWire<'a>>,
+    &'a [Value],
+) {
     if prefix_id.is_empty() {
-        (None, Some(dynamic))
+        // Dynamic path: dynamic_prefix.user_tools already carries the
+        // per-session private tools; the top-level slot stays empty
+        // (skip_serializing_if drops it from the wire body).
+        (None, Some(dynamic), &[])
     } else {
-        (Some(prefix_id), None)
+        // Registry path: lift user_tools out of the dropped
+        // dynamic_prefix and surface them at the top level. The base
+        // (system + builtin tools) lives in the worker's static slot
+        // so dynamic_prefix itself is omitted.
+        let top_level_user_tools = dynamic.user_tools;
+        (Some(prefix_id), None, top_level_user_tools)
     }
 }
 
@@ -1917,7 +1965,7 @@ impl TurnOptions {
 // ---------------------------------------------------------------------------
 
 /// Maps an `LlmRequest` onto the protocol's split fields per
-/// rsclaw-protocol §2.1 (post-rename, hybrid path).
+/// rsclaw-protocol §2.1 (v1.9 segment-aware hybrid path).
 ///
 /// When the runtime populated `req.system_shared` / `req.user_system`
 /// (kvCacheMode=2 path on the main agent loop), the split lands in the
@@ -1927,18 +1975,23 @@ impl TurnOptions {
 /// - `dynamic_user_system`   ← per-machine non-hashed segment → wire
 ///   `dynamic_prefix.user_system` (worker layer-2 cache key intentionally
 ///   EXCLUDES this, so it can vary per session without collapsing the hit rate)
-/// - `dynamic_tools`         ← all tools, builtin-first then per-client.
-///   Encoded as a single array because rsclaw-server's post-rename contract
-///   drops top-level `user_tools` (verified by its own
-///   `body.get("user_tools").is_none()` test). The ordering preserves a
-///   byte-stable rendered prefix across clients of the same RsClaw version
-///   regardless of their per-machine MCP/plugin tools.
+/// - `dynamic_tools`         ← shared/base tools — names from
+///   [`BUILTIN_TOOL_NAMES`]. Participates in `base_hash16`, so this set
+///   MUST be byte-identical across clients of the same RsClaw version
+///   or the base prefix cache fragments per-client.
+/// - `dynamic_user_tools`    ← per-session/per-client private tools:
+///   plugins, MCP, workspace-specific. Not in `base_hash16`; folded
+///   into the user-segment key so two sessions differing only here
+///   share the base cache but get separate segment slots.
 ///
 /// When the split fields are missing (internal sessions / non-runtime
 /// callers) we degrade gracefully: stuff `req.system` into
-/// `dynamic_system`, every tool into `dynamic_tools` in input order,
-/// leave `dynamic_user_system` empty. Same effective cache behaviour
-/// as before this change.
+/// `dynamic_system` and leave `dynamic_user_system` empty. Tool
+/// classification still applies — builtins go to `dynamic_tools`,
+/// everything else to `dynamic_user_tools`. The base cache now hashes
+/// only over the builtin slice, so even internal callers share the
+/// per-version base slot (strict cache improvement over the v1.8
+/// "everything-into-tools" degraded path).
 struct SplitRequest<'a> {
     /// Namespaced `rsclaw/<id>` per protocol §2.10.1.
     prefix_id: String,
@@ -1948,7 +2001,12 @@ struct SplitRequest<'a> {
     model: String,
     dynamic_system: &'a str,
     dynamic_user_system: &'a str,
+    /// Base / shared tools — only names in [`BUILTIN_TOOL_NAMES`].
+    /// Drives `base_hash16`.
     dynamic_tools: Vec<Value>,
+    /// Private tools — names NOT in [`BUILTIN_TOOL_NAMES`]. Drives only
+    /// the user-segment key.
+    dynamic_user_tools: Vec<Value>,
     options: TurnOptions,
 }
 
@@ -2042,13 +2100,18 @@ fn dump_turn_for_debug(
     // Wire body that would rehydrate this session from scratch via
     // `/sessions/replay`. Useful when the session_id is no longer alive
     // on the worker and the operator wants to recreate the exact state.
+    let mut dynamic_prefix_dump = serde_json::Map::new();
+    dynamic_prefix_dump.insert("system".to_owned(), json!(split.dynamic_system));
+    dynamic_prefix_dump.insert("tools".to_owned(), json!(split.dynamic_tools));
+    if !split.dynamic_user_tools.is_empty() {
+        dynamic_prefix_dump.insert("user_tools".to_owned(), json!(split.dynamic_user_tools));
+    }
+    if !split.dynamic_user_system.is_empty() {
+        dynamic_prefix_dump.insert("user_system".to_owned(), json!(split.dynamic_user_system));
+    }
     let replay_body = to_canonical_value(json!({
         "prefix_id": split.prefix_id,
-        "dynamic_prefix": {
-            "system": split.dynamic_system,
-            "tools": split.dynamic_tools,
-            "user_system": split.dynamic_user_system,
-        },
+        "dynamic_prefix": Value::Object(dynamic_prefix_dump),
         "history": history_values,
         "options": serde_json::to_value(&opts).unwrap_or(Value::Null),
     }));
@@ -2197,34 +2260,35 @@ fn split_request<'a>(req: &'a LlmRequest, prefix_id: &str) -> Result<SplitReques
         }))
     };
 
-    let (dynamic_system, dynamic_user_system, dynamic_tools) =
+    // v1.9 split: builtins → `dynamic_prefix.tools` (base hash), everything
+    // else → `dynamic_prefix.user_tools` (user segment). Classification is
+    // by name membership in `BUILTIN_TOOL_NAMES`. This applies in both real
+    // and degraded modes — the system text split degrades, but tool
+    // classification is unconditional so the base cache slot is byte-stable
+    // across clients of this version regardless of which MCP/plugin tools
+    // they bring.
+    let mut dynamic_tools: Vec<Value> = Vec::new();
+    let mut dynamic_user_tools: Vec<Value> = Vec::new();
+    for t in &req.tools {
+        if crate::agent::prompt_builder::BUILTIN_TOOL_NAMES.contains(&t.name.as_str()) {
+            dynamic_tools.push(tool_json(t));
+        } else {
+            dynamic_user_tools.push(tool_json(t));
+        }
+    }
+
+    let (dynamic_system, dynamic_user_system) =
         if req.system_shared.is_some() || req.user_system.is_some() {
-            // Real split — sort tools [builtin..., per-client...] so
-            // the rendered chat-template prefix is byte-stable across
-            // every client of this version up to the per-client tool
-            // boundary.
-            let mut builtin_t = Vec::new();
-            let mut user_t = Vec::new();
-            for t in &req.tools {
-                if crate::agent::prompt_builder::BUILTIN_TOOL_NAMES.contains(&t.name.as_str()) {
-                    builtin_t.push(tool_json(t));
-                } else {
-                    user_t.push(tool_json(t));
-                }
-            }
-            builtin_t.extend(user_t);
             (
                 req.system_shared.as_deref().unwrap_or(""),
                 req.user_system.as_deref().unwrap_or(""),
-                builtin_t,
             )
         } else {
-            // No split available — collapse everything into the
-            // dynamic prefix in input order. Per-client LRU key is over
-            // the full system + tools, so every distinct caller still
-            // gets its own slot (same as pre-split behaviour).
-            let all_tools: Vec<Value> = req.tools.iter().map(tool_json).collect();
-            (req.system.as_deref().unwrap_or(""), "", all_tools)
+            // Internal sessions / non-runtime callers: no system_shared/user_system
+            // split. Collapse the full system text into the base position; the
+            // tool classification above still gives us cacheable base+user
+            // segments.
+            (req.system.as_deref().unwrap_or(""), "")
         };
 
     Ok(SplitRequest {
@@ -2233,6 +2297,7 @@ fn split_request<'a>(req: &'a LlmRequest, prefix_id: &str) -> Result<SplitReques
         dynamic_system,
         dynamic_user_system,
         dynamic_tools,
+        dynamic_user_tools,
         options: TurnOptions::from_request(req),
     })
 }
@@ -4419,12 +4484,15 @@ data: {"type":"block_stop","index":0}
 
     #[test]
     fn split_request_dynamic_tools_are_canonical() {
-        // End-to-end: feed a tool whose input_schema has keys in a
-        // non-alphabetical order, verify the dynamic_tools entry the
-        // provider would put on the wire is in alphabetical order.
+        // End-to-end: feed a non-builtin tool whose input_schema has keys
+        // in a non-alphabetical order, verify the wire entry the provider
+        // would put on the worker (now in `dynamic_user_tools` after the
+        // v1.9 split) is in alphabetical order. Canonicalization is the
+        // same `tool_json` closure for both arrays, so testing one array
+        // covers the other.
         let mut req = req_with(vec![], 2, Some("k"));
         req.tools = vec![crate::provider::ToolDef {
-            name: "search".into(),
+            name: "search".into(), // not in BUILTIN_TOOL_NAMES → user_tools
             description: "look stuff up".into(),
             parameters: json!({
                 "type": "object",
@@ -4436,8 +4504,13 @@ data: {"type":"block_stop","index":0}
             }),
         }];
         let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
-        assert_eq!(split.dynamic_tools.len(), 1);
-        let serialized = serde_json::to_string(&split.dynamic_tools[0]).unwrap();
+        assert_eq!(
+            split.dynamic_tools.len(),
+            0,
+            "non-builtin 'search' must NOT land in the base tools array"
+        );
+        assert_eq!(split.dynamic_user_tools.len(), 1);
+        let serialized = serde_json::to_string(&split.dynamic_user_tools[0]).unwrap();
         // Top level keys: description, input_schema, name (alphabetical).
         // input_schema body: properties, required, type. properties body: k, q.
         // Property bodies: type only (single key — order irrelevant).
@@ -4515,20 +4588,17 @@ data: {"type":"block_stop","index":0}
     }
 
     #[test]
-    fn split_request_orders_builtin_before_user_tools_when_split_present() {
+    fn split_request_separates_builtin_and_user_tools_when_split_present() {
         // With `system_shared` populated, the runtime is in real-split
-        // mode: tools are ordered [builtin..., user...] inside
-        // `dynamic_prefix.tools` so the chat-template-rendered byte
-        // prefix stays stable across every client of this RsClaw
-        // version up to the per-client tool boundary. Top-level
-        // `user_tools` is GONE in the post-rename protocol — verified
-        // by rsclaw-server's own
-        // `v1 top-level user_tools must not be sent` test.
+        // mode: builtins go to `dynamic_prefix.tools` (base hash),
+        // non-builtins go to `dynamic_prefix.user_tools` (user segment).
+        // v1.9 separates the two arrays — they used to be concatenated
+        // with builtin-first ordering inside a single `tools` array.
         let mut req = req_with(vec![], 2, Some("k"));
         req.system_shared = Some("<shared system>".into());
         req.user_system = Some("<user suffix>".into());
-        // Push user-tool first to prove the split sorts it after the
-        // builtin regardless of input order.
+        // Order is irrelevant — classification is by name lookup in
+        // BUILTIN_TOOL_NAMES.
         req.tools.push(ToolDef {
             name: "search".into(), // not in BUILTIN_TOOL_NAMES
             description: "search the web".into(),
@@ -4540,31 +4610,37 @@ data: {"type":"block_stop","index":0}
             parameters: json!({"type":"object","properties":{}}),
         });
         let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
-        assert_eq!(split.dynamic_tools.len(), 2);
-        assert_eq!(
-            split.dynamic_tools[0]["name"], "memory",
-            "builtin must sort before user tool"
-        );
-        assert_eq!(split.dynamic_tools[1]["name"], "search");
+        assert_eq!(split.dynamic_tools.len(), 1, "only 'memory' is builtin");
+        assert_eq!(split.dynamic_tools[0]["name"], "memory");
+        assert_eq!(split.dynamic_user_tools.len(), 1, "'search' is per-client");
+        assert_eq!(split.dynamic_user_tools[0]["name"], "search");
         assert_eq!(split.dynamic_system, "<shared system>");
         assert_eq!(split.dynamic_user_system, "<user suffix>");
     }
 
     #[test]
-    fn split_request_collapses_to_dynamic_when_no_split() {
+    fn split_request_classifies_tools_in_degraded_mode_too() {
         // Internal sessions / non-runtime callers don't populate the
-        // shared/user split. Everything collapses into `dynamic_prefix`
-        // in input order — per-client cache sharing is forfeit but
-        // that's the no-regression baseline.
+        // system_shared/user_system text split — but tool classification
+        // is unconditional, so the base cache still hashes over builtins
+        // only. v1.8 collapsed everything into `tools` here and forfeited
+        // per-client cache sharing; v1.9 keeps the split.
         let mut req = req_with(vec![], 2, Some("k"));
         req.tools.push(ToolDef {
-            name: "search".into(),
+            name: "search".into(), // not builtin
             description: "search".into(),
+            parameters: json!({"type":"object"}),
+        });
+        req.tools.push(ToolDef {
+            name: "memory".into(), // builtin
+            description: "memory".into(),
             parameters: json!({"type":"object"}),
         });
         let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
         assert_eq!(split.dynamic_tools.len(), 1);
-        assert_eq!(split.dynamic_tools[0]["name"], "search");
+        assert_eq!(split.dynamic_tools[0]["name"], "memory");
+        assert_eq!(split.dynamic_user_tools.len(), 1);
+        assert_eq!(split.dynamic_user_tools[0]["name"], "search");
         assert_eq!(split.dynamic_system, "you are an agent");
         assert_eq!(split.dynamic_user_system, "");
     }
@@ -4583,11 +4659,12 @@ data: {"type":"block_stop","index":0}
             parameters: json!({"type":"object"}),
         });
         let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
-        let (prefix_id, dynamic_prefix) = prefix_fields(
+        let (prefix_id, dynamic_prefix, top_level_user_tools) = prefix_fields(
             &split.prefix_id,
             DynamicPrefixWire {
                 system: split.dynamic_system,
                 tools: &split.dynamic_tools,
+                user_tools: &split.dynamic_user_tools,
                 user_system: split.dynamic_user_system,
             },
         );
@@ -4595,6 +4672,7 @@ data: {"type":"block_stop","index":0}
             prefix_id,
             model: &split.model,
             dynamic_prefix,
+            user_tools: top_level_user_tools,
             options: Some(split.options.clone()),
         };
         let v = serde_json::to_value(&body).unwrap();
@@ -4603,9 +4681,12 @@ data: {"type":"block_stop","index":0}
             v.get("dynamic_prefix").is_none(),
             "non-empty prefix_id must OMIT dynamic_prefix (mutually exclusive)"
         );
+        // This req has only the builtin `memory` tool, so dynamic_user_tools
+        // is empty and the skip-if-empty serde rule drops the top-level
+        // `user_tools` slot. The next test exercises the non-empty case.
         assert!(
             v.get("user_tools").is_none(),
-            "post-rename body must omit top-level user_tools"
+            "no per-session private tools → top-level user_tools omitted"
         );
         assert!(
             v.get("rsclaw_version").is_none(),
@@ -4630,6 +4711,111 @@ data: {"type":"block_stop","index":0}
     }
 
     #[test]
+    fn create_session_req_registry_path_sends_top_level_user_tools() {
+        // Non-empty prefix_id + non-builtin tool → registry path: lift
+        // user tools out of the (omitted) dynamic_prefix and place them
+        // at the top level per protocol §2.1.1.
+        let mut req = req_with(vec![], 2, Some("k"));
+        req.system_shared = Some("<sys>".into());
+        req.tools.push(ToolDef {
+            name: "memory".into(), // builtin → drops into base, which the registered prefix already owns
+            description: "memory".into(),
+            parameters: json!({"type":"object"}),
+        });
+        req.tools.push(ToolDef {
+            name: "douyin__publish".into(), // namespaced plugin tool → user_tools
+            description: "publish to douyin".into(),
+            parameters: json!({"type":"object"}),
+        });
+        let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
+        let (prefix_id, dynamic_prefix, top_level_user_tools) = prefix_fields(
+            &split.prefix_id,
+            DynamicPrefixWire {
+                system: split.dynamic_system,
+                tools: &split.dynamic_tools,
+                user_tools: &split.dynamic_user_tools,
+                user_system: split.dynamic_user_system,
+            },
+        );
+        let body = CreateSessionReq {
+            prefix_id,
+            model: &split.model,
+            dynamic_prefix,
+            user_tools: top_level_user_tools,
+            options: Some(split.options.clone()),
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["prefix_id"], "rsclaw/2026.5.20");
+        assert!(
+            v.get("dynamic_prefix").is_none(),
+            "registry path must omit dynamic_prefix"
+        );
+        let tools = v["user_tools"]
+            .as_array()
+            .expect("top-level user_tools must be present");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "douyin__publish");
+    }
+
+    #[test]
+    fn create_session_req_dynamic_path_keeps_user_tools_inside_dynamic_prefix() {
+        // Empty prefix_id → dynamic path: per-session private tools
+        // belong inside dynamic_prefix.user_tools; the top-level slot
+        // must stay empty so we don't double-render the same payload.
+        let mut req = req_with(vec![], 2, Some("k"));
+        req.system_shared = Some("<sys>".into());
+        req.tools.push(ToolDef {
+            name: "memory".into(),
+            description: "memory".into(),
+            parameters: json!({"type":"object"}),
+        });
+        req.tools.push(ToolDef {
+            name: "douyin__publish".into(),
+            description: "publish to douyin".into(),
+            parameters: json!({"type":"object"}),
+        });
+        let split = split_request(&req, "").unwrap();
+        let (prefix_id, dynamic_prefix, top_level_user_tools) = prefix_fields(
+            &split.prefix_id,
+            DynamicPrefixWire {
+                system: split.dynamic_system,
+                tools: &split.dynamic_tools,
+                user_tools: &split.dynamic_user_tools,
+                user_system: split.dynamic_user_system,
+            },
+        );
+        let body = CreateSessionReq {
+            prefix_id,
+            model: &split.model,
+            dynamic_prefix,
+            user_tools: top_level_user_tools,
+            options: Some(split.options.clone()),
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert!(
+            v.get("prefix_id").is_none(),
+            "dynamic path omits top-level prefix_id"
+        );
+        assert!(
+            v.get("user_tools").is_none(),
+            "dynamic path keeps user_tools inside dynamic_prefix"
+        );
+        let dyn_user_tools = v["dynamic_prefix"]["user_tools"]
+            .as_array()
+            .expect("dynamic_prefix.user_tools must be present");
+        assert_eq!(dyn_user_tools.len(), 1);
+        assert_eq!(dyn_user_tools[0]["name"], "douyin__publish");
+        let dyn_tools = v["dynamic_prefix"]["tools"]
+            .as_array()
+            .expect("dynamic_prefix.tools must be present");
+        assert_eq!(dyn_tools.len(), 1);
+        assert_eq!(
+            dyn_tools[0]["name"], "memory",
+            "builtins stay in dynamic_prefix.tools (base hash)"
+        );
+    }
+
+    #[test]
     fn create_session_req_empty_prefix_id_sends_dynamic_prefix() {
         // Empty prefix_id → dynamic-LRU mode: OMIT `prefix_id`, send the
         // full `dynamic_prefix{system,tools,user_system}`.
@@ -4643,11 +4829,12 @@ data: {"type":"block_stop","index":0}
         });
         // Empty prefix_id forces the dynamic-LRU path.
         let split = split_request(&req, "").unwrap();
-        let (prefix_id, dynamic_prefix) = prefix_fields(
+        let (prefix_id, dynamic_prefix, top_level_user_tools) = prefix_fields(
             &split.prefix_id,
             DynamicPrefixWire {
                 system: split.dynamic_system,
                 tools: &split.dynamic_tools,
+                user_tools: &split.dynamic_user_tools,
                 user_system: split.dynamic_user_system,
             },
         );
@@ -4655,6 +4842,7 @@ data: {"type":"block_stop","index":0}
             prefix_id,
             model: &split.model,
             dynamic_prefix,
+            user_tools: top_level_user_tools,
             options: Some(split.options.clone()),
         };
         let v = serde_json::to_value(&body).unwrap();
