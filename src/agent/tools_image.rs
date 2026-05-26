@@ -8,6 +8,27 @@
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
+/// Marker error: a 2xx came back but we couldn't extract the artifact
+/// (parse failed, no image data, download of the returned URL failed,
+/// base64 didn't decode). Per the cost-gate contract, the provider has
+/// already been billed for this attempt, so the chain MUST NOT advance
+/// to another provider — that would double-bill the user. The outer
+/// `tool_image` loop downcasts to detect this and bails immediately.
+#[derive(Debug)]
+struct PostBillingError(String);
+
+impl std::fmt::Display for PostBillingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "image: post-billing failure: {}", self.0)
+    }
+}
+
+impl std::error::Error for PostBillingError {}
+
+fn post_billing<T: Into<String>>(msg: T) -> anyhow::Error {
+    anyhow::Error::new(PostBillingError(msg.into()))
+}
+
 /// Persist generated image bytes to `~/Downloads/rsclaw/images/` with the
 /// canonical `dl_i_<YYYYMMDDHHmm><abc>.<ext>` filename and return the
 /// absolute path. Avoids shipping multi-MB base64 over the WebSocket — the
@@ -102,6 +123,11 @@ impl super::runtime::AgentRuntime {
         };
 
         // ── Pre-submit chain retry ──────────────────────────────────────
+        // Eagerly register health entries for every chain candidate so
+        // `/api/v1/models/health` (and the UI dots) see the full chain
+        // even on a first-call success — `record_success` is a no-op
+        // when the entry doesn't exist yet.
+        self.model_health.ensure(&attempt_models);
         let mut last_error: Option<anyhow::Error> = None;
         for chain_model in &attempt_models {
             if !self.model_health.is_callable(chain_model) {
@@ -120,8 +146,21 @@ impl super::runtime::AgentRuntime {
                     let kind = crate::provider::health::classify_error(&e);
                     let body = format!("{e:#}");
                     let truncated = crate::util::truncate_str(&body, 200).to_owned();
-                    self.model_health.ensure(&[chain_model.clone()]);
                     self.model_health.record_failure(chain_model, kind.clone(), truncated);
+                    // Cost gate: provider already charged for this
+                    // attempt. Surface the failure to the user instead
+                    // of double-billing through the next chain entry.
+                    if e.downcast_ref::<PostBillingError>().is_some() {
+                        tracing::warn!(
+                            model = %chain_model,
+                            kind = ?kind,
+                            error = %e,
+                            "tool_image: post-billing failure — NOT advancing chain"
+                        );
+                        return Err(anyhow!(
+                            "image_gen: provider {chain_model} was billed but did not return a usable image: {e:#}"
+                        ));
+                    }
                     tracing::warn!(
                         model = %chain_model,
                         kind = ?kind,
@@ -262,6 +301,25 @@ impl super::runtime::AgentRuntime {
         let is_qwen = img_prov == "qwen";
         let is_minimax = img_prov == "minimax";
         let is_gemini = img_prov == "gemini";
+        // Read response as raw bytes first, then parse — splitting the
+        // two lets us tell "provider rejected before billing" (non-2xx,
+        // parse-can-be-anything) from "provider charged but didn't
+        // deliver" (2xx with garbled or empty body). The post-billing
+        // case becomes `PostBillingError`, which the chain loop sees
+        // and refuses to advance on.
+        fn parse_response_body(
+            status: reqwest::StatusCode,
+            bytes: &[u8],
+        ) -> Result<Value, anyhow::Error> {
+            if status.is_success() {
+                serde_json::from_slice::<Value>(bytes).map_err(|e| {
+                    let preview: String = String::from_utf8_lossy(bytes).chars().take(200).collect();
+                    post_billing(format!("parse error: {e} (body preview: {preview})"))
+                })
+            } else {
+                Ok(serde_json::from_slice::<Value>(bytes).unwrap_or(Value::Null))
+            }
+        }
         let (resp_status, resp_body) = if is_qwen {
             let qwen_size = size.replace('x', "*");
             let resp = client
@@ -275,10 +333,11 @@ impl super::runtime::AgentRuntime {
                 .send().await
                 .map_err(|e| anyhow!("image: request failed: {e}"))?;
             let st = resp.status();
-            let body: Value = resp
-                .json()
+            let body_bytes = resp
+                .bytes()
                 .await
-                .map_err(|e| anyhow!("image: parse error: {e}"))?;
+                .map_err(|e| anyhow!("image: read body: {e}"))?;
+            let body = parse_response_body(st, &body_bytes)?;
             (st, body)
         } else if is_minimax {
             // Minimax: /v1/image_generation, aspect_ratio instead of size
@@ -322,10 +381,11 @@ impl super::runtime::AgentRuntime {
                 .send().await
                 .map_err(|e| anyhow!("image: request failed: {e}"))?;
             let st = resp.status();
-            let body: Value = resp
-                .json()
+            let body_bytes = resp
+                .bytes()
                 .await
-                .map_err(|e| anyhow!("image: parse error: {e}"))?;
+                .map_err(|e| anyhow!("image: read body: {e}"))?;
+            let body = parse_response_body(st, &body_bytes)?;
             (st, body)
         } else if is_gemini {
             // Gemini: generateContent with responseModalities: ["IMAGE"]
@@ -363,10 +423,11 @@ impl super::runtime::AgentRuntime {
                 .await
                 .map_err(|e| anyhow!("image: gemini request failed: {e}"))?;
             let st = resp.status();
-            let body: Value = resp
-                .json()
+            let body_bytes = resp
+                .bytes()
                 .await
-                .map_err(|e| anyhow!("image: gemini parse error: {e}"))?;
+                .map_err(|e| anyhow!("image: gemini read body: {e}"))?;
+            let body = parse_response_body(st, &body_bytes)?;
             (st, body)
         } else {
             let url = format!("{}/images/generations", img_url.trim_end_matches('/'));
@@ -376,10 +437,11 @@ impl super::runtime::AgentRuntime {
                 .send().await
                 .map_err(|e| anyhow!("image: request failed: {e}"))?;
             let st = resp.status();
-            let body: Value = resp
-                .json()
+            let body_bytes = resp
+                .bytes()
                 .await
-                .map_err(|e| anyhow!("image: parse error: {e}"))?;
+                .map_err(|e| anyhow!("image: read body: {e}"))?;
+            let body = parse_response_body(st, &body_bytes)?;
             (st, body)
         };
 
@@ -410,8 +472,10 @@ impl super::runtime::AgentRuntime {
                         if let Some(b64_data) = inline.get("data").and_then(|v| v.as_str()) {
                             let bytes = base64::engine::general_purpose::STANDARD
                                 .decode(b64_data)
-                                .map_err(|e| anyhow!("image: gemini base64 decode: {e}"))?;
-                            let path = save_generated_image_bytes(&bytes, mime).await?;
+                                .map_err(|e| post_billing(format!("gemini base64 decode: {e}")))?;
+                            let path = save_generated_image_bytes(&bytes, mime)
+                                .await
+                                .map_err(|e| post_billing(format!("save: {e}")))?;
                             return Ok(json!({
                                 "image_path": path,
                                 "mime": mime,
@@ -421,7 +485,7 @@ impl super::runtime::AgentRuntime {
                     }
                 }
             }
-            return Err(anyhow!("image: no image data in Gemini response"));
+            return Err(post_billing("no image data in Gemini response"));
         }
 
         // Each provider may return either a fetchable URL or inline base64.
@@ -455,7 +519,7 @@ impl super::runtime::AgentRuntime {
         };
 
         let Some(img_ref) = img_ref else {
-            return Err(anyhow!("image: no image data in response"));
+            return Err(post_billing("no image data in response"));
         };
 
         // Resolve `img_ref` → bytes + mime.  Three shapes are accepted:
@@ -476,7 +540,7 @@ impl super::runtime::AgentRuntime {
             };
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(b64.trim())
-                .map_err(|e| anyhow!("image: base64 decode: {e}"))?;
+                .map_err(|e| post_billing(format!("base64 decode: {e}")))?;
             (bytes, mime_static)
         } else if img_ref.starts_with("http://") || img_ref.starts_with("https://") {
             let resp = reqwest::Client::new()
@@ -484,14 +548,14 @@ impl super::runtime::AgentRuntime {
                 .timeout(std::time::Duration::from_secs(60))
                 .send()
                 .await
-                .map_err(|e| anyhow!("image: download error: {e}"))?;
+                .map_err(|e| post_billing(format!("download error: {e}")))?;
             if !resp.status().is_success() {
-                return Err(anyhow!("image: download returned {}", resp.status()));
+                return Err(post_billing(format!("download returned {}", resp.status())));
             }
             let bytes = resp
                 .bytes()
                 .await
-                .map_err(|e| anyhow!("image: download failed: {e}"))?
+                .map_err(|e| post_billing(format!("download failed: {e}")))?
                 .to_vec();
             let mime: &str = if img_ref.ends_with(".jpg") || img_ref.ends_with(".jpeg") {
                 "image/jpeg"
@@ -506,10 +570,12 @@ impl super::runtime::AgentRuntime {
             // OpenAI b64_json fall through here.
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(img_ref.trim())
-                .map_err(|e| anyhow!("image: raw base64 decode: {e}"))?;
+                .map_err(|e| post_billing(format!("raw base64 decode: {e}")))?;
             (bytes, "image/png")
         };
-        let image_path = save_generated_image_bytes(&bytes, mime).await?;
+        let image_path = save_generated_image_bytes(&bytes, mime)
+            .await
+            .map_err(|e| post_billing(format!("save: {e}")))?;
 
         let revised = resp_body
             .pointer("/data/0/revised_prompt")

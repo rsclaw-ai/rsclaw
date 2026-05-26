@@ -771,6 +771,9 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
         // the previous one was trying. Acceptable trade-off — sticking
         // with a borked model burns more LLM cost than starting over
         // with a working one.
+        // Eagerly register every chain candidate so /api/v1/models/health
+        // shows the full chain on first-call success.
+        self.model_health.ensure(&vision_chain);
         let mut last_error: Option<anyhow::Error> = None;
         let mut outcome_opt: Option<DriverOutcome> = None;
         for (idx, attempt_model) in vision_chain.iter().enumerate() {

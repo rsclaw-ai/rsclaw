@@ -120,6 +120,12 @@ impl super::runtime::AgentRuntime {
 
         let prompt_preview: String = prompt.chars().take(80).collect();
 
+        // Eagerly register health entries for every chain candidate so
+        // `/api/v1/models/health` sees the full chain even on first-call
+        // success — `record_success` is a no-op when the entry doesn't
+        // exist yet.
+        self.model_health.ensure(&attempt_models);
+
         // ── Submit-only chain retry ──────────────────────────────────────
         // For each model in `attempt_models`:
         //   1. Skip if the shared health table has marked it Disabled or
