@@ -1,15 +1,25 @@
 //! `cap_rs::AgentEvent` → rsclaw sinks dispatch.
+//!
+//! Three sink channels:
+//! - `notif`: live progress notifications to the user's IM channel
+//!   (used by the actor's async submission pattern).
+//! - `agent_event`: real-time WS/desktop event bus (used by the
+//!   originating rsclaw session subscriber to render deltas live).
+//! - `reply`: per-turn accumulator the actor reads at `Done` time for
+//!   the followup-inject summary.
 
 // cap-rs doesn't re-export at the crate root; all protocol types live in cap_rs::core.
 use cap_rs::core::{AgentEvent, TextChannel};
 use tokio::sync::broadcast;
 
+use super::runtime::NotifTarget;
+
 /// Where bridge output lands. All fields are optional so the same
-/// dispatch function serves both tool-mode (reply collector + bus)
-/// and the future P2 conversation mode (live user-channel sink).
+/// dispatch function serves tool-mode (live IM progress + WS bus +
+/// reply collector) and the future P2 conversation mode.
 #[allow(dead_code)]
 pub(crate) struct Sinks<'a> {
-    pub notification: Option<&'a dyn crate::cap::notification::NotificationSink>,
+    pub notif: Option<&'a NotifTarget>,
     pub agent_event: Option<&'a broadcast::Sender<crate::events::AgentEvent>>,
     pub reply: Option<&'a mut String>,
     pub session_id: &'a str,
@@ -19,13 +29,20 @@ pub(crate) struct Sinks<'a> {
 /// Pure mapping: cap-rs AgentEvent → side effects on `sinks`. Returns
 /// `true` when the event is a terminal `Done` so the actor task knows
 /// to resolve the pending oneshot.
+///
+/// Notification policy (matches old `tool_acp*` behaviour):
+/// - `ToolCallStart` → push "🔧 {name}" to IM (low-volume, useful
+///   progress signal).
+/// - `TextChunk` → accumulate into `reply` + relay to `agent_event`
+///   bus (NOT pushed to IM — would flood the channel).
+/// - `Done` → returns `true`. Final summary push is the actor's job
+///   (it has the full `reply` text at that point).
 #[allow(dead_code)]
 pub(crate) fn dispatch(event: &AgentEvent, sinks: &mut Sinks<'_>) -> bool {
     match event {
         AgentEvent::TextChunk { text, channel, .. } => {
-            // cap-rs TextChannel has: Assistant, Thought, System.
-            // Plan assumed Final|Default — adjusted to relay Assistant channel
-            // (the normal output channel) and skip Thought/System here.
+            // cap-rs TextChannel has Assistant, Thought, System.
+            // Only relay Assistant (normal model output).
             if matches!(channel, TextChannel::Assistant) {
                 if let Some(buf) = sinks.reply.as_deref_mut() {
                     buf.push_str(text);
@@ -51,6 +68,21 @@ pub(crate) fn dispatch(event: &AgentEvent, sinks: &mut Sinks<'_>) -> bool {
         }
         AgentEvent::ToolCallStart { name, .. } => {
             tracing::debug!(target: "cap", agent = sinks.agent_id, tool = %name, "cap tool start");
+            if let Some(n) = sinks.notif {
+                let msg = crate::channel::OutboundMessage {
+                    target_id: n.target_id.clone(),
+                    is_group: n.is_group,
+                    text: format!("🔧 {name}"),
+                    reply_to: None,
+                    images: Vec::new(),
+                    files: Vec::new(),
+                    channel: Some(n.channel.clone()),
+                    account: None,
+                };
+                if let Err(e) = n.tx.send(msg) {
+                    tracing::warn!(target: "cap", err = %e, "cap tool-call notif send failed");
+                }
+            }
             false
         }
         AgentEvent::ToolCallEnd { is_error, .. } => {
@@ -85,7 +117,7 @@ mod tests {
         let mut reply = String::new();
         let (tx, mut rx) = broadcast::channel(8);
         let mut sinks = Sinks {
-            notification: None,
+            notif: None,
             agent_event: Some(&tx),
             reply: Some(&mut reply),
             session_id: "sess",
@@ -104,7 +136,7 @@ mod tests {
     #[test]
     fn done_returns_true() {
         let mut sinks = Sinks {
-            notification: None,
+            notif: None,
             agent_event: None,
             reply: None,
             session_id: "sess",
@@ -125,7 +157,7 @@ mod tests {
     fn thought_is_swallowed_not_relayed() {
         let mut reply = String::new();
         let mut sinks = Sinks {
-            notification: None,
+            notif: None,
             agent_event: None,
             reply: Some(&mut reply),
             session_id: "sess",
