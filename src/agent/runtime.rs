@@ -723,6 +723,7 @@ impl AgentRuntime {
         mcp: Option<Arc<crate::mcp::McpRegistry>>,
         notification_tx: Option<tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>>,
         model_health: crate::provider::health::ProviderHealthRegistry,
+        cap_manager: Option<std::sync::Arc<crate::cap::CapAgentManager>>,
     ) -> Self {
         // Populate auth.order so FailoverManager uses the configured profile
         // priority per provider (AGENTS.md §12).
@@ -788,7 +789,7 @@ impl AgentRuntime {
             codex_client: Arc::new(tokio::sync::OnceCell::new()),
             session_aliases,
             exec_pool,
-            cap_manager: None,
+            cap_manager,
         };
 
         // Purge any internal-session history left over in redb from older
