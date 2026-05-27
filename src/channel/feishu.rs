@@ -982,13 +982,41 @@ impl FeishuChannel {
                     match self.download_image(message_id, image_key).await {
                         Ok(bytes) => {
                             use base64::Engine;
-                            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                            let data_url = format!("data:image/png;base64,{b64}");
+                            let orig_len = bytes.len();
+                            // Downscale oversize / hi-res images before
+                            // base64-ing so they fit every provider's inline
+                            // limit. Falls back to original bytes on decode
+                            // failure (best-effort).
+                            let (final_bytes, final_mime) =
+                                crate::util::downscale_image_for_vision(
+                                    bytes,
+                                    "image/png",
+                                    1 * 1024 * 1024, // 1 MB byte trigger
+                                    1920,            // long-edge cap
+                                    85,              // jpeg quality
+                                )
+                                .unwrap_or_else(|e| {
+                                    warn!(error = %e, "feishu: downscale failed, sending original");
+                                    // Reload not possible without bytes; we
+                                    // moved them. This branch is rare (decode
+                                    // failure on a successful download).
+                                    (Vec::new(), "image/png".to_string())
+                                });
+                            if final_bytes.is_empty() {
+                                return Ok(None);
+                            }
+                            let b64 =
+                                base64::engine::general_purpose::STANDARD.encode(&final_bytes);
+                            let data_url = format!("data:{final_mime};base64,{b64}");
                             images.push(crate::agent::registry::ImageAttachment {
                                 data: data_url,
-                                mime_type: "image/png".to_string(),
+                                mime_type: final_mime,
                             });
-                            info!(size = bytes.len(), "feishu: image downloaded for vision");
+                            info!(
+                                from = orig_len,
+                                to = final_bytes.len(),
+                                "feishu: image downloaded for vision"
+                            );
                         }
                         Err(e) => {
                             warn!("feishu: image download failed: {e:#}");
@@ -1066,11 +1094,63 @@ impl FeishuChannel {
                     .await
                 {
                     Ok(bytes) => {
-                        file_attachments.push(crate::agent::registry::FileAttachment {
-                            filename: file_name.to_owned(),
-                            data: bytes,
-                            mime_type: "application/octet-stream".to_owned(),
-                        });
+                        // Feishu auto-promotes large images to "file" type
+                        // messages — same filename extension, just no
+                        // longer routed via the image channel. Detect by
+                        // extension and reroute back to vision so the agent
+                        // can analyze the screenshot the user dragged in.
+                        let lower_name = file_name.to_lowercase();
+                        let is_image = lower_name.ends_with(".jpg")
+                            || lower_name.ends_with(".jpeg")
+                            || lower_name.ends_with(".png")
+                            || lower_name.ends_with(".gif")
+                            || lower_name.ends_with(".webp");
+                        if is_image {
+                            use base64::Engine;
+                            let orig_mime = if lower_name.ends_with(".png") {
+                                "image/png"
+                            } else if lower_name.ends_with(".gif") {
+                                "image/gif"
+                            } else if lower_name.ends_with(".webp") {
+                                "image/webp"
+                            } else {
+                                "image/jpeg"
+                            };
+                            let orig_len = bytes.len();
+                            match crate::util::downscale_image_for_vision(
+                                bytes,
+                                orig_mime,
+                                1 * 1024 * 1024,
+                                1920,
+                                85,
+                            ) {
+                                Ok((final_bytes, final_mime)) => {
+                                    let b64 = base64::engine::general_purpose::STANDARD
+                                        .encode(&final_bytes);
+                                    let data_url =
+                                        format!("data:{final_mime};base64,{b64}");
+                                    images.push(crate::agent::registry::ImageAttachment {
+                                        data: data_url,
+                                        mime_type: final_mime,
+                                    });
+                                    info!(
+                                        name = file_name,
+                                        from = orig_len,
+                                        to = final_bytes.len(),
+                                        "feishu: oversize image rerouted from file to vision"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(name = file_name, error = %e, "feishu: image downscale failed, dropping");
+                                }
+                            }
+                        } else {
+                            file_attachments.push(crate::agent::registry::FileAttachment {
+                                filename: file_name.to_owned(),
+                                data: bytes,
+                                mime_type: "application/octet-stream".to_owned(),
+                            });
+                        }
                         String::new()
                     }
                     Err(e) => {

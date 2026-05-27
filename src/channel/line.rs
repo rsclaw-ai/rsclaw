@@ -148,13 +148,26 @@ impl LineChannel {
                 "image" => match self.download_line_content(&msg.id).await {
                     Ok(bytes) => {
                         use base64::Engine;
-                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        let orig_len = bytes.len();
+                        let (final_bytes, final_mime) =
+                            crate::util::downscale_image_for_vision(
+                                bytes.clone(),
+                                "image/jpeg",
+                                1 * 1024 * 1024,
+                                1920,
+                                85,
+                            )
+                            .unwrap_or_else(|e| {
+                                warn!(error = %e, "LINE: downscale failed");
+                                (bytes, "image/jpeg".to_owned())
+                            });
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&final_bytes);
                         images.push(crate::agent::registry::ImageAttachment {
-                            data: format!("data:image/jpeg;base64,{b64}"),
-                            mime_type: "image/jpeg".to_owned(),
+                            data: format!("data:{final_mime};base64,{b64}"),
+                            mime_type: final_mime,
                         });
                         text = String::new();
-                        info!(size = bytes.len(), "LINE: image downloaded");
+                        info!(from = orig_len, to = final_bytes.len(), "LINE: image downloaded");
                     }
                     Err(e) => {
                         warn!("LINE: image download failed: {e:#}");

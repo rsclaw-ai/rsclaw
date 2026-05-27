@@ -368,13 +368,17 @@ pub fn extract_file_refs(text: &str) -> (String, Vec<ImageAttachment>, Vec<FileA
     let mut images = Vec::new();
     let mut files = Vec::new();
 
-    // Per-image cap. Most providers (Anthropic 5 MB, OpenAI Responses
-    // ~20 MB, Gemini 20 MB, Doubao ~10 MB) reject larger inputs with
-    // opaque 400s; we cap here so the user sees a clear "too large"
-    // marker in the conversation instead of a downstream provider
-    // failure. 10 MB of original bytes = ~13.3 MB of base64 — within
-    // every supported provider's hard limit.
-    const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+    // Downscale thresholds. Anything over 1 MB of bytes OR with a long
+    // edge above 1920 px gets resized + JPEG-re-encoded before going on
+    // the wire. The token cost for vision LLMs is driven by pixel
+    // dimensions, not file size, so the downscale is quality-neutral for
+    // typical screenshots and keeps the payload below every major
+    // provider's hard inline limit. On decode failure we keep the original
+    // bytes — better to ship a possibly-too-large blob than to drop the
+    // user's attachment silently.
+    const DOWNSCALE_BYTE_THRESHOLD: usize = 1 * 1024 * 1024;
+    const DOWNSCALE_MAX_LONG_EDGE: u32 = 1920;
+    const DOWNSCALE_JPEG_QUALITY: u8 = 85;
 
     for cap in RE.captures_iter(text) {
         let path_str = cap[1].trim();
@@ -392,15 +396,7 @@ pub fn extract_file_refs(text: &str) -> (String, Vec<ImageAttachment>, Vec<FileA
             || lower.ends_with(".webp");
 
         if is_image {
-            if data.len() > MAX_IMAGE_BYTES {
-                tracing::warn!(
-                    path = path_str,
-                    bytes = data.len(),
-                    "file ref: image exceeds 10 MB cap, skipping"
-                );
-                continue;
-            }
-            let mime = if lower.ends_with(".png") {
+            let orig_mime = if lower.ends_with(".png") {
                 "image/png"
             } else if lower.ends_with(".gif") {
                 "image/gif"
@@ -409,10 +405,43 @@ pub fn extract_file_refs(text: &str) -> (String, Vec<ImageAttachment>, Vec<FileA
             } else {
                 "image/jpeg"
             };
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+            let orig_len = data.len();
+            let (final_bytes, final_mime) = match crate::util::downscale_image_for_vision(
+                data,
+                orig_mime,
+                DOWNSCALE_BYTE_THRESHOLD,
+                DOWNSCALE_MAX_LONG_EDGE,
+                DOWNSCALE_JPEG_QUALITY,
+            ) {
+                Ok((b, m)) => {
+                    if b.len() != orig_len {
+                        tracing::info!(
+                            path = path_str,
+                            from = orig_len,
+                            to = b.len(),
+                            mime = %m,
+                            "file ref: image downscaled for vision"
+                        );
+                    }
+                    (b, m)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = path_str,
+                        error = %e,
+                        "file ref: downscale failed, sending original bytes"
+                    );
+                    // Fall back: reload + keep original (re-read since `data` was moved)
+                    let Ok(d) = std::fs::read(path) else {
+                        continue;
+                    };
+                    (d, orig_mime.to_string())
+                }
+            };
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&final_bytes);
             images.push(ImageAttachment {
-                data: format!("data:{mime};base64,{b64}"),
-                mime_type: mime.to_owned(),
+                data: format!("data:{final_mime};base64,{b64}"),
+                mime_type: final_mime,
             });
         } else {
             let filename = path

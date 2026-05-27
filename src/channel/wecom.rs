@@ -427,11 +427,24 @@ impl WeComChannel {
                     match self.download_media(url, aeskey).await {
                         Ok(bytes) => {
                             use base64::Engine;
-                            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                            let data_url = format!("data:image/jpeg;base64,{b64}");
+                            let (final_bytes, final_mime) =
+                                crate::util::downscale_image_for_vision(
+                                    bytes.clone(),
+                                    "image/jpeg",
+                                    1 * 1024 * 1024,
+                                    1920,
+                                    85,
+                                )
+                                .unwrap_or_else(|e| {
+                                    warn!(error = %e, "wecom: downscale failed");
+                                    (bytes, "image/jpeg".to_owned())
+                                });
+                            let b64 =
+                                base64::engine::general_purpose::STANDARD.encode(&final_bytes);
+                            let data_url = format!("data:{final_mime};base64,{b64}");
                             images.push(crate::agent::registry::ImageAttachment {
                                 data: data_url,
-                                mime_type: "image/jpeg".to_string(),
+                                mime_type: final_mime,
                             });
                             if text.is_empty() {
                                 text =

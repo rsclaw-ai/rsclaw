@@ -675,15 +675,33 @@ impl WeChatPersonalChannel {
                                 if let Some(src) = src {
                                     match self.download_media_source(&src).await {
                                         Ok(bytes) => {
+                                            let orig_len = bytes.len();
+                                            let (final_bytes, final_mime) =
+                                                crate::util::downscale_image_for_vision(
+                                                    bytes.clone(),
+                                                    "image/jpeg",
+                                                    1 * 1024 * 1024,
+                                                    1920,
+                                                    85,
+                                                )
+                                                .unwrap_or_else(|e| {
+                                                    warn!(error = %e, "wechat: downscale failed");
+                                                    (bytes, "image/jpeg".to_owned())
+                                                });
                                             let b64 = base64::engine::general_purpose::STANDARD
-                                                .encode(&bytes);
-                                            let data_url = format!("data:image/jpeg;base64,{b64}");
+                                                .encode(&final_bytes);
+                                            let data_url =
+                                                format!("data:{final_mime};base64,{b64}");
                                             let images =
                                                 vec![crate::agent::registry::ImageAttachment {
                                                     data: data_url,
-                                                    mime_type: "image/jpeg".to_string(),
+                                                    mime_type: final_mime,
                                                 }];
-                                            info!(size = bytes.len(), "wechat: image received");
+                                            info!(
+                                                from = orig_len,
+                                                to = final_bytes.len(),
+                                                "wechat: image received"
+                                            );
                                             if !from.is_empty() {
                                                 (self.on_message)(
                                                     from.clone(),

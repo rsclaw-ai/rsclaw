@@ -876,20 +876,37 @@ impl Channel for TelegramChannel {
                                         match self.download_file(&largest.file_id).await {
                                             Ok(bytes) => {
                                                 use base64::Engine;
-                                                let b64 = base64::engine::general_purpose::STANDARD
-                                                    .encode(&bytes);
-                                                let data_url =
-                                                    format!("data:image/jpeg;base64,{b64}");
-                                                images.push(
-                                                    crate::agent::registry::ImageAttachment {
-                                                        data: data_url,
-                                                        mime_type: "image/jpeg".to_string(),
-                                                    },
-                                                );
-                                                info!(
-                                                    size = bytes.len(),
-                                                    "Telegram photo downloaded for vision"
-                                                );
+                                                let orig_len = bytes.len();
+                                                let (final_bytes, final_mime) =
+                                                    crate::util::downscale_image_for_vision(
+                                                        bytes,
+                                                        "image/jpeg",
+                                                        1 * 1024 * 1024,
+                                                        1920,
+                                                        85,
+                                                    )
+                                                    .unwrap_or_else(|e| {
+                                                        warn!(error = %e, "Telegram: downscale failed");
+                                                        (Vec::new(), "image/jpeg".to_string())
+                                                    });
+                                                if !final_bytes.is_empty() {
+                                                    let b64 =
+                                                        base64::engine::general_purpose::STANDARD
+                                                            .encode(&final_bytes);
+                                                    let data_url =
+                                                        format!("data:{final_mime};base64,{b64}");
+                                                    images.push(
+                                                        crate::agent::registry::ImageAttachment {
+                                                            data: data_url,
+                                                            mime_type: final_mime,
+                                                        },
+                                                    );
+                                                    info!(
+                                                        from = orig_len,
+                                                        to = final_bytes.len(),
+                                                        "Telegram photo downloaded for vision"
+                                                    );
+                                                }
                                             }
                                             Err(e) => {
                                                 warn!("Telegram photo download failed: {e:#}");

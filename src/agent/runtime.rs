@@ -1867,7 +1867,7 @@ impl AgentRuntime {
     async fn caption_images_for_text_only_primary(
         &self,
         user_text: &str,
-        images: &[ImageAttachment],
+        images: &[super::registry::ImageAttachment],
     ) -> Result<String> {
         let vision_chain = self.resolve_vision_chain();
         let vision_model = vision_chain

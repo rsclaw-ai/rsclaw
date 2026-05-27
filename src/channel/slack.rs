@@ -424,18 +424,31 @@ impl SlackChannel {
                                         }
                                     } else if mimetype.starts_with("image/") {
                                         use base64::Engine as _;
-                                        let b64 = base64::engine::general_purpose::STANDARD
-                                            .encode(&bytes);
-                                        let mime = if mimetype.is_empty() {
+                                        let orig_len = bytes.len();
+                                        let orig_mime = if mimetype.is_empty() {
                                             "image/png"
                                         } else {
                                             mimetype
                                         };
+                                        let (final_bytes, final_mime) =
+                                            crate::util::downscale_image_for_vision(
+                                                bytes.clone(),
+                                                orig_mime,
+                                                1 * 1024 * 1024,
+                                                1920,
+                                                85,
+                                            )
+                                            .unwrap_or_else(|e| {
+                                                warn!(error = %e, "Slack: downscale failed");
+                                                (bytes, orig_mime.to_owned())
+                                            });
+                                        let b64 = base64::engine::general_purpose::STANDARD
+                                            .encode(&final_bytes);
                                         images.push(crate::agent::registry::ImageAttachment {
-                                            data: format!("data:{mime};base64,{b64}"),
-                                            mime_type: mime.to_owned(),
+                                            data: format!("data:{final_mime};base64,{b64}"),
+                                            mime_type: final_mime,
                                         });
-                                        info!(size = bytes.len(), %filename, "Slack: image forwarded for vision");
+                                        info!(from = orig_len, to = final_bytes.len(), %filename, "Slack: image forwarded for vision");
                                     } else {
                                         let processed = slack_process_file(filename, &bytes);
                                         file_attachments.push(

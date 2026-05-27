@@ -333,17 +333,31 @@ impl Channel for MatrixChannel {
                             ).await {
                                 Ok(bytes) => {
                                     use base64::Engine;
-                                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                                    let mime = image.info.as_ref()
+                                    let orig_mime = image.info.as_ref()
                                         .and_then(|i| i.mimetype.as_deref())
-                                        .unwrap_or("image/png");
-                                    let data_url = format!("data:{mime};base64,{b64}");
-                                    info!(from = %sender, room = %room_id, size = bytes.len(), "Matrix: image downloaded (SDK)");
+                                        .unwrap_or("image/png")
+                                        .to_owned();
+                                    let orig_len = bytes.len();
+                                    let (final_bytes, final_mime) =
+                                        crate::util::downscale_image_for_vision(
+                                            bytes.clone(),
+                                            &orig_mime,
+                                            1 * 1024 * 1024,
+                                            1920,
+                                            85,
+                                        )
+                                        .unwrap_or_else(|e| {
+                                            warn!(error = %e, "Matrix: downscale failed (SDK)");
+                                            (bytes, orig_mime.clone())
+                                        });
+                                    let b64 = base64::engine::general_purpose::STANDARD.encode(&final_bytes);
+                                    let data_url = format!("data:{final_mime};base64,{b64}");
+                                    info!(from = %sender, room = %room_id, from_bytes = orig_len, to_bytes = final_bytes.len(), "Matrix: image downloaded (SDK)");
                                     on_msg(
                                         sender, crate::i18n::t("describe_image", crate::i18n::default_lang()), room_id, is_group,
                                         vec![crate::agent::registry::ImageAttachment {
                                             data: data_url,
-                                            mime_type: mime.to_owned(),
+                                            mime_type: final_mime,
                                         }],
                                         vec![],
                                     );
@@ -921,11 +935,25 @@ impl Channel for MatrixChannel {
                                                                     resp.bytes().await
                                                                 {
                                                                     use base64::Engine;
-                                                                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                                                    let bytes_vec = bytes.to_vec();
+                                                                    let orig_len = bytes_vec.len();
+                                                                    let (final_bytes, final_mime) =
+                                                                        crate::util::downscale_image_for_vision(
+                                                                            bytes_vec.clone(),
+                                                                            "image/png",
+                                                                            1 * 1024 * 1024,
+                                                                            1920,
+                                                                            85,
+                                                                        )
+                                                                        .unwrap_or_else(|e| {
+                                                                            warn!(error = %e, "Matrix: downscale failed");
+                                                                            (bytes_vec, "image/png".to_owned())
+                                                                        });
+                                                                    let b64 = base64::engine::general_purpose::STANDARD.encode(&final_bytes);
                                                                     let data_url = format!(
-                                                                        "data:image/png;base64,{b64}"
+                                                                        "data:{final_mime};base64,{b64}"
                                                                     );
-                                                                    info!(from = %sender, room = %room_id, size = bytes.len(), "Matrix: image received");
+                                                                    info!(from = %sender, room = %room_id, from_bytes = orig_len, to_bytes = final_bytes.len(), "Matrix: image received");
                                                                     (self.on_message)(
                                                                         sender.to_owned(),
                                                                         crate::i18n::t("describe_image", crate::i18n::default_lang()),
@@ -933,7 +961,7 @@ impl Channel for MatrixChannel {
                                                                         true,
                                                                         vec![crate::agent::registry::ImageAttachment {
                                                                             data: data_url,
-                                                                            mime_type: "image/png".to_owned(),
+                                                                            mime_type: final_mime,
                                                                         }],
                                                                         vec![],
                                                                     );
