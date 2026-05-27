@@ -1,72 +1,108 @@
 # RsClaw
 
-**AI Agent Engine with long-term memory and self-learning — one 15MB binary, 13 channels, 15 LLM providers, A2A cross-machine orchestration, browser automation, all in pure Rust. Your AI never forgets and gets better the more you use it.**
+> **Eine KI-Agenten-Engine, die sich erinnert, lernt und über Maschinen hinweg routet.**
+> 15MB Rust-Binary · A2A Hub-Spoke-Flotte · Dreistufiges Gedächtnis · Vektor + BM25 Wissensbasis · 13 Kanäle · 15 LLM-Anbieter · OpenClaw Drop-in-Ersatz.
 
-[![Rust](https://img.shields.io/badge/Rust-1.91%20Edition%202024-orange)](https://www.rust-lang.org/)
+[![GitHub Stars](https://img.shields.io/github/stars/rsclaw-ai/rsclaw?style=flat&logo=github)](https://github.com/rsclaw-ai/rsclaw/stargazers)
+[![Crates.io](https://img.shields.io/crates/v/rsclaw?style=flat&logo=rust)](https://crates.io/crates/rsclaw)
 [![License](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue)](../../README.md#license)
-[![Binary Size](https://img.shields.io/badge/binary-~15MB-green)]()
+[![Rust](https://img.shields.io/badge/Rust-1.91%2B-orange?logo=rust)](https://www.rust-lang.org/)
 
-[English](../../README.md) | [中文](README_cn.md) | [日本語](README_ja.md) | [한국어](README_ko.md) | [ไทย](README_th.md) | [Tiếng Việt](README_vi.md) | [Français](README_fr.md) | **Deutsch** | [Español](README_es.md) | [Русский](README_ru.md)
-
-RsClaw ist eine komplette Neuentwicklung von [OpenClaw](https://github.com/openclaw/openclaw) in Rust. Es bietet dasselbe Multi-Agenten-KI-Gateway-Protokoll mit 10x schnellerem Start, 10x kleinerem Footprint und ohne Node.js-Abhaengigkeit.
-
+[🇺🇸 English](../../README.md) · [🇨🇳 中文](README_cn.md) · [🇯🇵 日本語](README_ja.md) · [🇰🇷 한국어](README_ko.md) · [ไทย](README_th.md) · [Tiếng Việt](README_vi.md) · [Français](README_fr.md) · **Deutsch** · [Español](README_es.md) · [Русский](README_ru.md)
 
 <p align="center">
   <img src="../images/en.gif" alt="RsClaw Preview" width="800" />
 </p>
 
-💬 [Join Community](https://rsclaw.ai/en/community) — WeChat / Feishu / QQ / Telegram
+Die meisten KI-Agenten sind zustandslose Prozesse, die an einen Chat gebunden sind. **RsClaw ist eine Flotte**: Jeder Knoten speichert strukturiertes Gedächtnis, indiziert eine private Wissensbasis und spricht [Google A2A v1.0](https://a2a-protocol.org/). Eine Anfrage von Ihrem Laptop kann an einen GPU-Spoke für Bildgenerierung, einen Flottenknoten für RAG und einen Remote-Partner-Agent für Spezialaufgaben verteilt werden — alles als ein gestreamter Antwortstrom.
+
+15 MB, ~20 MB RAM, statisches Single-Binary. Reines Rust. Kein Node, kein Python.
+
+💬 [Community beitreten](https://rsclaw.ai/en/community) — WeChat / Feishu / QQ / Telegram
 
 ---
 
-## Hauptmerkmale
-
-- **13+ Nachrichtenkanaele** -- Telegram, Discord, Slack, WeChat, Feishu, DingTalk, QQ, WhatsApp, LINE, Signal, Matrix, Zalo, benutzerdefinierter Webhook
-- **15 LLM-Anbieter** -- OpenAI, Anthropic, Google Gemini, DeepSeek, Qwen, Ollama usw.
-- **32 integrierte Werkzeuge** -- Dateien, Shell, Websuche/Browser, Bildgenerierung, Speicher, Messaging, Cron, A2A
-- **40+ PreParse-Befehle** -- Umgehen LLM, null Token, Sub-Millisekunden-Antwort
-- **CDP-Browser-Automatisierung** -- Integrierte headless Chrome-Steuerung (20 Aktionen)
-- **A2A-Protokoll** -- Google A2A v1.0 (netzwerkuebergreifende Agenten-Zusammenarbeit)
-- **Ausfuehrungssicherheit** -- deny/confirm/allow-Regeln, 50+ Ablehnungsmuster
-
-## Schnellinstallation
+## Installation
 
 ```bash
-# macOS / Linux (automatische Plattformerkennung)
-curl -fsSL https://app.rsclaw.ai/scripts/install.sh | bash
-```
+# Homebrew (macOS / Linux) — empfohlen
+brew tap rsclaw-ai/tap
+brew install rsclaw            # CLI
+brew install --cask rsclaw     # Desktop-App (macOS DMG)
 
-```powershell
-# Windows (PowerShell)
+# Cargo
+cargo install rsclaw
+
+# One-Liner (macOS / Linux)
+curl -fsSL https://app.rsclaw.ai/scripts/install.sh | bash
+
+# Windows
 irm https://app.rsclaw.ai/scripts/install.ps1 | iex
 ```
 
-### Aus Quellcode kompilieren
-
 ```bash
-git clone https://github.com/rsclaw-ai/rsclaw.git
-cd rsclaw
-cargo build --release
+rsclaw setup          # ~/.rsclaw/ initialisieren
+rsclaw onboard        # Interaktiver Assistent: Provider, Channel, Embedder
+rsclaw start
 ```
 
-## Schnellstart
+---
+
+## A2A — Flotten-Level Agent-zu-Agent-Routing
+
+RsClaw implementiert die vollständige [Google A2A v1.0-Spezifikation](https://a2a-protocol.org/latest/specification/) — Streaming, Push-Benachrichtigungen, Task-Persistenz, Cancel, INPUT_REQUIRED-Interrupts, alle 11 JSON-RPC-Methoden — plus ein erstklassiges **Hub-Spoke-Relay**, das eine heterogene Maschinenflotte zu einem logischen Agent verschmilzt. Jeder Spoke hält eine persistente ausgehende WebSocket-Verbindung zum Hub — keine eingehenden Ports auf den Spokes erforderlich. Funktioniert hinter NAT, Firewalls und chinesischer Festlandverbindung.
+
+→ Vollständige Protokollfläche, Hub-Spoke-Betrieb, Identität & ACL, Tunnel-Rezepte: [docs/a2a.md](../a2a.md).
+
+---
+
+## Gedächtnis — dreistufig, zerfallsbewusst, hybride Suche
+
+Langzeitgedächtnis, das Sie nie manuell verwalten müssen. Jede relevante Konversationsrunde extrahiert die Laufzeit dauerhafte Signale in strukturierte Docs (entity / preference / fact / procedure / relationship / lesson / failure), klassifiziert sie in **Core / Working / Peripheral**-Stufen mit per-Stufe **Weibull-Streck-Exponential**-Zerfall und ruft sie über **hybride BM25 + Vektorsuche** (RRF-Fusion) zurück. Originalsprache wird beibehalten — Deutsch rein, Deutsch raus.
+
+→ Stufenmathematik, Extraktor-Prompt-Design, Embedder-Wechsel, HTTP-API: [docs/memory.md](../memory.md).
+
+---
+
+## Wissensbasis — verwaltetes RAG, OOXML-Ingest
+
+First-Class-Speicher für Projektdokumente, Code, Verträge, alles, was der Agent zitieren statt zusammenfassen soll. Collections sind Tag-Veneer über einem gemeinsamen Index. OOXML (.docx / .xlsx / .pptx), PDF, HTML, Markdown, Quellcode werden bei Ingest kanonisiert. Hybride Suche (BM25 + Vektor + RRF + MMR), Antworten zitieren `doc_id` + Offset.
 
 ```bash
-rsclaw onboard    # Einrichtungsassistent
-rsclaw start      # Gateway starten
-rsclaw status     # Status pruefen
-rsclaw doctor --fix  # Gesundheitscheck
+rsclaw knowledge ingest <pfad> --collection vertraege
+rsclaw knowledge search "Q3 Umsatzprognose" --collection finanzbericht
 ```
 
-## Unterstuetzte Plattformen
+→ Collections-Modell, Ingest-Pipeline, Such-Pipeline, CLI / HTTP-API: [docs/kb.md](../kb.md).
 
-macOS (x86_64, ARM64), Linux (x86_64, ARM64), Windows (x86_64, ARM64)
+---
 
-## Dokumentation
+## Kernfunktionen
 
-Vollstaendige Dokumentation in [README.md](../../README.md) (中文) oder [README_en.md](../../README.md) (English).
+- **13+ Nachrichtenkanäle**: Telegram, Discord, Slack, WeChat, Feishu, DingTalk, QQ, WhatsApp, LINE, Signal, Matrix, Zalo, benutzerdefinierter Webhook
+- **15+ LLM-Anbieter**: OpenAI, Anthropic, Gemini, DeepSeek, Qwen, Doubao, Ollama, etc.
+- **Vier Agent-Lebenszeiten**: Main / Named / Sub / Task; vier Backends: Native Rust / Claude Code / OpenCode / ACP
+- **36 eingebaute Tools**: Dateien, Shell, Web, Browser-Automatisierung (CDP), Image / Video, STT / TTS, computer_use, Cron, A2A, Memory, KB
+- **40+ vorab geparste Befehle**: zero-token, Sub-Millisekunden-Antwort
+- **Plugin-Dual-Runtime**: wasm (sandboxed) + node/bun/deno (OpenClaw-kompatibel)
+- **Exec-Sicherheit**: 50+ Deny-Patterns, sandboxed Write, signierte Skills
+
+---
+
+## Migration von OpenClaw
+
+```bash
+openclaw gateway stop
+rsclaw setup          # Erkennt ~/.openclaw/, bietet One-Click-Import
+rsclaw start
+```
+
+`~/.openclaw/` wird niemals modifiziert. Beide können parallel laufen (Ports 18888 vs 18789).
+
+---
 
 ## Lizenz
 
-Dieses Projekt ist unter MIT OR Apache-2.0 doppelt lizenziert. Details siehe [englische README](../../README.md#license).
+Doppelt lizenziert unter **MIT** OR **Apache-2.0**. Frei nutzbar in persönlichen, kommerziellen, Enterprise-, SaaS- oder proprietären Produkten. Modifikation und Weiterverteilung ohne Copyleft-Verpflichtung. Details: [Englisches README](../../README.md#license).
 
+🦀 Gebaut mit Rust. Inspiriert von der OpenClaw-Community.

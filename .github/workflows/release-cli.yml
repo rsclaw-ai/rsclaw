@@ -53,9 +53,9 @@ jobs:
           toolchain: "1.91"
           targets: ${{ matrix.target }}
 
-      # dtolnay/rust-toolchain@master 的 `targets:` 在某些 runner image
-      # 上偶发不真正下载 target (观察到 macos-14 x86_64-apple-darwin 缺
-      # core/std,E0463)。这一步做兜底,缺则装,装过则 no-op。
+      # Fallback for an intermittent dtolnay/rust-toolchain@master regression
+      # where `targets:` does not actually install the target on some runner
+      # images (E0463 "can't find crate for `core`" on macos-14 x86_64).
       - name: Ensure rust target installed
         shell: bash
         run: rustup target add ${{ matrix.target }} || true
@@ -78,8 +78,22 @@ jobs:
         if: runner.os == 'Windows'
         run: choco install protoc -y
 
-      - name: Build (Unix)
-        if: runner.os != 'Windows'
+      # Linux glibc pinning via cargo-zigbuild + zig as the linker. Without
+      # this, binaries built on ubuntu-24.04 link against glibc 2.39 and fail
+      # at runtime on Ubuntu 22.04 / Debian 11 boxes ("GLIBC_2.39 not found").
+      # Pinning to 2.31 covers Ubuntu 20.04 / Debian 11 and newer.
+      - name: Install zigbuild (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          pip install --user ziglang
+          cargo install --locked cargo-zigbuild
+
+      - name: Build (Linux, glibc-pinned via zigbuild)
+        if: runner.os == 'Linux'
+        run: cargo zigbuild --release --target ${{ matrix.target }}.2.31
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Build (Windows)

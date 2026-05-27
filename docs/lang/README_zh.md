@@ -1,759 +1,405 @@
 # RsClaw
 
-**拥有长期记忆与自我学习能力的 AI 智能体引擎 — 15MB 单文件、13 消息通道、15 LLM 提供商、A2A 跨机编排、浏览器自动化，纯 Rust 构建。你的 AI 不再健忘，越用越懂你。**
+> **会记住、会学习、能跨机路由的 AI Agent 引擎。**
+> 一个 15MB 的 Rust 二进制 · A2A hub-spoke 集群 · 三层记忆 · 向量 + BM25 知识库 · 13 个通道 · 15 个 LLM 提供商 · OpenClaw drop-in 替换。
 
-[![Rust](https://img.shields.io/badge/Rust-1.91%20Edition%202024-orange)](https://www.rust-lang.org/)
+[![GitHub Stars](https://img.shields.io/github/stars/rsclaw-ai/rsclaw?style=flat&logo=github)](https://github.com/rsclaw-ai/rsclaw/stargazers)
+[![Crates.io](https://img.shields.io/crates/v/rsclaw?style=flat&logo=rust)](https://crates.io/crates/rsclaw)
+[![Release](https://img.shields.io/github/v/release/rsclaw-ai/rsclaw)](https://github.com/rsclaw-ai/rsclaw/releases)
+[![Downloads](https://img.shields.io/crates/d/rsclaw?style=flat)](https://crates.io/crates/rsclaw)
 [![License](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue)](../../README.md#license)
-[![Binary Size](https://img.shields.io/badge/binary-~15MB-green)]()
+[![Rust](https://img.shields.io/badge/Rust-1.91%2B-orange?logo=rust)](https://www.rust-lang.org/)
 
-[English](../../README.md) | **中文** | [日本語](README_ja.md) | [한국어](README_ko.md) | [ไทย](README_th.md) | [Tiếng Việt](README_vi.md) | [Français](README_fr.md) | [Deutsch](README_de.md) | [Español](README_es.md) | [Русский](README_ru.md)
-
-螃蟹 AI（RsClaw）是一个会记住的 AI 智能体引擎。15MB 单文件原生可执行程序，连接 13 种消息通道与 AI 智能体，配备持久化长期记忆 — 基于 redb KV + tantivy 全文索引 + hnsw_rs 向量检索的三层存储架构 — 并能从你的使用习惯中自我学习。支持 A2A 协议跨机器编排 Agent、浏览器自动化、7×24 稳定运行。Rust 从零构建，OpenClaw 一键迁移，零 Node.js 依赖。
+[🇺🇸 English](../../README.md) · **🇨🇳 中文** · [🇯🇵 日本語](README_ja.md) · [🇰🇷 한국어](README_ko.md) · [更多语言 ▾](.)
 
 <p align="center">
-  <img src="../images/cn.gif" alt="RsClaw 预览" width="800" />
+  <img src="../images/en.gif" alt="RsClaw Preview" width="800" />
 </p>
 
-💬 [加入用户交流群](https://rsclaw.ai/community) — 微信 / 飞书 / QQ / Telegram
+绝大多数 AI Agent 是绑在聊天框上的无状态进程。**RsClaw 是一个集群**：每个节点持久化结构化记忆、维护私有知识库、说 [Google A2A v1.0 协议](https://a2a-protocol.org/)——你在笔记本上敲的一句话可以同时扇出到 GPU spoke 出图、到大内存 spoke 跑 RAG、到第三方 partner agent 调专项工具，最后汇聚成一条流式回答送回来。
+
+15 MB，~20 MB RAM，单文件静态二进制。纯 Rust，零 Node，零 Python。
+
+💬 [加入社区](https://rsclaw.ai/zh/community) — WeChat / Feishu / QQ / Telegram
+
+---
+
+## 安装
+
+### Homebrew（macOS / Linux）—— 推荐
+
+```bash
+brew tap rsclaw-ai/tap
+brew install rsclaw            # CLI
+brew install --cask rsclaw     # 桌面 app（macOS DMG）
+```
+
+### 其它方式
+
+```bash
+# Cargo
+cargo install rsclaw
+
+# 一键脚本（macOS / Linux）
+curl -fsSL https://app.rsclaw.ai/scripts/install.sh | bash
+
+# Windows
+irm https://app.rsclaw.ai/scripts/install.ps1 | iex
+
+# 或直接从 https://github.com/rsclaw-ai/rsclaw/releases 下载二进制
+```
+
+### 首次启动
+
+```bash
+rsclaw setup          # 初始化 ~/.rsclaw/
+rsclaw onboard        # 交互式向导:provider、channel、记忆嵌入器
+rsclaw start
+```
+
+首次启动会下载本地嵌入模型（BGE-small-zh，约 91 MB）到 `~/.rsclaw/models/`。断点续传;想跳过就预先放入 safetensors。桌面版预打包了该模型。
+
+---
+
+## A2A —— 集群级 Agent 互联
+
+RsClaw 完整实现 [Google A2A v1.0 spec](https://a2a-protocol.org/latest/specification/) —— streaming、push 通知、任务持久化、cancel、INPUT_REQUIRED 中断，11 个 JSON-RPC 方法全部覆盖 —— 再叠加一个**一等公民的 hub-spoke relay**，把异构机器组成的集群变成一个逻辑 Agent。
+
+### 为什么 A2A 是头牌特性
+
+- **一个 gateway，背后多种后端**。Hub 按能力把请求路由到对应 spoke——GPU 机出图出视频、大内存机跑 RAG、partner 机调专有工具。
+- **所有 spoke 在 LLM 眼里就是本地工具**（`agent_<peer-id>`），模型靠工具描述自然挑选，不需要写编排代码。
+- **穿透 NAT、防火墙、国内网络环境**：relay 走一条持久 outbound WebSocket，spoke 不需要开任何 inbound 端口。
+
+### 拓扑
+
+```
+        用户（chat / channel / curl）
+              │
+              ▼
+       ┌──────────────┐
+       │  Hub Agent   │  ← 公网,A2A v1.0 endpoint
+       │   (router)   │
+       └──────┬───────┘
+        WS relay（每个
+        spoke 一条持久
+        连接）
+              │
+   ┌──────────┼──────────┐
+   ▼          ▼          ▼
+spoke-mac  spoke-aihub  spoke-partner
+(你笔电)   (2×4090     (第三方
+            GPU)        gateway)
+```
+
+每个 spoke 就是一个跑在 **relay spoke 模式**下的 `rsclaw gateway run`。Hub 配置里把 spoke 声明为 A2A peer，hub 上的 LLM 就把它们看作 `agent_spoke_mac`、`agent_spoke_aihub` 之类的工具，按能力描述自动路由。
+
+Spoke 配置（一段——这就是全部）：
+
+```json5
+{
+  gateway: {
+    a2a: {
+      relay: {
+        mode: "spoke",
+        nodeId: "spoke-aihub",
+        relays: [
+          "wss://hub.example.com/api/v1/a2a/relay/ws",
+          "wss://backup.example.com/api/v1/a2a/relay/ws",   // 主备
+        ],
+        privateKey: "<keypair>",
+      },
+    },
+  },
+}
+```
+
+Hub 配置——声明 peer，LLM 看描述路由：
+
+```json5
+{
+  agents: {
+    a2a: [
+      { id: "spoke_aihub",
+        url: "http://localhost:18889",        // hub 调自己
+        remoteAgentId: "spoke-aihub/main",
+        description: "GPU 多媒体生成:文生图 / 图生视频 / 数字人 / TTS。\
+                      触发:画 / 生图 / 视频 / 配音 / 数字人。" },
+      { id: "spoke_mac",
+        url: "http://localhost:18889",
+        remoteAgentId: "spoke-mac/main",
+        description: "通用对话 + 浏览器自动化 + 抖音 / 微信 / 飞书。" },
+    ],
+  },
+}
+```
+
+用户说"**用 aihub 画一只猫**" → hub LLM 选中 `agent_spoke_aihub` → relay 转发 → aihub spoke 在 4090 上跑 `aihub-t2i` → 图片路径流式回到 hub，再回到用户。
+
+### 不只 hub-spoke
+
+直连模式也支持——`agents.a2a[].url` 直接指向任意 A2A v1.0 endpoint（rsclaw 或别的兼容实现）：
+
+```bash
+curl -X POST http://127.0.0.1:18888/api/v1/a2a \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"jsonrpc":"2.0","id":"1","method":"SendStreamingMessage",
+       "params":{"message":{"messageId":"m1","role":"user",
+         "parts":[{"type":"text","text":"hi"}]}}}'
+```
+
+Spec 覆盖：`SendMessage` / `SendStreamingMessage` / `SubscribeToTask` / `GetTask` / `ListTasks` / `CancelTask` / push-config CRUD / `GetExtendedAgentCard`。INPUT_REQUIRED 挂起恢复走内置 `wait_input` 工具。任务持久化到 `var/data/a2a/tasks.redb`,`GetTask` 和 webhook 重启不丢。
+
+公网暴露：Cloudflare Tunnel（境外），`frp` + 国内 VPS（国内），或 [`rsclaw-tunnel`](https://github.com/rsclaw-ai/rsclaw-tunnel) 做多租户。**上公网前一定要 set `RSCLAW_A2A_BEARER_TOKENS`**——空 = dev 模式 = 完全开放。
+
+→ 完整协议面、hub-spoke 运维、identity & ACL、tunnel 配方：[docs/a2a.md](../a2a.md)。
+
+---
+
+## 记忆 —— 三层、带衰减、混合召回
+
+不用你手工调 "save_memory" 的长期记忆。每个相关 turn,运行时会：
+
+1. **抽取** 你这条消息里的耐久信号,蒸馏成结构化 doc（entity / preference / fact / procedure / relationship / lesson / failure）,用 flash 模型跑一遍——**原语言保留**（中文输入 → 中文存储,不翻译）。
+2. **分层**：
+   - **Core** —— 身份级（你的名字、联系方式、固化事实）。半衰减地板 0.9,永不降级。
+   - **Working** —— 活跃上下文。标准指数衰减;从 Peripheral 升上来需要频繁被召回。
+   - **Peripheral** —— 低信号。快速衰减;自动降级,定期淘汰。
+3. **衰减** 每个 doc 走 **Weibull 拉伸指数**,每层有不同的 β —— 新近 + 频繁 + 重要的得分高;旧 + 被忽略的 doc 慢慢沉下去。
+4. **召回** 走 **混合检索**：BM25 关键词（tantivy）+ 向量余弦（hnsw_rs），用 RRF 融合。每个相关 turn 自动注入到 LLM 上下文——不用手动 recall。
+
+### 嵌入器分级
+
+| 档位 | 嵌入器 | 延迟 | 何时用 |
+|---|---|---|---|
+| **本地** | BGE-small-zh-v1.5（Candle，91 MB） | ~5 ms / doc | 默认。桌面预打包;CLI 首次启动自动下载。 |
+| **远程** | Qwen3-Embedding-0.6B（1024 维）on llama.cpp endpoint | ~30 ms / doc | 质量更高。配置 `memory.embedder.remote_url`。 |
+
+### 工具 & CLI
+
+```bash
+# Chat 内（预解析,零 token）
+/remember <文本>            # 存到长期记忆
+/recall <query>             # 混合检索（BM25 + 向量 RRF）
+/compact                    # 当前会话压缩 + 存摘要
+
+# CLI / HTTP
+rsclaw memory status        # 分层分布、scope 桶、pinned 数
+rsclaw memory search <q>    # BM25 + 向量混合检索
+curl http://127.0.0.1:18888/api/v1/memory/stats     # JSON 统计
+curl http://127.0.0.1:18888/api/v1/memory/docs?q=…  # 列出 + 搜
+```
+
+scope 默认按 agent 分（`agent:main`）——子 agent 和 channel 可以划自己的 scope 隔离上下文。
+
+→ 分层数学、抽取器 prompt 设计、嵌入器切换、HTTP API：[docs/memory.md](../memory.md)。重设计原始 rationale：[docs/memory-extraction-redesign.md](../memory-extraction-redesign.md)。
+
+---
+
+## 知识库 —— 受管 RAG，吃 OOXML，吐带引用的片段
+
+跟会话记忆解耦的一等公民持久化知识库。用途：项目文档、参考资料、代码库、会议记录、合同条款——任何你希望 agent **引用而不是凭训练自由发挥** 的内容。
+
+- **Collections** —— 单一 embedding 索引上的 tag veneer。桌面 UI 或 HTTP API 创建 / 列表 / 删除;没有 per-collection store 开销。
+- **Ingest** —— 桌面 app 里拖拽,或 `POST /api/v1/knowledge/collections/<id>/docs`。支持纯文本、Markdown、PDF、**OOXML**（.docx / .xlsx / .pptx）、HTML。
+- **Search** —— 跟记忆一样的混合 BM25 + 向量管线,按 collection scope。
+- **默认带引用** —— agent 的 `knowledge_base` 工具返回的 snippet 带 doc-id + offset,回答可以引原文。
+
+```bash
+rsclaw knowledge ingest <path> --collection 会议记录
+rsclaw knowledge search "Q3 营收预测" --collection 财报
+
+# Chat 里——query 命中 collection 时 agent 自动用 knowledge_base 工具
+"根据 Q3 财报,毛利率怎么样?"
+```
+
+→ Collections 模型、ingest 管线、检索（BM25 + 向量 + RRF + MMR）、CLI / HTTP API：[docs/kb.md](../kb.md)。工程实现：[src/kb/README.md](../../src/kb/README.md)。
+
+---
+
+## Agent —— 四种生命周期、四种后端
+
+| 类型 | 创建者 | 持久化 | 杀者 |
+|------|-----------|----------|-----------|
+| **Main** | 系统 | 永久 | 没人——main 不可杀 |
+| **Named** | 用户 / config | 重启幸存 | 仅用户 |
+| **Sub** | LLM `agent_spawn` | 会话级 | 创建者 |
+| **Task** | LLM `agent_task` | 一次性 | 返回时自动销毁 |
+
+```
+Main ──spawn──→ Named "pm"（持久化在 config）
+                 └─spawn──→ Sub "analyst"（会话内）
+                              ├─task──→ Task "search-jd"  ┐
+                              └─task──→ Task "search-tb"  │ 并行
+```
+
+每个 agent 独立选后端：**Native Rust**（默认、最快）、**Claude Code**（Claude Agent SDK + ACP）、**OpenCode**（开源 coding agent）、**任何 ACP-compliant agent**。每个 agent 工具白名单可选 `minimal`（12）/ `web` / `code` / `standard`（16）/ `full`。委派**只能自上而下**——Sub 不能调 Main，平级不能互通。
+
+---
+
+## 通道（13 + 自定义）
+
+| 通道 | 协议 | 备注 |
+|---------|----------|-------|
+| **微信 个人** | ilink long-poll | 扫码登录;语音 / 图片 / 文件 / 视频 |
+| **飞书 / Lark** | WebSocket | OAuth 或 appId+secret |
+| **企微 / WeCom** | AI Bot WebSocket | |
+| **QQ Bot** | Gateway WebSocket | |
+| **钉钉** | Stream Mode WS | |
+| **Telegram** | HTTP long-poll | DM + group |
+| **Discord** | Gateway WS | |
+| **Slack** | Socket Mode | |
+| **WhatsApp** | Cloud API webhook | |
+| **Signal** | signal-cli JSON-RPC | |
+| **LINE / Zalo** | Webhook | |
+| **Matrix** | HTTP /sync | 可选 E2EE |
+| **自定义** | `/hooks/{name}` | 入站 webhook |
+
+每个通道都有：DM/群组 ACL、配对码（8 字符,1 小时）、健康监控、重试、流式、上传文件 confirmation gate。
+
+---
+
+## LLM Providers（15+）
+
+Qwen · DeepSeek · Kimi · 智谱（GLM）· MiniMax · 豆包（字节）· SiliconFlow · GateRouter · OpenRouter · Anthropic · OpenAI · Gemini · xAI（Grok）· Groq · Ollama · 任意 OpenAI 兼容 endpoint。
+
+特性：failover chain、指数退避、模型 fallback（`primary` → `flash` → `vision` → `fallbacks`）、thinking budget、Responses API、Ollama 原生、RsClaw 自有 fleet 的 KV prefix-cache（`rsclaw/*` namespace）。
+
+---
+
+## 工具 & 插件
+
+**36 个内置工具**：文件读写搜、shell 执行（50+ 安全 deny 规则）、web 搜索 / fetch / 下载、浏览器自动化（CDP,50+ 动作,accessibility-tree snapshot）、记忆 CRUD、知识库 CRUD、文档抽取 / 创建（PDF / DOCX / XLSX / PPTX）、图像 / 视频生成、语音 STT（Whisper / SenseVoice）、TTS、computer_use、cron、multi-agent spawn/task、clarify（交互问询）、anycli（结构化 web 抽取）。
+
+**40+ 预解析命令**（本地、零 token、亚毫秒）：`/run`、`/search`、`/help`、`/status`、`/clear`、`/compact`、`/ctx`、`/btw`、`/remember`、`/recall`、`/model`、`/cron`、`/plugin`、…
+
+**插件** —— 双 runtime 设计：
+
+| Runtime | Sandbox | 何时用 |
+|---|---|---|
+| **wasm** | runtime + `host.cli` 允许列表 | 不可信、受限宿主、跨平台 |
+| **node / bun / deno** | install-time 允许列表 | OpenClaw 兼容,完整系统访问 |
+
+`/plugin install <name>` 从 slash 命令或桌面 UI 装。每 agent 启用上限防止上下文溢出（`tools_tokens` 预算）。现有插件：jimeng（即梦图像 / 视频）、douyin（抖音）、wechat、xianyu（闲鱼）、travel。
+
+---
+
+## 配置
+
+```json5
+{
+  gateway: { port: 18888 },
+  models: {
+    providers: {
+      doubao:   { apiKey: "${DOUBAO_API_KEY}" },
+      deepseek: { apiKey: "${DEEPSEEK_API_KEY}" },
+      ollama:   { baseUrl: "http://localhost:11434" },
+    },
+  },
+  agents: {
+    defaults: {
+      model: { primary: "doubao/doubao-seed-1-6-pro",
+               flash: ["doubao/doubao-seed-2.0-lite"] },
+    },
+    list: [{ id: "main", default: true }],
+  },
+  channels: {
+    telegram: { botToken: "${TELEGRAM_BOT_TOKEN}", dmPolicy: "pairing" },
+  },
+}
+```
+
+所有字符串支持 `${VAR}` 环境变量替换。优先级：CLI flag > `$RSCLAW_BASE_DIR/rsclaw.json5` > `~/.rsclaw/rsclaw.json5` > `./rsclaw.json5`。
+
+---
+
+## CLI 速查
+
+```bash
+rsclaw setup / onboard / configure        # 初始化 + 向导
+rsclaw start / stop / restart / status    # gateway 控制
+rsclaw doctor --fix                       # 健康检查
+rsclaw update / upgrade                   # 自更新
+rsclaw tools install chrome / ffmpeg / node / python / opencode
+rsclaw channels login wechat              # 扫码登录
+rsclaw memory status / search / docs      # 记忆操作
+rsclaw knowledge ingest / search / list   # 知识库操作
+rsclaw pairing pair / list / revoke       # 通道配对
+rsclaw browser open / snapshot / click    # 无头 Chrome CLI
+rsclaw anycli run / install / search      # 结构化 web 抽取
+```
 
 ---
 
 ## 从 OpenClaw 迁移
 
 ```bash
-# 停止 OpenClaw
 openclaw gateway stop
-
-# 运行 RsClaw 设置（检测 OpenClaw 数据，提供导入选项）
-rsclaw setup
-
-# 启动 RsClaw
-rsclaw gateway start
+rsclaw setup          # 检测到 ~/.openclaw/,提示一键导入
+rsclaw start
 ```
 
-`rsclaw setup` 检测现有 OpenClaw 安装并提供两个选项：
-
-- **导入**（推荐）-- 将配置、工作区和会话历史复制到 `~/.rsclaw/`。OpenClaw 数据只读，不会被修改。
-- **全新开始** -- 忽略 OpenClaw 数据，从零开始。
-
-配置解析优先级：
-
-| 优先级 | 来源 |
-|--------|------|
-| 1（最高） | `--config-path <file>` CLI 参数 |
-| 2 | `$RSCLAW_BASE_DIR/rsclaw.json5` |
-| 3 | `~/.rsclaw/rsclaw.json5` |
-| 4（最低） | `.rsclaw.json5`（当前目录） |
-
-完全支持所有 OpenClaw 配置字段，未知字段静默忽略以保持前向兼容。
-
----
-
-## RsClaw vs OpenClaw
-
-| 特性 | RsClaw | OpenClaw |
-|------|--------|----------|
-| 语言 | Rust | TypeScript/Node.js |
-| 二进制体积 | ~12MB | ~300MB+（node_modules） |
-| 启动时间 | ~26ms | 2-5s |
-| 内存占用 | ~20MB 空闲 | ~1000MB+ |
-| 依赖数 | 542（Rust crates） | 1000+（npm） |
-| 协议兼容 | OpenClaw WS v3（完整） | 原生 |
-| OpenAI 兼容 | `/v1/chat/completions` + `/v1/models` | `/v1/chat/completions` |
-| 消息通道 | 13 + 自定义 webhook | 8 |
-| LLM 提供商 | 15 个预配置 | ~10 |
-| 内置工具 | 32 | ~25 |
-| 预解析命令 | 40+（零 token，<1ms） | -- |
-| Shell 集成 | 完整 `sh -c`（管道、重定向） | -- |
-| CDP 浏览器 | 内置 headless Chrome（20 个操作） | -- |
-| 读写安全 | 阻止 .ssh、.env、凭证文件 | -- |
-| 可定制默认配置 | 运行时 defaults.toml 覆盖 | -- |
-| 执行安全规则 | deny/confirm/allow（40+ 模式） | -- |
-| 写入沙箱 | 路径隔离 + 内容扫描 | -- |
-| 文件上传门控 | 两层确认（体积 + token） | -- |
-| 视觉模型检测 | 模型名自动匹配 | -- |
-| 图片压缩 | 自动缩放至 1024px JPEG | -- |
-| 办公文档提取 | DOCX/XLSX/PPTX（原生，无需外部工具） | -- |
-| 每智能体权限 | 可配置命令 ACL | -- |
-| 工具循环检测 | 滑动窗口（12 次/8 阈值） | -- |
-| 上传运行时调参 | /set_upload_size, /set_upload_chars | -- |
-| 技能仓库 | ClawHub + SkillHub（自动回退） | 仅 ClawHub |
-| computer_use | 原生截图/鼠标/键盘控制 | 仅通过浏览器 |
-| 配置格式 | JSON5 | JSON5 |
-| 热重载 | 通道变更自动重启 | 支持 |
-| 自更新 | `rsclaw update` 从 GitHub 下载 | npm update |
-
----
-
-## RsClaw 独有功能
-
-### 预解析命令（40+）
-
-本地命令，完全绕过 LLM -- 零 token 消耗，亚毫秒响应。
-
-**Shell / 执行** -- 完整 shell 支持，管道、重定向、链式命令：
-
-| 命令 | 说明 |
-|------|------|
-| `/run <cmd>` | 通过 `sh -c` 执行任意 shell 命令（支持管道：`ls \| grep rs`） |
-| `/sh <cmd>` / `/exec <cmd>` | /run 的别名 |
-| `$ <cmd>` | Shell 快捷方式（同 /run） |
-| `! <cmd>` | Shell 快捷方式（同 /run） |
-| `/ls [args]` | 列出文件（和原生 `ls` 行为一致，如 `/ls -la src/`） |
-| `/cat <file>` | 读取文件内容 |
-| `/read <file>` | 读取文件内容（/cat 别名） |
-| `/write <path> <content>` | 写入文件 |
-| `/find <pattern>` | 按名称查找文件 (`find . -name <pattern>`) |
-| `/grep <pattern>` | 搜索文件内容 (`grep -rn <pattern>`) |
-
-**网页搜索：**
-
-| 命令 | 说明 |
-|------|------|
-| `/search <query>` | 网页搜索（DuckDuckGo/Google/Bing） |
-| `/google <query>` | 网页搜索（别名） |
-| `/fetch <url>` | 获取并提取网页内容 |
-| `/screenshot <url>` | 网页截图 |
-| `/ss` | 桌面截图 |
-
-**系统与会话：**
-
-| 命令 | 说明 |
-|------|------|
-| `/help` | 显示所有可用命令 |
-| `/version` | 显示版本号（日期 + git hash） |
-| `/status` | 网关状态 |
-| `/health` | 健康检查 |
-| `/uptime` | 显示运行时间 |
-| `/models` | 列出可用模型 |
-| `/model <name>` | 切换主模型 |
-| `/clear` | 清除当前会话 |
-| `/history [n]` | 显示最近 N 条消息（默认 20） |
-| `/sessions` | 列出所有会话 |
-| `/cron list` | 列出定时任务 |
-| `/send <to> <msg>` | 发送消息到指定通道/用户 |
-
-**上下文与侧查询：**
-
-| 命令 | 说明 |
-|------|------|
-| `/ctx <text>` | 添加持久背景上下文到当前会话 |
-| `/ctx --ttl <N> <text>` | 添加上下文（N 轮后过期） |
-| `/ctx --global <text>` | 添加全局上下文（所有会话） |
-| `/ctx --list` | 列出活跃上下文 |
-| `/ctx --remove <id>` | 按 ID 移除上下文 |
-| `/ctx --clear` | 清除当前会话所有上下文 |
-| `/btw <问题>` | 侧通道快速查询（跳过智能体队列，直接 LLM 调用） |
-
-**记忆：**
-
-| 命令 | 说明 |
-|------|------|
-| `/remember <text>` | 保存到长期记忆 |
-| `/recall <query>` | 搜索记忆 |
-
-**上传限制：**
-
-| 命令 | 说明 |
-|------|------|
-| `/get_upload_size` | 查看当前文件大小限制 |
-| `/set_upload_size <MB>` | 设置文件大小限制（运行时，重启恢复） |
-| `/get_upload_chars` | 查看当前文本字符限制 |
-| `/set_upload_chars <n>` | 设置文本字符限制（运行时，重启恢复） |
-| `/config_upload_size <MB>` | 设置文件大小限制（写入配置文件，永久生效） |
-| `/config_upload_chars <n>` | 设置文本字符限制（写入配置文件，永久生效） |
-
-**技能：**
-
-| 命令 | 说明 |
-|------|------|
-| `/skill install <name>` | 从仓库安装技能 |
-| `/skill list` | 列出已安装技能 |
-| `/skill search <query>` | 搜索技能仓库 |
-
-### 执行安全规则
-
-可配置的 deny/confirm/allow 模式，保护系统安全。内置 50+ 拒绝模式：
-
-- **拒绝**：`sudo`、`rm -rf /`、`dd`、`mkfs`、`shutdown`、`curl|sh`、读写 `.ssh/`、`.env`、`openclaw.json`、`rsclaw.json5` 等
-- **确认**：`rm -rf`、`git push --force`、`git reset --hard`、`docker rm`、`drop database` 等
-- **允许**：白名单覆盖拒绝规则
-
-读取保护阻止访问：SSH 密钥、GPG 密钥、云凭证（`.aws/`、`.kube/`、`.gcloud/`）、AI 工具配置（`.claude/`、`.opencode/`、`openclaw.json`、`rsclaw.json5`）、Shell 历史、数据库密码和系统认证文件。
-
-在配置中设置 `tools.exec.safety = true` 启用。
-
-### 两层文件上传确认
-
-防止大文件意外消耗大量 token：
-
-- **第一层（体积门）**：文件 > 50MB 触发确认，可选：分析 / 保存到工作区 / 丢弃
-- **第二层（Token 门）**：提取文本 > 50,000 字符触发 token 消耗确认
-
-限制可通过 `/set_upload_size` 和 `/set_upload_chars` 运行时调整。
-
-### 视觉模型自动检测
-
-自动检测当前模型是否支持图片（GPT-4V、Claude 3、Gemini、Qwen-VL 等）。非视觉模型接收 `[image]` 文本占位符而非 base64 数据，避免无声的 token 浪费。
-
-### 原生语音识别（STT）
-
-多提供商语音转文字，自动回退链：
-
-1. **Candle Whisper** -- 本地模型，零 API 成本
-2. **whisper.cpp** -- 本地二进制，CPU 快速推理
-3. **macOS SFSpeechRecognizer** -- 离线，系统级
-4. **腾讯云 ASR** / **阿里云 ASR** -- 云服务
-5. **OpenAI Whisper API** -- 兜底
-
-支持微信 SILK v3、Opus、MP3、WAV、OGG、M4A、AAC、FLAC，纯 Rust symphonia 解码器 + ffmpeg 回退。繁简中文自动转换。
-
-### 视频与音频处理
-
-视频文件（.mp4、.mov、.avi、.mkv、.webm）自动处理：ffmpeg 提取音轨，然后转写为文本。音频文件直接转写。结果作为 `[Audio transcription from {ext} file]` 上下文注入。
-
-### 文档提取
-
-原生文本提取，无需外部工具：
-
-| 格式 | 方式 |
-|------|------|
-| **PDF** | `pdf_extract` crate（纯 Rust），`pdftotext` 回退 |
-| **DOCX** | ZIP → `word/document.xml` 解析 |
-| **XLSX** | ZIP → `xl/sharedStrings.xml` 解析 |
-| **PPTX** | ZIP → `ppt/slides/slide*.xml` 解析 |
-| **文本/代码** | 直接读取（100+ 扩展名自动识别） |
-
-### 图片压缩
-
-图片自动缩放到最大 1024px 并转换为 JPEG，减少 token 消耗。
-
-### 写入沙箱
-
-工作区路径隔离和内容扫描。阻止写入敏感系统路径，扫描脚本内容中的危险模式。
-
-### 每智能体命令权限
-
-主智能体获得 `*`（所有命令）。其他智能体按配置限制，防止未授权的工具访问。
-
-### 工具循环检测
-
-滑动窗口检测器（12 次调用窗口，8 次阈值）防止无限工具调用循环。在生产性操作后自动重置。
-
-### 配置分区菜单
-
-交互式 `rsclaw configure` 包含 7 个分区：
-
-1. 网关（端口、绑定地址）
-2. 模型提供商（提供商、API 密钥、模型）
-3. 消息通道（逐个添加/移除/配置）
-4. 网页搜索（提供商、API 密钥）
-5. 上传限制（文件大小、文本字符数、视觉模型开关）
-6. 执行安全（开/关）
-
-支持 `--section` 参数直达：`rsclaw configure --section channels`。
-
-### CDP 浏览器自动化
-
-内置 headless Chrome 控制，通过 Chrome DevTools Protocol -- 无需 ChromeDriver、Playwright 或 Node.js：
-
-- **20 个操作**：open, snapshot, click, fill, type, select, check/uncheck, scroll, screenshot, pdf, back, forward, reload, get_text, get_url, get_title, wait, evaluate, cookies
-- **无障碍树快照** 带 `@e1`、`@e2` 元素引用，LLM 友好的交互方式
-- **内存自适应**：根据系统内存自动限制 Chrome 实例数（每 2GB 一个，最低 200MB 空闲）
-- **自动生命周期**：5 分钟空闲超时、崩溃检测 + 自动重启、进程退出清理
-
-### 可定制默认配置（`defaults.toml`）
-
-将 `defaults.toml` 放在 `$base_dir/` 即可在运行时覆盖内置默认值，无需重新编译：
-
-- Provider 定义（添加/移除 LLM 提供商）
-- Channel 字段定义（自定义 onboard/configure 向导）
-- 执行安全规则（deny/confirm/allow 模式）
-- 搜索引擎 URL
-- 技能仓库 URL
-
-`rsclaw setup` 会写入一份供编辑的副本。外部文件优先，内置版本为兜底。
-
-### 其他独有特性
-
-- **双技能仓库** -- ClawHub + SkillHub（腾讯 COS）自动回退
-- **computer_use 工具** -- 原生桌面截图、鼠标和键盘控制
-- **ACP 扩展命令** -- spawn/connect/run/send/list/kill（OpenClaw 仅有 `client`）
-- **配对撤销** -- OpenClaw 仅有 approve + list
-- **`--base-dir` / `--config-path` 全局参数** -- 灵活的配置路径覆盖
-- **日期版本号** -- 构建时自动生成 `YYYY.M.D (git-hash)`
-
----
-
-## 快速安装
-
-### 预编译二进制（推荐）
-
-```bash
-# macOS / Linux（自动检测平台）
-curl -fsSL https://app.rsclaw.ai/scripts/install.sh | bash
-```
-
-```powershell
-# Windows（PowerShell）
-irm https://app.rsclaw.ai/scripts/install.ps1 | iex
-```
-
-支持平台：macOS (x86_64, ARM64)、Linux (x86_64, ARM64)、Windows (x86_64, ARM64)。
-
-### 从源码编译
-
-```bash
-git clone https://github.com/rsclaw-ai/rsclaw.git
-cd rsclaw
-cargo build --release
-# 二进制文件位于 ./target/release/rsclaw
-```
-
-### 本地交叉编译
-
-```bash
-# 从 macOS/Linux 主机构建全平台
-./scripts/build.sh all
-
-# 或按平台组构建
-./scripts/build.sh macos    # macOS x86_64 + ARM64
-./scripts/build.sh linux    # Linux x86_64 + ARM64（musl 静态链接）
-./scripts/build.sh windows  # Windows x86_64（MSVC，通过 cargo-xwin）
-```
-
-### 首次运行
-
-```bash
-# 首次设置（检测 OpenClaw 数据并提供导入）
-rsclaw setup
-
-# 启动网关
-rsclaw gateway start
-```
-
----
-
-## 快速开始
-
-```bash
-# 交互式设置向导
-rsclaw onboard
-
-# 启动网关
-rsclaw gateway start
-
-# 查看状态
-rsclaw status
-
-# 健康检查
-rsclaw doctor --fix
-
-# 配置（分区菜单）
-rsclaw configure
-
-# 配置特定分区
-rsclaw configure --section channels
-```
-
----
-
-## 更新 / 升级
-
-```bash
-# 从 GitHub 自动更新
-rsclaw update
-
-# 或从源码手动更新
-cd /path/to/rsclaw
-git pull origin main
-cargo build --release
-
-# 查看当前版本
-rsclaw --version
-```
-
-`rsclaw update` 从 [github.com/rsclaw-ai/rsclaw](https://github.com/rsclaw-ai/rsclaw) 下载最新发布版二进制文件并原地替换。如果以服务方式运行，网关会在更新后自动重启。
-
----
-
-## 支持的消息通道（13 + 自定义）
-
-| # | 通道 | 协议 | 配置方式 |
-|---|------|------|----------|
-| 1 | **微信（个人号）** | ilink 长轮询 | 扫码登录 `rsclaw channels login wechat`。语音 STT、图片/文件/视频、SILK 解码。 |
-| 2 | **飞书 / Lark** | WebSocket | OAuth 扫码或手动填写 `appId` + `appSecret`。事件去重、富文本。 |
-| 3 | **企业微信** | AI Bot WebSocket | `botId` + `secret`（企业微信后台）。自动重连、Markdown 回复。 |
-| 4 | **QQ 机器人** | WebSocket Gateway | `appId` + `appSecret`。群/C2C/频道、沙箱模式。 |
-| 5 | **钉钉** | Stream Mode WebSocket | `appKey` + `appSecret`。私聊 + 群聊、语音转写。 |
-| 6 | **Telegram** | HTTP 长轮询 | `botToken`。私聊 + 群聊（@提及）、语音/图片/文件/视频。 |
-| 7 | **Matrix** | HTTP /sync 长轮询 | `homeserver` + `accessToken` + `userId`。可选 E2EE（`--features channel-matrix`）。 |
-| 8 | **Discord** | Gateway WebSocket | Bot token。Guild/DM、反应通知、流式编辑。 |
-| 9 | **Slack** | Socket Mode WebSocket | `botToken` + `appToken`。无需公网 URL。 |
-| 10 | **WhatsApp** | Webhook (Cloud API) | `WHATSAPP_PHONE_NUMBER_ID` + `WHATSAPP_ACCESS_TOKEN` 环境变量。Meta webhook 验证。 |
-| 11 | **Signal** | signal-cli JSON-RPC | 手机号 + signal-cli 二进制。端到端加密。 |
-| 12 | **LINE** | Webhook | `channelAccessToken` + `channelSecret`。推送/回复 API。 |
-| 13 | **Zalo** | Webhook | `accessToken` + `oaSecret`。官方账号 API。 |
-| -- | **自定义 Webhook** | Webhook POST | 发送 JSON 到 `/hooks/{name}`。通用入站处理器，支持任意平台。 |
-
-通道特性：DM/群组策略（open/pairing/allowlist/disabled）、健康监控、代码块保护的文本分块、指数退避消息重试、配对码（6 字符，1 小时有效期）、流式模式（off/partial/block/progress）、文件上传两层确认。
-
----
-
-## LLM 提供商（15 个预配置）
-
-| 提供商 | 基础 URL | 备注 |
-|--------|----------|------|
-| **通义千问**（阿里 DashScope） | dashscope.aliyuncs.com | qwen-turbo, qwen-plus, qwen-max |
-| **DeepSeek** | api.deepseek.com | 流式工具调用累积 |
-| **Kimi**（月之暗面） | api.moonshot.cn | |
-| **智谱**（GLM） | open.bigmodel.cn | |
-| **MiniMax** | api.minimax.chat | |
-| **GateRouter** | api.gaterouter.com | 多模型路由 |
-| **OpenRouter** | openrouter.ai/api | |
-| **Anthropic** | api.anthropic.com | Claude 3/4 系列 |
-| **OpenAI** | api.openai.com | GPT-4o, o1, o3 |
-| **Google Gemini** | generativelanguage.googleapis.com | |
-| **xAI**（Grok） | api.x.ai | |
-| **Groq** | api.groq.com | Llama, Mixtral |
-| **硅基流动** | api.siliconflow.cn | |
-| **Ollama** | localhost:11434 | 本地模型 |
-| **自定义** | 用户定义 | 任何 OpenAI 兼容 API |
-
-提供商特性：指数退避故障转移、模型回退链、图片回退模型、思维预算分配、token 用量追踪、从配置/环境变量/auth-profiles 自动注册。
-
----
-
-## 内置工具（32 个）
-
-| 分类 | 工具 |
-|------|------|
-| **文件** | `read`、`write` |
-| **Shell** | `exec`（带安全规则） |
-| **记忆** | `memory_search`、`memory_get`、`memory_put`、`memory_delete` |
-| **网页** | `web_search`、`web_fetch`、`web_browser`、`computer_use` |
-| **媒体** | `image`、`pdf`、`tts` |
-| **消息** | `message`、`telegram_actions`、`discord_actions`、`slack_actions`、`whatsapp_actions`、`feishu_actions`、`weixin_actions`、`qq_actions`、`dingtalk_actions` |
-| **会话** | `sessions_send`、`sessions_list`、`sessions_history`、`session_status` |
-| **系统** | `cron`、`gateway`、`subagents`、`agent_spawn`、`agent_list` |
-
-网页搜索引擎：DuckDuckGo（默认）、Brave、Google、Bing -- 通过 `rsclaw configure --section web_search` 配置。
-
----
-
-## 存储架构
-
-| 层级 | 引擎 | 用途 |
-|------|------|------|
-| **热 KV** | redb 2 | 会话、消息、配对状态、配置缓存 |
-| **全文搜索** | tantivy 0.22 | 记忆搜索、文档索引 |
-| **向量搜索** | hnsw_rs 0.3 | 语义相似度、自动召回 |
-
-数据存储在 `$base_dir/var/` -- `var/data/`（redb/search/memory）、`var/run/`、`var/logs/`、`var/cache/`。
-
----
-
-## 配置
-
-示例 `rsclaw.json5`：
-
-```json5
-{
-  gateway: {
-    port: 18888,
-    bind: "loopback",
-  },
-  models: {
-    providers: {
-      qwen: {
-        apiKey: "${DASHSCOPE_API_KEY}",
-        baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
-      },
-    },
-  },
-  agents: {
-    defaults: {
-      model: { primary: "qwen/qwen-turbo" },
-      thinking: { level: "medium" },
-    },
-  },
-  channels: {
-    telegram: { botToken: "${TELEGRAM_BOT_TOKEN}" },
-    feishu: { appId: "xxx", appSecret: "xxx" },
-  },
-  tools: {
-    exec: { safety: true },
-    upload: { max_file_size: 50000000, max_text_chars: 50000 },
-  },
-}
-```
-
-### 提供商自动注册
-
-LLM 提供商从以下来源自动注册：
-1. 配置文件 `models.providers` 段
-2. 环境变量（`OPENAI_API_KEY`、`ANTHROPIC_API_KEY` 等）
-
-### 多智能体配置
-
-```json5
-{
-  agents: {
-    defaults: {
-      model: { primary: "qwen/qwen-turbo" },
-      thinking: { level: "medium" },
-    },
-    list: [
-      {
-        id: "main",
-        default: true,
-        model: { primary: "anthropic/claude-sonnet-4-5" },
-        allowed_commands: "*",
-      },
-      {
-        id: "coder",
-        model: { primary: "anthropic/claude-sonnet-4-5" },
-        workspace: "~/projects",
-        allowed_commands: "read|write|exec",
-        temperature: 0.2,
-      },
-      {
-        id: "researcher",
-        model: { primary: "openai/gpt-4o" },
-        allowed_commands: "web_search|web_fetch|memory_search",
-      },
-    ],
-    // 远程智能体（A2A 协议）
-    a2a: [
-      {
-        id: "remote-agent",
-        url: "https://remote-gateway.example.com",
-        auth_token: "${REMOTE_AGENT_TOKEN}",
-      },
-    ],
-  },
-}
-```
-
-协作模式：**顺序执行**（链式）、**并行执行**（扇出）、**编排执行**（LLM 通过 `agent_<id>` 工具调用驱动）。
-
-### 多通道配置
-
-```json5
-{
-  channels: {
-    telegram: {
-      botToken: "${TELEGRAM_BOT_TOKEN}",  // ${VAR} 环境变量替换
-      dmPolicy: "pairing",               // 新用户需输入配对码
-      groupPolicy: "open",
-    },
-    feishu: {
-      appId: "cli_xxxx",
-      appSecret: "${FEISHU_APP_SECRET}",
-      dmPolicy: "pairing",
-    },
-    wechat: {
-      // 通过 `rsclaw channels login wechat` 扫码登录
-      dmPolicy: "pairing",
-    },
-    discord: {
-      token: "${DISCORD_BOT_TOKEN}",
-      dmPolicy: "pairing",
-      groupPolicy: "allowlist",
-      groupAllowFrom: ["server-id-1"],
-    },
-    // 自定义 Webhook 集成
-    custom: [
-      {
-        id: "my-webhook",
-        type: "webhook",
-        replyUrl: "https://your-app.example.com/callback",
-        textPath: "$.message.text",
-        senderPath: "$.message.from",
-      },
-    ],
-  },
-}
-```
-
-每个通道支持独立的 DM/群组策略、配对码、健康监控和智能体路由。所有字符串值支持 `${VAR}` 环境变量替换。
-
-### DM 配对
-
-`dmPolicy` 设为 `"pairing"` 时，新用户必须输入 6 位配对码（1 小时有效）才能开始聊天：
-
-```bash
-# 生成配对码
-rsclaw pairing pair
-
-# 列出活跃配对
-rsclaw pairing list
-
-# 撤销配对
-rsclaw pairing revoke <device-id>
-```
-
-用户将配对码作为第一条消息发送。配对成功后设备被记住，无需再次配对。
-
-### 多实例
-
-```bash
-rsclaw --dev gateway run          # 使用 ~/.rsclaw-dev
-rsclaw --profile test gateway run # 使用 ~/.rsclaw-test
-```
-
----
-
-## 集成
-
-### MCP（模型上下文协议）
-
-启动 MCP 服务器子进程，JSON-RPC 工具发现。工具自动注册为 `mcp_<server>_<tool>`。在 `mcp` 配置段中设置。
-
-### 插件
-
-基于 Hook 的插件架构，生命周期事件：`pre_turn`、`post_turn`、`pre_tool_call`、`post_tool_call`、`on_error`。插件从 `plugins/` 目录加载。
-
-### 技能
-
-从 ClawHub 和 SkillHub 仓库获取外部技能包。通过 `rsclaw skills install <name>` 或 `/skill install <name>` 安装。
-
-### 外部智能体
-
-通过 HTTP 调用远程智能体。工具自动注册为 `agent_<id>`。A2A（Agent-to-Agent）协议，Bearer token 认证。
-
-### 定时任务
-
-使用 cron 表达式定期调度智能体运行。通过 `rsclaw cron` 或 `/cron list` 管理。
-
-### Webhooks
-
-Webhook 入口 `/hooks/:path`，支持动作分发（调用智能体、触发定时任务等）。
-
----
-
-## 路线图
-
-### 第一阶段 -- CLI 补齐 + 稳定
-
-- 现有命令：补充 --json/--verbose/--timeout 通用选项
-- 新命令：completion、dashboard、daemon、qr、docs、uninstall
-- 中型命令：agent（单数）、devices、directory、approvals
-- Gateway/doctor/logs/sessions/status 选项补齐
-- Control UI：剩余 5 个 WS API 方法 + 配置 Schema 页面
-
-### 第二阶段 -- 大型命令 + 生态
-
-- message 命令树（25+ 子命令）
-- node/nodes 分布式计算命令
-- onboard 70+ 非交互参数
-- 插件市场 + uninstall/update/inspect
-
-### 第三阶段 -- 高级功能
-
-- browser 命令（35+ CDP 子命令）
-- `--container` 全局选项（Podman/Docker）
-- 非 Gemini 模型的视频帧提取
-- 企业微信/Signal 多媒体发送补全
-
-### 第四阶段 -- 公开发布
-
-- 100% CLI 兼容（browser 除外）
-- 100% Control UI 兼容
-- Homebrew / cargo install 分发
-- 完整文档站点
-
----
-
-## 常见问题
-
-**RsClaw 和 OpenClaw 可以同时运行吗？**
-可以。RsClaw 默认使用端口 18888，OpenClaw 默认使用 18789。它们使用独立的数据目录（`~/.rsclaw/` vs `~/.openclaw/`），可以并行运行。
-
-**RsClaw 会修改我的 OpenClaw 数据吗？**
-不会。导入模式读取 OpenClaw 文件（配置、工作区、会话）但不会写入 `~/.openclaw/`。所有 RsClaw 数据存储在 `~/.rsclaw/`。
-
-**如何切换回 OpenClaw？**
-`rsclaw gateway stop && openclaw gateway start`。你的 `~/.openclaw/` 目录未被修改。
-
-**支持所有 OpenClaw WebSocket 方法吗？**
-已实现 33+ 方法，包括聊天流式输出。RsClaw 与 OpenClaw WebUI（控制面板）在 `http://localhost:18789` 完全线路兼容。
-
-**Node.js 技能/插件怎么办？**
-RsClaw 可以从 ClawHub 和 SkillHub 安装和运行技能。JS 技能仍需要 Node.js 运行时。
-
-**如何启用执行安全？**
-在配置中设置 `tools.exec.safety = true`，或使用 `rsclaw configure --section exec_safety`。内置 40+ 拒绝模式，可在 `defaults.toml` 中自定义。
-
-**如何更新 RsClaw？**
-运行 `rsclaw update` 从 GitHub 下载最新发布版。源码构建用 `git pull && cargo build --release`。
-
-**RsClaw 数据存储在哪里？**
-在 `~/.rsclaw/`。导入模式在 setup 时将 OpenClaw 数据复制到此处。RsClaw 和 OpenClaw 目录完全独立。
-
-**如何配置文件上传限制？**
-使用 `rsclaw configure --section upload_limits` 或在配置中设置 `tools.upload.max_file_size` / `tools.upload.max_text_chars`。运行时可通过 `/set_upload_size` 和 `/set_upload_chars` 调整。
+导入对 `~/.openclaw/` 是只读;新数据写到 `~/.rsclaw/`。两边可以并行跑（端口 18888 vs 18789）——彼此不共享状态。
+
+| | RsClaw | OpenClaw |
+|---|---|---|
+| 二进制体积 | ~15 MB 单文件静态 | ~300 MB + node_modules |
+| 启动 | ~26 ms | 2–5 秒 |
+| 闲置内存 | ~20 MB | ~1 GB |
+| 长期记忆 | 三层 + Weibull 衰减 + 混合检索 | — |
+| 知识库 | OOXML + RRF 检索,按 collection | — |
+| A2A | Google v1.0 + hub-spoke relay | — |
+| 浏览器 | 内置 CDP,50+ 动作 | — |
+| 多后端 agent | Native / Claude Code / OpenCode / ACP | — |
+| 执行安全 | 50+ deny 规则 | — |
 
 ---
 
 ## 开发
 
 ```bash
-# 运行测试
-cargo test
-
-# 带调试日志运行
+git clone https://github.com/rsclaw-ai/rsclaw.git
+cd rsclaw
+cargo build --profile release-dev          # 别名:`cargo brd`
 RUST_LOG=rsclaw=debug cargo run -- gateway run
-
-# 构建发布版
-cargo build --release
 ```
 
-### 架构
+要求：Rust 1.91+,macOS / Linux / Windows。可选：ffmpeg、Chrome。
 
 ```
 src/
-  agent/       # 智能体运行时、记忆、工具分发、循环检测、预解析
-  channel/     # 13 个通道：Telegram、微信、飞书、钉钉等
-  config/      # JSON5 加载器、Schema、6 级配置优先级
-  gateway/     # 启动、热重载、通道接线
-  mcp/         # MCP 客户端（stdin/stdout JSON-RPC）
-  plugin/      # 插件 Shell 桥接、Hook 注册
-  provider/    # LLM 提供商：Anthropic、OpenAI、Gemini、故障转移
-  server/      # Axum HTTP 服务器、REST API、OpenAI 兼容端点
-  skill/       # 技能加载器、ClawHub/SkillHub 客户端、工具运行器
-  store/       # redb KV + tantivy BM25 + hnsw_rs 向量
-  ws/          # WebSocket 协议 v3
-  cmd/         # CLI 命令：setup、configure、security 等
-  acp/         # ACP 协议（智能体 spawn/connect/run）
-```
-
-### Matrix E2EE
-
-使用 `cargo build --release --features channel-matrix` 构建以支持加密房间。需要在配置中设置恢复密钥（`channels.matrix` 下的 `recoveryKey` 字段）。不带此 feature flag 时，Matrix 使用轻量 reqwest 驱动（仅支持未加密房间）。
-
-### 环境要求
-
-- Rust 1.91+（Edition 2024）
-- macOS / Linux / Windows
-- 可选：ffmpeg（图片压缩、语音转写）
-- 可选：whisper-cpp（本地语音转文字）
-- 可选：`--features channel-matrix`（Matrix E2EE，引入 matrix-sdk）
-
-### 交叉编译前置依赖（macOS 主机）
-
-```bash
-brew install filosottile/musl-cross/musl-cross   # Linux musl 目标
-cargo install cargo-xwin                          # Windows MSVC 目标
-rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
-                  x86_64-pc-windows-msvc aarch64-pc-windows-msvc \
-                  x86_64-apple-darwin
+  agent/       runtime、memory、tools、preparse
+  channel/     13 个 channel adapter
+  config/      JSON5 loader、schema、env 解析
+  gateway/     启动、热重载、watch
+  provider/    LLM provider、failover、prefix-cache
+  server/      Axum HTTP、REST、OpenAI 兼容
+  store/       redb + tantivy + hnsw_rs
+  browser/     Chrome CDP 自动化
+  a2a/         A2A v1.0 + hub-spoke relay
+  acp/         ACP 客户端后端
+  kb/          知识库 + collections
+  plugin/      wasm + node/bun/deno 运行时
+  skill/       skill 结晶化管线
 ```
 
 ---
 
-## 许可证
+## 支持
 
-本项目采用 MIT OR Apache-2.0 双协议授权。详见 [英文 README](../../README.md#license)。
+- ⭐ **Star** —— 帮助更多人发现 RsClaw
+- 🐛 **Issues** —— [github.com/rsclaw-ai/rsclaw/issues](https://github.com/rsclaw-ai/rsclaw/issues)
+- 💬 **社区** —— [WeChat / Feishu / QQ / Telegram](https://rsclaw.ai/zh/community)
+- 🤝 **贡献** —— 见 [CONTRIBUTING.md](../../CONTRIBUTING.md)
 
-这意味着你可以自由使用、修改和分发本软件，但任何修改版本（包括通过网络提供服务）都必须以相同许可证开源。
+## License
+
+双协议 **MIT** ([LICENSE-MIT](../../LICENSE-MIT)) **OR** **Apache-2.0** ([LICENSE-APACHE](../../LICENSE-APACHE)),任选其一。
+
+个人、商业、企业、SaaS、闭源产品都可以自由使用。可修改、可再分发,无 copyleft 义务。跟 Rust、Tokio、Serde、Axum 同一套许可。
+
+除非另有说明,所有贡献按同一双许可协议授权。
+
+---
+
+🦀 用 Rust 构建。感谢 OpenClaw 社区的启发。

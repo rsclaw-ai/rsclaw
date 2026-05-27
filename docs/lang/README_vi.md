@@ -1,73 +1,108 @@
 # RsClaw
 
-**AI Agent Engine with long-term memory and self-learning — one 15MB binary, 13 channels, 15 LLM providers, A2A cross-machine orchestration, browser automation, all in pure Rust. Your AI never forgets and gets better the more you use it.**
+> **Một AI agent engine biết ghi nhớ, học hỏi và định tuyến giữa các máy.**
+> Rust binary 15MB · Cụm A2A hub-spoke · Bộ nhớ ba lớp · Knowledge base vector + BM25 · 13 kênh · 15 nhà cung cấp LLM · Thay thế drop-in cho OpenClaw.
 
-[![Rust](https://img.shields.io/badge/Rust-1.91%20Edition%202024-orange)](https://www.rust-lang.org/)
+[![GitHub Stars](https://img.shields.io/github/stars/rsclaw-ai/rsclaw?style=flat&logo=github)](https://github.com/rsclaw-ai/rsclaw/stargazers)
+[![Crates.io](https://img.shields.io/crates/v/rsclaw?style=flat&logo=rust)](https://crates.io/crates/rsclaw)
 [![License](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue)](../../README.md#license)
-[![Binary Size](https://img.shields.io/badge/binary-~15MB-green)]()
+[![Rust](https://img.shields.io/badge/Rust-1.91%2B-orange?logo=rust)](https://www.rust-lang.org/)
 
-[English](../../README.md) | [中文](README_cn.md) | [日本語](README_ja.md) | [한국어](README_ko.md) | [ไทย](README_th.md) | **Tiếng Việt** | [Français](README_fr.md) | [Deutsch](README_de.md) | [Español](README_es.md) | [Русский](README_ru.md)
-
-RsClaw la ban viet lai hoan toan cua [OpenClaw](https://github.com/openclaw/openclaw) bang Rust, cung cap cung giao thuc AI Gateway da tac tu nhung khoi dong nhanh hon 10 lan, kich thuoc nho hon 10 lan va khong phu thuoc Node.js.
-
+[🇺🇸 English](../../README.md) · [🇨🇳 中文](README_cn.md) · [🇯🇵 日本語](README_ja.md) · [🇰🇷 한국어](README_ko.md) · [ไทย](README_th.md) · **Tiếng Việt** · [Français](README_fr.md) · [Deutsch](README_de.md) · [Español](README_es.md) · [Русский](README_ru.md)
 
 <p align="center">
   <img src="../images/en.gif" alt="RsClaw Preview" width="800" />
 </p>
 
-💬 [Join Community](https://rsclaw.ai/en/community) — WeChat / Feishu / QQ / Telegram
+Phần lớn AI agent là các process không trạng thái dán chặt vào hộp chat. **RsClaw là một cụm máy (fleet)**: mỗi node lưu trữ memory có cấu trúc, đánh index knowledge base riêng và nói [Google A2A v1.0](https://a2a-protocol.org/). Một yêu cầu gõ trên laptop của bạn có thể fan-out tới GPU spoke để tạo ảnh, fleet node để RAG và partner agent từ xa cho tác vụ chuyên biệt — tất cả trả về như một luồng streaming duy nhất.
+
+15 MB, ~20 MB RAM, binary tĩnh đơn lẻ. Rust thuần. Không Node, không Python.
+
+💬 [Tham gia cộng đồng](https://rsclaw.ai/en/community) — WeChat / Feishu / QQ / Telegram
 
 ---
 
-## Tinh nang chinh
-
-- **13+ kenh nhan tin** -- Telegram, Discord, Slack, WeChat, Feishu, DingTalk, QQ, WhatsApp, LINE, Signal, Matrix, Zalo, Custom Webhook
-- **15 nha cung cap LLM** -- OpenAI, Anthropic, Google Gemini, DeepSeek, Qwen, Ollama v.v.
-- **32 cong cu tich hop** -- Quan ly file, Shell, Tim kiem web/Trinh duyet, Tao anh, Bo nho, Nhan tin, cron, A2A
-- **40+ lenh PreParse** -- Bo qua LLM, khong ton token, phan hoi duoi mili giay
-- **Tu dong hoa trinh duyet CDP** -- Dieu khien headless Chrome tich hop (20 thao tac)
-- **Giao thuc A2A** -- Google A2A v1.0 (hop tac tac tu xuyen mang)
-- **Bao mat thuc thi** -- Quy tac deny/confirm/allow, 50+ mau tu choi
-
-## Cai dat nhanh
+## Cài đặt
 
 ```bash
-# macOS / Linux (tu dong phat hien nen tang)
-curl -fsSL https://app.rsclaw.ai/scripts/install.sh | bash
-```
+# Homebrew (macOS / Linux) — khuyên dùng
+brew tap rsclaw-ai/tap
+brew install rsclaw            # CLI
+brew install --cask rsclaw     # App desktop (macOS DMG)
 
-```powershell
-# Windows (PowerShell)
+# Cargo
+cargo install rsclaw
+
+# Một dòng (macOS / Linux)
+curl -fsSL https://app.rsclaw.ai/scripts/install.sh | bash
+
+# Windows
 irm https://app.rsclaw.ai/scripts/install.ps1 | iex
 ```
 
-### Xay dung tu ma nguon
-
 ```bash
-git clone https://github.com/rsclaw-ai/rsclaw.git
-cd rsclaw
-cargo build --release
+rsclaw setup          # khởi tạo ~/.rsclaw/
+rsclaw onboard        # wizard tương tác: provider, channel, embedder
+rsclaw start
 ```
 
-## Bat dau nhanh
+---
+
+## A2A — Định tuyến agent-tới-agent cấp fleet
+
+RsClaw triển khai đầy đủ [đặc tả Google A2A v1.0](https://a2a-protocol.org/latest/specification/) — streaming, push notification, task persistence, cancel, INPUT_REQUIRED interrupt, đủ cả 11 phương thức JSON-RPC — cộng thêm **hub-spoke relay hạng nhất** hợp nhất cụm máy không đồng nhất thành một logical agent duy nhất. Mỗi spoke giữ một kết nối WebSocket outbound bền tới hub — không cần inbound port phía spoke. Hoạt động sau NAT, firewall và điều kiện mạng đại lục Trung Quốc.
+
+→ Bề mặt protocol đầy đủ, vận hành hub-spoke, identity & ACL, công thức tunnel: [docs/a2a.md](../a2a.md).
+
+---
+
+## Memory — ba tầng, nhận biết suy giảm, recall lai
+
+Bộ nhớ dài hạn bạn không bao giờ phải quản lý thủ công. Mỗi turn liên quan, runtime trích xuất tín hiệu bền vững thành các docs có cấu trúc (entity / preference / fact / procedure / relationship / lesson / failure), phân tầng theo **Core / Working / Peripheral** với suy giảm **Weibull stretched-exponential** từng tầng, và recall thông qua **tìm kiếm lai BM25 + vector** (hợp nhất RRF). Ngôn ngữ gốc được giữ nguyên — tiếng Việt vào, tiếng Việt ra.
+
+→ Toán học của tầng, thiết kế prompt extractor, hoán đổi embedder, HTTP API: [docs/memory.md](../memory.md).
+
+---
+
+## Knowledge base — RAG được quản lý, ingest OOXML
+
+Kho lưu trữ bền hạng nhất cho tài liệu dự án, code, hợp đồng — bất cứ thứ gì bạn muốn agent **trích dẫn thay vì tóm tắt** từ training. Collections là tag veneer trên một index chung. OOXML (.docx / .xlsx / .pptx), PDF, HTML, Markdown, source code được canonicalize khi ingest. Tìm kiếm lai (BM25 + vector + RRF + MMR); câu trả lời trích dẫn `doc_id` + offset.
 
 ```bash
-rsclaw onboard    # Trinh huong dan cai dat
-rsclaw start      # Khoi dong Gateway
-rsclaw status     # Kiem tra trang thai
-rsclaw doctor --fix  # Kiem tra suc khoe
+rsclaw knowledge ingest <đường-dẫn> --collection hop-dong
+rsclaw knowledge search "dự báo doanh thu Q3" --collection tai-chinh
 ```
 
-## Nen tang ho tro
+→ Mô hình collections, pipeline ingest, search, API: [docs/kb.md](../kb.md).
 
-macOS (x86_64, ARM64), Linux (x86_64, ARM64), Windows (x86_64, ARM64)
+---
 
-## Tai lieu
+## Tính năng chính
 
-Tai lieu chi tiet tai [README.md](../../README.md) (中文) hoac [README_en.md](../../README.md) (English).
+- **13+ kênh nhắn tin**: Telegram, Discord, Slack, WeChat, Feishu, DingTalk, QQ, WhatsApp, LINE, Signal, Matrix, Zalo, webhook tùy chỉnh
+- **15+ nhà cung cấp LLM**: OpenAI, Anthropic, Gemini, DeepSeek, Qwen, Doubao, Ollama, v.v.
+- **4 vòng đời agent**: Main / Named / Sub / Task; 4 backend: Native Rust / Claude Code / OpenCode / ACP
+- **36 công cụ tích hợp**: files, shell, web, browser automation (CDP), image / video, STT / TTS, computer_use, cron, A2A, memory, KB
+- **40+ lệnh pre-parsed**: zero token, phản hồi sub-millisecond
+- **Plugin dual-runtime**: wasm (sandbox) + node/bun/deno (tương thích OpenClaw)
+- **An toàn exec**: 50+ deny pattern, sandbox write, skills có chữ ký
 
-## Giay phep
+---
 
-Dự án này được cấp phép kép MIT OR Apache-2.0. Xem [README tiếng Anh](../../README.md#license) để biết chi tiết.
+## Migration từ OpenClaw
 
-Ban co the tu do su dung, chinh sua va phan phoi phan mem nay, nhung cac phien ban da chinh sua (bao gom dich vu mang) phai duoc ma nguon mo theo cung giay phep.
+```bash
+openclaw gateway stop
+rsclaw setup          # phát hiện ~/.openclaw/, đề nghị import một lần nhấp
+rsclaw start
+```
+
+`~/.openclaw/` không bao giờ bị sửa đổi. Cả hai có thể chạy song song (cổng 18888 vs 18789).
+
+---
+
+## Giấy phép
+
+Cấp phép kép **MIT** HOẶC **Apache-2.0**. Tự do sử dụng trong sản phẩm cá nhân, thương mại, doanh nghiệp, SaaS hoặc proprietary. Sửa đổi và phân phối lại không có nghĩa vụ copyleft. Chi tiết: [README tiếng Anh](../../README.md#license).
+
+🦀 Xây dựng bằng Rust. Lấy cảm hứng từ cộng đồng OpenClaw.
