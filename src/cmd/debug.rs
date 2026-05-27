@@ -109,7 +109,9 @@ async fn dump_prompt_spec(args: DumpPromptSpecArgs) -> Result<()> {
     // than a divergent live state. Skills load from disk via the
     // SkillRegistry above; that's enough for the prompt-spec dump.
     let shared_prefix = build_shared_system_prefix();
-    let user_system = build_user_system(&ws_ctx, &skills, &[], None, &config.raw);
+    // `rsclaw debug` doesn't model per-agent toolset; pass None so the
+    // coding-profile guidance is suppressed in the offline dump.
+    let user_system = build_user_system(&ws_ctx, &skills, &[], None, &config.raw, None);
 
     // 6. Build the merged tool list, then split by name into the cacheable
     //    built-ins vs the per-machine remainder. `build_tool_list` only knows about

@@ -274,18 +274,34 @@ pub(crate) fn toolset_allowed_names(
         "skill_use",
     ];
     const CODE: &[&str] = &[
+        // Plugin discovery + invoke
         "plugin_list",
         "plugin_search",
         "plugin_describe",
         "plugin_invoke",
+        // Core file ops
         "shell",
         "read_file",
         "write_file",
+        "edit_file",         // exact-string replace; cheaper than rewriting whole files
         "list_dir",
         "search_file",
         "search_content",
+        // Large tool output handling: backstop artifact (tr_xxxxxxxx) reader
+        "read_artifact",
+        // Memory / KB / skills (read-mostly; users still want recall here)
         "memory",
+        "knowledge_base",
         "skill_use",
+        // Pre-compaction history search (multi-turn coding sessions hit this often)
+        "read_session_archive",
+        // Sub-agent dispatch — lets the coding profile escalate to cap-rs
+        // (claude-code / openclaude / opencode / codex) for tasks beyond its scope
+        "agent",
+        // Disambiguation: ask the user when the task description is genuinely ambiguous
+        "clarify",
+        // Mark task done / send final report
+        "task",
     ];
     const STANDARD: &[&str] = &[
         "shell",
@@ -618,10 +634,17 @@ pub fn build_tool_list(
             are auto-extracted to plain text.\n\
             Example: {\"path\":\"config.json\"} or {\"path\":\"src/main.py\"}\n\
             \n\
-            The whole file is read at once — there is no offset/limit yet. For very \
-            large files (logs, dumps), use `search_content` to grep for the relevant \
-            slice and read only the file(s) that match, or read after narrowing with \
-            `search_file`.\n\
+            For text files, output is paginated. By default the first 2000 lines are \
+            returned. Use `offset` (1-indexed line) and `limit` (max lines) for large \
+            files. When the result is truncated, the response contains \
+            `truncated: true` and `next_offset` — continue with `offset=next_offset` \
+            until you have what you need. If you only need to scan for a substring, \
+            `search_content` is cheaper than paging an entire file.\n\
+            \n\
+            For very large outputs (>~4 KB) the runtime backstop replaces the inline \
+            content with a `tool_result_id` (tr_xxxxxxxx) — call `read_artifact` with \
+            `mode=grep:PATTERN` / `head:N` / `tail:N` / `lines:A-B` instead of paging \
+            via offset, it's much cheaper than re-reading via offset.\n\
             \n\
             If you just edited the file in this turn, you do not need to read it again — \
             the prior `read_file` result still reflects what you wrote. Re-reading on \
@@ -629,7 +652,9 @@ pub fn build_tool_list(
         parameters: json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Relative file path. Examples: 'README.md', 'src/app.py', 'data/output.csv'"}
+                "path":   {"type": "string", "description": "Relative file path. Examples: 'README.md', 'src/app.py', 'data/output.csv'"},
+                "offset": {"type": "integer", "description": "1-indexed line number to start reading from. Default: 1."},
+                "limit":  {"type": "integer", "description": "Maximum number of lines to read. Default: 2000."}
             },
             "required": ["path"]
         }),

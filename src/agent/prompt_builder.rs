@@ -685,6 +685,7 @@ pub fn build_user_system(
     wasm_plugins: &[WasmPlugin],
     js_plugins: Option<&PluginRegistry>,
     config: &crate::config::schema::Config,
+    toolset: Option<&str>,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
 
@@ -692,6 +693,35 @@ pub fn build_user_system(
         parts.push(format!(
             "Default response language: {lang}. Always reply in {lang} unless the user explicitly uses another language."
         ));
+    }
+
+    // Coding profile guidance — appended early so it precedes generic blocks
+    // (plugins / skills / installed tools) and the model reads coding-specific
+    // discipline before being shown the workspace tail. Lives in user_system,
+    // NOT the shared prefix: only this profile's clients see it.
+    if matches!(toolset, Some("code")) {
+        parts.push(build_coding_mode_block());
+
+        // Ancestor AGENTS.md / CLAUDE.md walking, pi-style. Workspace-root
+        // AGENTS.md is already loaded into ws_ctx.agents_md by the regular
+        // workspace loader; start the walk from the workspace's PARENT so
+        // we don't double-inject. Outer-most ancestor renders first so
+        // nested project rules layer on top.
+        if let Some(parent) = ws_ctx.workspace_dir.parent() {
+            let ancestors = super::workspace::collect_ancestor_agents_md(parent, None);
+            if !ancestors.is_empty() {
+                let mut block = String::from("<project_context>\n");
+                for (path, content) in &ancestors {
+                    block.push_str(&format!(
+                        "<project_instructions path=\"{}\">\n{}\n</project_instructions>\n",
+                        path.display(),
+                        content.trim_end()
+                    ));
+                }
+                block.push_str("</project_context>");
+                parts.push(block);
+            }
+        }
     }
 
     // Per-session OS / shell guidance. This reflects the CLIENT's actual
@@ -830,14 +860,68 @@ pub(crate) fn build_system_prompt(
     wasm_plugins: &[WasmPlugin],
     js_plugins: Option<&PluginRegistry>,
     config: &crate::config::schema::Config,
+    toolset: Option<&str>,
 ) -> String {
     let prefix = build_shared_system_prefix();
-    let suffix = build_user_system(ws_ctx, skills, wasm_plugins, js_plugins, config);
+    let suffix = build_user_system(ws_ctx, skills, wasm_plugins, js_plugins, config, toolset);
     if suffix.is_empty() {
         prefix
     } else {
         format!("{prefix}\n\n{suffix}")
     }
+}
+
+/// Coding-profile guidance block. Appended to user_system when the agent's
+/// `model.toolset` is `"code"`. Borrows the well-trodden directives from
+/// pi/coding-agent (proven over 76 versions) and harmonizes them with rsclaw
+/// conventions (edit_file existence, read_artifact backstop, cap-rs escalation).
+fn build_coding_mode_block() -> String {
+    [
+        "## Coding profile (toolset=code)",
+        "",
+        "You are operating as a focused coding assistant. The user wants code \
+         changed, debugged, or shipped. Skip pleasantries, IM-channel chatter, \
+         and \"as an AI\" hedging. Apply changes directly using the tools below.",
+        "",
+        "**Tool preference order for file work:**",
+        "1. `edit_file` for modifying existing files — exact-string replacement, \
+            sends a small diff. PREFER THIS over `write_file` whenever possible.",
+        "2. `write_file` only for: (a) new files, (b) full rewrites where most \
+            content changes.",
+        "3. `read_file` BEFORE every `write_file` or `edit_file` on an existing \
+            file. If you have not read the file this session, you do not know \
+            what's in it and must not overwrite it.",
+        "4. `search_content` / `search_file` for locating things — cheaper than \
+            paging a whole file via `read_file` offset.",
+        "5. `read_artifact` when a previous tool returned a `tool_result_id` \
+            (tr_xxxxxxxx) — use `mode=grep:PATTERN` / `head:N` / `lines:A-B` \
+            rather than re-running the tool.",
+        "",
+        "**When NOT to do it yourself — escalate via `agent` (cap-rs):**",
+        "- Multi-file refactor across >5 files",
+        "- New module / feature with >200 LOC of fresh code",
+        "- Debug session that crosses >3 files",
+        "Call `agent action=task` with an appropriate `toolset` and let the \
+         dispatched sub-agent (claudecode / openclaude / opencode / codex) run \
+         it. You stay in charge of small surgical edits.",
+        "",
+        "**Project instructions:** If `AGENTS.md` or `CLAUDE.md` files exist in \
+         the current working directory or any ancestor directory, their contents \
+         appear in `<project_instructions path=\"...\">…</project_instructions>` \
+         tags below. Treat them as authoritative project rules.",
+        "",
+        "**Discipline:**",
+        "- Do not invent file paths, function names, or APIs. If unsure, \
+           `search_content` first or `clarify` with the user.",
+        "- When `edit_file` fails with \"not found\", re-read the file with \
+           `read_file` — DO NOT retry the same `old_string`.",
+        "- After a successful edit you do NOT need to re-read the file in the \
+           same turn. The prior read content is still accurate for what you \
+           just wrote.",
+        "- For long shell commands, prefer `wait=false` and poll via `task_id` \
+           on later turns; do NOT sleep-loop.",
+    ]
+    .join("\n")
 }
 
 /// Names of tools compiled into the RsClaw binary — byte-stable across

@@ -127,6 +127,75 @@ mod hint_tests {
     }
 }
 
+/// Normalize common LLM-introduced Unicode variants back to their ASCII form.
+///
+/// LLMs paste `old_string` from chat-rendered markdown which has often been
+/// "auto-corrected" — smart quotes, em-dashes, NBSP, zero-width spaces.
+/// The on-disk source code is plain ASCII, so the literal compare misses.
+///
+/// Kept in sync with `describe_fuzzy_diff` so the user-facing error message
+/// can name the exact transformation.
+fn fuzzy_normalize(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let mapped = match c {
+            // Smart single quotes (incl. low-9, prime, modifier letter apostrophe)
+            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' | '\u{02BC}' | '\u{2032}' => '\'',
+            // Smart double quotes (incl. low-9, double prime)
+            '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' | '\u{2033}' => '"',
+            // Various Unicode dashes → ASCII hyphen
+            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+            | '\u{2212}' => '-',
+            // Unicode spaces → ASCII space; zero-width characters dropped
+            '\u{00A0}' | '\u{2007}' | '\u{2008}' | '\u{2009}' | '\u{200A}' | '\u{202F}'
+            | '\u{205F}' | '\u{3000}' => ' ',
+            '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' => continue,
+            c => c,
+        };
+        out.push(mapped);
+    }
+    out
+}
+
+/// Human-readable summary of what `fuzzy_normalize` changed, for error
+/// messages. Reports only categories that actually appeared.
+fn describe_fuzzy_diff(original: &str, _normalized: &str) -> String {
+    let mut hits: Vec<&str> = Vec::new();
+    let mut has_smart_q = false;
+    let mut has_dash = false;
+    let mut has_space = false;
+    let mut has_zerowidth = false;
+    for c in original.chars() {
+        match c {
+            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' | '\u{02BC}' | '\u{2032}'
+            | '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' | '\u{2033}' => has_smart_q = true,
+            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+            | '\u{2212}' => has_dash = true,
+            '\u{00A0}' | '\u{2007}' | '\u{2008}' | '\u{2009}' | '\u{200A}' | '\u{202F}'
+            | '\u{205F}' | '\u{3000}' => has_space = true,
+            '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' => has_zerowidth = true,
+            _ => {}
+        }
+    }
+    if has_smart_q {
+        hits.push("smart quotes");
+    }
+    if has_dash {
+        hits.push("Unicode dashes (en/em/figure)");
+    }
+    if has_space {
+        hits.push("non-ASCII whitespace (NBSP/thin/full-width)");
+    }
+    if has_zerowidth {
+        hits.push("zero-width characters");
+    }
+    if hits.is_empty() {
+        "non-ASCII characters".to_owned()
+    } else {
+        hits.join(", ")
+    }
+}
+
 fn sanitize_shell_redirects(cmd: &str) -> String {
     // Conservative: only fix the common `something2>&1` → `something 2>&1` case.
     // Broader rewrites risk changing user intent.
@@ -514,7 +583,59 @@ impl super::runtime::AgentRuntime {
         let content = tokio::fs::read_to_string(&full)
             .await
             .map_err(|e| anyhow!("read `{}`: {e}", full.display()))?;
-        Ok(json!({"content": content, "path": path}))
+
+        // Pagination: 1-indexed `offset` line + `limit` lines (default 2000).
+        // Cheap path: when neither is set AND the file is small, skip the
+        // line-split allocation and return the whole content. Otherwise
+        // walk lines and slice. The runtime backstop still applies its
+        // size cap on the final returned payload.
+        const DEFAULT_LIMIT: usize = 2000;
+        let offset_raw = args
+            .get("offset")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1)
+            .max(1);
+        let limit_raw = args.get("limit").and_then(|v| v.as_u64());
+        let no_pagination = args.get("offset").is_none() && args.get("limit").is_none();
+
+        if no_pagination && content.len() < 64 * 1024 {
+            // Small file, caller didn't ask for pagination → original behavior.
+            return Ok(json!({"content": content, "path": path}));
+        }
+
+        let lines: Vec<&str> = content.lines().collect();
+        let total_lines = lines.len();
+        let offset = offset_raw as usize;
+        let start = offset.saturating_sub(1);
+        if start >= total_lines && total_lines > 0 {
+            anyhow::bail!(
+                "read `{}`: offset {offset} is beyond end of file ({total_lines} lines total)",
+                path
+            );
+        }
+        let limit = limit_raw.map(|n| n as usize).unwrap_or(DEFAULT_LIMIT).max(1);
+        let end = (start + limit).min(total_lines);
+        let slice = lines[start..end].join("\n");
+
+        let mut result = json!({
+            "content": slice,
+            "path": path,
+            "offset": offset,
+            "lines_returned": end - start,
+            "total_lines": total_lines,
+        });
+        if end < total_lines {
+            result["truncated"] = json!(true);
+            result["next_offset"] = json!(end + 1);
+            result["hint"] = json!(format!(
+                "[Showing lines {}-{} of {}. Use offset={} to continue.]",
+                start + 1,
+                end,
+                total_lines,
+                end + 1
+            ));
+        }
+        Ok(result)
     }
 
     /// Write content to a file, creating parent directories as needed.
@@ -1015,6 +1136,23 @@ impl super::runtime::AgentRuntime {
 
         let count = content.matches(old_string).count();
         if count == 0 {
+            // LLM-side gotcha: models sometimes copy old_string from a
+            // markdown-rendered code block, where ASCII quotes got smart-quoted,
+            // hyphens turned into em-dashes, regular spaces turned into NBSP,
+            // etc. Detect the case and tell the LLM precisely what's wrong —
+            // much more actionable than a bare "not found".
+            let norm_content = fuzzy_normalize(&content);
+            let norm_old = fuzzy_normalize(old_string);
+            if !norm_old.is_empty() && norm_content.contains(&norm_old) {
+                let diffs = describe_fuzzy_diff(old_string, &norm_old);
+                bail!(
+                    "edit_file: `old_string` not found verbatim in `{}`, but a fuzzy match exists. \
+                     Your old_string appears to contain non-ASCII variants: {}. \
+                     Re-read the file and copy the literal characters from disk, \
+                     not from a chat / markdown rendering.",
+                    path, diffs
+                );
+            }
             bail!(
                 "edit_file: `old_string` not found in `{}`. Read the file first and copy the exact substring (including whitespace).",
                 path

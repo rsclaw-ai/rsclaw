@@ -219,6 +219,67 @@ impl WorkspaceContext {
 }
 
 // ---------------------------------------------------------------------------
+// Ancestor AGENTS.md / CLAUDE.md walker (coding profile)
+// ---------------------------------------------------------------------------
+
+/// Walk from `start_dir` up to filesystem root, collecting AGENTS.md and
+/// CLAUDE.md files. Returns `(path, content)` pairs in *outer-most first*
+/// order — i.e. `/Users/foo/AGENTS.md` precedes
+/// `/Users/foo/proj/AGENTS.md`, matching pi/coding-agent's convention so
+/// nested rules layer on top of outer ones.
+///
+/// `stop_at` (when set) prunes the walk: the file at `stop_at` is included
+/// if present, but the walk does NOT continue past it. Useful to avoid
+/// re-reading the workspace-root AGENTS.md that the regular loader
+/// already injected via `WorkspaceContext::agents_md`.
+///
+/// Symlinks: paths are NOT canonicalized — we walk the logical parent
+/// chain so a symlinked-in workspace doesn't accidentally surface another
+/// project's AGENTS.md.
+pub fn collect_ancestor_agents_md(
+    start_dir: &Path,
+    stop_at: Option<&Path>,
+) -> Vec<(PathBuf, String)> {
+    const MAX_BYTES: usize = 64 * 1024;
+    let mut found: Vec<(PathBuf, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
+    let mut cur = start_dir.to_path_buf();
+    loop {
+        for name in ["AGENTS.md", "CLAUDE.md"] {
+            let candidate = cur.join(name);
+            if candidate.is_file() && !seen.contains(&candidate) {
+                if let Ok(content) = std::fs::read_to_string(&candidate) {
+                    let trimmed = if content.len() > MAX_BYTES {
+                        let mut s = content[..MAX_BYTES].to_owned();
+                        s.push_str("\n\n[…truncated…]");
+                        s
+                    } else {
+                        content
+                    };
+                    seen.insert(candidate.clone());
+                    found.push((candidate, trimmed));
+                }
+            }
+        }
+        if let Some(stop) = stop_at
+            && cur == stop
+        {
+            break;
+        }
+        match cur.parent() {
+            Some(parent) if parent != cur => cur = parent.to_path_buf(),
+            _ => break,
+        }
+    }
+
+    // Outer-most first: parent /Users/foo/AGENTS.md before child
+    // /Users/foo/proj/AGENTS.md.
+    found.reverse();
+    found
+}
+
+// ---------------------------------------------------------------------------
 // Workspace cache (P1 context optimisation)
 // ---------------------------------------------------------------------------
 

@@ -3395,12 +3395,24 @@ impl AgentRuntime {
             self.cached_minimal_prompt.clone().expect("just set")
         } else {
             if self.cached_system_prompt.is_none() {
+                // Resolve toolset from per-agent model config (falling back to
+                // gateway defaults), so build_user_system can branch on
+                // `toolset=="code"` and append the coding profile block.
+                let toolset_owned: Option<String> = self
+                    .handle
+                    .config
+                    .model
+                    .as_ref()
+                    .or(self.config.agents.defaults.model.as_ref())
+                    .and_then(|m| m.toolset.as_deref())
+                    .map(|s| s.to_owned());
                 let prompt = build_system_prompt(
                     &ws_ctx,
                     &self.skills,
                     &self.wasm_plugins,
                     self.plugins.as_deref(),
                     &self.config.raw,
+                    toolset_owned.as_deref(),
                 );
                 // DEBUG: dump full system prompt to file for inspection
                 if std::env::var("RSCLAW_DUMP_PROMPT").is_ok() {
