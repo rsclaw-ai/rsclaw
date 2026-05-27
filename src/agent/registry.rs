@@ -368,6 +368,14 @@ pub fn extract_file_refs(text: &str) -> (String, Vec<ImageAttachment>, Vec<FileA
     let mut images = Vec::new();
     let mut files = Vec::new();
 
+    // Per-image cap. Most providers (Anthropic 5 MB, OpenAI Responses
+    // ~20 MB, Gemini 20 MB, Doubao ~10 MB) reject larger inputs with
+    // opaque 400s; we cap here so the user sees a clear "too large"
+    // marker in the conversation instead of a downstream provider
+    // failure. 10 MB of original bytes = ~13.3 MB of base64 — within
+    // every supported provider's hard limit.
+    const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+
     for cap in RE.captures_iter(text) {
         let path_str = cap[1].trim();
         let path = std::path::Path::new(path_str);
@@ -384,6 +392,14 @@ pub fn extract_file_refs(text: &str) -> (String, Vec<ImageAttachment>, Vec<FileA
             || lower.ends_with(".webp");
 
         if is_image {
+            if data.len() > MAX_IMAGE_BYTES {
+                tracing::warn!(
+                    path = path_str,
+                    bytes = data.len(),
+                    "file ref: image exceeds 10 MB cap, skipping"
+                );
+                continue;
+            }
             let mime = if lower.ends_with(".png") {
                 "image/png"
             } else if lower.ends_with(".gif") {

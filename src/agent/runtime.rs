@@ -22,7 +22,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::{
@@ -1849,6 +1849,91 @@ impl AgentRuntime {
         Ok(buf)
     }
 
+    /// Caption incoming user-attached images via the agent's `vision` slot.
+    ///
+    /// Used when the agent's *primary* model is text-only (e.g.
+    /// `rsclaw-agent-v1` configured as primary while doubao-seed-2.0-lite
+    /// sits in the `vision` slot). Without this hop, base64 image data
+    /// would be shipped to a model that ignores it (silent hallucination)
+    /// or rejects it (provider 400). Instead, fan out to the vision slot,
+    /// get a text description, and let the primary continue against the
+    /// description.
+    ///
+    /// Returns the caption text on success. On any failure (no vision
+    /// chain configured, provider error, empty output, timeout) returns
+    /// `Err` and the caller is expected to fall back to pass-through
+    /// (preserves the previous behaviour for fully-vision primaries that
+    /// could read the image directly anyway).
+    async fn caption_images_for_text_only_primary(
+        &self,
+        user_text: &str,
+        images: &[ImageAttachment],
+    ) -> Result<String> {
+        let vision_chain = self.resolve_vision_chain();
+        let vision_model = vision_chain
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("no vision model in chain"))?;
+
+        // Build the multimodal prompt. The vision model's job is NOT to
+        // answer the user's question — just describe the image precisely
+        // so the primary can answer based on the description.
+        let prompt = format!(
+            "Describe the attached image(s) in detail. Be precise about \
+             visible text (quote verbatim), UI elements, layout, colors, \
+             positions, and any error messages or structural cues. Multiple \
+             images: describe each separately with a 'Image N:' heading.\n\n\
+             Do NOT analyze, interpret, or answer any question — just \
+             describe what is literally visible. Another AI will use your \
+             description to answer the user.\n\n\
+             For context, the user's request was: {}",
+            user_text
+        );
+
+        let mut parts = vec![ContentPart::Text { text: prompt }];
+        for img in images {
+            parts.push(ContentPart::Image {
+                url: img.data.clone(),
+            });
+        }
+
+        let req = LlmRequest {
+            model: vision_model,
+            fallback_models: vision_chain.into_iter().skip(1).collect(),
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Parts(parts),
+                rsclaw_hidden: None,
+            }],
+            max_tokens: Some(2048),
+            temperature: Some(0.3),
+            thinking_budget: Some(0),
+            ..Default::default()
+        };
+
+        let providers = Arc::clone(&self.providers);
+        let stream_fut = self.failover.call(req, &providers);
+        let mut stream = tokio::time::timeout(Duration::from_secs(45), stream_fut)
+            .await
+            .map_err(|_| anyhow!("vision caption timed out (45s)"))??;
+
+        let mut buf = String::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(StreamEvent::TextDelta(d)) => buf.push_str(&d),
+                Ok(StreamEvent::Done { .. }) => break,
+                Ok(StreamEvent::Error(msg)) => bail!("vision caption: {msg}"),
+                Ok(_) => {}
+                Err(e) => return Err(anyhow!("vision caption stream error: {e}")),
+            }
+        }
+
+        if buf.trim().is_empty() {
+            bail!("vision caption: empty output");
+        }
+        Ok(buf)
+    }
+
     /// Drive a single conversation turn.
     ///
     /// Takes individual fields (not the full `AgentMessage`) so callers can
@@ -3648,13 +3733,66 @@ impl AgentRuntime {
         // Session stores ONLY text — no base64, no binary blobs.
         // This preserves KV cache and prevents context bloat.
         // ---------------------------------------------------------------
-        let media_descriptions: Vec<String> = Vec::new();
+        let mut media_descriptions: Vec<String> = Vec::new();
         let mut vision_images_for_current_turn = Vec::<String>::new(); // base64 URIs for vision model
 
-        // @-referenced images go directly to vision (already saved, no re-save).
-        if !resolved.image_paths.is_empty() {
-            for img in &images {
-                vision_images_for_current_turn.push(img.data.clone());
+        // Image dispatch. Two paths funnel images into `images` upstream:
+        //   1. `extract_file_refs` parses `[file:/abs/path]` markers
+        //      (desktop drag-drop / paste path-references) and stores
+        //      base64-encoded bytes in `IncomingMsg.images` server-side.
+        //   2. `resolve_file_refs` parses `@<src>_<kind>_<id>.<ext>`
+        //      markers and produces `resolved.image_paths` (legacy uploads).
+        // For the current turn we decide where the bytes go:
+        //   - If the primary model is vision-capable: pass-through into
+        //     `vision_images_for_current_turn` so it sees the image
+        //     directly. Most accurate; fast.
+        //   - If the primary model is text-only: fan out to the agent's
+        //     `vision` slot for a caption, then inject the caption as a
+        //     text media-description. The primary then runs against text
+        //     only — saves base64 on the wire, keeps KV cache hot, and
+        //     stops the silent-hallucination failure mode where the
+        //     primary model receives image_url content it can't read and
+        //     either ignores it (faking a description) or keyword-routes
+        //     to a tool whose name happens to match the filename (e.g.
+        //     `computer_use action=screenshot` for `screenshot.png`).
+        //   - On caption failure (no vision chain configured, timeout,
+        //     provider error) fall back to pass-through. Worse than a
+        //     successful caption, but better than dropping the image.
+        if !images.is_empty() {
+            if model_has_vision {
+                for img in &images {
+                    vision_images_for_current_turn.push(img.data.clone());
+                }
+            } else {
+                match self
+                    .caption_images_for_text_only_primary(text, &images)
+                    .await
+                {
+                    Ok(caption) => {
+                        tracing::info!(
+                            n_images = images.len(),
+                            caption_len = caption.len(),
+                            primary = %model,
+                            "vision-as-tool: captioned images for text-only primary"
+                        );
+                        media_descriptions.push(format!(
+                            "[Image(s) attached — vision-model description below; \
+                             original image(s) not forwarded to primary]\n{}",
+                            caption.trim()
+                        ));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            n_images = images.len(),
+                            primary = %model,
+                            "vision-as-tool: caption failed, falling back to pass-through"
+                        );
+                        for img in &images {
+                            vision_images_for_current_turn.push(img.data.clone());
+                        }
+                    }
+                }
             }
         }
 
