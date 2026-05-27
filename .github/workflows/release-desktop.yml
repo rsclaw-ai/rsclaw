@@ -241,3 +241,76 @@ jobs:
           files: |
             artifacts/RsClaw-*
             artifacts/SHA256SUMS-desktop.txt
+
+  update-tap:
+    name: Update homebrew-tap Cask
+    runs-on: ubuntu-latest
+    needs: release
+    # app-v* tag pushes only; manual workflow_dispatch should leave the cask
+    # alone (operator can re-trigger via the tag if needed).
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/app-v')
+    steps:
+      - name: Checkout tap repo
+        uses: actions/checkout@v6
+        with:
+          repository: rsclaw-ai/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Fetch SHA256SUMS-desktop from the release we just published
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ github.ref_name }}"           # e.g. app-v2026.5.20
+          ver="${tag#app-v}"                     # → 2026.5.20
+          gh release download "$tag" -R rsclaw-ai/rsclaw -p SHA256SUMS-desktop.txt -O sha.txt
+          # Each line: "<sha256>  RsClaw-v<ver>-<target>.dmg"
+          extract() { awk -v t="$1" '$2 == "RsClaw-v'"$ver"'-"t".dmg" {print $1}' sha.txt; }
+          {
+            echo "VER=$ver"
+            echo "SHA_AA_DARWIN=$(extract aarch64-apple-darwin)"
+            echo "SHA_X86_DARWIN=$(extract x86_64-apple-darwin)"
+          } >> "$GITHUB_ENV"
+
+      - name: Regenerate Cask
+        run: |
+          cat > tap/Casks/rsclaw.rb <<EOF
+          cask "rsclaw" do
+            version "${VER}"
+
+            on_arm do
+              url "https://github.com/rsclaw-ai/rsclaw/releases/download/app-v#{version}/RsClaw-v#{version}-aarch64-apple-darwin.dmg"
+              sha256 "${SHA_AA_DARWIN}"
+            end
+            on_intel do
+              url "https://github.com/rsclaw-ai/rsclaw/releases/download/app-v#{version}/RsClaw-v#{version}-x86_64-apple-darwin.dmg"
+              sha256 "${SHA_X86_DARWIN}"
+            end
+
+            name "RsClaw"
+            desc "AI Agent Engine — desktop app"
+            homepage "https://github.com/rsclaw-ai/rsclaw"
+
+            app "RsClaw.app"
+
+            zap trash: [
+              "~/.rsclaw",
+              "~/Library/Application Support/ai.rsclaw",
+              "~/Library/Caches/ai.rsclaw",
+              "~/Library/Preferences/ai.rsclaw.plist",
+            ]
+          end
+          EOF
+
+      - name: Commit + push
+        working-directory: tap
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- Casks/rsclaw.rb; then
+            echo "Cask already up-to-date — nothing to push."
+            exit 0
+          fi
+          git add Casks/rsclaw.rb
+          git commit -m "rsclaw ${{ github.ref_name }} (cask)"
+          git push

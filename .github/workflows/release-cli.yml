@@ -132,3 +132,85 @@ jobs:
           files: |
             artifacts/rsclaw-*
             artifacts/SHA256SUMS.txt
+
+  update-tap:
+    name: Update homebrew-tap Formula
+    runs-on: ubuntu-latest
+    needs: release
+    # Only on real tag pushes; skip on workflow_dispatch reruns where the
+    # tap is already up-to-date or the operator wants manual control.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout tap repo
+        uses: actions/checkout@v6
+        with:
+          repository: rsclaw-ai/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Fetch SHA256SUMS from the release we just published
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ github.ref_name }}"
+          gh release download "$tag" -R rsclaw-ai/rsclaw -p SHA256SUMS.txt -O sha.txt
+          # Each line: "<sha256>  rsclaw-<tag>-<target>.tar.gz"
+          extract() { awk -v t="$1" '$2 == "rsclaw-'"$tag"'-"t".tar.gz" {print $1}' sha.txt; }
+          {
+            echo "SHA_AA_DARWIN=$(extract aarch64-apple-darwin)"
+            echo "SHA_X86_DARWIN=$(extract x86_64-apple-darwin)"
+            echo "SHA_AA_LINUX=$(extract aarch64-unknown-linux-gnu)"
+            echo "SHA_X86_LINUX=$(extract x86_64-unknown-linux-gnu)"
+          } >> "$GITHUB_ENV"
+
+      - name: Regenerate Formula
+        run: |
+          tag="${{ github.ref_name }}"
+          cat > tap/Formula/rsclaw.rb <<EOF
+          class Rsclaw < Formula
+            desc "AI Agent Engine Compatible with OpenClaw"
+            homepage "https://github.com/rsclaw-ai/rsclaw"
+            license any_of: ["MIT", "Apache-2.0"]
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/rsclaw-ai/rsclaw/releases/download/${tag}/rsclaw-${tag}-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA_AA_DARWIN}"
+              else
+                url "https://github.com/rsclaw-ai/rsclaw/releases/download/${tag}/rsclaw-${tag}-x86_64-apple-darwin.tar.gz"
+                sha256 "${SHA_X86_DARWIN}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "https://github.com/rsclaw-ai/rsclaw/releases/download/${tag}/rsclaw-${tag}-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_AA_LINUX}"
+              else
+                url "https://github.com/rsclaw-ai/rsclaw/releases/download/${tag}/rsclaw-${tag}-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_X86_LINUX}"
+              end
+            end
+
+            def install
+              bin.install "rsclaw"
+            end
+
+            test do
+              assert_match(/\d+\.\d+\.\d+/, shell_output("#{bin}/rsclaw --version"))
+            end
+          end
+          EOF
+
+      - name: Commit + push
+        working-directory: tap
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- Formula/rsclaw.rb; then
+            echo "Formula already up-to-date — nothing to push."
+            exit 0
+          fi
+          git add Formula/rsclaw.rb
+          git commit -m "rsclaw ${{ github.ref_name }}"
+          git push
