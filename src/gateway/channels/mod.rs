@@ -251,6 +251,7 @@ pub(crate) fn start_channels(
             let reg = Arc::clone(&registry);
             let cfg_arc = Arc::new(config.clone());
             let acct_for_log = acct_name.clone();
+            let w_acct_outer = acct_name.clone();
             let bound = bound_agent.clone();
             let enforcer = Arc::clone(&enforcer);
             let gp = Arc::new(group_policy.clone());
@@ -265,8 +266,10 @@ pub(crate) fn start_channels(
                 let mut senders = channel_senders
                     .write()
                     .expect("channel_senders lock poisoned");
-                senders.insert("telegram".to_string(), out_tx.clone());
                 senders.insert(format!("telegram/{}", acct_name), out_tx.clone());
+                senders
+                    .entry("telegram".to_string())
+                    .or_insert_with(|| out_tx.clone());
             }
 
             // Per-user inbound queue: serializes messages so each user's messages
@@ -301,6 +304,7 @@ pub(crate) fn start_channels(
                     let group_allow = Arc::clone(&ga);
                     let queues = Arc::clone(&tg_user_queues);
                     let tq = Arc::clone(&tq);
+                    let w_acct_outer = w_acct_outer.clone();
                     tokio::spawn(async move {
                         // Group policy check.
                         if is_group {
@@ -336,10 +340,10 @@ pub(crate) fn start_channels(
                                             text: crate::i18n::t_fmt("pairing_required", crate::i18n::default_lang(), &[("code", &code)]),
                                             reply_to: None,
                                             images: vec![],
-            channel: None,
-
-                                            account: None,
-                    files: vec![],                                        })
+                                            channel: None,
+                                            account: Some(w_acct_outer.clone()),
+                                            files: vec![],
+                                        })
                                         .await
                                     {
                                         tracing::warn!("failed to send message: {e}");
@@ -354,10 +358,10 @@ pub(crate) fn start_channels(
                                             text: crate::i18n::t("pairing_queue_full", crate::i18n::default_lang()).to_owned(),
                                             reply_to: None,
                                             images: vec![],
-            channel: None,
-
-                                            account: None,
-                    files: vec![],                                        })
+                                            channel: None,
+                                            account: Some(w_acct_outer.clone()),
+                                            files: vec![],
+                                        })
                                         .await
                                     {
                                         tracing::warn!("failed to send message: {e}");
@@ -383,6 +387,7 @@ pub(crate) fn start_channels(
                                 let w_cfg = Arc::clone(&cfg);
                                 let w_uid = queue_key.clone();
                                 let w_tq = Arc::clone(&tq);
+                                let w_acct = w_acct_outer.clone();
                                 tokio::spawn(async move {
                                     while let Some((text, peer_id, chat_id, is_group, bound, images, file_attachments)) = urx.recv().await {
                                         // No debounce — task queue merge_into_pending
@@ -390,15 +395,21 @@ pub(crate) fn start_channels(
                                         let handle = if let Some(ref agent_id) = bound {
                                             match w_reg.get(agent_id) {
                                                 Ok(h) => h,
-                                                Err(_) => match w_reg.route("telegram") {
+                                                Err(_) => match w_reg.route_account("telegram", Some(&w_acct)) {
                                                     Ok(h) => h,
-                                                    Err(e) => { error!("route error: {e:#}"); continue; }
+                                                    Err(_) => match w_reg.route_account("telegram", None) {
+                                                        Ok(h) => h,
+                                                        Err(e) => { error!("route error: {e:#}"); continue; }
+                                                    },
                                                 },
                                             }
                                         } else {
-                                            match w_reg.route("telegram") {
+                                            match w_reg.route_account("telegram", Some(&w_acct)) {
                                                 Ok(h) => h,
-                                                Err(e) => { error!("route error: {e:#}"); continue; }
+                                                Err(_) => match w_reg.route_account("telegram", None) {
+                                                    Ok(h) => h,
+                                                    Err(e) => { error!("route error: {e:#}"); continue; }
+                                                },
                                             }
                                         };
                                         let dm_scope = default_dm_scope(&w_cfg);
@@ -410,7 +421,7 @@ pub(crate) fn start_channels(
                                                     thread_id: None,
                                                 }
                                             } else {
-                                                MessageKind::DirectMessage { account_id: None }
+                                                MessageKind::DirectMessage { account_id: Some(w_acct.clone()) }
                                             },
                                             channel: "telegram".to_string(),
                                             peer_id: peer_id.to_string(),
@@ -428,7 +439,7 @@ pub(crate) fn start_channels(
                                             files: file_attachments.iter().filter_map(|f| {
                                                 crate::gateway::task_queue::stage_file(&f.filename, &f.data, &f.mime_type).ok()
                                             }).collect(),
-                                            account: None,
+                                            account: Some(w_acct.clone()),
                                         };
                                         if let Err(e) = w_tq.submit(&session_key, qmsg, crate::gateway::task_queue::Priority::User) {
                                             error!(user = %w_uid, "telegram: queue submit failed: {e:#}");
@@ -449,19 +460,26 @@ pub(crate) fn start_channels(
                             let question = text[5..].to_owned();
                             let chat_id_s = chat_id.to_string();
                             let bound = bound.clone();
+                            let w_acct_btw = w_acct_outer.clone();
                             tokio::spawn(async move {
                                 let handle = if let Some(ref agent_id) = bound {
                                     match reg.get(agent_id) {
                                         Ok(h) => h,
-                                        Err(_) => match reg.route("telegram") {
+                                        Err(_) => match reg.route_account("telegram", Some(&w_acct_btw)) {
                                             Ok(h) => h,
-                                            Err(_) => return,
+                                            Err(_) => match reg.route_account("telegram", None) {
+                                                Ok(h) => h,
+                                                Err(_) => return,
+                                            },
                                         },
                                     }
                                 } else {
-                                    match reg.route("telegram") {
+                                    match reg.route_account("telegram", Some(&w_acct_btw)) {
                                         Ok(h) => h,
-                                        Err(_) => return,
+                                        Err(_) => match reg.route_account("telegram", None) {
+                                            Ok(h) => h,
+                                            Err(_) => return,
+                                        },
                                     }
                                 };
                                 if let Some(reply_text) = btw_direct_call(
@@ -473,10 +491,10 @@ pub(crate) fn start_channels(
                                         text: format!("[/btw] {}", reply_text),
                                         reply_to: None,
                                         images: vec![],
-            channel: None,
-
-                                        account: None,
-                    files: vec![],                                    }).await
+                                        channel: None,
+                                        account: Some(w_acct_btw.clone()),
+                                        files: vec![],
+                                    }).await
                                     {
                                         tracing::warn!("failed to send message: {e}");
                                     }
@@ -492,19 +510,26 @@ pub(crate) fn start_channels(
                             let peer_id_s = peer_id.to_string();
                             let chat_id_s = chat_id.to_string();
                             let bound = bound.clone();
+                            let w_acct_pp = w_acct_outer.clone();
                             tokio::spawn(async move {
                                 let handle = if let Some(ref agent_id) = bound {
                                     match reg.get(agent_id) {
                                         Ok(h) => h,
-                                        Err(_) => match reg.route("telegram") {
+                                        Err(_) => match reg.route_account("telegram", Some(&w_acct_pp)) {
                                             Ok(h) => h,
-                                            Err(_) => return,
+                                            Err(_) => match reg.route_account("telegram", None) {
+                                                Ok(h) => h,
+                                                Err(_) => return,
+                                            },
                                         },
                                     }
                                 } else {
-                                    match reg.route("telegram") {
+                                    match reg.route_account("telegram", Some(&w_acct_pp)) {
                                         Ok(h) => h,
-                                        Err(_) => return,
+                                        Err(_) => match reg.route_account("telegram", None) {
+                                            Ok(h) => h,
+                                            Err(_) => return,
+                                        },
                                     }
                                 };
                                 let dm_scope = default_dm_scope(&cfg);
@@ -516,7 +541,7 @@ pub(crate) fn start_channels(
                                             thread_id: None,
                                         }
                                     } else {
-                                        MessageKind::DirectMessage { account_id: None }
+                                        MessageKind::DirectMessage { account_id: Some(w_acct_pp.clone()) }
                                     },
                                     channel: "telegram".to_string(),
                                     peer_id: peer_id_s.clone(),
@@ -550,7 +575,7 @@ pub(crate) fn start_channels(
                                     extra_tools: vec![],
                                     images,
                                     files: file_attachments,
-                                    account: None,
+                                    account: Some(w_acct_pp.clone()),
                                 };
                                 if handle.tx.send(msg).await.is_err() {
                                     return;
@@ -565,7 +590,7 @@ pub(crate) fn start_channels(
                                             images: r.images,
                                             files: r.files,
                                             channel: None,
-                                            account: None,
+                                            account: Some(w_acct_pp.clone()),
                                         }).await
                                         {
                                             tracing::warn!("failed to send message: {e}");
@@ -594,7 +619,10 @@ pub(crate) fn start_channels(
                 }
             });
 
-            if let Err(e) = manager.register(Arc::clone(&tg) as Arc<dyn Channel>) {
+            if let Err(e) = manager.register_with_name(
+                format!("telegram/{}", acct_for_log),
+                Arc::clone(&tg) as Arc<dyn Channel>,
+            ) {
                 tracing::warn!("failed to register channel: {e}");
             }
             tokio::spawn(async move {

@@ -271,7 +271,7 @@ pub(crate) fn start_feishu_if_configured(
                                         images: vec![],
                                         channel: None,
 
-                                        account: None,
+                                        account: Some(w_acct_outer.clone()),
                                         files: vec![],
                                     })
                                     .await
@@ -294,7 +294,7 @@ pub(crate) fn start_feishu_if_configured(
                                         images: vec![],
                                         channel: None,
 
-                                        account: None,
+                                        account: Some(w_acct_outer.clone()),
                                         files: vec![],
                                     })
                                     .await
@@ -407,7 +407,9 @@ pub(crate) fn start_feishu_if_configured(
                                                 thread_id: None,
                                             }
                                         } else {
-                                            MessageKind::DirectMessage { account_id: None }
+                                            MessageKind::DirectMessage {
+                                                account_id: Some(w_acct.clone()),
+                                            }
                                         },
                                         channel: "feishu".to_string(),
                                         peer_id: sender_id.clone(),
@@ -472,10 +474,14 @@ pub(crate) fn start_feishu_if_configured(
                         let cfg = cfg.clone();
                         let question = text[5..].to_owned();
                         let target = outbound_target.clone();
+                        let w_acct_btw = w_acct_outer.clone();
                         tokio::spawn(async move {
-                            let handle = match reg.route_account("feishu", None) {
+                            let handle = match reg.route_account("feishu", Some(&w_acct_btw)) {
                                 Ok(h) => h,
-                                Err(_) => return,
+                                Err(_) => match reg.route_account("feishu", None) {
+                                    Ok(h) => h,
+                                    Err(_) => return,
+                                },
                             };
                             if let Some(reply_text) = btw_direct_call(
                                 &question,
@@ -494,7 +500,7 @@ pub(crate) fn start_feishu_if_configured(
                                         images: vec![],
                                         channel: None,
 
-                                        account: None,
+                                        account: Some(w_acct_btw.clone()),
                                         files: vec![],
                                     })
                                     .await
@@ -539,7 +545,9 @@ pub(crate) fn start_feishu_if_configured(
                                         thread_id: None,
                                     }
                                 } else {
-                                    MessageKind::DirectMessage { account_id: None }
+                                    MessageKind::DirectMessage {
+                                        account_id: Some(w_acct_for_preparse.clone()),
+                                    }
                                 },
                                 channel: "feishu".to_string(),
                                 peer_id: sender_id.clone(),
@@ -580,7 +588,7 @@ pub(crate) fn start_feishu_if_configured(
                                 extra_tools: vec![],
                                 images,
                                 files: file_attachments,
-                                account: None,
+                                account: Some(w_acct_for_preparse.clone()),
                             };
                             if handle.tx.send(msg).await.is_err() {
                                 return;
@@ -599,7 +607,7 @@ pub(crate) fn start_feishu_if_configured(
                                             images: r.images,
                                             files: r.files,
                                             channel: None,
-                                            account: None,
+                                            account: Some(w_acct_for_preparse.clone()),
                                         })
                                         .await
                                     {

@@ -22,6 +22,7 @@ use crate::{
 /// Receives inbound messages and submits them to the task queue.
 fn spawn_wechat_user_worker(
     user_id: String,
+    w_acct: String,
     mut rx: mpsc::Receiver<(
         String,
         Vec<crate::agent::registry::ImageAttachment>,
@@ -32,12 +33,11 @@ fn spawn_wechat_user_worker(
     tq: Arc<crate::gateway::task_queue::TaskQueueManager>,
 ) {
     tokio::spawn(async move {
-        debug!(user = %user_id, "wechat: per-user worker started");
+        debug!(user = %user_id, account = %w_acct, "wechat: per-user worker started");
         while let Some((text, images, file_attachments)) = rx.recv().await {
-            // No debounce — task queue merge_into_pending
-            // handles rapid consecutive messages automatically.
             let handle = match reg
-                .route_account("wechat", Some("default"))
+                .route_account("wechat", Some(&w_acct))
+                .or_else(|_| reg.route_account("wechat", None))
                 .or_else(|_| reg.default_agent())
             {
                 Ok(h) => h,
@@ -49,7 +49,9 @@ fn spawn_wechat_user_worker(
             let dm_scope = default_dm_scope(&cfg);
             let session_key = derive_session_key(&SessionKeyParams {
                 agent_id: handle.id.clone(),
-                kind: MessageKind::DirectMessage { account_id: None },
+                kind: MessageKind::DirectMessage {
+                    account_id: Some(w_acct.clone()),
+                },
                 channel: "wechat".to_string(),
                 peer_id: user_id.clone(),
                 dm_scope,
@@ -70,7 +72,7 @@ fn spawn_wechat_user_worker(
                             .ok()
                     })
                     .collect(),
-                account: None,
+                account: Some(w_acct.clone()),
             };
             if let Err(e) = tq.submit(
                 &session_key,
@@ -196,22 +198,42 @@ pub(crate) fn start_wechat_personal_if_configured(
         .and_then(|c| c.base_url.as_deref())
         .map(str::to_owned);
 
-    for (_acct_name, token) in wc_accounts {
+    for (acct_name, token) in wc_accounts {
         let enforcer = Arc::clone(&enforcer);
         let wechat_base_url = wechat_base_url.clone();
         let reg = Arc::clone(&registry);
         let cfg = config.clone();
         let tq = Arc::clone(&task_queue);
         let shutdown_for_messages = shutdown.clone();
+        let w_acct_outer = acct_name.clone();
+
+        // Find binding for this account to determine which agent handles it.
+        let bound_agent = config
+            .agents
+            .bindings
+            .iter()
+            .find(|b| {
+                b.match_.channel.as_deref() == Some("wechat")
+                    && b.match_.account_id.as_deref() == Some(&acct_name)
+            })
+            .map(|b| b.agent_id.clone());
 
         let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
 
-        // Register WeChat channel sender for notification routing.
+        // Register channel sender for notification routing.
+        // - "wechat/{account}" is the canonical key — multi-account-aware callers use it.
+        // - bare "wechat" is registered only by the first account so legacy callers
+        //   still find a sender. Without this guard each account overwrote the bare key,
+        //   leaving the last-registered account routing replies for messages received
+        //   via every other account.
         {
             let mut senders = channel_senders
                 .write()
                 .expect("channel_senders lock poisoned");
-            senders.insert("wechat".to_string(), out_tx.clone());
+            senders.insert(format!("wechat/{}", acct_name), out_tx.clone());
+            senders
+                .entry("wechat".to_string())
+                .or_insert_with(|| out_tx.clone());
         }
 
         // Per-user inbound queue: serializes messages so each user's messages
@@ -238,6 +260,8 @@ pub(crate) fn start_wechat_personal_if_configured(
                 let queues = Arc::clone(&user_queues);
                 let enforcer = Arc::clone(&enforcer);
                 let shutdown = shutdown_for_messages.clone();
+                let bound = bound_agent.clone();
+                let w_acct = w_acct_outer.clone();
                 tokio::spawn(async move {
                     if shutdown.is_draining() {
                         debug!(peer_id = %from_user, "wechat: dropping inbound message during drain");
@@ -266,7 +290,7 @@ pub(crate) fn start_wechat_personal_if_configured(
                                         images: vec![],
                                         channel: None,
 
-                                        account: None,
+                                        account: Some(w_acct.clone()),
                                         files: vec![],
                                     })
                                     .await
@@ -289,7 +313,7 @@ pub(crate) fn start_wechat_personal_if_configured(
                                         images: vec![],
                                         channel: None,
 
-                                        account: None,
+                                        account: Some(w_acct.clone()),
                                         files: vec![],
                                     })
                                     .await
@@ -314,6 +338,7 @@ pub(crate) fn start_wechat_personal_if_configured(
                                 // Spawn per-user sequential processor.
                                 spawn_wechat_user_worker(
                                     from_user.clone(),
+                                    w_acct.clone(),
                                     urx,
                                     Arc::clone(&reg),
                                     cfg.clone(),
@@ -326,6 +351,7 @@ pub(crate) fn start_wechat_personal_if_configured(
                             map.insert(from_user.clone(), utx.clone());
                             spawn_wechat_user_worker(
                                 from_user.clone(),
+                                w_acct.clone(),
                                 urx,
                                 Arc::clone(&reg),
                                 cfg.clone(),
@@ -341,10 +367,22 @@ pub(crate) fn start_wechat_personal_if_configured(
                         let cfg = cfg.clone();
                         let question = text[5..].to_owned();
                         let from_user = from_user.clone();
+                        let bound = bound.clone();
+                        let w_acct = w_acct.clone();
                         tokio::spawn(async move {
-                            let handle = match reg.get("main").or_else(|_| reg.default_agent()) {
-                                Ok(h) => h,
-                                Err(_) => return,
+                            let handle = if let Some(ref agent_id) = bound {
+                                match reg.get(agent_id) {
+                                    Ok(h) => h,
+                                    Err(_) => match reg.route_account("wechat", None) {
+                                        Ok(h) => h,
+                                        Err(_) => return,
+                                    },
+                                }
+                            } else {
+                                match reg.route_account("wechat", None) {
+                                    Ok(h) => h,
+                                    Err(_) => return,
+                                }
                             };
                             if let Some(reply_text) = btw_direct_call(
                                 &question,
@@ -363,7 +401,7 @@ pub(crate) fn start_wechat_personal_if_configured(
                                         images: vec![],
                                         channel: None,
 
-                                        account: None,
+                                        account: Some(w_acct),
                                         files: vec![],
                                     })
                                     .await
@@ -380,15 +418,29 @@ pub(crate) fn start_wechat_personal_if_configured(
                         let tx = tx.clone();
                         let cfg = cfg.clone();
                         let from_user = from_user.clone();
+                        let bound = bound.clone();
+                        let w_acct = w_acct.clone();
                         tokio::spawn(async move {
-                            let handle = match reg.get("main").or_else(|_| reg.default_agent()) {
-                                Ok(h) => h,
-                                Err(_) => return,
+                            let handle = if let Some(ref agent_id) = bound {
+                                match reg.get(agent_id) {
+                                    Ok(h) => h,
+                                    Err(_) => match reg.route_account("wechat", None) {
+                                        Ok(h) => h,
+                                        Err(_) => return,
+                                    },
+                                }
+                            } else {
+                                match reg.route_account("wechat", None) {
+                                    Ok(h) => h,
+                                    Err(_) => return,
+                                }
                             };
                             let dm_scope = default_dm_scope(&cfg);
                             let session_key = derive_session_key(&SessionKeyParams {
                                 agent_id: handle.id.clone(),
-                                kind: MessageKind::DirectMessage { account_id: None },
+                                kind: MessageKind::DirectMessage {
+                                    account_id: Some(w_acct.clone()),
+                                },
                                 channel: "wechat".to_string(),
                                 peer_id: from_user.clone(),
                                 dm_scope,
@@ -427,7 +479,7 @@ pub(crate) fn start_wechat_personal_if_configured(
                                 extra_tools: vec![],
                                 images,
                                 files: file_attachments,
-                                account: None,
+                                account: Some(w_acct.clone()),
                             };
                             if handle.tx.send(msg).await.is_err() {
                                 return;
@@ -446,7 +498,7 @@ pub(crate) fn start_wechat_personal_if_configured(
                                             images: r.images,
                                             files: r.files,
                                             channel: None,
-                                            account: None,
+                                            account: Some(w_acct),
                                         })
                                         .await
                                     {
@@ -473,8 +525,20 @@ pub(crate) fn start_wechat_personal_if_configured(
                 ch
             }
         });
-        if let Err(e) = manager.register(Arc::clone(&wc) as Arc<dyn crate::channel::Channel>) {
-            tracing::warn!("failed to register channel: {e}");
+        let acct_key = format!("wechat/{}", acct_name);
+        if let Err(e) = manager.register_with_name(
+            acct_key.clone(),
+            Arc::clone(&wc) as Arc<dyn crate::channel::Channel>,
+        ) {
+            tracing::warn!("failed to register channel `{acct_key}`: {e}");
+        }
+        if manager.get("wechat").is_none()
+            && let Err(e) = manager.register_with_name(
+                "wechat".to_owned(),
+                Arc::clone(&wc) as Arc<dyn crate::channel::Channel>,
+            )
+        {
+            tracing::warn!("failed to register bare `wechat` channel: {e}");
         }
         let wc_send = Arc::clone(&wc);
         let shutdown_for_outbound = shutdown.clone();
@@ -514,6 +578,6 @@ pub(crate) fn start_wechat_personal_if_configured(
             }
         });
 
-        info!("wechat personal channel started");
+        info!(account = %acct_name, "wechat personal channel started");
     } // end for wc_accounts
 }

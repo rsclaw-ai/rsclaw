@@ -89,6 +89,7 @@ pub(crate) fn start_discord_if_configured(
         let cfg_arc = Arc::new(config.clone());
         let tq = Arc::clone(&task_queue);
         let acct_for_log = acct_name.clone();
+        let w_acct_outer = acct_name.clone();
         let enforcer = Arc::clone(&enforcer);
         let gp = Arc::new(group_policy.clone());
         let ga = Arc::new(group_allow_from.clone());
@@ -99,8 +100,10 @@ pub(crate) fn start_discord_if_configured(
             let mut senders = channel_senders
                 .write()
                 .expect("channel_senders lock poisoned");
-            senders.insert("discord".to_string(), out_tx.clone());
             senders.insert(format!("discord/{}", acct_name), out_tx.clone());
+            senders
+                .entry("discord".to_string())
+                .or_insert_with(|| out_tx.clone());
         }
 
         // Find binding for this account.
@@ -145,6 +148,7 @@ pub(crate) fn start_discord_if_configured(
                 let group_allow = Arc::clone(&ga);
                 let queues = Arc::clone(&dc_user_queues);
                 let tq = Arc::clone(&tq);
+                let w_acct_outer = w_acct_outer.clone();
                 tokio::spawn(async move {
                     // Group policy check.
                     if is_guild {
@@ -185,7 +189,7 @@ pub(crate) fn start_discord_if_configured(
                                         images: vec![],
                                         channel: None,
 
-                                        account: None,
+                                        account: Some(w_acct_outer.clone()),
                                         files: vec![],
                                     })
                                     .await
@@ -208,7 +212,7 @@ pub(crate) fn start_discord_if_configured(
                                         images: vec![],
                                         channel: None,
 
-                                        account: None,
+                                        account: Some(w_acct_outer.clone()),
                                         files: vec![],
                                     })
                                     .await
@@ -237,6 +241,7 @@ pub(crate) fn start_discord_if_configured(
                             let w_cfg = Arc::clone(&cfg);
                             let w_tq = Arc::clone(&tq);
                             let w_uid = peer_id.clone();
+                            let w_acct = w_acct_outer.clone();
                             tokio::spawn(async move {
                                 while let Some((
                                     text,
@@ -253,7 +258,7 @@ pub(crate) fn start_discord_if_configured(
                                     let handle = if let Some(ref agent_id) = bound {
                                         match w_reg.get(agent_id) {
                                             Ok(h) => h,
-                                            Err(_) => match w_reg.route("discord") {
+                                            Err(_) => match w_reg.route_account("discord", Some(&w_acct)).or_else(|_| w_reg.route_account("discord", None)) {
                                                 Ok(h) => h,
                                                 Err(e) => {
                                                     error!("discord route: {e:#}");
@@ -262,7 +267,7 @@ pub(crate) fn start_discord_if_configured(
                                             },
                                         }
                                     } else {
-                                        match w_reg.route("discord") {
+                                        match w_reg.route_account("discord", Some(&w_acct)).or_else(|_| w_reg.route_account("discord", None)) {
                                             Ok(h) => h,
                                             Err(e) => {
                                                 error!("discord route: {e:#}");
@@ -279,7 +284,7 @@ pub(crate) fn start_discord_if_configured(
                                                 thread_id: None,
                                             }
                                         } else {
-                                            MessageKind::DirectMessage { account_id: None }
+                                            MessageKind::DirectMessage { account_id: Some(w_acct.clone()) }
                                         },
                                         channel: "discord".to_string(),
                                         peer_id: peer_id.clone(),
@@ -305,7 +310,7 @@ pub(crate) fn start_discord_if_configured(
                                                 .ok()
                                             })
                                             .collect(),
-                                        account: None,
+                                        account: Some(w_acct.clone()),
                                     };
                                     if let Err(e) = w_tq.submit(
                                         &session_key,
@@ -329,8 +334,9 @@ pub(crate) fn start_discord_if_configured(
                         let cfg = Arc::clone(&cfg);
                         let question = text[5..].to_owned();
                         let channel_id = channel_id.clone();
+                        let w_acct_btw = w_acct_outer.clone();
                         tokio::spawn(async move {
-                            let handle = match reg.route("discord") {
+                            let handle = match reg.route_account("discord", Some(&w_acct_btw)).or_else(|_| reg.route_account("discord", None)) {
                                 Ok(h) => h,
                                 Err(_) => return,
                             };
@@ -351,7 +357,7 @@ pub(crate) fn start_discord_if_configured(
                                         images: vec![],
                                         channel: None,
 
-                                        account: None,
+                                        account: Some(w_acct_btw.clone()),
                                         files: vec![],
                                     })
                                     .await
@@ -372,17 +378,18 @@ pub(crate) fn start_discord_if_configured(
                         let bound = bound.clone();
                         let images = images.clone();
                         let files = files.clone();
+                        let w_acct_pp = w_acct_outer.clone();
                         tokio::spawn(async move {
                             let handle = if let Some(ref agent_id) = bound {
                                 match reg.get(agent_id) {
                                     Ok(h) => h,
-                                    Err(_) => match reg.route("discord") {
+                                    Err(_) => match reg.route_account("discord", Some(&w_acct_pp)).or_else(|_| reg.route_account("discord", None)) {
                                         Ok(h) => h,
                                         Err(_) => return,
                                     },
                                 }
                             } else {
-                                match reg.route("discord") {
+                                match reg.route_account("discord", Some(&w_acct_pp)).or_else(|_| reg.route_account("discord", None)) {
                                     Ok(h) => h,
                                     Err(_) => return,
                                 }
@@ -396,7 +403,7 @@ pub(crate) fn start_discord_if_configured(
                                         thread_id: None,
                                     }
                                 } else {
-                                    MessageKind::DirectMessage { account_id: None }
+                                    MessageKind::DirectMessage { account_id: Some(w_acct_pp.clone()) }
                                 },
                                 channel: "discord".to_string(),
                                 peer_id: peer_id.clone(),
@@ -436,7 +443,7 @@ pub(crate) fn start_discord_if_configured(
                                 extra_tools: vec![],
                                 images,
                                 files,
-                                account: None,
+                                account: Some(w_acct_pp.clone()),
                             };
                             if handle.tx.send(msg).await.is_err() {
                                 return;
@@ -455,7 +462,7 @@ pub(crate) fn start_discord_if_configured(
                                             images: r.images,
                                             files: r.files,
                                             channel: None,
-                                            account: None,
+                                            account: Some(w_acct_pp.clone()),
                                         })
                                         .await
                                     {

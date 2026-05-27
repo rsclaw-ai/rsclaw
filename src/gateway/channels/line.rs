@@ -91,6 +91,7 @@ pub(crate) fn start_line_if_configured(
 
     for (acct_name, channel_access_token) in line_accounts {
         let acct_for_log = acct_name.clone();
+        let w_acct_outer = acct_name.clone();
         let enforcer = Arc::clone(&enforcer);
         let reg = Arc::clone(&registry);
         let cfg_arc = Arc::new(config.clone());
@@ -101,8 +102,10 @@ pub(crate) fn start_line_if_configured(
             let mut senders = channel_senders
                 .write()
                 .expect("channel_senders lock poisoned");
-            senders.insert("line".to_string(), out_tx.clone());
             senders.insert(format!("line/{}", acct_name), out_tx.clone());
+            senders
+                .entry("line".to_string())
+                .or_insert_with(|| out_tx.clone());
         }
 
         let gp = Arc::new(group_policy.clone());
@@ -133,6 +136,7 @@ pub(crate) fn start_line_if_configured(
                 let group_allow = Arc::clone(&ga);
                 let queues = Arc::clone(&line_user_queues);
                 let tq = Arc::clone(&tq);
+                let w_acct_outer = w_acct_outer.clone();
                 tokio::spawn(async move {
                     // Group policy check.
                     if is_group {
@@ -173,7 +177,7 @@ pub(crate) fn start_line_if_configured(
                                         images: vec![],
                                         channel: None,
 
-                                        account: None,
+                                        account: Some(w_acct_outer.clone()),
                                         files: vec![],
                                     })
                                     .await
@@ -196,7 +200,7 @@ pub(crate) fn start_line_if_configured(
                                         images: vec![],
                                         channel: None,
 
-                                        account: None,
+                                        account: Some(w_acct_outer.clone()),
                                         files: vec![],
                                     })
                                     .await
@@ -225,12 +229,13 @@ pub(crate) fn start_line_if_configured(
                             let w_cfg = Arc::clone(&cfg);
                             let w_uid = user_id.clone();
                             let w_tq = Arc::clone(&tq);
+                            let w_acct = w_acct_outer.clone();
                             tokio::spawn(async move {
                                 while let Some((text, user_id, is_group, images)) = urx.recv().await
                                 {
                                     // No debounce — task queue merge_into_pending
                                     // handles rapid consecutive messages automatically.
-                                    let handle = match w_reg.route("line") {
+                                    let handle = match w_reg.route_account("line", Some(&w_acct)).or_else(|_| w_reg.route_account("line", None)) {
                                         Ok(h) => h,
                                         Err(e) => {
                                             error!("line route: {e:#}");
@@ -241,9 +246,9 @@ pub(crate) fn start_line_if_configured(
                                     let session_key = derive_session_key(&SessionKeyParams {
                                         agent_id: handle.id.clone(),
                                         kind: if is_group {
-                                            MessageKind::DirectMessage { account_id: None }
+                                            MessageKind::DirectMessage { account_id: Some(w_acct.clone()) }
                                         } else {
-                                            MessageKind::DirectMessage { account_id: None }
+                                            MessageKind::DirectMessage { account_id: Some(w_acct.clone()) }
                                         },
                                         channel: "line".to_string(),
                                         peer_id: user_id.clone(),
@@ -259,7 +264,7 @@ pub(crate) fn start_line_if_configured(
                                         timestamp: chrono::Utc::now().timestamp(),
                                         images: images.iter().map(|i| i.data.clone()).collect(),
                                         files: vec![],
-                                        account: None,
+                                        account: Some(w_acct.clone()),
                                     };
                                     if let Err(e) = w_tq.submit(
                                         &session_key,
@@ -283,8 +288,9 @@ pub(crate) fn start_line_if_configured(
                         let cfg = Arc::clone(&cfg);
                         let question = text[5..].to_owned();
                         let user_id = user_id.clone();
+                        let w_acct_btw = w_acct_outer.clone();
                         tokio::spawn(async move {
-                            let handle = match reg.route("line") {
+                            let handle = match reg.route_account("line", Some(&w_acct_btw)).or_else(|_| reg.route_account("line", None)) {
                                 Ok(h) => h,
                                 Err(_) => return,
                             };
@@ -305,7 +311,7 @@ pub(crate) fn start_line_if_configured(
                                         images: vec![],
                                         channel: None,
 
-                                        account: None,
+                                        account: Some(w_acct_btw.clone()),
                                         files: vec![],
                                     })
                                     .await
@@ -322,8 +328,9 @@ pub(crate) fn start_line_if_configured(
                         let tx = tx.clone();
                         let cfg = Arc::clone(&cfg);
                         let user_id = user_id.clone();
+                        let w_acct_pp = w_acct_outer.clone();
                         tokio::spawn(async move {
-                            let handle = match reg.route("line") {
+                            let handle = match reg.route_account("line", Some(&w_acct_pp)).or_else(|_| reg.route_account("line", None)) {
                                 Ok(h) => h,
                                 Err(_) => return,
                             };
@@ -336,7 +343,7 @@ pub(crate) fn start_line_if_configured(
                                         thread_id: None,
                                     }
                                 } else {
-                                    MessageKind::DirectMessage { account_id: None }
+                                    MessageKind::DirectMessage { account_id: Some(w_acct_pp.clone()) }
                                 },
                                 channel: "line".to_string(),
                                 peer_id: user_id.clone(),
@@ -376,7 +383,7 @@ pub(crate) fn start_line_if_configured(
                                 extra_tools: vec![],
                                 images,
                                 files: vec![],
-                                account: None,
+                                account: Some(w_acct_pp.clone()),
                             };
                             if handle.tx.send(msg).await.is_err() {
                                 return;
@@ -395,7 +402,7 @@ pub(crate) fn start_line_if_configured(
                                             images: r.images,
                                             files: r.files,
                                             channel: None,
-                                            account: None,
+                                            account: Some(w_acct_pp.clone()),
                                         })
                                         .await
                                     {

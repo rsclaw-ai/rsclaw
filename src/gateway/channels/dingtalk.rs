@@ -113,6 +113,7 @@ pub(crate) fn start_dingtalk_if_configured(
         let cfg = config.clone();
         let tq = Arc::clone(&task_queue);
         let acct_for_log = acct_name.clone();
+        let w_acct_outer = acct_name.clone();
         let enforcer = Arc::clone(&enforcer);
         let gp = Arc::new(group_policy.clone());
         let ga = Arc::new(group_allow_from.clone());
@@ -123,8 +124,10 @@ pub(crate) fn start_dingtalk_if_configured(
             let mut senders = channel_senders
                 .write()
                 .expect("channel_senders lock poisoned");
-            senders.insert("dingtalk".to_string(), out_tx.clone());
             senders.insert(format!("dingtalk/{}", acct_name), out_tx.clone());
+            senders
+                .entry("dingtalk".to_string())
+                .or_insert_with(|| out_tx.clone());
         }
 
         // Find binding for this account to determine which agent handles it.
@@ -167,6 +170,7 @@ pub(crate) fn start_dingtalk_if_configured(
                 let group_policy = Arc::clone(&gp);
                 let group_allow = Arc::clone(&ga);
                 let queues = Arc::clone(&dt_user_queues);
+                let w_acct_outer = w_acct_outer.clone();
                 tokio::spawn(async move {
                     // Group policy check.
                     if is_group {
@@ -207,7 +211,7 @@ pub(crate) fn start_dingtalk_if_configured(
                                         images: vec![],
                                         channel: None,
 
-                                        account: None,
+                                        account: Some(w_acct_outer.clone()),
                                         files: vec![],
                                     })
                                     .await
@@ -230,7 +234,7 @@ pub(crate) fn start_dingtalk_if_configured(
                                         images: vec![],
                                         channel: None,
 
-                                        account: None,
+                                        account: Some(w_acct_outer.clone()),
                                         files: vec![],
                                     })
                                     .await
@@ -259,6 +263,7 @@ pub(crate) fn start_dingtalk_if_configured(
                             let w_cfg = cfg.clone();
                             let w_uid = sender_id.clone();
                             let w_tq = Arc::clone(&tq);
+                            let w_acct = w_acct_outer.clone();
                             tokio::spawn(async move {
                                 while let Some((
                                     text,
@@ -300,7 +305,7 @@ pub(crate) fn start_dingtalk_if_configured(
                                                 thread_id: None,
                                             }
                                         } else {
-                                            MessageKind::DirectMessage { account_id: None }
+                                            MessageKind::DirectMessage { account_id: Some(w_acct.clone()) }
                                         },
                                         channel: "dingtalk".to_string(),
                                         peer_id: sender_id.clone(),
@@ -321,7 +326,7 @@ pub(crate) fn start_dingtalk_if_configured(
                                         timestamp: chrono::Utc::now().timestamp(),
                                         images: images.iter().map(|i| i.data.clone()).collect(),
                                         files: vec![],
-                                        account: None,
+                                        account: Some(w_acct.clone()),
                                     };
                                     if let Err(e) = w_tq.submit(
                                         &session_key,
@@ -343,13 +348,17 @@ pub(crate) fn start_dingtalk_if_configured(
                         let reg = Arc::clone(&reg);
                         let tx = tx.clone();
                         let cfg = cfg.clone();
+                        let w_acct_btw = w_acct_outer.clone();
                         let question = text[5..].to_owned();
                         let sender_id = sender_id.clone();
                         let conversation_id = conversation_id.clone();
                         tokio::spawn(async move {
-                            let handle = match reg.route_account("dingtalk", None) {
+                            let handle = match reg.route_account("dingtalk", Some(&w_acct_btw)) {
                                 Ok(h) => h,
-                                Err(_) => return,
+                                Err(_) => match reg.route_account("dingtalk", None) {
+                                    Ok(h) => h,
+                                    Err(_) => return,
+                                },
                             };
                             if let Some(reply_text) = btw_direct_call(
                                 &question,
@@ -369,7 +378,7 @@ pub(crate) fn start_dingtalk_if_configured(
                                         images: vec![],
                                         channel: None,
 
-                                        account: None,
+                                        account: Some(w_acct_outer.clone()),
                                         files: vec![],
                                     })
                                     .await
@@ -388,17 +397,18 @@ pub(crate) fn start_dingtalk_if_configured(
                         let sender_id = sender_id.clone();
                         let conversation_id = conversation_id.clone();
                         let bound = bound.clone();
+                        let w_acct_pp = w_acct_outer.clone();
                         tokio::spawn(async move {
                             let handle = if let Some(ref agent_id) = bound {
                                 match reg.get(agent_id) {
                                     Ok(h) => h,
-                                    Err(_) => match reg.route_account("dingtalk", None) {
+                                    Err(_) => match reg.route_account("dingtalk", Some(&w_acct_pp)) {
                                         Ok(h) => h,
                                         Err(_) => return,
                                     },
                                 }
                             } else {
-                                match reg.route_account("dingtalk", None) {
+                                match reg.route_account("dingtalk", Some(&w_acct_pp)) {
                                     Ok(h) => h,
                                     Err(_) => return,
                                 }
@@ -412,7 +422,7 @@ pub(crate) fn start_dingtalk_if_configured(
                                         thread_id: None,
                                     }
                                 } else {
-                                    MessageKind::DirectMessage { account_id: None }
+                                    MessageKind::DirectMessage { account_id: Some(w_acct_pp.clone()) }
                                 },
                                 channel: "dingtalk".to_string(),
                                 peer_id: sender_id.clone(),
@@ -456,7 +466,7 @@ pub(crate) fn start_dingtalk_if_configured(
                                 extra_tools: vec![],
                                 images,
                                 files: vec![],
-                                account: None,
+                                account: Some(w_acct_pp.clone()),
                             };
                             if handle.tx.send(msg).await.is_err() {
                                 return;
@@ -476,7 +486,7 @@ pub(crate) fn start_dingtalk_if_configured(
                                             images: r.images,
                                             files: r.files,
                                             channel: None,
-                                            account: None,
+                                            account: Some(w_acct_pp.clone()),
                                         })
                                         .await
                                     {
@@ -509,7 +519,7 @@ pub(crate) fn start_dingtalk_if_configured(
             dt_cfg.oapi_base.clone(),
             on_message,
         ));
-        if let Err(e) = manager.register(Arc::clone(&dt) as Arc<dyn crate::channel::Channel>) {
+        if let Err(e) = manager.register_with_name(format!("dingtalk/{}", acct_for_log), Arc::clone(&dt) as Arc<dyn crate::channel::Channel>) {
             tracing::warn!("failed to register channel: {e}");
         }
         let dt_send = Arc::clone(&dt);

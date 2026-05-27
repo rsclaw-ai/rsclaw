@@ -85,6 +85,7 @@ pub(crate) fn start_zalo_if_configured(
 
     for (acct_name, access_token) in zalo_accounts {
         let acct_for_log = acct_name.clone();
+        let w_acct_outer = acct_name.clone();
         let enforcer = Arc::clone(&enforcer);
         let reg = Arc::clone(&registry);
         let cfg_arc = Arc::new(config.clone());
@@ -95,8 +96,10 @@ pub(crate) fn start_zalo_if_configured(
             let mut senders = channel_senders
                 .write()
                 .expect("channel_senders lock poisoned");
-            senders.insert("zalo".to_string(), out_tx.clone());
             senders.insert(format!("zalo/{}", acct_name), out_tx.clone());
+            senders
+                .entry("zalo".to_string())
+                .or_insert_with(|| out_tx.clone());
         }
 
         let tq = Arc::clone(&task_queue);
@@ -117,6 +120,7 @@ pub(crate) fn start_zalo_if_configured(
                 let enforcer = Arc::clone(&enforcer);
                 let queues = Arc::clone(&zalo_user_queues);
                 let tq = Arc::clone(&tq);
+                let w_acct_outer = w_acct_outer.clone();
                 tokio::spawn(async move {
                     // DM policy check (Zalo is DM-only).
                     {
@@ -141,7 +145,7 @@ pub(crate) fn start_zalo_if_configured(
                                         images: vec![],
                                         channel: None,
 
-                                        account: None,
+                                        account: Some(w_acct_outer.clone()),
                                         files: vec![],
                                     })
                                     .await
@@ -164,7 +168,7 @@ pub(crate) fn start_zalo_if_configured(
                                         images: vec![],
                                         channel: None,
 
-                                        account: None,
+                                        account: Some(w_acct_outer.clone()),
                                         files: vec![],
                                     })
                                     .await
@@ -193,11 +197,12 @@ pub(crate) fn start_zalo_if_configured(
                             let w_cfg = Arc::clone(&cfg);
                             let w_uid = sender_id.clone();
                             let w_tq = Arc::clone(&tq);
+                            let w_acct = w_acct_outer.clone();
                             tokio::spawn(async move {
                                 while let Some((text, sender_id, images)) = urx.recv().await {
                                     // No debounce — task queue merge_into_pending
                                     // handles rapid consecutive messages automatically.
-                                    let handle = match w_reg.route("zalo") {
+                                    let handle = match w_reg.route_account("zalo", Some(&w_acct)).or_else(|_| w_reg.route_account("zalo", None)) {
                                         Ok(h) => h,
                                         Err(e) => {
                                             error!("zalo route: {e:#}");
@@ -207,7 +212,7 @@ pub(crate) fn start_zalo_if_configured(
                                     let dm_scope = default_dm_scope(&w_cfg);
                                     let session_key = derive_session_key(&SessionKeyParams {
                                         agent_id: handle.id.clone(),
-                                        kind: MessageKind::DirectMessage { account_id: None },
+                                        kind: MessageKind::DirectMessage { account_id: Some(w_acct.clone()) },
                                         channel: "zalo".to_string(),
                                         peer_id: sender_id.clone(),
                                         dm_scope,
@@ -222,7 +227,7 @@ pub(crate) fn start_zalo_if_configured(
                                         timestamp: chrono::Utc::now().timestamp(),
                                         images: images.iter().map(|i| i.data.clone()).collect(),
                                         files: vec![],
-                                        account: None,
+                                        account: Some(w_acct.clone()),
                                     };
                                     if let Err(e) = w_tq.submit(
                                         &session_key,
@@ -246,8 +251,9 @@ pub(crate) fn start_zalo_if_configured(
                         let cfg = Arc::clone(&cfg);
                         let question = text[5..].to_owned();
                         let sender_id = sender_id.clone();
+                        let w_acct_btw = w_acct_outer.clone();
                         tokio::spawn(async move {
-                            let handle = match reg.route("zalo") {
+                            let handle = match reg.route_account("zalo", Some(&w_acct_btw)).or_else(|_| reg.route_account("zalo", None)) {
                                 Ok(h) => h,
                                 Err(_) => return,
                             };
@@ -268,7 +274,7 @@ pub(crate) fn start_zalo_if_configured(
                                         images: vec![],
                                         channel: None,
 
-                                        account: None,
+                                        account: Some(w_acct_btw.clone()),
                                         files: vec![],
                                     })
                                     .await
@@ -285,15 +291,16 @@ pub(crate) fn start_zalo_if_configured(
                         let tx = tx.clone();
                         let cfg = Arc::clone(&cfg);
                         let sender_id = sender_id.clone();
+                        let w_acct_pp = w_acct_outer.clone();
                         tokio::spawn(async move {
-                            let handle = match reg.route("zalo") {
+                            let handle = match reg.route_account("zalo", Some(&w_acct_pp)).or_else(|_| reg.route_account("zalo", None)) {
                                 Ok(h) => h,
                                 Err(_) => return,
                             };
                             let dm_scope = default_dm_scope(&cfg);
                             let session_key = derive_session_key(&SessionKeyParams {
                                 agent_id: handle.id.clone(),
-                                kind: MessageKind::DirectMessage { account_id: None },
+                                kind: MessageKind::DirectMessage { account_id: Some(w_acct_pp.clone()) },
                                 channel: "zalo".to_string(),
                                 peer_id: sender_id.clone(),
                                 dm_scope,
@@ -332,7 +339,7 @@ pub(crate) fn start_zalo_if_configured(
                                 extra_tools: vec![],
                                 images,
                                 files: vec![],
-                                account: None,
+                                account: Some(w_acct_pp.clone()),
                             };
                             if handle.tx.send(msg).await.is_err() {
                                 return;
@@ -351,7 +358,7 @@ pub(crate) fn start_zalo_if_configured(
                                             images: r.images,
                                             files: r.files,
                                             channel: None,
-                                            account: None,
+                                            account: Some(w_acct_pp.clone()),
                                         })
                                         .await
                                     {

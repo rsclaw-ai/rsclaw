@@ -100,6 +100,7 @@ pub(crate) fn start_qq_if_configured(
 
     for (acct_name, app_id, app_secret) in qq_accounts {
         let acct_for_log = acct_name.clone();
+        let w_acct_outer = acct_name.clone();
         let enforcer = Arc::clone(&enforcer);
         let reg = Arc::clone(&registry);
         let qq_cfg_arc = Arc::new(config.clone());
@@ -111,8 +112,10 @@ pub(crate) fn start_qq_if_configured(
             let mut senders = channel_senders
                 .write()
                 .expect("channel_senders lock poisoned");
-            senders.insert("qq".to_string(), out_tx.clone());
             senders.insert(format!("qq/{}", acct_name), out_tx.clone());
+            senders
+                .entry("qq".to_string())
+                .or_insert_with(|| out_tx.clone());
         }
 
         let gp = Arc::new(group_policy.clone());
@@ -148,6 +151,7 @@ pub(crate) fn start_qq_if_configured(
                 let queues = Arc::clone(&qq_user_queues);
                 let qq_cfg = Arc::clone(&qq_cfg_arc);
                 let tq = Arc::clone(&tq);
+                let w_acct_outer = w_acct_outer.clone();
                 tokio::spawn(async move {
                     // Group policy check.
                     if is_group {
@@ -188,7 +192,7 @@ pub(crate) fn start_qq_if_configured(
                                         images: vec![],
                                         channel: None,
 
-                                        account: None,
+                                        account: Some(w_acct_outer.clone()),
                                         files: vec![],
                                     })
                                     .await
@@ -211,7 +215,7 @@ pub(crate) fn start_qq_if_configured(
                                         images: vec![],
                                         channel: None,
 
-                                        account: None,
+                                        account: Some(w_acct_outer.clone()),
                                         files: vec![],
                                     })
                                     .await
@@ -238,6 +242,7 @@ pub(crate) fn start_qq_if_configured(
                             map.insert(sender_id.clone(), utx.clone());
                             let w_uid = sender_id.clone();
                             let w_tq = Arc::clone(&tq);
+                            let w_acct = w_acct_outer.clone();
                             tokio::spawn(async move {
                                 while let Some((
                                     text,
@@ -276,7 +281,7 @@ pub(crate) fn start_qq_if_configured(
                                                 .ok()
                                             })
                                             .collect(),
-                                        account: None,
+                                        account: Some(w_acct.clone()),
                                     };
                                     if let Err(e) = w_tq.submit(
                                         &session_key,
@@ -300,8 +305,9 @@ pub(crate) fn start_qq_if_configured(
                         let qq_cfg = Arc::clone(&qq_cfg);
                         let question = text[5..].to_owned();
                         let target_id = target_id.clone();
+                        let w_acct_btw = w_acct_outer.clone();
                         tokio::spawn(async move {
-                            let handle = match reg.route("qq").or_else(|_| reg.default_agent()) {
+                            let handle = match reg.route_account("qq", Some(&w_acct_btw)).or_else(|_| reg.route_account("qq", None)).or_else(|_| reg.default_agent()) {
                                 Ok(h) => h,
                                 Err(_) => return,
                             };
@@ -322,7 +328,7 @@ pub(crate) fn start_qq_if_configured(
                                         images: vec![],
                                         channel: None,
 
-                                        account: None,
+                                        account: Some(w_acct_btw.clone()),
                                         files: vec![],
                                     })
                                     .await
@@ -340,8 +346,9 @@ pub(crate) fn start_qq_if_configured(
                         let qq_cfg = Arc::clone(&qq_cfg);
                         let sender_id = sender_id.clone();
                         let target_id = target_id.clone();
+                        let w_acct_pp = w_acct_outer.clone();
                         tokio::spawn(async move {
-                            let handle = match reg.route("qq").or_else(|_| reg.default_agent()) {
+                            let handle = match reg.route_account("qq", Some(&w_acct_pp)).or_else(|_| reg.route_account("qq", None)).or_else(|_| reg.default_agent()) {
                                 Ok(h) => h,
                                 Err(_) => return,
                             };
@@ -354,7 +361,7 @@ pub(crate) fn start_qq_if_configured(
                                         thread_id: None,
                                     }
                                 } else {
-                                    MessageKind::DirectMessage { account_id: None }
+                                    MessageKind::DirectMessage { account_id: Some(w_acct_pp.clone()) }
                                 },
                                 channel: "qq".to_string(),
                                 peer_id: sender_id.clone(),
@@ -394,7 +401,7 @@ pub(crate) fn start_qq_if_configured(
                                 extra_tools: vec![],
                                 images,
                                 files: file_attachments,
-                                account: None,
+                                account: Some(w_acct_pp.clone()),
                             };
                             if handle.tx.send(msg).await.is_err() {
                                 return;
@@ -413,7 +420,7 @@ pub(crate) fn start_qq_if_configured(
                                             images: r.images,
                                             files: r.files,
                                             channel: None,
-                                            account: None,
+                                            account: Some(w_acct_pp.clone()),
                                         })
                                         .await
                                     {
@@ -449,7 +456,7 @@ pub(crate) fn start_qq_if_configured(
             qq_token_url.clone(),
         ));
 
-        if let Err(e) = manager.register(Arc::clone(&qq) as Arc<dyn crate::channel::Channel>) {
+        if let Err(e) = manager.register_with_name(format!("qq/{}", acct_for_log), Arc::clone(&qq) as Arc<dyn crate::channel::Channel>) {
             tracing::warn!("failed to register channel: {e}");
         }
         let qq_send = Arc::clone(&qq);

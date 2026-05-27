@@ -97,6 +97,7 @@ pub(crate) fn start_wecom_if_configured(
 
     for (acct_name, bot_id, secret, ws_url) in wc_accounts {
         let acct_for_log = acct_name.clone();
+        let w_acct_outer = acct_name.clone();
         let enforcer = Arc::clone(&enforcer);
         let reg = Arc::clone(&registry);
         let cfg_arc = Arc::new(config.clone());
@@ -108,8 +109,10 @@ pub(crate) fn start_wecom_if_configured(
             let mut senders = channel_senders
                 .write()
                 .expect("channel_senders lock poisoned");
-            senders.insert("wecom".to_string(), out_tx.clone());
             senders.insert(format!("wecom/{}", acct_name), out_tx.clone());
+            senders
+                .entry("wecom".to_string())
+                .or_insert_with(|| out_tx.clone());
         }
 
         // Per-user inbound queue for WeCom.
@@ -139,6 +142,7 @@ pub(crate) fn start_wecom_if_configured(
                 let tq = Arc::clone(&tq);
                 let queues = Arc::clone(&wc_user_queues);
                 let enforcer = Arc::clone(&wc_enforcer);
+                let w_acct_outer = w_acct_outer.clone();
                 tokio::spawn(async move {
                     // DM policy check (pairing).
                     if !is_group {
@@ -166,7 +170,7 @@ pub(crate) fn start_wecom_if_configured(
                                         images: vec![],
                                         channel: None,
 
-                                        account: None,
+                                        account: Some(w_acct_outer.clone()),
                                         files: vec![],
                                     })
                                     .await
@@ -200,6 +204,7 @@ pub(crate) fn start_wecom_if_configured(
                             let w_cfg = Arc::clone(&cfg);
                             let w_uid = from.clone();
                             let w_tq = Arc::clone(&tq);
+                            let w_acct = w_acct_outer.clone();
                             tokio::spawn(async move {
                                 while let Some((text, from, chat_id, is_group, images, files)) =
                                     urx.recv().await
@@ -225,7 +230,7 @@ pub(crate) fn start_wecom_if_configured(
                                                 thread_id: None,
                                             }
                                         } else {
-                                            MessageKind::DirectMessage { account_id: None }
+                                            MessageKind::DirectMessage { account_id: Some(w_acct.clone()) }
                                         },
                                         channel: "wecom".to_string(),
                                         peer_id: from.clone(),
@@ -251,7 +256,7 @@ pub(crate) fn start_wecom_if_configured(
                                                 .ok()
                                             })
                                             .collect(),
-                                        account: None,
+                                        account: Some(w_acct.clone()),
                                     };
                                     if let Err(e) = w_tq.submit(
                                         &session_key,
@@ -276,8 +281,9 @@ pub(crate) fn start_wecom_if_configured(
                         let question = text[5..].to_owned();
                         let from = from.clone();
                         let chat_id = chat_id.clone();
+                        let w_acct_btw = w_acct_outer.clone();
                         tokio::spawn(async move {
-                            let handle = match reg.route("wecom").or_else(|_| reg.default_agent()) {
+                            let handle = match reg.route_account("wecom", Some(&w_acct_btw)).or_else(|_| reg.route_account("wecom", None)).or_else(|_| reg.default_agent()) {
                                 Ok(h) => h,
                                 Err(_) => return,
                             };
@@ -299,7 +305,7 @@ pub(crate) fn start_wecom_if_configured(
                                         images: vec![],
                                         channel: None,
 
-                                        account: None,
+                                        account: Some(w_acct_btw.clone()),
                                         files: vec![],
                                     })
                                     .await
@@ -317,8 +323,9 @@ pub(crate) fn start_wecom_if_configured(
                         let cfg = Arc::clone(&cfg);
                         let from = from.clone();
                         let chat_id = chat_id.clone();
+                        let w_acct_pp = w_acct_outer.clone();
                         tokio::spawn(async move {
-                            let handle = match reg.route("wecom").or_else(|_| reg.default_agent()) {
+                            let handle = match reg.route_account("wecom", Some(&w_acct_pp)).or_else(|_| reg.route_account("wecom", None)).or_else(|_| reg.default_agent()) {
                                 Ok(h) => h,
                                 Err(_) => return,
                             };
@@ -331,7 +338,7 @@ pub(crate) fn start_wecom_if_configured(
                                         thread_id: None,
                                     }
                                 } else {
-                                    MessageKind::DirectMessage { account_id: None }
+                                    MessageKind::DirectMessage { account_id: Some(w_acct_pp.clone()) }
                                 },
                                 channel: "wecom".to_string(),
                                 peer_id: from.clone(),
@@ -375,7 +382,7 @@ pub(crate) fn start_wecom_if_configured(
                                 extra_tools: vec![],
                                 images,
                                 files,
-                                account: None,
+                                account: Some(w_acct_pp.clone()),
                             };
                             if handle.tx.send(msg).await.is_err() {
                                 return;
@@ -395,7 +402,7 @@ pub(crate) fn start_wecom_if_configured(
                                             images: r.images,
                                             files: r.files,
                                             channel: None,
-                                            account: None,
+                                            account: Some(w_acct_pp.clone()),
                                         })
                                         .await
                                     {
@@ -417,7 +424,7 @@ pub(crate) fn start_wecom_if_configured(
 
         let wecom = Arc::new(WeComChannel::new(bot_id, secret, ws_url, on_message));
 
-        if let Err(e) = manager.register(Arc::clone(&wecom) as Arc<dyn crate::channel::Channel>) {
+        if let Err(e) = manager.register_with_name(format!("wecom/{}", acct_for_log), Arc::clone(&wecom) as Arc<dyn crate::channel::Channel>) {
             tracing::warn!("failed to register channel: {e}");
         }
         let wecom_send = Arc::clone(&wecom);

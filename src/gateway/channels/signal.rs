@@ -85,6 +85,7 @@ pub(crate) fn start_signal_if_configured(
 
     for (acct_name, phone) in sig_accounts {
         let acct_for_log = acct_name.clone();
+        let sig_acct_outer = acct_name.clone();
         let enforcer = Arc::clone(&enforcer);
         let sig_cli_path = sig_cli_path.clone();
         let reg = Arc::clone(&registry);
@@ -92,11 +93,18 @@ pub(crate) fn start_signal_if_configured(
         let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
 
         // Register Signal channel sender for notification routing.
+        // - "signal/{account}" is the canonical key for multi-account routing.
+        // - bare "signal" registered only by the first account so legacy callers
+        //   still find a sender. Without first-wins guarding, each account would
+        //   overwrite the bare key and replies route via the wrong principal.
         {
             let mut senders = channel_senders
                 .write()
                 .expect("channel_senders lock poisoned");
-            senders.insert("signal".to_string(), out_tx.clone());
+            senders.insert(format!("signal/{}", acct_name), out_tx.clone());
+            senders
+                .entry("signal".to_string())
+                .or_insert_with(|| out_tx.clone());
         }
 
         let gp = Arc::new(group_policy.clone());
@@ -118,6 +126,7 @@ pub(crate) fn start_signal_if_configured(
             let group_allow = Arc::clone(&ga);
             let queues = Arc::clone(&sig_user_queues);
             let tq = Arc::clone(&tq);
+            let sig_acct = sig_acct_outer.clone();
             tokio::spawn(async move {
                 // Group policy check.
                 if is_group {
@@ -158,7 +167,7 @@ pub(crate) fn start_signal_if_configured(
                                     images: vec![],
                                     channel: None,
 
-                                    account: None,
+                                    account: Some(sig_acct.clone()),
                                     files: vec![],
                                 })
                                 .await
@@ -181,7 +190,7 @@ pub(crate) fn start_signal_if_configured(
                                     images: vec![],
                                     channel: None,
 
-                                    account: None,
+                                    account: Some(sig_acct.clone()),
                                     files: vec![],
                                 })
                                 .await
@@ -210,11 +219,16 @@ pub(crate) fn start_signal_if_configured(
                         let w_cfg = Arc::clone(&cfg);
                         let w_uid = sender.clone();
                         let w_tq = Arc::clone(&tq);
+                        let w_acct = sig_acct.clone();
                         tokio::spawn(async move {
                             while let Some((text, sender, is_group)) = urx.recv().await {
                                 // No debounce — task queue merge_into_pending
                                 // handles rapid consecutive messages automatically.
-                                let handle = match w_reg.route("signal") {
+                                let handle = match w_reg
+                                    .route_account("signal", Some(&w_acct))
+                                    .or_else(|_| w_reg.route_account("signal", None))
+                                    .or_else(|_| w_reg.default_agent())
+                                {
                                     Ok(h) => h,
                                     Err(e) => {
                                         error!("signal route: {e:#}");
@@ -230,7 +244,9 @@ pub(crate) fn start_signal_if_configured(
                                             thread_id: None,
                                         }
                                     } else {
-                                        MessageKind::DirectMessage { account_id: None }
+                                        MessageKind::DirectMessage {
+                                            account_id: Some(w_acct.clone()),
+                                        }
                                     },
                                     channel: "signal".to_string(),
                                     peer_id: sender.clone(),
@@ -246,7 +262,7 @@ pub(crate) fn start_signal_if_configured(
                                     timestamp: chrono::Utc::now().timestamp(),
                                     images: vec![],
                                     files: vec![],
-                                    account: None,
+                                    account: Some(w_acct.clone()),
                                 };
                                 if let Err(e) = w_tq.submit(
                                     &session_key,
@@ -270,8 +286,13 @@ pub(crate) fn start_signal_if_configured(
                     let cfg = Arc::clone(&cfg);
                     let question = text[5..].to_owned();
                     let sender = sender.clone();
+                    let sig_acct = sig_acct.clone();
                     tokio::spawn(async move {
-                        let handle = match reg.route("signal") {
+                        let handle = match reg
+                            .route_account("signal", Some(&sig_acct))
+                            .or_else(|_| reg.route_account("signal", None))
+                            .or_else(|_| reg.default_agent())
+                        {
                             Ok(h) => h,
                             Err(_) => return,
                         };
@@ -288,7 +309,7 @@ pub(crate) fn start_signal_if_configured(
                                     images: vec![],
                                     channel: None,
 
-                                    account: None,
+                                    account: Some(sig_acct),
                                     files: vec![],
                                 })
                                 .await
@@ -305,8 +326,13 @@ pub(crate) fn start_signal_if_configured(
                     let tx = tx.clone();
                     let cfg = Arc::clone(&cfg);
                     let sender = sender.clone();
+                    let sig_acct = sig_acct.clone();
                     tokio::spawn(async move {
-                        let handle = match reg.route("signal") {
+                        let handle = match reg
+                            .route_account("signal", Some(&sig_acct))
+                            .or_else(|_| reg.route_account("signal", None))
+                            .or_else(|_| reg.default_agent())
+                        {
                             Ok(h) => h,
                             Err(_) => return,
                         };
@@ -319,7 +345,9 @@ pub(crate) fn start_signal_if_configured(
                                     thread_id: None,
                                 }
                             } else {
-                                MessageKind::DirectMessage { account_id: None }
+                                MessageKind::DirectMessage {
+                                    account_id: Some(sig_acct.clone()),
+                                }
                             },
                             channel: "signal".to_string(),
                             peer_id: sender.clone(),
@@ -359,7 +387,7 @@ pub(crate) fn start_signal_if_configured(
                             extra_tools: vec![],
                             images: vec![],
                             files: vec![],
-                            account: None,
+                            account: Some(sig_acct.clone()),
                         };
                         if handle.tx.send(msg).await.is_err() {
                             return;
@@ -377,7 +405,7 @@ pub(crate) fn start_signal_if_configured(
                                         images: r.images,
                                         files: r.files,
                                         channel: None,
-                                        account: None,
+                                        account: Some(sig_acct),
                                     })
                                     .await
                                 {
