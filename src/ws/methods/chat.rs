@@ -154,6 +154,13 @@ pub async fn chat_send(ctx: MethodCtx) -> MethodResult {
         }));
     }
 
+    // Extract `[file:/abs/path]` markers — desktop / WS clients embed
+    // image and file references via this syntax. Without this hop the
+    // markers travel as raw text and the LLM never sees the image; only
+    // the HTTP send_message handler in server/mod.rs ran extract_file_refs
+    // before, so the WS / desktop path was silently dropping every image.
+    let (text, file_images, file_files) = crate::agent::registry::extract_file_refs(&text);
+
     // Dispatch message to agent.
     let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
     let msg = AgentMessage {
@@ -169,8 +176,8 @@ pub async fn chat_send(ctx: MethodCtx) -> MethodResult {
         cancel_token: None,
         input_request_tx: None,
         extra_tools: vec![],
-        images: vec![],
-        files: vec![],
+        images: file_images,
+        files: file_files,
         account: None,
     };
 

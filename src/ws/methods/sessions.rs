@@ -148,6 +148,11 @@ pub async fn sessions_send(ctx: MethodCtx) -> MethodResult {
     let conn = ctx.conn.clone();
     let sk = session_key.clone();
 
+    // Extract `[file:/abs/path]` markers — same hop as the chat.send path,
+    // so WS-origin messages carrying image/file references actually reach
+    // the agent's `images` / `files` slots.
+    let (text, file_images, file_files) = crate::agent::registry::extract_file_refs(&text);
+
     // Build and send AgentMessage.
     let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
     let msg = AgentMessage {
@@ -163,8 +168,8 @@ pub async fn sessions_send(ctx: MethodCtx) -> MethodResult {
         cancel_token: None,
         input_request_tx: None,
         extra_tools: vec![],
-        images: vec![],
-        files: vec![],
+        images: file_images,
+        files: file_files,
         account: None,
     };
 
