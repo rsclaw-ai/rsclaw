@@ -218,6 +218,14 @@ pub struct ImageAttachment {
     pub data: String,
     /// MIME type (e.g. "image/png", "image/jpeg").
     pub mime_type: String,
+    /// Best-effort original on-disk source path, when the image came from a
+    /// path-referencing client (e.g. `[file:/abs/path]` from desktop, or a
+    /// channel that downloaded to a known cache location). `None` for
+    /// inline-only attachments (e.g. pasted base64).
+    ///
+    /// Surfaced in vision-failure fallback messages so the user can re-attach
+    /// or the agent can retry with the same file via a different tool.
+    pub source_path: Option<String>,
 }
 
 /// A file attachment sent by the user (raw bytes, not yet processed).
@@ -442,6 +450,7 @@ pub fn extract_file_refs(text: &str) -> (String, Vec<ImageAttachment>, Vec<FileA
             images.push(ImageAttachment {
                 data: format!("data:{final_mime};base64,{b64}"),
                 mime_type: final_mime,
+                source_path: Some(path_str.to_owned()),
             });
         } else {
             let filename = path

@@ -172,6 +172,7 @@ impl WhatsAppChannel {
                                             images.push(crate::agent::registry::ImageAttachment {
                                                 data: format!("data:{mime};base64,{b64}"),
                                                 mime_type: mime.to_owned(),
+                                                source_path: None,
                                             });
                                             text = crate::i18n::t(
                                                 "describe_image",

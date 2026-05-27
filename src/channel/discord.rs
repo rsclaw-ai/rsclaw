@@ -536,6 +536,7 @@ impl DiscordChannel {
                                             images.push(crate::agent::registry::ImageAttachment {
                                                 data: format!("data:{final_mime};base64,{b64}"),
                                                 mime_type: final_mime,
+                                                source_path: None,
                                             });
                                             info!(
                                                 from = orig_len,

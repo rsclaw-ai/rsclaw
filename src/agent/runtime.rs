@@ -1865,7 +1865,7 @@ impl AgentRuntime {
     /// (preserves the previous behaviour for fully-vision primaries that
     /// could read the image directly anyway).
     async fn caption_images_for_text_only_primary(
-        &self,
+        &mut self,
         user_text: &str,
         images: &[super::registry::ImageAttachment],
     ) -> Result<String> {
@@ -2005,27 +2005,49 @@ impl AgentRuntime {
             }
         }
 
-        // Load referenced images as vision attachments.
+        // Load @-referenced images as vision attachments. Used by desktop UI
+        // (saves drop/paste files to ~/.rsclaw/workspace/uploads/i/ and inserts
+        // `@up_i_<id>.<ext>`) and by HTTP/api clients that follow the same
+        // upload convention. The bytes get downscaled before base64 — same
+        // policy as the per-channel direct-push paths.
         let mut images = images;
         for img_path in &resolved.image_paths {
             if let Ok(bytes) = std::fs::read(img_path) {
                 use base64::Engine;
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                 let ext = img_path
                     .extension()
                     .and_then(|e| e.to_str())
                     .unwrap_or("png");
-                let mime = match ext {
+                let orig_mime = match ext {
                     "jpg" | "jpeg" => "image/jpeg",
                     "webp" => "image/webp",
                     "gif" => "image/gif",
                     _ => "image/png",
                 };
-                images.push(super::registry::ImageAttachment {
-                    data: format!("data:{mime};base64,{b64}"),
-                    mime_type: mime.to_string(),
+                let orig_len = bytes.len();
+                let (final_bytes, final_mime) = crate::util::downscale_image_for_vision(
+                    bytes.clone(),
+                    orig_mime,
+                    1 * 1024 * 1024,
+                    1920,
+                    85,
+                )
+                .unwrap_or_else(|e| {
+                    tracing::warn!(path = %img_path.display(), error = %e, "@-ref: downscale failed");
+                    (bytes, orig_mime.to_string())
                 });
-                info!(path = %img_path.display(), "loaded @-referenced image for vision");
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&final_bytes);
+                images.push(super::registry::ImageAttachment {
+                    data: format!("data:{final_mime};base64,{b64}"),
+                    mime_type: final_mime,
+                    source_path: Some(img_path.to_string_lossy().into_owned()),
+                });
+                info!(
+                    path = %img_path.display(),
+                    from = orig_len,
+                    to = final_bytes.len(),
+                    "loaded @-referenced image for vision"
+                );
             }
         }
 
@@ -3028,9 +3050,16 @@ impl AgentRuntime {
 
         // Convert NEW images to FileAttachments so they go through the
         // unified pending-file flow (save → menu → user choice).
-        // @-referenced images skip this (already on disk, going to vision).
+        // Skip this for:
+        //   - @-referenced images (already on disk, going to vision)
+        //   - Inline image+text turns (desktop/ws/a2a/api callers that pack
+        //     a question alongside the image; the user clearly wants this
+        //     image analysed THIS turn — the save-and-ask menu is friction
+        //     left over from old single-payload channels like feishu/wechat
+        //     where image-message and text-message arrive separately)
         let is_ref_image = !resolved.image_paths.is_empty();
-        if !images.is_empty() && !is_ref_image {
+        let is_inline_image = !text.trim().is_empty() && !images.is_empty();
+        if !images.is_empty() && !is_ref_image && !is_inline_image {
             for img in &images {
                 use base64::Engine;
                 let b64 = img
@@ -3782,15 +3811,37 @@ impl AgentRuntime {
                         ));
                     }
                     Err(e) => {
+                        // DO NOT pass-through to a text-only primary —
+                        // that ships ~85k tokens of base64 to a model
+                        // that can't read images, which then hallucinates
+                        // (or hangs streaming). Tell primary the image
+                        // exists and that vision failed; let it ask the
+                        // user instead of guessing.
                         tracing::warn!(
                             error = %e,
                             n_images = images.len(),
                             primary = %model,
-                            "vision-as-tool: caption failed, falling back to pass-through"
+                            "vision-as-tool: caption failed; surfacing as text-only error"
                         );
-                        for img in &images {
-                            vision_images_for_current_turn.push(img.data.clone());
-                        }
+                        // Surface source paths when we have them so the user
+                        // can re-attach or retry with a different tool —
+                        // base64 alone is useless to them.
+                        let path_hint: String = {
+                            let paths: Vec<&str> = images
+                                .iter()
+                                .filter_map(|img| img.source_path.as_deref())
+                                .collect();
+                            if paths.is_empty() {
+                                String::new()
+                            } else {
+                                format!("(路径: {})", paths.join(", "))
+                            }
+                        };
+                        media_descriptions.push(format!(
+                            "用户上传了 {n} 张图片{path_hint},但 vision 模型识别失败 ({e})。\
+                             请告诉用户图片无法解析,建议稍后重试,或换工具重新引用同一路径。",
+                            n = images.len()
+                        ));
                     }
                 }
             }

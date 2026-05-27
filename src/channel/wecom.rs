@@ -445,6 +445,7 @@ impl WeComChannel {
                             images.push(crate::agent::registry::ImageAttachment {
                                 data: data_url,
                                 mime_type: final_mime,
+                                source_path: None,
                             });
                             if text.is_empty() {
                                 text =
@@ -486,6 +487,7 @@ impl WeComChannel {
                                 images.push(crate::agent::registry::ImageAttachment {
                                     data: data_url,
                                     mime_type: mime.clone(),
+                                    source_path: None,
                                 });
                                 if text.is_empty() {
                                     text = crate::i18n::t(
@@ -584,6 +586,7 @@ impl WeComChannel {
                                             images.push(crate::agent::registry::ImageAttachment {
                                                 data: data_url,
                                                 mime_type: "image/jpeg".to_string(),
+                                                source_path: None,
                                             });
                                         }
                                         Err(e) => {

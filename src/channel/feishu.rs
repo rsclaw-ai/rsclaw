@@ -1011,6 +1011,7 @@ impl FeishuChannel {
                             images.push(crate::agent::registry::ImageAttachment {
                                 data: data_url,
                                 mime_type: final_mime,
+                                source_path: None,
                             });
                             info!(
                                 from = orig_len,
@@ -1132,6 +1133,7 @@ impl FeishuChannel {
                                     images.push(crate::agent::registry::ImageAttachment {
                                         data: data_url,
                                         mime_type: final_mime,
+                                        source_path: None,
                                     });
                                     info!(
                                         name = file_name,

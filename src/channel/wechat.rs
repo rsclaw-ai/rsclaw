@@ -696,6 +696,7 @@ impl WeChatPersonalChannel {
                                                 vec![crate::agent::registry::ImageAttachment {
                                                     data: data_url,
                                                     mime_type: final_mime,
+                                                    source_path: None,
                                                 }];
                                             info!(
                                                 from = orig_len,
@@ -778,6 +779,7 @@ impl WeChatPersonalChannel {
                                                 let img = crate::agent::registry::ImageAttachment {
                                                     data: data_uri,
                                                     mime_type: "video/mp4".to_owned(),
+                                                    source_path: None,
                                                 };
                                                 let fa = crate::agent::registry::FileAttachment {
                                                     filename: "video.mp4".to_owned(),

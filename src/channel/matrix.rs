@@ -358,6 +358,7 @@ impl Channel for MatrixChannel {
                                         vec![crate::agent::registry::ImageAttachment {
                                             data: data_url,
                                             mime_type: final_mime,
+                                            source_path: None,
                                         }],
                                         vec![],
                                     );
@@ -962,6 +963,7 @@ impl Channel for MatrixChannel {
                                                                         vec![crate::agent::registry::ImageAttachment {
                                                                             data: data_url,
                                                                             mime_type: final_mime,
+                                                                            source_path: None,
                                                                         }],
                                                                         vec![],
                                                                     );

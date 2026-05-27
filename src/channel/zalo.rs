@@ -143,6 +143,7 @@ impl ZaloChannel {
                             images.push(crate::agent::registry::ImageAttachment {
                                 data: format!("data:image/jpeg;base64,{b64}"),
                                 mime_type: "image/jpeg".to_owned(),
+                                source_path: None,
                             });
                             text = String::new();
                             info!(size = bytes.len(), "Zalo: image downloaded");

@@ -550,6 +550,7 @@ impl DingTalkChannel {
                             images.push(crate::agent::registry::ImageAttachment {
                                 data: format!("data:image/png;base64,{b64}"),
                                 mime_type: "image/png".to_owned(),
+                                source_path: None,
                             });
                             info!(size = bytes.len(), "DingTalk image downloaded");
                             String::new()
@@ -581,6 +582,7 @@ impl DingTalkChannel {
                                     images.push(crate::agent::registry::ImageAttachment {
                                         data: format!("data:image/png;base64,{b64}"),
                                         mime_type: "image/png".to_owned(),
+                                        source_path: None,
                                     });
                                     String::new()
                                 }

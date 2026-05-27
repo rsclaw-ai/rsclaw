@@ -632,6 +632,7 @@ impl QQBotChannel {
                         images.push(crate::agent::registry::ImageAttachment {
                             data: format!("data:{content_type};base64,{b64}"),
                             mime_type: content_type.to_owned(),
+                            source_path: None,
                         });
                         if text.is_empty() {
                             *text = String::new();

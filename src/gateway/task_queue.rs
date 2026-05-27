@@ -1287,6 +1287,7 @@ impl TaskQueueWorker {
                 m.images.iter().map(|data| ImageAttachment {
                     data: data.clone(),
                     mime_type: "image/png".to_string(),
+                    source_path: None,
                 })
             })
             .collect();
