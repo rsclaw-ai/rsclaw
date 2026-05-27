@@ -2013,6 +2013,19 @@ fn set_gateway_user_stopped(stopped: bool) {
     GATEWAY_USER_STOPPED.store(stopped, Ordering::Relaxed);
 }
 
+/// Read the in-process `GATEWAY_USER_STOPPED` flag. The frontend calls this
+/// at mount to align its `localStorage` mirror with the truth that lives
+/// inside this process — localStorage persists across app launches and
+/// would otherwise falsely report `stopped=true` after every fresh launch
+/// where the user had stopped the gateway in a previous session. The
+/// Tauri atomic resets to `false` on every process start (and the watchdog
+/// thread re-spawns the sidecar), so this is the correct source of truth
+/// for "is the user actively keeping the gateway off right now".
+#[tauri::command]
+fn get_gateway_user_stopped() -> bool {
+    GATEWAY_USER_STOPPED.load(Ordering::Relaxed)
+}
+
 /// Save a user-attached image (paste or upload) to
 /// `<Downloads>/rsclaw/images/<nanos_hex>/attach.<ext>` and return the
 /// absolute path. Keeps base64 blobs out of chat history so typing does
@@ -2193,6 +2206,7 @@ fn main() {
             set_auto_start,
             get_auto_start,
             set_gateway_user_stopped,
+            get_gateway_user_stopped,
             open_path,
             save_attach_image,
             read_file_as_data_url,

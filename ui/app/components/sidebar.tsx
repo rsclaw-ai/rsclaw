@@ -333,6 +333,21 @@ function GatewayStatus({ narrow }: { narrow: boolean }) {
     return () => { unlisten?.(); };
   }, []);
 
+  // Re-align userStopped with the Tauri-side `GATEWAY_USER_STOPPED` flag.
+  // localStorage persists across app launches; the Tauri atomic resets to
+  // `false` every process start (and the watchdog re-spawns the sidecar
+  // gateway). Without this sync, a fresh launch after a prior session's
+  // tray-stop would briefly flash "Offline" while the gateway is still
+  // cold-booting — the poller's fail branch reads stale localStorage,
+  // believes the user wanted it stopped, and skips the auto-start path.
+  React.useEffect(() => {
+    if (!isTauri) return;
+    const tauriInvoke = tauriInvokeV2;
+    tauriInvoke("get_gateway_user_stopped")
+      .then((stopped: boolean) => { setUserStopped(!!stopped); })
+      .catch(() => { setUserStopped(false); });
+  }, []);
+
   React.useEffect(() => {
     const check = () => {
       // Suppress this poll entirely while a panel-initiated restart is in
