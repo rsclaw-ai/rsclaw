@@ -24,6 +24,9 @@ pub(crate) fn start_custom_channels(
             std::collections::HashMap<String, Arc<crate::channel::custom::CustomWebhookChannel>>,
         >,
     >,
+    channel_senders: Arc<
+        std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
+    >,
 ) {
     let custom_cfgs = match &config.channel.channels.custom {
         Some(cfgs) => cfgs,
@@ -45,10 +48,17 @@ pub(crate) fn start_custom_channels(
                     Arc::clone(&registry),
                     manager,
                     Arc::clone(&custom_webhooks),
+                    Arc::clone(&channel_senders),
                 );
             }
             "websocket" => {
-                start_custom_websocket(config, ch_cfg.clone(), Arc::clone(&registry), manager);
+                start_custom_websocket(
+                    config,
+                    ch_cfg.clone(),
+                    Arc::clone(&registry),
+                    manager,
+                    Arc::clone(&channel_senders),
+                );
             }
             other => {
                 warn!(
@@ -71,6 +81,9 @@ fn start_custom_webhook(
             std::collections::HashMap<String, Arc<crate::channel::custom::CustomWebhookChannel>>,
         >,
     >,
+    channel_senders: Arc<
+        std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
+    >,
 ) {
     use crate::channel::custom::CustomWebhookChannel;
 
@@ -78,6 +91,14 @@ fn start_custom_webhook(
     let reg = Arc::clone(&registry);
     let cfg_arc = Arc::new(config.clone());
     let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
+
+    // Register the channel sender so cron / watch can dispatch messages here.
+    {
+        let mut senders = channel_senders
+            .write()
+            .expect("channel_senders lock poisoned");
+        senders.insert(ch_name.clone(), out_tx.clone());
+    }
 
     let ch_name_cb = ch_name.clone();
     let on_message = Arc::new(move |sender: String, text: String, is_group: bool| {
@@ -195,6 +216,9 @@ fn start_custom_websocket(
     ch_cfg: crate::config::schema::CustomChannelConfig,
     registry: Arc<AgentRegistry>,
     manager: &mut crate::channel::ChannelManager,
+    channel_senders: Arc<
+        std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
+    >,
 ) {
     use crate::channel::custom::CustomWebSocketChannel;
 
@@ -202,6 +226,14 @@ fn start_custom_websocket(
     let reg = Arc::clone(&registry);
     let cfg_arc = Arc::new(config.clone());
     let (out_tx, mut out_rx) = mpsc::channel::<OutboundMessage>(64);
+
+    // Register the channel sender so cron / watch can dispatch messages here.
+    {
+        let mut senders = channel_senders
+            .write()
+            .expect("channel_senders lock poisoned");
+        senders.insert(ch_name.clone(), out_tx.clone());
+    }
 
     let ch_name_cb = ch_name.clone();
     let on_message = Arc::new(move |sender: String, text: String, is_group: bool| {

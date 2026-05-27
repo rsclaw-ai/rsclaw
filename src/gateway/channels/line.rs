@@ -246,9 +246,14 @@ pub(crate) fn start_line_if_configured(
                                     let session_key = derive_session_key(&SessionKeyParams {
                                         agent_id: handle.id.clone(),
                                         kind: if is_group {
-                                            MessageKind::DirectMessage { account_id: Some(w_acct.clone()) }
+                                            MessageKind::GroupMessage {
+                                                group_id: user_id.clone(),
+                                                thread_id: None,
+                                            }
                                         } else {
-                                            MessageKind::DirectMessage { account_id: Some(w_acct.clone()) }
+                                            MessageKind::DirectMessage {
+                                                account_id: Some(w_acct.clone()),
+                                            }
                                         },
                                         channel: "line".to_string(),
                                         peer_id: user_id.clone(),
