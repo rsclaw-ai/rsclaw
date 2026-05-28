@@ -656,6 +656,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         &mut channel_manager,
         Arc::clone(&custom_webhooks),
         Arc::clone(&channel_senders),
+        Arc::clone(&store.db),
     );
 
     // Register desktop channel — routes cron delivery to connected WS clients.

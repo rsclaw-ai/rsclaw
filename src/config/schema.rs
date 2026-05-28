@@ -1194,6 +1194,14 @@ pub struct CustomChannelConfig {
     pub sender_path: Option<String>,
     /// JSON path to extract group/chat ID (if present = group message).
     pub group_path: Option<String>,
+    /// JSON path to extract a single image URL from inbound payload.
+    pub image_url_path: Option<String>,
+    /// JSON path to extract an array of image URLs from inbound payload.
+    pub image_urls_path: Option<String>,
+    /// JSON path to extract a file download URL from inbound payload.
+    pub file_url_path: Option<String>,
+    /// JSON path to extract the filename for file attachments.
+    pub file_name_path: Option<String>,
 
     // -- Outbound reply --
     /// For webhook: HTTP callback URL for replies.
@@ -1201,7 +1209,7 @@ pub struct CustomChannelConfig {
     /// HTTP method for reply (default: POST).
     pub reply_method: Option<String>,
     /// Reply body template with {{sender}}, {{chat_id}}, {{reply}},
-    /// {{is_group}} placeholders.
+    /// {{is_group}}, {{images}}, {{files}} placeholders.
     pub reply_template: Option<String>,
     /// Extra headers for reply HTTP call.
     pub reply_headers: Option<HashMap<String, String>>,
