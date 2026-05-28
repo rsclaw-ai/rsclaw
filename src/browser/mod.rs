@@ -195,19 +195,7 @@ impl ChromeProcess {
         let (user_data_dir, tmp_dir) = if let Some(profile_name) = profile {
             let profile_dir = if profile_name == "default" {
                 // Use Chrome's default user data directory.
-                #[cfg(target_os = "macos")]
-                let dir = dirs_next::home_dir()
-                    .unwrap_or_default()
-                    .join("Library/Application Support/Google/Chrome");
-                #[cfg(target_os = "windows")]
-                let dir = dirs_next::data_local_dir()
-                    .unwrap_or_default()
-                    .join("Google/Chrome/User Data");
-                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-                let dir = dirs_next::config_dir()
-                    .unwrap_or_default()
-                    .join("google-chrome");
-                dir
+                default_chrome_user_data_dir()
             } else {
                 // Named profile under ~/.rsclaw/browser-profiles/
                 crate::config::loader::base_dir()
@@ -492,13 +480,78 @@ pub(crate) fn chrome_pids() -> Vec<u32> {
     pids
 }
 
-/// True if a Chrome is running that is NOT `exclude_pid`. Used by the headed
-/// `web_browser` path to decide whether a *user's* Chrome is holding the
-/// singleton lock — `exclude_pid` is the pool's own (headless, invisible)
-/// Chrome, so a background web_fetch that started the pool doesn't trigger a
-/// spurious "please quit Chrome" prompt the user can't act on.
+/// True if a Chrome is running that is NOT `exclude_pid`. Windows fallback for
+/// [`default_profile_blocked`] (Chrome has no SingletonLock symlink there).
+#[cfg(not(unix))]
 pub(crate) fn is_external_chrome_running(exclude_pid: Option<u32>) -> bool {
     chrome_pids().into_iter().any(|pid| Some(pid) != exclude_pid)
+}
+
+/// The user's default Chrome user-data directory — where their real profile,
+/// cookies, and `SingletonLock` live.
+pub(crate) fn default_chrome_user_data_dir() -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        dirs_next::home_dir()
+            .unwrap_or_default()
+            .join("Library/Application Support/Google/Chrome")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        dirs_next::data_local_dir()
+            .unwrap_or_default()
+            .join("Google/Chrome/User Data")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        dirs_next::config_dir()
+            .unwrap_or_default()
+            .join("google-chrome")
+    }
+}
+
+/// (unix) True if the user's **default** Chrome profile is in use by a live
+/// process. Chrome maintains `<user-data-dir>/SingletonLock` as a symlink to
+/// `<hostname>-<pid>` while a profile is open; we resolve that pid and confirm
+/// it's a running Chrome. This is the exact resource that blocks launching
+/// `default` + CDP, and since the pool's Chrome runs on a *different* profile
+/// dir it never trips this — no PID bookkeeping, immune to macOS launcher
+/// re-exec (we match the live process table, not a spawn-time pid).
+#[cfg(unix)]
+pub(crate) fn default_profile_in_use() -> bool {
+    let lock = default_chrome_user_data_dir().join("SingletonLock");
+    let Ok(target) = std::fs::read_link(&lock) else {
+        return false; // no lock (or not a symlink) → not in use
+    };
+    // target: "<hostname>-<pid>" — pid is the trailing numeric component.
+    let pid = target
+        .to_string_lossy()
+        .rsplit('-')
+        .next()
+        .and_then(|s| s.parse::<u32>().ok());
+    match pid {
+        Some(pid) => chrome_pids().contains(&pid), // false if pid is stale
+        None => false,
+    }
+}
+
+/// Decide whether a **user's** Chrome is blocking us from launching the default
+/// profile with CDP.
+///
+/// - unix: precise — checks the default profile's `SingletonLock`. The pool's
+///   Chrome (different profile) never counts, so `pool_pid` is unused.
+/// - windows: Chrome has no SingletonLock symlink, so fall back to a process
+///   scan that excludes the pool's own (invisible) Chrome by PID.
+pub(crate) fn default_profile_blocked(pool_pid: Option<u32>) -> bool {
+    #[cfg(unix)]
+    {
+        let _ = pool_pid;
+        default_profile_in_use()
+    }
+    #[cfg(not(unix))]
+    {
+        is_external_chrome_running(pool_pid)
+    }
 }
 
 // ---------------------------------------------------------------------------

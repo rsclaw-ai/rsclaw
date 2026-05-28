@@ -1953,17 +1953,19 @@ impl AgentRuntime {
                             .await;
                         crate::browser::BrowserSession::connect_existing(&ws_url).await?
                     } else {
-                        // No CDP-enabled Chrome. If a plain *user* Chrome is
-                        // running it holds the singleton lock on the default
-                        // profile — ask them to quit, then poll up to 60s. We
-                        // exclude the pool's own (headless, invisible) Chrome so
-                        // a background web_fetch that already started the pool
-                        // doesn't trigger a quit prompt the user can't act on.
+                        // No CDP-enabled Chrome. Is a *user* Chrome holding the
+                        // singleton lock on the default profile? If so we can't
+                        // launch default+CDP — ask them to quit, then poll 60s.
+                        // unix checks the default profile's SingletonLock
+                        // directly; windows falls back to a process scan that
+                        // excludes the pool's own (invisible) Chrome by PID, so
+                        // a background web_fetch that started the pool doesn't
+                        // trigger a quit prompt the user can't act on.
                         let pool_pid = crate::browser::pool::BrowserPool::global()
                             .owned_chrome_pid()
                             .await;
                         let mut chrome_blocking =
-                            crate::browser::is_external_chrome_running(pool_pid);
+                            crate::browser::default_profile_blocked(pool_pid);
                         if chrome_blocking {
                             info!("Chrome running without CDP; asking user to quit (60s window)");
                             if let Some(ref tx) = self.notification_tx {
@@ -1991,9 +1993,9 @@ impl AgentRuntime {
                                     return Err(anyhow!("turn aborted"));
                                 }
                                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                                if !crate::browser::is_external_chrome_running(pool_pid) {
+                                if !crate::browser::default_profile_blocked(pool_pid) {
                                     chrome_blocking = false;
-                                    info!("user quit Chrome; relaunching with default profile + CDP");
+                                    info!("default profile freed; relaunching with default profile + CDP");
                                     break;
                                 }
                             }
