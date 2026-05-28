@@ -295,8 +295,10 @@ pub(crate) fn toolset_allowed_names(
         "skill_use",
         // Pre-compaction history search (multi-turn coding sessions hit this often)
         "read_session_archive",
-        // Sub-agent dispatch — lets the coding profile escalate to cap-rs
-        // (claude-code / openclaude / opencode / codex) for tasks beyond its scope
+        // Coding-agent escalation — dispatch big tasks to an external CLI
+        // coding agent (claude-code / openclaude / opencode / codex) via cap-rs.
+        "cap",
+        // Sub-agent dispatch — rsclaw-native task/spawn for non-coding sub-work
         "agent",
         // Disambiguation: ask the user when the task description is genuinely ambiguous
         "clarify",
@@ -384,13 +386,13 @@ pub fn build_tool_list(
         parameters: json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["search", "get", "put"], "description": "Action to perform: search, get, or put"},
-                "query":  {"type": "string", "description": "Search query (for search). Examples: 'user name', 'project deadlines', 'API keys'"},
-                "id":     {"type": "string", "description": "Memory document ID (for get)"},
-                "text":   {"type": "string", "description": "Content to store (for put). Be specific and include context."},
-                "scope":  {"type": "string", "description": "Scope filter (optional)"},
-                "kind":   {"type": "string", "description": "Document kind: note (general), fact (verified info), remember (user explicitly asked to remember). Do NOT use kind=summary; session summaries are written automatically by /compact and /new."},
-                "top_k":  {"type": "integer", "description": "Max results (for search, default 5)"}
+                "action": {"type": "string", "enum": ["search", "get", "put"], "description": "search | get | put"},
+                "query":  {"type": "string", "description": "Search query (search)."},
+                "id":     {"type": "string", "description": "Memory id (get)."},
+                "text":   {"type": "string", "description": "Content to store (put); be specific, include context."},
+                "scope":  {"type": "string", "description": "Optional scope filter."},
+                "kind":   {"type": "string", "description": "note | fact | remember. Never summary (auto-written by /compact, /new)."},
+                "top_k":  {"type": "integer", "default": 5, "description": "Max results (search)."}
             },
             "required": ["action"]
         }),
@@ -652,9 +654,9 @@ pub fn build_tool_list(
         parameters: json!({
             "type": "object",
             "properties": {
-                "path":   {"type": "string", "description": "Relative file path. Examples: 'README.md', 'src/app.py', 'data/output.csv'"},
-                "offset": {"type": "integer", "description": "1-indexed line number to start reading from. Default: 1."},
-                "limit":  {"type": "integer", "description": "Maximum number of lines to read. Default: 2000."}
+                "path":   {"type": "string", "description": "Relative file path, e.g. 'src/app.py'."},
+                "offset": {"type": "integer", "default": 1, "description": "1-indexed start line."},
+                "limit":  {"type": "integer", "default": 2000, "description": "Max lines."}
             },
             "required": ["path"]
         }),
@@ -751,16 +753,16 @@ pub fn build_tool_list(
         parameters: json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["search", "add", "create_collection", "list_collections"], "description": "Default \"search\". Write actions only when the user asks."},
-                "query": {"type": "string", "description": "Natural-language search query (action=search)."},
-                "collection_ids": {"type": "array", "items": {"type": "string"}, "description": "Optional: restrict search to specific collection ids. Omit to search all."},
-                "top_k": {"type": "integer", "description": "Max hits to return (action=search). Default 5."},
-                "collection": {"type": "string", "description": "Target collection NAME (action=add); created if it doesn't exist."},
-                "name": {"type": "string", "description": "New collection name (action=create_collection)."},
-                "description": {"type": "string", "description": "Optional collection description (action=create_collection)."},
-                "title": {"type": "string", "description": "Document title (action=add)."},
-                "content": {"type": "string", "description": "Document text to ingest (action=add)."},
-                "mime": {"type": "string", "description": "Optional MIME for content (action=add). Default text/markdown."}
+                "action": {"type": "string", "enum": ["search", "add", "create_collection", "list_collections"], "description": "Default search. Write actions only when asked."},
+                "query": {"type": "string", "description": "Search query."},
+                "collection_ids": {"type": "array", "items": {"type": "string"}, "description": "Restrict to these collection ids; omit for all."},
+                "top_k": {"type": "integer", "default": 5, "description": "Max hits."},
+                "collection": {"type": "string", "description": "Collection NAME (add); created if absent."},
+                "name": {"type": "string", "description": "New collection name."},
+                "description": {"type": "string", "description": "Optional collection description."},
+                "title": {"type": "string", "description": "Document title."},
+                "content": {"type": "string", "description": "Document text to ingest."},
+                "mime": {"type": "string", "default": "text/markdown", "description": "MIME for content."}
             },
             "required": []
         }),
@@ -791,9 +793,9 @@ pub fn build_tool_list(
         parameters: json!({
             "type": "object",
             "properties": {
-                "path":    {"type": "string", "description": "Relative file path within the workspace (REQUIRED). Example: 'output.py'"},
-                "content": {"type": "string", "description": "File content to write (REQUIRED). MUST preserve all numbers, dates, and specific values from the user's message exactly as given."},
-                "explanation": {"type": "string", "description": "Brief explanation of what you are creating and why, to help organize your thoughts before writing content."}
+                "path":    {"type": "string", "description": "Relative file path, e.g. 'output.py'."},
+                "content": {"type": "string", "description": "File content. MUST preserve all numbers/dates/values from the user verbatim."},
+                "explanation": {"type": "string", "description": "Brief note on what you're creating and why."}
             },
             "required": ["path", "content"]
         }),
@@ -889,10 +891,10 @@ pub fn build_tool_list(
         parameters: json!({
             "type": "object",
             "properties": {
-                "path":        {"type": "string", "description": "Relative file path within the workspace. Example: 'src/main.rs'"},
-                "old_string":  {"type": "string", "description": "Exact substring to replace (verbatim, including whitespace). Must be unique unless replace_all=true."},
-                "new_string":  {"type": "string", "description": "Replacement text. May be empty (= deletion of old_string)."},
-                "replace_all": {"type": "boolean", "description": "If true, replace ALL occurrences of old_string. Default: false (requires uniqueness)."}
+                "path":        {"type": "string", "description": "Relative file path, e.g. 'src/main.rs'."},
+                "old_string":  {"type": "string", "description": "Exact substring to replace (verbatim, incl. whitespace). Unique unless replace_all."},
+                "new_string":  {"type": "string", "description": "Replacement; may be empty (= delete)."},
+                "replace_all": {"type": "boolean", "default": false, "description": "Replace ALL occurrences (else requires uniqueness)."}
             },
             "required": ["path", "old_string", "new_string"]
         }),
@@ -1063,9 +1065,9 @@ pub fn build_tool_list(
         parameters: json!({
             "type": "object",
             "properties": {
-                "path":      {"type": "string", "description": "Directory path to list. Relative to workspace root or absolute. Examples: '.', 'src/', '/tmp'"},
-                "recursive": {"type": "boolean", "description": "If true, list all files in subdirectories recursively. Default: false."},
-                "pattern":   {"type": "string", "description": "Glob pattern filter. Examples: '*.json', '*.py', 'test_*'"}
+                "path":      {"type": "string", "description": "Dir to list. Relative to workspace or absolute. E.g. '.', 'src/'."},
+                "recursive": {"type": "boolean", "default": false, "description": "Recurse into subdirectories."},
+                "pattern":   {"type": "string", "description": "Glob filter, e.g. '*.json'."}
             }
         }),
     });
@@ -1080,9 +1082,9 @@ pub fn build_tool_list(
         parameters: json!({
             "type": "object",
             "properties": {
-                "pattern": {"type": "string", "description": "REQUIRED: File name pattern with wildcards. Examples: '*.log', 'config*', 'test_*.py', '**/*.rs'"},
-                "path":    {"type": "string", "description": "Root directory to search in. Defaults to workspace root. Can be relative or absolute."},
-                "max_results": {"type": "integer", "description": "Maximum results to return (default: 20)"}
+                "pattern": {"type": "string", "description": "Filename glob, e.g. 'test_*.py', '**/*.rs'."},
+                "path":    {"type": "string", "description": "Root dir. Default workspace root."},
+                "max_results": {"type": "integer", "default": 20, "description": "Max results."}
             },
             "required": ["pattern"]
         }),
@@ -1105,13 +1107,13 @@ pub fn build_tool_list(
         parameters: json!({
             "type": "object",
             "properties": {
-                "pattern":  {"type": "string", "description": "REQUIRED: Regex pattern to search for. Examples: 'TODO', 'import.*from', 'class\\s+\\w+', 'def main'"},
-                "path":     {"type": "string", "description": "File or directory to search in. Defaults to workspace root."},
-                "include":  {"type": "string", "description": "File glob filter. Examples: '*.py', '*.{ts,tsx}', '*.rs'"},
-                "ignore_case": {"type": "boolean", "description": "If true, match case-insensitively. Default: false."},
-                "max_results": {"type": "integer", "description": "Maximum results (default: 20)"},
-                "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"], "description": "Output detail level. 'files_with_matches' is much cheaper than 'content' when you only need to know WHICH files match. Default: 'content'. Requires ripgrep — ignored on fallback."},
-                "multiline":   {"type": "boolean", "description": "Enable cross-line pattern matching. Default: false. Requires ripgrep — ignored on fallback."}
+                "pattern":  {"type": "string", "description": "Regex to search for. E.g. 'class\\s+\\w+', 'def main'."},
+                "path":     {"type": "string", "description": "File/dir to search. Default workspace root."},
+                "include":  {"type": "string", "description": "Glob filter, e.g. '*.{ts,tsx}'."},
+                "ignore_case": {"type": "boolean", "default": false, "description": "Case-insensitive match."},
+                "max_results": {"type": "integer", "default": 20, "description": "Max results."},
+                "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"], "default": "content", "description": "files_with_matches is cheaper when you only need WHICH files match. (ripgrep only)"},
+                "multiline":   {"type": "boolean", "default": false, "description": "Cross-line matching. (ripgrep only)"}
             },
             "required": ["pattern"]
         }),

@@ -941,13 +941,14 @@ fn build_coding_mode_block() -> String {
             (tr_xxxxxxxx) — use `mode=grep:PATTERN` / `head:N` / `lines:A-B` \
             rather than re-running the tool.",
         "",
-        "**When NOT to do it yourself — escalate via `agent` (cap-rs):**",
+        "**When NOT to do it yourself — escalate with `cap`:**",
         "- Multi-file refactor across >5 files",
         "- New module / feature with >200 LOC of fresh code",
         "- Debug session that crosses >3 files",
-        "Call `agent action=task` with an appropriate `toolset` and let the \
-         dispatched sub-agent (claudecode / openclaude / opencode / codex) run \
-         it. You stay in charge of small surgical edits.",
+        "Dispatch to an external coding agent via `cap` (see the \"Coding \
+         agents\" section for how to pick claudecode / openclaude / opencode / \
+         codex). You stay in charge of small surgical edits; hand the heavy \
+         multi-file work to `cap` and let its async follow-up wake you.",
         "",
         "**Project instructions:** If `AGENTS.md` or `CLAUDE.md` files exist in \
          the current working directory or any ancestor directory, their contents \
