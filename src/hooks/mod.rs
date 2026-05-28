@@ -57,8 +57,15 @@ pub async fn handle_webhook(
         map.get(path.as_str()).cloned()
     };
     if let Some(ch) = custom_ch {
-        let body_str = String::from_utf8_lossy(&body);
-        ch.handle_webhook(&body_str).await;
+        // ACK immediately and process the payload in the background.
+        // handle_webhook downloads remote attachments and runs the agent
+        // pipeline; awaiting it here would hold the HTTP request open for
+        // tens of seconds and let slow attachment URLs delay the ACK.
+        let body_owned = body.to_vec();
+        tokio::spawn(async move {
+            let body_str = String::from_utf8_lossy(&body_owned).into_owned();
+            ch.handle_webhook(&body_str).await;
+        });
         return (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({"accepted": true, "channel": path})),

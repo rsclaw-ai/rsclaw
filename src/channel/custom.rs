@@ -271,14 +271,14 @@ pub struct CustomWebhookChannel {
     client: Client,
     #[allow(clippy::type_complexity)]
     on_message:
-        Arc<dyn Fn(String, String, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>, bool) + Send + Sync>,
+        Arc<dyn Fn(String, String, String, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>, bool) + Send + Sync>,
 }
 
 impl CustomWebhookChannel {
     pub fn new(
         cfg: CustomChannelConfig,
         on_message: Arc<
-            dyn Fn(String, String, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>, bool) + Send + Sync,
+            dyn Fn(String, String, String, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>, bool) + Send + Sync,
         >,
     ) -> Self {
         Self {
@@ -295,6 +295,12 @@ impl CustomWebhookChannel {
     pub async fn handle_webhook(&self, body: &str) {
         if let Some(parsed) = parse_inbound(&self.cfg, body) {
             let is_group = parsed.group_id.is_some();
+            // chat_id = group_id when present (so the agent reply lands in the
+            // group), else the sender's DM identity.
+            let chat_id = parsed
+                .group_id
+                .clone()
+                .unwrap_or_else(|| parsed.sender.clone());
             // Download images/files from URLs extracted by parse_inbound.
             let images = download_images(&self.client, &parsed.image_urls).await;
             let files = download_and_package_file(
@@ -303,7 +309,14 @@ impl CustomWebhookChannel {
                 parsed.file_name.as_deref().unwrap_or("file.bin"),
             )
             .await;
-            (self.on_message)(parsed.sender, parsed.text, images, files, is_group);
+            (self.on_message)(
+                parsed.sender,
+                parsed.text,
+                chat_id,
+                images,
+                files,
+                is_group,
+            );
         } else {
             debug!(channel = %self.cfg.name, "custom webhook: inbound message did not match filter/paths");
         }
@@ -428,7 +441,7 @@ pub struct CustomWebSocketChannel {
     client: Client,
     #[allow(clippy::type_complexity)]
     on_message:
-        Arc<dyn Fn(String, String, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>, bool) + Send + Sync>,
+        Arc<dyn Fn(String, String, String, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>, bool) + Send + Sync>,
     /// Sender half for outbound messages.
     ws_tx: Mutex<Option<mpsc::Sender<String>>>,
 }
@@ -437,7 +450,7 @@ impl CustomWebSocketChannel {
     pub fn new(
         cfg: CustomChannelConfig,
         on_message: Arc<
-            dyn Fn(String, String, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>, bool) + Send + Sync,
+            dyn Fn(String, String, String, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>, bool) + Send + Sync,
         >,
     ) -> Self {
         Self {
@@ -672,6 +685,10 @@ impl CustomWebSocketChannel {
                             let text_str: &str = &text;
                             if let Some(parsed) = parse_inbound(&self.cfg, text_str) {
                                 let is_group = parsed.group_id.is_some();
+                                let chat_id = parsed
+                                    .group_id
+                                    .clone()
+                                    .unwrap_or_else(|| parsed.sender.clone());
                                 let images =
                                     download_images(&self.client, &parsed.image_urls).await;
                                 let files = download_and_package_file(
@@ -680,13 +697,24 @@ impl CustomWebSocketChannel {
                                     parsed.file_name.as_deref().unwrap_or("file.bin"),
                                 )
                                 .await;
-                                (self.on_message)(parsed.sender, parsed.text, images, files, is_group);
+                                (self.on_message)(
+                                    parsed.sender,
+                                    parsed.text,
+                                    chat_id,
+                                    images,
+                                    files,
+                                    is_group,
+                                );
                             }
                         }
                         Some(Ok(WsMessage::Binary(data))) => {
                             let text = String::from_utf8_lossy(&data);
                             if let Some(parsed) = parse_inbound(&self.cfg, &text) {
                                 let is_group = parsed.group_id.is_some();
+                                let chat_id = parsed
+                                    .group_id
+                                    .clone()
+                                    .unwrap_or_else(|| parsed.sender.clone());
                                 let images =
                                     download_images(&self.client, &parsed.image_urls).await;
                                 let files = download_and_package_file(
@@ -695,7 +723,14 @@ impl CustomWebSocketChannel {
                                     parsed.file_name.as_deref().unwrap_or("file.bin"),
                                 )
                                 .await;
-                                (self.on_message)(parsed.sender, parsed.text, images, files, is_group);
+                                (self.on_message)(
+                                    parsed.sender,
+                                    parsed.text,
+                                    chat_id,
+                                    images,
+                                    files,
+                                    is_group,
+                                );
                             }
                         }
                         Some(Ok(WsMessage::Close(_))) => {
@@ -757,20 +792,102 @@ impl CustomWebSocketChannel {
 // Download helpers
 // ---------------------------------------------------------------------------
 
+/// Max bytes accepted for a single inbound attachment from an untrusted URL.
+/// Caps memory blowup from malicious or oversized payloads.
+const MAX_REMOTE_ATTACHMENT_BYTES: u64 = 32 * 1024 * 1024;
+
+/// SSRF guard: reject non-http(s) URLs and URLs pointing at loopback/private/
+/// link-local hosts. Custom-channel attachment URLs come from arbitrary
+/// upstream JSON, so they must never be allowed to hit the gateway's own
+/// internal services.
+fn url_looks_safe(url: &str) -> bool {
+    let parsed = match url::Url::parse(url) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let lower = host.to_ascii_lowercase();
+    if matches!(lower.as_str(), "localhost" | "ip6-localhost" | "ip6-loopback") {
+        return false;
+    }
+    // If the host literally is an IP, reject loopback/private/link-local/
+    // unspecified ranges. DNS-name hosts pass this gate; DNS resolution still
+    // happens inside reqwest. Full DNS-level rebinding defense would need
+    // resolver hooks — explicit allowlist is the cleanest follow-up.
+    if let Ok(ip) = lower.parse::<std::net::IpAddr>() {
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                if v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified() {
+                    return false;
+                }
+            }
+            std::net::IpAddr::V6(v6) => {
+                if v6.is_loopback() || v6.is_unspecified() {
+                    return false;
+                }
+                // 169.254/16 ipv6 equiv (fe80::/10) and ULA (fc00::/7).
+                let seg = v6.segments()[0];
+                if (seg & 0xffc0) == 0xfe80 || (seg & 0xfe00) == 0xfc00 {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Download up to `MAX_REMOTE_ATTACHMENT_BYTES` from `url`, streaming the
+/// body so a malicious server can't blow up memory with a giant Content-Length
+/// lie or chunked spam.
+async fn download_remote_attachment(client: &Client, url: &str) -> Result<Vec<u8>> {
+    if !url_looks_safe(url) {
+        bail!("custom channel attachment URL rejected by SSRF guard: {url}");
+    }
+    let resp = client.get(url).send().await.context("send request")?;
+    if !resp.status().is_success() {
+        bail!("attachment download failed: {}", resp.status());
+    }
+    if let Some(len) = resp.content_length() {
+        if len > MAX_REMOTE_ATTACHMENT_BYTES {
+            bail!(
+                "attachment too large: content-length {} > {} bytes",
+                len,
+                MAX_REMOTE_ATTACHMENT_BYTES
+            );
+        }
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("read chunk")?;
+        if buf.len() as u64 + chunk.len() as u64 > MAX_REMOTE_ATTACHMENT_BYTES {
+            bail!(
+                "attachment exceeded {} bytes during streaming",
+                MAX_REMOTE_ATTACHMENT_BYTES
+            );
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
 /// Download an image URL and package as ImageAttachment.
 async fn download_and_package_image(
     client: &Client,
     url: &str,
 ) -> Option<crate::agent::registry::ImageAttachment> {
-    let bytes = crate::channel::transcription::download_file(client, url)
-        .await
-        .ok()?;
+    let bytes = download_remote_attachment(client, url).await.ok()?;
     if bytes.is_empty() {
         return None;
     }
     let mime = mime_guess::from_path(url).first_or_octet_stream().to_string();
     let (final_bytes, final_mime) =
-        crate::util::downscale_image_for_vision(bytes.clone(), &mime, 1 * 1024 * 1024, 1920, 85)
+        crate::util::downscale_image_for_vision(&bytes, &mime, 1 * 1024 * 1024, 1920, 85)
             .unwrap_or_else(|_| (bytes, mime));
     let b64 = base64::engine::general_purpose::STANDARD.encode(&final_bytes);
     let data_url = format!("data:{final_mime};base64,{b64}");
@@ -802,7 +919,7 @@ async fn download_and_package_file(
     filename: &str,
 ) -> Vec<crate::agent::registry::FileAttachment> {
     let Some(url) = file_url else { return vec![] };
-    match crate::channel::transcription::download_file(client, url).await {
+    match download_remote_attachment(client, url).await {
         Ok(bytes) if !bytes.is_empty() => {
             let mime = mime_guess::from_path(filename)
                 .first_or_octet_stream()

@@ -678,7 +678,7 @@ impl WeChatPersonalChannel {
                                             let orig_len = bytes.len();
                                             let (final_bytes, final_mime) =
                                                 crate::util::downscale_image_for_vision(
-                                                    bytes.clone(),
+                                                    &bytes,
                                                     "image/jpeg",
                                                     1 * 1024 * 1024,
                                                     1920,

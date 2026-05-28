@@ -688,8 +688,17 @@ impl ChannelManager {
     /// Used for multi-account channels that need both an account-keyed
     /// alias (e.g. `"feishu/main"`) and a bare-name fallback so callers
     /// can route by account when they know it.
+    ///
+    /// Aliases — registrations whose `ch` is already present in the map
+    /// (detected via `Arc::ptr_eq`) — do not consume `max_concurrent` quota.
+    /// This lets a real multi-account channel register multiple lookup keys
+    /// (e.g. `"feishu"` and `"feishu/main"`) without burning extra slots.
     pub fn register_with_name(&mut self, name: String, ch: Arc<dyn Channel>) -> Result<()> {
-        if self.channels.len() >= self.max_concurrent() {
+        let is_alias = self
+            .channels
+            .values()
+            .any(|existing| Arc::ptr_eq(existing, &ch));
+        if !is_alias && self.distinct_channel_count() >= self.max_concurrent() {
             anyhow::bail!(
                 "channel limit reached ({}) for memory tier {:?}",
                 self.max_concurrent(),
@@ -698,6 +707,19 @@ impl ChannelManager {
         }
         self.channels.insert(name, ch);
         Ok(())
+    }
+
+    /// Count distinct underlying channels (collapses alias entries that point
+    /// at the same `Arc<dyn Channel>`).
+    fn distinct_channel_count(&self) -> usize {
+        let mut seen: Vec<*const ()> = Vec::with_capacity(self.channels.len());
+        for ch in self.channels.values() {
+            let ptr = Arc::as_ptr(ch) as *const ();
+            if !seen.iter().any(|p| *p == ptr) {
+                seen.push(ptr);
+            }
+        }
+        seen.len()
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Channel>> {

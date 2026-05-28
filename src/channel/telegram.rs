@@ -879,15 +879,15 @@ impl Channel for TelegramChannel {
                                                 let orig_len = bytes.len();
                                                 let (final_bytes, final_mime) =
                                                     crate::util::downscale_image_for_vision(
-                                                        bytes,
+                                                        &bytes,
                                                         "image/jpeg",
                                                         1 * 1024 * 1024,
                                                         1920,
                                                         85,
                                                     )
                                                     .unwrap_or_else(|e| {
-                                                        warn!(error = %e, "Telegram: downscale failed");
-                                                        (Vec::new(), "image/jpeg".to_string())
+                                                        warn!(error = %e, "Telegram: downscale failed, sending original");
+                                                        (bytes.clone(), "image/jpeg".to_string())
                                                     });
                                                 if !final_bytes.is_empty() {
                                                     let b64 =

@@ -521,7 +521,7 @@ impl DiscordChannel {
                                             };
                                             let (final_bytes, final_mime) =
                                                 crate::util::downscale_image_for_vision(
-                                                    bytes.clone(),
+                                                    &bytes,
                                                     orig_mime,
                                                     1 * 1024 * 1024,
                                                     1920,

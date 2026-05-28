@@ -340,7 +340,7 @@ impl Channel for MatrixChannel {
                                     let orig_len = bytes.len();
                                     let (final_bytes, final_mime) =
                                         crate::util::downscale_image_for_vision(
-                                            bytes.clone(),
+                                            &bytes,
                                             &orig_mime,
                                             1 * 1024 * 1024,
                                             1920,
@@ -940,7 +940,7 @@ impl Channel for MatrixChannel {
                                                                     let orig_len = bytes_vec.len();
                                                                     let (final_bytes, final_mime) =
                                                                         crate::util::downscale_image_for_vision(
-                                                                            bytes_vec.clone(),
+                                                                            &bytes_vec,
                                                                             "image/png",
                                                                             1 * 1024 * 1024,
                                                                             1920,
@@ -948,7 +948,7 @@ impl Channel for MatrixChannel {
                                                                         )
                                                                         .unwrap_or_else(|e| {
                                                                             warn!(error = %e, "Matrix: downscale failed");
-                                                                            (bytes_vec, "image/png".to_owned())
+                                                                            (bytes_vec.clone(), "image/png".to_owned())
                                                                         });
                                                                     let b64 = base64::engine::general_purpose::STANDARD.encode(&final_bytes);
                                                                     let data_url = format!(

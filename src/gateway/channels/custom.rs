@@ -124,6 +124,7 @@ fn start_custom_webhook(
     let on_message = Arc::new(
         move |sender: String,
               text: String,
+              chat_id: String,
               images: Vec<crate::agent::registry::ImageAttachment>,
               files: Vec<crate::agent::registry::FileAttachment>,
               is_group: bool| {
@@ -132,58 +133,63 @@ fn start_custom_webhook(
             let tx = out_tx.clone();
             let ch_name = ch_name_cb.clone();
             let enforcer = Arc::clone(&enforcer);
+            // Where agent replies go: groups → group chat, DMs → speaker.
+            let reply_target = if is_group { chat_id.clone() } else { sender.clone() };
             tokio::spawn(async move {
-                // DM policy check.
-                match enforcer.check(&sender).await {
-                    PolicyResult::Allow => {}
-                    PolicyResult::Deny => {
-                        warn!(peer_id = %sender, "custom channel DM rejected by policy");
-                        return;
-                    }
-                    PolicyResult::SendPairingCode(code) => {
-                        if let Err(e) = tx
-                            .send(OutboundMessage {
-                                target_id: sender.clone(),
-                                is_group: false,
-                                text: crate::i18n::t_fmt(
-                                    "pairing_required",
-                                    crate::i18n::default_lang(),
-                                    &[("code", &code)],
-                                )
-                                .to_owned(),
-                                reply_to: None,
-                                images: vec![],
-                                channel: None,
-                                account: None,
-                                files: vec![],
-                            })
-                            .await
-                        {
-                            tracing::warn!("failed to send pairing message: {e}");
+                // DM policy check (skip for groups — group_allow_from would
+                // belong here once the schema exposes it for custom channels).
+                if !is_group {
+                    match enforcer.check(&sender).await {
+                        PolicyResult::Allow => {}
+                        PolicyResult::Deny => {
+                            warn!(peer_id = %sender, "custom channel DM rejected by policy");
+                            return;
                         }
-                        return;
-                    }
-                    PolicyResult::PairingQueueFull => {
-                        if let Err(e) = tx
-                            .send(OutboundMessage {
-                                target_id: sender.clone(),
-                                is_group: false,
-                                text: crate::i18n::t(
-                                    "pairing_queue_full",
-                                    crate::i18n::default_lang(),
-                                )
-                                .to_owned(),
-                                reply_to: None,
-                                images: vec![],
-                                channel: None,
-                                account: None,
-                                files: vec![],
-                            })
-                            .await
-                        {
-                            tracing::warn!("failed to send message: {e}");
+                        PolicyResult::SendPairingCode(code) => {
+                            if let Err(e) = tx
+                                .send(OutboundMessage {
+                                    target_id: sender.clone(),
+                                    is_group: false,
+                                    text: crate::i18n::t_fmt(
+                                        "pairing_required",
+                                        crate::i18n::default_lang(),
+                                        &[("code", &code)],
+                                    )
+                                    .to_owned(),
+                                    reply_to: None,
+                                    images: vec![],
+                                    channel: None,
+                                    account: None,
+                                    files: vec![],
+                                })
+                                .await
+                            {
+                                tracing::warn!("failed to send pairing message: {e}");
+                            }
+                            return;
                         }
-                        return;
+                        PolicyResult::PairingQueueFull => {
+                            if let Err(e) = tx
+                                .send(OutboundMessage {
+                                    target_id: sender.clone(),
+                                    is_group: false,
+                                    text: crate::i18n::t(
+                                        "pairing_queue_full",
+                                        crate::i18n::default_lang(),
+                                    )
+                                    .to_owned(),
+                                    reply_to: None,
+                                    images: vec![],
+                                    channel: None,
+                                    account: None,
+                                    files: vec![],
+                                })
+                                .await
+                            {
+                                tracing::warn!("failed to send message: {e}");
+                            }
+                            return;
+                        }
                     }
                 }
 
@@ -193,7 +199,7 @@ fn start_custom_webhook(
                     let tx = tx.clone();
                     let cfg = cfg.clone();
                     let question = text[5..].to_owned();
-                    let sender = sender.clone();
+                    let reply_target = reply_target.clone();
                     tokio::spawn(async move {
                         let handle = match reg.route_account(&ch_name, None) {
                             Ok(h) => h,
@@ -209,8 +215,8 @@ fn start_custom_webhook(
                         {
                             if let Err(e) = tx
                                 .send(OutboundMessage {
-                                    target_id: sender,
-                                    is_group: false,
+                                    target_id: reply_target,
+                                    is_group,
                                     text: format!("[/btw] {}", reply_text),
                                     reply_to: None,
                                     images: vec![],
@@ -233,6 +239,8 @@ fn start_custom_webhook(
                     let tx = tx.clone();
                     let cfg = cfg.clone();
                     let sender = sender.clone();
+                    let chat_id_inner = chat_id.clone();
+                    let reply_target = reply_target.clone();
                     tokio::spawn(async move {
                         let handle = match reg.route_account(&ch_name, None) {
                             Ok(h) => h,
@@ -241,7 +249,14 @@ fn start_custom_webhook(
                         let dm_scope = default_dm_scope(&cfg);
                         let session_key = derive_session_key(&SessionKeyParams {
                             agent_id: handle.id.clone(),
-                            kind: MessageKind::DirectMessage { account_id: None },
+                            kind: if is_group {
+                                MessageKind::GroupMessage {
+                                    group_id: chat_id_inner.clone(),
+                                    thread_id: None,
+                                }
+                            } else {
+                                MessageKind::DirectMessage { account_id: None }
+                            },
                             channel: ch_name.clone(),
                             peer_id: sender.clone(),
                             dm_scope,
@@ -255,8 +270,8 @@ fn start_custom_webhook(
                         )
                         .await
                         {
-                            reply.target_id = sender.clone();
-                            reply.is_group = false;
+                            reply.target_id = reply_target.clone();
+                            reply.is_group = is_group;
                             if !reply.text.is_empty() || !reply.images.is_empty() {
                                 if let Err(e) = tx.send(reply).await {
                                     tracing::warn!("failed to send message: {e}");
@@ -270,7 +285,7 @@ fn start_custom_webhook(
                             text,
                             channel: ch_name.clone(),
                             peer_id: sender.clone(),
-                            chat_id: sender.clone(),
+                            chat_id: chat_id_inner.clone(),
                             reply_tx,
                             task_id: None,
                             context_id: None,
@@ -291,8 +306,8 @@ fn start_custom_webhook(
                             if !r.is_empty {
                                 if let Err(e) = tx
                                     .send(OutboundMessage {
-                                        target_id: sender,
-                                        is_group: false,
+                                        target_id: reply_target,
+                                        is_group,
                                         text: r.text,
                                         reply_to: None,
                                         images: r.images,
@@ -323,7 +338,7 @@ fn start_custom_webhook(
                     agent_id: handle.id.clone(),
                     kind: if is_group {
                         MessageKind::GroupMessage {
-                            group_id: sender.clone(),
+                            group_id: chat_id.clone(),
                             thread_id: None,
                         }
                     } else {
@@ -339,7 +354,7 @@ fn start_custom_webhook(
                     text,
                     channel: ch_name.clone(),
                     peer_id: sender.clone(),
-                    chat_id: sender.clone(),
+                    chat_id: chat_id.clone(),
                     reply_tx,
                     task_id: None,
                     context_id: None,
@@ -361,7 +376,7 @@ fn start_custom_webhook(
                     if !r.is_empty {
                         if let Err(e) = tx
                             .send(OutboundMessage {
-                                target_id: sender.clone(),
+                                target_id: reply_target.clone(),
                                 is_group,
                                 text: r.text,
                                 reply_to: None,
@@ -380,7 +395,7 @@ fn start_custom_webhook(
                             analysis,
                             Arc::clone(&handle),
                             &tx,
-                            sender,
+                            reply_target,
                             is_group,
                             &cfg,
                         )
@@ -460,6 +475,7 @@ fn start_custom_websocket(
     let on_message = Arc::new(
         move |sender: String,
               text: String,
+              chat_id: String,
               images: Vec<crate::agent::registry::ImageAttachment>,
               files: Vec<crate::agent::registry::FileAttachment>,
               is_group: bool| {
@@ -468,58 +484,60 @@ fn start_custom_websocket(
             let tx = out_tx.clone();
             let ch_name = ch_name_cb.clone();
             let enforcer = Arc::clone(&enforcer);
+            let reply_target = if is_group { chat_id.clone() } else { sender.clone() };
             tokio::spawn(async move {
-                // DM policy check.
-                match enforcer.check(&sender).await {
-                    PolicyResult::Allow => {}
-                    PolicyResult::Deny => {
-                        warn!(peer_id = %sender, "custom channel DM rejected by policy");
-                        return;
-                    }
-                    PolicyResult::SendPairingCode(code) => {
-                        if let Err(e) = tx
-                            .send(OutboundMessage {
-                                target_id: sender.clone(),
-                                is_group: false,
-                                text: crate::i18n::t_fmt(
-                                    "pairing_required",
-                                    crate::i18n::default_lang(),
-                                    &[("code", &code)],
-                                )
-                                .to_owned(),
-                                reply_to: None,
-                                images: vec![],
-                                channel: None,
-                                account: None,
-                                files: vec![],
-                            })
-                            .await
-                        {
-                            tracing::warn!("failed to send pairing message: {e}");
+                if !is_group {
+                    match enforcer.check(&sender).await {
+                        PolicyResult::Allow => {}
+                        PolicyResult::Deny => {
+                            warn!(peer_id = %sender, "custom channel DM rejected by policy");
+                            return;
                         }
-                        return;
-                    }
-                    PolicyResult::PairingQueueFull => {
-                        if let Err(e) = tx
-                            .send(OutboundMessage {
-                                target_id: sender.clone(),
-                                is_group: false,
-                                text: crate::i18n::t(
-                                    "pairing_queue_full",
-                                    crate::i18n::default_lang(),
-                                )
-                                .to_owned(),
-                                reply_to: None,
-                                images: vec![],
-                                channel: None,
-                                account: None,
-                                files: vec![],
-                            })
-                            .await
-                        {
-                            tracing::warn!("failed to send message: {e}");
+                        PolicyResult::SendPairingCode(code) => {
+                            if let Err(e) = tx
+                                .send(OutboundMessage {
+                                    target_id: sender.clone(),
+                                    is_group: false,
+                                    text: crate::i18n::t_fmt(
+                                        "pairing_required",
+                                        crate::i18n::default_lang(),
+                                        &[("code", &code)],
+                                    )
+                                    .to_owned(),
+                                    reply_to: None,
+                                    images: vec![],
+                                    channel: None,
+                                    account: None,
+                                    files: vec![],
+                                })
+                                .await
+                            {
+                                tracing::warn!("failed to send pairing message: {e}");
+                            }
+                            return;
                         }
-                        return;
+                        PolicyResult::PairingQueueFull => {
+                            if let Err(e) = tx
+                                .send(OutboundMessage {
+                                    target_id: sender.clone(),
+                                    is_group: false,
+                                    text: crate::i18n::t(
+                                        "pairing_queue_full",
+                                        crate::i18n::default_lang(),
+                                    )
+                                    .to_owned(),
+                                    reply_to: None,
+                                    images: vec![],
+                                    channel: None,
+                                    account: None,
+                                    files: vec![],
+                                })
+                                .await
+                            {
+                                tracing::warn!("failed to send message: {e}");
+                            }
+                            return;
+                        }
                     }
                 }
 
@@ -529,7 +547,7 @@ fn start_custom_websocket(
                     let tx = tx.clone();
                     let cfg = cfg.clone();
                     let question = text[5..].to_owned();
-                    let sender = sender.clone();
+                    let reply_target = reply_target.clone();
                     tokio::spawn(async move {
                         let handle = match reg.route_account(&ch_name, None) {
                             Ok(h) => h,
@@ -545,8 +563,8 @@ fn start_custom_websocket(
                         {
                             if let Err(e) = tx
                                 .send(OutboundMessage {
-                                    target_id: sender,
-                                    is_group: false,
+                                    target_id: reply_target,
+                                    is_group,
                                     text: format!("[/btw] {}", reply_text),
                                     reply_to: None,
                                     images: vec![],
@@ -569,6 +587,8 @@ fn start_custom_websocket(
                     let tx = tx.clone();
                     let cfg = cfg.clone();
                     let sender = sender.clone();
+                    let chat_id_inner = chat_id.clone();
+                    let reply_target = reply_target.clone();
                     tokio::spawn(async move {
                         let handle = match reg.route_account(&ch_name, None) {
                             Ok(h) => h,
@@ -577,7 +597,14 @@ fn start_custom_websocket(
                         let dm_scope = default_dm_scope(&cfg);
                         let session_key = derive_session_key(&SessionKeyParams {
                             agent_id: handle.id.clone(),
-                            kind: MessageKind::DirectMessage { account_id: None },
+                            kind: if is_group {
+                                MessageKind::GroupMessage {
+                                    group_id: chat_id_inner.clone(),
+                                    thread_id: None,
+                                }
+                            } else {
+                                MessageKind::DirectMessage { account_id: None }
+                            },
                             channel: ch_name.clone(),
                             peer_id: sender.clone(),
                             dm_scope,
@@ -591,8 +618,8 @@ fn start_custom_websocket(
                         )
                         .await
                         {
-                            reply.target_id = sender.clone();
-                            reply.is_group = false;
+                            reply.target_id = reply_target.clone();
+                            reply.is_group = is_group;
                             if !reply.text.is_empty() || !reply.images.is_empty() {
                                 if let Err(e) = tx.send(reply).await {
                                     tracing::warn!("failed to send message: {e}");
@@ -606,7 +633,7 @@ fn start_custom_websocket(
                             text,
                             channel: ch_name.clone(),
                             peer_id: sender.clone(),
-                            chat_id: sender.clone(),
+                            chat_id: chat_id_inner.clone(),
                             reply_tx,
                             task_id: None,
                             context_id: None,
@@ -627,8 +654,8 @@ fn start_custom_websocket(
                             if !r.is_empty {
                                 if let Err(e) = tx
                                     .send(OutboundMessage {
-                                        target_id: sender,
-                                        is_group: false,
+                                        target_id: reply_target,
+                                        is_group,
                                         text: r.text,
                                         reply_to: None,
                                         images: r.images,
@@ -659,7 +686,7 @@ fn start_custom_websocket(
                     agent_id: handle.id.clone(),
                     kind: if is_group {
                         MessageKind::GroupMessage {
-                            group_id: sender.clone(),
+                            group_id: chat_id.clone(),
                             thread_id: None,
                         }
                     } else {
@@ -675,7 +702,7 @@ fn start_custom_websocket(
                     text,
                     channel: ch_name.clone(),
                     peer_id: sender.clone(),
-                    chat_id: sender.clone(),
+                    chat_id: chat_id.clone(),
                     reply_tx,
                     task_id: None,
                     context_id: None,
@@ -697,7 +724,7 @@ fn start_custom_websocket(
                     if !r.is_empty {
                         if let Err(e) = tx
                             .send(OutboundMessage {
-                                target_id: sender.clone(),
+                                target_id: reply_target.clone(),
                                 is_group,
                                 text: r.text,
                                 reply_to: None,
@@ -716,7 +743,7 @@ fn start_custom_websocket(
                             analysis,
                             Arc::clone(&handle),
                             &tx,
-                            sender,
+                            reply_target,
                             is_group,
                             &cfg,
                         )
