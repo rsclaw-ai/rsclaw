@@ -1905,6 +1905,7 @@ impl AgentRuntime {
             });
         }
 
+        let vision_model_name = vision_model.clone();
         let req = LlmRequest {
             model: vision_model,
             fallback_models: vision_chain.into_iter().skip(1).collect(),
@@ -1925,10 +1926,20 @@ impl AgentRuntime {
             .await
             .map_err(|_| anyhow!("vision caption timed out (45s)"))??;
 
-        let mut buf = String::new();
+        // Collect text AND reasoning separately. Some vision workers stream the
+        // description as `thinking` frames (→ ReasoningDelta) rather than text
+        // deltas even with thinking_budget=0; in that case the description is
+        // still the answer we want, so fall back to it when no text arrived.
+        // Without this fallback the caption silently came back empty and the
+        // whole image turn degraded to "vision recognition failed".
+        let mut text_buf = String::new();
+        let mut reasoning_buf = String::new();
+        let mut frame_count: usize = 0;
         while let Some(event) = stream.next().await {
+            frame_count += 1;
             match event {
-                Ok(StreamEvent::TextDelta(d)) => buf.push_str(&d),
+                Ok(StreamEvent::TextDelta(d)) => text_buf.push_str(&d),
+                Ok(StreamEvent::ReasoningDelta(d)) => reasoning_buf.push_str(&d),
                 Ok(StreamEvent::Done { .. }) => break,
                 Ok(StreamEvent::Error(msg)) => bail!("vision caption: {msg}"),
                 Ok(_) => {}
@@ -1936,10 +1947,17 @@ impl AgentRuntime {
             }
         }
 
-        if buf.trim().is_empty() {
-            bail!("vision caption: empty output");
-        }
-        Ok(buf)
+        let out = if !text_buf.trim().is_empty() {
+            text_buf
+        } else if !reasoning_buf.trim().is_empty() {
+            debug!(model = %vision_model_name, "vision caption: using reasoning frames (no text deltas)");
+            reasoning_buf
+        } else {
+            bail!(
+                "vision caption: empty output (model={vision_model_name}, frames={frame_count})"
+            );
+        };
+        Ok(out)
     }
 
     /// Drive a single conversation turn.
