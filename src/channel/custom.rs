@@ -796,58 +796,96 @@ impl CustomWebSocketChannel {
 /// Caps memory blowup from malicious or oversized payloads.
 const MAX_REMOTE_ATTACHMENT_BYTES: u64 = 32 * 1024 * 1024;
 
-/// SSRF guard: reject non-http(s) URLs and URLs pointing at loopback/private/
-/// link-local hosts. Custom-channel attachment URLs come from arbitrary
-/// upstream JSON, so they must never be allowed to hit the gateway's own
-/// internal services.
-fn url_looks_safe(url: &str) -> bool {
-    let parsed = match url::Url::parse(url) {
-        Ok(u) => u,
-        Err(_) => return false,
-    };
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return false;
-    }
-    let Some(host) = parsed.host_str() else {
-        return false;
-    };
-    let lower = host.to_ascii_lowercase();
-    if matches!(lower.as_str(), "localhost" | "ip6-localhost" | "ip6-loopback") {
-        return false;
-    }
-    // If the host literally is an IP, reject loopback/private/link-local/
-    // unspecified ranges. DNS-name hosts pass this gate; DNS resolution still
-    // happens inside reqwest. Full DNS-level rebinding defense would need
-    // resolver hooks — explicit allowlist is the cleanest follow-up.
-    if let Ok(ip) = lower.parse::<std::net::IpAddr>() {
-        match ip {
-            std::net::IpAddr::V4(v4) => {
-                if v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified() {
-                    return false;
-                }
+/// Reject loopback / private / link-local / unspecified IPs so a malicious
+/// upstream payload can't redirect us at the gateway's own internal services.
+fn ip_is_safe(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast())
+        }
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+                return false;
             }
-            std::net::IpAddr::V6(v6) => {
-                if v6.is_loopback() || v6.is_unspecified() {
-                    return false;
-                }
-                // 169.254/16 ipv6 equiv (fe80::/10) and ULA (fc00::/7).
-                let seg = v6.segments()[0];
-                if (seg & 0xffc0) == 0xfe80 || (seg & 0xfe00) == 0xfc00 {
-                    return false;
-                }
+            // fe80::/10 link-local and fc00::/7 ULA.
+            let seg = v6.segments()[0];
+            if (seg & 0xffc0) == 0xfe80 || (seg & 0xfe00) == 0xfc00 {
+                return false;
             }
+            // IPv4-mapped (::ffff:0:0/96) — re-check the embedded v4.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return ip_is_safe(std::net::IpAddr::V4(v4));
+            }
+            true
         }
     }
-    true
 }
 
 /// Download up to `MAX_REMOTE_ATTACHMENT_BYTES` from `url`, streaming the
-/// body so a malicious server can't blow up memory with a giant Content-Length
-/// lie or chunked spam.
-async fn download_remote_attachment(client: &Client, url: &str) -> Result<Vec<u8>> {
-    if !url_looks_safe(url) {
-        bail!("custom channel attachment URL rejected by SSRF guard: {url}");
+/// body. Hardens against SSRF + DNS rebinding by pre-resolving the hostname,
+/// rejecting if ANY resolved IP is unsafe, then pinning reqwest to the
+/// validated address set via `resolve_to_addrs` so the actual TCP connect
+/// can't end up at a different IP than the one we checked.
+///
+/// `_client` is unused — we build a per-request client so the DNS pin can be
+/// scoped to this single download. Channel-level client pooling isn't useful
+/// here since each webhook attachment hits a different host.
+async fn download_remote_attachment(_client: &Client, url: &str) -> Result<Vec<u8>> {
+    let parsed = url::Url::parse(url).context("parse attachment url")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!("custom channel: blocked non-http(s) URL {url}");
     }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("custom channel: URL has no host: {url}"))?
+        .to_owned();
+    let host_lower = host.to_ascii_lowercase();
+    if matches!(
+        host_lower.as_str(),
+        "localhost" | "ip6-localhost" | "ip6-loopback"
+    ) {
+        bail!("custom channel: blocked loopback host {host}");
+    }
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| anyhow::anyhow!("custom channel: URL has no port: {url}"))?;
+
+    // Resolve every candidate IP up-front. Bail if ANY is unsafe — even one
+    // private-range record in a round-robin set lets an attacker exploit
+    // reqwest's choice. This closes the DNS-rebinding window for the duration
+    // of the pinned request below.
+    let lookup_target = format!("{host}:{port}");
+    let addrs: Vec<std::net::SocketAddr> =
+        match tokio::net::lookup_host(lookup_target.as_str()).await {
+            Ok(it) => it.collect(),
+            Err(e) => bail!("custom channel: DNS lookup failed for {host}: {e}"),
+        };
+    if addrs.is_empty() {
+        bail!("custom channel: no DNS records for {host}");
+    }
+    for addr in &addrs {
+        if !ip_is_safe(addr.ip()) {
+            bail!(
+                "custom channel: DNS resolved {host} to unsafe IP {}",
+                addr.ip()
+            );
+        }
+    }
+
+    // Build a per-request client pinned to the validated address set. After
+    // this call reqwest will only TCP-connect to one of `addrs`; a malicious
+    // resolver flipping records before the request fires cannot redirect us.
+    let client = crate::config::build_proxy_client()
+        .timeout(Duration::from_secs(30))
+        .resolve_to_addrs(&host, &addrs)
+        .build()
+        .context("build pinned reqwest client")?;
+
     let resp = client.get(url).send().await.context("send request")?;
     if !resp.status().is_success() {
         bail!("attachment download failed: {}", resp.status());
