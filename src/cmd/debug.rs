@@ -117,6 +117,8 @@ async fn dump_prompt_spec(args: DumpPromptSpecArgs) -> Result<()> {
         .toolset
         .clone()
         .or_else(|| agent_cfg.model.as_ref().and_then(|m| m.toolset.clone()));
+    // Debug dump is a no-runtime path — `cap_available = true` so the
+    // dumped prompt-spec shows what the live agent sees (tool_cap hint present).
     let user_system = build_user_system(
         &ws_ctx,
         &skills,
@@ -124,6 +126,7 @@ async fn dump_prompt_spec(args: DumpPromptSpecArgs) -> Result<()> {
         None,
         &config.raw,
         toolset.as_deref(),
+        true,
     );
 
     // 6. Build the merged tool list, then split by name into the cacheable

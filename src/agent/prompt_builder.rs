@@ -679,6 +679,12 @@ fn build_shared_system_prefix_uncached() -> String {
 /// - Installed skills + their on-disk paths
 ///
 /// Never goes into the shared kvCache prefix — sent fresh each turn.
+/// `cap_available` controls whether the "## Coding agents" hint block
+/// is included. Pass `true` when `CapAgentManager` is wired into the
+/// caller's `AgentRuntime` (so `tool_cap` is callable); pass `false`
+/// for tests or runtime paths where the manager wasn't initialised, so
+/// the LLM doesn't see a hint for a tool that will reject with
+/// "CapAgentManager not initialised".
 pub fn build_user_system(
     ws_ctx: &WorkspaceContext,
     skills: &SkillRegistry,
@@ -686,6 +692,7 @@ pub fn build_user_system(
     js_plugins: Option<&PluginRegistry>,
     config: &crate::config::schema::Config,
     toolset: Option<&str>,
+    cap_available: bool,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
 
@@ -788,6 +795,34 @@ pub fn build_user_system(
         parts.push(plugins_block);
     }
 
+    // ## Coding agents — hint block for `tool_cap`. Only injected when
+    // CapAgentManager is wired (Some). Lives in user_system rather than
+    // the shared prefix because not every AgentRuntime has cap_manager
+    // (tests, alternate runtimes) — putting it in the shared prefix
+    // would advertise a tool that doesn't always exist. Byte-stable
+    // when cap_available is true so KV-cache prefix holds.
+    if cap_available {
+        parts.push(
+            "## Coding agents (via `tool_cap`)\n\n\
+             You can dispatch a coding task to one of four CLI coding agents via \
+             `tool_cap(agent, task)`. Pick the agent that best fits the task:\n\
+             - `claudecode` — Anthropic Claude Code. Strongest tool use, general-purpose. \
+             Default choice when in doubt.\n\
+             - `openclaude` — Claude-compatible OSS fork. Same interface, different upstream — \
+             pick when the user explicitly asks for it or for cost-sensitive tasks.\n\
+             - `opencode` — OpenCode (TUI-native). Fast iteration on small focused tasks; \
+             lower latency for simple edits.\n\
+             - `codex` — OpenAI Codex. Slower but reasoning-heavy; good for code review, \
+             debugging hard issues, or tasks needing deep analysis.\n\n\
+             `tool_cap` returns `{status: \"submitted\"}` immediately; the agent runs \
+             asynchronously. Live progress reaches the user's IM channel directly. \
+             The final summary arrives as a follow-up message you can act on \
+             (e.g. call `send_file`). Don't wait for the result in the same turn — \
+             acknowledge the dispatch to the user and let the follow-up wake you."
+                .to_owned(),
+        );
+    }
+
     // ## Installed Skills — pure enumeration, sorted by name.
     //
     // The generic "how to invoke a skill" guide lives in
@@ -861,9 +896,18 @@ pub(crate) fn build_system_prompt(
     js_plugins: Option<&PluginRegistry>,
     config: &crate::config::schema::Config,
     toolset: Option<&str>,
+    cap_available: bool,
 ) -> String {
     let prefix = build_shared_system_prefix();
-    let suffix = build_user_system(ws_ctx, skills, wasm_plugins, js_plugins, config, toolset);
+    let suffix = build_user_system(
+        ws_ctx,
+        skills,
+        wasm_plugins,
+        js_plugins,
+        config,
+        toolset,
+        cap_available,
+    );
     if suffix.is_empty() {
         prefix
     } else {
@@ -961,9 +1005,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "cron",
     "session",
     "gateway",
-    "opencode",
-    "claudecode",
-    "codex",
+    "cap",
     "channel",
     "anycli",
     "clarify",
@@ -1078,5 +1120,41 @@ mod tests {
         assert!(prompt.contains("Hard anti-patterns"));
         assert!(prompt.contains("`meituan-travel`"));
         assert!(prompt.contains("WRONG"));
+    }
+
+    fn empty_user_system(cap_available: bool) -> String {
+        // Bare-minimum context — empty skills, no plugins, default
+        // workspace. Just enough to exercise the cap_available branch.
+        // toolset=None so the coding-profile block stays out of this fixture.
+        let ws = WorkspaceContext::default();
+        let skills = SkillRegistry::new();
+        let config = crate::config::schema::Config::default();
+        build_user_system(&ws, &skills, &[], None, &config, None, cap_available)
+    }
+
+    #[test]
+    fn user_system_includes_cap_block_when_available() {
+        let prompt = empty_user_system(true);
+        assert!(
+            prompt.contains("## Coding agents (via `tool_cap`)"),
+            "expected cap block in: {prompt}"
+        );
+        // All 4 agent kinds named.
+        assert!(prompt.contains("`claudecode`"));
+        assert!(prompt.contains("`openclaude`"));
+        assert!(prompt.contains("`opencode`"));
+        assert!(prompt.contains("`codex`"));
+        // Async-submission semantics are documented so the LLM doesn't
+        // wait for the result in the same turn.
+        assert!(prompt.contains("returns `{status: \"submitted\"}` immediately"));
+    }
+
+    #[test]
+    fn user_system_omits_cap_block_when_unavailable() {
+        let prompt = empty_user_system(false);
+        assert!(
+            !prompt.contains("tool_cap"),
+            "cap block leaked when manager unavailable: {prompt}"
+        );
     }
 }

@@ -63,7 +63,7 @@
 )]
 
 pub mod a2a;
-pub mod acp;
+pub(crate) mod cap;
 pub mod agent;
 pub mod artifact;
 pub mod browser;

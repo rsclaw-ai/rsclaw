@@ -159,6 +159,11 @@ once_cell  = "1"
 jieba-rs   = "0.7"
 mailparse = "0.16.1"
 
+# cap-rs — CLI Agent Protocol drivers. Path dep so we can iterate on
+# the protocol alongside rsclaw. Switch to a published version (or
+# pinned git rev) once cap-rs hits 0.1.0.
+cap-rs = { path = "../cap-protocol/crates/cap-rs", default-features = false, features = ["stream-json", "codex"] }
+
 [features]
 default = ["openclaw-migrate"]
 channel-matrix = ["dep:matrix-sdk"]

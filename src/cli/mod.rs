@@ -3,7 +3,6 @@
 
 use clap::{Parser, Subcommand};
 
-pub mod acp;
 pub mod agent_turn;
 pub mod agents;
 pub mod anycli;
@@ -40,7 +39,6 @@ pub mod tools;
 pub mod watch;
 pub mod webhooks;
 
-pub use acp::AcpCommand;
 pub use agent_turn::AgentTurnArgs;
 pub use agents::{AgentsCommand, BindArgs};
 pub use anycli::AnycliCommand;
@@ -269,10 +267,6 @@ pub enum Command {
     /// DM pairing management.
     #[command(subcommand)]
     Pairing(PairingCommand),
-
-    /// ACP protocol commands - control coding agents
-    #[command(subcommand)]
-    Acp(AcpCommand),
 
     /// Manage exec approvals.
     #[command(subcommand)]

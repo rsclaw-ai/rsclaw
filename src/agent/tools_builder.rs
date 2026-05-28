@@ -1569,47 +1569,20 @@ pub fn build_tool_list(
         }),
     });
     tools.push(ToolDef {
-        name: "opencode".to_owned(),
-        description: "Execute coding/debugging tasks using OpenCode (a powerful coding agent).\n\n\
-            MANDATORY USAGE RULES:\n\
-            1. When user reports a bug/error/crash -> MUST call this tool to investigate\n\
-            2. When user asks to fix/debug a script -> MUST call this tool\n\
-            3. When user says '让opencode...' or '用opencode...' -> MUST call this tool\n\
-            4. DO NOT say '已委托opencode' without actually calling this tool\n\
-            5. Saying you delegated without calling = LYING = worst failure mode\n\
-            \n\
-            If you cannot or will not call this tool, tell user honestly why.\n\
-            NEVER pretend to have called it.\n\
-            \n\
-            Technical: Create project subdirectory for new projects. Runs async, results delivered when complete.".to_owned(),
+        name: "cap".to_owned(),
+        description: "Dispatch a coding task to a CLI coding agent. Pick one of four agents via `agent`.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "task": {"type": "string", "description": "The coding task to execute. Be specific about file paths and always mention creating a project subdirectory for new projects."}
+                "agent": {
+                    "type": "string",
+                    "enum": ["claudecode", "openclaude", "opencode", "codex"],
+                    "description": "claudecode — Anthropic Claude Code (general-purpose, strongest tool use). openclaude — OpenClaude (Claude-compatible OSS fork). opencode — OpenCode (TUI-native, fast iteration). codex — OpenAI Codex (reasoning-heavy, slower)."
+                },
+                "task":  { "type": "string", "description": "Task prompt for the agent." },
+                "cwd":   { "type": "string", "description": "Optional working directory; defaults to the agent workspace." }
             },
-            "required": ["task"]
-        }),
-    });
-    tools.push(ToolDef {
-        name: "claudecode".to_owned(),
-        description: "Execute coding tasks using Claude Code (official Claude Agent SDK via ACP protocol). Uses Claude's native coding capabilities with full context awareness. IMPORTANT: When creating new projects or files, ALWAYS create a dedicated project directory first. The task will run asynchronously and results will be sent when complete.".to_owned(),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "task": {"type": "string", "description": "The coding task to execute. Be specific about requirements and file paths."}
-            },
-            "required": ["task"]
-        }),
-    });
-    tools.push(ToolDef {
-        name: "codex".to_owned(),
-        description: "Execute coding tasks using OpenAI Codex CLI (MCP Server mode). Uses OpenAI's coding capabilities with sandboxed file operations. IMPORTANT: When creating new projects or files, ALWAYS create a dedicated project directory first. Requires Codex CLI installation: npm install -g @openai/codex. The task will run asynchronously and results will be sent when complete.".to_owned(),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "task": {"type": "string", "description": "The coding task to execute. Be specific about requirements and file paths."}
-            },
-            "required": ["task"]
+            "required": ["agent", "task"]
         }),
     });
     // A2A v1.0 INPUT_REQUIRED / AUTH_REQUIRED suspend-resume bridge.

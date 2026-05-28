@@ -767,9 +767,6 @@ pub struct AgentRuntime {
     pub(crate) cached_tools: Vec<crate::provider::ToolDef>,
     pub(crate) notification_tx:
         Option<tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>>,
-    pub(crate) opencode_client: Arc<tokio::sync::OnceCell<crate::acp::client::AcpClient>>,
-    pub(crate) claudecode_client: Arc<tokio::sync::OnceCell<crate::acp::client::AcpClient>>,
-    pub(crate) codex_client: Arc<tokio::sync::OnceCell<crate::acp::CodexClient>>,
     /// In-memory session alias cache: alias_key → canonical session_key.
     /// Loaded from redb on first use, avoids repeated DB lookups.
     session_aliases: std::collections::HashMap<String, String>,
@@ -782,6 +779,9 @@ pub struct AgentRuntime {
     /// Background exec pool — runs long commands without blocking the agent
     /// loop.
     pub(crate) exec_pool: Arc<super::exec_pool::ExecPool>,
+    /// Coding-agent proxy (Claude Code, Opencode, Codex, Amp). `None` until
+    /// Task 9 wires up construction; `None` outside the gateway.
+    pub(crate) cap_manager: Option<std::sync::Arc<crate::cap::CapAgentManager>>,
 }
 
 impl AgentRuntime {
@@ -801,6 +801,7 @@ impl AgentRuntime {
         mcp: Option<Arc<crate::mcp::McpRegistry>>,
         notification_tx: Option<tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>>,
         model_health: crate::provider::health::ProviderHealthRegistry,
+        cap_manager: Option<std::sync::Arc<crate::cap::CapAgentManager>>,
     ) -> Self {
         // Populate auth.order so FailoverManager uses the configured profile
         // priority per provider (AGENTS.md §12).
@@ -861,11 +862,9 @@ impl AgentRuntime {
             pending_task_results: Arc::new(std::sync::Mutex::new(Vec::new())),
             voice_mode_sessions: std::collections::HashSet::new(),
             notification_tx,
-            opencode_client: Arc::new(tokio::sync::OnceCell::new()),
-            claudecode_client: Arc::new(tokio::sync::OnceCell::new()),
-            codex_client: Arc::new(tokio::sync::OnceCell::new()),
             session_aliases,
             exec_pool,
+            cap_manager,
         };
 
         // Purge any internal-session history left over in redb from older
@@ -905,8 +904,6 @@ impl AgentRuntime {
 
         rt
     }
-
-    // OpenCode / Claude Code ACP integration -> moved to tools_acp.rs
 
     /// Resolve the current model name from agent config with fallback.
     pub(crate) fn resolve_model_name(&self) -> String {
@@ -3413,6 +3410,7 @@ impl AgentRuntime {
                     self.plugins.as_deref(),
                     &self.config.raw,
                     toolset_owned.as_deref(),
+                    self.cap_manager.is_some(),
                 );
                 // DEBUG: dump full system prompt to file for inspection
                 if std::env::var("RSCLAW_DUMP_PROMPT").is_ok() {
@@ -5908,7 +5906,7 @@ impl AgentRuntime {
                     if let crate::provider::MessageContent::Parts(parts) = &msg.content {
                         parts.iter().any(|p| {
                             matches!(p, crate::provider::ContentPart::ToolUse { name, .. }
-                                if name == "opencode" || name == "claudecode" || name == "codex"
+                                if name == "cap"
                                     || name == "web_search" || name == "shell" || name == "execute_command")
                         })
                     } else {
@@ -6301,8 +6299,7 @@ impl AgentRuntime {
                 if matches!(
                     tool_name.as_str(),
                     "web_browser"
-                        | "opencode"
-                        | "claudecode"
+                        | "cap"
                         | "agent"
                         | "search_content"
                         | "search_file"
@@ -8286,9 +8283,7 @@ impl AgentRuntime {
                 a["action"] = serde_json::json!("create_ppt");
                 return self.tool_doc(a).await;
             }
-            "opencode" => return self.tool_opencode(ctx, args).await,
-            "claudecode" => return self.tool_claudecode(ctx, args).await,
-            "codex" => return self.tool_codex(ctx, args).await,
+            "cap" => return self.tool_cap(ctx, args).await,
             _ => {}
         }
 

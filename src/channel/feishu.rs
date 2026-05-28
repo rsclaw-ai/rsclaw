@@ -1804,10 +1804,15 @@ impl Channel for FeishuChannel {
 }
 
 // ---------------------------------------------------------------------------
-// FeishuNotifier for ACP notifications
+// FeishuNotifier notification types — canonical definitions live in
+// crate::cap::notification; re-exported here for backward-compat.
 // ---------------------------------------------------------------------------
 
-use crate::acp::notification::{Notification, NotificationPriority, NotificationSink};
+pub use crate::cap::notification::{Notification, NotificationPriority, NotificationSink};
+
+// ---------------------------------------------------------------------------
+// FeishuNotifier implementation
+// ---------------------------------------------------------------------------
 
 pub struct FeishuNotifier {
     app_id: String,
