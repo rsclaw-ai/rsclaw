@@ -87,6 +87,21 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "ru" => "\u{26A0}\u{FE0F} \u{0421}\u{0435}\u{0440}\u{0432}\u{0438}\u{0441} \u{0432}\u{0440}\u{0435}\u{043C}\u{0435}\u{043D}\u{043D}\u{043E} \u{043D}\u{0435}\u{0434}\u{043E}\u{0441}\u{0442}\u{0443}\u{043F}\u{0435}\u{043D}. \u{041F}\u{043E}\u{0432}\u{0442}\u{043E}\u{0440}\u{0438}\u{0442}\u{0435} \u{043F}\u{043E}\u{043F}\u{044B}\u{0442}\u{043A}\u{0443} \u{043F}\u{043E}\u{0437}\u{0436}\u{0435}.",
     );
 
+    // web_browser headed mode: a non-CDP Chrome holds the singleton lock on
+    // the user's default profile, so we ask them to quit and wait up to 60s
+    // before relaunching it with remote debugging + their profile.
+    msg!("browser_quit_for_cdp",
+        "en" => "Chrome is running without remote debugging. To browse with your login state (cookies/session), please quit Chrome — I'll reopen it with your profile automatically (valid for 60s). If you don't quit within 60s, I'll continue with a temporary browser (no login state).",
+        "zh" => "检测到 Chrome 正在运行但未开启远程调试。为了用你的登录态(cookie/会话)操作浏览器，请退出 Chrome——我会自动用你的默认配置重新打开它(60 秒内有效)。若 60 秒内未退出，我将使用临时浏览器(无登录态)继续。",
+    );
+
+    // web_browser headed mode: the 60s quit window elapsed and Chrome is still
+    // running, so we fall back to an isolated temp profile (no user cookies).
+    msg!("browser_using_temp_profile",
+        "en" => "You didn't quit Chrome, so I'll continue with a temporary browser (without your login state / cookies).",
+        "zh" => "未检测到你退出 Chrome，本次将使用临时浏览器(无你的登录态/cookie)继续。",
+    );
+
     msg!("file_saved",
         "en" => "Saved {count} file(s) to uploads/",
         "zh" => "已保存 {count} 个文件到 uploads/",

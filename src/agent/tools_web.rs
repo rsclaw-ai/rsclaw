@@ -1953,22 +1953,27 @@ impl AgentRuntime {
                             .await;
                         crate::browser::BrowserSession::connect_existing(&ws_url).await?
                     } else {
-                        // No CDP-enabled Chrome. If a plain Chrome is running we
-                        // can't reuse its (singleton-locked) default profile —
-                        // ask the user to quit, then poll up to 60s. The moment
-                        // they quit, relaunch with their profile + CDP.
-                        let mut chrome_blocking = crate::browser::is_chrome_running();
+                        // No CDP-enabled Chrome. If a plain *user* Chrome is
+                        // running it holds the singleton lock on the default
+                        // profile — ask them to quit, then poll up to 60s. We
+                        // exclude the pool's own (headless, invisible) Chrome so
+                        // a background web_fetch that already started the pool
+                        // doesn't trigger a quit prompt the user can't act on.
+                        let pool_pid = crate::browser::pool::BrowserPool::global()
+                            .owned_chrome_pid()
+                            .await;
+                        let mut chrome_blocking =
+                            crate::browser::is_external_chrome_running(pool_pid);
                         if chrome_blocking {
                             info!("Chrome running without CDP; asking user to quit (60s window)");
                             if let Some(ref tx) = self.notification_tx {
                                 let _ = tx.send(crate::channel::OutboundMessage {
                                     target_id: ctx.peer_id.clone(),
                                     is_group: false,
-                                    text: "检测到 Chrome 正在运行但未开启远程调试。\
-                                           为了用你的登录态(cookie/会话)操作浏览器,请退出 Chrome——\
-                                           我会自动用你的默认配置重新打开它(60 秒内有效)。\n\
-                                           若 60 秒内未退出,我将使用临时浏览器(无登录态)继续。"
-                                        .to_string(),
+                                    text: crate::i18n::t(
+                                        "browser_quit_for_cdp",
+                                        crate::i18n::default_lang(),
+                                    ),
                                     reply_to: None,
                                     images: vec![],
                                     files: vec![],
@@ -1986,7 +1991,7 @@ impl AgentRuntime {
                                     return Err(anyhow!("turn aborted"));
                                 }
                                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                                if !crate::browser::is_chrome_running() {
+                                if !crate::browser::is_external_chrome_running(pool_pid) {
                                     chrome_blocking = false;
                                     info!("user quit Chrome; relaunching with default profile + CDP");
                                     break;
@@ -2007,9 +2012,10 @@ impl AgentRuntime {
                                 let _ = tx.send(crate::channel::OutboundMessage {
                                     target_id: ctx.peer_id.clone(),
                                     is_group: false,
-                                    text: "未检测到你退出 Chrome,本次将使用临时浏览器\
-                                           (无你的登录态/cookie)继续。"
-                                        .to_string(),
+                                    text: crate::i18n::t(
+                                        "browser_using_temp_profile",
+                                        crate::i18n::default_lang(),
+                                    ),
                                     reply_to: None,
                                     images: vec![],
                                     files: vec![],

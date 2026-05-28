@@ -193,6 +193,22 @@ impl BrowserPool {
             .ok_or_else(|| anyhow!("pool: /json/version missing webSocketDebuggerUrl"))
     }
 
+    /// PID of the pool-owned Chrome, if the pool currently owns a live one.
+    /// `None` for an external (user) Chrome or when nothing is launched.
+    /// Lets the headed `web_browser` path exclude the pool's own invisible
+    /// Chrome when checking whether a user's browser is blocking the profile.
+    pub async fn owned_chrome_pid(&self) -> Option<u32> {
+        let mut guard = self.chrome.lock().await;
+        if let Some(ref mut pooled) = *guard {
+            if let Some(ref mut proc) = pooled.process {
+                if !proc.child.try_wait().is_ok_and(|s| s.is_some()) {
+                    return proc.child.id();
+                }
+            }
+        }
+        None
+    }
+
     /// Browser-level CDP ws_url for a debug port (GET /json/version).
     async fn ws_url_for_port(&self, port: u16) -> Result<String> {
         let version_info: Value =

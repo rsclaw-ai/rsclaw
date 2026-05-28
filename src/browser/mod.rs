@@ -439,52 +439,66 @@ pub(crate) async fn detect_existing_chrome(ports: &[u16]) -> Option<String> {
     None
 }
 
-/// Check if Google Chrome (or Chromium) is currently running on the system.
-/// Used to decide whether to ask the user to enable remote debugging,
-/// or to launch Chrome ourselves if it's not running.
+/// Main-process PIDs of every Google Chrome / Chromium currently running.
+/// Best-effort: returns the launcher/main process PIDs (helper/renderer
+/// children are excluded by exact-name matching).
 #[cfg(target_os = "windows")]
-pub(crate) fn is_chrome_running() -> bool {
+pub(crate) fn chrome_pids() -> Vec<u32> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut pids = Vec::new();
     for name in ["chrome.exe", "chromium.exe"] {
         if let Ok(output) = std::process::Command::new("tasklist")
-            .args(["/FI", &format!("IMAGENAME eq {name}"), "/NH"])
+            .args(["/FI", &format!("IMAGENAME eq {name}"), "/FO", "CSV", "/NH"])
             .creation_flags(CREATE_NO_WINDOW)
             .output()
         {
-            // tasklist prints "INFO: No tasks..." when nothing matches; a real
-            // match contains the image name.
-            if String::from_utf8_lossy(&output.stdout).contains(name) {
-                return true;
+            // CSV rows: "chrome.exe","12345","Console","1","123,456 K"
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                if let Some(pid) = line
+                    .split(',')
+                    .nth(1)
+                    .map(|f| f.trim_matches('"'))
+                    .and_then(|f| f.parse::<u32>().ok())
+                {
+                    pids.push(pid);
+                }
             }
         }
     }
-    false
+    pids
 }
 
-/// Check if Google Chrome (or Chromium) is currently running on the system.
-/// Used to decide whether to ask the user to enable remote debugging,
-/// or to launch Chrome ourselves if it's not running.
+/// Main-process PIDs of every Google Chrome / Chromium currently running.
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn is_chrome_running() -> bool {
+pub(crate) fn chrome_pids() -> Vec<u32> {
     let names: &[&str] = if cfg!(target_os = "macos") {
         &["Google Chrome", "Chromium"]
     } else {
         &["google-chrome", "chromium", "chromium-browser", "chrome"]
     };
-
+    let mut pids = Vec::new();
     for &name in names {
-        if let Ok(output) = std::process::Command::new("pgrep")
-            .arg("-x")
-            .arg(name)
-            .output()
-        {
+        if let Ok(output) = std::process::Command::new("pgrep").arg("-x").arg(name).output() {
             if output.status.success() {
-                return true;
+                for line in String::from_utf8_lossy(&output.stdout).lines() {
+                    if let Ok(pid) = line.trim().parse::<u32>() {
+                        pids.push(pid);
+                    }
+                }
             }
         }
     }
-    false
+    pids
+}
+
+/// True if a Chrome is running that is NOT `exclude_pid`. Used by the headed
+/// `web_browser` path to decide whether a *user's* Chrome is holding the
+/// singleton lock — `exclude_pid` is the pool's own (headless, invisible)
+/// Chrome, so a background web_fetch that started the pool doesn't trigger a
+/// spurious "please quit Chrome" prompt the user can't act on.
+pub(crate) fn is_external_chrome_running(exclude_pid: Option<u32>) -> bool {
+    chrome_pids().into_iter().any(|pid| Some(pid) != exclude_pid)
 }
 
 // ---------------------------------------------------------------------------
