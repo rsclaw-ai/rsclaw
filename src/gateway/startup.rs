@@ -1460,13 +1460,29 @@ fn spawn_agent_tasks(
                     .await;
                 let turn_errored = result.is_err();
                 let reply = result.unwrap_or_else(|e| {
-                    error!(agent = %handle.id, "turn error: {e:#}");
                     // A2A consumers key off `outcome` to publish the right
                     // terminal status (Failed vs Canceled). Without this
                     // distinction the A2A reply-watcher saw `Ok(reply)` and
                     // always published Completed — so cancellations and
                     // LLM/tool errors were silently reported as success.
-                    let outcome = if e.to_string().contains("canceled by A2A CancelTask") {
+                    //
+                    // Both A2A CancelTask and WS chat.abort produce
+                    // cancellations from the user; only genuine LLM/tool
+                    // failures should map to Error and show
+                    // "backend_unavailable" to the user. "turn aborted" is
+                    // the WS abort path (agent/runtime.rs:5457), "canceled
+                    // by A2A CancelTask" is the A2A path.
+                    let err_str = e.to_string();
+                    let is_user_cancel = err_str.contains("canceled by A2A CancelTask")
+                        || err_str.contains("turn aborted");
+                    // A user-initiated cancel is not an error — log at INFO so
+                    // it doesn't pollute error dashboards / alerting.
+                    if is_user_cancel {
+                        info!(agent = %handle.id, "turn canceled by user: {e:#}");
+                    } else {
+                        error!(agent = %handle.id, "turn error: {e:#}");
+                    }
+                    let outcome = if is_user_cancel {
                         crate::agent::registry::ReplyOutcome::Canceled
                     } else {
                         crate::agent::registry::ReplyOutcome::Error
