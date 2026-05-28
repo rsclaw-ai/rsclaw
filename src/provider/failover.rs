@@ -140,14 +140,31 @@ impl FailoverManager {
                 ChainStep::PropagateError(e) => return Err(e),
                 ChainStep::TryNextModel(e) => {
                     let kind = classify_error(&e);
-                    let body = format!("{e:#}");
-                    let truncated = crate::util::truncate_str(&body, 200).to_owned();
-                    self.model_health.record_failure(model_str, kind.clone(), truncated);
-                    info!(
-                        model = %model_str,
-                        kind = ?kind,
-                        "model marked unavailable, advancing chain"
-                    );
+                    if kind == ErrorKind::Unknown {
+                        // Ambiguous error — we can't attribute it to the model
+                        // being unhealthy (it may be a transient hiccup, a
+                        // malformed/empty response, or something model-specific
+                        // that the next request recovers from). Advance the
+                        // chain for THIS request so the user still gets an
+                        // answer, but do NOT cool the model down — otherwise a
+                        // flaky-but-usable primary (e.g. agent-v1) gets parked
+                        // and every later request is forced onto the fallback.
+                        info!(
+                            model = %model_str,
+                            kind = ?kind,
+                            "ambiguous error; advancing chain for this request without marking the model unavailable"
+                        );
+                    } else {
+                        let body = format!("{e:#}");
+                        let truncated = crate::util::truncate_str(&body, 200).to_owned();
+                        self.model_health
+                            .record_failure(model_str, kind.clone(), truncated);
+                        info!(
+                            model = %model_str,
+                            kind = ?kind,
+                            "model marked unavailable, advancing chain"
+                        );
+                    }
                     last_error = Some(e);
                     continue;
                 }
@@ -264,7 +281,14 @@ impl FailoverManager {
                             | ErrorKind::Unknown => {
                                 return ChainStep::TryNextModel(e);
                             }
-                            ErrorKind::BadRequest => {
+                            // BadRequest: our serialization fault, not the
+                            // model's — bubble to caller.
+                            // ContextExceeded: session too big for this
+                            // backend; failing over to another model just
+                            // masks it (a bigger-ctx fallback "works" but
+                            // slowly). Bubble so the agent loop can compact /
+                            // recreate the session and retry the SAME model.
+                            ErrorKind::BadRequest | ErrorKind::ContextExceeded => {
                                 return ChainStep::PropagateError(e);
                             }
                         }
