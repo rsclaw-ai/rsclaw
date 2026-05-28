@@ -151,6 +151,14 @@ use crate::{
 /// Reduced from OpenClaw's 48h default to 30min for better UX.
 /// Can be overridden via `agents.defaults.timeout_seconds`.
 pub(crate) const DEFAULT_TIMEOUT_SECONDS: u64 = 1800;
+/// Idle watchdog for the LLM response stream: if no event arrives within this
+/// window the connection is treated as stalled and the turn fails. This is an
+/// *inactivity* limit, not a total-duration cap — a long but actively-streaming
+/// turn never trips it. It exists to recover the single-threaded worker queue
+/// from "connected, 200 OK, then silent forever" hangs without waiting for the
+/// 30-minute turn timeout. Sized generously above worst-case time-to-first-
+/// token on a loaded GGUF fleet (large-context prefill) to avoid false kills.
+const STREAM_IDLE_TIMEOUT_SECS: u64 = 120;
 /// Max consecutive tool parse errors before aborting the turn.
 /// Prevents infinite retry loops when model output gets corrupted.
 const MAX_PARSE_ERRORS: usize = 10;
@@ -5450,7 +5458,25 @@ impl AgentRuntime {
             let mut delta_buf = String::new();
             let mut last_delta_flush = std::time::Instant::now();
 
-            while let Some(event) = stream.next().await {
+            loop {
+                // Idle watchdog: bound each await on the next stream event so a
+                // stalled connection (200 OK then silence) can't wedge the
+                // worker queue. A healthy stream — even a slow reasoning model —
+                // emits deltas well within this window.
+                let event = match tokio::time::timeout(
+                    Duration::from_secs(STREAM_IDLE_TIMEOUT_SECS),
+                    stream.next(),
+                )
+                .await
+                {
+                    Ok(Some(ev)) => ev,
+                    Ok(None) => break,
+                    Err(_) => {
+                        return Err(anyhow!(
+                            "LLM stream stalled: no data for {STREAM_IDLE_TIMEOUT_SECS}s"
+                        ));
+                    }
+                };
                 // Check abort flag.
                 if abort_flag.load(Ordering::SeqCst) {
                     abort_flag.store(false, Ordering::SeqCst);
