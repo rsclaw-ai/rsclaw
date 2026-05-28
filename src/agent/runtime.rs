@@ -5473,6 +5473,18 @@ impl AgentRuntime {
             let mut loop_warnings: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
             // Streaming throttle: batch small deltas to reduce channel update rate.
+            // The 150ms cadence exists to spare Feishu/DingTalk interactive
+            // cards (in-place edits are rate-limited). The desktop UI streams
+            // over a local WebSocket with no such limit, so the same 150ms
+            // throttle there just chops a token-at-a-time model (e.g. deepseek
+            // emits one char per SSE frame) into visible 6-7fps stutter. Give
+            // the local desktop path a much tighter cadence so content reads
+            // smoothly; keep 150ms for card-based channels.
+            let delta_flush_interval = if matches!(ctx.channel.as_str(), "ws" | "desktop") {
+                std::time::Duration::from_millis(33)
+            } else {
+                std::time::Duration::from_millis(150)
+            };
             let mut delta_buf = String::new();
             let mut last_delta_flush = std::time::Instant::now();
 
@@ -5529,8 +5541,7 @@ impl AgentRuntime {
                         delta_buf.push_str(&delta);
                         let now = std::time::Instant::now();
                         let elapsed = now.duration_since(last_delta_flush);
-                        if delta_buf.len() >= 80 || elapsed >= std::time::Duration::from_millis(150)
-                        {
+                        if delta_buf.len() >= 80 || elapsed >= delta_flush_interval {
                             if let Some(ref bus) = self.event_bus {
                                 let _ = bus.send(AgentEvent {
                                     session_id: ctx.session_key.clone(),
