@@ -1637,7 +1637,7 @@ impl AgentRuntime {
             .await
             .defaults
             .btw_tokens
-            .unwrap_or(10_000) as usize;
+            .unwrap_or(5_000) as usize;
         let history: Vec<Message> = self.sessions.get(session_key).cloned().unwrap_or_default();
         let mut messages = Vec::new();
         let mut token_count = 0usize;
@@ -5476,12 +5476,14 @@ impl AgentRuntime {
             // The 150ms cadence exists to spare Feishu/DingTalk interactive
             // cards (in-place edits are rate-limited). The desktop UI streams
             // over a local WebSocket with no such limit, so the same 150ms
-            // throttle there just chops a token-at-a-time model (e.g. deepseek
-            // emits one char per SSE frame) into visible 6-7fps stutter. Give
-            // the local desktop path a much tighter cadence so content reads
-            // smoothly; keep 150ms for card-based channels.
+            // throttle there chops a token-at-a-time model (e.g. deepseek emits
+            // one char per SSE frame) into visible ~7fps stutter. Give the
+            // local desktop path a tighter 100ms cadence — noticeably smoother
+            // than 150ms without flooding the frontend's per-delta markdown
+            // re-parse (which has no render throttle of its own). Card-based
+            // channels keep 150ms.
             let delta_flush_interval = if matches!(ctx.channel.as_str(), "ws" | "desktop") {
-                std::time::Duration::from_millis(33)
+                std::time::Duration::from_millis(100)
             } else {
                 std::time::Duration::from_millis(150)
             };
