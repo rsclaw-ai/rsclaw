@@ -192,6 +192,16 @@ impl WorkspaceContext {
     /// Build the system-prompt segment from loaded workspace files.
     /// Each non-None file is wrapped with a header.
     pub fn to_prompt_segment(&self) -> String {
+        self.to_prompt_segment_filtered(false)
+    }
+
+    /// Same as [`to_prompt_segment`] but, when `skip_persona` is true, omits
+    /// the persona files (IDENTITY.md, USER.md) that describe *who the agent
+    /// is* rather than *what the project needs*. The coding profile passes
+    /// `true`: writing code doesn't need the agent's personality or the
+    /// user's bio, and those files cost real per-turn tokens in user_system.
+    /// AGENTS.md / SOUL.md / TOOLS.md / memory are kept either way.
+    pub fn to_prompt_segment_filtered(&self, skip_persona: bool) -> String {
         let mut parts: Vec<String> = Vec::new();
 
         macro_rules! append {
@@ -204,8 +214,10 @@ impl WorkspaceContext {
 
         append!(self.agents_md, "AGENTS.md");
         append!(self.soul_md, "SOUL.md");
-        append!(self.identity_md, "IDENTITY.md");
-        append!(self.user_md, "USER.md");
+        if !skip_persona {
+            append!(self.identity_md, "IDENTITY.md");
+            append!(self.user_md, "USER.md");
+        }
         append!(self.tools_md, "TOOLS.md");
         append!(self.heartbeat_md, "HEARTBEAT.md");
         append!(self.boot_md, "BOOT.md");

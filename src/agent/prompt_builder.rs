@@ -803,9 +803,9 @@ pub fn build_user_system(
     // when cap_available is true so KV-cache prefix holds.
     if cap_available {
         parts.push(
-            "## Coding agents (via `tool_cap`)\n\n\
+            "## Coding agents (via `cap`)\n\n\
              You can dispatch a coding task to one of four CLI coding agents via \
-             `tool_cap(agent, task)`. Pick the agent that best fits the task:\n\
+             `cap(agent, task)`. Pick the agent that best fits the task:\n\
              - `claudecode` — Anthropic Claude Code. Strongest tool use, general-purpose. \
              Default choice when in doubt.\n\
              - `openclaude` — Claude-compatible OSS fork. Same interface, different upstream — \
@@ -814,7 +814,7 @@ pub fn build_user_system(
              lower latency for simple edits.\n\
              - `codex` — OpenAI Codex. Slower but reasoning-heavy; good for code review, \
              debugging hard issues, or tasks needing deep analysis.\n\n\
-             `tool_cap` returns `{status: \"submitted\"}` immediately; the agent runs \
+             `cap` returns `{status: \"submitted\"}` immediately; the agent runs \
              asynchronously. Live progress reaches the user's IM channel directly. \
              The final summary arrives as a follow-up message you can act on \
              (e.g. call `send_file`). Don't wait for the result in the same turn — \
@@ -834,7 +834,14 @@ pub fn build_user_system(
     // SkillRegistry iterates a HashMap whose order is non-deterministic
     // across gateway starts. Sorting by name produces a byte-stable
     // payload so worker-side hashing of system+tools doesn't churn.
-    if !skills.is_empty() {
+    //
+    // Coding profile: skip the full skill enumeration. Installed skills
+    // are overwhelmingly non-coding (image gen, travel booking, video
+    // publishing) and cost ~500-800 tok of user_system noise per turn.
+    // The `skill_search` tool lets the LLM discover a relevant skill on
+    // demand, matching pi's lazy approach.
+    let render_skills = !matches!(toolset, Some("code"));
+    if render_skills && !skills.is_empty() {
         let mut skill_refs: Vec<_> = skills.all().collect();
         skill_refs.sort_by(|a, b| a.name.cmp(&b.name));
         let blocks: Vec<String> = skill_refs
@@ -875,7 +882,9 @@ pub fn build_user_system(
     // over daily. Keeping them at the very tail of user_system means a
     // day-boundary KV miss only re-hydrates this trailing block, not the
     // plugins/skills enumeration above it.
-    let ws_segment = ws_ctx.to_prompt_segment();
+    // Coding profile drops persona files (IDENTITY.md / USER.md) — writing
+    // code doesn't need the agent's personality or the user's bio.
+    let ws_segment = ws_ctx.to_prompt_segment_filtered(matches!(toolset, Some("code")));
     if !ws_segment.is_empty() {
         parts.push(ws_segment);
     }
