@@ -351,13 +351,21 @@ pub async fn chat_abort(ctx: MethodCtx) -> MethodResult {
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    // Set abort flag for the session on all agents.
+    // Two-layer abort for the session on all agents:
+    //   1. abort_flag — cooperative, polled at stream/tool boundaries.
+    //   2. cancel_token — hard cancel, drops a wedged turn immediately so the
+    //      single-threaded queue isn't blocked behind a stalled await.
     for agent in ctx.state.agents.all() {
         if let Ok(mut flags) = agent.abort_flags.write() {
             let flag = flags
                 .entry(sk.to_string())
                 .or_insert_with(|| Arc::new(AtomicBool::new(false)));
             flag.store(true, Ordering::SeqCst);
+        }
+        if let Ok(tokens) = agent.cancel_tokens.read() {
+            if let Some(token) = tokens.get(sk) {
+                token.cancel();
+            }
         }
     }
 

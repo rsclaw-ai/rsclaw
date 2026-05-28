@@ -60,7 +60,20 @@ pub struct AgentHandle {
     pub providers: Arc<crate::provider::registry::ProviderRegistry>,
     /// Per-session abort flags: session_key -> atomic abort flag.
     /// Uses std::sync::RwLock (not tokio) so it can be accessed in Drop impls.
+    ///
+    /// Cooperative: polled at stream-loop and tool-dispatch boundaries. Useless
+    /// when the turn is blocked inside a non-yielding `.await` (e.g. a hung LLM
+    /// SSE connection) — for that, [`Self::cancel_tokens`] provides a hard
+    /// cancel that drops the in-flight future regardless of where it parked.
     pub abort_flags: Arc<std::sync::RwLock<HashMap<String, Arc<AtomicBool>>>>,
+    /// Per-session hard-cancel tokens: session_key -> CancellationToken.
+    /// Minted per turn by the runtime worker for non-A2A turns and registered
+    /// here so `chat.abort` can fire `.cancel()`, which the worker's
+    /// `tokio::select!` observes immediately — even when the turn is stuck on
+    /// a stalled await. Without this a hung turn would block the whole
+    /// single-threaded queue until the 30-minute turn timeout fired.
+    pub cancel_tokens:
+        Arc<std::sync::RwLock<HashMap<String, tokio_util::sync::CancellationToken>>>,
     /// Per-session plugin activation overrides:
     /// `session_key → { plugin_name → PluginOverride }`. Mutated by the
     /// `/plugin` slash command (host-side, never enters conversation
@@ -682,6 +695,7 @@ impl AgentRegistry {
                     ),
                     providers: Arc::clone(&providers),
                     abort_flags: Arc::new(std::sync::RwLock::new(HashMap::new())),
+                    cancel_tokens: Arc::new(std::sync::RwLock::new(HashMap::new())),
                     plugin_overrides: Arc::new(std::sync::RwLock::new(HashMap::new())),
                     started_at: Instant::now(),
                     session_count: Arc::new(AtomicUsize::new(0)),

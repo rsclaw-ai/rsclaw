@@ -1432,21 +1432,43 @@ fn spawn_agent_tasks(
                     event_tx,
                     input_request_tx,
                 } = msg;
-                // Build a TurnContext from the A2A wires on AgentMessage;
-                // empty for non-A2A callers. The runtime polls
-                // `is_cancelled()` between iterations and at every
-                // tool-dispatch boundary, so the worker stops waiting on
-                // a long turn as soon as the cancel token fires —
-                // no outer tokio::select shim needed.
+                // Hard-cancel token for this turn. A2A callers supply their own
+                // (CancelTask). For everyone else (WS chat.abort, channels) we
+                // mint one and register it under the session key so chat.abort
+                // can fire `.cancel()` — the `tokio::select!` below then drops
+                // the in-flight `run_turn` future immediately, even if it's
+                // parked on a stalled LLM stream. `registered` tracks whether
+                // we own the map entry so we clean it up afterwards.
+                let (turn_token, registered) = match cancel_token {
+                    Some(t) => (t, false),
+                    None => {
+                        let t = tokio_util::sync::CancellationToken::new();
+                        if let Ok(mut toks) = handle.cancel_tokens.write() {
+                            toks.insert(session_key.clone(), t.clone());
+                        }
+                        (t, true)
+                    }
+                };
+
+                // Build a TurnContext from the A2A wires on AgentMessage.
+                // `cancel_token` is now always set, so the runtime's
+                // cooperative `is_cancelled()` checks (between iterations and
+                // at tool-dispatch boundaries) also observe WS aborts.
                 let turn_ctx = crate::agent::registry::TurnContext {
                     task_id,
                     context_id,
                     event_tx,
-                    cancel_token,
+                    cancel_token: Some(turn_token.clone()),
                     input_request_tx,
                 };
-                let result = runtime
-                    .run_turn(
+                let result = tokio::select! {
+                    biased;
+                    // Hard cancel: drops the run_turn future (and every await
+                    // it holds — LLM stream, tool calls) the moment the token
+                    // fires. This is what frees the single-threaded queue when
+                    // a turn is wedged on a non-yielding await.
+                    _ = turn_token.cancelled() => Err(anyhow::anyhow!("turn aborted")),
+                    r = runtime.run_turn(
                         &session_key,
                         &text,
                         &channel,
@@ -1456,8 +1478,15 @@ fn spawn_agent_tasks(
                         images,
                         files,
                         turn_ctx,
-                    )
-                    .await;
+                    ) => r,
+                };
+                // Drop our registered token so a later abort for this session
+                // can't cancel a future turn, and the map doesn't leak.
+                if registered {
+                    if let Ok(mut toks) = handle.cancel_tokens.write() {
+                        toks.remove(&session_key);
+                    }
+                }
                 let turn_errored = result.is_err();
                 let reply = result.unwrap_or_else(|e| {
                     // A2A consumers key off `outcome` to publish the right
