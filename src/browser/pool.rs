@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, warn};
 
+
 use super::{CdpClient, ChromeProcess, can_launch_chrome};
 use crate::agent::platform::detect_chrome;
 
@@ -52,9 +53,12 @@ pub struct BrowserPool {
     engine_counter: std::sync::atomic::AtomicU32,
 }
 
-/// Internal: a Chrome process with its debug port.
+/// Internal: a Chrome process (or external connection) with its debug port.
 struct PooledChrome {
-    process: ChromeProcess,
+    /// `Some(process)` when we own the Chrome (can kill/restart).
+    /// `None` when using an external Chrome (e.g. user's browser or
+    /// agent-launched headed Chrome with default profile).
+    process: Option<ChromeProcess>,
     port: u16,
 }
 
@@ -189,24 +193,44 @@ impl BrowserPool {
             .ok_or_else(|| anyhow!("pool: /json/version missing webSocketDebuggerUrl"))
     }
 
-    /// Ensure the shared headless Chrome is running. Returns the debug port.
+    /// Register an external Chrome as the shared pool instance.
+    /// All subsequent `acquire_tab()` calls create tabs in this Chrome.
+    /// The pool does NOT own the process (no liveness checks, no restart).
+    pub async fn set_chrome_ws_url(&self, ws_url: &str) -> Result<()> {
+        let parsed = url::Url::parse(ws_url)
+            .map_err(|e| anyhow!("pool: invalid ws_url {ws_url}: {e}"))?;
+        let port = parsed
+            .port()
+            .ok_or_else(|| anyhow!("pool: ws_url {ws_url} has no port"))?;
+
+        let mut guard = self.chrome.lock().await;
+        *guard = Some(PooledChrome {
+            process: None,
+            port,
+        });
+        info!(port, "pool: using external Chrome");
+        Ok(())
+    }
+
+    /// Ensure the shared Chrome is running. Returns the debug port.
     async fn ensure_chrome(&self) -> Result<u16> {
         let mut guard = self.chrome.lock().await;
 
-        // Check if existing process is still alive.
+        // Check if existing Chrome is still alive.
         if let Some(ref mut pooled) = *guard {
-            if pooled.process.child.try_wait().is_ok_and(|s| s.is_some()) {
-                warn!("pool: Chrome process exited, will restart");
-                // Drop on ChromeProcess (browser/mod.rs:372) already calls
-                // `ACTIVE_INSTANCES.fetch_sub(1)`. Setting `*guard = None`
-                // here moves the ChromeProcess out of the Option and runs
-                // that Drop exactly once — we must NOT subtract again, or
-                // the counter underflows from 0 to u32::MAX and every
-                // subsequent `can_launch_chrome` check refuses (observed
-                // as "Chrome instance limit reached (4294967295/4)").
-                *guard = None;
-            } else {
-                return Ok(pooled.port);
+            match pooled.process {
+                None => {
+                    // External Chrome (not owned by pool) — assume alive.
+                    return Ok(pooled.port);
+                }
+                Some(ref mut proc) => {
+                    if proc.child.try_wait().is_ok_and(|s| s.is_some()) {
+                        warn!("pool: Chrome process exited, will restart");
+                        *guard = None;
+                    } else {
+                        return Ok(pooled.port);
+                    }
+                }
             }
         }
 
@@ -243,7 +267,10 @@ impl BrowserPool {
         let port = process.port()?;
         info!(port, profile = ?profile, "pool: shared headless Chrome launched");
 
-        *guard = Some(PooledChrome { process, port });
+        *guard = Some(PooledChrome {
+            process: Some(process),
+            port,
+        });
         Ok(port)
     }
 

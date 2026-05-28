@@ -1933,29 +1933,54 @@ impl AgentRuntime {
                     }
                 };
 
-                // Architecture: at most TWO Chrome processes on the system —
-                //   1. User's own Chrome (optional, headed UI)
-                //   2. Agent's shared pool Chrome (headless, multi-tab)
-                // Everyone (main agent, sub-agents, web_fetch, web_search)
-                // uses one of these. No per-agent Chrome process.
+                // Architecture: at most ONE Chrome process on the system.
+                // The shared pool's Chrome (or user's own Chrome with CDP)
+                // serves everyone — main agent, sub-agents, web_fetch,
+                // web_search. No per-agent Chrome processes.
                 let bs = if headed {
-                    // Main agent prefers the user's visible Chrome if running.
                     let default_ports: Vec<u16> = vec![9222, 9223];
                     let ports = wb_cfg
                         .and_then(|b| b.remote_debug_ports.as_ref())
                         .unwrap_or(&default_ports);
+
+                    // 1. User's Chrome with CDP already open? Use it.
                     if let Some(ws_url) = crate::browser::detect_existing_chrome(ports).await {
                         info!("connecting to user Chrome (remote debugging, headed)");
+                        let _ = crate::browser::pool::BrowserPool::global()
+                            .set_chrome_ws_url(&ws_url)
+                            .await;
                         crate::browser::BrowserSession::connect_existing(&ws_url).await?
-                    } else {
-                        // No user Chrome — share the agent pool instead of
-                        // launching a 3rd process.
+                    } else if crate::browser::is_chrome_running() {
+                        // 2. Chrome running but no CDP — notify user, fall
+                        //    through to pool (may have to use temp profile).
+                        info!("Chrome running without CDP; notifying user, falling back to pool");
+                        if let Some(ref tx) = self.notification_tx {
+                            let msg = format!(
+                                "Chrome is running without remote debugging. \
+                                 For full browser access (cookies, session) please close \
+                                 Chrome so the agent can relaunch it with debugging enabled.\n\
+                                 Or restart Chrome manually:\n\
+                                 {} --remote-debugging-port=9222\n\n\
+                                 Using temporary profile for now.",
+                                chrome_path
+                            );
+                            let _ = tx.send(crate::channel::OutboundMessage {
+                                target_id: ctx.peer_id.clone(),
+                                is_group: false,
+                                text: msg,
+                                reply_to: None,
+                                images: vec![],
+                                files: vec![],
+                                channel: Some(ctx.channel.clone()),
+                                account: None,
+                            });
+                        }
                         match crate::browser::pool::BrowserPool::global()
                             .chrome_ws_url()
                             .await
                         {
                             Ok(ws_url) => {
-                                info!("no user Chrome — connecting to shared agent pool Chrome");
+                                info!("connecting to shared agent pool Chrome (headed fallback)");
                                 crate::browser::BrowserSession::connect_existing(&ws_url).await?
                             }
                             Err(e) => {
@@ -1964,11 +1989,33 @@ impl AgentRuntime {
                                 crate::browser::BrowserSession::start(
                                     &chrome_path,
                                     true,
-                                    profile.as_deref(),
+                                    Some("default"),
                                 )
                                 .await?
                             }
                         }
+                    } else {
+                        // 3. No Chrome running — launch with user profile
+                        //    + CDP. Register with pool so browser_get_article
+                        //    and sub-agents share this single Chrome.
+                        info!("no Chrome running, launching with user default profile + CDP");
+                        crate::browser::can_launch_chrome()?;
+                        let session = crate::browser::BrowserSession::start(
+                            &chrome_path,
+                            true,
+                            Some("default"),
+                        )
+                        .await?;
+                        let port = session.debug_port();
+                        match crate::browser::browser_ws_url_from_port(port).await {
+                            Ok(bws) => {
+                                let _ = crate::browser::pool::BrowserPool::global()
+                                    .set_chrome_ws_url(&bws)
+                                    .await;
+                            }
+                            Err(e) => warn!(error = %e, "pool: failed to register agent-launched Chrome"),
+                        }
+                        session
                     }
                 } else {
                     // Sub/task agents always use the shared pool Chrome.
