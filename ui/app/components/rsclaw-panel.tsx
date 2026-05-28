@@ -2716,6 +2716,69 @@ function dotFor(
   };
 }
 
+/**
+ * Per-account QR scan-login pane for IM channels (wechat / feishu).
+ *
+ * Module-level so it gets a real mount lifecycle: when the account's QR
+ * tab first renders with no QR yet, the mount effect auto-issues
+ * `onStart()` — that's the "adding a new account auto-shows a fresh QR"
+ * behavior. Each account passes its own `slot` key so panes don't share
+ * a stale QR (the previous channel-keyed code reused one account's code
+ * for every account of the channel).
+ */
+function QrPane({
+  slot,
+  qr,
+  status,
+  onStart,
+  scanHint,
+  zh,
+  V,
+}: {
+  slot: string;
+  chId: string;
+  qr?: string;
+  status?: string;
+  onStart: () => void;
+  scanHint: string;
+  zh: boolean;
+  V: Record<string, string>;
+}) {
+  // Auto-fetch once when this pane mounts without a QR. Keyed on `slot`
+  // so switching between accounts re-triggers for the newly-shown one.
+  const startedFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (!qr && startedFor.current !== slot) {
+      startedFor.current = slot;
+      onStart();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [slot]);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 10, padding: "14px 0" }}>
+      <div style={{ width: 130, height: 130, background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden" }}>
+        {qr ? (
+          <img src={qr} alt="QR" style={{ width: 110, height: 110 }} />
+        ) : (
+          <div style={{ color: V.t3, fontSize: 11 }}>{zh ? "加载中..." : "Loading..."}</div>
+        )}
+      </div>
+      <div style={{ fontSize: 11, color: V.t2, textAlign: "center", lineHeight: 1.5 }}>{scanHint}</div>
+      {status && (
+        <div style={{ fontSize: 11, color: V.t3, display: "flex", alignItems: "center", gap: 5 }}>
+          <span style={{ width: 10, height: 10, borderRadius: "50%", border: `2px solid ${V.green}`, borderTopColor: "transparent", display: "inline-block", animation: "spin 0.7s linear infinite" }} />
+          {status}
+        </div>
+      )}
+      <button onClick={onStart}
+        style={{ fontSize: 10, color: V.or, cursor: "pointer", fontFamily: V.mono, background: V.olo, border: `1px solid ${V.obrd}`, padding: "4px 12px", borderRadius: 5, transition: "all .12s" }}>
+        {qr ? (zh ? "刷新二维码" : "Refresh QR") : (zh ? "重新获取" : "Get QR Code")}
+      </button>
+    </div>
+  );
+}
+
 function TauriConfigPageInner() {
   const zh = getLang() === "cn";
   const [raw, setRaw] = useState("");
@@ -3255,12 +3318,21 @@ function TauriConfigPageInner() {
   const bindVal = getVal("gateway.bind", "loopback");
   const isCustomBind = bindVal !== "loopback" && bindVal !== "all";
 
-  const handleQrStart = async (chId: string) => {
-    setQrStatus((prev) => ({ ...prev, [chId]: zh ? "\u83B7\u53D6\u4E2D..." : "Loading..." }));
+  // Fetch a QR for one account's scan-login pane. `slot` is the per-account
+  // key (`${chId}-${acctId}`) so each account's pane has its own QR + status
+  // \u2014 previously everything keyed on `chId`, so a freshly-added account
+  // showed the *previous* account's stale QR. We also clear any existing
+  // QR up-front and re-issue `channel_login_start`, which mints a fresh
+  // session server-side, so "Refresh" never re-displays a used code.
+  const handleQrStart = async (chId: string, slot?: string) => {
+    const key = slot || chId;
+    // Drop any stale QR for this slot before we start fetching the new one.
+    setQrData((prev) => { const n = { ...prev }; delete n[key]; return n; });
+    setQrStatus((prev) => ({ ...prev, [key]: zh ? "\u83B7\u53D6\u4E2D..." : "Loading..." }));
     try {
       const tauriInvoke = isTauri ? tauriInvokeV2 : null;
       if (tauriInvoke) {
-        // Use sidecar to start channel login
+        // Use sidecar to start channel login (fresh session each call).
         await tauriInvoke("channel_login_start", { channel: chId });
         // Poll for QR image
         if (qrPollRef.current) clearInterval(qrPollRef.current);
@@ -3272,7 +3344,7 @@ function TauriConfigPageInner() {
             const status: string = await tauriInvoke("channel_login_status");
             if (status === "done") {
               if (qrPollRef.current) clearInterval(qrPollRef.current);
-              setQrStatus((prev) => ({ ...prev, [chId]: zh ? "\u2713 \u767B\u5F55\u6210\u529F" : "\u2713 Login success" }));
+              setQrStatus((prev) => ({ ...prev, [key]: zh ? "\u2713 \u767B\u5F55\u6210\u529F" : "\u2713 Login success" }));
               // Reload config to pick up token written by channel login command
               try {
                 const content: string = await tauriInvoke("read_config_file");
@@ -3285,8 +3357,8 @@ function TauriConfigPageInner() {
             // Check for QR image
             const dataUri: string | null = await tauriInvoke("channel_login_qr");
             if (dataUri) {
-              setQrData((prev) => ({ ...prev, [chId]: dataUri }));
-              setQrStatus((prev) => ({ ...prev, [chId]: zh ? "\u7B49\u5F85\u626B\u7801..." : "Waiting for scan..." }));
+              setQrData((prev) => ({ ...prev, [key]: dataUri }));
+              setQrStatus((prev) => ({ ...prev, [key]: zh ? "\u7B49\u5F85\u626B\u7801..." : "Waiting for scan..." }));
             }
           } catch {}
           if (attempts > 60) { if (qrPollRef.current) clearInterval(qrPollRef.current); }
@@ -3295,52 +3367,72 @@ function TauriConfigPageInner() {
         // Fallback: gateway API
         const res = await wechatQrStart();
         if (res.qrcode_url || res.qr_url || res.url) {
-          setQrData((prev) => ({ ...prev, [chId]: res.qrcode_url || res.qr_url || res.url }));
-          setQrStatus((prev) => ({ ...prev, [chId]: zh ? "\u7B49\u5F85\u626B\u7801..." : "Waiting..." }));
+          setQrData((prev) => ({ ...prev, [key]: res.qrcode_url || res.qr_url || res.url }));
+          setQrStatus((prev) => ({ ...prev, [key]: zh ? "\u7B49\u5F85\u626B\u7801..." : "Waiting..." }));
         }
       }
     } catch {
-      setQrStatus((prev) => ({ ...prev, [chId]: zh ? "\u83B7\u53D6\u5931\u8D25" : "Failed to get QR" }));
+      setQrStatus((prev) => ({ ...prev, [key]: zh ? "\u83B7\u53D6\u5931\u8D25" : "Failed to get QR" }));
     }
   };
 
   // ── Multi-account channel helpers ──
-  const getChannelAccounts = (chId: string): { id: string; data: any }[] => {
+  //
+  // Canonical structure (matches the gateway, e.g. feishu.rs):
+  //   channels.<ch>.{appId,appSecret,...}   ← the "default" account (flat)
+  //   channels.<ch>.accounts.<name>.{...}   ← additional named accounts
+  // The gateway dedups an accounts.* entry whose appId equals the flat
+  // default. So the flat fields at the channel ROOT are a first-class
+  // account, NOT something to migrate away — that was the old bug that
+  // made "add account" duplicate / clobber the default.
+  //
+  // Each returned account carries its own `path` so the renderer reads /
+  // writes the right config location regardless of whether it's the flat
+  // default or a named account.
+  const getChannelAccounts = (
+    chId: string,
+  ): { id: string; data: any; path: string }[] => {
     const chConf = getVal(`channels.${chId}`, {});
-    if (chConf.accounts && typeof chConf.accounts === "object") {
-      return Object.keys(chConf.accounts).map((k) => ({ id: k, data: chConf.accounts[k] || {} }));
-    }
-    // Legacy flat config: check if any credential field is set
     const fields = CRED_FIELDS[chId] || [];
+    const out: { id: string; data: any; path: string }[] = [];
+
+    // Flat/default account lives at the channel root.
     const hasFlat = fields.some((f) => chConf[f.key]);
-    if (hasFlat) return [{ id: "default", data: chConf }];
-    return [];
+    if (hasFlat) {
+      out.push({ id: "default", data: chConf, path: `channels.${chId}` });
+    }
+
+    // Named accounts under .accounts.*. Skip a literal "default" key when
+    // we already surfaced a flat default — that's a legacy artifact of the
+    // old migrate-on-add bug and would otherwise list twice with the same id.
+    if (chConf.accounts && typeof chConf.accounts === "object") {
+      for (const k of Object.keys(chConf.accounts)) {
+        if (k === "default" && hasFlat) continue;
+        out.push({
+          id: k,
+          data: chConf.accounts[k] || {},
+          path: `channels.${chId}.accounts.${k}`,
+        });
+      }
+    }
+    return out;
   };
 
   const addAccount = (chId: string) => {
-    // Single atomic config update to avoid stale state overwrites
+    // Single atomic config update to avoid stale state overwrites.
     const newConfig = JSON.parse(JSON.stringify(config));
-    // Ensure channels.{chId} exists
     if (!newConfig.channels) newConfig.channels = {};
     if (!newConfig.channels[chId]) newConfig.channels[chId] = {};
     const chConf = newConfig.channels[chId];
 
-    // Migrate legacy flat fields into accounts.default if needed
+    // Leave the flat/default account at the channel root untouched — it's
+    // a valid account on its own. Just ensure the accounts map exists and
+    // append a fresh empty named account. (Previously we migrated the flat
+    // fields into accounts.default, which clobbered the outer default and
+    // produced the duplicate-id display bug.)
     if (!chConf.accounts || typeof chConf.accounts !== "object") {
-      const fields = CRED_FIELDS[chId] || [];
-      const hasFlat = fields.some((f) => chConf[f.key]);
-      if (hasFlat) {
-        const acctData: any = {};
-        fields.forEach((f) => { if (chConf[f.key]) { acctData[f.key] = chConf[f.key]; delete chConf[f.key]; } });
-        if (chConf.dmPolicy) { acctData.dmPolicy = chConf.dmPolicy; delete chConf.dmPolicy; }
-        if (chConf.label) { acctData.label = chConf.label; delete chConf.label; }
-        chConf.accounts = { default: acctData };
-      } else {
-        chConf.accounts = {};
-      }
+      chConf.accounts = {};
     }
-
-    // Add the new account
     const newId = chId + "-" + Date.now().toString(36);
     chConf.accounts[newId] = { label: "" };
 
@@ -4079,8 +4171,10 @@ function TauriConfigPageInner() {
                         const aKey = `${c.id}-${acct.id}`;
                         const aOpen = openAccts[aKey] || false;
                         const aTab = acctTab[aKey] || (c.hasQr ? "qr" : "cred");
-                        const aPath = acct.id === "default" ? `channels.${c.id}` : `channels.${c.id}.accounts.${acct.id}`;
-                        const acctLabel = acct.id === "default" ? getVal(`${aPath}.label`, "") : getVal(`${aPath}.label`, "");
+                        // Path comes from getChannelAccounts — flat default →
+                        // channels.<ch>, named → channels.<ch>.accounts.<id>.
+                        const aPath = acct.path;
+                        const acctLabel = getVal(`${aPath}.label`, "");
                         const hasAnyCred = fields.some((f) => getVal(`${aPath}.${f.key}`, ""));
 
                         return (
@@ -4133,29 +4227,17 @@ function TauriConfigPageInner() {
                                       </button>
                                     </div>
                                     {/* QR pane */}
-                                    {aTab === "qr" && (
-                                      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 10, padding: "14px 0" }}>
-                                        <div style={{ width: 130, height: 130, background: V.bg4, border: `1px solid ${V.bd2}`, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden" }}>
-                                          {qrData[aKey] || qrData[c.id] ? (
-                                            <img src={qrData[aKey] || qrData[c.id]} alt="QR" style={{ width: 110, height: 110 }} />
-                                          ) : (
-                                            <div style={{ color: V.t3, fontSize: 11 }}>{zh ? "\u70B9\u51FB\u83B7\u53D6" : "Click to get QR"}</div>
-                                          )}
-                                        </div>
-                                        <div style={{ fontSize: 11, color: V.t2, textAlign: "center", lineHeight: 1.5 }}>
-                                          {zh ? `\u4F7F\u7528${c.name.split("/")[0].trim()}\u626B\u7801\u767B\u5F55` : `Scan with ${c.nameEn.split("/")[0].trim()}`}
-                                        </div>
-                                        {(qrStatus[aKey] || qrStatus[c.id]) && (
-                                          <div style={{ fontSize: 11, color: V.t3, display: "flex", alignItems: "center", gap: 5 }}>
-                                            <Spinner color="green" />
-                                            {qrStatus[aKey] || qrStatus[c.id]}
-                                          </div>
-                                        )}
-                                        <button onClick={() => handleQrStart(c.id)}
-                                          style={{ fontSize: 10, color: V.or, cursor: "pointer", fontFamily: V.mono, background: V.olo, border: `1px solid ${V.obrd}`, padding: "4px 12px", borderRadius: 5, transition: "all .12s" }}>
-                                          {(qrData[aKey] || qrData[c.id]) ? (zh ? "\u5237\u65B0\u4E8C\u7EF4\u7801" : "Refresh QR") : (zh ? "\u83B7\u53D6\u4E8C\u7EF4\u7801" : "Get QR Code")}
-                                        </button>
-                                      </div>
+                                    {aOpen && aTab === "qr" && (
+                                      <QrPane
+                                        slot={aKey}
+                                        chId={c.id}
+                                        qr={qrData[aKey]}
+                                        status={qrStatus[aKey]}
+                                        onStart={() => handleQrStart(c.id, aKey)}
+                                        scanHint={zh ? `\u4F7F\u7528${c.name.split("/")[0].trim()}\u626B\u7801\u767B\u5F55` : `Scan with ${c.nameEn.split("/")[0].trim()}`}
+                                        zh={zh}
+                                        V={V}
+                                      />
                                     )}
                                     {/* Credential pane */}
                                     {aTab === "cred" && (
