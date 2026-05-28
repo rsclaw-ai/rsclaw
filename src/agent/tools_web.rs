@@ -962,6 +962,36 @@ impl AgentRuntime {
             }
         }
 
+        // Non-success status (e.g. 412 anti-bot challenge, 5xx server error) —
+        // try browser fallback for GET requests before falling through to the
+        // empty-body SPA detection below.
+        if !response.status().is_success() && is_get {
+            tracing::warn!(
+                url = %fetch_url,
+                status = %response.status(),
+                "web_fetch: non-success status, trying browser fallback"
+            );
+            match self.browser_get_article(&fetch_url).await {
+                Ok((t, md)) if !md.is_empty() => {
+                    let raw_chars = md.chars().count();
+                    let raw_artifact = self
+                        .preserve_raw_for_summarize(&ctx.session_key, &md, prompt)
+                        .await;
+                    let text = self.maybe_summarize(&md, prompt).await;
+                    let mut out = json!({
+                        "url": url,
+                        "title": t,
+                        "text": text,
+                        "length": text.len(),
+                        "source": "browser_fallback",
+                    });
+                    attach_raw_artifact(&mut out, raw_artifact, raw_chars);
+                    return Ok(out);
+                }
+                _ => {} // fall through to normal processing (may still get empty body)
+            }
+        }
+
         let content_type = response
             .headers()
             .get("content-type")
