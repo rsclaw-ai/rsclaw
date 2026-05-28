@@ -37,7 +37,7 @@ pub fn truncate_str(s: &str, max_bytes: usize) -> &str {
 /// passing the original bytes is also reasonable for callers that prioritize
 /// "ship something" over "reject corrupt input".
 pub fn downscale_image_for_vision(
-    data: Vec<u8>,
+    data: &[u8],
     original_mime: &str,
     byte_threshold: usize,
     max_long_edge: u32,
@@ -46,7 +46,7 @@ pub fn downscale_image_for_vision(
     // Cheap dimension probe via image's reader — avoids full decode when the
     // image is already small in both bytes and pixels.
     let needs_pixel_resize = {
-        let cursor = std::io::Cursor::new(&data);
+        let cursor = std::io::Cursor::new(data);
         match image::ImageReader::new(cursor).with_guessed_format() {
             Ok(reader) => match reader.into_dimensions() {
                 Ok((w, h)) => w.max(h) > max_long_edge,
@@ -57,10 +57,10 @@ pub fn downscale_image_for_vision(
     };
 
     if data.len() <= byte_threshold && !needs_pixel_resize {
-        return Ok((data, original_mime.to_string()));
+        return Ok((data.to_vec(), original_mime.to_string()));
     }
 
-    let img = image::load_from_memory(&data)
+    let img = image::load_from_memory(data)
         .map_err(|e| anyhow::anyhow!("downscale: decode failed: {e}"))?;
     let (w, h) = (img.width(), img.height());
     let resized = if w.max(h) > max_long_edge {

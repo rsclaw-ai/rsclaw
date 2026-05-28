@@ -989,7 +989,7 @@ impl FeishuChannel {
                             // failure (best-effort).
                             let (final_bytes, final_mime) =
                                 crate::util::downscale_image_for_vision(
-                                    bytes,
+                                    &bytes,
                                     "image/png",
                                     1 * 1024 * 1024, // 1 MB byte trigger
                                     1920,            // long-edge cap
@@ -997,10 +997,7 @@ impl FeishuChannel {
                                 )
                                 .unwrap_or_else(|e| {
                                     warn!(error = %e, "feishu: downscale failed, sending original");
-                                    // Reload not possible without bytes; we
-                                    // moved them. This branch is rare (decode
-                                    // failure on a successful download).
-                                    (Vec::new(), "image/png".to_string())
+                                    (bytes.clone(), "image/png".to_string())
                                 });
                             if final_bytes.is_empty() {
                                 return Ok(None);
@@ -1119,7 +1116,7 @@ impl FeishuChannel {
                             };
                             let orig_len = bytes.len();
                             match crate::util::downscale_image_for_vision(
-                                bytes,
+                                &bytes,
                                 orig_mime,
                                 1 * 1024 * 1024,
                                 1920,

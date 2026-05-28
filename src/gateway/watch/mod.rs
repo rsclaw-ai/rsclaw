@@ -435,6 +435,8 @@ impl WatchRegistry {
         }
     }
 
+    /// Stop a single watch task identified by its id within a channel+peer scope.
+    /// Returns `true` if a task was found and stopped.
     pub async fn stop_one(&self, channel: &str, peer: &str, id: &str) -> bool {
         let mut inner = self.inner.lock().await;
         let key_to_remove = inner
@@ -452,6 +454,8 @@ impl WatchRegistry {
         false
     }
 
+    /// Stop all watch tasks for a given channel+peer scope.
+    /// Returns the number of tasks that were stopped.
     pub async fn stop_all_for(&self, channel: &str, peer: &str) -> usize {
         let mut inner = self.inner.lock().await;
         let keys: Vec<DedupKey> = inner

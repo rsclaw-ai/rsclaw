@@ -194,7 +194,6 @@ pub(crate) fn start_feishu_if_configured(
             })
             .map(|b| b.agent_id.clone());
         let bound = bound_agent.clone();
-        let _acct_for_route = acct_name.clone();
         // Capture acct_name for the on_message closure → per-user worker;
         // the inner spawn only sees what's been moved into the closure.
         let w_acct_outer = acct_name.clone();

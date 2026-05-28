@@ -20,7 +20,7 @@ dashmap      = "6"
 eventsource-stream = "0.2"
 
 # Web framework
-axum         = { version = "0.8", features = ["ws", "multipart"] }
+axum         = { version = "0.8", features = ["ws", "multipart", "macros"] }
 
 # HTTP client
 # TLS: use aws-lc-rs instead of ring for better cross-compilation (esp. Windows ARM64)
@@ -126,6 +126,7 @@ ogg = "0.9"
 lark-websocket-protobuf = "0.1"
 prost = "0.13"
 mime = "0.3"
+mime_guess = "2"
 matrix-sdk = { version = "0.9", optional = true, default-features = false, features = ["e2e-encryption", "rustls-tls", "sqlite"] }
 fs2 = "0.4.3"
 rusqlite = { version = "0.32", optional = true, features = ["bundled"] }

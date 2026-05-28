@@ -50,16 +50,27 @@ pub async fn handle_webhook(
     body: Bytes,
 ) -> impl IntoResponse {
     // Custom webhook channels take priority (don't need hooks.enabled).
-    if let Ok(map) = state.custom_webhooks.read() {
-        if let Some(ch) = map.get(path.as_str()) {
-            let body_str = String::from_utf8_lossy(&body);
-            ch.handle_webhook(&body_str);
-            return (
-                StatusCode::ACCEPTED,
-                Json(serde_json::json!({"accepted": true, "channel": path})),
-            )
-                .into_response();
-        }
+    // Clone the Arc out of the lock before .await to avoid holding a
+    // !Send RwLockReadGuard across the yield point.
+    let custom_ch = {
+        let map = state.custom_webhooks.read().expect("custom_webhooks lock poisoned");
+        map.get(path.as_str()).cloned()
+    };
+    if let Some(ch) = custom_ch {
+        // ACK immediately and process the payload in the background.
+        // handle_webhook downloads remote attachments and runs the agent
+        // pipeline; awaiting it here would hold the HTTP request open for
+        // tens of seconds and let slow attachment URLs delay the ACK.
+        let body_owned = body.to_vec();
+        tokio::spawn(async move {
+            let body_str = String::from_utf8_lossy(&body_owned).into_owned();
+            ch.handle_webhook(&body_str).await;
+        });
+        return (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({"accepted": true, "channel": path})),
+        )
+            .into_response();
     }
 
     let hooks_cfg = match state.config.ops.hooks.as_ref() {

@@ -219,6 +219,60 @@ mod tests {
     }
 
     #[test]
+    fn astock_hit_v_shape_break_falls_through_else() {
+        let out = run_astock(json!({
+            "event": "hit",
+            "data": {
+                "code": "000539",
+                "name": "粤电力Ａ",
+                "filter": "quick_v_shape_break",
+                "diag": {
+                    "break_over_open_pct": 0.0013, "break_price": 7.91,
+                    "break_ts": 1779931803, "current_price": 7.91,
+                    "day_before_close": 6.67, "gap_pct": 0.0763,
+                    "market": "SZ", "today_low": 7.8, "today_open": 7.9,
+                    "yesterday_close": 7.34, "yesterday_high": 7.34,
+                    "yesterday_pct": 0.1004
+                },
+                "ts": 1779931807
+            }
+        }));
+        eprintln!("v_shape_break hit output: {:?}", out);
+        assert_eq!(out.len(), 1, "expected exactly 1 output line, got {:?}", out);
+        assert!(out[0].contains("000539"), "expected code in output: {}", out[0]);
+        assert!(out[0].contains("粤电力"), "expected name in output: {}", out[0]);
+        assert!(out[0].contains("quick_v_shape_break"), "expected filter in brackets: {}", out[0]);
+    }
+
+    #[test]
+    fn astock_snapshot_v_shape_break_with_10_codes() {
+        let out = run_astock(json!({
+            "event": "snapshot",
+            "data": {
+                "filter": "quick_v_shape_break",
+                "count": 10,
+                "codes": [
+                    {"code":"000539","name":"粤电力Ａ","diag":{"market":"SZ"}},
+                    {"code":"000509","name":"华塑控股","diag":{"market":"SZ"}},
+                    {"code":"605055","name":"迎丰股份","diag":{"market":"SH"}},
+                    {"code":"605066","name":"天正电气","diag":{"market":"SH"}},
+                    {"code":"002484","name":"江海股份","diag":{"market":"SZ"}},
+                    {"code":"002388","name":"新亚制程","diag":{"market":"SZ"}},
+                    {"code":"002771","name":"真视通","diag":{"market":"SZ"}},
+                    {"code":"002185","name":"华天科技","diag":{"market":"SZ"}},
+                    {"code":"600183","name":"生益科技","diag":{"market":"SH"}},
+                    {"code":"600162","name":"香江控股","diag":{"market":"SH"}}
+                ],
+                "ts": 1779931807
+            }
+        }));
+        eprintln!("v_shape_break snapshot output: {:?}", out);
+        assert_eq!(out.len(), 1, "expected 1 line, got {:?}", out);
+        assert!(out[0].contains("命中 10 只"), "expected count: {}", out[0]);
+        assert!(out[0].contains("000539"), "expected first code: {}", out[0]);
+    }
+
+    #[test]
     fn astock_unknown_event_falls_back() {
         let out = run_astock(json!({
             "event": "weird",

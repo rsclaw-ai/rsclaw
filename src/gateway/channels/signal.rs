@@ -1,6 +1,8 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
-use tokio::sync::mpsc;
+use anyhow::anyhow;
+use futures::future::BoxFuture;
+use tokio::sync::{Notify, OnceCell, mpsc};
 use tracing::{debug, error, info, warn};
 
 use super::{
@@ -9,10 +11,69 @@ use super::{
 };
 use crate::{
     agent::{AgentMessage, AgentRegistry},
-    channel::{Channel, OutboundMessage},
+    channel::{Channel, OutboundMessage, signal::SignalChannel},
     config::runtime::RuntimeConfig,
     gateway::session::{MessageKind, SessionKeyParams, derive_session_key},
 };
+
+/// How long the proxy will wait for the real `SignalChannel` to finish
+/// initializing before erroring out. Covers the signal-cli spawn cost on
+/// gateway start (typically <1s).
+const SIGNAL_PROXY_READY_WAIT: Duration = Duration::from_secs(5);
+
+/// Forwarding stub registered in `ChannelManager` synchronously at startup;
+/// the real `SignalChannel` is spawned asynchronously (signal-cli subprocess)
+/// and filled into the `OnceCell` once available. `ready` is pulsed when the
+/// slot is filled so `send()` can wait the first few seconds after gateway
+/// start without dropping cron deliveries.
+struct SignalProxy {
+    name: String,
+    real: Arc<OnceCell<Arc<SignalChannel>>>,
+    ready: Arc<Notify>,
+}
+
+impl Channel for SignalProxy {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn send(&self, msg: OutboundMessage) -> BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async move {
+            if let Some(real) = self.real.get() {
+                return real.send(msg).await;
+            }
+            // Cold path: gateway just started, signal-cli still spawning.
+            // Wait briefly for the slot to fill instead of dropping the
+            // message. `notified()` is created before the check that follows
+            // so a `notify_one` that fires between our get() and notified()
+            // is still observed.
+            let notified = self.ready.notified();
+            if let Some(real) = self.real.get() {
+                return real.send(msg).await;
+            }
+            match tokio::time::timeout(SIGNAL_PROXY_READY_WAIT, notified).await {
+                Ok(()) => {}
+                Err(_) => {
+                    return Err(anyhow!(
+                        "signal channel still not ready after {:?}",
+                        SIGNAL_PROXY_READY_WAIT
+                    ));
+                }
+            }
+            let real = self
+                .real
+                .get()
+                .ok_or_else(|| anyhow!("signal channel ready signaled but slot empty"))?;
+            real.send(msg).await
+        })
+    }
+
+    /// The proxy is a dispatch shim; the real channel's `run` loop is driven
+    /// by the task that filled the slot.
+    fn run(self: Arc<Self>) -> BoxFuture<'static, anyhow::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
 
 pub(crate) fn start_signal_if_configured(
     config: &RuntimeConfig,
@@ -27,8 +88,6 @@ pub(crate) fn start_signal_if_configured(
     >,
     task_queue: Arc<crate::gateway::task_queue::TaskQueueManager>,
 ) {
-    use crate::channel::signal::SignalChannel;
-
     let Some(sig_cfg) = &config.channel.channels.signal else {
         return;
     };
@@ -422,11 +481,49 @@ pub(crate) fn start_signal_if_configured(
             });
         });
 
-        // spawn() is async — drive it in a task.
+        // Register a synchronous proxy in ChannelManager so cron/watch can
+        // resolve "signal/{acct}" (and bare "signal" for the first account)
+        // even though the real SignalChannel is spawned asynchronously below.
+        // The proxy forwards `send` to the OnceCell once filled, briefly
+        // waiting (via `ready` Notify) for the cold-start window so an early
+        // cron tick doesn't lose its message.
+        let signal_slot: Arc<OnceCell<Arc<SignalChannel>>> = Arc::new(OnceCell::new());
+        let signal_ready = Arc::new(Notify::new());
+        let proxy_name = format!("signal/{}", acct_name);
+        let proxy = Arc::new(SignalProxy {
+            name: proxy_name.clone(),
+            real: Arc::clone(&signal_slot),
+            ready: Arc::clone(&signal_ready),
+        });
+        if let Err(e) = manager
+            .register_with_name(proxy_name.clone(), Arc::clone(&proxy) as Arc<dyn Channel>)
+        {
+            warn!(account = %acct_for_log, "signal: failed to register proxy: {e:#}");
+        }
+        if manager.get("signal").is_none() {
+            let bare = Arc::new(SignalProxy {
+                name: "signal".to_owned(),
+                real: Arc::clone(&signal_slot),
+                ready: Arc::clone(&signal_ready),
+            });
+            if let Err(e) =
+                manager.register_with_name("signal".to_owned(), bare as Arc<dyn Channel>)
+            {
+                warn!("signal: failed to register bare proxy: {e:#}");
+            }
+        }
+
+        // spawn() is async — drive it in a task. Once SignalChannel is constructed,
+        // fill the slot and pulse `ready` so the proxy can release any waiting
+        // sends.
         tokio::spawn(async move {
             match SignalChannel::spawn(phone, sig_cli_path, on_message).await {
                 Ok(ch) => {
                     let ch = Arc::new(ch);
+                    if signal_slot.set(Arc::clone(&ch)).is_err() {
+                        warn!(account = %acct_for_log, "signal: slot already filled (duplicate spawn?)");
+                    }
+                    signal_ready.notify_waiters();
                     let ch_send = Arc::clone(&ch);
                     tokio::spawn(async move {
                         while let Some(msg) = out_rx.recv().await {
@@ -443,9 +540,5 @@ pub(crate) fn start_signal_if_configured(
                 Err(e) => warn!("signal-cli not available: {e:#}"),
             }
         });
-
-        // Register a placeholder so ChannelManager knows signal is configured.
-        // The real channel handle is inside the spawned task above.
-        let _ = manager; // manager.register() can't be called here without the real Arc
     } // end for sig_accounts
 }

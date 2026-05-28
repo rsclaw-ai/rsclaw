@@ -3,6 +3,7 @@
 //! Allows users to connect any platform without writing code, using JSON path
 //! extraction for inbound parsing and template-based outbound replies.
 
+use base64::Engine as _;
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
@@ -77,20 +78,24 @@ fn value_as_string(val: &Value) -> String {
 // Template engine
 // ---------------------------------------------------------------------------
 
-/// Replace `{{sender}}`, `{{chat_id}}`, `{{reply}}`, `{{is_group}}` in a
-/// template.
+/// Replace `{{sender}}`, `{{chat_id}}`, `{{reply}}`, `{{is_group}}`,
+/// `{{images}}`, `{{files}}` in a template.
 fn render_template(
     template: &str,
     sender: &str,
     chat_id: &str,
     reply: &str,
     is_group: bool,
+    image_urls_json: &str,
+    files_json: &str,
 ) -> String {
     template
         .replace("{{sender}}", sender)
         .replace("{{chat_id}}", chat_id)
         .replace("{{reply}}", &escape_json_string(reply))
         .replace("{{is_group}}", if is_group { "true" } else { "false" })
+        .replace("{{images}}", image_urls_json)
+        .replace("{{files}}", files_json)
 }
 
 /// Expand `${VAR}` references to environment variables.
@@ -143,6 +148,29 @@ pub struct ParsedMessage {
     pub text: String,
     pub sender: String,
     pub group_id: Option<String>,
+    /// Raw image URLs extracted from inbound payload (to be downloaded by
+    /// gateway code).
+    pub image_urls: Vec<String>,
+    /// File download URL extracted from inbound payload.
+    pub file_url: Option<String>,
+    /// Filename for the file attachment.
+    pub file_name: Option<String>,
+}
+
+/// Extract a value as a string from JSON. For arrays, join elements.
+fn extract_string_value<'a>(root: &'a Value, path: &str) -> Option<String> {
+    let v = json_path_extract(root, path)?;
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(arr) => {
+            let parts: Vec<String> = arr.iter().filter_map(|e| match e {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            }).collect();
+            if parts.is_empty() { None } else { Some(parts.join(",")) }
+        }
+        other => Some(other.to_string()),
+    }
 }
 
 /// Parse an inbound JSON payload using the custom channel config paths.
@@ -187,10 +215,48 @@ pub fn parse_inbound(cfg: &CustomChannelConfig, body: &str) -> Option<ParsedMess
         .as_ref()
         .and_then(|gp| json_path_extract(&val, gp).map(value_as_string));
 
+    // Extract image URLs.
+    let mut image_urls: Vec<String> = Vec::new();
+    if let Some(ref ip) = cfg.image_url_path {
+        if let Some(url) = extract_string_value(&val, ip) {
+            image_urls.push(url);
+        }
+    }
+    if let Some(ref ip) = cfg.image_urls_path {
+        if let Some(val) = json_path_extract(&val, ip) {
+            match val {
+                Value::Array(arr) => {
+                    for v in arr {
+                        if let Value::String(s) = v {
+                            if !s.is_empty() {
+                                image_urls.push(s.clone());
+                            }
+                        }
+                    }
+                }
+                Value::String(s) => image_urls.push(s.clone()),
+                _ => {}
+            }
+        }
+    }
+
+    // Extract file URL and name.
+    let file_url = cfg
+        .file_url_path
+        .as_ref()
+        .and_then(|fp| extract_string_value(&val, fp));
+    let file_name = cfg
+        .file_name_path
+        .as_ref()
+        .and_then(|np| extract_string_value(&val, np));
+
     Some(ParsedMessage {
         text,
         sender,
         group_id,
+        image_urls,
+        file_url,
+        file_name,
     })
 }
 
@@ -204,13 +270,16 @@ pub struct CustomWebhookChannel {
     pub cfg: CustomChannelConfig,
     client: Client,
     #[allow(clippy::type_complexity)]
-    on_message: Arc<dyn Fn(String, String, bool) + Send + Sync>,
+    on_message:
+        Arc<dyn Fn(String, String, String, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>, bool) + Send + Sync>,
 }
 
 impl CustomWebhookChannel {
     pub fn new(
         cfg: CustomChannelConfig,
-        on_message: Arc<dyn Fn(String, String, bool) + Send + Sync>,
+        on_message: Arc<
+            dyn Fn(String, String, String, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>, bool) + Send + Sync,
+        >,
     ) -> Self {
         Self {
             cfg,
@@ -223,10 +292,31 @@ impl CustomWebhookChannel {
     }
 
     /// Handle an inbound webhook POST.
-    pub fn handle_webhook(&self, body: &str) {
+    pub async fn handle_webhook(&self, body: &str) {
         if let Some(parsed) = parse_inbound(&self.cfg, body) {
             let is_group = parsed.group_id.is_some();
-            (self.on_message)(parsed.sender, parsed.text, is_group);
+            // chat_id = group_id when present (so the agent reply lands in the
+            // group), else the sender's DM identity.
+            let chat_id = parsed
+                .group_id
+                .clone()
+                .unwrap_or_else(|| parsed.sender.clone());
+            // Download images/files from URLs extracted by parse_inbound.
+            let images = download_images(&self.client, &parsed.image_urls).await;
+            let files = download_and_package_file(
+                &self.client,
+                &parsed.file_url,
+                parsed.file_name.as_deref().unwrap_or("file.bin"),
+            )
+            .await;
+            (self.on_message)(
+                parsed.sender,
+                parsed.text,
+                chat_id,
+                images,
+                files,
+                is_group,
+            );
         } else {
             debug!(channel = %self.cfg.name, "custom webhook: inbound message did not match filter/paths");
         }
@@ -246,12 +336,37 @@ impl CustomWebhookChannel {
             r#"{"sender":"{{sender}}","chat_id":"{{chat_id}}","text":"{{reply}}","is_group":{{is_group}}}"#,
         );
 
+        // Build {{images}} and {{files}} JSON arrays from the reply message.
+        let image_urls_json = if msg.images.is_empty() {
+            "[]".to_owned()
+        } else {
+            serde_json::to_string(&msg.images).unwrap_or_else(|_| "[]".to_owned())
+        };
+        let files_json = if msg.files.is_empty() {
+            "[]".to_owned()
+        } else {
+            let file_entries: Vec<serde_json::Value> = msg
+                .files
+                .iter()
+                .map(|(name, mime, path)| {
+                    serde_json::json!({
+                        "filename": name,
+                        "mime_type": mime,
+                        "url": path,
+                    })
+                })
+                .collect();
+            serde_json::to_string(&file_entries).unwrap_or_else(|_| "[]".to_owned())
+        };
+
         let body = render_template(
             template,
             &msg.target_id,
             &msg.target_id,
             &msg.text,
             msg.is_group,
+            &image_urls_json,
+            &files_json,
         );
 
         let method = self
@@ -323,8 +438,10 @@ impl Channel for CustomWebhookChannel {
 /// heartbeat, inbound parsing, and outbound reply frames.
 pub struct CustomWebSocketChannel {
     pub cfg: CustomChannelConfig,
+    client: Client,
     #[allow(clippy::type_complexity)]
-    on_message: Arc<dyn Fn(String, String, bool) + Send + Sync>,
+    on_message:
+        Arc<dyn Fn(String, String, String, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>, bool) + Send + Sync>,
     /// Sender half for outbound messages.
     ws_tx: Mutex<Option<mpsc::Sender<String>>>,
 }
@@ -332,9 +449,15 @@ pub struct CustomWebSocketChannel {
 impl CustomWebSocketChannel {
     pub fn new(
         cfg: CustomChannelConfig,
-        on_message: Arc<dyn Fn(String, String, bool) + Send + Sync>,
+        on_message: Arc<
+            dyn Fn(String, String, String, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>, bool) + Send + Sync,
+        >,
     ) -> Self {
         Self {
+            client: crate::config::build_proxy_client()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("reqwest client"),
             cfg,
             on_message,
             ws_tx: Mutex::new(None),
@@ -450,12 +573,35 @@ impl CustomWebSocketChannel {
     /// Send a reply frame on the WS connection.
     fn format_reply(&self, msg: &OutboundMessage) -> Option<String> {
         let template = self.cfg.reply_frame.as_ref()?;
+        let image_urls_json = if msg.images.is_empty() {
+            "[]".to_owned()
+        } else {
+            serde_json::to_string(&msg.images).unwrap_or_else(|_| "[]".to_owned())
+        };
+        let files_json = if msg.files.is_empty() {
+            "[]".to_owned()
+        } else {
+            let file_entries: Vec<serde_json::Value> = msg
+                .files
+                .iter()
+                .map(|(name, mime, path)| {
+                    serde_json::json!({
+                        "filename": name,
+                        "mime_type": mime,
+                        "url": path,
+                    })
+                })
+                .collect();
+            serde_json::to_string(&file_entries).unwrap_or_else(|_| "[]".to_owned())
+        };
         Some(render_template(
             template,
             &msg.target_id,
             &msg.target_id,
             &msg.text,
             msg.is_group,
+            &image_urls_json,
+            &files_json,
         ))
     }
 }
@@ -539,14 +685,52 @@ impl CustomWebSocketChannel {
                             let text_str: &str = &text;
                             if let Some(parsed) = parse_inbound(&self.cfg, text_str) {
                                 let is_group = parsed.group_id.is_some();
-                                (self.on_message)(parsed.sender, parsed.text, is_group);
+                                let chat_id = parsed
+                                    .group_id
+                                    .clone()
+                                    .unwrap_or_else(|| parsed.sender.clone());
+                                let images =
+                                    download_images(&self.client, &parsed.image_urls).await;
+                                let files = download_and_package_file(
+                                    &self.client,
+                                    &parsed.file_url,
+                                    parsed.file_name.as_deref().unwrap_or("file.bin"),
+                                )
+                                .await;
+                                (self.on_message)(
+                                    parsed.sender,
+                                    parsed.text,
+                                    chat_id,
+                                    images,
+                                    files,
+                                    is_group,
+                                );
                             }
                         }
                         Some(Ok(WsMessage::Binary(data))) => {
                             let text = String::from_utf8_lossy(&data);
                             if let Some(parsed) = parse_inbound(&self.cfg, &text) {
                                 let is_group = parsed.group_id.is_some();
-                                (self.on_message)(parsed.sender, parsed.text, is_group);
+                                let chat_id = parsed
+                                    .group_id
+                                    .clone()
+                                    .unwrap_or_else(|| parsed.sender.clone());
+                                let images =
+                                    download_images(&self.client, &parsed.image_urls).await;
+                                let files = download_and_package_file(
+                                    &self.client,
+                                    &parsed.file_url,
+                                    parsed.file_name.as_deref().unwrap_or("file.bin"),
+                                )
+                                .await;
+                                (self.on_message)(
+                                    parsed.sender,
+                                    parsed.text,
+                                    chat_id,
+                                    images,
+                                    files,
+                                    is_group,
+                                );
                             }
                         }
                         Some(Ok(WsMessage::Close(_))) => {
@@ -601,6 +785,190 @@ impl CustomWebSocketChannel {
         }
 
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Download helpers
+// ---------------------------------------------------------------------------
+
+/// Max bytes accepted for a single inbound attachment from an untrusted URL.
+/// Caps memory blowup from malicious or oversized payloads.
+const MAX_REMOTE_ATTACHMENT_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Reject loopback / private / link-local / unspecified IPs so a malicious
+/// upstream payload can't redirect us at the gateway's own internal services.
+fn ip_is_safe(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast())
+        }
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+                return false;
+            }
+            // fe80::/10 link-local and fc00::/7 ULA.
+            let seg = v6.segments()[0];
+            if (seg & 0xffc0) == 0xfe80 || (seg & 0xfe00) == 0xfc00 {
+                return false;
+            }
+            // IPv4-mapped (::ffff:0:0/96) — re-check the embedded v4.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return ip_is_safe(std::net::IpAddr::V4(v4));
+            }
+            true
+        }
+    }
+}
+
+/// Download up to `MAX_REMOTE_ATTACHMENT_BYTES` from `url`, streaming the
+/// body. Hardens against SSRF + DNS rebinding by pre-resolving the hostname,
+/// rejecting if ANY resolved IP is unsafe, then pinning reqwest to the
+/// validated address set via `resolve_to_addrs` so the actual TCP connect
+/// can't end up at a different IP than the one we checked.
+///
+/// `_client` is unused — we build a per-request client so the DNS pin can be
+/// scoped to this single download. Channel-level client pooling isn't useful
+/// here since each webhook attachment hits a different host.
+async fn download_remote_attachment(_client: &Client, url: &str) -> Result<Vec<u8>> {
+    let parsed = url::Url::parse(url).context("parse attachment url")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!("custom channel: blocked non-http(s) URL {url}");
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("custom channel: URL has no host: {url}"))?
+        .to_owned();
+    let host_lower = host.to_ascii_lowercase();
+    if matches!(
+        host_lower.as_str(),
+        "localhost" | "ip6-localhost" | "ip6-loopback"
+    ) {
+        bail!("custom channel: blocked loopback host {host}");
+    }
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| anyhow::anyhow!("custom channel: URL has no port: {url}"))?;
+
+    // Resolve every candidate IP up-front. Bail if ANY is unsafe — even one
+    // private-range record in a round-robin set lets an attacker exploit
+    // reqwest's choice. This closes the DNS-rebinding window for the duration
+    // of the pinned request below.
+    let lookup_target = format!("{host}:{port}");
+    let addrs: Vec<std::net::SocketAddr> =
+        match tokio::net::lookup_host(lookup_target.as_str()).await {
+            Ok(it) => it.collect(),
+            Err(e) => bail!("custom channel: DNS lookup failed for {host}: {e}"),
+        };
+    if addrs.is_empty() {
+        bail!("custom channel: no DNS records for {host}");
+    }
+    for addr in &addrs {
+        if !ip_is_safe(addr.ip()) {
+            bail!(
+                "custom channel: DNS resolved {host} to unsafe IP {}",
+                addr.ip()
+            );
+        }
+    }
+
+    // Build a per-request client pinned to the validated address set. After
+    // this call reqwest will only TCP-connect to one of `addrs`; a malicious
+    // resolver flipping records before the request fires cannot redirect us.
+    let client = crate::config::build_proxy_client()
+        .timeout(Duration::from_secs(30))
+        .resolve_to_addrs(&host, &addrs)
+        .build()
+        .context("build pinned reqwest client")?;
+
+    let resp = client.get(url).send().await.context("send request")?;
+    if !resp.status().is_success() {
+        bail!("attachment download failed: {}", resp.status());
+    }
+    if let Some(len) = resp.content_length() {
+        if len > MAX_REMOTE_ATTACHMENT_BYTES {
+            bail!(
+                "attachment too large: content-length {} > {} bytes",
+                len,
+                MAX_REMOTE_ATTACHMENT_BYTES
+            );
+        }
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("read chunk")?;
+        if buf.len() as u64 + chunk.len() as u64 > MAX_REMOTE_ATTACHMENT_BYTES {
+            bail!(
+                "attachment exceeded {} bytes during streaming",
+                MAX_REMOTE_ATTACHMENT_BYTES
+            );
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Download an image URL and package as ImageAttachment.
+async fn download_and_package_image(
+    client: &Client,
+    url: &str,
+) -> Option<crate::agent::registry::ImageAttachment> {
+    let bytes = download_remote_attachment(client, url).await.ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let mime = mime_guess::from_path(url).first_or_octet_stream().to_string();
+    let (final_bytes, final_mime) =
+        crate::util::downscale_image_for_vision(&bytes, &mime, 1 * 1024 * 1024, 1920, 85)
+            .unwrap_or_else(|_| (bytes, mime));
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&final_bytes);
+    let data_url = format!("data:{final_mime};base64,{b64}");
+    Some(crate::agent::registry::ImageAttachment {
+        data: data_url,
+        mime_type: final_mime,
+        source_path: None,
+    })
+}
+
+/// Download multiple image URLs.
+async fn download_images(
+    client: &Client,
+    urls: &[String],
+) -> Vec<crate::agent::registry::ImageAttachment> {
+    let mut images = Vec::new();
+    for url in urls {
+        if let Some(img) = download_and_package_image(client, url).await {
+            images.push(img);
+        }
+    }
+    images
+}
+
+/// Download a file and package as FileAttachment.
+async fn download_and_package_file(
+    client: &Client,
+    file_url: &Option<String>,
+    filename: &str,
+) -> Vec<crate::agent::registry::FileAttachment> {
+    let Some(url) = file_url else { return vec![] };
+    match download_remote_attachment(client, url).await {
+        Ok(bytes) if !bytes.is_empty() => {
+            let mime = mime_guess::from_path(filename)
+                .first_or_octet_stream()
+                .to_string();
+            vec![crate::agent::registry::FileAttachment {
+                filename: filename.to_owned(),
+                data: bytes,
+                mime_type: mime,
+            }]
+        }
+        _ => vec![],
     }
 }
 
@@ -674,6 +1042,8 @@ mod tests {
             "chat1",
             "hello world",
             true,
+            "[]",
+            "[]",
         );
         assert_eq!(result, r#"{"to":"user1","msg":"hello world","group":true}"#);
     }
@@ -686,6 +1056,8 @@ mod tests {
             "",
             "line1\nline2\"quoted\"",
             false,
+            "[]",
+            "[]",
         );
         assert_eq!(result, r#"{"text":"line1\nline2\"quoted\""}"#);
     }
@@ -720,6 +1092,10 @@ mod tests {
             text_path: Some("$.data.text".to_owned()),
             sender_path: Some("$.data.from".to_owned()),
             group_path: None,
+            image_url_path: None,
+            image_urls_path: None,
+            file_url_path: None,
+            file_name_path: None,
             reply_url: None,
             reply_method: None,
             reply_template: None,
