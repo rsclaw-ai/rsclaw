@@ -13,6 +13,7 @@
 //!     commands)
 
 use anyhow::{Result, anyhow};
+use tracing::debug;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedCommand {
@@ -336,7 +337,7 @@ fn apply_flags(spec: &mut WatchSpec, tail: &str) -> Result<()> {
                     .map_err(|_| anyhow!("--rate must be a number, got `{val}`"))?;
             }
             "--only" | "--tee" => {
-                // Stretch — accept but ignore in v1 so the command still parses.
+                debug!("watch flag `{tok}` accepted but ignored (reserved for future use)");
                 tokens
                     .get(i)
                     .ok_or_else(|| anyhow!("{tok} needs a value"))?;

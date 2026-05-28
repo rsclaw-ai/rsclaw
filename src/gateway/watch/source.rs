@@ -10,6 +10,8 @@ use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
+use tracing::warn;
+
 use crate::gateway::watch::parser::SourceKind;
 
 /// Unified event record emitted by every EventSource.
@@ -140,7 +142,9 @@ async fn run_file(src: FileSource, tx: mpsc::Sender<EventRecord>, mut stop: ones
     let open = File::open(&src.path).await;
     let file = match open {
         Ok(mut f) => {
-            let _ = f.seek(SeekFrom::End(0)).await;
+            if let Err(e) = f.seek(SeekFrom::End(0)).await {
+                warn!(path = %src.path.display(), "watch file seek failed: {e}");
+            }
             f
         }
         Err(e) => {
@@ -293,8 +297,12 @@ async fn run_shell(
         }
     }
 
-    let _ = r1.await;
-    let _ = r2.await;
+    if let Err(e) = r1.await {
+        warn!("watch shell stdout reader task failed: {e}");
+    }
+    if let Err(e) = r2.await {
+        warn!("watch shell stderr reader task failed: {e}");
+    }
 }
 
 fn now_ms() -> u64 {

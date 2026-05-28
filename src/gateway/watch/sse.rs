@@ -80,8 +80,12 @@ async fn run_sse_single_tracking(
         return SseOutcome::Fatal(format!("non-SSE content type: {ct}"));
     }
 
-    // First success of this attempt → reset the backoff.
-    *out_backoff_ms = 2000;
+    // Let `retry:` from the server set the reconnect base, or keep default
+    // 2000. Do NOT reset here — per SSE spec, `retry:` must persist across
+    // all subsequent reconnection attempts until superseded.
+    if *out_backoff_ms == 0 {
+        *out_backoff_ms = 2000;
+    }
 
     let mut stream = resp.bytes_stream();
     let mut parser = SseParser::default();
