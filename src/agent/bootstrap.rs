@@ -455,6 +455,25 @@ pub fn tool_prompts_for_system() -> String {
     parts.join("\n\n")
 }
 
+// Per-tool usage guides, exposed so each can be appended to the matching
+// ToolDef.description instead of living in the shared system prefix. A
+// tool-specific guide that sits in the cacheable prefix is paid for by
+// every client even when the tool isn't in their toolset (e.g. the CODE
+// profile has no web_* tools but still ate ~1.6k tok of web guides).
+// Riding on the ToolDef means the guide is only sent when the tool is.
+pub fn shell_guide() -> &'static str {
+    EN_TOOL_SHELL.trim()
+}
+pub fn web_search_guide() -> &'static str {
+    EN_TOOL_WEB_SEARCH.trim()
+}
+pub fn web_fetch_guide() -> &'static str {
+    EN_TOOL_WEB_FETCH.trim()
+}
+pub fn web_browser_guide() -> &'static str {
+    EN_TOOL_WEB_BROWSER.trim()
+}
+
 /// Extract the bundled site-rules (web_browser) and app-rules
 /// (computer_use) trees under `base_dir/tools/`. Tool prompt files
 /// (`prompt.md`) are no longer seeded — the shared system prompt is

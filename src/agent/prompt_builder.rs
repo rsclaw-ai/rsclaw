@@ -616,10 +616,12 @@ fn build_shared_system_prefix_uncached() -> String {
             .to_owned(),
     );
 
-    let tool_prompts = crate::agent::bootstrap::tool_prompts_for_system();
-    if !tool_prompts.is_empty() {
-        parts.push(tool_prompts);
-    }
+    // Per-tool usage guides (shell / web_search / web_fetch / web_browser)
+    // used to live here in the shared prefix. They now ride on each tool's
+    // ToolDef.description (see tools_builder.rs), so a client only pays for
+    // a guide when the tool is actually in its toolset. This removes ~2.3k
+    // tok of web/shell guidance from the cacheable prefix that profiles like
+    // CODE (no web tools) never benefited from. prefix_id bumped accordingly.
 
     parts.push(
         "## Self-Evolution & Skill Autonomy\n\

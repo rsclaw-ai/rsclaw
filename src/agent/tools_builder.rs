@@ -922,7 +922,7 @@ pub fn build_tool_list(
         // PowerShell edition quirks) live in the per-session `user_system`
         // "Platform" section (see prompt_builder::build_user_system), which
         // reflects the CLIENT's real OS and never enters the base hash.
-        description: "Run a shell command. Your OS, shell, package manager, and \
+        description: format!("Run a shell command. Your OS, shell, package manager, and \
              shell-specific syntax (command chaining, quoting, encoding) are described in \
              the system prompt's \"Platform\" section — follow those.\n\
              IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`, for HTTP/API requests use `web_fetch`. Only use shell for commands that have no dedicated tool.\n\
@@ -949,15 +949,15 @@ pub fn build_tool_list(
              - NEVER force-push to main / master.\n\
              - NEVER `--no-verify`, `--no-gpg-sign`, or `-c commit.gpgsign=false` unless the user explicitly asks — fix the hook failure instead.\n\
              - AVOID `git add -A` / `git add .` — stage specific files so you don't leak `.env`, credentials, or build artifacts.\n\
-             - Prefer NEW commits over `--amend`; amending after a pre-commit-hook failure can destroy work because the failed commit never landed."
-            .to_owned(),
+             - Prefer NEW commits over `--amend`; amending after a pre-commit-hook failure can destroy work because the failed commit never landed.\n\n{shell_guide}",
+            shell_guide = crate::agent::bootstrap::shell_guide()),
         parameters: json!({
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "Shell command to execute. Must be valid for the current OS."},
-                "timeout": {"type": "integer", "description": "Timeout in seconds (default: 30, max: 300)"},
-                "wait": {"type": "boolean", "description": "If true (default), wait for the command to finish and return stdout/stderr/exit_code. Set to false only for long-running commands (builds, servers, installs) where you want a task_id to poll later."},
-                "task_id": {"type": "string", "description": "Poll a previously started background task by its task_id."}
+                "timeout": {"type": "integer", "default": 30, "description": "Timeout seconds (max 300)."},
+                "wait": {"type": "boolean", "default": true, "description": "Wait for finish (stdout/stderr/exit_code). false → long task, returns task_id to poll."},
+                "task_id": {"type": "string", "description": "Poll a background task by its id."}
             },
             "required": []
         }),
@@ -1122,7 +1122,7 @@ pub fn build_tool_list(
     // Web tools.
     tools.push(ToolDef {
         name: "web_search".to_owned(),
-        description: "Search the web for real-time information.\n\
+        description: format!("Search the web for real-time information.\n\
             When to use:\n\
             - Questions beyond your knowledge cutoff or training data\n\
             - Current events, recent updates, time-sensitive information\n\
@@ -1140,20 +1140,20 @@ pub fn build_tool_list(
               - [Title](URL)\n\
               - [Title](URL)\n\
             so the user can verify the claim. Unsourced web-search-backed claims feel\n\
-            invented and erode trust.".to_owned(),
+            invented and erode trust.\n\n{}", crate::agent::bootstrap::web_search_guide()),
         parameters: json!({
             "type": "object",
             "properties": {
-                "query":    {"type": "string", "description": "Search query — be specific, include keywords and dates"},
-                "provider": {"type": "string", "description": "Search provider: duckduckgo, google, bing, brave. Leave empty for default."},
-                "limit":    {"type": "integer", "description": "Max results (default 5)"}
+                "query":    {"type": "string", "description": "Search query — specific keywords + dates."},
+                "provider": {"type": "string", "description": "duckduckgo | google | bing | brave. Empty = default."},
+                "limit":    {"type": "integer", "default": 5, "description": "Max results."}
             },
             "required": ["query"]
         }),
     });
     tools.push(ToolDef {
         name: "web_fetch".to_owned(),
-        description: "PREFERRED tool for HTTP requests — web pages, REST APIs, documentation, articles.\n\
+        description: format!("PREFERRED tool for HTTP requests — web pages, REST APIs, documentation, articles.\n\
             Do NOT use shell with curl/wget/Invoke-WebRequest — use web_fetch instead.\n\
             - URL must be fully-formed (https://...)\n\
             - HTTP auto-upgraded to HTTPS\n\
@@ -1188,7 +1188,7 @@ pub fn build_tool_list(
             Redirects: if the response indicates the URL redirected to a DIFFERENT host,\n\
             issue a fresh web_fetch on the redirect URL — do not assume the original URL\n\
             content was served. GET responses are cached for ~15 min keyed on the final\n\
-            URL, so re-fetching after a redirect is cheap.".to_owned(),
+            URL, so re-fetching after a redirect is cheap.\n\n{}", crate::agent::bootstrap::web_fetch_guide()),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -1222,7 +1222,7 @@ pub fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "web_browser".to_owned(),
-        description: "Control a web browser. Core workflow:\n\
+        description: format!("Control a web browser. Core workflow:\n\
             1. `open` — navigate to a URL\n\
             2. `snapshot` — get page structure with interactive element refs (@e1, @e2...). Use `interactive: true` to only get actionable elements (saves tokens). Use `interactive: true, annotate: true` to also get a screenshot with colorful borders + numbered labels overlaid on each element — the model sees both structured text and visual markers for better grounding.\n\
             3. `click` ref=@e1 / `fill` ref=@e2 text='...' — interact using refs\n\
@@ -1263,7 +1263,7 @@ pub fn build_tool_list(
               `screencapture` / Windows / Linux equivalent).\n\
             - Plain `action=screenshot` (no url) only captures what's already\n\
               in the persistent browser session — usually a blank Chrome new\n\
-              tab → near-black PNG. Don't do this.".to_owned(),
+              tab → near-black PNG. Don't do this.\n\n{}", crate::agent::bootstrap::web_browser_guide()),
         parameters: json!({
             "type": "object",
             "properties": {
