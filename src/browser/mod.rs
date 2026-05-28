@@ -442,11 +442,33 @@ pub(crate) async fn detect_existing_chrome(ports: &[u16]) -> Option<String> {
 /// Check if Google Chrome (or Chromium) is currently running on the system.
 /// Used to decide whether to ask the user to enable remote debugging,
 /// or to launch Chrome ourselves if it's not running.
+#[cfg(target_os = "windows")]
+pub(crate) fn is_chrome_running() -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    for name in ["chrome.exe", "chromium.exe"] {
+        if let Ok(output) = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("IMAGENAME eq {name}"), "/NH"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        {
+            // tasklist prints "INFO: No tasks..." when nothing matches; a real
+            // match contains the image name.
+            if String::from_utf8_lossy(&output.stdout).contains(name) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Check if Google Chrome (or Chromium) is currently running on the system.
+/// Used to decide whether to ask the user to enable remote debugging,
+/// or to launch Chrome ourselves if it's not running.
+#[cfg(not(target_os = "windows"))]
 pub(crate) fn is_chrome_running() -> bool {
     let names: &[&str] = if cfg!(target_os = "macos") {
         &["Google Chrome", "Chromium"]
-    } else if cfg!(target_os = "windows") {
-        &["chrome.exe", "chromium.exe"]
     } else {
         &["google-chrome", "chromium", "chromium-browser", "chrome"]
     };
@@ -463,24 +485,6 @@ pub(crate) fn is_chrome_running() -> bool {
         }
     }
     false
-}
-
-/// Fetch the browser-level CDP WebSocket URL from a Chrome debug port.
-/// Used by tool_web_browser to register an agent-launched Chrome with the pool.
-pub(crate) async fn browser_ws_url_from_port(port: u16) -> Result<String> {
-    let url = format!("http://127.0.0.1:{port}/json/version");
-    let body: serde_json::Value = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()?
-        .get(&url)
-        .send()
-        .await?
-        .json()
-        .await?;
-    body["webSocketDebuggerUrl"]
-        .as_str()
-        .map(String::from)
-        .ok_or_else(|| anyhow!("no webSocketDebuggerUrl at {url}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -806,12 +810,7 @@ impl BrowserSession {
     ///    risk).
     /// 5. **Launch fresh isolated profile** as the last resort (e.g. when only
     ///    Chrome for Testing is available).
-    /// Access the Chrome remote debugging port. Useful for registering
-    /// this session's Chrome with the shared browser pool.
-    pub(crate) fn debug_port(&self) -> u16 {
-        self.debug_port
-    }
-
+    ///
     /// Helper: launch chrome and connect CDP. Factored out so `start`
     /// can attempt path-3 (user profile) with a path-5 (rsclaw isolated profile)
     /// fallback without duplicating the launch sequence.

@@ -193,6 +193,82 @@ impl BrowserPool {
             .ok_or_else(|| anyhow!("pool: /json/version missing webSocketDebuggerUrl"))
     }
 
+    /// Browser-level CDP ws_url for a debug port (GET /json/version).
+    async fn ws_url_for_port(&self, port: u16) -> Result<String> {
+        let version_info: Value =
+            reqwest::get(format!("http://127.0.0.1:{port}/json/version"))
+                .await?
+                .json()
+                .await?;
+        version_info["webSocketDebuggerUrl"]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| anyhow!("pool: /json/version missing webSocketDebuggerUrl"))
+    }
+
+    /// Cheap liveness probe for a Chrome debug port.
+    async fn port_alive(port: u16) -> bool {
+        let url = format!("http://127.0.0.1:{port}/json/version");
+        match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+        {
+            Ok(client) => client
+                .get(&url)
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
+    /// Ensure a **pool-owned** Chrome is running with the given headed/profile
+    /// settings, returning its browser-level CDP ws_url.
+    ///
+    /// Unlike [`Self::set_chrome_ws_url`] (which registers an *unowned*
+    /// external Chrome), the pool owns this process and keeps it alive across
+    /// turns. This is what lets a headed Chrome the main agent launches
+    /// survive for sub-agents / web_fetch instead of dying when the launching
+    /// turn's `BrowserSession` drops. An existing live pool Chrome is reused
+    /// rather than launching a second process.
+    pub async fn ensure_owned_chrome(
+        &self,
+        chrome_path: &str,
+        headed: bool,
+        profile: Option<&str>,
+    ) -> Result<String> {
+        let port = {
+            let mut guard = self.chrome.lock().await;
+            if let Some(ref mut pooled) = *guard {
+                let alive = match pooled.process {
+                    None => true, // external — caller vouches for it
+                    Some(ref mut proc) => {
+                        !proc.child.try_wait().is_ok_and(|s| s.is_some())
+                    }
+                };
+                if alive {
+                    let p = pooled.port;
+                    drop(guard);
+                    return self.ws_url_for_port(p).await;
+                }
+                // Owned process exited — drop it (Drop runs fetch_sub once)
+                // and relaunch below.
+                *guard = None;
+            }
+            can_launch_chrome()?;
+            let process = ChromeProcess::launch(chrome_path, headed, profile).await?;
+            let port = process.port()?;
+            info!(port, headed, profile = ?profile, "pool: launched pool-owned Chrome");
+            *guard = Some(PooledChrome {
+                process: Some(process),
+                port,
+            });
+            port
+        };
+        self.ws_url_for_port(port).await
+    }
+
     /// Register an external Chrome as the shared pool instance.
     /// All subsequent `acquire_tab()` calls create tabs in this Chrome.
     /// The pool does NOT own the process (no liveness checks, no restart).
@@ -220,8 +296,18 @@ impl BrowserPool {
         if let Some(ref mut pooled) = *guard {
             match pooled.process {
                 None => {
-                    // External Chrome (not owned by pool) — assume alive.
-                    return Ok(pooled.port);
+                    // External Chrome (user's own). Probe it — if the user
+                    // closed their browser the registered port is dead, so
+                    // clear the entry and fall through to launching our own
+                    // pool Chrome instead of wedging on a stale port.
+                    if Self::port_alive(pooled.port).await {
+                        return Ok(pooled.port);
+                    }
+                    warn!(
+                        port = pooled.port,
+                        "pool: external Chrome no longer reachable, launching own"
+                    );
+                    *guard = None;
                 }
                 Some(ref mut proc) => {
                     if proc.child.try_wait().is_ok_and(|s| s.is_some()) {

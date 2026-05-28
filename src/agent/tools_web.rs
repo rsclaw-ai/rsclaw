@@ -1943,79 +1943,99 @@ impl AgentRuntime {
                         .and_then(|b| b.remote_debug_ports.as_ref())
                         .unwrap_or(&default_ports);
 
-                    // 1. User's Chrome with CDP already open? Use it.
+                    // 1. User's Chrome with CDP already open? Use it. The user
+                    //    owns this process, so register it as *external* (pool
+                    //    won't try to kill/restart it).
                     if let Some(ws_url) = crate::browser::detect_existing_chrome(ports).await {
                         info!("connecting to user Chrome (remote debugging, headed)");
                         let _ = crate::browser::pool::BrowserPool::global()
                             .set_chrome_ws_url(&ws_url)
                             .await;
                         crate::browser::BrowserSession::connect_existing(&ws_url).await?
-                    } else if crate::browser::is_chrome_running() {
-                        // 2. Chrome running but no CDP — notify user, fall
-                        //    through to pool (may have to use temp profile).
-                        info!("Chrome running without CDP; notifying user, falling back to pool");
-                        if let Some(ref tx) = self.notification_tx {
-                            let msg = format!(
-                                "Chrome is running without remote debugging. \
-                                 For full browser access (cookies, session) please close \
-                                 Chrome so the agent can relaunch it with debugging enabled.\n\
-                                 Or restart Chrome manually:\n\
-                                 {} --remote-debugging-port=9222\n\n\
-                                 Using temporary profile for now.",
-                                chrome_path
-                            );
-                            let _ = tx.send(crate::channel::OutboundMessage {
-                                target_id: ctx.peer_id.clone(),
-                                is_group: false,
-                                text: msg,
-                                reply_to: None,
-                                images: vec![],
-                                files: vec![],
-                                channel: Some(ctx.channel.clone()),
-                                account: None,
-                            });
+                    } else {
+                        // No CDP-enabled Chrome. If a plain Chrome is running we
+                        // can't reuse its (singleton-locked) default profile —
+                        // ask the user to quit, then poll up to 60s. The moment
+                        // they quit, relaunch with their profile + CDP.
+                        let mut chrome_blocking = crate::browser::is_chrome_running();
+                        if chrome_blocking {
+                            info!("Chrome running without CDP; asking user to quit (60s window)");
+                            if let Some(ref tx) = self.notification_tx {
+                                let _ = tx.send(crate::channel::OutboundMessage {
+                                    target_id: ctx.peer_id.clone(),
+                                    is_group: false,
+                                    text: "检测到 Chrome 正在运行但未开启远程调试。\
+                                           为了用你的登录态(cookie/会话)操作浏览器,请退出 Chrome——\
+                                           我会自动用你的默认配置重新打开它(60 秒内有效)。\n\
+                                           若 60 秒内未退出,我将使用临时浏览器(无登录态)继续。"
+                                        .to_string(),
+                                    reply_to: None,
+                                    images: vec![],
+                                    files: vec![],
+                                    channel: Some(ctx.channel.clone()),
+                                    account: None,
+                                });
+                            }
+                            // Cancellable poll: wait for the user to quit Chrome.
+                            // Respects chat.abort via turn_ctx so a user who
+                            // changes their mind isn't stuck waiting 60s.
+                            let deadline = std::time::Instant::now()
+                                + std::time::Duration::from_secs(60);
+                            while std::time::Instant::now() < deadline {
+                                if ctx.turn_ctx.is_cancelled() {
+                                    return Err(anyhow!("turn aborted"));
+                                }
+                                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                                if !crate::browser::is_chrome_running() {
+                                    chrome_blocking = false;
+                                    info!("user quit Chrome; relaunching with default profile + CDP");
+                                    break;
+                                }
+                            }
+                        }
+
+                        // Profile choice: user's real "default" profile when no
+                        // Chrome blocks it (login state), else an isolated temp
+                        // profile (no cookies) as a last resort. Either way the
+                        // Chrome is launched *pool-owned* so it outlives this
+                        // turn and is shared by web_fetch / sub-agents.
+                        let launch_profile: Option<&str> =
+                            if chrome_blocking { None } else { Some("default") };
+                        if chrome_blocking {
+                            warn!("user kept Chrome open; using temporary profile (no login state)");
+                            if let Some(ref tx) = self.notification_tx {
+                                let _ = tx.send(crate::channel::OutboundMessage {
+                                    target_id: ctx.peer_id.clone(),
+                                    is_group: false,
+                                    text: "未检测到你退出 Chrome,本次将使用临时浏览器\
+                                           (无你的登录态/cookie)继续。"
+                                        .to_string(),
+                                    reply_to: None,
+                                    images: vec![],
+                                    files: vec![],
+                                    channel: Some(ctx.channel.clone()),
+                                    account: None,
+                                });
+                            }
                         }
                         match crate::browser::pool::BrowserPool::global()
-                            .chrome_ws_url()
+                            .ensure_owned_chrome(&chrome_path, true, launch_profile)
                             .await
                         {
                             Ok(ws_url) => {
-                                info!("connecting to shared agent pool Chrome (headed fallback)");
                                 crate::browser::BrowserSession::connect_existing(&ws_url).await?
                             }
                             Err(e) => {
-                                warn!(error = %e, "pool Chrome unavailable, last-resort launch");
+                                warn!(error = %e, "pool-owned launch failed, last-resort direct launch");
                                 crate::browser::can_launch_chrome()?;
                                 crate::browser::BrowserSession::start(
                                     &chrome_path,
                                     true,
-                                    Some("default"),
+                                    launch_profile,
                                 )
                                 .await?
                             }
                         }
-                    } else {
-                        // 3. No Chrome running — launch with user profile
-                        //    + CDP. Register with pool so browser_get_article
-                        //    and sub-agents share this single Chrome.
-                        info!("no Chrome running, launching with user default profile + CDP");
-                        crate::browser::can_launch_chrome()?;
-                        let session = crate::browser::BrowserSession::start(
-                            &chrome_path,
-                            true,
-                            Some("default"),
-                        )
-                        .await?;
-                        let port = session.debug_port();
-                        match crate::browser::browser_ws_url_from_port(port).await {
-                            Ok(bws) => {
-                                let _ = crate::browser::pool::BrowserPool::global()
-                                    .set_chrome_ws_url(&bws)
-                                    .await;
-                            }
-                            Err(e) => warn!(error = %e, "pool: failed to register agent-launched Chrome"),
-                        }
-                        session
                     }
                 } else {
                     // Sub/task agents always use the shared pool Chrome.
