@@ -506,151 +506,55 @@ pub fn seed_tools(base_dir: &Path, _lang: Option<&str>) -> Result<usize> {
 // -- Tool prompts (English) --------------------------------------------------
 
 const EN_TOOL_WEB_BROWSER: &str = r#"# web_browser Usage Guide
-
-## Required Flow
-1. **open** — Call `action: "open"` with target URL first
-2. **snapshot** — Call `action: "snapshot"` to get element refs (@e1, @e10, etc.)
-3. **interact** — Use refs for click, fill, etc. Prefer `"ref": "@e10"` over `"text": "..."`
-4. **re-snapshot** — After every click/fill, snapshot again for fresh refs
-5. **Enter to submit** — Use `action: "press"`, `key: "Enter"` to submit forms
-
-## Login Handling
-- Look for QR code login first; if found, screenshot and send to user
-- Wait for user to scan, then continue the task
-- Fall back to phone/SMS login if no QR code available
-
-## Extracting Data
-- Images (filter UI icons, only naturalWidth > 200):
-  `action: "evaluate"`, `js: "(function(){var r=[];document.querySelectorAll('img').forEach(function(i){var s=i.src||i.dataset.src||'';if(s&&s.startsWith('http')&&i.naturalWidth>200)r.push(s);});return JSON.stringify([...new Set(r)]);})()"`
-- Links: `action: "evaluate"`, `js: "Array.from(document.querySelectorAll('a')).map(a=>({href:a.href,text:a.innerText}))"`
-- Download images/files: use `web_download` (supports browser cookies via use_browser_cookies=true), then send_file
-- IMPORTANT: after generating images/files, always extract URL → web_download → send_file to user
-
-## Never
-- Skip open and interact on about:blank
-- Use stale refs after page changes
-- Fabricate image URLs — only use URLs extracted from the page
-- Just reply "done" without actually downloading and sending the generated content to user
+- Login: prefer QR — screenshot it, send to user, wait for scan, continue. Fall back to phone/SMS.
+- Extract images (skip UI icons, naturalWidth>200): `action:"evaluate"`,
+  `js:"(function(){var r=[];document.querySelectorAll('img').forEach(function(i){var s=i.src||i.dataset.src||'';if(s&&s.startsWith('http')&&i.naturalWidth>200)r.push(s);});return JSON.stringify([...new Set(r)]);})()"`
+- Extract links: `js:"Array.from(document.querySelectorAll('a')).map(a=>({href:a.href,text:a.innerText}))"`
+- After generating an image/file on a site: extract URL → `web_download` → `send_file`. Never
+  fabricate URLs or reply "done" without actually delivering the file. Never use stale refs.
 "#;
 
 const EN_TOOL_SHELL: &str = r#"# shell Usage Guide
+- Unfamiliar CLI? Run `tool --help` (or `tool subcommand --help`) FIRST — guessing flag
+  names is a common LLM failure (kebab-case `--dep-date` vs camelCase `--depDate` differ
+  across ecosystems).
+- On failure, read stderr for `tip:` / `Did you mean` (the result JSON's `hint` surfaces
+  these). Use the suggestion or `--help`; do NOT retry the same args.
+- Limit large output with `| head -n 20` / `| tail -n 20`.
+- Long task → wait=false (background). Need output now → wait=true.
 
-## Tool Mastery — Choose the Right Tool
-| Task | Best Tool |
-|------|-----------|
-| HTTP requests, REST APIs, fetching pages | **`web_fetch`** (NOT curl/wget/shell) |
-| File downloads (images/videos/binaries) | **`web_download`** (NOT curl/wget/shell) |
-| File/text ops, pipes, system info | bash/zsh (macOS/Linux) or PowerShell (Windows) |
-| Data processing (CSV/JSON local files) | Python (`python3 -c "..."` or write script) |
-| Package install | pip/npm, or `install_tool` for system tools |
-| Multi-line complex logic | Write to file first, then execute |
+## File attachments from the user
+A `[file:/absolute/path]` in the user's message IS the file — use the path as-is, do NOT
+`ls` to guess it. Paths often contain SPACES (macOS screenshots), so quote them:
+  GOOD: `file '/Users/x/Desktop/Screenshot 2026.png'`   BAD: `file /Users/x/.../Screenshot 2026.png`
 
-## Execution Tips
-- Check if a tool is installed before using (`which python3`, `which node`)
-- Use `install_tool` for system tools (python, node, ffmpeg, chrome)
-- Use pip/npm for language-specific packages
-- Use `| head -n 20` or `| tail -n 20` to limit large output
-- Long tasks: use wait=false (background). Short tasks needing output: wait=true
-- **Unfamiliar CLI tool? Run `tool --help` (or `tool subcommand --help`) FIRST** — guessing flag names is a common LLM failure (kebab-case `--dep-date` vs camelCase `--depDate` differ across ecosystems)
-- If a command fails: check stderr for `tip:` / `Did you mean` suggestions — the result JSON's `hint` field surfaces these on top. Use the suggestion or run `--help` to see real flags. Do NOT retry the same args.
-- Never run dangerous commands (rm -rf /, format, disable firewall)
-
-## File Attachments from the User
-When the user's message contains `[file:/absolute/path/to/file]`, that IS the
-file. Use the path as-is — do NOT `ls` to guess it. The path can (and often
-does) contain SPACES (e.g. macOS screenshots). Quote it:
-  GOOD:  `file '/Users/x/Desktop/Screenshot 2026.png'`
-  GOOD:  `file "/Users/x/Desktop/Screenshot 2026.png"`
-  BAD:   `file /Users/x/Desktop/Screenshot 2026.png`   (word-split into 3 args)
-
-## Shell Redirect Gotcha
-Always put a SPACE before `2>&1` and `&>`. Writing `foo.png2>&1` makes bash
-parse `foo.png2` as the filename (with the `2` as a suffix) — the redirect
-eats the last character of the previous token. This is a classic trap.
-  GOOD:  `cmd args 2>&1`
-  BAD:   `cmd args2>&1`
-
-## Python Quick Patterns
-- One-liner: `python3 -c "import json; print(json.dumps({'key':'val'}))"`
-- Script: write to /tmp/script.py, then `python3 /tmp/script.py`
-- Packages: `pip install pandas requests` then use
-
-## Node.js Quick Patterns
-- One-liner: `node -e "console.log(JSON.stringify({key:'val'}))"`
-- Packages: `npm install -g <pkg>` or `npx <pkg>`
-- For HTTP, use `web_fetch` instead of `node -e "fetch(...)"`.
-
-## Shell Quick Patterns
-- Find files: `find . -name "*.py" -mtime -7`
-- Text processing: `grep -r "pattern" . | head -20`
-- JSON file: `cat file.json | python3 -m json.tool`
-- Process: `ps aux | grep <name>`, `kill <pid>`
-- For HTTP/API requests, use `web_fetch` — NOT `curl`/`wget`.
+## Shell redirect gotcha
+Put a SPACE before `2>&1` / `&>`. `foo.png2>&1` makes bash treat `foo.png2` as the filename
+(the `2` is eaten into the previous token). GOOD: `cmd args 2>&1`  BAD: `cmd args2>&1`
 "#;
 
 // -- web_search / web_fetch prompts -----------------------------------------
 
 const EN_TOOL_WEB_SEARCH: &str = r#"# web_search Usage Guide
+- Open a NAMED site → `web_browser` directly (don't search first). Known URL → `web_fetch`.
+  Open-ended lookup → `web_search`. Files/images/videos → `web_download` (not curl/wget).
+- SHORT keyword queries (2-5 words), `site:` filters for authority. Don't retry the same
+  query after "No results"; don't open a browser for google.com/baidu.com.
 
-## Tool Selection
-- User asks to open a specific site (e.g. "go to douyin") -> use `web_browser` directly, do NOT search first
-- General questions or info lookup -> use `web_search`
-- Known authoritative URL -> use `web_fetch` directly
-- Download files/images/videos -> use `web_download` (supports resume, browser cookies), do NOT use curl/wget
-
-## Prefer direct APIs
-These are cleaner and faster than scraping SEO-polluted search results. Use `web_fetch` (JSON is returned as-is). **Do NOT use curl/exec for these**:
-
+## Prefer direct APIs over scraping SEO results (via `web_fetch`, JSON returned as-is)
 | Intent | URL |
 |---|---|
 | Weather | `https://wttr.in/City?format=j1` |
 | IP geolocation | `https://ipinfo.io/8.8.8.8/json` |
-| Currency rate | `https://api.exchangerate.host/latest?base=USD&symbols=CNY` |
+| Currency | `https://api.exchangerate.host/latest?base=USD&symbols=CNY` |
 | Wikipedia | `https://en.wikipedia.org/api/rest_v1/page/summary/TOPIC` |
 | GitHub | `https://api.github.com/repos/owner/name` |
-
-Use direct API first. web_search for open-ended or unstructured questions only.
-
-## Query rules
-- SHORT keywords (2-5 words), not natural-language questions
-- English for international topics; Chinese for domestic
-- Add `site:` filters for authoritative sources
-
-## Low-quality results
-1. Retry with shorter, simpler keywords
-2. Try a direct API
-3. Use `web_fetch` on a known authoritative URL
-4. Fall back to `web_browser` as last resort
-
-## Never
-- Retry the same query after "No results found"
-- Open a browser to visit google.com / baidu.com
-- Treat zhihu/reddit snippets as authoritative facts
 "#;
 
 const EN_TOOL_WEB_FETCH: &str = r#"# web_fetch Usage Guide
-
-- **PREFERRED for any HTTP request** — web pages, JSON APIs, REST endpoints, documentation, articles
-- **Do NOT** use `shell` with `curl`/`wget`/`Invoke-WebRequest` for HTTP — use web_fetch
-- HTML pages are auto-converted to clean text/markdown
-- JSON / plain-text / non-HTML responses are returned **as-is (raw body)** — works for wttr.in, openweather, github, ipinfo, etc.
-- Use web_fetch for static content; only use web_browser when interaction is needed (login, clicking, form filling)
-- GET requests fall back to browser rendering on HTTP failure or CAPTCHA
-
-## Full HTTP capability
-- `method`: GET (default), POST, PUT, PATCH, DELETE
-- `headers`: object — Authorization, X-API-Key, Cookie, custom Content-Type, etc.
-- `body`: string (sent as-is) or object/array (JSON-serialized; Content-Type set automatically)
-
-Example — authenticated POST:
-```json
-{
-  "url": "https://api.example.com/v1/items",
-  "method": "POST",
-  "headers": {"Authorization": "Bearer abc123"},
-  "body": {"name": "foo", "qty": 3}
-}
-```
+Authenticated POST example (body object auto-JSON-serialized, Content-Type set):
+`{"url": "https://api.example.com/v1/items", "method": "POST",
+  "headers": {"Authorization": "Bearer abc123"}, "body": {"name": "foo", "qty": 3}}`
 
 ## Only fall back to curl/exec for
 - multipart file upload
