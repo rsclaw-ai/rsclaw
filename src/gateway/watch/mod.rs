@@ -167,21 +167,29 @@ impl WatchRegistry {
         // /watch <same-source> calls from both missing dedup and double-spawning.
         let mut inner = self.inner.lock().await;
 
-        // Dedup.
-        if let Some(existing) = inner.get(&key) {
-            let id = existing.id.clone();
-            let started = existing.started_at_ms;
-            let count = existing
-                .event_count
-                .load(std::sync::atomic::Ordering::Relaxed);
-            drop(inner);
+        // Dedup / restart-on-manual-reissue.
+        //
+        // Cron re-issues stay silent (the existing watch is presumed healthy;
+        // restarting it every tick would churn the SSE connection). A MANUAL
+        // re-issue of the same source means "give me a fresh watch" — so we
+        // stop the existing one and fall through to spawn a clean replacement.
+        // This is the one-command recovery for a wedged zombie: SSE still
+        // connected but its processor stuck (e.g. on a hung delivery), so it
+        // silently stops forwarding while the registry still reports it as
+        // "running" and blocks a plain re-watch. (Old behavior: replied
+        // "already running … stop with /watch stop <id>" and refused.)
+        if inner.contains_key(&key) {
             if origin == Origin::Cron {
+                drop(inner);
                 return WatchCommandReply::Silent;
             }
-            let secs = now_ms().saturating_sub(started) / 1000;
-            return WatchCommandReply::Reply(format!(
-                "Watch {id} already running ({secs}s, {count} events). Stop with: /watch stop {id}"
-            ));
+            if let Some(mut task) = inner.remove(&key) {
+                if let Some(tx) = task.stop_tx.take() {
+                    let _ = tx.send(());
+                }
+                info!(id = %task.id, "watch: manual re-issue → restarting (stopped previous)");
+            }
+            // fall through to spawn a fresh watch below
         }
 
         // Concurrency cap.
@@ -430,8 +438,21 @@ impl WatchRegistry {
                 format!("{dropped} more events in 2s, last: {last}")
             }
         };
-        if let Err(e) = delivery::deliver(&self.channels, channel, account, peer, body).await {
-            warn!(channel = %channel, peer = %peer, "watch delivery failed: {e}");
+        // Bound the chat push. A hung send (stale feishu/wechat socket after
+        // a gateway/network blip) must NOT wedge processor_loop — if it does,
+        // src_rx stops draining, events pile up undelivered, and the watch
+        // goes zombie across ALL channels equally while still looking
+        // "running". 15s is ample for a chat API; on timeout we drop this one
+        // message and keep draining.
+        match tokio::time::timeout(
+            Duration::from_secs(15),
+            delivery::deliver(&self.channels, channel, account, peer, body),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!(channel = %channel, peer = %peer, "watch delivery failed: {e}"),
+            Err(_) => warn!(channel = %channel, peer = %peer, "watch delivery timed out (15s); dropped"),
         }
     }
 
