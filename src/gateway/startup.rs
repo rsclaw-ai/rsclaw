@@ -59,7 +59,87 @@ fn is_sync_only_channel(name: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Start the full gateway. Blocks until shutdown (Ctrl-C).
+/// Prepend common tool directories to the process `PATH`, in priority order,
+/// so subprocesses (cap-rs coding agents, shell exec, MCP servers) can find
+/// user-installed binaries even when the gateway was launched from a desktop
+/// app / launchd (which inherit a stripped PATH without the shell profile).
+///
+/// Priority (earlier wins): system package dirs first, then user-local dirs,
+/// then per-tool dirs, finally the inherited PATH. Only existing dirs and
+/// not-already-present entries are added, so this is idempotent and never
+/// shadows a dir the user already ordered ahead.
+fn enrich_process_path() {
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    let current = std::env::var("PATH").unwrap_or_default();
+    let existing: std::collections::HashSet<&str> = current.split(sep).collect();
+
+    let mut prefix: Vec<String> = Vec::new();
+    let mut push_if = |p: String| {
+        if std::path::Path::new(&p).is_dir() && !existing.contains(p.as_str()) {
+            prefix.push(p);
+        }
+    };
+
+    // HIGHEST priority: the single rsclaw shim dir {base_dir}/tools/bin,
+    // populated by sync_tool_shims() with symlinks to each install_tool-
+    // managed binary under its canonical command name. One clean entry that
+    // wins over any system-wide install; respects --profile / --base-dir.
+    push_if(
+        crate::config::loader::base_dir()
+            .join("tools")
+            .join("bin")
+            .to_string_lossy()
+            .to_string(),
+    );
+
+    // System / package-manager dirs next.
+    #[cfg(target_os = "macos")]
+    {
+        for p in ["/usr/local/bin", "/opt/homebrew/bin", "/opt/homebrew/sbin"] {
+            push_if(p.to_owned());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        for p in ["/usr/local/bin"] {
+            push_if(p.to_owned());
+        }
+    }
+    // User-local dirs next.
+    if let Some(home) = dirs_next::home_dir() {
+        for rel in [
+            ".local/bin",
+            ".cargo/bin",
+            "bin",
+            "go/bin",
+            ".bun/bin",
+            ".opencode/bin",
+        ] {
+            push_if(home.join(rel).to_string_lossy().to_string());
+        }
+    }
+
+    if prefix.is_empty() {
+        return;
+    }
+    prefix.push(current);
+    let joined = prefix.join(&sep.to_string());
+    // SAFETY: called once at startup before any worker thread spawns a child.
+    unsafe {
+        std::env::set_var("PATH", &joined);
+    }
+    tracing::info!(path = %joined, "enriched process PATH for subprocess tool resolution");
+}
+
 pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Result<()> {
+    // 0. Refresh the tools/bin shim dir, then enrich the process PATH before
+    //    anything spawns a subprocess. Desktop/launchd-started gateways inherit
+    //    a stripped PATH; the shim dir + PATH prepend let cap-rs coding-agent
+    //    drivers and shell tools resolve every binary by bare name from one
+    //    place. Sync first so the shims exist before PATH points at them.
+    crate::cmd::tools::sync_tool_shims();
+    enrich_process_path();
+
     // 0. Apply global proxy env vars before any HTTP clients are created.
     crate::config::apply_proxy_env(&config);
 

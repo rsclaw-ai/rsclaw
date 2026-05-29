@@ -94,6 +94,27 @@ const TOOLS: &[ToolDef] = &[
         local_bin: "claude-code",
         optional: true,
     },
+    ToolDef {
+        name: "openclaude",
+        display: "OpenClaude (Claude-compatible coding agent, optional)",
+        detect_cmd: &["openclaude"],
+        local_bin: "openclaude",
+        optional: true,
+    },
+    ToolDef {
+        name: "codex",
+        display: "Codex (OpenAI coding agent, optional)",
+        detect_cmd: &["codex"],
+        local_bin: "codex",
+        optional: true,
+    },
+    ToolDef {
+        name: "aider",
+        display: "Aider (AI pair-programming coding agent, optional)",
+        detect_cmd: &["aider"],
+        local_bin: "aider",
+        optional: true,
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -276,6 +297,119 @@ pub async fn fetch_manifest_if_missing() {
 /// Public accessor for the tools dir (used by the agent prompt/tool builders).
 pub fn tools_dir_pub() -> PathBuf {
     tools_dir()
+}
+
+/// Refresh `{base_dir}/tools/bin/` shim symlinks so every installed tool's
+/// real binary is reachable by its canonical command name(s) from a single
+/// PATH entry. cap-rs coding-agent drivers and the shell tool spawn by bare
+/// name, and desktop/launchd gateways inherit a stripped PATH — one shim dir
+/// at the front of PATH fixes both without per-call PATH munging.
+///
+/// Idempotent: stale links are removed and recreated. Tools whose binary
+/// isn't present (partial / failed install) are skipped. Called after
+/// `rsclaw tools install` and at gateway startup.
+pub fn sync_tool_shims() {
+    let tools_dir = tools_dir();
+    let bin_dir = tools_dir.join("bin");
+    if std::fs::create_dir_all(&bin_dir).is_err() {
+        return;
+    }
+    let mut shimmed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for def in TOOLS {
+        let sub = tools_dir.join(def.local_bin);
+        if !sub.is_dir() {
+            continue;
+        }
+        // The real binary sits at <sub>/<name> or <sub>/bin/<name>. Link
+        // under every detect_cmd alias (e.g. claude-code → `claude`, which is
+        // also what cap-rs spawns for the Claudecode driver).
+        for name in def.detect_cmd {
+            let Some(target) = [sub.join(name), sub.join("bin").join(name)]
+                .into_iter()
+                .find(|p| is_executable_file(p))
+            else {
+                continue;
+            };
+            link_shim(&bin_dir, name, &target);
+            shimmed.insert((*name).to_owned());
+        }
+    }
+
+    // Coding-agent binaries cap-rs spawns that may be system-installed rather
+    // than managed by `rsclaw tools install`. For any not already shimmed
+    // above (rsclaw-installed wins), resolve from the system PATH + common
+    // dirs and shim that, so all agents resolve uniformly from tools/bin.
+    for name in CODING_AGENT_NAMES {
+        if shimmed.contains(*name) {
+            continue;
+        }
+        if let Some(target) = resolve_command(name, &bin_dir) {
+            link_shim(&bin_dir, name, &target);
+        } else {
+            // Clear a stale shim if the system binary went away.
+            let _ = std::fs::remove_file(bin_dir.join(name));
+        }
+    }
+}
+
+/// Command names cap-rs spawns for the coding agents. `claude` is the
+/// Claudecode driver's default bin; the rest match their drivers.
+const CODING_AGENT_NAMES: &[&str] = &["opencode", "claude", "openclaude", "codex", "aider"];
+
+fn link_shim(bin_dir: &std::path::Path, name: &str, target: &std::path::Path) {
+    let link = bin_dir.join(name);
+    // Don't link a shim to itself (target resolved to the shim dir).
+    if link == target {
+        return;
+    }
+    let _ = std::fs::remove_file(&link); // clear stale link/file
+    #[cfg(unix)]
+    {
+        let _ = std::os::unix::fs::symlink(target, &link);
+    }
+    #[cfg(windows)]
+    {
+        // Symlinks need privilege on Windows; copy is the safe shim.
+        let _ = std::fs::copy(target, &link);
+    }
+}
+
+/// Resolve a command to an absolute executable by scanning PATH plus common
+/// install dirs. Skips the shim dir itself so we never self-link.
+fn resolve_command(name: &str, shim_dir: &std::path::Path) -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    if let Some(home) = dirs_next::home_dir() {
+        for rel in [".opencode/bin", ".local/bin", ".bun/bin", ".cargo/bin", "bin"] {
+            dirs.push(home.join(rel));
+        }
+    }
+    for d in ["/usr/local/bin", "/opt/homebrew/bin", "/opt/homebrew/sbin"] {
+        dirs.push(PathBuf::from(d));
+    }
+    for d in dirs {
+        if d == shim_dir {
+            continue;
+        }
+        let cand = d.join(name);
+        if is_executable_file(&cand) {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn is_executable_file(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+#[cfg(not(unix))]
+fn is_executable_file(p: &std::path::Path) -> bool {
+    p.is_file()
 }
 
 /// Public accessor for the cached manifest (used by the agent prompt/tool
@@ -713,6 +847,10 @@ pub async fn cmd_install(name: &str, force: bool) -> Result<()> {
             }
         }
     }
+
+    // Refresh tools/bin/ shims so the just-installed binary is reachable by
+    // its command name from the single tools/bin PATH entry (cap-rs + shell).
+    sync_tool_shims();
 
     Ok(())
 }
