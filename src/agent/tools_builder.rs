@@ -274,18 +274,36 @@ pub(crate) fn toolset_allowed_names(
         "skill_use",
     ];
     const CODE: &[&str] = &[
+        // Plugin discovery + invoke
         "plugin_list",
         "plugin_search",
         "plugin_describe",
         "plugin_invoke",
+        // Core file ops
         "shell",
         "read_file",
         "write_file",
+        "edit_file",         // exact-string replace; cheaper than rewriting whole files
         "list_dir",
         "search_file",
         "search_content",
+        // Large tool output handling: backstop artifact (tr_xxxxxxxx) reader
+        "read_artifact",
+        // Memory / KB / skills (read-mostly; users still want recall here)
         "memory",
+        "knowledge_base",
         "skill_use",
+        // Pre-compaction history search (multi-turn coding sessions hit this often)
+        "read_session_archive",
+        // Coding-agent escalation — dispatch big tasks to an external CLI
+        // coding agent (claude-code / openclaude / opencode / codex) via cap-rs.
+        "cap",
+        // Sub-agent dispatch — rsclaw-native task/spawn for non-coding sub-work
+        "agent",
+        // Disambiguation: ask the user when the task description is genuinely ambiguous
+        "clarify",
+        // Mark task done / send final report
+        "task",
     ];
     const STANDARD: &[&str] = &[
         "shell",
@@ -368,13 +386,13 @@ pub fn build_tool_list(
         parameters: json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["search", "get", "put"], "description": "Action to perform: search, get, or put"},
-                "query":  {"type": "string", "description": "Search query (for search). Examples: 'user name', 'project deadlines', 'API keys'"},
-                "id":     {"type": "string", "description": "Memory document ID (for get)"},
-                "text":   {"type": "string", "description": "Content to store (for put). Be specific and include context."},
-                "scope":  {"type": "string", "description": "Scope filter (optional)"},
-                "kind":   {"type": "string", "description": "Document kind: note (general), fact (verified info), remember (user explicitly asked to remember). Do NOT use kind=summary; session summaries are written automatically by /compact and /new."},
-                "top_k":  {"type": "integer", "description": "Max results (for search, default 5)"}
+                "action": {"type": "string", "enum": ["search", "get", "put"], "description": "search | get | put"},
+                "query":  {"type": "string", "description": "Search query (search)."},
+                "id":     {"type": "string", "description": "Memory id (get)."},
+                "text":   {"type": "string", "description": "Content to store (put); be specific, include context."},
+                "scope":  {"type": "string", "description": "Optional scope filter."},
+                "kind":   {"type": "string", "description": "note | fact | remember. Never summary (auto-written by /compact, /new)."},
+                "top_k":  {"type": "integer", "default": 5, "description": "Max results (search)."}
             },
             "required": ["action"]
         }),
@@ -618,10 +636,17 @@ pub fn build_tool_list(
             are auto-extracted to plain text.\n\
             Example: {\"path\":\"config.json\"} or {\"path\":\"src/main.py\"}\n\
             \n\
-            The whole file is read at once — there is no offset/limit yet. For very \
-            large files (logs, dumps), use `search_content` to grep for the relevant \
-            slice and read only the file(s) that match, or read after narrowing with \
-            `search_file`.\n\
+            For text files, output is paginated. By default the first 2000 lines are \
+            returned. Use `offset` (1-indexed line) and `limit` (max lines) for large \
+            files. When the result is truncated, the response contains \
+            `truncated: true` and `next_offset` — continue with `offset=next_offset` \
+            until you have what you need. If you only need to scan for a substring, \
+            `search_content` is cheaper than paging an entire file.\n\
+            \n\
+            For very large outputs (>~4 KB) the runtime backstop replaces the inline \
+            content with a `tool_result_id` (tr_xxxxxxxx) — call `read_artifact` with \
+            `mode=grep:PATTERN` / `head:N` / `tail:N` / `lines:A-B` instead of paging \
+            via offset, it's much cheaper than re-reading via offset.\n\
             \n\
             If you just edited the file in this turn, you do not need to read it again — \
             the prior `read_file` result still reflects what you wrote. Re-reading on \
@@ -629,7 +654,9 @@ pub fn build_tool_list(
         parameters: json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Relative file path. Examples: 'README.md', 'src/app.py', 'data/output.csv'"}
+                "path":   {"type": "string", "description": "Relative file path, e.g. 'src/app.py'."},
+                "offset": {"type": "integer", "default": 1, "description": "1-indexed start line."},
+                "limit":  {"type": "integer", "default": 2000, "description": "Max lines."}
             },
             "required": ["path"]
         }),
@@ -726,16 +753,16 @@ pub fn build_tool_list(
         parameters: json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["search", "add", "create_collection", "list_collections"], "description": "Default \"search\". Write actions only when the user asks."},
-                "query": {"type": "string", "description": "Natural-language search query (action=search)."},
-                "collection_ids": {"type": "array", "items": {"type": "string"}, "description": "Optional: restrict search to specific collection ids. Omit to search all."},
-                "top_k": {"type": "integer", "description": "Max hits to return (action=search). Default 5."},
-                "collection": {"type": "string", "description": "Target collection NAME (action=add); created if it doesn't exist."},
-                "name": {"type": "string", "description": "New collection name (action=create_collection)."},
-                "description": {"type": "string", "description": "Optional collection description (action=create_collection)."},
-                "title": {"type": "string", "description": "Document title (action=add)."},
-                "content": {"type": "string", "description": "Document text to ingest (action=add)."},
-                "mime": {"type": "string", "description": "Optional MIME for content (action=add). Default text/markdown."}
+                "action": {"type": "string", "enum": ["search", "add", "create_collection", "list_collections"], "description": "Default search. Write actions only when asked."},
+                "query": {"type": "string", "description": "Search query."},
+                "collection_ids": {"type": "array", "items": {"type": "string"}, "description": "Restrict to these collection ids; omit for all."},
+                "top_k": {"type": "integer", "default": 5, "description": "Max hits."},
+                "collection": {"type": "string", "description": "Collection NAME (add); created if absent."},
+                "name": {"type": "string", "description": "New collection name."},
+                "description": {"type": "string", "description": "Optional collection description."},
+                "title": {"type": "string", "description": "Document title."},
+                "content": {"type": "string", "description": "Document text to ingest."},
+                "mime": {"type": "string", "default": "text/markdown", "description": "MIME for content."}
             },
             "required": []
         }),
@@ -766,9 +793,9 @@ pub fn build_tool_list(
         parameters: json!({
             "type": "object",
             "properties": {
-                "path":    {"type": "string", "description": "Relative file path within the workspace (REQUIRED). Example: 'output.py'"},
-                "content": {"type": "string", "description": "File content to write (REQUIRED). MUST preserve all numbers, dates, and specific values from the user's message exactly as given."},
-                "explanation": {"type": "string", "description": "Brief explanation of what you are creating and why, to help organize your thoughts before writing content."}
+                "path":    {"type": "string", "description": "Relative file path, e.g. 'output.py'."},
+                "content": {"type": "string", "description": "File content. MUST preserve all numbers/dates/values from the user verbatim."},
+                "explanation": {"type": "string", "description": "Brief note on what you're creating and why."}
             },
             "required": ["path", "content"]
         }),
@@ -864,10 +891,10 @@ pub fn build_tool_list(
         parameters: json!({
             "type": "object",
             "properties": {
-                "path":        {"type": "string", "description": "Relative file path within the workspace. Example: 'src/main.rs'"},
-                "old_string":  {"type": "string", "description": "Exact substring to replace (verbatim, including whitespace). Must be unique unless replace_all=true."},
-                "new_string":  {"type": "string", "description": "Replacement text. May be empty (= deletion of old_string)."},
-                "replace_all": {"type": "boolean", "description": "If true, replace ALL occurrences of old_string. Default: false (requires uniqueness)."}
+                "path":        {"type": "string", "description": "Relative file path, e.g. 'src/main.rs'."},
+                "old_string":  {"type": "string", "description": "Exact substring to replace (verbatim, incl. whitespace). Unique unless replace_all."},
+                "new_string":  {"type": "string", "description": "Replacement; may be empty (= delete)."},
+                "replace_all": {"type": "boolean", "default": false, "description": "Replace ALL occurrences (else requires uniqueness)."}
             },
             "required": ["path", "old_string", "new_string"]
         }),
@@ -895,7 +922,7 @@ pub fn build_tool_list(
         // PowerShell edition quirks) live in the per-session `user_system`
         // "Platform" section (see prompt_builder::build_user_system), which
         // reflects the CLIENT's real OS and never enters the base hash.
-        description: "Run a shell command. Your OS, shell, package manager, and \
+        description: format!("Run a shell command. Your OS, shell, package manager, and \
              shell-specific syntax (command chaining, quoting, encoding) are described in \
              the system prompt's \"Platform\" section — follow those.\n\
              IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`, for HTTP/API requests use `web_fetch`. Only use shell for commands that have no dedicated tool.\n\
@@ -922,15 +949,15 @@ pub fn build_tool_list(
              - NEVER force-push to main / master.\n\
              - NEVER `--no-verify`, `--no-gpg-sign`, or `-c commit.gpgsign=false` unless the user explicitly asks — fix the hook failure instead.\n\
              - AVOID `git add -A` / `git add .` — stage specific files so you don't leak `.env`, credentials, or build artifacts.\n\
-             - Prefer NEW commits over `--amend`; amending after a pre-commit-hook failure can destroy work because the failed commit never landed."
-            .to_owned(),
+             - Prefer NEW commits over `--amend`; amending after a pre-commit-hook failure can destroy work because the failed commit never landed.\n\n{shell_guide}",
+            shell_guide = crate::agent::bootstrap::shell_guide()),
         parameters: json!({
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "Shell command to execute. Must be valid for the current OS."},
-                "timeout": {"type": "integer", "description": "Timeout in seconds (default: 30, max: 300)"},
-                "wait": {"type": "boolean", "description": "If true (default), wait for the command to finish and return stdout/stderr/exit_code. Set to false only for long-running commands (builds, servers, installs) where you want a task_id to poll later."},
-                "task_id": {"type": "string", "description": "Poll a previously started background task by its task_id."}
+                "timeout": {"type": "integer", "default": 30, "description": "Timeout seconds (max 300)."},
+                "wait": {"type": "boolean", "default": true, "description": "Wait for finish (stdout/stderr/exit_code). false → long task, returns task_id to poll."},
+                "task_id": {"type": "string", "description": "Poll a background task by its id."}
             },
             "required": []
         }),
@@ -1038,9 +1065,9 @@ pub fn build_tool_list(
         parameters: json!({
             "type": "object",
             "properties": {
-                "path":      {"type": "string", "description": "Directory path to list. Relative to workspace root or absolute. Examples: '.', 'src/', '/tmp'"},
-                "recursive": {"type": "boolean", "description": "If true, list all files in subdirectories recursively. Default: false."},
-                "pattern":   {"type": "string", "description": "Glob pattern filter. Examples: '*.json', '*.py', 'test_*'"}
+                "path":      {"type": "string", "description": "Dir to list. Relative to workspace or absolute. E.g. '.', 'src/'."},
+                "recursive": {"type": "boolean", "default": false, "description": "Recurse into subdirectories."},
+                "pattern":   {"type": "string", "description": "Glob filter, e.g. '*.json'."}
             }
         }),
     });
@@ -1055,9 +1082,9 @@ pub fn build_tool_list(
         parameters: json!({
             "type": "object",
             "properties": {
-                "pattern": {"type": "string", "description": "REQUIRED: File name pattern with wildcards. Examples: '*.log', 'config*', 'test_*.py', '**/*.rs'"},
-                "path":    {"type": "string", "description": "Root directory to search in. Defaults to workspace root. Can be relative or absolute."},
-                "max_results": {"type": "integer", "description": "Maximum results to return (default: 20)"}
+                "pattern": {"type": "string", "description": "Filename glob, e.g. 'test_*.py', '**/*.rs'."},
+                "path":    {"type": "string", "description": "Root dir. Default workspace root."},
+                "max_results": {"type": "integer", "default": 20, "description": "Max results."}
             },
             "required": ["pattern"]
         }),
@@ -1080,13 +1107,13 @@ pub fn build_tool_list(
         parameters: json!({
             "type": "object",
             "properties": {
-                "pattern":  {"type": "string", "description": "REQUIRED: Regex pattern to search for. Examples: 'TODO', 'import.*from', 'class\\s+\\w+', 'def main'"},
-                "path":     {"type": "string", "description": "File or directory to search in. Defaults to workspace root."},
-                "include":  {"type": "string", "description": "File glob filter. Examples: '*.py', '*.{ts,tsx}', '*.rs'"},
-                "ignore_case": {"type": "boolean", "description": "If true, match case-insensitively. Default: false."},
-                "max_results": {"type": "integer", "description": "Maximum results (default: 20)"},
-                "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"], "description": "Output detail level. 'files_with_matches' is much cheaper than 'content' when you only need to know WHICH files match. Default: 'content'. Requires ripgrep — ignored on fallback."},
-                "multiline":   {"type": "boolean", "description": "Enable cross-line pattern matching. Default: false. Requires ripgrep — ignored on fallback."}
+                "pattern":  {"type": "string", "description": "Regex to search for. E.g. 'class\\s+\\w+', 'def main'."},
+                "path":     {"type": "string", "description": "File/dir to search. Default workspace root."},
+                "include":  {"type": "string", "description": "Glob filter, e.g. '*.{ts,tsx}'."},
+                "ignore_case": {"type": "boolean", "default": false, "description": "Case-insensitive match."},
+                "max_results": {"type": "integer", "default": 20, "description": "Max results."},
+                "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"], "default": "content", "description": "files_with_matches is cheaper when you only need WHICH files match. (ripgrep only)"},
+                "multiline":   {"type": "boolean", "default": false, "description": "Cross-line matching. (ripgrep only)"}
             },
             "required": ["pattern"]
         }),
@@ -1095,7 +1122,7 @@ pub fn build_tool_list(
     // Web tools.
     tools.push(ToolDef {
         name: "web_search".to_owned(),
-        description: "Search the web for real-time information.\n\
+        description: format!("Search the web for real-time information.\n\
             When to use:\n\
             - Questions beyond your knowledge cutoff or training data\n\
             - Current events, recent updates, time-sensitive information\n\
@@ -1113,20 +1140,20 @@ pub fn build_tool_list(
               - [Title](URL)\n\
               - [Title](URL)\n\
             so the user can verify the claim. Unsourced web-search-backed claims feel\n\
-            invented and erode trust.".to_owned(),
+            invented and erode trust.\n\n{}", crate::agent::bootstrap::web_search_guide()),
         parameters: json!({
             "type": "object",
             "properties": {
-                "query":    {"type": "string", "description": "Search query — be specific, include keywords and dates"},
-                "provider": {"type": "string", "description": "Search provider: duckduckgo, google, bing, brave. Leave empty for default."},
-                "limit":    {"type": "integer", "description": "Max results (default 5)"}
+                "query":    {"type": "string", "description": "Search query — specific keywords + dates."},
+                "provider": {"type": "string", "description": "duckduckgo | google | bing | brave. Empty = default."},
+                "limit":    {"type": "integer", "default": 5, "description": "Max results."}
             },
             "required": ["query"]
         }),
     });
     tools.push(ToolDef {
         name: "web_fetch".to_owned(),
-        description: "PREFERRED tool for HTTP requests — web pages, REST APIs, documentation, articles.\n\
+        description: format!("PREFERRED tool for HTTP requests — web pages, REST APIs, documentation, articles.\n\
             Do NOT use shell with curl/wget/Invoke-WebRequest — use web_fetch instead.\n\
             - URL must be fully-formed (https://...)\n\
             - HTTP auto-upgraded to HTTPS\n\
@@ -1161,7 +1188,7 @@ pub fn build_tool_list(
             Redirects: if the response indicates the URL redirected to a DIFFERENT host,\n\
             issue a fresh web_fetch on the redirect URL — do not assume the original URL\n\
             content was served. GET responses are cached for ~15 min keyed on the final\n\
-            URL, so re-fetching after a redirect is cheap.".to_owned(),
+            URL, so re-fetching after a redirect is cheap.\n\n{}", crate::agent::bootstrap::web_fetch_guide()),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -1195,7 +1222,7 @@ pub fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "web_browser".to_owned(),
-        description: "Control a web browser. Core workflow:\n\
+        description: format!("Control a web browser. Core workflow:\n\
             1. `open` — navigate to a URL\n\
             2. `snapshot` — get page structure with interactive element refs (@e1, @e2...). Use `interactive: true` to only get actionable elements (saves tokens). Use `interactive: true, annotate: true` to also get a screenshot with colorful borders + numbered labels overlaid on each element — the model sees both structured text and visual markers for better grounding.\n\
             3. `click` ref=@e1 / `fill` ref=@e2 text='...' — interact using refs\n\
@@ -1236,7 +1263,7 @@ pub fn build_tool_list(
               `screencapture` / Windows / Linux equivalent).\n\
             - Plain `action=screenshot` (no url) only captures what's already\n\
               in the persistent browser session — usually a blank Chrome new\n\
-              tab → near-black PNG. Don't do this.".to_owned(),
+              tab → near-black PNG. Don't do this.\n\n{}", crate::agent::bootstrap::web_browser_guide()),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -1544,47 +1571,20 @@ pub fn build_tool_list(
         }),
     });
     tools.push(ToolDef {
-        name: "opencode".to_owned(),
-        description: "Execute coding/debugging tasks using OpenCode (a powerful coding agent).\n\n\
-            MANDATORY USAGE RULES:\n\
-            1. When user reports a bug/error/crash -> MUST call this tool to investigate\n\
-            2. When user asks to fix/debug a script -> MUST call this tool\n\
-            3. When user says '让opencode...' or '用opencode...' -> MUST call this tool\n\
-            4. DO NOT say '已委托opencode' without actually calling this tool\n\
-            5. Saying you delegated without calling = LYING = worst failure mode\n\
-            \n\
-            If you cannot or will not call this tool, tell user honestly why.\n\
-            NEVER pretend to have called it.\n\
-            \n\
-            Technical: Create project subdirectory for new projects. Runs async, results delivered when complete.".to_owned(),
+        name: "cap".to_owned(),
+        description: "Dispatch a coding task to a CLI coding agent. Pick one of four agents via `agent`.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "task": {"type": "string", "description": "The coding task to execute. Be specific about file paths and always mention creating a project subdirectory for new projects."}
+                "agent": {
+                    "type": "string",
+                    "enum": ["claudecode", "openclaude", "opencode", "codex"],
+                    "description": "claudecode — Anthropic Claude Code (general-purpose, strongest tool use). openclaude — OpenClaude (Claude-compatible OSS fork). opencode — OpenCode (TUI-native, fast iteration). codex — OpenAI Codex (reasoning-heavy, slower)."
+                },
+                "task":  { "type": "string", "description": "Task prompt for the agent." },
+                "cwd":   { "type": "string", "description": "Optional working directory; defaults to the agent workspace." }
             },
-            "required": ["task"]
-        }),
-    });
-    tools.push(ToolDef {
-        name: "claudecode".to_owned(),
-        description: "Execute coding tasks using Claude Code (official Claude Agent SDK via ACP protocol). Uses Claude's native coding capabilities with full context awareness. IMPORTANT: When creating new projects or files, ALWAYS create a dedicated project directory first. The task will run asynchronously and results will be sent when complete.".to_owned(),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "task": {"type": "string", "description": "The coding task to execute. Be specific about requirements and file paths."}
-            },
-            "required": ["task"]
-        }),
-    });
-    tools.push(ToolDef {
-        name: "codex".to_owned(),
-        description: "Execute coding tasks using OpenAI Codex CLI (MCP Server mode). Uses OpenAI's coding capabilities with sandboxed file operations. IMPORTANT: When creating new projects or files, ALWAYS create a dedicated project directory first. Requires Codex CLI installation: npm install -g @openai/codex. The task will run asynchronously and results will be sent when complete.".to_owned(),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "task": {"type": "string", "description": "The coding task to execute. Be specific about requirements and file paths."}
-            },
-            "required": ["task"]
+            "required": ["agent", "task"]
         }),
     });
     // A2A v1.0 INPUT_REQUIRED / AUTH_REQUIRED suspend-resume bridge.

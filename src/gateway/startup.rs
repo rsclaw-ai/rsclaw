@@ -306,6 +306,10 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // share the same sender.
     let (event_tx, _) = broadcast::channel::<crate::events::AgentEvent>(1024);
 
+    // Construct the cap manager once — shared by every AgentRuntime so
+    // `tool_cap` works in production (not just unit tests).
+    let cap_manager = std::sync::Arc::new(crate::cap::CapAgentManager::new(event_tx.clone()));
+
     // Build LiveConfig BEFORE the spawner: hot-reloadable per-domain locks
     // that AgentRuntime reads for live-mutable fields (temperature, etc.).
     let live = Arc::new(LiveConfig::new((*config).clone()));
@@ -328,6 +332,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         event_tx.clone(),
         Some(Arc::clone(&plugins)),
         model_health.clone(),
+        Some(Arc::clone(&cap_manager)),
     );
 
     // Spawn MCP servers and discover tools (before agent tasks so tools are
@@ -384,6 +389,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         computer_status_tx.clone(),
         Arc::clone(&computer_runs),
         model_health.clone(),
+        Arc::clone(&cap_manager),
     );
 
     // Set i18n default language from gateway config.
@@ -1357,6 +1363,7 @@ fn spawn_agent_tasks(
         tokio::sync::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
     >,
     model_health: crate::provider::health::ProviderHealthRegistry,
+    cap_manager: std::sync::Arc<crate::cap::CapAgentManager>,
 ) {
     for (agent_id, mut rx) in receivers {
         let handle = match registry.get(&agent_id) {
@@ -1399,6 +1406,7 @@ fn spawn_agent_tasks(
             mcp.clone(),
             notification_tx.clone(),
             model_health.clone(),
+            Some(Arc::clone(&cap_manager)),
         );
 
         // Inject WASM plugins into the agent runtime.

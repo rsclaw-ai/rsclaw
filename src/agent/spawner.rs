@@ -37,6 +37,9 @@ pub struct AgentSpawner {
     /// spawned sub-agents see the same Disabled/Cooling decisions as the
     /// main loop, so a balance-out doubao trips the chain once globally.
     pub model_health: crate::provider::health::ProviderHealthRegistry,
+    /// Coding-agent cap manager — shared from gateway startup so dynamically
+    /// spawned agents also have `tool_cap` available.
+    pub cap_manager: Option<std::sync::Arc<crate::cap::CapAgentManager>>,
     me: OnceLock<Weak<AgentSpawner>>,
 }
 
@@ -55,6 +58,7 @@ impl AgentSpawner {
         event_tx: broadcast::Sender<AgentEvent>,
         plugins: Option<Arc<PluginRegistry>>,
         model_health: crate::provider::health::ProviderHealthRegistry,
+        cap_manager: Option<std::sync::Arc<crate::cap::CapAgentManager>>,
     ) -> Arc<Self> {
         let s = Arc::new(Self {
             registry,
@@ -67,6 +71,7 @@ impl AgentSpawner {
             event_tx,
             plugins,
             model_health,
+            cap_manager,
             me: OnceLock::new(),
         });
         s.me.set(Arc::downgrade(&s)).ok();
@@ -152,6 +157,7 @@ impl AgentSpawner {
             None, // MCP registry not propagated to dynamically spawned agents
             None, // notification_tx not available for dynamically spawned agents
             self.model_health.clone(),
+            self.cap_manager.clone(),
         );
 
         // Capture for i18n lookup on the error reply path inside the

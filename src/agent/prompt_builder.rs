@@ -616,10 +616,12 @@ fn build_shared_system_prefix_uncached() -> String {
             .to_owned(),
     );
 
-    let tool_prompts = crate::agent::bootstrap::tool_prompts_for_system();
-    if !tool_prompts.is_empty() {
-        parts.push(tool_prompts);
-    }
+    // Per-tool usage guides (shell / web_search / web_fetch / web_browser)
+    // used to live here in the shared prefix. They now ride on each tool's
+    // ToolDef.description (see tools_builder.rs), so a client only pays for
+    // a guide when the tool is actually in its toolset. This removes ~2.3k
+    // tok of web/shell guidance from the cacheable prefix that profiles like
+    // CODE (no web tools) never benefited from. prefix_id bumped accordingly.
 
     parts.push(
         "## Self-Evolution & Skill Autonomy\n\
@@ -679,12 +681,20 @@ fn build_shared_system_prefix_uncached() -> String {
 /// - Installed skills + their on-disk paths
 ///
 /// Never goes into the shared kvCache prefix — sent fresh each turn.
+/// `cap_available` controls whether the "## Coding agents" hint block
+/// is included. Pass `true` when `CapAgentManager` is wired into the
+/// caller's `AgentRuntime` (so `tool_cap` is callable); pass `false`
+/// for tests or runtime paths where the manager wasn't initialised, so
+/// the LLM doesn't see a hint for a tool that will reject with
+/// "CapAgentManager not initialised".
 pub fn build_user_system(
     ws_ctx: &WorkspaceContext,
     skills: &SkillRegistry,
     wasm_plugins: &[WasmPlugin],
     js_plugins: Option<&PluginRegistry>,
     config: &crate::config::schema::Config,
+    toolset: Option<&str>,
+    cap_available: bool,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
 
@@ -692,6 +702,35 @@ pub fn build_user_system(
         parts.push(format!(
             "Default response language: {lang}. Always reply in {lang} unless the user explicitly uses another language."
         ));
+    }
+
+    // Coding profile guidance — appended early so it precedes generic blocks
+    // (plugins / skills / installed tools) and the model reads coding-specific
+    // discipline before being shown the workspace tail. Lives in user_system,
+    // NOT the shared prefix: only this profile's clients see it.
+    if matches!(toolset, Some("code")) {
+        parts.push(build_coding_mode_block());
+
+        // Ancestor AGENTS.md / CLAUDE.md walking, pi-style. Workspace-root
+        // AGENTS.md is already loaded into ws_ctx.agents_md by the regular
+        // workspace loader; start the walk from the workspace's PARENT so
+        // we don't double-inject. Outer-most ancestor renders first so
+        // nested project rules layer on top.
+        if let Some(parent) = ws_ctx.workspace_dir.parent() {
+            let ancestors = super::workspace::collect_ancestor_agents_md(parent, None);
+            if !ancestors.is_empty() {
+                let mut block = String::from("<project_context>\n");
+                for (path, content) in &ancestors {
+                    block.push_str(&format!(
+                        "<project_instructions path=\"{}\">\n{}\n</project_instructions>\n",
+                        path.display(),
+                        content.trim_end()
+                    ));
+                }
+                block.push_str("</project_context>");
+                parts.push(block);
+            }
+        }
     }
 
     // Per-session OS / shell guidance. This reflects the CLIENT's actual
@@ -758,6 +797,34 @@ pub fn build_user_system(
         parts.push(plugins_block);
     }
 
+    // ## Coding agents — hint block for `tool_cap`. Only injected when
+    // CapAgentManager is wired (Some). Lives in user_system rather than
+    // the shared prefix because not every AgentRuntime has cap_manager
+    // (tests, alternate runtimes) — putting it in the shared prefix
+    // would advertise a tool that doesn't always exist. Byte-stable
+    // when cap_available is true so KV-cache prefix holds.
+    if cap_available {
+        parts.push(
+            "## Coding agents (via `cap`)\n\n\
+             You can dispatch a coding task to one of four CLI coding agents via \
+             `cap(agent, task)`. Pick the agent that best fits the task:\n\
+             - `claudecode` — Anthropic Claude Code. Strongest tool use, general-purpose. \
+             Default choice when in doubt.\n\
+             - `openclaude` — Claude-compatible OSS fork. Same interface, different upstream — \
+             pick when the user explicitly asks for it or for cost-sensitive tasks.\n\
+             - `opencode` — OpenCode (TUI-native). Fast iteration on small focused tasks; \
+             lower latency for simple edits.\n\
+             - `codex` — OpenAI Codex. Slower but reasoning-heavy; good for code review, \
+             debugging hard issues, or tasks needing deep analysis.\n\n\
+             `cap` returns `{status: \"submitted\"}` immediately; the agent runs \
+             asynchronously. Live progress reaches the user's IM channel directly. \
+             The final summary arrives as a follow-up message you can act on \
+             (e.g. call `send_file`). Don't wait for the result in the same turn — \
+             acknowledge the dispatch to the user and let the follow-up wake you."
+                .to_owned(),
+        );
+    }
+
     // ## Installed Skills — pure enumeration, sorted by name.
     //
     // The generic "how to invoke a skill" guide lives in
@@ -769,7 +836,14 @@ pub fn build_user_system(
     // SkillRegistry iterates a HashMap whose order is non-deterministic
     // across gateway starts. Sorting by name produces a byte-stable
     // payload so worker-side hashing of system+tools doesn't churn.
-    if !skills.is_empty() {
+    //
+    // Coding profile: skip the full skill enumeration. Installed skills
+    // are overwhelmingly non-coding (image gen, travel booking, video
+    // publishing) and cost ~500-800 tok of user_system noise per turn.
+    // The `skill_search` tool lets the LLM discover a relevant skill on
+    // demand, matching pi's lazy approach.
+    let render_skills = !matches!(toolset, Some("code"));
+    if render_skills && !skills.is_empty() {
         let mut skill_refs: Vec<_> = skills.all().collect();
         skill_refs.sort_by(|a, b| a.name.cmp(&b.name));
         let blocks: Vec<String> = skill_refs
@@ -810,7 +884,9 @@ pub fn build_user_system(
     // over daily. Keeping them at the very tail of user_system means a
     // day-boundary KV miss only re-hydrates this trailing block, not the
     // plugins/skills enumeration above it.
-    let ws_segment = ws_ctx.to_prompt_segment();
+    // Coding profile drops persona files (IDENTITY.md / USER.md) — writing
+    // code doesn't need the agent's personality or the user's bio.
+    let ws_segment = ws_ctx.to_prompt_segment_filtered(matches!(toolset, Some("code")));
     if !ws_segment.is_empty() {
         parts.push(ws_segment);
     }
@@ -830,14 +906,78 @@ pub(crate) fn build_system_prompt(
     wasm_plugins: &[WasmPlugin],
     js_plugins: Option<&PluginRegistry>,
     config: &crate::config::schema::Config,
+    toolset: Option<&str>,
+    cap_available: bool,
 ) -> String {
     let prefix = build_shared_system_prefix();
-    let suffix = build_user_system(ws_ctx, skills, wasm_plugins, js_plugins, config);
+    let suffix = build_user_system(
+        ws_ctx,
+        skills,
+        wasm_plugins,
+        js_plugins,
+        config,
+        toolset,
+        cap_available,
+    );
     if suffix.is_empty() {
         prefix
     } else {
         format!("{prefix}\n\n{suffix}")
     }
+}
+
+/// Coding-profile guidance block. Appended to user_system when the agent's
+/// `model.toolset` is `"code"`. Borrows the well-trodden directives from
+/// pi/coding-agent (proven over 76 versions) and harmonizes them with rsclaw
+/// conventions (edit_file existence, read_artifact backstop, cap-rs escalation).
+fn build_coding_mode_block() -> String {
+    [
+        "## Coding profile (toolset=code)",
+        "",
+        "You are operating as a focused coding assistant. The user wants code \
+         changed, debugged, or shipped. Skip pleasantries, IM-channel chatter, \
+         and \"as an AI\" hedging. Apply changes directly using the tools below.",
+        "",
+        "**Tool preference order for file work:**",
+        "1. `edit_file` for modifying existing files — exact-string replacement, \
+            sends a small diff. PREFER THIS over `write_file` whenever possible.",
+        "2. `write_file` only for: (a) new files, (b) full rewrites where most \
+            content changes.",
+        "3. `read_file` BEFORE every `write_file` or `edit_file` on an existing \
+            file. If you have not read the file this session, you do not know \
+            what's in it and must not overwrite it.",
+        "4. `search_content` / `search_file` for locating things — cheaper than \
+            paging a whole file via `read_file` offset.",
+        "5. `read_artifact` when a previous tool returned a `tool_result_id` \
+            (tr_xxxxxxxx) — use `mode=grep:PATTERN` / `head:N` / `lines:A-B` \
+            rather than re-running the tool.",
+        "",
+        "**When NOT to do it yourself — escalate with `cap`:**",
+        "- Multi-file refactor across >5 files",
+        "- New module / feature with >200 LOC of fresh code",
+        "- Debug session that crosses >3 files",
+        "Dispatch to an external coding agent via `cap` (see the \"Coding \
+         agents\" section for how to pick claudecode / openclaude / opencode / \
+         codex). You stay in charge of small surgical edits; hand the heavy \
+         multi-file work to `cap` and let its async follow-up wake you.",
+        "",
+        "**Project instructions:** If `AGENTS.md` or `CLAUDE.md` files exist in \
+         the current working directory or any ancestor directory, their contents \
+         appear in `<project_instructions path=\"...\">…</project_instructions>` \
+         tags below. Treat them as authoritative project rules.",
+        "",
+        "**Discipline:**",
+        "- Do not invent file paths, function names, or APIs. If unsure, \
+           `search_content` first or `clarify` with the user.",
+        "- When `edit_file` fails with \"not found\", re-read the file with \
+           `read_file` — DO NOT retry the same `old_string`.",
+        "- After a successful edit you do NOT need to re-read the file in the \
+           same turn. The prior read content is still accurate for what you \
+           just wrote.",
+        "- For long shell commands, prefer `wait=false` and poll via `task_id` \
+           on later turns; do NOT sleep-loop.",
+    ]
+    .join("\n")
 }
 
 /// Names of tools compiled into the RsClaw binary — byte-stable across
@@ -877,9 +1017,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "cron",
     "session",
     "gateway",
-    "opencode",
-    "claudecode",
-    "codex",
+    "cap",
     "channel",
     "anycli",
     "clarify",
@@ -994,5 +1132,41 @@ mod tests {
         assert!(prompt.contains("Hard anti-patterns"));
         assert!(prompt.contains("`meituan-travel`"));
         assert!(prompt.contains("WRONG"));
+    }
+
+    fn empty_user_system(cap_available: bool) -> String {
+        // Bare-minimum context — empty skills, no plugins, default
+        // workspace. Just enough to exercise the cap_available branch.
+        // toolset=None so the coding-profile block stays out of this fixture.
+        let ws = WorkspaceContext::default();
+        let skills = SkillRegistry::new();
+        let config = crate::config::schema::Config::default();
+        build_user_system(&ws, &skills, &[], None, &config, None, cap_available)
+    }
+
+    #[test]
+    fn user_system_includes_cap_block_when_available() {
+        let prompt = empty_user_system(true);
+        assert!(
+            prompt.contains("## Coding agents (via `tool_cap`)"),
+            "expected cap block in: {prompt}"
+        );
+        // All 4 agent kinds named.
+        assert!(prompt.contains("`claudecode`"));
+        assert!(prompt.contains("`openclaude`"));
+        assert!(prompt.contains("`opencode`"));
+        assert!(prompt.contains("`codex`"));
+        // Async-submission semantics are documented so the LLM doesn't
+        // wait for the result in the same turn.
+        assert!(prompt.contains("returns `{status: \"submitted\"}` immediately"));
+    }
+
+    #[test]
+    fn user_system_omits_cap_block_when_unavailable() {
+        let prompt = empty_user_system(false);
+        assert!(
+            !prompt.contains("tool_cap"),
+            "cap block leaked when manager unavailable: {prompt}"
+        );
     }
 }

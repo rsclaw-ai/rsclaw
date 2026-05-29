@@ -72,7 +72,7 @@ src/
               Qwen Ollama + 25+ OAI-compat + rsclaw (kvCacheMode=2) + failover
   store/      redb KV + tantivy full-text + hnsw_rs vector
   ws/         WebSocket protocol v3 (OpenClaw-compatible)
-  acp/        Agent Client Protocol
+  cap/        cap-protocol coding-agent driver (claudecode/openclaude/opencode/codex)
   a2a/        Google A2A v1.0 (cross-network agent collaboration)
   mcp/        MCP client (stdin/stdout JSON-RPC)
   plugin/     Shell bridge, hook registration
@@ -297,7 +297,8 @@ it work") require constant clarification.
 | WebSocket protocol v3 | `src/ws/` |
 | All HTTP endpoints | `src/server/` |
 | OpenAI-compat inbound | `src/server/openai.rs` (or similar) |
-| A2A / ACP inbound | `src/a2a/`, `src/acp/` |
+| A2A inbound | `src/a2a/` |
+| Coding-agent driver (cap-protocol) | `src/cap/` |
 | LLM provider registry | `src/gateway/providers.rs` (entry), `src/provider/registry.rs` |
 | LLM provider trait | `src/provider/mod.rs` (LlmProvider, LlmRequest, kv_cache_mode) |
 | rsclaw-server provider (kvCacheMode=2) | `src/provider/rsclaw.rs` |
@@ -392,6 +393,32 @@ consistently strongest across providers.
 3. src/gateway/providers.rs           — add registration block (config-driven + env-var fallback)
 4. ui/app/components/onboarding.tsx   — add to ALL_PROVIDERS for UI
 ```
+
+### Coding-agent integration (cap-protocol)
+
+rsclaw drives external CLI coding agents (Claude Code, OpenClaude, OpenCode,
+Codex) through [cap-protocol](https://github.com/rsclaw-ai/cap-protocol)
+(`cap-rs`). The LLM uses a single tool `tool_cap(agent, task, cwd?, model?)`
+where `agent` is one of `claudecode | openclaude | opencode | codex`.
+
+Implementation: `src/cap/` — `mod.rs` (driver dispatch), `runtime.rs` (process
+management + streaming), `bridge.rs` (i18n bridge), `permission.rs` (auto-approve).
+
+**Binary resolution** (override via env when not on `$PATH`):
+
+| Agent | Binary | Env override |
+|---|---|---|
+| claudecode | `claude` | `CLAUDE_BIN` |
+| openclaude | `openclaude` | `OPENCLAUDE_BIN` |
+| opencode | `opencode` | `OPENCODE_BIN` |
+| codex | `codex` | *(must be on `$PATH`; no env override yet)* |
+
+**Permission policy:** the driver auto-approves every permission request from
+the subprocess. Human-in-the-loop (conversation mode) is P2 scope, not yet
+implemented.
+
+**i18n keys:** `acp_*` prefix (kept for historical continuity). Values use
+`{name}` placeholder so no agent-specific string exists in the key body.
 
 ---
 
@@ -515,7 +542,7 @@ If any QA check is ambiguous or a breaking change touches `ws/` or
 | `/.well-known/agent.json` | GET | A2A Agent Card |
 | `/api/v1/a2a` | POST | A2A JSON-RPC tasks |
 
-(WebSocket v3 + ACP endpoints are separate, see `src/ws/` and `src/acp/`.)
+(WebSocket v3 endpoints are separate, see `src/ws/`. Coding-agent driver lives in `src/cap/`.)
 
 ---
 

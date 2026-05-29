@@ -109,7 +109,25 @@ async fn dump_prompt_spec(args: DumpPromptSpecArgs) -> Result<()> {
     // than a divergent live state. Skills load from disk via the
     // SkillRegistry above; that's enough for the prompt-spec dump.
     let shared_prefix = build_shared_system_prefix();
-    let user_system = build_user_system(&ws_ctx, &skills, &[], None, &config.raw);
+    // Toolset resolution (highest priority first):
+    //   1. --toolset CLI flag (lets us dump baselines without editing config)
+    //   2. agent's model.toolset
+    //   3. None (no coding-profile block, no whitelist filtering)
+    let toolset: Option<String> = args
+        .toolset
+        .clone()
+        .or_else(|| agent_cfg.model.as_ref().and_then(|m| m.toolset.clone()));
+    // Debug dump is a no-runtime path — `cap_available = true` so the
+    // dumped prompt-spec shows what the live agent sees (tool_cap hint present).
+    let user_system = build_user_system(
+        &ws_ctx,
+        &skills,
+        &[],
+        None,
+        &config.raw,
+        toolset.as_deref(),
+        true,
+    );
 
     // 6. Build the merged tool list, then split by name into the cacheable
     //    built-ins vs the per-machine remainder. `build_tool_list` only knows about
@@ -138,6 +156,20 @@ async fn dump_prompt_spec(args: DumpPromptSpecArgs) -> Result<()> {
             }),
         });
     }
+
+    // Apply toolset filter to mirror what a live AgentRuntime does (see
+    // runtime.rs around the `toolset_allowed_names` call). Without this,
+    // a `--toolset code` dump still shows every tool — defeating the
+    // purpose of inspecting the coding-profile baseline.
+    if let Some(toolset_str) = toolset.as_deref() {
+        let custom_tools = agent_cfg.model.as_ref().and_then(|m| m.tools.as_ref());
+        if let Some(allowed) =
+            crate::agent::tools_builder::toolset_allowed_names(toolset_str, custom_tools)
+        {
+            tool_defs.retain(|t| allowed.contains(t.name.as_str()));
+        }
+    }
+
     let to_json = |t: &crate::provider::ToolDef| {
         json!({
             "name": t.name,
@@ -180,6 +212,7 @@ async fn dump_prompt_spec(args: DumpPromptSpecArgs) -> Result<()> {
         json!({
             "rsclaw_version": rsclaw_version,
             "agent_id": agent_id,
+            "toolset": toolset,
             "shared_prefix": shared_prefix,
             "user_system": user_system,
             "builtin_tools": builtin_tools,

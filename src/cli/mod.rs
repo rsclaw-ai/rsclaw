@@ -3,7 +3,6 @@
 
 use clap::{Parser, Subcommand};
 
-pub mod acp;
 pub mod agent_turn;
 pub mod agents;
 pub mod anycli;
@@ -40,7 +39,6 @@ pub mod tools;
 pub mod watch;
 pub mod webhooks;
 
-pub use acp::AcpCommand;
 pub use agent_turn::AgentTurnArgs;
 pub use agents::{AgentsCommand, BindArgs};
 pub use anycli::AnycliCommand;
@@ -270,10 +268,6 @@ pub enum Command {
     #[command(subcommand)]
     Pairing(PairingCommand),
 
-    /// ACP protocol commands - control coding agents
-    #[command(subcommand)]
-    Acp(AcpCommand),
-
     /// Manage exec approvals.
     #[command(subcommand)]
     Approvals(ApprovalsCommand),
@@ -378,6 +372,13 @@ pub struct DumpPromptSpecArgs {
     /// noise.
     #[arg(long)]
     pub shared_only: bool,
+
+    /// Override the toolset preset for this dump. Useful for inspecting
+    /// the baseline `coding` profile output without editing config first.
+    /// Values: "minimal" | "standard" | "web" | "code" | "full".
+    /// Defaults to the agent's configured `model.toolset` (or "standard").
+    #[arg(long)]
+    pub toolset: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]

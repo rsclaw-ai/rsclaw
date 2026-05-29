@@ -1,4 +1,11 @@
-//! Tests for new features: User-Agent configuration and OpenCode tool
+//! Tests for new features: User-Agent configuration and coding-agent
+//! tool surface.
+//!
+//! The coding-agent tests changed shape during the cap migration: the
+//! four old `tool_opencode/codex/claudecode` entries collapsed into a
+//! single `tool_cap` with an `agent` enum. Source-level smoke checks
+//! below verify the new surface stays wired; behavioural coverage
+//! lives in `cap::*` unit tests inside the lib crate.
 
 // ---------------------------------------------------------------------------
 // User-Agent from providers.json
@@ -101,49 +108,30 @@ fn user_agent_none_when_no_config() {
 }
 
 // ---------------------------------------------------------------------------
-// OpenCode ToolDef
+// Coding-agent tool surface (post-cap migration)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn opencode_tooldef_in_tool_list() {
-    // Check that opencode tool definition is present in runtime.rs
-    // This tests the static definition by searching for it in the source
-
+fn tool_cap_registered_in_tool_builder() {
     let source = include_str!("../src/agent/tools_builder.rs");
-
-    // Check that opencode tool is defined
     assert!(
-        source.contains(r#"name: "opencode".to_owned()"#),
-        "opencode tool should be defined in tools_builder.rs"
+        source.contains(r#"name: "cap".to_owned()"#),
+        "tool_cap should be registered in tools_builder.rs"
     );
-
-    // Check that it has the correct description
-    assert!(
-        source.contains("OpenCode"),
-        "opencode tool should mention OpenCode"
-    );
-
-    // Check that it has task parameter
-    assert!(
-        source.contains(r#""task""#),
-        "opencode tool should have task parameter"
-    );
+    for agent in ["claudecode", "openclaude", "opencode", "codex"] {
+        assert!(
+            source.contains(agent),
+            "tool_cap should mention agent `{agent}`"
+        );
+    }
 }
 
 #[test]
-fn opencode_tool_dispatch_exists() {
-    // Verify that the dispatch logic handles opencode
+fn tool_cap_dispatched_in_runtime() {
     let source = include_str!("../src/agent/runtime.rs");
-
     assert!(
-        source.contains(r#""opencode" => return self.tool_opencode(ctx, args).await"#),
-        "opencode tool should be dispatched in runtime"
-    );
-
-    let acp_source = include_str!("../src/agent/tools_acp.rs");
-    assert!(
-        acp_source.contains("async fn tool_opencode"),
-        "tool_opencode method should exist in tools_acp.rs"
+        source.contains(r#""cap" => return self.tool_cap(ctx, args).await"#),
+        "tool_cap should be dispatched in runtime"
     );
 }
 
@@ -171,48 +159,25 @@ fn provider_config_has_user_agent_field() {
 }
 
 // ---------------------------------------------------------------------------
-// OpenCode tool implementation exists
+// Cap tool implementation smoke checks
 // ---------------------------------------------------------------------------
 
 #[test]
-fn opencode_tool_calls_acp_client() {
-    // Verify tool_opencode implementation uses AcpClient
-    let source = include_str!("../src/agent/tools_acp.rs");
-
+fn tool_cap_drives_cap_agent_manager() {
+    // tool_cap goes through CapAgentManager::dispatch_async rather
+    // than directly poking an AcpClient. Behavioural coverage lives in
+    // cap::* unit tests (run_turn_*, bridge::tests, permission::tests).
+    let source = include_str!("../src/agent/tools_cap.rs");
     assert!(
-        source.contains("crate::acp::client::AcpClient"),
-        "tool_opencode should use AcpClient"
+        source.contains("CapAgentManager"),
+        "tool_cap should reference CapAgentManager"
     );
-
     assert!(
-        source.contains("AcpClient::spawn"),
-        "tool_opencode should spawn AcpClient"
+        source.contains("dispatch_async"),
+        "tool_cap should call dispatch_async (returns Submitted, not blocking)"
     );
-
     assert!(
-        source.contains(".initialize("),
-        "tool_opencode should initialize the client"
-    );
-
-    assert!(
-        source.contains("client.create_session"),
-        "tool_opencode should create session"
-    );
-
-    // Method call might be .send_prompt( or client.send_prompt
-    assert!(
-        source.contains("send_prompt"),
-        "tool_opencode should send prompt"
-    );
-}
-
-#[test]
-fn opencode_tool_handles_session_id() {
-    // Verify that session_id parameter is handled
-    let source = include_str!("../src/agent/tools_acp.rs");
-
-    assert!(
-        source.contains("session_id"),
-        "tool_opencode should handle session_id"
+        source.contains("\"status\": \"submitted\""),
+        "tool_cap should return status=submitted to the LLM"
     );
 }

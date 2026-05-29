@@ -1083,6 +1083,12 @@ impl AgentRuntime {
          [THE MOST IMPORTANT FIELD. Copy the user's most recent unfulfilled request \
          verbatim. If no outstanding task, write \"None.\"]\n\n\
          ## Goal\n[Overall goal]\n\n\
+         ## Constraints & Preferences\n\
+         [User-stated constraints or preferences mentioned anywhere in this session: \
+         response language (Chinese / English), tooling choice (npm vs pnpm, Rust \
+         edition, package manager), style rules, deadlines, banned approaches \
+         (\"no force-push\", \"keep backward compatibility\"), required-platform \
+         compatibility (Windows, Linux). If none: (none)]\n\n\
          ## Completed\n[Numbered list: N. ACTION target - outcome]\n\n\
          ## Active State\n[Modified files, test status, running processes, branch]\n\n\
          ## In Progress\n[Work underway when compaction fired]\n\n\
