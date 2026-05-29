@@ -486,11 +486,19 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             info!("notification router started");
             while let Ok(msg) = rx.recv().await {
                 if let Some(ref ch_name) = msg.channel {
-                    // Get sender BEFORE any await — drop guard immediately after cloning sender
+                    // Try per-account sender first (wechat/acct → wechat),
+                    // same pattern as task_queue::channel_tx_for.
                     let tx = {
                         let senders_guard =
                             senders.read().expect("channel_senders RwLock poisoned");
-                        senders_guard.get(ch_name).cloned()
+                        msg.account
+                            .as_ref()
+                            .filter(|a| !a.is_empty())
+                            .and_then(|acct| {
+                                let key = format!("{ch_name}/{acct}");
+                                senders_guard.get(&key).cloned()
+                            })
+                            .or_else(|| senders_guard.get(ch_name).cloned())
                     };
                     if let Some(tx) = tx {
                         info!(channel = %ch_name, target_id = %msg.target_id, "routing notification");
