@@ -5598,11 +5598,20 @@ impl AgentRuntime {
             // than 150ms without flooding the frontend's per-delta markdown
             // re-parse (which has no render throttle of its own). Card-based
             // channels keep 150ms.
-            let delta_flush_interval = if matches!(ctx.channel.as_str(), "ws" | "desktop") {
-                std::time::Duration::from_millis(100)
+            // ws/desktop now has a client-side typewriter reveal (chat.tsx
+            // useTypewriter), so a tighter 50ms cadence keeps the frontend's
+            // target text fresh without affecting visual smoothness — the
+            // reveal interpolates regardless. Card-based channels stay at
+            // 150ms to avoid IM card-update throttling.
+            let is_local_ui = matches!(ctx.channel.as_str(), "ws" | "desktop");
+            let delta_flush_interval = if is_local_ui {
+                std::time::Duration::from_millis(50)
             } else {
                 std::time::Duration::from_millis(150)
             };
+            // Char-count flush trigger: 40 for the local UI (finer chunks,
+            // fresher reveal), 80 for card channels (fewer card edits).
+            let delta_flush_chars = if is_local_ui { 40 } else { 80 };
             let mut delta_buf = String::new();
             let mut last_delta_flush = std::time::Instant::now();
 
@@ -5659,7 +5668,7 @@ impl AgentRuntime {
                         delta_buf.push_str(&delta);
                         let now = std::time::Instant::now();
                         let elapsed = now.duration_since(last_delta_flush);
-                        if delta_buf.len() >= 80 || elapsed >= delta_flush_interval {
+                        if delta_buf.len() >= delta_flush_chars || elapsed >= delta_flush_interval {
                             if let Some(ref bus) = self.event_bus {
                                 let _ = bus.send(AgentEvent {
                                     session_id: ctx.session_key.clone(),

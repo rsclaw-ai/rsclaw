@@ -1231,6 +1231,130 @@ function ThinkBlock({ message }: { message: any }) {
   );
 }
 
+/**
+ * Smooth typewriter reveal. The backend streams text in ~80-char / 100ms
+ * chunks (runtime.rs delta debounce), so feeding raw chunks straight to
+ * render makes the bubble jump block-by-block. This hook decouples the
+ * visual reveal from network chunk size: it keeps a `shown` cursor and
+ * advances it toward `target.length` on each animation frame, catching up
+ * faster the further behind it is so it never lags meaningfully.
+ *
+ * - Not streaming (history / finished turns): returns the full text at once.
+ * - Streaming: returns a growing prefix, animated.
+ */
+function useTypewriter(target: string, streaming: boolean): string {
+  const [shown, setShown] = useState(streaming ? 0 : target.length);
+  const shownRef = useRef(shown);
+  shownRef.current = shown;
+  const rafRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (!streaming) {
+      // Finished or historical: reveal everything, stop any loop.
+      if (rafRef.current != null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      setShown(target.length);
+      return;
+    }
+    let cancelled = false;
+    const step = () => {
+      if (cancelled) return;
+      const cur = shownRef.current;
+      const tgt = target.length;
+      if (cur < tgt) {
+        const remaining = tgt - cur;
+        // Adaptive: ~1/8 of the backlog per frame (min 1 char). At 60fps a
+        // typical 80-char chunk reveals in ~130ms; large backlogs drain fast.
+        const inc = Math.max(1, Math.ceil(remaining / 8));
+        setShown(Math.min(tgt, cur + inc));
+        rafRef.current = requestAnimationFrame(step);
+      } else {
+        rafRef.current = null;
+      }
+    };
+    if (rafRef.current == null && shownRef.current < target.length) {
+      rafRef.current = requestAnimationFrame(step);
+    }
+    return () => {
+      cancelled = true;
+      if (rafRef.current != null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+    };
+  }, [target, streaming]);
+
+  // Clamp when the target shrinks (session switch / reset reuses the bubble).
+  useEffect(() => {
+    if (shownRef.current > target.length) setShown(target.length);
+  }, [target.length]);
+
+  return streaming ? target.slice(0, Math.min(shown, target.length)) : target;
+}
+
+/**
+ * Assistant message body. Extracted from the message map into a real
+ * component so it can own the `useTypewriter` hook (hooks can't live in a
+ * `.map()` callback). Applies the reveal to the cleaned content BEFORE the
+ * chunk/tool parsing pipeline, so the whole downstream render sees a
+ * progressively-growing prefix — which the parser already tolerates
+ * (unclosed tags at the tail render inline while streaming).
+ */
+function AssistantBody(props: {
+  cleanContent: string;
+  streaming?: boolean;
+  contentEmpty: boolean;
+  preview?: boolean;
+  fontSize: number;
+  fontFamily: string;
+  scrollRef: React.RefObject<HTMLDivElement>;
+  defaultShow: boolean;
+  msgText: string;
+  isMobileScreen: boolean;
+  setUserInput: (v: string) => void;
+}) {
+  const revealed = useTypewriter(props.cleanContent, !!props.streaming);
+  const chunks = parseAssistantChunks(revealed);
+  if (chunks.length === 0) {
+    return (
+      <Markdown
+        key={props.streaming ? "loading" : "done"}
+        content=""
+        loading={(props.preview || props.streaming) && props.contentEmpty}
+        fontSize={props.fontSize}
+        fontFamily={props.fontFamily}
+        parentRef={props.scrollRef}
+        defaultShow={props.defaultShow}
+      />
+    );
+  }
+  return (
+    <>
+      {groupChatChunks(chunks).map((g, gIdx) =>
+        g.kind === "text" ? (
+          <Markdown
+            key={`t-${gIdx}-${props.streaming ? "s" : "d"}`}
+            content={g.content}
+            loading={false}
+            onDoubleClickCapture={() => {
+              if (!props.isMobileScreen) return;
+              props.setUserInput(props.msgText);
+            }}
+            fontSize={props.fontSize}
+            fontFamily={props.fontFamily}
+            parentRef={props.scrollRef}
+            defaultShow={props.defaultShow}
+          />
+        ) : (
+          <ToolGroupBlock key={`g-${gIdx}`} items={g.items} streaming={props.streaming} />
+        ),
+      )}
+    </>
+  );
+}
+
 function _Chat() {
   type RenderMessage = ChatMessage & { preview?: boolean };
 
@@ -2448,48 +2572,21 @@ function _Chat() {
                                   );
                                 })()}
                               </>
-                            ) : (() => {
-                              const chunks = parseAssistantChunks(rsExtract.cleanContent);
-                              if (chunks.length === 0) {
-                                return (
-                                  <Markdown
-                                    key={message.streaming ? "loading" : "done"}
-                                    content=""
-                                    loading={
-                                      (message.preview || message.streaming) &&
-                                      message.content.length === 0
-                                    }
-                                    fontSize={fontSize}
-                                    fontFamily={fontFamily}
-                                    parentRef={scrollRef}
-                                    defaultShow={i >= messages.length - 6}
-                                  />
-                                );
-                              }
-                              return groupChatChunks(chunks).map((g, gIdx) =>
-                                g.kind === "text" ? (
-                                  <Markdown
-                                    key={`t-${gIdx}-${message.streaming ? "s" : "d"}`}
-                                    content={g.content}
-                                    loading={false}
-                                    onDoubleClickCapture={() => {
-                                      if (!isMobileScreen) return;
-                                      setUserInput(msgText);
-                                    }}
-                                    fontSize={fontSize}
-                                    fontFamily={fontFamily}
-                                    parentRef={scrollRef}
-                                    defaultShow={i >= messages.length - 6}
-                                  />
-                                ) : (
-                                  <ToolGroupBlock
-                                    key={`g-${gIdx}`}
-                                    items={g.items}
-                                    streaming={message.streaming}
-                                  />
-                                ),
-                              );
-                            })()}
+                            ) : (
+                              <AssistantBody
+                                cleanContent={rsExtract.cleanContent}
+                                streaming={message.streaming}
+                                contentEmpty={message.content.length === 0}
+                                preview={message.preview}
+                                fontSize={fontSize}
+                                fontFamily={fontFamily}
+                                scrollRef={scrollRef}
+                                defaultShow={i >= messages.length - 6}
+                                msgText={msgText}
+                                isMobileScreen={isMobileScreen}
+                                setUserInput={setUserInput}
+                              />
+                            )}
                             {msgImages.length == 1 && (
                               <img
                                 className={styles["chat-message-item-image"]}
