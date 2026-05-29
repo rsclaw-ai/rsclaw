@@ -1740,6 +1740,96 @@ impl AgentRuntime {
     /// (HTML, search results, screenshots) is never concatenated into the
     /// conversation. Returns the extracted text; error means caller should fall
     /// back to plain truncation.
+    /// Per-turn aggregate input guard. Caps the total ToolResult payload in
+    /// `scratchpad` to `budget` tokens by trimming the largest results first.
+    ///
+    /// Each trimmed result keeps (or, when it has none yet, is given) a
+    /// `read_artifact` handle so the model can page into the full content —
+    /// this is lossless pagination, not lossy truncation. `read_artifact`'s
+    /// own results are already ≤ budget (paginated in `tool_read_artifact`),
+    /// so they're never the largest and pass through untouched. skill_use /
+    /// other large contract docs ARE included (no exemption): a 60k-token
+    /// SKILL.md sent whole would blow the kvCacheMode=2 session in one shot,
+    /// so it's paged with a strong "read all pages before executing" hint.
+    ///
+    /// No-op when the aggregate already fits.
+    async fn cap_turn_input_to_budget(&self, session_key: &str, scratchpad: &mut [Message], budget: usize) {
+        use super::context_mgr::estimate_tokens;
+        use crate::provider::ContentPart;
+
+        // Index every ToolResult part with its current token cost.
+        let mut idx: Vec<(usize, usize, usize)> = Vec::new();
+        for (mi, msg) in scratchpad.iter().enumerate() {
+            if let MessageContent::Parts(parts) = &msg.content {
+                for (pi, part) in parts.iter().enumerate() {
+                    if let ContentPart::ToolResult { content, .. } = part {
+                        idx.push((mi, pi, estimate_tokens(content)));
+                    }
+                }
+            }
+        }
+        let mut total: usize = idx.iter().map(|(_, _, t)| *t).sum();
+        if total <= budget {
+            return;
+        }
+
+        // Floor so each trimmed result keeps a useful head + its handle.
+        const MIN_RESULT_TOKENS: usize = 256;
+        // Trim the biggest results first.
+        idx.sort_by_key(|(_, _, t)| std::cmp::Reverse(*t));
+
+        for (mi, pi, toks) in idx {
+            if total <= budget {
+                break;
+            }
+            let excess = total - budget;
+            let target = toks.saturating_sub(excess).max(MIN_RESULT_TOKENS);
+            if target >= toks {
+                continue; // already at/under its share
+            }
+            let MessageContent::Parts(parts) = &mut scratchpad[mi].content else {
+                continue;
+            };
+            let Some(ContentPart::ToolResult { content, .. }) = parts.get_mut(pi) else {
+                continue;
+            };
+            let new = self.paginate_tool_result(session_key, content, target).await;
+            let new_toks = estimate_tokens(&new);
+            total = total + new_toks - toks;
+            *content = new;
+        }
+    }
+
+    /// Trim one tool-result `content` to ~`target` tokens, preserving (or
+    /// minting) a `read_artifact` handle so the full content stays
+    /// recoverable. Whole-line / char-safe head via `paginate_to_budget`.
+    async fn paginate_tool_result(&self, session_key: &str, content: &str, target: usize) -> String {
+        use super::tools_artifact::{paginate_to_budget, split_artifact_marker};
+
+        let (body, existing_marker) = split_artifact_marker(content);
+        // Reserve ~32 tokens for the marker line so page+marker stays ≤ target.
+        let page_budget = target.saturating_sub(32).max(64);
+        let (page, _lines, _total) = paginate_to_budget(body, page_budget);
+
+        if let Some(marker) = existing_marker {
+            return format!("{page}{marker}");
+        }
+        // No handle yet — persist the full body so trimming stays lossless.
+        match crate::artifact::default_store().write(session_key, body) {
+            Ok(id) => format!(
+                "{page}\n\n[truncated to fit the per-turn input budget — full output preserved; \
+                 call read_artifact(tool_result_id=\"{}\", mode=\"lines:A-B\" | \"grep:PATTERN\") \
+                 to page through the rest]",
+                id.as_str()
+            ),
+            // Artifact write failed: bounded but lossy. Mark it honestly.
+            Err(e) => {
+                tracing::warn!(error = %e, "per-turn guard: artifact write failed; trimming lossy");
+                format!("{page}\n\n[truncated to fit the per-turn input budget; full output unavailable]")
+            }
+        }
+    }
+
     async fn compress_tool_result_for_session(
         &mut self,
         session_key: &str,
@@ -5044,6 +5134,25 @@ impl AgentRuntime {
             } else {
                 configured_kv_mode
             };
+            // Per-turn aggregate input guard: cap this iteration's total
+            // tool-result payload. Runs for ALL kv modes — the mode-2
+            // (rsclaw kvCacheMode=2) path skips `apply_context_budget_trim`
+            // below, so without this it had NO per-turn input bound, which
+            // is the direct cause of the worker's `session_ctx_exceeded`
+            // (413) when a big tool result / SKILL.md landed in one turn.
+            // Lossless: oversized results are paged (read_artifact handle
+            // preserved), not dropped.
+            let per_turn_budget = self
+                .live
+                .agents
+                .read()
+                .await
+                .defaults
+                .max_per_turn_input_tokens
+                .unwrap_or(5_000) as usize;
+            self.cap_turn_input_to_budget(&ctx.session_key, &mut turn_scratchpad, per_turn_budget)
+                .await;
+
             let scratchpad_tokens: usize = turn_scratchpad.iter().map(msg_tokens).sum();
             if effective_kv_mode < 2
                 && let Some(sess) = self.sessions.get_mut(&ctx.session_key)
@@ -5448,11 +5557,18 @@ impl AgentRuntime {
             let stream_result = self.failover.call(req.clone(), &providers).await;
 
             // If the LLM rejects for context overflow, compact and retry once.
+            // Use the precise `ContextExceeded` classification rather than a
+            // fragile `contains("exceed")/("context")` string match: the
+            // gateway's 413 `session_ctx_exceeded` envelope is now a
+            // first-class ErrorKind (see provider::health), and the failover
+            // layer propagates it instead of advancing to another model — so
+            // this is the one place that owns the compact-and-retry recovery.
             let mut stream = match stream_result {
                 Err(ref e)
-                    if e.to_string().contains("exceed") || e.to_string().contains("context") =>
+                    if crate::provider::health::classify_error(e)
+                        == crate::provider::health::ErrorKind::ContextExceeded =>
                 {
-                    warn!(session = %ctx.session_key, error = %e, "LLM context overflow, compacting and retrying");
+                    warn!(session = %ctx.session_key, error = %e, "session context exceeded; compacting and retrying once");
                     self.compact_inner(&ctx.session_key, &model, true).await;
                     // Rebuild messages after compaction.
                     let compacted = self

@@ -41,6 +41,14 @@ pub enum ErrorKind {
     /// 400/422 with a request-shape problem unrelated to the model
     /// (max_tokens overage etc.). NOT a model fault — caller handles.
     BadRequest,
+    /// 413 `session_ctx_exceeded` from the rsclaw kvCacheMode=2 session
+    /// backend: the conversation (system + tools + history) grew past the
+    /// worker's `--rsclaw-max-session-ctx`. NOT a model fault and NOT a
+    /// failover trigger — switching models just masks it (a bigger-ctx
+    /// fallback "works" but slowly). The caller (agent loop) must compact
+    /// the history or recreate the session and retry the SAME model.
+    /// Propagated, never advances the chain, never disables the model.
+    ContextExceeded,
     /// Default bucket for unrecognised errors. Treated as Transient so the
     /// chain still tries the next model, but flagged in logs so we can
     /// extend `classify_error` later.
@@ -382,7 +390,10 @@ pub fn cooling_backoff(consecutive: u32, kind: ErrorKind) -> Duration {
     let base = match kind {
         ErrorKind::RateLimit => 30u64,
         ErrorKind::Transient | ErrorKind::Unknown => 10u64,
-        ErrorKind::BadRequest => 5u64,
+        // BadRequest / ContextExceeded are caller-handled (propagated, not
+        // advanced), so they never actually cool down a profile — this arm
+        // only satisfies exhaustiveness.
+        ErrorKind::BadRequest | ErrorKind::ContextExceeded => 5u64,
         // Disabling kinds never get here (early-returned in record_failure).
         ErrorKind::Auth | ErrorKind::Balance | ErrorKind::ModelMissing => 60u64,
     };
@@ -416,6 +427,21 @@ pub fn classify_error(err: &anyhow::Error) -> ErrorKind {
 /// anyhow::Error values.
 pub fn classify_str(s: &str) -> ErrorKind {
     let lower = s.to_lowercase();
+
+    // -------- Session context budget exhausted (rsclaw kvCacheMode=2) --
+    // The gateway returns HTTP 413 with error.code = "session_ctx_exceeded"
+    // when the session's (system + tools + history) tokens exceed the
+    // worker's --rsclaw-max-session-ctx. Match this BEFORE the generic
+    // max_tokens / "exceed" → BadRequest bucket below, because the body
+    // contains both "exceed_context_size_error" and "max-session-ctx" and
+    // we want the dedicated kind, not BadRequest. This is caller-handled
+    // (compact / recreate the session), NOT a model failover trigger.
+    if lower.contains("session_ctx_exceeded")
+        || lower.contains("exceed_context_size_error")
+        || lower.contains("max-session-ctx")
+    {
+        return ErrorKind::ContextExceeded;
+    }
 
     // -------- Balance / quota — strongest signal, check first --------
     // Volcengine Ark: "AccountOverdueError" body, sometimes status 402.
@@ -579,6 +605,28 @@ mod tests {
 
     #[test]
     fn classify_bad_request_max_tokens() {
+        let body = r#"400 Bad Request: max_tokens exceeds model ceiling"#;
+        assert_eq!(classify_str(body), ErrorKind::BadRequest);
+    }
+
+    #[test]
+    fn classify_session_ctx_exceeded() {
+        // The gateway's 413 envelope (rsclaw kvCacheMode=2 session backend).
+        let body = r#"413 Payload Too Large: {"error":{"code":"session_ctx_exceeded","detail":"session has grown past the worker's max-session-ctx budget; call /compact to summarize history or recreate the session"}}"#;
+        assert_eq!(classify_str(body), ErrorKind::ContextExceeded);
+    }
+
+    #[test]
+    fn classify_session_ctx_exceeded_worker_envelope() {
+        // The raw worker envelope, in case it reaches the client un-mapped.
+        let body = r#"{"error":{"code":400,"message":"session_ctx_exceeded: replay session would start with 35518 tokens, reaching --rsclaw-max-session-ctx=32768; compact history before replaying this session","type":"exceed_context_size_error","n_prompt_tokens":35518,"n_ctx":32768}}"#;
+        assert_eq!(classify_str(body), ErrorKind::ContextExceeded);
+    }
+
+    #[test]
+    fn classify_session_ctx_exceeded_not_confused_with_plain_max_tokens() {
+        // A plain max_tokens overage (no session-ctx markers) stays BadRequest,
+        // so the dedicated kind doesn't over-capture generic context errors.
         let body = r#"400 Bad Request: max_tokens exceeds model ceiling"#;
         assert_eq!(classify_str(body), ErrorKind::BadRequest);
     }

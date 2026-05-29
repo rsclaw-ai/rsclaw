@@ -420,8 +420,18 @@ pub struct AgentDefaults {
     /// delta/incremental.
     pub kv_cache_mode: Option<u8>,
     /// Maximum token budget for `/btw` side-channel quick queries
-    /// (handled by `handle_side_query`). Default: 10000.
+    /// (handled by `handle_side_query`). Default: 5000.
     pub btw_tokens: Option<u32>,
+    /// Maximum tokens a SINGLE turn may add to the session input
+    /// (user message + tool_results), before the turn is sent upstream.
+    /// Oversized tool_results are compressed down until the turn's new
+    /// input fits this budget. This caps per-turn growth so one giant
+    /// tool output (a huge web page, a multi-image batch) can't blow the
+    /// kvCacheMode=2 session past the worker's `--rsclaw-max-session-ctx`
+    /// in a single step. It is NOT the total context budget — the total
+    /// is bounded by the worker's max-session-ctx; this only bounds the
+    /// per-turn delta. Default: 5000.
+    pub max_per_turn_input_tokens: Option<u32>,
     pub timezone: Option<String>,
     pub timestamp: Option<Value>,
     pub thinking: Option<ThinkingConfig>,
