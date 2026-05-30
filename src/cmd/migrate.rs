@@ -493,7 +493,17 @@ async fn import_data(openclaw_dir: &PathBuf, rsclaw_dir: &PathBuf) -> Result<()>
             let mut ch_cfg = serde_json::Map::new();
             for (name, val) in channels {
                 if supported.iter().any(|s| name.starts_with(s)) {
-                    ch_cfg.insert(name.clone(), val.clone());
+                    // OpenClaw stores per-account creds at the top of
+                    // `channels.<name>`. rsclaw's outbound router uses
+                    // `accounts.{name}` as the canonical layout — leaving
+                    // creds at the top causes the gateway to register
+                    // bare-name and account-name channels in parallel,
+                    // and the outbound router picks the bare key for some
+                    // sessions → cross-app errors (Feishu 99992361,
+                    // WeChat ret=-2). Hoist before import.
+                    let mut chv = val.clone();
+                    normalize_channel_layout(&mut chv);
+                    ch_cfg.insert(name.clone(), chv);
                 }
             }
             if !ch_cfg.is_empty() {
@@ -843,6 +853,61 @@ fn print_import_stats(stats: &ImportStats) {
         warn_msg(&format!("{} errors during import", stats.errors));
     }
     println!();
+}
+
+/// Move per-account credential fields out of the channel object's top
+/// level and into `accounts.default.*`. Idempotent: if a field already
+/// exists under `accounts.default`, the top-level copy is dropped (no
+/// overwrite). Used at OpenClaw import time so the rsclaw layout matches
+/// what the gateway's outbound router expects.
+fn normalize_channel_layout(ch: &mut serde_json::Value) {
+    use serde_json::{Map, Value};
+    // Token-ish fields the outbound router needs to bind per account.
+    // Anything not in this list (enabled, dmPolicy, brand, …) stays at
+    // the top — those are channel-wide, not credential-scoped.
+    const ACCOUNT_FIELDS: &[&str] = &[
+        "appId",
+        "appSecret",
+        "botId",
+        "botToken",
+        "token",
+        "clientId",
+        "clientSecret",
+        "secret",
+        "encryptKey",
+        "verificationToken",
+        "webhookUrl",
+        "robotCode",
+    ];
+    let Some(obj) = ch.as_object_mut() else {
+        return;
+    };
+    let mut hoisted: Map<String, Value> = Map::new();
+    for k in ACCOUNT_FIELDS {
+        if let Some(v) = obj.remove(*k) {
+            hoisted.insert((*k).to_owned(), v);
+        }
+    }
+    if hoisted.is_empty() {
+        return;
+    }
+    let accounts = obj
+        .entry("accounts".to_owned())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(accts_obj) = accounts.as_object_mut() else {
+        return;
+    };
+    let default = accts_obj
+        .entry("default".to_owned())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(default_obj) = default.as_object_mut() else {
+        return;
+    };
+    for (k, v) in hoisted {
+        // Don't overwrite an explicit accounts.default field — the
+        // existing value wins (more recent / more intentional).
+        default_obj.entry(k).or_insert(v);
+    }
 }
 
 // ---------------------------------------------------------------------------

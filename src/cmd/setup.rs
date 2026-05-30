@@ -2532,6 +2532,17 @@ fn has_top_level_fields(
 /// Move `channels.<ch>.<field>` values to
 /// `channels.<ch>.accounts.default.<field>`, leaving non-account keys (enabled
 /// / dmPolicy / groupPolicy / accounts) intact.
+/// Strip channel-credential fields from the top of `channels.<ch>`.
+/// Use when accounts.* is already canonical and the top-level entries are
+/// stale leftovers (legacy single-account config that picked up new
+/// per-account credentials, or an OpenClaw import that hasn't been
+/// normalized yet).
+fn strip_top_fields(val: &mut serde_json::Value, ch_name: &str, fields: &[ChannelFieldDef]) {
+    for f in fields {
+        remove_nested_value(val, &format!("channels.{}.{}", ch_name, f.key));
+    }
+}
+
 fn migrate_top_to_accounts(
     val: &mut serde_json::Value,
     ch_name: &str,
@@ -2736,8 +2747,22 @@ async fn edit_channel_config(val: &mut serde_json::Value, ch: &ChannelDef) -> bo
             prompt_add_another_account(&ch.label, lang)
         };
         if want_multi {
-            if !has_accounts && has_top {
-                migrate_top_to_accounts(val, &ch.name, &ch.fields, "default");
+            if has_top {
+                // Top-level credentials and accounts.* must never coexist:
+                // the gateway registers both as separate channels, the
+                // outbound router falls back to the bare key (= top-level)
+                // for messages received via the account branch, and the
+                // app's open_id is rejected as cross-app (Feishu 99992361,
+                // WeChat ret=-2). Strip cleanly:
+                //   - no accounts.* yet → migrate top into accounts.default
+                //   - accounts.* exists → drop top (accounts is canonical;
+                //     never overwrite a configured accounts.default with
+                //     a stale top value).
+                if has_accounts {
+                    strip_top_fields(val, &ch.name, &ch.fields);
+                } else {
+                    migrate_top_to_accounts(val, &ch.name, &ch.fields, "default");
+                }
                 changed = true;
             }
             if edit_channel_multi_account(val, ch, lang) {

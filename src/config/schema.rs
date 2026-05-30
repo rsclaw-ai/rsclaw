@@ -1525,6 +1525,8 @@ pub struct FeishuConfig {
     pub api_base: Option<String>,
     /// WS endpoint request domain override (for testing). Defaults to https://open.feishu.cn
     pub ws_url: Option<String>,
+    /// Seconds to wait between WS reconnect attempts. Defaults to 5.
+    pub reconnect_delay_secs: Option<u64>,
     pub accounts: Option<HashMap<String, Value>>,
 }
 

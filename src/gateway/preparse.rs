@@ -350,30 +350,51 @@ pub(crate) async fn try_preparse_locally_with_account(
         };
         return Some(txt(s));
     }
-    // /abort — set all abort flags
+    // Helper: session_key for THIS preparse call so /abort, /clear, /new
+    // only touch the originating session — not every session the agent has
+    // ever seen. Cross-session blast was the cause of a real incident:
+    // user types `/new` in feishu, the loop-over-all-values set every
+    // wechat session's abort_flag to true too, killing an in-progress
+    // wechat cap_live mid-iteration as `[aborted]`.
+    let this_session_key = derive_session_key(&SessionKeyParams {
+        agent_id: handle.id.clone(),
+        channel: channel.to_owned(),
+        peer_id: peer_id.to_owned(),
+        kind: MessageKind::DirectMessage {
+            account_id: account.map(|s| s.to_owned()),
+        },
+        // Use the default scope; IM dm sessions overwhelmingly run at
+        // PerChannelPeer (the default). If a deployment ever sets a
+        // different scope, /abort would target a slightly different key —
+        // worst case the abort is a no-op (which is the correct fallback,
+        // since the alternative — blasting every session — is what we're
+        // fixing here).
+        dm_scope: DmScope::PerChannelPeer,
+    });
+
+    // /abort — set abort flag for THIS session only.
     if lower == "/abort" {
         let flags = handle
             .abort_flags
             .read()
             .expect("abort_flags lock poisoned");
-        let count = flags.len();
-        for f in flags.values() {
+        let hit = flags.get(&this_session_key).map(|f| {
             f.store(true, Ordering::SeqCst);
-        }
-        return Some(txt(if count > 0 {
-            format!("abort signal sent ({count} session(s))")
+        });
+        return Some(txt(if hit.is_some() {
+            "abort signal sent".to_owned()
         } else {
             "nothing to abort".to_owned()
         }));
     }
-    // /clear — abort running turns + signal session clear (fully non-blocking)
+    // /clear — abort current session's running turn + signal session clear
     if lower == "/clear" {
-        // 1. Abort all running turns
+        // 1. Abort the running turn FOR THIS SESSION only.
         let flags = handle
             .abort_flags
             .read()
             .expect("abort_flags lock poisoned");
-        for f in flags.values() {
+        if let Some(f) = flags.get(&this_session_key) {
             f.store(true, Ordering::SeqCst);
         }
         drop(flags);
@@ -391,7 +412,7 @@ pub(crate) async fn try_preparse_locally_with_account(
             .abort_flags
             .read()
             .expect("abort_flags lock poisoned");
-        for f in flags.values() {
+        if let Some(f) = flags.get(&this_session_key) {
             f.store(true, Ordering::SeqCst);
         }
         drop(flags);

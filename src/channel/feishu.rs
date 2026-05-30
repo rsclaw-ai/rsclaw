@@ -150,6 +150,8 @@ pub struct FeishuChannel {
     pub ws_url_override: Option<String>,
     /// Max file size for downloads (from config tools.upload.maxFileSize).
     pub max_file_size: usize,
+    /// Seconds to wait between WS reconnect attempts (config: feishu.reconnectDelaySecs).
+    pub ws_reconnect_delay_secs: u64,
     /// Callback: (sender_open_id, text, chat_id, is_group, images, files).
     #[allow(clippy::type_complexity)]
     on_message: Arc<
@@ -374,6 +376,7 @@ impl FeishuChannel {
             api_base_override: None,
             ws_url_override: None,
             max_file_size: 128_000_000, // default 128MB, overridden by startup
+            ws_reconnect_delay_secs: 5,
             on_message,
         }
     }
@@ -1792,12 +1795,13 @@ impl Channel for FeishuChannel {
     fn run(self: Arc<Self>) -> BoxFuture<'static, Result<()>> {
         Box::pin(async move {
             info!("feishu: starting WebSocket mode");
+            let delay = self.ws_reconnect_delay_secs;
             loop {
                 match self.ws_connect_loop().await {
                     Ok(_) => info!("feishu: WS connection ended, reconnecting..."),
-                    Err(e) => warn!("feishu: WS error: {e:#}, reconnecting in 5s"),
+                    Err(e) => warn!("feishu: WS error: {e:#}, reconnecting in {delay}s"),
                 }
-                sleep(Duration::from_secs(5)).await;
+                sleep(Duration::from_secs(delay)).await;
             }
         })
     }
