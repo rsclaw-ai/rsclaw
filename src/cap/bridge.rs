@@ -67,22 +67,13 @@ pub(crate) fn dispatch(event: &AgentEvent, sinks: &mut Sinks<'_>) -> bool {
             false
         }
         AgentEvent::ToolCallStart { name, .. } => {
+            // Don't push per-tool-call progress to the IM channel. Each cap
+            // dispatch can fire dozens of inner tool calls (Bash, Write,
+            // read_file, …); pushing one IM line per call drowns the user
+            // and hammers rate-limited channels (wechat ret=-2). The cap
+            // completion notification (`acp_done_summary`) gives the
+            // final state, which is what the user actually wants.
             tracing::debug!(target: "cap", agent = sinks.agent_id, tool = %name, "cap tool start");
-            if let Some(n) = sinks.notif {
-                let msg = crate::channel::OutboundMessage {
-                    target_id: n.target_id.clone(),
-                    is_group: n.is_group,
-                    text: format!("🔧 {name}"),
-                    reply_to: None,
-                    images: Vec::new(),
-                    files: Vec::new(),
-                    channel: Some(n.channel.clone()),
-                    account: None,
-                };
-                if let Err(e) = n.tx.send(msg) {
-                    tracing::warn!(target: "cap", err = %e, "cap tool-call notif send failed");
-                }
-            }
             false
         }
         AgentEvent::ToolCallEnd { is_error, .. } => {
