@@ -108,14 +108,24 @@ pub(crate) fn detect_chrome() -> Option<String> {
     // 1. System-installed Chrome (well-known locations + PATH).
     #[cfg(target_os = "macos")]
     {
-        let app_paths = [
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        // Relative-to-Applications bundle paths, checked under both the
+        // system /Applications and the per-user ~/Applications.
+        let rel = [
+            "Google Chrome.app/Contents/MacOS/Google Chrome",
+            "Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "Brave Browser.app/Contents/MacOS/Brave Browser",
+            "Chromium.app/Contents/MacOS/Chromium",
         ];
-        for p in &app_paths {
-            if std::path::Path::new(p).exists() {
-                return Some((*p).to_owned());
+        let mut roots = vec![std::path::PathBuf::from("/Applications")];
+        if let Some(home) = dirs_next::home_dir() {
+            roots.push(home.join("Applications"));
+        }
+        for root in &roots {
+            for r in &rel {
+                let p = root.join(r);
+                if p.exists() {
+                    return Some(p.to_string_lossy().to_string());
+                }
             }
         }
     }
@@ -149,28 +159,69 @@ pub(crate) fn detect_chrome() -> Option<String> {
         let candidates = [
             r"C:\Program Files\Google\Chrome\Application\chrome.exe",
             r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
             r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+            r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
         ];
         for path in &candidates {
             if std::path::Path::new(path).exists() {
                 return Some((*path).to_string());
             }
         }
-        if let Ok(userprofile) = std::env::var("USERPROFILE") {
-            let user_chrome = format!(
-                r"{}\AppData\Local\Google\Chrome\Application\chrome.exe",
-                userprofile
-            );
-            if std::path::Path::new(&user_chrome).exists() {
-                return Some(user_chrome);
+        // Per-user installs under %LOCALAPPDATA%.
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let user_candidates = [
+                format!(r"{local}\Google\Chrome\Application\chrome.exe"),
+                format!(r"{local}\Microsoft\Edge\Application\msedge.exe"),
+                format!(r"{local}\BraveSoftware\Brave-Browser\Application\brave.exe"),
+            ];
+            for path in &user_candidates {
+                if std::path::Path::new(path).exists() {
+                    return Some(path.clone());
+                }
             }
         }
     }
 
-    for name in &["google-chrome", "chromium", "chromium-browser", "chrome"] {
+    // PATH lookup (all platforms; primary path on Linux). Includes the
+    // distro-specific binary names apt/dnf/snap install under.
+    for name in &[
+        "google-chrome-stable",
+        "google-chrome",
+        "chromium",
+        "chromium-browser",
+        "brave-browser",
+        "microsoft-edge",
+        "microsoft-edge-stable",
+        "chrome",
+    ] {
         if let Ok(path) = which::which(name) {
             return Some(path.to_string_lossy().to_string());
+        }
+    }
+
+    // Linux absolute-path fallback: a GUI/launchd-launched gateway inherits a
+    // stripped PATH that often omits /usr/bin, so `which` above can miss a
+    // perfectly-installed browser. Probe the well-known install locations.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let candidates = [
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/brave-browser",
+            "/usr/bin/microsoft-edge",
+            "/usr/bin/microsoft-edge-stable",
+            "/opt/google/chrome/chrome",
+            "/snap/bin/chromium",
+            "/var/lib/snapd/snap/bin/chromium",
+        ];
+        for p in &candidates {
+            if std::path::Path::new(p).exists() {
+                return Some((*p).to_owned());
+            }
         }
     }
 
