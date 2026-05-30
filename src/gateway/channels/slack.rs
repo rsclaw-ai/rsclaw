@@ -26,6 +26,7 @@ pub(crate) fn start_slack_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
     task_queue: Arc<crate::gateway::task_queue::TaskQueueManager>,
+    shutdown: crate::gateway::ShutdownCoordinator,
 ) {
     use crate::channel::slack::SlackChannel;
 
@@ -511,19 +512,37 @@ pub(crate) fn start_slack_if_configured(
             bot_token, app_token, api_base, on_message,
         ));
         let sl_send = Arc::clone(&sl);
+        let shutdown_for_out = shutdown.clone();
         tokio::spawn(async move {
-            while let Some(msg) = out_rx.recv().await {
-                if let Err(e) = sl_send.send(msg).await {
-                    error!("slack send: {e:#}");
+            loop {
+                tokio::select! {
+                    () = shutdown_for_out.notified() => {
+                        info!("slack: drain signaled, stopping outbound sender");
+                        break;
+                    }
+                    msg = out_rx.recv() => {
+                        let Some(msg) = msg else { break };
+                        if let Err(e) = sl_send.send(msg).await {
+                            error!("slack send: {e:#}");
+                        }
+                    }
                 }
             }
         });
         if let Err(e) = manager.register(Arc::clone(&sl) as Arc<dyn Channel>) {
             tracing::warn!("failed to register channel: {e}");
         }
+        let shutdown_for_run = shutdown.clone();
         tokio::spawn(async move {
-            if let Err(e) = sl.run().await {
-                error!("slack channel: {e:#}");
+            tokio::select! {
+                res = sl.run() => {
+                    if let Err(e) = res {
+                        error!("slack channel: {e:#}");
+                    }
+                }
+                () = shutdown_for_run.notified() => {
+                    info!("slack: drain signaled, stopping run loop");
+                }
             }
         });
         info!(account = %acct_for_log, "slack channel started");

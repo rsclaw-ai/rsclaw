@@ -613,6 +613,7 @@ async fn send_message(
         // Track this streaming request in the gateway's inflight count.
         // Guard moves into the filter_map closure and drops with the stream.
         let inflight_guard = state.shutdown.begin_work();
+        let shutdown_for_stream = state.shutdown.clone();
 
         let stream = tokio_stream::wrappers::BroadcastStream::new(rx)
             .filter_map(move |msg| {
@@ -652,7 +653,8 @@ async fn send_message(
                 if *done { return std::future::ready(None); }
                 if line.contains("[DONE]") { *done = true; }
                 std::future::ready(Some(Ok::<_, Infallible>(line)))
-            });
+            })
+            .take_until(Box::pin(async move { shutdown_for_stream.notified().await }));
 
         let mut hdrs = axum::http::HeaderMap::new();
         hdrs.insert(
@@ -671,6 +673,7 @@ async fn send_message(
 
     // Non-streaming: track inflight while we await the agent's full reply.
     let _inflight_guard = state.shutdown.begin_work();
+    let shutdown_for_wait = state.shutdown.clone();
     let timeout_secs = state
         .config
         .raw
@@ -679,7 +682,15 @@ async fn send_message(
         .and_then(|a| a.defaults.as_ref())
         .and_then(|d| d.timeout_seconds)
         .unwrap_or(600) as u64;
-    let reply = match tokio::time::timeout(Duration::from_secs(timeout_secs), reply_rx).await {
+    let reply = match tokio::select! {
+        r = tokio::time::timeout(Duration::from_secs(timeout_secs), reply_rx) => r,
+        () = shutdown_for_wait.notified() => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "gateway draining"})),
+            ).into_response();
+        }
+    } {
         Ok(Ok(r)) => r,
         Ok(Err(_)) => {
             return (
@@ -2410,6 +2421,7 @@ async fn openai_chat_completions(
         // moved into the filter_map closure below; it drops when the stream
         // is dropped (client disconnect, [DONE] sent, or scan terminator).
         let inflight_guard = state.shutdown.begin_work();
+        let shutdown_for_stream = state.shutdown.clone();
 
         let stream = tokio_stream::wrappers::BroadcastStream::new(rx)
             .filter_map(move |msg| {
@@ -2450,7 +2462,8 @@ async fn openai_chat_completions(
                 if *done { return std::future::ready(None); }
                 if line.contains("[DONE]") { *done = true; }
                 std::future::ready(Some(Ok::<_, Infallible>(line)))
-            });
+            })
+            .take_until(Box::pin(async move { shutdown_for_stream.notified().await }));
 
         let mut response_headers = axum::http::HeaderMap::new();
         response_headers.insert(
@@ -2480,8 +2493,15 @@ async fn openai_chat_completions(
 
     // Non-streaming: track inflight while we await the agent's full reply.
     let _inflight_guard = state.shutdown.begin_work();
+    let shutdown_for_wait = state.shutdown.clone();
     let timeout_secs = state.config.agents.defaults.timeout_seconds.unwrap_or(600) as u64;
-    let reply = match tokio::time::timeout(Duration::from_secs(timeout_secs), reply_rx).await {
+    let reply = match tokio::select! {
+        r = tokio::time::timeout(Duration::from_secs(timeout_secs), reply_rx) => r,
+        () = shutdown_for_wait.notified() => {
+            return (StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error":{"message":"gateway draining","type":"server_error"}}))).into_response();
+        }
+    } {
         Ok(Ok(r)) => r,
         Ok(Err(_)) => {
             return (StatusCode::INTERNAL_SERVER_ERROR,

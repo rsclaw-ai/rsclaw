@@ -610,11 +610,21 @@ pub(crate) fn start_channels(
             let api_base = tg_cfg.api_base.clone();
             let tg = Arc::new(TelegramChannel::new(token, api_base, on_message));
             let tg_send = Arc::clone(&tg);
+            let shutdown_for_out = shutdown.clone();
 
             tokio::spawn(async move {
-                while let Some(msg) = out_rx.recv().await {
-                    if let Err(e) = tg_send.send(msg).await {
-                        error!("telegram send error: {e:#}");
+                loop {
+                    tokio::select! {
+                        () = shutdown_for_out.notified() => {
+                            info!("telegram: drain signaled, stopping outbound sender");
+                            break;
+                        }
+                        msg = out_rx.recv() => {
+                            let Some(msg) = msg else { break };
+                            if let Err(e) = tg_send.send(msg).await {
+                                error!("telegram send error: {e:#}");
+                            }
+                        }
                     }
                 }
             });
@@ -625,9 +635,17 @@ pub(crate) fn start_channels(
             ) {
                 tracing::warn!("failed to register channel: {e}");
             }
+            let shutdown_for_run = shutdown.clone();
             tokio::spawn(async move {
-                if let Err(e) = tg.run().await {
-                    error!("telegram channel error: {e:#}");
+                tokio::select! {
+                    res = tg.run() => {
+                        if let Err(e) = res {
+                            error!("telegram channel error: {e:#}");
+                        }
+                    }
+                    () = shutdown_for_run.notified() => {
+                        info!("telegram: drain signaled, stopping run loop");
+                    }
                 }
             });
             info!(account = %acct_for_log, "telegram channel started");
@@ -642,6 +660,7 @@ pub(crate) fn start_channels(
         Arc::clone(&redb_store),
         Arc::clone(&channel_senders),
         Arc::clone(&task_queue),
+        shutdown.clone(),
     );
     start_slack_if_configured(
         config,
@@ -651,6 +670,7 @@ pub(crate) fn start_channels(
         Arc::clone(&redb_store),
         Arc::clone(&channel_senders),
         Arc::clone(&task_queue),
+        shutdown.clone(),
     );
     start_whatsapp_if_configured(
         config,
@@ -661,6 +681,7 @@ pub(crate) fn start_channels(
         Arc::clone(&redb_store),
         Arc::clone(&channel_senders),
         Arc::clone(&task_queue),
+        shutdown.clone(),
     );
     start_line_if_configured(
         config,
@@ -671,6 +692,7 @@ pub(crate) fn start_channels(
         Arc::clone(&redb_store),
         Arc::clone(&channel_senders),
         Arc::clone(&task_queue),
+        shutdown.clone(),
     );
     start_zalo_if_configured(
         config,
@@ -681,6 +703,7 @@ pub(crate) fn start_channels(
         Arc::clone(&redb_store),
         Arc::clone(&channel_senders),
         Arc::clone(&task_queue),
+        shutdown.clone(),
     );
     start_signal_if_configured(
         config,
@@ -690,6 +713,7 @@ pub(crate) fn start_channels(
         Arc::clone(&redb_store),
         Arc::clone(&channel_senders),
         Arc::clone(&task_queue),
+        shutdown.clone(),
     );
     start_wechat_personal_if_configured(
         config,
@@ -710,6 +734,7 @@ pub(crate) fn start_channels(
         Arc::clone(&redb_store),
         Arc::clone(&channel_senders),
         Arc::clone(&task_queue),
+        shutdown.clone(),
     );
     start_dingtalk_if_configured(
         config,
@@ -719,6 +744,7 @@ pub(crate) fn start_channels(
         Arc::clone(&redb_store),
         Arc::clone(&channel_senders),
         Arc::clone(&task_queue),
+        shutdown.clone(),
     );
     start_qq_if_configured(
         config,
@@ -728,6 +754,7 @@ pub(crate) fn start_channels(
         Arc::clone(&redb_store),
         Arc::clone(&channel_senders),
         Arc::clone(&task_queue),
+        shutdown.clone(),
     );
     start_matrix_if_configured(
         config,
@@ -737,6 +764,7 @@ pub(crate) fn start_channels(
         Arc::clone(&redb_store),
         Arc::clone(&channel_senders),
         Arc::clone(&task_queue),
+        shutdown.clone(),
     );
     start_wecom_if_configured(
         config,
@@ -747,5 +775,6 @@ pub(crate) fn start_channels(
         Arc::clone(&redb_store),
         Arc::clone(&channel_senders),
         Arc::clone(&task_queue),
+        shutdown.clone(),
     );
 }

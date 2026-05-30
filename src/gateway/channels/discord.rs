@@ -26,6 +26,7 @@ pub(crate) fn start_discord_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
     task_queue: Arc<crate::gateway::task_queue::TaskQueueManager>,
+    shutdown: crate::gateway::ShutdownCoordinator,
 ) {
     use crate::channel::discord::DiscordChannel;
 
@@ -496,19 +497,37 @@ pub(crate) fn start_discord_if_configured(
             dc_cfg.gateway_url.clone(),
         ));
         let dc_send = Arc::clone(&dc);
+        let shutdown_for_out = shutdown.clone();
         tokio::spawn(async move {
-            while let Some(msg) = out_rx.recv().await {
-                if let Err(e) = dc_send.send(msg).await {
-                    error!("discord send: {e:#}");
+            loop {
+                tokio::select! {
+                    () = shutdown_for_out.notified() => {
+                        info!("discord: drain signaled, stopping outbound sender");
+                        break;
+                    }
+                    msg = out_rx.recv() => {
+                        let Some(msg) = msg else { break };
+                        if let Err(e) = dc_send.send(msg).await {
+                            error!("discord send: {e:#}");
+                        }
+                    }
                 }
             }
         });
         if let Err(e) = manager.register(Arc::clone(&dc) as Arc<dyn Channel>) {
             tracing::warn!("failed to register channel: {e}");
         }
+        let shutdown_for_run = shutdown.clone();
         tokio::spawn(async move {
-            if let Err(e) = dc.run().await {
-                error!("discord channel: {e:#}");
+            tokio::select! {
+                res = dc.run() => {
+                    if let Err(e) = res {
+                        error!("discord channel: {e:#}");
+                    }
+                }
+                () = shutdown_for_run.notified() => {
+                    info!("discord: drain signaled, stopping run loop");
+                }
             }
         });
         info!(account = %acct_for_log, "discord channel started");
