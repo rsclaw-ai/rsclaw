@@ -790,6 +790,11 @@ pub struct AgentRuntime {
     /// Coding-agent proxy (Claude Code, Opencode, Codex, Amp). `None` until
     /// Task 9 wires up construction; `None` outside the gateway.
     pub(crate) cap_manager: Option<std::sync::Arc<crate::cap::CapAgentManager>>,
+    /// Interactive multi-instance cap session manager — backs the
+    /// `cap_live` / `cap_live_end` tools and the IM `/cap` direct-mode
+    /// command. Shares the same driver primitives as `cap_manager` but
+    /// keeps long-lived drivers keyed by session_id.
+    pub(crate) cap_live_manager: Option<std::sync::Arc<crate::cap::CapLiveManager>>,
 }
 
 impl AgentRuntime {
@@ -810,6 +815,7 @@ impl AgentRuntime {
         notification_tx: Option<tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>>,
         model_health: crate::provider::health::ProviderHealthRegistry,
         cap_manager: Option<std::sync::Arc<crate::cap::CapAgentManager>>,
+        cap_live_manager: Option<std::sync::Arc<crate::cap::CapLiveManager>>,
     ) -> Self {
         // Populate auth.order so FailoverManager uses the configured profile
         // priority per provider (AGENTS.md §12).
@@ -873,6 +879,7 @@ impl AgentRuntime {
             session_aliases,
             exec_pool,
             cap_manager,
+            cap_live_manager,
         };
 
         // Purge any internal-session history left over in redb from older
@@ -3725,6 +3732,28 @@ impl AgentRuntime {
             }
             // else: "full" or unknown -> keep all
 
+            // cap-followup sessions: agent is meant to briefly summarise one
+            // or more cap completions whose results were already pushed to
+            // the user via push_notif. Strip research/exec/chain tools so it
+            // can't go web_search-ing the result text (wastes time + floods
+            // rate-limited IM channels) or dispatch yet another cap/task.
+            if session_key.ends_with(":cap-followup") {
+                const FOLLOWUP_BLOCKED: &[&str] = &[
+                    "web_search",
+                    "web_fetch",
+                    "browser",
+                    "computer_use",
+                    "shell",
+                    "execute_command",
+                    "exec",
+                    "cap",
+                    "cap_live",
+                    "cap_live_end",
+                    "task",
+                ];
+                all.retain(|t| !FOLLOWUP_BLOCKED.contains(&t.name.as_str()));
+            }
+
             // Group chat safety: strip dangerous tools to prevent exec via LLM
             let is_group = session_key.contains(":group:");
             if is_group {
@@ -6482,6 +6511,8 @@ impl AgentRuntime {
                     tool_name.as_str(),
                     "web_browser"
                         | "cap"
+                        | "cap_live"
+                        | "cap_live_end"
                         | "agent"
                         | "search_content"
                         | "search_file"
@@ -8189,6 +8220,33 @@ impl AgentRuntime {
             }
         }
 
+        // Per-session filter: even when no explicit whitelist is configured,
+        // run_turn strips certain tools for special sessions (cap-followup
+        // bans research/exec/chain tools so it can briefly summarise without
+        // wandering off). The model still occasionally hallucinates a stripped
+        // name from training data — re-apply the same filter at dispatch.
+        if ctx.session_key.ends_with(":cap-followup") {
+            const FOLLOWUP_BLOCKED: &[&str] = &[
+                "web_search",
+                "web_fetch",
+                "browser",
+                "computer_use",
+                "shell",
+                "execute_command",
+                "exec",
+                "cap",
+                "cap_live",
+                "cap_live_end",
+                "task",
+            ];
+            if FOLLOWUP_BLOCKED.contains(&name) {
+                return Err(anyhow!(
+                    "tool '{name}' is unavailable in cap-followup sessions — \
+                     just summarise the completed cap results in plain text."
+                ));
+            }
+        }
+
         // 2. Built-in tools (checked before A2A prefix so reserved names are not
         //    hijacked).
         match name {
@@ -8466,6 +8524,8 @@ impl AgentRuntime {
                 return self.tool_doc(a).await;
             }
             "cap" => return self.tool_cap(ctx, args).await,
+            "cap_live" => return self.tool_cap_live(ctx, args).await,
+            "cap_live_end" => return self.tool_cap_live_end(ctx, args).await,
             _ => {}
         }
 

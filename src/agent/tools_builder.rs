@@ -298,6 +298,10 @@ pub(crate) fn toolset_allowed_names(
         // Coding-agent escalation — dispatch big tasks to an external CLI
         // coding agent (claude-code / openclaude / opencode / codex) via cap-rs.
         "cap",
+        // Interactive cap session — multi-turn warm session against a single
+        // agent, useful for orchestrating several cap agents in one IM turn.
+        "cap_live",
+        "cap_live_end",
         // Sub-agent dispatch — rsclaw-native task/spawn for non-coding sub-work
         "agent",
         // Disambiguation: ask the user when the task description is genuinely ambiguous
@@ -512,7 +516,10 @@ pub fn build_tool_list(
             data pipelines, end-to-end deployments. \
             Do NOT call for: greetings, casual questions, single tool calls (one web_search, \
             one read_file, one calculation), explanations, or anything you can answer in this \
-            same turn. When in doubt, just answer directly — the user can always send \
+            same turn. \
+            Do NOT use this to dispatch to an external CLI coding agent (claude / claudecode / \
+            openclaude / opencode / codex) — those need `cap`, not `task`. \
+            When in doubt, just answer directly — the user can always send \
             `/task <request>` to escalate manually.\n\n\
             Returns a task ID; the gateway then runs the work in the background and posts \
             replies as turns complete. After calling task, your reply to the user should be a \
@@ -977,15 +984,18 @@ pub fn build_tool_list(
             - Always specify toolset matching the task (web for search, code for file ops).\n\
             - After dispatching, tell the user what you delegated and continue with other work.\n\
             \n\
-            CRITICAL: When user EXPLICITLY asks to use a specific tool (opencode, claudecode, codex),\n\
-            you MUST call that tool directly. DO NOT create a task agent instead.\n\
-            - User says \"让opencode去...\" -> call opencode tool (action=call, NOT task agent)\n\
-            - User says \"用claudecode...\" -> call claudecode tool\n\
+            CRITICAL: When the user names a CLI coding agent (claude, claudecode, openclaude,\n\
+            opencode, codex), dispatch via `cap(agent=..., task=...)` — NOT this `agent` tool.\n\
+            This tool's `task` action creates an INTERNAL background sub-agent; it does not\n\
+            spawn any external coding CLI and will never produce the output the user expects.\n\
+            - User says \"让opencode去...\" -> `cap(agent=\"opencode\", task=...)`\n\
+            - User says \"用claudecode...\" -> `cap(agent=\"claudecode\", task=...)`\n\
+            - User names multiple agents in one request -> issue multiple `cap` calls, one per agent.\n\
             \n\
             [HARD RULE - DECEPTION]\n\
-            Claiming \"已委托opencode\" or \"已用opencode检查\" WITHOUT a tool_call is LYING.\n\
-            If you say these words, there MUST be an actual opencode tool call in this turn.\n\
-            No tool call + claim of delegation = you are deceiving the user.\n\
+            Claiming \"已委托opencode\" / \"已派发给四个 coding agent\" / similar WITHOUT a `cap`\n\
+            tool_call is LYING. If you say these words, there MUST be a `cap` call in this turn\n\
+            for each named agent. No tool call + claim of delegation = you are deceiving the user.\n\
             This is worse than admitting \"I didn't call it\" - trust is destroyed.\n\
             \n\
             DO NOT delegate these tasks — handle them yourself directly:\n\
@@ -1568,6 +1578,56 @@ pub fn build_tool_list(
                 "action": {"type": "string", "enum": ["status", "health", "version"], "description": "REQUIRED: Info to retrieve. Examples: 'status', 'version'"}
             },
             "required": ["action"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "cap_live".to_owned(),
+        description: "Interactive (synchronous) call into a CLI coding agent that keeps its \
+            session warm across multiple turns. Use this — NOT `cap` — when you want to chain \
+            several requests against the same agent (e.g. ask codex to design, then ask the \
+            same codex session to refine), or to orchestrate multiple agents in one IM turn \
+            (codex designs → claudecode implements → opencode reviews, each with their own \
+            session_id). Returns the agent's full reply synchronously, plus a `session_id` you \
+            pass back on subsequent calls to continue the same warm session. Omit `session_id` \
+            (or pass an empty string) to open a brand-new session. Call `cap_live_end` when done. \
+            For one-shot fire-and-forget work where you don't need to read the agent's reply in \
+            this turn, prefer the async `cap` tool instead — it returns immediately and pushes \
+            the completion summary to the user via IM."
+            .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "agent": {
+                    "type": "string",
+                    "enum": ["claudecode", "openclaude", "opencode", "codex"],
+                    "description": "Which CLI coding agent to dispatch to. A session is locked \
+                        to one agent — you can't pass session_id from a codex call to a \
+                        claudecode call."
+                },
+                "task":       { "type": "string", "description": "Prompt for the agent (this turn)." },
+                "session_id": { "type": "string", "description": "Optional. Pass back the value \
+                    returned from a prior cap_live call to continue the same session. Omit or \
+                    leave empty to open a new session." },
+                "cwd":        { "type": "string", "description": "Optional working directory for \
+                    NEW sessions (ignored when continuing an existing session_id)." }
+            },
+            "required": ["agent", "task"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "cap_live_end".to_owned(),
+        description: "Release a `cap_live` session and tear down its underlying driver process. \
+            Always call this when you're done orchestrating a multi-turn cap session, both to \
+            free the global session limit (default 8) and to avoid keeping coding-CLI processes \
+            warm in the background. Idle sessions auto-close after 10 minutes anyway, but \
+            explicit cleanup is good citizenship."
+            .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "session_id": { "type": "string", "description": "session_id returned by a prior cap_live call." }
+            },
+            "required": ["session_id"]
         }),
     });
     tools.push(ToolDef {

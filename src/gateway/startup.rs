@@ -80,17 +80,43 @@ fn enrich_process_path() {
         }
     };
 
-    // HIGHEST priority: the single rsclaw shim dir {base_dir}/tools/bin,
-    // populated by sync_tool_shims() with symlinks to each install_tool-
-    // managed binary under its canonical command name. One clean entry that
-    // wins over any system-wide install; respects --profile / --base-dir.
-    push_if(
-        crate::config::loader::base_dir()
-            .join("tools")
-            .join("bin")
-            .to_string_lossy()
-            .to_string(),
-    );
+    // HIGHEST priority: rsclaw-managed tools under {base_dir}/tools, winning
+    // over any system-wide install; respects --profile / --base-dir.
+    let tools = crate::config::loader::base_dir().join("tools");
+    #[cfg(unix)]
+    {
+        // One clean shim dir of symlinks (sync_tool_shims) to each
+        // install_tool-managed binary under its canonical command name.
+        push_if(tools.join("bin").to_string_lossy().to_string());
+    }
+    #[cfg(windows)]
+    {
+        // No shim dir on Windows (symlinks need privilege; an .exe must stay
+        // beside its sibling DLLs). Add each tool's own dir + bin/ +
+        // node_modules/.bin so `<tool>.exe`/`.cmd` resolves by name in place.
+        if let Ok(entries) = std::fs::read_dir(&tools) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    push_if(p.join("node_modules").join(".bin").to_string_lossy().to_string());
+                    push_if(p.join("bin").to_string_lossy().to_string());
+                    push_if(p.to_string_lossy().to_string());
+                }
+            }
+        }
+        // claude-code's Windows binary lives deep under the npm package tree:
+        // tools/claude-code/node_modules/@anthropic-ai/claude-code/bin/claude.exe
+        push_if(
+            tools
+                .join("claude-code")
+                .join("node_modules")
+                .join("@anthropic-ai")
+                .join("claude-code")
+                .join("bin")
+                .to_string_lossy()
+                .to_string(),
+        );
+    }
 
     // System / package-manager dirs next.
     #[cfg(target_os = "macos")]
@@ -390,6 +416,12 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // `tool_cap` works in production (not just unit tests).
     let cap_manager = std::sync::Arc::new(crate::cap::CapAgentManager::new(event_tx.clone()));
 
+    // Interactive cap session manager (Phase 1 of cap multi-instance
+    // sessions). Shared the same way as `cap_manager` so every
+    // AgentRuntime can offer the `cap_live` tool to its LLM.
+    let cap_live_manager =
+        std::sync::Arc::new(crate::cap::CapLiveManager::new(event_tx.clone()));
+
     // Build LiveConfig BEFORE the spawner: hot-reloadable per-domain locks
     // that AgentRuntime reads for live-mutable fields (temperature, etc.).
     let live = Arc::new(LiveConfig::new((*config).clone()));
@@ -413,6 +445,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         Some(Arc::clone(&plugins)),
         model_health.clone(),
         Some(Arc::clone(&cap_manager)),
+        Some(Arc::clone(&cap_live_manager)),
     );
 
     // Spawn MCP servers and discover tools (before agent tasks so tools are
@@ -470,6 +503,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         Arc::clone(&computer_runs),
         model_health.clone(),
         Arc::clone(&cap_manager),
+        Arc::clone(&cap_live_manager),
     );
 
     // Set i18n default language from gateway config.
@@ -751,6 +785,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         Arc::clone(&custom_webhooks),
         Arc::clone(&channel_senders),
         Arc::clone(&store.db),
+        shutdown.clone(),
     );
 
     // Register desktop channel — routes cron delivery to connected WS clients.
@@ -1444,6 +1479,7 @@ fn spawn_agent_tasks(
     >,
     model_health: crate::provider::health::ProviderHealthRegistry,
     cap_manager: std::sync::Arc<crate::cap::CapAgentManager>,
+    cap_live_manager: std::sync::Arc<crate::cap::CapLiveManager>,
 ) {
     for (agent_id, mut rx) in receivers {
         let handle = match registry.get(&agent_id) {
@@ -1487,6 +1523,7 @@ fn spawn_agent_tasks(
             notification_tx.clone(),
             model_health.clone(),
             Some(Arc::clone(&cap_manager)),
+            Some(Arc::clone(&cap_live_manager)),
         );
 
         // Inject WASM plugins into the agent runtime.

@@ -40,6 +40,8 @@ pub struct AgentSpawner {
     /// Coding-agent cap manager — shared from gateway startup so dynamically
     /// spawned agents also have `tool_cap` available.
     pub cap_manager: Option<std::sync::Arc<crate::cap::CapAgentManager>>,
+    /// Interactive multi-instance cap session manager, shared identically.
+    pub cap_live_manager: Option<std::sync::Arc<crate::cap::CapLiveManager>>,
     me: OnceLock<Weak<AgentSpawner>>,
 }
 
@@ -59,6 +61,7 @@ impl AgentSpawner {
         plugins: Option<Arc<PluginRegistry>>,
         model_health: crate::provider::health::ProviderHealthRegistry,
         cap_manager: Option<std::sync::Arc<crate::cap::CapAgentManager>>,
+        cap_live_manager: Option<std::sync::Arc<crate::cap::CapLiveManager>>,
     ) -> Arc<Self> {
         let s = Arc::new(Self {
             registry,
@@ -72,6 +75,7 @@ impl AgentSpawner {
             plugins,
             model_health,
             cap_manager,
+            cap_live_manager,
             me: OnceLock::new(),
         });
         s.me.set(Arc::downgrade(&s)).ok();
@@ -158,6 +162,7 @@ impl AgentSpawner {
             None, // notification_tx not available for dynamically spawned agents
             self.model_health.clone(),
             self.cap_manager.clone(),
+            self.cap_live_manager.clone(),
         );
 
         // Capture for i18n lookup on the error reply path inside the

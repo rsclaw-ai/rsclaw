@@ -805,9 +805,13 @@ pub fn build_user_system(
     // when cap_available is true so KV-cache prefix holds.
     if cap_available {
         parts.push(
-            "## Coding agents (via `cap`)\n\n\
-             You can dispatch a coding task to one of four CLI coding agents via \
-             `cap(agent, task)`. Pick the agent that best fits the task:\n\
+            "## Coding agents (via `cap` and `cap_live`)\n\n\
+             **TRIGGER — any time the user names one of the four CLI coding agents \
+             (`claude`, `claudecode`, `openclaude`, `opencode`, `codex`) and asks it \
+             to do work, dispatch via `cap` or `cap_live`.** Never via the `agent` or \
+             `task` tools — those are internal sub-agent / background-task \
+             primitives and won't spawn an external coding CLI.\n\n\
+             Agents:\n\
              - `claudecode` — Anthropic Claude Code. Strongest tool use, general-purpose. \
              Default choice when in doubt.\n\
              - `openclaude` — Claude-compatible OSS fork. Same interface, different upstream — \
@@ -816,11 +820,39 @@ pub fn build_user_system(
              lower latency for simple edits.\n\
              - `codex` — OpenAI Codex. Slower but reasoning-heavy; good for code review, \
              debugging hard issues, or tasks needing deep analysis.\n\n\
-             `cap` returns `{status: \"submitted\"}` immediately; the agent runs \
-             asynchronously. Live progress reaches the user's IM channel directly. \
-             The final summary arrives as a follow-up message you can act on \
-             (e.g. call `send_file`). Don't wait for the result in the same turn — \
-             acknowledge the dispatch to the user and let the follow-up wake you."
+             **Picking the right tool:**\n\n\
+             1. **PIPELINE / ORCHESTRATION → `cap_live`** (synchronous, you read each \
+             result before issuing the next call). Use cap_live when the user describes \
+             a chain where one agent's output feeds the next: e.g. \"让 codex 设计、\
+             claudecode 实现、opencode review\", \"X 出方案、Y 写代码、Z 检查\", \
+             \"design / implement / review\", \"draft / refine\", \"A 起草、B 改写\". \
+             Issue cap_live calls SEQUENTIALLY: get codex's design text → embed it in \
+             the `task` you send to claudecode → embed claudecode's code in the `task` \
+             for opencode. Each call returns synchronously with output + session_id. \
+             Call `cap_live_end` on every session_id when done.\n\
+             **session_id rules:**\n\
+             - `session_id` is bound to ONE agent. Reuse it only on a follow-up \
+             cap_live call with the SAME `agent` value. Passing codex's session_id \
+             to a claudecode call errors out and wastes a turn.\n\
+             - When switching agents in the pipeline, OMIT `session_id` (or pass an \
+             empty string). The new agent gets a fresh session — embed the previous \
+             agent's output as plain TEXT inside `task`.\n\
+             - `task` is REQUIRED on every call, including continuations. Never send \
+             an empty/whitespace task; if you have nothing concrete to ask, end the \
+             session instead.\n\n\
+             2. **PARALLEL / INDEPENDENT → `cap`** (fire-and-forget, push notifications). \
+             Use cap when the user asks several agents to do unrelated work that doesn't \
+             depend on each other (e.g. \"让 codex/claudecode/opencode 各写一个 fibonacci\"). \
+             `cap` returns `{status: submitted}` immediately, the agent runs async, the \
+             completion summary is pushed to the user's IM channel directly. You just \
+             acknowledge the dispatch and end the turn.\n\n\
+             3. **SINGLE TASK, just want the agent to do it** → `cap` (one-shot, easier).\n\
+             4. **SINGLE TASK, you need to read the agent's actual output and act on \
+             it this turn** → `cap_live` (single call, then `cap_live_end`).\n\n\
+             ⚠️ A pipeline expressed as multiple `cap` calls runs the agents in \
+             PARALLEL with no shared context. Each agent starts from a blank session, \
+             so claudecode won't see codex's design and opencode won't see the code — \
+             the chain is broken. Use `cap_live` for any \"A then B then C\" pattern."
                 .to_owned(),
         );
     }
@@ -1018,6 +1050,8 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "session",
     "gateway",
     "cap",
+    "cap_live",
+    "cap_live_end",
     "channel",
     "anycli",
     "clarify",

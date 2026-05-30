@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 use super::runtime::RunContext;
 use crate::cap::{
-    AgentKind, CapAgentManager,
+    AgentKind, CapAgentManager, CapLiveManager,
     runtime::{InboxTarget, NotifTarget},
 };
 
@@ -102,5 +102,93 @@ impl super::runtime::AgentRuntime {
                 &[("name", kind.display_name())],
             ),
         }))
+    }
+
+    /// `cap_live` — interactive synchronous call into a warm cap driver.
+    /// Opens a new session when `session_id` is missing/empty; otherwise
+    /// re-uses the existing session. Waits for the driver's full reply
+    /// before returning so the LLM can chain follow-ups in the same turn.
+    pub(crate) async fn tool_cap_live(&self, ctx: &RunContext, args: Value) -> Result<Value> {
+        let agent_str = args["agent"]
+            .as_str()
+            .ok_or_else(|| anyhow!("tool_cap_live: `agent` required"))?;
+        let kind = AgentKind::from_str(agent_str)
+            .ok_or_else(|| anyhow!("tool_cap_live: unknown agent `{agent_str}`"))?;
+        let task = args["task"]
+            .as_str()
+            .ok_or_else(|| anyhow!("tool_cap_live: `task` required"))?;
+        if task.trim().is_empty() {
+            return Err(anyhow!(
+                "tool_cap_live: `task` is empty — pass the prompt text the agent should \
+                 act on. If you are continuing a session, the new turn's instruction \
+                 belongs in `task`; do not send a blank message."
+            ));
+        }
+        let session_id = args["session_id"].as_str().map(|s| s.to_owned());
+        let cwd = args["cwd"]
+            .as_str()
+            .map(|s| std::path::PathBuf::from(crate::agent::runtime::expand_tilde(s)))
+            .unwrap_or_else(|| self.default_workspace());
+
+        let manager: &CapLiveManager = self
+            .cap_live_manager
+            .as_ref()
+            .ok_or_else(|| anyhow!("tool_cap_live: CapLiveManager not initialised"))?;
+
+        let lang = self
+            .config
+            .raw
+            .gateway
+            .as_ref()
+            .and_then(|g| g.language.as_deref())
+            .map(crate::i18n::resolve_lang)
+            .unwrap_or("en");
+
+        // Optional IM notification (same shape as cap task mode — surfaces
+        // the driver's inner tool-call progress + completion summary live
+        // to the user). `cap-followup` filtering does NOT apply here
+        // because this is a synchronous LLM-mediated call, not a passive
+        // re-injection.
+        let notif = match (&self.notification_tx, ctx.peer_id.is_empty()) {
+            (Some(tx), false) => Some(NotifTarget {
+                tx: tx.clone(),
+                target_id: ctx.peer_id.clone(),
+                is_group: false,
+                channel: ctx.channel.clone(),
+                lang,
+            }),
+            _ => None,
+        };
+
+        tracing::info!(
+            agent = agent_str,
+            session_id = ?session_id,
+            cwd = %cwd.display(),
+            task_preview = %task.chars().take(80).collect::<String>(),
+            "tool_cap_live: dispatch (sync)"
+        );
+
+        let result = manager
+            .dispatch_sync(kind, session_id, task.to_owned(), cwd, notif)
+            .await?;
+
+        Ok(json!({
+            "agent": result.agent_kind.as_str(),
+            "session_id": result.session_id,
+            "output": result.output,
+        }))
+    }
+
+    /// `cap_live_end` — release a live cap session and tear down its driver.
+    pub(crate) async fn tool_cap_live_end(&self, _ctx: &RunContext, args: Value) -> Result<Value> {
+        let session_id = args["session_id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("tool_cap_live_end: `session_id` required"))?;
+        let manager: &CapLiveManager = self
+            .cap_live_manager
+            .as_ref()
+            .ok_or_else(|| anyhow!("tool_cap_live_end: CapLiveManager not initialised"))?;
+        manager.end_session(session_id).await?;
+        Ok(json!({ "session_id": session_id, "status": "closed" }))
     }
 }

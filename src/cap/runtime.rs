@@ -184,7 +184,10 @@ impl CapAgentManager {
     }
 }
 
-async fn spawn_driver(kind: AgentKind, cwd: &std::path::Path) -> Result<Box<dyn Driver>> {
+pub(crate) async fn spawn_driver(
+    kind: AgentKind,
+    cwd: &std::path::Path,
+) -> Result<Box<dyn Driver>> {
     use cap_rs::driver::stream_json::ClaudeCodeDriver;
 
     let driver: Box<dyn Driver> = match kind {
@@ -228,7 +231,7 @@ async fn spawn_driver(kind: AgentKind, cwd: &std::path::Path) -> Result<Box<dyn 
 /// Send a notification to the IM channel, if a target is configured.
 /// Logs at warn! on send error so a transient channel issue doesn't kill
 /// the whole turn.
-fn push_notif(target: &NotifTarget, text: String) {
+pub(crate) fn push_notif(target: &NotifTarget, text: String) {
     let msg = OutboundMessage {
         target_id: target.target_id.clone(),
         is_group: target.is_group,
@@ -263,14 +266,12 @@ async fn actor_loop(
             } => {
                 let session_id = format!("cap-{agent_id}-{}", uuid::Uuid::new_v4());
 
-                // 1. Initial "submitted" notification to the user IM
-                //    channel. Mirrors old tools_acp's first-message.
-                if let Some(n) = &notif {
-                    push_notif(
-                        n,
-                        i18n::t_fmt("acp_submitted", n.lang, &[("name", display)]),
-                    );
-                }
+                // Note: no "submitted" ack notification — the calling LLM's
+                // text reply already tells the user the dispatch happened.
+                // Pushing an extra IM message per cap call floods rate-limited
+                // channels (wechat ret=-2 anti-spam) when several agents are
+                // dispatched in one turn; completion notifications still go
+                // through below.
 
                 // 2. Tell the LLM the prompt is queued. From here on the
                 //    LLM is free; the result is delivered async.
@@ -303,17 +304,33 @@ async fn actor_loop(
 
                 // 4. Run the turn. `run_turn` streams ToolCallStart
                 //    progress to `notif` and accumulates the final text
-                //    into `reply_buf`.
+                //    into `reply_buf`. Wrap in a 5-minute timeout so a
+                //    driver that hangs (e.g. an external CLI that never
+                //    emits its terminator) doesn't tie up the actor
+                //    indefinitely — on timeout we treat it as an error,
+                //    notify the user, and let the loop break + respawn.
+                const TURN_TIMEOUT: std::time::Duration =
+                    std::time::Duration::from_secs(300);
                 let mut reply_buf = String::new();
-                let outcome = run_turn(
-                    driver.as_mut(),
-                    &bus,
-                    &session_id,
-                    agent_id,
-                    notif.as_ref(),
-                    &mut reply_buf,
+                let outcome = match tokio::time::timeout(
+                    TURN_TIMEOUT,
+                    run_turn(
+                        driver.as_mut(),
+                        &bus,
+                        &session_id,
+                        agent_id,
+                        notif.as_ref(),
+                        &mut reply_buf,
+                    ),
                 )
-                .await;
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => Err(anyhow!(
+                        "cap {display}: turn timed out after {}s (driver hang?)",
+                        TURN_TIMEOUT.as_secs()
+                    )),
+                };
 
                 // 5. Completion / error notification + inbox reinjection.
                 match &outcome {
@@ -339,9 +356,16 @@ async fn actor_loop(
                             };
                             push_notif(n, body);
                         }
-                        if let Some(ib) = &inbox {
-                            inject_followup(ib, display, &reply_buf);
-                        }
+                        // inject_followup intentionally NOT called: the
+                        // followup turn doubles every cap completion (one
+                        // push_notif + one agent reply restating the same
+                        // text), and 4 caps × 2 msgs hammers rate-limited
+                        // channels. push_notif above is the canonical
+                        // result delivery. If you need the agent to chain
+                        // a follow-up action, re-enable inject_followup
+                        // here and route the result back through the user
+                        // session instead of `:cap-followup`.
+                        let _ = &inbox;
                     }
                     Err(e) => {
                         if let Some(n) = &notif {
@@ -374,6 +398,7 @@ async fn actor_loop(
 /// `send_file`, post a summary, schedule follow-ups). The follow-up
 /// runs on a `:cap-followup` sub-session so the live user-visible
 /// session does not get re-activated.
+#[allow(dead_code)] // see comment in actor where it used to be called
 fn inject_followup(inbox: &InboxTarget, display: &str, summary: &str) {
     let followup_session = format!("{}:cap-followup", inbox.session_key);
     let text = if summary.is_empty() {
@@ -411,7 +436,7 @@ fn inject_followup(inbox: &InboxTarget, display: &str, summary: &str) {
     });
 }
 
-async fn run_turn(
+pub(crate) async fn run_turn(
     driver: &mut dyn Driver,
     bus: &broadcast::Sender<crate::events::AgentEvent>,
     session_id: &str,

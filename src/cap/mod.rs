@@ -6,8 +6,10 @@
 //! `crate::agent::tools_cap`.
 
 pub(crate) mod bridge;
+pub(crate) mod live;
 pub(crate) mod notification;
 pub(crate) mod permission;
 pub(crate) mod runtime;
 
+pub(crate) use live::CapLiveManager;
 pub(crate) use runtime::{AgentKind, CapAgentManager};
