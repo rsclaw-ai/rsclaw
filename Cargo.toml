@@ -144,6 +144,15 @@ muda = { version = "0.16", optional = true }
 bzip2 = "0.6.1"
 lopdf = "0.34"
 glob = "0.3.3"
+# ripgrep's walker — gitignore-aware, no symlink-follow by default,
+# parallel-capable. Replaces `glob` for fs-tree traversal in agent
+# tools so `node_modules` symlink loops and `target/` blow-ups stop
+# wedging the worker thread.
+ignore = "0.4"
+# Glob matcher shared with `ignore`. Used by `safe_walk` to apply an
+# optional basename filter (`*.rs`, `Cargo.toml`, etc.) on top of the
+# walker's gitignore-aware traversal.
+globset = "0.4"
 encoding_rs = "0.8.35"
 
 # Knowledge base (src/kb/)

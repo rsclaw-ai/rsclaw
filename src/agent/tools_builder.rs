@@ -302,6 +302,13 @@ pub(crate) fn toolset_allowed_names(
         // agent, useful for orchestrating several cap agents in one IM turn.
         "cap_live",
         "cap_live_end",
+        // Sticky direct-mode bind/unbind — the user can ask in natural
+        // language ("接下来都让 claudecode 来" / "back to normal") and the
+        // LLM translates to these tools. After bind, the runtime routes
+        // subsequent user messages straight to the cap driver, skipping
+        // the LLM entirely until unbind.
+        "cap_bind_sticky",
+        "cap_unbind_sticky",
         // Sub-agent dispatch — rsclaw-native task/spawn for non-coding sub-work
         "agent",
         // Disambiguation: ask the user when the task description is genuinely ambiguous
@@ -1628,6 +1635,51 @@ pub fn build_tool_list(
                 "session_id": { "type": "string", "description": "session_id returned by a prior cap_live call." }
             },
             "required": ["session_id"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "cap_bind_sticky".to_owned(),
+        description: "Hand the conversation off to a CLI coding agent in STICKY DIRECT MODE — \
+            from the next user message onward, the user's messages flow STRAIGHT to the cap \
+            driver, completely BYPASSING this main LLM. Call this when the user explicitly \
+            asks to switch to a coding agent for the next several turns: \
+            \"接下来让 claudecode 来\", \"switch to codex\", \"用 opencode 帮我做\", \
+            \"let claude take over\". Equivalent to the `/cap <agent>` slash command but \
+            invoked via tool. Use `cap_unbind_sticky` when the user wants to come back. \n\
+            \n\
+            Tradeoff vs `cap_live`: cap_live keeps YOU in the loop (you read each cap reply \
+            and decide what to send next, can orchestrate multiple agents). cap_bind_sticky \
+            REMOVES YOU from the loop — the user talks to the coding agent directly. Pick \
+            cap_bind_sticky when the user signals \"step out of the way\"; pick cap_live \
+            when the user asks for orchestration / wants you to interpret results."
+            .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "agent": {
+                    "type": "string",
+                    "enum": ["claudecode", "openclaude", "opencode", "codex"],
+                    "description": "Which CLI coding agent to bind the IM session to."
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Optional working directory for the new session; defaults to the agent workspace."
+                }
+            },
+            "required": ["agent"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "cap_unbind_sticky".to_owned(),
+        description: "Release any sticky cap binding on the current IM session and tear down \
+            the underlying driver. Call this when the user signals they're done with the \
+            coding agent and want to talk to the main LLM again: \"回到正常对话\", \
+            \"stop using claudecode\", \"unbind\", \"done with codex\", \"thanks, that's all\". \
+            Safe to call defensively — returns `status: \"not_bound\"` if nothing was bound."
+            .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {}
         }),
     });
     tools.push(ToolDef {

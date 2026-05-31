@@ -1052,6 +1052,8 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "cap",
     "cap_live",
     "cap_live_end",
+    "cap_bind_sticky",
+    "cap_unbind_sticky",
     "channel",
     "anycli",
     "clarify",

@@ -191,4 +191,128 @@ impl super::runtime::AgentRuntime {
         manager.end_session(session_id).await?;
         Ok(json!({ "session_id": session_id, "status": "closed" }))
     }
+
+    /// `cap_bind_sticky` — natural-language equivalent of the `/cap <agent>`
+    /// slash command. The LLM calls this when the user expresses intent to
+    /// hand the conversation off to a coding subagent ("接下来让 claudecode
+    /// 来", "switch to codex for the next few turns"). Opens a new cap_live
+    /// session and binds it to the current IM session_key so subsequent
+    /// user messages bypass the main LLM entirely.
+    ///
+    /// Returns the freshly minted `session_id` for traceability, but the
+    /// LLM should NOT need to pass it back anywhere — sticky direct mode
+    /// is consumed at the runtime layer (see
+    /// `AgentRuntime::run_turn` → sticky bypass branch). Use this
+    /// alongside `cap_unbind_sticky` to wind it down.
+    pub(crate) async fn tool_cap_bind_sticky(
+        &self,
+        ctx: &RunContext,
+        args: Value,
+    ) -> Result<Value> {
+        let agent_str = args["agent"]
+            .as_str()
+            .ok_or_else(|| anyhow!("tool_cap_bind_sticky: `agent` required"))?;
+        let kind = AgentKind::from_str(agent_str)
+            .ok_or_else(|| anyhow!("tool_cap_bind_sticky: unknown agent `{agent_str}`"))?;
+        let cwd = args["cwd"]
+            .as_str()
+            .map(|s| std::path::PathBuf::from(crate::agent::runtime::expand_tilde(s)))
+            .unwrap_or_else(|| self.default_workspace());
+
+        let manager: &CapLiveManager = self
+            .cap_live_manager
+            .as_ref()
+            .ok_or_else(|| anyhow!("tool_cap_bind_sticky: CapLiveManager not initialised"))?;
+
+        if ctx.session_key.is_empty() {
+            return Err(anyhow!(
+                "tool_cap_bind_sticky: empty session_key — sticky binding only meaningful inside \
+                 a real IM/WS session"
+            ));
+        }
+
+        let session_id = manager.open_session(kind, cwd).await?;
+        manager
+            .bind_sticky(ctx.session_key.clone(), session_id.clone(), kind)
+            .await;
+
+        tracing::info!(
+            target: "cap",
+            session_id = %session_id,
+            agent = kind.as_str(),
+            im_session_key = %ctx.session_key,
+            "cap_live sticky bind via LLM tool"
+        );
+
+        let lang = self
+            .config
+            .raw
+            .gateway
+            .as_ref()
+            .and_then(|g| g.language.as_deref())
+            .map(crate::i18n::resolve_lang)
+            .unwrap_or("en");
+        Ok(json!({
+            "agent": kind.as_str(),
+            "session_id": session_id,
+            "status": "bound",
+            "output": crate::i18n::t_fmt(
+                "cap_bound",
+                lang,
+                &[
+                    ("agent", kind.display_name()),
+                    ("sid", &session_id[..8.min(session_id.len())]),
+                ],
+            ),
+        }))
+    }
+
+    /// `cap_unbind_sticky` — natural-language `/cap-end`. The LLM calls
+    /// this when the user signals "back to normal" / "stop using
+    /// claudecode" / "release". Releases the sticky binding on the
+    /// current IM session AND tears down the underlying live driver.
+    /// No-op (returns `status: "not_bound"`) if nothing was bound — the
+    /// LLM can call it defensively.
+    pub(crate) async fn tool_cap_unbind_sticky(
+        &self,
+        ctx: &RunContext,
+        _args: Value,
+    ) -> Result<Value> {
+        let manager: &CapLiveManager = self
+            .cap_live_manager
+            .as_ref()
+            .ok_or_else(|| anyhow!("tool_cap_unbind_sticky: CapLiveManager not initialised"))?;
+        let lang = self
+            .config
+            .raw
+            .gateway
+            .as_ref()
+            .and_then(|g| g.language.as_deref())
+            .map(crate::i18n::resolve_lang)
+            .unwrap_or("en");
+        let Some((sid, kind)) = manager.unbind_sticky(&ctx.session_key).await else {
+            return Ok(json!({
+                "status": "not_bound",
+                "output": crate::i18n::t("cap_no_active", lang),
+            }));
+        };
+        let _ = manager.end_session(&sid).await;
+        tracing::info!(
+            target: "cap",
+            session_id = %sid,
+            agent = kind.as_str(),
+            im_session_key = %ctx.session_key,
+            "cap_live sticky unbind via LLM tool"
+        );
+        Ok(json!({
+            "agent": kind.as_str(),
+            "session_id": sid,
+            "status": "released",
+            "output": crate::i18n::t_fmt(
+                "cap_session_closed",
+                lang,
+                &[("agent", kind.display_name())],
+            ),
+        }))
+    }
 }

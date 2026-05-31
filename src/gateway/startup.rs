@@ -1599,6 +1599,32 @@ fn spawn_agent_tasks(
                     cancel_token: Some(turn_token.clone()),
                     input_request_tx,
                 };
+                // Per-turn stuck-turn watchdog (P2c). If a single user turn
+                // runs longer than this without completing, assume something
+                // is wedged (LLM provider hang, runaway tool-call loop, a
+                // tool that ignored its own internal deadline) and force-
+                // abort the turn via the cancel_token. Generous because
+                // long legitimate cap_live + multi-tool turns can take a
+                // while, but tight enough to keep the single-threaded
+                // agent queue from going dark for an hour.
+                const TURN_WALL_CLOCK_LIMIT: std::time::Duration =
+                    std::time::Duration::from_secs(20 * 60);
+                let watchdog_token = turn_token.clone();
+                let watchdog_agent = handle.id.clone();
+                let watchdog_session = session_key.clone();
+                let watchdog = tokio::spawn(async move {
+                    tokio::time::sleep(TURN_WALL_CLOCK_LIMIT).await;
+                    if !watchdog_token.is_cancelled() {
+                        tracing::error!(
+                            agent = %watchdog_agent,
+                            session = %watchdog_session,
+                            limit_s = TURN_WALL_CLOCK_LIMIT.as_secs(),
+                            "stuck-turn watchdog: firing cancel_token — turn exceeded \
+                             wall-clock limit; the agent queue must not stay dark"
+                        );
+                        watchdog_token.cancel();
+                    }
+                });
                 let result = tokio::select! {
                     biased;
                     // Hard cancel: drops the run_turn future (and every await
@@ -1618,6 +1644,11 @@ fn spawn_agent_tasks(
                         turn_ctx,
                     ) => r,
                 };
+                // Turn completed (success/error/cancel) — stop the watchdog.
+                // If the watchdog already fired the cancel, the select! above
+                // already exited via the cancellation branch; this abort is
+                // just hygiene to release the spawned task.
+                watchdog.abort();
                 // Drop our registered token so a later abort for this session
                 // can't cancel a future turn, and the map doesn't leak.
                 if registered {

@@ -215,9 +215,41 @@ impl AgentHandle {
             }
         }
 
+        // In-flight tool snapshot — surfaces "search_file running for
+        // 8min" so the user can see exactly why their /status reply was
+        // delayed. Without this section, a wedged tool is invisible
+        // until the operator goes hunting in logs.
+        //
+        // `live_status` is a tokio::sync::RwLock, so the only way to
+        // peek synchronously from this non-async fn is `try_read`. That
+        // returns immediately whether the lock is held or not — we
+        // accept that a /status fired the same instant another task
+        // holds the write side just gets an empty in-flight section
+        // (caller can /status again). Vastly cheaper than retrofitting
+        // format_status into an async fn touched by 30+ callers.
+        let mut in_flight_lines = String::new();
+        if let Ok(status) = self.live_status.try_read() {
+            if !status.in_flight_tools.is_empty() {
+                in_flight_lines.push_str("In-flight tools:\n");
+                let now = Instant::now();
+                for (tool, started) in &status.in_flight_tools {
+                    let secs = now.saturating_duration_since(*started).as_secs();
+                    let label = if secs < 60 {
+                        format!("{secs}s")
+                    } else if secs < 3600 {
+                        format!("{}m {}s", secs / 60, secs % 60)
+                    } else {
+                        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+                    };
+                    in_flight_lines.push_str(&format!("\u{A0} {tool} ({label})\n"));
+                }
+            }
+        }
+
         format!(
             "Gateway: running\nOS: {os}\nModel: {model}\nSessions: {sessions}\n\
              {ctx_lines}\
+             {in_flight_lines}\
              Uptime: {uptime}\nVersion: rsclaw {}",
             option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
         )

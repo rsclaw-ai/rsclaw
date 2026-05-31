@@ -433,21 +433,20 @@ pub(crate) async fn try_preparse_locally_with_account(
     // Sticky direct mode is for "I want to talk to claudecode directly
     // for the next several turns" without the LLM in the middle.
     if lower == "/cap" || lower == "/cap -h" || lower == "/cap --help" || lower == "/cap help" {
-        return Some(txt(
-            "/cap <agent> — bind this chat to a coding agent (claudecode | openclaude | opencode | codex)\n\
-             /cap-end       — release the binding"
-                .to_owned(),
-        ));
+        return Some(txt(crate::i18n::t("cap_help", crate::i18n::default_lang())));
     }
     if let Some(rest) = lower.strip_prefix("/cap ") {
         let agent_str = rest.trim();
+        let lang = crate::i18n::default_lang();
         let Some(kind) = crate::cap::AgentKind::from_str(agent_str) else {
-            return Some(txt(format!(
-                "/cap: unknown agent `{agent_str}` (try: claudecode, openclaude, opencode, codex)"
+            return Some(txt(crate::i18n::t_fmt(
+                "cap_unknown_agent",
+                lang,
+                &[("agent", agent_str)],
             )));
         };
         let Some(manager) = crate::cap::GLOBAL_CAP_LIVE.get() else {
-            return Some(txt("/cap: cap_live not initialised".to_owned()));
+            return Some(txt(crate::i18n::t("cap_not_initialised", lang)));
         };
         let cwd = workspace();
         match manager.open_session(kind, cwd).await {
@@ -462,24 +461,33 @@ pub(crate) async fn try_preparse_locally_with_account(
                     im_session_key = %this_session_key,
                     "cap_live sticky bind"
                 );
-                return Some(txt(format!(
-                    "bound to {} (session {}). Next messages go directly to the driver. /cap-end to release.",
-                    kind.display_name(),
-                    &sid[..8.min(sid.len())]
+                return Some(txt(crate::i18n::t_fmt(
+                    "cap_bound",
+                    lang,
+                    &[
+                        ("agent", kind.display_name()),
+                        ("sid", &sid[..8.min(sid.len())]),
+                    ],
                 )));
             }
             Err(e) => {
-                return Some(txt(format!("/cap: failed to open session: {e}")));
+                let err = e.to_string();
+                return Some(txt(crate::i18n::t_fmt(
+                    "cap_open_failed",
+                    lang,
+                    &[("err", &err)],
+                )));
             }
         }
     }
     // /cap-end — release any sticky binding on this IM session.
     if lower == "/cap-end" {
+        let lang = crate::i18n::default_lang();
         let Some(manager) = crate::cap::GLOBAL_CAP_LIVE.get() else {
-            return Some(txt("/cap-end: cap_live not initialised".to_owned()));
+            return Some(txt(crate::i18n::t("cap_not_initialised", lang)));
         };
         let Some((sid, kind)) = manager.unbind_sticky(&this_session_key).await else {
-            return Some(txt("/cap-end: no active cap session here".to_owned()));
+            return Some(txt(crate::i18n::t("cap_no_active", lang)));
         };
         let _ = manager.end_session(&sid).await;
         tracing::info!(
@@ -489,9 +497,10 @@ pub(crate) async fn try_preparse_locally_with_account(
             im_session_key = %this_session_key,
             "cap_live sticky unbind + end"
         );
-        return Some(txt(format!(
-            "{} session closed. Normal LLM behavior resumed.",
-            kind.display_name()
+        return Some(txt(crate::i18n::t_fmt(
+            "cap_session_closed",
+            lang,
+            &[("agent", kind.display_name())],
         )));
     }
     // /status

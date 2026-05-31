@@ -262,6 +262,211 @@ mod shell_sanitize_tests {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Safe filesystem walker (P0a)
+//
+// Replaces `glob::glob` for tool-side traversal. The story:
+//   - `glob` follows symlinks, has no gitignore awareness, and runs
+//     synchronously without yielding. A `glob::glob("/Users/$HOME/**/*")`
+//     on a tree with one `node_modules` hoist symlink loop loops forever,
+//     pinning a tokio worker thread.
+//   - `tokio::time::timeout` does NOT save us — the future never reaches an
+//     await point, so the timeout's drop-on-elapsed never fires.
+//
+// `safe_walk` runs the walk on a dedicated blocking thread via
+// `spawn_blocking`, polls a wall-clock deadline at every directory entry,
+// uses `ignore::WalkBuilder` (BurntSushi's gitignore-aware walker that
+// powers ripgrep), and disables symlink-follow so `node_modules` loops
+// cannot kill us.
+// ---------------------------------------------------------------------------
+
+/// Why a walk stopped early. Returned alongside results so the LLM (and
+/// the user) can tell "I gave you the whole tree" from "I bailed at the
+/// 50k file mark and there's probably more."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalkTrunc {
+    NotTruncated,
+    /// Hit `max_results` matches — stopped accumulating but the walk
+    /// itself ran to completion.
+    MaxResults,
+    /// Scanned through `max_scanned` directory entries before either
+    /// reaching `max_results` matches or running out of tree.
+    MaxScanned,
+    /// Wall-clock deadline elapsed mid-walk.
+    Deadline,
+}
+
+impl WalkTrunc {
+    fn as_str(self) -> &'static str {
+        match self {
+            WalkTrunc::NotTruncated => "complete",
+            WalkTrunc::MaxResults => "max_results",
+            WalkTrunc::MaxScanned => "max_files_scanned",
+            WalkTrunc::Deadline => "wall_clock_timeout",
+        }
+    }
+}
+
+/// One returned filesystem entry. Metadata is best-effort (None when the
+/// stat call failed — e.g. permission denied, dangling symlink).
+struct WalkEntry {
+    path: std::path::PathBuf,
+    is_dir: bool,
+    size: u64,
+    mtime: std::time::SystemTime,
+}
+
+struct WalkOutcome {
+    entries: Vec<WalkEntry>,
+    /// How many directory entries the walker visited (NOT how many matched).
+    /// Useful telemetry — a search that returned 3 matches but scanned
+    /// 200k entries probably needs a tighter `path` argument.
+    scanned: usize,
+    truncated: WalkTrunc,
+}
+
+/// Walk a directory tree safely.
+///
+/// - `root` — absolute path of the directory to walk. Must exist.
+/// - `name_filter` — optional `globset` glob (matches against BASENAME).
+///   `None` = include every entry. Pattern like `*.rs`, `Cargo.toml`,
+///   `opencode` (literal-name match), etc.
+/// - `recursive` — descend into subdirs. When false, only `root`'s direct
+///   children are visited.
+/// - `max_results` — cap on returned `entries`. Walk continues internally
+///   only until this is hit (or one of the other limits).
+/// - `max_scanned` — cap on directory entries the walker is allowed to
+///   visit. Catches "result is rare but tree is enormous" scenarios.
+/// - `deadline` — wall-clock cap. Walker exits cleanly when exceeded.
+///
+/// All blocking work happens inside `spawn_blocking`, so the caller's
+/// async runtime can cancel via `tokio::select!` or task abort.
+async fn safe_walk(
+    root: std::path::PathBuf,
+    name_filter: Option<String>,
+    recursive: bool,
+    max_results: usize,
+    max_scanned: usize,
+    deadline: Duration,
+) -> Result<WalkOutcome> {
+    use ignore::WalkBuilder;
+    let started = std::time::Instant::now();
+
+    let outcome = tokio::task::spawn_blocking(move || -> Result<WalkOutcome> {
+        // Compile the optional basename filter. `None` => include everything.
+        // Glob compile errors propagate to the LLM so it can fix the pattern.
+        let matcher = match &name_filter {
+            Some(p) => Some(
+                globset::Glob::new(p)
+                    .map_err(|e| anyhow!("invalid name pattern `{p}`: {e}"))?
+                    .compile_matcher(),
+            ),
+            None => None,
+        };
+
+        let mut builder = WalkBuilder::new(&root);
+        builder
+            // .gitignore + global ignore + .ignore — sane defaults so
+            // `target/`, `node_modules/`, `.venv/` etc. are skipped.
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .ignore(true)
+            .hidden(true) // skip dotfiles by default; LLM can pass an explicit dotpath
+            // CRITICAL: don't follow symlinks. node_modules npm hoist
+            // typically creates dir→dir symlink chains that loop.
+            .follow_links(false)
+            // Bound depth even when "recursive" — pathological trees
+            // (e.g. a misconfigured FUSE mount) can be arbitrarily deep.
+            .max_depth(if recursive { Some(32) } else { Some(1) });
+
+        let mut entries: Vec<WalkEntry> = Vec::with_capacity(max_results.min(256));
+        let mut scanned: usize = 0;
+        let mut truncated = WalkTrunc::NotTruncated;
+
+        for dent in builder.build() {
+            scanned += 1;
+
+            // Cheap checks first to keep the hot loop tight.
+            if scanned >= max_scanned {
+                truncated = WalkTrunc::MaxScanned;
+                break;
+            }
+            // Poll the wall-clock every 256 entries — cheaper than per-entry
+            // Instant::now() (which is a syscall on some platforms).
+            if scanned & 0xff == 0 && started.elapsed() >= deadline {
+                truncated = WalkTrunc::Deadline;
+                break;
+            }
+
+            let dent = match dent {
+                Ok(d) => d,
+                // Permission denied / unreadable entry — skip silently.
+                // ignore::Error already logs internally if RUST_LOG=ignore=debug.
+                Err(_) => continue,
+            };
+
+            // Skip the root itself; ignore::Walk yields it as depth=0.
+            if dent.depth() == 0 {
+                continue;
+            }
+
+            let p = dent.path().to_path_buf();
+
+            // Apply optional name filter against basename only — matches
+            // the original `glob::glob("root/**/<pattern>")` semantics.
+            if let Some(m) = &matcher {
+                let name_match = p
+                    .file_name()
+                    .map(|n| {
+                        let np: &std::path::Path = std::path::Path::new(n);
+                        m.is_match(np)
+                    })
+                    .unwrap_or(false);
+                if !name_match {
+                    continue;
+                }
+            }
+
+            let (is_dir, size, mtime) = match dent.metadata() {
+                Ok(meta) => {
+                    let is_dir = meta.is_dir();
+                    let size = if is_dir { 0 } else { meta.len() };
+                    let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                    (is_dir, size, mtime)
+                }
+                Err(_) => (
+                    dent.file_type().map(|ft| ft.is_dir()).unwrap_or(false),
+                    0,
+                    std::time::UNIX_EPOCH,
+                ),
+            };
+
+            entries.push(WalkEntry {
+                path: p,
+                is_dir,
+                size,
+                mtime,
+            });
+
+            if entries.len() >= max_results {
+                truncated = WalkTrunc::MaxResults;
+                break;
+            }
+        }
+
+        Ok(WalkOutcome {
+            entries,
+            scanned,
+            truncated,
+        })
+    })
+    .await
+    .map_err(|e| anyhow!("walker panicked: {e}"))??;
+
+    Ok(outcome)
+}
+
 impl super::runtime::AgentRuntime {
     /// Default workspace path for this agent, used when a file tool was
     /// invoked without an explicit `path`. See [`resolve_default_workspace`]
@@ -276,7 +481,8 @@ impl super::runtime::AgentRuntime {
     }
 
     /// List files and directories in a path (structured alternative to `exec
-    /// ls`).
+    /// ls`). Uses [`safe_walk`] so a huge or pathological tree (symlink
+    /// loops, deeply nested `node_modules`) cannot wedge the worker.
     pub(crate) async fn tool_list_dir(&self, args: Value) -> Result<Value> {
         let default_ws = self.default_workspace();
         let path = args["path"]
@@ -285,7 +491,10 @@ impl super::runtime::AgentRuntime {
             .map(expand_tilde)
             .unwrap_or(default_ws);
         let recursive = args["recursive"].as_bool().unwrap_or(false);
-        let pattern = args["pattern"].as_str().unwrap_or("*");
+        let pattern_raw = args["pattern"].as_str().unwrap_or("*");
+        // "*" means "no filter"; safe_walk treats None as "any entry"
+        // which is faster (no globset compile + no per-entry match).
+        let pattern = if pattern_raw == "*" { None } else { Some(pattern_raw.to_owned()) };
 
         if !path.exists() {
             return Ok(json!({"error": format!("path not found: {}", path.display())}));
@@ -294,46 +503,69 @@ impl super::runtime::AgentRuntime {
             return Ok(json!({"error": format!("not a directory: {}", path.display())}));
         }
 
-        let glob_pattern = if recursive {
-            format!("{}/**/{}", path.display(), pattern)
-        } else {
-            format!("{}/{}", path.display(), pattern)
+        // Budgets:
+        //   max_results 100 (back-compat with previous hard-cap).
+        //   max_scanned 50k — `ls` should never need to look at more than that.
+        //   deadline 30s — `ls` is interactive; if it can't finish in 30s
+        //   on the first 50k entries something is wrong.
+        let outcome = match safe_walk(
+            path.clone(),
+            pattern,
+            recursive,
+            100,
+            50_000,
+            Duration::from_secs(30),
+        )
+        .await
+        {
+            Ok(o) => o,
+            Err(e) => return Ok(json!({"error": format!("walk failed: {e}")})),
         };
 
-        let mut entries: Vec<Value> = Vec::new();
-        let entries_iter = match glob::glob(&glob_pattern) {
-            Ok(iter) => iter,
-            Err(e) => return Ok(json!({"error": format!("invalid pattern: {e}")})),
-        };
-        for entry in entries_iter {
-            if entries.len() >= 100 {
-                break;
-            }
-            if let Ok(p) = entry {
-                let is_dir = p.is_dir();
-                let size = if is_dir {
-                    0
-                } else {
-                    p.metadata().map(|m| m.len()).unwrap_or(0)
-                };
-                entries.push(json!({
-                    "name": p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
-                    "path": p.to_string_lossy(),
-                    "is_dir": is_dir,
-                    "size": size,
-                }));
-            }
-        }
+        let entries: Vec<Value> = outcome
+            .entries
+            .iter()
+            .map(|e| {
+                let name = e
+                    .path
+                    .file_name()
+                    .map(|n| {
+                        let s = n.to_string_lossy().into_owned();
+                        crate::util::truncate_str(&s, 200).to_owned()
+                    })
+                    .unwrap_or_default();
+                json!({
+                    "name": name,
+                    "path": e.path.to_string_lossy(),
+                    "is_dir": e.is_dir,
+                    "size": e.size,
+                })
+            })
+            .collect();
 
-        Ok(json!({
+        let mut out = json!({
             "path": path.to_string_lossy(),
             "count": entries.len(),
             "entries": entries,
-        }))
+            "scanned": outcome.scanned,
+            "status": outcome.truncated.as_str(),
+        });
+        if outcome.truncated != WalkTrunc::NotTruncated {
+            out["truncated_note"] = json!(format!(
+                "list_dir stopped early ({}). Narrow `path` or `pattern` to see more.",
+                outcome.truncated.as_str()
+            ));
+        }
+        Ok(out)
     }
 
     /// Search for files by name pattern (structured alternative to `exec
-    /// find`).
+    /// find`). Uses [`safe_walk`] — gitignore-aware, no symlink-follow,
+    /// hard wall-clock cap. The pre-2026-06-01 implementation used
+    /// `glob::glob` synchronously which would hang indefinitely on trees
+    /// with `node_modules` symlink loops or huge `target/` dirs because
+    /// the iterator's blocking syscalls never yielded back to tokio for
+    /// the dispatch_tool timeout to take effect.
     pub(crate) async fn tool_search_file(&self, args: Value) -> Result<Value> {
         let default_ws = self.default_workspace();
         let root_path = args["path"]
@@ -343,52 +575,64 @@ impl super::runtime::AgentRuntime {
             .unwrap_or(default_ws);
         let pattern = args["pattern"]
             .as_str()
-            .ok_or_else(|| anyhow!("search_file: `pattern` required"))?;
+            .ok_or_else(|| anyhow!("search_file: `pattern` required"))?
+            .to_owned();
         let max_results = args["max_results"].as_u64().unwrap_or(20) as usize;
 
-        let glob_pattern = format!("{}/**/{}", root_path.display(), pattern);
-        let entries_iter = match glob::glob(&glob_pattern) {
-            Ok(iter) => iter,
-            Err(e) => return Ok(json!({"error": format!("invalid pattern: {e}")})),
+        // Budgets:
+        //   max_scanned 200k — generous for code searches, tight enough
+        //   that pathological trees don't burn worker time forever.
+        //   deadline 60s — search_file is an interactive tool; longer
+        //   than this and the LLM should narrow `path` and retry.
+        let outcome = match safe_walk(
+            root_path.clone(),
+            Some(pattern.clone()),
+            true,
+            max_results,
+            200_000,
+            Duration::from_secs(60),
+        )
+        .await
+        {
+            Ok(o) => o,
+            Err(e) => return Ok(json!({"error": format!("search_file: {e}")})),
         };
 
-        // Collect (path, metadata, mtime) so we can sort by most-recent
-        // before truncating to max_results. Files without readable metadata
-        // sink to the bottom with mtime=0.
-        let mut entries: Vec<(std::path::PathBuf, u64, std::time::SystemTime)> = entries_iter
-            .filter_map(|e| e.ok())
-            .map(|p| {
-                let meta = p.metadata().ok();
-                let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-                let mtime = meta
-                    .and_then(|m| m.modified().ok())
-                    .unwrap_or(std::time::UNIX_EPOCH);
-                (p, size, mtime)
-            })
-            .collect();
+        // Newest first — most recently modified files are usually most
+        // relevant when an agent is investigating recent activity. With
+        // truncation, "newest" is only over the scanned slice, but that's
+        // the same caveat as before.
+        let mut sorted = outcome.entries;
+        sorted.sort_by(|a, b| b.mtime.cmp(&a.mtime));
 
-        // Newest first — most recently modified files are usually the most
-        // relevant when an agent is investigating recent activity.
-        entries.sort_by(|a, b| b.2.cmp(&a.2));
-        entries.truncate(max_results);
-
-        let results: Vec<Value> = entries
+        let results: Vec<Value> = sorted
             .into_iter()
-            .map(|(p, size, _)| {
+            .map(|e| {
                 json!({
-                    "path": p.to_string_lossy(),
-                    "size": size,
-                    "is_dir": p.is_dir(),
+                    "path": e.path.to_string_lossy(),
+                    "size": e.size,
+                    "is_dir": e.is_dir,
                 })
             })
             .collect();
 
-        Ok(json!({
+        let mut out = json!({
             "pattern": pattern,
             "root": root_path.to_string_lossy(),
             "count": results.len(),
+            "scanned": outcome.scanned,
+            "status": outcome.truncated.as_str(),
             "results": results,
-        }))
+        });
+        if outcome.truncated != WalkTrunc::NotTruncated {
+            out["truncated_note"] = json!(format!(
+                "search_file stopped early ({}). Scanned {} entries. \
+                 Narrow `path` (e.g. to a specific repo) or refine `pattern` to see more.",
+                outcome.truncated.as_str(),
+                outcome.scanned,
+            ));
+        }
+        Ok(out)
     }
 
     /// Search file contents by pattern (structured alternative to `exec grep`).

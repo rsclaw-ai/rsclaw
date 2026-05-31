@@ -114,6 +114,11 @@ pub struct LiveStatus {
     pub started_at: Option<std::time::Instant>,
     /// Session key for the current turn.
     pub session_key: String,
+    /// Tools currently running this turn (parallel dispatch). Each entry
+    /// is (tool_name, started_at). Populated at dispatch_tool entry,
+    /// drained at exit. /status renders one line per entry so the user
+    /// can see "search_file running for 8min" instead of a silent hang.
+    pub in_flight_tools: Vec<(String, std::time::Instant)>,
 }
 
 pub use super::context_mgr::estimate_tokens;
@@ -2198,6 +2203,14 @@ impl AgentRuntime {
                     agent = kind.as_str(),
                     "sticky bypass: routing user message direct to cap driver"
                 );
+                let lang = self
+                    .config
+                    .raw
+                    .gateway
+                    .as_ref()
+                    .and_then(|g| g.language.as_deref())
+                    .map(crate::i18n::resolve_lang)
+                    .unwrap_or("en");
                 let reply_text = match manager
                     .dispatch_sync(
                         kind,
@@ -2214,18 +2227,22 @@ impl AgentRuntime {
                         // message either re-routes through the LLM or
                         // the user can /cap again.
                         let _ = manager.unbind_sticky(session_key).await;
-                        format!(
-                            "[cap {} driver error] {e}\n(sticky binding released; \
-                             use /cap {} to reconnect or just keep chatting with the main LLM)",
-                            kind.as_str(),
-                            kind.as_str()
+                        let err = e.to_string();
+                        crate::i18n::t_fmt(
+                            "cap_driver_error",
+                            lang,
+                            &[("agent", kind.as_str()), ("err", &err)],
                         )
                     }
                 };
                 let is_empty = reply_text.trim().is_empty();
                 return Ok(AgentReply {
                     text: if is_empty {
-                        format!("[{}] (no output)", kind.display_name())
+                        crate::i18n::t_fmt(
+                            "cap_no_output",
+                            lang,
+                            &[("agent", kind.display_name())],
+                        )
                     } else {
                         reply_text
                     },
@@ -3816,6 +3833,8 @@ impl AgentRuntime {
                     "cap",
                     "cap_live",
                     "cap_live_end",
+                    "cap_bind_sticky",
+                    "cap_unbind_sticky",
                     "task",
                 ];
                 all.retain(|t| !FOLLOWUP_BLOCKED.contains(&t.name.as_str()));
@@ -6580,6 +6599,8 @@ impl AgentRuntime {
                         | "cap"
                         | "cap_live"
                         | "cap_live_end"
+                        | "cap_bind_sticky"
+                        | "cap_unbind_sticky"
                         | "agent"
                         | "search_content"
                         | "search_file"
@@ -6644,10 +6665,151 @@ impl AgentRuntime {
                     let tool_input_str = p.tool_input_str.clone();
                     let fut =
                         self.dispatch_tool(ctx, &p.tool_id, &p.tool_name, p.tool_input.clone());
+                    // Snapshot the live_status arc so the dispatch future
+                    // can register/unregister itself without re-borrowing
+                    // &self into the spawned closure.
+                    let live_status_for_tool = Arc::clone(&self.live_status);
+                    // Clone the cancel_token OUTSIDE the async move below
+                    // so we don't need to re-borrow `ctx` inside the
+                    // future (which would conflict with the borrow that
+                    // dispatch_tool already holds). `None` for non-A2A /
+                    // non-WS turns gracefully falls back to pending().
+                    let cancel_token_owned = ctx.turn_ctx.cancel_token.clone();
                     async move {
-                        let timed =
-                            time::timeout(Duration::from_secs(TOOL_DISPATCH_TIMEOUT_SECS), fut)
-                                .await;
+                        // Per-tool latency tracking. Sub-30s = silent, the
+                        // common case. >30s = warn so operators see the slow
+                        // tool in logs. >5min = error + a bus emit so the
+                        // user actually sees "still running X" in chat. The
+                        // outer 600s timeout below is the last-resort kill;
+                        // tools that block past then are killed regardless.
+                        let started = std::time::Instant::now();
+                        // Register on the agent's in-flight tools list so
+                        // /status renders an accurate snapshot. Drop the
+                        // registration when this future exits (success,
+                        // error, timeout, or cancel — all roads lead here).
+                        if let Ok(mut s) = live_status_for_tool.try_write() {
+                            s.in_flight_tools.push((tool_name.clone(), started));
+                        }
+                        struct InFlightGuard {
+                            ls: Arc<RwLock<LiveStatus>>,
+                            tool: String,
+                            started: std::time::Instant,
+                        }
+                        impl Drop for InFlightGuard {
+                            fn drop(&mut self) {
+                                if let Ok(mut s) = self.ls.try_write() {
+                                    if let Some(pos) = s.in_flight_tools.iter().position(
+                                        |(n, t)| n == &self.tool && *t == self.started,
+                                    ) {
+                                        s.in_flight_tools.swap_remove(pos);
+                                    }
+                                }
+                            }
+                        }
+                        let _in_flight_guard = InFlightGuard {
+                            ls: Arc::clone(&live_status_for_tool),
+                            tool: tool_name.clone(),
+                            started,
+                        };
+                        let slow_warn_emitted = std::sync::Arc::new(
+                            std::sync::atomic::AtomicBool::new(false),
+                        );
+                        // Spawn a sibling watcher so we can emit the
+                        // long-running warning *while* the tool is still
+                        // executing (not just after it returns).
+                        let watcher = {
+                            let tool_name = tool_name.clone();
+                            let session_id = session_id.clone();
+                            let agent_id = agent_id.clone();
+                            let bus_w = bus.clone();
+                            let emitted = std::sync::Arc::clone(&slow_warn_emitted);
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_secs(300)).await;
+                                if emitted
+                                    .compare_exchange(
+                                        false,
+                                        true,
+                                        std::sync::atomic::Ordering::SeqCst,
+                                        std::sync::atomic::Ordering::SeqCst,
+                                    )
+                                    .is_ok()
+                                {
+                                    tracing::error!(
+                                        target: "agent::dispatch_tool",
+                                        tool = %tool_name,
+                                        "tool still running after 5 minutes — \
+                                         the 10 minute outer timeout will fire if it \
+                                         doesn't return soon"
+                                    );
+                                    if let Some(bus) = bus_w {
+                                        let marker = format!(
+                                            "<rstool name=\"{tool_name}\">⚠️ still running after 5 minutes…</rstool>"
+                                        );
+                                        let _ = bus.send(AgentEvent {
+                                            session_id,
+                                            agent_id,
+                                            delta: marker,
+                                            done: false,
+                                            files: vec![],
+                                            images: vec![],
+                                            tool_log: vec![],
+                                            question: None,
+                                        });
+                                    }
+                                }
+                            })
+                        };
+                        // Cancel-aware dispatch: race the tool future against
+                        // the turn's cancel_token AND the outer timeout.
+                        // `/abort` (and A2A CancelTask) flips the token; the
+                        // select! below drops the in-flight future at the
+                        // next await point, including the await-on-JoinHandle
+                        // that spawn_blocking-backed tools park on. This is
+                        // what makes /abort actually responsive when a tool
+                        // is mid-flight (vs. the old behaviour where the
+                        // token was only polled BETWEEN iterations).
+                        let cancel_fut = async move {
+                            match cancel_token_owned {
+                                Some(t) => t.cancelled().await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        };
+                        let timed = tokio::select! {
+                            biased;
+                            _ = cancel_fut => Ok(Err(anyhow!(
+                                "tool `{tool_name}` cancelled by /abort \
+                                 (cancel_token fired)"
+                            ))),
+                            r = time::timeout(
+                                Duration::from_secs(TOOL_DISPATCH_TIMEOUT_SECS),
+                                fut,
+                            ) => r,
+                        };
+                        // Stop the long-run watcher — either the tool
+                        // finished in time or we're about to report it.
+                        watcher.abort();
+                        let elapsed_ms = started.elapsed().as_millis();
+                        match &timed {
+                            Ok(Ok(_)) if elapsed_ms > 30_000 => {
+                                tracing::warn!(
+                                    target: "agent::dispatch_tool",
+                                    tool = %tool_name,
+                                    elapsed_ms,
+                                    "slow tool completed"
+                                );
+                            }
+                            Err(_) => {
+                                tracing::error!(
+                                    target: "agent::dispatch_tool",
+                                    tool = %tool_name,
+                                    elapsed_ms,
+                                    "tool dispatch HIT outer timeout — future was dropped, \
+                                     but any spawn_blocking work it launched may still leak \
+                                     until its own internal deadline expires"
+                                );
+                            }
+                            _ => {}
+                        }
                         if let Some(bus) = bus {
                             let preview = match &timed {
                                 Ok(Ok(v)) => {
@@ -8304,6 +8466,8 @@ impl AgentRuntime {
                 "cap",
                 "cap_live",
                 "cap_live_end",
+                "cap_bind_sticky",
+                "cap_unbind_sticky",
                 "task",
             ];
             if FOLLOWUP_BLOCKED.contains(&name) {
@@ -8593,6 +8757,8 @@ impl AgentRuntime {
             "cap" => return self.tool_cap(ctx, args).await,
             "cap_live" => return self.tool_cap_live(ctx, args).await,
             "cap_live_end" => return self.tool_cap_live_end(ctx, args).await,
+            "cap_bind_sticky" => return self.tool_cap_bind_sticky(ctx, args).await,
+            "cap_unbind_sticky" => return self.tool_cap_unbind_sticky(ctx, args).await,
             _ => {}
         }
 
