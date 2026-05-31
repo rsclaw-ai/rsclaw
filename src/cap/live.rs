@@ -49,6 +49,12 @@ const PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub(crate) struct CapLiveManager {
     sessions: Arc<RwLock<HashMap<String, LiveSessionHandle>>>,
+    /// Sticky bindings: IM session_key → (live session_id, agent_kind).
+    /// Populated by `/cap <agent>`, read inside `AgentRuntime::run_turn`
+    /// to bypass the main LLM for plain-text messages. The map is swept
+    /// whenever a live session ends (actor exit, idle GC) so a stale
+    /// binding never points at a dead driver.
+    sticky: Arc<RwLock<HashMap<String, (String, AgentKind)>>>,
     bus: broadcast::Sender<crate::events::AgentEvent>,
     max_sessions: usize,
     idle_timeout: Duration,
@@ -87,10 +93,75 @@ impl CapLiveManager {
     pub(crate) fn new(bus: broadcast::Sender<crate::events::AgentEvent>) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            sticky: Arc::new(RwLock::new(HashMap::new())),
             bus,
             max_sessions: DEFAULT_MAX_SESSIONS,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
         }
+    }
+
+    /// Spawn a new live session WITHOUT sending an initial prompt.
+    /// Used by the IM `/cap <agent>` slash command which wants to open
+    /// a session and bind it sticky before any user message arrives.
+    /// Returns the freshly minted `session_id`.
+    pub(crate) async fn open_session(
+        &self,
+        kind: AgentKind,
+        cwd: std::path::PathBuf,
+    ) -> Result<String> {
+        let sid = uuid::Uuid::new_v4().simple().to_string();
+        self.spawn_session(&sid, kind, &cwd).await?;
+        Ok(sid)
+    }
+
+    /// Bind an IM session key to a live cap session. Idempotent — re-binding
+    /// the same key replaces any prior binding (the old live session is
+    /// NOT torn down; the caller is responsible for that if desired).
+    pub(crate) async fn bind_sticky(
+        &self,
+        im_session_key: String,
+        live_session_id: String,
+        kind: AgentKind,
+    ) {
+        let mut g = self.sticky.write().await;
+        g.insert(im_session_key, (live_session_id, kind));
+    }
+
+    /// Remove a sticky binding. Returns the previously bound
+    /// `(live_session_id, kind)` if there was one.
+    pub(crate) async fn unbind_sticky(
+        &self,
+        im_session_key: &str,
+    ) -> Option<(String, AgentKind)> {
+        let mut g = self.sticky.write().await;
+        g.remove(im_session_key)
+    }
+
+    /// Look up the live session bound to this IM key. Returns
+    /// `None` if the binding doesn't exist OR if the underlying live
+    /// session is gone (in which case the stale entry is also evicted).
+    pub(crate) async fn resolve_sticky(
+        &self,
+        im_session_key: &str,
+    ) -> Option<(String, AgentKind)> {
+        let entry = {
+            let g = self.sticky.read().await;
+            g.get(im_session_key).cloned()
+        }?;
+        let (sid, _kind) = &entry;
+        let alive = {
+            let g = self.sessions.read().await;
+            g.contains_key(sid)
+        };
+        if !alive {
+            // Self-heal: stale binding (actor died / idle-reaped). Drop it
+            // so the next /cap re-bind succeeds and run_turn never tries
+            // to dispatch to a ghost.
+            let mut g = self.sticky.write().await;
+            g.remove(im_session_key);
+            return None;
+        }
+        Some(entry)
     }
 
     /// Send a prompt to a live cap session. If `session_id` is `None`, a
@@ -211,6 +282,7 @@ impl CapLiveManager {
         let last_active = Arc::new(StdMutex::new(Instant::now()));
         let bus = self.bus.clone();
         let sessions_for_gc = Arc::clone(&self.sessions);
+        let sticky_for_gc = Arc::clone(&self.sticky);
         let sid_owned = session_id.to_owned();
         tokio::spawn(actor_loop(
             sid_owned,
@@ -219,6 +291,7 @@ impl CapLiveManager {
             rx,
             bus,
             sessions_for_gc,
+            sticky_for_gc,
         ));
         let handle = LiveSessionHandle {
             agent_kind: kind,
@@ -247,18 +320,26 @@ impl CapLiveManager {
         if to_remove.is_empty() {
             return;
         }
-        let mut g = self.sessions.write().await;
-        for sid in &to_remove {
-            if let Some(h) = g.remove(sid) {
-                tracing::info!(
-                    target: "cap",
-                    session_id = %sid,
-                    "live session reaped (idle > {}s)",
-                    idle.as_secs()
-                );
-                let _ = h.tx.send(LiveRequest::Shutdown).await;
+        {
+            let mut g = self.sessions.write().await;
+            for sid in &to_remove {
+                if let Some(h) = g.remove(sid) {
+                    tracing::info!(
+                        target: "cap",
+                        session_id = %sid,
+                        "live session reaped (idle > {}s)",
+                        idle.as_secs()
+                    );
+                    let _ = h.tx.send(LiveRequest::Shutdown).await;
+                }
             }
         }
+        // Sweep sticky bindings that point at reaped sessions so a
+        // subsequent inbound IM message doesn't try to dispatch into a
+        // ghost (resolve_sticky also self-heals, but doing it here keeps
+        // the map size bounded under high churn).
+        let mut sg = self.sticky.write().await;
+        sg.retain(|_, (sid, _)| !to_remove.contains(sid));
     }
 }
 
@@ -272,6 +353,7 @@ async fn actor_loop(
     mut rx: mpsc::Receiver<LiveRequest>,
     bus: broadcast::Sender<crate::events::AgentEvent>,
     sessions: Arc<RwLock<HashMap<String, LiveSessionHandle>>>,
+    sticky: Arc<RwLock<HashMap<String, (String, AgentKind)>>>,
 ) {
     tracing::info!(
         target: "cap",
@@ -319,8 +401,16 @@ async fn actor_loop(
         }
     }
     let _ = driver.shutdown().await;
-    let mut g = sessions.write().await;
-    g.remove(&sid);
+    {
+        let mut g = sessions.write().await;
+        g.remove(&sid);
+    }
+    // Drop any sticky bindings that still point at this session — driver
+    // is gone (clean shutdown or mid-turn death), the binding is dead.
+    {
+        let mut sg = sticky.write().await;
+        sg.retain(|_, (s, _)| s != &sid);
+    }
     tracing::info!(
         target: "cap",
         session_id = %sid,

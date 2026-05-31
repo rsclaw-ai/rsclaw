@@ -2176,6 +2176,73 @@ impl AgentRuntime {
         let session_key = self.resolve_session_key(session_key).to_owned();
         let session_key = session_key.as_str();
 
+        // cap_live sticky direct mode: if /cap <agent> was issued on this
+        // IM session, route plain-text user messages straight to the cap
+        // driver, skipping the main LLM. The slash-command registration
+        // happens in preparse (`/cap`, `/cap-end`); here we only consume
+        // the binding. Slash commands that preparse didn't handle still
+        // get routed to the driver — sticky means "everything to the
+        // subagent."
+        if let Some(manager) = self.cap_live_manager.as_ref() {
+            if let Some((live_sid, kind)) = manager.resolve_sticky(session_key).await {
+                let task = text.to_owned();
+                // No notif target: TextChunks already go to the WS bus
+                // (so the desktop UI streams), and we send the final
+                // text as the AgentReply itself — passing a notif here
+                // would only enable ToolCallStart pushes, which the
+                // bridge intentionally silences for IM noise reasons.
+                tracing::info!(
+                    target: "cap",
+                    session = session_key,
+                    live_session_id = %live_sid,
+                    agent = kind.as_str(),
+                    "sticky bypass: routing user message direct to cap driver"
+                );
+                let reply_text = match manager
+                    .dispatch_sync(
+                        kind,
+                        Some(live_sid.clone()),
+                        task,
+                        workspace.clone(),
+                        None,
+                    )
+                    .await
+                {
+                    Ok(r) => r.output,
+                    Err(e) => {
+                        // Drop the (now-broken) binding so the next
+                        // message either re-routes through the LLM or
+                        // the user can /cap again.
+                        let _ = manager.unbind_sticky(session_key).await;
+                        format!(
+                            "[cap {} driver error] {e}\n(sticky binding released; \
+                             use /cap {} to reconnect or just keep chatting with the main LLM)",
+                            kind.as_str(),
+                            kind.as_str()
+                        )
+                    }
+                };
+                let is_empty = reply_text.trim().is_empty();
+                return Ok(AgentReply {
+                    text: if is_empty {
+                        format!("[{}] (no output)", kind.display_name())
+                    } else {
+                        reply_text
+                    },
+                    is_empty,
+                    tool_calls: None,
+                    images: vec![],
+                    files: vec![],
+                    pending_analysis: None,
+                    // Bypassing agent_loop — the outer dispatcher must
+                    // emit the WS `done=true` terminator, otherwise the
+                    // desktop chat input stays frozen.
+                    needs_outer_done_emit: true,
+                    outcome: crate::agent::registry::ReplyOutcome::Ok,
+                });
+            }
+        }
+
         // Check clear_signal: if /clear was issued via bypass, clear sessions now.
         // Preserve a brief summary of each session so the agent retains key context.
         if self.handle.clear_signal.load(Ordering::SeqCst) {

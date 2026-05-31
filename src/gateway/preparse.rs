@@ -423,6 +423,77 @@ pub(crate) async fn try_preparse_locally_with_account(
         )
         .to_owned()));
     }
+    // /cap <agent> — open a cap_live session and bind it sticky to this
+    // IM session so subsequent plain-text messages route directly to the
+    // driver, skipping the main LLM. `/cap-end` releases the binding.
+    //
+    // Why bypass the LLM here: phase 1 already exposes `cap_live` as a
+    // tool the LLM can call, but going through the LLM costs an extra
+    // round-trip (LLM reads, decides to call cap_live, then forwards).
+    // Sticky direct mode is for "I want to talk to claudecode directly
+    // for the next several turns" without the LLM in the middle.
+    if lower == "/cap" || lower == "/cap -h" || lower == "/cap --help" || lower == "/cap help" {
+        return Some(txt(
+            "/cap <agent> — bind this chat to a coding agent (claudecode | openclaude | opencode | codex)\n\
+             /cap-end       — release the binding"
+                .to_owned(),
+        ));
+    }
+    if let Some(rest) = lower.strip_prefix("/cap ") {
+        let agent_str = rest.trim();
+        let Some(kind) = crate::cap::AgentKind::from_str(agent_str) else {
+            return Some(txt(format!(
+                "/cap: unknown agent `{agent_str}` (try: claudecode, openclaude, opencode, codex)"
+            )));
+        };
+        let Some(manager) = crate::cap::GLOBAL_CAP_LIVE.get() else {
+            return Some(txt("/cap: cap_live not initialised".to_owned()));
+        };
+        let cwd = workspace();
+        match manager.open_session(kind, cwd).await {
+            Ok(sid) => {
+                manager
+                    .bind_sticky(this_session_key.clone(), sid.clone(), kind)
+                    .await;
+                tracing::info!(
+                    target: "cap",
+                    session_id = %sid,
+                    agent = kind.as_str(),
+                    im_session_key = %this_session_key,
+                    "cap_live sticky bind"
+                );
+                return Some(txt(format!(
+                    "bound to {} (session {}). Next messages go directly to the driver. /cap-end to release.",
+                    kind.display_name(),
+                    &sid[..8.min(sid.len())]
+                )));
+            }
+            Err(e) => {
+                return Some(txt(format!("/cap: failed to open session: {e}")));
+            }
+        }
+    }
+    // /cap-end — release any sticky binding on this IM session.
+    if lower == "/cap-end" {
+        let Some(manager) = crate::cap::GLOBAL_CAP_LIVE.get() else {
+            return Some(txt("/cap-end: cap_live not initialised".to_owned()));
+        };
+        let Some((sid, kind)) = manager.unbind_sticky(&this_session_key).await else {
+            return Some(txt("/cap-end: no active cap session here".to_owned()));
+        };
+        let _ = manager.end_session(&sid).await;
+        tracing::info!(
+            target: "cap",
+            session_id = %sid,
+            agent = kind.as_str(),
+            im_session_key = %this_session_key,
+            "cap_live sticky unbind + end"
+        );
+        return Some(txt(format!(
+            "{} session closed. Normal LLM behavior resumed.",
+            kind.display_name()
+        )));
+    }
     // /status
     if lower == "/status" {
         return Some(txt(handle.format_status()));
@@ -1052,7 +1123,7 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
         lower.as_str(),
         "/ls" | "/status" | "/version" | "/help" | "/?" | "/health" | "/uptime"
             | "/model" | "/models" | "/cron" | "/clear" | "/new" | "/abort" | "/sessions"
-            | "/loop" | "/task" | "/watch" | "/plugin"
+            | "/loop" | "/task" | "/watch" | "/plugin" | "/cap" | "/cap-end"
     )
     // Commands with optional/required args
     || lower.starts_with("/ls ")
@@ -1070,6 +1141,7 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
     || lower.starts_with("/exec ")
     || lower.starts_with("/loop ")
     || lower.starts_with("/watch ")
+    || lower.starts_with("/cap ")
     // /task only short-circuits on help variants; non-help forms must NOT
     // bypass the queue (the task queue worker owns the multi-turn flow).
     || lower == "/task -h"
@@ -1174,6 +1246,9 @@ fn help_text(lang: &str) -> String {
          \u{0020}\u{0020}/webshot <url>   网页截图\n\n\
          技能/插件\n\
          \u{0020}\u{0020}/skill list      已安装技能\n\n\
+         编程代理直连\n\
+         \u{0020}\u{0020}/cap <agent>     绑定本会话直连 cap 子代理\n\
+         \u{0020}\u{0020}/cap-end         释放绑定，恢复主 LLM\n\n\
          其他\n\
          \u{0020}\u{0020}/btw <问题>      旁路一次性提问，不写入会话\n\
          \u{0020}\u{0020}!cmd  /  $cmd    在工作区执行一行 shell 命令\n\
@@ -1203,6 +1278,9 @@ fn help_text(lang: &str) -> String {
          \u{0020}\u{0020}/webshot <url>   web-page screenshot\n\n\
          Skills / plugins\n\
          \u{0020}\u{0020}/skill list      installed skills\n\n\
+         Coding-agent direct mode\n\
+         \u{0020}\u{0020}/cap <agent>     route this chat directly to a cap subagent\n\
+         \u{0020}\u{0020}/cap-end         release binding, resume main LLM\n\n\
          Other\n\
          \u{0020}\u{0020}/btw <q>         side-channel ask, not added to session\n\
          \u{0020}\u{0020}!cmd  /  $cmd    run a one-line shell command in the workspace\n\
@@ -1488,6 +1566,25 @@ mod tests {
         // Real /task usage must NOT bypass the queue — task_queue owns that flow.
         assert!(!is_fast_preparse("/task fix the bug"));
         assert!(!is_fast_preparse("/task --turns 20 do something"));
+    }
+
+    #[test]
+    fn is_fast_preparse_recognizes_cap_sticky_commands() {
+        // Bare /cap, /cap-end, and `/cap <agent>` must short-circuit
+        // through preparse so the binding is registered immediately
+        // instead of being queued behind the LLM. Without these
+        // entries, the channel inbound code would treat them as plain
+        // text and the sticky bind never happens.
+        assert!(is_fast_preparse("/cap"));
+        assert!(is_fast_preparse("/cap-end"));
+        assert!(is_fast_preparse("/cap claudecode"));
+        assert!(is_fast_preparse("/cap codex"));
+        assert!(is_fast_preparse("/CAP claudecode")); // case-insensitive
+        // Plain text not starting with /cap remains queue-bound; the
+        // sticky bypass kicks in inside AgentRuntime::run_turn, not
+        // here.
+        assert!(!is_fast_preparse("cap something"));
+        assert!(!is_fast_preparse("just chatting"));
     }
 
     // -----------------------------------------------------------------

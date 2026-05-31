@@ -421,6 +421,11 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // AgentRuntime can offer the `cap_live` tool to its LLM.
     let cap_live_manager =
         std::sync::Arc::new(crate::cap::CapLiveManager::new(event_tx.clone()));
+    // Publish a process-wide handle so preparse (`/cap`, `/cap-end`)
+    // can register sticky IM bindings without per-channel plumbing.
+    // Set BEFORE any channel inbound task is spawned; runtime code
+    // accesses the manager via `self.cap_live_manager` directly.
+    crate::cap::set_global_cap_live(std::sync::Arc::clone(&cap_live_manager));
 
     // Build LiveConfig BEFORE the spawner: hot-reloadable per-domain locks
     // that AgentRuntime reads for live-mutable fields (temperature, etc.).
