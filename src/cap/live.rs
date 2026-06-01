@@ -114,17 +114,43 @@ impl CapLiveManager {
         Ok(sid)
     }
 
-    /// Bind an IM session key to a live cap session. Idempotent — re-binding
-    /// the same key replaces any prior binding (the old live session is
-    /// NOT torn down; the caller is responsible for that if desired).
+    /// Bind an IM session key to a live cap session, tearing down any
+    /// prior binding's driver as a side effect.
+    ///
+    /// Was: idempotent overwrite that LEAKED the old driver subprocess
+    /// until idle GC (10 min). Real-world flow: user types
+    /// `/cap claudecode` → tests it → `/cap codex` to switch. Without
+    /// this teardown, the claudecode driver kept running in the
+    /// background until the 10-min idle reap, eating an active-session
+    /// slot (cap of 8) and burning memory/CPU. Worse, the user has no
+    /// visibility into it from `/status` (today) — silent resource
+    /// leak.
+    ///
+    /// Now: returns the prior `(live_session_id, kind)` if any, so the
+    /// caller can also wait on `end_session` if it wants strict
+    /// teardown ordering. The internal `end_session` call is fire-and-
+    /// forget through the actor's mpsc Shutdown.
     pub(crate) async fn bind_sticky(
         &self,
         im_session_key: String,
         live_session_id: String,
         kind: AgentKind,
-    ) {
-        let mut g = self.sticky.write().await;
-        g.insert(im_session_key, (live_session_id, kind));
+    ) -> Option<(String, AgentKind)> {
+        let prior = {
+            let mut g = self.sticky.write().await;
+            g.insert(im_session_key, (live_session_id, kind))
+        };
+        if let Some((old_sid, old_kind)) = &prior {
+            tracing::info!(
+                target: "cap",
+                old_session_id = %old_sid,
+                old_agent = old_kind.as_str(),
+                new_agent = kind.as_str(),
+                "cap_live sticky rebind — tearing down previous driver"
+            );
+            let _ = self.end_session(old_sid).await;
+        }
+        prior
     }
 
     /// Remove a sticky binding. Returns the previously bound
@@ -233,6 +259,25 @@ impl CapLiveManager {
             agent_kind: kind,
             output,
         })
+    }
+
+    /// Best-effort SYNC snapshot of all sticky bindings.
+    /// Used by `/status` (which is async-unaware — it runs on
+    /// `AgentHandle::format_status`) to render the user's current cap
+    /// session bindings without having to refactor the entire status
+    /// path through async.
+    ///
+    /// Returns an empty vec when the sticky lock is held by another
+    /// task (rare; we'd rather render an empty section than block
+    /// the status reply).
+    pub(crate) fn snapshot_sticky_blocking(&self) -> Vec<(String, String, AgentKind)> {
+        match self.sticky.try_read() {
+            Ok(g) => g
+                .iter()
+                .map(|(im_key, (sid, kind))| (im_key.clone(), sid.clone(), *kind))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
     }
 
     /// Force-close a live session. Idempotent — returns Ok even if the

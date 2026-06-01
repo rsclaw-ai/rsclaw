@@ -2424,6 +2424,11 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "zh" => "[{agent}]（无输出）",
     );
 
+    msg!("cap_thinking",
+        "en" => "💭 {agent} is responding…",
+        "zh" => "💭 {agent} 正在处理…",
+    );
+
     m
 });
 

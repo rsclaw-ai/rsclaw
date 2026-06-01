@@ -215,6 +215,39 @@ impl AgentHandle {
             }
         }
 
+        // Sticky cap binding snapshot — without this section the user
+        // has no way to tell whether `/cap claudecode` is still
+        // routing every message to a coding agent, or whether main
+        // LLM is back in charge. The cap_live_manager is reached via
+        // a process-wide OnceLock so this stays sync and free of
+        // tokio::runtime::Handle::current() dependencies.
+        let mut sticky_lines = String::new();
+        if let Some(mgr) = crate::cap::GLOBAL_CAP_LIVE.get() {
+            let snapshot = mgr.snapshot_sticky_blocking();
+            if !snapshot.is_empty() {
+                sticky_lines.push_str("Sticky cap:\n");
+                for (im_key, sid, kind) in &snapshot {
+                    // Keep the IM session key short — first 24 chars
+                    // is enough to identify it across the common
+                    // `agent:main:feishu:direct:<peer>` shape, and
+                    // long enough that two peers don't collide.
+                    let key_label = if im_key.chars().count() > 32 {
+                        let head: String = im_key.chars().take(32).collect();
+                        format!("{head}…")
+                    } else {
+                        im_key.clone()
+                    };
+                    let sid_short = &sid[..8.min(sid.len())];
+                    sticky_lines.push_str(&format!(
+                        "\u{A0} {} → {} ({})\n",
+                        key_label,
+                        kind.as_str(),
+                        sid_short
+                    ));
+                }
+            }
+        }
+
         // In-flight tool snapshot — surfaces "search_file running for
         // 8min" so the user can see exactly why their /status reply was
         // delayed. Without this section, a wedged tool is invisible
@@ -249,6 +282,7 @@ impl AgentHandle {
         format!(
             "Gateway: running\nOS: {os}\nModel: {model}\nSessions: {sessions}\n\
              {ctx_lines}\
+             {sticky_lines}\
              {in_flight_lines}\
              Uptime: {uptime}\nVersion: rsclaw {}",
             option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")

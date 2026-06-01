@@ -2287,6 +2287,8 @@ impl AgentRuntime {
                         chunker_account,
                         chunker_chunk_count,
                         signal_rx,
+                        kind.display_name().to_string(),
+                        lang,
                     ));
                     Some((handle, signal_tx, chunk_count))
                 } else {
@@ -10815,6 +10817,8 @@ async fn stream_cap_chunks_to_im(
     account: Option<String>,
     chunk_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     mut signal_rx: tokio::sync::oneshot::Receiver<()>,
+    agent_label: String,
+    lang: &'static str,
 ) {
     use std::sync::atomic::Ordering;
 
@@ -10823,6 +10827,20 @@ async fn stream_cap_chunks_to_im(
     /// 1-2 sentence chunk lands quickly, multi-paragraph replies split
     /// into 3-5 sends.
     const MIN_FLUSH_CHARS: usize = 120;
+    /// If the cap driver hasn't emitted a single delta within this
+    /// window after the chunker spins up, push a heartbeat so the
+    /// user knows we're still working. Codex (and any reasoning
+    /// model that buffers its thinking) routinely waits 20-30s
+    /// before the first `agent_message_content_delta` — without a
+    /// heartbeat the chat client shows a stone-dead silence and the
+    /// user assumes the bot crashed.
+    ///
+    /// Fires at most ONCE per turn. After the first real delta lands,
+    /// the heartbeat is suppressed for the rest of the turn (each
+    /// real flush is its own progress signal).
+    const HEARTBEAT_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+    let chunker_started = tokio::time::Instant::now();
+    let mut heartbeat_sent = false;
 
     let mut buf = String::new();
     let mut first_delta_at: Option<tokio::time::Instant> = None;
@@ -10890,10 +10908,48 @@ async fn stream_cap_chunks_to_im(
             }
         };
 
+        // Heartbeat deadline = chunker-start + HEARTBEAT_AFTER, but
+        // only while we haven't sent it yet AND haven't received any
+        // real delta. Past the first real delta the user is no longer
+        // staring at silence, so the heartbeat is pointless noise.
+        let heartbeat_fut = async {
+            if heartbeat_sent || first_delta_at.is_some() {
+                std::future::pending::<()>().await
+            } else {
+                tokio::time::sleep_until(chunker_started + HEARTBEAT_AFTER).await
+            }
+        };
+
         tokio::select! {
             biased;
             // Termination signal from the caller (dispatch_sync done).
             _ = &mut signal_rx => break,
+
+            // 5-second silent-start heartbeat.
+            _ = heartbeat_fut => {
+                let text = crate::i18n::t_fmt(
+                    "cap_thinking",
+                    lang,
+                    &[("agent", &agent_label)],
+                );
+                let msg = crate::channel::OutboundMessage {
+                    target_id: target_id.clone(),
+                    is_group,
+                    text,
+                    reply_to: None,
+                    images: vec![],
+                    files: vec![],
+                    channel: Some(channel.clone()),
+                    account: account.clone(),
+                };
+                // Heartbeats DON'T count toward chunk_count — the
+                // sticky-bypass caller uses chunk_count to decide
+                // whether to suppress the final AgentReply, and we
+                // don't want a heartbeat alone to suppress a real
+                // late-arriving message.
+                let _ = notif_tx.send(msg);
+                heartbeat_sent = true;
+            }
 
             // New event on the bus.
             ev = bus_rx.recv() => match ev {
