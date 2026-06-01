@@ -940,6 +940,7 @@ $synth.Speak('{}')
                 images: vec![],
                 tool_log: vec![],
                 question: Some(prompt),
+                channel: None,
             });
         }
 

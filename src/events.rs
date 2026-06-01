@@ -11,7 +11,7 @@
 //! - No event filtering: every subscriber receives every agent's events. Add
 //!   topic-based or session-based filtering when load requires it.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Why the gateway is asking the user to restart.
 ///
@@ -116,9 +116,38 @@ pub struct AskUserPrompt {
     pub header: Option<String>,
 }
 
+/// Which logical channel a streamed text delta belongs to. Mirrors
+/// `cap_rs::core::TextChannel` so rsclaw can preserve the distinction
+/// when a cap driver (claudecode / opencode / codex / openclaude)
+/// emits reasoning tokens separately from visible assistant text.
+///
+/// Why this exists: codex (GPT-5 reasoning) spends most of a turn in
+/// the `Thought` channel — the user sees nothing for 30-60s, then a
+/// burst of visible reply. Without forwarding Thought through the bus,
+/// IM chunkers and the desktop UI have no way to render reasoning
+/// progress. With it, the UI can choose to render reasoning inline
+/// (greyed out, collapsed) or hide it entirely; IM chunkers can
+/// prefix thought lines with `💭 ` so users see codex thinking in
+/// real time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TextChannel {
+    /// Visible reply text — what the user expects in the chat bubble.
+    /// Default for back-compat with pre-existing AgentEvent producers
+    /// (every existing rsclaw call site emits assistant text).
+    #[default]
+    Assistant,
+    /// Reasoning / planning tokens. Distinct stream, lower display
+    /// priority. UIs SHOULD render but MAY hide based on user prefs.
+    Thought,
+    /// System notices (e.g. "cap driver started", environment info).
+    /// Rare; surfaced primarily for debugging. UIs MAY drop entirely.
+    System,
+}
+
 /// Emitted by `AgentRuntime` and broadcast to SSE subscribers via the
 /// `AppState::event_bus` channel.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct AgentEvent {
     pub session_id: String,
     pub agent_id: String,
@@ -143,4 +172,15 @@ pub struct AgentEvent {
     /// this as native UI; others rely on the agent's text reply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question: Option<AskUserPrompt>,
+    /// Which text channel this delta is on. `None` = legacy producer
+    /// that pre-dates this field, treat as Assistant. `Some(Thought)`
+    /// = reasoning tokens from a cap driver (codex). UIs and IM
+    /// chunkers decide rendering per channel.
+    ///
+    /// `Option<…>` instead of `TextChannel` with a default to keep the
+    /// blast radius of this field tiny: existing AgentEvent construction
+    /// sites scattered across runtime.rs / startup.rs / tools_misc.rs
+    /// don't need to be updated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<TextChannel>,
 }

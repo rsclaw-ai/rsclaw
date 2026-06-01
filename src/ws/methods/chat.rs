@@ -92,6 +92,7 @@ pub async fn chat_send(ctx: MethodCtx) -> MethodResult {
             images: vec![],
             tool_log: vec![],
             question: None,
+            channel: None,
         });
         let _ = ctx.state.event_bus.send(AgentEvent {
             session_id: session_key.clone(),
@@ -102,6 +103,7 @@ pub async fn chat_send(ctx: MethodCtx) -> MethodResult {
             images: reply.images,
             tool_log: vec![],
             question: None,
+            channel: None,
         });
 
         // Same relay spawn shape as the agent-dispatch path — the events
