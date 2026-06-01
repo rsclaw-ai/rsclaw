@@ -2191,11 +2191,6 @@ impl AgentRuntime {
         if let Some(manager) = self.cap_live_manager.as_ref() {
             if let Some((live_sid, kind)) = manager.resolve_sticky(session_key).await {
                 let task = text.to_owned();
-                // No notif target: TextChunks already go to the WS bus
-                // (so the desktop UI streams), and we send the final
-                // text as the AgentReply itself — passing a notif here
-                // would only enable ToolCallStart pushes, which the
-                // bridge intentionally silences for IM noise reasons.
                 tracing::info!(
                     target: "cap",
                     session = session_key,
@@ -2211,7 +2206,94 @@ impl AgentRuntime {
                     .and_then(|g| g.language.as_deref())
                     .map(crate::i18n::resolve_lang)
                     .unwrap_or("en");
-                let reply_text = match manager
+
+                // -----------------------------------------------------
+                // Phase 2b — chunked streaming to IM.
+                //
+                // The cap actor already broadcasts every TextChunk to
+                // `event_bus` keyed by the pseudo session_id
+                // `cap-live-<agent>-<sid>` (see
+                // `src/cap/runtime.rs::run_turn` → bridge.rs::dispatch).
+                // The desktop UI subscribes to that bus directly and
+                // streams tokens. IM channels do NOT subscribe — they
+                // only see `OutboundMessage`s pushed on
+                // `notification_tx`. So we plant a sibling task here
+                // that bridges the two: subscribe → debounce → push.
+                //
+                // Without this, a long cap reply (100s of tokens, many
+                // tens of seconds) would land on feishu/wechat as a
+                // single late message — the user sees silence the
+                // whole time. With the bridge, partial chunks arrive
+                // every ~1s, matching the chat-UI "still typing" feel.
+                //
+                // Outline:
+                //   - Detect IM target: channel + peer/chat + group flag
+                //     come from run_turn args; group routing keys off
+                //     session_key's ":group:" segment.
+                //   - Spawn chunker task subscribed to event_bus.
+                //   - Run dispatch_sync (which fills event_bus
+                //     synchronously via run_turn → bridge::dispatch).
+                //   - Signal chunker to flush + exit.
+                //   - Suppress final AgentReply.text if anything was
+                //     streamed — otherwise the user sees the whole
+                //     reply twice.
+                //
+                // Falls back to the pre-2b non-streaming path when:
+                //   - `notification_tx` is None (WS-only sessions),
+                //   - or `event_bus` is None (test runtimes / agent
+                //     constructed without a bus).
+                let pseudo_session_id =
+                    format!("cap-live-{}-{}", kind.as_str(), live_sid);
+                let im_target_id = if session_key.contains(":group:") {
+                    chat_id.to_owned()
+                } else {
+                    peer_id.to_owned()
+                };
+                let im_is_group = session_key.contains(":group:");
+                let can_stream = self.notification_tx.is_some()
+                    && self.event_bus.is_some()
+                    && !im_target_id.is_empty();
+
+                let chunker_handle = if can_stream {
+                    let notif_tx = self
+                        .notification_tx
+                        .as_ref()
+                        .expect("checked above")
+                        .clone();
+                    let bus_rx = self
+                        .event_bus
+                        .as_ref()
+                        .expect("checked above")
+                        .subscribe();
+                    let chunk_count =
+                        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
+                    let chunker_chunk_count = std::sync::Arc::clone(&chunk_count);
+                    let chunker_session = pseudo_session_id.clone();
+                    let chunker_channel = channel.to_owned();
+                    let chunker_target = im_target_id.clone();
+                    let chunker_account = self
+                        .notification_tx
+                        .is_some()
+                        .then(|| None::<String>) // best-effort: outbound dispatcher figures out account from session
+                        .flatten();
+                    let handle = tokio::spawn(stream_cap_chunks_to_im(
+                        bus_rx,
+                        chunker_session,
+                        notif_tx,
+                        chunker_target,
+                        im_is_group,
+                        chunker_channel,
+                        chunker_account,
+                        chunker_chunk_count,
+                        signal_rx,
+                    ));
+                    Some((handle, signal_tx, chunk_count))
+                } else {
+                    None
+                };
+
+                let dispatch_result = manager
                     .dispatch_sync(
                         kind,
                         Some(live_sid.clone()),
@@ -2219,44 +2301,96 @@ impl AgentRuntime {
                         workspace.clone(),
                         None,
                     )
-                    .await
+                    .await;
+
+                // Tell the chunker we're done so it can flush remaining
+                // buffered text and exit. The signal is best-effort:
+                // if the chunker already exited (e.g. bus dropped),
+                // send() returns Err which we ignore.
+                let streamed_count = if let Some((handle, signal_tx, chunk_count)) =
+                    chunker_handle
                 {
-                    Ok(r) => r.output,
+                    let _ = signal_tx.send(());
+                    // Bounded wait so a stuck flush can't drag the turn
+                    // out; the chunker should always exit within ~1s of
+                    // the signal because its flush loop is short.
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        handle,
+                    )
+                    .await;
+                    chunk_count.load(std::sync::atomic::Ordering::SeqCst)
+                } else {
+                    0
+                };
+
+                match dispatch_result {
+                    Ok(_) if streamed_count > 0 => {
+                        // Already streamed everything to IM; suppress
+                        // the final outbound by returning an empty
+                        // reply. WS subscribers got the same deltas
+                        // straight off event_bus, so they aren't
+                        // shortchanged by this.
+                        return Ok(AgentReply {
+                            text: String::new(),
+                            is_empty: true,
+                            tool_calls: None,
+                            images: vec![],
+                            files: vec![],
+                            pending_analysis: None,
+                            needs_outer_done_emit: true,
+                            outcome: crate::agent::registry::ReplyOutcome::Ok,
+                        });
+                    }
+                    Ok(r) => {
+                        // Driver returned text but nothing was streamed
+                        // (no IM target, or notif/bus unavailable).
+                        // Fall back to the legacy single-message path.
+                        let reply_text = r.output;
+                        let is_empty = reply_text.trim().is_empty();
+                        return Ok(AgentReply {
+                            text: if is_empty {
+                                crate::i18n::t_fmt(
+                                    "cap_no_output",
+                                    lang,
+                                    &[("agent", kind.display_name())],
+                                )
+                            } else {
+                                reply_text
+                            },
+                            is_empty,
+                            tool_calls: None,
+                            images: vec![],
+                            files: vec![],
+                            pending_analysis: None,
+                            needs_outer_done_emit: true,
+                            outcome: crate::agent::registry::ReplyOutcome::Ok,
+                        });
+                    }
                     Err(e) => {
-                        // Drop the (now-broken) binding so the next
-                        // message either re-routes through the LLM or
-                        // the user can /cap again.
+                        // Driver died. Drop the binding so the user
+                        // can /cap again, return the error message
+                        // (it'll come through the normal reply path
+                        // since chunker hasn't streamed an error).
                         let _ = manager.unbind_sticky(session_key).await;
                         let err = e.to_string();
-                        crate::i18n::t_fmt(
+                        let msg = crate::i18n::t_fmt(
                             "cap_driver_error",
                             lang,
                             &[("agent", kind.as_str()), ("err", &err)],
-                        )
+                        );
+                        return Ok(AgentReply {
+                            text: msg,
+                            is_empty: false,
+                            tool_calls: None,
+                            images: vec![],
+                            files: vec![],
+                            pending_analysis: None,
+                            needs_outer_done_emit: true,
+                            outcome: crate::agent::registry::ReplyOutcome::Ok,
+                        });
                     }
-                };
-                let is_empty = reply_text.trim().is_empty();
-                return Ok(AgentReply {
-                    text: if is_empty {
-                        crate::i18n::t_fmt(
-                            "cap_no_output",
-                            lang,
-                            &[("agent", kind.display_name())],
-                        )
-                    } else {
-                        reply_text
-                    },
-                    is_empty,
-                    tool_calls: None,
-                    images: vec![],
-                    files: vec![],
-                    pending_analysis: None,
-                    // Bypassing agent_loop — the outer dispatcher must
-                    // emit the WS `done=true` terminator, otherwise the
-                    // desktop chat input stays frozen.
-                    needs_outer_done_emit: true,
-                    outcome: crate::agent::registry::ReplyOutcome::Ok,
-                });
+                }
             }
         }
 
@@ -10615,6 +10749,157 @@ fn intermediate_notification_text(text: &str) -> Option<&str> {
         None
     } else {
         Some(trimmed)
+    }
+}
+
+/// Bridge the cap event_bus → IM channel for sticky direct mode (Phase 2b).
+///
+/// Subscribes to the broadcast `event_bus`, filters for events whose
+/// `session_id` matches our pseudo session id (`cap-live-<agent>-<sid>`),
+/// debounces deltas, and pushes them onto `notification_tx` as
+/// `OutboundMessage`s addressed to the user's IM target.
+///
+/// The chunker has two flush triggers, whichever fires first:
+///   * **Size:** once the buffer reaches `MIN_FLUSH_CHARS`, push immediately.
+///     Keeps perceived latency low on fast-token replies.
+///   * **Time:** once `DEBOUNCE` has elapsed since the first un-flushed
+///     delta, push whatever's in the buffer. Keeps slow tail-of-reply
+///     deltas from sitting unsent.
+///
+/// Exits when:
+///   * the caller fires `signal_rx` (dispatch_sync returned — we flush
+///     remaining buffer and exit), OR
+///   * the bus subscriber errors (e.g. Lagged with too few slots — we
+///     drop on the floor; the final reply path in run_turn won't go
+///     through this chunker because by then the caller will have moved
+///     on).
+///
+/// Defensive throttle:
+///   * 800ms debounce is chosen to be safely above wechat personal's
+///     per-target throttle (3s) AS COMBINED with the per-chunk inter-
+///     send delay on the outbound side (see commits 54ed9ba, 85988f6).
+///     The chunker doesn't try to be smarter — outbound dispatch
+///     already handles per-channel rate limiting.
+async fn stream_cap_chunks_to_im(
+    mut bus_rx: tokio::sync::broadcast::Receiver<crate::events::AgentEvent>,
+    pseudo_session_id: String,
+    notif_tx: tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>,
+    target_id: String,
+    is_group: bool,
+    channel: String,
+    account: Option<String>,
+    chunk_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    mut signal_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    use std::sync::atomic::Ordering;
+
+    const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(800);
+    /// Approx char count to trigger an early flush. Tuned so a typical
+    /// 1-2 sentence chunk lands quickly, multi-paragraph replies split
+    /// into 3-5 sends.
+    const MIN_FLUSH_CHARS: usize = 120;
+
+    let mut buf = String::new();
+    let mut first_delta_at: Option<tokio::time::Instant> = None;
+
+    let flush = |buf: &mut String,
+                 chunk_count: &std::sync::Arc<std::sync::atomic::AtomicUsize>|
+     -> Option<crate::channel::OutboundMessage> {
+        if buf.is_empty() {
+            return None;
+        }
+        let msg = crate::channel::OutboundMessage {
+            target_id: target_id.clone(),
+            is_group,
+            text: std::mem::take(buf),
+            reply_to: None,
+            images: vec![],
+            files: vec![],
+            channel: Some(channel.clone()),
+            account: account.clone(),
+        };
+        chunk_count.fetch_add(1, Ordering::SeqCst);
+        Some(msg)
+    };
+
+    loop {
+        // Compute the next flush deadline. If no buffered deltas, we
+        // wait forever (pending) so the time-flush branch only fires
+        // when there's actual buffered content waiting to go out.
+        let deadline_fut = async {
+            match first_delta_at {
+                Some(t) => tokio::time::sleep_until(t + DEBOUNCE).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+
+        tokio::select! {
+            biased;
+            // Termination signal from the caller (dispatch_sync done).
+            _ = &mut signal_rx => break,
+
+            // New event on the bus.
+            ev = bus_rx.recv() => match ev {
+                Ok(e) => {
+                    if e.session_id != pseudo_session_id {
+                        continue;
+                    }
+                    if !e.delta.is_empty() {
+                        buf.push_str(&e.delta);
+                        if first_delta_at.is_none() {
+                            first_delta_at = Some(tokio::time::Instant::now());
+                        }
+                        // Size-based fast flush so the first chunk
+                        // lands quickly on long replies.
+                        if buf.chars().count() >= MIN_FLUSH_CHARS {
+                            if let Some(msg) = flush(&mut buf, &chunk_count) {
+                                let _ = notif_tx.send(msg);
+                            }
+                            first_delta_at = None;
+                        }
+                    }
+                    if e.done {
+                        // The actor signalled end-of-turn. dispatch_sync
+                        // is about to return; flush + exit.
+                        if let Some(msg) = flush(&mut buf, &chunk_count) {
+                            let _ = notif_tx.send(msg);
+                        }
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // Lossy on extreme bus lag. Keep going — better to
+                    // drop a few deltas than to abandon the chunker.
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            },
+
+            // Debounce timer elapsed — flush whatever's buffered.
+            _ = deadline_fut => {
+                if let Some(msg) = flush(&mut buf, &chunk_count) {
+                    let _ = notif_tx.send(msg);
+                }
+                first_delta_at = None;
+            }
+        }
+    }
+
+    // Final flush on the way out so a tail that hasn't crossed the
+    // debounce or the size threshold still reaches the user.
+    if !buf.is_empty() {
+        let msg = crate::channel::OutboundMessage {
+            target_id,
+            is_group,
+            text: buf,
+            reply_to: None,
+            images: vec![],
+            files: vec![],
+            channel: Some(channel),
+            account,
+        };
+        chunk_count.fetch_add(1, Ordering::SeqCst);
+        let _ = notif_tx.send(msg);
     }
 }
 
