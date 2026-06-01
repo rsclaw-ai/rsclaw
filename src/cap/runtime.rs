@@ -204,18 +204,17 @@ async fn spawn_driver(kind: AgentKind, cwd: &std::path::Path) -> Result<Box<dyn 
                 .map_err(|e| anyhow!("cap openclaude spawn: {e}"))?,
         ),
         AgentKind::Opencode => Box::new(
-            ClaudeCodeDriver::opencode_builder(cwd)
+            ClaudeCodeDriver::builder(cwd)
+                .bin("opencode")
+                .dangerously_skip_permissions(true)
                 .spawn()
                 .await
                 .map_err(|e| anyhow!("cap opencode spawn: {e}"))?,
         ),
         AgentKind::Codex => {
-            // Transitional path until cap-rs ships a stream-json driver
-            // for codex; swap to ClaudeCodeDriver::codex_builder when
-            // available. Box<dyn Driver> is the same shape.
-            use cap_rs::driver::codex_mcp::CodexMcpDriver;
+            use cap_rs::driver::codex::CodexExecDriver;
             Box::new(
-                CodexMcpDriver::builder(cwd)
+                CodexExecDriver::builder(cwd)
                     .spawn()
                     .await
                     .map_err(|e| anyhow!("cap codex spawn: {e}"))?,
