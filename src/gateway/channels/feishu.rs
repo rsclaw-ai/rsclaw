@@ -154,6 +154,13 @@ pub(crate) fn start_feishu_if_configured(
         .and_then(|t| t.upload.as_ref())
         .and_then(|u| u.max_file_size)
         .unwrap_or(128_000_000);
+    let download_timeout_secs = config
+        .ext
+        .tools
+        .as_ref()
+        .and_then(|t| t.upload.as_ref())
+        .and_then(|u| u.download_timeout_secs)
+        .unwrap_or(600);
 
     for (acct_name, app_id, app_secret, brand) in fs_accounts {
         let reg = Arc::clone(&registry);
@@ -640,6 +647,7 @@ pub(crate) fn start_feishu_if_configured(
         fs_channel.api_base_override = feishu_api_base.clone();
         fs_channel.ws_url_override = feishu_ws_url.clone();
         fs_channel.max_file_size = max_file_size;
+        fs_channel.download_timeout_secs = download_timeout_secs;
         fs_channel.ws_reconnect_delay_secs = feishu_reconnect_delay;
         let fs = Arc::new(fs_channel);
 

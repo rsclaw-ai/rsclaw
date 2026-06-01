@@ -150,6 +150,10 @@ pub struct FeishuChannel {
     pub ws_url_override: Option<String>,
     /// Max file size for downloads (from config tools.upload.maxFileSize).
     pub max_file_size: usize,
+    /// Idle read timeout (secs) for resource downloads (config
+    /// tools.upload.downloadTimeoutSecs, default 600). Read-idle, not total:
+    /// a progressing download is never killed, a stalled one fails after this.
+    pub download_timeout_secs: u64,
     /// Seconds to wait between WS reconnect attempts (config: feishu.reconnectDelaySecs).
     pub ws_reconnect_delay_secs: u64,
     /// Callback: (sender_open_id, text, chat_id, is_group, images, files).
@@ -376,6 +380,7 @@ impl FeishuChannel {
             api_base_override: None,
             ws_url_override: None,
             max_file_size: 128_000_000, // default 128MB, overridden by startup
+            download_timeout_secs: 600, // overridden by startup from config
             ws_reconnect_delay_secs: 5,
             on_message,
         }
@@ -1062,8 +1067,8 @@ impl FeishuChannel {
                         String::new()
                     }
                     Err(e) => {
-                        warn!("feishu: video download failed: {e:#}");
-                        "[video message]".to_owned()
+                        warn!(error = format!("{e:#}"), "feishu: video download failed");
+                        "__DIRECT_REPLY__视频下载失败（可能下载超时或连接中断）。请重试或改用更小的文件。".to_owned()
                     }
                 }
             }
@@ -1165,7 +1170,11 @@ impl FeishuChannel {
                                 "__DIRECT_REPLY__File too large ({actual} MB, limit {limit} MB). Adjust via /config_upload_size <MB>"
                             )
                         } else {
-                            format!("[file download failed: {e}]")
+                            // Log the full error chain ({e:#}) — without this the
+                            // real reqwest cause (timeout vs reset vs decode) is
+                            // invisible and the agent just hallucinates "no file".
+                            warn!(name = file_name, error = format!("{e:#}"), "feishu: file download failed");
+                            "__DIRECT_REPLY__文件下载失败（可能下载超时或连接中断）。请重试，或改用更小的文件 / 公网链接。".to_owned()
                         }
                     }
                 }
@@ -1210,9 +1219,13 @@ impl FeishuChannel {
             self.api_base()
         );
 
-        // Use a longer timeout for file downloads (5 min)
+        // Read-idle timeout instead of a flat total timeout: a large file that
+        // transfers slowly-but-steadily must not be killed mid-download (the old
+        // 300s total cap failed any 58MB+ file on a slow link). `read_timeout`
+        // only fires when the body stalls for this long between chunks.
         let dl_client = crate::config::build_proxy_client()
-            .timeout(Duration::from_secs(300))
+            .connect_timeout(Duration::from_secs(30))
+            .read_timeout(Duration::from_secs(self.download_timeout_secs))
             .build()
             .unwrap_or_else(|_| self.client.clone());
 

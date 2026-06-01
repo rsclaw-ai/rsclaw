@@ -430,7 +430,18 @@ fn detect_port() -> u16 {
 pub const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const STOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 /// Maximum time to wait for the restarted gateway health endpoint.
-pub const START_HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(75);
+///
+/// Must comfortably exceed the gateway's OWN graceful-drain budget so a
+/// restart that waits on an in-flight request isn't falsely reported as
+/// failed. On `/restart` the old process: stops serving health, drains
+/// in-flight HTTP, then waits up to 60s for non-HTTP inflight to clear
+/// (`gateway::startup` drain loop), THEN re-execs the child, which must
+/// init (KB rebuild, model load, channel WS connects) before it binds and
+/// health goes green. 75s was shorter than 60s drain + child init, so a
+/// busy gateway (an active agent turn or cap session holding inflight) timed
+/// out on the first restart and only the second — with nothing in flight —
+/// succeeded. 150s leaves ~90s of init headroom on top of the 60s drain cap.
+pub const START_HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(150);
 const START_HEALTH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Result of waiting for a gateway process to exit.
