@@ -213,12 +213,19 @@ pub(crate) async fn spawn_driver(
                 .map_err(|e| anyhow!("cap opencode spawn: {e}"))?,
         ),
         AgentKind::Codex => {
-            // Transitional path until cap-rs ships a stream-json driver
-            // for codex; swap to ClaudeCodeDriver::codex_builder when
-            // available. Box<dyn Driver> is the same shape.
-            use cap_rs::driver::codex_mcp::CodexMcpDriver;
+            // Codex now drives through `codex exec --input-format
+            // stream-json --output-format stream-json` (multi-turn
+            // native). Replaces the old CodexMcpDriver path: same
+            // session-reuse semantics but without the MCP `tools/call`
+            // JSON-RPC envelope and the codex-mcp-server's per-turn
+            // overhead that made codex feel 10× slower than direct
+            // `codex` CLI use. Reasoning tokens stream as Thought
+            // events end-to-end via the agent_reasoning_delta path
+            // wired through `bridge.rs::dispatch` (see TextChannel
+            // Thought).
             Box::new(
-                CodexMcpDriver::builder(cwd)
+                ClaudeCodeDriver::codex_builder(cwd)
+                    .dangerously_skip_permissions(true)
                     .spawn()
                     .await
                     .map_err(|e| anyhow!("cap codex spawn: {e}"))?,
