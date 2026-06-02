@@ -454,19 +454,109 @@ pub(crate) async fn try_preparse_locally_with_account(
                 manager
                     .bind_sticky(this_session_key.clone(), sid.clone(), kind)
                     .await;
+                // Pull the agent's native session_id (claudecode UUID,
+                // opencode ses_…, codex thread_id) so the bind reply
+                // can show it — that's what the user needs to type
+                // into `/cap-resume <agent> <id>` later to come back
+                // to THIS conversation.
+                let native_sid = manager.get_agent_session_id(&sid).await;
                 tracing::info!(
                     target: "cap",
                     session_id = %sid,
+                    agent_session_id = ?native_sid,
                     agent = kind.as_str(),
                     im_session_key = %this_session_key,
                     "cap_live sticky bind"
                 );
+                let reply = if let Some(nsid) = &native_sid {
+                    crate::i18n::t_fmt(
+                        "cap_bound_with_resume",
+                        lang,
+                        &[
+                            ("agent", kind.display_name()),
+                            ("sid", &sid[..8.min(sid.len())]),
+                            ("session_id", nsid.as_str()),
+                            ("agent_slug", kind.as_str()),
+                        ],
+                    )
+                } else {
+                    crate::i18n::t_fmt(
+                        "cap_bound",
+                        lang,
+                        &[
+                            ("agent", kind.display_name()),
+                            ("sid", &sid[..8.min(sid.len())]),
+                        ],
+                    )
+                };
+                return Some(txt(reply));
+            }
+            Err(e) => {
+                let err = e.to_string();
                 return Some(txt(crate::i18n::t_fmt(
-                    "cap_bound",
+                    "cap_open_failed",
+                    lang,
+                    &[("err", &err)],
+                )));
+            }
+        }
+    }
+    // /cap-resume <agent> <session_id> — like /cap but resumes an
+    // existing on-disk session by the agent's NATIVE session id
+    // instead of starting fresh. Format mirrors `claude --resume
+    // <uuid>` / `codex exec resume <id>` / `opencode --session <id>`.
+    //
+    // Example:
+    //   /cap-resume claudecode 00000000-0000-0000-0000-deadbeefcafe
+    //
+    // The id format is whatever the agent itself uses; we just pass
+    // it through. If the id doesn't match a stored session the agent
+    // CLI errors at spawn — we surface that as a cap_open_failed
+    // reply.
+    if lower.starts_with("/cap-resume ") || lower == "/cap-resume" {
+        let lang = crate::i18n::default_lang();
+        // Parse "<agent> <session_id>" from the original (non-lowered)
+        // text because session ids are case-sensitive on opencode.
+        let rest = t.get("/cap-resume ".len()..).unwrap_or("").trim();
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let agent_str = parts.next().unwrap_or("").trim();
+        let session_id = parts.next().unwrap_or("").trim();
+        if agent_str.is_empty() || session_id.is_empty() {
+            return Some(txt(crate::i18n::t("cap_resume_help", lang)));
+        }
+        let Some(kind) = crate::cap::AgentKind::from_str(&agent_str.to_lowercase()) else {
+            return Some(txt(crate::i18n::t_fmt(
+                "cap_unknown_agent",
+                lang,
+                &[("agent", agent_str)],
+            )));
+        };
+        let Some(manager) = crate::cap::GLOBAL_CAP_LIVE.get() else {
+            return Some(txt(crate::i18n::t("cap_not_initialised", lang)));
+        };
+        let cwd = workspace();
+        match manager
+            .open_session_resume(kind, cwd, session_id.to_owned())
+            .await
+        {
+            Ok(sid) => {
+                manager
+                    .bind_sticky(this_session_key.clone(), sid.clone(), kind)
+                    .await;
+                tracing::info!(
+                    target: "cap",
+                    session_id = %sid,
+                    agent = kind.as_str(),
+                    resume_id = %session_id,
+                    im_session_key = %this_session_key,
+                    "cap_live sticky bind via /cap-resume"
+                );
+                return Some(txt(crate::i18n::t_fmt(
+                    "cap_resumed",
                     lang,
                     &[
                         ("agent", kind.display_name()),
-                        ("sid", &sid[..8.min(sid.len())]),
+                        ("session_id", session_id),
                     ],
                 )));
             }
@@ -1132,7 +1222,7 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
         lower.as_str(),
         "/ls" | "/status" | "/version" | "/help" | "/?" | "/health" | "/uptime"
             | "/model" | "/models" | "/cron" | "/clear" | "/new" | "/abort" | "/sessions"
-            | "/loop" | "/task" | "/watch" | "/plugin" | "/cap" | "/cap-end"
+            | "/loop" | "/task" | "/watch" | "/plugin" | "/cap" | "/cap-end" | "/cap-resume"
     )
     // Commands with optional/required args
     || lower.starts_with("/ls ")
@@ -1256,8 +1346,9 @@ fn help_text(lang: &str) -> String {
          技能/插件\n\
          \u{0020}\u{0020}/skill list      已安装技能\n\n\
          编程代理直连\n\
-         \u{0020}\u{0020}/cap <agent>     绑定本会话直连 cap 子代理\n\
-         \u{0020}\u{0020}/cap-end         释放绑定，恢复主 LLM\n\n\
+         \u{0020}\u{0020}/cap <agent>            绑定本会话直连 cap 子代理\n\
+         \u{0020}\u{0020}/cap-resume <ag> <id>   按 ID 恢复磁盘保存的会话\n\
+         \u{0020}\u{0020}/cap-end                释放绑定，恢复主 LLM\n\n\
          其他\n\
          \u{0020}\u{0020}/btw <问题>      旁路一次性提问，不写入会话\n\
          \u{0020}\u{0020}!cmd  /  $cmd    在工作区执行一行 shell 命令\n\
@@ -1288,8 +1379,9 @@ fn help_text(lang: &str) -> String {
          Skills / plugins\n\
          \u{0020}\u{0020}/skill list      installed skills\n\n\
          Coding-agent direct mode\n\
-         \u{0020}\u{0020}/cap <agent>     route this chat directly to a cap subagent\n\
-         \u{0020}\u{0020}/cap-end         release binding, resume main LLM\n\n\
+         \u{0020}\u{0020}/cap <agent>            route this chat directly to a cap subagent\n\
+         \u{0020}\u{0020}/cap-resume <ag> <id>   resume a saved session by id\n\
+         \u{0020}\u{0020}/cap-end                release binding, resume main LLM\n\n\
          Other\n\
          \u{0020}\u{0020}/btw <q>         side-channel ask, not added to session\n\
          \u{0020}\u{0020}!cmd  /  $cmd    run a one-line shell command in the workspace\n\

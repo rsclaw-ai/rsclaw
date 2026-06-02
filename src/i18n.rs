@@ -2429,6 +2429,21 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "zh" => "💭 {agent} 正在处理…",
     );
 
+    msg!("cap_bound_with_resume",
+        "en" => "Bound to {agent} (session {sid}). Next messages go directly to the driver. /cap-end to release.\nResume later: /cap-resume {agent_slug} {session_id}",
+        "zh" => "已绑定到 {agent}（会话 {sid}）。接下来的消息会直接发给子代理，使用 /cap-end 释放绑定。\n下次恢复对话：/cap-resume {agent_slug} {session_id}",
+    );
+
+    msg!("cap_resumed",
+        "en" => "Resumed {agent} session {session_id}. Next messages continue the previous conversation. /cap-end to release.",
+        "zh" => "已恢复 {agent} 会话 {session_id}。后续消息继续之前的对话。使用 /cap-end 释放绑定。",
+    );
+
+    msg!("cap_resume_help",
+        "en" => "/cap-resume <agent> <session_id> — resume an on-disk session by id (e.g. /cap-resume claudecode 00000000-…). Use the session_id printed by a prior /cap bind.",
+        "zh" => "/cap-resume <代理> <会话ID> — 按 ID 恢复磁盘上保存的会话（例如 /cap-resume claudecode 00000000-…）。会话ID 是之前 /cap 绑定时显示的 session_id。",
+    );
+
     m
 });
 

@@ -188,30 +188,73 @@ pub(crate) async fn spawn_driver(
     kind: AgentKind,
     cwd: &std::path::Path,
 ) -> Result<Box<dyn Driver>> {
+    spawn_driver_inner(kind, cwd, None).await
+}
+
+/// Spawn a driver that resumes an existing on-disk session by the
+/// agent's NATIVE session id (claudecode UUID, opencode session id,
+/// codex thread_id). Each driver maps the id to its own CLI flag /
+/// subcommand:
+///
+///   * claudecode/openclaude: `claude --resume <uuid>` (replays
+///     `~/.claude/projects/<path>/<uuid>.jsonl` into memory).
+///   * opencode: `opencode run --session <id>`.
+///   * codex: `codex exec resume <thread_id>`.
+///
+/// If the id doesn't match a stored session for that agent the CLI
+/// errors out at spawn — cap-rs surfaces the error to the actor which
+/// propagates it back to /cap-resume's caller.
+pub(crate) async fn spawn_driver_resume(
+    kind: AgentKind,
+    cwd: &std::path::Path,
+    agent_session_id: &str,
+) -> Result<Box<dyn Driver>> {
+    spawn_driver_inner(kind, cwd, Some(agent_session_id)).await
+}
+
+async fn spawn_driver_inner(
+    kind: AgentKind,
+    cwd: &std::path::Path,
+    resume_id: Option<&str>,
+) -> Result<Box<dyn Driver>> {
     use cap_rs::driver::stream_json::ClaudeCodeDriver;
 
     let driver: Box<dyn Driver> = match kind {
-        AgentKind::Claudecode => Box::new(
-            ClaudeCodeDriver::builder(cwd)
-                .dangerously_skip_permissions(true)
-                .spawn()
-                .await
-                .map_err(|e| anyhow!("cap claudecode spawn: {e}"))?,
-        ),
-        AgentKind::Openclaude => Box::new(
-            ClaudeCodeDriver::builder(cwd)
+        AgentKind::Claudecode => {
+            let mut b = ClaudeCodeDriver::builder(cwd).dangerously_skip_permissions(true);
+            if let Some(rid) = resume_id {
+                b = b.resume(rid);
+            }
+            Box::new(
+                b.spawn()
+                    .await
+                    .map_err(|e| anyhow!("cap claudecode spawn: {e}"))?,
+            )
+        }
+        AgentKind::Openclaude => {
+            let mut b = ClaudeCodeDriver::builder(cwd)
                 .bin("openclaude")
-                .dangerously_skip_permissions(true)
-                .spawn()
-                .await
-                .map_err(|e| anyhow!("cap openclaude spawn: {e}"))?,
-        ),
-        AgentKind::Opencode => Box::new(
-            ClaudeCodeDriver::opencode_builder(cwd)
-                .spawn()
-                .await
-                .map_err(|e| anyhow!("cap opencode spawn: {e}"))?,
-        ),
+                .dangerously_skip_permissions(true);
+            if let Some(rid) = resume_id {
+                b = b.resume(rid);
+            }
+            Box::new(
+                b.spawn()
+                    .await
+                    .map_err(|e| anyhow!("cap openclaude spawn: {e}"))?,
+            )
+        }
+        AgentKind::Opencode => {
+            let mut b = ClaudeCodeDriver::opencode_builder(cwd);
+            if let Some(rid) = resume_id {
+                b = b.resume(rid);
+            }
+            Box::new(
+                b.spawn()
+                    .await
+                    .map_err(|e| anyhow!("cap opencode spawn: {e}"))?,
+            )
+        }
         AgentKind::Codex => {
             // Codex now drives through `codex exec --input-format
             // stream-json --output-format stream-json` (multi-turn
@@ -223,10 +266,12 @@ pub(crate) async fn spawn_driver(
             // events end-to-end via the agent_reasoning_delta path
             // wired through `bridge.rs::dispatch` (see TextChannel
             // Thought).
+            let mut b = ClaudeCodeDriver::codex_builder(cwd).dangerously_skip_permissions(true);
+            if let Some(rid) = resume_id {
+                b = b.resume(rid);
+            }
             Box::new(
-                ClaudeCodeDriver::codex_builder(cwd)
-                    .dangerously_skip_permissions(true)
-                    .spawn()
+                b.spawn()
                     .await
                     .map_err(|e| anyhow!("cap codex spawn: {e}"))?,
             )

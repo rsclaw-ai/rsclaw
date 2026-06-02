@@ -40,7 +40,7 @@ use cap_rs::core::{ClientFrame, Content};
 use cap_rs::driver::Driver;
 
 use super::AgentKind;
-use super::runtime::{NotifTarget, run_turn, spawn_driver};
+use super::runtime::{NotifTarget, run_turn, spawn_driver, spawn_driver_resume};
 
 const DEFAULT_MAX_SESSIONS: usize = 8;
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(600); // 10 min
@@ -67,6 +67,13 @@ struct LiveSessionHandle {
     /// Bumped to `Instant::now()` every time a prompt arrives. The GC
     /// reads this to decide whether a session is idle-eligible.
     last_active: Arc<StdMutex<Instant>>,
+    /// Agent's NATIVE session id (claudecode UUID, opencode session
+    /// id, codex thread_id). Captured at spawn time from the
+    /// driver's first `AgentEvent::Ready` event. `None` while the
+    /// session is still initializing OR if the driver didn't emit
+    /// Ready before timeout. Used by `/cap` reply to show the user
+    /// the id they'd type into `/cap-resume` later.
+    agent_session_id: Option<String>,
 }
 
 enum LiveRequest {
@@ -110,7 +117,28 @@ impl CapLiveManager {
         cwd: std::path::PathBuf,
     ) -> Result<String> {
         let sid = uuid::Uuid::new_v4().simple().to_string();
-        self.spawn_session(&sid, kind, &cwd).await?;
+        self.spawn_session(&sid, kind, &cwd, None).await?;
+        Ok(sid)
+    }
+
+    /// Spawn a new live session that RESUMES an existing on-disk
+    /// session by the agent's native session id. Like `open_session`
+    /// but passes `--resume <id>` (or its agent-specific equivalent)
+    /// to the driver subprocess.
+    ///
+    /// Use case: `/cap-resume claudecode <uuid>` — the user knows the
+    /// uuid of an earlier conversation (from `claude /sessions` or the
+    /// last-bind reply) and wants to continue it as if no time had
+    /// passed.
+    pub(crate) async fn open_session_resume(
+        &self,
+        kind: AgentKind,
+        cwd: std::path::PathBuf,
+        agent_session_id: String,
+    ) -> Result<String> {
+        let sid = uuid::Uuid::new_v4().simple().to_string();
+        self.spawn_session(&sid, kind, &cwd, Some(agent_session_id))
+            .await?;
         Ok(sid)
     }
 
@@ -206,7 +234,7 @@ impl CapLiveManager {
             Some(s) if !s.trim().is_empty() => s,
             _ => {
                 let new_id = uuid::Uuid::new_v4().simple().to_string();
-                self.spawn_session(&new_id, kind, &cwd).await?;
+                self.spawn_session(&new_id, kind, &cwd, None).await?;
                 new_id
             }
         };
@@ -307,6 +335,7 @@ impl CapLiveManager {
         session_id: &str,
         kind: AgentKind,
         cwd: &std::path::Path,
+        resume_agent_sid: Option<String>,
     ) -> Result<()> {
         // Reap idle sessions BEFORE checking the limit so capacity
         // pressure doesn't lock callers out behind stale sessions.
@@ -322,7 +351,22 @@ impl CapLiveManager {
             }
         }
 
-        let driver = spawn_driver(kind, cwd).await?;
+        let mut driver = match resume_agent_sid.as_deref() {
+            Some(rid) => spawn_driver_resume(kind, cwd, rid).await?,
+            None => spawn_driver(kind, cwd).await?,
+        };
+        // Drain the driver's startup events until Ready so we can
+        // capture the agent's NATIVE session id. Each driver emits
+        // Ready (sometimes via a `system/init` stream-json frame)
+        // as its first significant event. We swallow earlier non-
+        // Ready events (these are server-side config dumps with no
+        // downstream consumer in cap_live mode). Bounded at 10s so
+        // a misbehaving driver doesn't block spawn forever.
+        let agent_sid = capture_ready_session_id(
+            driver.as_mut(),
+            std::time::Duration::from_secs(10),
+        )
+        .await;
         let (tx, rx) = mpsc::channel::<LiveRequest>(4);
         let last_active = Arc::new(StdMutex::new(Instant::now()));
         let bus = self.bus.clone();
@@ -342,10 +386,17 @@ impl CapLiveManager {
             agent_kind: kind,
             tx,
             last_active,
+            agent_session_id: agent_sid,
         };
         let mut g = self.sessions.write().await;
         g.insert(session_id.to_owned(), handle);
         Ok(())
+    }
+
+    /// Look up the captured native session_id for a given cap-internal sid.
+    pub(crate) async fn get_agent_session_id(&self, sid: &str) -> Option<String> {
+        let g = self.sessions.read().await;
+        g.get(sid).and_then(|h| h.agent_session_id.clone())
     }
 
     async fn gc_idle(&self) {
@@ -385,6 +436,55 @@ impl CapLiveManager {
         // the map size bounded under high churn).
         let mut sg = self.sticky.write().await;
         sg.retain(|_, (sid, _)| !to_remove.contains(sid));
+    }
+}
+
+/// Drain driver events until a `Ready` arrives (or timeout). Returns
+/// `Ready.session_id` so callers can surface the agent's NATIVE
+/// session id (claudecode UUID, opencode `ses_…`, codex thread_id)
+/// to the user — that's what they later type into `/cap-resume`.
+///
+/// Non-Ready events that arrive before Ready are dropped on the floor.
+/// In practice each stream-json driver emits Ready as its FIRST
+/// AgentEvent (mapped from the agent's `system/init` frame), so we
+/// expect to consume exactly one event here. The loop is defensive in
+/// case a future driver emits earlier non-Ready frames.
+async fn capture_ready_session_id(
+    driver: &mut dyn Driver,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    use cap_rs::core::AgentEvent;
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => {
+                tracing::warn!(
+                    target: "cap",
+                    "no Ready event within {}s; agent_session_id will be unknown",
+                    timeout.as_secs()
+                );
+                return None;
+            }
+            ev = driver.next_event() => match ev {
+                Some(AgentEvent::Ready { session_id, .. }) => {
+                    tracing::info!(
+                        target: "cap",
+                        agent_session_id = ?session_id,
+                        "cap_live captured Ready"
+                    );
+                    return session_id;
+                }
+                Some(_) => continue,
+                None => {
+                    tracing::warn!(
+                        target: "cap",
+                        "driver event stream ended before Ready"
+                    );
+                    return None;
+                }
+            }
+        }
     }
 }
 
