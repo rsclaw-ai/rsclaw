@@ -435,10 +435,17 @@ pub(crate) async fn try_preparse_locally_with_account(
     if lower == "/cap" || lower == "/cap -h" || lower == "/cap --help" || lower == "/cap help" {
         return Some(txt(crate::i18n::t("cap_help", crate::i18n::default_lang())));
     }
-    if let Some(rest) = lower.strip_prefix("/cap ") {
-        let agent_str = rest.trim();
+    if lower.starts_with("/cap ") {
+        // Parse from `t` (case-preserved) so path arguments like
+        // ~/Dev/MyProj survive — `lower` would have lowercased the
+        // directory name and broken canonicalize() on case-sensitive
+        // filesystems (and made paths confusing on macOS).
+        let rest = t.get("/cap ".len()..).unwrap_or("").trim();
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let agent_str = parts.next().unwrap_or("").trim();
+        let path_arg = parts.next().unwrap_or("").trim();
         let lang = crate::i18n::default_lang();
-        let Some(kind) = crate::cap::AgentKind::from_str(agent_str) else {
+        let Some(kind) = crate::cap::AgentKind::from_str(&agent_str.to_lowercase()) else {
             return Some(txt(crate::i18n::t_fmt(
                 "cap_unknown_agent",
                 lang,
@@ -448,7 +455,16 @@ pub(crate) async fn try_preparse_locally_with_account(
         let Some(manager) = crate::cap::GLOBAL_CAP_LIVE.get() else {
             return Some(txt(crate::i18n::t("cap_not_initialised", lang)));
         };
-        let cwd = workspace();
+        let cwd = match resolve_cap_workspace(path_arg, workspace()) {
+            Ok(p) => p,
+            Err(reason) => {
+                return Some(txt(crate::i18n::t_fmt(
+                    "cap_bad_workspace",
+                    lang,
+                    &[("path", path_arg), ("reason", &reason)],
+                )));
+            }
+        };
         match manager.open_session(kind, cwd).await {
             Ok(sid) => {
                 manager
@@ -1286,6 +1302,57 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
 /// follow-up IM message with the `/cap-resume` command the user can
 /// copy-paste to resume this exact conversation later. Fires at most
 /// once per /cap call; silent if the id never lands (30s timeout).
+/// Resolve a user-supplied `/cap <agent> [path]` workspace argument.
+///
+/// Empty input → fall back to the caller's `default` (the rsclaw
+/// configured workspace). Non-empty input must:
+///   * tilde-expand (`~/foo` → `$HOME/foo`),
+///   * resolve to an existing directory,
+///   * canonicalize within the user's home directory.
+///
+/// The home-only check is a deliberate safety floor — coding agents
+/// can spawn writes/exec, and accepting `/`, `/etc`, `/System`,
+/// `/var`, or sibling-user dirs from a chat message would be a real
+/// foot-gun. Inside `$HOME` the user already has full write authority,
+/// so this is the minimum gate that prevents misrouted IM messages
+/// from pointing a subagent at system roots.
+fn resolve_cap_workspace(
+    input: &str,
+    default: std::path::PathBuf,
+) -> std::result::Result<std::path::PathBuf, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(default);
+    }
+    let expanded = if let Some(rest) = input.strip_prefix("~/") {
+        match dirs_next::home_dir() {
+            Some(h) => h.join(rest),
+            None => return Err("HOME 不可用，无法展开 ~".to_string()),
+        }
+    } else if input == "~" {
+        match dirs_next::home_dir() {
+            Some(h) => h,
+            None => return Err("HOME 不可用，无法展开 ~".to_string()),
+        }
+    } else {
+        std::path::PathBuf::from(input)
+    };
+    let canon = std::fs::canonicalize(&expanded)
+        .map_err(|e| format!("路径不可达 ({e})"))?;
+    if !canon.is_dir() {
+        return Err("不是目录".to_string());
+    }
+    let home = dirs_next::home_dir().ok_or_else(|| "HOME 不可用".to_string())?;
+    let home_canon = std::fs::canonicalize(&home).unwrap_or(home);
+    if !canon.starts_with(&home_canon) {
+        return Err(format!(
+            "路径必须在 {} 之下",
+            home_canon.display()
+        ));
+    }
+    Ok(canon)
+}
+
 fn spawn_resume_hint_followup(
     manager: std::sync::Arc<crate::cap::CapLiveManager>,
     cap_sid: String,

@@ -2380,8 +2380,8 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
     // cap_live sticky direct mode (Phase 2a, 2026-05-31)
     // -----------------------------------------------------------------
     msg!("cap_help",
-        "en" => "/cap <agent> — bind this chat to a coding agent (claudecode | openclaude | opencode | codex)\n/cap-exit       — release the binding",
-        "zh" => "/cap <代理> — 把当前会话直连到一个编程代理（claudecode | openclaude | opencode | codex）\n/cap-exit       — 释放绑定，恢复主 LLM",
+        "en" => "/cap <agent> [path] — bind this chat to a coding agent (claudecode | openclaude | opencode | codex), optionally rooting the session at <path> (must be under $HOME; default: rsclaw workspace)\n/cap-exit             — release the binding",
+        "zh" => "/cap <代理> [路径] — 把当前会话直连到一个编程代理（claudecode | openclaude | opencode | codex），可选指定工作目录 [路径]（必须在 $HOME 之下，默认使用 rsclaw 工作区）\n/cap-exit             — 释放绑定，恢复主 LLM",
     );
 
     msg!("cap_bound",
@@ -2402,6 +2402,11 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
     msg!("cap_open_failed",
         "en" => "/cap: failed to open session: {err}",
         "zh" => "/cap：打开会话失败：{err}",
+    );
+
+    msg!("cap_bad_workspace",
+        "en" => "/cap: workspace path rejected — {path}: {reason}",
+        "zh" => "/cap：工作目录被拒绝 — {path}：{reason}",
     );
 
     msg!("cap_session_closed",
