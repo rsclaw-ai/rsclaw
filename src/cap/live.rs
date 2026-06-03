@@ -100,6 +100,16 @@ struct LiveSessionHandle {
     /// and `/status` (or a later `get_agent_session_id`) picks up
     /// the captured id once the actor's startup drain finishes.
     agent_session_id: Arc<StdMutex<Option<String>>>,
+    /// One-shot flag: when `true`, the runtime's sticky-bypass path
+    /// should prepend a memory recall bundle to the first user
+    /// message of this binding (giving the cap subagent context
+    /// rsclaw already knows — user preferences, prior facts).
+    /// Flipped to `false` after the first injection so subsequent
+    /// turns don't duplicate the context (the driver process keeps
+    /// its own history). Initialised `true` for fresh `/cap <agent>`,
+    /// `false` for `/cap-resume` / `--continue-last` (the resumed
+    /// session already has whatever context it ended on).
+    pending_memory_inject: Arc<std::sync::atomic::AtomicBool>,
 }
 
 enum LiveRequest {
@@ -369,6 +379,22 @@ impl CapLiveManager {
         }
     }
 
+    /// Atomically take the "inject memory on next turn" flag for this
+    /// live session. Returns `true` exactly once per binding (the first
+    /// caller wins), `false` thereafter. The runtime's sticky-bypass
+    /// path uses this to decide whether to prepend a memory recall
+    /// bundle to the outgoing prompt — only on the first turn, since
+    /// the driver process keeps its own history across turns.
+    pub(crate) async fn try_take_pending_memory_inject(&self, sid: &str) -> bool {
+        let g = self.sessions.read().await;
+        match g.get(sid) {
+            Some(h) => h
+                .pending_memory_inject
+                .swap(false, std::sync::atomic::Ordering::SeqCst),
+            None => false,
+        }
+    }
+
     /// Best-effort SYNC lookup of a cap session's agent-native id.
     /// Pair with `snapshot_sticky_blocking` to render `/status`
     /// entries that include the resume id (when the actor has
@@ -450,11 +476,18 @@ impl CapLiveManager {
             sticky_for_gc,
             agent_sid_slot,
         ));
+        // Only inject memory on a FRESH bind. `/cap-resume` and
+        // `--continue-last` reattach to a driver session whose process
+        // already remembers its prior turns — re-injecting rsclaw's
+        // memory bundle there would just burn tokens duplicating context
+        // the driver already has.
+        let inject = matches!(resume_mode, ResumeMode::None);
         let handle = LiveSessionHandle {
             agent_kind: kind,
             tx,
             last_active,
             agent_session_id,
+            pending_memory_inject: Arc::new(std::sync::atomic::AtomicBool::new(inject)),
         };
         let mut g = self.sessions.write().await;
         g.insert(session_id.to_owned(), handle);

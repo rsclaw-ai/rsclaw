@@ -2190,7 +2190,50 @@ impl AgentRuntime {
         // subagent."
         if let Some(manager) = self.cap_live_manager.as_ref() {
             if let Some((live_sid, kind)) = manager.resolve_sticky(session_key).await {
-                let task = text.to_owned();
+                // One-shot memory injection: on the FIRST user message
+                // after a fresh `/cap <agent>` bind, prepend whatever
+                // rsclaw's auto-recall has on this user (preferences,
+                // prior facts, project context) so the cap subagent
+                // starts the conversation with the same background the
+                // main LLM would have had. Subsequent turns skip — the
+                // driver process keeps its own history, so re-injecting
+                // would just burn tokens. `/cap-resume` also skips
+                // (resume_mode != None sets pending=false at spawn).
+                let task = if manager
+                    .try_take_pending_memory_inject(&live_sid)
+                    .await
+                {
+                    match self
+                        .build_auto_recall_bundle(&self.handle.id, channel, text)
+                        .await
+                    {
+                        Some(bundle) if !bundle.context.trim().is_empty() => {
+                            tracing::info!(
+                                target: "cap",
+                                live_session_id = %live_sid,
+                                docs = bundle.metadata.doc_ids.len(),
+                                "sticky bypass: injecting memory recall on first turn"
+                            );
+                            format!(
+                                "<background_from_main_agent_memory>\n\
+                                 The following facts come from the main rsclaw \
+                                 agent's long-term memory and may help you \
+                                 understand the user's preferences, prior \
+                                 context, or earlier decisions. Use them as \
+                                 hints; verify before acting on them.\n\n\
+                                 {}\n\
+                                 </background_from_main_agent_memory>\n\n\
+                                 ---\n\n\
+                                 {}",
+                                bundle.context.trim(),
+                                text
+                            )
+                        }
+                        _ => text.to_owned(),
+                    }
+                } else {
+                    text.to_owned()
+                };
                 tracing::info!(
                     target: "cap",
                     session = session_key,
