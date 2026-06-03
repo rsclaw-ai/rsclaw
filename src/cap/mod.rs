@@ -16,7 +16,7 @@ pub(crate) use runtime::{AgentKind, CapAgentManager};
 
 /// Process-wide handle to the single `CapLiveManager`. Set once by
 /// `gateway/startup.rs` after construction; read by preparse so the
-/// `/cap` and `/cap-end` slash commands can register/unregister sticky
+/// `/cap` and `/cap-exit` slash commands can register/unregister sticky
 /// IM-session bindings without each channel having to plumb the manager
 /// through its own state.
 ///

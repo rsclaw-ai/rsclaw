@@ -40,12 +40,24 @@ use cap_rs::core::{ClientFrame, Content};
 use cap_rs::driver::Driver;
 
 use super::AgentKind;
-use super::runtime::{NotifTarget, run_turn, spawn_driver, spawn_driver_resume};
+use super::runtime::{
+    NotifTarget, run_turn, spawn_driver, spawn_driver_continue_last, spawn_driver_resume,
+};
 
 const DEFAULT_MAX_SESSIONS: usize = 8;
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(600); // 10 min
 /// Per-prompt timeout, matching cap task mode (`runtime.rs` actor).
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How a new live session should be opened — fresh, or resuming a
+/// prior agent session. Owned-string variant for the by-id case so
+/// the value can be threaded through async without lifetime gymnastics.
+#[derive(Clone, Debug)]
+enum ResumeMode {
+    None,
+    ById(String),
+    ContinueLast,
+}
 
 pub(crate) struct CapLiveManager {
     sessions: Arc<RwLock<HashMap<String, LiveSessionHandle>>>,
@@ -56,6 +68,13 @@ pub(crate) struct CapLiveManager {
     /// binding never points at a dead driver.
     sticky: Arc<RwLock<HashMap<String, (String, AgentKind)>>>,
     bus: broadcast::Sender<crate::events::AgentEvent>,
+    /// Outbound notification channel — when set, preparse can post
+    /// asynchronous follow-up messages to IM after `/cap` returns its
+    /// initial bind reply (e.g. surface the agent's native session_id
+    /// once `AgentEvent::Ready` lands in the actor). `None` in test /
+    /// embedded contexts that don't have a channel layer.
+    notification_tx:
+        Option<broadcast::Sender<crate::channel::OutboundMessage>>,
     max_sessions: usize,
     idle_timeout: Duration,
 }
@@ -68,12 +87,19 @@ struct LiveSessionHandle {
     /// reads this to decide whether a session is idle-eligible.
     last_active: Arc<StdMutex<Instant>>,
     /// Agent's NATIVE session id (claudecode UUID, opencode session
-    /// id, codex thread_id). Captured at spawn time from the
-    /// driver's first `AgentEvent::Ready` event. `None` while the
-    /// session is still initializing OR if the driver didn't emit
-    /// Ready before timeout. Used by `/cap` reply to show the user
-    /// the id they'd type into `/cap-resume` later.
-    agent_session_id: Option<String>,
+    /// id, codex thread_id). Populated by the actor's first event
+    /// drain — `AgentEvent::Ready` carries it. Mutex'd so the actor
+    /// can write it asynchronously without blocking `spawn_session`.
+    ///
+    /// `Arc<Mutex<Option<...>>>` instead of letting capture block
+    /// the spawn: claudecode's `system/init` frame can land 10-20s
+    /// after process spawn (the SessionStart hook runs first and
+    /// fires a huge `hook_response` frame), so blocking the
+    /// `/cap <agent>` reply on capture made the user wait 10+s for
+    /// EVERY bind. With the async slot, `/cap` returns instantly
+    /// and `/status` (or a later `get_agent_session_id`) picks up
+    /// the captured id once the actor's startup drain finishes.
+    agent_session_id: Arc<StdMutex<Option<String>>>,
 }
 
 enum LiveRequest {
@@ -102,9 +128,27 @@ impl CapLiveManager {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             sticky: Arc::new(RwLock::new(HashMap::new())),
             bus,
+            notification_tx: None,
             max_sessions: DEFAULT_MAX_SESSIONS,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
         }
+    }
+
+    /// Late-set the outbound notification channel. Called once from
+    /// `gateway::startup` after the broadcast channel is created.
+    pub(crate) fn set_notification_tx(
+        &mut self,
+        tx: broadcast::Sender<crate::channel::OutboundMessage>,
+    ) {
+        self.notification_tx = Some(tx);
+    }
+
+    /// Cheap clone of the outbound notification sender, for preparse-
+    /// side follow-up dispatches (e.g. resume-id hint after /cap).
+    pub(crate) fn notification_tx(
+        &self,
+    ) -> Option<broadcast::Sender<crate::channel::OutboundMessage>> {
+        self.notification_tx.clone()
     }
 
     /// Spawn a new live session WITHOUT sending an initial prompt.
@@ -117,7 +161,7 @@ impl CapLiveManager {
         cwd: std::path::PathBuf,
     ) -> Result<String> {
         let sid = uuid::Uuid::new_v4().simple().to_string();
-        self.spawn_session(&sid, kind, &cwd, None).await?;
+        self.spawn_session(&sid, kind, &cwd, ResumeMode::None).await?;
         Ok(sid)
     }
 
@@ -137,7 +181,23 @@ impl CapLiveManager {
         agent_session_id: String,
     ) -> Result<String> {
         let sid = uuid::Uuid::new_v4().simple().to_string();
-        self.spawn_session(&sid, kind, &cwd, Some(agent_session_id))
+        self.spawn_session(&sid, kind, &cwd, ResumeMode::ById(agent_session_id))
+            .await?;
+        Ok(sid)
+    }
+
+    /// Spawn a new live session that resumes the MOST RECENT saved
+    /// session for this agent + cwd. Equivalent to `claude --continue`
+    /// / `opencode --continue` / `codex exec resume --last`.
+    /// Use case: `/cap-resume claudecode` (no id) — user wants to
+    /// pick up where they left off without typing the uuid.
+    pub(crate) async fn open_session_continue_last(
+        &self,
+        kind: AgentKind,
+        cwd: std::path::PathBuf,
+    ) -> Result<String> {
+        let sid = uuid::Uuid::new_v4().simple().to_string();
+        self.spawn_session(&sid, kind, &cwd, ResumeMode::ContinueLast)
             .await?;
         Ok(sid)
     }
@@ -234,7 +294,8 @@ impl CapLiveManager {
             Some(s) if !s.trim().is_empty() => s,
             _ => {
                 let new_id = uuid::Uuid::new_v4().simple().to_string();
-                self.spawn_session(&new_id, kind, &cwd, None).await?;
+                self.spawn_session(&new_id, kind, &cwd, ResumeMode::None)
+                    .await?;
                 new_id
             }
         };
@@ -308,6 +369,18 @@ impl CapLiveManager {
         }
     }
 
+    /// Best-effort SYNC lookup of a cap session's agent-native id.
+    /// Pair with `snapshot_sticky_blocking` to render `/status`
+    /// entries that include the resume id (when the actor has
+    /// finished capturing Ready). Returns None for a live session
+    /// whose Ready event hasn't landed yet OR if the sessions lock
+    /// is contended.
+    pub(crate) fn agent_session_id_blocking(&self, sid: &str) -> Option<String> {
+        let g = self.sessions.try_read().ok()?;
+        let h = g.get(sid)?;
+        h.agent_session_id.lock().ok().and_then(|s| s.clone())
+    }
+
     /// Force-close a live session. Idempotent — returns Ok even if the
     /// session was already gone.
     pub(crate) async fn end_session(&self, session_id: &str) -> Result<()> {
@@ -335,7 +408,7 @@ impl CapLiveManager {
         session_id: &str,
         kind: AgentKind,
         cwd: &std::path::Path,
-        resume_agent_sid: Option<String>,
+        resume_mode: ResumeMode,
     ) -> Result<()> {
         // Reap idle sessions BEFORE checking the limit so capacity
         // pressure doesn't lock callers out behind stale sessions.
@@ -351,28 +424,22 @@ impl CapLiveManager {
             }
         }
 
-        let mut driver = match resume_agent_sid.as_deref() {
-            Some(rid) => spawn_driver_resume(kind, cwd, rid).await?,
-            None => spawn_driver(kind, cwd).await?,
+        let driver = match &resume_mode {
+            ResumeMode::ById(rid) => spawn_driver_resume(kind, cwd, rid).await?,
+            ResumeMode::ContinueLast => spawn_driver_continue_last(kind, cwd).await?,
+            ResumeMode::None => spawn_driver(kind, cwd).await?,
         };
-        // Drain the driver's startup events until Ready so we can
-        // capture the agent's NATIVE session id. Each driver emits
-        // Ready (sometimes via a `system/init` stream-json frame)
-        // as its first significant event. We swallow earlier non-
-        // Ready events (these are server-side config dumps with no
-        // downstream consumer in cap_live mode). Bounded at 10s so
-        // a misbehaving driver doesn't block spawn forever.
-        let agent_sid = capture_ready_session_id(
-            driver.as_mut(),
-            std::time::Duration::from_secs(10),
-        )
-        .await;
         let (tx, rx) = mpsc::channel::<LiveRequest>(4);
         let last_active = Arc::new(StdMutex::new(Instant::now()));
+        // Async slot for the agent's native session id. Actor_loop's
+        // startup drain populates it; `/cap` returns immediately
+        // without blocking on Ready.
+        let agent_session_id = Arc::new(StdMutex::new(None::<String>));
         let bus = self.bus.clone();
         let sessions_for_gc = Arc::clone(&self.sessions);
         let sticky_for_gc = Arc::clone(&self.sticky);
         let sid_owned = session_id.to_owned();
+        let agent_sid_slot = Arc::clone(&agent_session_id);
         tokio::spawn(actor_loop(
             sid_owned,
             kind,
@@ -381,12 +448,13 @@ impl CapLiveManager {
             bus,
             sessions_for_gc,
             sticky_for_gc,
+            agent_sid_slot,
         ));
         let handle = LiveSessionHandle {
             agent_kind: kind,
             tx,
             last_active,
-            agent_session_id: agent_sid,
+            agent_session_id,
         };
         let mut g = self.sessions.write().await;
         g.insert(session_id.to_owned(), handle);
@@ -394,9 +462,35 @@ impl CapLiveManager {
     }
 
     /// Look up the captured native session_id for a given cap-internal sid.
+    /// Returns `None` if the actor hasn't drained the Ready event yet
+    /// (claudecode/opencode/codex with heavy startup hooks can take
+    /// 10-30s to emit init). Callers SHOULD retry / poll if they need
+    /// the id immediately after spawn.
     pub(crate) async fn get_agent_session_id(&self, sid: &str) -> Option<String> {
         let g = self.sessions.read().await;
-        g.get(sid).and_then(|h| h.agent_session_id.clone())
+        g.get(sid).and_then(|h| h.agent_session_id.lock().ok().and_then(|s| s.clone()))
+    }
+
+    /// Same as `get_agent_session_id` but polls for up to `timeout`
+    /// duration so callers that want the id immediately at `/cap` bind
+    /// time (and are willing to wait a bit) get a result. Returns
+    /// `None` if the timeout elapses.
+    #[allow(dead_code)]
+    pub(crate) async fn wait_agent_session_id(
+        &self,
+        sid: &str,
+        timeout: std::time::Duration,
+    ) -> Option<String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(s) = self.get_agent_session_id(sid).await {
+                return Some(s);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
     }
 
     async fn gc_idle(&self) {
@@ -449,6 +543,7 @@ impl CapLiveManager {
 /// AgentEvent (mapped from the agent's `system/init` frame), so we
 /// expect to consume exactly one event here. The loop is defensive in
 /// case a future driver emits earlier non-Ready frames.
+#[allow(dead_code)]
 async fn capture_ready_session_id(
     driver: &mut dyn Driver,
     timeout: std::time::Duration,
@@ -499,6 +594,7 @@ async fn actor_loop(
     bus: broadcast::Sender<crate::events::AgentEvent>,
     sessions: Arc<RwLock<HashMap<String, LiveSessionHandle>>>,
     sticky: Arc<RwLock<HashMap<String, (String, AgentKind)>>>,
+    agent_sid_slot: Arc<StdMutex<Option<String>>>,
 ) {
     tracing::info!(
         target: "cap",
@@ -506,8 +602,75 @@ async fn actor_loop(
         agent = kind.as_str(),
         "cap_live actor started"
     );
+    // Race the first events against the first user prompt. EITHER
+    // path advances the actor: if Ready arrives first we capture the
+    // native session id and proceed to the main loop, if a Prompt
+    // arrives first we hold it in `prebuf_request` so the main loop
+    // handles it without re-waiting on rx.
+    //
+    // Why this matters: blocking on Ready (the prior implementation)
+    // stalled `/cap codex → 你好` for 30s because the Prompt sat in
+    // the mpsc while the actor was draining events looking for Ready.
+    // The user-visible cost — 30s of dead silence after the bind
+    // reply — was way worse than the capture's value.
+    let mut prebuf_request: Option<LiveRequest> = None;
+    {
+        use cap_rs::core::AgentEvent;
+        let capture_deadline = tokio::time::sleep(std::time::Duration::from_secs(30));
+        tokio::pin!(capture_deadline);
+        loop {
+            tokio::select! {
+                biased;
+                first_req = rx.recv() => {
+                    prebuf_request = first_req;
+                    break;
+                }
+                _ = &mut capture_deadline => {
+                    tracing::warn!(
+                        target: "cap",
+                        session_id = %sid,
+                        agent = kind.as_str(),
+                        "no Ready captured in 30s; resume id unavailable until next bind"
+                    );
+                    break;
+                }
+                ev = driver.next_event() => match ev {
+                    Some(AgentEvent::Ready { session_id, .. }) => {
+                        if let Ok(mut g) = agent_sid_slot.lock() {
+                            *g = session_id.clone();
+                        }
+                        tracing::info!(
+                            target: "cap",
+                            session_id = %sid,
+                            agent_session_id = ?session_id,
+                            "cap_live captured Ready"
+                        );
+                        break;
+                    }
+                    Some(_) => continue,
+                    None => {
+                        tracing::warn!(
+                            target: "cap",
+                            session_id = %sid,
+                            "driver event stream ended before Ready"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
     let pseudo_session_id = format!("cap-live-{}-{sid}", kind.as_str());
-    while let Some(req) = rx.recv().await {
+    // Main loop: process the pre-buffered request first (if any),
+    // then drain rx as usual.
+    loop {
+        let req = match prebuf_request.take() {
+            Some(r) => r,
+            None => match rx.recv().await {
+                Some(r) => r,
+                None => break,
+            },
+        };
         match req {
             LiveRequest::Prompt { task, notif, reply } => {
                 if let Err(e) = driver

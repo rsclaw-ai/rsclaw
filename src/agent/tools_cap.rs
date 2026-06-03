@@ -267,7 +267,7 @@ impl super::runtime::AgentRuntime {
         }))
     }
 
-    /// `cap_unbind_sticky` — natural-language `/cap-end`. The LLM calls
+    /// `cap_unbind_sticky` — natural-language `/cap-exit`. The LLM calls
     /// this when the user signals "back to normal" / "stop using
     /// claudecode" / "release". Releases the sticky binding on the
     /// current IM session AND tears down the underlying live driver.

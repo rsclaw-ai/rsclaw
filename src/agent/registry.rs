@@ -238,12 +238,24 @@ impl AgentHandle {
                         im_key.clone()
                     };
                     let sid_short = &sid[..8.min(sid.len())];
-                    sticky_lines.push_str(&format!(
-                        "\u{A0} {} → {} ({})\n",
-                        key_label,
-                        kind.as_str(),
-                        sid_short
-                    ));
+                    let native = mgr.agent_session_id_blocking(sid);
+                    if let Some(nsid) = native {
+                        sticky_lines.push_str(&format!(
+                            "\u{A0} {} → {} ({})\n  resume: /cap-resume {} {}\n",
+                            key_label,
+                            kind.as_str(),
+                            sid_short,
+                            kind.as_str(),
+                            nsid
+                        ));
+                    } else {
+                        sticky_lines.push_str(&format!(
+                            "\u{A0} {} → {} ({})\n  resume id: (capturing…)\n",
+                            key_label,
+                            kind.as_str(),
+                            sid_short
+                        ));
+                    }
                 }
             }
         }

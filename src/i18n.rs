@@ -2380,13 +2380,13 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
     // cap_live sticky direct mode (Phase 2a, 2026-05-31)
     // -----------------------------------------------------------------
     msg!("cap_help",
-        "en" => "/cap <agent> — bind this chat to a coding agent (claudecode | openclaude | opencode | codex)\n/cap-end       — release the binding",
-        "zh" => "/cap <代理> — 把当前会话直连到一个编程代理（claudecode | openclaude | opencode | codex）\n/cap-end       — 释放绑定，恢复主 LLM",
+        "en" => "/cap <agent> — bind this chat to a coding agent (claudecode | openclaude | opencode | codex)\n/cap-exit       — release the binding",
+        "zh" => "/cap <代理> — 把当前会话直连到一个编程代理（claudecode | openclaude | opencode | codex）\n/cap-exit       — 释放绑定，恢复主 LLM",
     );
 
     msg!("cap_bound",
-        "en" => "Bound to {agent} (session {sid}). Next messages go directly to the driver. /cap-end to release.",
-        "zh" => "已绑定到 {agent}（会话 {sid}）。接下来的消息会直接发给子代理，使用 /cap-end 释放绑定。",
+        "en" => "Bound to {agent} (session {sid}). Next messages go directly to the driver. /cap-exit to release, /status to see the resume id.",
+        "zh" => "已绑定到 {agent}（会话 {sid}）。接下来的消息会直接发给子代理。/cap-exit 释放，/status 查看 resume id。",
     );
 
     msg!("cap_unknown_agent",
@@ -2410,8 +2410,8 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
     );
 
     msg!("cap_no_active",
-        "en" => "/cap-end: no active cap session here",
-        "zh" => "/cap-end：当前会话没有绑定中的代理",
+        "en" => "/cap-exit: no active cap session here",
+        "zh" => "/cap-exit：当前会话没有绑定中的代理",
     );
 
     msg!("cap_driver_error",
@@ -2430,18 +2430,28 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
     );
 
     msg!("cap_bound_with_resume",
-        "en" => "Bound to {agent} (session {sid}). Next messages go directly to the driver. /cap-end to release.\nResume later: /cap-resume {agent_slug} {session_id}",
-        "zh" => "已绑定到 {agent}（会话 {sid}）。接下来的消息会直接发给子代理，使用 /cap-end 释放绑定。\n下次恢复对话：/cap-resume {agent_slug} {session_id}",
+        "en" => "Bound to {agent} (session {sid}). Next messages go directly to the driver. /cap-exit to release.\nResume later: /cap-resume {agent_slug} {session_id}",
+        "zh" => "已绑定到 {agent}（会话 {sid}）。接下来的消息会直接发给子代理，使用 /cap-exit 释放绑定。\n下次恢复对话：/cap-resume {agent_slug} {session_id}",
     );
 
     msg!("cap_resumed",
-        "en" => "Resumed {agent} session {session_id}. Next messages continue the previous conversation. /cap-end to release.",
-        "zh" => "已恢复 {agent} 会话 {session_id}。后续消息继续之前的对话。使用 /cap-end 释放绑定。",
+        "en" => "Resumed {agent} session {session_id}. Next messages continue the previous conversation. /cap-exit to release.",
+        "zh" => "已恢复 {agent} 会话 {session_id}。后续消息继续之前的对话。使用 /cap-exit 释放绑定。",
     );
 
     msg!("cap_resume_help",
-        "en" => "/cap-resume <agent> <session_id> — resume an on-disk session by id (e.g. /cap-resume claudecode 00000000-…). Use the session_id printed by a prior /cap bind.",
-        "zh" => "/cap-resume <代理> <会话ID> — 按 ID 恢复磁盘上保存的会话（例如 /cap-resume claudecode 00000000-…）。会话ID 是之前 /cap 绑定时显示的 session_id。",
+        "en" => "/cap-resume <agent> [session_id]\n  /cap-resume claudecode 00000000-…   resume by id\n  /cap-resume claudecode               resume the most recent saved session",
+        "zh" => "/cap-resume <代理> [会话ID]\n  /cap-resume claudecode 00000000-…   按 ID 恢复\n  /cap-resume claudecode               恢复最近一次会话",
+    );
+
+    msg!("cap_resume_hint",
+        "en" => "📌 Resume command:\n/cap-resume {agent} {session_id}",
+        "zh" => "📌 续聊命令:\n/cap-resume {agent} {session_id}",
+    );
+
+    msg!("cap_resume_hint_after_exit",
+        "en" => "📌 To resume this conversation:\n/cap-resume {agent} {session_id}",
+        "zh" => "📌 恢复本次对话:\n/cap-resume {agent} {session_id}",
     );
 
     m

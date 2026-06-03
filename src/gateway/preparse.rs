@@ -425,7 +425,7 @@ pub(crate) async fn try_preparse_locally_with_account(
     }
     // /cap <agent> — open a cap_live session and bind it sticky to this
     // IM session so subsequent plain-text messages route directly to the
-    // driver, skipping the main LLM. `/cap-end` releases the binding.
+    // driver, skipping the main LLM. `/cap-exit` releases the binding.
     //
     // Why bypass the LLM here: phase 1 already exposes `cap_live` as a
     // tool the LLM can call, but going through the LLM costs an extra
@@ -454,41 +454,38 @@ pub(crate) async fn try_preparse_locally_with_account(
                 manager
                     .bind_sticky(this_session_key.clone(), sid.clone(), kind)
                     .await;
-                // Pull the agent's native session_id (claudecode UUID,
-                // opencode ses_…, codex thread_id) so the bind reply
-                // can show it — that's what the user needs to type
-                // into `/cap-resume <agent> <id>` later to come back
-                // to THIS conversation.
-                let native_sid = manager.get_agent_session_id(&sid).await;
                 tracing::info!(
                     target: "cap",
                     session_id = %sid,
-                    agent_session_id = ?native_sid,
                     agent = kind.as_str(),
                     im_session_key = %this_session_key,
                     "cap_live sticky bind"
                 );
-                let reply = if let Some(nsid) = &native_sid {
-                    crate::i18n::t_fmt(
-                        "cap_bound_with_resume",
-                        lang,
-                        &[
-                            ("agent", kind.display_name()),
-                            ("sid", &sid[..8.min(sid.len())]),
-                            ("session_id", nsid.as_str()),
-                            ("agent_slug", kind.as_str()),
-                        ],
-                    )
-                } else {
-                    crate::i18n::t_fmt(
-                        "cap_bound",
-                        lang,
-                        &[
-                            ("agent", kind.display_name()),
-                            ("sid", &sid[..8.min(sid.len())]),
-                        ],
-                    )
-                };
+                // Native session id is captured asynchronously by the
+                // actor loop (claudecode's SessionStart hook can delay
+                // the Ready event by 10-30s — we don't block the bind
+                // reply on it). Spawn a follow-up task that waits up
+                // to 30s for the id and then pushes a second IM
+                // message with the resume hint, so the user has the
+                // `/cap-resume` command ready to copy without having
+                // to run `/status`.
+                spawn_resume_hint_followup(
+                    manager.clone(),
+                    sid.clone(),
+                    kind,
+                    peer_id.to_owned(),
+                    channel.to_owned(),
+                    account.map(|s| s.to_owned()),
+                    lang,
+                );
+                let reply = crate::i18n::t_fmt(
+                    "cap_bound",
+                    lang,
+                    &[
+                        ("agent", kind.display_name()),
+                        ("sid", &sid[..8.min(sid.len())]),
+                    ],
+                );
                 return Some(txt(reply));
             }
             Err(e) => {
@@ -515,13 +512,14 @@ pub(crate) async fn try_preparse_locally_with_account(
     // reply.
     if lower.starts_with("/cap-resume ") || lower == "/cap-resume" {
         let lang = crate::i18n::default_lang();
-        // Parse "<agent> <session_id>" from the original (non-lowered)
+        // Parse "<agent> [session_id]" from the original (non-lowered)
         // text because session ids are case-sensitive on opencode.
+        // Empty session_id → "continue last" mode (CLI-native flag).
         let rest = t.get("/cap-resume ".len()..).unwrap_or("").trim();
         let mut parts = rest.splitn(2, char::is_whitespace);
         let agent_str = parts.next().unwrap_or("").trim();
         let session_id = parts.next().unwrap_or("").trim();
-        if agent_str.is_empty() || session_id.is_empty() {
+        if agent_str.is_empty() {
             return Some(txt(crate::i18n::t("cap_resume_help", lang)));
         }
         let Some(kind) = crate::cap::AgentKind::from_str(&agent_str.to_lowercase()) else {
@@ -535,10 +533,12 @@ pub(crate) async fn try_preparse_locally_with_account(
             return Some(txt(crate::i18n::t("cap_not_initialised", lang)));
         };
         let cwd = workspace();
-        match manager
-            .open_session_resume(kind, cwd, session_id.to_owned())
-            .await
-        {
+        let spawn_result = if session_id.is_empty() {
+            manager.open_session_continue_last(kind, cwd).await
+        } else {
+            manager.open_session_resume(kind, cwd, session_id.to_owned()).await
+        };
+        match spawn_result {
             Ok(sid) => {
                 manager
                     .bind_sticky(this_session_key.clone(), sid.clone(), kind)
@@ -548,16 +548,19 @@ pub(crate) async fn try_preparse_locally_with_account(
                     session_id = %sid,
                     agent = kind.as_str(),
                     resume_id = %session_id,
+                    continue_last = session_id.is_empty(),
                     im_session_key = %this_session_key,
                     "cap_live sticky bind via /cap-resume"
                 );
+                let label = if session_id.is_empty() {
+                    "(latest)"
+                } else {
+                    session_id
+                };
                 return Some(txt(crate::i18n::t_fmt(
                     "cap_resumed",
                     lang,
-                    &[
-                        ("agent", kind.display_name()),
-                        ("session_id", session_id),
-                    ],
+                    &[("agent", kind.display_name()), ("session_id", label)],
                 )));
             }
             Err(e) => {
@@ -570,8 +573,8 @@ pub(crate) async fn try_preparse_locally_with_account(
             }
         }
     }
-    // /cap-end — release any sticky binding on this IM session.
-    if lower == "/cap-end" {
+    // /cap-exit — release any sticky binding on this IM session.
+    if lower == "/cap-exit" {
         let lang = crate::i18n::default_lang();
         let Some(manager) = crate::cap::GLOBAL_CAP_LIVE.get() else {
             return Some(txt(crate::i18n::t("cap_not_initialised", lang)));
@@ -579,19 +582,40 @@ pub(crate) async fn try_preparse_locally_with_account(
         let Some((sid, kind)) = manager.unbind_sticky(&this_session_key).await else {
             return Some(txt(crate::i18n::t("cap_no_active", lang)));
         };
+        // Capture the native session_id BEFORE tearing the actor down
+        // — once `end_session` drops the LiveSessionHandle, that
+        // information is gone. By now the actor has had plenty of
+        // time to drain Ready (any /cap-exit follows actual usage),
+        // so this should usually be Some(...).
+        let native_sid = manager.get_agent_session_id(&sid).await;
         let _ = manager.end_session(&sid).await;
         tracing::info!(
             target: "cap",
             session_id = %sid,
             agent = kind.as_str(),
+            agent_session_id = ?native_sid,
             im_session_key = %this_session_key,
             "cap_live sticky unbind + end"
         );
-        return Some(txt(crate::i18n::t_fmt(
+        // Build the close reply, append the resume hint if we have
+        // the native id so the user has the `/cap-resume` command
+        // ready to copy without having to run `/status`.
+        let closed = crate::i18n::t_fmt(
             "cap_session_closed",
             lang,
             &[("agent", kind.display_name())],
-        )));
+        );
+        let body = if let Some(nsid) = native_sid {
+            let hint = crate::i18n::t_fmt(
+                "cap_resume_hint_after_exit",
+                lang,
+                &[("agent", kind.as_str()), ("session_id", &nsid)],
+            );
+            format!("{closed}\n\n{hint}")
+        } else {
+            closed
+        };
+        return Some(txt(body));
     }
     // /status
     if lower == "/status" {
@@ -1222,7 +1246,7 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
         lower.as_str(),
         "/ls" | "/status" | "/version" | "/help" | "/?" | "/health" | "/uptime"
             | "/model" | "/models" | "/cron" | "/clear" | "/new" | "/abort" | "/sessions"
-            | "/loop" | "/task" | "/watch" | "/plugin" | "/cap" | "/cap-end" | "/cap-resume"
+            | "/loop" | "/task" | "/watch" | "/plugin" | "/cap" | "/cap-exit" | "/cap-resume"
     )
     // Commands with optional/required args
     || lower.starts_with("/ls ")
@@ -1241,6 +1265,7 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
     || lower.starts_with("/loop ")
     || lower.starts_with("/watch ")
     || lower.starts_with("/cap ")
+    || lower.starts_with("/cap-resume ")
     // /task only short-circuits on help variants; non-help forms must NOT
     // bypass the queue (the task queue worker owns the multi-turn flow).
     || lower == "/task -h"
@@ -1256,6 +1281,66 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
 
 /// Parse a human-readable interval like "30s", "5m", "1h", "2h30m", "1d".
 /// A bare number is interpreted as seconds.
+/// Spawn a background task that waits for the actor to capture the
+/// agent's native session_id (via `AgentEvent::Ready`), then pushes a
+/// follow-up IM message with the `/cap-resume` command the user can
+/// copy-paste to resume this exact conversation later. Fires at most
+/// once per /cap call; silent if the id never lands (30s timeout).
+fn spawn_resume_hint_followup(
+    manager: std::sync::Arc<crate::cap::CapLiveManager>,
+    cap_sid: String,
+    kind: crate::cap::AgentKind,
+    target_id: String,
+    channel: String,
+    account: Option<String>,
+    lang: &'static str,
+) {
+    let Some(notif_tx) = manager.notification_tx() else {
+        return;
+    };
+    if target_id.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        let Some(nsid) = manager
+            .wait_agent_session_id(&cap_sid, std::time::Duration::from_secs(30))
+            .await
+        else {
+            tracing::debug!(
+                target: "cap",
+                cap_session_id = %cap_sid,
+                "resume-hint followup: native id not captured in 30s; skipping"
+            );
+            return;
+        };
+        let text = crate::i18n::t_fmt(
+            "cap_resume_hint",
+            lang,
+            &[("agent", kind.as_str()), ("session_id", &nsid)],
+        );
+        let msg = crate::channel::OutboundMessage {
+            target_id,
+            // Sticky bindings only exist for DM (per-channel-peer scope),
+            // so this is always a 1:1 chat. Group chats don't have a
+            // sticky-mode UX today.
+            is_group: false,
+            text,
+            reply_to: None,
+            images: vec![],
+            files: vec![],
+            channel: Some(channel),
+            account,
+        };
+        if let Err(e) = notif_tx.send(msg) {
+            tracing::warn!(
+                target: "cap",
+                error = %e,
+                "resume-hint followup: notification_tx send failed"
+            );
+        }
+    });
+}
+
 fn parse_interval_ms(s: &str) -> Option<u64> {
     let mut total: u64 = 0;
     let mut num_buf = String::new();
@@ -1348,7 +1433,7 @@ fn help_text(lang: &str) -> String {
          编程代理直连\n\
          \u{0020}\u{0020}/cap <agent>            绑定本会话直连 cap 子代理\n\
          \u{0020}\u{0020}/cap-resume <ag> <id>   按 ID 恢复磁盘保存的会话\n\
-         \u{0020}\u{0020}/cap-end                释放绑定，恢复主 LLM\n\n\
+         \u{0020}\u{0020}/cap-exit                释放绑定，恢复主 LLM\n\n\
          其他\n\
          \u{0020}\u{0020}/btw <问题>      旁路一次性提问，不写入会话\n\
          \u{0020}\u{0020}!cmd  /  $cmd    在工作区执行一行 shell 命令\n\
@@ -1381,7 +1466,7 @@ fn help_text(lang: &str) -> String {
          Coding-agent direct mode\n\
          \u{0020}\u{0020}/cap <agent>            route this chat directly to a cap subagent\n\
          \u{0020}\u{0020}/cap-resume <ag> <id>   resume a saved session by id\n\
-         \u{0020}\u{0020}/cap-end                release binding, resume main LLM\n\n\
+         \u{0020}\u{0020}/cap-exit                release binding, resume main LLM\n\n\
          Other\n\
          \u{0020}\u{0020}/btw <q>         side-channel ask, not added to session\n\
          \u{0020}\u{0020}!cmd  /  $cmd    run a one-line shell command in the workspace\n\
@@ -1671,13 +1756,13 @@ mod tests {
 
     #[test]
     fn is_fast_preparse_recognizes_cap_sticky_commands() {
-        // Bare /cap, /cap-end, and `/cap <agent>` must short-circuit
+        // Bare /cap, /cap-exit, and `/cap <agent>` must short-circuit
         // through preparse so the binding is registered immediately
         // instead of being queued behind the LLM. Without these
         // entries, the channel inbound code would treat them as plain
         // text and the sticky bind never happens.
         assert!(is_fast_preparse("/cap"));
-        assert!(is_fast_preparse("/cap-end"));
+        assert!(is_fast_preparse("/cap-exit"));
         assert!(is_fast_preparse("/cap claudecode"));
         assert!(is_fast_preparse("/cap codex"));
         assert!(is_fast_preparse("/CAP claudecode")); // case-insensitive

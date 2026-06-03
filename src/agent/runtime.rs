@@ -2184,7 +2184,7 @@ impl AgentRuntime {
         // cap_live sticky direct mode: if /cap <agent> was issued on this
         // IM session, route plain-text user messages straight to the cap
         // driver, skipping the main LLM. The slash-command registration
-        // happens in preparse (`/cap`, `/cap-end`); here we only consume
+        // happens in preparse (`/cap`, `/cap-exit`); here we only consume
         // the binding. Slash commands that preparse didn't handle still
         // get routed to the driver — sticky means "everything to the
         // subagent."

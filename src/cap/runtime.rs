@@ -188,7 +188,7 @@ pub(crate) async fn spawn_driver(
     kind: AgentKind,
     cwd: &std::path::Path,
 ) -> Result<Box<dyn Driver>> {
-    spawn_driver_inner(kind, cwd, None).await
+    spawn_driver_inner(kind, cwd, ResumeMode::None).await
 }
 
 /// Spawn a driver that resumes an existing on-disk session by the
@@ -209,22 +209,48 @@ pub(crate) async fn spawn_driver_resume(
     cwd: &std::path::Path,
     agent_session_id: &str,
 ) -> Result<Box<dyn Driver>> {
-    spawn_driver_inner(kind, cwd, Some(agent_session_id)).await
+    spawn_driver_inner(kind, cwd, ResumeMode::ById(agent_session_id)).await
+}
+
+/// Spawn a driver that resumes the MOST RECENT saved session for
+/// this agent in `cwd`. Equivalent to `claude --continue` / `opencode
+/// run --continue` / `codex exec resume --last`.
+pub(crate) async fn spawn_driver_continue_last(
+    kind: AgentKind,
+    cwd: &std::path::Path,
+) -> Result<Box<dyn Driver>> {
+    spawn_driver_inner(kind, cwd, ResumeMode::ContinueLast).await
+}
+
+#[derive(Copy, Clone)]
+enum ResumeMode<'a> {
+    None,
+    ById(&'a str),
+    ContinueLast,
 }
 
 async fn spawn_driver_inner(
     kind: AgentKind,
     cwd: &std::path::Path,
-    resume_id: Option<&str>,
+    resume_mode: ResumeMode<'_>,
 ) -> Result<Box<dyn Driver>> {
     use cap_rs::driver::stream_json::ClaudeCodeDriver;
+
+    fn apply_resume_mode(
+        b: cap_rs::driver::stream_json::ClaudeCodeDriverBuilder,
+        mode: ResumeMode<'_>,
+    ) -> cap_rs::driver::stream_json::ClaudeCodeDriverBuilder {
+        match mode {
+            ResumeMode::None => b,
+            ResumeMode::ById(rid) => b.resume(rid),
+            ResumeMode::ContinueLast => b.continue_last(true),
+        }
+    }
 
     let driver: Box<dyn Driver> = match kind {
         AgentKind::Claudecode => {
             let mut b = ClaudeCodeDriver::builder(cwd).dangerously_skip_permissions(true);
-            if let Some(rid) = resume_id {
-                b = b.resume(rid);
-            }
+            b = apply_resume_mode(b, resume_mode);
             Box::new(
                 b.spawn()
                     .await
@@ -235,9 +261,7 @@ async fn spawn_driver_inner(
             let mut b = ClaudeCodeDriver::builder(cwd)
                 .bin("openclaude")
                 .dangerously_skip_permissions(true);
-            if let Some(rid) = resume_id {
-                b = b.resume(rid);
-            }
+            b = apply_resume_mode(b, resume_mode);
             Box::new(
                 b.spawn()
                     .await
@@ -246,9 +270,7 @@ async fn spawn_driver_inner(
         }
         AgentKind::Opencode => {
             let mut b = ClaudeCodeDriver::opencode_builder(cwd);
-            if let Some(rid) = resume_id {
-                b = b.resume(rid);
-            }
+            b = apply_resume_mode(b, resume_mode);
             Box::new(
                 b.spawn()
                     .await
@@ -267,9 +289,7 @@ async fn spawn_driver_inner(
             // wired through `bridge.rs::dispatch` (see TextChannel
             // Thought).
             let mut b = ClaudeCodeDriver::codex_builder(cwd).dangerously_skip_permissions(true);
-            if let Some(rid) = resume_id {
-                b = b.resume(rid);
-            }
+            b = apply_resume_mode(b, resume_mode);
             Box::new(
                 b.spawn()
                     .await

@@ -419,9 +419,16 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // Interactive cap session manager (Phase 1 of cap multi-instance
     // sessions). Shared the same way as `cap_manager` so every
     // AgentRuntime can offer the `cap_live` tool to its LLM.
-    let cap_live_manager =
-        std::sync::Arc::new(crate::cap::CapLiveManager::new(event_tx.clone()));
-    // Publish a process-wide handle so preparse (`/cap`, `/cap-end`)
+    //
+    // Wire the outbound notification channel BEFORE wrapping in Arc so
+    // preparse-side `/cap` follow-up tasks (resume-id hint after Ready
+    // fires) can push to IM without per-channel plumbing.
+    let cap_live_manager = {
+        let mut m = crate::cap::CapLiveManager::new(event_tx.clone());
+        m.set_notification_tx(notification_tx.clone());
+        std::sync::Arc::new(m)
+    };
+    // Publish a process-wide handle so preparse (`/cap`, `/cap-exit`)
     // can register sticky IM bindings without per-channel plumbing.
     // Set BEFORE any channel inbound task is spawned; runtime code
     // accesses the manager via `self.cap_live_manager` directly.
