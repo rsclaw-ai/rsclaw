@@ -2203,33 +2203,42 @@ impl AgentRuntime {
                     .try_take_pending_memory_inject(&live_sid)
                     .await
                 {
-                    match self
+                    let mem_part = self
                         .build_auto_recall_bundle(&self.handle.id, channel, text)
                         .await
-                    {
-                        Some(bundle) if !bundle.context.trim().is_empty() => {
-                            tracing::info!(
-                                target: "cap",
-                                live_session_id = %live_sid,
-                                docs = bundle.metadata.doc_ids.len(),
-                                "sticky bypass: injecting memory recall on first turn"
-                            );
-                            format!(
-                                "<background_from_main_agent_memory>\n\
-                                 The following facts come from the main rsclaw \
-                                 agent's long-term memory and may help you \
-                                 understand the user's preferences, prior \
-                                 context, or earlier decisions. Use them as \
-                                 hints; verify before acting on them.\n\n\
-                                 {}\n\
-                                 </background_from_main_agent_memory>\n\n\
-                                 ---\n\n\
-                                 {}",
-                                bundle.context.trim(),
-                                text
-                            )
-                        }
-                        _ => text.to_owned(),
+                        .filter(|b| !b.context.trim().is_empty());
+                    let helper_part = build_cap_helper_cheatsheet(&self.skills);
+                    if mem_part.is_some() || !helper_part.is_empty() {
+                        tracing::info!(
+                            target: "cap",
+                            live_session_id = %live_sid,
+                            mem_docs = mem_part.as_ref().map(|b| b.metadata.doc_ids.len()).unwrap_or(0),
+                            helper_chars = helper_part.len(),
+                            "sticky bypass: injecting first-turn background"
+                        );
+                        let mem_block = match &mem_part {
+                            Some(b) => format!(
+                                "## Long-term memory (from prior conversations)\n\n{}\n\n",
+                                b.context.trim()
+                            ),
+                            None => String::new(),
+                        };
+                        format!(
+                            "<background_from_main_agent_memory>\n\
+                             You are a coding subagent that rsclaw (the main \
+                             chat-side agent) has bridged into this user's \
+                             IM session. The user can still read everything \
+                             you say. Treat the items below as hints — they \
+                             come from rsclaw's own memory and tooling — \
+                             and verify before acting on them.\n\n\
+                             {}{}\
+                             </background_from_main_agent_memory>\n\n\
+                             ---\n\n\
+                             {}",
+                            mem_block, helper_part, text
+                        )
+                    } else {
+                        text.to_owned()
                     }
                 } else {
                     text.to_owned()
@@ -10504,6 +10513,96 @@ fn default_memory_scope(agent_id: &str, channel: &str) -> String {
     } else {
         format!("agent:{agent_id}")
     }
+}
+
+/// Build the "## rsclaw helpers" cheatsheet appended to the cap subagent's
+/// first-turn prompt. Lists the cross-process CLI commands the subagent
+/// can call via bash to reach rsclaw's memory store, knowledge base,
+/// installed plugins, and (lightweight, name-only) skill library.
+///
+/// The cheatsheet intentionally lists CLI commands rather than raw curl
+/// templates: cap subagents drive bash natively, and the `rsclaw` binary
+/// wraps auth tokens + JSON shell-escaping uniformly across macOS / Linux
+/// / Windows (Windows' curl/PowerShell alias quirks would otherwise leak
+/// into every example). Empty string when there are no skills AND we
+/// can't introduce the CLI surface meaningfully — though in practice the
+/// CLI surface is always present, so this only returns "" if the agent
+/// has skills disabled by config.
+fn build_cap_helper_cheatsheet(skills: &Arc<crate::skill::SkillRegistry>) -> String {
+    let mut sections: Vec<String> = Vec::new();
+
+    // Always include the rsclaw CLI helpers — they're the most useful
+    // tools a coding subagent has into the rest of the user's stack.
+    sections.push(
+        "## rsclaw helpers (run via bash; auth/URL handled internally)\n\n\
+         ```\n\
+         # Memory — persistent facts/preferences the main agent has learned.\n\
+         rsclaw memory search \"<query>\" [--max-results N] [--json]\n\
+         rsclaw memory save \"<fact>\" [--scope SCOPE] [--kind fact|note] [--pinned] [--json]\n\n\
+         # Knowledge base — ingested docs/URLs (semantic + BM25 hybrid).\n\
+         rsclaw kb search \"<query>\" [-k N] [--json]\n\
+         rsclaw kb add <path-or-url> [--tag T ...] [--recursive] [--ext glob]\n\n\
+         # Plugins — list/describe/invoke installed plugin tools.\n\
+         rsclaw plugins list\n\
+         rsclaw plugins describe <plugin>\n\
+         rsclaw plugins call <plugin>.<tool> --args '{\"k\":\"v\"}'\n\n\
+         # Messaging — send/read/broadcast through the IM channels rsclaw is wired to.\n\
+         rsclaw message send --channel <wechat|feishu|telegram|...> --target <id> -m \"...\"\n\
+         rsclaw message read --channel <ch> --target <id> [--limit N] [--json]\n\
+         rsclaw message broadcast --channel <ch> --targets <id1> --targets <id2> -m \"...\"\n\
+         ```\n\n\
+         All commands print JSON with --json. Run any with --help for full flags."
+            .to_owned(),
+    );
+
+    // Skill library — name + one-line description so the subagent can
+    // decide if any recipe matches, then Read the SKILL.md file from
+    // disk on its own. Keeping the cheatsheet at name-level (not
+    // pasting SKILL.md content) keeps token cost bounded.
+    let skill_root = crate::skill::default_global_skills_dir();
+    let mut entries: Vec<(String, String)> = skills
+        .all()
+        .filter_map(|m| {
+            let desc = m
+                .description
+                .as_deref()
+                .unwrap_or("")
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            // Skip skills without a name (shouldn't happen but be safe).
+            if m.name.is_empty() {
+                None
+            } else {
+                Some((m.name.clone(), desc))
+            }
+        })
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    if !entries.is_empty() {
+        let mut lines = String::new();
+        lines.push_str(
+            "## Skill library (read SKILL.md for usage; not auto-invoked)\n\n",
+        );
+        if let Some(root) = skill_root.as_ref() {
+            lines.push_str(&format!(
+                "Skill files live under `{}`. Read the SKILL.md when a name looks relevant.\n\n",
+                root.display()
+            ));
+        }
+        for (name, desc) in entries.iter().take(50) {
+            if desc.is_empty() {
+                lines.push_str(&format!("- **{name}**\n"));
+            } else {
+                lines.push_str(&format!("- **{name}** — {desc}\n"));
+            }
+        }
+        sections.push(lines);
+    }
+
+    sections.join("\n")
 }
 
 /// Resolve a KB collection by name, creating it if absent. Returns

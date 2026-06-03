@@ -37,7 +37,49 @@ pub async fn cmd_plugins(sub: PluginsCommand) -> Result<()> {
         }
         PluginsCommand::Uninstall { plugin } => plugins_uninstall(&plugin),
         PluginsCommand::Update { plugin } => plugins_update(plugin.as_deref()).await,
+        PluginsCommand::Describe { plugin } => plugins_describe(&plugin).await,
+        PluginsCommand::Call { tool_ref, args } => plugins_call(&tool_ref, &args).await,
     }
+}
+
+// ---------------------------------------------------------------------------
+// describe / call — HTTP-only paths into the running gateway.
+//
+// Plugin invocation has to go through the gateway because the wasm/js
+// plugin runtimes hold their own state (load context, credential
+// caches, the host-notify channel for delivering side-effects back to
+// channels). A direct CLI re-load would either fight that state or
+// silently no-op host effects, neither of which is useful for a
+// coding agent driving plugins from a cap_live session.
+// ---------------------------------------------------------------------------
+
+async fn plugins_describe(plugin: &str) -> Result<()> {
+    if !crate::cmd::gateway_http::is_gateway_up().await {
+        bail!(crate::cmd::gateway_http::down_hint());
+    }
+    let resp: serde_json::Value =
+        crate::cmd::gateway_http::get_json(&format!("/api/v1/plugins/{plugin}/tools")).await?;
+    println!("{}", serde_json::to_string_pretty(&resp)?);
+    Ok(())
+}
+
+async fn plugins_call(tool_ref: &str, args_json: &str) -> Result<()> {
+    if !crate::cmd::gateway_http::is_gateway_up().await {
+        bail!(crate::cmd::gateway_http::down_hint());
+    }
+    if !tool_ref.contains('.') {
+        bail!("tool ref must be in `plugin.tool` form, e.g. `jimeng.txt2img`");
+    }
+    let args: serde_json::Value = serde_json::from_str(args_json)
+        .with_context(|| format!("--args is not valid JSON: {args_json}"))?;
+    let body = serde_json::json!({
+        "tool": tool_ref,
+        "args": args,
+    });
+    let resp: serde_json::Value =
+        crate::cmd::gateway_http::post_json("/api/v1/tools/execute", &body).await?;
+    println!("{}", serde_json::to_string_pretty(&resp)?);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

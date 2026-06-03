@@ -4,6 +4,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
 
+use crate::cmd::style::{banner, bold, cyan, dim, kv, ok};
 use crate::{
     cli::kb::KbCommand,
     kb::{
@@ -19,6 +20,35 @@ use crate::{
 };
 
 pub async fn cmd_kb(cmd: KbCommand, kb_root: PathBuf) -> Result<()> {
+    // HTTP-first routing for the read/write ops a running gateway
+    // already serves. When the gateway is up the redb file is held
+    // under its exclusive write lock, so a direct CLI open either
+    // fights the lock or sees a stale view — the same footgun
+    // documented for memory in `reference_memory_readonly_lock`.
+    //
+    // Only the ops that have a matching HTTP endpoint route through
+    // here; the rest (Show / Rm / Visibility / Compact / Export /
+    // SyncAll) fall through to their existing direct-store impls.
+    let gateway_up = crate::cmd::gateway_http::is_gateway_up().await;
+    if gateway_up {
+        match &cmd {
+            KbCommand::Search { query, k, json } => {
+                return kb_search_http(query, *k, *json).await;
+            }
+            KbCommand::Stats => {
+                return kb_stats_http().await;
+            }
+            KbCommand::Add {
+                path_or_url,
+                tags,
+                recursive,
+                ext,
+            } => {
+                return kb_add_http(path_or_url, tags, *recursive, ext).await;
+            }
+            _ => {}
+        }
+    }
     match cmd {
         KbCommand::Add {
             path_or_url,
@@ -44,6 +74,146 @@ pub async fn cmd_kb(cmd: KbCommand, kb_root: PathBuf) -> Result<()> {
             dry_run,
         } => sync_all(kb_root, interval_min, max, dry_run).await,
     }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP routes — used when the gateway is running so the CLI sees the same
+// live view as the agent runtime and writes land in the live store.
+// ---------------------------------------------------------------------------
+
+async fn kb_search_http(query: &str, k: usize, json_out: bool) -> Result<()> {
+    let body = serde_json::json!({
+        "query": query,
+        "topK": k,
+        "scoreThreshold": 0.0,
+    });
+    let resp: serde_json::Value =
+        crate::cmd::gateway_http::post_json("/api/v1/knowledge/search", &body).await?;
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&resp)?);
+        return Ok(());
+    }
+    let hits = resp.get("hits").and_then(|v| v.as_array());
+    banner(&format!(
+        "rsclaw kb search v{} (via http)",
+        option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
+    ));
+    kv("query", &cyan(query));
+    let count = hits.map(|a| a.len()).unwrap_or(0);
+    kv("results", &bold(&count.to_string()));
+    println!();
+    if let Some(arr) = hits {
+        for h in arr {
+            let title = h
+                .get("sourceTitle")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(untitled)");
+            let text = h.get("chunkText").and_then(|v| v.as_str()).unwrap_or("");
+            let score = h.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let trimmed: String = text.chars().take(200).collect();
+            println!(
+                "  {} {} {}",
+                dim(&format!("[{score:.3}]")),
+                bold(title),
+                trimmed
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn kb_stats_http() -> Result<()> {
+    let resp: serde_json::Value =
+        crate::cmd::gateway_http::get_json("/api/v1/knowledge/stats").await?;
+    banner(&format!(
+        "rsclaw kb stats v{} (via http)",
+        option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
+    ));
+    if let Some(obj) = resp.as_object() {
+        for (k, v) in obj {
+            kv(k, &bold(&v.to_string()));
+        }
+    }
+    Ok(())
+}
+
+async fn kb_add_http(
+    path_or_url: &str,
+    tags: &[String],
+    recursive: bool,
+    _ext: &str,
+) -> Result<()> {
+    // The HTTP API ingest endpoints sit under a collection. For the
+    // ergonomic `rsclaw kb add <thing>` form we resolve a default
+    // collection: prefer one named "default" if it exists, otherwise
+    // pick the first collection, otherwise create one called "default".
+    let collections: serde_json::Value =
+        crate::cmd::gateway_http::get_json("/api/v1/knowledge/collections").await?;
+    let coll_id = pick_default_collection(&collections).await?;
+
+    let is_url = path_or_url.starts_with("http://") || path_or_url.starts_with("https://");
+    let (endpoint, body) = if is_url {
+        (
+            format!("/api/v1/knowledge/collections/{coll_id}/docs/from-url"),
+            serde_json::json!({
+                "url": path_or_url,
+                "tags": tags,
+            }),
+        )
+    } else {
+        let abs = std::fs::canonicalize(path_or_url)
+            .with_context(|| format!("canonicalize path {path_or_url}"))?;
+        let endpoint = if abs.is_dir() {
+            format!("/api/v1/knowledge/collections/{coll_id}/docs/from-dir")
+        } else {
+            format!("/api/v1/knowledge/collections/{coll_id}/docs/from-path")
+        };
+        (
+            endpoint,
+            serde_json::json!({
+                "path": abs.to_string_lossy(),
+                "tags": tags,
+                "recursive": recursive,
+            }),
+        )
+    };
+    let resp: serde_json::Value = crate::cmd::gateway_http::post_json(&endpoint, &body).await?;
+    ok(&format!(
+        "queued ingest into {} → {}",
+        bold(&coll_id),
+        resp
+    ));
+    Ok(())
+}
+
+async fn pick_default_collection(list: &serde_json::Value) -> Result<String> {
+    let arr = list
+        .as_array()
+        .or_else(|| list.get("collections").and_then(|v| v.as_array()))
+        .ok_or_else(|| anyhow::anyhow!("unexpected /knowledge/collections response shape"))?;
+    if let Some(c) = arr.iter().find(|c| {
+        c.get("name").and_then(|v| v.as_str()) == Some("default")
+            || c.get("id").and_then(|v| v.as_str()) == Some("default")
+    }) {
+        if let Some(id) = c.get("id").and_then(|v| v.as_str()) {
+            return Ok(id.to_owned());
+        }
+    }
+    if let Some(first) = arr.first()
+        && let Some(id) = first.get("id").and_then(|v| v.as_str())
+    {
+        return Ok(id.to_owned());
+    }
+    // No collections exist yet — create one named "default".
+    let resp: serde_json::Value = crate::cmd::gateway_http::post_json(
+        "/api/v1/knowledge/collections",
+        &serde_json::json!({ "name": "default" }),
+    )
+    .await?;
+    resp.get("id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_owned())
+        .ok_or_else(|| anyhow::anyhow!("created default collection but response had no id"))
 }
 
 struct Handles {
