@@ -153,6 +153,10 @@ struct HostState {
     providers: Option<Arc<crate::provider::registry::ProviderRegistry>>,
     /// Default vision model name for host-vlm interface.
     vision_model: Option<String>,
+    /// ADB device serial (`RSCLAW_ANDROID_SERIAL` env var). Passed `-s
+    /// <serial>` to every adb invocation; `None` uses the single attached
+    /// device (adb default).
+    android_serial: Option<String>,
 }
 
 fn new_host_state(
@@ -176,6 +180,7 @@ fn new_host_state(
         desktop: crate::desktop::create_session(),
         providers,
         vision_model,
+        android_serial: std::env::var("RSCLAW_ANDROID_SERIAL").ok(),
     }
 }
 
@@ -934,6 +939,187 @@ pub(crate) fn allocate_dl_paths(filename: &str, count: usize) -> Result<Vec<Stri
     Err("allocate_artifact: could not pick a unique name after 10 attempts".to_owned())
 }
 
+// ---------------------------------------------------------------------------
+// ADB helper functions (host-android)
+// ---------------------------------------------------------------------------
+
+/// Run `adb [-s SERIAL] SUBCMD...` and return stdout as UTF-8.
+async fn adb_run_str(serial: Option<&str>, sub: &[&str]) -> Result<String, String> {
+    let mut args: Vec<String> = Vec::with_capacity(sub.len() + 2);
+    if let Some(s) = serial {
+        args.push("-s".into());
+        args.push(s.into());
+    }
+    for &s in sub {
+        args.push(s.into());
+    }
+    let out = tokio::process::Command::new("adb")
+        .args(&args)
+        .output()
+        .await
+        .map_err(|e| format!("adb spawn failed: {e} (is adb in PATH?)"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("adb ({}): {}", out.status, stderr.trim()));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Run `adb [-s SERIAL] SUBCMD...` and return raw stdout bytes (screencap).
+async fn adb_run_bytes(serial: Option<&str>, sub: &[&str]) -> Result<Vec<u8>, String> {
+    let mut args: Vec<String> = Vec::with_capacity(sub.len() + 2);
+    if let Some(s) = serial {
+        args.push("-s".into());
+        args.push(s.into());
+    }
+    for &s in sub {
+        args.push(s.into());
+    }
+    let out = tokio::process::Command::new("adb")
+        .args(&args)
+        .output()
+        .await
+        .map_err(|e| format!("adb spawn failed: {e} (is adb in PATH?)"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("adb ({}): {}", out.status, stderr.trim()));
+    }
+    Ok(out.stdout)
+}
+
+/// Characters refused in any `input text` payload that ultimately runs
+/// through the device's shell via `adb shell`. The shell sees the whole
+/// trailing argv joined with spaces, so `\n`, `\r`, `\0` would let an
+/// attacker-supplied text smuggle a second command after the first.
+/// Quoting/escaping `input text` arguments correctly across device shells
+/// (sh / mksh / toybox) is far harder than rejecting the small set of
+/// metacharacters that have no legitimate use in user-visible input.
+const ADB_INPUT_REFUSED_CHARS: &[char] = &[
+    ';', '&', '|', '>', '<', '$', '`', '\\', '"', '\'', '\n', '\r', '\0',
+];
+
+/// Per-call counter that names temp UI dumps on the device so concurrent
+/// callers from different plugins don't clobber the same path.
+static ADB_UI_DUMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Dump the UI hierarchy via uiautomator and return the XML string.
+///
+/// Writes to a unique path under `/sdcard/` per call (process pid +
+/// monotonically increasing counter) so two concurrent
+/// `android-get-ui-xml` calls don't race over the same file. Best-effort
+/// removes the temp file after reading so /sdcard doesn't accumulate
+/// dumps over a long session — failure to remove is silent (the next
+/// call uses a fresh path anyway).
+async fn adb_ui_xml(serial: Option<&str>, compressed: bool) -> Result<String, String> {
+    let seq = ADB_UI_DUMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dest = format!("/sdcard/rsclaw_ui_dump_{}_{}.xml", std::process::id(), seq);
+    let dump_args: &[&str] = if compressed {
+        &["shell", "uiautomator", "dump", "--compressed", &dest]
+    } else {
+        &["shell", "uiautomator", "dump", &dest]
+    };
+    adb_run_str(serial, dump_args)
+        .await
+        .map_err(|e| format!("uiautomator dump: {e}"))?;
+    let xml = adb_run_str(serial, &["exec-out", "cat", &dest]).await?;
+    let _ = adb_run_str(serial, &["shell", "rm", "-f", &dest]).await;
+    Ok(xml)
+}
+
+/// Decode XML character references (e.g. `&#10;` → newline) found in
+/// uiautomator attribute values.
+fn adb_xml_unescape(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&#10;", "\n")
+        .replace("&#xA;", "\n")
+}
+
+/// Extract a single XML attribute value from a `<node ...>` tag string.
+fn adb_xml_attr<'a>(node: &'a str, attr: &str) -> &'a str {
+    let needle = format!(" {}=\"", attr);
+    match node.find(&needle) {
+        None => "",
+        Some(i) => {
+            let s = i + needle.len();
+            match node[s..].find('"') {
+                None => "",
+                Some(e) => &node[s..s + e],
+            }
+        }
+    }
+}
+
+/// Parse `"[x1,y1][x2,y2]"` bounds string and return the center coordinate.
+fn adb_bounds_center(bounds: &str) -> (i32, i32) {
+    let coords: Vec<i32> = bounds
+        .split(|c: char| !c.is_ascii_digit() && c != '-')
+        .filter(|s: &&str| !s.is_empty())
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    if coords.len() >= 4 {
+        ((coords[0] + coords[2]) / 2, (coords[1] + coords[3]) / 2)
+    } else {
+        (0, 0)
+    }
+}
+
+/// Scan UI XML for `<node>` tags and return those matching the selector.
+fn adb_match_elements(xml: &str, sel_type: &str, sel_val: &str) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while let Some(rel) = xml[pos..].find("<node ") {
+        let start = pos + rel;
+        // Opening tag ends at the first `>` (attribute values use &gt; for literal `>`).
+        let tag_end = xml[start..]
+            .find('>')
+            .map(|r| start + r + 1)
+            .unwrap_or(xml.len());
+        let node = &xml[start..tag_end.min(xml.len())];
+        pos = tag_end.max(start + 1);
+
+        // Decode `text` AND `content-desc` — both come through XML
+        // attribute encoding (text containing `"` arrives as `&quot;`,
+        // newlines as `&#10;`). The earlier code only decoded `content-
+        // desc`, which meant `text="Don't"` showed up in matches and
+        // JSON as `Don&apos;t` and `text-contains` would miss obvious
+        // user-visible strings. Match against the decoded form so
+        // selectors see what a human reading the screen sees.
+        let text = adb_xml_unescape(adb_xml_attr(node, "text"));
+        let rid = adb_xml_attr(node, "resource-id");
+        let cdesc = adb_xml_unescape(adb_xml_attr(node, "content-desc"));
+        let class = adb_xml_attr(node, "class");
+        let bounds = adb_xml_attr(node, "bounds");
+        let clickable = adb_xml_attr(node, "clickable") == "true";
+
+        let matched = match sel_type {
+            "resource-id" => rid == sel_val,
+            "text" => text == sel_val,
+            "text-contains" => !sel_val.is_empty() && text.contains(sel_val),
+            "content-desc" => cdesc == sel_val,
+            "content-desc-contains" => !sel_val.is_empty() && cdesc.contains(sel_val),
+            "class" => class == sel_val,
+            _ => false,
+        };
+        if !matched {
+            continue;
+        }
+
+        let (cx, cy) = adb_bounds_center(bounds);
+        out.push(serde_json::json!({
+            "text": text,
+            "resource-id": rid,
+            "content-desc": cdesc,
+            "bounds": {"centerX": cx, "centerY": cy, "raw": bounds},
+            "clickable": clickable,
+        }));
+    }
+    out
+}
+
 impl HostState {
     /// Execute a browser action by locking the shared browser session.
     /// Auto-starts Chrome if no session exists.
@@ -1205,6 +1391,388 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
 }
 
 // ---------------------------------------------------------------------------
+// host-android trait implementation
+// ---------------------------------------------------------------------------
+
+impl rsclaw::plugin::host_android::Host for HostState {
+    async fn android_tap(&mut self, x: u32, y: u32) -> HostTrapResult<Result<String, String>> {
+        let serial = self.android_serial.clone();
+        let (xs, ys) = (x.to_string(), y.to_string());
+        Ok(adb_run_str(serial.as_deref(), &["shell", "input", "tap", &xs, &ys])
+            .await
+            .map(|_| "tapped".to_string()))
+    }
+
+    async fn android_swipe(
+        &mut self,
+        x1: u32, y1: u32, x2: u32, y2: u32, duration_ms: u32,
+    ) -> HostTrapResult<Result<String, String>> {
+        let serial = self.android_serial.clone();
+        let (s1, s2, s3, s4, s5) = (
+            x1.to_string(), y1.to_string(),
+            x2.to_string(), y2.to_string(),
+            duration_ms.to_string(),
+        );
+        Ok(adb_run_str(
+            serial.as_deref(),
+            &["shell", "input", "swipe", &s1, &s2, &s3, &s4, &s5],
+        )
+        .await
+        .map(|_| "swiped".to_string()))
+    }
+
+    async fn android_type(&mut self, text: String) -> HostTrapResult<Result<String, String>> {
+        // adb shell input text runs through the device shell. See
+        // `ADB_INPUT_REFUSED_CHARS` for the rejection list — includes
+        // `\n` / `\r` / `\0` so a malicious payload can't smuggle a
+        // second command past `input text`.
+        if let Some(bad) = text.chars().find(|c| ADB_INPUT_REFUSED_CHARS.contains(c)) {
+            return Ok(Err(format!(
+                "android_type: refusing text with shell metachar '{}' (strip and retry)",
+                bad.escape_debug()
+            )));
+        }
+        let serial = self.android_serial.clone();
+        let escaped = text.replace(' ', "%s");
+        Ok(adb_run_str(serial.as_deref(), &["shell", "input", "text", &escaped])
+            .await
+            .map(|_| "typed".to_string()))
+    }
+
+    async fn android_press(&mut self, key: String) -> HostTrapResult<Result<String, String>> {
+        let kc = match key.to_lowercase().as_str() {
+            "back" => "KEYCODE_BACK",
+            "home" => "KEYCODE_HOME",
+            "menu" => "KEYCODE_MENU",
+            "enter" | "return" => "KEYCODE_ENTER",
+            "tab" => "KEYCODE_TAB",
+            "delete" | "del" => "KEYCODE_DEL",
+            "space" => "KEYCODE_SPACE",
+            "escape" | "esc" => "KEYCODE_ESCAPE",
+            "search" => "KEYCODE_SEARCH",
+            "recent" | "recents" | "app-switch" => "KEYCODE_APP_SWITCH",
+            "power" => "KEYCODE_POWER",
+            "volume-up" | "vol-up" => "KEYCODE_VOLUME_UP",
+            "volume-down" | "vol-down" => "KEYCODE_VOLUME_DOWN",
+            "volume-mute" | "vol-mute" => "KEYCODE_VOLUME_MUTE",
+            "media-play" | "play" => "KEYCODE_MEDIA_PLAY",
+            "media-pause" | "pause" => "KEYCODE_MEDIA_PAUSE",
+            "media-play-pause" => "KEYCODE_MEDIA_PLAY_PAUSE",
+            "media-next" | "next" => "KEYCODE_MEDIA_NEXT",
+            "media-previous" | "media-prev" | "prev" => "KEYCODE_MEDIA_PREVIOUS",
+            "page-up" => "KEYCODE_PAGE_UP",
+            "page-down" => "KEYCODE_PAGE_DOWN",
+            other => {
+                return Ok(Err(format!(
+                    "android_press: unknown key '{other}'; supported: \
+                     back/home/menu/enter/tab/delete/space/escape/search/recent/power/\
+                     volume-up/volume-down/volume-mute/media-play/media-pause/\
+                     media-play-pause/media-next/media-previous/page-up/page-down"
+                )));
+            }
+        };
+        let serial = self.android_serial.clone();
+        Ok(adb_run_str(serial.as_deref(), &["shell", "input", "keyevent", kc])
+            .await
+            .map(|_| format!("pressed {key}")))
+    }
+
+    async fn android_get_ui_xml(
+        &mut self,
+        compressed: bool,
+    ) -> HostTrapResult<Result<String, String>> {
+        let serial = self.android_serial.clone();
+        Ok(adb_ui_xml(serial.as_deref(), compressed).await)
+    }
+
+    async fn android_current_activity(&mut self) -> HostTrapResult<Result<String, String>> {
+        let serial = self.android_serial.clone();
+        // Try the focused window first (works on most Android versions
+        // and matches what the user sees on screen). Fall back to the
+        // resumed activity from `dumpsys activity activities` when the
+        // window service doesn't expose mCurrentFocus in the expected
+        // shape — happens on some single-user images and during ANR.
+        if let Ok(out) =
+            adb_run_str(serial.as_deref(), &["shell", "dumpsys", "window", "windows"]).await
+            && let Some(activity) = parse_current_focus_activity(&out)
+        {
+            return Ok(Ok(activity));
+        }
+        match adb_run_str(serial.as_deref(), &["shell", "dumpsys", "activity", "activities"]).await
+        {
+            Ok(out) => match parse_resumed_activity(&out) {
+                Some(activity) => Ok(Ok(activity)),
+                None => Ok(Err(
+                    "could not determine current activity (neither mCurrentFocus nor \
+                     mResumedActivity matched in dumpsys output)"
+                        .to_string(),
+                )),
+            },
+            Err(e) => Ok(Err(format!(
+                "dumpsys activity activities failed: {e}"
+            ))),
+        }
+    }
+
+    async fn android_launch_app(&mut self, pkg: String) -> HostTrapResult<Result<String, String>> {
+        let serial = self.android_serial.clone();
+        Ok(adb_run_str(
+            serial.as_deref(),
+            &[
+                "shell", "monkey", "-p", &pkg,
+                "-c", "android.intent.category.LAUNCHER", "1",
+            ],
+        )
+        .await
+        .map(|_| format!("launched {pkg}")))
+    }
+
+    async fn android_stop_app(&mut self, pkg: String) -> HostTrapResult<Result<String, String>> {
+        let serial = self.android_serial.clone();
+        Ok(
+            adb_run_str(serial.as_deref(), &["shell", "am", "force-stop", &pkg])
+                .await
+                .map(|_| format!("stopped {pkg}")),
+        )
+    }
+
+    async fn android_screenshot(&mut self) -> HostTrapResult<Result<String, String>> {
+        let serial = self.android_serial.clone();
+        let png_bytes =
+            match adb_run_bytes(serial.as_deref(), &["exec-out", "screencap", "-p"]).await {
+                Ok(b) => b,
+                Err(e) => return Ok(Err(e)),
+            };
+        if png_bytes.len() < 24 {
+            return Ok(Err(
+                "android_screenshot: screencap returned empty/truncated data".to_string(),
+            ));
+        }
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+        Ok(Ok(format!("data:image/png;base64,{b64}")))
+    }
+
+    async fn android_find_elements(
+        &mut self,
+        selector_type: String,
+        selector_value: String,
+    ) -> HostTrapResult<Result<String, String>> {
+        let serial = self.android_serial.clone();
+        let xml = match adb_ui_xml(serial.as_deref(), false).await {
+            Ok(x) => x,
+            Err(e) => return Ok(Err(e)),
+        };
+        let elements = adb_match_elements(&xml, &selector_type, &selector_value);
+        Ok(Ok(serde_json::to_string(&elements).unwrap_or_else(|_| "[]".to_string())))
+    }
+
+    async fn android_tap_element(
+        &mut self,
+        selector_type: String,
+        selector_value: String,
+    ) -> HostTrapResult<Result<String, String>> {
+        let serial = self.android_serial.clone();
+        let xml = match adb_ui_xml(serial.as_deref(), false).await {
+            Ok(x) => x,
+            Err(e) => return Ok(Err(e)),
+        };
+        let elements = adb_match_elements(&xml, &selector_type, &selector_value);
+        let el = match elements.first() {
+            Some(e) => e.clone(),
+            None => {
+                return Ok(Err(format!(
+                    "element not found: {selector_type}={selector_value}"
+                )));
+            }
+        };
+        let cx = el["bounds"]["centerX"].as_i64().unwrap_or(0) as u32;
+        let cy = el["bounds"]["centerY"].as_i64().unwrap_or(0) as u32;
+        let (xs, ys) = (cx.to_string(), cy.to_string());
+        Ok(adb_run_str(serial.as_deref(), &["shell", "input", "tap", &xs, &ys])
+            .await
+            .map(|_| "tapped".to_string()))
+    }
+
+    async fn android_get_element_text(
+        &mut self,
+        selector_type: String,
+        selector_value: String,
+    ) -> HostTrapResult<Result<String, String>> {
+        let serial = self.android_serial.clone();
+        let xml = match adb_ui_xml(serial.as_deref(), false).await {
+            Ok(x) => x,
+            Err(e) => return Ok(Err(e)),
+        };
+        let elements = adb_match_elements(&xml, &selector_type, &selector_value);
+        match elements.first() {
+            Some(el) => Ok(Ok(el["text"].as_str().unwrap_or("").to_string())),
+            None => Ok(Err(format!(
+                "element not found: {selector_type}={selector_value}"
+            ))),
+        }
+    }
+
+    async fn android_set_element_text(
+        &mut self,
+        selector_type: String,
+        selector_value: String,
+        text: String,
+    ) -> HostTrapResult<Result<String, String>> {
+        if let Some(bad) = text.chars().find(|c| ADB_INPUT_REFUSED_CHARS.contains(c)) {
+            return Ok(Err(format!(
+                "android_set_element_text: refusing text with shell metachar '{}'",
+                bad.escape_debug()
+            )));
+        }
+        let serial = self.android_serial.clone();
+        // Find element and get center coords.
+        let xml = match adb_ui_xml(serial.as_deref(), false).await {
+            Ok(x) => x,
+            Err(e) => return Ok(Err(e)),
+        };
+        let elements = adb_match_elements(&xml, &selector_type, &selector_value);
+        let el = match elements.first() {
+            Some(e) => e.clone(),
+            None => {
+                return Ok(Err(format!(
+                    "element not found: {selector_type}={selector_value}"
+                )));
+            }
+        };
+        let cx = el["bounds"]["centerX"].as_i64().unwrap_or(0) as u32;
+        let cy = el["bounds"]["centerY"].as_i64().unwrap_or(0) as u32;
+        let (xs, ys) = (cx.to_string(), cy.to_string());
+
+        // Single tap → double tap → triple tap to select all existing text.
+        for _ in 0..3u8 {
+            if let Err(e) =
+                adb_run_str(serial.as_deref(), &["shell", "input", "tap", &xs, &ys]).await
+            {
+                return Ok(Err(format!("tap to focus failed: {e}")));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let escaped = text.replace(' ', "%s");
+        Ok(adb_run_str(serial.as_deref(), &["shell", "input", "text", &escaped])
+            .await
+            .map(|_| "set".to_string()))
+    }
+
+    async fn android_element_exists(
+        &mut self,
+        selector_type: String,
+        selector_value: String,
+    ) -> HostTrapResult<Result<bool, String>> {
+        let serial = self.android_serial.clone();
+        let xml = match adb_ui_xml(serial.as_deref(), false).await {
+            Ok(x) => x,
+            Err(e) => return Ok(Err(e)),
+        };
+        let elements = adb_match_elements(&xml, &selector_type, &selector_value);
+        Ok(Ok(!elements.is_empty()))
+    }
+
+    async fn android_wait_for_element(
+        &mut self,
+        selector_type: String,
+        selector_value: String,
+        timeout_ms: u32,
+    ) -> HostTrapResult<Result<String, String>> {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(u64::from(timeout_ms));
+        let serial = self.android_serial.clone();
+        // Surface ADB failure after a small streak — otherwise a
+        // disconnected device or a wedged uiautomator service silently
+        // burns the entire timeout returning "timeout" instead of the
+        // real error (much harder to diagnose from a plugin caller).
+        const MAX_CONSECUTIVE_ADB_FAILURES: u8 = 3;
+        let mut consecutive_failures: u8 = 0;
+        let mut last_err: Option<String> = None;
+        loop {
+            match adb_ui_xml(serial.as_deref(), false).await {
+                Ok(xml) => {
+                    consecutive_failures = 0;
+                    if !adb_match_elements(&xml, &selector_type, &selector_value).is_empty() {
+                        return Ok(Ok("found".to_string()));
+                    }
+                }
+                Err(e) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    last_err = Some(e);
+                    if consecutive_failures >= MAX_CONSECUTIVE_ADB_FAILURES {
+                        return Ok(Err(format!(
+                            "android_wait_for_element: adb ui dump failed {} times in a row: {}",
+                            consecutive_failures,
+                            last_err.unwrap_or_default()
+                        )));
+                    }
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                let suffix = match last_err {
+                    Some(e) => format!(" (last error: {e})"),
+                    None => String::new(),
+                };
+                return Ok(Err(format!(
+                    "timeout waiting for {selector_type}={selector_value} after {timeout_ms}ms{suffix}"
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+}
+
+/// Parse `mCurrentFocus=Window{xxxx [u0 ]<package>/<Activity>}` out of
+/// `dumpsys window windows`. Returns the `<package>/<Activity>` slug
+/// without the surrounding `Window{...}` envelope. Handles both the
+/// multi-user (`u0 `) and single-user (no `u0`) shapes.
+fn parse_current_focus_activity(dumpsys_output: &str) -> Option<String> {
+    for line in dumpsys_output.lines() {
+        if !line.contains("mCurrentFocus") {
+            continue;
+        }
+        let open = line.find('{')?;
+        let close = line[open..].find('}').map(|r| open + r)?;
+        let inside = &line[open + 1..close];
+        // The activity is the last whitespace-separated token; on multi-
+        // user images it's preceded by a `u<N>` marker, on single-user
+        // images it follows the hash directly. Both shapes resolve by
+        // taking the trailing token that contains `/`.
+        let tok = inside
+            .split_whitespace()
+            .rfind(|t| t.contains('/'))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        return Some(tok.to_string());
+    }
+    None
+}
+
+/// Parse `mResumedActivity: ActivityRecord{xxxx u0 <package>/<Activity> ...}`
+/// out of `dumpsys activity activities`. Used as a fallback when
+/// `mCurrentFocus` parsing didn't resolve.
+fn parse_resumed_activity(dumpsys_output: &str) -> Option<String> {
+    for line in dumpsys_output.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("mResumedActivity") {
+            continue;
+        }
+        let open = trimmed.find('{')?;
+        let close = trimmed[open..].find('}').map(|r| open + r)?;
+        let inside = &trimmed[open + 1..close];
+        let tok = inside
+            .split_whitespace()
+            .find(|t| t.contains('/'))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        return Some(tok.to_string());
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Loading
 // ---------------------------------------------------------------------------
 
@@ -1246,6 +1814,11 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostState>> {
         |state: &mut HostState| state,
     )
     .map_err(|e| anyhow::anyhow!("failed to add host-vlm linker interfaces: {e}"))?;
+    rsclaw::plugin::host_android::add_to_linker::<
+        HostState,
+        wasmtime::component::HasSelf<HostState>,
+    >(&mut linker, |state: &mut HostState| state)
+    .map_err(|e| anyhow::anyhow!("failed to add host-android linker interfaces: {e}"))?;
     Ok(linker)
 }
 
@@ -1412,6 +1985,132 @@ impl WasmPlugin {
                     err_str
                 )
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — pure parsing helpers (no device required)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod android_helper_tests {
+    use super::*;
+
+    #[test]
+    fn xml_unescape_handles_common_entities() {
+        assert_eq!(adb_xml_unescape("plain"), "plain");
+        assert_eq!(adb_xml_unescape("Don&apos;t"), "Don't");
+        assert_eq!(adb_xml_unescape("a&amp;b"), "a&b");
+        assert_eq!(adb_xml_unescape("quote &quot; lt &lt; gt &gt;"), "quote \" lt < gt >");
+        assert_eq!(adb_xml_unescape("line1&#10;line2"), "line1\nline2");
+        assert_eq!(adb_xml_unescape("line1&#xA;line2"), "line1\nline2");
+    }
+
+    #[test]
+    fn xml_attr_extracts_quoted_value() {
+        let node = r#"<node text="hello world" resource-id="com.x:id/foo" bounds="[0,0][100,200]">"#;
+        assert_eq!(adb_xml_attr(node, "text"), "hello world");
+        assert_eq!(adb_xml_attr(node, "resource-id"), "com.x:id/foo");
+        assert_eq!(adb_xml_attr(node, "bounds"), "[0,0][100,200]");
+        assert_eq!(adb_xml_attr(node, "missing"), "");
+    }
+
+    #[test]
+    fn bounds_center_handles_typical_shape() {
+        assert_eq!(adb_bounds_center("[0,0][100,200]"), (50, 100));
+        assert_eq!(adb_bounds_center("[10,20][50,60]"), (30, 40));
+    }
+
+    #[test]
+    fn bounds_center_handles_malformed() {
+        // Missing one number → defaults to (0,0) rather than panicking.
+        assert_eq!(adb_bounds_center("[0,0]"), (0, 0));
+        assert_eq!(adb_bounds_center(""), (0, 0));
+        assert_eq!(adb_bounds_center("garbage"), (0, 0));
+    }
+
+    #[test]
+    fn match_elements_decodes_text_attribute() {
+        let xml = concat!(
+            "<?xml version='1.0' encoding='UTF-8' standalone='yes'?>",
+            "<hierarchy rotation=\"0\">",
+            "<node text=\"Don&apos;t panic\" resource-id=\"id1\" content-desc=\"\" ",
+            "class=\"android.widget.TextView\" bounds=\"[0,0][100,40]\" clickable=\"false\"/>",
+            "</hierarchy>"
+        );
+        // text-contains should hit on the decoded apostrophe form, not the
+        // raw &apos; sequence — the bug-fix case for the unescape change.
+        let hits = adb_match_elements(xml, "text-contains", "Don't");
+        assert_eq!(hits.len(), 1, "expected one match, got: {hits:?}");
+        assert_eq!(hits[0]["text"].as_str(), Some("Don't panic"));
+        // And the raw escaped form should NOT match anymore.
+        let no_hits = adb_match_elements(xml, "text-contains", "Don&apos;t");
+        assert!(no_hits.is_empty());
+    }
+
+    #[test]
+    fn match_elements_resource_id_exact() {
+        let xml = concat!(
+            "<hierarchy>",
+            "<node text=\"A\" resource-id=\"com.x:id/btn\" content-desc=\"\" class=\"X\" bounds=\"[0,0][10,10]\" clickable=\"true\"/>",
+            "<node text=\"B\" resource-id=\"com.x:id/btn2\" content-desc=\"\" class=\"X\" bounds=\"[10,10][20,20]\" clickable=\"true\"/>",
+            "</hierarchy>"
+        );
+        let hits = adb_match_elements(xml, "resource-id", "com.x:id/btn");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["text"].as_str(), Some("A"));
+    }
+
+    #[test]
+    fn parse_current_focus_handles_multi_user_shape() {
+        let dump = "  mCurrentFocus=Window{abcd u0 com.example.app/com.example.app.MainActivity}";
+        assert_eq!(
+            parse_current_focus_activity(dump).as_deref(),
+            Some("com.example.app/com.example.app.MainActivity")
+        );
+    }
+
+    #[test]
+    fn parse_current_focus_handles_single_user_shape() {
+        // Some images omit `u0 `; pick the trailing `/`-bearing token.
+        let dump = "  mCurrentFocus=Window{abcd com.example.app/com.example.app.MainActivity}";
+        assert_eq!(
+            parse_current_focus_activity(dump).as_deref(),
+            Some("com.example.app/com.example.app.MainActivity")
+        );
+    }
+
+    #[test]
+    fn parse_current_focus_returns_none_when_null() {
+        let dump = "  mCurrentFocus=null";
+        assert_eq!(parse_current_focus_activity(dump), None);
+    }
+
+    #[test]
+    fn parse_resumed_activity_typical_shape() {
+        let dump = concat!(
+            "ACTIVITY MANAGER ACTIVITIES (dumpsys activity activities)\n",
+            "  mResumedActivity: ActivityRecord{1234 u0 com.example.foo/.MainActivity t42}\n",
+        );
+        assert_eq!(
+            parse_resumed_activity(dump).as_deref(),
+            Some("com.example.foo/.MainActivity")
+        );
+    }
+
+    #[test]
+    fn adb_input_refused_includes_newlines() {
+        // Regression guard: the refusal list MUST include \n/\r/\0 so a
+        // malicious text payload can't smuggle a second command past
+        // `adb shell input text`.
+        for c in ['\n', '\r', '\0', ';', '&', '|', '`', '$'] {
+            assert!(
+                ADB_INPUT_REFUSED_CHARS.contains(&c),
+                "expected '{}' (\\u{{{:x}}}) to be refused for adb input text",
+                c.escape_debug(),
+                c as u32
+            );
         }
     }
 }
