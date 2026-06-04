@@ -384,6 +384,31 @@ fn parse_port_from_ws_url(url: &str) -> Result<u16> {
         .map_err(|e| anyhow!("invalid port in ws URL: {e}"))
 }
 
+/// True if two URLs share the same origin (scheme + host, ignoring port).
+/// Used by `cmd_open` to reuse existing tabs instead of navigating the
+/// current one, which prevents tab accumulation when cron jobs repeatedly
+/// open the same site.
+fn same_origin(a: &str, b: &str) -> bool {
+    let extract = |url: &str| -> Option<(String, String)> {
+        let url = url.trim();
+        let scheme_end = url.find("://")?;
+        let scheme = url[..scheme_end].to_lowercase();
+        let rest = &url[scheme_end + 3..];
+        let host_end = rest.find('/').unwrap_or(rest.len());
+        let host_port = &rest[..host_end];
+        let host = host_port
+            .rsplit(':')
+            .nth(1)
+            .unwrap_or(host_port)
+            .to_lowercase();
+        Some((scheme, host))
+    };
+    match (extract(a), extract(b)) {
+        (Some((s1, h1)), Some((s2, h2))) => s1 == s2 && h1 == h2,
+        _ => false,
+    }
+}
+
 /// Try to connect to an already-running Chrome with remote debugging.
 /// Probes the given ports and returns the browser WebSocket URL if found.
 pub(crate) async fn detect_existing_chrome(ports: &[u16]) -> Option<String> {
@@ -1162,21 +1187,33 @@ impl BrowserSession {
                 Err(_) => browser_ws,
             };
             let browser_cdp = CdpClient::connect(&browser_ws_url).await?;
+
+            // Close the previously-owned tab before creating a new one —
+            // otherwise tabs accumulate indefinitely in the shared Chrome.
+            if let Some(ref old_target_id) = self.owned_external_tab {
+                let _ = browser_cdp
+                    .send("Target.closeTarget", json!({"targetId": old_target_id}))
+                    .await;
+            }
+
             let create = browser_cdp
                 .send("Target.createTarget", json!({"url": "about:blank"}))
                 .await?;
             let target_id = create["targetId"]
                 .as_str()
-                .ok_or_else(|| anyhow!("restart: no targetId from Target.createTarget"))?;
+                .ok_or_else(|| anyhow!("restart: no targetId from Target.createTarget"))?
+                .to_owned();
+            // Mark the new tab as owned so Drop closes it and prevents leaks.
+            self.owned_external_tab = Some(target_id.clone());
             // browser_cdp intentionally dropped here — we only needed it for
-            // Target.createTarget.
+            // Target.closeTarget and Target.createTarget.
             drop(browser_cdp);
 
             let discovery = format!("http://127.0.0.1:{}/json", self.debug_port);
             let targets: Vec<serde_json::Value> = reqwest::get(&discovery).await?.json().await?;
             let tab_ws = targets
                 .iter()
-                .find(|t| t["id"].as_str() == Some(target_id))
+                .find(|t| t["id"].as_str() == Some(&target_id))
                 .and_then(|t| t["webSocketDebuggerUrl"].as_str())
                 .ok_or_else(|| anyhow!("restart: new tab ws URL not found"))?;
             let new_cdp = CdpClient::connect(tab_ws).await?;
@@ -1405,6 +1442,70 @@ impl BrowserSession {
             .get("url")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("open: `url` required"))?;
+
+        // Fast path: if already on this URL (or a prefix of it), skip navigation.
+        // This prevents redundant reloads when plugins call browser_open in a loop.
+        if let Ok(current_val) = self.cmd_get_url().await {
+            if let Some(current) = current_val.get("url").and_then(|v| v.as_str()) {
+                if current == url || current.starts_with(url) || url.starts_with(current) {
+                    let skills = crate::config::loader::applicable_site_rules(&url);
+                    let mut result = json!({
+                        "action": "open",
+                        "url": url,
+                        "text": format!("Already on {url}"),
+                    });
+                    if !skills.is_empty() {
+                        result["applicable_site_rules"] = json!(skills);
+                        if let Some(body) = crate::config::loader::applicable_site_rules_body(&url) {
+                            result["site_rule"] = json!(body);
+                        }
+                        result["site_rules_hint"] = json!(
+                            "Read the inlined `site_rule` above BEFORE the next \
+                             snapshot/click. It documents verified selectors, URL \
+                             routes, and quirks for this host — using it saves \
+                             5+ trial-and-error iterations and avoids stale-selector \
+                             breakage."
+                        );
+                    }
+                    return Ok(result);
+                }
+            }
+        }
+
+        // Try to switch to an existing tab with the same origin before creating
+        // noise in the current tab. This reduces tab accumulation when cron jobs
+        // or retries repeatedly hit the same site.
+        let port = self.debug_port;
+        let discovery_url = format!("http://127.0.0.1:{port}/json");
+        if let Ok(resp) = reqwest::get(&discovery_url).await {
+            if let Ok(targets) = resp.json::<Vec<Value>>().await {
+                if let Some(existing) = targets.iter().find(|t| {
+                    t["type"].as_str() == Some("page")
+                        && t["url"].as_str().map(|u| same_origin(u, url)).unwrap_or(false)
+                }) {
+                    if let (Some(target_id), Some(ws_url)) = (
+                        existing["id"].as_str(),
+                        existing["webSocketDebuggerUrl"].as_str(),
+                    ) {
+                        // Activate so the user sees it if they're watching Chrome.
+                        let _ = self
+                            .cdp
+                            .send("Target.activateTarget", json!({"targetId": target_id}))
+                            .await;
+                        // Switch CDP session to the existing tab.
+                        if let Ok(new_cdp) = CdpClient::connect(ws_url).await {
+                            let _ = new_cdp.send("Page.enable", json!({})).await;
+                            let _ = new_cdp.send("DOM.enable", json!({})).await;
+                            let _ = new_cdp.send("Runtime.enable", json!({})).await;
+                            let _ = new_cdp.send("Network.enable", json!({})).await;
+                            self.cdp = new_cdp;
+                            self.refs.clear();
+                            self.ref_counter = 0;
+                        }
+                    }
+                }
+            }
+        }
 
         // Drain stale events before navigating.
         {
