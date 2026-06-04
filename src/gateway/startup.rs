@@ -1283,9 +1283,15 @@ fn try_service_self_restart() -> bool {
     #[cfg(target_os = "macos")]
     {
         // launchd sets XPC_SERVICE_NAME (= job label) for managed processes.
-        // Absence means we're not under launchd → fall back to native respawn.
-        let Ok(label) = std::env::var("XPC_SERVICE_NAME") else {
-            return false;
+        // BUT macOS sets it to the literal string "0" for processes that are
+        // NOT launched as a managed service (shells, `cargo run`, Terminal
+        // children). Treating "0" (or empty) as "supervised" sends us to
+        // `launchctl kickstart gui/<uid>/0`, which fails with "Could not find
+        // service 0" on every restart before falling back. Only a real job
+        // label means we're actually supervised.
+        let label = match std::env::var("XPC_SERVICE_NAME") {
+            Ok(l) if !l.is_empty() && l != "0" => l,
+            _ => return false,
         };
         info!(label = %label, "detected launchd supervision; kickstarting via launchctl");
         // Try the user agent domain first (gui/<uid>/<label>), then the

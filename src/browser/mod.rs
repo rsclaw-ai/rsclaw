@@ -8,7 +8,6 @@ pub mod pool;
 
 use std::{
     collections::HashMap,
-    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicU32, AtomicU64, Ordering},
@@ -193,15 +192,17 @@ impl ChromeProcess {
 
         // Resolve user-data-dir: named profile or temp dir.
         let (user_data_dir, tmp_dir) = if let Some(profile_name) = profile {
-            let profile_dir = if profile_name == "default" {
-                // Use Chrome's default user data directory.
-                default_chrome_user_data_dir()
-            } else {
-                // Named profile under ~/.rsclaw/browser-profiles/
-                crate::config::loader::base_dir()
-                    .join("browser-profiles")
-                    .join(profile_name)
-            };
+            // Every named profile (including "default") lives under
+            // ~/.rsclaw/browser-profiles/<name>. We deliberately do NOT reuse
+            // Chrome's own default user-data-dir: Chrome 136+ silently ignores
+            // --remote-debugging-port when --user-data-dir points at the
+            // browser's default profile, so DevTools never starts and the
+            // launch times out waiting for the WebSocket URL. A dedicated
+            // persistent dir is debuggable and keeps login state warm across
+            // restarts (the user logs into each site once).
+            let profile_dir = crate::config::loader::base_dir()
+                .join("browser-profiles")
+                .join(profile_name);
             std::fs::create_dir_all(&profile_dir).ok();
             // Kill stale Chrome processes using this profile (e.g. after gateway restart).
             let profile_str = profile_dir.to_string_lossy().to_string();
@@ -773,48 +774,6 @@ impl Drop for BrowserSession {
     }
 }
 
-/// User's daily-driver Chrome profile dir (NOT rsclaw's isolated one).
-fn user_chrome_profile_dir() -> Option<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        return Some(dirs_next::home_dir()?.join("Library/Application Support/Google/Chrome"));
-    }
-    #[cfg(target_os = "windows")]
-    {
-        return Some(dirs_next::data_local_dir()?.join("Google/Chrome/User Data"));
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        return Some(dirs_next::config_dir()?.join("google-chrome"));
-    }
-}
-
-/// Whether the user's daily Chrome is currently running on its default
-/// profile. Used to decide between (a) launching it on the user's behalf
-/// with debug enabled vs (b) refusing and prompting the user — we never
-/// auto-quit a running browser because of unsaved-work risk.
-#[cfg(unix)]
-fn user_chrome_is_running() -> bool {
-    let Some(dir) = user_chrome_profile_dir() else {
-        return false;
-    };
-    let dir_str = dir.to_string_lossy().to_string();
-    std::process::Command::new("pgrep")
-        .args(["-f", &format!("user-data-dir={dir_str}")])
-        .output()
-        .map(|o| !o.stdout.is_empty())
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn user_chrome_is_running() -> bool {
-    // Lock-file probe: chrome creates these and removes them on clean exit.
-    let Some(dir) = user_chrome_profile_dir() else {
-        return false;
-    };
-    dir.join("lockfile").exists()
-}
-
 /// Whether `chrome_path` points at the user's system Chrome (vs the
 /// rsclaw-managed Chrome for Testing under `<base_dir>/tools/chrome/`).
 /// Only system Chrome is a candidate for "use the user's profile" —
@@ -910,29 +869,17 @@ impl BrowserSession {
             }
         }
 
-        // 3. System Chrome + user's profile available + nobody using it? Launch it on
-        //    the user's behalf with debug enabled. The `Some("default")` shortcut in
-        //    ChromeProcess::launch already resolves to the user's Library/Application
-        //    Support/Google/ Chrome dir (or the platform equivalent), so we get full
-        //    cookies / extensions / history for free.
+        // 3. System Chrome: launch it against rsclaw's persistent "default"
+        //    profile (resolved to ~/.rsclaw/browser-profiles/default by
+        //    ChromeProcess::launch). That dir is debuggable under Chrome 136+
+        //    (which blocks debugging on the browser's own default profile) AND
+        //    lives in its own user-data-dir, so it coexists with the user's
+        //    daily Chrome — no need to refuse or ask them to quit. Login state
+        //    is entered once and persists across restarts.
         let mut chosen_profile = profile;
         if is_system_chrome(chrome_path) {
-            if user_chrome_is_running() {
-                // 4. User's chrome IS running, but without debug. Don't kill it.
-                bail!(
-                    "RSCLAW_CHROME_NEEDS_CDP: 你的 Chrome 正在运行但没启用调试模式 (CDP 端口未开)。\n\n\
-                     两个解决办法：\n\
-                     1) 退出 Chrome（cmd+Q），让 rsclaw 自动启动新进程（你的标签和登录态会被恢复）\n\
-                     2) 或者手动用以下命令重新启动：\n   {chrome_path} --remote-debugging-port=9222 &\n\n\
-                     完成后重试请求。"
-                );
-            }
-            // Always set "default" for system chrome — Chrome creates
-            // the profile dir on first launch if missing, and using it
-            // means later when the user opens chrome themselves they
-            // share the same process / cookies / session naturally.
             info!(
-                "BrowserSession: launching user's Chrome with debug enabled (using their daily profile)"
+                "BrowserSession: launching system Chrome with rsclaw's persistent 'default' profile"
             );
             chosen_profile = Some("default");
         }
