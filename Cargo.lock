@@ -1027,15 +1027,15 @@ dependencies = [
 
 [[package]]
 name = "cap-rs"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
+ "futures",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
- "toml 0.8.23",
  "tracing",
 ]
 

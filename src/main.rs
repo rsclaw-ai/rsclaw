@@ -55,6 +55,7 @@ fn main() -> Result<()> {
 
     // Build an appropriate tokio runtime for the detected hardware tier.
     let rt = sys::build_runtime(tier)?;
+
     rt.block_on(run())
 }
 
