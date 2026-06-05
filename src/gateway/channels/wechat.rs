@@ -545,6 +545,14 @@ pub(crate) fn start_wechat_personal_if_configured(
 
         tokio::spawn(async move {
             debug!("wechat: outbound sender task started");
+            // Per-target throttle: wechat ilink returns ret=-2 (anti-spam)
+            // when two notifications hit the same recipient within ~1s.
+            // Keep one timestamp per target_id; sleep the deficit before
+            // sending, listening to drain so restart isn't blocked.
+            let mut last_send: std::collections::HashMap<String, std::time::Instant> =
+                std::collections::HashMap::new();
+            const PER_TARGET_INTERVAL: std::time::Duration =
+                std::time::Duration::from_millis(3000);
             loop {
                 tokio::select! {
                     () = shutdown_for_outbound.notified() => {
@@ -553,12 +561,25 @@ pub(crate) fn start_wechat_personal_if_configured(
                     }
                     msg = out_rx.recv() => {
                         let Some(msg) = msg else { break };
-                        debug!(target = %msg.target_id, text_len = msg.text.len(), "wechat: sending reply");
+                        if let Some(prev) = last_send.get(&msg.target_id)
+                            && let Some(wait) = PER_TARGET_INTERVAL.checked_sub(prev.elapsed())
+                        {
+                            tokio::select! {
+                                _ = tokio::time::sleep(wait) => {}
+                                () = shutdown_for_outbound.notified() => {
+                                    info!("wechat: drain during throttle wait, dropping message");
+                                    break;
+                                }
+                            }
+                        }
+                        let target = msg.target_id.clone();
+                        debug!(target = %target, text_len = msg.text.len(), "wechat: sending reply");
                         if let Err(e) = wc_send.send(msg).await {
                             error!("wechat send error: {e:#}");
                         } else {
                             debug!("wechat: reply sent successfully");
                         }
+                        last_send.insert(target, std::time::Instant::now());
                     }
                 }
             }

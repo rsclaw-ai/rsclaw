@@ -542,6 +542,7 @@ mod tests {
             api_base: None,
             ws_url: None,
             accounts: Some(Default::default()),
+            reconnect_delay_secs: None,
         };
         if let Some(map) = feishu_old.accounts.as_mut() {
             map.insert("feishu-a".to_owned(), serde_json::json!({"appId": "a"}));
@@ -587,6 +588,7 @@ mod tests {
                 api_base: None,
                 ws_url: None,
                 accounts: None,
+                reconnect_delay_secs: None,
             }),
             ..Default::default()
         });
@@ -618,6 +620,7 @@ mod tests {
             api_base: None,
             ws_url: None,
             accounts: Some(Default::default()),
+            reconnect_delay_secs: None,
         };
         if let Some(map) = feishu.accounts.as_mut() {
             map.insert("feishu-a".to_owned(), serde_json::json!({"appId": "a"}));
@@ -967,6 +970,7 @@ mod tests {
                 max_file_size: Some(50 * 1024 * 1024),
                 max_text_chars: Some(20_000),
                 supports_vision: Some(false),
+                download_timeout_secs: None,
             }),
             session_result_limits: None,
         });
@@ -983,6 +987,7 @@ mod tests {
                 max_file_size: Some(100 * 1024 * 1024),
                 max_text_chars: Some(50_000),
                 supports_vision: Some(true),
+                download_timeout_secs: None,
             }),
             session_result_limits: None,
         });

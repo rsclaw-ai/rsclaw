@@ -30,6 +30,7 @@ pub(crate) fn start_dingtalk_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
     task_queue: Arc<crate::gateway::task_queue::TaskQueueManager>,
+    shutdown: crate::gateway::ShutdownCoordinator,
 ) {
     let Some(dt_cfg) = &config.channel.channels.dingtalk else {
         return;
@@ -523,18 +524,36 @@ pub(crate) fn start_dingtalk_if_configured(
             tracing::warn!("failed to register channel: {e}");
         }
         let dt_send = Arc::clone(&dt);
+        let shutdown_for_out = shutdown.clone();
 
         tokio::spawn(async move {
-            while let Some(msg) = out_rx.recv().await {
-                if let Err(e) = dt_send.send(msg).await {
-                    error!("dingtalk send error: {e:#}");
+            loop {
+                tokio::select! {
+                    () = shutdown_for_out.notified() => {
+                        info!("dingtalk: drain signaled, stopping outbound sender");
+                        break;
+                    }
+                    msg = out_rx.recv() => {
+                        let Some(msg) = msg else { break };
+                        if let Err(e) = dt_send.send(msg).await {
+                            error!("dingtalk send error: {e:#}");
+                        }
+                    }
                 }
             }
         });
 
+        let shutdown_for_run = shutdown.clone();
         tokio::spawn(async move {
-            if let Err(e) = dt.run().await {
-                error!("dingtalk channel error: {e:#}");
+            tokio::select! {
+                res = dt.run() => {
+                    if let Err(e) = res {
+                        error!("dingtalk channel error: {e:#}");
+                    }
+                }
+                () = shutdown_for_run.notified() => {
+                    info!("dingtalk: drain signaled, stopping run loop");
+                }
             }
         });
 

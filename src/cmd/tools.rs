@@ -309,6 +309,15 @@ pub fn tools_dir_pub() -> PathBuf {
 /// isn't present (partial / failed install) are skipped. Called after
 /// `rsclaw tools install` and at gateway startup.
 pub fn sync_tool_shims() {
+    // Windows resolves tools via PATH-dir enrichment (see
+    // gateway::startup::enrich_process_path), not a shim dir: symlinks need
+    // privilege and copying an .exe out of its dir breaks sibling-DLL lookup.
+    #[cfg(unix)]
+    sync_tool_shims_unix();
+}
+
+#[cfg(unix)]
+fn sync_tool_shims_unix() {
     let tools_dir = tools_dir();
     let bin_dir = tools_dir.join("bin");
     if std::fs::create_dir_all(&bin_dir).is_err() {
@@ -320,14 +329,30 @@ pub fn sync_tool_shims() {
         if !sub.is_dir() {
             continue;
         }
-        // The real binary sits at <sub>/<name> or <sub>/bin/<name>. Link
-        // under every detect_cmd alias (e.g. claude-code → `claude`, which is
-        // also what cap-rs spawns for the Claudecode driver).
+        // Link under every detect_cmd alias (e.g. claude-code → `claude`,
+        // which is what cap-rs spawns for the Claudecode driver). Probe
+        // tool-specific native-binary paths first, falling back to the
+        // generic `<sub>/<name>` / `<sub>/bin/<name>` layouts.
         for name in def.detect_cmd {
-            let Some(target) = [sub.join(name), sub.join("bin").join(name)]
-                .into_iter()
-                .find(|p| is_executable_file(p))
-            else {
+            let mut candidates: Vec<PathBuf> = Vec::new();
+            // claude-code (npm @anthropic-ai/claude-code) ships precompiled
+            // native binaries under per-platform subpackages — prefer those
+            // over `node_modules/.bin/claude` (a bash wrapper that re-execs
+            // node + cli.js).
+            if def.name == "claude-code" {
+                let subpkg = native_claude_subpkg();
+                if !subpkg.is_empty() {
+                    candidates.push(
+                        sub.join("node_modules")
+                            .join("@anthropic-ai")
+                            .join(format!("claude-code-{subpkg}"))
+                            .join(name),
+                    );
+                }
+            }
+            candidates.push(sub.join(name));
+            candidates.push(sub.join("bin").join(name));
+            let Some(target) = candidates.into_iter().find(|p| is_executable_file(p)) else {
                 continue;
             };
             link_shim(&bin_dir, name, &target);
@@ -354,8 +379,27 @@ pub fn sync_tool_shims() {
 
 /// Command names cap-rs spawns for the coding agents. `claude` is the
 /// Claudecode driver's default bin; the rest match their drivers.
+#[cfg(unix)]
 const CODING_AGENT_NAMES: &[&str] = &["opencode", "claude", "openclaude", "codex", "aider"];
 
+/// Subpackage tag for `@anthropic-ai/claude-code-<tag>` matching this host.
+/// Empty string on unsupported platforms (probe falls back to generic paths).
+#[cfg(unix)]
+fn native_claude_subpkg() -> &'static str {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "darwin-arm64"
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        "darwin-x64"
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        "linux-arm64"
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        "linux-x64"
+    } else {
+        ""
+    }
+}
+
+#[cfg(unix)]
 fn link_shim(bin_dir: &std::path::Path, name: &str, target: &std::path::Path) {
     let link = bin_dir.join(name);
     // Don't link a shim to itself (target resolved to the shim dir).
@@ -363,19 +407,12 @@ fn link_shim(bin_dir: &std::path::Path, name: &str, target: &std::path::Path) {
         return;
     }
     let _ = std::fs::remove_file(&link); // clear stale link/file
-    #[cfg(unix)]
-    {
-        let _ = std::os::unix::fs::symlink(target, &link);
-    }
-    #[cfg(windows)]
-    {
-        // Symlinks need privilege on Windows; copy is the safe shim.
-        let _ = std::fs::copy(target, &link);
-    }
+    let _ = std::os::unix::fs::symlink(target, &link);
 }
 
 /// Resolve a command to an absolute executable by scanning PATH plus common
 /// install dirs. Skips the shim dir itself so we never self-link.
+#[cfg(unix)]
 fn resolve_command(name: &str, shim_dir: &std::path::Path) -> Option<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
@@ -406,10 +443,6 @@ fn is_executable_file(p: &std::path::Path) -> bool {
     std::fs::metadata(p)
         .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
-}
-#[cfg(not(unix))]
-fn is_executable_file(p: &std::path::Path) -> bool {
-    p.is_file()
 }
 
 /// Public accessor for the cached manifest (used by the agent prompt/tool

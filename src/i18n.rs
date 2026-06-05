@@ -2376,6 +2376,89 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "ru" => "Генерация видео использует платный сторонний API (Seedance / Hailuo / Kling — каждый ролик стоит реальных денег и занимает минуты) и отключена до выбора модели. Задайте `agents.defaults.model.video` в rsclaw.json5 (например, \"doubao/doubao-seedance-2-0-260128\", \"minimax/video-01-director\" или \"kling/kling-v2-master\") или выберите его в десктопном приложении: 配置管理 → 模型 → 视频生成模型. Затем повторите.",
     );
 
+    // -----------------------------------------------------------------
+    // cap_live sticky direct mode (Phase 2a, 2026-05-31)
+    // -----------------------------------------------------------------
+    msg!("cap_help",
+        "en" => "/cap <agent> [path] — bind this chat to a coding agent (claudecode | openclaude | opencode | codex), optionally rooting the session at <path> (must be under $HOME; default: rsclaw workspace)\n/cap-exit             — release the binding",
+        "zh" => "/cap <代理> [路径] — 把当前会话直连到一个编程代理（claudecode | openclaude | opencode | codex），可选指定工作目录 [路径]（必须在 $HOME 之下，默认使用 rsclaw 工作区）\n/cap-exit             — 释放绑定，恢复主 LLM",
+    );
+
+    msg!("cap_bound",
+        "en" => "Bound to {agent} (session {sid}). Next messages go directly to the driver. /cap-exit to release, /status to see the resume id.",
+        "zh" => "已绑定到 {agent}（会话 {sid}）。接下来的消息会直接发给子代理。/cap-exit 释放，/status 查看 resume id。",
+    );
+
+    msg!("cap_unknown_agent",
+        "en" => "/cap: unknown agent `{agent}` (try: claudecode, openclaude, opencode, codex)",
+        "zh" => "/cap：未知代理 `{agent}`（可选：claudecode、openclaude、opencode、codex）",
+    );
+
+    msg!("cap_not_initialised",
+        "en" => "/cap: cap_live not initialised",
+        "zh" => "/cap：cap_live 尚未初始化",
+    );
+
+    msg!("cap_open_failed",
+        "en" => "/cap: failed to open session: {err}",
+        "zh" => "/cap：打开会话失败：{err}",
+    );
+
+    msg!("cap_bad_workspace",
+        "en" => "/cap: workspace path rejected — {path}: {reason}",
+        "zh" => "/cap：工作目录被拒绝 — {path}：{reason}",
+    );
+
+    msg!("cap_session_closed",
+        "en" => "{agent} session closed. Normal LLM behavior resumed.",
+        "zh" => "{agent} 会话已关闭，恢复正常对话。",
+    );
+
+    msg!("cap_no_active",
+        "en" => "/cap-exit: no active cap session here",
+        "zh" => "/cap-exit：当前会话没有绑定中的代理",
+    );
+
+    msg!("cap_driver_error",
+        "en" => "[cap {agent} driver error] {err}\n(sticky binding released; use /cap {agent} to reconnect or just keep chatting with the main LLM)",
+        "zh" => "[cap {agent} 驱动错误] {err}\n（已自动释放绑定；可用 /cap {agent} 重新连接，或直接继续跟主 LLM 对话）",
+    );
+
+    msg!("cap_no_output",
+        "en" => "[{agent}] (no output)",
+        "zh" => "[{agent}]（无输出）",
+    );
+
+    msg!("cap_thinking",
+        "en" => "💭 {agent} is responding…",
+        "zh" => "💭 {agent} 正在处理…",
+    );
+
+    msg!("cap_bound_with_resume",
+        "en" => "Bound to {agent} (session {sid}). Next messages go directly to the driver. /cap-exit to release.\nResume later: /cap-resume {agent_slug} {session_id}",
+        "zh" => "已绑定到 {agent}（会话 {sid}）。接下来的消息会直接发给子代理，使用 /cap-exit 释放绑定。\n下次恢复对话：/cap-resume {agent_slug} {session_id}",
+    );
+
+    msg!("cap_resumed",
+        "en" => "Resumed {agent} session {session_id}. Next messages continue the previous conversation. /cap-exit to release.",
+        "zh" => "已恢复 {agent} 会话 {session_id}。后续消息继续之前的对话。使用 /cap-exit 释放绑定。",
+    );
+
+    msg!("cap_resume_help",
+        "en" => "/cap-resume <agent> [session_id]\n  /cap-resume claudecode 00000000-…   resume by id\n  /cap-resume claudecode               resume the most recent saved session",
+        "zh" => "/cap-resume <代理> [会话ID]\n  /cap-resume claudecode 00000000-…   按 ID 恢复\n  /cap-resume claudecode               恢复最近一次会话",
+    );
+
+    msg!("cap_resume_hint",
+        "en" => "📌 Resume command:\n/cap-resume {agent} {session_id}",
+        "zh" => "📌 续聊命令:\n/cap-resume {agent} {session_id}",
+    );
+
+    msg!("cap_resume_hint_after_exit",
+        "en" => "📌 To resume this conversation:\n/cap-resume {agent} {session_id}",
+        "zh" => "📌 恢复本次对话:\n/cap-resume {agent} {session_id}",
+    );
+
     m
 });
 

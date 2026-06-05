@@ -30,4 +30,18 @@ pub enum PluginsCommand {
     Update {
         plugin: Option<String>,
     },
+    /// Describe a plugin's tool surface (name + description + parameters).
+    /// Talks to the running gateway over HTTP; the gateway must be up.
+    Describe {
+        plugin: String,
+    },
+    /// Invoke a plugin tool via the running gateway. Args are passed as a
+    /// JSON object via `--args`. The gateway must be up.
+    Call {
+        /// Tool reference in `plugin.tool` form, e.g. `jimeng.txt2img`.
+        tool_ref: String,
+        /// JSON object of arguments (default: `{}`).
+        #[arg(long, default_value = "{}")]
+        args: String,
+    },
 }

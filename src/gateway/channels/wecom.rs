@@ -27,6 +27,7 @@ pub(crate) fn start_wecom_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
     task_queue: Arc<crate::gateway::task_queue::TaskQueueManager>,
+    shutdown: crate::gateway::ShutdownCoordinator,
 ) {
     use crate::channel::wecom::WeComChannel;
 
@@ -428,10 +429,20 @@ pub(crate) fn start_wecom_if_configured(
             tracing::warn!("failed to register channel: {e}");
         }
         let wecom_send = Arc::clone(&wecom);
+        let shutdown_for_out = shutdown.clone();
         tokio::spawn(async move {
-            while let Some(msg) = out_rx.recv().await {
-                if let Err(e) = wecom_send.send(msg).await {
-                    error!("wecom send: {e:#}");
+            loop {
+                tokio::select! {
+                    () = shutdown_for_out.notified() => {
+                        info!("wecom: drain signaled, stopping outbound sender");
+                        break;
+                    }
+                    msg = out_rx.recv() => {
+                        let Some(msg) = msg else { break };
+                        if let Err(e) = wecom_send.send(msg).await {
+                            error!("wecom send: {e:#}");
+                        }
+                    }
                 }
             }
         });
@@ -441,9 +452,17 @@ pub(crate) fn start_wecom_if_configured(
             tracing::debug!("slot already set, skipping");
         }
 
+        let shutdown_for_run = shutdown.clone();
         tokio::spawn(async move {
-            if let Err(e) = wecom.run().await {
-                error!("wecom channel: {e:#}");
+            tokio::select! {
+                res = wecom.run() => {
+                    if let Err(e) = res {
+                        error!("wecom channel: {e:#}");
+                    }
+                }
+                () = shutdown_for_run.notified() => {
+                    info!("wecom: drain signaled, stopping run loop");
+                }
             }
         });
 

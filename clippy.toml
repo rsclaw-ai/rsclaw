@@ -1,0 +1,32 @@
+# Clippy configuration (P3 — defense in depth for the search_file 36-min hang
+# incident on 2026-06-01). The point: forbid blocking `std::fs::*` and `glob`
+# tree-walks anywhere in the codebase, so future tool authors can't reintroduce
+# the same class of bug. Async fns that need fs I/O must reach for `tokio::fs`,
+# and tree walkers must go through `safe_walk` in `tools_file.rs`.
+#
+# These are advisory (warn-level), not deny. We hit them in places where the
+# blocking call is genuinely fine (startup-time config load, single-file image
+# decode that's already bounded). Wrap those call sites in
+# `#[allow(clippy::disallowed_methods)]` with a comment naming WHY.
+#
+# To suppress with intent:
+#
+#     #[allow(clippy::disallowed_methods)] // bootstrap-time, runs once, < 1ms
+#     let cfg = std::fs::read_to_string(&cfg_path)?;
+#
+# The lint won't catch every case (it's name-based, not async-context-aware),
+# but it makes the previously-invisible blocking call visible at code-review
+# time. Combined with the safe_walk helper, this is the strongest tripwire
+# we can build without a custom rustc plugin.
+
+disallowed-methods = [
+  # Recursive tree walk — the literal API that caused 2026-06-01.
+  # If you need to walk a tree from a tool, use `safe_walk` in
+  # `crate::agent::tools_file`.
+  { path = "glob::glob", reason = "use crate::agent::tools_file::safe_walk for tree walks" },
+
+  # Blocking read_dir is the same bug just one syscall at a time. Single-level
+  # listings are bounded enough that this is mostly precautionary; if you have
+  # a known-small dir (e.g. ~/.rsclaw/models), suppress with #[allow] + comment.
+  { path = "std::fs::read_dir", reason = "blocks worker thread; prefer tokio::fs::read_dir or spawn_blocking" },
+]

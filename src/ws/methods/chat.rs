@@ -92,6 +92,7 @@ pub async fn chat_send(ctx: MethodCtx) -> MethodResult {
             images: vec![],
             tool_log: vec![],
             question: None,
+            channel: None,
         });
         let _ = ctx.state.event_bus.send(AgentEvent {
             session_id: session_key.clone(),
@@ -102,47 +103,55 @@ pub async fn chat_send(ctx: MethodCtx) -> MethodResult {
             images: reply.images,
             tool_log: vec![],
             question: None,
+            channel: None,
         });
 
         // Same relay spawn shape as the agent-dispatch path — the events
         // we just published are visible to it via the `rx` subscription
         // taken above.
         let inflight_guard = ctx.state.shutdown.begin_work();
+        let shutdown_for_relay = ctx.state.shutdown.clone();
         tokio::spawn(async move {
             let _inflight_guard = inflight_guard;
             use futures::StreamExt;
             let mut stream = tokio_stream::wrappers::BroadcastStream::new(rx);
-            while let Some(Ok(event)) = stream.next().await {
-                if event.session_id != sk {
-                    continue;
-                }
-                let conn_seq = conn.write().await.next_seq();
-                let payload = if event.done {
-                    serde_json::json!({
-                        "runId": rid,
-                        "sessionKey": sk,
-                        "type": "done",
-                        "role": "assistant",
-                        "files": event.files,
-                        "images": event.images,
-                        "toolLog": event.tool_log,
-                    })
-                } else {
-                    serde_json::json!({
-                        "runId": rid,
-                        "sessionKey": sk,
-                        "type": "text_delta",
-                        "delta": event.delta,
-                        "role": "assistant",
-                    })
-                };
-                let frame = EventFrame::new("chat", payload, conn_seq);
-                let json = serde_json::to_string(&frame).unwrap_or_default();
-                if event_tx.send(json).await.is_err() {
-                    break;
-                }
-                if event.done {
-                    break;
+            loop {
+                tokio::select! {
+                    () = shutdown_for_relay.notified() => break,
+                    next = stream.next() => {
+                        let Some(Ok(event)) = next else { break };
+                        if event.session_id != sk {
+                            continue;
+                        }
+                        let conn_seq = conn.write().await.next_seq();
+                        let payload = if event.done {
+                            serde_json::json!({
+                                "runId": rid,
+                                "sessionKey": sk,
+                                "type": "done",
+                                "role": "assistant",
+                                "files": event.files,
+                                "images": event.images,
+                                "toolLog": event.tool_log,
+                            })
+                        } else {
+                            serde_json::json!({
+                                "runId": rid,
+                                "sessionKey": sk,
+                                "type": "text_delta",
+                                "delta": event.delta,
+                                "role": "assistant",
+                            })
+                        };
+                        let frame = EventFrame::new("chat", payload, conn_seq);
+                        let json = serde_json::to_string(&frame).unwrap_or_default();
+                        if event_tx.send(json).await.is_err() {
+                            break;
+                        }
+                        if event.done {
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -209,6 +218,7 @@ pub async fn chat_send(ctx: MethodCtx) -> MethodResult {
     // waits for the relay task to finish (event.done or stream end). The
     // guard is moved into the spawned task and drops on task exit.
     let inflight_guard = ctx.state.shutdown.begin_work();
+    let shutdown_for_relay = ctx.state.shutdown.clone();
 
     // Spawn relay task: emit OpenClaw-format "chat" events back to the WS
     // client that initiated the request.  The payload uses the `event:chat`
@@ -219,39 +229,45 @@ pub async fn chat_send(ctx: MethodCtx) -> MethodResult {
         let _inflight_guard = inflight_guard;
         use futures::StreamExt;
         let mut stream = tokio_stream::wrappers::BroadcastStream::new(rx);
-        while let Some(Ok(event)) = stream.next().await {
-            if event.session_id != sk {
-                continue;
-            }
+        loop {
+            tokio::select! {
+                () = shutdown_for_relay.notified() => break,
+                next = stream.next() => {
+                    let Some(Ok(event)) = next else { break };
+                    if event.session_id != sk {
+                        continue;
+                    }
 
-            let conn_seq = conn.write().await.next_seq();
+                    let conn_seq = conn.write().await.next_seq();
 
-            let payload = if event.done {
-                serde_json::json!({
-                    "runId": rid,
-                    "sessionKey": sk,
-                    "type": "done",
-                    "role": "assistant",
-                    "files": event.files,
-                    "images": event.images,
-                    "toolLog": event.tool_log,
-                })
-            } else {
-                serde_json::json!({
-                    "runId": rid,
-                    "sessionKey": sk,
-                    "type": "text_delta",
-                    "delta": event.delta,
-                    "role": "assistant",
-                })
-            };
-            let frame = EventFrame::new("chat", payload, conn_seq);
-            let json = serde_json::to_string(&frame).unwrap_or_default();
-            if event_tx.send(json).await.is_err() {
-                break;
-            }
-            if event.done {
-                break;
+                    let payload = if event.done {
+                        serde_json::json!({
+                            "runId": rid,
+                            "sessionKey": sk,
+                            "type": "done",
+                            "role": "assistant",
+                            "files": event.files,
+                            "images": event.images,
+                            "toolLog": event.tool_log,
+                        })
+                    } else {
+                        serde_json::json!({
+                            "runId": rid,
+                            "sessionKey": sk,
+                            "type": "text_delta",
+                            "delta": event.delta,
+                            "role": "assistant",
+                        })
+                    };
+                    let frame = EventFrame::new("chat", payload, conn_seq);
+                    let json = serde_json::to_string(&frame).unwrap_or_default();
+                    if event_tx.send(json).await.is_err() {
+                        break;
+                    }
+                    if event.done {
+                        break;
+                    }
+                }
             }
         }
     });

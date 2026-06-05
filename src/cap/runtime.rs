@@ -184,38 +184,114 @@ impl CapAgentManager {
     }
 }
 
-async fn spawn_driver(kind: AgentKind, cwd: &std::path::Path) -> Result<Box<dyn Driver>> {
+pub(crate) async fn spawn_driver(
+    kind: AgentKind,
+    cwd: &std::path::Path,
+) -> Result<Box<dyn Driver>> {
+    spawn_driver_inner(kind, cwd, ResumeMode::None).await
+}
+
+/// Spawn a driver that resumes an existing on-disk session by the
+/// agent's NATIVE session id (claudecode UUID, opencode session id,
+/// codex thread_id). Each driver maps the id to its own CLI flag /
+/// subcommand:
+///
+///   * claudecode/openclaude: `claude --resume <uuid>` (replays
+///     `~/.claude/projects/<path>/<uuid>.jsonl` into memory).
+///   * opencode: `opencode run --session <id>`.
+///   * codex: `codex exec resume <thread_id>`.
+///
+/// If the id doesn't match a stored session for that agent the CLI
+/// errors out at spawn — cap-rs surfaces the error to the actor which
+/// propagates it back to /cap-resume's caller.
+pub(crate) async fn spawn_driver_resume(
+    kind: AgentKind,
+    cwd: &std::path::Path,
+    agent_session_id: &str,
+) -> Result<Box<dyn Driver>> {
+    spawn_driver_inner(kind, cwd, ResumeMode::ById(agent_session_id)).await
+}
+
+/// Spawn a driver that resumes the MOST RECENT saved session for
+/// this agent in `cwd`. Equivalent to `claude --continue` / `opencode
+/// run --continue` / `codex exec resume --last`.
+pub(crate) async fn spawn_driver_continue_last(
+    kind: AgentKind,
+    cwd: &std::path::Path,
+) -> Result<Box<dyn Driver>> {
+    spawn_driver_inner(kind, cwd, ResumeMode::ContinueLast).await
+}
+
+#[derive(Copy, Clone)]
+enum ResumeMode<'a> {
+    None,
+    ById(&'a str),
+    ContinueLast,
+}
+
+async fn spawn_driver_inner(
+    kind: AgentKind,
+    cwd: &std::path::Path,
+    resume_mode: ResumeMode<'_>,
+) -> Result<Box<dyn Driver>> {
     use cap_rs::driver::stream_json::ClaudeCodeDriver;
 
+    fn apply_resume_mode(
+        b: cap_rs::driver::stream_json::ClaudeCodeDriverBuilder,
+        mode: ResumeMode<'_>,
+    ) -> cap_rs::driver::stream_json::ClaudeCodeDriverBuilder {
+        match mode {
+            ResumeMode::None => b,
+            ResumeMode::ById(rid) => b.resume(rid),
+            ResumeMode::ContinueLast => b.continue_last(true),
+        }
+    }
+
     let driver: Box<dyn Driver> = match kind {
-        AgentKind::Claudecode => Box::new(
-            ClaudeCodeDriver::builder(cwd)
-                .dangerously_skip_permissions(true)
-                .spawn()
-                .await
-                .map_err(|e| anyhow!("cap claudecode spawn: {e}"))?,
-        ),
-        AgentKind::Openclaude => Box::new(
-            ClaudeCodeDriver::builder(cwd)
-                .bin("openclaude")
-                .dangerously_skip_permissions(true)
-                .spawn()
-                .await
-                .map_err(|e| anyhow!("cap openclaude spawn: {e}"))?,
-        ),
-        AgentKind::Opencode => Box::new(
-            ClaudeCodeDriver::builder(cwd)
-                .bin("opencode")
-                .dangerously_skip_permissions(true)
-                .spawn()
-                .await
-                .map_err(|e| anyhow!("cap opencode spawn: {e}"))?,
-        ),
-        AgentKind::Codex => {
-            use cap_rs::driver::codex::CodexExecDriver;
+        AgentKind::Claudecode => {
+            let mut b = ClaudeCodeDriver::builder(cwd).dangerously_skip_permissions(true);
+            b = apply_resume_mode(b, resume_mode);
             Box::new(
-                CodexExecDriver::builder(cwd)
-                    .spawn()
+                b.spawn()
+                    .await
+                    .map_err(|e| anyhow!("cap claudecode spawn: {e}"))?,
+            )
+        }
+        AgentKind::Openclaude => {
+            let mut b = ClaudeCodeDriver::builder(cwd)
+                .bin("openclaude")
+                .dangerously_skip_permissions(true);
+            b = apply_resume_mode(b, resume_mode);
+            Box::new(
+                b.spawn()
+                    .await
+                    .map_err(|e| anyhow!("cap openclaude spawn: {e}"))?,
+            )
+        }
+        AgentKind::Opencode => {
+            let mut b = ClaudeCodeDriver::opencode_builder(cwd);
+            b = apply_resume_mode(b, resume_mode);
+            Box::new(
+                b.spawn()
+                    .await
+                    .map_err(|e| anyhow!("cap opencode spawn: {e}"))?,
+            )
+        }
+        AgentKind::Codex => {
+            // Codex now drives through `codex exec --input-format
+            // stream-json --output-format stream-json` (multi-turn
+            // native). Replaces the old CodexMcpDriver path: same
+            // session-reuse semantics but without the MCP `tools/call`
+            // JSON-RPC envelope and the codex-mcp-server's per-turn
+            // overhead that made codex feel 10× slower than direct
+            // `codex` CLI use. Reasoning tokens stream as Thought
+            // events end-to-end via the agent_reasoning_delta path
+            // wired through `bridge.rs::dispatch` (see TextChannel
+            // Thought).
+            let mut b = ClaudeCodeDriver::codex_builder(cwd).dangerously_skip_permissions(true);
+            b = apply_resume_mode(b, resume_mode);
+            Box::new(
+                b.spawn()
                     .await
                     .map_err(|e| anyhow!("cap codex spawn: {e}"))?,
             )
@@ -227,7 +303,7 @@ async fn spawn_driver(kind: AgentKind, cwd: &std::path::Path) -> Result<Box<dyn 
 /// Send a notification to the IM channel, if a target is configured.
 /// Logs at warn! on send error so a transient channel issue doesn't kill
 /// the whole turn.
-fn push_notif(target: &NotifTarget, text: String) {
+pub(crate) fn push_notif(target: &NotifTarget, text: String) {
     let msg = OutboundMessage {
         target_id: target.target_id.clone(),
         is_group: target.is_group,
@@ -262,14 +338,12 @@ async fn actor_loop(
             } => {
                 let session_id = format!("cap-{agent_id}-{}", uuid::Uuid::new_v4());
 
-                // 1. Initial "submitted" notification to the user IM
-                //    channel. Mirrors old tools_acp's first-message.
-                if let Some(n) = &notif {
-                    push_notif(
-                        n,
-                        i18n::t_fmt("acp_submitted", n.lang, &[("name", display)]),
-                    );
-                }
+                // Note: no "submitted" ack notification — the calling LLM's
+                // text reply already tells the user the dispatch happened.
+                // Pushing an extra IM message per cap call floods rate-limited
+                // channels (wechat ret=-2 anti-spam) when several agents are
+                // dispatched in one turn; completion notifications still go
+                // through below.
 
                 // 2. Tell the LLM the prompt is queued. From here on the
                 //    LLM is free; the result is delivered async.
@@ -302,17 +376,33 @@ async fn actor_loop(
 
                 // 4. Run the turn. `run_turn` streams ToolCallStart
                 //    progress to `notif` and accumulates the final text
-                //    into `reply_buf`.
+                //    into `reply_buf`. Wrap in a 5-minute timeout so a
+                //    driver that hangs (e.g. an external CLI that never
+                //    emits its terminator) doesn't tie up the actor
+                //    indefinitely — on timeout we treat it as an error,
+                //    notify the user, and let the loop break + respawn.
+                const TURN_TIMEOUT: std::time::Duration =
+                    std::time::Duration::from_secs(300);
                 let mut reply_buf = String::new();
-                let outcome = run_turn(
-                    driver.as_mut(),
-                    &bus,
-                    &session_id,
-                    agent_id,
-                    notif.as_ref(),
-                    &mut reply_buf,
+                let outcome = match tokio::time::timeout(
+                    TURN_TIMEOUT,
+                    run_turn(
+                        driver.as_mut(),
+                        &bus,
+                        &session_id,
+                        agent_id,
+                        notif.as_ref(),
+                        &mut reply_buf,
+                    ),
                 )
-                .await;
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => Err(anyhow!(
+                        "cap {display}: turn timed out after {}s (driver hang?)",
+                        TURN_TIMEOUT.as_secs()
+                    )),
+                };
 
                 // 5. Completion / error notification + inbox reinjection.
                 match &outcome {
@@ -338,9 +428,16 @@ async fn actor_loop(
                             };
                             push_notif(n, body);
                         }
-                        if let Some(ib) = &inbox {
-                            inject_followup(ib, display, &reply_buf);
-                        }
+                        // inject_followup intentionally NOT called: the
+                        // followup turn doubles every cap completion (one
+                        // push_notif + one agent reply restating the same
+                        // text), and 4 caps × 2 msgs hammers rate-limited
+                        // channels. push_notif above is the canonical
+                        // result delivery. If you need the agent to chain
+                        // a follow-up action, re-enable inject_followup
+                        // here and route the result back through the user
+                        // session instead of `:cap-followup`.
+                        let _ = &inbox;
                     }
                     Err(e) => {
                         if let Some(n) = &notif {
@@ -373,6 +470,7 @@ async fn actor_loop(
 /// `send_file`, post a summary, schedule follow-ups). The follow-up
 /// runs on a `:cap-followup` sub-session so the live user-visible
 /// session does not get re-activated.
+#[allow(dead_code)] // see comment in actor where it used to be called
 fn inject_followup(inbox: &InboxTarget, display: &str, summary: &str) {
     let followup_session = format!("{}:cap-followup", inbox.session_key);
     let text = if summary.is_empty() {
@@ -410,7 +508,7 @@ fn inject_followup(inbox: &InboxTarget, display: &str, summary: &str) {
     });
 }
 
-async fn run_turn(
+pub(crate) async fn run_turn(
     driver: &mut dyn Driver,
     bus: &broadcast::Sender<crate::events::AgentEvent>,
     session_id: &str,

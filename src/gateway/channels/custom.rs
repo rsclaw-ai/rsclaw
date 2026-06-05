@@ -31,6 +31,7 @@ pub(crate) fn start_custom_channels(
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
     redb_store: Arc<crate::store::redb_store::RedbStore>,
+    shutdown: crate::gateway::ShutdownCoordinator,
 ) {
     let custom_cfgs = match &config.channel.channels.custom {
         Some(cfgs) => cfgs,
@@ -54,6 +55,7 @@ pub(crate) fn start_custom_channels(
                     Arc::clone(&custom_webhooks),
                     Arc::clone(&channel_senders),
                     Arc::clone(&redb_store),
+                    shutdown.clone(),
                 );
             }
             "websocket" => {
@@ -64,6 +66,7 @@ pub(crate) fn start_custom_channels(
                     manager,
                     Arc::clone(&channel_senders),
                     Arc::clone(&redb_store),
+                    shutdown.clone(),
                 );
             }
             other => {
@@ -91,6 +94,7 @@ fn start_custom_webhook(
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
     redb_store: Arc<crate::store::redb_store::RedbStore>,
+    shutdown: crate::gateway::ShutdownCoordinator,
 ) {
     use crate::channel::custom::CustomWebhookChannel;
 
@@ -414,10 +418,20 @@ fn start_custom_webhook(
     }
 
     let ch_send = Arc::clone(&ch);
+    let shutdown_for_out = shutdown.clone();
     tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
-            if let Err(e) = ch_send.send(msg).await {
-                error!(channel = %ch_send.cfg.name, "custom webhook send error: {e:#}");
+        loop {
+            tokio::select! {
+                () = shutdown_for_out.notified() => {
+                    info!("custom webhook: drain signaled, stopping outbound sender");
+                    break;
+                }
+                msg = out_rx.recv() => {
+                    let Some(msg) = msg else { break };
+                    if let Err(e) = ch_send.send(msg).await {
+                        error!(channel = %ch_send.cfg.name, "custom webhook send error: {e:#}");
+                    }
+                }
             }
         }
     });
@@ -425,9 +439,17 @@ fn start_custom_webhook(
     if let Err(e) = manager.register(Arc::clone(&ch) as Arc<dyn Channel>) {
         tracing::warn!("failed to register channel: {e}");
     }
+    let shutdown_for_run = shutdown.clone();
     tokio::spawn(async move {
-        if let Err(e) = ch.run().await {
-            error!("custom webhook channel error: {e:#}");
+        tokio::select! {
+            res = ch.run() => {
+                if let Err(e) = res {
+                    error!("custom webhook channel error: {e:#}");
+                }
+            }
+            () = shutdown_for_run.notified() => {
+                info!("custom webhook: drain signaled, stopping run loop");
+            }
         }
     });
     info!(channel = %ch_name, "custom webhook channel started");
@@ -442,6 +464,7 @@ fn start_custom_websocket(
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
     redb_store: Arc<crate::store::redb_store::RedbStore>,
+    shutdown: crate::gateway::ShutdownCoordinator,
 ) {
     use crate::channel::custom::CustomWebSocketChannel;
 
@@ -757,10 +780,20 @@ fn start_custom_websocket(
     let ch = Arc::new(CustomWebSocketChannel::new(ch_cfg, on_message));
 
     let ch_send = Arc::clone(&ch);
+    let shutdown_for_out = shutdown.clone();
     tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
-            if let Err(e) = ch_send.send(msg).await {
-                error!(channel = %ch_send.cfg.name, "custom WS send error: {e:#}");
+        loop {
+            tokio::select! {
+                () = shutdown_for_out.notified() => {
+                    info!("custom WS: drain signaled, stopping outbound sender");
+                    break;
+                }
+                msg = out_rx.recv() => {
+                    let Some(msg) = msg else { break };
+                    if let Err(e) = ch_send.send(msg).await {
+                        error!(channel = %ch_send.cfg.name, "custom WS send error: {e:#}");
+                    }
+                }
             }
         }
     });
@@ -768,9 +801,17 @@ fn start_custom_websocket(
     if let Err(e) = manager.register(Arc::clone(&ch) as Arc<dyn Channel>) {
         tracing::warn!("failed to register channel: {e}");
     }
+    let shutdown_for_run = shutdown.clone();
     tokio::spawn(async move {
-        if let Err(e) = ch.run().await {
-            error!("custom WS channel error: {e:#}");
+        tokio::select! {
+            res = ch.run() => {
+                if let Err(e) = res {
+                    error!("custom WS channel error: {e:#}");
+                }
+            }
+            () = shutdown_for_run.notified() => {
+                info!("custom WS: drain signaled, stopping run loop");
+            }
         }
     });
     info!(channel = %ch_name, "custom websocket channel started");

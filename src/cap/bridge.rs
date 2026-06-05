@@ -33,8 +33,15 @@ pub(crate) struct Sinks<'a> {
 /// Notification policy (matches old `tool_acp*` behaviour):
 /// - `ToolCallStart` → push "🔧 {name}" to IM (low-volume, useful
 ///   progress signal).
-/// - `TextChunk` → accumulate into `reply` + relay to `agent_event`
-///   bus (NOT pushed to IM — would flood the channel).
+/// - `TextChunk` Assistant → accumulate into `reply` + relay to
+///   `agent_event` bus (NOT pushed to IM directly — IM chunker
+///   subscribes to the bus and handles its own batching).
+/// - `TextChunk` Thought + `Thought {...}` events → relay to bus on
+///   a separate `channel: Thought` track so reasoning is visible to
+///   subscribers (desktop UI, IM chunker) without contaminating
+///   `reply_buf` (which is the final assistant text saved to history).
+///   This makes codex's reasoning streamable to feishu — pre-fix,
+///   thoughts were silently logged and dropped.
 /// - `Done` → returns `true`. Final summary push is the actor's job
 ///   (it has the full `reply` text at that point).
 #[allow(dead_code)]
@@ -42,47 +49,70 @@ pub(crate) fn dispatch(event: &AgentEvent, sinks: &mut Sinks<'_>) -> bool {
     match event {
         AgentEvent::TextChunk { text, channel, .. } => {
             // cap-rs TextChannel has Assistant, Thought, System.
-            // Only relay Assistant (normal model output).
-            if matches!(channel, TextChannel::Assistant) {
+            let (delta_channel, write_to_reply) = match channel {
+                TextChannel::Assistant => (crate::events::TextChannel::Assistant, true),
+                TextChannel::Thought => (crate::events::TextChannel::Thought, false),
+                TextChannel::System => (crate::events::TextChannel::System, false),
+                // cap_rs::core::TextChannel is `#[non_exhaustive]` —
+                // a future variant we don't recognise falls through
+                // as System (debug-only, won't pollute reply text).
+                _ => (crate::events::TextChannel::System, false),
+            };
+            if write_to_reply {
                 if let Some(buf) = sinks.reply.as_deref_mut() {
                     buf.push_str(text);
                 }
-                if let Some(bus) = sinks.agent_event {
-                    let _ = bus.send(crate::events::AgentEvent {
-                        session_id: sinks.session_id.to_owned(),
-                        agent_id: sinks.agent_id.to_owned(),
-                        delta: text.clone(),
-                        done: false,
-                        files: Vec::new(),
-                        images: Vec::new(),
-                        tool_log: Vec::new(),
-                        question: None,
-                    });
-                }
+            }
+            if let Some(bus) = sinks.agent_event {
+                let _ = bus.send(crate::events::AgentEvent {
+                    session_id: sinks.session_id.to_owned(),
+                    agent_id: sinks.agent_id.to_owned(),
+                    delta: text.clone(),
+                    done: false,
+                    files: Vec::new(),
+                    images: Vec::new(),
+                    tool_log: Vec::new(),
+                    question: None,
+                    channel: Some(delta_channel),
+                });
             }
             false
         }
         AgentEvent::Thought { text, .. } => {
-            tracing::info!(target: "cap", agent = sinks.agent_id, thought = %text, "cap thought");
+            // Reasoning event distinct from TextChunk-Thought. Same UX
+            // intent: surface to subscribers as channel=Thought so the
+            // codex thinking phase isn't 30s of dead silence.
+            // Always logged at debug for noise control; the realtime
+            // path is the bus send below.
+            tracing::debug!(
+                target: "cap",
+                agent = sinks.agent_id,
+                thought_len = text.len(),
+                "cap thought event"
+            );
+            if let Some(bus) = sinks.agent_event {
+                let _ = bus.send(crate::events::AgentEvent {
+                    session_id: sinks.session_id.to_owned(),
+                    agent_id: sinks.agent_id.to_owned(),
+                    delta: text.clone(),
+                    done: false,
+                    files: Vec::new(),
+                    images: Vec::new(),
+                    tool_log: Vec::new(),
+                    question: None,
+                    channel: Some(crate::events::TextChannel::Thought),
+                });
+            }
             false
         }
         AgentEvent::ToolCallStart { name, .. } => {
+            // Don't push per-tool-call progress to the IM channel. Each cap
+            // dispatch can fire dozens of inner tool calls (Bash, Write,
+            // read_file, …); pushing one IM line per call drowns the user
+            // and hammers rate-limited channels (wechat ret=-2). The cap
+            // completion notification (`acp_done_summary`) gives the
+            // final state, which is what the user actually wants.
             tracing::debug!(target: "cap", agent = sinks.agent_id, tool = %name, "cap tool start");
-            if let Some(n) = sinks.notif {
-                let msg = crate::channel::OutboundMessage {
-                    target_id: n.target_id.clone(),
-                    is_group: n.is_group,
-                    text: format!("🔧 {name}"),
-                    reply_to: None,
-                    images: Vec::new(),
-                    files: Vec::new(),
-                    channel: Some(n.channel.clone()),
-                    account: None,
-                };
-                if let Err(e) = n.tx.send(msg) {
-                    tracing::warn!(target: "cap", err = %e, "cap tool-call notif send failed");
-                }
-            }
             false
         }
         AgentEvent::ToolCallEnd { is_error, .. } => {

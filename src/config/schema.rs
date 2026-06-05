@@ -1525,6 +1525,8 @@ pub struct FeishuConfig {
     pub api_base: Option<String>,
     /// WS endpoint request domain override (for testing). Defaults to https://open.feishu.cn
     pub ws_url: Option<String>,
+    /// Seconds to wait between WS reconnect attempts. Defaults to 5.
+    pub reconnect_delay_secs: Option<u64>,
     pub accounts: Option<HashMap<String, Value>>,
 }
 
@@ -1789,6 +1791,11 @@ pub struct SessionResultLimits {
 pub struct UploadConfig {
     /// Max file size before first confirmation (bytes, default 50MB)
     pub max_file_size: Option<usize>,
+    /// Idle read timeout (seconds) for inbound resource downloads (e.g. Feishu
+    /// file/video/voice). This is a read-idle timeout, not a total cap: a
+    /// slow-but-progressing download is never killed; only a fully stalled
+    /// connection fails after this many seconds without new bytes. Default 600.
+    pub download_timeout_secs: Option<u64>,
     /// Max text chars before token confirmation (default 20000)
     pub max_text_chars: Option<usize>,
     /// Whether current model supports vision/images

@@ -27,6 +27,7 @@ pub(crate) fn start_line_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
     task_queue: Arc<crate::gateway::task_queue::TaskQueueManager>,
+    shutdown: crate::gateway::ShutdownCoordinator,
 ) {
     use crate::channel::line::LineChannel;
 
@@ -434,19 +435,37 @@ pub(crate) fn start_line_if_configured(
             tracing::debug!("slot already set, skipping");
         }
         let line_send = Arc::clone(&line);
+        let shutdown_for_out = shutdown.clone();
         tokio::spawn(async move {
-            while let Some(msg) = out_rx.recv().await {
-                if let Err(e) = line_send.send(msg).await {
-                    error!("line send: {e:#}");
+            loop {
+                tokio::select! {
+                    () = shutdown_for_out.notified() => {
+                        info!("line: drain signaled, stopping outbound sender");
+                        break;
+                    }
+                    msg = out_rx.recv() => {
+                        let Some(msg) = msg else { break };
+                        if let Err(e) = line_send.send(msg).await {
+                            error!("line send: {e:#}");
+                        }
+                    }
                 }
             }
         });
         if let Err(e) = manager.register(Arc::clone(&line) as Arc<dyn Channel>) {
             tracing::warn!("failed to register channel: {e}");
         }
+        let shutdown_for_run = shutdown.clone();
         tokio::spawn(async move {
-            if let Err(e) = line.run().await {
-                error!("line channel: {e:#}");
+            tokio::select! {
+                res = line.run() => {
+                    if let Err(e) = res {
+                        error!("line channel: {e:#}");
+                    }
+                }
+                () = shutdown_for_run.notified() => {
+                    info!("line: drain signaled, stopping run loop");
+                }
             }
         });
         info!(account = %acct_for_log, "line channel started (webhook mode)");

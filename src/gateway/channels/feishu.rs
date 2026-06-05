@@ -52,6 +52,7 @@ pub(crate) fn start_feishu_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
     task_queue: Arc<crate::gateway::task_queue::TaskQueueManager>,
+    shutdown: crate::gateway::ShutdownCoordinator,
 ) {
     let fs_cfg = config.channel.channels.feishu.as_ref();
     if let Some(cfg) = fs_cfg {
@@ -145,6 +146,7 @@ pub(crate) fn start_feishu_if_configured(
 
     let feishu_api_base = fs_cfg.and_then(|c| c.api_base.clone());
     let feishu_ws_url = fs_cfg.and_then(|c| c.ws_url.clone());
+    let feishu_reconnect_delay = fs_cfg.and_then(|c| c.reconnect_delay_secs).unwrap_or(5);
     let max_file_size = config
         .ext
         .tools
@@ -152,6 +154,13 @@ pub(crate) fn start_feishu_if_configured(
         .and_then(|t| t.upload.as_ref())
         .and_then(|u| u.max_file_size)
         .unwrap_or(128_000_000);
+    let download_timeout_secs = config
+        .ext
+        .tools
+        .as_ref()
+        .and_then(|t| t.upload.as_ref())
+        .and_then(|u| u.download_timeout_secs)
+        .unwrap_or(600);
 
     for (acct_name, app_id, app_secret, brand) in fs_accounts {
         let reg = Arc::clone(&registry);
@@ -638,6 +647,8 @@ pub(crate) fn start_feishu_if_configured(
         fs_channel.api_base_override = feishu_api_base.clone();
         fs_channel.ws_url_override = feishu_ws_url.clone();
         fs_channel.max_file_size = max_file_size;
+        fs_channel.download_timeout_secs = download_timeout_secs;
+        fs_channel.ws_reconnect_delay_secs = feishu_reconnect_delay;
         let fs = Arc::new(fs_channel);
 
         // First account fills the webhook slot for backward compatibility.
@@ -668,17 +679,35 @@ pub(crate) fn start_feishu_if_configured(
         }
 
         let fs_send = Arc::clone(&fs);
+        let shutdown_for_out = shutdown.clone();
         tokio::spawn(async move {
-            while let Some(msg) = out_rx.recv().await {
-                if let Err(e) = fs_send.send(msg).await {
-                    error!("feishu send error: {e:#}");
+            loop {
+                tokio::select! {
+                    () = shutdown_for_out.notified() => {
+                        info!("feishu: drain signaled, stopping outbound sender");
+                        break;
+                    }
+                    msg = out_rx.recv() => {
+                        let Some(msg) = msg else { break };
+                        if let Err(e) = fs_send.send(msg).await {
+                            error!("feishu send error: {e:#}");
+                        }
+                    }
                 }
             }
         });
 
+        let shutdown_for_run = shutdown.clone();
         tokio::spawn(async move {
-            if let Err(e) = fs.run().await {
-                error!("feishu channel error: {e:#}");
+            tokio::select! {
+                res = fs.run() => {
+                    if let Err(e) = res {
+                        error!("feishu channel error: {e:#}");
+                    }
+                }
+                () = shutdown_for_run.notified() => {
+                    info!("feishu: drain signaled, stopping run loop");
+                }
             }
         });
 

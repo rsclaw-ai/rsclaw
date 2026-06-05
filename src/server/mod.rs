@@ -342,6 +342,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/hub/skills", get(hub_skills))
         .route("/hub/plugins", get(hub_plugins))
         .route("/hub/tools", get(hub_tools))
+        .route("/plugins/{name}/tools", get(plugin_describe))
         .route(
             "/computer-use/permissions",
             get(computer_use_permissions_list),
@@ -363,7 +364,7 @@ pub fn build_router(state: AppState) -> Router {
         // agent runtime's live store. Mutating endpoints (delete,
         // pin/unpin, importance bump) need shared-state coordination
         // and land in a follow-up.
-        .route("/memory/docs", get(memory_list_docs))
+        .route("/memory/docs", get(memory_list_docs).post(memory_add_doc))
         .route("/memory/stats", get(memory_stats));
 
     // Mount the knowledge base routes only when the store opened. A KB
@@ -613,6 +614,7 @@ async fn send_message(
         // Track this streaming request in the gateway's inflight count.
         // Guard moves into the filter_map closure and drops with the stream.
         let inflight_guard = state.shutdown.begin_work();
+        let shutdown_for_stream = state.shutdown.clone();
 
         let stream = tokio_stream::wrappers::BroadcastStream::new(rx)
             .filter_map(move |msg| {
@@ -652,7 +654,8 @@ async fn send_message(
                 if *done { return std::future::ready(None); }
                 if line.contains("[DONE]") { *done = true; }
                 std::future::ready(Some(Ok::<_, Infallible>(line)))
-            });
+            })
+            .take_until(Box::pin(async move { shutdown_for_stream.notified().await }));
 
         let mut hdrs = axum::http::HeaderMap::new();
         hdrs.insert(
@@ -671,6 +674,7 @@ async fn send_message(
 
     // Non-streaming: track inflight while we await the agent's full reply.
     let _inflight_guard = state.shutdown.begin_work();
+    let shutdown_for_wait = state.shutdown.clone();
     let timeout_secs = state
         .config
         .raw
@@ -679,7 +683,15 @@ async fn send_message(
         .and_then(|a| a.defaults.as_ref())
         .and_then(|d| d.timeout_seconds)
         .unwrap_or(600) as u64;
-    let reply = match tokio::time::timeout(Duration::from_secs(timeout_secs), reply_rx).await {
+    let reply = match tokio::select! {
+        r = tokio::time::timeout(Duration::from_secs(timeout_secs), reply_rx) => r,
+        () = shutdown_for_wait.notified() => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "gateway draining"})),
+            ).into_response();
+        }
+    } {
         Ok(Ok(r)) => r,
         Ok(Err(_)) => {
             return (
@@ -1206,6 +1218,73 @@ async fn hub_skills() -> impl IntoResponse {
 /// GET /api/v1/hub/plugins
 async fn hub_plugins() -> impl IntoResponse {
     Json(build_plugin_catalog().await)
+}
+
+/// GET /api/v1/plugins/{name}/tools — describe one plugin's tool surface.
+///
+/// Returns `{ plugin, runtime: "wasm"|"js", tools: [{ name, description,
+/// parameters }] }`. WASM plugins win on slug collision (matches
+/// /tools/execute dispatch order). The shape is intentionally agent-friendly
+/// — `rsclaw plugin describe <name>` and `rsclaw plugin call` consume this
+/// to know what args a given tool wants without the agent having to read
+/// plugin manifests off disk.
+async fn plugin_describe(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let name = name.trim();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "plugin name required"})),
+        )
+            .into_response();
+    }
+    if let Some(wp) = state.wasm_plugins.iter().find(|p| p.name == name) {
+        let tools: Vec<serde_json::Value> = wp
+            .tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                    "headline": t.headline,
+                })
+            })
+            .collect();
+        return Json(serde_json::json!({
+            "plugin": wp.name,
+            "runtime": "wasm",
+            "tools": tools,
+        }))
+        .into_response();
+    }
+    if let Some(plugin) = state.plugins.get_js(name) {
+        let tools: Vec<serde_json::Value> = plugin
+            .manifest
+            .tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.input_schema,
+                })
+            })
+            .collect();
+        return Json(serde_json::json!({
+            "plugin": plugin.manifest.name,
+            "runtime": "js",
+            "tools": tools,
+        }))
+        .into_response();
+    }
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": format!("plugin '{name}' not found")})),
+    )
+        .into_response()
 }
 
 /// GET /api/v1/hub/tools
@@ -2410,6 +2489,7 @@ async fn openai_chat_completions(
         // moved into the filter_map closure below; it drops when the stream
         // is dropped (client disconnect, [DONE] sent, or scan terminator).
         let inflight_guard = state.shutdown.begin_work();
+        let shutdown_for_stream = state.shutdown.clone();
 
         let stream = tokio_stream::wrappers::BroadcastStream::new(rx)
             .filter_map(move |msg| {
@@ -2450,7 +2530,8 @@ async fn openai_chat_completions(
                 if *done { return std::future::ready(None); }
                 if line.contains("[DONE]") { *done = true; }
                 std::future::ready(Some(Ok::<_, Infallible>(line)))
-            });
+            })
+            .take_until(Box::pin(async move { shutdown_for_stream.notified().await }));
 
         let mut response_headers = axum::http::HeaderMap::new();
         response_headers.insert(
@@ -2480,8 +2561,15 @@ async fn openai_chat_completions(
 
     // Non-streaming: track inflight while we await the agent's full reply.
     let _inflight_guard = state.shutdown.begin_work();
+    let shutdown_for_wait = state.shutdown.clone();
     let timeout_secs = state.config.agents.defaults.timeout_seconds.unwrap_or(600) as u64;
-    let reply = match tokio::time::timeout(Duration::from_secs(timeout_secs), reply_rx).await {
+    let reply = match tokio::select! {
+        r = tokio::time::timeout(Duration::from_secs(timeout_secs), reply_rx) => r,
+        () = shutdown_for_wait.notified() => {
+            return (StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error":{"message":"gateway draining","type":"server_error"}}))).into_response();
+        }
+    } {
         Ok(Ok(r)) => r,
         Ok(Err(_)) => {
             return (StatusCode::INTERNAL_SERVER_ERROR,
@@ -4083,6 +4171,143 @@ async fn memory_stats(State(state): State<AppState>) -> impl IntoResponse {
         by_kind,
         by_scope,
         pinned,
+    })
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryAddRequest {
+    text: String,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    importance: Option<f32>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+    #[serde(default)]
+    pinned: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryAddResponse {
+    id: String,
+    scope: String,
+    kind: String,
+    tier: String,
+    deduped: bool,
+}
+
+/// POST /api/v1/memory/docs — write a memory entry.
+///
+/// Inserts via the same `add_off_lock` path the agent runtime uses, so
+/// embeddings are computed off the store mutex and the new doc is
+/// immediately discoverable by subsequent searches. If an identical
+/// (scope, kind, text) tuple already exists, returns that doc's id and
+/// flags `deduped: true` instead of creating a duplicate.
+async fn memory_add_doc(
+    State(state): State<AppState>,
+    Json(req): Json<MemoryAddRequest>,
+) -> impl IntoResponse {
+    let text = req.text.trim().to_owned();
+    if text.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "text required"})),
+        )
+            .into_response();
+    }
+    let Some(mem) = live_memory_store(&state) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "memory store not available"})),
+        )
+            .into_response();
+    };
+    let scope = req
+        .scope
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "global".to_owned());
+    let kind = req
+        .kind
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "fact".to_owned());
+    let importance = req.importance.unwrap_or(0.7).clamp(0.0, 1.0);
+    let tags = req.tags.unwrap_or_default();
+    let pinned = req.pinned.unwrap_or(false);
+
+    // Dedupe lookup BEFORE generating an id so an HTTP caller hammering
+    // the endpoint with the same fact doesn't keep creating new ids.
+    if let Some(existing) = {
+        let store = mem.lock().await;
+        store
+            .find_exact(&scope, &kind, &text)
+            .map(|d| MemoryAddResponse {
+                id: d.id.clone(),
+                scope: d.scope.clone(),
+                kind: d.kind.clone(),
+                tier: match d.tier {
+                    crate::agent::memory::MemDocTier::Core => "core",
+                    crate::agent::memory::MemDocTier::Working => "working",
+                    crate::agent::memory::MemDocTier::Peripheral => "peripheral",
+                }
+                .to_string(),
+                deduped: true,
+            })
+    } {
+        return Json(existing).into_response();
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let doc = crate::agent::memory::MemoryDoc {
+        id: id.clone(),
+        scope: scope.clone(),
+        kind: kind.clone(),
+        text,
+        vector: vec![],
+        created_at: 0,
+        accessed_at: 0,
+        access_count: 0,
+        importance,
+        tier: Default::default(),
+        abstract_text: None,
+        overview_text: None,
+        tags,
+        pinned,
+    };
+    if let Err(e) = crate::agent::memory::add_off_lock(&mem, doc).await {
+        warn!(error = %e, "memory_add: store insert failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{e:#}")})),
+        )
+            .into_response();
+    }
+
+    // Re-read to surface the tier the store actually evaluated this doc
+    // into (Core/Working/Peripheral depends on importance + thresholds).
+    let tier_str = {
+        let store = mem.lock().await;
+        store
+            .get_sync(&id)
+            .map(|d| match d.tier {
+                crate::agent::memory::MemDocTier::Core => "core",
+                crate::agent::memory::MemDocTier::Working => "working",
+                crate::agent::memory::MemDocTier::Peripheral => "peripheral",
+            })
+            .unwrap_or("working")
+            .to_string()
+    };
+
+    Json(MemoryAddResponse {
+        id,
+        scope,
+        kind,
+        tier: tier_str,
+        deduped: false,
     })
     .into_response()
 }

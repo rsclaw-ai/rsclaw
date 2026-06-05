@@ -57,7 +57,9 @@ pub use env::{EnvCommand, EnvSyncArgs};
 pub use gateway::{GatewayCommand, GatewayRunArgs};
 pub use hooks::HooksCommand;
 pub use kb::KbCommand;
-pub use memory::{MemoryCommand, MemoryIndexArgs, MemorySearchArgs, MemoryStatusArgs};
+pub use memory::{
+    MemoryCommand, MemoryIndexArgs, MemorySaveArgs, MemorySearchArgs, MemoryStatusArgs,
+};
 pub use message::MessageCommand;
 pub use migrate::MigrateArgs;
 pub use models::{

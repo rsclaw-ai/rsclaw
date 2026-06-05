@@ -240,7 +240,7 @@
     },
     {
       "name": "task",
-      "description": "Escalate the user's current request into a multi-turn background task. Call this ONLY when the work clearly needs sustained execution: implementation across multiple files, multi-step debugging, deep research with many web fetches, data pipelines, end-to-end deployments. Do NOT call for: greetings, casual questions, single tool calls (one web_search, one read_file, one calculation), explanations, or anything you can answer in this same turn. When in doubt, just answer directly — the user can always send `/task <request>` to escalate manually.\n\nReturns a task ID; the gateway then runs the work in the background and posts replies as turns complete. After calling task, your reply to the user should be a short acknowledgement only — the actual work happens in the background turns.",
+      "description": "Escalate the user's current request into a multi-turn background task. Call this ONLY when the work clearly needs sustained execution: implementation across multiple files, multi-step debugging, deep research with many web fetches, data pipelines, end-to-end deployments. Do NOT call for: greetings, casual questions, single tool calls (one web_search, one read_file, one calculation), explanations, or anything you can answer in this same turn. Do NOT use this to dispatch to an external CLI coding agent (claude / claudecode / openclaude / opencode / codex) — those need `cap`, not `task`. When in doubt, just answer directly — the user can always send `/task <request>` to escalate manually.\n\nReturns a task ID; the gateway then runs the work in the background and posts replies as turns complete. After calling task, your reply to the user should be a short acknowledgement only — the actual work happens in the background turns.",
       "input_schema": {
         "type": "object",
         "properties": {
@@ -654,7 +654,7 @@
     },
     {
       "name": "agent",
-      "description": "Manage agents. You are the architect — delegate work, never block.\nActions:\n- task: Create a task agent for a one-shot job. Returns immediately with task_id. The task agent runs independently and delivers results when done.\n- spawn: Create a persistent agent (survives across turns).\n- send: Send a message to an existing agent (async, result delivered when done).\n- list: List all registered agents.\n- update: Edit a named agent's config (model, name). Pass model=\"\" to remove and fall back to defaults. Hot-reloads automatically.\n- kill: Stop an agent.\nTips:\n- Use task for independent, parallelizable work. You can dispatch multiple tasks at once.\n- Always specify toolset matching the task (web for search, code for file ops).\n- After dispatching, tell the user what you delegated and continue with other work.\n\nCRITICAL: When user EXPLICITLY asks to use a specific tool (opencode, claudecode, codex),\nyou MUST call that tool directly. DO NOT create a task agent instead.\n- User says \"让opencode去...\" -> call opencode tool (action=call, NOT task agent)\n- User says \"用claudecode...\" -> call claudecode tool\n\n[HARD RULE - DECEPTION]\nClaiming \"已委托opencode\" or \"已用opencode检查\" WITHOUT a tool_call is LYING.\nIf you say these words, there MUST be an actual opencode tool call in this turn.\nNo tool call + claim of delegation = you are deceiving the user.\nThis is worse than admitting \"I didn't call it\" - trust is destroyed.\n\nDO NOT delegate these tasks — handle them yourself directly:\n- Any GUI/desktop automation (WeChat, Finder, Safari, system apps, etc.)\n- Anything using `computer_use` (screenshot, click, key, type)\n- AppleScript/osascript workflows that control another application\n- Visual verification (\"did the window appear?\", \"is the button there?\")\nReason: GUI tasks depend on live state (frontmost window, mouse position, display\nfocus) and the current session's permission grants. Sub-agents start fresh with\nno visual context and frequently fail on first attempts, creating loops. The\nmain agent that already has the screenshot/context should complete these tasks.\n\nDON'T PEEK / DON'T RACE (for action=task):\n- After dispatching a task agent, do NOT call action=list, action=send, or any\nother status probe in the same conversation just to check progress. You will\nbe notified when the task completes — polling burns turns and pollutes context.\n- Do NOT predict, summarize, or fabricate the task's findings before the\nnotification arrives. If the user asks mid-flight, say it's still running.\n- If you need the result before you can proceed, you delegated wrong — either\ndo the work inline, or accept this turn ends here and resume in a later turn.\n\nWRITING THE TASK PROMPT (the single biggest quality lever):\n- Brief the task agent like a colleague who just walked in. It has zero context\nfrom this conversation — no idea what you've tried, what's been ruled out, or\nwhy the work matters.\n- Include: the goal, what you already know, what the agent should NOT do (so it\ndoesn't duplicate your work), the exit criterion (\"report under 200 words\",\n\"return the diff\", \"give a yes/no with one sentence of evidence\").\n- For lookups, hand over the exact command. For investigations, hand over the\nquestion — prescribed steps die when the premise is wrong.\n- Terse one-line prompts produce shallow generic work. Spend the tokens up front.",
+      "description": "Manage agents. You are the architect — delegate work, never block.\nActions:\n- task: Create a task agent for a one-shot job. Returns immediately with task_id. The task agent runs independently and delivers results when done.\n- spawn: Create a persistent agent (survives across turns).\n- send: Send a message to an existing agent (async, result delivered when done).\n- list: List all registered agents.\n- update: Edit a named agent's config (model, name). Pass model=\"\" to remove and fall back to defaults. Hot-reloads automatically.\n- kill: Stop an agent.\nTips:\n- Use task for independent, parallelizable work. You can dispatch multiple tasks at once.\n- Always specify toolset matching the task (web for search, code for file ops).\n- After dispatching, tell the user what you delegated and continue with other work.\n\nCRITICAL: When the user names a CLI coding agent (claude, claudecode, openclaude,\nopencode, codex), dispatch via `cap(agent=..., task=...)` — NOT this `agent` tool.\nThis tool's `task` action creates an INTERNAL background sub-agent; it does not\nspawn any external coding CLI and will never produce the output the user expects.\n- User says \"让opencode去...\" -> `cap(agent=\"opencode\", task=...)`\n- User says \"用claudecode...\" -> `cap(agent=\"claudecode\", task=...)`\n- User names multiple agents in one request -> issue multiple `cap` calls, one per agent.\n\n[HARD RULE - DECEPTION]\nClaiming \"已委托opencode\" / \"已派发给四个 coding agent\" / similar WITHOUT a `cap`\ntool_call is LYING. If you say these words, there MUST be a `cap` call in this turn\nfor each named agent. No tool call + claim of delegation = you are deceiving the user.\nThis is worse than admitting \"I didn't call it\" - trust is destroyed.\n\nDO NOT delegate these tasks — handle them yourself directly:\n- Any GUI/desktop automation (WeChat, Finder, Safari, system apps, etc.)\n- Anything using `computer_use` (screenshot, click, key, type)\n- AppleScript/osascript workflows that control another application\n- Visual verification (\"did the window appear?\", \"is the button there?\")\nReason: GUI tasks depend on live state (frontmost window, mouse position, display\nfocus) and the current session's permission grants. Sub-agents start fresh with\nno visual context and frequently fail on first attempts, creating loops. The\nmain agent that already has the screenshot/context should complete these tasks.\n\nDON'T PEEK / DON'T RACE (for action=task):\n- After dispatching a task agent, do NOT call action=list, action=send, or any\nother status probe in the same conversation just to check progress. You will\nbe notified when the task completes — polling burns turns and pollutes context.\n- Do NOT predict, summarize, or fabricate the task's findings before the\nnotification arrives. If the user asks mid-flight, say it's still running.\n- If you need the result before you can proceed, you delegated wrong — either\ndo the work inline, or accept this turn ends here and resume in a later turn.\n\nWRITING THE TASK PROMPT (the single biggest quality lever):\n- Brief the task agent like a colleague who just walked in. It has zero context\nfrom this conversation — no idea what you've tried, what's been ruled out, or\nwhy the work matters.\n- Include: the goal, what you already know, what the agent should NOT do (so it\ndoesn't duplicate your work), the exit criterion (\"report under 200 words\",\n\"return the diff\", \"give a yes/no with one sentence of evidence\").\n- For lookups, hand over the exact command. For investigations, hand over the\nquestion — prescribed steps die when the premise is wrong.\n- Terse one-line prompts produce shallow generic work. Spend the tokens up front.",
       "input_schema": {
         "type": "object",
         "properties": {
@@ -711,18 +711,21 @@
     },
     {
       "name": "install_tool",
-      "description": "Install a tool/runtime. Available: bun, chrome, claude-code, ffmpeg, node, opencode, python, sherpa-onnx.",
+      "description": "Install a tool/runtime. Available: aider, bun, chrome, claude-code, codex, ffmpeg, node, openclaude, opencode, python, sherpa-onnx.",
       "input_schema": {
         "type": "object",
         "properties": {
           "name": {
             "type": "string",
             "enum": [
+              "aider",
               "bun",
               "chrome",
               "claude-code",
+              "codex",
               "ffmpeg",
               "node",
+              "openclaude",
               "opencode",
               "python",
               "sherpa-onnx"
@@ -1616,6 +1619,61 @@
         },
         "required": [
           "action"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      }
+    },
+    {
+      "name": "cap_live",
+      "description": "Interactive (synchronous) call into a CLI coding agent that keeps its session warm across multiple turns. Use this — NOT `cap` — when you want to chain several requests against the same agent (e.g. ask codex to design, then ask the same codex session to refine), or to orchestrate multiple agents in one IM turn (codex designs → claudecode implements → opencode reviews, each with their own session_id). Returns the agent's full reply synchronously, plus a `session_id` you pass back on subsequent calls to continue the same warm session. Omit `session_id` (or pass an empty string) to open a brand-new session. Call `cap_live_end` when done. For one-shot fire-and-forget work where you don't need to read the agent's reply in this turn, prefer the async `cap` tool instead — it returns immediately and pushes the completion summary to the user via IM.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "agent": {
+            "type": "string",
+            "enum": [
+              "claudecode",
+              "openclaude",
+              "opencode",
+              "codex"
+            ],
+            "description": "Which CLI coding agent to dispatch to. A session is locked to one agent — you can't pass session_id from a codex call to a claudecode call."
+          },
+          "task": {
+            "type": "string",
+            "description": "Prompt for the agent (this turn)."
+          },
+          "session_id": {
+            "type": "string",
+            "description": "Optional. Pass back the value returned from a prior cap_live call to continue the same session. Omit or leave empty to open a new session."
+          },
+          "cwd": {
+            "type": "string",
+            "description": "Optional working directory for NEW sessions (ignored when continuing an existing session_id)."
+          }
+        },
+        "required": [
+          "agent",
+          "task"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      }
+    },
+    {
+      "name": "cap_live_end",
+      "description": "Release a `cap_live` session and tear down its underlying driver process. Always call this when you're done orchestrating a multi-turn cap session, both to free the global session limit (default 8) and to avoid keeping coding-CLI processes warm in the background. Idle sessions auto-close after 10 minutes anyway, but explicit cleanup is good citizenship.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "description": "session_id returned by a prior cap_live call."
+          }
+        },
+        "required": [
+          "session_id"
         ],
         "additionalProperties": false,
         "$schema": "http://json-schema.org/draft-07/schema#"

@@ -117,6 +117,54 @@ interface host-media {
     extract-keyframes: func(video-path: string, count: u32) -> result<list<string>, string>;
 }
 
+interface host-android {
+    /// Tap screen at absolute coordinate.
+    android-tap: func(x: u32, y: u32) -> result<string, string>;
+
+    /// Swipe from (x1,y1) to (x2,y2) over duration-ms milliseconds.
+    android-swipe: func(x1: u32, y1: u32, x2: u32, y2: u32, duration-ms: u32) -> result<string, string>;
+
+    /// Type text into the currently focused element (equivalent to send_keys).
+    android-type: func(text: string) -> result<string, string>;
+
+    /// Press a hardware/nav key by name: back, home, enter.
+    android-press: func(key: string) -> result<string, string>;
+
+    /// Get full UI hierarchy as XML. Set compressed=false for WebView or Flutter content.
+    android-get-ui-xml: func(compressed: bool) -> result<string, string>;
+
+    /// Get current foreground "package/ActivityName".
+    android-current-activity: func() -> result<string, string>;
+
+    /// Launch app by package name and wait for it to become foreground.
+    android-launch-app: func(pkg: string) -> result<string, string>;
+
+    /// Force-stop app by package name.
+    android-stop-app: func(pkg: string) -> result<string, string>;
+
+    /// Capture screenshot as data:image/png;base64,... URI.
+    android-screenshot: func() -> result<string, string>;
+
+    /// Find elements by selector. Returns JSON array of {text, resource-id, content-desc, bounds, clickable}.
+    /// selector-type: "resource-id" | "text" | "text-contains" | "content-desc" | "content-desc-contains" | "class"
+    android-find-elements: func(selector-type: string, selector-value: string) -> result<string, string>;
+
+    /// Tap the first element matching selector. Returns "tapped" or error.
+    android-tap-element: func(selector-type: string, selector-value: string) -> result<string, string>;
+
+    /// Get text content of the first element matching selector.
+    android-get-element-text: func(selector-type: string, selector-value: string) -> result<string, string>;
+
+    /// Set text of the first element matching selector, clearing existing content.
+    android-set-element-text: func(selector-type: string, selector-value: string, text: string) -> result<string, string>;
+
+    /// Return whether any element matching selector is currently on screen.
+    android-element-exists: func(selector-type: string, selector-value: string) -> result<bool, string>;
+
+    /// Wait up to timeout-ms for an element matching selector to appear. Returns "found" or error.
+    android-wait-for-element: func(selector-type: string, selector-value: string, timeout-ms: u32) -> result<string, string>;
+}
+
 interface host-desktop {
     /// Activate an application by bundle-id (macOS), exe name (Windows), or WM_CLASS (Linux).
     desktop-activate-app: func(bundle-id: string) -> result<string, string>;
@@ -196,6 +244,7 @@ world jimeng-plugin {
     import host-runtime;
     import host-storage;
     import host-media;
+    import host-android;
     import host-desktop;
     import host-vlm;
     export plugin-api;

@@ -80,17 +80,43 @@ fn enrich_process_path() {
         }
     };
 
-    // HIGHEST priority: the single rsclaw shim dir {base_dir}/tools/bin,
-    // populated by sync_tool_shims() with symlinks to each install_tool-
-    // managed binary under its canonical command name. One clean entry that
-    // wins over any system-wide install; respects --profile / --base-dir.
-    push_if(
-        crate::config::loader::base_dir()
-            .join("tools")
-            .join("bin")
-            .to_string_lossy()
-            .to_string(),
-    );
+    // HIGHEST priority: rsclaw-managed tools under {base_dir}/tools, winning
+    // over any system-wide install; respects --profile / --base-dir.
+    let tools = crate::config::loader::base_dir().join("tools");
+    #[cfg(unix)]
+    {
+        // One clean shim dir of symlinks (sync_tool_shims) to each
+        // install_tool-managed binary under its canonical command name.
+        push_if(tools.join("bin").to_string_lossy().to_string());
+    }
+    #[cfg(windows)]
+    {
+        // No shim dir on Windows (symlinks need privilege; an .exe must stay
+        // beside its sibling DLLs). Add each tool's own dir + bin/ +
+        // node_modules/.bin so `<tool>.exe`/`.cmd` resolves by name in place.
+        if let Ok(entries) = std::fs::read_dir(&tools) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    push_if(p.join("node_modules").join(".bin").to_string_lossy().to_string());
+                    push_if(p.join("bin").to_string_lossy().to_string());
+                    push_if(p.to_string_lossy().to_string());
+                }
+            }
+        }
+        // claude-code's Windows binary lives deep under the npm package tree:
+        // tools/claude-code/node_modules/@anthropic-ai/claude-code/bin/claude.exe
+        push_if(
+            tools
+                .join("claude-code")
+                .join("node_modules")
+                .join("@anthropic-ai")
+                .join("claude-code")
+                .join("bin")
+                .to_string_lossy()
+                .to_string(),
+        );
+    }
 
     // System / package-manager dirs next.
     #[cfg(target_os = "macos")]
@@ -390,6 +416,24 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // `tool_cap` works in production (not just unit tests).
     let cap_manager = std::sync::Arc::new(crate::cap::CapAgentManager::new(event_tx.clone()));
 
+    // Interactive cap session manager (Phase 1 of cap multi-instance
+    // sessions). Shared the same way as `cap_manager` so every
+    // AgentRuntime can offer the `cap_live` tool to its LLM.
+    //
+    // Wire the outbound notification channel BEFORE wrapping in Arc so
+    // preparse-side `/cap` follow-up tasks (resume-id hint after Ready
+    // fires) can push to IM without per-channel plumbing.
+    let cap_live_manager = {
+        let mut m = crate::cap::CapLiveManager::new(event_tx.clone());
+        m.set_notification_tx(notification_tx.clone());
+        std::sync::Arc::new(m)
+    };
+    // Publish a process-wide handle so preparse (`/cap`, `/cap-exit`)
+    // can register sticky IM bindings without per-channel plumbing.
+    // Set BEFORE any channel inbound task is spawned; runtime code
+    // accesses the manager via `self.cap_live_manager` directly.
+    crate::cap::set_global_cap_live(std::sync::Arc::clone(&cap_live_manager));
+
     // Build LiveConfig BEFORE the spawner: hot-reloadable per-domain locks
     // that AgentRuntime reads for live-mutable fields (temperature, etc.).
     let live = Arc::new(LiveConfig::new((*config).clone()));
@@ -413,6 +457,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         Some(Arc::clone(&plugins)),
         model_health.clone(),
         Some(Arc::clone(&cap_manager)),
+        Some(Arc::clone(&cap_live_manager)),
     );
 
     // Spawn MCP servers and discover tools (before agent tasks so tools are
@@ -470,6 +515,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         Arc::clone(&computer_runs),
         model_health.clone(),
         Arc::clone(&cap_manager),
+        Arc::clone(&cap_live_manager),
     );
 
     // Set i18n default language from gateway config.
@@ -751,6 +797,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         Arc::clone(&custom_webhooks),
         Arc::clone(&channel_senders),
         Arc::clone(&store.db),
+        shutdown.clone(),
     );
 
     // Register desktop channel — routes cron delivery to connected WS clients.
@@ -1236,9 +1283,15 @@ fn try_service_self_restart() -> bool {
     #[cfg(target_os = "macos")]
     {
         // launchd sets XPC_SERVICE_NAME (= job label) for managed processes.
-        // Absence means we're not under launchd → fall back to native respawn.
-        let Ok(label) = std::env::var("XPC_SERVICE_NAME") else {
-            return false;
+        // BUT macOS sets it to the literal string "0" for processes that are
+        // NOT launched as a managed service (shells, `cargo run`, Terminal
+        // children). Treating "0" (or empty) as "supervised" sends us to
+        // `launchctl kickstart gui/<uid>/0`, which fails with "Could not find
+        // service 0" on every restart before falling back. Only a real job
+        // label means we're actually supervised.
+        let label = match std::env::var("XPC_SERVICE_NAME") {
+            Ok(l) if !l.is_empty() && l != "0" => l,
+            _ => return false,
         };
         info!(label = %label, "detected launchd supervision; kickstarting via launchctl");
         // Try the user agent domain first (gui/<uid>/<label>), then the
@@ -1444,6 +1497,7 @@ fn spawn_agent_tasks(
     >,
     model_health: crate::provider::health::ProviderHealthRegistry,
     cap_manager: std::sync::Arc<crate::cap::CapAgentManager>,
+    cap_live_manager: std::sync::Arc<crate::cap::CapLiveManager>,
 ) {
     for (agent_id, mut rx) in receivers {
         let handle = match registry.get(&agent_id) {
@@ -1487,6 +1541,7 @@ fn spawn_agent_tasks(
             notification_tx.clone(),
             model_health.clone(),
             Some(Arc::clone(&cap_manager)),
+            Some(Arc::clone(&cap_live_manager)),
         );
 
         // Inject WASM plugins into the agent runtime.
@@ -1557,6 +1612,32 @@ fn spawn_agent_tasks(
                     cancel_token: Some(turn_token.clone()),
                     input_request_tx,
                 };
+                // Per-turn stuck-turn watchdog (P2c). If a single user turn
+                // runs longer than this without completing, assume something
+                // is wedged (LLM provider hang, runaway tool-call loop, a
+                // tool that ignored its own internal deadline) and force-
+                // abort the turn via the cancel_token. Generous because
+                // long legitimate cap_live + multi-tool turns can take a
+                // while, but tight enough to keep the single-threaded
+                // agent queue from going dark for an hour.
+                const TURN_WALL_CLOCK_LIMIT: std::time::Duration =
+                    std::time::Duration::from_secs(20 * 60);
+                let watchdog_token = turn_token.clone();
+                let watchdog_agent = handle.id.clone();
+                let watchdog_session = session_key.clone();
+                let watchdog = tokio::spawn(async move {
+                    tokio::time::sleep(TURN_WALL_CLOCK_LIMIT).await;
+                    if !watchdog_token.is_cancelled() {
+                        tracing::error!(
+                            agent = %watchdog_agent,
+                            session = %watchdog_session,
+                            limit_s = TURN_WALL_CLOCK_LIMIT.as_secs(),
+                            "stuck-turn watchdog: firing cancel_token — turn exceeded \
+                             wall-clock limit; the agent queue must not stay dark"
+                        );
+                        watchdog_token.cancel();
+                    }
+                });
                 let result = tokio::select! {
                     biased;
                     // Hard cancel: drops the run_turn future (and every await
@@ -1576,6 +1657,11 @@ fn spawn_agent_tasks(
                         turn_ctx,
                     ) => r,
                 };
+                // Turn completed (success/error/cancel) — stop the watchdog.
+                // If the watchdog already fired the cancel, the select! above
+                // already exited via the cancellation branch; this abort is
+                // just hygiene to release the spawned task.
+                watchdog.abort();
                 // Drop our registered token so a later abort for this session
                 // can't cancel a future turn, and the map doesn't leak.
                 if registered {
@@ -1662,6 +1748,7 @@ fn spawn_agent_tasks(
                             images: vec![],
                             tool_log: vec![],
                             question: None,
+                            channel: None,
                         });
                     }
                     // receiver may have been dropped
@@ -1674,6 +1761,7 @@ fn spawn_agent_tasks(
                         images: vec![],
                         tool_log: vec![],
                         question: None,
+                        channel: None,
                     });
                 }
                 // receiver may have been dropped (e.g. channel timeout)

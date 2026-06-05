@@ -19,6 +19,7 @@ pub mod docs;
 pub mod doctor;
 pub mod env;
 pub mod gateway;
+pub mod gateway_http;
 pub mod hooks;
 pub mod kb;
 pub mod memory;

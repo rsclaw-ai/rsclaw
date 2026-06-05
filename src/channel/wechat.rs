@@ -1705,6 +1705,7 @@ impl Channel for WeChatPersonalChannel {
             };
             if !msg.text.trim().is_empty() {
                 let chunks = chunk_text(&msg.text, &chunk_cfg);
+                let n = chunks.len();
                 for (i, chunk) in chunks.iter().enumerate() {
                     match self.send_text(&msg.target_id, chunk).await {
                         Ok(()) => {}
@@ -1717,6 +1718,11 @@ impl Channel for WeChatPersonalChannel {
                             warn!(chunk = i, "wechat: text chunk rejected by upstream: {e:#}");
                         }
                         Err(e) => return Err(e),
+                    }
+                    // Inter-chunk delay: wechat ilink rejects (ret=-2) on
+                    // back-to-back sends to the same recipient within ~1s.
+                    if i + 1 < n {
+                        tokio::time::sleep(Duration::from_millis(800)).await;
                     }
                 }
             }

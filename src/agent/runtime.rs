@@ -114,6 +114,11 @@ pub struct LiveStatus {
     pub started_at: Option<std::time::Instant>,
     /// Session key for the current turn.
     pub session_key: String,
+    /// Tools currently running this turn (parallel dispatch). Each entry
+    /// is (tool_name, started_at). Populated at dispatch_tool entry,
+    /// drained at exit. /status renders one line per entry so the user
+    /// can see "search_file running for 8min" instead of a silent hang.
+    pub in_flight_tools: Vec<(String, std::time::Instant)>,
 }
 
 pub use super::context_mgr::estimate_tokens;
@@ -790,6 +795,11 @@ pub struct AgentRuntime {
     /// Coding-agent proxy (Claude Code, Opencode, Codex, Amp). `None` until
     /// Task 9 wires up construction; `None` outside the gateway.
     pub(crate) cap_manager: Option<std::sync::Arc<crate::cap::CapAgentManager>>,
+    /// Interactive multi-instance cap session manager — backs the
+    /// `cap_live` / `cap_live_end` tools and the IM `/cap` direct-mode
+    /// command. Shares the same driver primitives as `cap_manager` but
+    /// keeps long-lived drivers keyed by session_id.
+    pub(crate) cap_live_manager: Option<std::sync::Arc<crate::cap::CapLiveManager>>,
 }
 
 impl AgentRuntime {
@@ -810,6 +820,7 @@ impl AgentRuntime {
         notification_tx: Option<tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>>,
         model_health: crate::provider::health::ProviderHealthRegistry,
         cap_manager: Option<std::sync::Arc<crate::cap::CapAgentManager>>,
+        cap_live_manager: Option<std::sync::Arc<crate::cap::CapLiveManager>>,
     ) -> Self {
         // Populate auth.order so FailoverManager uses the configured profile
         // priority per provider (AGENTS.md §12).
@@ -873,6 +884,7 @@ impl AgentRuntime {
             session_aliases,
             exec_pool,
             cap_manager,
+            cap_live_manager,
         };
 
         // Purge any internal-session history left over in redb from older
@@ -2168,6 +2180,287 @@ impl AgentRuntime {
         // key, use that so all messages stay under one session.
         let session_key = self.resolve_session_key(session_key).to_owned();
         let session_key = session_key.as_str();
+
+        // cap_live sticky direct mode: if /cap <agent> was issued on this
+        // IM session, route plain-text user messages straight to the cap
+        // driver, skipping the main LLM. The slash-command registration
+        // happens in preparse (`/cap`, `/cap-exit`); here we only consume
+        // the binding. Slash commands that preparse didn't handle still
+        // get routed to the driver — sticky means "everything to the
+        // subagent."
+        if let Some(manager) = self.cap_live_manager.as_ref() {
+            if let Some((live_sid, kind)) = manager.resolve_sticky(session_key).await {
+                // One-shot memory injection: on the FIRST user message
+                // after a fresh `/cap <agent>` bind, prepend whatever
+                // rsclaw's auto-recall has on this user (preferences,
+                // prior facts, project context) so the cap subagent
+                // starts the conversation with the same background the
+                // main LLM would have had. Subsequent turns skip — the
+                // driver process keeps its own history, so re-injecting
+                // would just burn tokens. `/cap-resume` also skips
+                // (resume_mode != None sets pending=false at spawn).
+                let task = if manager
+                    .try_take_pending_memory_inject(&live_sid)
+                    .await
+                {
+                    let mem_part = self
+                        .build_auto_recall_bundle(&self.handle.id, channel, text)
+                        .await
+                        .filter(|b| !b.context.trim().is_empty());
+                    let helper_part = build_cap_helper_cheatsheet(&self.skills);
+                    if mem_part.is_some() || !helper_part.is_empty() {
+                        tracing::info!(
+                            target: "cap",
+                            live_session_id = %live_sid,
+                            mem_docs = mem_part.as_ref().map(|b| b.metadata.doc_ids.len()).unwrap_or(0),
+                            helper_chars = helper_part.len(),
+                            "sticky bypass: injecting first-turn background"
+                        );
+                        let mem_block = match &mem_part {
+                            Some(b) => format!(
+                                "## Long-term memory (from prior conversations)\n\n{}\n\n",
+                                b.context.trim()
+                            ),
+                            None => String::new(),
+                        };
+                        format!(
+                            "<background_from_main_agent_memory>\n\
+                             You are a coding subagent that rsclaw (the main \
+                             chat-side agent) has bridged into this user's \
+                             IM session. The user can still read everything \
+                             you say. Treat the items below as hints — they \
+                             come from rsclaw's own memory and tooling — \
+                             and verify before acting on them.\n\n\
+                             {}{}\
+                             </background_from_main_agent_memory>\n\n\
+                             ---\n\n\
+                             {}",
+                            mem_block, helper_part, text
+                        )
+                    } else {
+                        text.to_owned()
+                    }
+                } else {
+                    text.to_owned()
+                };
+                tracing::info!(
+                    target: "cap",
+                    session = session_key,
+                    live_session_id = %live_sid,
+                    agent = kind.as_str(),
+                    "sticky bypass: routing user message direct to cap driver"
+                );
+                let lang = self
+                    .config
+                    .raw
+                    .gateway
+                    .as_ref()
+                    .and_then(|g| g.language.as_deref())
+                    .map(crate::i18n::resolve_lang)
+                    .unwrap_or("en");
+
+                // -----------------------------------------------------
+                // Phase 2b — chunked streaming to IM.
+                //
+                // The cap actor already broadcasts every TextChunk to
+                // `event_bus` keyed by the pseudo session_id
+                // `cap-live-<agent>-<sid>` (see
+                // `src/cap/runtime.rs::run_turn` → bridge.rs::dispatch).
+                // The desktop UI subscribes to that bus directly and
+                // streams tokens. IM channels do NOT subscribe — they
+                // only see `OutboundMessage`s pushed on
+                // `notification_tx`. So we plant a sibling task here
+                // that bridges the two: subscribe → debounce → push.
+                //
+                // Without this, a long cap reply (100s of tokens, many
+                // tens of seconds) would land on feishu/wechat as a
+                // single late message — the user sees silence the
+                // whole time. With the bridge, partial chunks arrive
+                // every ~1s, matching the chat-UI "still typing" feel.
+                //
+                // Outline:
+                //   - Detect IM target: channel + peer/chat + group flag
+                //     come from run_turn args; group routing keys off
+                //     session_key's ":group:" segment.
+                //   - Spawn chunker task subscribed to event_bus.
+                //   - Run dispatch_sync (which fills event_bus
+                //     synchronously via run_turn → bridge::dispatch).
+                //   - Signal chunker to flush + exit.
+                //   - Suppress final AgentReply.text if anything was
+                //     streamed — otherwise the user sees the whole
+                //     reply twice.
+                //
+                // Falls back to the pre-2b non-streaming path when:
+                //   - `notification_tx` is None (WS-only sessions),
+                //   - or `event_bus` is None (test runtimes / agent
+                //     constructed without a bus).
+                let pseudo_session_id =
+                    format!("cap-live-{}-{}", kind.as_str(), live_sid);
+                let im_target_id = if session_key.contains(":group:") {
+                    chat_id.to_owned()
+                } else {
+                    peer_id.to_owned()
+                };
+                let im_is_group = session_key.contains(":group:");
+                let can_stream = self.notification_tx.is_some()
+                    && self.event_bus.is_some()
+                    && !im_target_id.is_empty();
+
+                let chunker_handle = if can_stream {
+                    let notif_tx = self
+                        .notification_tx
+                        .as_ref()
+                        .expect("checked above")
+                        .clone();
+                    let bus_rx = self
+                        .event_bus
+                        .as_ref()
+                        .expect("checked above")
+                        .subscribe();
+                    let chunk_count =
+                        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
+                    let chunker_chunk_count = std::sync::Arc::clone(&chunk_count);
+                    let chunker_session = pseudo_session_id.clone();
+                    let chunker_channel = channel.to_owned();
+                    let chunker_target = im_target_id.clone();
+                    let chunker_account = self
+                        .notification_tx
+                        .is_some()
+                        .then(|| None::<String>) // best-effort: outbound dispatcher figures out account from session
+                        .flatten();
+                    let handle = tokio::spawn(stream_cap_chunks_to_im(
+                        bus_rx,
+                        chunker_session,
+                        notif_tx,
+                        chunker_target,
+                        im_is_group,
+                        chunker_channel,
+                        chunker_account,
+                        chunker_chunk_count,
+                        signal_rx,
+                        kind.display_name().to_string(),
+                        lang,
+                    ));
+                    Some((handle, signal_tx, chunk_count))
+                } else {
+                    None
+                };
+
+                let dispatch_result = manager
+                    .dispatch_sync(
+                        kind,
+                        Some(live_sid.clone()),
+                        task,
+                        workspace.clone(),
+                        None,
+                    )
+                    .await;
+
+                // Tell the chunker we're done so it can flush remaining
+                // buffered text and exit. The signal is best-effort:
+                // if the chunker already exited (e.g. bus dropped),
+                // send() returns Err which we ignore.
+                let (assistant_chunks, thought_chunks) = if let Some((handle, signal_tx, chunk_count)) =
+                    chunker_handle
+                {
+                    let _ = signal_tx.send(());
+                    // Bounded wait so a stuck flush can't drag the turn
+                    // out; the chunker should always exit within ~1s of
+                    // the signal because its flush loop is short.
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        handle,
+                    )
+                    .await;
+                    decode_chunk_counts(
+                        chunk_count.load(std::sync::atomic::Ordering::SeqCst),
+                    )
+                } else {
+                    (0, 0)
+                };
+                if assistant_chunks + thought_chunks > 0 {
+                    tracing::info!(
+                        target: "cap",
+                        live_session_id = %live_sid,
+                        agent = kind.as_str(),
+                        assistant_chunks,
+                        thought_chunks,
+                        "sticky chunker streamed deltas to IM"
+                    );
+                }
+
+                match dispatch_result {
+                    // Visible reply was streamed — suppress the final
+                    // outbound. WS subscribers already got the same
+                    // deltas straight off event_bus, so they aren't
+                    // shortchanged by the empty AgentReply.
+                    Ok(_) if assistant_chunks > 0 => {
+                        return Ok(AgentReply {
+                            text: String::new(),
+                            is_empty: true,
+                            tool_calls: None,
+                            images: vec![],
+                            files: vec![],
+                            pending_analysis: None,
+                            needs_outer_done_emit: true,
+                            outcome: crate::agent::registry::ReplyOutcome::Ok,
+                        });
+                    }
+                    Ok(r) => {
+                        // Either nothing streamed at all (no IM target /
+                        // bus unavailable), OR only thought chunks
+                        // streamed but no final assistant text. Fall
+                        // back to the legacy single-message path so the
+                        // user always sees a concrete reply or a
+                        // "(no output)" marker after the thinking.
+                        let reply_text = r.output;
+                        let is_empty = reply_text.trim().is_empty();
+                        return Ok(AgentReply {
+                            text: if is_empty {
+                                crate::i18n::t_fmt(
+                                    "cap_no_output",
+                                    lang,
+                                    &[("agent", kind.display_name())],
+                                )
+                            } else {
+                                reply_text
+                            },
+                            is_empty,
+                            tool_calls: None,
+                            images: vec![],
+                            files: vec![],
+                            pending_analysis: None,
+                            needs_outer_done_emit: true,
+                            outcome: crate::agent::registry::ReplyOutcome::Ok,
+                        });
+                    }
+                    Err(e) => {
+                        // Driver died. Drop the binding so the user
+                        // can /cap again, return the error message
+                        // (it'll come through the normal reply path
+                        // since chunker hasn't streamed an error).
+                        let _ = manager.unbind_sticky(session_key).await;
+                        let err = e.to_string();
+                        let msg = crate::i18n::t_fmt(
+                            "cap_driver_error",
+                            lang,
+                            &[("agent", kind.as_str()), ("err", &err)],
+                        );
+                        return Ok(AgentReply {
+                            text: msg,
+                            is_empty: false,
+                            tool_calls: None,
+                            images: vec![],
+                            files: vec![],
+                            pending_analysis: None,
+                            needs_outer_done_emit: true,
+                            outcome: crate::agent::registry::ReplyOutcome::Ok,
+                        });
+                    }
+                }
+            }
+        }
 
         // Check clear_signal: if /clear was issued via bypass, clear sessions now.
         // Preserve a brief summary of each session so the agent retains key context.
@@ -3725,6 +4018,30 @@ impl AgentRuntime {
             }
             // else: "full" or unknown -> keep all
 
+            // cap-followup sessions: agent is meant to briefly summarise one
+            // or more cap completions whose results were already pushed to
+            // the user via push_notif. Strip research/exec/chain tools so it
+            // can't go web_search-ing the result text (wastes time + floods
+            // rate-limited IM channels) or dispatch yet another cap/task.
+            if session_key.ends_with(":cap-followup") {
+                const FOLLOWUP_BLOCKED: &[&str] = &[
+                    "web_search",
+                    "web_fetch",
+                    "browser",
+                    "computer_use",
+                    "shell",
+                    "execute_command",
+                    "exec",
+                    "cap",
+                    "cap_live",
+                    "cap_live_end",
+                    "cap_bind_sticky",
+                    "cap_unbind_sticky",
+                    "task",
+                ];
+                all.retain(|t| !FOLLOWUP_BLOCKED.contains(&t.name.as_str()));
+            }
+
             // Group chat safety: strip dangerous tools to prevent exec via LLM
             let is_group = session_key.contains(":group:");
             if is_group {
@@ -4983,6 +5300,7 @@ impl AgentRuntime {
                         images: vec![],
                         tool_log: vec![],
                         question: None,
+                        channel: None,
                     });
                 }
                 return Ok(AgentReply {
@@ -5021,6 +5339,7 @@ impl AgentRuntime {
                         images: tool_images.clone(),
                         tool_log: tool_log.clone(),
                         question: None,
+                        channel: None,
                     });
                 }
                 return Ok(AgentReply {
@@ -5055,6 +5374,7 @@ impl AgentRuntime {
                         images: tool_images.clone(),
                         tool_log: tool_log.clone(),
                         question: None,
+                        channel: None,
                     });
                 }
                 return Ok(AgentReply {
@@ -5095,6 +5415,7 @@ impl AgentRuntime {
                         images: tool_images.clone(),
                         tool_log: tool_log.clone(),
                         question: None,
+                        channel: None,
                     });
                 }
                 return Ok(AgentReply {
@@ -5689,6 +6010,7 @@ impl AgentRuntime {
                                     images: vec![],
                                     tool_log: vec![],
                                     question: None,
+                                    channel: None,
                                 });
                             }
                             last_delta_flush = now;
@@ -5845,6 +6167,7 @@ impl AgentRuntime {
                         images: vec![],
                         tool_log: vec![],
                         question: None,
+                        channel: None,
                     });
                 }
             }
@@ -6171,6 +6494,7 @@ impl AgentRuntime {
                         images: tool_images.clone(),
                         tool_log: tool_log.clone(),
                         question: None,
+                        channel: None,
                     });
                 }
 
@@ -6459,6 +6783,7 @@ impl AgentRuntime {
                                 images: tool_images.clone(),
                                 tool_log: tool_log.clone(),
                                 question: None,
+                                channel: None,
                             });
                         }
                         return Ok(AgentReply {
@@ -6482,6 +6807,10 @@ impl AgentRuntime {
                     tool_name.as_str(),
                     "web_browser"
                         | "cap"
+                        | "cap_live"
+                        | "cap_live_end"
+                        | "cap_bind_sticky"
+                        | "cap_unbind_sticky"
                         | "agent"
                         | "search_content"
                         | "search_file"
@@ -6546,10 +6875,152 @@ impl AgentRuntime {
                     let tool_input_str = p.tool_input_str.clone();
                     let fut =
                         self.dispatch_tool(ctx, &p.tool_id, &p.tool_name, p.tool_input.clone());
+                    // Snapshot the live_status arc so the dispatch future
+                    // can register/unregister itself without re-borrowing
+                    // &self into the spawned closure.
+                    let live_status_for_tool = Arc::clone(&self.live_status);
+                    // Clone the cancel_token OUTSIDE the async move below
+                    // so we don't need to re-borrow `ctx` inside the
+                    // future (which would conflict with the borrow that
+                    // dispatch_tool already holds). `None` for non-A2A /
+                    // non-WS turns gracefully falls back to pending().
+                    let cancel_token_owned = ctx.turn_ctx.cancel_token.clone();
                     async move {
-                        let timed =
-                            time::timeout(Duration::from_secs(TOOL_DISPATCH_TIMEOUT_SECS), fut)
-                                .await;
+                        // Per-tool latency tracking. Sub-30s = silent, the
+                        // common case. >30s = warn so operators see the slow
+                        // tool in logs. >5min = error + a bus emit so the
+                        // user actually sees "still running X" in chat. The
+                        // outer 600s timeout below is the last-resort kill;
+                        // tools that block past then are killed regardless.
+                        let started = std::time::Instant::now();
+                        // Register on the agent's in-flight tools list so
+                        // /status renders an accurate snapshot. Drop the
+                        // registration when this future exits (success,
+                        // error, timeout, or cancel — all roads lead here).
+                        if let Ok(mut s) = live_status_for_tool.try_write() {
+                            s.in_flight_tools.push((tool_name.clone(), started));
+                        }
+                        struct InFlightGuard {
+                            ls: Arc<RwLock<LiveStatus>>,
+                            tool: String,
+                            started: std::time::Instant,
+                        }
+                        impl Drop for InFlightGuard {
+                            fn drop(&mut self) {
+                                if let Ok(mut s) = self.ls.try_write() {
+                                    if let Some(pos) = s.in_flight_tools.iter().position(
+                                        |(n, t)| n == &self.tool && *t == self.started,
+                                    ) {
+                                        s.in_flight_tools.swap_remove(pos);
+                                    }
+                                }
+                            }
+                        }
+                        let _in_flight_guard = InFlightGuard {
+                            ls: Arc::clone(&live_status_for_tool),
+                            tool: tool_name.clone(),
+                            started,
+                        };
+                        let slow_warn_emitted = std::sync::Arc::new(
+                            std::sync::atomic::AtomicBool::new(false),
+                        );
+                        // Spawn a sibling watcher so we can emit the
+                        // long-running warning *while* the tool is still
+                        // executing (not just after it returns).
+                        let watcher = {
+                            let tool_name = tool_name.clone();
+                            let session_id = session_id.clone();
+                            let agent_id = agent_id.clone();
+                            let bus_w = bus.clone();
+                            let emitted = std::sync::Arc::clone(&slow_warn_emitted);
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_secs(300)).await;
+                                if emitted
+                                    .compare_exchange(
+                                        false,
+                                        true,
+                                        std::sync::atomic::Ordering::SeqCst,
+                                        std::sync::atomic::Ordering::SeqCst,
+                                    )
+                                    .is_ok()
+                                {
+                                    tracing::error!(
+                                        target: "agent::dispatch_tool",
+                                        tool = %tool_name,
+                                        "tool still running after 5 minutes — \
+                                         the 10 minute outer timeout will fire if it \
+                                         doesn't return soon"
+                                    );
+                                    if let Some(bus) = bus_w {
+                                        let marker = format!(
+                                            "<rstool name=\"{tool_name}\">⚠️ still running after 5 minutes…</rstool>"
+                                        );
+                                        let _ = bus.send(AgentEvent {
+                                            session_id,
+                                            agent_id,
+                                            delta: marker,
+                                            done: false,
+                                            files: vec![],
+                                            images: vec![],
+                                            tool_log: vec![],
+                                            question: None,
+                                            channel: None,
+                                        });
+                                    }
+                                }
+                            })
+                        };
+                        // Cancel-aware dispatch: race the tool future against
+                        // the turn's cancel_token AND the outer timeout.
+                        // `/abort` (and A2A CancelTask) flips the token; the
+                        // select! below drops the in-flight future at the
+                        // next await point, including the await-on-JoinHandle
+                        // that spawn_blocking-backed tools park on. This is
+                        // what makes /abort actually responsive when a tool
+                        // is mid-flight (vs. the old behaviour where the
+                        // token was only polled BETWEEN iterations).
+                        let cancel_fut = async move {
+                            match cancel_token_owned {
+                                Some(t) => t.cancelled().await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        };
+                        let timed = tokio::select! {
+                            biased;
+                            _ = cancel_fut => Ok(Err(anyhow!(
+                                "tool `{tool_name}` cancelled by /abort \
+                                 (cancel_token fired)"
+                            ))),
+                            r = time::timeout(
+                                Duration::from_secs(TOOL_DISPATCH_TIMEOUT_SECS),
+                                fut,
+                            ) => r,
+                        };
+                        // Stop the long-run watcher — either the tool
+                        // finished in time or we're about to report it.
+                        watcher.abort();
+                        let elapsed_ms = started.elapsed().as_millis();
+                        match &timed {
+                            Ok(Ok(_)) if elapsed_ms > 30_000 => {
+                                tracing::warn!(
+                                    target: "agent::dispatch_tool",
+                                    tool = %tool_name,
+                                    elapsed_ms,
+                                    "slow tool completed"
+                                );
+                            }
+                            Err(_) => {
+                                tracing::error!(
+                                    target: "agent::dispatch_tool",
+                                    tool = %tool_name,
+                                    elapsed_ms,
+                                    "tool dispatch HIT outer timeout — future was dropped, \
+                                     but any spawn_blocking work it launched may still leak \
+                                     until its own internal deadline expires"
+                                );
+                            }
+                            _ => {}
+                        }
                         if let Some(bus) = bus {
                             let preview = match &timed {
                                 Ok(Ok(v)) => {
@@ -6610,6 +7081,7 @@ impl AgentRuntime {
                                 images: vec![],
                                 tool_log: vec![],
                                 question: None,
+                                channel: None,
                             });
                         }
                         (idx, timed)
@@ -8189,6 +8661,35 @@ impl AgentRuntime {
             }
         }
 
+        // Per-session filter: even when no explicit whitelist is configured,
+        // run_turn strips certain tools for special sessions (cap-followup
+        // bans research/exec/chain tools so it can briefly summarise without
+        // wandering off). The model still occasionally hallucinates a stripped
+        // name from training data — re-apply the same filter at dispatch.
+        if ctx.session_key.ends_with(":cap-followup") {
+            const FOLLOWUP_BLOCKED: &[&str] = &[
+                "web_search",
+                "web_fetch",
+                "browser",
+                "computer_use",
+                "shell",
+                "execute_command",
+                "exec",
+                "cap",
+                "cap_live",
+                "cap_live_end",
+                "cap_bind_sticky",
+                "cap_unbind_sticky",
+                "task",
+            ];
+            if FOLLOWUP_BLOCKED.contains(&name) {
+                return Err(anyhow!(
+                    "tool '{name}' is unavailable in cap-followup sessions — \
+                     just summarise the completed cap results in plain text."
+                ));
+            }
+        }
+
         // 2. Built-in tools (checked before A2A prefix so reserved names are not
         //    hijacked).
         match name {
@@ -8466,6 +8967,10 @@ impl AgentRuntime {
                 return self.tool_doc(a).await;
             }
             "cap" => return self.tool_cap(ctx, args).await,
+            "cap_live" => return self.tool_cap_live(ctx, args).await,
+            "cap_live_end" => return self.tool_cap_live_end(ctx, args).await,
+            "cap_bind_sticky" => return self.tool_cap_bind_sticky(ctx, args).await,
+            "cap_unbind_sticky" => return self.tool_cap_unbind_sticky(ctx, args).await,
             _ => {}
         }
 
@@ -8714,6 +9219,7 @@ impl AgentRuntime {
                                             images: vec![],
                                             tool_log: vec![],
                                             question: None,
+                                            channel: None,
                                         });
                                     }
                                 }
@@ -10009,6 +10515,96 @@ fn default_memory_scope(agent_id: &str, channel: &str) -> String {
     }
 }
 
+/// Build the "## rsclaw helpers" cheatsheet appended to the cap subagent's
+/// first-turn prompt. Lists the cross-process CLI commands the subagent
+/// can call via bash to reach rsclaw's memory store, knowledge base,
+/// installed plugins, and (lightweight, name-only) skill library.
+///
+/// The cheatsheet intentionally lists CLI commands rather than raw curl
+/// templates: cap subagents drive bash natively, and the `rsclaw` binary
+/// wraps auth tokens + JSON shell-escaping uniformly across macOS / Linux
+/// / Windows (Windows' curl/PowerShell alias quirks would otherwise leak
+/// into every example). Empty string when there are no skills AND we
+/// can't introduce the CLI surface meaningfully — though in practice the
+/// CLI surface is always present, so this only returns "" if the agent
+/// has skills disabled by config.
+fn build_cap_helper_cheatsheet(skills: &Arc<crate::skill::SkillRegistry>) -> String {
+    let mut sections: Vec<String> = Vec::new();
+
+    // Always include the rsclaw CLI helpers — they're the most useful
+    // tools a coding subagent has into the rest of the user's stack.
+    sections.push(
+        "## rsclaw helpers (run via bash; auth/URL handled internally)\n\n\
+         ```\n\
+         # Memory — persistent facts/preferences the main agent has learned.\n\
+         rsclaw memory search \"<query>\" [--max-results N] [--json]\n\
+         rsclaw memory save \"<fact>\" [--scope SCOPE] [--kind fact|note] [--pinned] [--json]\n\n\
+         # Knowledge base — ingested docs/URLs (semantic + BM25 hybrid).\n\
+         rsclaw kb search \"<query>\" [-k N] [--json]\n\
+         rsclaw kb add <path-or-url> [--tag T ...] [--recursive] [--ext glob]\n\n\
+         # Plugins — list/describe/invoke installed plugin tools.\n\
+         rsclaw plugins list\n\
+         rsclaw plugins describe <plugin>\n\
+         rsclaw plugins call <plugin>.<tool> --args '{\"k\":\"v\"}'\n\n\
+         # Messaging — send/read/broadcast through the IM channels rsclaw is wired to.\n\
+         rsclaw message send --channel <wechat|feishu|telegram|...> --target <id> -m \"...\"\n\
+         rsclaw message read --channel <ch> --target <id> [--limit N] [--json]\n\
+         rsclaw message broadcast --channel <ch> --targets <id1> --targets <id2> -m \"...\"\n\
+         ```\n\n\
+         All commands print JSON with --json. Run any with --help for full flags."
+            .to_owned(),
+    );
+
+    // Skill library — name + one-line description so the subagent can
+    // decide if any recipe matches, then Read the SKILL.md file from
+    // disk on its own. Keeping the cheatsheet at name-level (not
+    // pasting SKILL.md content) keeps token cost bounded.
+    let skill_root = crate::skill::default_global_skills_dir();
+    let mut entries: Vec<(String, String)> = skills
+        .all()
+        .filter_map(|m| {
+            let desc = m
+                .description
+                .as_deref()
+                .unwrap_or("")
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            // Skip skills without a name (shouldn't happen but be safe).
+            if m.name.is_empty() {
+                None
+            } else {
+                Some((m.name.clone(), desc))
+            }
+        })
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    if !entries.is_empty() {
+        let mut lines = String::new();
+        lines.push_str(
+            "## Skill library (read SKILL.md for usage; not auto-invoked)\n\n",
+        );
+        if let Some(root) = skill_root.as_ref() {
+            lines.push_str(&format!(
+                "Skill files live under `{}`. Read the SKILL.md when a name looks relevant.\n\n",
+                root.display()
+            ));
+        }
+        for (name, desc) in entries.iter().take(50) {
+            if desc.is_empty() {
+                lines.push_str(&format!("- **{name}**\n"));
+            } else {
+                lines.push_str(&format!("- **{name}** — {desc}\n"));
+            }
+        }
+        sections.push(lines);
+    }
+
+    sections.join("\n")
+}
+
 /// Resolve a KB collection by name, creating it if absent. Returns
 /// `(id, name, created)`. Used by the `knowledge_base` write actions so the
 /// agent can target a collection by human name ("会议记录") without first
@@ -10323,6 +10919,280 @@ fn intermediate_notification_text(text: &str) -> Option<&str> {
     } else {
         Some(trimmed)
     }
+}
+
+/// Bridge the cap event_bus → IM channel for sticky direct mode (Phase 2b).
+///
+/// Subscribes to the broadcast `event_bus`, filters for events whose
+/// `session_id` matches our pseudo session id (`cap-live-<agent>-<sid>`),
+/// debounces deltas, and pushes them onto `notification_tx` as
+/// `OutboundMessage`s addressed to the user's IM target.
+///
+/// The chunker has two flush triggers, whichever fires first:
+///   * **Size:** once the buffer reaches `MIN_FLUSH_CHARS`, push immediately.
+///     Keeps perceived latency low on fast-token replies.
+///   * **Time:** once `DEBOUNCE` has elapsed since the first un-flushed
+///     delta, push whatever's in the buffer. Keeps slow tail-of-reply
+///     deltas from sitting unsent.
+///
+/// Exits when:
+///   * the caller fires `signal_rx` (dispatch_sync returned — we flush
+///     remaining buffer and exit), OR
+///   * the bus subscriber errors (e.g. Lagged with too few slots — we
+///     drop on the floor; the final reply path in run_turn won't go
+///     through this chunker because by then the caller will have moved
+///     on).
+///
+/// Defensive throttle:
+///   * 800ms debounce is chosen to be safely above wechat personal's
+///     per-target throttle (3s) AS COMBINED with the per-chunk inter-
+///     send delay on the outbound side (see commits 54ed9ba, 85988f6).
+///     The chunker doesn't try to be smarter — outbound dispatch
+///     already handles per-channel rate limiting.
+async fn stream_cap_chunks_to_im(
+    mut bus_rx: tokio::sync::broadcast::Receiver<crate::events::AgentEvent>,
+    pseudo_session_id: String,
+    notif_tx: tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>,
+    target_id: String,
+    is_group: bool,
+    channel: String,
+    account: Option<String>,
+    chunk_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    mut signal_rx: tokio::sync::oneshot::Receiver<()>,
+    agent_label: String,
+    lang: &'static str,
+) {
+    use std::sync::atomic::Ordering;
+
+    const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(800);
+    /// Approx char count to trigger an early flush. Tuned so a typical
+    /// 1-2 sentence chunk lands quickly, multi-paragraph replies split
+    /// into 3-5 sends.
+    const MIN_FLUSH_CHARS: usize = 120;
+    /// If the cap driver hasn't emitted a single delta within this
+    /// window after the chunker spins up, push a heartbeat so the
+    /// user knows we're still working. Codex (and any reasoning
+    /// model that buffers its thinking) routinely waits 20-30s
+    /// before the first `agent_message_content_delta` — without a
+    /// heartbeat the chat client shows a stone-dead silence and the
+    /// user assumes the bot crashed.
+    ///
+    /// Fires at most ONCE per turn. After the first real delta lands,
+    /// the heartbeat is suppressed for the rest of the turn (each
+    /// real flush is its own progress signal).
+    const HEARTBEAT_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+    let chunker_started = tokio::time::Instant::now();
+    let mut heartbeat_sent = false;
+
+    let mut buf = String::new();
+    let mut first_delta_at: Option<tokio::time::Instant> = None;
+    // Tracks whether the current buf is a thought stream. We never
+    // mix assistant + thought in one OutboundMessage — switching
+    // channels triggers an immediate flush of the in-flight buffer.
+    let mut buf_is_thought = false;
+
+    // `chunk_count` is the legacy "did we send anything" counter; the
+    // sticky-bypass caller reads its low bits to decide whether to
+    // suppress the final outbound. Splitting it lets us distinguish
+    // "user saw the actual answer" (assistant chunks) from "user only
+    // saw codex thinking, no answer materialised" (thought chunks
+    // only) — the second case still needs a fallback message.
+    //
+    // Encoding: low 32 bits = assistant, high 32 bits = thought.
+    // Atomic adds preserve the per-half counters independently as
+    // long as neither overflows (which would need ~2 billion chunks
+    // in one turn — not happening).
+    const THOUGHT_BIT_SHIFT: u32 = 32;
+    let flush = |buf: &mut String,
+                 buf_is_thought: bool,
+                 chunk_count: &std::sync::Arc<std::sync::atomic::AtomicUsize>|
+     -> Option<crate::channel::OutboundMessage> {
+        if buf.is_empty() {
+            return None;
+        }
+        // Prefix thought chunks with 💭 so users (and screen-readers)
+        // can tell reasoning apart from the actual answer. The emoji
+        // is duplicated across IM platforms (feishu/wechat/etc.) and
+        // costs ~6 bytes per flush — negligible compared to the
+        // multi-hundred-char body that follows.
+        let text = if buf_is_thought {
+            format!("💭 {}", std::mem::take(buf))
+        } else {
+            std::mem::take(buf)
+        };
+        let msg = crate::channel::OutboundMessage {
+            target_id: target_id.clone(),
+            is_group,
+            text,
+            reply_to: None,
+            images: vec![],
+            files: vec![],
+            channel: Some(channel.clone()),
+            account: account.clone(),
+        };
+        let increment = if buf_is_thought {
+            1usize << THOUGHT_BIT_SHIFT
+        } else {
+            1usize
+        };
+        chunk_count.fetch_add(increment, Ordering::SeqCst);
+        Some(msg)
+    };
+
+    loop {
+        // Compute the next flush deadline. If no buffered deltas, we
+        // wait forever (pending) so the time-flush branch only fires
+        // when there's actual buffered content waiting to go out.
+        let deadline_fut = async {
+            match first_delta_at {
+                Some(t) => tokio::time::sleep_until(t + DEBOUNCE).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+
+        // Heartbeat deadline = chunker-start + HEARTBEAT_AFTER, but
+        // only while we haven't sent it yet AND haven't received any
+        // real delta. Past the first real delta the user is no longer
+        // staring at silence, so the heartbeat is pointless noise.
+        let heartbeat_fut = async {
+            if heartbeat_sent || first_delta_at.is_some() {
+                std::future::pending::<()>().await
+            } else {
+                tokio::time::sleep_until(chunker_started + HEARTBEAT_AFTER).await
+            }
+        };
+
+        tokio::select! {
+            biased;
+            // Termination signal from the caller (dispatch_sync done).
+            _ = &mut signal_rx => break,
+
+            // 5-second silent-start heartbeat.
+            _ = heartbeat_fut => {
+                let text = crate::i18n::t_fmt(
+                    "cap_thinking",
+                    lang,
+                    &[("agent", &agent_label)],
+                );
+                let msg = crate::channel::OutboundMessage {
+                    target_id: target_id.clone(),
+                    is_group,
+                    text,
+                    reply_to: None,
+                    images: vec![],
+                    files: vec![],
+                    channel: Some(channel.clone()),
+                    account: account.clone(),
+                };
+                // Heartbeats DON'T count toward chunk_count — the
+                // sticky-bypass caller uses chunk_count to decide
+                // whether to suppress the final AgentReply, and we
+                // don't want a heartbeat alone to suppress a real
+                // late-arriving message.
+                let _ = notif_tx.send(msg);
+                heartbeat_sent = true;
+            }
+
+            // New event on the bus.
+            ev = bus_rx.recv() => match ev {
+                Ok(e) => {
+                    if e.session_id != pseudo_session_id {
+                        continue;
+                    }
+                    if !e.delta.is_empty() {
+                        // Detect channel switch (assistant ⇄ thought).
+                        // Different channels must NEVER share a buffer
+                        // because (a) they render with different
+                        // prefixes (💭 vs none), and (b) thought is
+                        // semantically distinct from the answer — a
+                        // burst of reasoning sandwiched inside the
+                        // visible reply text would look like the agent
+                        // is talking to itself.
+                        let ev_is_thought = matches!(
+                            e.channel,
+                            Some(crate::events::TextChannel::Thought)
+                        );
+                        if !buf.is_empty() && ev_is_thought != buf_is_thought {
+                            if let Some(msg) = flush(&mut buf, buf_is_thought, &chunk_count) {
+                                let _ = notif_tx.send(msg);
+                            }
+                            first_delta_at = None;
+                        }
+                        buf_is_thought = ev_is_thought;
+                        buf.push_str(&e.delta);
+                        if first_delta_at.is_none() {
+                            first_delta_at = Some(tokio::time::Instant::now());
+                        }
+                        // Size-based fast flush so the first chunk
+                        // lands quickly on long replies.
+                        if buf.chars().count() >= MIN_FLUSH_CHARS {
+                            if let Some(msg) = flush(&mut buf, buf_is_thought, &chunk_count) {
+                                let _ = notif_tx.send(msg);
+                            }
+                            first_delta_at = None;
+                        }
+                    }
+                    if e.done {
+                        // The actor signalled end-of-turn. dispatch_sync
+                        // is about to return; flush + exit.
+                        if let Some(msg) = flush(&mut buf, buf_is_thought, &chunk_count) {
+                            let _ = notif_tx.send(msg);
+                        }
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // Lossy on extreme bus lag. Keep going — better to
+                    // drop a few deltas than to abandon the chunker.
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            },
+
+            // Debounce timer elapsed — flush whatever's buffered.
+            _ = deadline_fut => {
+                if let Some(msg) = flush(&mut buf, buf_is_thought, &chunk_count) {
+                    let _ = notif_tx.send(msg);
+                }
+                first_delta_at = None;
+            }
+        }
+    }
+
+    // Final flush on the way out so a tail that hasn't crossed the
+    // debounce or the size threshold still reaches the user.
+    if !buf.is_empty() {
+        let text = if buf_is_thought {
+            format!("💭 {buf}")
+        } else {
+            buf
+        };
+        let msg = crate::channel::OutboundMessage {
+            target_id,
+            is_group,
+            text,
+            reply_to: None,
+            images: vec![],
+            files: vec![],
+            channel: Some(channel),
+            account,
+        };
+        let increment = if buf_is_thought {
+            1usize << THOUGHT_BIT_SHIFT
+        } else {
+            1usize
+        };
+        chunk_count.fetch_add(increment, Ordering::SeqCst);
+        let _ = notif_tx.send(msg);
+    }
+}
+
+/// Decode the split chunk_count atomic into (assistant_chunks, thought_chunks).
+/// See the `THOUGHT_BIT_SHIFT` constant inside `stream_cap_chunks_to_im`.
+fn decode_chunk_counts(packed: usize) -> (usize, usize) {
+    let assistant = packed & 0xFFFF_FFFF;
+    let thought = (packed >> 32) & 0xFFFF_FFFF;
+    (assistant, thought)
 }
 
 // Tests

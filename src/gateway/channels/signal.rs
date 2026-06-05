@@ -87,6 +87,7 @@ pub(crate) fn start_signal_if_configured(
         std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
     >,
     task_queue: Arc<crate::gateway::task_queue::TaskQueueManager>,
+    shutdown: crate::gateway::ShutdownCoordinator,
 ) {
     let Some(sig_cfg) = &config.channel.channels.signal else {
         return;
@@ -516,6 +517,7 @@ pub(crate) fn start_signal_if_configured(
         // spawn() is async — drive it in a task. Once SignalChannel is constructed,
         // fill the slot and pulse `ready` so the proxy can release any waiting
         // sends.
+        let shutdown_for_signal = shutdown.clone();
         tokio::spawn(async move {
             match SignalChannel::spawn(phone, sig_cli_path, on_message).await {
                 Ok(ch) => {
@@ -525,16 +527,33 @@ pub(crate) fn start_signal_if_configured(
                     }
                     signal_ready.notify_waiters();
                     let ch_send = Arc::clone(&ch);
+                    let shutdown_for_out = shutdown_for_signal.clone();
                     tokio::spawn(async move {
-                        while let Some(msg) = out_rx.recv().await {
-                            if let Err(e) = ch_send.send(msg).await {
-                                error!("signal send: {e:#}");
+                        loop {
+                            tokio::select! {
+                                () = shutdown_for_out.notified() => {
+                                    info!("signal: drain signaled, stopping outbound sender");
+                                    break;
+                                }
+                                msg = out_rx.recv() => {
+                                    let Some(msg) = msg else { break };
+                                    if let Err(e) = ch_send.send(msg).await {
+                                        error!("signal send: {e:#}");
+                                    }
+                                }
                             }
                         }
                     });
                     info!(account = %acct_for_log, "signal channel started");
-                    if let Err(e) = ch.run().await {
-                        error!("signal channel: {e:#}");
+                    tokio::select! {
+                        res = ch.run() => {
+                            if let Err(e) = res {
+                                error!("signal channel: {e:#}");
+                            }
+                        }
+                        () = shutdown_for_signal.notified() => {
+                            info!("signal: drain signaled, stopping run loop");
+                        }
                     }
                 }
                 Err(e) => warn!("signal-cli not available: {e:#}"),
