@@ -329,7 +329,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 Err(e) => warn!("memory: BM25 reindex failed (vector still works): {e:#}"),
             }
             info!("memory store opened");
-            Some(Arc::new(tokio::sync::Mutex::new(m)))
+            let arc = Arc::new(tokio::sync::Mutex::new(m));
+            crate::agent::memory::set_global_store(Arc::clone(&arc));
+            Some(arc)
         }
         Err(e) => {
             // Memory store opening should not fail once the model is
