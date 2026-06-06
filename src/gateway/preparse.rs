@@ -465,6 +465,14 @@ pub(crate) async fn try_preparse_locally_with_account(
                 )));
             }
         };
+        // Write USER.md + AGENTS.md BEFORE spawning the driver process.
+        // Coding agents (claudecode/codex/opencode/openclaude) all scan
+        // the cwd for AGENTS.md or CLAUDE.md on startup and feed it
+        // into their system prompt — if we write after spawn, the agent
+        // already loaded an empty/stale view and won't reread on its
+        // own. Best-effort: any write failure is logged inside the
+        // helper and does not abort the bind.
+        let _ = crate::cap::identity::write_identity_files(&cwd).await;
         match manager.open_session(kind, cwd).await {
             Ok(sid) => {
                 manager

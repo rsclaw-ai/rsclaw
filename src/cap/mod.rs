@@ -6,6 +6,7 @@
 //! `crate::agent::tools_cap`.
 
 pub(crate) mod bridge;
+pub(crate) mod identity;
 pub(crate) mod live;
 pub(crate) mod notification;
 pub(crate) mod permission;
