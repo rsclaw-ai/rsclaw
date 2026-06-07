@@ -247,6 +247,165 @@ impl AgentRuntime {
             })),
         }
     }
+
+    // ----- tool: stock_chart -----------------------------------------
+
+    /// `stock_chart` — render a K-line + volume PNG for the user.
+    ///
+    /// Distinct from `stock_kline` on purpose: `stock_kline` returns
+    /// raw bars for the LLM to ANALYSE; `stock_chart` returns a file
+    /// the agent runtime auto-uploads to the IM channel for the USER
+    /// to LOOK AT. The two are routinely called together — analyze
+    /// first, then send the chart with commentary.
+    ///
+    /// Defaults to 60 daily bars + MA5/10/20/60 overlay + volume
+    /// subplot, 红涨绿跌 colors, light background. Returns the
+    /// `__send_file` envelope the agent runtime recognises (same
+    /// convention as the workspace `send_file` tool).
+    pub(crate) async fn tool_stock_chart(&self, args: Value) -> Result<Value> {
+        let arc = match crate::astock::global_client() {
+            Some(c) => c,
+            None => return Ok(astock_dormant_note()),
+        };
+        let code = match args.get("code").and_then(Value::as_str) {
+            Some(s) if !s.trim().is_empty() => s.trim().to_owned(),
+            _ => {
+                return Ok(json!({
+                    "ok": false,
+                    "error": "`code` (string) is required"
+                }));
+            }
+        };
+        let period = args
+            .get("period")
+            .and_then(Value::as_str)
+            .unwrap_or("1d")
+            .to_owned();
+        let count = args
+            .get("count")
+            .and_then(Value::as_u64)
+            .map(|n| n as u32)
+            .unwrap_or(60)
+            .clamp(20, 200);
+        let adjust = args
+            .get("adjust")
+            .and_then(Value::as_str)
+            .unwrap_or("none");
+        let ma_periods: Vec<usize> = args
+            .get("ma")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_u64().map(|n| n as usize))
+                    .filter(|p| (2..=120).contains(p))
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![5, 10, 20, 60]);
+        let name_hint = args
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+
+        // Fetch bars + the latest quote in parallel — the quote
+        // gives us a fresh price + change% for the title, which is
+        // more meaningful than the last K-line's close (the close
+        // is yesterday's number on daily bars during today's
+        // trading session).
+        let kline_fut = arc.kline(&code, Some(&period), Some(count), Some(0), Some(adjust));
+        let quote_fut = arc.quote(&code);
+        let (kline_res, quote_res) = tokio::join!(kline_fut, quote_fut);
+        let kr = match kline_res {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(json!({
+                    "ok": false,
+                    "error": format!("astock kline: {e}"),
+                }));
+            }
+        };
+        if kr.klines.is_empty() {
+            return Ok(json!({
+                "ok": false,
+                "error": format!("astock returned 0 bars for {code} ({period})"),
+            }));
+        }
+        let quote = quote_res.ok();
+
+        // Title composition: `<name> <code>  ¥<price>  +X.XX%`.
+        // Falls back to the latest K-line close when the live quote
+        // didn't come back (after-hours / pytdx hiccup).
+        let (price, change_pct) = if let Some(q) = &quote {
+            (q.price, q.change_pct())
+        } else {
+            let last = kr.klines.last().unwrap();
+            let prev = kr
+                .klines
+                .get(kr.klines.len().saturating_sub(2))
+                .map(|b| b.close)
+                .unwrap_or(last.close);
+            let pct = if prev.abs() > f64::EPSILON {
+                (last.close - prev) / prev * 100.0
+            } else {
+                0.0
+            };
+            (last.close, pct)
+        };
+        let display_name = name_hint
+            .as_deref()
+            .map(|n| format!("{n}  "))
+            .unwrap_or_default();
+        let title = format!(
+            "{display_name}{code}  ¥{price:.2}  {sign}{pct:.2}%",
+            sign = if change_pct >= 0.0 { "+" } else { "" },
+            pct = change_pct,
+        );
+        let ma_str = ma_periods
+            .iter()
+            .map(|p| format!("MA{p}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        let subtitle = format!("{period}  ·  {n} 根  ·  {ma_str}", n = kr.klines.len());
+
+        // Render to a fresh path under the rsclaw base var dir. We
+        // do NOT reuse the artifact store here — that store is text-
+        // only and per-session-keyed. Charts are short-lived files
+        // for IM upload, so a flat ~/.rsclaw/var/charts/ with a uuid
+        // name is the simplest sufficient layout.
+        let charts_dir = crate::config::loader::base_dir().join("var").join("charts");
+        let file_name = format!(
+            "chart_{}_{}.png",
+            code.replace(['.', '/', ':'], "_"),
+            uuid::Uuid::new_v4().simple()
+        );
+        let path = charts_dir.join(&file_name);
+
+        let opts = crate::astock::chart::ChartOpts {
+            title: title.clone(),
+            subtitle: Some(subtitle),
+            ma_periods,
+            ..Default::default()
+        };
+        let size = match crate::astock::chart::render_kline_png(&kr.klines, &opts, &path) {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(json!({
+                    "ok": false,
+                    "error": format!("render_kline_png: {e:#}"),
+                }));
+            }
+        };
+
+        // `__send_file` envelope matches the existing workspace-file
+        // send convention so the agent runtime auto-uploads to the
+        // active IM channel without any extra plumbing.
+        Ok(json!({
+            "__send_file": true,
+            "path": path.to_string_lossy(),
+            "filename": file_name,
+            "size": size,
+            "summary": title,
+        }))
+    }
 }
 
 // --- module-level helpers (no `&self` needed) ----------------------------

@@ -350,6 +350,7 @@ pub(crate) fn toolset_allowed_names(
         "stock_snapshot",
         "stock_ask",
         "stock_query",
+        "stock_chart",
     ];
 
     let base: Option<&[&str]> = match toolset {
@@ -884,6 +885,32 @@ pub fn build_tool_list(
                 "call_type": {"type": "string", "description": "Advanced iwencai hint; usually omit."}
             },
             "required": ["query"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "stock_chart".to_owned(),
+        description: "Render a K-line + volume chart PNG for the user and send \
+            it to the IM channel. DIFFERENT from `stock_kline` — that returns \
+            raw bars for YOU to analyse; this one delivers a picture to the \
+            USER's chat. Common pattern: call `stock_kline` first to read the \
+            recent trajectory, draft your written analysis, then call \
+            `stock_chart` so the user sees the picture beside your commentary.\n\
+            \n\
+            Defaults: 60 daily bars + MA5/10/20/60 overlays + volume subplot, \
+            红涨绿跌 color convention (NOT US green/red). Pass `name` if you \
+            know the Chinese stock name — it appears in the chart title.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "description": "Stock code (any common form)."},
+                "name": {"type": "string", "description": "Chinese stock name to show in the title; optional."},
+                "period": {"type": "string", "enum": ["1m","5m","15m","30m","1h","1d","1w","1mon"], "default": "1d"},
+                "count": {"type": "integer", "default": 60, "minimum": 20, "maximum": 200},
+                "adjust": {"type": "string", "enum": ["none","qfq","hfq"], "default": "none"},
+                "ma": {"type": "array", "items": {"type": "integer"}, "default": [5,10,20,60],
+                       "description": "MA overlay periods; pass `[]` to disable."}
+            },
+            "required": ["code"]
         }),
     });
     tools.push(ToolDef {

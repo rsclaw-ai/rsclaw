@@ -8886,6 +8886,7 @@ impl AgentRuntime {
             "stock_snapshot" => return self.tool_stock_snapshot(args).await,
             "stock_ask" => return self.tool_stock_ask(args).await,
             "stock_query" => return self.tool_stock_query(args).await,
+            "stock_chart" => return self.tool_stock_chart(args).await,
             "write_file" | "write" => return self.tool_write(args).await,
             "edit_file" | "edit" => return self.tool_edit(args).await,
             "shell" | "execute_command" | "exec" => return self.tool_exec(ctx, _id, args).await,
