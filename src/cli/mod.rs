@@ -34,6 +34,7 @@ pub mod security;
 pub mod sessions;
 pub mod setup;
 pub mod skills;
+pub mod stock;
 pub mod system;
 pub mod tools;
 pub mod watch;
@@ -71,6 +72,10 @@ pub use ops::{
     UpdateArgs, UpdateCommand, UpdateWrapper,
 };
 pub use plugins::PluginsCommand;
+pub use stock::{
+    StockAskArgs, StockCommand, StockKlineArgs, StockQueryArgs, StockQuoteArgs,
+    StockQuoteBatchArgs, StockSnapshotArgs,
+};
 pub use qr::QrArgs;
 pub use sandbox::SandboxCommand;
 pub use secrets::{SecretsApplyArgs, SecretsCommand};
@@ -201,6 +206,10 @@ pub enum Command {
     /// Memory management.
     #[command(subcommand)]
     Memory(MemoryCommand),
+
+    /// A-share market data (requires `astock` config block).
+    #[command(subcommand)]
+    Stock(StockCommand),
 
     /// Session management.
     #[command(subcommand)]

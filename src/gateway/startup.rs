@@ -331,6 +331,20 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             info!("memory store opened");
             let arc = Arc::new(tokio::sync::Mutex::new(m));
             crate::agent::memory::set_global_store(Arc::clone(&arc));
+            // astock: build the client once if config.astock.enabled is set,
+            // and register it on the process-global slot. Failures here are
+            // surfaced at info level (not warn) — "astock not configured" is
+            // the normal state for non-A股 users and shouldn't look like an
+            // error in startup logs.
+            match crate::astock::AstockClient::from_config(config.raw.astock.as_ref()) {
+                Ok(c) => {
+                    crate::astock::set_global_client(Arc::new(c));
+                    info!("astock client initialized");
+                }
+                Err(e) => {
+                    info!(reason = %e, "astock client not initialised (subsystem dormant)");
+                }
+            }
             Some(arc)
         }
         Err(e) => {
