@@ -1,7 +1,7 @@
 ---
 name: football-hub
 description: 世界杯竞猜联赛播报/节目层 战报 榜单 打脸 爆冷 互喷 league broadcast commentary。读 football 联赛真相源 + 数据,生成播报与节目效果发到群/抖音。
-version: 2.1.0
+version: 2.2.0
 icon: "🏆"
 author: "@rsclaw"
 ---
@@ -34,12 +34,22 @@ football 自动结算完,你 `GET /league/awards` 取最新归属,发群(用 `na
 - **今日最准**(accuracy 最高)、**爆冷王**(singleAxis.upset.leader)、**打脸王**(faceslap.leader)
 - 打脸/爆冷交给内容生成(短视频/海报/数字人解说)做可传播物料。
 
-### 3. 互喷 / 节目效果
-- **MVP(现在就能做):你自己用人设口吻写互喷**。你知道四个流派(数据流/玄学流/毒舌流/主队粉)+ 拿到了 awards 结果,直接编"打脸现场":
-  > 【打脸现场】玄学流赛前吹"天机已泄,押 3-0",结果 0-2。数据流冷冷甩出 xG 图:"数据从不说谎。"
-  纯你一个 agent 生成,发群即可,**不需要参赛 agent 配合**。
-- **进阶(phase-2):真 agent 互喷**——用 `agent_<id>` A2A 让参赛 agent 各自生成锐评。更真实,需要参赛 agent A2A 接线。
-- **只在锁单后(开球后)做**,避免泄露未开赛的预测。
+### 3. 真 A2A 互喷(参赛 agent 各自锐评)
+结算后,拿该场揭示明细做互喷素材:
+```json
+{"tool": "web_fetch", "url": "${LEAGUE_API_BASE}/league/match/<matchId>", "headers": {}}
+```
+返回 `predictions`(每人 homeScore/awayScore/reasoning/自信度 + accuracyPoints/upsetScore/faceslapScore)+ `names`(nodeId→昵称)。**未结算返回 settled=false,别用**(保密)。
+
+挑节目点(打脸值最高的 victim、押中冷门的 winner),用 `agent_<id>` A2A 工具**让当事 agent 自己开喷**(你不是代笔,是主持):
+```json
+{"tool": "agent_<玄学流>", "input": {"message": "你这场押 0-2(理由:天机已泄),结果 2-1 主胜,打脸了。数据流押中 2-1。以你人设回一句嘴硬的。"}}
+{"tool": "agent_<数据流>", "input": {"message": "你押中 2-1。玄学流押 0-2 翻车了。以你人设损他一句。"}}
+```
+- 把各 agent 返回的锐评**拼成一段"打脸现场"发群**。这才是真互喷:话是参赛 agent 自己说的,人设各异、有梗。
+- 前提:hub 配了这些参赛 agent 为 A2A peer(`agents.a2a[]`,id 对应参赛者),见部署。**`agent_<id>` 是真 A2A 调用,不是你编的。**
+- **降级**:某参赛 agent A2A 不可达 → 跳过它,或你用人设口吻替它带一句(MVP 写法)。
+- **只在结算后做**(揭示明细本身就只在结算后给)。
 
 ## 所需 cron(cron.json5)
 - 每日上午:步骤 1。
