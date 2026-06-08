@@ -158,6 +158,19 @@ fn enrich_process_path() {
 }
 
 pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Result<()> {
+    // 0. (Restart safety net.) When this process was spawned as a
+    //    replacement during a `gateway restart`, the parent sets
+    //    `RSCLAW_PARENT_PID=<self>` on the child's env before spawn.
+    //    On macOS the native-respawn path uses `execv` so the parent's
+    //    fds (including redb's exclusive file lock) close atomically
+    //    when the new image takes over — no race. But on platforms
+    //    where exec isn't available, OR when the user starts a fresh
+    //    `rsclaw gateway start` while a previous gateway is still
+    //    holding the lock during graceful drain, opening redb here
+    //    would fail with "Database locked by another gateway
+    //    instance". Wait up to 5s for the parent to actually exit
+    //    before letting MemoryStore / KB / a2a tasks open their redbs.
+    wait_for_parent_release();
     // 0. Refresh the tools/bin shim dir, then enrich the process PATH before
     //    anything spawns a subprocess. Desktop/launchd-started gateways inherit
     //    a stripped PATH; the shim dir + PATH prepend let cap-rs coding-agent
@@ -1255,12 +1268,46 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         }
         extra_args.extend(["gateway".to_owned(), "run".to_owned()]);
         cmd.args(&extra_args);
+        // Pass our PID so the replacement's `wait_for_parent_release`
+        // safety net knows whose exit to wait for before opening
+        // redb. Even on the Unix exec path (where the fd / lock
+        // release is atomic) we set this so a re-exec from a SIGTERM
+        // path that didn't quite finish drain still has a fallback
+        // signal to wait on. Cheap to set, narrows the window of any
+        // future race introduction.
+        cmd.env("RSCLAW_PARENT_PID", std::process::id().to_string());
         // Windows: suppress the console flash when re-execing from a GUI app.
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::process::CommandExt;
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        // Unix: use `exec()` instead of `spawn() + exit(0)`. The race
+        // we kept hitting on every `gateway restart`:
+        //   1. parent spawns child (clone semantics: child inherits
+        //      our open fds, but the redb file LOCK is process-scoped
+        //      and NOT inherited — both processes are now contending)
+        //   2. parent calls exit(0), eventually closes redb and
+        //      releases the lock — but not before
+        //   3. child reaches MemoryStore::open and fails with
+        //      "Database locked by another gateway instance"
+        // `exec` replaces the current process image in place: all
+        // file descriptors (and therefore the redb lock) close
+        // atomically before the new image runs `main`. Zero overlap
+        // window, no spawn+exit race. Doesn't return on success.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let err = cmd.exec();
+            // exec() only returns on failure (e.g. EACCES, ENOENT on
+            // the binary itself). Fall through to the legacy
+            // spawn+exit path so the user at least gets SOMETHING
+            // running — even if it does hit the lock race.
+            error!(
+                "exec for replacement gateway failed: {err:#}; \
+                 falling back to spawn+exit (may hit lock race)"
+            );
         }
         match cmd.spawn() {
             Ok(_) => info!("replacement gateway spawned"),
@@ -1288,6 +1335,121 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 /// PID 1 and loses anything the supervisor would have re-applied.
 ///
 /// Detection is **runtime-only** (env vars set by the supervisor on the
+/// Safety net for the replacement gateway during a `gateway restart`.
+///
+/// The parent sets `RSCLAW_PARENT_PID=<pid>` on the child's env right
+/// before respawn. On the macOS / Linux exec path this is mostly
+/// belt-and-suspenders (exec replaces the process image in place, so
+/// fds + the redb file lock close atomically before `main` runs).
+/// But it also covers the cases exec doesn't:
+///   * Windows native respawn — still uses spawn+exit, so a window
+///     where parent + child both contend the redb lock is real.
+///   * `rsclaw gateway start` invoked by a human while a previous
+///     gateway is still in the middle of graceful drain (60s
+///     window): the new process inherits no env from the old one,
+///     `RSCLAW_PARENT_PID` is unset, and we just proceed; if it
+///     genuinely conflicts the existing PID-file check + redb's
+///     own error surface that condition cleanly.
+///   * Future codepaths that bypass exec for whatever reason.
+///
+/// Polls `kill(pid, 0)` every 50ms for up to 5s. Returns immediately
+/// when the env var is unset (clean cold start) or the parent has
+/// already exited. Logs at info on actual wait so the next
+/// "why did startup take 3 seconds" question is answerable from the
+/// log alone.
+fn wait_for_parent_release() {
+    let Ok(pid_str) = std::env::var("RSCLAW_PARENT_PID") else {
+        return;
+    };
+    let Ok(pid) = pid_str.trim().parse::<i32>() else {
+        // Malformed env — degrade silently rather than blocking
+        // startup forever. The PID file / redb error path takes
+        // over if there's actually a conflict.
+        return;
+    };
+    // Don't wait on ourselves. Can happen on weird launchd / shell
+    // setups that re-export the env across a re-exec.
+    if pid == std::process::id() as i32 {
+        return;
+    }
+    let start = std::time::Instant::now();
+    let deadline = start + std::time::Duration::from_secs(5);
+    let mut waited = false;
+    while std::time::Instant::now() < deadline {
+        if !parent_alive(pid) {
+            if waited {
+                info!(
+                    parent_pid = pid,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "parent gateway exited; lock released"
+                );
+            }
+            return;
+        }
+        waited = true;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    warn!(
+        parent_pid = pid,
+        "parent gateway still alive after 5s; opening anyway (may hit lock race)"
+    );
+    // Best-effort clean of the env so any further re-execs from THIS
+    // process don't replay the wait.
+    unsafe {
+        std::env::remove_var("RSCLAW_PARENT_PID");
+    }
+}
+
+/// Cross-platform "is this PID still running" probe.
+///
+/// Unix uses `kill(pid, 0)` — the kernel rejects it with `ESRCH` when
+/// no process is running with that pid (or `EPERM` if it IS running
+/// but we lack permission; either way the process exists). Windows
+/// is handled by shelling out to `tasklist` — adds a few-ms cost,
+/// but the Windows native-respawn path is rare enough that the
+/// extra spawn isn't worth a `windows-sys` dependency in Cargo.toml.
+fn parent_alive(pid: i32) -> bool {
+    #[cfg(unix)]
+    {
+        // libc::kill returns 0 on success, -1 on failure with errno
+        // set; ESRCH (3) = "no such process".
+        // SAFETY: kill is async-signal-safe; signal 0 is the
+        // "existence check" syscall that doesn't actually deliver.
+        let rc = unsafe { libc::kill(pid, 0) };
+        if rc == 0 {
+            return true;
+        }
+        // Any errno OTHER than ESRCH means the process exists but we
+        // can't signal it — treat as alive.
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows fallback: `tasklist /FI "PID eq <n>" /NH` prints a
+        // single matching row when the pid is alive, or "INFO: No
+        // tasks ..." when it's gone. Cheap and dependency-free.
+        match std::process::Command::new("tasklist")
+            .args([
+                "/FI",
+                &format!("PID eq {pid}"),
+                "/NH",
+                "/FO",
+                "CSV",
+            ])
+            .output()
+        {
+            Ok(out) => {
+                let s = String::from_utf8_lossy(&out.stdout);
+                s.lines().any(|l| l.contains(&pid.to_string()))
+            }
+            // tasklist unavailable (very old Windows / WSL edge) —
+            // treat as dead so we don't deadlock startup; the redb
+            // lock surface will error cleanly on actual conflict.
+            Err(_) => false,
+        }
+    }
+}
+
 /// running process), distinct from `cmd::gateway::try_service_start` /
 /// `try_service_stop` which probe install-file presence.
 ///
