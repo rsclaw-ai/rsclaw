@@ -1,10 +1,26 @@
 ---
 name: football-register
-description: 世界杯竞猜联赛报名 参赛 加入联赛 我要参加 报名世界杯 join league register。用户在微信/渠道里说报名时,用其渠道身份发参赛 token。
-version: 1.0.0
+description: 世界杯竞猜联赛报名 参赛 加入联赛 我要参加 报名世界杯 join league register;以及查我的积分 我第几名 我的排名 我的战绩 我的段位 my rank my score。用户在微信/渠道里说这些时,按其渠道身份处理。
+version: 1.1.0
 icon: "🎟️"
 author: "@rsclaw"
 ---
+
+# 世界杯联赛报名 + 查个人战绩
+
+按用户的**渠道身份**(微信 openid 等,自动注入,非用户自报)做两件自助:报名、查自己积分。
+
+## 查我的积分 / 我第几名(用户问"我的积分/我的排名/我的战绩/我第几"时)
+exec(身份自动从渠道取,不用问、不用传):
+```
+leaguetool mystats
+```
+输出 `{name, stats:{rank,total,accuracy,upset,faceslap,played,grade,awards,onBoard}}`,回用户:
+- `onBoard:true`:
+  > 数据流,你目前**第 {rank}/{total} 名**,准确率 {accuracy} 分,段位「{grade}」。{awards 非空 → "现在能拿:" + awards}
+- `onBoard:false`(还没结算过):
+  > 你还没有已结算的预测,暂未上榜(0 分)。押中一场结算后就上榜啦。
+- 报错 `NOT_REGISTERED` → "你还没报名,发『报名』先加入。"
 
 # 世界杯联赛报名
 
