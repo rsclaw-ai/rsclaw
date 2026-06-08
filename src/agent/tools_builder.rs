@@ -351,6 +351,7 @@ pub(crate) fn toolset_allowed_names(
         "stock_ask",
         "stock_query",
         "stock_chart",
+        "stock_watchlist",
     ];
 
     let base: Option<&[&str]> = match toolset {
@@ -911,6 +912,33 @@ pub fn build_tool_list(
                        "description": "MA overlay periods; pass `[]` to disable."}
             },
             "required": ["code"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "stock_watchlist".to_owned(),
+        description: "Per-user persistent stock watchlist. Stored in rsclaw \
+            memory, scoped to (channel, peer) so each IM user has their own \
+            list across restarts. Use this when the user says \"加入关注\" / \
+            \"关注一下 600519\" / \"以后每天给我看茅台\" — adding to the \
+            watchlist lets downstream features (briefings, alerts, default \
+            snapshot filter) personalize automatically.\n\
+            \n\
+            Actions:\n\
+            - list — return all codes currently on the watchlist.\n\
+            - add — codes:[...] adds N codes; existing entries are skipped.\n\
+            - remove — codes:[...] removes by code.\n\
+            - clear — wipe the entire watchlist for this peer.\n\
+            \n\
+            Don't proactively add stocks the user merely asked about once — \
+            wait for explicit '关注/收藏/加入关注' intent.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["list","add","remove","clear"], "default": "list"},
+                "code": {"type": "string", "description": "Single stock code (alternative to `codes`)."},
+                "codes": {"type": "array", "items": {"type": "string"}, "description": "Multiple stock codes."}
+            },
+            "required": []
         }),
     });
     tools.push(ToolDef {

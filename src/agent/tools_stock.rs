@@ -1,10 +1,11 @@
 //! Stock tools — A-share market data via the astock gateway.
 //!
-//! Five built-in tools surfaced to the LLM, all behind a single
+//! Six built-in tools surfaced to the LLM, all behind a single
 //! "astock not configured → return structured note instead of
-//! panicking" gate. None of them write state on rsclaw's side:
-//! quotes and snapshots are read-through from astock; watchlist
-//! changes (a write-side concern) belong in a follow-up.
+//! panicking" gate. Five of them (quote/kline/snapshot/ask/query)
+//! are read-through; `stock_chart` writes a PNG artifact;
+//! `stock_watchlist` writes to the memory store (peer-scoped facts
+//! pinned against decay).
 //!
 //! Tool naming convention (snake_case underscored) matches the
 //! existing `knowledge_base` / `memory` / `web_browser` tools so
@@ -13,7 +14,7 @@
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use super::runtime::AgentRuntime;
+use super::runtime::{AgentRuntime, RunContext};
 
 /// Cap on JSON output a single tool call returns to the LLM. Snapshot
 /// responses can carry 5000+ rows on a busy day — pushing all of them
@@ -406,6 +407,57 @@ impl AgentRuntime {
             "summary": title,
         }))
     }
+
+    // ----- tool: stock_watchlist -------------------------------------
+
+    /// `stock_watchlist` — per-IM-user persistent stock list.
+    ///
+    /// Stored in the live memory store as docs with
+    /// `scope = "agent:{agent_id}:watchlist:{channel}:{peer_id}"`,
+    /// `kind = "watchlist"`, `pinned = true` (immune to tier decay —
+    /// these are deliberate user choices, not learned facts). One doc
+    /// per code so add/remove are atomic and the per-row tier doesn't
+    /// matter.
+    ///
+    /// Actions:
+    ///   * `list`  — return all codes currently on the watchlist.
+    ///   * `add`   — `codes: [...]` adds N codes; dedupes against
+    ///     existing entries (no duplicate docs).
+    ///   * `remove` — `codes: [...]` removes by code. Missing codes
+    ///     are silently skipped.
+    ///   * `clear` — wipe the entire watchlist for this peer (rare;
+    ///     used by reset / debug flows).
+    pub(crate) async fn tool_stock_watchlist(
+        &self,
+        ctx: &RunContext,
+        args: Value,
+    ) -> Result<Value> {
+        let action = args
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("list")
+            .trim();
+        let Some(mem) = self.memory.as_ref() else {
+            return Ok(json!({
+                "ok": false,
+                "code": "memory_unavailable",
+                "error": "memory store not initialised — cannot persist watchlist"
+            }));
+        };
+        let scope = watchlist_scope(&ctx.agent_id, &ctx.channel, &ctx.peer_id);
+        match action {
+            "list" => watchlist_list(mem, &scope).await,
+            "add" => watchlist_add(mem, &scope, extract_codes(&args)).await,
+            "remove" => watchlist_remove(mem, &scope, extract_codes(&args)).await,
+            "clear" => watchlist_clear(mem, &scope).await,
+            other => Ok(json!({
+                "ok": false,
+                "error": format!(
+                    "unknown action '{other}'. Use list, add, remove, or clear."
+                )
+            })),
+        }
+    }
 }
 
 // --- module-level helpers (no `&self` needed) ----------------------------
@@ -508,6 +560,184 @@ fn truncate_ask_response(mut v: Value) -> Value {
     v
 }
 
+/// Build the memory scope a single IM peer's watchlist lives under.
+///
+/// Each (agent, channel, peer) tuple gets its own scope so the same
+/// gateway can serve multiple IM users without their watchlists
+/// bleeding into each other. Format is hierarchical so a future
+/// admin tool can list "every watchlist on this agent" via prefix
+/// match.
+pub(crate) fn watchlist_scope(agent_id: &str, channel: &str, peer_id: &str) -> String {
+    format!("agent:{agent_id}:watchlist:{channel}:{peer_id}")
+}
+
+const WATCHLIST_KIND: &str = "watchlist";
+/// Max codes a single watchlist can hold. Keeps `stock_snapshot
+/// codes=[...watchlist...]` calls from accidentally batching a
+/// thousand-code request that times out the upstream sidecar.
+const WATCHLIST_CAP: usize = 50;
+
+async fn watchlist_list(
+    mem: &std::sync::Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>,
+    scope: &str,
+) -> Result<Value> {
+    let store = mem.lock().await;
+    let codes: Vec<String> = store
+        .list_active()
+        .into_iter()
+        .filter(|d| d.scope == scope && d.kind == WATCHLIST_KIND)
+        .map(|d| d.text)
+        .collect();
+    Ok(json!({
+        "ok": true,
+        "count": codes.len(),
+        "codes": codes,
+    }))
+}
+
+async fn watchlist_add(
+    mem: &std::sync::Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>,
+    scope: &str,
+    raw_codes: Vec<String>,
+) -> Result<Value> {
+    if raw_codes.is_empty() {
+        return Ok(json!({
+            "ok": false,
+            "error": "no codes provided — pass `code: \"600519\"` or `codes: [\"600519\", ...]`"
+        }));
+    }
+    // Normalise + dedupe input (case-preserved, but trimmed). We
+    // store the as-typed code so the user sees back what they
+    // entered; normalise on read at the astock-client edge.
+    let mut wanted: Vec<String> = raw_codes
+        .into_iter()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+    wanted.sort();
+    wanted.dedup();
+
+    let mut store = mem.lock().await;
+    let existing: std::collections::HashSet<String> = store
+        .list_active()
+        .into_iter()
+        .filter(|d| d.scope == scope && d.kind == WATCHLIST_KIND)
+        .map(|d| d.text)
+        .collect();
+    let current_count = existing.len();
+    let to_add: Vec<String> = wanted
+        .into_iter()
+        .filter(|c| !existing.contains(c))
+        .collect();
+    if current_count + to_add.len() > WATCHLIST_CAP {
+        return Ok(json!({
+            "ok": false,
+            "error": format!(
+                "watchlist cap reached: {current_count} existing + {} new > {WATCHLIST_CAP} max. \
+                 Remove some codes first (action=remove) or raise the cap.",
+                to_add.len()
+            ),
+            "cap": WATCHLIST_CAP,
+            "current": current_count,
+        }));
+    }
+    let mut added: Vec<String> = Vec::new();
+    for code in to_add {
+        let doc = crate::agent::memory::MemoryDoc {
+            id: uuid::Uuid::new_v4().to_string(),
+            scope: scope.to_owned(),
+            kind: WATCHLIST_KIND.to_owned(),
+            text: code.clone(),
+            vector: vec![],
+            created_at: 0,
+            accessed_at: 0,
+            access_count: 0,
+            importance: 0.9,
+            tier: Default::default(),
+            abstract_text: None,
+            overview_text: None,
+            tags: vec!["stock_watchlist".to_owned()],
+            // Pinned: user-curated, never decay, immune to crystallizer
+            // demotion. Matches the contract for the memory note (per
+            // `MemoryDoc.pinned` docs).
+            pinned: true,
+        };
+        if let Err(e) = store.add(doc).await {
+            return Ok(json!({
+                "ok": false,
+                "error": format!("watchlist add failed at {code}: {e:#}"),
+                "added": added,
+            }));
+        }
+        added.push(code);
+    }
+    Ok(json!({
+        "ok": true,
+        "added": added,
+        "skipped_duplicates": current_count, // before-state count for context
+        "total": existing.len() + added.len(),
+    }))
+}
+
+async fn watchlist_remove(
+    mem: &std::sync::Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>,
+    scope: &str,
+    raw_codes: Vec<String>,
+) -> Result<Value> {
+    if raw_codes.is_empty() {
+        return Ok(json!({
+            "ok": false,
+            "error": "no codes provided"
+        }));
+    }
+    let targets: std::collections::HashSet<String> = raw_codes
+        .into_iter()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut store = mem.lock().await;
+    let to_delete: Vec<String> = store
+        .list_active()
+        .into_iter()
+        .filter(|d| d.scope == scope && d.kind == WATCHLIST_KIND && targets.contains(&d.text))
+        .map(|d| d.id)
+        .collect();
+    let mut removed = 0usize;
+    for id in &to_delete {
+        if store.delete(id).await.is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(json!({
+        "ok": true,
+        "removed": removed,
+        "requested": targets.len(),
+    }))
+}
+
+async fn watchlist_clear(
+    mem: &std::sync::Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>,
+    scope: &str,
+) -> Result<Value> {
+    let mut store = mem.lock().await;
+    let to_delete: Vec<String> = store
+        .list_active()
+        .into_iter()
+        .filter(|d| d.scope == scope && d.kind == WATCHLIST_KIND)
+        .map(|d| d.id)
+        .collect();
+    let mut removed = 0usize;
+    for id in &to_delete {
+        if store.delete(id).await.is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(json!({
+        "ok": true,
+        "removed": removed,
+    }))
+}
+
 fn astock_dormant_note() -> Value {
     json!({
         "ok": false,
@@ -607,6 +837,24 @@ mod tests {
         assert_eq!(out["text"].as_str(), Some("short"));
         assert_eq!(out["n"].as_i64(), Some(1));
         assert_eq!(out["arr"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn watchlist_scope_format() {
+        assert_eq!(
+            watchlist_scope("main", "feishu", "ou_abc"),
+            "agent:main:watchlist:feishu:ou_abc"
+        );
+        // Per (channel, peer) — same peer on a different channel gets
+        // its own list. Important so the wechat / feishu watchlists
+        // don't bleed.
+        assert_ne!(
+            watchlist_scope("main", "feishu", "x"),
+            watchlist_scope("main", "wechat", "x")
+        );
+        // Prefix is stable so a future admin tool can `list_active`
+        // and prefix-match `agent:main:watchlist:` to dump everything.
+        assert!(watchlist_scope("main", "feishu", "x").starts_with("agent:main:watchlist:"));
     }
 
     #[test]
