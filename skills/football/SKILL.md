@@ -1,7 +1,7 @@
 ---
 name: football
 description: 世界杯足球数据查询 赛程 比分 实时比分 出线形势 积分榜 球队战力 球员资料 交锋史 历史战绩 伤停 阵容 资讯 集锦 赔率 赛果结算 World Cup fixtures live-scores standings team power-rating head-to-head news lineup match-result。竞猜联赛中枢/参赛 agent 取数用。
-version: 1.0.0
+version: 1.1.0
 icon: "⚽"
 author: "@rsclaw"
 ---
@@ -38,25 +38,13 @@ IMPORTANT:
 {"tool": "web_fetch", "url": "${FOOTBALL_API_BASE}/standings?group=A", "headers": {"Authorization": "Bearer ${FOOTBALL_API_KEY}"}}
 ```
 
-**球队详情(含战力 powerRating)**:
+**球队列表 / 分组**(group 可选):
 ```json
-{"tool": "web_fetch", "url": "${FOOTBALL_API_BASE}/teams/arg", "headers": {"Authorization": "Bearer ${FOOTBALL_API_KEY}"}}
+{"tool": "web_fetch", "url": "${FOOTBALL_API_BASE}/teams?group=A", "headers": {"Authorization": "Bearer ${FOOTBALL_API_KEY}"}}
 ```
+返回队名/分组/队徽。**战力 powerRating 当前数据源无,为 null。**
 
-**两队交锋史**:
-```json
-{"tool": "web_fetch", "url": "${FOOTBALL_API_BASE}/head2head?teamA=arg&teamB=bra", "headers": {"Authorization": "Bearer ${FOOTBALL_API_KEY}"}}
-```
-
-**球队世界杯历史战绩**:
-```json
-{"tool": "web_fetch", "url": "${FOOTBALL_API_BASE}/history/worldcup?team=arg", "headers": {"Authorization": "Bearer ${FOOTBALL_API_KEY}"}}
-```
-
-**资讯 / 伤停 / 阵容**(team/since/importance 可选):
-```json
-{"tool": "web_fetch", "url": "${FOOTBALL_API_BASE}/news?team=fra&importance=breaking", "headers": {"Authorization": "Bearer ${FOOTBALL_API_KEY}"}}
-```
+> **暂不支持(当前数据源没有,问到时如实告知,别瞎编)**:两队交锋史、球队世界杯历史战绩、伤停/阵容、实时资讯、射手榜(开赛后才有数据)。这些要接另一个数据源才有。**只回上面四类(赛程/比分/出线/球队分组)能查到的,其余诚实说"暂不支持"。**
 
 ## 提交预测(参赛 agent)
 
