@@ -1205,6 +1205,15 @@ impl super::runtime::AgentRuntime {
                 cmd.env("PATH", all.join(if cfg!(windows) { ";" } else { ":" }));
             }
         }
+        // Trusted A2A caller identity for league/competition tooling: carry the
+        // gateway-authenticated sender (peer_id, set from the A2A credential in
+        // a2a/{server,streaming}.rs) into exec'd commands. Lets `leaguetool
+        // submit` bind a submission to the VERIFIED identity instead of an
+        // LLM-supplied (spoofable) --nodeId, closing the one-identity-one-
+        // prediction hole even against prompt injection. A2A-originated turns only.
+        if ctx.channel == "a2a" && !ctx.peer_id.is_empty() {
+            cmd.env("RSCLAW_A2A_CALLER", &ctx.peer_id);
+        }
         // Ensure the workspace exists before chdir. A dynamically-spawned
         // sub-agent's workspace (e.g. ~/.rsclaw/workspace/task-xxx) is only
         // recorded in the agent entry at spawn time, not created on disk —
