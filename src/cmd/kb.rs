@@ -38,6 +38,35 @@ pub async fn cmd_kb(cmd: KbCommand, kb_root: PathBuf) -> Result<()> {
             KbCommand::Stats => {
                 return kb_stats_http().await;
             }
+            KbCommand::Compact => {
+                return kb_compact_http().await;
+            }
+            KbCommand::Ls {
+                tag,
+                source_kind,
+                limit,
+            } => {
+                return kb_ls_http(tag, source_kind.as_deref(), *limit).await;
+            }
+            KbCommand::Rm { doc_id, tag, yes } => {
+                return kb_rm_http(doc_id.clone(), tag.clone(), *yes).await;
+            }
+            KbCommand::Show { id } => {
+                return kb_show_http(id).await;
+            }
+            KbCommand::Visibility { doc_id, visibility } => {
+                return kb_visibility_http(doc_id, visibility).await;
+            }
+            KbCommand::Export { doc_id, to } => {
+                return kb_export_http(doc_id, to).await;
+            }
+            KbCommand::SyncAll {
+                interval_min,
+                max,
+                dry_run,
+            } => {
+                return kb_sync_all_http(*interval_min, *max, *dry_run).await;
+            }
             KbCommand::Add {
                 path_or_url,
                 tags,
@@ -117,6 +146,192 @@ async fn kb_search_http(query: &str, k: usize, json_out: bool) -> Result<()> {
                 bold(title),
                 trimmed
             );
+        }
+    }
+    Ok(())
+}
+
+async fn kb_ls_http(
+    tags: &[String],
+    source_kind: Option<&str>,
+    limit: usize,
+) -> Result<()> {
+    // Server takes a single optional `tag` query param; the CLI's
+    // multi-tag UX is rare and not worth a multi-value endpoint.
+    let mut path = format!("/api/v1/knowledge/docs?limit={limit}");
+    if let Some(t) = tags.first().filter(|s| !s.is_empty()) {
+        path.push_str(&format!(
+            "&tag={}",
+            urlencoding::encode(t),
+        ));
+    }
+    if let Some(sk) = source_kind.filter(|s| !s.is_empty()) {
+        path.push_str(&format!(
+            "&source_kind={}",
+            urlencoding::encode(sk),
+        ));
+    }
+    let resp: serde_json::Value = crate::cmd::gateway_http::get_json(&path).await?;
+    let docs = resp.get("docs").and_then(|v| v.as_array());
+    if docs.is_none_or(|a| a.is_empty()) {
+        println!("(no documents)");
+        return Ok(());
+    }
+    println!(
+        "{:<26} {:<8} v {:<5}  tags                            title",
+        "doc_id", "kind", ""
+    );
+    for d in docs.unwrap() {
+        let id = d.get("doc_id").and_then(|v| v.as_str()).unwrap_or("?");
+        let kind = d.get("source_kind").and_then(|v| v.as_str()).unwrap_or("?");
+        let ver = d.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+        let tags: Vec<&str> = d
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+            .unwrap_or_default();
+        let title = d.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        println!(
+            "{id:<26} {kind:<8} v {ver:<5}  {:<30}  {title}",
+            tags.join(",")
+        );
+    }
+    if let Some(next) = resp.get("nextCursor").and_then(|v| v.as_str()) {
+        if !next.is_empty() {
+            println!("\n(cursor for next page: {next})");
+        }
+    }
+    Ok(())
+}
+
+async fn kb_rm_http(
+    doc_id: Option<String>,
+    tag: Option<String>,
+    yes: bool,
+) -> Result<()> {
+    if !yes {
+        eprintln!("Refusing to tombstone without --yes (this is a destructive operation).");
+        return Ok(());
+    }
+    let (did, query) = match (doc_id, tag) {
+        (Some(id), None) => (id, String::new()),
+        // Bulk-by-tag: the `_bulk` segment is a placeholder for the route's
+        // {doc_id} slot; the server prefers the `tag` query param when set.
+        (None, Some(t)) => ("_bulk".to_owned(), format!("?tag={}", urlencoding::encode(&t))),
+        (Some(_), Some(_)) => anyhow::bail!("pass either doc_id or --tag, not both"),
+        (None, None) => anyhow::bail!("pass either a doc_id or --tag <name>"),
+    };
+    let path = format!("/api/v1/knowledge/docs/{did}{query}");
+    let resp: serde_json::Value = crate::cmd::gateway_http::delete_json(&path).await?;
+    if let Some(n) = resp.get("tombstoned").and_then(|v| v.as_u64()) {
+        let tag = resp.get("tag").and_then(|v| v.as_str()).unwrap_or("?");
+        println!("tombstoned {n} docs with tag={tag}");
+    } else {
+        println!("tombstoned {did}");
+    }
+    Ok(())
+}
+
+async fn kb_show_http(id: &str) -> Result<()> {
+    // Try doc_id first; on 404 fall back to /search-style chunk fetch.
+    let path = format!("/api/v1/knowledge/docs/{id}");
+    match crate::cmd::gateway_http::get_json::<serde_json::Value>(&path).await {
+        Ok(meta) => {
+            println!("doc_id:    {}", meta.get("docId").and_then(|v| v.as_str()).unwrap_or("?"));
+            println!("title:     {}", meta.get("title").and_then(|v| v.as_str()).unwrap_or(""));
+            println!("kind:      {}", meta.get("sourceKind").and_then(|v| v.as_str()).unwrap_or("?"));
+            println!("version:   {}", meta.get("version").and_then(|v| v.as_u64()).unwrap_or(0));
+            if let Some(cid) = meta.get("collectionId").and_then(|v| v.as_str()) {
+                println!("collection:{cid}");
+            }
+            if let Some(arr) = meta.get("tags").and_then(|v| v.as_array()) {
+                let tags: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+                if !tags.is_empty() {
+                    println!("tags:      {}", tags.join(", "));
+                }
+            }
+            let chunks_path = format!("/api/v1/knowledge/docs/{id}/chunks");
+            let chunks: serde_json::Value =
+                crate::cmd::gateway_http::get_json(&chunks_path).await?;
+            let arr = chunks.get("chunks").and_then(|v| v.as_array());
+            let n = arr.map(|a| a.len()).unwrap_or(0);
+            println!("chunks:    {n}");
+            println!("---");
+            if let Some(arr) = arr {
+                for c in arr {
+                    let cid = c.get("chunkId").and_then(|v| v.as_str()).unwrap_or("?");
+                    let head: Vec<&str> = c
+                        .get("headingPath")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+                        .unwrap_or_default();
+                    let head_s = if head.is_empty() {
+                        "(root)".to_owned()
+                    } else {
+                        head.join(" > ")
+                    };
+                    let text = c.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    let snippet: String = text.chars().take(180).collect();
+                    println!("[{cid}]  §{head_s}");
+                    println!("    {snippet}");
+                }
+            }
+            Ok(())
+        }
+        Err(e) => {
+            // Likely doc_not_found — try treating id as chunk_id by hitting search.
+            // The chunk-lookup HTTP surface is currently bound to the search
+            // endpoint; emit the original error if id doesn't look like a chunk.
+            if id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit()) {
+                eprintln!("doc-id lookup failed: {e}; chunk_id lookup over HTTP not yet exposed.");
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+async fn kb_visibility_http(doc_id: &str, visibility: &str) -> Result<()> {
+    let path = format!("/api/v1/knowledge/docs/{doc_id}/visibility");
+    let body = serde_json::json!({ "visibility": visibility });
+    let _: serde_json::Value =
+        crate::cmd::gateway_http::patch_json(&path, &body).await?;
+    println!("updated {doc_id} visibility → {visibility}");
+    Ok(())
+}
+
+async fn kb_export_http(doc_id: &str, to: &std::path::Path) -> Result<()> {
+    let path = format!("/api/v1/knowledge/docs/{doc_id}/content");
+    let bytes = crate::cmd::gateway_http::get_bytes(&path).await?;
+    std::fs::write(to, &bytes).with_context(|| format!("write {}", to.display()))?;
+    println!("exported {doc_id} → {} ({} bytes)", to.display(), bytes.len());
+    Ok(())
+}
+
+async fn kb_sync_all_http(interval_min: u64, max: usize, dry_run: bool) -> Result<()> {
+    let body = serde_json::json!({
+        "interval_min": interval_min,
+        "max": max,
+        "dry_run": dry_run,
+    });
+    let resp: serde_json::Value =
+        crate::cmd::gateway_http::post_json("/api/v1/knowledge/sync-all", &body).await?;
+    println!("{}", serde_json::to_string_pretty(&resp).unwrap_or_default());
+    Ok(())
+}
+
+async fn kb_compact_http() -> Result<()> {
+    let empty = serde_json::json!({});
+    let resp: serde_json::Value =
+        crate::cmd::gateway_http::post_json("/api/v1/knowledge/compact", &empty).await?;
+    banner(&format!(
+        "rsclaw kb compact v{} (via http)",
+        option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
+    ));
+    if let Some(obj) = resp.as_object() {
+        for (k, v) in obj {
+            kv(k, &bold(&v.to_string()));
         }
     }
     Ok(())

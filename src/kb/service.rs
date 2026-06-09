@@ -20,6 +20,7 @@ use tokio::sync::broadcast;
 use crate::kb::{
     KbEmbedder, KbIndex, KbPaths, KbStore,
     canonicalize::{CanonicalizeInput, canonicalize_by_mime, detect_mime},
+    compactor::{CompactStats, run_compactor_tick},
     content_store::read::read_doc_body,
     embedder::resolve_embedder,
     jobs::{Job, JobKind, JobStatus},
@@ -613,6 +614,252 @@ impl KnowledgeService {
             chunk_count,
             bytes,
         })
+    }
+
+    /// Run one compactor tick + HNSW snapshot dump. The CLI `kb compact`
+    /// used to open the redb file directly, which fights the gateway's
+    /// exclusive write lock — this is the gateway-internal path that
+    /// the HTTP endpoint and the CLI HTTP fallback both call.
+    /// Returns the compaction stats and whether the snapshot dump
+    /// succeeded; snapshot failure is non-fatal (next startup rebuilds
+    /// from redb) so we surface it as a bool rather than an error.
+    pub fn compact(&self) -> KResult<(CompactStats, bool)> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let stats = run_compactor_tick(&self.store, &self.paths, now)
+            .map_err(KnowledgeError::Internal)?;
+        let snapshot_ok = match self.index.snapshot_hnsw(&self.paths) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("kb snapshot dump failed: {e:#}");
+                false
+            }
+        };
+        Ok((stats, snapshot_ok))
+    }
+
+    /// Look up an active doc by id alone and report which collection it
+    /// belongs to (decoded from its `collection:<id>` tag, if any). Used
+    /// by the doc-id-only HTTP convenience endpoints so CLI callers
+    /// (`kb rm <doc_id>`, `kb show <doc_id>`, `kb export <doc_id>`) don't
+    /// have to know the collection.
+    pub fn find_doc(&self, doc_id: &str) -> KResult<(KbDoc, Option<String>)> {
+        let rtx = self.store.begin_read()?;
+        let d = docs::get(&rtx, doc_id)?
+            .filter(|d| d.status == KbStatus::Active)
+            .ok_or(KnowledgeError::DocNotFound)?;
+        let cid = d
+            .tags
+            .iter()
+            .find_map(|t| t.strip_prefix(COLLECTION_TAG_PREFIX).map(|s| s.to_owned()));
+        Ok((d, cid))
+    }
+
+    /// Tombstone a doc by id alone. Same end-state as `delete_doc` but
+    /// no collection arg required.
+    pub fn delete_doc_by_id(&self, doc_id: &str) -> KResult<()> {
+        let rtx = self.store.begin_read()?;
+        let mut d = docs::get(&rtx, doc_id)?
+            .filter(|d| d.status == KbStatus::Active)
+            .ok_or(KnowledgeError::DocNotFound)?;
+        drop(rtx);
+        d.status = KbStatus::Tombstoned;
+        let wtx = self.store.begin_write()?;
+        docs::put(&wtx, &d)?;
+        wtx.commit().map_err(anyhow::Error::from)?;
+        Ok(())
+    }
+
+    /// Bulk-tombstone every Active doc whose `tags` contains `tag`.
+    /// Returns the number of docs affected. CLI's `kb rm --tag <name>`
+    /// HTTP path.
+    pub fn tombstone_by_tag(&self, tag: &str) -> KResult<usize> {
+        use redb::ReadableTable;
+        let rtx = self.store.begin_read()?;
+        let mut victims: Vec<KbDoc> = Vec::new();
+        {
+            let tbl = rtx.open_table(KB_DOCS).map_err(anyhow::Error::from)?;
+            for entry in tbl.iter().map_err(anyhow::Error::from)? {
+                let (_, v) = entry.map_err(anyhow::Error::from)?;
+                let d: KbDoc = decode(v.value())?;
+                if d.status == KbStatus::Active && d.tags.iter().any(|t| t == tag) {
+                    victims.push(d);
+                }
+            }
+        }
+        drop(rtx);
+        if victims.is_empty() {
+            return Ok(0);
+        }
+        let n = victims.len();
+        let wtx = self.store.begin_write()?;
+        for mut d in victims {
+            d.status = KbStatus::Tombstoned;
+            docs::put(&wtx, &d)?;
+        }
+        wtx.commit().map_err(anyhow::Error::from)?;
+        Ok(n)
+    }
+
+    /// Update a doc's `visibility` field. `kb visibility` HTTP path.
+    pub fn set_doc_visibility(
+        &self,
+        doc_id: &str,
+        visibility: crate::kb::model::KbVisibility,
+    ) -> KResult<()> {
+        let rtx = self.store.begin_read()?;
+        let mut d = docs::get(&rtx, doc_id)?
+            .filter(|d| d.status == KbStatus::Active)
+            .ok_or(KnowledgeError::DocNotFound)?;
+        drop(rtx);
+        d.visibility = visibility;
+        let wtx = self.store.begin_write()?;
+        docs::put(&wtx, &d)?;
+        wtx.commit().map_err(anyhow::Error::from)?;
+        Ok(())
+    }
+
+    /// Read a doc's canonical markdown body by id alone. Used by
+    /// `kb export <doc_id>` and `kb show`. Returns `(mime, body)`.
+    pub fn doc_body(&self, doc_id: &str) -> KResult<(String, String)> {
+        let (d, _) = self.find_doc(doc_id)?;
+        let abs = self.paths.root.join(&d.markdown_path);
+        let body = read_doc_body(&abs).map_err(KnowledgeError::Internal)?;
+        Ok((d.mime, body))
+    }
+
+    /// Active chunks for a doc, sorted by `seq`. Used by `kb show` to
+    /// dump the chunk list with snippets.
+    pub fn doc_chunks(&self, doc_id: &str) -> KResult<Vec<KbChunk>> {
+        let rtx = self.store.begin_read()?;
+        let d = docs::get(&rtx, doc_id)?
+            .filter(|d| d.status == KbStatus::Active)
+            .ok_or(KnowledgeError::DocNotFound)?;
+        let mut chunks: Vec<KbChunk> =
+            crate::kb::store::chunks::chunks_for_logical(&rtx, &d.logical_source_id)
+                .map_err(KnowledgeError::Internal)?
+                .into_iter()
+                .filter(|c| c.doc_id == d.id && c.status == ChunkStatus::Active)
+                .collect();
+        chunks.sort_by_key(|c| c.seq);
+        Ok(chunks)
+    }
+
+    /// Flat list of Active docs across all collections, with the same
+    /// tag/source_kind/limit filters as the existing `kb_list_docs`
+    /// tool. Used by `kb ls` (no collection arg) over HTTP.
+    pub fn list_all_docs(
+        &self,
+        tags: Vec<String>,
+        source_kind: Option<String>,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> KResult<crate::kb::tools::kb_list_docs::KbListDocsOutput> {
+        let ctx = self.search_ctx();
+        crate::kb::tools::kb_list_docs::run(
+            &ctx,
+            crate::kb::tools::kb_list_docs::KbListDocsInput {
+                tags,
+                source_kind,
+                limit,
+                cursor,
+            },
+            &CallerScope::default(),
+        )
+        .map_err(KnowledgeError::Internal)
+    }
+
+    /// Re-sync every Active URL-backed doc whose last sync is older than
+    /// `interval_min` minutes, up to `max` urls per call. `kb sync-all`
+    /// HTTP path. When `dry_run` is set, returns the candidate list
+    /// without firing any syncs. Heavy CPU/network — call from
+    /// spawn_blocking.
+    pub fn sync_all_urls(
+        &self,
+        interval_min: u64,
+        max: usize,
+        dry_run: bool,
+    ) -> KResult<serde_json::Value> {
+        use redb::ReadableTable;
+        use crate::kb::{
+            canonicalize::canonicalize_url,
+            store::{schema::KB_DOCS, seen::get_sync_state},
+            sync::{KbSourceSyncer, SyncContext, SyncReason, UrlSyncer},
+        };
+        let cutoff_ms =
+            chrono::Utc::now().timestamp_millis() - (interval_min as i64) * 60_000;
+        let mut candidates: Vec<(String, Vec<String>)> = Vec::new();
+        {
+            let rtx = self.store.begin_read()?;
+            let tbl = rtx.open_table(KB_DOCS).map_err(anyhow::Error::from)?;
+            for entry in tbl.iter().map_err(anyhow::Error::from)? {
+                let (_, v) = entry.map_err(anyhow::Error::from)?;
+                let d: KbDoc = decode(v.value())?;
+                if d.status != KbStatus::Active {
+                    continue;
+                }
+                let url = match &d.source {
+                    crate::kb::model::KbSource::Url { url, .. } => url.clone(),
+                    _ => continue,
+                };
+                let canonical = canonicalize_url(&url).unwrap_or(url);
+                let last = get_sync_state(&rtx, &canonical)
+                    .ok()
+                    .flatten()
+                    .map(|s| s.last_sync_at)
+                    .unwrap_or(0);
+                if last < cutoff_ms {
+                    candidates.push((canonical, d.tags.clone()));
+                }
+            }
+        }
+        candidates.sort_by(|a, b| a.0.cmp(&b.0));
+        candidates.dedup_by(|a, b| a.0 == b.0);
+        let total = candidates.len();
+        let to_run: Vec<_> = candidates.into_iter().take(max).collect();
+        if dry_run {
+            return Ok(serde_json::json!({
+                "dryRun": true,
+                "candidates": total,
+                "wouldRun": to_run.iter().map(|(u, _)| u).collect::<Vec<_>>(),
+            }));
+        }
+        let ctx = SyncContext {
+            store: self.store.clone(),
+            paths: self.paths.clone(),
+            index: self.index.clone(),
+            embedder: self.embedder.clone(),
+        };
+        let mut added = 0u64;
+        let mut skipped = 0u64;
+        let mut errored: Vec<String> = Vec::new();
+        // sync() is async, but we're inside a sync service method called
+        // from spawn_blocking — drive it with the current Tokio handle's
+        // block_on. The HTTP handler hops into spawn_blocking precisely
+        // because of this.
+        let handle = tokio::runtime::Handle::current();
+        for (url, tags) in &to_run {
+            let syncer = UrlSyncer {
+                url: url.clone(),
+                tags: tags.clone(),
+            };
+            match handle.block_on(syncer.sync(&ctx, SyncReason::Periodic)) {
+                Ok(o) => {
+                    added += o.docs_added as u64;
+                    skipped += o.docs_skipped as u64;
+                }
+                Err(e) => errored.push(format!("{url}: {e}")),
+            }
+        }
+        // Drain the in-process worker so freshly-enqueued chunk+embed
+        // jobs are committed before we report counts.
+        let _ = self.drain_once();
+        Ok(serde_json::json!({
+            "candidates": total,
+            "ran": to_run.len(),
+            "added": added,
+            "skipped": skipped,
+            "errors": errored,
+        }))
     }
 
     /// Embedders the UI can offer. The active one is marked default; local BGE

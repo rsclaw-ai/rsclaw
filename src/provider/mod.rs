@@ -13,6 +13,7 @@ pub mod model_defaults;
 pub mod openai;
 pub mod registry;
 pub mod rsclaw;
+pub mod rsclaw_http;
 
 use std::pin::Pin;
 

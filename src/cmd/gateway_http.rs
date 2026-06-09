@@ -115,6 +115,62 @@ pub async fn post_json<B: Serialize, T: DeserializeOwned>(path: &str, body: &B) 
         .with_context(|| format!("gateway POST {path}: invalid JSON response"))
 }
 
+/// PATCH JSON body. Same error semantics as `get_json`/`post_json`.
+pub async fn patch_json<B: Serialize, T: DeserializeOwned>(path: &str, body: &B) -> Result<T> {
+    let ep = GatewayEndpoint::resolve();
+    let c = client(Duration::from_secs(30));
+    let rb = c.patch(ep.url(path)).json(body);
+    let resp = auth_header(rb, ep.token.as_deref())
+        .send()
+        .await
+        .with_context(|| format!("gateway PATCH {path} failed"))?;
+    if !resp.status().is_success() {
+        let st = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("gateway returned {st}: {}", body.chars().take(400).collect::<String>()));
+    }
+    resp.json::<T>()
+        .await
+        .with_context(|| format!("gateway PATCH {path}: invalid JSON response"))
+}
+
+/// DELETE returning JSON.
+pub async fn delete_json<T: DeserializeOwned>(path: &str) -> Result<T> {
+    let ep = GatewayEndpoint::resolve();
+    let c = client(Duration::from_secs(30));
+    let rb = c.delete(ep.url(path));
+    let resp = auth_header(rb, ep.token.as_deref())
+        .send()
+        .await
+        .with_context(|| format!("gateway DELETE {path} failed"))?;
+    if !resp.status().is_success() {
+        let st = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("gateway returned {st}: {}", body.chars().take(400).collect::<String>()));
+    }
+    resp.json::<T>()
+        .await
+        .with_context(|| format!("gateway DELETE {path}: invalid JSON response"))
+}
+
+/// GET raw bytes (for content endpoints that return non-JSON payloads
+/// like markdown). Same auth + error semantics as `get_json`.
+pub async fn get_bytes(path: &str) -> Result<Vec<u8>> {
+    let ep = GatewayEndpoint::resolve();
+    let c = client(Duration::from_secs(60));
+    let rb = c.get(ep.url(path));
+    let resp = auth_header(rb, ep.token.as_deref())
+        .send()
+        .await
+        .with_context(|| format!("gateway GET {path} failed"))?;
+    if !resp.status().is_success() {
+        let st = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("gateway returned {st}: {}", body.chars().take(400).collect::<String>()));
+    }
+    Ok(resp.bytes().await?.to_vec())
+}
+
 /// Format a "gateway down" hint suitable for CLI error output. Used by
 /// HTTP-only subcommands that can't fall back to a direct file open.
 pub fn down_hint() -> String {

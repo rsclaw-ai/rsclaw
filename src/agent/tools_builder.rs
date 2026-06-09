@@ -770,21 +770,28 @@ pub fn build_tool_list(
             Never curate proactively.\n\
             - action=list_collections — see existing collections (reuse one before creating).\n\
             - action=create_collection {name, description?} — make a new collection.\n\
-            - action=add {collection, title, content, mime?} — ingest text you prepared; \
-              `collection` is a NAME (created if absent); `content` is markdown/plain text.".to_owned(),
+            - action=add {collection, title, content, mime?, force?} — ingest text you prepared; \
+              `collection` is a NAME (created if absent); `content` is markdown/plain text. \
+              Returns `status:\"near_duplicate\"` with the existing doc if a semantically similar \
+              entry already exists; pass `force:true` to add anyway.\n\
+            - action=delete {collection, doc_id} — tombstone a doc by its exact id. Only call when \
+              the user explicitly asks to remove something; never to clean up your own mistakes \
+              without confirmation.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["search", "add", "create_collection", "list_collections"], "description": "Default search. Write actions only when asked."},
+                "action": {"type": "string", "enum": ["search", "add", "delete", "create_collection", "list_collections"], "description": "Default search. Write actions only when asked."},
                 "query": {"type": "string", "description": "Search query."},
                 "collection_ids": {"type": "array", "items": {"type": "string"}, "description": "Restrict to these collection ids; omit for all."},
                 "top_k": {"type": "integer", "default": 5, "description": "Max hits."},
-                "collection": {"type": "string", "description": "Collection NAME (add); created if absent."},
+                "collection": {"type": "string", "description": "Collection NAME or ID (add/delete)."},
                 "name": {"type": "string", "description": "New collection name."},
                 "description": {"type": "string", "description": "Optional collection description."},
                 "title": {"type": "string", "description": "Document title."},
                 "content": {"type": "string", "description": "Document text to ingest."},
-                "mime": {"type": "string", "default": "text/markdown", "description": "MIME for content."}
+                "mime": {"type": "string", "default": "text/markdown", "description": "MIME for content."},
+                "doc_id": {"type": "string", "description": "Exact doc id (delete only)."},
+                "force": {"type": "boolean", "default": false, "description": "Skip near-duplicate check on add."}
             },
             "required": []
         }),
@@ -846,7 +853,14 @@ pub fn build_tool_list(
             50) so the LLM context stays bounded — the upstream service can \
             return 5000+ rows on a busy day. Filter by `market` (SH/SZ/BJ) or an \
             explicit `codes` list to narrow further. Set `ts=<date>` for a \
-            historical snapshot.".to_owned(),
+            historical snapshot.\n\
+            \n\
+            Smart default: if you pass NO `codes`, NO `market`, and NO `ts`, \
+            the snapshot auto-filters to the caller's watchlist (see \
+            `stock_watchlist`). The result envelope's `used_watchlist: true` \
+            flag tells you whether that happened, so you can phrase the reply \
+            as \"你关注的 N 只...\" instead of \"全市场...\". Override with \
+            `use_watchlist=false` to force a market-wide snapshot.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -859,7 +873,8 @@ pub fn build_tool_list(
                           "description": "Cap rows returned to the LLM."},
                 "sort_by": {"type": "string", "enum": ["amount","pct","price"], "default": "amount",
                             "description": "Primary sort key."},
-                "order": {"type": "string", "enum": ["desc","asc"], "default": "desc"}
+                "order": {"type": "string", "enum": ["desc","asc"], "default": "desc"},
+                "use_watchlist": {"type": "boolean", "description": "When unset, defaults to the caller's watchlist if codes/market/ts are all empty. Pass false to force market-wide."}
             },
             "required": []
         }),

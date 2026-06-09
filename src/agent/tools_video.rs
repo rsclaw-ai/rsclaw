@@ -92,6 +92,8 @@ impl super::runtime::AgentRuntime {
                 "kling"
             } else if m.contains("minimax") || m.contains("hailuo") {
                 "minimax"
+            } else if m.starts_with("rsclaw/") || m.contains("rsclaw-video") || m == "rsclaw" {
+                "rsclaw"
             } else {
                 "doubao"
             }
@@ -222,6 +224,19 @@ impl super::runtime::AgentRuntime {
                         )),
                     }
                 }
+                "rsclaw" => match resolve_key("rsclaw", "RSCLAW_API_KEY") {
+                    Some(key) => submit_rsclaw_video(
+                        &client,
+                        &key,
+                        prompt,
+                        duration,
+                        aspect_ratio,
+                        Some(model_id.as_str()),
+                    )
+                    .await
+                    .map(|id| ("rsclaw", id)),
+                    None => Err(anyhow!("video_gen: no API key for rsclaw")),
+                },
                 other => Err(anyhow!("video_gen: unsupported provider {other}")),
             };
 
@@ -301,4 +316,65 @@ impl super::runtime::AgentRuntime {
             "message": "Video generation submitted. The finished video will be delivered automatically when ready (typically 30s–5min). The user has been informed; do NOT poll or wait — your turn is complete."
         }))
     }
+}
+
+/// Submit a rsclaw text→video task and return the rsclaw `video_<id>`.
+///
+/// Hits `POST https://api.rsclaw.ai/v1/videos` with the OAI Sora-2 +
+/// Seedance superset body. Polling is handled by
+/// `gateway::external_jobs_worker::poll_rsclaw` after the caller
+/// enqueues the corresponding `ExternalJob{ provider: "rsclaw" }`.
+///
+/// 307/308 redirects from the LB are followed by
+/// `crate::provider::rsclaw_http::post_json` — same protocol as the
+/// LLM-side `src/provider/rsclaw.rs::send_following_redirects` (Bearer
+/// re-attached on each cross-origin hop, max 5 hops).
+async fn submit_rsclaw_video(
+    _client: &reqwest::Client,
+    api_key: &str,
+    prompt: &str,
+    duration: u64,
+    aspect_ratio: &str,
+    model_hint: Option<&str>,
+) -> Result<String> {
+    let model = model_hint.unwrap_or("rsclaw-video-v1");
+    let body = json!({
+        "model": model,
+        "prompt": prompt,
+        "resolution": "720p",
+        "ratio": aspect_ratio,
+        "duration": duration,
+    });
+
+    let url = format!(
+        "{}/v1/videos",
+        crate::provider::rsclaw_http::gen_host_base(None)
+    );
+    let redirect_client =
+        crate::provider::rsclaw_http::build_client(crate::provider::DEFAULT_USER_AGENT, 30)?;
+    let resp = crate::provider::rsclaw_http::post_json(&redirect_client, &url, api_key, &body)
+        .await?;
+    let status = resp.status();
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| anyhow!("video_gen: rsclaw read body: {e}"))?;
+
+    if !status.is_success() {
+        let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        let msg = v
+            .pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .or_else(|| v.get("message").and_then(|v| v.as_str()))
+            .unwrap_or("unknown error");
+        return Err(anyhow!("video_gen: rsclaw API {status}: {msg}"));
+    }
+    let v: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| anyhow!("video_gen: rsclaw parse response: {e}"))?;
+    let id = v
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("video_gen: rsclaw no `id` in response: {v}"))?
+        .to_owned();
+    Ok(id)
 }

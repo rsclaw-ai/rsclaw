@@ -1336,7 +1336,7 @@ impl TaskQueueWorker {
                 extra_tools: vec![],
                 images: next_images,
                 files: next_files,
-                account: None,
+                account: account.clone(),
             };
 
             info!(task_id = %task_id, turn, "task queue worker: agent turn");

@@ -17,6 +17,7 @@
 //! whole block is missing), `global_client()` returns `None` and
 //! callers degrade to a structured "astock not configured" reply.
 
+pub mod briefing;
 pub mod chart;
 pub mod client;
 

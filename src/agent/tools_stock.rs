@@ -76,10 +76,16 @@ impl AgentRuntime {
             }
         };
         let items: Vec<Value> = quotes.iter().map(|q| quote_to_json(q, format)).collect();
+        let markdown = render_quotes_markdown(&quotes);
         Ok(json!({
             "ok": true,
             "count": items.len(),
             "quotes": items,
+            // Pre-rendered IM-friendly text. Use this verbatim in chat
+            // replies — it already carries +/- sign, 万/亿 units,
+            // and aligns columns. Saves the LLM from re-formatting JSON
+            // and keeps the rendering consistent across chats / models.
+            "markdown": markdown,
         }))
     }
 
@@ -107,15 +113,19 @@ impl AgentRuntime {
         let offset = args.get("offset").and_then(Value::as_u64).map(|n| n as u32);
         let adjust = args.get("adjust").and_then(Value::as_str);
         match arc.kline(code, period, count, offset, adjust).await {
-            Ok(r) => Ok(json!({
-                "ok": true,
-                "code": r.code,
-                "period": r.period,
-                "adjust": r.adjust,
-                "adjust_warning": r.adjust_warning,
-                "bars": r.klines,
-                "data_quality": r.data_quality,
-            })),
+            Ok(r) => {
+                let markdown = render_kline_summary_markdown(&r);
+                Ok(json!({
+                    "ok": true,
+                    "code": r.code,
+                    "period": r.period,
+                    "adjust": r.adjust,
+                    "adjust_warning": r.adjust_warning,
+                    "bars": r.klines,
+                    "data_quality": r.data_quality,
+                    "markdown": markdown,
+                }))
+            }
             Err(e) => Ok(json!({
                 "ok": false,
                 "error": format!("astock kline: {e}"),
@@ -130,15 +140,51 @@ impl AgentRuntime {
     /// args: `{ ts?: string, market?: "SH"|"SZ"|"BJ", codes?: [string],
     ///          adjust?: "none"|"qfq"|"hfq", limit?: int<=5000,
     ///          sort_by?: "amount"|"pct"|"price" (default amount),
-    ///          order?: "desc"|"asc" (default desc) }`.
-    pub(crate) async fn tool_stock_snapshot(&self, args: Value) -> Result<Value> {
+    ///          order?: "desc"|"asc" (default desc),
+    ///          use_watchlist?: bool }`.
+    ///
+    /// Default watchlist behaviour: when `codes` is empty AND
+    /// `market` is unset AND `ts` is unset AND the calling peer has
+    /// a non-empty watchlist (via `stock_watchlist`), the snapshot
+    /// auto-filters to those codes. Lets the user ask
+    /// "我关注的股票今天怎么样" with a single tool call instead of
+    /// `stock_watchlist list` → `stock_snapshot codes=[...]`.
+    /// Set `use_watchlist=false` to force a full-market snapshot
+    /// even when the watchlist is non-empty.
+    pub(crate) async fn tool_stock_snapshot(
+        &self,
+        ctx: &RunContext,
+        args: Value,
+    ) -> Result<Value> {
         let arc = match crate::astock::global_client() {
             Some(c) => c,
             None => return Ok(astock_dormant_note()),
         };
         let ts = args.get("ts").and_then(Value::as_str);
         let market = args.get("market").and_then(Value::as_str);
-        let codes = extract_codes(&args);
+        let mut codes = extract_codes(&args);
+        let mut used_watchlist = false;
+        // Watchlist auto-fill: only when the LLM hasn't passed any
+        // explicit filter (no codes, no market, no historical ts).
+        // Adding a market filter implies "I want the whole market",
+        // so honour that and skip the watchlist substitution.
+        let use_watchlist_opt = args.get("use_watchlist").and_then(Value::as_bool);
+        let watchlist_eligible = codes.is_empty()
+            && market.is_none()
+            && ts.is_none()
+            && use_watchlist_opt != Some(false);
+        if watchlist_eligible && let Some(mem) = self.memory.as_ref() {
+            let scope = watchlist_scope(&ctx.agent_id, &ctx.channel, &ctx.peer_id);
+            let store = mem.lock().await;
+            codes = store
+                .list_active()
+                .into_iter()
+                .filter(|d| d.scope == scope && d.kind == WATCHLIST_KIND)
+                .map(|d| d.text)
+                .collect();
+            drop(store);
+            used_watchlist = !codes.is_empty();
+        }
         let adjust = args.get("adjust").and_then(Value::as_str);
         let limit = args
             .get("limit")
@@ -168,13 +214,21 @@ impl AgentRuntime {
             if order == "asc" { ord } else { ord.reverse() }
         });
         rows.truncate(limit);
+        let markdown = render_snapshot_markdown(&rows, used_watchlist, sort_by);
         Ok(json!({
             "ok": true,
             "total": total,
             "shown": rows.len(),
             "sort_by": sort_by,
             "order": order,
+            // Tells the LLM whether it just got a watchlist-scoped
+            "used_watchlist": used_watchlist,
+            // snapshot or a market-wide one. Useful when composing
+            // the user-facing reply ("你关注的 5 只股票:..."" vs
+            // "全市场前 50:....""), and avoids the LLM having to
+            // remember the call shape.
             "rows": rows,
+            "markdown": markdown,
         }))
     }
 
@@ -738,6 +792,182 @@ async fn watchlist_clear(
     }))
 }
 
+// ---------------------------------------------------------------------------
+// IM-friendly markdown rendering
+// ---------------------------------------------------------------------------
+//
+// Each stock_* tool returns a `markdown` field next to its JSON. Goals:
+//
+// * **Survive every IM client** — no emoji that renders differently in
+//   feishu/wechat/telegram-with-default-font. Plain ASCII signs and CJK
+//   numerals (`万` / `亿`).
+// * **Preserve the 红涨绿跌 convention** — but in plain text, since IM
+//   markdown doesn't reliably colorize. Use sign + leading character
+//   (`+2.35%` / `-1.20%`) and let the user's brain do the rest.
+// * **Compact** — one line per quote in batch, ≤4 columns in tables.
+//   Chat windows are narrow; lines longer than ~40 CJK chars wrap ugly.
+// * **No agent re-formatting needed** — the LLM should echo this field
+//   verbatim. Saves tokens, avoids 9B-models mangling the precision.
+
+/// Format a single quote as a one-line summary.
+///
+/// Shape: `<code>  ¥<price>  <+|-N.NN%>  额<money>  量<volume>`
+/// Example: `600519  ¥1272.86  +0.07%  额39.84亿  量313.04万手`
+fn render_one_quote_line(q: &crate::astock::Quote) -> String {
+    let pct = q.change_pct();
+    let sign = if pct >= 0.0 { "+" } else { "" };
+    format!(
+        "{}  ¥{:.2}  {}{:.2}%  额{}  量{}",
+        q.code,
+        q.price,
+        sign,
+        pct,
+        compact_cny(q.amount),
+        compact_volume(q.volume),
+    )
+}
+
+fn render_quotes_markdown(quotes: &[crate::astock::Quote]) -> String {
+    if quotes.is_empty() {
+        return "_没有报价数据_".to_owned();
+    }
+    if quotes.len() == 1 {
+        return render_one_quote_line(&quotes[0]);
+    }
+    quotes
+        .iter()
+        .map(|q| format!("- {}", render_one_quote_line(q)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Snapshot rendered as a markdown table. Truncates the row count to
+/// `MAX_MARKDOWN_ROWS` so a 5000-row snapshot doesn't carry a 5000-row
+/// table into the next IM message. The JSON `rows` field still carries
+/// the full data for any LLM that wants to scan.
+fn render_snapshot_markdown(
+    rows: &[crate::astock::SnapshotRow],
+    used_watchlist: bool,
+    sort_by: &str,
+) -> String {
+    const MAX_MARKDOWN_ROWS: usize = 20;
+    if rows.is_empty() {
+        if used_watchlist {
+            return "_关注列表里没有有效报价 — 可能没设置或市场未开盘_".to_owned();
+        }
+        return "_无快照数据_".to_owned();
+    }
+    let header = if used_watchlist {
+        format!("**关注列表** ({} 只, 按 {sort_by})", rows.len())
+    } else {
+        format!("**全市场** ({} 行, 按 {sort_by})", rows.len())
+    };
+    let mut out = String::new();
+    out.push_str(&header);
+    out.push_str("\n\n");
+    out.push_str("| 代码 | 名称 | 现价 | 涨跌幅 | 成交额 |\n");
+    out.push_str("|---|---|---:|---:|---:|\n");
+    for r in rows.iter().take(MAX_MARKDOWN_ROWS) {
+        let pct = if r.pre_close.abs() > f64::EPSILON {
+            (r.price - r.pre_close) / r.pre_close * 100.0
+        } else {
+            0.0
+        };
+        let sign = if pct >= 0.0 { "+" } else { "" };
+        out.push_str(&format!(
+            "| {} | {} | {:.2} | {}{:.2}% | {} |\n",
+            r.code,
+            r.name.as_deref().unwrap_or(""),
+            r.price,
+            sign,
+            pct,
+            compact_cny(r.amount),
+        ));
+    }
+    if rows.len() > MAX_MARKDOWN_ROWS {
+        out.push_str(&format!("\n_... 共 {} 行,显示前 {}_", rows.len(), MAX_MARKDOWN_ROWS));
+    }
+    out
+}
+
+/// K-line summary stats for the period covered. The chart itself
+/// gets delivered via `stock_chart`; this block is the textual
+/// commentary that should accompany the chart.
+fn render_kline_summary_markdown(r: &crate::astock::KlineResp) -> String {
+    if r.klines.is_empty() {
+        return "_无 K 线数据_".to_owned();
+    }
+    let first = r.klines.first().unwrap();
+    let last = r.klines.last().unwrap();
+    let total_pct = if first.close.abs() > f64::EPSILON {
+        (last.close - first.close) / first.close * 100.0
+    } else {
+        0.0
+    };
+    let mut hi = f64::NEG_INFINITY;
+    let mut lo = f64::INFINITY;
+    let mut max_vol: i64 = 0;
+    for b in &r.klines {
+        if b.high > hi {
+            hi = b.high;
+        }
+        if b.low < lo {
+            lo = b.low;
+        }
+        if b.volume > max_vol {
+            max_vol = b.volume;
+        }
+    }
+    let sign = if total_pct >= 0.0 { "+" } else { "" };
+    let warn_line = match &r.adjust_warning {
+        Some(w) => format!("\n⚠️ 复权降级 — {w}"),
+        None => String::new(),
+    };
+    format!(
+        "**{}**  {}  ({} 根, {})\n\n\
+         - 最新: ¥{:.2}  ({sign}{:.2}% vs 区间起点)\n\
+         - 区间: ¥{:.2} - ¥{:.2}\n\
+         - 最大成交: {}{}",
+        r.code,
+        r.period,
+        r.klines.len(),
+        if r.adjust == "none" { "未复权" } else { &r.adjust },
+        last.close,
+        total_pct,
+        lo,
+        hi,
+        compact_volume(max_vol),
+        warn_line,
+    )
+}
+
+/// Format CNY in 万 / 亿 with one decimal place. astock returns yuan
+/// (元), so 万 = 1e4, 亿 = 1e8. Below 万 falls back to plain integer.
+fn compact_cny(yuan: f64) -> String {
+    let abs = yuan.abs();
+    if abs >= 1e8 {
+        format!("{:.2}亿", yuan / 1e8)
+    } else if abs >= 1e4 {
+        format!("{:.2}万", yuan / 1e4)
+    } else {
+        format!("{:.0}", yuan)
+    }
+}
+
+/// Format share volume in 万 / 亿 手. astock returns volume in lots
+/// ("手" — 1 lot = 100 shares on A-share). Same scale as CNY: above
+/// 1e4 lots = 万手, above 1e8 = 亿手.
+fn compact_volume(vol: i64) -> String {
+    let abs = vol.unsigned_abs();
+    if abs >= 100_000_000 {
+        format!("{:.2}亿手", vol as f64 / 1e8)
+    } else if abs >= 10_000 {
+        format!("{:.2}万手", vol as f64 / 1e4)
+    } else {
+        format!("{vol}手")
+    }
+}
+
 fn astock_dormant_note() -> Value {
     json!({
         "ok": false,
@@ -837,6 +1067,122 @@ mod tests {
         assert_eq!(out["text"].as_str(), Some("short"));
         assert_eq!(out["n"].as_i64(), Some(1));
         assert_eq!(out["arr"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn compact_cny_thresholds() {
+        assert_eq!(compact_cny(0.0), "0");
+        assert_eq!(compact_cny(9_999.0), "9999");
+        assert_eq!(compact_cny(12_345.0), "1.23万");
+        assert_eq!(compact_cny(12_345_678_000.0), "123.46亿");
+    }
+
+    #[test]
+    fn compact_volume_thresholds() {
+        assert_eq!(compact_volume(0), "0手");
+        assert_eq!(compact_volume(9_999), "9999手");
+        assert_eq!(compact_volume(123_456), "12.35万手");
+        assert_eq!(compact_volume(123_456_789_012), "1234.57亿手");
+    }
+
+    #[test]
+    fn render_one_quote_line_shape() {
+        let q = crate::astock::Quote {
+            code: "600519".into(),
+            market: String::new(),
+            price: 1272.86,
+            open: 1271.0,
+            high: 1283.0,
+            low: 1267.74,
+            pre_close: 1272.0,
+            volume: 3_130_400,
+            amount: 3_984_001_792.0,
+            bids: vec![],
+            asks: vec![],
+            timestamp: 0,
+        };
+        let s = render_one_quote_line(&q);
+        assert!(s.contains("600519"));
+        assert!(s.contains("¥1272.86"));
+        assert!(s.contains("+"), "positive change should carry leading +");
+        assert!(s.contains("亿"), "amount in billions");
+        assert!(s.contains("万手"), "volume in 万手");
+    }
+
+    #[test]
+    fn render_quotes_markdown_single_vs_batch() {
+        let q1 = crate::astock::Quote {
+            code: "600519".into(),
+            market: String::new(),
+            price: 100.0,
+            open: 100.0,
+            high: 100.0,
+            low: 100.0,
+            pre_close: 100.0,
+            volume: 0,
+            amount: 0.0,
+            bids: vec![],
+            asks: vec![],
+            timestamp: 0,
+        };
+        let q2 = crate::astock::Quote {
+            code: "000001".into(),
+            ..q1.clone()
+        };
+        let single = render_quotes_markdown(&[q1.clone()]);
+        assert!(!single.starts_with('-'), "single quote should NOT bullet");
+        let batch = render_quotes_markdown(&[q1, q2]);
+        assert!(batch.starts_with("- "), "batch quotes should bullet");
+        assert!(batch.contains("600519"));
+        assert!(batch.contains("000001"));
+    }
+
+    #[test]
+    fn render_snapshot_markdown_used_watchlist() {
+        let rows = vec![crate::astock::SnapshotRow {
+            code: "600519".into(),
+            name: Some("贵州茅台".into()),
+            market: "SH".into(),
+            price: 1272.86,
+            pre_close: 1272.0,
+            volume: 0,
+            amount: 3_984_001_792.0,
+            timestamp: 0,
+            extra: Default::default(),
+        }];
+        let md = render_snapshot_markdown(&rows, true, "amount");
+        assert!(md.contains("关注列表"));
+        assert!(md.contains("600519"));
+        assert!(md.contains("贵州茅台"));
+    }
+
+    #[test]
+    fn render_snapshot_empty_watchlist_message() {
+        let md = render_snapshot_markdown(&[], true, "amount");
+        assert!(md.contains("关注列表"));
+        assert!(md.contains("没设置或市场未开盘"));
+    }
+
+    #[test]
+    fn render_kline_summary_carries_range_and_change() {
+        use crate::astock::{KlineBar, KlineResp};
+        let kr = KlineResp {
+            code: "600519".into(),
+            period: "1d".into(),
+            adjust: "none".into(),
+            adjust_warning: None,
+            klines: vec![
+                KlineBar { timestamp: 1, open: 100.0, high: 102.0, low: 99.0, close: 100.0, volume: 1000, amount: 0.0 },
+                KlineBar { timestamp: 2, open: 100.0, high: 110.0, low: 99.5, close: 110.0, volume: 5000, amount: 0.0 },
+            ],
+            data_quality: serde_json::Value::Null,
+        };
+        let md = render_kline_summary_markdown(&kr);
+        assert!(md.contains("600519"));
+        assert!(md.contains("1d"));
+        assert!(md.contains("+10.00%"), "open-to-close change %");
+        assert!(md.contains("99.00"), "low");
+        assert!(md.contains("110.00"), "high");
     }
 
     #[test]

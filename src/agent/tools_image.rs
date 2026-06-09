@@ -224,15 +224,27 @@ impl super::runtime::AgentRuntime {
         // Providers with image generation support. The explicit image model is
         // the cost gate: do not silently fall back to another paid provider
         // just because an API key happens to be configured.
-        let image_providers = ["doubao", "bytedance", "openai", "qwen", "minimax", "gemini"];
+        let image_providers = ["doubao", "bytedance", "openai", "qwen", "minimax", "gemini", "rsclaw"];
         let (img_url, img_key, img_prov) = if image_providers.contains(&prov_name) {
-            let url = cfg_url.unwrap_or(base_url);
+            // rsclaw's LLM default in defaults.toml ends in `/v1/agent`;
+            // the gen surface lives off the host root. `gen_host_base`
+            // normalises both shapes; we append `/v1` for the OAI mount.
+            let raw = cfg_url.unwrap_or(base_url);
+            let url = if prov_name == "rsclaw" {
+                format!(
+                    "{}/v1",
+                    crate::provider::rsclaw_http::gen_host_base(Some(&raw))
+                )
+            } else {
+                raw
+            };
             let env_key = match prov_name {
                 "doubao" | "bytedance" => std::env::var("ARK_API_KEY").ok(),
                 "qwen" => std::env::var("DASHSCOPE_API_KEY").ok(),
                 "minimax" => std::env::var("MINIMAX_API_KEY").ok(),
                 "gemini" => std::env::var("GEMINI_API_KEY").ok(),
                 "openai" => std::env::var("OPENAI_API_KEY").ok(),
+                "rsclaw" => std::env::var("RSCLAW_API_KEY").ok(),
                 _ => None,
             };
             let key = cfg_key.or(env_key);
@@ -240,7 +252,7 @@ impl super::runtime::AgentRuntime {
         } else {
             return Ok(json!({
                 "error": format!(
-                    "Configured image model provider `{prov_name}` does not support image generation. Configure agents.defaults.model.image with one of: doubao, qwen, minimax, gemini, openai."
+                    "Configured image model provider `{prov_name}` does not support image generation. Configure agents.defaults.model.image with one of: doubao, qwen, minimax, gemini, openai, rsclaw."
                 )
             }));
         };
@@ -266,11 +278,12 @@ impl super::runtime::AgentRuntime {
             })
             .unwrap_or_else(|| match img_prov {
                 "doubao" | "bytedance" => "doubao-seedream-5-0-260128",
-                "openai" => "dall-e-3",
+                "openai" => "gpt-image-2",
                 "qwen" => "qwen-image-2.0-pro",
                 "minimax" => "image-01",
                 "gemini" => "gemini-3-pro-image-preview",
-                _ => "dall-e-3",
+                "rsclaw" => "rsclaw-image-v1",
+                _ => "gpt-image-2",
             });
 
         // Resolve User-Agent: provider config -> gateway config -> default
@@ -430,19 +443,78 @@ impl super::runtime::AgentRuntime {
             let body = parse_response_body(st, &body_bytes)?;
             (st, body)
         } else {
+            // OAI-compat block: shared by openai (incl. gpt-image-2),
+            // doubao seedream, and rsclaw (rsclaw-image-v1). All three
+            // accept the OAI `/v1/images/generations` request shape.
+            //
+            // gpt-image-2 specifics (per developers.openai.com docs,
+            // released 2026-04-21): GPT models ALWAYS return b64_json
+            // regardless of `response_format`, and accept additional
+            // `quality / output_format / output_compression / background
+            // / moderation` controls. We pass them through verbatim when
+            // the caller sets them in `args`; the existing data[0].url
+            // → data[0].b64_json fallback in the response parser handles
+            // either return shape transparently.
             let url = format!("{}/images/generations", img_url.trim_end_matches('/'));
-            let resp = client.post(&url)
-                .header("Authorization", format!("Bearer {api_key}"))
-                .json(&json!({ "model": image_model, "prompt": prompt, "size": size, "n": 1, "response_format": "url" }))
-                .send().await
-                .map_err(|e| anyhow!("image: request failed: {e}"))?;
-            let st = resp.status();
-            let body_bytes = resp
-                .bytes()
-                .await
-                .map_err(|e| anyhow!("image: read body: {e}"))?;
-            let body = parse_response_body(st, &body_bytes)?;
-            (st, body)
+            let is_gpt_image = image_model.starts_with("gpt-image");
+            let mut body = json!({
+                "model": image_model,
+                "prompt": prompt,
+                "size": size,
+                "n": 1,
+            });
+            // gpt-image-* ignore response_format (always b64_json). Sending
+            // it is harmless but cleaner to omit.
+            if !is_gpt_image {
+                body["response_format"] = json!("url");
+            }
+            // Pass-through optional gpt-image-2 / rsclaw-image-v1 fields.
+            // Applied uniformly — providers that don't recognise them
+            // simply ignore (we already pre-validated model→provider mapping).
+            for field in ["quality", "output_format", "background", "moderation"] {
+                if let Some(v) = args.get(field).and_then(|v| v.as_str()) {
+                    body[field] = json!(v);
+                }
+            }
+            if let Some(c) = args.get("output_compression").and_then(|v| v.as_u64()) {
+                body["output_compression"] = json!(c);
+            }
+
+            if img_prov == "rsclaw" {
+                // rsclaw LB may emit 307/308 redirecting to a backend
+                // pool with a different origin. reqwest's default policy
+                // strips Authorization across origins, so route through
+                // the shared `rsclaw_http` helper which manages the loop
+                // and re-attaches Bearer on each hop. Mirrors the LLM
+                // side's `send_following_redirects`.
+                let redirect_client = crate::provider::rsclaw_http::build_client(img_ua, 120)
+                    .map_err(|e| anyhow!("image: rsclaw client: {e}"))?;
+                let resp =
+                    crate::provider::rsclaw_http::post_json(&redirect_client, &url, &api_key, &body)
+                        .await?;
+                let st = resp.status();
+                let body_bytes = resp
+                    .bytes()
+                    .await
+                    .map_err(|e| anyhow!("image: rsclaw read body: {e}"))?;
+                let body = parse_response_body(st, &body_bytes)?;
+                (st, body)
+            } else {
+                let resp = client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {api_key}"))
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow!("image: request failed: {e}"))?;
+                let st = resp.status();
+                let body_bytes = resp
+                    .bytes()
+                    .await
+                    .map_err(|e| anyhow!("image: read body: {e}"))?;
+                let body = parse_response_body(st, &body_bytes)?;
+                (st, body)
+            }
         };
 
         if !resp_status.is_success() {
