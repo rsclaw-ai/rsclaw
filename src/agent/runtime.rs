@@ -564,6 +564,12 @@ pub struct RunContext {
     pub peer_id: String,
     /// Chat/conversation ID for sending intermediate progress messages.
     pub chat_id: String,
+    /// Inbound account key (e.g. feishu app account name). Threaded to
+    /// outbound `OutboundMessage.account` so notifications route via
+    /// `<channel>/<account>` and not bare `<channel>` — fixes Feishu
+    /// 99992361 "open_id cross app" on multi-app deployments where
+    /// the first-registered app would otherwise swallow every send.
+    pub account: Option<String>,
     /// Background exec pool for polling task results.
     pub exec_pool: Arc<super::exec_pool::ExecPool>,
     pub loop_detector: LoopDetector,
@@ -2070,6 +2076,7 @@ impl AgentRuntime {
         channel: &str,
         peer_id: &str,
         chat_id: &str,
+        account: Option<&str>,
         extra_tools: Vec<ToolDef>,
         images: Vec<super::registry::ImageAttachment>,
         files: Vec<super::registry::FileAttachment>,
@@ -2324,11 +2331,7 @@ impl AgentRuntime {
                     let chunker_session = pseudo_session_id.clone();
                     let chunker_channel = channel.to_owned();
                     let chunker_target = im_target_id.clone();
-                    let chunker_account = self
-                        .notification_tx
-                        .is_some()
-                        .then(|| None::<String>) // best-effort: outbound dispatcher figures out account from session
-                        .flatten();
+                    let chunker_account = account.map(str::to_owned);
                     let handle = tokio::spawn(stream_cap_chunks_to_im(
                         bus_rx,
                         chunker_session,
@@ -3301,6 +3304,7 @@ impl AgentRuntime {
                             channel: channel.to_owned(),
                             peer_id: peer_id.to_owned(),
                             chat_id: String::new(),
+                            account: None,
                             exec_pool: Arc::clone(&self.exec_pool),
                             loop_detector: crate::agent::loop_detection::LoopDetector::default(),
                             has_images: false,
@@ -3535,6 +3539,7 @@ impl AgentRuntime {
                     channel,
                     peer_id,
                     chat_id,
+                    account,
                     extra_tools,
                     images,
                     vec![],
@@ -3554,6 +3559,7 @@ impl AgentRuntime {
                     channel,
                     peer_id,
                     chat_id,
+                    account,
                     extra_tools,
                     images,
                     files,
@@ -4405,6 +4411,7 @@ impl AgentRuntime {
             // which on Discord groups produces a 404 (Discord rejects POST
             // to /channels/<user_id>/messages — DMs need a created channel).
             chat_id: chat_id.to_owned(),
+            account: account.map(str::to_owned),
             exec_pool: Arc::clone(&self.exec_pool),
             loop_detector: {
                 let ld_cfg_owned = self
@@ -6450,7 +6457,7 @@ impl AgentRuntime {
                             images: vec![],
                             files: vec![],
                             channel: Some(ctx.channel.clone()),
-                            account: None,
+                            account: ctx.account.clone(),
                         });
                     }
                 }
@@ -6598,7 +6605,7 @@ impl AgentRuntime {
                         images: vec![],
                         files: vec![],
                         channel: Some(ctx.channel.clone()),
-                        account: None,
+                        account: ctx.account.clone(),
                     });
                     tracing::debug!(
                         text_len = intermediate_text.len(),
