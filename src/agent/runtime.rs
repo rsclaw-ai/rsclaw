@@ -9367,6 +9367,7 @@ impl AgentRuntime {
                 let coll = args["collection"].as_str().unwrap_or("").trim().to_owned();
                 let title = args["title"].as_str().unwrap_or("").trim().to_owned();
                 let content = args["content"].as_str().unwrap_or("").to_owned();
+                let force = args["force"].as_bool().unwrap_or(false);
                 if coll.is_empty() || title.is_empty() || content.trim().is_empty() {
                     return Ok(json!({"error": "add requires collection, title, and content"}));
                 }
@@ -9378,7 +9379,30 @@ impl AgentRuntime {
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "text/markdown".to_owned());
                 let out = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
-                    let (cid, _name, _created) = resolve_or_create_collection(&kb, &coll, None)?;
+                    let (cid, _name, created) =
+                        resolve_or_create_collection(&kb, &coll, None)?;
+                    // Pre-search dedup: a brand-new collection can't have
+                    // duplicates; for existing ones, probe the top hit by
+                    // title against this collection and surface anything
+                    // within the near-duplicate band so the LLM can decide
+                    // whether to merge, replace, or `force: true`.
+                    if !created && !force {
+                        let probe_query = format!("{title}\n{}", content.chars().take(400).collect::<String>());
+                        let hits = kb
+                            .search(&probe_query, &[cid.clone()], 3, 0.0)
+                            .unwrap_or_default();
+                        const NEAR_DUP_THRESHOLD: f32 = 0.85;
+                        if let Some(top) = hits.iter().find(|h| h.score >= NEAR_DUP_THRESHOLD) {
+                            return Ok(json!({
+                                "status": "near_duplicate",
+                                "existing_doc_id": top.doc_id,
+                                "existing_title": top.source_title,
+                                "score": top.score,
+                                "collection_id": cid,
+                                "hint": "A semantically similar doc already exists. Re-call with `force: true` to add anyway, or `action: delete` the existing doc first.",
+                            }));
+                        }
+                    }
                     let (doc_id, noop) = kb
                         .ingest(&cid, &title, content.as_bytes(), Some(&mime))
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -9392,8 +9416,35 @@ impl AgentRuntime {
                 .map_err(|e| anyhow::anyhow!("kb add task failed: {e}"))??;
                 Ok(out)
             }
+            "delete" => {
+                let coll = args["collection"].as_str().unwrap_or("").trim().to_owned();
+                let doc_id = args["doc_id"].as_str().unwrap_or("").trim().to_owned();
+                if coll.is_empty() || doc_id.is_empty() {
+                    return Ok(json!({"error": "delete requires both `collection` and `doc_id`"}));
+                }
+                let out = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+                    let cols = kb
+                        .list_collections()
+                        .map_err(|e| anyhow::anyhow!("kb list_collections failed: {e}"))?;
+                    let cid = cols
+                        .iter()
+                        .find(|c| c.id == coll || c.name == coll)
+                        .map(|c| c.id.clone())
+                        .ok_or_else(|| anyhow::anyhow!("collection not found: {coll}"))?;
+                    kb.delete_doc(&cid, &doc_id)
+                        .map_err(|e| anyhow::anyhow!("kb delete_doc failed: {e}"))?;
+                    Ok(json!({
+                        "doc_id": doc_id,
+                        "collection_id": cid,
+                        "status": "tombstoned",
+                    }))
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("kb delete task failed: {e}"))??;
+                Ok(out)
+            }
             other => Ok(json!({
-                "error": format!("unknown action '{other}' (use search, add, create_collection, list_collections)")
+                "error": format!("unknown action '{other}' (use search, add, delete, create_collection, list_collections)")
             })),
         }
     }
@@ -10375,14 +10426,25 @@ fn format_tool_result(val: &serde_json::Value) -> String {
             // identifier fields any result-shaped payload exposes.
             let title = r
                 .get("title")
+                .or_else(|| r.get("source_title"))
+                .or_else(|| r.get("doc_title"))
                 .or_else(|| r.get("summary"))
                 .or_else(|| r.get("content"))
                 .or_else(|| r.get("slug"))
                 .or_else(|| r.get("name"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("(no title)");
-            let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("");
-            let snippet = r.get("snippet").and_then(|v| v.as_str()).unwrap_or("");
+            let url = r
+                .get("url")
+                .or_else(|| r.get("doc_id"))
+                .or_else(|| r.get("chunk_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let snippet = r
+                .get("snippet")
+                .or_else(|| r.get("text"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             out.push_str(&format!("{}. {}\n", i + 1, title));
             if !url.is_empty() {
                 out.push_str(&format!("   {url}\n"));
