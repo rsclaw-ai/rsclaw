@@ -1,7 +1,7 @@
 ---
 name: football
 description: 世界杯足球数据查询 赛程 比分 实时比分 出线形势 积分榜 球队战力 球员资料 交锋史 历史战绩 伤停 阵容 资讯 集锦 赔率 赛果结算 World Cup fixtures live-scores standings team power-rating head-to-head news lineup match-result。竞猜联赛中枢/参赛 agent 取数用。
-version: 1.1.0
+version: 1.2.0
 icon: "⚽"
 author: "@rsclaw"
 ---
@@ -44,7 +44,25 @@ IMPORTANT:
 ```
 返回队名/分组/队徽。**战力 powerRating 当前数据源无,为 null。**
 
-> **暂不支持(当前数据源没有,问到时如实告知,别瞎编)**:两队交锋史、球队世界杯历史战绩、伤停/阵容、实时资讯、射手榜(开赛后才有数据)。这些要接另一个数据源才有。**只回上面四类(赛程/比分/出线/球队分组)能查到的,其余诚实说"暂不支持"。**
+**两队世界杯交锋史**(teamA/teamB,中文或英文队名皆可):
+```json
+{"tool": "web_fetch", "url": "${FOOTBALL_API_BASE}/head2head?teamA=巴西&teamB=阿根廷", "headers": {"Authorization": "Bearer ${FOOTBALL_API_KEY}"}}
+```
+返回 `played/winsA/winsB/draws/goalsA/goalsB` + 逐场 `matches[]`。`matched=false` 表示没匹配到队名(换个写法或告知查不到)。数据为 1930-2022 世界杯正赛(点球以平局记)。
+
+**球队历届世界杯战绩**(team,中文或英文):
+```json
+{"tool": "web_fetch", "url": "${FOOTBALL_API_BASE}/history/worldcup?team=德国", "headers": {"Authorization": "Bearer ${FOOTBALL_API_KEY}"}}
+```
+返回 `appearances`(参赛届数)+ 总 `played/win/draw/loss/goalsFor/goalsAgainst` + 逐届 `editions[]`。
+
+**世界杯资讯**(q 关键词过滤、limit 条数,均可选):
+```json
+{"tool": "web_fetch", "url": "${FOOTBALL_API_BASE}/news?q=世界杯&limit=10", "headers": {"Authorization": "Bearer ${FOOTBALL_API_KEY}"}}
+```
+返回 `data[]`(title/summary/url/author/publishedAt/tags)。来源懂球帝,已滤掉非足球内容;实时更新,缓存数分钟。
+
+> **暂不支持(当前数据源没有,问到时如实告知,别瞎编)**:球队战力 powerRating、伤停/阵容、射手榜(开赛后才有数据)。**交锋史/历史战绩/资讯已支持(见上)**;战力/伤停/阵容这些要接另一个数据源才有,诚实说"暂不支持"。
 
 ## 提交预测(参赛 agent)
 
