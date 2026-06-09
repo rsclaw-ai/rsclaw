@@ -1,7 +1,7 @@
 ---
 name: football-hub
-description: 世界杯竞猜联赛播报/节目层 战报 榜单 打脸 爆冷 互喷 公告 H5直播大屏 SSE watch league broadcast commentary。读 football 联赛真相源 + 数据,生成播报与节目效果发到群/抖音 + 实时直播。
-version: 2.3.0
+description: 世界杯竞猜联赛播报/节目层 战报 榜单 打脸 爆冷 互喷 公告 坐庄 设赔率 odds H5直播大屏 SSE watch league broadcast commentary bookmaker。读 football 联赛真相源 + 数据,生成播报与节目效果发到群/抖音 + 实时直播 + 坐庄设赔率。
+version: 2.4.0
 icon: "🏆"
 author: "@rsclaw"
 ---
@@ -42,6 +42,20 @@ football 的 `/league/stream` 推下注/结算/公告事件。**用 rsclaw 的 `
  "body": "{\"title\":\"开赛\",\"text\":\"🏆 16强淘汰赛今晚打响,截止开球前下注！\"}"}
 ```
 - **用 `${LEAGUE_ANNOUNCE_KEY}`(只能发公告),不是 admin key** —— 你被注入也只能发公告,碰不到发 token/结算。
+
+## 坐庄设赔率(开球前,决定派彩倍数)
+押注玩法靠**赔率**派彩(押中冷门高赔率赢得多)。百度数据源没赔率,**由你坐庄手设**:
+1. 开球前用 `football` 技能拉**交锋史/历史战绩/积分榜**判断强弱:
+   `GET ${FOOTBALL_API_BASE}/head2head?teamA=&teamB=`、`/history/worldcup?team=`、`/standings`。
+2. 据此定胜/平/负赔率(越可能的结果赔率越低;三者倒数和略 >1 留点庄家边际),POST(**用 `${LEAGUE_ANNOUNCE_KEY}`**,坐庄是主持的一部分):
+```json
+{"tool": "web_fetch", "url": "${LEAGUE_API_BASE}/league/odds/<matchId>", "method": "POST",
+ "headers": {"Authorization": "Bearer ${LEAGUE_ANNOUNCE_KEY}", "content-type": "application/json"},
+ "body": "{\"home\":1.6,\"draw\":3.8,\"away\":5.5}"}
+```
+- 赔率须 >1。设完玩家在 `/v1/matches` 和大屏能看到,据此决定押哪个。
+- **可调节目性**:把冷门赔率拉高些更刺激(爆冷派彩更爽)。结算按设好的赔率派彩。
+- 用 announce key,碰不到结算/发 token(被注入也只能改赔率,影响有限;真奖励有实名兜底)。
 
 ## H5 直播大屏
 `${LEAGUE_API_BASE}/live` 是直播大屏(排行榜+实时互喷流+公告)。**把这个链接转发进群**——微信群进不了多 bot,但链接谁都能点开看完整战况。播报金句后附一句"完整战况看大屏 👉 ${LEAGUE_API_BASE}/live"。
