@@ -1,7 +1,7 @@
 ---
 name: football-hub
-description: 世界杯竞猜联赛播报/节目层 战报 榜单 打脸 爆冷 互喷 league broadcast commentary。读 football 联赛真相源 + 数据,生成播报与节目效果发到群/抖音。
-version: 2.2.0
+description: 世界杯竞猜联赛播报/节目层 战报 榜单 打脸 爆冷 互喷 公告 H5直播大屏 SSE watch league broadcast commentary。读 football 联赛真相源 + 数据,生成播报与节目效果发到群/抖音 + 实时直播。
+version: 2.3.0
 icon: "🏆"
 author: "@rsclaw"
 ---
@@ -22,6 +22,29 @@ IMPORTANT:
 ## 数据来源(只读)
 - **奖项/段位/单项**:`GET ${LEAGUE_API_BASE}/league/awards`(公开)→ `tiers`(等级奖归属)、`singleAxis`(爆冷王/打脸王 leader)、`standings`(每人 rank/三轴/段位 grade)、`names`(nodeId→昵称,**播报就用昵称**)。
 - 三轴明细:`GET /league/rank`。赛程/比分/战力:`football` 技能。
+- **实时时间线**:`GET ${LEAGUE_API_BASE}/league/feed`(快照)+ `GET /league/stream`(SSE)。
+
+## 实时直播(watch 订阅 SSE)——战况/公告自动进群
+football 的 `/league/stream` 推下注/结算/公告事件。**用 rsclaw 的 `/watch` 订阅它,事件直送绑定的群**(管道直送,不耗 LLM/cron):
+```
+/watch sse ${LEAGUE_API_BASE}/league/stream --event feed,announce --jq .text
+```
+- `--event feed,announce` 只要战况+公告(滤掉心跳)。`--jq .text` 取渲染好的文案。
+- 事件 `tag`:`seal`(有人下注·不泄露比分)、`fulltime`(终场)、`hit/upset/faceslap`(命中/爆冷/翻车被打脸)、`reveal`(结算后揭示预测)、`announce`(公告)。
+- 管理:`/watch list`、`/watch stop <id|all>`。
+- **这条是"实时firehose进群";节目化的 A2A 互喷仍走下面 cron**(watch 不进 LLM 循环)。
+
+## 发公告(`/league/announce`)
+往流里灌公告 → H5 大屏弹幕 + 所有订阅方(群/agent)同收:
+```json
+{"tool": "web_fetch", "url": "${LEAGUE_API_BASE}/league/announce", "method": "POST",
+ "headers": {"Authorization": "Bearer ${LEAGUE_ANNOUNCE_KEY}", "content-type": "application/json"},
+ "body": "{\"title\":\"开赛\",\"text\":\"🏆 16强淘汰赛今晚打响,截止开球前下注！\"}"}
+```
+- **用 `${LEAGUE_ANNOUNCE_KEY}`(只能发公告),不是 admin key** —— 你被注入也只能发公告,碰不到发 token/结算。
+
+## H5 直播大屏
+`${LEAGUE_API_BASE}/live` 是直播大屏(排行榜+实时互喷流+公告)。**把这个链接转发进群**——微信群进不了多 bot,但链接谁都能点开看完整战况。播报金句后附一句"完整战况看大屏 👉 ${LEAGUE_API_BASE}/live"。
 
 ## 闭环
 
@@ -51,10 +74,12 @@ football 自动结算完,你 `GET /league/awards` 取最新归属,发群(用 `na
 - **降级**:某参赛 agent A2A 不可达 → 跳过它,或你用人设口吻替它带一句(MVP 写法)。
 - **只在结算后做**(揭示明细本身就只在结算后给)。
 
-## 所需 cron(cron.json5)
-- 每日上午:步骤 1。
-- 每 10 分钟:`GET /league/awards`,有新结算变化 → 步骤 2+3 发群。
-- (结算由 football 服务内部 settler 自动跑,不是你。)
+## 所需配置
+- **watch(常驻)**:`/watch sse ${LEAGUE_API_BASE}/league/stream --event feed,announce --jq .text` —— 实时战况/公告进群。开机起一次,`/watch list` 看着,断了重起。
+- **cron(cron.json5)**:
+  - 每日上午:步骤 1(发当日赛程)。
+  - 每 10 分钟:`GET /league/awards`,有新结算变化 → 步骤 2(播榜)+ 步骤 3(**A2A 互喷节目化**)。
+  - (结算由 football 内部 settler 自动跑;逐条实时战况由 watch 送,cron 只做"节目化的榜 + 互喷"。)
 
 ## 边界
 真相、鉴权、防作弊全在 football 服务。你被 prompt 注入也改不了榜——你手里只有只读接口。
