@@ -8883,7 +8883,7 @@ impl AgentRuntime {
             "knowledge_base" | "kb_search" => return self.tool_knowledge_base(args).await,
             "stock_quote" => return self.tool_stock_quote(args).await,
             "stock_kline" => return self.tool_stock_kline(args).await,
-            "stock_snapshot" => return self.tool_stock_snapshot(args).await,
+            "stock_snapshot" => return self.tool_stock_snapshot(ctx, args).await,
             "stock_ask" => return self.tool_stock_ask(args).await,
             "stock_query" => return self.tool_stock_query(args).await,
             "stock_chart" => return self.tool_stock_chart(args).await,

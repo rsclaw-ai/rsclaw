@@ -846,7 +846,14 @@ pub fn build_tool_list(
             50) so the LLM context stays bounded — the upstream service can \
             return 5000+ rows on a busy day. Filter by `market` (SH/SZ/BJ) or an \
             explicit `codes` list to narrow further. Set `ts=<date>` for a \
-            historical snapshot.".to_owned(),
+            historical snapshot.\n\
+            \n\
+            Smart default: if you pass NO `codes`, NO `market`, and NO `ts`, \
+            the snapshot auto-filters to the caller's watchlist (see \
+            `stock_watchlist`). The result envelope's `used_watchlist: true` \
+            flag tells you whether that happened, so you can phrase the reply \
+            as \"你关注的 N 只...\" instead of \"全市场...\". Override with \
+            `use_watchlist=false` to force a market-wide snapshot.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -859,7 +866,8 @@ pub fn build_tool_list(
                           "description": "Cap rows returned to the LLM."},
                 "sort_by": {"type": "string", "enum": ["amount","pct","price"], "default": "amount",
                             "description": "Primary sort key."},
-                "order": {"type": "string", "enum": ["desc","asc"], "default": "desc"}
+                "order": {"type": "string", "enum": ["desc","asc"], "default": "desc"},
+                "use_watchlist": {"type": "boolean", "description": "When unset, defaults to the caller's watchlist if codes/market/ts are all empty. Pass false to force market-wide."}
             },
             "required": []
         }),

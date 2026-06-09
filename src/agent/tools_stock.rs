@@ -130,15 +130,51 @@ impl AgentRuntime {
     /// args: `{ ts?: string, market?: "SH"|"SZ"|"BJ", codes?: [string],
     ///          adjust?: "none"|"qfq"|"hfq", limit?: int<=5000,
     ///          sort_by?: "amount"|"pct"|"price" (default amount),
-    ///          order?: "desc"|"asc" (default desc) }`.
-    pub(crate) async fn tool_stock_snapshot(&self, args: Value) -> Result<Value> {
+    ///          order?: "desc"|"asc" (default desc),
+    ///          use_watchlist?: bool }`.
+    ///
+    /// Default watchlist behaviour: when `codes` is empty AND
+    /// `market` is unset AND `ts` is unset AND the calling peer has
+    /// a non-empty watchlist (via `stock_watchlist`), the snapshot
+    /// auto-filters to those codes. Lets the user ask
+    /// "我关注的股票今天怎么样" with a single tool call instead of
+    /// `stock_watchlist list` → `stock_snapshot codes=[...]`.
+    /// Set `use_watchlist=false` to force a full-market snapshot
+    /// even when the watchlist is non-empty.
+    pub(crate) async fn tool_stock_snapshot(
+        &self,
+        ctx: &RunContext,
+        args: Value,
+    ) -> Result<Value> {
         let arc = match crate::astock::global_client() {
             Some(c) => c,
             None => return Ok(astock_dormant_note()),
         };
         let ts = args.get("ts").and_then(Value::as_str);
         let market = args.get("market").and_then(Value::as_str);
-        let codes = extract_codes(&args);
+        let mut codes = extract_codes(&args);
+        let mut used_watchlist = false;
+        // Watchlist auto-fill: only when the LLM hasn't passed any
+        // explicit filter (no codes, no market, no historical ts).
+        // Adding a market filter implies "I want the whole market",
+        // so honour that and skip the watchlist substitution.
+        let use_watchlist_opt = args.get("use_watchlist").and_then(Value::as_bool);
+        let watchlist_eligible = codes.is_empty()
+            && market.is_none()
+            && ts.is_none()
+            && use_watchlist_opt != Some(false);
+        if watchlist_eligible && let Some(mem) = self.memory.as_ref() {
+            let scope = watchlist_scope(&ctx.agent_id, &ctx.channel, &ctx.peer_id);
+            let store = mem.lock().await;
+            codes = store
+                .list_active()
+                .into_iter()
+                .filter(|d| d.scope == scope && d.kind == WATCHLIST_KIND)
+                .map(|d| d.text)
+                .collect();
+            drop(store);
+            used_watchlist = !codes.is_empty();
+        }
         let adjust = args.get("adjust").and_then(Value::as_str);
         let limit = args
             .get("limit")
@@ -174,6 +210,12 @@ impl AgentRuntime {
             "shown": rows.len(),
             "sort_by": sort_by,
             "order": order,
+            // Tells the LLM whether it just got a watchlist-scoped
+            "used_watchlist": used_watchlist,
+            // snapshot or a market-wide one. Useful when composing
+            // the user-facing reply ("你关注的 5 只股票:..."" vs
+            // "全市场前 50:....""), and avoids the LLM having to
+            // remember the call shape.
             "rows": rows,
         }))
     }
