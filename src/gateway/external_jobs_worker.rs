@@ -326,6 +326,12 @@ impl ExternalJobsWorker {
                 })?;
                 poll_kling(&self.client, &ak, &sk, &job.external_task_id).await
             }
+            "rsclaw" => {
+                let key = self
+                    .resolve_provider_key("rsclaw", "RSCLAW_API_KEY")
+                    .ok_or_else(|| anyhow!("rsclaw: no API key configured"))?;
+                poll_rsclaw(&key, &job.external_task_id).await
+            }
             other => Err(anyhow!("no async polling adapter for provider: {other}")),
         }
     }
@@ -755,4 +761,84 @@ async fn download_artifact(
         .await
         .map_err(|e| anyhow!("download: write: {e}"))?;
     Ok(path.to_string_lossy().to_string())
+}
+
+// ---------------------------------------------------------------------------
+// rsclaw (in-fleet `RsclawGenBackend`) — async submit (via
+// `agent::tools_video::submit_rsclaw_video`) + poll here.
+// ---------------------------------------------------------------------------
+
+/// Poll a rsclaw `video_<id>` job and resolve to an authless download
+/// URL on completion.
+///
+/// Flow:
+/// 1. `GET https://api.rsclaw.ai/v1/videos/{id}` (with Bearer; 307/308
+///    re-attached by `rsclaw_http::get`) → JSON `{id, status, …}`.
+/// 2. `status == "completed"` →
+///    `GET https://api.rsclaw.ai/v1/videos/{id}/content` (with Bearer)
+///    returns 307 to a Cloudflare R2 presigned URL — we DON'T follow
+///    that hop here so Authorization never crosses to R2. The presigned
+///    URL is handed back as `PollOutcome::Done(url)`; the caller's
+///    `download_artifact` GETs it without auth.
+/// 3. `status` in {"failed","cancelled"} → `PollOutcome::Failed(reason)`.
+/// 4. Else (`queued` / `in_progress`) → `PollOutcome::Pending`.
+async fn poll_rsclaw(api_key: &str, video_id: &str) -> Result<PollOutcome> {
+    let host = crate::provider::rsclaw_http::gen_host_base(None);
+    let client = crate::provider::rsclaw_http::build_client(
+        crate::provider::DEFAULT_USER_AGENT,
+        30,
+    )?;
+
+    // 1. Status probe.
+    let status_url = format!("{host}/v1/videos/{video_id}");
+    let resp = crate::provider::rsclaw_http::get(&client, &status_url, api_key).await?;
+    let st = resp.status();
+    if !st.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "rsclaw: status {st}: {}",
+            body.chars().take(200).collect::<String>()
+        ));
+    }
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| anyhow!("rsclaw: status parse: {e}"))?;
+    let status = v["status"].as_str().unwrap_or("unknown");
+
+    match status {
+        "completed" => {
+            // 2. Resolve `/content` → R2 presigned URL via the 307. The
+            //    helper returns the Location target without following
+            //    so Bearer never reaches Cloudflare.
+            let content_url = format!("{host}/v1/videos/{video_id}/content");
+            match crate::provider::rsclaw_http::get_content_url(&client, &content_url, api_key)
+                .await?
+            {
+                Some(presigned) => Ok(PollOutcome::Done(presigned)),
+                None => {
+                    // In-memory BlobStore (dev) — content endpoint
+                    // serves bytes inline. Surface the API URL itself;
+                    // `download_artifact` will hit it without auth and
+                    // get 401 — flag as failed so ops sees the
+                    // misconfiguration rather than a silent hang.
+                    Err(anyhow!(
+                        "rsclaw: /content returned bytes inline (in-memory BlobStore); \
+                         configure S3-shaped blob store to enable artifact delivery"
+                    ))
+                }
+            }
+        }
+        "failed" | "cancelled" => {
+            let msg = v
+                .pointer("/error/message")
+                .and_then(|v| v.as_str())
+                .or_else(|| v["error"].as_str())
+                .or_else(|| v["message"].as_str())
+                .unwrap_or("task failed");
+            Ok(PollOutcome::Failed(format!("{status}: {msg}")))
+        }
+        // queued / in_progress / anything else the server may add later
+        _ => Ok(PollOutcome::Pending),
+    }
 }
