@@ -41,6 +41,35 @@ pub use crate::embed::{
 const REDB_TABLE: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("memory_docs");
 
 // ---------------------------------------------------------------------------
+// Process-global live store handle
+//
+// The gateway opens one `Arc<Mutex<MemoryStore>>` at startup and shares it
+// with the agent runtime (via spawner) and the HTTP server (via AppState).
+// Non-runtime code paths — cap_live binding setup, preparse slash commands,
+// future cron hooks — need that same instance without re-opening redb (which
+// is exclusively locked) and without plumbing an Arc through every caller.
+// `set_global_store()` is called once from gateway startup right after open;
+// `global_store()` is the read accessor for those non-runtime paths.
+// ---------------------------------------------------------------------------
+static GLOBAL_STORE: std::sync::OnceLock<Arc<tokio::sync::Mutex<MemoryStore>>> =
+    std::sync::OnceLock::new();
+
+/// Register the live `MemoryStore`. Idempotent — second + calls are
+/// silently dropped, matching `crate::kb::set_global_service` so the
+/// callsite contract is uniform across stores. Called once from gateway
+/// startup.
+pub fn set_global_store(store: Arc<tokio::sync::Mutex<MemoryStore>>) {
+    let _ = GLOBAL_STORE.set(store);
+}
+
+/// Reach the live memory store, if the gateway opened one. Returns
+/// `None` in test runtimes and CLI subcommands that run without a
+/// gateway (those should fall back to opening their own readonly handle).
+pub fn global_store() -> Option<Arc<tokio::sync::Mutex<MemoryStore>>> {
+    GLOBAL_STORE.get().cloned()
+}
+
+// ---------------------------------------------------------------------------
 // MemDocTier -- 3-tier memory classification (P1)
 // ---------------------------------------------------------------------------
 

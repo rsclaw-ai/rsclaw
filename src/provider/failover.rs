@@ -36,9 +36,17 @@ const MAX_COOLDOWN: Duration = Duration::from_secs(300);
 pub struct FailoverManager {
     /// provider_name → [profile_id, ...]  (resolution order)
     order: HashMap<String, Vec<String>>,
-    /// profile_id → cooldown_until
+    /// `"{provider_name}/{profile_id}"` → cooldown_until.
+    ///
+    /// Keyed by the combined `(provider_name, profile_id)` pair so a
+    /// rate-limited provider does NOT poison its siblings. When users
+    /// don't set `models.auth.order`, every provider falls back to
+    /// profile_id `"default"`; if we keyed on profile_id alone, a 429
+    /// on (kimi, default) would cool-block (deepseek, default) on the
+    /// SAME chain attempt — silently making fallback unreachable.
     cooldowns: HashMap<String, Instant>,
-    /// profile_id → consecutive failure count
+    /// `"{provider_name}/{profile_id}"` → consecutive failure count.
+    /// Pair-keyed for the same reason as `cooldowns`.
     failure_counts: HashMap<String, u32>,
     /// profile_id → api_key
     #[allow(dead_code)]
@@ -200,8 +208,12 @@ impl FailoverManager {
         let mut last_err: Option<anyhow::Error> = None;
 
         for profile_id in profiles {
-            if self.is_cooling_down(profile_id) {
-                warn!(profile = profile_id, "profile is cooling down, skipping");
+            if self.is_cooling_down(provider_name, profile_id) {
+                warn!(
+                    provider = provider_name,
+                    profile = profile_id,
+                    "provider/profile is cooling down, skipping"
+                );
                 continue;
             }
 
@@ -221,7 +233,8 @@ impl FailoverManager {
             loop {
                 match provider.stream(req.clone()).await {
                     Ok(stream) => {
-                        self.failure_counts.remove(profile_id);
+                        self.failure_counts
+                            .remove(&cooldown_key(provider_name, profile_id));
                         info!(
                             provider = provider_name,
                             api = provider_api,
@@ -252,7 +265,7 @@ impl FailoverManager {
                         ));
                     }
                     Err(e) if is_rate_limit(&e) || is_auth_error(&e) => {
-                        let attempt = self.hit_count(profile_id);
+                        let attempt = self.hit_count(provider_name, profile_id);
                         let delay = backoff_delay(attempt, &self.retry)
                             .max(MIN_COOLDOWN)
                             .min(MAX_COOLDOWN);
@@ -263,9 +276,9 @@ impl FailoverManager {
                             error = %e,
                             ?delay,
                             attempt,
-                            "rate limit / auth error — cooling down profile"
+                            "rate limit / auth error — cooling down provider/profile"
                         );
-                        self.set_cooldown(profile_id, delay);
+                        self.set_cooldown(provider_name, profile_id, delay);
                         last_err = Some(e);
                         break; // try next profile
                     }
@@ -306,24 +319,37 @@ impl FailoverManager {
         }
     }
 
-    fn is_cooling_down(&self, profile_id: &str) -> bool {
+    fn is_cooling_down(&self, provider_name: &str, profile_id: &str) -> bool {
         self.cooldowns
-            .get(profile_id)
+            .get(&cooldown_key(provider_name, profile_id))
             .is_some_and(|&until| Instant::now() < until)
     }
 
-    fn set_cooldown(&mut self, profile_id: &str, delay: Duration) {
+    fn set_cooldown(&mut self, provider_name: &str, profile_id: &str, delay: Duration) {
+        let key = cooldown_key(provider_name, profile_id);
         self.cooldowns
-            .insert(profile_id.to_owned(), Instant::now() + delay);
-        *self
-            .failure_counts
-            .entry(profile_id.to_owned())
-            .or_insert(0) += 1;
+            .insert(key.clone(), Instant::now() + delay);
+        *self.failure_counts.entry(key).or_insert(0) += 1;
     }
 
-    fn hit_count(&self, profile_id: &str) -> u32 {
-        self.failure_counts.get(profile_id).copied().unwrap_or(0)
+    fn hit_count(&self, provider_name: &str, profile_id: &str) -> u32 {
+        self.failure_counts
+            .get(&cooldown_key(provider_name, profile_id))
+            .copied()
+            .unwrap_or(0)
     }
+}
+
+/// Build the composite cooldown / failure-count map key.
+///
+/// Profiles in `models.auth.order` are SHARED across providers (every
+/// provider that doesn't override falls back to `"default"`), so a
+/// rate-limited provider must NOT poison the global pool. Pair-keying
+/// by `(provider_name, profile_id)` keeps each provider's failure
+/// bookkeeping isolated.
+#[inline]
+fn cooldown_key(provider_name: &str, profile_id: &str) -> String {
+    format!("{provider_name}/{profile_id}")
 }
 
 /// Outcome of the inner per-profile loop, telling the outer chain loop
@@ -413,5 +439,62 @@ mod tests {
         let e = anyhow!("401 Unauthorized: invalid api key");
         assert!(is_auth_error(&e));
         assert!(!is_max_tokens_error(&e));
+    }
+
+    #[test]
+    fn cooldown_key_pairs_provider_with_profile() {
+        // Different providers on the same default profile must produce
+        // DIFFERENT cooldown keys — that's the whole reason the bleed
+        // fix exists.
+        assert_eq!(cooldown_key("kimi", "default"), "kimi/default");
+        assert_eq!(cooldown_key("deepseek", "default"), "deepseek/default");
+        assert_ne!(
+            cooldown_key("kimi", "default"),
+            cooldown_key("deepseek", "default")
+        );
+    }
+
+    #[test]
+    fn provider_cooldown_does_not_bleed_to_sibling() {
+        // Regression for the bug where a 429 on kimi (profile=default)
+        // silently skipped deepseek (also profile=default) because
+        // cooldowns were keyed on profile_id alone.
+        let mut mgr = FailoverManager::new(
+            HashMap::new(),
+            HashMap::new(),
+            vec![],
+            crate::provider::health::ProviderHealthRegistry::default(),
+        );
+        mgr.set_cooldown("kimi", "default", Duration::from_secs(60));
+        assert!(
+            mgr.is_cooling_down("kimi", "default"),
+            "kimi should be cooling"
+        );
+        assert!(
+            !mgr.is_cooling_down("deepseek", "default"),
+            "deepseek must NOT be cooling — that's the bug we fixed"
+        );
+        assert!(
+            !mgr.is_cooling_down("doubao", "default"),
+            "other providers on the same profile name stay unaffected"
+        );
+    }
+
+    #[test]
+    fn hit_count_is_per_provider_pair() {
+        let mut mgr = FailoverManager::new(
+            HashMap::new(),
+            HashMap::new(),
+            vec![],
+            crate::provider::health::ProviderHealthRegistry::default(),
+        );
+        mgr.set_cooldown("kimi", "default", Duration::from_millis(1));
+        mgr.set_cooldown("kimi", "default", Duration::from_millis(1));
+        assert_eq!(mgr.hit_count("kimi", "default"), 2);
+        assert_eq!(
+            mgr.hit_count("deepseek", "default"),
+            0,
+            "sibling provider's hit count must stay at zero"
+        );
     }
 }

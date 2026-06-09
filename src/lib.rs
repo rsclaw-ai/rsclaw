@@ -63,6 +63,7 @@
 )]
 
 pub mod a2a;
+pub mod astock;
 pub(crate) mod cap;
 pub mod agent;
 pub mod artifact;

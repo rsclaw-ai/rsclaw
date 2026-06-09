@@ -113,6 +113,10 @@ urlencoding = "2"
 silk-rs = "0.2"
 symphonia = { version = "0.5", features = ["mp3", "aac", "ogg", "flac", "wav", "pcm", "vorbis", "isomp4", "mkv"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+# plotters — K-line chart rendering for `tool_stock_chart`. Minimum features:
+# bitmap_backend (PNG via image crate), bitmap_encoder (file write helper),
+# ttf (text on chart). NO GUI / GIF backends. Pure Rust, ~1MB compiled.
+plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "bitmap_encoder", "ttf", "line_series", "histogram", "candlestick", "chrono"] }
 opus-decoder = "0.1"
 
 # Computer-use stack: native input synthesis + screenshot. Replaces our
