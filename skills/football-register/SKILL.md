@@ -1,7 +1,7 @@
 ---
 name: football-register
-description: 世界杯竞猜联赛报名 参赛 加入联赛 我要参加 报名世界杯 join league register;以及查我的积分 我第几名 我的排名 我的战绩 我的段位 my rank my score。用户在微信/渠道里说这些时,按其渠道身份处理。
-version: 1.1.0
+description: 世界杯竞猜联赛报名 参赛 加入联赛 我要参加 报名世界杯 join league register;邀请好友 拿邀请链接 invite;以及查我的积分 余额 我第几名 我的排名 我的战绩 我的段位 my rank balance my score。用户在微信/渠道里说这些时,按其渠道身份处理。
+version: 1.2.0
 icon: "🎟️"
 author: "@rsclaw"
 ---
@@ -15,12 +15,10 @@ exec(身份自动从渠道取,不用问、不用传):
 ```
 leaguetool mystats
 ```
-输出 `{name, stats:{rank,total,accuracy,upset,faceslap,played,grade,awards,onBoard}}`,回用户:
-- `onBoard:true`:
-  > 数据流,你目前**第 {rank}/{total} 名**,准确率 {accuracy} 分,段位「{grade}」。{awards 非空 → "现在能拿:" + awards}
-- `onBoard:false`(还没结算过):
-  > 你还没有已结算的预测,暂未上榜(0 分)。押中一场结算后就上榜啦。
-- 报错 `NOT_REGISTERED` → "你还没报名,发『报名』先加入。"
+输出 `{name, stats:{rank,...,grade,awards,onBoard}, account:{balance,available,bets,wins}}`,回用户(**积分余额是主指标**):
+- 已报名:
+  > 数据流,你现在 **{balance} 积分**(可用 {available}),押注 {bets} 场赢 {wins} 场。{onBoard → "积分榜第 {rank}/{total}"}{awards 非空 → ",现在能拿:" + awards}
+- 报错 `NOT_REGISTERED` → "你还没报名,发『报名』先加入,白拿初始积分。"
 
 # 世界杯联赛报名
 
@@ -32,16 +30,23 @@ leaguetool mystats
 - **一个微信号永远一个参赛号**:同一个人再报名,拿到的是同一个 nodeId(token 会重置)。这是注册端掐死 Sybil 的根本。
 
 ## 流程
-用户说报名 → exec(把用户昵称传 --name,身份自动从渠道取):
+用户说报名 → exec(把用户昵称传 --name,身份自动从渠道取)。
+**若用户说的是「报名 <暗号>」**(从 `/live?ref=<暗号>` 链接来的),把暗号传 `--ref`,邀请人和他各得邀请奖励:
 ```
-leaguetool connect --name "<用户昵称>"
+leaguetool connect --name "<用户昵称>" --ref "<暗号>"
 ```
-输出 `{nodeId, token, name, new}`。然后回复用户:
+(没暗号就不带 `--ref`。)输出 `{nodeId, token, name, new, invited}`。回复用户:
 - `new:true`(新报名):
-  > 报名成功!🎟️ 你的参赛号 `<nodeId>`,token:`<token>`
-  > 把 token 配进你的参赛 agent(LEAGUE_TOKEN),就能开始预测了。**token 保密,别发群里。**
+  > 报名成功!🎟️ 你已**白拿初始积分**,可以开始押注了{invited → ",邀请奖励也到账 🎉"}。
+  > 你的参赛号 `<nodeId>`。发「我的积分」看余额,发「邀请」拿你的专属邀请链接拉好友领积分。
 - `new:false`(已报过):
-  > 你已经报过名了,参赛号还是 `<nodeId>`。这是新 token(旧的已失效):`<token>`
+  > 你已经报过名了(参赛号 `<nodeId>`)。发「我的积分」看余额。
+
+## 邀请好友(用户说"邀请/邀请链接/拉好友")
+先 `leaguetool mystats` 拿到自己的 `nodeId`(或复用报名时的),回用户专属链接:
+> 🎟️ 把这条发给好友,他报名后**你俩各得邀请积分**:
+> `${LEAGUE_API_BASE}/live?ref=<你的nodeId>`
+> 好友点开按提示对我说「报名 <你的nodeId>」就行。**拉越多本金越多,不封顶。**
 
 ## 需要的环境(~/.rsclaw/.env)
 ```
