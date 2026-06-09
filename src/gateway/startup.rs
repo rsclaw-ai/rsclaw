@@ -353,6 +353,13 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 Ok(c) => {
                     crate::astock::set_global_client(Arc::new(c));
                     info!("astock client initialized");
+                    // Spin up the daily-briefing scheduler — it's
+                    // cheap (one tokio task) and silently no-ops if
+                    // no peer has a watchlist. Only meaningful when
+                    // astock itself is live, so gate on the client
+                    // being installed.
+                    crate::astock::briefing::spawn_scheduler();
+                    info!("astock briefing scheduler started");
                 }
                 Err(e) => {
                     info!(reason = %e, "astock client not initialised (subsystem dormant)");
