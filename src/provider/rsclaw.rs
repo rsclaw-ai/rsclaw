@@ -339,11 +339,20 @@ impl RsclawProvider {
         // mirrors `http_client_with_ua` since rsclaw-server lives in
         // the same operational envelope as the OAI-compat upstreams
         // that helper was tuned for.
+        // Tuned for rsclaw native protocol (NOT OpenAI-compat):
+        // - connect_timeout 30s: localhost loopback connects fast (<1ms) but a
+        //   saturated rsclaw-server under heavy session churn can accept-stall.
+        //   30s tolerates a brief bind() backlog without surfacing as timeout.
+        // - pool_idle_timeout 30s: rsclaw-server (axum) keeps idle keepalive
+        //   for 60s by default, so a 30s client-side idle is safely inside that
+        //   window. Old 10s caused stale-pool refetches under bursty load.
+        // - tcp_keepalive 30s: keeps long-prefill streaming connections alive
+        //   through any intermediate timeouts during a 20+ second prefill.
         let client = reqwest::Client::builder()
             .user_agent(user_agent.as_deref().unwrap_or(super::DEFAULT_USER_AGENT))
             .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(20))
-            .pool_idle_timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(30))
             .tcp_keepalive(Duration::from_secs(30))
             .build()
             .expect("failed to build rsclaw HTTP client");
