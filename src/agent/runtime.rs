@@ -2484,9 +2484,18 @@ impl AgentRuntime {
             if let Ok(mut map) = self.handle.session_tokens.write() {
                 map.clear();
             }
-            // Also clear persisted sessions from redb
+            // Also clear persisted sessions from redb (and their working
+            // plans — session_key is stable per peer, so a stale todo would
+            // leak into the next conversation after /clear).
             for key in self.store.db.list_sessions().unwrap_or_default() {
                 let _ = self.store.db.delete_session(&key);
+                if let Err(e) = self
+                    .store
+                    .db
+                    .kv_delete(&super::tools_misc::todo_kv_key(&key))
+                {
+                    tracing::warn!("todo kv cleanup failed for {key}: {e:#}");
+                }
             }
 
             // Re-inject summaries so agent retains context, and persist to redb.
@@ -3921,6 +3930,41 @@ impl AgentRuntime {
                 .await
         } else {
             None
+        };
+        // Keep the session's working plan (todo tool) visible every turn on
+        // the native path. It rides the turn-local recall side channel, so it
+        // never dirties the KV prefix and survives the original tool result
+        // being sketched out of the transcript.
+        let auto_recall_bundle = if model_provider == "rsclaw" {
+            match (auto_recall_bundle, self.load_todo_rendered(session_key)) {
+                (bundle, None) => bundle,
+                (Some(mut bundle), Some(plan)) => {
+                    bundle.context.push_str("\n\n[Current plan]\n");
+                    bundle.context.push_str(&plan);
+                    bundle.metadata.hash = {
+                        use sha2::{Digest, Sha256};
+                        format!("sha256:{:x}", Sha256::digest(bundle.context.as_bytes()))
+                    };
+                    Some(bundle)
+                }
+                (None, Some(plan)) => {
+                    let context = format!("[Current plan]\n{plan}");
+                    let hash = {
+                        use sha2::{Digest, Sha256};
+                        format!("sha256:{:x}", Sha256::digest(context.as_bytes()))
+                    };
+                    Some(RecallBundle {
+                        context,
+                        metadata: crate::provider::RecallMetadata {
+                            source: "todo".to_owned(),
+                            hash,
+                            ..Default::default()
+                        },
+                    })
+                }
+            }
+        } else {
+            auto_recall_bundle
         };
         let auto_recalled_ids = auto_recall_bundle
             .as_ref()
@@ -8784,6 +8828,7 @@ impl AgentRuntime {
         match name {
             // --- Consolidated tools (new unified names) ---
             "memory" => return self.tool_memory_consolidated(ctx, args).await,
+            "todo" => return self.tool_todo(ctx, args).await,
             "session" => return self.tool_session_consolidated(ctx, args).await,
             "agent" | "subagents" => return self.tool_agent_consolidated(ctx, args).await,
             "channel" => return self.tool_channel_consolidated(args).await,

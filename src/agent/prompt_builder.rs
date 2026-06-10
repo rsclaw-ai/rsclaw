@@ -569,6 +569,12 @@ fn build_shared_system_prefix_uncached() -> String {
          - Have enough info to answer? STOP and reply immediately.\n\
          - Do NOT repeat a tool call that already returned useful results.\n\
          - One successful search/fetch is usually enough. Two is the maximum.\n\
+         ### Plan Tracking (todo)\n\
+         For any task needing 3+ steps or multiple tool calls: call `todo` FIRST with the \
+         full step list, keep exactly ONE item in_progress, mark it done IMMEDIATELY after \
+         the step lands. Every call sends the COMPLETE list (full replace). The plan \
+         survives context compaction — it is your recovery anchor in long sessions. \
+         Skip it for single-step requests and chat.\n\
          ### Agent & Task Delegation\n\
          Delegate work to sub-agents for parallelism, never block.\n\
          - `agent` action=task for background sub-tasks. Specify `toolset` matching the task.\n\
@@ -1022,6 +1028,7 @@ fn build_coding_mode_block() -> String {
 /// `RSCLAW_DUMP_PROMPT` debug payload.
 pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "memory",
+    "todo",
     "skill_use",
     "task",
     "task_finish",

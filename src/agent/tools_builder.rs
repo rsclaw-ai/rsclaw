@@ -271,6 +271,7 @@ pub(crate) fn toolset_allowed_names(
         "list_dir",
         "search_file",
         "memory",
+        "todo",
         "skill_use",
     ];
     const CODE: &[&str] = &[
@@ -293,6 +294,9 @@ pub(crate) fn toolset_allowed_names(
         "memory",
         "knowledge_base",
         "skill_use",
+        // Working-plan checklist — multi-step coding tasks are exactly where
+        // plan tracking pays off (and where compaction loses implicit plans).
+        "todo",
         // Pre-compaction history search (multi-turn coding sessions hit this often)
         "read_session_archive",
         // Coding-agent escalation — dispatch big tasks to an external CLI
@@ -326,6 +330,7 @@ pub(crate) fn toolset_allowed_names(
         "web_search",
         "web_fetch",
         "memory",
+        "todo",
         "web_browser",
         "image_gen",
         "video_gen",
@@ -416,6 +421,39 @@ pub fn build_tool_list(
                 "top_k":  {"type": "integer", "default": 5, "description": "Max results (search)."}
             },
             "required": ["action"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "todo".to_owned(),
+        description: "Maintain this session's working plan as a status checklist. \
+            FULL-REPLACE semantics: every call must send the COMPLETE updated list \
+            (include finished items with status done); an empty items array clears the plan.\n\
+            When to use: any task needing 3+ steps or multiple tool calls — write the plan \
+            FIRST, keep exactly ONE item in_progress, flip it to done IMMEDIATELY after the \
+            step lands, then promote the next. Skip it for single-step requests and chat.\n\
+            The plan is persisted outside the conversation: it survives context compaction, \
+            so an accurate list is your recovery anchor in long sessions.\n\
+            Example: {\"items\":[{\"text\":\"Read the config loader\",\"status\":\"done\"},\
+            {\"text\":\"Add the provider flag\",\"status\":\"in_progress\"},\
+            {\"text\":\"Run cargo test\",\"status\":\"pending\"}]}"
+            .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "description": "The complete plan, in execution order (full replace). Empty array clears it.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "text":   {"type": "string", "description": "One concrete step."},
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "done"], "description": "Defaults to pending."}
+                        },
+                        "required": ["text"]
+                    }
+                }
+            },
+            "required": ["items"]
         }),
     });
     tools.extend(build_plugin_meta_tool_defs());

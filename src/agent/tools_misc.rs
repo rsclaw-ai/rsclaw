@@ -6,12 +6,53 @@
 //! `AgentRuntime` struct.
 
 use anyhow::{Result, anyhow, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
     platform::powershell_hidden,
     runtime::{AgentRuntime, RunContext},
 };
+
+/// One step in the session's working plan (the `todo` tool).
+#[derive(Debug, Serialize, Deserialize)]
+struct TodoItem {
+    text: String,
+    status: String,
+}
+
+/// redb KV key for a session's working plan.
+pub(crate) fn todo_kv_key(session_key: &str) -> String {
+    format!("todo:{session_key}")
+}
+
+/// Normalize a todo status keyword. Tolerates the whitespace/case/hyphen
+/// noise the v1 block protocol introduces into string args; returns `None`
+/// for genuinely unknown values so the tool can teach the model the enum.
+fn normalize_todo_status(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_lowercase().replace('-', "_").as_str() {
+        "" | "pending" | "todo" => Some("pending"),
+        "in_progress" | "doing" | "active" => Some("in_progress"),
+        "done" | "completed" | "complete" => Some("done"),
+        _ => None,
+    }
+}
+
+/// Render a plan as `[x]` done / `[>]` in progress / `[ ]` pending lines.
+fn render_todo(items: &[TodoItem]) -> String {
+    items
+        .iter()
+        .map(|it| {
+            let mark = match it.status.as_str() {
+                "done" => "x",
+                "in_progress" => ">",
+                _ => " ",
+            };
+            format!("[{mark}] {}", it.text)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 impl AgentRuntime {
     // -----------------------------------------------------------------------
@@ -692,6 +733,79 @@ $synth.Speak('{}')
     }
 
     // -------------------------------------------------------------------
+    // Todo — session working-plan checklist
+    // -------------------------------------------------------------------
+
+    /// `todo` tool: full-replace write of the session's working plan.
+    ///
+    /// State lives in the redb KV table keyed by session (NOT in the
+    /// transcript), so it survives context compaction; native rsclaw turns
+    /// re-inject it through the recall side channel each turn.
+    pub(crate) async fn tool_todo(&self, ctx: &RunContext, args: Value) -> Result<Value> {
+        const MAX_ITEMS: usize = 50;
+        const MAX_TEXT_BYTES: usize = 500;
+        let Some(items) = args["items"].as_array() else {
+            bail!(
+                "todo: 'items' array is required. Full-replace semantics: send the \
+                 COMPLETE updated list every call; an empty array clears the plan. \
+                 Item shape: {{\"text\":\"...\",\"status\":\"pending|in_progress|done\"}}"
+            );
+        };
+        let key = todo_kv_key(&ctx.session_key);
+        if items.is_empty() {
+            if let Err(e) = self.store.db.kv_delete(&key) {
+                tracing::warn!("todo: clear failed for {key}: {e:#}");
+            }
+            return Ok(json!({"plan": "(cleared)", "items": 0}));
+        }
+        if items.len() > MAX_ITEMS {
+            bail!(
+                "todo: {} items exceeds the cap of {MAX_ITEMS}. Collapse finished \
+                 steps or group sub-steps under one item.",
+                items.len()
+            );
+        }
+        let mut clean: Vec<TodoItem> = Vec::with_capacity(items.len());
+        for (i, it) in items.iter().enumerate() {
+            let text = it["text"].as_str().map(str::trim).unwrap_or("");
+            if text.is_empty() {
+                bail!("todo: item {i} is missing a non-empty 'text'");
+            }
+            let status_raw = it["status"].as_str().unwrap_or("pending");
+            let Some(status) = normalize_todo_status(status_raw) else {
+                bail!(
+                    "todo: item {i} has unknown status '{status_raw}' — use \
+                     pending | in_progress | done"
+                );
+            };
+            clean.push(TodoItem {
+                text: crate::util::truncate_str(text, MAX_TEXT_BYTES).to_owned(),
+                status: status.to_owned(),
+            });
+        }
+        let raw = serde_json::to_string(&clean)?;
+        self.store.db.kv_set(&key, &raw)?;
+        Ok(json!({"plan": render_todo(&clean), "items": clean.len()}))
+    }
+
+    /// Render the session's stored plan as a checklist string, or `None`
+    /// when no plan exists. Used by the per-turn recall injection and the
+    /// compaction summarizer.
+    pub(crate) fn load_todo_rendered(&self, session_key: &str) -> Option<String> {
+        let raw = self
+            .store
+            .db
+            .kv_get(&todo_kv_key(session_key))
+            .ok()
+            .flatten()?;
+        let items: Vec<TodoItem> = serde_json::from_str(&raw).ok()?;
+        if items.is_empty() {
+            return None;
+        }
+        Some(render_todo(&items))
+    }
+
+    // -------------------------------------------------------------------
     // Tool installer
     // -------------------------------------------------------------------
 
@@ -1131,4 +1245,35 @@ fn find_vits_model() -> Option<VitsModel> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod todo_tests {
+    use super::*;
+
+    #[test]
+    fn normalize_todo_status_tolerates_v1_arg_noise() {
+        // The v1 block protocol pads keyword args with whitespace/newlines
+        // (the same class of bug that bit `action` and `mode`).
+        assert_eq!(normalize_todo_status("\npending\n"), Some("pending"));
+        assert_eq!(normalize_todo_status(" In-Progress "), Some("in_progress"));
+        assert_eq!(normalize_todo_status("DONE"), Some("done"));
+        assert_eq!(normalize_todo_status(""), Some("pending"));
+        assert_eq!(normalize_todo_status("blocked"), None);
+    }
+
+    #[test]
+    fn render_todo_marks_statuses() {
+        let items = vec![
+            TodoItem { text: "读配置".to_owned(), status: "done".to_owned() },
+            TodoItem { text: "加 flag".to_owned(), status: "in_progress".to_owned() },
+            TodoItem { text: "跑测试".to_owned(), status: "pending".to_owned() },
+        ];
+        assert_eq!(render_todo(&items), "[x] 读配置\n[>] 加 flag\n[ ] 跑测试");
+    }
+
+    #[test]
+    fn todo_kv_key_is_namespaced() {
+        assert_eq!(todo_kv_key("telegram:123"), "todo:telegram:123");
+    }
 }
