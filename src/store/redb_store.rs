@@ -138,6 +138,51 @@ pub(crate) fn upgrade_legacy_if_needed(path: &Path) -> Result<()> {
     }
 }
 
+/// How long to wait for another process to release the redb file lock before
+/// giving up. Sized to cover a graceful-restart handoff: the outgoing gateway
+/// spawns its replacement (see `gateway::startup`) and only releases its
+/// exclusive redb locks when it `exit(0)`s a moment later. Without this window
+/// the new process loses the race on `Database::create` and either crashes
+/// (memory store) or — for the a2a task store — misreads the lock as corruption
+/// and resets task history.
+const LOCK_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+/// Poll interval while waiting for the lock to free up.
+const LOCK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Open (create) a redb database via `builder`, retrying while the file is
+/// locked by another process (`DatabaseError::DatabaseAlreadyOpen`). Every
+/// other error — corruption, upgrade-required, IO — returns immediately so
+/// callers keep their existing handling.
+///
+/// Synchronous (uses `thread::sleep`); intended for the startup path before the
+/// gateway begins serving, where blocking briefly to wait out a restart handoff
+/// is correct: there is nothing to serve until the store opens.
+pub fn create_with_lock_retry(
+    builder: &redb::Builder,
+    path: &Path,
+) -> std::result::Result<Database, redb::DatabaseError> {
+    let deadline = std::time::Instant::now() + LOCK_RETRY_WINDOW;
+    let mut warned = false;
+    loop {
+        match builder.create(path) {
+            Err(redb::DatabaseError::DatabaseAlreadyOpen)
+                if std::time::Instant::now() < deadline =>
+            {
+                if !warned {
+                    tracing::warn!(
+                        path = %path.display(),
+                        wait_secs = LOCK_RETRY_WINDOW.as_secs(),
+                        "redb locked by another process (likely a restarting gateway handing off); retrying"
+                    );
+                    warned = true;
+                }
+                std::thread::sleep(LOCK_RETRY_INTERVAL);
+            }
+            other => return other,
+        }
+    }
+}
+
 #[cfg(test)]
 fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
@@ -254,8 +299,7 @@ impl RedbStore {
         upgrade_legacy_if_needed(path)?;
         let mut builder = Database::builder();
         builder.set_cache_size(cache_bytes);
-        let db = builder
-            .create(path)
+        let db = create_with_lock_retry(&builder, path)
             .with_context(|| format!("open redb at {}", path.display()))?;
 
         // Ensure all tables exist.
@@ -1555,6 +1599,60 @@ mod tests {
         let store =
             RedbStore::open(&dir.path().join("test.redb"), MemoryTier::Low).expect("open redb");
         (store, dir)
+    }
+
+    /// Regression: graceful restart hands the redb lock from the outgoing
+    /// gateway to the incoming one. The new process must wait out the brief
+    /// window where the old one still holds the exclusive lock instead of
+    /// failing immediately. A plain `Database::create` here returns
+    /// `DatabaseAlreadyOpen` at once; `create_with_lock_retry` must succeed
+    /// once the holder drops the lock.
+    #[test]
+    fn create_with_lock_retry_waits_for_lock_release() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("lock.redb");
+
+        // Outgoing process holds the lock, then releases it shortly after.
+        let first = Database::create(&path).expect("first open");
+        let released = Arc::new(AtomicBool::new(false));
+        let released_writer = Arc::clone(&released);
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            released_writer.store(true, Ordering::SeqCst);
+            drop(first); // releases the exclusive lock
+        });
+
+        // Sanity: a plain open right now fails because the lock is held.
+        assert!(
+            matches!(
+                Database::create(&path),
+                Err(redb::DatabaseError::DatabaseAlreadyOpen)
+            ),
+            "lock should be held while the holder thread is alive"
+        );
+
+        // The retry helper waits the lock out and succeeds.
+        let db = create_with_lock_retry(&Database::builder(), &path)
+            .expect("retry should succeed once the lock is released");
+        assert!(
+            released.load(Ordering::SeqCst),
+            "retry must only succeed after the holder released the lock"
+        );
+        drop(db);
+        holder.join().expect("holder thread");
+    }
+
+    /// No contention → the helper returns immediately, same as a plain open.
+    #[test]
+    fn create_with_lock_retry_succeeds_immediately_when_unlocked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fresh.redb");
+        let db =
+            create_with_lock_retry(&Database::builder(), &path).expect("open uncontended redb");
+        drop(db);
     }
 
     #[test]
