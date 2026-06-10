@@ -456,8 +456,9 @@ pub struct AgentDefaults {
     pub media: Option<Value>,
     pub embedded: Option<Value>,
     pub archive: Option<Value>,
-    /// Max tool-call iterations per turn. Simple tasks default to 10, complex
-    /// (browser) to 100.
+    /// Stagnation budget per turn (progress-aware). Simple tasks: 50, complex
+    /// (browser/shell/cap): 100. Budget depletes on stagnation/errors, not on
+    /// productive iterations. Set to 0 to use built-in defaults.
     pub max_iterations: Option<u32>,
     /// Send intermediate text to user during multi-step tool calls. Default:
     /// true.

@@ -1862,7 +1862,7 @@ pub fn build_tool_list(
             "properties": {
                 "agent": {
                     "type": "string",
-                    "enum": ["claudecode", "openclaude", "opencode", "codex"],
+                    "enum": ["claudecode", "openclaude", "opencode", "codex", "qoder"],
                     "description": "Which CLI coding agent to dispatch to. A session is locked \
                         to one agent — you can't pass session_id from a codex call to a \
                         claudecode call."
@@ -1914,7 +1914,7 @@ pub fn build_tool_list(
             "properties": {
                 "agent": {
                     "type": "string",
-                    "enum": ["claudecode", "openclaude", "opencode", "codex"],
+                    "enum": ["claudecode", "openclaude", "opencode", "codex", "qoder"],
                     "description": "Which CLI coding agent to bind the IM session to."
                 },
                 "cwd": {
@@ -1940,14 +1940,14 @@ pub fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "cap".to_owned(),
-        description: "Dispatch a coding task to a CLI coding agent. Pick one of four agents via `agent`.".to_owned(),
+        description: "Dispatch a coding task to a CLI coding agent. Pick one of five agents via `agent`.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "agent": {
                     "type": "string",
-                    "enum": ["claudecode", "openclaude", "opencode", "codex"],
-                    "description": "claudecode — Anthropic Claude Code (general-purpose, strongest tool use). openclaude — OpenClaude (Claude-compatible OSS fork). opencode — OpenCode (TUI-native, fast iteration). codex — OpenAI Codex (reasoning-heavy, slower)."
+                    "enum": ["claudecode", "openclaude", "opencode", "codex", "qoder"],
+                    "description": "claudecode — Anthropic Claude Code (general-purpose, strongest tool use). openclaude — OpenClaude (Claude-compatible OSS fork). opencode — OpenCode (TUI-native, fast iteration). codex — OpenAI Codex (reasoning-heavy, slower). qoder — Qoder CLI (Claude Code compatible)."
                 },
                 "task":  { "type": "string", "description": "Task prompt for the agent." },
                 "cwd":   { "type": "string", "description": "Optional working directory; defaults to the agent workspace." }

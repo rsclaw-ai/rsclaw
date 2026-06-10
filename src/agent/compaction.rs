@@ -179,7 +179,7 @@ impl AgentRuntime {
                 .await
                 .defaults
                 .context_tokens
-                .unwrap_or(64_000) as usize
+                .unwrap_or(128_000) as usize
         };
         // Used later to pick the splice strategy (mode 2 = rsclaw stateful).
         //

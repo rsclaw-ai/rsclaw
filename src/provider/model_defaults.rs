@@ -35,20 +35,20 @@ pub fn get_model_defaults(provider: &str, model_id: &str) -> Option<ModelDefault
         "deepseek" => match model_lower.as_str() {
             "deepseek-chat" | "deepseek-v4-flash" => Some(ModelDefaults {
                 max_tokens: 8192,
-                context_window: 64_000,
+                context_window: 1_048_576,
             }),
             // Reasoning models need much larger output budget
             "deepseek-reasoner" | "deepseek-v4-pro" | "deepseek-r1" => Some(ModelDefaults {
                 max_tokens: 65536,
-                context_window: 131_072,
+                context_window: 1_048_576,
             }),
             "deepseek-coder" => Some(ModelDefaults {
                 max_tokens: 4096,
-                context_window: 16_384,
+                context_window: 131_072,
             }),
             _ => Some(ModelDefaults {
                 max_tokens: 8192,
-                context_window: 64_000,
+                context_window: 1_048_576,
             }),
         },
 
@@ -117,12 +117,12 @@ pub fn get_model_defaults(provider: &str, model_id: &str) -> Option<ModelDefault
             {
                 Some(ModelDefaults {
                     max_tokens: 65536,
-                    context_window: 131_072,
+                    context_window: 1_048_576,
                 })
             } else if model_lower.contains("deepseek") {
                 Some(ModelDefaults {
                     max_tokens: 8192,
-                    context_window: 64_000,
+                    context_window: 1_048_576,
                 })
             } else if model_lower.contains("qwq")
                 || (model_lower.contains("qwen") && model_lower.contains("reasoning"))
@@ -296,7 +296,7 @@ mod tests {
     fn test_deepseek_chat_defaults() {
         let defaults = get_model_defaults("deepseek", "deepseek-chat").unwrap();
         assert_eq!(defaults.max_tokens, 8192);
-        assert_eq!(defaults.context_window, 64_000);
+        assert_eq!(defaults.context_window, 1_048_576);
     }
 
     #[test]
@@ -304,7 +304,7 @@ mod tests {
         // Reasoning models need larger output budget
         let defaults = get_model_defaults("deepseek", "deepseek-reasoner").unwrap();
         assert_eq!(defaults.max_tokens, 65536);
-        assert_eq!(defaults.context_window, 131_072);
+        assert_eq!(defaults.context_window, 1_048_576);
 
         let defaults_r1 = get_model_defaults("deepseek", "deepseek-r1").unwrap();
         assert_eq!(defaults_r1.max_tokens, 65536);

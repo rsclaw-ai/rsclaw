@@ -2904,7 +2904,7 @@ impl AgentRuntime {
                                 let (context_tokens, cfg) = {
                                     let agents = self.live.agents.read().await;
                                     (
-                                        agents.defaults.context_tokens.unwrap_or(64_000) as usize,
+                                        agents.defaults.context_tokens.unwrap_or(128_000) as usize,
                                         agents.defaults.compaction.clone().unwrap_or_default(),
                                     )
                                 };
@@ -5088,7 +5088,7 @@ impl AgentRuntime {
                     .as_ref()
                     .and_then(|m| m.context_tokens)
             })
-            .unwrap_or(64_000) as usize;
+            .unwrap_or(128_000) as usize;
 
         let mut tool_images: Vec<String> = Vec::new();
         let mut tool_files: Vec<(String, String, String)> = Vec::new();
@@ -5263,11 +5263,13 @@ impl AgentRuntime {
             }
         }
 
-        // Dynamic iteration limit based on task complexity.
-        // Default: 20 iterations. Complex tools (browser/opencode/exec): up to
-        // configured max.
-        const BASE_ITERATIONS: usize = 20;
-        let configured_complex: usize = self
+        // Stagnation budget: progress-aware iteration limit.
+        // Simple tools start at 50; complex tools (browser/cap/shell/etc.) upgrade to 100.
+        // The budget depletes when tool calls show no progress (same results),
+        // errors, or repeated identical calls. Productive iterations cost 0.
+        const BASE_ITERATIONS_SIMPLE: usize = 50;
+        const BASE_ITERATIONS_COMPLEX: usize = 100;
+        let configured_max: usize = self
             .live
             .agents
             .read()
@@ -5275,7 +5277,7 @@ impl AgentRuntime {
             .defaults
             .max_iterations
             .map(|v| v as usize)
-            .unwrap_or(30);
+            .unwrap_or(0);
         // Track consecutive identical tool calls (same name + same args).
         let mut last_tool_key = String::new();
         let mut same_call_streak: usize = 0;
@@ -5285,7 +5287,15 @@ impl AgentRuntime {
         const MAX_ERROR_STREAK: usize = 5;
         // Store last error info so we can surface it when the loop breaks.
         let mut last_error_info: Option<String> = None;
-        let mut max_iterations = BASE_ITERATIONS;
+        let mut budget: i32 = BASE_ITERATIONS_SIMPLE as i32;
+        // If user configured max_iterations, use it as the initial budget cap.
+        if configured_max > 0 {
+            budget = budget.min(configured_max as i32);
+        }
+        ctx.turn_metrics.stagnation_budget = budget;
+        let mut last_result_hash: Option<String> = None;
+        let mut last_tool_name = String::new();
+        let mut wrapup_injected = false;
         let mut iteration = 0usize;
 
         loop {
@@ -5360,17 +5370,49 @@ impl AgentRuntime {
                     outcome: crate::agent::registry::ReplyOutcome::Ok,
                 });
             }
-            if iteration > max_iterations {
+            // Stagnation budget check: when budget depletes, inject a wrap-up
+            // prompt (soft limit). If the LLM still calls tools after that,
+            // hard-stop with contextual message.
+            if budget <= 0 && !wrapup_injected {
                 warn!(
                     session = %ctx.session_key,
                     iterations = iteration,
-                    "agent_loop: hit max iteration limit, breaking out"
+                    budget,
+                    "agent_loop: stagnation budget exhausted, injecting wrap-up prompt"
                 );
-                let terminal_text =
-                    crate::i18n::t("agent_max_iterations", crate::i18n::default_lang()).to_owned();
+                // Soft limit: inject a system message asking the LLM to wrap up.
+                // This is NOT user-facing; LLM prompts are always English literals.
+                if let Some(sess) = self.sessions.get_mut(&ctx.session_key) {
+                    sess.push(Message {
+                        role: Role::User,
+                        content: MessageContent::Text(
+                            "[system] You have been executing for many steps without producing new results. \
+                             Please summarize your progress and provide a final answer, \
+                             or clearly state what is blocking you.".to_owned(),
+                        ),
+                        rsclaw_hidden: None,
+                    });
+                }
+                wrapup_injected = true;
+                // Give the LLM one more chance to produce a final answer.
+            } else if budget <= 0 && wrapup_injected {
+                // Hard stop: LLM called another tool despite the wrap-up prompt.
+                warn!(
+                    session = %ctx.session_key,
+                    iterations = iteration,
+                    "agent_loop: stagnation budget exhausted after wrap-up, breaking out"
+                );
+                let lang = crate::i18n::default_lang();
+                let terminal_text = crate::i18n::t_fmt(
+                    "agent_max_iterations",
+                    lang,
+                    &[
+                        ("iterations", &iteration.to_string()),
+                        ("tool", &last_tool_name),
+                    ],
+                );
                 // Emit a done=true event so WS subscribers get both the
-                // terminal text and the terminator frame. Without this, the
-                // UI hangs waiting for done and never shows this message.
+                // terminal text and the terminator frame.
                 if let Some(ref bus) = self.event_bus {
                     let _ = bus.send(AgentEvent {
                         session_id: ctx.session_key.clone(),
@@ -5404,9 +5446,16 @@ impl AgentRuntime {
                 );
                 // Return last error info to user with details
                 let error_text = if let Some(ref info) = last_error_info {
-                    format!("工具执行连续失败。\n\n最后错误详情：\n{}", info)
+                    let lang = crate::i18n::default_lang();
+                    let truncated: String = info.chars().take(500).collect();
+                    crate::i18n::t_fmt(
+                        "agent_tool_errors",
+                        lang,
+                        &[("error", &truncated)],
+                    )
                 } else {
-                    crate::i18n::t("agent_tool_errors", crate::i18n::default_lang()).to_owned()
+                    crate::i18n::t("agent_tool_errors", crate::i18n::default_lang())
+                        .replace("{error}", "(unknown)")
                 };
                 // Emit done=true so WS subscribers (desktop chat) see the
                 // terminal text and the terminator frame together. Without
@@ -5742,7 +5791,7 @@ impl AgentRuntime {
             // context_limit chain (matches AgentHandle.context_window so
             // /status and the pre-flight emergency compact agree):
             // per-agent model.context_tokens → defaults.context_tokens
-            // → 64000. Previously read defaults only, so a per-agent
+            // → 128000. Previously read defaults only, so a per-agent
             // override of 200_000 was ignored here and emergency
             // compaction kicked in too early.
             let (temperature, context_limit) = {
@@ -5765,7 +5814,7 @@ impl AgentRuntime {
                     per_agent_entry.and_then(|a| a.model.as_ref().and_then(|m| m.context_tokens));
                 let context_limit = per_agent_ctx
                     .or(agents_live.defaults.context_tokens)
-                    .unwrap_or(64_000) as usize;
+                    .unwrap_or(128_000) as usize;
                 (temperature, context_limit)
             };
 
@@ -6764,6 +6813,11 @@ impl AgentRuntime {
                     crate::agent::loop_detection::hash_tool_call(&tool_name, &tool_input);
                 if call_key == last_tool_key {
                     same_call_streak += 1;
+                    // Repeated identical call costs extra in the stagnation budget.
+                    if same_call_streak > 1 {
+                        budget -= 2;
+                        ctx.turn_metrics.stagnation_budget = budget;
+                    }
                     ctx.turn_metrics.same_call_streak_max =
                         ctx.turn_metrics.same_call_streak_max.max(same_call_streak);
                     if same_call_streak >= MAX_SAME_CALL_STREAK {
@@ -6809,7 +6863,7 @@ impl AgentRuntime {
                     same_call_streak = 1;
                 }
 
-                // Upgrade iteration limit when complex or multi-step tools are used.
+                // Upgrade stagnation budget when complex or multi-step tools are used.
                 if matches!(
                     tool_name.as_str(),
                     "web_browser"
@@ -6825,7 +6879,15 @@ impl AgentRuntime {
                         | "execute_command"
                         | "exec"
                 ) {
-                    max_iterations = max_iterations.max(configured_complex);
+                    let complex_budget = if configured_max > 0 {
+                        BASE_ITERATIONS_COMPLEX.min(configured_max) as i32
+                    } else {
+                        BASE_ITERATIONS_COMPLEX as i32
+                    };
+                    if budget < complex_budget {
+                        budget = complex_budget;
+                        ctx.turn_metrics.stagnation_budget = budget;
+                    }
                 }
 
                 let tool_input_str = tool_input.to_string();
@@ -7224,6 +7286,26 @@ impl AgentRuntime {
                             v.clone()
                         };
                         ctx.loop_detector.record_result(&result_for_loop);
+
+                        // Stagnation budget depletion: progress-aware cost model.
+                        // - New output (different result hash) → budget unchanged (free)
+                        // - Same output (stagnation)           → budget -= 1
+                        // - Tool error                         → budget -= 2
+                        // - Repeated identical call             → budget -= 2 (added below)
+                        last_tool_name = tool_name.clone();
+                        let current_hash = ctx
+                            .loop_detector
+                            .last_result_hash()
+                            .map(String::from);
+                        if has_error {
+                            budget -= 2;
+                        } else if current_hash.as_deref() == last_result_hash.as_deref() {
+                            // Same result as previous iteration = stagnation
+                            budget -= 1;
+                        }
+                        // else: new output, budget unchanged
+                        last_result_hash = current_hash;
+                        ctx.turn_metrics.stagnation_budget = budget;
                         // Loop A: capture recalled memory IDs from search results.
                         if tool_name == "memory" || tool_name == "memory_search" {
                             if let Some(results) = v.get("results").and_then(|r| r.as_array()) {

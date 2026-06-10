@@ -179,11 +179,11 @@ impl AgentHandle {
         // Resolution chain (already done at AgentHandle construction):
         //   1. agent.model.contextTokens
         //   2. agents.defaults.contextTokens
-        //   3. fallback 64000 below when both are unset (handle.context_window == 0).
+        //   3. fallback 128000 below when both are unset (handle.context_window == 0).
         let ctx_limit = if self.context_window > 0 {
             self.context_window
         } else {
-            64000
+            128000
         };
 
         let mut ctx_lines = String::new();
