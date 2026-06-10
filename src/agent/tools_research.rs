@@ -44,10 +44,13 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use base64::Engine as _;
+use futures::StreamExt;
 use serde_json::{Value, json};
 
 use super::runtime::AgentRuntime;
+use crate::provider::{ContentPart, LlmRequest, Message, MessageContent, Role, StreamEvent};
 
 /// User-Agent string that gets us past WeChat's IP-based gating
 /// without needing cookies. Mirrors what an actual iPhone WeChat
@@ -232,6 +235,298 @@ impl AgentRuntime {
             })),
         }
     }
+
+    /// `research_analyze_charts` — run a vision LLM over a batch of
+    /// image URLs (usually returned by `research_ingest_wechat`)
+    /// and extract structured chart data.
+    ///
+    /// Heavy-chart research accounts (TGB湖南人 复盘, 金融界 morning
+    /// reports, 卖方研究 stat sheets) often deliver the actual
+    /// quantitative payload as chart pixels — section headers and
+    /// captions go through the text ingest pipeline, but the numbers,
+    /// trend annotations, and table cells only show up after a
+    /// vision pass. This tool is that pass: fetch each image as
+    /// bytes, send them in a single multimodal call to the configured
+    /// vision chain, return the LLM's per-chart extraction so the
+    /// caller can append the analysis back to the KB doc.
+    ///
+    /// args: `{ image_urls: [string], max_images?: int<=10,
+    ///          extra_prompt?: string }`.
+    pub(crate) async fn tool_research_analyze_charts(&self, args: Value) -> Result<Value> {
+        let urls: Vec<String> = args
+            .get("image_urls")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::trim).map(str::to_owned))
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if urls.is_empty() {
+            return Ok(json!({
+                "ok": false,
+                "error": "`image_urls` (non-empty array of URLs) is required"
+            }));
+        }
+        let max = args
+            .get("max_images")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .unwrap_or(8)
+            .clamp(1, MAX_CHART_BATCH);
+        let urls: Vec<String> = urls.into_iter().take(max).collect();
+        let extra_prompt = args
+            .get("extra_prompt")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+
+        // Fetch every image in parallel — most articles point at
+        // mmbiz.qpic.cn which is fast and CDN-friendly. Failures
+        // are per-image: the call proceeds with whatever did fetch
+        // and tells the LLM which were missing.
+        let client = match reqwest::Client::builder()
+            .user_agent(WECHAT_UA)
+            .timeout(std::time::Duration::from_secs(12))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(json!({
+                    "ok": false,
+                    "code": "client_build_failed",
+                    "error": format!("{e:#}"),
+                }));
+            }
+        };
+        let mut data_uris: Vec<(String, String)> = Vec::with_capacity(urls.len());
+        let mut failures: Vec<Value> = Vec::new();
+        for (idx, url) in urls.iter().enumerate() {
+            match fetch_image_as_data_uri(&client, url).await {
+                Ok(uri) => data_uris.push((url.clone(), uri)),
+                Err(e) => {
+                    failures.push(json!({
+                        "index": idx,
+                        "url": url,
+                        "error": format!("{e:#}"),
+                    }));
+                }
+            }
+        }
+        if data_uris.is_empty() {
+            return Ok(json!({
+                "ok": false,
+                "code": "all_fetches_failed",
+                "error": "every image URL failed to fetch",
+                "failures": failures,
+            }));
+        }
+
+        let vision_chain = self.resolve_vision_chain();
+        let vision_model = match vision_chain.first().cloned() {
+            Some(m) => m,
+            None => {
+                return Ok(json!({
+                    "ok": false,
+                    "code": "no_vision_model",
+                    "error": "no vision model configured in agents.defaults.model.vision (or per-agent override)",
+                    "image_count": data_uris.len(),
+                }));
+            }
+        };
+
+        let prompt = compose_chart_prompt(data_uris.len(), extra_prompt.as_deref());
+        let mut parts: Vec<ContentPart> = Vec::with_capacity(1 + data_uris.len());
+        parts.push(ContentPart::Text { text: prompt });
+        for (_url, uri) in &data_uris {
+            parts.push(ContentPart::Image { url: uri.clone() });
+        }
+
+        let req = LlmRequest {
+            model: vision_model.clone(),
+            fallback_models: vision_chain.iter().skip(1).cloned().collect(),
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Parts(parts),
+                rsclaw_hidden: None,
+            }],
+            max_tokens: Some(3072),
+            temperature: Some(0.2),
+            thinking_budget: Some(0),
+            ..Default::default()
+        };
+
+        // Bypass FailoverManager — it requires `&mut self` and
+        // `dispatch_tool` runs through `&self`. For a one-shot vision
+        // call the cooldown bookkeeping is not load-bearing; we go
+        // straight to the resolved provider. If the primary errors
+        // we walk the rest of the vision_chain manually below.
+        let providers = Arc::clone(&self.providers);
+        let mut chain_iter = std::iter::once(vision_model.clone())
+            .chain(vision_chain.iter().skip(1).cloned());
+        let mut stream_opt = None;
+        let mut tried_chain: Vec<(String, String)> = Vec::new();
+        loop {
+            let next = match chain_iter.next() {
+                Some(m) => m,
+                None => break,
+            };
+            let (prov_name, model_id) = providers.resolve_model(&next);
+            let provider = match providers.get(prov_name) {
+                Ok(p) => p,
+                Err(e) => {
+                    tried_chain.push((next.clone(), format!("provider not found: {e}")));
+                    continue;
+                }
+            };
+            let mut req_for_call = req.clone();
+            req_for_call.model = model_id.to_owned();
+            req_for_call.fallback_models = vec![];
+            let stream_fut = provider.stream(req_for_call);
+            match tokio::time::timeout(std::time::Duration::from_secs(90), stream_fut).await {
+                Ok(Ok(s)) => {
+                    stream_opt = Some((next, s));
+                    break;
+                }
+                Ok(Err(e)) => {
+                    tried_chain.push((next, format!("{e:#}")));
+                }
+                Err(_) => {
+                    tried_chain.push((next, "timed out after 90s".to_owned()));
+                }
+            }
+        }
+        let (used_model, mut stream) = match stream_opt {
+            Some(t) => t,
+            None => {
+                return Ok(json!({
+                    "ok": false,
+                    "code": "vision_chain_exhausted",
+                    "error": "every model in the vision chain failed",
+                    "tried": tried_chain.iter().map(|(m, e)| json!({"model": m, "error": e})).collect::<Vec<_>>(),
+                }));
+            }
+        };
+
+        // Collect text + reasoning. Same fallback semantics as
+        // `caption_images_for_text_only_primary`: some vision
+        // workers stream the response as `thinking` frames.
+        let mut text_buf = String::new();
+        let mut reasoning_buf = String::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(StreamEvent::TextDelta(d)) => text_buf.push_str(&d),
+                Ok(StreamEvent::ReasoningDelta(d)) => reasoning_buf.push_str(&d),
+                Ok(StreamEvent::Done { .. }) => break,
+                Ok(StreamEvent::Error(msg)) => {
+                    return Ok(json!({
+                        "ok": false,
+                        "code": "vision_stream_error",
+                        "error": msg,
+                    }));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return Ok(json!({
+                        "ok": false,
+                        "code": "vision_stream_error",
+                        "error": format!("{e:#}"),
+                    }));
+                }
+            }
+        }
+        let analysis = if !text_buf.trim().is_empty() {
+            text_buf
+        } else {
+            reasoning_buf
+        };
+        if analysis.trim().is_empty() {
+            return Ok(json!({
+                "ok": false,
+                "code": "empty_response",
+                "error": "vision LLM returned empty content",
+                "model": used_model,
+            }));
+        }
+        Ok(json!({
+            "ok": true,
+            "model": used_model,
+            "analyzed_count": data_uris.len(),
+            "skipped_count": failures.len(),
+            "skipped": failures,
+            "analysis": analysis,
+            "image_urls": data_uris.iter().map(|(u, _)| u.clone()).collect::<Vec<_>>(),
+        }))
+    }
+}
+
+const MAX_CHART_BATCH: usize = 10;
+
+async fn fetch_image_as_data_uri(client: &reqwest::Client, url: &str) -> Result<String> {
+    let resp = client
+        .get(url)
+        .header("Referer", "https://mp.weixin.qq.com/")
+        .send()
+        .await?
+        .error_for_status()?;
+    let ctype = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let bytes = resp.bytes().await?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Err(anyhow!("image too large ({} bytes)", bytes.len()));
+    }
+    // Sniff MIME when the server didn't say. WeChat / mmbiz returns
+    // proper content-type usually, but defensive sniffing protects
+    // against the rare case of a 200 with no header.
+    let mime = ctype.unwrap_or_else(|| sniff_image_mime(&bytes).to_owned());
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:{mime};base64,{b64}"))
+}
+
+fn sniff_image_mime(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        "image/jpeg"
+    } else if bytes.starts_with(b"GIF8") {
+        "image/gif"
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "image/webp"
+    } else {
+        // Default to jpeg — most WeChat images are jpg even when the
+        // URL ends in `.png`.
+        "image/jpeg"
+    }
+}
+
+fn compose_chart_prompt(n: usize, extra: Option<&str>) -> String {
+    let mut p = format!(
+        "你是 A 股技术分析师。下面是 {n} 张来自微信公众号研报的图表 (按顺序排列)。\n\
+         请对每张图按以下结构提取信息,**逐张** 输出:\n\
+         \n\
+         ## 图 {{N}}\n\
+         - **类型**: K线 / 折线 / 柱状 / 排行表 / 热力图 / 其他\n\
+         - **标题或主题**: 直接读取图标题(如果有)\n\
+         - **关键数值**: 精确读出可见的数字、个股名、板块名、涨跌幅、价格区间;\
+         看不清就写 \"无法读取\"\n\
+         - **趋势/结论**: 一句话总结该图表传达的核心信息\n\
+         \n\
+         规则:\n\
+         - 不要瞎猜数据。看不清的数字、模糊的标注、被遮挡的部分都明确说 \"无法读取\"\n\
+         - 不要给投资建议、买卖推荐、风险提示 — 只做客观提取\n\
+         - 保持简洁,每图 4 个字段控制在 250 字以内\n\
+         - 如果图里有表格,把行/列尽量保留为 markdown 表格"
+    );
+    if let Some(e) = extra {
+        p.push_str("\n\n额外指令:\n");
+        p.push_str(e);
+    }
+    p
 }
 
 // ---------------------------------------------------------------------------

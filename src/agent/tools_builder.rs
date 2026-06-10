@@ -353,6 +353,7 @@ pub(crate) fn toolset_allowed_names(
         "stock_chart",
         "stock_watchlist",
         "research_ingest_wechat",
+        "research_analyze_charts",
     ];
 
     let base: Option<&[&str]> = match toolset {
@@ -955,6 +956,38 @@ pub fn build_tool_list(
                 "codes": {"type": "array", "items": {"type": "string"}, "description": "Multiple stock codes."}
             },
             "required": []
+        }),
+    });
+    tools.push(ToolDef {
+        name: "research_analyze_charts".to_owned(),
+        description: "Run a vision LLM over a batch of chart image URLs and \
+            extract structured data (chart type, title, key numbers, trend). \
+            Use this AS A FOLLOW-UP to `research_ingest_wechat` when the \
+            ingested article is chart-heavy (TGB湖南人 复盘 series, 金融界 \
+            morning reports, 卖方研究 stat sheets) — the text-only ingest \
+            pulls section headers but not the numbers inside the charts. \
+            Pass the `image_urls` array straight from the ingest tool's \
+            response.\n\
+            \n\
+            Each image is fetched in parallel (with WeChat Referer to dodge \
+            anti-hotlink), base64-encoded, sent in a single multimodal call. \
+            Vision chain falls back per `agents.defaults.model.vision` \
+            config. The LLM is instructed NOT to give investment advice — \
+            just structured extraction.\n\
+            \n\
+            Returns `analysis` (markdown per chart) + `skipped` (per-image \
+            failures, mostly 403/404). Save the analysis back into the KB \
+            doc with `knowledge_base` add if you want it searchable.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "image_urls": {"type": "array", "items": {"type": "string"},
+                               "description": "Chart image URLs (typically from `research_ingest_wechat`'s `image_urls` field)."},
+                "max_images": {"type": "integer", "default": 8, "minimum": 1, "maximum": 10,
+                               "description": "Cap how many images to send in one call. More charts = larger context = slower call."},
+                "extra_prompt": {"type": "string", "description": "Optional extra instructions appended to the per-chart prompt (e.g. \"focus on 涨幅 vs 板块\")."}
+            },
+            "required": ["image_urls"]
         }),
     });
     tools.push(ToolDef {
