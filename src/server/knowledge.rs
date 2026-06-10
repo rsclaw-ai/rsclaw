@@ -53,6 +53,16 @@ pub fn routes(max_doc_bytes: usize) -> Router<Arc<KnowledgeService>> {
         .route("/collections/{id}/docs/{doc_id}/reindex", post(reindex_doc))
         .route("/search", post(search))
         .route("/stats", get(stats))
+        .route("/compact", post(compact))
+        .route("/sync-all", post(sync_all))
+        .route("/docs", get(list_all_docs))
+        .route(
+            "/docs/{doc_id}",
+            get(get_doc_by_id).delete(delete_doc_by_id),
+        )
+        .route("/docs/{doc_id}/content", get(get_doc_content_by_id))
+        .route("/docs/{doc_id}/chunks", get(get_doc_chunks))
+        .route("/docs/{doc_id}/visibility", axum::routing::patch(patch_doc_visibility))
         .route("/embedders", get(embedders))
         .route("/events", get(events))
         // Allow large document uploads (default axum limit is 2MB).
@@ -859,6 +869,35 @@ async fn stats(State(svc): State<Arc<KnowledgeService>>) -> Response {
     }
 }
 
+/// Run one compactor tick (orphan content-file cleanup + ledger advance)
+/// plus an HNSW snapshot dump, going through the gateway so the redb
+/// write lock isn't fought with. CLI `kb compact` calls this when the
+/// gateway is up.
+async fn compact(State(svc): State<Arc<KnowledgeService>>) -> Response {
+    // Compactor walks the whole content tree and may issue redb writes;
+    // keep it off the axum runtime so we don't stall request handling.
+    let svc_clone = Arc::clone(&svc);
+    let res = tokio::task::spawn_blocking(move || svc_clone.compact()).await;
+    match res {
+        Ok(Ok((stats, snapshot_ok))) => Json(serde_json::json!({
+            "orphansDeleted": stats.orphans_deleted,
+            "ledgerAdvancedToCleanup": stats.ledger_advanced_to_cleanup,
+            "ledgerAdvancedToDone": stats.ledger_advanced_to_done,
+            "hnswSnapshot": if snapshot_ok { "ok" } else { "failed" },
+        }))
+        .into_response(),
+        Ok(Err(e)) => err_response(e),
+        Err(e) => {
+            tracing::warn!("compact task join error: {e:#}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// SSE stream of `knowledge.doc.status_changed` events, so the UI can react to
 /// async indexing finishing without polling. Each event's data is the JSON
 /// `{ type, docId, status }`.
@@ -889,6 +928,214 @@ async fn embedders(State(svc): State<Arc<KnowledgeService>>) -> Response {
         })
         .collect();
     Json(serde_json::json!({ "default": default, "available": available })).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Doc-id-only convenience routes.
+//
+// These mirror the existing `/collections/{cid}/docs/{did}*` routes but
+// require only `doc_id`, which is what every CLI workflow (`kb show`,
+// `kb rm`, `kb export`, `kb visibility`) actually has. The service-layer
+// `find_doc` decodes the doc's `collection:` tag to surface the
+// containing collection on read responses.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ListAllDocsQuery {
+    #[serde(default)]
+    tag: Option<String>,
+    #[serde(default)]
+    source_kind: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+async fn list_all_docs(
+    State(svc): State<Arc<KnowledgeService>>,
+    axum::extract::Query(q): axum::extract::Query<ListAllDocsQuery>,
+) -> Response {
+    let tags: Vec<String> = q.tag.into_iter().collect();
+    let limit = q.limit.unwrap_or(50).clamp(1, 1000);
+    let svc_clone = Arc::clone(&svc);
+    let res = tokio::task::spawn_blocking(move || {
+        svc_clone.list_all_docs(tags, q.source_kind, limit, q.cursor)
+    })
+    .await;
+    match res {
+        Ok(Ok(out)) => Json(serde_json::json!({
+            "docs": out.docs,
+            "nextCursor": out.next_cursor,
+        }))
+        .into_response(),
+        Ok(Err(e)) => err_response(e),
+        Err(e) => {
+            tracing::warn!("list_all_docs join error: {e:#}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn get_doc_by_id(
+    State(svc): State<Arc<KnowledgeService>>,
+    Path(did): Path<String>,
+) -> Response {
+    match svc.find_doc(&did) {
+        Ok((d, cid)) => Json(serde_json::json!({
+            "docId": d.id,
+            "title": d.title,
+            "version": d.version,
+            "sourceKind": d.source_kind.as_str(),
+            "mime": d.mime,
+            "tags": d.tags,
+            "visibility": d.visibility,
+            "collectionId": cid,
+        }))
+        .into_response(),
+        Err(e) => err_response(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct DeleteDocByIdQuery {
+    /// Bulk delete: tombstone every Active doc tagged with `tag`.
+    #[serde(default)]
+    tag: Option<String>,
+}
+
+async fn delete_doc_by_id(
+    State(svc): State<Arc<KnowledgeService>>,
+    Path(did): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<DeleteDocByIdQuery>,
+) -> Response {
+    // Bulk-by-tag mode: the route path's `{doc_id}` is ignored; clients
+    // hit `/docs/_bulk?tag=<name>` (any path segment works as the slot
+    // filler) since axum needs a path param to match the route. Keeping
+    // it on the same route avoids a second handler and the auth layer's
+    // path-allowlisting only knows about `/docs/{doc_id}`.
+    if let Some(tag) = q.tag.filter(|s| !s.is_empty()) {
+        return match svc.tombstone_by_tag(&tag) {
+            Ok(n) => Json(serde_json::json!({ "tombstoned": n, "tag": tag })).into_response(),
+            Err(e) => err_response(e),
+        };
+    }
+    match svc.delete_doc_by_id(&did) {
+        Ok(()) => Json(serde_json::json!({ "deleted": true })).into_response(),
+        Err(e) => err_response(e),
+    }
+}
+
+async fn get_doc_content_by_id(
+    State(svc): State<Arc<KnowledgeService>>,
+    Path(did): Path<String>,
+) -> Response {
+    match svc.doc_body(&did) {
+        Ok((mime, body)) => (
+            [(header::CONTENT_TYPE, format!("{mime}; charset=utf-8"))],
+            body,
+        )
+            .into_response(),
+        Err(e) => err_response(e),
+    }
+}
+
+async fn get_doc_chunks(
+    State(svc): State<Arc<KnowledgeService>>,
+    Path(did): Path<String>,
+) -> Response {
+    match svc.doc_chunks(&did) {
+        Ok(chunks) => {
+            let arr: Vec<_> = chunks
+                .into_iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "chunkId": c.id,
+                        "seq": c.seq,
+                        "headingPath": c.heading_path,
+                        "text": c.indexed_text,
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({ "chunks": arr })).into_response()
+        }
+        Err(e) => err_response(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct VisibilityReq {
+    visibility: String,
+}
+
+async fn patch_doc_visibility(
+    State(svc): State<Arc<KnowledgeService>>,
+    Path(did): Path<String>,
+    Json(req): Json<VisibilityReq>,
+) -> Response {
+    let Some(vis) = parse_visibility_string(&req.visibility) else {
+        return bad_request("invalid_visibility");
+    };
+    match svc.set_doc_visibility(&did, vis) {
+        Ok(()) => Json(serde_json::json!({ "updated": true, "visibility": req.visibility }))
+            .into_response(),
+        Err(e) => err_response(e),
+    }
+}
+
+fn parse_visibility_string(s: &str) -> Option<crate::kb::model::KbVisibility> {
+    use crate::kb::model::KbVisibility;
+    match s {
+        "global" => Some(KbVisibility::Global),
+        "private" => Some(KbVisibility::Private),
+        other => other.strip_prefix("agent:").map(|id| KbVisibility::Agent {
+            agent_id: id.to_owned(),
+        }),
+    }
+}
+
+#[derive(Deserialize)]
+struct SyncAllReq {
+    #[serde(default = "default_sync_interval_min")]
+    interval_min: u64,
+    #[serde(default = "default_sync_max")]
+    max: usize,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+fn default_sync_interval_min() -> u64 {
+    60
+}
+fn default_sync_max() -> usize {
+    100
+}
+
+async fn sync_all(
+    State(svc): State<Arc<KnowledgeService>>,
+    Json(req): Json<SyncAllReq>,
+) -> Response {
+    let svc_clone = Arc::clone(&svc);
+    let res = tokio::task::spawn_blocking(move || {
+        svc_clone.sync_all_urls(req.interval_min, req.max, req.dry_run)
+    })
+    .await;
+    match res {
+        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Err(e)) => err_response(e),
+        Err(e) => {
+            tracing::warn!("sync_all join error: {e:#}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal"})),
+            )
+                .into_response()
+        }
+    }
 }
 
 #[cfg(test)]

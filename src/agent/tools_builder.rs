@@ -344,6 +344,14 @@ pub(crate) fn toolset_allowed_names(
         "plugin_search",
         "plugin_describe",
         "plugin_invoke",
+        // astock — built-in tools, dormant when not configured.
+        "stock_quote",
+        "stock_kline",
+        "stock_snapshot",
+        "stock_ask",
+        "stock_query",
+        "stock_chart",
+        "stock_watchlist",
     ];
 
     let base: Option<&[&str]> = match toolset {
@@ -762,25 +770,208 @@ pub fn build_tool_list(
             Never curate proactively.\n\
             - action=list_collections — see existing collections (reuse one before creating).\n\
             - action=create_collection {name, description?} — make a new collection.\n\
-            - action=add {collection, title, content, mime?} — ingest text you prepared; \
-              `collection` is a NAME (created if absent); `content` is markdown/plain text.".to_owned(),
+            - action=add {collection, title, content, mime?, force?} — ingest text you prepared; \
+              `collection` is a NAME (created if absent); `content` is markdown/plain text. \
+              Returns `status:\"near_duplicate\"` with the existing doc if a semantically similar \
+              entry already exists; pass `force:true` to add anyway.\n\
+            - action=delete {collection, doc_id} — tombstone a doc by its exact id. Only call when \
+              the user explicitly asks to remove something; never to clean up your own mistakes \
+              without confirmation.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["search", "add", "create_collection", "list_collections"], "description": "Default search. Write actions only when asked."},
+                "action": {"type": "string", "enum": ["search", "add", "delete", "create_collection", "list_collections"], "description": "Default search. Write actions only when asked."},
                 "query": {"type": "string", "description": "Search query."},
                 "collection_ids": {"type": "array", "items": {"type": "string"}, "description": "Restrict to these collection ids; omit for all."},
                 "top_k": {"type": "integer", "default": 5, "description": "Max hits."},
-                "collection": {"type": "string", "description": "Collection NAME (add); created if absent."},
+                "collection": {"type": "string", "description": "Collection NAME or ID (add/delete)."},
                 "name": {"type": "string", "description": "New collection name."},
                 "description": {"type": "string", "description": "Optional collection description."},
                 "title": {"type": "string", "description": "Document title."},
                 "content": {"type": "string", "description": "Document text to ingest."},
-                "mime": {"type": "string", "default": "text/markdown", "description": "MIME for content."}
+                "mime": {"type": "string", "default": "text/markdown", "description": "MIME for content."},
+                "doc_id": {"type": "string", "description": "Exact doc id (delete only)."},
+                "force": {"type": "boolean", "default": false, "description": "Skip near-duplicate check on add."}
             },
             "required": []
         }),
     });
+
+    // -----------------------------------------------------------------
+    // A-share market data (astock). Tools no-op with a structured
+    // "astock_not_configured" reply when the gateway hasn't been wired
+    // to an astock instance — so they're always safe to advertise; the
+    // LLM learns at first call that it can't use them and stops trying.
+    // -----------------------------------------------------------------
+    tools.push(ToolDef {
+        name: "stock_quote".to_owned(),
+        description: "Real-time A-share quote(s). Pass `code` (string) for one \
+            quote, or `codes` (array) for a batch. Accepts codes in any common \
+            form (600519, sh600519, SH:600519, 600519.SH — normalized internally). \
+            Returns price, open/high/low, prior close, change %, volume, amount, \
+            and timestamp. Cached ~5s on the gateway side so the LLM can ask the \
+            same quote multiple times within a turn cheaply.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "description": "Single stock code."},
+                "codes": {"type": "array", "items": {"type": "string"}, "description": "Multiple codes (batch)."},
+                "format": {"type": "string", "enum": ["summary", "raw"], "default": "summary",
+                           "description": "`summary` trims order-book levels (default); `raw` keeps bids/asks."}
+            },
+            "required": []
+        }),
+    });
+    tools.push(ToolDef {
+        name: "stock_kline".to_owned(),
+        description: "Historical K-line bars for one A-share code. Use for \
+            technical-analysis questions (\"近 60 日趋势\", \"创新高了吗\", \
+            \"突破均线没有\"). Defaults: 200 daily bars (`period=1d`), no \
+            adjustment. Set `adjust=qfq` for 前复权 / `hfq` for 后复权 when \
+            comparing across dividend events.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "description": "Stock code (any common form)."},
+                "period": {"type": "string", "enum": ["1m","5m","15m","30m","1h","1d","1w","1mon"],
+                           "default": "1d", "description": "Bar granularity."},
+                "count": {"type": "integer", "default": 200, "minimum": 1, "maximum": 800,
+                          "description": "Number of bars to fetch."},
+                "offset": {"type": "integer", "default": 0,
+                           "description": "Skip N most-recent bars before counting."},
+                "adjust": {"type": "string", "enum": ["none","qfq","hfq"], "default": "none"}
+            },
+            "required": ["code"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "stock_snapshot".to_owned(),
+        description: "Full-market snapshot, sorted + capped. Use for broad market \
+            questions where you want a ranked list of A-shares: \"今天涨幅前 20\", \
+            \"沪市量比最高的票\", a watchlist refresh. The result is sorted by \
+            `sort_by` (default `amount`) and trimmed to `limit` rows (default \
+            50) so the LLM context stays bounded — the upstream service can \
+            return 5000+ rows on a busy day. Filter by `market` (SH/SZ/BJ) or an \
+            explicit `codes` list to narrow further. Set `ts=<date>` for a \
+            historical snapshot.\n\
+            \n\
+            Smart default: if you pass NO `codes`, NO `market`, and NO `ts`, \
+            the snapshot auto-filters to the caller's watchlist (see \
+            `stock_watchlist`). The result envelope's `used_watchlist: true` \
+            flag tells you whether that happened, so you can phrase the reply \
+            as \"你关注的 N 只...\" instead of \"全市场...\". Override with \
+            `use_watchlist=false` to force a market-wide snapshot.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "ts": {"type": "string", "description": "Historical timestamp (YYYY-MM-DD or RFC3339); omit for live."},
+                "market": {"type": "string", "enum": ["SH","SZ","BJ"], "description": "Filter by exchange."},
+                "codes": {"type": "array", "items": {"type": "string"}, "description": "Explicit code allowlist."},
+                "adjust": {"type": "string", "enum": ["none","qfq","hfq"], "default": "none",
+                           "description": "Only valid with `ts`; live snapshots are always raw."},
+                "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 5000,
+                          "description": "Cap rows returned to the LLM."},
+                "sort_by": {"type": "string", "enum": ["amount","pct","price"], "default": "amount",
+                            "description": "Primary sort key."},
+                "order": {"type": "string", "enum": ["desc","asc"], "default": "desc"},
+                "use_watchlist": {"type": "boolean", "description": "When unset, defaults to the caller's watchlist if codes/market/ts are all empty. Pass false to force market-wide."}
+            },
+            "required": []
+        }),
+    });
+    tools.push(ToolDef {
+        name: "stock_ask".to_owned(),
+        description: "PREFERRED A-share entry point — natural-language query \
+            routed through iwencai (同花顺's question-understanding service via \
+            astock). Use this whenever the user phrases a market question in \
+            human terms: \"今天涨停的科技股有哪些\", \"北向资金净流入前 20\", \
+            \"最近一周创业板连板高度榜\", \"机构调研最多的票\". Don't try to \
+            assemble snapshot filters or SQL by hand for this kind of question — \
+            iwencai handles the parsing and returns structured results that are \
+            usually richer than what we'd compute locally.\n\
+            \n\
+            Falls back gracefully on empty / unknown queries: returns \
+            `ok: false` with the upstream error so you can rephrase.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Free-form A-share question in Chinese or English."},
+                "page": {"type": "integer", "description": "Result page (default 1)."},
+                "limit": {"type": "integer", "description": "Page size (upstream default applies if omitted)."},
+                "call_type": {"type": "string", "description": "Advanced iwencai hint; usually omit."}
+            },
+            "required": ["query"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "stock_chart".to_owned(),
+        description: "Render a K-line + volume chart PNG for the user and send \
+            it to the IM channel. DIFFERENT from `stock_kline` — that returns \
+            raw bars for YOU to analyse; this one delivers a picture to the \
+            USER's chat. Common pattern: call `stock_kline` first to read the \
+            recent trajectory, draft your written analysis, then call \
+            `stock_chart` so the user sees the picture beside your commentary.\n\
+            \n\
+            Defaults: 60 daily bars + MA5/10/20/60 overlays + volume subplot, \
+            红涨绿跌 color convention (NOT US green/red). Pass `name` if you \
+            know the Chinese stock name — it appears in the chart title.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "description": "Stock code (any common form)."},
+                "name": {"type": "string", "description": "Chinese stock name to show in the title; optional."},
+                "period": {"type": "string", "enum": ["1m","5m","15m","30m","1h","1d","1w","1mon"], "default": "1d"},
+                "count": {"type": "integer", "default": 60, "minimum": 20, "maximum": 200},
+                "adjust": {"type": "string", "enum": ["none","qfq","hfq"], "default": "none"},
+                "ma": {"type": "array", "items": {"type": "integer"}, "default": [5,10,20,60],
+                       "description": "MA overlay periods; pass `[]` to disable."}
+            },
+            "required": ["code"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "stock_watchlist".to_owned(),
+        description: "Per-user persistent stock watchlist. Stored in rsclaw \
+            memory, scoped to (channel, peer) so each IM user has their own \
+            list across restarts. Use this when the user says \"加入关注\" / \
+            \"关注一下 600519\" / \"以后每天给我看茅台\" — adding to the \
+            watchlist lets downstream features (briefings, alerts, default \
+            snapshot filter) personalize automatically.\n\
+            \n\
+            Actions:\n\
+            - list — return all codes currently on the watchlist.\n\
+            - add — codes:[...] adds N codes; existing entries are skipped.\n\
+            - remove — codes:[...] removes by code.\n\
+            - clear — wipe the entire watchlist for this peer.\n\
+            \n\
+            Don't proactively add stocks the user merely asked about once — \
+            wait for explicit '关注/收藏/加入关注' intent.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["list","add","remove","clear"], "default": "list"},
+                "code": {"type": "string", "description": "Single stock code (alternative to `codes`)."},
+                "codes": {"type": "array", "items": {"type": "string"}, "description": "Multiple stock codes."}
+            },
+            "required": []
+        }),
+    });
+    tools.push(ToolDef {
+        name: "stock_query".to_owned(),
+        description: "Read-only SQL against astock's DuckDB. ESCAPE HATCH only — \
+            use when `stock_ask` / `stock_snapshot` / `stock_kline` genuinely \
+            cannot express the query. astock validates the SQL server-side and \
+            rejects anything that isn't a single SELECT. Joining the live K-line \
+            tables and the EOD aggregates here is fine; we trust the validator.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "sql": {"type": "string", "description": "A single read-only SELECT."}
+            },
+            "required": ["sql"]
+        }),
+    });
+
     tools.push(ToolDef {
         name: "write_file".to_owned(),
         description: "Write/create a file (full-overwrite). Use this for ALL file creation and full \

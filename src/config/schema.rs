@@ -38,6 +38,13 @@ pub struct Config {
     pub memory_search: Option<MemorySearchConfig>,
     pub memory: Option<MemoryTopConfig>,
     pub kb: Option<KbConfig>,
+    /// A-share market data integration. Backs the `astock` Go gateway
+    /// (https://github.com/oopos/astock — pytdx + DuckDB + iwencai). When
+    /// `enabled = false` or this block is missing entirely, the astock
+    /// subsystem stays dormant: tools return "astock not configured",
+    /// the CLI subcommand errors with a hint, and nothing connects
+    /// outbound. Lets non-A股 users carry the binary cost-free.
+    pub astock: Option<AstockConfig>,
     pub mcp: Option<McpConfig>,
     /// Per-registry overrides keyed by registry name (`iwencai`, `clawhub`,
     /// `skillhub`, ...). Lets users put `apiKey`/`baseUrl` for paid skill
@@ -2368,6 +2375,64 @@ pub struct MemoryTopSearchConfig {
 
 // ---------------------------------------------------------------------------
 // mcp (Model Context Protocol servers)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// astock — A-share market data integration
+// ---------------------------------------------------------------------------
+
+/// Top-level astock config. See the parent `Config.astock` field for the
+/// rationale on `enabled` gating; field-level docs cover the rest.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AstockConfig {
+    /// Master switch. `false` (or omitted entirely) leaves the
+    /// subsystem dormant: tools no-op with a "not configured" error,
+    /// no outbound connections, zero runtime cost.
+    pub enabled: Option<bool>,
+    /// astock gateway base URL. Local default would be
+    /// `http://127.0.0.1:19999`. Remote / shared deployments point at
+    /// the team's astock instance.
+    pub base_url: Option<String>,
+    /// Bearer token for astock's x402 paywall (or session-init flow).
+    /// `None` when astock runs paywall-disabled (dev mode) — the
+    /// client just skips the Authorization header.
+    pub auth_token: Option<String>,
+    /// In-process response caches. Saves astock credits + latency for
+    /// the typical "LLM repeatedly asks the same quote in one turn"
+    /// pattern. Each field is TTL in seconds; `0` disables the cache
+    /// for that endpoint. Defaults applied at usage site.
+    pub cache: Option<AstockCacheConfig>,
+    /// Per-tool rate caps, applied per-IM-peer so one runaway LLM
+    /// loop doesn't burn through the whole quota.
+    pub rate_limit: Option<AstockRateLimitConfig>,
+    /// Appended verbatim to every AI-rendered IM message that quotes
+    /// stock data. Compliance gate — keep it explicit so users can't
+    /// rely on the LLM remembering to add it.
+    pub disclaimer_suffix: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AstockCacheConfig {
+    /// Quote cache TTL during trading hours (seconds). Suggested 5s.
+    pub quote_secs: Option<u32>,
+    /// K-line cache TTL (seconds). Suggested 30s.
+    pub kline_secs: Option<u32>,
+    /// Full-market snapshot cache TTL (seconds). Suggested 60s.
+    pub snapshot_secs: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AstockRateLimitConfig {
+    /// Max real-time quotes per IM peer per minute.
+    pub quote_per_minute: Option<u32>,
+    /// Max screen calls per peer per hour (screen is the expensive
+    /// endpoint under x402 — credits charged per filter component).
+    pub screen_per_hour: Option<u32>,
+}
+
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

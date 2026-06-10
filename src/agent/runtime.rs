@@ -564,6 +564,12 @@ pub struct RunContext {
     pub peer_id: String,
     /// Chat/conversation ID for sending intermediate progress messages.
     pub chat_id: String,
+    /// Inbound account key (e.g. feishu app account name). Threaded to
+    /// outbound `OutboundMessage.account` so notifications route via
+    /// `<channel>/<account>` and not bare `<channel>` — fixes Feishu
+    /// 99992361 "open_id cross app" on multi-app deployments where
+    /// the first-registered app would otherwise swallow every send.
+    pub account: Option<String>,
     /// Background exec pool for polling task results.
     pub exec_pool: Arc<super::exec_pool::ExecPool>,
     pub loop_detector: LoopDetector,
@@ -2070,6 +2076,7 @@ impl AgentRuntime {
         channel: &str,
         peer_id: &str,
         chat_id: &str,
+        account: Option<&str>,
         extra_tools: Vec<ToolDef>,
         images: Vec<super::registry::ImageAttachment>,
         files: Vec<super::registry::FileAttachment>,
@@ -2324,11 +2331,7 @@ impl AgentRuntime {
                     let chunker_session = pseudo_session_id.clone();
                     let chunker_channel = channel.to_owned();
                     let chunker_target = im_target_id.clone();
-                    let chunker_account = self
-                        .notification_tx
-                        .is_some()
-                        .then(|| None::<String>) // best-effort: outbound dispatcher figures out account from session
-                        .flatten();
+                    let chunker_account = account.map(str::to_owned);
                     let handle = tokio::spawn(stream_cap_chunks_to_im(
                         bus_rx,
                         chunker_session,
@@ -3301,6 +3304,7 @@ impl AgentRuntime {
                             channel: channel.to_owned(),
                             peer_id: peer_id.to_owned(),
                             chat_id: String::new(),
+                            account: None,
                             exec_pool: Arc::clone(&self.exec_pool),
                             loop_detector: crate::agent::loop_detection::LoopDetector::default(),
                             has_images: false,
@@ -3535,6 +3539,7 @@ impl AgentRuntime {
                     channel,
                     peer_id,
                     chat_id,
+                    account,
                     extra_tools,
                     images,
                     vec![],
@@ -3554,6 +3559,7 @@ impl AgentRuntime {
                     channel,
                     peer_id,
                     chat_id,
+                    account,
                     extra_tools,
                     images,
                     files,
@@ -4405,6 +4411,7 @@ impl AgentRuntime {
             // which on Discord groups produces a 404 (Discord rejects POST
             // to /channels/<user_id>/messages — DMs need a created channel).
             chat_id: chat_id.to_owned(),
+            account: account.map(str::to_owned),
             exec_pool: Arc::clone(&self.exec_pool),
             loop_detector: {
                 let ld_cfg_owned = self
@@ -6450,7 +6457,7 @@ impl AgentRuntime {
                             images: vec![],
                             files: vec![],
                             channel: Some(ctx.channel.clone()),
-                            account: None,
+                            account: ctx.account.clone(),
                         });
                     }
                 }
@@ -6598,7 +6605,7 @@ impl AgentRuntime {
                         images: vec![],
                         files: vec![],
                         channel: Some(ctx.channel.clone()),
-                        account: None,
+                        account: ctx.account.clone(),
                     });
                     tracing::debug!(
                         text_len = intermediate_text.len(),
@@ -8881,6 +8888,13 @@ impl AgentRuntime {
             "read_artifact" => return self.tool_read_artifact(ctx, args).await,
             "read_session_archive" => return self.tool_read_session_archive(ctx, args).await,
             "knowledge_base" | "kb_search" => return self.tool_knowledge_base(args).await,
+            "stock_quote" => return self.tool_stock_quote(args).await,
+            "stock_kline" => return self.tool_stock_kline(args).await,
+            "stock_snapshot" => return self.tool_stock_snapshot(ctx, args).await,
+            "stock_ask" => return self.tool_stock_ask(args).await,
+            "stock_query" => return self.tool_stock_query(args).await,
+            "stock_chart" => return self.tool_stock_chart(args).await,
+            "stock_watchlist" => return self.tool_stock_watchlist(ctx, args).await,
             "write_file" | "write" => return self.tool_write(args).await,
             "edit_file" | "edit" => return self.tool_edit(args).await,
             "shell" | "execute_command" | "exec" => return self.tool_exec(ctx, _id, args).await,
@@ -9353,6 +9367,7 @@ impl AgentRuntime {
                 let coll = args["collection"].as_str().unwrap_or("").trim().to_owned();
                 let title = args["title"].as_str().unwrap_or("").trim().to_owned();
                 let content = args["content"].as_str().unwrap_or("").to_owned();
+                let force = args["force"].as_bool().unwrap_or(false);
                 if coll.is_empty() || title.is_empty() || content.trim().is_empty() {
                     return Ok(json!({"error": "add requires collection, title, and content"}));
                 }
@@ -9364,7 +9379,30 @@ impl AgentRuntime {
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "text/markdown".to_owned());
                 let out = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
-                    let (cid, _name, _created) = resolve_or_create_collection(&kb, &coll, None)?;
+                    let (cid, _name, created) =
+                        resolve_or_create_collection(&kb, &coll, None)?;
+                    // Pre-search dedup: a brand-new collection can't have
+                    // duplicates; for existing ones, probe the top hit by
+                    // title against this collection and surface anything
+                    // within the near-duplicate band so the LLM can decide
+                    // whether to merge, replace, or `force: true`.
+                    if !created && !force {
+                        let probe_query = format!("{title}\n{}", content.chars().take(400).collect::<String>());
+                        let hits = kb
+                            .search(&probe_query, &[cid.clone()], 3, 0.0)
+                            .unwrap_or_default();
+                        const NEAR_DUP_THRESHOLD: f32 = 0.85;
+                        if let Some(top) = hits.iter().find(|h| h.score >= NEAR_DUP_THRESHOLD) {
+                            return Ok(json!({
+                                "status": "near_duplicate",
+                                "existing_doc_id": top.doc_id,
+                                "existing_title": top.source_title,
+                                "score": top.score,
+                                "collection_id": cid,
+                                "hint": "A semantically similar doc already exists. Re-call with `force: true` to add anyway, or `action: delete` the existing doc first.",
+                            }));
+                        }
+                    }
                     let (doc_id, noop) = kb
                         .ingest(&cid, &title, content.as_bytes(), Some(&mime))
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -9378,8 +9416,35 @@ impl AgentRuntime {
                 .map_err(|e| anyhow::anyhow!("kb add task failed: {e}"))??;
                 Ok(out)
             }
+            "delete" => {
+                let coll = args["collection"].as_str().unwrap_or("").trim().to_owned();
+                let doc_id = args["doc_id"].as_str().unwrap_or("").trim().to_owned();
+                if coll.is_empty() || doc_id.is_empty() {
+                    return Ok(json!({"error": "delete requires both `collection` and `doc_id`"}));
+                }
+                let out = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+                    let cols = kb
+                        .list_collections()
+                        .map_err(|e| anyhow::anyhow!("kb list_collections failed: {e}"))?;
+                    let cid = cols
+                        .iter()
+                        .find(|c| c.id == coll || c.name == coll)
+                        .map(|c| c.id.clone())
+                        .ok_or_else(|| anyhow::anyhow!("collection not found: {coll}"))?;
+                    kb.delete_doc(&cid, &doc_id)
+                        .map_err(|e| anyhow::anyhow!("kb delete_doc failed: {e}"))?;
+                    Ok(json!({
+                        "doc_id": doc_id,
+                        "collection_id": cid,
+                        "status": "tombstoned",
+                    }))
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("kb delete task failed: {e}"))??;
+                Ok(out)
+            }
             other => Ok(json!({
-                "error": format!("unknown action '{other}' (use search, add, create_collection, list_collections)")
+                "error": format!("unknown action '{other}' (use search, add, delete, create_collection, list_collections)")
             })),
         }
     }
@@ -10361,14 +10426,25 @@ fn format_tool_result(val: &serde_json::Value) -> String {
             // identifier fields any result-shaped payload exposes.
             let title = r
                 .get("title")
+                .or_else(|| r.get("source_title"))
+                .or_else(|| r.get("doc_title"))
                 .or_else(|| r.get("summary"))
                 .or_else(|| r.get("content"))
                 .or_else(|| r.get("slug"))
                 .or_else(|| r.get("name"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("(no title)");
-            let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("");
-            let snippet = r.get("snippet").and_then(|v| v.as_str()).unwrap_or("");
+            let url = r
+                .get("url")
+                .or_else(|| r.get("doc_id"))
+                .or_else(|| r.get("chunk_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let snippet = r
+                .get("snippet")
+                .or_else(|| r.get("text"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             out.push_str(&format!("{}. {}\n", i + 1, title));
             if !url.is_empty() {
                 out.push_str(&format!("   {url}\n"));
