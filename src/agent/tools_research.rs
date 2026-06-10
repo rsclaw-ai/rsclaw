@@ -558,7 +558,13 @@ fn is_wechat_article_url(url: &str) -> bool {
 async fn fetch_wechat_html(url: &str) -> Result<String> {
     let client = reqwest::Client::builder()
         .user_agent(WECHAT_UA)
-        .timeout(std::time::Duration::from_secs(20))
+        // 60s total: WeChat occasionally chunks the response slowly
+        // (article + tracking iframe + comment bundle), the curl
+        // probe during the live debug session timed out at 30s on
+        // the same network. Plus 5s connect for fast-fail when the
+        // network is genuinely dead vs slow.
+        .timeout(std::time::Duration::from_secs(60))
+        .connect_timeout(std::time::Duration::from_secs(5))
         .build()?;
     let resp = client.get(url).send().await?.error_for_status()?;
     // Length-cap defensively: WeChat articles are typically 100-400 KB.
