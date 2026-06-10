@@ -513,7 +513,12 @@ impl MemoryStore {
             embed_dim,
             swap: None,
             pending_migration: skipped,
-            query_instruction: search_cfg.and_then(|c| c.query_instruction.clone()),
+            query_instruction: search_cfg.and_then(|c| {
+                crate::embed::resolve_query_instruction(
+                    c.query_instruction.clone(),
+                    c.model.as_deref(),
+                )
+            }),
             search: None,
         };
 

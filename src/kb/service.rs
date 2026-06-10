@@ -180,8 +180,9 @@ impl KnowledgeService {
         // queryInstruction comes from the SAME effective embed config the
         // embedder was resolved from (`kb.embed` override, else `memorySearch`),
         // so a KB-specific asymmetric model uses its own instruction.
-        let query_instruction =
-            crate::kb::embedder::effective_embed_config().and_then(|m| m.query_instruction);
+        let query_instruction = crate::kb::embedder::effective_embed_config().and_then(|m| {
+            crate::embed::resolve_query_instruction(m.query_instruction, m.model.as_deref())
+        });
         // kb.maxDocMb → bytes; default 50 MB, clamp negatives/zero to default.
         let max_doc_bytes = cfg
             .as_ref()
