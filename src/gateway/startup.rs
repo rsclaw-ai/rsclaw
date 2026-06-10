@@ -360,6 +360,14 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                     // being installed.
                     crate::astock::briefing::spawn_scheduler();
                     info!("astock briefing scheduler started");
+                    // SSE listeners: one tokio task per configured
+                    // filter, push notifications on `hit` events for
+                    // codes any peer is watching. Gated on the same
+                    // astock-client-present check so non-A股 users
+                    // carry zero background cost.
+                    if let Some(astock_cfg) = config.raw.astock.as_ref() {
+                        crate::astock::sse::spawn_listeners(astock_cfg);
+                    }
                 }
                 Err(e) => {
                     info!(reason = %e, "astock client not initialised (subsystem dormant)");

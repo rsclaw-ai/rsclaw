@@ -2410,6 +2410,26 @@ pub struct AstockConfig {
     /// stock data. Compliance gate — keep it explicit so users can't
     /// rely on the LLM remembering to add it.
     pub disclaimer_suffix: Option<String>,
+    /// SSE bridge config. When present + enabled, gateway opens one
+    /// long-lived `GET /v1/stream/quick?filter=<f>` connection per
+    /// listed filter and pushes IM notifications on `hit` events for
+    /// codes any peer is watching.
+    pub sse: Option<AstockSseConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AstockSseConfig {
+    /// Default true when the `sse` block is present at all. Set
+    /// `false` to bench / disable the bridge without removing the
+    /// listener config.
+    pub enabled: Option<bool>,
+    /// astock `quick_*` filter slugs to subscribe to. Common
+    /// values: `quick_rally`, `quick_goldcross`, `quick_cow_catch`,
+    /// `quick_deadtogold`. Unknown filters render with a generic
+    /// "异动" label in IM notifications. Omitted / empty defaults
+    /// to `[quick_rally, quick_goldcross, quick_cow_catch]`.
+    pub filters: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]

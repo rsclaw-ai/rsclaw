@@ -20,6 +20,7 @@
 pub mod briefing;
 pub mod chart;
 pub mod client;
+pub mod sse;
 
 pub use client::{
     AstockClient, AstockError, AskResp, KlineBar, KlineResp, Quote, QuoteLevel, SnapshotRow,

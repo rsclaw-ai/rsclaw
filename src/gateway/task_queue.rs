@@ -584,6 +584,27 @@ pub fn get_task_queue() -> Option<Arc<TaskQueueManager>> {
 /// `{name}` key last. Falls back to the bare `{name}` key. Returns `None` if
 /// the channel is not registered (or `install_channel_senders` was never
 /// called).
+/// Push an outbound message directly to a channel without going through
+/// the task queue. Used by background subsystems (cron briefings, astock
+/// SSE bridge, etc.) that have a pre-formatted message and don't need
+/// an LLM turn to produce it. Falls back to bare `{name}` lookup when
+/// `account` is `None` or absent from the sender map.
+///
+/// Best-effort via `try_send` so a saturated channel buffer never blocks
+/// the caller's hot path; if delivery fails, returns the error and lets
+/// the caller decide whether to retry or drop. Same semantics as
+/// `send_task_ack`.
+pub fn push_outbound(
+    channel: &str,
+    account: Option<&str>,
+    msg: OutboundMessage,
+) -> Result<(), String> {
+    let tx = lookup_channel_sender_for(channel, account)
+        .ok_or_else(|| format!("channel sender '{channel}' not registered"))?;
+    tx.try_send(msg)
+        .map_err(|e| format!("channel '{channel}' send failed: {e}"))
+}
+
 fn lookup_channel_sender_for(
     name: &str,
     account: Option<&str>,
