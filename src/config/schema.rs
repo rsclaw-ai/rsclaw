@@ -1056,6 +1056,15 @@ pub struct ProviderConfig {
     /// omitted. Ignored for non-rsclaw `api` formats.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact_timeout_secs: Option<u64>,
+    /// `rsclaw` providers only: send `options.constrain_tool_calls` on every
+    /// turn so the worker constrains tool-call decoding with the lazy GBNF
+    /// grammar it derived from the session's tools at create/replay time.
+    /// Eliminates malformed tool-call JSON/XML at the decode stage. Requires
+    /// workers that advertise `supports_constrained_tool_calls`; older
+    /// workers ignore the option. Defaults to false (off) while the fleet
+    /// rolls out. Ignored for non-rsclaw `api` formats.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constrain_tool_calls: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

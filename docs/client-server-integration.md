@@ -133,6 +133,13 @@ prefill KV state. If you care about cache hit rate, use this lane.
    ├─ in:  {user_message:"..." | tool_results:[...], stream:true, options?}
    └─ out: SSE stream (§4.2)
 
+   options.constrain_tool_calls (bool, protocol v1.9.1): worker decodes the
+   turn under the lazy tool-call grammar it derived from the session's tools
+   at create/replay — malformed tool calls become impossible at the sampler.
+   The github-rsclaw provider sends it on every tool-carrying turn when the
+   per-provider config `constrainToolCalls: true` is set. rsclaw-server
+   forwards `options` verbatim; pre-v1.9.1 workers ignore the key.
+
 3. POST /v1/agent/sessions/{session_id}/compact      (optional, when context grows)
 4. DELETE /v1/agent/sessions/{session_id}            (when the conversation ends)
 ```

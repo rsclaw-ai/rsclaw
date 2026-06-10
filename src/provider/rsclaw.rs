@@ -163,6 +163,14 @@ pub struct RsclawProvider {
     /// per-provider config `compactTimeoutSecs` so it can be aligned with
     /// the server's splice ceiling without a rebuild.
     compact_timeout: Duration,
+    /// When true, every turn whose request carries tools sends
+    /// `options.constrain_tool_calls: true` so the worker constrains
+    /// tool-call decoding with the lazy GBNF grammar it derived from the
+    /// session's tools at create/replay. Per-provider config
+    /// `constrainToolCalls`; defaults to false during fleet rollout
+    /// (workers without `supports_constrained_tool_calls` ignore the
+    /// option, so a stale mix is safe but pointless).
+    constrain_tool_calls: bool,
     sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
     /// Cache of 308 redirects, keyed by *origin* (scheme + host + port)
     /// of the requested URL. Lets a single LB call amortise across the
@@ -362,9 +370,18 @@ impl RsclawProvider {
             bearer,
             prefix_id: RSCLAW_DEFAULT_PREFIX_ID.to_owned(),
             compact_timeout: Duration::from_secs(RSCLAW_DEFAULT_COMPACT_TIMEOUT_SECS),
+            constrain_tool_calls: false,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             redirect_cache: Arc::new(Mutex::new(RedirectCache::default())),
         }
+    }
+
+    /// Enable per-turn grammar-constrained tool-call decoding. Used by the
+    /// provider builder in `gateway::providers` when the config carries an
+    /// explicit `constrainToolCalls: true`.
+    pub fn with_constrain_tool_calls(mut self, enabled: bool) -> Self {
+        self.constrain_tool_calls = enabled;
+        self
     }
 
     /// Override the `/compact` splice HTTP timeout (seconds). Used by the
@@ -663,7 +680,7 @@ impl LlmProvider for RsclawProvider {
             // preceding User delta so the model still gets the context.
             normalize_trailing_system(&mut req.messages);
 
-            let split = split_request(&req, &self.prefix_id)?;
+            let split = split_request(&req, &self.prefix_id, self.constrain_tool_calls)?;
 
             // Lookup or hydrate. Cache miss / mutation happens on first
             // call, version drift, after a prior replay failure, or
@@ -1503,7 +1520,7 @@ impl RsclawProvider {
             delta,
             recall_context: recall.map(|r| r.context.as_str()),
             recall: recall.map(|r| &r.metadata),
-            options: Some(TurnOptions::from_request(req)),
+            options: Some(TurnOptions::from_request(req, self.constrain_tool_calls)),
             stream: true,
         };
         // No per-hop builder timeout: reqwest's `.timeout()` is a
@@ -1977,10 +1994,19 @@ struct TurnOptions {
     stop: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     idle_ttl_secs: Option<u32>,
+    /// Worker constrains tool-call decoding with the lazy GBNF grammar it
+    /// derived from this session's tools at create/replay. `None` keeps the
+    /// wire bytes identical to pre-grammar builds (and lets old workers
+    /// stay oblivious).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    constrain_tool_calls: Option<bool>,
 }
 
 impl TurnOptions {
-    fn from_request(req: &LlmRequest) -> Self {
+    /// `constrain_tool_calls` comes from the provider-level config flag;
+    /// it is only put on the wire when the request actually carries tools
+    /// (a tool-less request has no grammar to constrain with).
+    fn from_request(req: &LlmRequest, constrain_tool_calls: bool) -> Self {
         Self {
             max_tokens: req.max_tokens,
             temperature: req.temperature,
@@ -1988,6 +2014,8 @@ impl TurnOptions {
             enable_thinking: req.thinking_budget.map(|b| b > 0),
             stop: None,
             idle_ttl_secs: None,
+            constrain_tool_calls: (constrain_tool_calls && !req.tools.is_empty())
+                .then_some(true),
         }
     }
 }
@@ -2098,7 +2126,7 @@ fn dump_turn_for_debug(
         })
         .collect();
 
-    let opts = TurnOptions::from_request(req);
+    let opts = split.options.clone();
 
     // Wire body of the actual `/sessions/<id>/turn` request we're about
     // to send. Must match what `Provider::turn()` puts on the wire: the
@@ -2250,7 +2278,11 @@ fn to_canonical_value(v: serde_json::Value) -> serde_json::Value {
     }
 }
 
-fn split_request<'a>(req: &'a LlmRequest, prefix_id: &str) -> Result<SplitRequest<'a>> {
+fn split_request<'a>(
+    req: &'a LlmRequest,
+    prefix_id: &str,
+    constrain_tool_calls: bool,
+) -> Result<SplitRequest<'a>> {
     // `prefix_id` is config-driven (provider-level, default
     // [`RSCLAW_DEFAULT_PREFIX_ID`]) — NOT derived from `req.model` or
     // any per-turn data. Protocol §2.10.1 only mandates exactly one
@@ -2330,7 +2362,7 @@ fn split_request<'a>(req: &'a LlmRequest, prefix_id: &str) -> Result<SplitReques
         dynamic_user_system,
         dynamic_tools,
         dynamic_user_tools,
-        options: TurnOptions::from_request(req),
+        options: TurnOptions::from_request(req, constrain_tool_calls),
     })
 }
 
@@ -4535,7 +4567,7 @@ data: {"type":"block_stop","index":0}
                 }
             }),
         }];
-        let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
+        let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID, false).unwrap();
         assert_eq!(
             split.dynamic_tools.len(),
             0,
@@ -4564,11 +4596,11 @@ data: {"type":"block_stop","index":0}
         // caller supplied the same value.
         let mut req = req_with(vec![], 2, Some("k"));
         req.model = "qwen3-235b".into();
-        let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
+        let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID, false).unwrap();
         assert_eq!(split.prefix_id, "rsclaw/2026.5.28");
 
         req.model = "myorg/qwen3-235b".into();
-        let split2 = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
+        let split2 = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID, false).unwrap();
         assert_eq!(split2.prefix_id, "rsclaw/2026.5.28");
     }
 
@@ -4579,7 +4611,7 @@ data: {"type":"block_stop","index":0}
         // override verbatim, independent of req.model.
         let mut req = req_with(vec![], 2, Some("k"));
         req.model = "qwen3-235b".into();
-        let split = split_request(&req, "myorg/2026.5.15").unwrap();
+        let split = split_request(&req, "myorg/2026.5.15", false).unwrap();
         assert_eq!(split.prefix_id, "myorg/2026.5.15");
     }
 
@@ -4641,7 +4673,7 @@ data: {"type":"block_stop","index":0}
             description: "memory tool".into(),
             parameters: json!({"type":"object","properties":{}}),
         });
-        let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
+        let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID, false).unwrap();
         assert_eq!(split.dynamic_tools.len(), 1, "only 'memory' is builtin");
         assert_eq!(split.dynamic_tools[0]["name"], "memory");
         assert_eq!(split.dynamic_user_tools.len(), 1, "'search' is per-client");
@@ -4668,7 +4700,7 @@ data: {"type":"block_stop","index":0}
             description: "memory".into(),
             parameters: json!({"type":"object"}),
         });
-        let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
+        let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID, false).unwrap();
         assert_eq!(split.dynamic_tools.len(), 1);
         assert_eq!(split.dynamic_tools[0]["name"], "memory");
         assert_eq!(split.dynamic_user_tools.len(), 1);
@@ -4690,7 +4722,7 @@ data: {"type":"block_stop","index":0}
             description: "memory tool".into(),
             parameters: json!({"type":"object"}),
         });
-        let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
+        let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID, false).unwrap();
         let (prefix_id, dynamic_prefix, top_level_user_tools) = prefix_fields(
             &split.prefix_id,
             DynamicPrefixWire {
@@ -4759,7 +4791,7 @@ data: {"type":"block_stop","index":0}
             description: "publish to douyin".into(),
             parameters: json!({"type":"object"}),
         });
-        let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID).unwrap();
+        let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID, false).unwrap();
         let (prefix_id, dynamic_prefix, top_level_user_tools) = prefix_fields(
             &split.prefix_id,
             DynamicPrefixWire {
@@ -4806,7 +4838,7 @@ data: {"type":"block_stop","index":0}
             description: "publish to douyin".into(),
             parameters: json!({"type":"object"}),
         });
-        let split = split_request(&req, "").unwrap();
+        let split = split_request(&req, "", false).unwrap();
         let (prefix_id, dynamic_prefix, top_level_user_tools) = prefix_fields(
             &split.prefix_id,
             DynamicPrefixWire {
@@ -4860,7 +4892,7 @@ data: {"type":"block_stop","index":0}
             parameters: json!({"type":"object"}),
         });
         // Empty prefix_id forces the dynamic-LRU path.
-        let split = split_request(&req, "").unwrap();
+        let split = split_request(&req, "", false).unwrap();
         let (prefix_id, dynamic_prefix, top_level_user_tools) = prefix_fields(
             &split.prefix_id,
             DynamicPrefixWire {
@@ -5136,7 +5168,7 @@ data: {"type":"block_stop","index":0}
             delta: &delta,
             recall_context: req.recall.as_ref().map(|r| r.context.as_str()),
             recall: req.recall.as_ref().map(|r| &r.metadata),
-            options: Some(TurnOptions::from_request(&req)),
+            options: Some(TurnOptions::from_request(&req, false)),
             stream: true,
         })
         .unwrap();
@@ -5173,7 +5205,7 @@ data: {"type":"block_stop","index":0}
             delta: &delta,
             recall_context: recall.map(|r| r.context.as_str()),
             recall: recall.map(|r| &r.metadata),
-            options: Some(TurnOptions::from_request(&req)),
+            options: Some(TurnOptions::from_request(&req, false)),
             stream: true,
         })
         .unwrap();
@@ -5772,6 +5804,7 @@ data: {"type":"block_stop","index":0}
             enable_thinking: None,
             stop: None,
             idle_ttl_secs: None,
+            constrain_tool_calls: None,
         };
         let body = serde_json::to_value(&opts).unwrap();
         // serde_json compares numbers by value not by string repr, so
@@ -5800,10 +5833,43 @@ data: {"type":"block_stop","index":0}
             enable_thinking: None,
             stop: None,
             idle_ttl_secs: None,
+            constrain_tool_calls: None,
         };
         let body = serde_json::to_value(&opts).unwrap();
         assert!(body.get("temperature").is_none());
         assert!(body.get("top_p").is_none());
+    }
+
+    #[test]
+    fn turn_options_constrain_tool_calls_wire_shape() {
+        // Off (provider default): the field must be absent so the wire
+        // stays byte-identical to pre-grammar builds.
+        let mut req = req_with(
+            vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("hi".into()),
+                rsclaw_hidden: None,
+            }],
+            2,
+            Some("k"),
+        );
+        req.tools = vec![crate::provider::ToolDef {
+            name: "read_file".into(),
+            description: "read".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }];
+        let off = serde_json::to_value(TurnOptions::from_request(&req, false)).unwrap();
+        assert!(off.get("constrain_tool_calls").is_none());
+
+        // On + tools present: serialized as a bare true.
+        let on = serde_json::to_value(TurnOptions::from_request(&req, true)).unwrap();
+        assert_eq!(on["constrain_tool_calls"], true);
+
+        // On but no tools: nothing to constrain — field stays absent so
+        // the worker never arms a grammar for a tool-less session.
+        req.tools.clear();
+        let no_tools = serde_json::to_value(TurnOptions::from_request(&req, true)).unwrap();
+        assert!(no_tools.get("constrain_tool_calls").is_none());
     }
 
     #[test]
