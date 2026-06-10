@@ -342,10 +342,21 @@ impl AgentRuntime {
             .map(|n| n as u32)
             .unwrap_or(60)
             .clamp(20, 200);
+        // Default to qfq (前复权) for chart rendering, not `none`.
+        // The first cut defaulted to none — which produced visible
+        // discontinuities on stocks that paid dividends or did splits
+        // during the chart window (verified against 600519 where
+        // raw-price candles showed a ~30% gap across a dividend ex-
+        // date that the MA20 then "chased" up in a way that looked
+        // like a fake trend. qfq adjusts ALL historical bars to the
+        // current price scale so the candles + MAs read as one
+        // continuous series. The LLM can still override with
+        // `adjust=none` for forensic "what did people actually pay"
+        // questions, but the default IM-chart use case wants qfq.
         let adjust = args
             .get("adjust")
             .and_then(Value::as_str)
-            .unwrap_or("none");
+            .unwrap_or("qfq");
         let ma_periods: Vec<usize> = args
             .get("ma")
             .and_then(Value::as_array)
@@ -386,24 +397,44 @@ impl AgentRuntime {
         }
         let quote = quote_res.ok();
 
-        // Title composition: `<name> <code>  ¥<price>  +X.XX%`.
-        // Falls back to the latest K-line close when the live quote
-        // didn't come back (after-hours / pytdx hiccup).
-        let (price, change_pct) = if let Some(q) = &quote {
+        // Title price source: prefer the live quote (it shows what
+        // the stock is doing NOW), but ONLY when the live quote's
+        // calendar day matches the last K-line bar's day. The first
+        // cut always used the live quote — which produced charts
+        // where the title said "¥1272.86 +0.38%" while the visible
+        // last candle was 10 days old at ¥1270, looking like a data
+        // mismatch even though both numbers were correct. Now: when
+        // the live quote is from a day that ISN'T plotted, we fall
+        // back to the last K-line bar's close + the bar-over-bar
+        // change. Honesty over freshness for the headline number.
+        let last_bar = kr.klines.last().unwrap();
+        let last_bar_day = chrono::DateTime::from_timestamp(last_bar.timestamp, 0)
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_default();
+        let live_quote_is_today_bar = match &quote {
+            Some(q) => {
+                let qd = chrono::DateTime::from_timestamp(q.timestamp, 0)
+                    .map(|d| d.format("%Y-%m-%d").to_string())
+                    .unwrap_or_default();
+                !qd.is_empty() && qd == last_bar_day
+            }
+            None => false,
+        };
+        let (price, change_pct) = if live_quote_is_today_bar {
+            let q = quote.as_ref().unwrap();
             (q.price, q.change_pct())
         } else {
-            let last = kr.klines.last().unwrap();
             let prev = kr
                 .klines
                 .get(kr.klines.len().saturating_sub(2))
                 .map(|b| b.close)
-                .unwrap_or(last.close);
+                .unwrap_or(last_bar.close);
             let pct = if prev.abs() > f64::EPSILON {
-                (last.close - prev) / prev * 100.0
+                (last_bar.close - prev) / prev * 100.0
             } else {
                 0.0
             };
-            (last.close, pct)
+            (last_bar.close, pct)
         };
         let display_name = name_hint
             .as_deref()
@@ -419,7 +450,25 @@ impl AgentRuntime {
             .map(|p| format!("MA{p}"))
             .collect::<Vec<_>>()
             .join("/");
-        let subtitle = format!("{period}  ·  {n} 根  ·  {ma_str}", n = kr.klines.len());
+        // Subtitle: period · N 根 · 截至 date · adjust state ·
+        // MA list. The adjust state is REAL — if the caller asked
+        // for qfq but astock downgraded to none (no factor table
+        // for the code), we surface that in the subtitle so the
+        // user understands why the chart shows a price gap. Without
+        // this hint, a user looks at a non-adjusted dividend ex-day
+        // jump and assumes the data is broken or the stock did
+        // something insane.
+        let adjust_label = match (kr.adjust.as_str(), kr.adjust_warning.as_deref()) {
+            ("qfq", _) => "前复权",
+            ("hfq", _) => "后复权",
+            ("none", Some(_)) => "未复权 ⚠",
+            ("none", None) => "未复权",
+            (other, _) => other,
+        };
+        let subtitle = format!(
+            "{period}  ·  {n} 根  ·  截至 {last_bar_day}  ·  {adjust_label}  ·  {ma_str}",
+            n = kr.klines.len()
+        );
 
         // Render to a fresh path under the rsclaw base var dir. We
         // do NOT reuse the artifact store here — that store is text-

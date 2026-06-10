@@ -36,7 +36,17 @@ const COLOR_GRID: RGBColor = RGBColor(0xDD, 0xDD, 0xDD);
 const COLOR_AXIS: RGBColor = RGBColor(0x88, 0x88, 0x88);
 const COLOR_TITLE: RGBColor = RGBColor(0x33, 0x33, 0x33);
 
-const COLOR_MA5: RGBColor = RGBColor(0xFF, 0xFF, 0xFF); // white-ish, actually grey on light bg
+// MA line colors. All four must contrast against the `#FAFAFA` light
+// background AND against the red/green candle bodies — the first cut
+// painted MA5 white (`#FFFFFF`), which the live-feishu screenshot
+// proved was invisible on the chart. Replaced with a warm grey that
+// still reads as "muted" against the louder MA10/20/60 colors but is
+// actually drawable. Order matches 散户 conventions:
+//   MA5  灰白 (now visible)
+//   MA10 黄
+//   MA20 紫
+//   MA60 蓝
+const COLOR_MA5: RGBColor = RGBColor(0x55, 0x55, 0x55);
 const COLOR_MA10: RGBColor = RGBColor(0xE6, 0xB4, 0x22);
 const COLOR_MA20: RGBColor = RGBColor(0x8E, 0x44, 0xAD);
 const COLOR_MA60: RGBColor = RGBColor(0x29, 0x80, 0xB9);
@@ -180,10 +190,17 @@ pub fn render_kline_png<P: AsRef<Path>>(
             .label(format!("MA{period}"))
             .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 14, y)], color.stroke_width(2)));
     }
+    // Legend in the UPPER-RIGHT — the first cut put it in UpperLeft
+    // which overlaps the candle series for any chart whose earliest
+    // bars are near the top of the price range (verified against the
+    // 600519 screenshot the user sent from feishu). UpperRight is
+    // empty on >90% of charts because the most recent bars are
+    // rarely also the chart's highest point. Slight white background
+    // opacity (0.92) so wicks visible behind the box still read.
     chart
         .configure_series_labels()
-        .position(SeriesLabelPosition::UpperLeft)
-        .background_style(COLOR_BG.mix(0.85))
+        .position(SeriesLabelPosition::UpperRight)
+        .background_style(COLOR_BG.mix(0.92))
         .border_style(COLOR_GRID)
         .label_font(("sans-serif", 11).into_font().color(&COLOR_TITLE))
         .draw()
