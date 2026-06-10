@@ -39,6 +39,7 @@ pub mod tools_file;
 pub mod tools_image;
 pub mod tools_misc;
 pub mod tools_session;
+pub mod tools_research;
 pub mod tools_session_archive;
 pub mod tools_stock;
 pub mod tools_video;

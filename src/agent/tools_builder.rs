@@ -352,6 +352,7 @@ pub(crate) fn toolset_allowed_names(
         "stock_query",
         "stock_chart",
         "stock_watchlist",
+        "research_ingest_wechat",
     ];
 
     let base: Option<&[&str]> = match toolset {
@@ -954,6 +955,37 @@ pub fn build_tool_list(
                 "codes": {"type": "array", "items": {"type": "string"}, "description": "Multiple stock codes."}
             },
             "required": []
+        }),
+    });
+    tools.push(ToolDef {
+        name: "research_ingest_wechat".to_owned(),
+        description: "Fetch a WeChat 公众号 article by URL and ingest the title \
+            / author / body / chart image URLs into the user's knowledge base. \
+            Works on any `https://mp.weixin.qq.com/s/...` link the user pastes \
+            or forwards — no browser, no OCR, no anti-bot dance. The body is \
+            inlined in WeChat's response as a JS variable; we parse it server-\
+            side. Charts come back as a separate URL list so a follow-up vision \
+            LLM pass can extract data from them.\n\
+            \n\
+            Use when:\n\
+            - User pastes / forwards a `mp.weixin.qq.com/s/...` URL\n\
+            - User asks to \"save / collect this research / 收藏这篇\"\n\
+            - You see a 研报 / 复盘 / 卖方报告 URL during a conversation\n\
+            \n\
+            The article lands in the knowledge base under `collection` \
+            (default `research`), tagged `wechat_official_account`, account \
+            name (e.g. `TGB湖南人`), and account id (e.g. `gh_xxx`). Later \
+            `knowledge_base` searches can filter or rank by those tags.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "WeChat article URL (https://mp.weixin.qq.com/s/...)"},
+                "collection": {"type": "string", "default": "research",
+                               "description": "KB collection name. Created on demand."},
+                "extra_tags": {"type": "array", "items": {"type": "string"},
+                               "description": "Optional extra tags (e.g. 板块名, 个股代码) to attach for later filtering."}
+            },
+            "required": ["url"]
         }),
     });
     tools.push(ToolDef {
