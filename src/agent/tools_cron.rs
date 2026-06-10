@@ -553,10 +553,30 @@ pub(crate) fn format_cron_jobs(jobs: &[Value]) -> String {
     lines.join("\n")
 }
 
-/// Read cron jobs from cron.json5.
-/// Handles both bare array `[...]` and wrapped `{"version":1,"jobs":[...]}`
-/// formats. Parses with json5 for comment support.
+/// Read cron jobs.
+///
+/// Authoritative source is redb once the gateway has initialised the cron store
+/// (mirrors `crate::cron::load_cron_jobs`). Without this, the agent tool read
+/// from `cron.json5` while the rest of the system used redb — so a job added
+/// here was invisible to the runner and got clobbered when the runner
+/// re-exported redb→file on the next reload (add succeeded, list came back
+/// empty). Falls back to the file for tests / standalone tools where redb
+/// isn't wired up. Handles both bare array `[...]` and wrapped
+/// `{"version":1,"jobs":[...]}` formats; parses with json5 for comment support.
 pub(crate) async fn read_cron_jobs(path: &std::path::Path) -> Vec<Value> {
+    if let Some(store) = crate::cron::cron_store() {
+        match store.cron_list() {
+            Ok(entries) => {
+                return entries
+                    .into_iter()
+                    .filter_map(|(_, json)| serde_json::from_str::<Value>(&json).ok())
+                    .collect();
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "cron: redb list failed in agent tool; falling back to file");
+            }
+        }
+    }
     let data = tokio::fs::read_to_string(path)
         .await
         .unwrap_or_else(|_| "[]".to_owned());
@@ -573,8 +593,26 @@ pub(crate) async fn read_cron_jobs(path: &std::path::Path) -> Vec<Value> {
     Vec::new()
 }
 
-/// Write cron jobs as JSON (readable by json5 parser).
+/// Write cron jobs.
+///
+/// Authoritative target is redb once initialised (mirrors
+/// `crate::cron::save_cron_jobs`): the agent tool must write the same store the
+/// runner reads, or the runner's redb→file re-export on reload wipes the
+/// agent's write. The `cron.json5` file is still (re)written as a best-effort
+/// export so `cat` / git-diff / hand-edit / the pre-redb fallback keep working.
 pub(crate) async fn write_cron_jobs(path: &std::path::Path, jobs: &[Value]) -> Result<()> {
+    if let Some(store) = crate::cron::cron_store() {
+        let entries: Vec<(String, String)> = jobs
+            .iter()
+            .filter_map(|j| {
+                let id = j.get("id").and_then(|v| v.as_str())?.to_owned();
+                serde_json::to_string(j).ok().map(|s| (id, s))
+            })
+            .collect();
+        store
+            .cron_bulk_replace(&entries)
+            .map_err(|e| anyhow!("cron: redb bulk_replace failed: {e}"))?;
+    }
     let wrapper = json!({"version": 1, "jobs": jobs});
     let json = serde_json::to_string_pretty(&wrapper)?;
     let tmp = format!("{}.tmp", path.display());
