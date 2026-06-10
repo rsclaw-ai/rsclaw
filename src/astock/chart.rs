@@ -34,6 +34,118 @@ const COLOR_DOWN: RGBColor = RGBColor(0x2E, 0xCC, 0x71);
 const COLOR_BG: RGBColor = RGBColor(0xFA, 0xFA, 0xFA);
 const COLOR_GRID: RGBColor = RGBColor(0xDD, 0xDD, 0xDD);
 const COLOR_AXIS: RGBColor = RGBColor(0x88, 0x88, 0x88);
+
+/// In-process logical font name. We register a real CJK-bearing
+/// font file under this name at startup (see
+/// `ensure_cjk_font_registered`), so referring to `CHART_FONT`
+/// everywhere just routes to whatever we managed to load.
+///
+/// Why not `("PingFang SC", ...)` directly: plotters' font resolver
+/// uses ab_glyph + a tiny in-memory map. It does NOT walk the OS
+/// font catalog (no fontconfig / fontdb integration). So naming a
+/// system font does nothing unless we've registered it ourselves
+/// first. Verified on macOS — setting the family to "PingFang SC"
+/// fell through to ab_glyph's no-glyph path and CJK chars silently
+/// dropped from subtitles. Registering the file explicitly is the
+/// only path that works.
+const CHART_FONT: &str = "rsclaw-chart-cjk";
+
+/// Try to register a system CJK font under `CHART_FONT`. Runs once
+/// per process via `OnceLock`; subsequent calls are a noop.
+///
+/// Search order:
+///   * macOS: `STHeiti Light.ttc` then `STHeiti Medium.ttc` —
+///     ship with every macOS install since 10.11. They're TTCs
+///     (font collections) but ab_glyph's `try_from_slice` accepts
+///     the first face inside them, which is plenty for chart
+///     subtitle / tick labels (we don't need bold/italic).
+///   * Windows: `C:\Windows\Fonts\msyh.ttc` (Microsoft YaHei) and
+///     `simhei.ttf` (SimHei) as a fallback.
+///   * Linux: Noto Sans CJK SC / WenQuanYi Micro Hei at common
+///     fontconfig install paths.
+///
+/// Returns `true` if a font was successfully registered, `false`
+/// if every candidate failed (e.g. minimal Linux containers).
+/// Caller's behaviour when registration fails: chart still renders,
+/// CJK glyphs silently drop — same as the pre-fix state, so no
+/// regression for systems we couldn't help.
+fn ensure_cjk_font_registered() -> bool {
+    static REGISTERED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REGISTERED.get_or_init(|| {
+        let candidates: &[&str] = {
+            #[cfg(target_os = "macos")]
+            {
+                // Single-face TTFs FIRST — ab_glyph's `try_from_slice`
+                // ostensibly accepts the first face of a TTC, but the
+                // first run against `STHeiti Light.ttc` registered
+                // cleanly yet still dropped Chinese glyphs at render
+                // time (probably ab_glyph parsing the TTC header as
+                // a corrupt single-face TTF). Arial Unicode.ttf is a
+                // 23 MB single-face TTF covering CJK + every other
+                // Unicode block, shipped at `/Library/Fonts/` on every
+                // modern macOS install. Falling back to the TTCs only
+                // when that path is missing — better than nothing on
+                // systems that don't ship Arial Unicode.
+                &[
+                    "/Library/Fonts/Arial Unicode.ttf",
+                    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+                    "/System/Library/Fonts/STHeiti Light.ttc",
+                    "/System/Library/Fonts/STHeiti Medium.ttc",
+                    "/System/Library/Fonts/Supplemental/Songti.ttc",
+                ]
+            }
+            #[cfg(target_os = "windows")]
+            {
+                &[
+                    "C:\\Windows\\Fonts\\msyh.ttc",
+                    "C:\\Windows\\Fonts\\msyh.ttf",
+                    "C:\\Windows\\Fonts\\simhei.ttf",
+                    "C:\\Windows\\Fonts\\simsun.ttc",
+                ]
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            {
+                &[
+                    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+                    "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
+                    "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+                ]
+            }
+        };
+        for path in candidates {
+            match std::fs::read(path) {
+                Ok(bytes) => {
+                    // plotters' `register_font` wants a `&'static [u8]`.
+                    // We never UNregister within the process lifetime, so
+                    // a one-shot `Box::leak` is the cleanest path — the
+                    // leaked memory persists exactly as long as plotters
+                    // needs it, no Arc/Rc bookkeeping required.
+                    let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+                    match plotters::style::register_font(
+                        CHART_FONT,
+                        FontStyle::Normal,
+                        leaked,
+                    ) {
+                        Ok(()) => {
+                            tracing::info!(font = path, "chart: CJK font registered");
+                            return true;
+                        }
+                        Err(_) => {
+                            tracing::debug!(font = path, "chart: register_font rejected (likely TTC face-0 mismatch); trying next");
+                            // Leaked bytes stay allocated; we tried.
+                        }
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+        tracing::warn!(
+            "chart: no CJK font found at known paths; subtitles/axis labels may drop Chinese glyphs"
+        );
+        false
+    })
+}
 const COLOR_TITLE: RGBColor = RGBColor(0x33, 0x33, 0x33);
 
 // MA line colors. All four must contrast against the `#FAFAFA` light
@@ -91,6 +203,11 @@ pub fn render_kline_png<P: AsRef<Path>>(
     if bars.is_empty() {
         anyhow::bail!("render_kline_png: no bars supplied");
     }
+    // First call per-process loads the CJK font; subsequent calls
+    // are a OnceLock-guarded noop. Cheaper to inline here than to
+    // require every caller (cron, LLM tool, future Tauri preview)
+    // to remember a separate init step.
+    let _ = ensure_cjk_font_registered();
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -108,7 +225,7 @@ pub fn render_kline_png<P: AsRef<Path>>(
     title_area
         .titled(
             &opts.title,
-            ("sans-serif", 22).into_font().color(&COLOR_TITLE),
+            (CHART_FONT, 22).into_font().color(&COLOR_TITLE),
         )
         .context("title")?;
     if let Some(sub) = &opts.subtitle {
@@ -116,7 +233,7 @@ pub fn render_kline_png<P: AsRef<Path>>(
         title_area
             .draw_text(
                 sub,
-                &("sans-serif", 12).into_font().color(&COLOR_AXIS),
+                &(CHART_FONT, 12).into_font().color(&COLOR_AXIS),
                 (10, sub_y),
             )
             .context("subtitle")?;
@@ -148,7 +265,7 @@ pub fn render_kline_png<P: AsRef<Path>>(
         .light_line_style(COLOR_GRID.mix(0.5))
         .bold_line_style(COLOR_GRID)
         .axis_style(COLOR_AXIS)
-        .label_style(("sans-serif", 11).into_font().color(&COLOR_AXIS))
+        .label_style((CHART_FONT, 11).into_font().color(&COLOR_AXIS))
         .y_label_formatter(&|y| format!("{y:.2}"))
         .draw()
         .context("price mesh")?;
@@ -202,7 +319,7 @@ pub fn render_kline_png<P: AsRef<Path>>(
         .position(SeriesLabelPosition::UpperRight)
         .background_style(COLOR_BG.mix(0.92))
         .border_style(COLOR_GRID)
-        .label_font(("sans-serif", 11).into_font().color(&COLOR_TITLE))
+        .label_font((CHART_FONT, 11).into_font().color(&COLOR_TITLE))
         .draw()
         .context("legend")?;
 
@@ -225,7 +342,7 @@ pub fn render_kline_png<P: AsRef<Path>>(
         .light_line_style(COLOR_GRID.mix(0.5))
         .bold_line_style(COLOR_GRID)
         .axis_style(COLOR_AXIS)
-        .label_style(("sans-serif", 11).into_font().color(&COLOR_AXIS))
+        .label_style((CHART_FONT, 11).into_font().color(&COLOR_AXIS))
         .x_label_formatter(&|x| label_x(bars, *x))
         .y_label_formatter(&|v| compact_volume(*v))
         .draw()
