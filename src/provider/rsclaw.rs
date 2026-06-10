@@ -1054,11 +1054,19 @@ impl RsclawProvider {
     /// per individual hop (NOT cumulative across redirects). `None`
     /// = no builder timeout, used by streaming `turn()` which wraps
     /// the headers phase externally with `tokio::time::timeout`.
+    ///
+    /// `idempotency_key` adds an `Idempotency-Key: <key>` header on
+    /// every hop. Pass `Some(uuid)` on requests that are safe to
+    /// dedupe at the server (e.g. `/sessions/replay`) so a transport
+    /// retry that crossed the wire twice doesn't create two sessions.
+    /// The server is expected to cache the response by key within a
+    /// short TTL (5 min) and return the cached result on duplicate.
     async fn send_following_redirects<B: Serialize>(
         &self,
         path: &str,
         body: &B,
         builder_timeout: Option<Duration>,
+        idempotency_key: Option<&str>,
     ) -> Result<reqwest::Response> {
         let mut current_url = self.resolve_url(path);
         let mut hops = 0;
@@ -1067,6 +1075,9 @@ impl RsclawProvider {
             let mut builder = self.client.post(&current_url).json(body);
             if let Some(t) = builder_timeout {
                 builder = builder.timeout(t);
+            }
+            if let Some(key) = idempotency_key {
+                builder = builder.header("Idempotency-Key", key);
             }
             if let Some((k, v)) = self.auth_header() {
                 builder = builder.header(k, v);
@@ -1179,7 +1190,7 @@ impl RsclawProvider {
         // so a redirected open still gets the full budget against the
         // ultimate target rather than splitting it.
         let resp = self
-            .send_following_redirects("/sessions", &body, Some(Duration::from_secs(180)))
+            .send_following_redirects("/sessions", &body, Some(Duration::from_secs(180)), None)
             .await?;
         let status = resp.status();
         if !status.is_success() {
@@ -1248,8 +1259,20 @@ impl RsclawProvider {
         // stalled server (connect_timeout only covers TCP setup).
         // Deadline applies per redirect hop so a redirected replay
         // still gets the full budget against the ultimate target.
+        //
+        // Idempotency-Key: per-call UUID so a transport retry (transient
+        // timeout, 503) that may have actually reached the server is
+        // safely deduped server-side instead of creating two sessions
+        // for the same gateway turn. Server caches the response by key
+        // for 5 minutes (rsclaw-server agent_proxy::IDEMPOTENCY_TTL).
+        let idem_key = uuid::Uuid::new_v4().to_string();
         let resp = self
-            .send_following_redirects("/sessions/replay", &body, Some(Duration::from_secs(300)))
+            .send_following_redirects(
+                "/sessions/replay",
+                &body,
+                Some(Duration::from_secs(300)),
+                Some(&idem_key),
+            )
             .await?;
         let status = resp.status();
         if !status.is_success() {
@@ -1312,7 +1335,7 @@ impl RsclawProvider {
             expected_msgs_count,
         };
         let resp = self
-            .send_following_redirects(&path, &body, Some(self.compact_timeout))
+            .send_following_redirects(&path, &body, Some(self.compact_timeout), None)
             .await?;
         let status = resp.status();
         // 409 msg_count_mismatch is optimistic-concurrency, NOT a hard
@@ -1433,7 +1456,7 @@ impl RsclawProvider {
         // LB benefits from the same per-origin caching as the primary
         // pool.
         let resp = self
-            .send_following_redirects(path, &body, Some(Duration::from_secs(60)))
+            .send_following_redirects(path, &body, Some(Duration::from_secs(60)), None)
             .await?;
         let status = resp.status();
         if !status.is_success() {
@@ -1515,7 +1538,7 @@ impl RsclawProvider {
         const RETRY_BACKOFFS: [Duration; 2] = [Duration::from_millis(500), Duration::from_secs(2)];
         let mut attempt: usize = 0;
         let resp = loop {
-            let send_fut = self.send_following_redirects(&path, &body, None);
+            let send_fut = self.send_following_redirects(&path, &body, None, None);
             let resp = match tokio::time::timeout(TURN_HEADERS_TIMEOUT, send_fut).await {
                 Ok(r) => r?,
                 Err(_) => anyhow::bail!(
