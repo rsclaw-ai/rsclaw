@@ -118,7 +118,7 @@ const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "qoder",
         display: "Qoder CLI (AI coding agent, optional)",
-        detect_cmd: &["qoder"],
+        detect_cmd: &["qodercli", "qoder"],
         local_bin: "qoder",
         optional: true,
     },
@@ -400,7 +400,7 @@ fn sync_tool_shims_unix() {
 /// Command names cap-rs spawns for the coding agents. `claude` is the
 /// Claudecode driver's default bin; the rest match their drivers.
 #[cfg(unix)]
-const CODING_AGENT_NAMES: &[&str] = &["opencode", "claude", "openclaude", "codex", "aider", "qoder"];
+const CODING_AGENT_NAMES: &[&str] = &["opencode", "claude", "openclaude", "codex", "aider", "qodercli", "qoder"];
 
 /// Subpackage tag for `@anthropic-ai/claude-code-<tag>` matching this host.
 /// Empty string on unsupported platforms (probe falls back to generic paths).

@@ -305,9 +305,9 @@ async fn spawn_driver_inner(
         }
         AgentKind::Qoder => {
             // Qoder uses the same stream-json protocol as Claude Code.
-            // Binary: `qoder` (or $QODER_BIN via .bin()).
+            // Binary: `qodercli` (or $QODER_BIN via .bin()).
             let mut b = ClaudeCodeDriver::builder(cwd)
-                .bin("qoder")
+                .bin("qodercli")
                 .dangerously_skip_permissions(true);
             b = apply_resume_mode(b, resume_mode);
             Box::new(
