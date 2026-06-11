@@ -10021,6 +10021,12 @@ impl AgentRuntime {
                 skill_md_path.display()
             )
         });
+        // Usage stat: feeds the meditation retirement pass for
+        // auto-crystallized skills (zero-use-in-N-days → .retired/).
+        // Best-effort — a stats write must never fail the activation.
+        if let Err(e) = crate::skill::record_skill_use(&self.store.db, name) {
+            tracing::debug!(skill = name, "skill use stat write failed: {e:#}");
+        }
         Ok(serde_json::json!({
             "name": name,
             "dir": dir,
