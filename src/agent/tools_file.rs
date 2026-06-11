@@ -906,10 +906,19 @@ impl super::runtime::AgentRuntime {
             .or_else(|| args["filename"].as_str())
             .or_else(|| args["file"].as_str())
             .or_else(|| args.as_str());
-        let content = args["content"].as_str();
+        // v1's raw-text tool params let structured values flow through
+        // verbatim — writing a .json file often arrives as `content: {...}`
+        // (object), not a string. The intent is unambiguous: serialize it
+        // instead of bouncing the call with a "missing content" error the
+        // model cannot act on (observed: 5x identical-retry loops).
+        let content = match &args["content"] {
+            Value::Null => None,
+            Value::String(s) => Some(s.clone()),
+            other => Some(serde_json::to_string_pretty(other).unwrap_or_default()),
+        };
 
         if path.is_none() || path.map(|p| p.is_empty()).unwrap_or(true) {
-            let has_content = content.map(|c| !c.is_empty()).unwrap_or(false);
+            let has_content = content.as_ref().map(|c| !c.is_empty()).unwrap_or(false);
             tracing::warn!(has_content, "tool_write: missing path parameter");
             return Ok(json!({
                 "error": "Missing 'path' parameter. The write tool requires BOTH 'path' and 'content'.",
@@ -926,7 +935,7 @@ impl super::runtime::AgentRuntime {
         }
 
         let path = path.unwrap().to_owned();
-        let content = content.unwrap().to_owned();
+        let content = content.unwrap();
         let workspace = self.default_workspace();
 
         let full = canonicalize_external_path(&path, &workspace);
