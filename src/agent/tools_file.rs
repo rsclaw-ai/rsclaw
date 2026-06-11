@@ -906,10 +906,19 @@ impl super::runtime::AgentRuntime {
             .or_else(|| args["filename"].as_str())
             .or_else(|| args["file"].as_str())
             .or_else(|| args.as_str());
-        let content = args["content"].as_str();
+        // v1's raw-text tool params let structured values flow through
+        // verbatim — writing a .json file often arrives as `content: {...}`
+        // (object), not a string. The intent is unambiguous: serialize it
+        // instead of bouncing the call with a "missing content" error the
+        // model cannot act on (observed: 5x identical-retry loops).
+        let content = match &args["content"] {
+            Value::Null => None,
+            Value::String(s) => Some(s.clone()),
+            other => Some(serde_json::to_string_pretty(other).unwrap_or_default()),
+        };
 
         if path.is_none() || path.map(|p| p.is_empty()).unwrap_or(true) {
-            let has_content = content.map(|c| !c.is_empty()).unwrap_or(false);
+            let has_content = content.as_ref().map(|c| !c.is_empty()).unwrap_or(false);
             tracing::warn!(has_content, "tool_write: missing path parameter");
             return Ok(json!({
                 "error": "Missing 'path' parameter. The write tool requires BOTH 'path' and 'content'.",
@@ -926,7 +935,27 @@ impl super::runtime::AgentRuntime {
         }
 
         let path = path.unwrap().to_owned();
-        let content = content.unwrap().to_owned();
+        let content = content.unwrap();
+
+        // Office/PDF formats are binary containers — writing prose into a
+        // file named *.docx produces a fake document that won't open.
+        // Observed with the cold-tool stub live: the model writes the fake
+        // instead of requesting create_docx. Redirect with an actionable
+        // error (the create_* tools may be behind `request_tool`).
+        let lower = path.to_lowercase();
+        for (ext, tool) in [
+            (".docx", "create_docx"),
+            (".xlsx", "create_xlsx"),
+            (".pptx", "create_pptx"),
+            (".pdf", "create_pdf"),
+        ] {
+            if lower.ends_with(ext) {
+                return Ok(json!({
+                    "error": format!("`{ext}` is a binary format — write_file would produce a corrupt file that won't open."),
+                    "hint": format!("Use the `{tool}` tool instead (if it is not in your tool list, call request_tool(name=\"{tool}\") first, then call it).")
+                }));
+            }
+        }
         let workspace = self.default_workspace();
 
         let full = canonicalize_external_path(&path, &workspace);
@@ -1203,6 +1232,20 @@ impl super::runtime::AgentRuntime {
                 }
                 all.push(sys_path);
                 cmd.env("PATH", all.join(if cfg!(windows) { ";" } else { ":" }));
+            }
+        }
+        // Trusted caller identity for league/competition tooling: carry the
+        // CHANNEL-AUTHENTICATED sender (peer_id) into exec'd commands so tools
+        // like `leaguetool connect`/`submit` bind to the VERIFIED identity
+        // instead of an LLM-supplied (spoofable) value — closing Sybil/spoof
+        // even against prompt injection. Works for ALL channels:
+        //   wechat → openid, feishu → open_id, a2a → caller.id, …
+        if !ctx.peer_id.is_empty() {
+            cmd.env("RSCLAW_CALLER_ID", &ctx.peer_id);
+            cmd.env("RSCLAW_CALLER_CHANNEL", &ctx.channel);
+            // Back-compat alias for the earlier A2A-only env var.
+            if ctx.channel == "a2a" {
+                cmd.env("RSCLAW_A2A_CALLER", &ctx.peer_id);
             }
         }
         // Ensure the workspace exists before chdir. A dynamically-spawned

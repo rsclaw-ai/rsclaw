@@ -167,6 +167,15 @@ impl super::runtime::AgentRuntime {
                     job["schedule"] =
                         json!({"kind": "every", "everyMs": interval_ms, "anchorMs": now_ms});
                 } else if let Some(sched) = schedule {
+                    // Validate BEFORE persisting — the WS path always did this,
+                    // but the tool path used to write bad expressions straight
+                    // to cron.json5 where they failed silently at reload. The
+                    // validator's message teaches the 5-field format (incl. the
+                    // "017 * * *" missing-space hint), so the model can fix the
+                    // expression on its next try.
+                    if let Err(msg) = crate::cron::validate_cron_expr(sched) {
+                        return Err(anyhow!("cron add: invalid schedule: {msg}"));
+                    }
                     // Standard cron expression or interval.
                     // Always include timezone. Use LLM-provided, config, or auto-detected.
                     let tz_val = tz
@@ -269,10 +278,32 @@ impl super::runtime::AgentRuntime {
                 }
 
                 let mut resp = json!({"added": id, "message": message});
+                // Echo back WHAT was scheduled in plain words. The two
+                // historical cron mistakes (one-time intent built as a
+                // forever-recurring job; systemEvent echoing an instruction
+                // instead of executing it) are both invisible in a bare
+                // {"added": id} ack — but obvious in this summary, so the
+                // model can remove+re-add in the same turn. This echo is
+                // what allowed the tool description to drop its 1.3k-token
+                // prevention manual.
                 if let Some(interval_ms) = every_ms {
                     resp["every_ms"] = json!(interval_ms);
+                    resp["fires"] = json!(format!(
+                        "every {}s, repeating forever — if the user wanted this once, remove and re-add with delay_ms",
+                        interval_ms / 1000
+                    ));
                 } else if let Some(s) = schedule {
                     resp["schedule"] = json!(s);
+                    resp["fires"] = json!(format!(
+                        "recurring per '{s}', repeating forever — if the user asked for ONE specific time (today/tomorrow), remove this and re-add with delay_ms"
+                    ));
+                } else {
+                    resp["fires"] = json!("once, then auto-removes");
+                }
+                if kind == "systemEvent" {
+                    resp["note"] = json!(
+                        "systemEvent delivers the message text VERBATIM each fire — no agent, no tools. If the message describes an action to perform (query/check/fetch), remove and re-add with kind=agentTurn."
+                    );
                 }
                 Ok(resp)
             }
@@ -396,6 +427,10 @@ impl super::runtime::AgentRuntime {
 
                 let id = jobs[idx]["id"].as_str().unwrap_or("?").to_string();
                 if let Some(schedule) = args["schedule"].as_str() {
+                    // Same teaching validation as the add path.
+                    if let Err(msg) = crate::cron::validate_cron_expr(schedule) {
+                        return Err(anyhow!("cron edit: invalid schedule: {msg}"));
+                    }
                     let tz = args["tz"].as_str();
                     if let Some(tz_val) = tz {
                         jobs[idx]["schedule"] =
@@ -553,10 +588,30 @@ pub(crate) fn format_cron_jobs(jobs: &[Value]) -> String {
     lines.join("\n")
 }
 
-/// Read cron jobs from cron.json5.
-/// Handles both bare array `[...]` and wrapped `{"version":1,"jobs":[...]}`
-/// formats. Parses with json5 for comment support.
+/// Read cron jobs.
+///
+/// Authoritative source is redb once the gateway has initialised the cron store
+/// (mirrors `crate::cron::load_cron_jobs`). Without this, the agent tool read
+/// from `cron.json5` while the rest of the system used redb — so a job added
+/// here was invisible to the runner and got clobbered when the runner
+/// re-exported redb→file on the next reload (add succeeded, list came back
+/// empty). Falls back to the file for tests / standalone tools where redb
+/// isn't wired up. Handles both bare array `[...]` and wrapped
+/// `{"version":1,"jobs":[...]}` formats; parses with json5 for comment support.
 pub(crate) async fn read_cron_jobs(path: &std::path::Path) -> Vec<Value> {
+    if let Some(store) = crate::cron::cron_store() {
+        match store.cron_list() {
+            Ok(entries) => {
+                return entries
+                    .into_iter()
+                    .filter_map(|(_, json)| serde_json::from_str::<Value>(&json).ok())
+                    .collect();
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "cron: redb list failed in agent tool; falling back to file");
+            }
+        }
+    }
     let data = tokio::fs::read_to_string(path)
         .await
         .unwrap_or_else(|_| "[]".to_owned());
@@ -573,8 +628,26 @@ pub(crate) async fn read_cron_jobs(path: &std::path::Path) -> Vec<Value> {
     Vec::new()
 }
 
-/// Write cron jobs as JSON (readable by json5 parser).
+/// Write cron jobs.
+///
+/// Authoritative target is redb once initialised (mirrors
+/// `crate::cron::save_cron_jobs`): the agent tool must write the same store the
+/// runner reads, or the runner's redb→file re-export on reload wipes the
+/// agent's write. The `cron.json5` file is still (re)written as a best-effort
+/// export so `cat` / git-diff / hand-edit / the pre-redb fallback keep working.
 pub(crate) async fn write_cron_jobs(path: &std::path::Path, jobs: &[Value]) -> Result<()> {
+    if let Some(store) = crate::cron::cron_store() {
+        let entries: Vec<(String, String)> = jobs
+            .iter()
+            .filter_map(|j| {
+                let id = j.get("id").and_then(|v| v.as_str())?.to_owned();
+                serde_json::to_string(j).ok().map(|s| (id, s))
+            })
+            .collect();
+        store
+            .cron_bulk_replace(&entries)
+            .map_err(|e| anyhow!("cron: redb bulk_replace failed: {e}"))?;
+    }
     let wrapper = json!({"version": 1, "jobs": jobs});
     let json = serde_json::to_string_pretty(&wrapper)?;
     let tmp = format!("{}.tmp", path.display());

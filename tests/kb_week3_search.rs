@@ -62,6 +62,7 @@ async fn e2e_kb_search_ranks_relevant_chunks_top() -> Result<()> {
         index,
         paths,
         embedder,
+        reranker: None,
     };
     let out = kb_search::run(
         &ctx,

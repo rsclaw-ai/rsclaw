@@ -216,7 +216,7 @@ it work") require constant clarification.
 - No .unwrap() in production paths. Use ? or .expect("explanation"). Tests are exempt.
 - No silent error discard (`let _ = ...`). If best-effort, log with warn!.
 - All `pub fn` must have a doc comment.
-- No emojis in code, comments, logs, or commit messages.
+- No emojis in code or comments (user-facing strings may contain emojis).
 - All user-facing strings through src/i18n.rs (channels, UI). NOT for LLM-facing prompts.
 - LLM-facing prompts (system messages, tool descriptions, summarize/analyze prompts,
   agent instructions) are ALWAYS English. Hardcoded English literals in source.

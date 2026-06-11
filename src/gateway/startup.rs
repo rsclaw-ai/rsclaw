@@ -360,6 +360,14 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                     // being installed.
                     crate::astock::briefing::spawn_scheduler();
                     info!("astock briefing scheduler started");
+                    // SSE listeners: one tokio task per configured
+                    // filter, push notifications on `hit` events for
+                    // codes any peer is watching. Gated on the same
+                    // astock-client-present check so non-A股 users
+                    // carry zero background cost.
+                    if let Some(astock_cfg) = config.raw.astock.as_ref() {
+                        crate::astock::sse::spawn_listeners(astock_cfg);
+                    }
                 }
                 Err(e) => {
                     info!(reason = %e, "astock client not initialised (subsystem dormant)");
@@ -728,6 +736,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         )
         .with_meditation_deps(crate::heartbeat::MeditationDeps {
             config: Arc::clone(&config),
+            db: Arc::clone(&store.db),
         });
         let runner = std::sync::Arc::new(runner);
         runner.run();
@@ -1283,6 +1292,29 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         // signal to wait on. Cheap to set, narrows the window of any
         // future race introduction.
         cmd.env("RSCLAW_PARENT_PID", std::process::id().to_string());
+        // Re-attach stdio to the canonical gateway log. fd inheritance
+        // usually carries this through exec(), but the spawn() fallback —
+        // and an exec that failed mid-rebuild (ETXTBSY) — leaves the
+        // replacement logging into whatever pipe the restart requester
+        // happened to hold. Observed 2026-06-12: a post-restart instance
+        // logged nowhere for 85 minutes (wechat outage invisible).
+        // Explicit re-attach makes both paths deterministic; Rust's
+        // CommandExt::exec applies configured stdio before the exec.
+        {
+            let log_path = crate::config::loader::log_file();
+            if let Some(parent) = log_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                && let Ok(f2) = f.try_clone()
+            {
+                cmd.stdout(std::process::Stdio::from(f));
+                cmd.stderr(std::process::Stdio::from(f2));
+            }
+        }
         // Windows: suppress the console flash when re-execing from a GUI app.
         #[cfg(target_os = "windows")]
         {
@@ -1494,7 +1526,9 @@ fn try_service_self_restart() -> bool {
                 return true;
             }
         }
-        warn!("launchctl kickstart failed for label {label}; falling back to native respawn");
+        // Routine on every non-launchd dev gateway (nohup/CLI starts) —
+        // info, not warn: the native respawn below is the expected path.
+        info!("launchctl kickstart unavailable for label {label}; using native respawn");
         false
     }
 
@@ -1950,6 +1984,79 @@ fn spawn_agent_tasks(
                         channel: None,
                     });
                 }
+                // /goal — completion-driven turn loop. See
+                // `src/agent/goal.rs`. After every turn, if the
+                // session has an active goal we either:
+                //   * append a terminal status (✅/❌/⚠) to the reply
+                //     text so the user sees it in the same chat
+                //     bubble, AND clear the goal state, OR
+                //   * schedule the next iteration via the task queue.
+                //
+                // Mutating `reply.text` is safe because nothing on the
+                // path from here to the channel send re-evaluates the
+                // text against goal markers — the hook ran, the
+                // decision is made. Submitting the next turn happens
+                // INSIDE this match arm (not via reply_tx) because the
+                // channel reply path delivers `reply` to the user; the
+                // next /goal turn is a separate enqueued message that
+                // arrives through the normal worker loop.
+                let mut reply = reply;
+                if !turn_errored
+                    && let Some(reaction) =
+                        crate::agent::goal::check_after_turn(&session_key, &reply.text).await
+                {
+                    use crate::agent::goal::Reaction;
+                    match reaction {
+                        Reaction::Done(status_line) => {
+                            // Strip the GOAL_ marker line itself so it
+                            // doesn't read as machine output in the
+                            // user's chat — the human-friendly status
+                            // line we append takes its place.
+                            reply.text = strip_trailing_goal_marker(&reply.text);
+                            if !reply.text.is_empty() {
+                                reply.text.push_str("\n\n");
+                            }
+                            reply.text.push_str(&status_line);
+                            reply.is_empty = reply.text.is_empty()
+                                && reply.images.is_empty()
+                                && reply.files.is_empty();
+                        }
+                        Reaction::Continue(next_prompt) => {
+                            // Strip the user-visible reply of any
+                            // accidentally-leaked GOAL_* marker
+                            // (parse_terminal said Continue, so there
+                            // can't be one — but defensive).
+                            if let Some(tq) =
+                                crate::gateway::task_queue::get_task_queue()
+                            {
+                                let delivery_channel: &str =
+                                    if channel == "ws" { "desktop" } else { &channel };
+                                if let Err(e) =
+                                    crate::gateway::task_queue::submit_to_queue(
+                                        &tq,
+                                        &session_key,
+                                        &next_prompt,
+                                        delivery_channel,
+                                        &peer_id,
+                                        &peer_id,
+                                        false,
+                                        crate::gateway::task_queue::Priority::Cron,
+                                    )
+                                {
+                                    warn!(
+                                        session = %session_key,
+                                        error = %e,
+                                        "/goal: failed to enqueue continuation turn"
+                                    );
+                                }
+                            } else {
+                                warn!(
+                                    "/goal: task_queue not installed; cannot enqueue continuation"
+                                );
+                            }
+                        }
+                    }
+                }
                 // receiver may have been dropped (e.g. channel timeout)
                 let _ = reply_tx.send(reply);
             }
@@ -1961,6 +2068,40 @@ fn spawn_agent_tasks(
 // ---------------------------------------------------------------------------
 // Bind address helper
 // ---------------------------------------------------------------------------
+
+/// Drop the trailing `GOAL_ACHIEVED` / `GOAL_FAILED ...` line from a
+/// reply when it terminated a `/goal` loop. Anything after the marker
+/// on the same line is also dropped (per spec the marker must be the
+/// last non-blank line). We then trim any leftover trailing blank
+/// lines so the appended "✅ Goal achieved" status reads as a clean
+/// continuation, not as a margin-floating block.
+fn strip_trailing_goal_marker(text: &str) -> String {
+    let mut lines: Vec<&str> = text.lines().collect();
+    // Find the last non-blank line. If it carries a marker, remove it
+    // plus any blank lines that immediately precede it.
+    while let Some(last) = lines.last() {
+        if last.trim().is_empty() {
+            lines.pop();
+            continue;
+        }
+        break;
+    }
+    if let Some(last) = lines.last() {
+        let t = last.trim();
+        if t == "GOAL_ACHIEVED" || t.starts_with("GOAL_FAILED") {
+            lines.pop();
+            // Strip any blank lines now trailing.
+            while let Some(last) = lines.last() {
+                if last.trim().is_empty() {
+                    lines.pop();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    lines.join("\n")
+}
 
 fn resolve_bind_addr(config: &RuntimeConfig) -> SocketAddr {
     let port = config.gateway.port;

@@ -60,6 +60,7 @@ fn pipeline(paths: &KbPaths, src_path: &Path) -> Result<PipelineOut> {
         logical_source_id: &canon.metadata.logical_source_id,
         doc_id: &doc_id,
         doc_version: 1,
+        doc_title: "",
         markdown_body: &canon.markdown,
         default_locator_kind: LocatorKind::MdSection,
     });
@@ -161,6 +162,7 @@ fn reingest_same_file_same_chunk_ids() -> Result<()> {
         logical_source_id: &canon1.metadata.logical_source_id,
         doc_id: "doc_A",
         doc_version: 1, // simulate first ingest
+        doc_title: "",
         markdown_body: &canon1.markdown,
         default_locator_kind: LocatorKind::MdSection,
     });
@@ -168,6 +170,7 @@ fn reingest_same_file_same_chunk_ids() -> Result<()> {
         logical_source_id: &canon2.metadata.logical_source_id,
         doc_id: "doc_B",
         doc_version: 5, // simulate later re-ingest (different doc_id + version)
+        doc_title: "",
         markdown_body: &canon2.markdown,
         default_locator_kind: LocatorKind::MdSection,
     });

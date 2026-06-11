@@ -102,6 +102,9 @@ pub async fn cmd_kb(cmd: KbCommand, kb_root: PathBuf) -> Result<()> {
             max,
             dry_run,
         } => sync_all(kb_root, interval_min, max, dry_run).await,
+        KbCommand::Eval { golden, k, verbose } => {
+            eval_golden(kb_root, golden, k, verbose, gateway_up).await
+        }
     }
 }
 
@@ -1086,5 +1089,253 @@ fn search_ctx(h: &Handles) -> SearchCtx {
         index: h.index.clone(),
         paths: h.paths.clone(),
         embedder: h.embedder.clone(),
+        reranker: crate::kb::rerank::KbReranker::from_config(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Eval — retrieval golden-set harness
+// ---------------------------------------------------------------------------
+
+/// One golden retrieval case. A hit "satisfies" the case when it matches
+/// ALL expectations present (they constrain the same hit).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EvalCase {
+    query: String,
+    #[serde(default)]
+    expect_doc_id: Option<String>,
+    #[serde(default)]
+    expect_title_contains: Option<String>,
+    #[serde(default)]
+    expect_text_contains: Option<String>,
+}
+
+/// Transport-normalized search hit for eval scoring.
+struct EvalHit {
+    doc_id: String,
+    title: String,
+    text: String,
+}
+
+/// 1-based rank of the first hit satisfying the case, if any.
+fn eval_case_rank(case: &EvalCase, hits: &[EvalHit]) -> Option<usize> {
+    hits.iter()
+        .position(|h| {
+            case.expect_doc_id.as_ref().is_none_or(|d| &h.doc_id == d)
+                && case
+                    .expect_title_contains
+                    .as_ref()
+                    .is_none_or(|t| h.title.to_lowercase().contains(&t.to_lowercase()))
+                && case
+                    .expect_text_contains
+                    .as_ref()
+                    .is_none_or(|t| h.text.to_lowercase().contains(&t.to_lowercase()))
+        })
+        .map(|i| i + 1)
+}
+
+/// `rsclaw kb eval <golden.json>` — measure retrieval quality before/after
+/// any pipeline change (embedder, chunking, reranker). Uses the production
+/// search path: HTTP when the gateway is up (live view, no redb lock fight),
+/// direct store with the production query-instruction resolution otherwise.
+async fn eval_golden(
+    kb_root: PathBuf,
+    golden: PathBuf,
+    k: usize,
+    verbose: bool,
+    via_http: bool,
+) -> Result<()> {
+    let raw = std::fs::read_to_string(&golden)
+        .with_context(|| format!("read golden file {}", golden.display()))?;
+    let cases: Vec<EvalCase> = serde_json::from_str(&raw)
+        .context("golden file must be a JSON array of {query, expect*} cases")?;
+    if cases.is_empty() {
+        anyhow::bail!("golden file has no cases");
+    }
+    for (i, c) in cases.iter().enumerate() {
+        if c.expect_doc_id.is_none()
+            && c.expect_title_contains.is_none()
+            && c.expect_text_contains.is_none()
+        {
+            anyhow::bail!(
+                "case {i} ({:?}) has no expectation — add expectDocId / \
+                 expectTitleContains / expectTextContains",
+                c.query
+            );
+        }
+    }
+
+    let direct = if via_http { None } else { Some(open_kb(&kb_root)?) };
+    // Mirror the production query path: the gateway applies the configured
+    // (or Qwen3-defaulted) query instruction; the direct path must too, or
+    // the eval measures a pipeline nobody actually serves.
+    let query_instruction = crate::kb::embedder::effective_embed_config().and_then(|m| {
+        crate::embed::resolve_query_instruction(m.query_instruction, m.model.as_deref())
+    });
+
+    banner(&format!(
+        "rsclaw kb eval v{} ({})",
+        option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev"),
+        if via_http { "via http" } else { "direct store" }
+    ));
+    kv("golden", &cyan(&golden.display().to_string()));
+    kv("cases", &bold(&cases.len().to_string()));
+    kv("k", &bold(&k.to_string()));
+    println!();
+
+    let mut hit1 = 0usize;
+    let mut hitk = 0usize;
+    let mut mrr_sum = 0f64;
+    for (i, case) in cases.iter().enumerate() {
+        let hits: Vec<EvalHit> = if via_http {
+            let body = serde_json::json!({
+                "query": case.query,
+                "topK": k,
+                "scoreThreshold": 0.0,
+            });
+            let resp: serde_json::Value =
+                crate::cmd::gateway_http::post_json("/api/v1/knowledge/search", &body).await?;
+            resp.get("hits")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|h| EvalHit {
+                            doc_id: h
+                                .get("docId")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_owned(),
+                            title: h
+                                .get("sourceTitle")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_owned(),
+                            text: h
+                                .get("chunkText")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_owned(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            let h = direct.as_ref().expect("direct handles opened above");
+            let ctx = search_ctx(h);
+            let out = kb_search::run(
+                &ctx,
+                kb_search::KbSearchInput {
+                    query: case.query.clone(),
+                    k,
+                    filter: Default::default(),
+                    mode: "hybrid".into(),
+                    diversity: "mmr".into(),
+                    mmr_lambda: 0.5,
+                    boost_entities: vec![],
+                    query_instruction: query_instruction.clone(),
+                },
+                &CallerScope::default(),
+            )?;
+            out.results
+                .into_iter()
+                .map(|r| EvalHit {
+                    doc_id: r.doc_id,
+                    title: r.doc_title,
+                    text: r.text,
+                })
+                .collect()
+        };
+
+        match eval_case_rank(case, &hits) {
+            Some(r) => {
+                if r == 1 {
+                    hit1 += 1;
+                }
+                hitk += 1;
+                mrr_sum += 1.0 / r as f64;
+                if verbose {
+                    println!("  hit  [{}] rank {} — {}", i + 1, r, case.query);
+                }
+            }
+            None => {
+                println!("  {} [{}] {}", bold("MISS"), i + 1, cyan(&case.query));
+                for (j, h) in hits.iter().take(3).enumerate() {
+                    let snippet: String = h.text.chars().take(80).collect();
+                    println!("        top{}: {} — {snippet}", j + 1, h.title);
+                }
+                if hits.is_empty() {
+                    println!("        (no hits at all)");
+                }
+            }
+        }
+    }
+
+    println!();
+    let n = cases.len() as f64;
+    kv(
+        "hit@1",
+        &bold(&format!(
+            "{:.1}%  ({hit1}/{})",
+            hit1 as f64 / n * 100.0,
+            cases.len()
+        )),
+    );
+    kv(
+        &format!("hit@{k}"),
+        &bold(&format!(
+            "{:.1}%  ({hitk}/{})",
+            hitk as f64 / n * 100.0,
+            cases.len()
+        )),
+    );
+    kv("MRR", &bold(&format!("{:.3}", mrr_sum / n)));
+    Ok(())
+}
+
+#[cfg(test)]
+mod eval_tests {
+    use super::*;
+
+    fn hit(doc_id: &str, title: &str, text: &str) -> EvalHit {
+        EvalHit {
+            doc_id: doc_id.into(),
+            title: title.into(),
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn rank_matches_all_expectations_on_one_hit() {
+        let case: EvalCase = serde_json::from_str(
+            r#"{"query":"q","expectTitleContains":"蒙牛","expectTextContains":"12%"}"#,
+        )
+        .unwrap();
+        let hits = vec![
+            // Title matches but text doesn't — expectations constrain the
+            // SAME hit, so this must not count.
+            hit("d1", "蒙牛年报", "其他内容"),
+            hit("d2", "蒙牛2025年报", "营收增长12%"),
+        ];
+        assert_eq!(eval_case_rank(&case, &hits), Some(2));
+    }
+
+    #[test]
+    fn rank_is_case_insensitive_and_none_on_miss() {
+        let case: EvalCase =
+            serde_json::from_str(r#"{"query":"q","expectTitleContains":"mengniu"}"#).unwrap();
+        assert_eq!(
+            eval_case_rank(&case, &[hit("d", "Mengniu Report", "x")]),
+            Some(1)
+        );
+        assert_eq!(eval_case_rank(&case, &[hit("d", "Other", "x")]), None);
+    }
+
+    #[test]
+    fn rank_by_doc_id_exact() {
+        let case: EvalCase =
+            serde_json::from_str(r#"{"query":"q","expectDocId":"abc"}"#).unwrap();
+        let hits = vec![hit("xyz", "t", "x"), hit("abc", "t", "x")];
+        assert_eq!(eval_case_rank(&case, &hits), Some(2));
     }
 }

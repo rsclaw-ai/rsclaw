@@ -3625,7 +3625,7 @@ function TauriConfigPageInner() {
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "上下文窗口" : "Context Window"} <span style={{ color: V.t3, fontWeight: 400 }}>(tokens)</span></div>
                 <div style={{ fontSize: 10, color: V.t3, fontFamily: V.mono, marginTop: 2 }}>agents.defaults.contextTokens</div>
               </div>
-              <input style={{ ...fInput, minWidth: 100 }} type="number" value={getVal("agents.defaults.contextTokens", 64000)} onChange={(e) => updateConfig("agents.defaults.contextTokens", parseInt(e.target.value) || 64000)} />
+              <input style={{ ...fInput, minWidth: 100 }} type="number" value={getVal("agents.defaults.contextTokens", 128000)} onChange={(e) => updateConfig("agents.defaults.contextTokens", parseInt(e.target.value) || 128000)} />
             </div>
             <div style={fieldRow}>
               <div style={{ flex: 1 }}>

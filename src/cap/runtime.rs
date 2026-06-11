@@ -29,6 +29,7 @@ pub(crate) enum AgentKind {
     Openclaude,
     Opencode,
     Codex,
+    Qoder,
 }
 
 impl AgentKind {
@@ -38,6 +39,7 @@ impl AgentKind {
             "openclaude" => Some(Self::Openclaude),
             "opencode" => Some(Self::Opencode),
             "codex" => Some(Self::Codex),
+            "qoder" => Some(Self::Qoder),
             _ => None,
         }
     }
@@ -48,6 +50,7 @@ impl AgentKind {
             Self::Openclaude => "openclaude",
             Self::Opencode => "opencode",
             Self::Codex => "codex",
+            Self::Qoder => "qoder",
         }
     }
 
@@ -58,6 +61,7 @@ impl AgentKind {
             Self::Openclaude => "OpenClaude",
             Self::Opencode => "OpenCode",
             Self::Codex => "Codex",
+            Self::Qoder => "Qoder",
         }
     }
 }
@@ -105,11 +109,12 @@ pub(crate) enum ToolCapRequest {
 
 type Slot = Arc<RwLock<Option<mpsc::Sender<ToolCapRequest>>>>;
 
-pub(crate) struct CapAgentManager {
+pub struct CapAgentManager {
     claudecode: Slot,
     openclaude: Slot,
     opencode: Slot,
     codex: Slot,
+    qoder: Slot,
     bus: broadcast::Sender<crate::events::AgentEvent>,
 }
 
@@ -120,6 +125,7 @@ impl CapAgentManager {
             openclaude: Arc::new(RwLock::new(None)),
             opencode: Arc::new(RwLock::new(None)),
             codex: Arc::new(RwLock::new(None)),
+            qoder: Arc::new(RwLock::new(None)),
             bus,
         }
     }
@@ -130,6 +136,7 @@ impl CapAgentManager {
             AgentKind::Openclaude => Arc::clone(&self.openclaude),
             AgentKind::Opencode => Arc::clone(&self.opencode),
             AgentKind::Codex => Arc::clone(&self.codex),
+            AgentKind::Qoder => Arc::clone(&self.qoder),
         }
     }
 
@@ -294,6 +301,19 @@ async fn spawn_driver_inner(
                 b.spawn()
                     .await
                     .map_err(|e| anyhow!("cap codex spawn: {e}"))?,
+            )
+        }
+        AgentKind::Qoder => {
+            // Qoder uses the same stream-json protocol as Claude Code.
+            // Binary: `qodercli` (or $QODER_BIN via .bin()).
+            let mut b = ClaudeCodeDriver::builder(cwd)
+                .bin("qodercli")
+                .dangerously_skip_permissions(true);
+            b = apply_resume_mode(b, resume_mode);
+            Box::new(
+                b.spawn()
+                    .await
+                    .map_err(|e| anyhow!("cap qoder spawn: {e}"))?,
             )
         }
     };

@@ -59,7 +59,7 @@ enum ResumeMode {
     ContinueLast,
 }
 
-pub(crate) struct CapLiveManager {
+pub struct CapLiveManager {
     sessions: Arc<RwLock<HashMap<String, LiveSessionHandle>>>,
     /// Sticky bindings: IM session_key → (live session_id, agent_kind).
     /// Populated by `/cap <agent>`, read inside `AgentRuntime::run_turn`

@@ -6,14 +6,14 @@
 > full test suite MUST stay green (`cargo test`). Do NOT batch extractions. Steps use
 > checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Proposed · **Date:** 2026-05-21 · **Owner decides architecture; Sonnet-class model can execute the mechanical steps.**
+**Status:** Proposed · **Date:** 2026-05-21 · **Revised:** 2026-06-12 (re-measured LOC/churn; profile mismatch found; added `rsclaw-tools` step and re-measure gate) · **Owner decides architecture; Sonnet-class model can execute the mechanical steps.**
 
 ---
 
 ## Goal
 
-Cut the single monolithic `rsclaw` crate (~160K LOC, 28 modules) into a workspace of
-smaller crates so that:
+Cut the single monolithic `rsclaw` crate (~160K LOC at first writing, 28 modules) into a
+workspace of smaller crates so that:
 
 1. Editing one module no longer re-type-checks + re-codegens the whole crate.
 2. Crate codegen parallelizes instead of serializing on the final `rsclaw` unit.
@@ -42,6 +42,25 @@ Conclusions:
 - The bottleneck is frontend + codegen of the monolith → splitting is the right (and only)
   fix for the dominant cost.
 
+### ⚠️ 2026-06-12: the measurement above used the WRONG profile
+
+The numbers above are **debug opt-0**. The actual daily workflow is `cargo brd` =
+`release-dev` = **opt-level 3 + thin LTO + codegen-units 16**. Under that profile:
+
+- Codegen dominates far harder than the 9.3s debug figure suggests.
+- **Thin LTO is whole-program and runs at link time** — crate splitting caches the
+  frontend+codegen of untouched crates, but the thin-LTO link tail is paid in full on
+  every build regardless of how many crates exist. The "link is small, lld is the wrong
+  lever" conclusion above only holds for debug; it is **unverified for release-dev**.
+
+**Required before starting step 1 (and again at every re-measure gate):**
+
+1. `RSCLAW_BUILD_VERSION=dev RSCLAW_BUILD_DATE=test cargo build --profile release-dev --timings`
+   on a one-line edit to `agent/runtime.rs` — this is the real baseline.
+2. Control experiment: temporarily set `lto = false` in `[profile.release-dev]` and re-time
+   the same edit. If this alone recovers a large share of iteration time at acceptable
+   runtime cost, it is a zero-day lever that changes the payoff math of the whole plan.
+
 ---
 
 ## Recommendation (updated after review)
@@ -54,7 +73,7 @@ Prefer several small, stable interface crates:
 
 | crate | owns | depends on | why |
 |---|---|---|---|
-| `rsclaw-types` | wire/DTO types: `Message`, `Role`, `ToolDef`, `ContentPart`, `ImageAttachment`, `FileAttachment`, `OutboundMessage`, task/external-job records | `serde`, `serde_json`, small utilities only | shared language between runtime crates |
+| `rsclaw-types` | **stable** cross-crate DTOs only: `ImageAttachment`, `FileAttachment`, `OutboundMessage`, task/external-job records. **NOT provider wire types** (`Message`, `Role`, `ToolDef`, `ContentPart` — these churn with protocol work and live in `rsclaw-provider`, see step 1) | `serde`, `serde_json`, small utilities only | shared language between runtime crates |
 | `rsclaw-config` | JSON5 schema, loader, env/secrets resolution, proxy client construction | `rsclaw-types` where needed | many crates need config, but config should not know runtime modules |
 | `rsclaw-platform` | OS/tool detection: Chrome, ffmpeg, PowerShell, base tool paths | `rsclaw-config` or a small path provider | breaks current `agent::platform` leakage |
 | `rsclaw-retry` | `RetryConfig`, backoff helpers, transport retry primitives | none or small deps | avoids making channels depend on `provider` |
@@ -73,11 +92,42 @@ this one; `out` = how many it depends on.
 
 **Hubs (hard, do LAST):**
 
-| module | LOC | out | in | note |
-|---|---|---|---|---|
-| `agent` | 33K | 18 | 15 | the core; entangled with everything |
-| `gateway` | 18K | 18 | 8 | orchestrates agent |
-| `channel` | 18K | 6 | 6 | heavy bidirectional with agent |
+| module | LOC (05-21) | LOC (06-12) | out | in | note |
+|---|---|---|---|---|---|
+| `agent` | 33K | **45K** | 18 | 15 | the core; entangled with everything |
+| `gateway` | 18K | **22K** | 18 | 8 | orchestrates agent |
+| `channel` | 18K | **20K** | 6 | 6 | heavy bidirectional with agent |
+
+The hubs grew ~25% in three weeks. The growth rate itself is an argument for starting the
+cheap steps now — every week of delay raises the import-churn cost of each extraction.
+
+`cmd` (**17K LOC** — bigger than `provider`) was missing from the first draft entirely. It
+sits at the top of the graph (depends on everything, nothing depends on it), so extracting
+it is cheap and stops `cmd` edits from re-type-checking the monolith. Added to step 11.
+
+### The real hotspot: `agent/runtime.rs` (added 2026-06-12)
+
+90-day file-touch counts inside `src/agent`:
+
+| file | touches | LOC |
+|---|---:|---:|
+| `agent/runtime.rs` | **440** | 12.4K |
+| `agent/tools_builder.rs` | 108 | 2.5K |
+| `agent/prompt_builder.rs` | 64 | 1.2K |
+| `agent/registry.rs` | 60 | 1.1K |
+| `agent/tools_web.rs` | 55 | 2.8K |
+
+`runtime.rs` alone takes 4× the churn of the next file — it is the single hottest edit
+path in the repo, and the first draft deferred everything that would help it to step 10
+("only if still the bottleneck"). A plan that ships steps 1–8 and stops leaves the most
+common edit recompiling a ~80K-LOC runtime crate + bin + LTO link: roughly a 2× win for
+the daily loop, not an order of magnitude.
+
+Structural finding: all `tools_*.rs` files (~15K LOC total) are `impl AgentRuntime`
+method blocks (e.g. `pub(crate) async fn tool_web_search(&self, ...)`). This coupling is
+*the* structural reason `agent` cannot shrink. Breaking it does not require the full
+event-bus inversion — a narrow `ToolCtx` (providers/config/store handles) turns tools
+into free functions that can sink below the runtime. See step 6.
 
 **Leaves / near-leaves (easy, but not all first):**
 
@@ -154,41 +204,64 @@ RSCLAW_BUILD_VERSION=dev RSCLAW_BUILD_DATE=test cargo test
 - [ ] **0. Workspace scaffold + facade policy** — convert root package to a workspace,
       add `crates/`, keep the root `rsclaw` package/bin as the compatibility facade.
       Do not move large modules yet. Verify: `cargo check && cargo test`.
-- [ ] **1. `rsclaw-types`** — move stable DTOs only: provider message/tool types,
-      `ImageAttachment`, `FileAttachment`, `OutboundMessage`, task queue persistent records,
-      external job persistent records, and small enums that are serialized across modules.
-      Keep logic out. Verify downstream imports.
+- [ ] **1. `rsclaw-types`** — move stable DTOs only: `ImageAttachment`, `FileAttachment`,
+      `OutboundMessage`, task queue persistent records, external job persistent records,
+      and small enums that are serialized across modules. Keep logic out.
+      **Revised 2026-06-12 — wire DTOs are NOT stable here:** provider wire types
+      (`Message`, `ToolDef`, `ContentPart`, …) churn with every protocol iteration
+      (incremental protocol, constrained tool-calls, v1 arg fixes). If they land in a
+      frozen `types`, every protocol edit becomes a full-workspace rebuild — the monolith
+      bottleneck moved down one level. Keep provider wire DTOs in `rsclaw-provider`;
+      `types` holds only cross-crate types that have actually been stable for months.
 - [ ] **2. `rsclaw-config`** — move schema, loader, env/secrets resolution, and proxy client
       construction. This should depend on `rsclaw-types` where needed, not on runtime crates.
 - [ ] **3. `rsclaw-platform` + `rsclaw-retry`** — move OS/tool detection and generic retry
       helpers. This breaks the easy provider/channel/browser/platform leakage without growing
       `types`.
-- [ ] **4. `rsclaw-provider`** (10K) — after `BUILTIN_TOOL_NAMES` and provider DTOs are out
-      of agent, extract provider implementations, registry, defaults, and failover. This is
-      the best first large payoff extraction.
-- [ ] **5. `rsclaw-store`** (2K+) — extract only after both task queue and external job
+- [ ] **4. `rsclaw-provider`** (13K) — after `BUILTIN_TOOL_NAMES` is out of agent, extract
+      provider implementations, wire DTOs, registry, defaults, and failover. This is the
+      best first large payoff extraction.
+- [ ] **5. RE-MEASURE GATE** — `cargo build --profile release-dev --timings` on a one-line
+      `runtime.rs` edit, plus the `lto = false` control experiment (see the profile warning
+      above). The result decides priority between step 6 (tools, hits the hot path) and
+      steps 8–10 (kb/media/channel, isolates cold churn). Do not skip this and proceed on
+      the 05-21 debug-profile numbers.
+- [ ] **6. `rsclaw-tools` via `ToolCtx`** (~15K) — **added 2026-06-12; the only step that
+      directly targets the 440-touch/90-day hot path.** Introduce a narrow `ToolCtx`
+      exposing provider/config/store handles; convert `tools_*.rs` from `impl AgentRuntime`
+      blocks into free functions over the ctx; sink them into a `rsclaw-tools` crate that
+      depends on types/config/provider and **not** on the runtime. Effect is two-way:
+      editing `runtime.rs` recompiles only the runtime crate; editing a tool recompiles
+      tools + runtime (same as today). This is a real refactor, not a file move — but it is
+      far smaller than the step-12 event-bus inversion and attacks the same knot from
+      inside. `tools_builder.rs` (ToolDef assembly, 108 touches) likely stays runtime-side
+      initially; decide per-function during the move.
+- [ ] **7. `rsclaw-store`** (2K+) — extract only after both task queue and external job
       records no longer live in gateway. Store should not depend on gateway.
-- [ ] **6. `rsclaw-kb`** (11K) — extract after config is available. Current KB code has only
+- [ ] **8. `rsclaw-kb`** (13K) — extract after config is available. Current KB code has only
       small config edges (`config::load`, `EmbedConfig`); either keep those through
       `rsclaw-config` or inject the config explicitly before moving.
-- [ ] **7. `rsclaw-media`** — move attachment classification, upload naming/path helpers,
+- [ ] **9. `rsclaw-media`** — move attachment classification, upload naming/path helpers,
       office/PDF extraction, and transcription facade. This prepares channel extraction and
       removes agent's dependency on channel helpers.
       **⚠️ Verify before committing media's dep set:** `transcrib*` is referenced across
       several channels AND in `agent/runtime.rs` — and runtime.rs is the only one of those
       that imports `crate::provider`. If transcription routes through a provider/STT call,
       then `media → provider`, and since `channel → media`, channel transitively depends on
-      provider — violating the channel boundary (line 137). Resolve the actual transcription
-      call path first; if it needs provider, keep transcription behind a **trait injected by
-      the runtime**, not a concrete facade owned by `media`.
-- [ ] **8. `rsclaw-channel`** (18K) — extract the aggregate channel crate once it depends
+      provider — violating the channel boundary (see "Channel crate decision" target shape).
+      Resolve the actual transcription call path first; if it needs provider, keep
+      transcription behind a **trait injected by the runtime**, not a concrete facade owned
+      by `media`.
+- [ ] **10. `rsclaw-channel`** (20K) — extract the aggregate channel crate once it depends
       only on types/config/platform/retry/media and a small pairing persistence trait. Keep
       gateway startup/webhook wiring in gateway/server; channel owns protocol clients and
       send/run implementations.
-- [ ] **9. Small leaves** — extract `i18n`, `events`, `hooks`, `embed`, `artifact`, `mcp`,
-      `plugin`, `skill`, `browser`, `computer` where the remaining dependency graph is clean.
-      Batch only genuinely independent leaves.
-- [ ] **10. Runtime knot** — keep `agent` + `gateway` + `server` + `ws` + `a2a` + `acp`
+- [ ] **11. Small leaves + `rsclaw-cmd`** — extract `i18n`, `events`, `hooks`, `embed`,
+      `artifact`, `mcp`, `plugin`, `skill`, `browser`, `computer` where the remaining
+      dependency graph is clean. Batch only genuinely independent leaves. Also extract
+      `cmd` (17K) here: it is top-of-graph (nothing depends on it), so the move is cheap
+      and stops CLI edits from re-type-checking the runtime.
+- [ ] **12. Runtime knot** — keep `agent` + `gateway` + `server` + `ws` + `a2a` + `acp`
       together as `rsclaw-runtime` initially. Re-measure. Only design event-bus/trait
       inversion if this remaining crate is still the dominant edit-time bottleneck.
 
@@ -196,23 +269,26 @@ RSCLAW_BUILD_VERSION=dev RSCLAW_BUILD_DATE=test cargo test
 
 ## Expected payoff
 
-`agent` (33K) dominates frontend+codegen, but a large part of the current cost is that every
-small edit shares the same final crate. Pulling `provider` (10K), `kb` (11K), `channel` (18K),
-media helpers, config, and store out should make edits to those areas compile only the touched
-crate plus dependents. The remaining runtime crate may still be substantial, but it will no
-longer absorb unrelated provider/channel/kb churn.
+`agent` (45K) dominates frontend+codegen, but a large part of the current cost is that every
+small edit shares the same final crate. Pulling `provider` (13K), `kb` (13K), `channel` (20K),
+`cmd` (17K), media helpers, config, and store out should make edits to those areas compile only
+the touched crate plus dependents. The remaining runtime crate may still be substantial, but it
+will no longer absorb unrelated provider/channel/kb churn.
 
-Re-measure after steps 4, 6, 8, and 10 with `cargo build --timings`. Do not continue splitting
-purely for tidiness if timing data says the bottleneck moved elsewhere.
+Re-measure at step 5 (mandatory gate) and again after steps 6, 8, 10, and 12 with
+`cargo build --profile release-dev --timings` — **the daily-driver profile, not debug**. Do not
+continue splitting purely for tidiness if timing data says the bottleneck moved elsewhere.
 
-**Honest payoff caveat — the early steps speed up the modules you edit LEAST.** 90-day
-edit churn (file-touches per top-level module): **`agent` 1044, `gateway` 491**, `provider`
-225, `channel` 223, `kb` 218, `config` 99, `server`/`ws` ~80 each. The dominant edit cost is
-`agent` + `gateway` (~1500 touches), and those are **deferred to step 10 ("only if still the
-bottleneck")**. So steps 1–8 do **not** make the most common edit (touching the agent runtime)
-compile faster; they isolate provider/kb/channel churn from each other and shrink the agent
-crate as DTOs/media leave it. That is still worth doing, but do not expect day-to-day
-agent edits to get faster until the deferred runtime knot (step 10) is actually broken.
+**Honest payoff caveat — without step 6, the split speeds up the modules you edit LEAST.**
+90-day edit churn (file-touches per top-level module): **`agent` 1044, `gateway` 491**,
+`provider` 225, `channel` 223, `kb` 218, `config` 99, `server`/`ws` ~80 each. Within `agent`,
+`runtime.rs` alone is 440 touches. The first draft deferred everything that helps that hot path
+to the final step ("only if still the bottleneck"); the 2026-06-12 revision adds step 6
+(`rsclaw-tools` via `ToolCtx`) precisely to carve ~15K LOC of tools out of the hot crate so a
+`runtime.rs` edit recompiles a markedly smaller unit. Even so: until step 6 lands, do not
+expect day-to-day agent edits to get faster — steps 1–4 isolate provider/kb/channel churn,
+nothing more. And the thin-LTO link tail (see profile warning) is paid every build regardless
+of crate count; only the step-5 measurement can say how big that floor is.
 
 ---
 
@@ -226,14 +302,16 @@ They include compile/test loops, not review/merge waiting.
 | Workspace scaffold + `rsclaw-types` | 0.5-1.5 days | wide import churn, low logic risk |
 | `rsclaw-config` + `rsclaw-platform` + `rsclaw-retry` | 0.5-1 day | mostly mechanical, but config is referenced everywhere |
 | `rsclaw-provider` | 0.5-1 day | high payoff, moderate dependency cleanup |
+| Re-measure gate (step 5) | 0.5 day | release-dev `--timings` + `lto = false` control; decides 6 vs 8–10 priority |
+| `rsclaw-tools` via `ToolCtx` (step 6) | 1-2 days | real refactor (impl blocks → ctx functions), not a file move; the only step on the hot path |
 | `rsclaw-store` | 0.5 day | only if task + external-job records are already moved |
 | `rsclaw-kb` | 0.5-1 day | self-contained, but has many files and e2e coverage |
 | `rsclaw-media` prep | 0.5-1 day | important for channel; avoid mixing with channel extraction |
 | `rsclaw-channel` | 1-2 days | many concrete integrations and gateway/server/cmd touch points |
-| Remaining leaves | 0.5-1.5 days | depends on how clean the graph is after earlier steps |
+| Remaining leaves + `rsclaw-cmd` | 0.5-1.5 days | depends on how clean the graph is after earlier steps |
 | Runtime knot re-measure/design | 0.5 day for measurement, more only if inversion is needed | do not start deep inversion without a separate plan |
 
-Practical total: **4-8 focused working days** for the useful split through channel, assuming
+Practical total: **5-10 focused working days** for the useful split through channel, assuming
 tests are healthy and no large feature branches are competing. A conservative calendar estimate
 is **1-2 weeks** because this kind of refactor benefits from small PRs and review checkpoints.
 
@@ -256,6 +334,8 @@ Do **not** parallelize:
 - `rsclaw-config`, because it is referenced across most modules.
 - `rsclaw-channel` extraction with `rsclaw-media` extraction; these touch the same call sites.
 - Multiple large extraction PRs that rewrite imports across `agent`, `gateway`, and `server`.
+- The `ToolCtx` refactor (step 6) with ANY other agent-touching work — it rewrites every
+  `tools_*.rs` and `runtime.rs` dispatch site.
 
 Recommended execution model:
 
@@ -274,15 +354,19 @@ Recommended execution model:
 - **Churn / merge-conflict risk: HIGH** — sweeping path edits. Mitigate: one small crate per
   PR; do NOT start while large branches (UI WIP, future feature branches) are mid-flight;
   land each step fast.
-  **Current-state gate (2026-05-21):** the channel layer is being actively refactored and
-  there is uncommitted WIP (e.g. `tools_misc.rs`, `ui/*`). Steps **7–8 (media + channel)
-  touch exactly those call sites — do NOT start them until the channel refactor lands.**
-  Steps 0–4 (scaffold, types, config, platform/retry, provider) are largely orthogonal to
-  channel and may proceed in the meantime.
+  **Current-state gate (re-checked 2026-06-12, still holds):** there is uncommitted WIP
+  across exactly the hot files (`agent/runtime.rs`, `channel/feishu.rs`, `gateway/preparse.rs`,
+  `config/schema.rs`, …). Steps **9–10 (media + channel) touch those call sites — do NOT
+  start them until in-flight channel work lands.** Steps 0–4 (scaffold, types, config,
+  platform/retry, provider) are largely orthogonal and may proceed in the meantime. Step 6
+  (tools/`ToolCtx`) rewrites `tools_*.rs` wholesale — it needs a clean `src/agent` working
+  tree before starting.
 - **`rsclaw-types` becomes the new choke point if it churns** — every crate depends on it, so
   any edit to `types` triggers a full-workspace rebuild. After step 1, `types` MUST be frozen /
   append-only. If a DTO needs behavior or non-trivial deps, it does not belong in `types`.
-  A churning `types` just moves the monolith bottleneck down one level.
+  A churning `types` just moves the monolith bottleneck down one level. **This is not
+  hypothetical:** provider wire types churn with every protocol iteration, which is why
+  step 1 now keeps them in `rsclaw-provider` instead.
 - **build.rs / version stamping** — the `RSCLAW_BUILD_VERSION` / `RSCLAW_BUILD_DATE` plumbing
   (see the check commands) must stay in the root facade **bin** crate; do not scatter it into
   library crates. Re-plumbing **cargo feature flags** across the workspace (zip/bzip2/etc.) is
@@ -298,7 +382,9 @@ Recommended execution model:
 
 ## Out of scope
 
-- Faster linker (lld/mold): rejected for this codebase (link is not the bottleneck).
+- Faster linker (lld/mold): rejected **for the debug profile** (link is not the bottleneck
+  there). Under release-dev the link/LTO stage is unmeasured — the step-5 gate covers it via
+  the `lto = false` experiment; revisit only if that measurement says otherwise.
 - Behavior / API changes.
 - Per-channel crates (`rsclaw-channel-telegram`, etc.) until aggregate `rsclaw-channel` has
   proven useful.

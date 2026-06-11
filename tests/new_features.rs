@@ -153,6 +153,7 @@ fn provider_config_has_user_agent_field() {
         user_agent: Some("TestAgent/1.0".to_string()),
         prefix_id: None,
         compact_timeout_secs: None,
+        constrain_tool_calls: None,
     };
 
     assert_eq!(config.user_agent, Some("TestAgent/1.0".to_string()));

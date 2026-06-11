@@ -230,6 +230,17 @@ impl FailoverManager {
 
             any_profile_called = true;
             let mut dropped_max_tokens = false;
+            // Transient-error in-place retry. A single network blip or
+            // server-side reload (e.g. rsclaw session replay slot churn)
+            // shouldn't take the only model in a chain out of rotation
+            // — that surfaces as user-visible "LLM chain exhausted" on a
+            // recoverable hiccup. Retry the SAME (provider, profile) up to
+            // TRANSIENT_RETRY_MAX times with TRANSIENT_RETRY_BACKOFFS
+            // before classifying as TryNextModel.
+            const TRANSIENT_RETRY_MAX: u32 = 2;
+            const TRANSIENT_RETRY_BACKOFFS: [Duration; 2] =
+                [Duration::from_millis(500), Duration::from_secs(2)];
+            let mut transient_attempts: u32 = 0;
             loop {
                 match provider.stream(req.clone()).await {
                     Ok(stream) => {
@@ -285,6 +296,31 @@ impl FailoverManager {
                     Err(e) => {
                         // Classify to decide: bubble or advance chain.
                         let kind = classify_error(&e);
+                        // Transient (timeouts / connection blips / 5xx) and
+                        // Unknown (default bucket, treated as transient per
+                        // docs in ErrorKind) deserve in-place retry on the
+                        // SAME (provider, profile) before advancing chain.
+                        // Single-model chains otherwise exhaust on the first
+                        // 10s network hiccup.
+                        if matches!(kind, ErrorKind::Transient | ErrorKind::Unknown)
+                            && transient_attempts < TRANSIENT_RETRY_MAX
+                        {
+                            let delay = TRANSIENT_RETRY_BACKOFFS[transient_attempts as usize];
+                            warn!(
+                                provider = provider_name,
+                                api = provider_api,
+                                profile = profile_id,
+                                attempt = transient_attempts + 1,
+                                max_attempts = TRANSIENT_RETRY_MAX,
+                                delay_ms = delay.as_millis() as u64,
+                                kind = ?kind,
+                                error = %e,
+                                "transient error — retrying same model/profile before advancing chain"
+                            );
+                            transient_attempts += 1;
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        }
                         match kind {
                             ErrorKind::Balance
                             | ErrorKind::ModelMissing

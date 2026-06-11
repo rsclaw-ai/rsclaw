@@ -317,7 +317,31 @@ pub fn slugify(name: &str) -> String {
 /// the assistant text accumulated from the stream. Tool-call events are
 /// ignored (the request carries no tools). Returns an error on stream
 /// failure or empty output so the caller can decide whether to fall back.
+///
+/// Retries ONCE on any failure: transient fleet instability ("error decoding
+/// response body", empty output under load) is the dominant cause of dropped
+/// extractions, and the call is read-only/idempotent so a blanket retry is
+/// safe. Serves every distill consumer (L1 memory, lesson, failure-lesson,
+/// memory crystallization, workflow crystallization).
 pub async fn distill_with_llm(
+    prompt: &str,
+    provider: Arc<dyn LlmProvider>,
+    model: String,
+) -> Result<String> {
+    match distill_once(prompt, Arc::clone(&provider), model.clone()).await {
+        Ok(out) => Ok(out),
+        Err(first) => {
+            tracing::debug!("distill attempt 1 failed, retrying once: {first:#}");
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            distill_once(prompt, provider, model)
+                .await
+                .with_context(|| format!("retry also failed; first attempt: {first:#}"))
+        }
+    }
+}
+
+/// Single distill attempt — see [`distill_with_llm`] for the retry wrapper.
+async fn distill_once(
     prompt: &str,
     provider: Arc<dyn LlmProvider>,
     model: String,
