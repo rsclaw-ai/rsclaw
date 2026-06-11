@@ -74,15 +74,89 @@ impl BriefingSlot {
         }
     }
 
+    /// Short slug used by `/astock briefing run <slot>` and any other
+    /// callers that need a stable identifier (cleaner than `{:?}`).
+    pub fn slug(&self) -> &'static str {
+        match self {
+            BriefingSlot::PreMarket => "premarket",
+            BriefingSlot::MidDay => "midday",
+            BriefingSlot::PostMarket => "postmarket",
+        }
+    }
+
+    /// Parse a user-typed slug back into a slot. Accepts the canonical
+    /// `premarket / midday / postmarket` plus common aliases so the
+    /// slash command does the right thing for `/astock briefing run pre`
+    /// or `... noon` or `... close` without typo-shaming the user.
+    pub fn from_slug(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "premarket" | "pre" | "pre-market" | "morning" => Some(Self::PreMarket),
+            "midday" | "mid" | "mid-day" | "noon" | "lunch" => Some(Self::MidDay),
+            "postmarket" | "post" | "post-market" | "close" | "evening" => Some(Self::PostMarket),
+            _ => None,
+        }
+    }
+
     /// Ordered list of all slots in wallclock order — used to find
-    /// the next slot from "now".
-    fn all_in_order() -> [BriefingSlot; 3] {
+    /// the next slot from "now" and to enumerate the full schedule
+    /// for `/astock briefing list`.
+    pub fn all_in_order() -> [BriefingSlot; 3] {
         [
             BriefingSlot::PreMarket,
             BriefingSlot::MidDay,
             BriefingSlot::PostMarket,
         ]
     }
+}
+
+/// One-row snapshot of the next future fire time per slot. Returned in
+/// wallclock order (PreMarket → MidDay → PostMarket). Each entry's
+/// `next_local` is the next Asia/Shanghai datetime at which the
+/// scheduler will dispatch that slot (skipping weekends — see
+/// `is_trading_day`).
+///
+/// Used by `/astock briefing list` and `/astock briefing next` so the
+/// user can see at a glance when each slot is next due, without
+/// having to grep gateway.log. The internal scheduler still owns
+/// firing; this is a read-only projection of its calendar.
+pub fn schedule_snapshot() -> Vec<(BriefingSlot, chrono::DateTime<chrono_tz::Tz>)> {
+    let now_utc = chrono::Utc::now();
+    let now_local = now_utc.with_timezone(&Shanghai);
+    BriefingSlot::all_in_order()
+        .iter()
+        .copied()
+        .map(|slot| {
+            let mut day = now_local.date_naive();
+            for _ in 0..14 {
+                if is_trading_day(day) {
+                    let candidate = Shanghai
+                        .from_local_datetime(&day.and_time(slot.wallclock()))
+                        .single()
+                        .unwrap_or(now_local);
+                    if candidate > now_local {
+                        return (slot, candidate);
+                    }
+                }
+                day += ChronoDuration::days(1);
+            }
+            // Defensive fallback so the slash command never panics on a
+            // broken calendar helper — same shape as `next_slot`'s
+            // 1-hour escape hatch.
+            (slot, now_local + ChronoDuration::hours(1))
+        })
+        .collect()
+}
+
+/// Manual one-shot dispatch — mirrors what the scheduler does on its
+/// own at the wallclock time. Used by `/astock briefing run <slot>`
+/// so the user can re-fire (or test) a briefing on demand.
+///
+/// Does NOT bypass the trading-day check, but DOES ignore weekday —
+/// the caller asked for it, fire it. If you wanted a no-op
+/// weekend run you'd call this from a weekend, which is rare and
+/// usually intentional (testing).
+pub async fn dispatch_one(slot: BriefingSlot) {
+    dispatch_for_slot(slot).await;
 }
 
 /// Compute the next briefing slot to fire, in `Asia/Shanghai`.

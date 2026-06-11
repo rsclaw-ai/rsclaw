@@ -318,10 +318,6 @@ impl AgentRuntime {
     /// `__send_file` envelope the agent runtime recognises (same
     /// convention as the workspace `send_file` tool).
     pub(crate) async fn tool_stock_chart(&self, args: Value) -> Result<Value> {
-        let arc = match crate::astock::global_client() {
-            Some(c) => c,
-            None => return Ok(astock_dormant_note()),
-        };
         let code = match args.get("code").and_then(Value::as_str) {
             Some(s) if !s.trim().is_empty() => s.trim().to_owned(),
             _ => {
@@ -342,21 +338,12 @@ impl AgentRuntime {
             .map(|n| n as u32)
             .unwrap_or(60)
             .clamp(20, 200);
-        // Default to qfq (前复权) for chart rendering, not `none`.
-        // The first cut defaulted to none — which produced visible
-        // discontinuities on stocks that paid dividends or did splits
-        // during the chart window (verified against 600519 where
-        // raw-price candles showed a ~30% gap across a dividend ex-
-        // date that the MA20 then "chased" up in a way that looked
-        // like a fake trend. qfq adjusts ALL historical bars to the
-        // current price scale so the candles + MAs read as one
-        // continuous series. The LLM can still override with
-        // `adjust=none` for forensic "what did people actually pay"
-        // questions, but the default IM-chart use case wants qfq.
+        // Default to qfq (前复权) — see ChartRenderInput rationale below.
         let adjust = args
             .get("adjust")
             .and_then(Value::as_str)
-            .unwrap_or("qfq");
+            .unwrap_or("qfq")
+            .to_owned();
         let ma_periods: Vec<usize> = args
             .get("ma")
             .and_then(Value::as_array)
@@ -372,143 +359,29 @@ impl AgentRuntime {
             .and_then(Value::as_str)
             .map(str::to_owned);
 
-        // Fetch bars + the latest quote in parallel — the quote
-        // gives us a fresh price + change% for the title, which is
-        // more meaningful than the last K-line's close (the close
-        // is yesterday's number on daily bars during today's
-        // trading session).
-        let kline_fut = arc.kline(&code, Some(&period), Some(count), Some(0), Some(adjust));
-        let quote_fut = arc.quote(&code);
-        let (kline_res, quote_res) = tokio::join!(kline_fut, quote_fut);
-        let kr = match kline_res {
-            Ok(r) => r,
-            Err(e) => {
-                return Ok(json!({
-                    "ok": false,
-                    "error": format!("astock kline: {e}"),
-                }));
-            }
-        };
-        if kr.klines.is_empty() {
-            return Ok(json!({
-                "ok": false,
-                "error": format!("astock returned 0 bars for {code} ({period})"),
-            }));
-        }
-        let quote = quote_res.ok();
-
-        // Title price source: prefer the live quote (it shows what
-        // the stock is doing NOW), but ONLY when the live quote's
-        // calendar day matches the last K-line bar's day. The first
-        // cut always used the live quote — which produced charts
-        // where the title said "¥1272.86 +0.38%" while the visible
-        // last candle was 10 days old at ¥1270, looking like a data
-        // mismatch even though both numbers were correct. Now: when
-        // the live quote is from a day that ISN'T plotted, we fall
-        // back to the last K-line bar's close + the bar-over-bar
-        // change. Honesty over freshness for the headline number.
-        let last_bar = kr.klines.last().unwrap();
-        let last_bar_day = chrono::DateTime::from_timestamp(last_bar.timestamp, 0)
-            .map(|d| d.format("%Y-%m-%d").to_string())
-            .unwrap_or_default();
-        let live_quote_is_today_bar = match &quote {
-            Some(q) => {
-                let qd = chrono::DateTime::from_timestamp(q.timestamp, 0)
-                    .map(|d| d.format("%Y-%m-%d").to_string())
-                    .unwrap_or_default();
-                !qd.is_empty() && qd == last_bar_day
-            }
-            None => false,
-        };
-        let (price, change_pct) = if live_quote_is_today_bar {
-            let q = quote.as_ref().unwrap();
-            (q.price, q.change_pct())
-        } else {
-            let prev = kr
-                .klines
-                .get(kr.klines.len().saturating_sub(2))
-                .map(|b| b.close)
-                .unwrap_or(last_bar.close);
-            let pct = if prev.abs() > f64::EPSILON {
-                (last_bar.close - prev) / prev * 100.0
-            } else {
-                0.0
-            };
-            (last_bar.close, pct)
-        };
-        let display_name = name_hint
-            .as_deref()
-            .map(|n| format!("{n}  "))
-            .unwrap_or_default();
-        let title = format!(
-            "{display_name}{code}  ¥{price:.2}  {sign}{pct:.2}%",
-            sign = if change_pct >= 0.0 { "+" } else { "" },
-            pct = change_pct,
-        );
-        let ma_str = ma_periods
-            .iter()
-            .map(|p| format!("MA{p}"))
-            .collect::<Vec<_>>()
-            .join("/");
-        // Subtitle: period · N 根 · 截至 date · adjust state ·
-        // MA list. The adjust state is REAL — if the caller asked
-        // for qfq but astock downgraded to none (no factor table
-        // for the code), we surface that in the subtitle so the
-        // user understands why the chart shows a price gap. Without
-        // this hint, a user looks at a non-adjusted dividend ex-day
-        // jump and assumes the data is broken or the stock did
-        // something insane.
-        let adjust_label = match (kr.adjust.as_str(), kr.adjust_warning.as_deref()) {
-            ("qfq", _) => "前复权",
-            ("hfq", _) => "后复权",
-            ("none", Some(_)) => "未复权 ⚠",
-            ("none", None) => "未复权",
-            (other, _) => other,
-        };
-        let subtitle = format!(
-            "{period}  ·  {n} 根  ·  截至 {last_bar_day}  ·  {adjust_label}  ·  {ma_str}",
-            n = kr.klines.len()
-        );
-
-        // Render to a fresh path under the rsclaw base var dir. We
-        // do NOT reuse the artifact store here — that store is text-
-        // only and per-session-keyed. Charts are short-lived files
-        // for IM upload, so a flat ~/.rsclaw/var/charts/ with a uuid
-        // name is the simplest sufficient layout.
-        let charts_dir = crate::config::loader::base_dir().join("var").join("charts");
-        let file_name = format!(
-            "chart_{}_{}.png",
-            code.replace(['.', '/', ':'], "_"),
-            uuid::Uuid::new_v4().simple()
-        );
-        let path = charts_dir.join(&file_name);
-
-        let opts = crate::astock::chart::ChartOpts {
-            title: title.clone(),
-            subtitle: Some(subtitle),
+        match render_chart_for_code(ChartRenderInput {
+            code: &code,
+            period: &period,
+            count,
+            adjust: &adjust,
             ma_periods,
-            ..Default::default()
-        };
-        let size = match crate::astock::chart::render_kline_png(&kr.klines, &opts, &path) {
-            Ok(s) => s,
-            Err(e) => {
-                return Ok(json!({
-                    "ok": false,
-                    "error": format!("render_kline_png: {e:#}"),
-                }));
-            }
-        };
-
-        // `__send_file` envelope matches the existing workspace-file
-        // send convention so the agent runtime auto-uploads to the
-        // active IM channel without any extra plumbing.
-        Ok(json!({
-            "__send_file": true,
-            "path": path.to_string_lossy(),
-            "filename": file_name,
-            "size": size,
-            "summary": title,
-        }))
+            name_hint: name_hint.as_deref(),
+        })
+        .await
+        {
+            Ok(out) => Ok(json!({
+                "__send_file": true,
+                "path": out.path.to_string_lossy(),
+                "filename": out.filename,
+                "size": out.size,
+                "summary": out.title,
+            })),
+            Err(ChartRenderError::Dormant) => Ok(astock_dormant_note()),
+            Err(ChartRenderError::Soft(msg)) => Ok(json!({
+                "ok": false,
+                "error": msg,
+            })),
+        }
     }
 
     // ----- tool: stock_watchlist -------------------------------------
@@ -561,6 +434,169 @@ impl AgentRuntime {
             })),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Chart render — free-function form used by `tool_stock_chart` and
+// the `/astock chart` slash command. Kept here (not under
+// `astock::chart`) because the rendering recipe (qfq default, MA list,
+// live-quote-vs-bar honesty, subtitle text, file-path scheme) is part
+// of the public chart "look" — the `astock::chart` module owns the
+// low-level rasterisation primitive only.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub(crate) struct ChartRenderInput<'a> {
+    pub code: &'a str,
+    pub period: &'a str,
+    pub count: u32,
+    pub adjust: &'a str,
+    pub ma_periods: Vec<usize>,
+    pub name_hint: Option<&'a str>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ChartRenderOutput {
+    pub path: std::path::PathBuf,
+    pub filename: String,
+    pub title: String,
+    pub size: u64,
+}
+
+#[derive(Debug)]
+pub(crate) enum ChartRenderError {
+    /// astock is not configured (mirrors `astock_dormant_note`).
+    Dormant,
+    /// User-actionable error message — bad code, empty bars, render
+    /// failure, etc. Caller picks the surface (JSON for tool, plain
+    /// text for slash).
+    Soft(String),
+}
+
+pub(crate) async fn render_chart_for_code(
+    input: ChartRenderInput<'_>,
+) -> std::result::Result<ChartRenderOutput, ChartRenderError> {
+    let arc = match crate::astock::global_client() {
+        Some(c) => c,
+        None => return Err(ChartRenderError::Dormant),
+    };
+    let code = input.code.to_owned();
+    let period = input.period;
+    let count = input.count.clamp(20, 200);
+    let adjust = input.adjust;
+    let ma_periods = input.ma_periods;
+    let name_hint = input.name_hint;
+
+    // Fetch bars + the latest quote in parallel — the quote gives us
+    // a fresh price + change% for the title, more meaningful than
+    // the last K-line's close (the close is yesterday's number on
+    // daily bars during today's trading session).
+    let kline_fut = arc.kline(&code, Some(period), Some(count), Some(0), Some(adjust));
+    let quote_fut = arc.quote(&code);
+    let (kline_res, quote_res) = tokio::join!(kline_fut, quote_fut);
+    let kr = match kline_res {
+        Ok(r) => r,
+        Err(e) => return Err(ChartRenderError::Soft(format!("astock kline: {e}"))),
+    };
+    if kr.klines.is_empty() {
+        return Err(ChartRenderError::Soft(format!(
+            "astock returned 0 bars for {code} ({period})"
+        )));
+    }
+    let quote = quote_res.ok();
+
+    // Title price source: prefer the live quote (it shows what the
+    // stock is doing NOW), but ONLY when the live quote's calendar
+    // day matches the last K-line bar's day. The first cut always
+    // used the live quote — which produced charts where the title
+    // said "¥1272.86 +0.38%" while the visible last candle was 10
+    // days old at ¥1270, looking like a data mismatch even though
+    // both numbers were correct. Now: when the live quote is from
+    // a day that ISN'T plotted, we fall back to the last K-line
+    // bar's close + the bar-over-bar change. Honesty over freshness
+    // for the headline number.
+    let last_bar = kr.klines.last().unwrap();
+    let last_bar_day = chrono::DateTime::from_timestamp(last_bar.timestamp, 0)
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .unwrap_or_default();
+    let live_quote_is_today_bar = match &quote {
+        Some(q) => {
+            let qd = chrono::DateTime::from_timestamp(q.timestamp, 0)
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .unwrap_or_default();
+            !qd.is_empty() && qd == last_bar_day
+        }
+        None => false,
+    };
+    let (price, change_pct) = if live_quote_is_today_bar {
+        let q = quote.as_ref().unwrap();
+        (q.price, q.change_pct())
+    } else {
+        let prev = kr
+            .klines
+            .get(kr.klines.len().saturating_sub(2))
+            .map(|b| b.close)
+            .unwrap_or(last_bar.close);
+        let pct = if prev.abs() > f64::EPSILON {
+            (last_bar.close - prev) / prev * 100.0
+        } else {
+            0.0
+        };
+        (last_bar.close, pct)
+    };
+    let display_name = name_hint
+        .map(|n| format!("{n}  "))
+        .unwrap_or_default();
+    let title = format!(
+        "{display_name}{code}  ¥{price:.2}  {sign}{pct:.2}%",
+        sign = if change_pct >= 0.0 { "+" } else { "" },
+        pct = change_pct,
+    );
+    let ma_str = ma_periods
+        .iter()
+        .map(|p| format!("MA{p}"))
+        .collect::<Vec<_>>()
+        .join("/");
+    // Subtitle: period · N 根 · 截至 date · adjust state · MA list.
+    // The adjust state is REAL — if the caller asked for qfq but
+    // astock downgraded to none (no factor table for the code), we
+    // surface that in the subtitle so the user understands why the
+    // chart shows a price gap.
+    let adjust_label = match (kr.adjust.as_str(), kr.adjust_warning.as_deref()) {
+        ("qfq", _) => "前复权",
+        ("hfq", _) => "后复权",
+        ("none", Some(_)) => "未复权 ⚠",
+        ("none", None) => "未复权",
+        (other, _) => other,
+    };
+    let subtitle = format!(
+        "{period}  ·  {n} 根  ·  截至 {last_bar_day}  ·  {adjust_label}  ·  {ma_str}",
+        n = kr.klines.len()
+    );
+
+    let charts_dir = crate::config::loader::base_dir().join("var").join("charts");
+    let filename = format!(
+        "chart_{}_{}.png",
+        code.replace(['.', '/', ':'], "_"),
+        uuid::Uuid::new_v4().simple()
+    );
+    let path = charts_dir.join(&filename);
+
+    let opts = crate::astock::chart::ChartOpts {
+        title: title.clone(),
+        subtitle: Some(subtitle),
+        ma_periods,
+        ..Default::default()
+    };
+    let size = crate::astock::chart::render_kline_png(&kr.klines, &opts, &path)
+        .map_err(|e| ChartRenderError::Soft(format!("render_kline_png: {e:#}")))?;
+
+    Ok(ChartRenderOutput {
+        path,
+        filename,
+        title,
+        size,
+    })
 }
 
 // --- module-level helpers (no `&self` needed) ----------------------------
@@ -680,7 +716,7 @@ const WATCHLIST_KIND: &str = "watchlist";
 /// thousand-code request that times out the upstream sidecar.
 const WATCHLIST_CAP: usize = 50;
 
-async fn watchlist_list(
+pub(crate) async fn watchlist_list(
     mem: &std::sync::Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>,
     scope: &str,
 ) -> Result<Value> {
@@ -698,7 +734,7 @@ async fn watchlist_list(
     }))
 }
 
-async fn watchlist_add(
+pub(crate) async fn watchlist_add(
     mem: &std::sync::Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>,
     scope: &str,
     raw_codes: Vec<String>,
@@ -782,7 +818,7 @@ async fn watchlist_add(
     }))
 }
 
-async fn watchlist_remove(
+pub(crate) async fn watchlist_remove(
     mem: &std::sync::Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>,
     scope: &str,
     raw_codes: Vec<String>,
@@ -818,7 +854,7 @@ async fn watchlist_remove(
     }))
 }
 
-async fn watchlist_clear(
+pub(crate) async fn watchlist_clear(
     mem: &std::sync::Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>,
     scope: &str,
 ) -> Result<Value> {
@@ -876,7 +912,7 @@ fn render_one_quote_line(q: &crate::astock::Quote) -> String {
     )
 }
 
-fn render_quotes_markdown(quotes: &[crate::astock::Quote]) -> String {
+pub(crate) fn render_quotes_markdown(quotes: &[crate::astock::Quote]) -> String {
     if quotes.is_empty() {
         return "_没有报价数据_".to_owned();
     }
@@ -894,7 +930,7 @@ fn render_quotes_markdown(quotes: &[crate::astock::Quote]) -> String {
 /// `MAX_MARKDOWN_ROWS` so a 5000-row snapshot doesn't carry a 5000-row
 /// table into the next IM message. The JSON `rows` field still carries
 /// the full data for any LLM that wants to scan.
-fn render_snapshot_markdown(
+pub(crate) fn render_snapshot_markdown(
     rows: &[crate::astock::SnapshotRow],
     used_watchlist: bool,
     sort_by: &str,

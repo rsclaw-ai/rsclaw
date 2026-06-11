@@ -1256,7 +1256,376 @@ $g.Dispose();$b.Dispose()"#
         };
         return Some(txt(reply));
     }
+    // /astock — A股数据/调度快路径。子命令:
+    //   briefing list / next / run <slot>
+    //   watchlist list / add <code...> / remove <code...> / clear
+    //   quote <code>
+    //   snapshot [code...]
+    //   chart <code> [period] [count]
+    // 不进 LLM，直接调 astock 子模块。
+    if lower == "/astock" || lower == "/astock help" || lower == "/astock -h" || lower == "/astock --help" {
+        return Some(txt(astock_help_text()));
+    }
+    if let Some(rest) = lower.strip_prefix("/astock ") {
+        let raw_rest = t.strip_prefix("/astock ").unwrap_or(rest).trim();
+        // chart needs to attach the rendered PNG, so it bypasses the
+        // text-only `txt` helper and builds its own OutboundMessage.
+        // All other sub-commands stay text-only.
+        let first_word = raw_rest
+            .split_whitespace()
+            .next()
+            .map(str::to_lowercase)
+            .unwrap_or_default();
+        if first_word == "chart" {
+            let chart_args: Vec<String> = raw_rest
+                .split_whitespace()
+                .skip(1)
+                .map(str::to_owned)
+                .collect();
+            return Some(astock_chart_outbound(chart_args).await);
+        }
+        return Some(txt(
+            handle_astock_command(handle, channel, peer_id, raw_rest).await,
+        ));
+    }
     None
+}
+
+// ---------------------------------------------------------------------------
+// /astock dispatcher
+// ---------------------------------------------------------------------------
+//
+// Routes the `/astock <sub> <args...>` form to the appropriate
+// astock helper. Returns a single plain-text reply (the only shape
+// the fast preparse path can use). Chart sub-command returns a
+// special marker token consumed by the higher-level wrapper —
+// see `dispatch_astock_chart` for the image-attachment path.
+
+fn astock_help_text() -> String {
+    "/astock — A股数据 & 调度 (本地快路径，不进 LLM)\n\n\
+     调度\n\
+       /astock briefing list                 三个时段 + 下次 fire\n\
+       /astock briefing next                 只看下次\n\
+       /astock briefing run <slot>           立即补发 (premarket|midday|postmarket)\n\n\
+     自选股\n\
+       /astock watchlist list                当前自选股\n\
+       /astock watchlist add <code> [...]    加入 (支持批量)\n\
+       /astock watchlist remove <code> [...] 删除\n\
+       /astock watchlist clear               清空\n\n\
+     即时数据\n\
+       /astock quote <code> [<code>...]      实时报价\n\
+       /astock snapshot [<code>...]          快照 (空参 = 自选股)\n\
+       /astock chart <code> [period] [count] K 线图 (会推送到当前会话)\n\n\
+     备注: astock 未启用时所有子命令静默回 '_astock 未启用_'。"
+        .to_owned()
+}
+
+async fn handle_astock_command(
+    handle: &crate::agent::AgentHandle,
+    channel: &str,
+    peer_id: &str,
+    rest: &str,
+) -> String {
+    let mut parts = rest.split_whitespace();
+    let Some(sub) = parts.next() else {
+        return astock_help_text();
+    };
+    let args: Vec<String> = parts.map(str::to_owned).collect();
+    match sub.to_lowercase().as_str() {
+        "briefing" => astock_briefing(args).await,
+        "watchlist" => astock_watchlist(handle, channel, peer_id, args).await,
+        "quote" => astock_quote(args).await,
+        "snapshot" => astock_snapshot(handle, channel, peer_id, args).await,
+        // `chart` is handled directly at the slash callsite so the
+        // PNG can be attached as an image — it never reaches this
+        // dispatcher. Document the case for the reader.
+        "chart" => "internal error: chart should be handled at the slash callsite".to_owned(),
+        other => format!("/astock: 未知子命令 `{other}`。看 `/astock help`"),
+    }
+}
+
+async fn astock_briefing(args: Vec<String>) -> String {
+    let action = args
+        .first()
+        .map(|s| s.to_lowercase())
+        .unwrap_or_else(|| "list".to_owned());
+    match action.as_str() {
+        "list" | "" => {
+            let snapshot = crate::astock::briefing::schedule_snapshot();
+            let mut lines = vec!["**早报调度**".to_owned()];
+            for (slot, when) in snapshot {
+                lines.push(format!(
+                    "  {}  ·  {}  →  {}",
+                    slot.slug(),
+                    slot.label(),
+                    when.format("%Y-%m-%d %H:%M %Z")
+                ));
+            }
+            lines.push(String::new());
+            lines.push(
+                "提示: 调度写在 src/astock/briefing.rs，时间表硬编码。\
+                 改时间需 rebuild + `cargo run -- gateway restart`。"
+                    .to_owned(),
+            );
+            lines.join("\n")
+        }
+        "next" => {
+            let snapshot = crate::astock::briefing::schedule_snapshot();
+            // schedule_snapshot returns slots in wallclock order; find
+            // the earliest absolute time among them — that's "next".
+            match snapshot.into_iter().min_by_key(|(_, w)| *w) {
+                Some((slot, when)) => format!(
+                    "下次: {} ({}) @ {}",
+                    slot.slug(),
+                    slot.label(),
+                    when.format("%Y-%m-%d %H:%M %Z")
+                ),
+                None => "_无可用 slot_".to_owned(),
+            }
+        }
+        "run" => {
+            let Some(slug) = args.get(1) else {
+                return "用法: /astock briefing run <premarket|midday|postmarket>".to_owned();
+            };
+            let Some(slot) = crate::astock::briefing::BriefingSlot::from_slug(slug) else {
+                return format!(
+                    "未知 slot `{slug}`，可选: premarket | midday | postmarket"
+                );
+            };
+            // Fire-and-forget — the dispatch path drops a synthetic
+            // user turn onto the task queue, which the agent runtime
+            // handles asynchronously. The reply we return below is
+            // immediate; the briefing itself arrives a few seconds
+            // later via the normal channel send path.
+            tokio::spawn(async move {
+                crate::astock::briefing::dispatch_one(slot).await;
+            });
+            format!("已触发 {} ({})，几秒内到达。", slot.slug(), slot.label())
+        }
+        other => format!("briefing: 未知动作 `{other}`，可选: list | next | run"),
+    }
+}
+
+async fn astock_watchlist(
+    handle: &crate::agent::AgentHandle,
+    channel: &str,
+    peer_id: &str,
+    args: Vec<String>,
+) -> String {
+    let action = args
+        .first()
+        .map(|s| s.to_lowercase())
+        .unwrap_or_else(|| "list".to_owned());
+    let Some(mem) = crate::agent::memory::global_store() else {
+        return "_memory 未启用，自选股无法持久化_".to_owned();
+    };
+    let scope = crate::agent::tools_stock::watchlist_scope(&handle.id, channel, peer_id);
+    let result = match action.as_str() {
+        "list" | "" => crate::agent::tools_stock::watchlist_list(&mem, &scope).await,
+        "add" => {
+            let codes: Vec<String> = args.iter().skip(1).cloned().collect();
+            crate::agent::tools_stock::watchlist_add(&mem, &scope, codes).await
+        }
+        "remove" | "rm" | "delete" | "del" => {
+            let codes: Vec<String> = args.iter().skip(1).cloned().collect();
+            crate::agent::tools_stock::watchlist_remove(&mem, &scope, codes).await
+        }
+        "clear" => crate::agent::tools_stock::watchlist_clear(&mem, &scope).await,
+        other => {
+            return format!(
+                "watchlist: 未知动作 `{other}`，可选: list | add | remove | clear"
+            );
+        }
+    };
+    match result {
+        Ok(v) => format_watchlist_reply(&action, &v),
+        Err(e) => format!("/astock watchlist 出错: {e:#}"),
+    }
+}
+
+fn format_watchlist_reply(action: &str, v: &serde_json::Value) -> String {
+    let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
+    if !ok {
+        return v
+            .get("error")
+            .and_then(|x| x.as_str())
+            .unwrap_or("_出错_")
+            .to_owned();
+    }
+    match action {
+        "list" | "" => {
+            let codes: Vec<&str> = v
+                .get("codes")
+                .and_then(|x| x.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            if codes.is_empty() {
+                "_自选股为空 — `/astock watchlist add <code>` 加一只_".to_owned()
+            } else {
+                format!(
+                    "自选股 ({}): {}",
+                    codes.len(),
+                    codes.join(", ")
+                )
+            }
+        }
+        "add" => {
+            let added: Vec<&str> = v
+                .get("added")
+                .and_then(|x| x.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            let total = v.get("total").and_then(|x| x.as_u64()).unwrap_or(0);
+            if added.is_empty() {
+                format!("已存在或无新代码 (当前 {total} 只)")
+            } else {
+                format!(
+                    "已加入 {}: {}  (当前 {} 只)",
+                    added.len(),
+                    added.join(", "),
+                    total
+                )
+            }
+        }
+        "remove" | "rm" | "delete" | "del" => {
+            let removed = v.get("removed").and_then(|x| x.as_u64()).unwrap_or(0);
+            let requested = v.get("requested").and_then(|x| x.as_u64()).unwrap_or(0);
+            format!("删除 {removed}/{requested}")
+        }
+        "clear" => {
+            let removed = v.get("removed").and_then(|x| x.as_u64()).unwrap_or(0);
+            format!("已清空 (删除 {removed} 只)")
+        }
+        _ => v.to_string(),
+    }
+}
+
+async fn astock_quote(args: Vec<String>) -> String {
+    let codes: Vec<String> = args
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+    if codes.is_empty() {
+        return "用法: /astock quote <code> [<code>...]".to_owned();
+    }
+    let Some(arc) = crate::astock::global_client() else {
+        return "_astock 未启用_".to_owned();
+    };
+    let result = if codes.len() == 1 {
+        match arc.quote(&codes[0]).await {
+            Ok(q) => vec![q],
+            Err(e) => return format!("astock quote: {e}"),
+        }
+    } else {
+        match arc.quote_batch(&codes).await {
+            Ok(qs) => qs,
+            Err(e) => return format!("astock quote_batch: {e}"),
+        }
+    };
+    crate::agent::tools_stock::render_quotes_markdown(&result)
+}
+
+async fn astock_snapshot(
+    handle: &crate::agent::AgentHandle,
+    channel: &str,
+    peer_id: &str,
+    args: Vec<String>,
+) -> String {
+    let mut codes: Vec<String> = args
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+    let Some(arc) = crate::astock::global_client() else {
+        return "_astock 未启用_".to_owned();
+    };
+    let mut used_watchlist = false;
+    if codes.is_empty() {
+        // No explicit args → fall back to the caller's watchlist
+        // (matches `tool_stock_snapshot`'s `use_watchlist` default).
+        if let Some(mem) = crate::agent::memory::global_store() {
+            let scope = crate::agent::tools_stock::watchlist_scope(&handle.id, channel, peer_id);
+            let store = mem.lock().await;
+            codes = store
+                .list_active()
+                .into_iter()
+                .filter(|d| d.scope == scope && d.kind == "watchlist")
+                .map(|d| d.text)
+                .collect();
+            drop(store);
+            used_watchlist = !codes.is_empty();
+        }
+    }
+    if codes.is_empty() {
+        return "_无代码且自选股为空 — `/astock watchlist add <code>` 先加一只_".to_owned();
+    }
+    let rows = match arc.snapshot(None, None, &codes, None).await {
+        Ok(r) => r,
+        Err(e) => return format!("astock snapshot: {e}"),
+    };
+    crate::agent::tools_stock::render_snapshot_markdown(&rows, used_watchlist, "amount")
+}
+
+/// Render a chart and return an `OutboundMessage` with the PNG
+/// attached as a base64 data URI. The channel sender (feishu/wechat)
+/// already knows how to upload `data:image/png;base64,...` payloads
+/// from the `images` field — see `feishu.rs::send_text_with_images`.
+async fn astock_chart_outbound(args: Vec<String>) -> OutboundMessage {
+    let code = match args.first() {
+        Some(c) if !c.is_empty() => c.clone(),
+        _ => {
+            return OutboundMessage {
+                text: "用法: /astock chart <code> [period] [count]".to_owned(),
+                ..Default::default()
+            };
+        }
+    };
+    let period = args.get(1).cloned().unwrap_or_else(|| "1d".to_owned());
+    let count_n = args.get(2).and_then(|s| s.parse::<u32>().ok()).unwrap_or(60);
+    let input = crate::agent::tools_stock::ChartRenderInput {
+        code: &code,
+        period: &period,
+        count: count_n,
+        adjust: "qfq",
+        ma_periods: vec![5, 10, 20, 60],
+        name_hint: None,
+    };
+    let out = match crate::agent::tools_stock::render_chart_for_code(input).await {
+        Ok(o) => o,
+        Err(crate::agent::tools_stock::ChartRenderError::Dormant) => {
+            return OutboundMessage {
+                text: "_astock 未启用_".to_owned(),
+                ..Default::default()
+            };
+        }
+        Err(crate::agent::tools_stock::ChartRenderError::Soft(msg)) => {
+            return OutboundMessage {
+                text: msg,
+                ..Default::default()
+            };
+        }
+    };
+    // PNG → base64 data URI. Same shape as
+    // `server::resolve_media_to_image_data` and what the feishu
+    // sender expects from `OutboundMessage::images`.
+    use base64::Engine;
+    let bytes = match tokio::fs::read(&out.path).await {
+        Ok(b) => b,
+        Err(e) => {
+            return OutboundMessage {
+                text: format!("chart 渲染成功但读取失败: {e}"),
+                ..Default::default()
+            };
+        }
+    };
+    let data_uri = format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    );
+    OutboundMessage {
+        text: out.title,
+        images: vec![data_uri],
+        ..Default::default()
+    }
 }
 
 /// Check if a message is a fast preparse command that should bypass the
@@ -1271,6 +1640,7 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
         "/ls" | "/status" | "/version" | "/help" | "/?" | "/health" | "/uptime"
             | "/model" | "/models" | "/cron" | "/clear" | "/new" | "/abort" | "/sessions"
             | "/loop" | "/task" | "/watch" | "/plugin" | "/cap" | "/cap-exit" | "/cap-resume"
+            | "/astock"
     )
     // Commands with optional/required args
     || lower.starts_with("/ls ")
@@ -1290,6 +1660,7 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
     || lower.starts_with("/watch ")
     || lower.starts_with("/cap ")
     || lower.starts_with("/cap-resume ")
+    || lower.starts_with("/astock ")
     // /task only short-circuits on help variants; non-help forms must NOT
     // bypass the queue (the task queue worker owns the multi-turn flow).
     || lower == "/task -h"
@@ -1498,6 +1869,8 @@ fn help_text(lang: &str) -> String {
          \u{0020}\u{0020}/task -h         多轮任务（详见 -h）\n\
          \u{0020}\u{0020}/loop -h         定时循环（详见 -h）\n\
          \u{0020}\u{0020}/cron list       查看定时任务\n\n\
+         A股 (astock)\n\
+         \u{0020}\u{0020}/astock          A股数据 & 早报调度（详见 /astock help）\n\n\
          文件/截图\n\
          \u{0020}\u{0020}/ls [path]       列出工作区目录\n\
          \u{0020}\u{0020}/cat <file>      查看文件内容\n\
@@ -1531,6 +1904,8 @@ fn help_text(lang: &str) -> String {
          \u{0020}\u{0020}/task -h         multi-turn task (see -h)\n\
          \u{0020}\u{0020}/loop -h         repeat on a schedule (see -h)\n\
          \u{0020}\u{0020}/cron list       view cron jobs\n\n\
+         A-shares (astock)\n\
+         \u{0020}\u{0020}/astock          A-share data & briefing scheduler (see /astock help)\n\n\
          File / screenshot\n\
          \u{0020}\u{0020}/ls [path]       list workspace directory\n\
          \u{0020}\u{0020}/cat <file>      view file contents\n\
