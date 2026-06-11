@@ -2191,6 +2191,14 @@ pub struct MemoryConfig {
     /// content. Set false to keep auto-recall memory-only (the explicit
     /// `knowledge_base` tool is unaffected).
     pub kb_auto_recall: Option<bool>,
+    /// Deliver auto-recall (memory + KB + working plan) to NON-rsclaw
+    /// providers too, by injecting it as turn-local text into the request
+    /// copy of the user message (never persisted — session history stays
+    /// clean). Default true. The cost on paid APIs is the recall budget
+    /// (~1.8K tokens max per recall-bearing turn) plus losing prefix-cache
+    /// reuse of the final exchange each turn. Set false to restore the old
+    /// rsclaw-only behaviour.
+    pub recall_external_providers: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
