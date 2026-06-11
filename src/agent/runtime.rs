@@ -2364,7 +2364,7 @@ impl AgentRuntime {
                 // buffered text and exit. The signal is best-effort:
                 // if the chunker already exited (e.g. bus dropped),
                 // send() returns Err which we ignore.
-                let (assistant_chunks, thought_chunks) = if let Some((handle, signal_tx, chunk_count)) =
+                let streamed_chunks = if let Some((handle, signal_tx, chunk_count)) =
                     chunker_handle
                 {
                     let _ = signal_tx.send(());
@@ -2376,19 +2376,16 @@ impl AgentRuntime {
                         handle,
                     )
                     .await;
-                    decode_chunk_counts(
-                        chunk_count.load(std::sync::atomic::Ordering::SeqCst),
-                    )
+                    chunk_count.load(std::sync::atomic::Ordering::SeqCst)
                 } else {
-                    (0, 0)
+                    0
                 };
-                if assistant_chunks + thought_chunks > 0 {
+                if streamed_chunks > 0 {
                     tracing::info!(
                         target: "cap",
                         live_session_id = %live_sid,
                         agent = kind.as_str(),
-                        assistant_chunks,
-                        thought_chunks,
+                        streamed_chunks,
                         "sticky chunker streamed deltas to IM"
                     );
                 }
@@ -2398,7 +2395,7 @@ impl AgentRuntime {
                     // outbound. WS subscribers already got the same
                     // deltas straight off event_bus, so they aren't
                     // shortchanged by the empty AgentReply.
-                    Ok(_) if assistant_chunks > 0 => {
+                    Ok(_) if streamed_chunks > 0 => {
                         return Ok(AgentReply {
                             text: String::new(),
                             is_empty: true,
@@ -2412,11 +2409,9 @@ impl AgentRuntime {
                     }
                     Ok(r) => {
                         // Either nothing streamed at all (no IM target /
-                        // bus unavailable), OR only thought chunks
-                        // streamed but no final assistant text. Fall
-                        // back to the legacy single-message path so the
-                        // user always sees a concrete reply or a
-                        // "(no output)" marker after the thinking.
+                        // bus unavailable). Fall back to the legacy
+                        // single-message path so the user always sees
+                        // a concrete reply or a "(no output)" marker.
                         let reply_text = r.output;
                         let is_empty = reply_text.trim().is_empty();
                         return Ok(AgentReply {
@@ -4405,12 +4400,13 @@ impl AgentRuntime {
                             if paths.is_empty() {
                                 String::new()
                             } else {
-                                format!("(路径: {})", paths.join(", "))
+                                format!(" (path: {})", paths.join(", "))
                             }
                         };
                         media_descriptions.push(format!(
-                            "用户上传了 {n} 张图片{path_hint},但 vision 模型识别失败 ({e})。\
-                             请告诉用户图片无法解析,建议稍后重试,或换工具重新引用同一路径。",
+                            "User uploaded {n} image(s){path_hint} but vision captioning failed ({e}). \
+                             Tell the user the image could not be parsed. Suggest retrying later, \
+                             or re-referencing the same path with a different tool.",
                             n = images.len()
                         ));
                     }
@@ -11447,56 +11443,28 @@ async fn stream_cap_chunks_to_im(
 
     let mut buf = String::new();
     let mut first_delta_at: Option<tokio::time::Instant> = None;
-    // Tracks whether the current buf is a thought stream. We never
-    // mix assistant + thought in one OutboundMessage — switching
-    // channels triggers an immediate flush of the in-flight buffer.
-    let mut buf_is_thought = false;
 
-    // `chunk_count` is the legacy "did we send anything" counter; the
-    // sticky-bypass caller reads its low bits to decide whether to
-    // suppress the final outbound. Splitting it lets us distinguish
-    // "user saw the actual answer" (assistant chunks) from "user only
-    // saw codex thinking, no answer materialised" (thought chunks
-    // only) — the second case still needs a fallback message.
-    //
-    // Encoding: low 32 bits = assistant, high 32 bits = thought.
-    // Atomic adds preserve the per-half counters independently as
-    // long as neither overflows (which would need ~2 billion chunks
-    // in one turn — not happening).
-    const THOUGHT_BIT_SHIFT: u32 = 32;
+    // `chunk_count` tracks how many IM messages the chunker sent.
+    // The sticky-bypass caller reads it to decide whether to suppress
+    // the final outbound (if we already streamed the answer, skip the
+    // duplicate AgentReply).
     let flush = |buf: &mut String,
-                 buf_is_thought: bool,
                  chunk_count: &std::sync::Arc<std::sync::atomic::AtomicUsize>|
      -> Option<crate::channel::OutboundMessage> {
         if buf.is_empty() {
             return None;
         }
-        // Prefix thought chunks with 💭 so users (and screen-readers)
-        // can tell reasoning apart from the actual answer. The emoji
-        // is duplicated across IM platforms (feishu/wechat/etc.) and
-        // costs ~6 bytes per flush — negligible compared to the
-        // multi-hundred-char body that follows.
-        let text = if buf_is_thought {
-            format!("💭 {}", std::mem::take(buf))
-        } else {
-            std::mem::take(buf)
-        };
         let msg = crate::channel::OutboundMessage {
             target_id: target_id.clone(),
             is_group,
-            text,
+            text: std::mem::take(buf),
             reply_to: None,
             images: vec![],
             files: vec![],
             channel: Some(channel.clone()),
             account: account.clone(),
         };
-        let increment = if buf_is_thought {
-            1usize << THOUGHT_BIT_SHIFT
-        } else {
-            1usize
-        };
-        chunk_count.fetch_add(increment, Ordering::SeqCst);
+        chunk_count.fetch_add(1, Ordering::SeqCst);
         Some(msg)
     };
 
@@ -11561,25 +11529,17 @@ async fn stream_cap_chunks_to_im(
                         continue;
                     }
                     if !e.delta.is_empty() {
-                        // Detect channel switch (assistant ⇄ thought).
-                        // Different channels must NEVER share a buffer
-                        // because (a) they render with different
-                        // prefixes (💭 vs none), and (b) thought is
-                        // semantically distinct from the answer — a
-                        // burst of reasoning sandwiched inside the
-                        // visible reply text would look like the agent
-                        // is talking to itself.
                         let ev_is_thought = matches!(
                             e.channel,
                             Some(crate::events::TextChannel::Thought)
                         );
-                        if !buf.is_empty() && ev_is_thought != buf_is_thought {
-                            if let Some(msg) = flush(&mut buf, buf_is_thought, &chunk_count) {
-                                let _ = notif_tx.send(msg);
-                            }
-                            first_delta_at = None;
+                        // Skip thought/reasoning tokens in IM stream.
+                        // Coding agents emit verbose English thinking
+                        // that clutters Feishu/WeChat/etc. Only
+                        // Assistant-channel text goes to IM.
+                        if ev_is_thought {
+                            continue;
                         }
-                        buf_is_thought = ev_is_thought;
                         buf.push_str(&e.delta);
                         if first_delta_at.is_none() {
                             first_delta_at = Some(tokio::time::Instant::now());
@@ -11587,7 +11547,7 @@ async fn stream_cap_chunks_to_im(
                         // Size-based fast flush so the first chunk
                         // lands quickly on long replies.
                         if buf.chars().count() >= MIN_FLUSH_CHARS {
-                            if let Some(msg) = flush(&mut buf, buf_is_thought, &chunk_count) {
+                            if let Some(msg) = flush(&mut buf, &chunk_count) {
                                 let _ = notif_tx.send(msg);
                             }
                             first_delta_at = None;
@@ -11596,7 +11556,7 @@ async fn stream_cap_chunks_to_im(
                     if e.done {
                         // The actor signalled end-of-turn. dispatch_sync
                         // is about to return; flush + exit.
-                        if let Some(msg) = flush(&mut buf, buf_is_thought, &chunk_count) {
+                        if let Some(msg) = flush(&mut buf, &chunk_count) {
                             let _ = notif_tx.send(msg);
                         }
                         break;
@@ -11612,7 +11572,7 @@ async fn stream_cap_chunks_to_im(
 
             // Debounce timer elapsed — flush whatever's buffered.
             _ = deadline_fut => {
-                if let Some(msg) = flush(&mut buf, buf_is_thought, &chunk_count) {
+                if let Some(msg) = flush(&mut buf, &chunk_count) {
                     let _ = notif_tx.send(msg);
                 }
                 first_delta_at = None;
@@ -11623,37 +11583,19 @@ async fn stream_cap_chunks_to_im(
     // Final flush on the way out so a tail that hasn't crossed the
     // debounce or the size threshold still reaches the user.
     if !buf.is_empty() {
-        let text = if buf_is_thought {
-            format!("💭 {buf}")
-        } else {
-            buf
-        };
         let msg = crate::channel::OutboundMessage {
             target_id,
             is_group,
-            text,
+            text: std::mem::take(&mut buf),
             reply_to: None,
             images: vec![],
             files: vec![],
             channel: Some(channel),
             account,
         };
-        let increment = if buf_is_thought {
-            1usize << THOUGHT_BIT_SHIFT
-        } else {
-            1usize
-        };
-        chunk_count.fetch_add(increment, Ordering::SeqCst);
+        chunk_count.fetch_add(1, Ordering::SeqCst);
         let _ = notif_tx.send(msg);
     }
-}
-
-/// Decode the split chunk_count atomic into (assistant_chunks, thought_chunks).
-/// See the `THOUGHT_BIT_SHIFT` constant inside `stream_cap_chunks_to_im`.
-fn decode_chunk_counts(packed: usize) -> (usize, usize) {
-    let assistant = packed & 0xFFFF_FFFF;
-    let thought = (packed >> 32) & 0xFFFF_FFFF;
-    (assistant, thought)
 }
 
 // Tests

@@ -1068,7 +1068,7 @@ impl FeishuChannel {
                     }
                     Err(e) => {
                         warn!(error = format!("{e:#}"), "feishu: video download failed");
-                        "__DIRECT_REPLY__视频下载失败（可能下载超时或连接中断）。请重试或改用更小的文件。".to_owned()
+                        "__DIRECT_REPLY__Video download failed (timeout or connection issue). Please retry or use a smaller file.".to_owned()
                     }
                 }
             }
@@ -1174,7 +1174,7 @@ impl FeishuChannel {
                             // real reqwest cause (timeout vs reset vs decode) is
                             // invisible and the agent just hallucinates "no file".
                             warn!(name = file_name, error = format!("{e:#}"), "feishu: file download failed");
-                            "__DIRECT_REPLY__文件下载失败（可能下载超时或连接中断）。请重试，或改用更小的文件 / 公网链接。".to_owned()
+                            "__DIRECT_REPLY__File download failed (timeout or connection issue). Please retry, use a smaller file, or provide a public URL.".to_owned()
                         }
                     }
                 }
