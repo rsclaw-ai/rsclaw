@@ -10591,7 +10591,7 @@ pub(crate) fn canonicalize_external_path(
 
 /// Attempt to extract readable text from a file based on extension.
 /// Returns `None` for binary/unrecognized formats.
-async fn extract_file_text(filename: &str, bytes: &[u8]) -> Option<String> {
+pub(crate) async fn extract_file_text(filename: &str, bytes: &[u8]) -> Option<String> {
     let lower = filename.to_lowercase();
     if lower.ends_with(".pdf") {
         match crate::agent::doc::safe_extract_pdf_from_mem(bytes) {

@@ -45,6 +45,9 @@ interface host-runtime {
     log: func(level: string, msg: string);
     sleep: func(ms: u32);
     read-file: func(path: string) -> result<string, string>;
+    /// Extract readable text from a saved plugin artifact. The path is
+    /// sandboxed to plugin-controlled artifact directories.
+    extract-file-text: func(path: string) -> result<string, string>;
     /// Write `contents` to `path`. The path is sandboxed to the plugin
     /// workspace or var/plugins/<name>/ directory; writes outside these
     /// dirs are rejected. Parent directories are created automatically.
@@ -77,6 +80,11 @@ interface host-runtime {
     /// host populates OutboundMessage.files; channel handlers decide
     /// how to deliver (IM channels upload, desktop surfaces the path).
     notify-with-file: func(message: string, file-path: string, mime: string) -> result<string, string>;
+
+    /// Ingest a prepared document into the local knowledge base. The
+    /// collection is resolved by name and created when missing.
+    kb-ingest-document: func(collection: string, title: string, content: string, mime: string)
+        -> result<string, string>;
 }
 
 interface host-storage {

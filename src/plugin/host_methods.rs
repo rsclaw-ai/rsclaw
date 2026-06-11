@@ -52,6 +52,8 @@ impl HostMethodRegistry {
             "browser_download" => self.host_browser_download(params).await,
             "sleep" => self.host_sleep(params).await,
             "storage_allocate_artifact" => self.host_storage_allocate_artifact(params).await,
+            "extract_file_text" => self.host_extract_file_text(params).await,
+            "kb_ingest_document" => self.host_kb_ingest_document(params).await,
             "extract_audio" => self.host_extract_audio(params).await,
             "transcribe" => self.host_transcribe(params).await,
             "extract_keyframes" => self.host_extract_keyframes(params).await,
@@ -364,6 +366,38 @@ impl HostMethodRegistry {
             }
             Err(e) => Err(anyhow::anyhow!("{e}")),
         }
+    }
+
+    /// Extract readable text from a saved plugin artifact.
+    /// Params: `{ "path": "<artifact path>" }`. Mirrors wasm `extract-file-text`.
+    async fn host_extract_file_text(&self, params: Value) -> Result<Value> {
+        let path = params["path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("extract_file_text: `path` required"))?;
+        match crate::plugin::wasm_runtime::extract_text_from_plugin_file(path).await {
+            Ok(text) => Ok(Value::String(text)),
+            Err(e) => Err(anyhow::anyhow!("{e}")),
+        }
+    }
+
+    /// Ingest a prepared document into the local knowledge base.
+    /// Params: `{ "collection": "...", "title": "...", "content": "...", "mime": "text/markdown" }`.
+    async fn host_kb_ingest_document(&self, params: Value) -> Result<Value> {
+        let collection = params["collection"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("kb_ingest_document: `collection` required"))?;
+        let title = params["title"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("kb_ingest_document: `title` required"))?;
+        let content = params["content"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("kb_ingest_document: `content` required"))?;
+        let mime = params["mime"].as_str().unwrap_or("text/markdown");
+        let out =
+            crate::plugin::wasm_runtime::kb_ingest_document(collection, title, content, mime)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        serde_json::from_str(&out).map_err(|e| anyhow::anyhow!("kb ingest result JSON: {e}"))
     }
 
     // ---- Media methods ----
