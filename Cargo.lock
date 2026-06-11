@@ -1044,6 +1044,7 @@ dependencies = [
 [[package]]
 name = "cap-rs"
 version = "0.1.0"
+source = "git+https://github.com/rsclaw-ai/cap-protocol.git?rev=52aea033a7facd5c08d1f0366955363113d8ecc3#52aea033a7facd5c08d1f0366955363113d8ecc3"
 dependencies = [
  "async-trait",
  "serde",
