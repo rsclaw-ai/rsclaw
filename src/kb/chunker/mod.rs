@@ -25,6 +25,11 @@ pub struct ChunkerInput<'a> {
     pub logical_source_id: &'a LogicalSourceId,
     pub doc_id: &'a str,
     pub doc_version: u32,
+    /// Document title, prepended to every chunk's `indexed_text` (contextual
+    /// retrieval). Critical for heading-less articles (公众号 posts): without
+    /// it a chunk embeds as bare body text with zero document identity.
+    /// Empty string = no title prefix.
+    pub doc_title: &'a str,
     pub markdown_body: &'a str,
     pub default_locator_kind: LocatorKind,
 }
@@ -105,10 +110,21 @@ fn flush(
     // index under "Title > Sub", which is the heading state at the
     // END of the chunk, not the empty state before the first heading.
     let path = heading_path_at(input.markdown_body, end);
-    let indexed = if path.is_empty() {
+    // Contextual prefix: doc title first, then the heading path — both
+    // embedding and BM25 run over `indexed_text`, so this is what gives a
+    // chunk its document identity. Skip the title when the first heading
+    // already IS the title (markdown whose H1 doubles as the title would
+    // otherwise index "标题 > 标题 > 小节").
+    let title = input.doc_title.trim();
+    let mut crumbs: Vec<&str> = Vec::with_capacity(path.len() + 1);
+    if !title.is_empty() && path.first().map(String::as_str) != Some(title) {
+        crumbs.push(title);
+    }
+    crumbs.extend(path.iter().map(String::as_str));
+    let indexed = if crumbs.is_empty() {
         body.to_string()
     } else {
-        format!("{}\n\n{body}", path.join(" > "))
+        format!("{}\n\n{body}", crumbs.join(" > "))
     };
     let id = chunk_id(input.logical_source_id, *seq, body);
     let sim = simhash64(body);
@@ -164,6 +180,7 @@ mod tests {
             logical_source_id: &lsid(),
             doc_id: "d1",
             doc_version: 1,
+            doc_title: "",
             markdown_body: "tiny.",
             default_locator_kind: LocatorKind::Offset,
         });
@@ -177,6 +194,7 @@ mod tests {
             logical_source_id: &lsid(),
             doc_id: "d1",
             doc_version: 1,
+            doc_title: "",
             markdown_body: &md,
             default_locator_kind: LocatorKind::Offset,
         });
@@ -190,6 +208,7 @@ mod tests {
             logical_source_id: &lsid(),
             doc_id: "d1",
             doc_version: 1,
+            doc_title: "",
             markdown_body: md,
             default_locator_kind: LocatorKind::MdSection,
         });
@@ -197,6 +216,49 @@ mod tests {
         assert_eq!(
             chunks[0].heading_path,
             vec!["Mengniu".to_string(), "Recipe".to_string()]
+        );
+    }
+
+    #[test]
+    fn doc_title_prefixes_headingless_chunks() {
+        // 公众号-style article: title lives in doc metadata, body has no
+        // headings. Without the title prefix the chunk embeds as bare body
+        // text with zero document identity.
+        let chunks = chunk_markdown(ChunkerInput {
+            logical_source_id: &lsid(),
+            doc_id: "d1",
+            doc_version: 1,
+            doc_title: "蒙牛2025年报解读",
+            markdown_body: "营收同比增长12%，净利润率改善。",
+            default_locator_kind: LocatorKind::MdSection,
+        });
+        assert!(
+            chunks[0].indexed_text.starts_with("蒙牛2025年报解读\n\n"),
+            "{}",
+            chunks[0].indexed_text
+        );
+        // The displayed body (byte_offset into the doc file) is unaffected —
+        // only indexed_text carries the prefix.
+        assert!(chunks[0].heading_path.is_empty());
+    }
+
+    #[test]
+    fn doc_title_deduped_when_h1_equals_title() {
+        // Markdown whose H1 doubles as the doc title must not index as
+        // "标题 > 标题 > 小节".
+        let md = "# Mengniu\n## Recipe\n100g + 100ml.";
+        let chunks = chunk_markdown(ChunkerInput {
+            logical_source_id: &lsid(),
+            doc_id: "d1",
+            doc_version: 1,
+            doc_title: "Mengniu",
+            markdown_body: md,
+            default_locator_kind: LocatorKind::MdSection,
+        });
+        assert!(
+            chunks[0].indexed_text.starts_with("Mengniu > Recipe\n\n"),
+            "{}",
+            chunks[0].indexed_text
         );
     }
 
@@ -209,6 +271,7 @@ mod tests {
             logical_source_id: &lsid(),
             doc_id: "d1",
             doc_version: 1,
+            doc_title: "",
             markdown_body: md,
             default_locator_kind: LocatorKind::Offset,
         });
@@ -216,6 +279,7 @@ mod tests {
             logical_source_id: &lsid(),
             doc_id: "d2",
             doc_version: 5, // different doc_id and version
+            doc_title: "",
             markdown_body: md,
             default_locator_kind: LocatorKind::Offset,
         });
@@ -236,6 +300,7 @@ mod tests {
             logical_source_id: &lsid(),
             doc_id: "d1",
             doc_version: 1,
+            doc_title: "",
             markdown_body: md,
             default_locator_kind: LocatorKind::Offset,
         });
@@ -249,6 +314,7 @@ mod tests {
             logical_source_id: &lsid(),
             doc_id: "d1",
             doc_version: 1,
+            doc_title: "",
             markdown_body: md,
             default_locator_kind: LocatorKind::Offset,
         });
