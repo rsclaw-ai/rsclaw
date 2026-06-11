@@ -50,6 +50,9 @@ impl Default for MeditationConfig {
 /// Summary of actions taken during a meditation cycle.
 #[derive(Debug, Default)]
 pub struct MeditationReport {
+    /// Lessons published to the workspace `memory/lessons.md` (0 also when
+    /// the file was removed because no lesson qualified).
+    pub lessons_published: usize,
     /// Number of duplicate documents merged (deleted).
     pub duplicates_merged: usize,
     /// Number of crystallized documents cleaned (demoted).
@@ -269,4 +272,102 @@ async fn cleanup_phase(
     }
 
     Ok(cleaned)
+}
+
+/// Lessons phase: publish the top user-correction lessons into the agent's
+/// workspace as `memory/lessons.md`, which the workspace context loads into
+/// the system prompt's "Learned Rules" section every turn. This is the
+/// always-visible channel for behavioural corrections — vector recall only
+/// surfaces a lesson when the query happens to be near it; rules like
+/// "don't add comments unless asked" must not depend on that luck.
+///
+/// Deterministic and idempotent: top `max` lessons by importance (floor
+/// 0.6), rendered as bullets. No qualifying lessons → the file is removed
+/// so stale rules never linger.
+pub fn lessons_phase(
+    store: &crate::agent::memory::MemoryStore,
+    scope: &str,
+    workspace: &std::path::Path,
+    max: usize,
+) -> Result<usize> {
+    const MIN_IMPORTANCE: f32 = 0.6;
+    let lessons: Vec<String> = store
+        .find_by_kind(scope, "lesson")
+        .into_iter()
+        .filter(|d| d.importance >= MIN_IMPORTANCE)
+        .take(max)
+        .map(|d| format!("- {}", d.text.replace('\n', " ")))
+        .collect();
+
+    let path = workspace.join("memory").join("lessons.md");
+    if lessons.is_empty() {
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+        return Ok(0);
+    }
+    std::fs::create_dir_all(workspace.join("memory"))?;
+    let body = format!(
+        "<!-- Auto-maintained by the meditation cycle from kind=lesson \
+memories. Edit the memories, not this file. -->\n\
+These are standing behavioural rules learned from the user's corrections. \
+Follow them unless the user says otherwise.\n\n{}\n",
+        lessons.join("\n")
+    );
+    std::fs::write(&path, body)?;
+    Ok(lessons.len())
+}
+
+#[cfg(test)]
+mod lessons_tests {
+    use super::*;
+    use crate::agent::memory::{MemDocTier, MemoryDoc, MemoryStore};
+    use crate::MemoryTier;
+
+    fn lesson(id: &str, text: &str, importance: f32) -> MemoryDoc {
+        MemoryDoc {
+            id: id.into(),
+            scope: "agent:t".into(),
+            kind: "lesson".into(),
+            text: text.into(),
+            vector: vec![],
+            created_at: 0,
+            accessed_at: 0,
+            access_count: 0,
+            importance,
+            tier: MemDocTier::Core,
+            abstract_text: None,
+            overview_text: None,
+            tags: vec![],
+            pinned: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn lessons_phase_publishes_and_retracts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let mut store = MemoryStore::open(&tmp.path().join("mem"), None, MemoryTier::High, None)
+            .await
+            .unwrap();
+        store.add(lesson("l1", "回答代码问题时不要加解释性注释", 0.85)).await.unwrap();
+        store.add(lesson("l2", "提交信息永远不要加 Co-Authored-By", 0.9)).await.unwrap();
+        store.add(lesson("l3", "低置信教训不该出现", 0.3)).await.unwrap();
+
+        let n = lessons_phase(&store, "agent:t", &ws, 8).unwrap();
+        assert_eq!(n, 2);
+        let body = std::fs::read_to_string(ws.join("memory").join("lessons.md")).unwrap();
+        assert!(body.contains("Co-Authored-By"));
+        assert!(body.contains("解释性注释"));
+        assert!(!body.contains("低置信教训"));
+        // importance 排序：0.9 在前
+        assert!(body.find("Co-Authored-By").unwrap() < body.find("解释性注释").unwrap());
+
+        // 全部教训失格 → 文件撤下
+        store.adjust_importance("l1", -0.8).await.unwrap();
+        store.adjust_importance("l2", -0.8).await.unwrap();
+        let n = lessons_phase(&store, "agent:t", &ws, 8).unwrap();
+        assert_eq!(n, 0);
+        assert!(!ws.join("memory").join("lessons.md").exists());
+    }
 }

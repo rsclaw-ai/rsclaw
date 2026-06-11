@@ -1310,6 +1310,23 @@ impl MemoryStore {
         Ok(idxs.len())
     }
 
+    /// Return all non-deleted docs of `kind` in `scope`, sorted by
+    /// importance descending. Used by the meditation lessons phase.
+    pub fn find_by_kind(&self, scope: &str, kind: &str) -> Vec<&MemoryDoc> {
+        let mut out: Vec<&MemoryDoc> = self
+            .docs
+            .iter()
+            .filter(|d| !d.id.is_empty() && d.scope == scope && d.kind == kind)
+            .collect();
+        out.sort_by(|a, b| {
+            b.importance
+                .partial_cmp(&a.importance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.created_at.cmp(&a.created_at))
+        });
+        out
+    }
+
     /// Return all non-deleted docs in the given tier and scope.
     pub fn find_by_tier(&self, tier: &MemDocTier, scope: Option<&str>) -> Vec<&MemoryDoc> {
         self.docs

@@ -477,11 +477,30 @@ impl HeartbeatRunner {
             }
         }
 
+        // Lessons phase: publish standing behavioural rules (kind=lesson,
+        // importance >= 0.6) into the workspace's memory/lessons.md so the
+        // system prompt's "Learned Rules" section carries them every turn —
+        // corrections must not depend on vector-recall luck.
+        match self.registry.get(agent_id) {
+            Ok(handle) => {
+                if let Some(ws) = handle.config.workspace.as_deref() {
+                    let ws = crate::config::loader::expand_tilde_path_pub(ws);
+                    let store = mem.lock().await;
+                    match meditation::lessons_phase(&store, &scope, &ws, 8) {
+                        Ok(n) => report.lessons_published = n,
+                        Err(e) => warn!(agent_id, "lessons phase failed: {e:#}"),
+                    }
+                }
+            }
+            Err(e) => warn!(agent_id, "lessons phase: agent handle missing: {e:#}"),
+        }
+
         info!(
             agent_id,
             merged = report.duplicates_merged,
             cleaned = report.crystallized_cleaned,
             crystallized = report.skills_crystallized,
+            lessons = report.lessons_published,
             processed = report.total_processed,
             "meditation cycle complete"
         );
