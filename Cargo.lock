@@ -1044,6 +1044,8 @@ dependencies = [
 [[package]]
 name = "cap-rs"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52eb9d61af034f7ceac356611d8eff80af6705c546905756db9920fac1a6d045"
 dependencies = [
  "async-trait",
  "serde",
