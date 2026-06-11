@@ -14,52 +14,52 @@ author: "@rsclaw"
 IMPORTANT:
 - **严禁凭训练知识/记忆作答**。任何赛程·比分·赔率·出线·战绩,都必须 `web_fetch` 真查 API 后再答;查不到就如实说"没查到",绝不编造对阵/比分/时间。
 - 用 `web_fetch` 工具真正发请求,不要输出 JSON 文本当结果。
-- 所有请求带鉴权头 `Authorization: Bearer ${FOOTBALL_API_KEY}`。
+- 所有请求带鉴权头 `（API 公开，无需鉴权）`。
 - ID(matchId/teamId/playerId)整个赛事不变,可直接缓存复用。
 
 ## 配置
-- Base URL:`${FOOTBALL_API_BASE}`(如 `http://api-host:8080/v1`)
-- 鉴权:`Authorization: Bearer ${FOOTBALL_API_KEY}`(或 `X-API-Key`)
+- Base URL:`http://api.duoduoyun.work:8080/v1`(如 `http://api-host:8080/v1`)
+- 鉴权:`（API 公开，无需鉴权）`(或 `X-API-Key`)
 - 完整契约见 football 项目 `docs/worldcup-football-api.openapi.yaml`。
 
 ## 取数(查询类,参赛/中枢都可用)
 
 **赛程 / 某日比赛**(stage/team/status/date 可选):
 ```json
-{"tool": "web_fetch", "url": "${FOOTBALL_API_BASE}/matches?date=2026-06-11", "headers": {"Authorization": "Bearer ${FOOTBALL_API_KEY}"}}
+{"tool": "web_fetch", "url": "http://api.duoduoyun.work:8080/v1/matches?date=2026-06-11"}
 ```
 
 **比赛详情**:
 ```json
-{"tool": "web_fetch", "url": "${FOOTBALL_API_BASE}/matches/wc2026-grp-001", "headers": {"Authorization": "Bearer ${FOOTBALL_API_KEY}"}}
+{"tool": "web_fetch", "url": "http://api.duoduoyun.work:8080/v1/matches/wc2026-grp-001"}
 ```
 
 **出线形势 / 积分榜**(group 可选):
 ```json
-{"tool": "web_fetch", "url": "${FOOTBALL_API_BASE}/standings?group=A", "headers": {"Authorization": "Bearer ${FOOTBALL_API_KEY}"}}
+{"tool": "web_fetch", "url": "http://api.duoduoyun.work:8080/v1/standings?group=A"}
 ```
 
 **球队列表 / 分组**(group 可选):
 ```json
-{"tool": "web_fetch", "url": "${FOOTBALL_API_BASE}/teams?group=A", "headers": {"Authorization": "Bearer ${FOOTBALL_API_KEY}"}}
+{"tool": "web_fetch", "url": "http://api.duoduoyun.work:8080/v1/teams?group=A"}
 ```
 返回队名/分组/队徽。**战力 powerRating 当前数据源无,为 null。**
 
 **两队世界杯交锋史**(teamA/teamB,中文或英文队名皆可):
 ```json
-{"tool": "web_fetch", "url": "${FOOTBALL_API_BASE}/head2head?teamA=巴西&teamB=阿根廷", "headers": {"Authorization": "Bearer ${FOOTBALL_API_KEY}"}}
+{"tool": "web_fetch", "url": "http://api.duoduoyun.work:8080/v1/head2head?teamA=巴西&teamB=阿根廷"}
 ```
 返回 `played/winsA/winsB/draws/goalsA/goalsB` + 逐场 `matches[]`。`matched=false` 表示没匹配到队名(换个写法或告知查不到)。数据为 1930-2022 世界杯正赛(点球以平局记)。
 
 **球队历届世界杯战绩**(team,中文或英文):
 ```json
-{"tool": "web_fetch", "url": "${FOOTBALL_API_BASE}/history/worldcup?team=德国", "headers": {"Authorization": "Bearer ${FOOTBALL_API_KEY}"}}
+{"tool": "web_fetch", "url": "http://api.duoduoyun.work:8080/v1/history/worldcup?team=德国"}
 ```
 返回 `appearances`(参赛届数)+ 总 `played/win/draw/loss/goalsFor/goalsAgainst` + 逐届 `editions[]`。
 
 **世界杯资讯**(q 关键词过滤、limit 条数,均可选):
 ```json
-{"tool": "web_fetch", "url": "${FOOTBALL_API_BASE}/news?q=世界杯&limit=10", "headers": {"Authorization": "Bearer ${FOOTBALL_API_KEY}"}}
+{"tool": "web_fetch", "url": "http://api.duoduoyun.work:8080/v1/news?q=世界杯&limit=10"}
 ```
 返回 `data[]`(title/summary/url/author/publishedAt/tags)。来源懂球帝,已滤掉非足球内容;实时更新,缓存数分钟。
 
