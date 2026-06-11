@@ -185,6 +185,39 @@ const LESSON_PROMPT: &str = "The user message below is reacting to the assistant
 
 const EXTRACTION_PROMPT: &str = "Extract durable, long-term-worthy information from the user message below. Capture only stable, reusable knowledge: identity, contact details, preferences, stable facts, project state, relationships between people/orgs, and reusable procedures. Ignore greetings, questions, one-off task requests, and emotional venting.\nCRITICAL: Use ONLY facts the user explicitly states in THIS message. Never infer, complete, guess, or invent any value — in particular do NOT fabricate emails, phone numbers, IDs, names, addresses, or dates (e.g. never output a placeholder like test@example.com). If a detail is not literally present in the message, omit it entirely.\nOutput a JSON array; each element: {\"kind\":\"<kind>\",\"text\":\"<concise third-person statement>\",\"confidence\":<number 0..1>}\nkind must be exactly one of: entity, preference, fact, project_state, relationship, procedure.\nWrite text in the third person and self-contained. CRITICAL: the text MUST be in the SAME language as the user message — if the user wrote in Chinese, the text MUST be in Chinese; if English, English. Never translate. Translating breaks keyword recall.\nExamples — Chinese in, Chinese out: \"用户名叫东升\", \"用户偏好简洁直接的回答\", \"用户最喜欢的车是 tesla\", \"用户的发布流程：cargo test，然后检查 UI，然后 commit\". English in, English out: \"User's name is John\", \"User prefers concise answers\".\nEvery item must include a numeric confidence in [0,1]. If nothing is worth remembering long-term, output an empty array []. Output ONLY JSON — no explanation, no code fences.\n\nUser message:\n";
 
+/// Pre-insert dedup for extracted memories: exact text match within
+/// (scope, kind) first, then semantic near-dup across kinds (Phase 4 —
+/// catches the deterministic-phone vs L1-phone class of duplicate that
+/// `find_exact` never could). A semantic hit refreshes the existing doc
+/// (max-merge importance + recency bump) instead of inserting a sibling.
+/// Returns true when the new item should be skipped.
+async fn dedup_or_refresh(
+    mem: &Arc<Mutex<MemoryStore>>,
+    scope: &str,
+    kind: &str,
+    text: &str,
+    importance: f32,
+) -> bool {
+    let threshold = crate::agent::evolution::evolution_config()
+        .meditation
+        .dedup_threshold;
+    let mut guard = mem.lock().await;
+    if guard.find_exact(scope, kind, text).is_some() {
+        return true;
+    }
+    if let Some((dup_id, sim)) = guard.find_semantic_dup(scope, text, threshold) {
+        match guard.refresh_as_duplicate(&dup_id, importance) {
+            Ok(true) => {
+                tracing::debug!(%dup_id, sim, kind, "semantic dup — refreshed existing doc");
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!("semantic dup refresh failed: {e:#}"),
+        }
+        return true;
+    }
+    false
+}
+
 /// Spawn-friendly L1 extraction. Resolves the flash model, distills the user
 /// message into structured candidates, and writes the salient ones (deduped via
 /// `find_exact`).
@@ -246,13 +279,7 @@ pub(crate) async fn extract_l1(
         if text.chars().count() < 3 {
             continue;
         }
-        // Exact-text dedup against the same scope+kind (Phase 4 adds semantic
-        // merge). Cheap insurance against the model re-emitting a known fact.
-        let dup = {
-            let guard = mem.lock().await;
-            guard.find_exact(&scope, &item.kind, &text).is_some()
-        };
-        if dup {
+        if dedup_or_refresh(&mem, &scope, &item.kind, &text, importance).await {
             continue;
         }
         let tags = if pinned {
@@ -356,11 +383,7 @@ pub(crate) async fn extract_lesson(
         if text.chars().count() < 3 {
             continue;
         }
-        let dup = {
-            let guard = mem.lock().await;
-            guard.find_exact(&scope, "lesson", &text).is_some()
-        };
-        if dup {
+        if dedup_or_refresh(&mem, &scope, "lesson", &text, importance).await {
             continue;
         }
         let doc = MemoryDoc {
@@ -453,11 +476,7 @@ pub(crate) async fn extract_failure_lesson(
         let Some((tier, importance, pinned)) = kind_policy("failure") else {
             continue;
         };
-        let dup = {
-            let guard = mem.lock().await;
-            guard.find_exact(&scope, "failure", &text).is_some()
-        };
-        if dup {
+        if dedup_or_refresh(&mem, &scope, "failure", &text, importance).await {
             continue;
         }
         let doc = MemoryDoc {

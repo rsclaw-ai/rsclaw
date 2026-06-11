@@ -658,6 +658,29 @@ pub(crate) async fn write_entity_memories(
     }
     let mut written = Vec::new();
     for entity in entities {
+        // Supersede stale values of the same attribute FIRST (before the
+        // exact-dup early-out, so re-stating the current value still demotes
+        // older conflicting ones). Entity texts follow the fixed
+        // "标签: 值" format, so the label prefix identifies the attribute:
+        // "用户地址: 上海" must stop outranking "用户地址: 杭州" the moment
+        // the user moves. Old values are demoted, not deleted.
+        if let Some((label, _)) = entity.memory_text.split_once(':') {
+            let prefix = format!("{}:", label.trim());
+            let mut guard = mem.lock().await;
+            match guard.supersede_label_entities(scope, &prefix, &entity.memory_text) {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(
+                    kind = entity.kind,
+                    value = entity.value,
+                    superseded = n,
+                    "stale entity values demoted"
+                ),
+                Err(e) => {
+                    tracing::warn!(kind = entity.kind, "entity supersede failed: {e:#}");
+                }
+            }
+        }
+
         // Dedup: skip if memory already contains this exact entity value.
         let already_exact = {
             let guard = mem.lock().await;

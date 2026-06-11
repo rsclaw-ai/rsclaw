@@ -1213,6 +1213,99 @@ impl MemoryStore {
         Ok(pairs)
     }
 
+    /// Find the best semantic near-duplicate of `text` within `scope`
+    /// (cosine ≥ `threshold`), across all kinds. Pre-insert guard for the
+    /// extraction paths: at ≥0.92 the fact is already stored — possibly
+    /// phrased differently or classified under a sibling kind (the
+    /// deterministic-phone vs L1-phone dup that `find_exact` could never
+    /// catch).
+    pub fn find_semantic_dup(
+        &self,
+        scope: &str,
+        text: &str,
+        threshold: f32,
+    ) -> Option<(String, f32)> {
+        // Doc-side embed (no query instruction): this is a doc-to-doc compare.
+        let vec = self.embedder.embed(text);
+        if vec.is_empty() {
+            return None;
+        }
+        let neighbours = self.hnsw.search(&vec, 8, 64);
+        let mut best: Option<(String, f32)> = None;
+        for n in neighbours {
+            let idx = n.d_id;
+            if idx >= self.docs.len() {
+                continue;
+            }
+            let doc = &self.docs[idx];
+            if doc.id.is_empty() || doc.scope != scope || doc.vector.is_empty() {
+                continue;
+            }
+            let sim = cosine_similarity(&vec, &doc.vector);
+            if sim >= threshold && best.as_ref().is_none_or(|(_, b)| sim > *b) {
+                best = Some((doc.id.clone(), sim));
+            }
+        }
+        best
+    }
+
+    /// Freshness-touch an existing doc as the dedup outcome of a
+    /// re-extracted fact: max-merge importance, bump access/recency,
+    /// re-evaluate tier. Persists. Returns false when the doc vanished.
+    pub fn refresh_as_duplicate(&mut self, id: &str, importance: f32) -> Result<bool> {
+        let Some(idx) = self.docs.iter().position(|d| d.id == id) else {
+            return Ok(false);
+        };
+        {
+            let doc = &mut self.docs[idx];
+            doc.importance = doc.importance.max(importance);
+            doc.touch();
+        }
+        self.persist_doc(idx)?;
+        Ok(true)
+    }
+
+    /// Mark every entity doc in `scope` that carries the same `"label:"`
+    /// prefix but a DIFFERENT value as superseded: unpin, demote to Working,
+    /// floor the importance so decay retires it, tag "superseded". The stale
+    /// value stays searchable (history) but ranks far below the fresh pin —
+    /// "用户地址: 上海" must stop outranking "用户地址: 杭州" the moment the
+    /// user moves. Returns the number of docs demoted.
+    pub fn supersede_label_entities(
+        &mut self,
+        scope: &str,
+        label_prefix: &str,
+        keep_text: &str,
+    ) -> Result<usize> {
+        let keep = normalized_memory_text(keep_text);
+        let idxs: Vec<usize> = self
+            .docs
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| {
+                !d.id.is_empty()
+                    && d.scope == scope
+                    && d.kind == "entity"
+                    && d.text.trim_start().starts_with(label_prefix)
+                    && normalized_memory_text(&d.text) != keep
+            })
+            .map(|(i, _)| i)
+            .collect();
+        for &idx in &idxs {
+            {
+                let doc = &mut self.docs[idx];
+                doc.pinned = false;
+                doc.tier = MemDocTier::Working;
+                doc.importance = doc.importance.min(0.3);
+                if !doc.tags.iter().any(|t| t == "superseded") {
+                    doc.tags.push("superseded".to_owned());
+                }
+            }
+            self.persist_doc(idx)?;
+        }
+        Ok(idxs.len())
+    }
+
     /// Return all non-deleted docs in the given tier and scope.
     pub fn find_by_tier(&self, tier: &MemDocTier, scope: Option<&str>) -> Vec<&MemoryDoc> {
         self.docs
@@ -1883,5 +1976,110 @@ mod swap_tests {
             after.iter().all(|h| h.id != "d-del"),
             "BM25 should not return deleted doc"
         );
+    }
+}
+
+#[cfg(test)]
+mod dedup_supersede_tests {
+    use super::*;
+
+    fn doc(id: &str, kind: &str, text: &str) -> MemoryDoc {
+        MemoryDoc {
+            id: id.into(),
+            scope: "test".into(),
+            kind: kind.into(),
+            text: text.into(),
+            vector: Vec::new(),
+            created_at: 0,
+            accessed_at: 0,
+            access_count: 0,
+            importance: 0.5,
+            tier: MemDocTier::default(),
+            abstract_text: None,
+            overview_text: None,
+            tags: Vec::new(),
+            pinned: false,
+        }
+    }
+
+    async fn open_temp_store() -> (MemoryStore, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = MemoryStore::open(tmp.path(), None, MemoryTier::High, None)
+            .await
+            .expect("open");
+        (store, tmp)
+    }
+
+    #[tokio::test]
+    async fn find_semantic_dup_catches_cross_kind_duplicates() {
+        let (mut store, _tmp) = open_temp_store().await;
+        store
+            .add(doc("e1", "entity", "用户手机号: 13900001234"))
+            .await
+            .unwrap();
+        // The same fact re-extracted under a sibling kind: find_exact is
+        // keyed by (scope, kind) and misses it; the semantic guard must
+        // catch it regardless of the kind the L1 classifier picked.
+        let hit = store.find_semantic_dup("test", "用户手机号: 13900001234", 0.92);
+        assert_eq!(hit.map(|(id, _)| id).as_deref(), Some("e1"));
+        // Other scopes are never matched.
+        assert!(
+            store
+                .find_semantic_dup("other-scope", "用户手机号: 13900001234", 0.92)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_as_duplicate_bumps_freshness_and_importance() {
+        let (mut store, _tmp) = open_temp_store().await;
+        store
+            .add(doc("r1", "preference", "用户偏好简洁回答"))
+            .await
+            .unwrap();
+        assert!(store.refresh_as_duplicate("r1", 0.8).unwrap());
+        let d = store.docs.iter().find(|d| d.id == "r1").unwrap();
+        assert!(d.importance >= 0.8);
+        assert_eq!(d.access_count, 1);
+        assert!(d.accessed_at > 0);
+        // Refresh never LOWERS importance (max-merge).
+        assert!(store.refresh_as_duplicate("r1", 0.1).unwrap());
+        let d = store.docs.iter().find(|d| d.id == "r1").unwrap();
+        assert!(d.importance >= 0.8);
+        assert!(!store.refresh_as_duplicate("missing", 0.9).unwrap());
+    }
+
+    #[tokio::test]
+    async fn supersede_demotes_stale_attribute_values() {
+        let (mut store, _tmp) = open_temp_store().await;
+        let mut old = doc("a1", "entity", "用户地址: 上海市浦东新区");
+        old.pinned = true;
+        old.tier = MemDocTier::Core;
+        old.importance = 0.95;
+        store.add(old).await.unwrap();
+        // A different attribute with the same value-ish text is untouched.
+        store
+            .add(doc("a2", "entity", "用户收货地址: 上海市浦东新区"))
+            .await
+            .unwrap();
+
+        let n = store
+            .supersede_label_entities("test", "用户地址:", "用户地址: 杭州市西湖区")
+            .unwrap();
+        assert_eq!(n, 1);
+        let d = store.docs.iter().find(|d| d.id == "a1").unwrap();
+        assert!(!d.pinned);
+        assert_eq!(d.tier, MemDocTier::Working);
+        assert!(d.importance <= 0.3);
+        assert!(d.tags.iter().any(|t| t == "superseded"));
+        // "用户收货地址" has its own label — not a "用户地址" value.
+        let d2 = store.docs.iter().find(|d| d.id == "a2").unwrap();
+        assert!(d2.tags.is_empty());
+
+        // Re-stating the surviving value demotes nothing further.
+        let n2 = store
+            .supersede_label_entities("test", "用户地址:", "用户地址: 上海市浦东新区")
+            .unwrap();
+        assert_eq!(n2, 0);
     }
 }
