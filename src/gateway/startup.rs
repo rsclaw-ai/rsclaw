@@ -1526,7 +1526,9 @@ fn try_service_self_restart() -> bool {
                 return true;
             }
         }
-        warn!("launchctl kickstart failed for label {label}; falling back to native respawn");
+        // Routine on every non-launchd dev gateway (nohup/CLI starts) —
+        // info, not warn: the native respawn below is the expected path.
+        info!("launchctl kickstart unavailable for label {label}; using native respawn");
         false
     }
 
