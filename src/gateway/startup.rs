@@ -736,6 +736,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         )
         .with_meditation_deps(crate::heartbeat::MeditationDeps {
             config: Arc::clone(&config),
+            db: Arc::clone(&store.db),
         });
         let runner = std::sync::Arc::new(runner);
         runner.run();

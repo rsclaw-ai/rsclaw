@@ -17,6 +17,8 @@ pub mod loader;
 pub mod manifest;
 pub mod registry;
 pub mod runner;
+pub mod stats;
+pub use stats::{record_skill_use, retire_unused_auto_skills};
 pub mod sig;
 pub mod workflow_distill;
 

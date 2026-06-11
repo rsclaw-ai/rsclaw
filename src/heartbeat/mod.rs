@@ -178,6 +178,9 @@ pub struct MeditationDeps {
     /// Runtime config — used to resolve per-agent flash model with fallback
     /// to global defaults.
     pub config: Arc<crate::config::runtime::RuntimeConfig>,
+    /// redb handle for skill usage stats — drives the disuse-retirement
+    /// pass over auto-crystallized skills.
+    pub db: Arc<crate::store::redb_store::RedbStore>,
 }
 
 /// Heartbeat runner — scans agent workspaces and spawns per-agent heartbeat
@@ -474,6 +477,18 @@ impl HeartbeatRunner {
                 Err(e) => {
                     warn!(agent_id, "crystallize phase failed: {e:#}");
                 }
+            }
+
+            // Retirement pass: auto-crystallized skills with no activation
+            // inside the disuse window move to skills/.retired/ — closes
+            // the generate→use→retire loop so bad or obsolete auto-skills
+            // stop occupying the prompt's skill list forever.
+            match crate::skill::retire_unused_auto_skills(&deps.db, &skills_dir) {
+                Ok(retired) if !retired.is_empty() => {
+                    info!(agent_id, ?retired, "retired unused auto-skills");
+                }
+                Ok(_) => {}
+                Err(e) => warn!(agent_id, "skill retirement failed: {e:#}"),
             }
         }
 
