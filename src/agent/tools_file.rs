@@ -936,6 +936,26 @@ impl super::runtime::AgentRuntime {
 
         let path = path.unwrap().to_owned();
         let content = content.unwrap();
+
+        // Office/PDF formats are binary containers — writing prose into a
+        // file named *.docx produces a fake document that won't open.
+        // Observed with the cold-tool stub live: the model writes the fake
+        // instead of requesting create_docx. Redirect with an actionable
+        // error (the create_* tools may be behind `request_tool`).
+        let lower = path.to_lowercase();
+        for (ext, tool) in [
+            (".docx", "create_docx"),
+            (".xlsx", "create_xlsx"),
+            (".pptx", "create_pptx"),
+            (".pdf", "create_pdf"),
+        ] {
+            if lower.ends_with(ext) {
+                return Ok(json!({
+                    "error": format!("`{ext}` is a binary format — write_file would produce a corrupt file that won't open."),
+                    "hint": format!("Use the `{tool}` tool instead (if it is not in your tool list, call request_tool(name=\"{tool}\") first, then call it).")
+                }));
+            }
+        }
         let workspace = self.default_workspace();
 
         let full = canonicalize_external_path(&path, &workspace);

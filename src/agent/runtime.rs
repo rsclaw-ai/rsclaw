@@ -4018,6 +4018,19 @@ impl AgentRuntime {
                 &self.handle.id,
                 &self.config.agents.a2a,
             );
+            // Cold pool snapshot BEFORE toolset filtering: request_tool is an
+            // on-demand tier over the FULL builtin set, not just the agent's
+            // toolset — a `standard` agent asked for a .docx must be able to
+            // request create_docx even though the preset excludes it (its
+            // only alternative is faking the binary with write_file, which
+            // tool_write now rejects).
+            let cold_pool: Vec<crate::provider::ToolDef> = all
+                .iter()
+                .filter(|t| {
+                    crate::agent::tools_builder::COLD_TOOLS.contains(&t.name.as_str())
+                })
+                .cloned()
+                .collect();
             all.extend(extra_tools.iter().cloned());
             // Plugin tools: `plugin_search`/`plugin_describe`/`plugin_invoke`
             // builtin meta-tools remain the long-tail discovery path. On top
@@ -4167,12 +4180,15 @@ impl AgentRuntime {
             // tool defs on every request, so near-zero-usage tools (~2.8k
             // tokens) collapse into the one-line `request_tool` stub. A
             // per-agent `tools` whitelist is the user's explicit word — never
-            // defer those. Tools re-enabled earlier in this session stay live.
+            // defer those. Tools re-enabled earlier in this session stay live
+            // (including ones outside the agent's toolset preset — the stub
+            // is deliberately an escape hatch over the full cold pool).
             let primary_provider = model_cfg
                 .and_then(|m| m.primary_head())
                 .map(|m| self.providers.resolve_model(m).0.to_owned())
                 .unwrap_or_default();
-            if primary_provider != "rsclaw" && custom_tools.is_none() {
+            if primary_provider != "rsclaw" && custom_tools.is_none() && !cold_pool.is_empty()
+            {
                 let enabled = self
                     .handle
                     .cold_enabled
@@ -4180,19 +4196,28 @@ impl AgentRuntime {
                     .ok()
                     .and_then(|g| g.get(session_key).cloned())
                     .unwrap_or_default();
-                let deferred_names: Vec<&str> = crate::agent::tools_builder::COLD_TOOLS
+                let deferred_names: Vec<&str> = cold_pool
                     .iter()
-                    .copied()
-                    .filter(|n| !enabled.contains(*n) && all.iter().any(|t| t.name == *n))
+                    .map(|t| t.name.as_str())
+                    .filter(|n| !enabled.contains(*n))
                     .collect();
                 if !deferred_names.is_empty() {
-                    let (cold, hot): (Vec<_>, Vec<_>) = all
-                        .into_iter()
-                        .partition(|t| deferred_names.contains(&t.name.as_str()));
-                    all = hot;
+                    all.retain(|t| !deferred_names.contains(&t.name.as_str()));
                     all.push(crate::agent::tools_builder::request_tool_def(&deferred_names));
-                    deferred_tool_defs = cold;
                 }
+                // Session-enabled cold tools that the toolset filter dropped
+                // (or that were just deferred): make sure their real defs are
+                // live.
+                for t in &cold_pool {
+                    if enabled.contains(&t.name) && !all.iter().any(|x| x.name == t.name) {
+                        all.push(t.clone());
+                    }
+                }
+                deferred_tool_defs = cold_pool
+                    .iter()
+                    .filter(|t| !enabled.contains(&t.name))
+                    .cloned()
+                    .collect();
             }
 
             all
