@@ -1209,6 +1209,37 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     //     `cmd_gateway` to see "port in use" and exit cleanly, leaving the gateway
     //     dead.
     if shutdown.is_restart_requested() {
+        // Channel-origin turns cannot deliver their result anymore — the
+        // outbound channel senders stopped when drain began — so waiting
+        // for them only delays the restart (observed: 81/108 historical
+        // restarts burned the full 60s on exactly this). Cancel their
+        // turns now; HTTP/API turns still hold an open connection that CAN
+        // answer, so they keep the full drain window. Explicit allowlist:
+        // only origins whose delivery path is provably dead.
+        const UNDELIVERABLE_ORIGINS: &[&str] = &[
+            "wechat", "feishu", "telegram", "discord", "qq", "dingtalk",
+            "wecom", "slack", "whatsapp", "line", "matrix", "signal", "cron",
+        ];
+        let mut cancelled = 0usize;
+        for handle in registry.all() {
+            if let Ok(map) = handle.cancel_tokens.read() {
+                for (sk, tok) in map.iter() {
+                    // Channel session keys: "agent:<id>:<channel>:..."
+                    let channel = sk.split(':').nth(2).unwrap_or("");
+                    if UNDELIVERABLE_ORIGINS.contains(&channel) {
+                        tok.cancel();
+                        cancelled += 1;
+                    }
+                }
+            }
+        }
+        if cancelled > 0 {
+            info!(
+                cancelled,
+                "drain: cancelled channel-origin turns whose delivery path already stopped"
+            );
+        }
+
         info!("restart requested - waiting for inflight drain (max 60s)");
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         loop {
