@@ -1295,6 +1295,10 @@ impl MemoryStore {
             {
                 let doc = &mut self.docs[idx];
                 doc.pinned = false;
+                // The L0 writer also tags pinned entities with a "pinned"
+                // string tag — drop it too, or the demoted doc reads as
+                // pinned in any tag-based view (seen in live testing).
+                doc.tags.retain(|t| t != "pinned");
                 doc.tier = MemDocTier::Working;
                 doc.importance = doc.importance.min(0.3);
                 if !doc.tags.iter().any(|t| t == "superseded") {
@@ -2054,6 +2058,7 @@ mod dedup_supersede_tests {
         let (mut store, _tmp) = open_temp_store().await;
         let mut old = doc("a1", "entity", "用户地址: 上海市浦东新区");
         old.pinned = true;
+        old.tags.push("pinned".to_owned());
         old.tier = MemDocTier::Core;
         old.importance = 0.95;
         store.add(old).await.unwrap();
@@ -2069,6 +2074,7 @@ mod dedup_supersede_tests {
         assert_eq!(n, 1);
         let d = store.docs.iter().find(|d| d.id == "a1").unwrap();
         assert!(!d.pinned);
+        assert!(!d.tags.iter().any(|t| t == "pinned"), "stale pinned tag survived");
         assert_eq!(d.tier, MemDocTier::Working);
         assert!(d.importance <= 0.3);
         assert!(d.tags.iter().any(|t| t == "superseded"));
