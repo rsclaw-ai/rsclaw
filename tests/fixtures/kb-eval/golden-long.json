@@ -1,0 +1,282 @@
+[
+ {
+  "query": "长江存储最新闪存堆了多少层",
+  "expectTitleContains": "changjiang-storage",
+  "expectTextContains": "294层",
+  "_pos": "front-mid",
+  "_off": 341
+ },
+ {
+  "query": "做存储芯片的哪家企业级生意做到了86亿",
+  "expectTitleContains": "changjiang-storage",
+  "expectTextContains": "86亿",
+  "_pos": "mid",
+  "_off": 923
+ },
+ {
+  "query": "长存的新工厂产能规划",
+  "expectTitleContains": "changjiang-storage",
+  "expectTextContains": "12万片",
+  "_pos": "tail",
+  "_off": 1518
+ },
+ {
+  "query": "哪家存储公司的车规产品通过了极端温度测试",
+  "expectTitleContains": "changjiang-storage",
+  "expectTextContains": "全温区验证",
+  "_pos": "tail",
+  "_off": 1632
+ },
+ {
+  "query": "长江存储在欧美拿了多少专利",
+  "expectTitleContains": "changjiang-storage",
+  "expectTextContains": "4200件",
+  "_pos": "tail",
+  "_off": 1563
+ },
+ {
+  "query": "东方甄选自营卖了多少钱",
+  "expectTitleContains": "dongfang-select",
+  "expectTextContains": "52亿",
+  "_pos": "front-mid",
+  "_off": 314
+ },
+ {
+  "query": "东方甄选付费会员有多少",
+  "expectTitleContains": "dongfang-select",
+  "expectTextContains": "480万",
+  "_pos": "mid",
+  "_off": 878
+ },
+ {
+  "query": "东方甄选生鲜损耗率降到多少",
+  "expectTitleContains": "dongfang-select",
+  "expectTextContains": "2.3%",
+  "_pos": "tail",
+  "_off": 1557
+ },
+ {
+  "query": "哪家电商在新疆建有机种植基地",
+  "expectTitleContains": "dongfang-select",
+  "expectTextContains": "1.4万亩",
+  "_pos": "tail",
+  "_off": 1581
+ },
+ {
+  "query": "东方甄选App收入占比",
+  "expectTitleContains": "dongfang-select",
+  "expectTextContains": "37%",
+  "_pos": "tail",
+  "_off": 1487
+ },
+ {
+  "query": "智谱最新模型多大参数",
+  "expectTitleContains": "zhipu-ai",
+  "expectTextContains": "1.2万亿",
+  "_pos": "front-mid",
+  "_off": 324
+ },
+ {
+  "query": "智谱企业服务收入",
+  "expectTitleContains": "zhipu-ai",
+  "expectTextContains": "21亿",
+  "_pos": "mid",
+  "_off": 881
+ },
+ {
+  "query": "AutoGLM卖出了多少席位",
+  "expectTitleContains": "zhipu-ai",
+  "expectTextContains": "9.5万个",
+  "_pos": "tail",
+  "_off": 1525
+ },
+ {
+  "query": "智谱最新估值",
+  "expectTitleContains": "zhipu-ai",
+  "expectTextContains": "460亿",
+  "_pos": "tail",
+  "_off": 1598
+ },
+ {
+  "query": "哪家大模型公司拿了中东主权基金的钱",
+  "expectTitleContains": "zhipu-ai",
+  "expectTextContains": "中东主权基金",
+  "_pos": "tail",
+  "_off": 1583
+ },
+ {
+  "query": "元气森林气泡水卖了多少",
+  "expectTitleContains": "yuanqi-senlin",
+  "expectTextContains": "78亿",
+  "_pos": "front-mid",
+  "_off": 314
+ },
+ {
+  "query": "外星人电解质水增长情况",
+  "expectTitleContains": "yuanqi-senlin",
+  "expectTextContains": "41%",
+  "_pos": "mid",
+  "_off": 881
+ },
+ {
+  "query": "元气森林经销商库存周转改善到几天",
+  "expectTitleContains": "yuanqi-senlin",
+  "expectTextContains": "26天",
+  "_pos": "tail",
+  "_off": 1509
+ },
+ {
+  "query": "元气森林在海外哪个国家卖得最好",
+  "expectTitleContains": "yuanqi-senlin",
+  "expectTextContains": "印尼",
+  "_pos": "tail",
+  "_off": 1565
+ },
+ {
+  "query": "纤茶铺了多少网点",
+  "expectTitleContains": "yuanqi-senlin",
+  "expectTextContains": "42万个",
+  "_pos": "tail",
+  "_off": 1602
+ },
+ {
+  "query": "宇树四足机器人卖了多少台",
+  "expectTitleContains": "unitree",
+  "expectTextContains": "9万台",
+  "_pos": "front-mid",
+  "_off": 314
+ },
+ {
+  "query": "宇树人形机器人出货量",
+  "expectTitleContains": "unitree",
+  "expectTextContains": "2400台",
+  "_pos": "mid",
+  "_off": 865
+ },
+ {
+  "query": "宇树灵巧手有几个自由度",
+  "expectTitleContains": "unitree",
+  "expectTextContains": "21个自由度",
+  "_pos": "tail",
+  "_off": 1550
+ },
+ {
+  "query": "人形机器人第一次被电力行业批量采购是哪家",
+  "expectTitleContains": "unitree",
+  "expectTextContains": "国家电网",
+  "_pos": "tail",
+  "_off": 1583
+ },
+ {
+  "query": "宇树新一代机器人成本降了多少",
+  "expectTitleContains": "unitree",
+  "expectTextContains": "31%",
+  "_pos": "tail",
+  "_off": 1533
+ },
+ {
+  "query": "老铺黄金营收多少",
+  "expectTitleContains": "laopu-gold",
+  "expectTextContains": "142亿",
+  "_pos": "front-mid",
+  "_off": 305
+ },
+ {
+  "query": "老铺单店一年卖多少",
+  "expectTitleContains": "laopu-gold",
+  "expectTextContains": "3.4亿",
+  "_pos": "mid",
+  "_off": 886
+ },
+ {
+  "query": "老铺海外第一家店开在哪",
+  "expectTitleContains": "laopu-gold",
+  "expectTextContains": "新加坡",
+  "_pos": "tail",
+  "_off": 1513
+ },
+ {
+  "query": "老铺签了多少位金雕大师",
+  "expectTitleContains": "laopu-gold",
+  "expectTextContains": "14位",
+  "_pos": "tail",
+  "_off": 1600
+ },
+ {
+  "query": "镶钻黄金系列毛利率",
+  "expectTitleContains": "laopu-gold",
+  "expectTextContains": "46%",
+  "_pos": "tail",
+  "_off": 1500
+ },
+ {
+  "query": "泡泡玛特总收入",
+  "expectTitleContains": "pop-mart",
+  "expectTextContains": "298亿",
+  "_pos": "front-mid",
+  "_off": 310
+ },
+ {
+  "query": "LABUBU那个系列卖了多少",
+  "expectTitleContains": "pop-mart",
+  "expectTextContains": "96亿",
+  "_pos": "mid",
+  "_off": 884
+ },
+ {
+  "query": "泡泡玛特乐园一年多少游客",
+  "expectTitleContains": "pop-mart",
+  "expectTextContains": "310万",
+  "_pos": "tail",
+  "_off": 1518
+ },
+ {
+  "query": "泡泡玛特和哪家影业公司合作",
+  "expectTitleContains": "pop-mart",
+  "expectTextContains": "环球影业",
+  "_pos": "tail",
+  "_off": 1535
+ },
+ {
+  "query": "泡泡玛特的手游流水",
+  "expectTitleContains": "pop-mart",
+  "expectTextContains": "7亿",
+  "_pos": "tail",
+  "_off": 1590
+ },
+ {
+  "query": "小红书月活多少",
+  "expectTitleContains": "xiaohongshu",
+  "expectTextContains": "3.9亿",
+  "_pos": "front-mid",
+  "_off": 307
+ },
+ {
+  "query": "小红书广告收入",
+  "expectTitleContains": "xiaohongshu",
+  "expectTextContains": "310亿",
+  "_pos": "mid",
+  "_off": 876
+ },
+ {
+  "query": "小红书团购做到了多少交易额",
+  "expectTitleContains": "xiaohongshu",
+  "expectTextContains": "73亿",
+  "_pos": "tail",
+  "_off": 1504
+ },
+ {
+  "query": "小红书用户每天刷多久",
+  "expectTitleContains": "xiaohongshu",
+  "expectTextContains": "91分钟",
+  "_pos": "tail",
+  "_off": 1545
+ },
+ {
+  "query": "小红书上市前估值",
+  "expectTitleContains": "xiaohongshu",
+  "expectTextContains": "320亿美元",
+  "_pos": "tail",
+  "_off": 1571
+ }
+]

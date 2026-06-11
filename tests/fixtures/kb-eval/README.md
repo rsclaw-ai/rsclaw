@@ -56,6 +56,30 @@ at embed time) — that regime is where Qwen3 (32K input) should pull ahead
 and is NOT yet covered by this golden set. Add long-doc cases before
 treating bge-small as the final answer for production corpora.
 
+
+## Long-doc set (`corpus-long/` + `golden-long.json`)
+
+8 docs at ~1620 CJK chars (production-sized single chunks under the current
+chars/4 token estimate) with facts planted at front (<400 chars), mid, and
+tail (>900 chars) positions; 40 paraphrase-leaning queries. Ingest TOGETHER
+with `corpus/` (62 docs total) so short docs act as distractors.
+
+Scores (2026-06-11, hybrid, k=5, run with the 54 short docs as distractors):
+
+| embedder | hit@1 | hit@5 | MRR |
+|---|---|---|---|
+| bge-small-zh | 20.0% | 20.0% | 0.200 |
+| Qwen3-0.6B + instruction | 5.0% | 65.0% | 0.251 |
+
+Two findings this set exposed:
+1. bge-small embeds only the first 512 real tokens (~512 CJK chars) of a
+   chunk — on production-sized Chinese chunks it is blind to 3/4 of the
+   text and COLLAPSES (the short-doc set never triggers this).
+2. The chunker token estimate (chars/4) is English-calibrated: for Chinese
+   it yields ~2048-char chunks, 4x the intended 512 tokens. Recalibrating
+   CJK chunk sizing is the upstream fix; a cross-encoder reranker is the
+   query-time mitigation for Qwen3's rank-1 weakness (65% hit@5 vs 5% hit@1).
+
 Sanity checks this benchmark has caught: a remote endpoint returning
 IDENTICAL vectors for different inputs (slot corruption — two different
 queries scoring bit-identical against every doc), mean-pooling deployments
