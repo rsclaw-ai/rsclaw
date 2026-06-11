@@ -4773,11 +4773,11 @@ data: {"type":"block_stop","index":0}
         let mut req = req_with(vec![], 2, Some("k"));
         req.model = "qwen3-235b".into();
         let split = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID, false).unwrap();
-        assert_eq!(split.prefix_id, "rsclaw/2026.5.28");
+        assert_eq!(split.prefix_id, RSCLAW_DEFAULT_PREFIX_ID);
 
         req.model = "myorg/qwen3-235b".into();
         let split2 = split_request(&req, RSCLAW_DEFAULT_PREFIX_ID, false).unwrap();
-        assert_eq!(split2.prefix_id, "rsclaw/2026.5.28");
+        assert_eq!(split2.prefix_id, RSCLAW_DEFAULT_PREFIX_ID);
     }
 
     #[test]
@@ -4916,7 +4916,7 @@ data: {"type":"block_stop","index":0}
             options: Some(split.options.clone()),
         };
         let v = serde_json::to_value(&body).unwrap();
-        assert_eq!(v["prefix_id"], "rsclaw/2026.5.28");
+        assert_eq!(v["prefix_id"], RSCLAW_DEFAULT_PREFIX_ID);
         assert!(
             v.get("dynamic_prefix").is_none(),
             "non-empty prefix_id must OMIT dynamic_prefix (mutually exclusive)"
@@ -4985,7 +4985,7 @@ data: {"type":"block_stop","index":0}
             options: Some(split.options.clone()),
         };
         let v = serde_json::to_value(&body).unwrap();
-        assert_eq!(v["prefix_id"], "rsclaw/2026.5.28");
+        assert_eq!(v["prefix_id"], RSCLAW_DEFAULT_PREFIX_ID);
         assert!(
             v.get("dynamic_prefix").is_none(),
             "registry path must omit dynamic_prefix"

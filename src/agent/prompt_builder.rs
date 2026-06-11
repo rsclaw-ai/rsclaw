@@ -1191,7 +1191,7 @@ mod tests {
     fn user_system_includes_cap_block_when_available() {
         let prompt = empty_user_system(true);
         assert!(
-            prompt.contains("## Coding agents (via `tool_cap`)"),
+            prompt.contains("## Coding agents (via `cap` and `cap_live`)"),
             "expected cap block in: {prompt}"
         );
         // All 4 agent kinds named.
@@ -1201,14 +1201,14 @@ mod tests {
         assert!(prompt.contains("`codex`"));
         // Async-submission semantics are documented so the LLM doesn't
         // wait for the result in the same turn.
-        assert!(prompt.contains("returns `{status: \"submitted\"}` immediately"));
+        assert!(prompt.contains("returns `{status: submitted}` immediately"));
     }
 
     #[test]
     fn user_system_omits_cap_block_when_unavailable() {
         let prompt = empty_user_system(false);
         assert!(
-            !prompt.contains("tool_cap"),
+            !prompt.contains("## Coding agents"),
             "cap block leaked when manager unavailable: {prompt}"
         );
     }
