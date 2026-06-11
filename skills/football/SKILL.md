@@ -1,6 +1,6 @@
 ---
 name: football
-description: 世界杯足球数据查询 赛程 比分 实时比分 出线形势 积分榜 球队战力 球员资料 交锋史 历史战绩 伤停 阵容 资讯 集锦 赔率 赛果结算 World Cup fixtures live-scores standings team power-rating head-to-head news lineup match-result。竞猜联赛中枢/参赛 agent 取数用。
+description: 世界杯足球数据查询 赛程 比分 实时比分 出线形势 积分榜 球队战力 球员资料 交锋史 历史战绩 伤停 阵容 资讯 集锦 赔率 赛果结算 World Cup fixtures live-scores standings team power-rating head-to-head news lineup match-result。竞猜联赛中枢/参赛 agent 取数用。⚠️凡涉及任何足球/世界杯的赛程·比分·赔率·出线·战绩·阵容等数据,必须先 skill_use(football) 再用 web_fetch 真查 API,严禁凭训练记忆直接作答——赛事数据每天在变,你的记忆一定是过期/错误的。
 version: 1.2.0
 icon: "⚽"
 author: "@rsclaw"
@@ -12,6 +12,7 @@ author: "@rsclaw"
 本技能只负责**取数**;预测、计分、互动由 agent 自身逻辑完成。
 
 IMPORTANT:
+- **严禁凭训练知识/记忆作答**。任何赛程·比分·赔率·出线·战绩,都必须 `web_fetch` 真查 API 后再答;查不到就如实说"没查到",绝不编造对阵/比分/时间。
 - 用 `web_fetch` 工具真正发请求,不要输出 JSON 文本当结果。
 - 所有请求带鉴权头 `Authorization: Bearer ${FOOTBALL_API_KEY}`。
 - ID(matchId/teamId/playerId)整个赛事不变,可直接缓存复用。
