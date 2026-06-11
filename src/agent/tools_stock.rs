@@ -1221,7 +1221,7 @@ mod tests {
             asks: vec![],
             timestamp: 0,
         };
-        let s = render_one_quote_line(&q);
+        let s = render_one_quote_line(&q, None);
         assert!(s.contains("600519"));
         assert!(s.contains("¥1272.86"));
         assert!(s.contains("+"), "positive change should carry leading +");
