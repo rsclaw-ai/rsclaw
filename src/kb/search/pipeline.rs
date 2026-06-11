@@ -224,19 +224,37 @@ impl SearchCtx {
                         let lo = finite.iter().copied().fold(f32::INFINITY, f32::min);
                         let hi = finite.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                         let span = (hi - lo).max(f32::EPSILON);
+                        // Blend rather than replace: the cross-encoder is
+                        // decisively better on long chunks (reads text the
+                        // embedder truncated) but the hybrid fusion carries
+                        // real signal on short ones — full replacement
+                        // regressed the short-doc benchmark 82.9% → 70.8%
+                        // while pure fusion left the long-doc one at 5%.
+                        // Both scores are min-max normalized to [0,1] first.
+                        const RERANK_BLEND: f32 = 0.7;
+                        let f_lo = fused[..n]
+                            .iter()
+                            .map(|(_, s)| *s)
+                            .fold(f32::INFINITY, f32::min);
+                        let f_hi = fused[..n]
+                            .iter()
+                            .map(|(_, s)| *s)
+                            .fold(f32::NEG_INFINITY, f32::max);
+                        let f_span = (f_hi - f_lo).max(f32::EPSILON);
                         let mut reranked: Vec<(String, f32)> = fused[..n]
                             .iter()
                             .zip(scores.iter())
                             .map(|((cid, fused_score), s)| {
-                                // Unscored entries (endpoint omitted the index)
-                                // sink to the bottom of the window but stay
-                                // above nothing — keep their fused tiebreak.
-                                let norm = if s.is_finite() {
-                                    (s - lo) / span
+                                let f_norm = (fused_score - f_lo) / f_span;
+                                // Unscored entries (endpoint omitted the
+                                // index) fall back to fused-only.
+                                let blended = if s.is_finite() {
+                                    let r_norm = (s - lo) / span;
+                                    RERANK_BLEND * r_norm + (1.0 - RERANK_BLEND) * f_norm
                                 } else {
-                                    f32::MIN_POSITIVE * fused_score.max(0.0)
+                                    (1.0 - RERANK_BLEND) * f_norm
                                 };
-                                (cid.clone(), norm)
+                                (cid.clone(), blended)
                             })
                             .collect();
                         reranked.sort_by(|a, b| {

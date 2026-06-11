@@ -1,7 +1,7 @@
 //! Cross-encoder rerank client for the KB search pipeline.
 //!
 //! Speaks the Jina/Cohere-compatible `/v1/rerank` shape that llama.cpp
-//! serves under `--reranking` (e.g. Qwen3-Reranker / bge-reranker GGUFs):
+//! serves under `--reranking` (e.g. bge-reranker-v2-m3 GGUF):
 //!
 //! ```json
 //! POST {base_url}/rerank
@@ -9,26 +9,27 @@
 //! → {"results": [{"index": 0, "relevance_score": 1.23}, ...]}
 //! ```
 //!
-//! The pipeline calls this synchronously from inside `spawn_blocking`
-//! (same execution model as the embedder), so a blocking HTTP client is
-//! correct here. The client is lazily constructed on first use because
-//! `reqwest::blocking::Client::new()` panics when called from an async
-//! runtime thread — service construction happens in async context, the
-//! first search does not.
-
-use std::sync::OnceLock;
+//! Sync-callable from any context: the search pipeline runs under
+//! `spawn_blocking` on the agent-tool path but directly on the async
+//! handler thread on the HTTP path, so this mirrors `OpenAiEmbedder`'s
+//! transport pattern exactly — an async reqwest client driven via
+//! `block_in_place` when a runtime is present, or a temp runtime when
+//! not. A `reqwest::blocking` client is NOT safe here: its inner
+//! runtime panics with "Cannot drop a runtime in a context where
+//! blocking is not allowed" the moment it's touched from an async
+//! thread (observed live, took the whole rerank stage down with it).
 
 use anyhow::{Context, Result};
 
 /// Default fused-candidate window sent to the reranker.
 pub const DEFAULT_RERANK_TOP_N: usize = 20;
-/// Hard ceiling on the request timeout — reranking 20 short chunks on a
-/// GPU takes well under a second; anything past this means the endpoint
-/// is wedged and the fused order is the better answer.
-const RERANK_TIMEOUT_SECS: u64 = 10;
+/// Request deadline — reranking 20 chunks on a GPU is sub-second; a
+/// long-chunk window on an old card can take a few seconds. Past this
+/// the endpoint is wedged and the fused order is the better answer.
+const RERANK_TIMEOUT_SECS: u64 = 30;
 
 pub struct KbReranker {
-    client: OnceLock<reqwest::blocking::Client>,
+    client: reqwest::Client,
     url: String,
     model: Option<String>,
     pub top_n: usize,
@@ -47,8 +48,12 @@ impl KbReranker {
         if base.is_empty() {
             return None;
         }
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(RERANK_TIMEOUT_SECS))
+            .build()
+            .ok()?;
         Some(std::sync::Arc::new(Self {
-            client: OnceLock::new(),
+            client,
             url: format!("{base}/rerank"),
             model: rr.model,
             top_n: rr.top_n.unwrap_or(DEFAULT_RERANK_TOP_N).clamp(2, 100),
@@ -59,12 +64,6 @@ impl KbReranker {
     /// index (input order preserved); higher is more relevant. Errors
     /// bubble up so the caller can fall back to the fused order.
     pub fn rerank(&self, query: &str, docs: &[&str]) -> Result<Vec<f32>> {
-        let client = self.client.get_or_init(|| {
-            reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(RERANK_TIMEOUT_SECS))
-                .build()
-                .expect("failed to build rerank HTTP client")
-        });
         let mut body = serde_json::json!({
             "query": query,
             "documents": docs,
@@ -72,15 +71,27 @@ impl KbReranker {
         if let Some(m) = &self.model {
             body["model"] = serde_json::json!(m);
         }
-        let resp: serde_json::Value = client
-            .post(&self.url)
-            .json(&body)
-            .send()
-            .context("rerank request failed")?
-            .error_for_status()
-            .context("rerank endpoint returned error status")?
-            .json()
-            .context("rerank response is not JSON")?;
+
+        let send = || async {
+            self.client
+                .post(self.url.as_str())
+                .json(&body)
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<serde_json::Value>()
+                .await
+        };
+        let resp: serde_json::Value = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(send()))
+                .context("rerank request failed")?,
+            Err(_) => {
+                let tmp_rt = tokio::runtime::Runtime::new()
+                    .context("failed to create temp runtime for rerank")?;
+                tmp_rt.block_on(send()).context("rerank request failed")?
+            }
+        };
+
         let results = resp
             .get("results")
             .and_then(|v| v.as_array())
