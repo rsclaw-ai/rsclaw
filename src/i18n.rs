@@ -2410,6 +2410,16 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "zh" => "/cap：打开会话失败：{err}",
     );
 
+    msg!("cap_install_hint_npm",
+        "en" => "{agent} not found. Run `rsclaw tools install {cmd}` to install it.",
+        "zh" => "未找到 {agent}，请运行 `rsclaw tools install {cmd}` 安装。",
+    );
+
+    msg!("cap_install_hint_go",
+        "en" => "{agent} not found. Install it from https://github.com/opencode-ai/opencode then retry /cap {cmd}.",
+        "zh" => "未找到 {agent}，请从 https://github.com/opencode-ai/opencode 安装后重试 /cap {cmd}。",
+    );
+
     msg!("cap_bad_workspace",
         "en" => "/cap: workspace path rejected — {path}: {reason}",
         "zh" => "/cap：工作目录被拒绝 — {path}：{reason}",

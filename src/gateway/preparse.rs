@@ -514,11 +514,30 @@ pub(crate) async fn try_preparse_locally_with_account(
             }
             Err(e) => {
                 let err = e.to_string();
-                return Some(txt(crate::i18n::t_fmt(
-                    "cap_open_failed",
-                    lang,
-                    &[("err", &err)],
-                )));
+                let is_binary_missing = err.contains("binary not found on PATH");
+                let hint = if is_binary_missing {
+                    match kind {
+                        crate::cap::AgentKind::Opencode => crate::i18n::t_fmt(
+                            "cap_install_hint_go",
+                            lang,
+                            &[
+                                ("agent", kind.display_name()),
+                                ("cmd", kind.as_str()),
+                            ],
+                        ),
+                        _ => crate::i18n::t_fmt(
+                            "cap_install_hint_npm",
+                            lang,
+                            &[
+                                ("agent", kind.display_name()),
+                                ("cmd", kind.as_str()),
+                            ],
+                        ),
+                    }
+                } else {
+                    crate::i18n::t_fmt("cap_open_failed", lang, &[("err", &err)])
+                };
+                return Some(txt(hint));
             }
         }
     }
@@ -589,11 +608,30 @@ pub(crate) async fn try_preparse_locally_with_account(
             }
             Err(e) => {
                 let err = e.to_string();
-                return Some(txt(crate::i18n::t_fmt(
-                    "cap_open_failed",
-                    lang,
-                    &[("err", &err)],
-                )));
+                let is_binary_missing = err.contains("binary not found on PATH");
+                let hint = if is_binary_missing {
+                    match kind {
+                        crate::cap::AgentKind::Opencode => crate::i18n::t_fmt(
+                            "cap_install_hint_go",
+                            lang,
+                            &[
+                                ("agent", kind.display_name()),
+                                ("cmd", kind.as_str()),
+                            ],
+                        ),
+                        _ => crate::i18n::t_fmt(
+                            "cap_install_hint_npm",
+                            lang,
+                            &[
+                                ("agent", kind.display_name()),
+                                ("cmd", kind.as_str()),
+                            ],
+                        ),
+                    }
+                } else {
+                    crate::i18n::t_fmt("cap_open_failed", lang, &[("err", &err)])
+                };
+                return Some(txt(hint));
             }
         }
     }
@@ -2022,26 +2060,26 @@ fn resolve_cap_workspace(
     let expanded = if let Some(rest) = input.strip_prefix("~/") {
         match dirs_next::home_dir() {
             Some(h) => h.join(rest),
-            None => return Err("HOME 不可用，无法展开 ~".to_string()),
+            None => return Err("HOME not available, cannot expand ~".to_string()),
         }
     } else if input == "~" {
         match dirs_next::home_dir() {
             Some(h) => h,
-            None => return Err("HOME 不可用，无法展开 ~".to_string()),
+            None => return Err("HOME not available, cannot expand ~".to_string()),
         }
     } else {
         std::path::PathBuf::from(input)
     };
     let canon = std::fs::canonicalize(&expanded)
-        .map_err(|e| format!("路径不可达 ({e})"))?;
+        .map_err(|e| format!("path not accessible ({e})"))?;
     if !canon.is_dir() {
-        return Err("不是目录".to_string());
+        return Err("not a directory".to_string());
     }
-    let home = dirs_next::home_dir().ok_or_else(|| "HOME 不可用".to_string())?;
+    let home = dirs_next::home_dir().ok_or_else(|| "HOME not available".to_string())?;
     let home_canon = std::fs::canonicalize(&home).unwrap_or(home);
     if !canon.starts_with(&home_canon) {
         return Err(format!(
-            "路径必须在 {} 之下",
+            "path must be under {}",
             home_canon.display()
         ));
     }

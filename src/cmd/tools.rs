@@ -800,6 +800,7 @@ pub async fn cmd_install(name: &str, force: bool) -> Result<()> {
         let npm_package = match *tool_name {
             "claude-code" => Some("@anthropic-ai/claude-code"),
             "qoder" => Some("@qoder-ai/qodercli"),
+            "codex" => Some("@openai/codex"),
             _ => None,
         };
         if let Some(pkg) = npm_package {
