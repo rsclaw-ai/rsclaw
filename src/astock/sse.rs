@@ -120,6 +120,7 @@ async fn run_listener(base_url: String, auth_token: Option<String>, filter: Stri
     let dedupe: Arc<Mutex<DedupeLru>> = Arc::new(Mutex::new(DedupeLru::new(DEDUPE_LRU_CAP)));
     let mut last_event_id: Option<i64> = None;
     let mut backoff = Duration::from_secs(1);
+    let mut consecutive_errs: u32 = 0;
     const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
     loop {
@@ -134,16 +135,34 @@ async fn run_listener(base_url: String, auth_token: Option<String>, filter: Stri
         .await
         {
             Ok(()) => {
+                if consecutive_errs >= 5 {
+                    tracing::info!(filter, after_failures = consecutive_errs, "astock SSE: recovered");
+                }
+                consecutive_errs = 0;
                 tracing::info!(filter, "astock SSE: stream ended cleanly; reconnecting");
                 backoff = Duration::from_secs(1);
             }
             Err(e) => {
-                tracing::warn!(
-                    filter,
-                    error = %e,
-                    backoff_secs = backoff.as_secs(),
-                    "astock SSE: listener error; reconnecting after backoff"
-                );
+                // Same escalation contract as wechat/feishu reconnect loops:
+                // singles are debug weather, streaks are the outage signal.
+                consecutive_errs = consecutive_errs.saturating_add(1);
+                if consecutive_errs == 5 || (consecutive_errs > 5 && consecutive_errs % 10 == 0) {
+                    tracing::warn!(
+                        filter,
+                        error = %e,
+                        consecutive = consecutive_errs,
+                        backoff_secs = backoff.as_secs(),
+                        "astock SSE: failing repeatedly; reconnecting after backoff"
+                    );
+                } else {
+                    tracing::debug!(
+                        filter,
+                        error = %e,
+                        consecutive = consecutive_errs,
+                        backoff_secs = backoff.as_secs(),
+                        "astock SSE: listener error; reconnecting after backoff"
+                    );
+                }
             }
         }
         tokio::time::sleep(backoff).await;
