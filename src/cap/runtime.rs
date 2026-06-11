@@ -276,32 +276,52 @@ async fn spawn_driver_inner(
             )
         }
         AgentKind::Opencode => {
+            // Try stream-json first (faster, lower overhead). Fall
+            // back to ACP (`opencode acp`) if stream-json spawn fails
+            // — older / non-fork opencode binaries may not support
+            // `--output-format stream-json --persist`.
             let mut b = ClaudeCodeDriver::opencode_builder(cwd);
             b = apply_resume_mode(b, resume_mode);
-            Box::new(
-                b.spawn()
-                    .await
-                    .map_err(|e| anyhow!("cap opencode spawn: {e}"))?,
-            )
+            match b.spawn().await {
+                Ok(d) => Box::new(d),
+                Err(e) => {
+                    tracing::info!(
+                        target: "cap",
+                        error = %e,
+                        "opencode stream-json spawn failed, falling back to ACP"
+                    );
+                    Box::new(
+                        cap_rs::driver::acp::AcpDriver::opencode(&cwd)
+                            .await
+                            .map_err(|e2| anyhow!("cap opencode spawn (stream-json: {e}, ACP: {e2})"))?,
+                    )
+                }
+            }
         }
         AgentKind::Codex => {
-            // Codex now drives through `codex exec --input-format
-            // stream-json --output-format stream-json` (multi-turn
-            // native). Replaces the old CodexMcpDriver path: same
-            // session-reuse semantics but without the MCP `tools/call`
-            // JSON-RPC envelope and the codex-mcp-server's per-turn
-            // overhead that made codex feel 10× slower than direct
-            // `codex` CLI use. Reasoning tokens stream as Thought
-            // events end-to-end via the agent_reasoning_delta path
-            // wired through `bridge.rs::dispatch` (see TextChannel
-            // Thought).
+            // Try stream-json first (`codex exec --input-format
+            // stream-json`). Fall back to MCP (`codex mcp-server`)
+            // if spawn fails — older codex binaries may not support
+            // the stream-json exec subcommand.
             let mut b = ClaudeCodeDriver::codex_builder(cwd).dangerously_skip_permissions(true);
             b = apply_resume_mode(b, resume_mode);
-            Box::new(
-                b.spawn()
-                    .await
-                    .map_err(|e| anyhow!("cap codex spawn: {e}"))?,
-            )
+            match b.spawn().await {
+                Ok(d) => Box::new(d),
+                Err(e) => {
+                    tracing::info!(
+                        target: "cap",
+                        error = %e,
+                        "codex stream-json spawn failed, falling back to MCP"
+                    );
+                    Box::new(
+                        cap_rs::driver::codex_mcp::CodexMcpDriver::builder(&cwd)
+                            .approval_policy("never")
+                            .spawn()
+                            .await
+                            .map_err(|e2| anyhow!("cap codex spawn (stream-json: {e}, MCP: {e2})"))?,
+                    )
+                }
+            }
         }
         AgentKind::Qoder => {
             // Qoder uses the same stream-json protocol as Claude Code.

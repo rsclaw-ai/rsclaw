@@ -2420,6 +2420,11 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "zh" => "未找到 {agent}，请从 https://github.com/opencode-ai/opencode 安装后重试 /cap {cmd}。",
     );
 
+    msg!("cap_fallback_protocol",
+        "en" => "{agent} connected via {protocol} (stream-json not available)",
+        "zh" => "{agent} 通过 {protocol} 连接（stream-json 不可用）",
+    );
+
     msg!("cap_bad_workspace",
         "en" => "/cap: workspace path rejected — {path}: {reason}",
         "zh" => "/cap：工作目录被拒绝 — {path}：{reason}",
