@@ -26,11 +26,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux runners pinned to 22.04 (glibc 2.35) so the system
+          # libc headers don't expose C23 `__isoc23_*` symbols that the
+          # zigbuild 2.34 pin can't resolve. The 24.04 runners pulled
+          # those in via system libs and broke linking with
+          # `__isoc23_strtoull@GLIBC_2.38` and friends on 2026-06-11.
+          # Switch back once cargo-zigbuild handles the C23 leak.
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-24.04
+            os: ubuntu-22.04
             archive: tar.gz
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
+            os: ubuntu-22.04-arm
             archive: tar.gz
           - target: x86_64-apple-darwin
             os: macos-14
