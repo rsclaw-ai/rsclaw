@@ -485,7 +485,19 @@ pub(crate) async fn render_chart_for_code(
     let count = input.count.clamp(20, 200);
     let adjust = input.adjust;
     let ma_periods = input.ma_periods;
-    let name_hint = input.name_hint;
+    // Auto-fill the chart title's name when the caller didn't provide
+    // one — the resolver hits the same name_cache the rest of the
+    // /astock surface uses, so subsequent charts in the same minute
+    // are free.
+    let resolved_name: Option<String> = if input.name_hint.is_some() {
+        None
+    } else {
+        let map = arc.resolve_names(std::slice::from_ref(&code)).await;
+        map.get(&code).cloned()
+    };
+    let name_hint: Option<&str> = input
+        .name_hint
+        .or(resolved_name.as_deref());
 
     // Fetch bars + the latest quote in parallel — the quote gives us
     // a fresh price + change% for the title, more meaningful than
@@ -898,12 +910,24 @@ pub(crate) async fn watchlist_clear(
 ///
 /// Shape: `<code>  ¥<price>  <+|-N.NN%>  额<money>  量<volume>`
 /// Example: `600519  ¥1272.86  +0.07%  额39.84亿  量313.04万手`
-fn render_one_quote_line(q: &crate::astock::Quote) -> String {
+fn render_one_quote_line(
+    q: &crate::astock::Quote,
+    names: Option<&std::collections::HashMap<String, String>>,
+) -> String {
     let pct = q.change_pct();
     let sign = if pct >= 0.0 { "+" } else { "" };
+    let name = names
+        .and_then(|m| m.get(&q.code))
+        .map(String::as_str)
+        .unwrap_or("");
+    let head = if name.is_empty() {
+        q.code.clone()
+    } else {
+        format!("{} {}", q.code, name)
+    };
     format!(
         "{}  ¥{:.2}  {}{:.2}%  额{}  量{}",
-        q.code,
+        head,
         q.price,
         sign,
         pct,
@@ -913,15 +937,26 @@ fn render_one_quote_line(q: &crate::astock::Quote) -> String {
 }
 
 pub(crate) fn render_quotes_markdown(quotes: &[crate::astock::Quote]) -> String {
+    render_quotes_markdown_with_names(quotes, None)
+}
+
+/// Same shape as `render_quotes_markdown` but accepts an optional
+/// code → name lookup so callers that already resolved names (e.g.
+/// the `/astock quote` slash handler) can render `600519 贵州茅台`
+/// instead of `600519` alone.
+pub(crate) fn render_quotes_markdown_with_names(
+    quotes: &[crate::astock::Quote],
+    names: Option<&std::collections::HashMap<String, String>>,
+) -> String {
     if quotes.is_empty() {
         return "_没有报价数据_".to_owned();
     }
     if quotes.len() == 1 {
-        return render_one_quote_line(&quotes[0]);
+        return render_one_quote_line(&quotes[0], names);
     }
     quotes
         .iter()
-        .map(|q| format!("- {}", render_one_quote_line(q)))
+        .map(|q| format!("- {}", render_one_quote_line(q, names)))
         .collect::<Vec<_>>()
         .join("\n")
 }

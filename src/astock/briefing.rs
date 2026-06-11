@@ -66,11 +66,43 @@ impl BriefingSlot {
         }
     }
 
+    /// Wall-clock time for this slot, in Asia/Shanghai. Reads
+    /// `astock.briefing.slots.<slug>` from the live config — when
+    /// absent or malformed, falls back to the hardcoded default
+    /// (`07:50 / 12:05 / 18:30`).
+    ///
+    /// Each call re-reads the config (cheap — JSON5 file < 10 KB),
+    /// but the scheduler captures the value once per loop iteration
+    /// so changes only take effect after the scheduler wakes for the
+    /// next slot. In practice that means: edit `rsclaw.json5`, wait
+    /// for the next briefing to fire (or `cargo run -- gateway
+    /// restart`), and the new time applies from then on.
     pub fn wallclock(&self) -> NaiveTime {
+        self.config_wallclock().unwrap_or_else(|| self.default_wallclock())
+    }
+
+    fn default_wallclock(&self) -> NaiveTime {
         match self {
             BriefingSlot::PreMarket => NaiveTime::from_hms_opt(7, 50, 0).unwrap(),
             BriefingSlot::MidDay => NaiveTime::from_hms_opt(12, 5, 0).unwrap(),
             BriefingSlot::PostMarket => NaiveTime::from_hms_opt(18, 30, 0).unwrap(),
+        }
+    }
+
+    fn config_wallclock(&self) -> Option<NaiveTime> {
+        let cfg = crate::config::load().ok()?;
+        let slots = cfg.raw.astock.as_ref()?.briefing.as_ref()?.slots.as_ref()?;
+        let raw = slots.get(self.slug())?;
+        match NaiveTime::parse_from_str(raw.trim(), "%H:%M") {
+            Ok(t) => Some(t),
+            Err(_) => {
+                tracing::warn!(
+                    slot = self.slug(),
+                    raw = %raw,
+                    "astock.briefing.slots: malformed HH:MM, using default"
+                );
+                None
+            }
         }
     }
 

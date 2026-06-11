@@ -1831,7 +1831,23 @@ pub fn build_tool_list(
                 cron whose message names every item — the agent fans out tool calls in\n\
                 one turn and replies with the combined result.\n\
               When in doubt, BATCH is the safer default: a single late report is much\n\
-              less surprising than silently dropping items every cycle.".to_owned(),
+              less surprising than silently dropping items every cycle.\n\
+            \n\
+            CANCELLING — when the user says \"停掉\" / \"取消\" / \"别再\" / \"cancel\" /\n\
+              \"stop X\" / \"我不要 X 了\" for a recurring task you previously scheduled,\n\
+              call `cron(action=\"list\")` to find the job, then `cron(action=\"remove\",\n\
+              index=<N>)`. Do not silently acknowledge — the job keeps firing until\n\
+              you actually remove it.\n\
+            \n\
+            SELF-TERMINATING /loop — when this turn was fired by a /loop cron job\n\
+              (you can tell because `session_key` and `peer_id` look like\n\
+              `cron:loop-<12-hex>`), and the looped task has reached its natural\n\
+              stopping condition (\"tests pass\", \"build green\", \"file exists\",\n\
+              \"目标完成\", etc.), call `cron(action=\"remove\", id=\"loop-<12-hex>\")`\n\
+              using the id extracted from session_key. This is how the user gets\n\
+              goal-driven behaviour out of /loop without needing a separate /goal\n\
+              command — the LLM checks the condition each fire and removes itself\n\
+              when satisfied.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {

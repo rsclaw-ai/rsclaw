@@ -289,6 +289,26 @@ pub fn render_kline_png<P: AsRef<Path>>(
         }))
         .context("candlesticks")?;
 
+    // ---- Current-price horizontal hint ------------------------------
+    // Dashed line at the last bar's close — common Chinese-broker
+    // chart convention. Helps the eye find "where we are now"
+    // without having to read the tick label. Uses the up/down
+    // colour of the last bar so the colour itself encodes whether
+    // today is green or red versus the prior close.
+    if let Some(last) = bars.last() {
+        let line_color = if last.close >= last.open {
+            COLOR_UP
+        } else {
+            COLOR_DOWN
+        };
+        chart
+            .draw_series(std::iter::once(PathElement::new(
+                vec![(0i32, last.close), (n, last.close)],
+                line_color.mix(0.45).stroke_width(1),
+            )))
+            .context("current-price line")?;
+    }
+
     // ---- MA overlays ------------------------------------------------
     for (idx, &period) in opts.ma_periods.iter().enumerate() {
         if period < 2 || bars.len() < period {
@@ -337,7 +357,13 @@ pub fn render_kline_png<P: AsRef<Path>>(
 
     vol_chart
         .configure_mesh()
-        .x_labels(6)
+        // 10 ticks across 60-bar charts gives ≈ one per 6 bars,
+        // which lines up with weekly granularity (5 trading days)
+        // without the labels colliding. 6 ticks (the prior cut)
+        // skipped enough that the user had to count bars to find
+        // a date — confirmed against the 600519 chart shared this
+        // morning where labels read 03-13 / 03-27 / 04-13 / 04-27.
+        .x_labels(10)
         .y_labels(3)
         .light_line_style(COLOR_GRID.mix(0.5))
         .bold_line_style(COLOR_GRID)

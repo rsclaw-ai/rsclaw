@@ -1315,7 +1315,8 @@ fn astock_help_text() -> String {
      即时数据\n\
        /astock quote <code> [<code>...]      实时报价\n\
        /astock snapshot [<code>...]          快照 (空参 = 自选股)\n\
-       /astock chart <code> [period] [count] K 线图 (会推送到当前会话)\n\n\
+       /astock chart <code> [period] [count] K 线图 (会推送到当前会话)\n\
+       /astock screen <filter> [limit]       异动筛选 (quick_rally / quick_goldcross / ...)\n\n\
      备注: astock 未启用时所有子命令静默回 '_astock 未启用_'。"
         .to_owned()
 }
@@ -1336,6 +1337,7 @@ async fn handle_astock_command(
         "watchlist" => astock_watchlist(handle, channel, peer_id, args).await,
         "quote" => astock_quote(args).await,
         "snapshot" => astock_snapshot(handle, channel, peer_id, args).await,
+        "screen" => astock_screen(args).await,
         // `chart` is handled directly at the slash callsite so the
         // PNG can be attached as an image — it never reaches this
         // dispatcher. Document the case for the reader.
@@ -1437,10 +1439,47 @@ async fn astock_watchlist(
             );
         }
     };
-    match result {
-        Ok(v) => format_watchlist_reply(&action, &v),
-        Err(e) => format!("/astock watchlist 出错: {e:#}"),
+    let v = match result {
+        Ok(v) => v,
+        Err(e) => return format!("/astock watchlist 出错: {e:#}"),
+    };
+    // For `list`, enrich with display names so the reply reads as
+    // `600519 贵州茅台 / 000001 平安银行` instead of bare codes.
+    // The name resolver caches aggressively (1h) so this is a noop
+    // round trip after the first call.
+    if matches!(action.as_str(), "list" | "") {
+        if let Some(arc) = crate::astock::global_client() {
+            let codes: Vec<String> = v
+                .get("codes")
+                .and_then(|x| x.as_array())
+                .map(|arr| arr.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect())
+                .unwrap_or_default();
+            if !codes.is_empty() {
+                let names = arc.resolve_names(&codes).await;
+                return format_watchlist_list_with_names(&codes, &names);
+            }
+        }
     }
+    format_watchlist_reply(&action, &v)
+}
+
+fn format_watchlist_list_with_names(
+    codes: &[String],
+    names: &std::collections::HashMap<String, String>,
+) -> String {
+    if codes.is_empty() {
+        return "_自选股为空 — `/astock watchlist add <code>` 加一只_".to_owned();
+    }
+    let mut lines = vec![format!("自选股 ({})", codes.len())];
+    for c in codes {
+        let name = names.get(c).map(String::as_str).unwrap_or("");
+        if name.is_empty() {
+            lines.push(format!("- {c}"));
+        } else {
+            lines.push(format!("- {c} {name}"));
+        }
+    }
+    lines.join("\n")
 }
 
 fn format_watchlist_reply(action: &str, v: &serde_json::Value) -> String {
@@ -1511,18 +1550,136 @@ async fn astock_quote(args: Vec<String>) -> String {
     let Some(arc) = crate::astock::global_client() else {
         return "_astock 未启用_".to_owned();
     };
-    let result = if codes.len() == 1 {
-        match arc.quote(&codes[0]).await {
-            Ok(q) => vec![q],
-            Err(e) => return format!("astock quote: {e}"),
-        }
-    } else {
-        match arc.quote_batch(&codes).await {
-            Ok(qs) => qs,
-            Err(e) => return format!("astock quote_batch: {e}"),
+    let quote_codes = codes.clone();
+    let names_codes = codes;
+    // Fetch quotes + names in parallel. Names are best-effort —
+    // we render code-only if resolution times out / fails.
+    let quotes_fut = async {
+        if quote_codes.len() == 1 {
+            arc.quote(&quote_codes[0]).await.map(|q| vec![q])
+        } else {
+            arc.quote_batch(&quote_codes).await
         }
     };
-    crate::agent::tools_stock::render_quotes_markdown(&result)
+    let names_fut = arc.resolve_names(&names_codes);
+    let (quotes_res, names) = tokio::join!(quotes_fut, names_fut);
+    let quotes = match quotes_res {
+        Ok(q) => q,
+        Err(e) => return format!("astock quote: {e}"),
+    };
+    crate::agent::tools_stock::render_quotes_markdown_with_names(&quotes, Some(&names))
+}
+
+async fn astock_screen(args: Vec<String>) -> String {
+    let filter = match args.first() {
+        Some(f) if !f.is_empty() => f.clone(),
+        _ => {
+            return "用法: /astock screen <quick_filter> [limit]\n\
+                    可选 filter: quick_rally | quick_goldcross | \
+                    quick_cow_catch | quick_deadtogold"
+                .to_owned();
+        }
+    };
+    let limit = args.get(1).and_then(|s| s.parse::<u32>().ok()).or(Some(10));
+    let Some(arc) = crate::astock::global_client() else {
+        return "_astock 未启用_".to_owned();
+    };
+    let resp = match arc.screen_quick(&filter, limit).await {
+        Ok(v) => v,
+        Err(e) => return format!("astock screen: {e}"),
+    };
+    format_screen_reply(&filter, &resp)
+}
+
+/// Render the screen-quick JSON tree as IM-friendly markdown.
+///
+/// Astock's response shape (verified live against quick_rally at
+/// 2026-06-11 13:39):
+///   {
+///     "as_of_ts": null,
+///     "computed_at": "2026-06-11T13:39:30+08:00",
+///     "cost_credits": 85,
+///     "count": 0,
+///     "filters_applied": [...],
+///     "limit": 50,
+///     "results": [...],
+///     "total_matched": 0
+///   }
+///
+/// Each entry in `results` is per-filter — we surface code/name when
+/// present and otherwise dump the row as compact JSON. Defensive on
+/// shape because astock's filters expose different telemetry per
+/// type (rally has pct_change, goldcross has ma cross series, ...).
+fn format_screen_reply(filter: &str, v: &serde_json::Value) -> String {
+    let total = v
+        .get("total_matched")
+        .and_then(|x| x.as_u64())
+        .or_else(|| v.get("count").and_then(|x| x.as_u64()))
+        .unwrap_or(0);
+    let cost = v
+        .get("cost_credits")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    let computed = v
+        .get("computed_at")
+        .and_then(|x| x.as_str())
+        .unwrap_or("?");
+    let results = v
+        .get("results")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut lines = vec![format!(
+        "**{}** · {} 命中 · {} 积分 · {}",
+        filter, total, cost, computed
+    )];
+    if results.is_empty() {
+        lines.push("_无命中_".to_owned());
+        return lines.join("\n");
+    }
+    for row in results.iter().take(20) {
+        let code = row
+            .get("code")
+            .and_then(|x| x.as_str())
+            .unwrap_or("?");
+        let name = row
+            .get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        // Best-effort: surface whichever metric column the filter
+        // chose to highlight, falling back to a compact JSON dump.
+        let metric = row
+            .get("pct_change")
+            .or_else(|| row.get("change_pct"))
+            .or_else(|| row.get("score"))
+            .or_else(|| row.get("rally"))
+            .and_then(|x| x.as_f64())
+            .map(|p| format!("{:+.2}%", p))
+            .unwrap_or_else(|| {
+                serde_json::to_string(row)
+                    .map(|s| {
+                        if s.len() > 60 {
+                            // CJK-safe truncate — `&s[..60]` can
+                            // panic mid-codepoint. See
+                            // crate::util::truncate_str.
+                            format!("{}…", crate::util::truncate_str(&s, 60))
+                        } else {
+                            s
+                        }
+                    })
+                    .unwrap_or_default()
+            });
+        let head = if name.is_empty() {
+            code.to_owned()
+        } else {
+            format!("{} {}", code, name)
+        };
+        lines.push(format!("- {}  {}", head, metric));
+    }
+    if results.len() > 20 {
+        lines.push(format!("_…剩余 {} 行_", results.len() - 20));
+    }
+    lines.join("\n")
 }
 
 async fn astock_snapshot(

@@ -281,6 +281,60 @@ impl AstockClient {
         })
     }
 
+    /// Resolve a batch of stock codes to display names.
+    ///
+    /// Currently a no-op: as of 2026-06-11 the upstream astock service
+    /// does NOT carry stock-name data on ANY endpoint or table —
+    /// verified by:
+    ///   * `GET /v1/quote/600519`     → no `name` field
+    ///   * `GET /v1/snapshot?codes=…` → no `name` field (despite our
+    ///     `SnapshotRow.name: Option<String>` being declared, the
+    ///     server never populates it)
+    ///   * `SELECT column_name FROM information_schema.columns ...` →
+    ///     no name column anywhere in the duckdb store
+    ///   * `POST /v1/ask` (iwencai) → would work but needs an
+    ///     `IWENCAI_API_KEY` we don't currently have
+    ///
+    /// The infrastructure here (cache + signature) is kept so callers
+    /// can opt in without changes once a real source lands —
+    /// upstream is the natural place (free Chinese stock data
+    /// providers like sina / eastmoney expose names trivially), or we
+    /// bundle a static `code → name` JSON at build time (~150KB for
+    /// top 5000 A-shares).
+    ///
+    /// Until then, ALWAYS returns an empty map → callers render
+    /// code-only. The cache is still maintained as "we asked, got
+    /// nothing" sentinel so future opt-ins don't re-ask hot codes.
+    pub async fn resolve_names(
+        &self,
+        _codes: &[String],
+    ) -> std::collections::HashMap<String, String> {
+        // No-op for v1. See doc comment for rationale.
+        std::collections::HashMap::new()
+    }
+
+    /// astock `GET /v1/screen/quick/<filter>?limit=<n>`. One-shot
+    /// snapshot of a quick screener — same data set the SSE bridge
+    /// streams continuously, but returned in full at the moment of
+    /// call. Returns the raw JSON tree (the response shape carries
+    /// `results: [...]`, `count`, `cost_credits`, etc.) so the
+    /// caller can format it however it likes.
+    ///
+    /// Not cached — screen results change frequently and the user
+    /// asking via `/astock screen quick_rally` is specifically asking
+    /// for a NOW snapshot.
+    pub async fn screen_quick(
+        &self,
+        filter: &str,
+        limit: Option<u32>,
+    ) -> Result<serde_json::Value, AstockError> {
+        let mut url = format!("{}/v1/screen/quick/{}", self.base_url, filter);
+        if let Some(n) = limit {
+            url.push_str(&format!("?limit={n}"));
+        }
+        self.get_json(&url).await
+    }
+
     /// astock `GET /v1/quote/:code`. Cached per TTL (default 5s).
     pub async fn quote(&self, code: &str) -> Result<Quote, AstockError> {
         let code = normalize_code(code);
@@ -374,7 +428,22 @@ impl AstockClient {
         let rb = self.http.get(&url).query(&params);
         let rb = self.with_auth(rb);
         let resp = rb.send().await?;
-        let rows: Vec<SnapshotRow> = self.read_json(resp).await?;
+        // Astock wraps snapshot rows in
+        //   { "count": N, "snapshots": [...], "market": "...", "ts": ... }
+        // The bare `Vec<SnapshotRow>` decode shape used to be the upstream
+        // contract — at some point astock added the wrapper and we kept
+        // decoding into a bare array, which silently failed serde
+        // deserialisation. Side effect: `tool_stock_snapshot` returned an
+        // error for every non-trivial call, and `resolve_names` got an
+        // empty map every time (so `/astock quote` never showed Chinese
+        // names). Unwrap the `snapshots` key defensively — fall back to
+        // treating the body as a bare array for back-compat in case the
+        // shape regresses.
+        let body: serde_json::Value = self.read_json(resp).await?;
+        let rows: Vec<SnapshotRow> = match body.get("snapshots") {
+            Some(arr) => serde_json::from_value(arr.clone())?,
+            None => serde_json::from_value(body)?,
+        };
         if cache_eligible {
             self.snapshot_cache.put(cache_key, rows.clone());
         }
