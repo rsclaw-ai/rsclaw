@@ -617,6 +617,12 @@ pub(crate) fn extract_key_entities(text: &str) -> Vec<KeyEntity> {
                 "我住在", "我家在", "我搬到了", "我搬到", "我现在住在",
                 "现在住在", "我在", "家住", "住在", "搬到了", "搬到",
                 "记住", "记一下",
+                // Workplace variants — "我的工位在B栋7楼706室" kept the
+                // whole phrase as the entity value (seen live 2026-06-12).
+                // Compounds listed explicitly: the stripper is prefix-based,
+                // so "工位在" alone never matches "我的工位在".
+                "我的工位在", "工位在", "我的办公室在", "办公室在",
+                "我的公司在", "公司在", "我的家在",
             ];
             let addr_parts: Vec<String> = addr_parts
                 .into_iter()
@@ -1157,6 +1163,21 @@ mod entity_extraction_tests {
         );
         assert!(!addr[0].value.contains("记住"));
         assert!(!addr[0].value.contains("我住在"));
+    }
+
+    #[test]
+    fn address_strips_workplace_narration() {
+        // Live 2026-06-12: "我的工位在B栋7楼706室" landed verbatim as the
+        // entity value, lead-in and all.
+        let es = extract_key_entities("记住：我的工位在B栋7楼706室");
+        let addr: Vec<&KeyEntity> = es.iter().filter(|e| e.kind == "address").collect();
+        assert_eq!(addr.len(), 1, "{es:?}");
+        assert!(
+            addr[0].value.starts_with("B栋"),
+            "narration leaked into value: {:?}",
+            addr[0].value
+        );
+        assert!(!addr[0].value.contains("工位在"));
     }
 
     #[test]
