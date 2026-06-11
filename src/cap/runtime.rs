@@ -109,7 +109,7 @@ pub(crate) enum ToolCapRequest {
 
 type Slot = Arc<RwLock<Option<mpsc::Sender<ToolCapRequest>>>>;
 
-pub(crate) struct CapAgentManager {
+pub struct CapAgentManager {
     claudecode: Slot,
     openclaude: Slot,
     opencode: Slot,
