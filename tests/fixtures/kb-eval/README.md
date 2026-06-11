@@ -44,10 +44,17 @@ rsclaw --profile <test> kb eval tests/fixtures/kb-eval/golden.json -k 5
 
 | embedder | hit@1 | MRR | notes |
 |---|---|---|---|
-| bge-small-zh (512d, local) | 87.0% | 0.870 | reproduced twice |
-| bge-base-zh (768d, local) | 81.9% | 0.819 | 3× params, loses anyway |
-| Qwen3-Embedding-0.6B | (pending) | — | first deployment had mean
-pooling + stale-result slot corruption; re-test after `--pooling last` |
+| bge-small-zh (512d, local) | 87.0% | 0.870 | reproduced twice; the default |
+| Qwen3-0.6B + query instruction (1024d, remote) | 82.9% | 0.829 | healthy deployment |
+| bge-base-zh (768d, local) | 81.9% | 0.819 | 3× params over small, loses anyway |
+| Qwen3-0.6B, no instruction | 79.6% | 0.796 | instruction is worth +3.3 |
+
+Caveat on the Qwen3 rows: this corpus is short docs (~1 chunk each), so
+bge-small's 512-token input limit never bites. Real 研报 chunks at the
+512-token chunk target + title prefix DO exceed it (tail silently truncated
+at embed time) — that regime is where Qwen3 (32K input) should pull ahead
+and is NOT yet covered by this golden set. Add long-doc cases before
+treating bge-small as the final answer for production corpora.
 
 Sanity checks this benchmark has caught: a remote endpoint returning
 IDENTICAL vectors for different inputs (slot corruption — two different
