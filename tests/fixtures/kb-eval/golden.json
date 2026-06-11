@@ -1,0 +1,1082 @@
+[
+ {
+  "query": "蒙牛2025年营收多少",
+  "expectTitleContains": "mengniu-2025",
+  "expectTextContains": "1042"
+ },
+ {
+  "query": "贝拉米品牌最近表现如何",
+  "expectTitleContains": "mengniu-2025",
+  "expectTextContains": "下滑9%"
+ },
+ {
+  "query": "蒙牛的赚钱能力有没有变好",
+  "expectTitleContains": "mengniu-2025",
+  "expectTextContains": "5.8%"
+ },
+ {
+  "query": "哪家乳企要在内蒙古建新厂",
+  "expectTitleContains": "mengniu-2025",
+  "expectTextContains": "内蒙古新工厂"
+ },
+ {
+  "query": "伊利总收入是多少",
+  "expectTitleContains": "yili-2025",
+  "expectTextContains": "1356"
+ },
+ {
+  "query": "金领冠奶粉卖得怎么样",
+  "expectTitleContains": "yili-2025",
+  "expectTextContains": "增长15%"
+ },
+ {
+  "query": "哪个乳业巨头在东南亚做得不错",
+  "expectTitleContains": "yili-2025",
+  "expectTextContains": "东南亚市场表现亮眼"
+ },
+ {
+  "query": "伊利在研发上花了多少钱",
+  "expectTitleContains": "yili-2025",
+  "expectTextContains": "12亿"
+ },
+ {
+  "query": "光明乳业营收",
+  "expectTitleContains": "guangming-2025",
+  "expectTextContains": "295亿"
+ },
+ {
+  "query": "莫斯利安销量怎么样了",
+  "expectTitleContains": "guangming-2025",
+  "expectTextContains": "下滑6%"
+ },
+ {
+  "query": "做低温鲜奶最重的乳企是哪家",
+  "expectTitleContains": "guangming-2025",
+  "expectTextContains": "48%"
+ },
+ {
+  "query": "光明的冷链网络覆盖多少站点",
+  "expectTitleContains": "guangming-2025",
+  "expectTextContains": "1200个配送站点"
+ },
+ {
+  "query": "君乐宝营收增速多少",
+  "expectTitleContains": "junlebao-2025",
+  "expectTextContains": "18.5%"
+ },
+ {
+  "query": "乳业里增长最快的公司是谁",
+  "expectTitleContains": "junlebao-2025",
+  "expectTextContains": "增速位居行业第一"
+ },
+ {
+  "query": "无糖酸奶的大单品属于哪家",
+  "expectTitleContains": "junlebao-2025",
+  "expectTextContains": "简醇零蔗糖酸奶"
+ },
+ {
+  "query": "君乐宝什么时候上市",
+  "expectTitleContains": "junlebao-2025",
+  "expectTextContains": "推进上市进程"
+ },
+ {
+  "query": "飞鹤2025年收入",
+  "expectTitleContains": "feihe-2025",
+  "expectTextContains": "213亿"
+ },
+ {
+  "query": "乳制品行业里利润率最高的是谁",
+  "expectTitleContains": "feihe-2025",
+  "expectTextContains": "16.8%"
+ },
+ {
+  "query": "星飞帆在飞鹤收入里占比多少",
+  "expectTitleContains": "feihe-2025",
+  "expectTextContains": "58%"
+ },
+ {
+  "query": "飞鹤手里有多少现金",
+  "expectTitleContains": "feihe-2025",
+  "expectTextContains": "150亿"
+ },
+ {
+  "query": "农夫山泉一年卖多少钱",
+  "expectTitleContains": "nongfu-2025",
+  "expectTextContains": "486亿"
+ },
+ {
+  "query": "东方树叶增长情况",
+  "expectTitleContains": "nongfu-2025",
+  "expectTextContains": "增长34%"
+ },
+ {
+  "query": "卖水的公司里利润率最高的",
+  "expectTitleContains": "nongfu-2025",
+  "expectTextContains": "23.5%"
+ },
+ {
+  "query": "农夫山泉新工厂在哪投产",
+  "expectTitleContains": "nongfu-2025",
+  "expectTextContains": "武夷山工厂"
+ },
+ {
+  "query": "蔚来2025交付了多少辆车",
+  "expectTitleContains": "nio-2025",
+  "expectTextContains": "32万辆"
+ },
+ {
+  "query": "换电站建得最多的车企",
+  "expectTitleContains": "nio-2025",
+  "expectTextContains": "3100座"
+ },
+ {
+  "query": "乐道这个牌子卖得怎么样",
+  "expectTitleContains": "nio-2025",
+  "expectTextContains": "1.5万辆"
+ },
+ {
+  "query": "蔚来电池是跟谁合作的",
+  "expectTitleContains": "nio-2025",
+  "expectTextContains": "宁德时代"
+ },
+ {
+  "query": "理想汽车去年交付量",
+  "expectTitleContains": "lixiang-2025",
+  "expectTextContains": "58万"
+ },
+ {
+  "query": "新势力车企里毛利率最高的是哪家",
+  "expectTitleContains": "lixiang-2025",
+  "expectTextContains": "20.1%"
+ },
+ {
+  "query": "理想的纯电车型销量如何",
+  "expectTitleContains": "lixiang-2025",
+  "expectTextContains": "2.8万辆"
+ },
+ {
+  "query": "理想智能驾驶覆盖范围",
+  "expectTitleContains": "lixiang-2025",
+  "expectTextContains": "所有地级市"
+ },
+ {
+  "query": "小鹏一年交付多少",
+  "expectTitleContains": "xiaopeng-2025",
+  "expectTextContains": "46万辆"
+ },
+ {
+  "query": "造车新势力里增速最猛的",
+  "expectTitleContains": "xiaopeng-2025",
+  "expectTextContains": "增速居新势力之首"
+ },
+ {
+  "query": "哪家车企的毛利率刚刚由负转正",
+  "expectTitleContains": "xiaopeng-2025",
+  "expectTextContains": "首次转正"
+ },
+ {
+  "query": "会飞的汽车是哪家做的",
+  "expectTitleContains": "xiaopeng-2025",
+  "expectTextContains": "飞行汽车"
+ },
+ {
+  "query": "比亚迪全球卖了多少辆",
+  "expectTitleContains": "byd-2025",
+  "expectTextContains": "460万辆"
+ },
+ {
+  "query": "出海卖车最多的中国车企",
+  "expectTitleContains": "byd-2025",
+  "expectTextContains": "海外销售98万辆"
+ },
+ {
+  "query": "比亚迪混动百公里油耗",
+  "expectTitleContains": "byd-2025",
+  "expectTextContains": "2.6L"
+ },
+ {
+  "query": "比亚迪欧洲工厂在哪",
+  "expectTitleContains": "byd-2025",
+  "expectTextContains": "匈牙利和土耳其"
+ },
+ {
+  "query": "零跑去年卖了多少台",
+  "expectTitleContains": "leapmotor-2025",
+  "expectTextContains": "51万辆"
+ },
+ {
+  "query": "新势力里第一个全年赚钱的是谁",
+  "expectTitleContains": "leapmotor-2025",
+  "expectTextContains": "首次实现全年盈利"
+ },
+ {
+  "query": "零跑跟哪个外国集团合资",
+  "expectTitleContains": "leapmotor-2025",
+  "expectTextContains": "Stellantis"
+ },
+ {
+  "query": "15万级六座SUV销冠是哪款",
+  "expectTitleContains": "leapmotor-2025",
+  "expectTextContains": "C16"
+ },
+ {
+  "query": "极氪年交付量",
+  "expectTitleContains": "zeekr-2025",
+  "expectTextContains": "31万辆"
+ },
+ {
+  "query": "充电10分钟能跑500公里的电池",
+  "expectTitleContains": "zeekr-2025",
+  "expectTextContains": "金砖电池"
+ },
+ {
+  "query": "极氪和哪个品牌合并了",
+  "expectTitleContains": "zeekr-2025",
+  "expectTextContains": "领克"
+ },
+ {
+  "query": "极氪在欧洲哪些国家有直营店",
+  "expectTitleContains": "zeekr-2025",
+  "expectTextContains": "荷兰、瑞典、德国"
+ },
+ {
+  "query": "茅台2025年收入",
+  "expectTitleContains": "maotai-2025",
+  "expectTextContains": "1738亿"
+ },
+ {
+  "query": "A股净利润率最高的消费股",
+  "expectTitleContains": "maotai-2025",
+  "expectTextContains": "52.6%"
+ },
+ {
+  "query": "i茅台有多少用户",
+  "expectTitleContains": "maotai-2025",
+  "expectTextContains": "8000万"
+ },
+ {
+  "query": "茅台海外卖了多少",
+  "expectTitleContains": "maotai-2025",
+  "expectTextContains": "55亿"
+ },
+ {
+  "query": "五粮液营收接近千亿了吗",
+  "expectTitleContains": "wuliangye-2025",
+  "expectTextContains": "989亿"
+ },
+ {
+  "query": "普五提价后卖得动吗",
+  "expectTitleContains": "wuliangye-2025",
+  "expectTextContains": "动销平稳"
+ },
+ {
+  "query": "五粮液低度酒增长多少",
+  "expectTitleContains": "wuliangye-2025",
+  "expectTextContains": "增长21%"
+ },
+ {
+  "query": "哪个白酒在拍卖市场溢价四成",
+  "expectTitleContains": "wuliangye-2025",
+  "expectTextContains": "溢价40%"
+ },
+ {
+  "query": "泸州老窖营收规模",
+  "expectTitleContains": "luzhou-2025",
+  "expectTextContains": "356亿"
+ },
+ {
+  "query": "国窖1573一年卖多少",
+  "expectTitleContains": "luzhou-2025",
+  "expectTextContains": "218亿"
+ },
+ {
+  "query": "白酒五码合一数字化是哪家搞的",
+  "expectTitleContains": "luzhou-2025",
+  "expectTextContains": "五码合一"
+ },
+ {
+  "query": "28度的低度国窖上市了吗",
+  "expectTitleContains": "luzhou-2025",
+  "expectTextContains": "28度国窖试点上市"
+ },
+ {
+  "query": "汾酒去年营收",
+  "expectTitleContains": "fenjiu-2025",
+  "expectTextContains": "412亿"
+ },
+ {
+  "query": "头部白酒里增长最快的是谁",
+  "expectTitleContains": "fenjiu-2025",
+  "expectTextContains": "增速居头部白酒第一"
+ },
+ {
+  "query": "青花汾在汾酒收入里占多少",
+  "expectTitleContains": "fenjiu-2025",
+  "expectTextContains": "51%"
+ },
+ {
+  "query": "汾酒在南方市场表现",
+  "expectTitleContains": "fenjiu-2025",
+  "expectTextContains": "增长35%"
+ },
+ {
+  "query": "小米2025总收入",
+  "expectTitleContains": "xiaomi-2025",
+  "expectTextContains": "4520亿"
+ },
+ {
+  "query": "雷军的公司高端手机卖得如何",
+  "expectTitleContains": "xiaomi-2025",
+  "expectTextContains": "28%"
+ },
+ {
+  "query": "SU7一年交付多少",
+  "expectTitleContains": "xiaomi-2025",
+  "expectTextContains": "38万辆"
+ },
+ {
+  "query": "小米手机出货量全球排第几",
+  "expectTitleContains": "xiaomi-2025",
+  "expectTextContains": "重回全球前二"
+ },
+ {
+  "query": "华为消费者业务收入",
+  "expectTitleContains": "huawei-2025",
+  "expectTextContains": "3890亿"
+ },
+ {
+  "query": "折叠屏手机市场谁是老大",
+  "expectTitleContains": "huawei-2025",
+  "expectTextContains": "58%"
+ },
+ {
+  "query": "Mate 80用的什么芯片",
+  "expectTitleContains": "huawei-2025",
+  "expectTextContains": "麒麟9120"
+ },
+ {
+  "query": "问界汽车交付量",
+  "expectTitleContains": "huawei-2025",
+  "expectTextContains": "52万辆"
+ },
+ {
+  "query": "OPPO全球出货量",
+  "expectTitleContains": "oppo-2025",
+  "expectTextContains": "1.08亿台"
+ },
+ {
+  "query": "国内手机市场份额第一是谁",
+  "expectTitleContains": "oppo-2025",
+  "expectTextContains": "16.2%"
+ },
+ {
+  "query": "OPPO相机和哪家联名",
+  "expectTitleContains": "oppo-2025",
+  "expectTextContains": "哈苏"
+ },
+ {
+  "query": "潮汐架构省电效果",
+  "expectTitleContains": "oppo-2025",
+  "expectTextContains": "降低30%"
+ },
+ {
+  "query": "vivo一年出货多少",
+  "expectTitleContains": "vivo-2025",
+  "expectTextContains": "1.02亿台"
+ },
+ {
+  "query": "X200系列卖了多少台",
+  "expectTitleContains": "vivo-2025",
+  "expectTextContains": "900万"
+ },
+ {
+  "query": "vivo在印度排名",
+  "expectTitleContains": "vivo-2025",
+  "expectTextContains": "19%"
+ },
+ {
+  "query": "蓝心大模型是哪家手机厂的",
+  "expectTitleContains": "vivo-2025",
+  "expectTextContains": "蓝心大模型"
+ },
+ {
+  "query": "荣耀出货量多少",
+  "expectTitleContains": "honor-2025",
+  "expectTextContains": "7200万台"
+ },
+ {
+  "query": "哪家手机厂在准备上市",
+  "expectTitleContains": "honor-2025",
+  "expectTextContains": "启动IPO辅导"
+ },
+ {
+  "query": "续航能撑两天的手机电池技术",
+  "expectTitleContains": "honor-2025",
+  "expectTextContains": "青海湖电池"
+ },
+ {
+  "query": "荣耀在中东非洲增长多快",
+  "expectTitleContains": "honor-2025",
+  "expectTextContains": "88%"
+ },
+ {
+  "query": "招行净利润多少",
+  "expectTitleContains": "zhaohang-2025",
+  "expectTextContains": "1510亿"
+ },
+ {
+  "query": "零售之王管理多少客户资产",
+  "expectTitleContains": "zhaohang-2025",
+  "expectTextContains": "15.8万亿"
+ },
+ {
+  "query": "招行私人银行有多少客户",
+  "expectTitleContains": "zhaohang-2025",
+  "expectTextContains": "17万户"
+ },
+ {
+  "query": "招行坏账率",
+  "expectTitleContains": "zhaohang-2025",
+  "expectTextContains": "0.94%"
+ },
+ {
+  "query": "宇宙行净利润",
+  "expectTitleContains": "gongshang-2025",
+  "expectTextContains": "3720亿"
+ },
+ {
+  "query": "全球最赚钱的银行是哪家",
+  "expectTitleContains": "gongshang-2025",
+  "expectTextContains": "全球最赚钱银行"
+ },
+ {
+  "query": "工行总资产规模",
+  "expectTitleContains": "gongshang-2025",
+  "expectTextContains": "52万亿"
+ },
+ {
+  "query": "数字人民币钱包开得最多的银行",
+  "expectTitleContains": "gongshang-2025",
+  "expectTextContains": "1.9亿个"
+ },
+ {
+  "query": "平安银行净利润",
+  "expectTitleContains": "pingan-bank-2025",
+  "expectTextContains": "468亿"
+ },
+ {
+  "query": "汽车贷款市占率第一的银行",
+  "expectTitleContains": "pingan-bank-2025",
+  "expectTextContains": "3400亿"
+ },
+ {
+  "query": "平安银行信用卡用户数",
+  "expectTitleContains": "pingan-bank-2025",
+  "expectTextContains": "4900万"
+ },
+ {
+  "query": "哪家银行AI客服用得最狠",
+  "expectTitleContains": "pingan-bank-2025",
+  "expectTextContains": "92%"
+ },
+ {
+  "query": "宁波银行净利润",
+  "expectTitleContains": "ningbo-bank-2025",
+  "expectTextContains": "295亿"
+ },
+ {
+  "query": "拨备覆盖率最高的上市银行",
+  "expectTitleContains": "ningbo-bank-2025",
+  "expectTextContains": "458%"
+ },
+ {
+  "query": "宁波银行小微户均贷款",
+  "expectTitleContains": "ningbo-bank-2025",
+  "expectTextContains": "82万"
+ },
+ {
+  "query": "连续18年坏账率低于1%的银行",
+  "expectTitleContains": "ningbo-bank-2025",
+  "expectTextContains": "连续18年"
+ },
+ {
+  "query": "恒瑞营收多少",
+  "expectTitleContains": "hengrui-2025",
+  "expectTextContains": "342亿"
+ },
+ {
+  "query": "恒瑞创新药占比过半了吗",
+  "expectTitleContains": "hengrui-2025",
+  "expectTextContains": "53%"
+ },
+ {
+  "query": "恒瑞的减肥药进展",
+  "expectTitleContains": "hengrui-2025",
+  "expectTextContains": "三期临床达到主要终点"
+ },
+ {
+  "query": "PD-1出海首付款多少",
+  "expectTitleContains": "hengrui-2025",
+  "expectTextContains": "2.5亿美元"
+ },
+ {
+  "query": "百济神州全球收入",
+  "expectTitleContains": "beigene-2025",
+  "expectTextContains": "48亿美元"
+ },
+ {
+  "query": "第一个卖到30亿美金的国产药",
+  "expectTitleContains": "beigene-2025",
+  "expectTextContains": "泽布替尼"
+ },
+ {
+  "query": "百济的收入主要来自哪个市场",
+  "expectTitleContains": "beigene-2025",
+  "expectTextContains": "61%"
+ },
+ {
+  "query": "索托克拉批了吗",
+  "expectTitleContains": "beigene-2025",
+  "expectTextContains": "获FDA批准"
+ },
+ {
+  "query": "药明康德营收",
+  "expectTitleContains": "wuxi-2025",
+  "expectTextContains": "438亿"
+ },
+ {
+  "query": "多肽业务增长多快",
+  "expectTitleContains": "wuxi-2025",
+  "expectTextContains": "增长60%"
+ },
+ {
+  "query": "药明在手订单多少",
+  "expectTitleContains": "wuxi-2025",
+  "expectTextContains": "523亿"
+ },
+ {
+  "query": "药明海外新基地在哪",
+  "expectTitleContains": "wuxi-2025",
+  "expectTextContains": "新加坡基地"
+ },
+ {
+  "query": "信达生物收入",
+  "expectTitleContains": "xinda-2025",
+  "expectTextContains": "118亿"
+ },
+ {
+  "query": "国内第一个双靶点减肥药",
+  "expectTitleContains": "xinda-2025",
+  "expectTextContains": "玛仕度肽"
+ },
+ {
+  "query": "信达跟哪家外企合作ADC",
+  "expectTitleContains": "xinda-2025",
+  "expectTextContains": "罗氏"
+ },
+ {
+  "query": "信达盈利了吗",
+  "expectTitleContains": "xinda-2025",
+  "expectTextContains": "首次实现全年净盈利"
+ },
+ {
+  "query": "腾讯年营收",
+  "expectTitleContains": "tencent-2025",
+  "expectTextContains": "7180亿"
+ },
+ {
+  "query": "三角洲行动月活多少",
+  "expectTitleContains": "tencent-2025",
+  "expectTextContains": "8000万"
+ },
+ {
+  "query": "视频号广告增长",
+  "expectTitleContains": "tencent-2025",
+  "expectTextContains": "增长44%"
+ },
+ {
+  "query": "微信有多少月活",
+  "expectTitleContains": "tencent-2025",
+  "expectTextContains": "13.9亿"
+ },
+ {
+  "query": "阿里全年收入过万亿了吗",
+  "expectTitleContains": "alibaba-2025",
+  "expectTextContains": "10120亿"
+ },
+ {
+  "query": "阿里云收入多少",
+  "expectTitleContains": "alibaba-2025",
+  "expectTextContains": "1280亿"
+ },
+ {
+  "query": "下载量全球第一的开源大模型",
+  "expectTitleContains": "alibaba-2025",
+  "expectTextContains": "通义千问"
+ },
+ {
+  "query": "88VIP会员规模",
+  "expectTitleContains": "alibaba-2025",
+  "expectTextContains": "5000万"
+ },
+ {
+  "query": "美团营收",
+  "expectTitleContains": "meituan-2025",
+  "expectTextContains": "3980亿"
+ },
+ {
+  "query": "美团一天最多送多少单",
+  "expectTitleContains": "meituan-2025",
+  "expectTextContains": "1.2亿单"
+ },
+ {
+  "query": "美团在中东的外卖业务",
+  "expectTitleContains": "meituan-2025",
+  "expectTextContains": "Keeta"
+ },
+ {
+  "query": "闪购一年交易额",
+  "expectTitleContains": "meituan-2025",
+  "expectTextContains": "4200亿"
+ },
+ {
+  "query": "拼多多营收",
+  "expectTitleContains": "pdd-2025",
+  "expectTextContains": "4680亿"
+ },
+ {
+  "query": "Temu覆盖多少国家",
+  "expectTitleContains": "pdd-2025",
+  "expectTextContains": "92个国家"
+ },
+ {
+  "query": "电商里净利润率最高的",
+  "expectTitleContains": "pdd-2025",
+  "expectTextContains": "33%"
+ },
+ {
+  "query": "拼多多给商家减了多少佣金",
+  "expectTitleContains": "pdd-2025",
+  "expectTextContains": "230亿"
+ },
+ {
+  "query": "B站营收多少",
+  "expectTitleContains": "bilibili-2025",
+  "expectTextContains": "312亿"
+ },
+ {
+  "query": "B站用户每天刷多久",
+  "expectTitleContains": "bilibili-2025",
+  "expectTextContains": "108分钟"
+ },
+ {
+  "query": "三国谋定天下流水",
+  "expectTitleContains": "bilibili-2025",
+  "expectTextContains": "45亿"
+ },
+ {
+  "query": "B站日活",
+  "expectTitleContains": "bilibili-2025",
+  "expectTextContains": "1.18亿"
+ },
+ {
+  "query": "美的营收规模",
+  "expectTitleContains": "midea-2025",
+  "expectTextContains": "4350亿"
+ },
+ {
+  "query": "库卡机器人订单增长",
+  "expectTitleContains": "midea-2025",
+  "expectTextContains": "31%"
+ },
+ {
+  "query": "美的海外自有品牌占比",
+  "expectTitleContains": "midea-2025",
+  "expectTextContains": "45%"
+ },
+ {
+  "query": "美的有多少研发中心",
+  "expectTitleContains": "midea-2025",
+  "expectTextContains": "35个"
+ },
+ {
+  "query": "格力营收",
+  "expectTitleContains": "gree-2025",
+  "expectTextContains": "2080亿"
+ },
+ {
+  "query": "空调市占率第一是谁",
+  "expectTitleContains": "gree-2025",
+  "expectTextContains": "31.2%"
+ },
+ {
+  "query": "格力的车用热管理业务",
+  "expectTitleContains": "gree-2025",
+  "expectTextContains": "增长67%"
+ },
+ {
+  "query": "董明珠直播一年卖多少",
+  "expectTitleContains": "gree-2025",
+  "expectTextContains": "85亿"
+ },
+ {
+  "query": "海尔智家营收",
+  "expectTitleContains": "haier-2025",
+  "expectTextContains": "2890亿"
+ },
+ {
+  "query": "卡萨帝增长多少",
+  "expectTitleContains": "haier-2025",
+  "expectTextContains": "增长19%"
+ },
+ {
+  "query": "三翼鸟门店数量",
+  "expectTitleContains": "haier-2025",
+  "expectTextContains": "3200家"
+ },
+ {
+  "query": "海尔库存周转多少天",
+  "expectTitleContains": "haier-2025",
+  "expectTextContains": "38天"
+ },
+ {
+  "query": "海底捞营收",
+  "expectTitleContains": "haidilao-2025",
+  "expectTextContains": "465亿"
+ },
+ {
+  "query": "海底捞翻台率",
+  "expectTitleContains": "haidilao-2025",
+  "expectTextContains": "4.3次"
+ },
+ {
+  "query": "海底捞的烤肉副牌叫什么",
+  "expectTitleContains": "haidilao-2025",
+  "expectTextContains": "焰请烤肉铺子"
+ },
+ {
+  "query": "海底捞会员有多少",
+  "expectTitleContains": "haidilao-2025",
+  "expectTextContains": "2亿"
+ },
+ {
+  "query": "瑞幸营收",
+  "expectTitleContains": "luckin-2025",
+  "expectTextContains": "498亿"
+ },
+ {
+  "query": "瑞幸有多少家店",
+  "expectTitleContains": "luckin-2025",
+  "expectTextContains": "26000家"
+ },
+ {
+  "query": "生椰拿铁卖了多少杯",
+  "expectTitleContains": "luckin-2025",
+  "expectTextContains": "10亿杯"
+ },
+ {
+  "query": "瑞幸进军美国了吗",
+  "expectTitleContains": "luckin-2025",
+  "expectTextContains": "纽约"
+ },
+ {
+  "query": "蜜雪冰城门店总数",
+  "expectTitleContains": "mixue-2025",
+  "expectTextContains": "48000家"
+ },
+ {
+  "query": "奶茶里最便宜的品牌均价",
+  "expectTitleContains": "mixue-2025",
+  "expectTextContains": "6.8元"
+ },
+ {
+  "query": "柠檬水一年卖多少杯",
+  "expectTitleContains": "mixue-2025",
+  "expectTextContains": "11亿杯"
+ },
+ {
+  "query": "蜜雪市值多少",
+  "expectTitleContains": "mixue-2025",
+  "expectTextContains": "2000亿港元"
+ },
+ {
+  "query": "顺丰营收",
+  "expectTitleContains": "sf-2025",
+  "expectTextContains": "3120亿"
+ },
+ {
+  "query": "亚洲第一货运机场",
+  "expectTitleContains": "sf-2025",
+  "expectTextContains": "鄂州花湖机场"
+ },
+ {
+  "query": "顺丰无人机航线多少条",
+  "expectTitleContains": "sf-2025",
+  "expectTextContains": "230条"
+ },
+ {
+  "query": "顺丰国际业务收入",
+  "expectTitleContains": "sf-2025",
+  "expectTextContains": "720亿"
+ },
+ {
+  "query": "京东物流营收",
+  "expectTitleContains": "jdl-2025",
+  "expectTextContains": "2150亿"
+ },
+ {
+  "query": "亚洲一号仓库有多少座",
+  "expectTitleContains": "jdl-2025",
+  "expectTextContains": "60座"
+ },
+ {
+  "query": "京东物流中东仓在哪",
+  "expectTitleContains": "jdl-2025",
+  "expectTextContains": "利雅得"
+ },
+ {
+  "query": "京东物流外部收入占比",
+  "expectTitleContains": "jdl-2025",
+  "expectTextContains": "72%"
+ },
+ {
+  "query": "中通一年送多少件",
+  "expectTitleContains": "zto-2025",
+  "expectTextContains": "385亿件"
+ },
+ {
+  "query": "快递市场份额第一",
+  "expectTitleContains": "zto-2025",
+  "expectTextContains": "21.8%"
+ },
+ {
+  "query": "中通单票成本",
+  "expectTitleContains": "zto-2025",
+  "expectTextContains": "0.82元"
+ },
+ {
+  "query": "中通净利润",
+  "expectTitleContains": "zto-2025",
+  "expectTextContains": "105亿"
+ },
+ {
+  "query": "中芯国际营收",
+  "expectTitleContains": "smic-2025",
+  "expectTextContains": "625亿"
+ },
+ {
+  "query": "中芯产能利用率",
+  "expectTitleContains": "smic-2025",
+  "expectTextContains": "94%"
+ },
+ {
+  "query": "中芯的车规芯片业务",
+  "expectTitleContains": "smic-2025",
+  "expectTextContains": "增长56%"
+ },
+ {
+  "query": "中芯资本开支",
+  "expectTitleContains": "smic-2025",
+  "expectTextContains": "480亿"
+ },
+ {
+  "query": "韦尔股份营收",
+  "expectTitleContains": "will-semi-2025",
+  "expectTextContains": "298亿"
+ },
+ {
+  "query": "车载摄像头芯片全球第一",
+  "expectTitleContains": "will-semi-2025",
+  "expectTextContains": "38%"
+ },
+ {
+  "query": "韦尔高像素手机芯片增长",
+  "expectTitleContains": "will-semi-2025",
+  "expectTextContains": "增长72%"
+ },
+ {
+  "query": "韦尔海外研发中心在哪",
+  "expectTitleContains": "will-semi-2025",
+  "expectTextContains": "新加坡"
+ },
+ {
+  "query": "北方华创营收",
+  "expectTitleContains": "naura-2025",
+  "expectTextContains": "412亿"
+ },
+ {
+  "query": "国产半导体设备龙头",
+  "expectTitleContains": "naura-2025",
+  "expectTextContains": "国产半导体设备第一"
+ },
+ {
+  "query": "北方华创刻蚀机收入",
+  "expectTitleContains": "naura-2025",
+  "expectTextContains": "128亿"
+ },
+ {
+  "query": "北方华创在手订单",
+  "expectTitleContains": "naura-2025",
+  "expectTextContains": "600亿"
+ },
+ {
+  "query": "澜起科技营收",
+  "expectTitleContains": "montage-2025",
+  "expectTextContains": "52亿"
+ },
+ {
+  "query": "DDR5接口芯片市占率",
+  "expectTitleContains": "montage-2025",
+  "expectTextContains": "42%"
+ },
+ {
+  "query": "澜起AI芯片增长多少",
+  "expectTitleContains": "montage-2025",
+  "expectTextContains": "增长220%"
+ },
+ {
+  "query": "芯片设计里毛利率最高之一",
+  "expectTitleContains": "montage-2025",
+  "expectTextContains": "62%"
+ },
+ {
+  "query": "安踏营收",
+  "expectTitleContains": "anta-2025",
+  "expectTextContains": "782亿"
+ },
+ {
+  "query": "国产运动品牌老大",
+  "expectTitleContains": "anta-2025",
+  "expectTextContains": "国产运动品牌第一"
+ },
+ {
+  "query": "FILA收入多少",
+  "expectTitleContains": "anta-2025",
+  "expectTextContains": "285亿"
+ },
+ {
+  "query": "始祖鸟的母公司跟谁有关",
+  "expectTitleContains": "anta-2025",
+  "expectTextContains": "亚玛芬"
+ },
+ {
+  "query": "李宁营收",
+  "expectTitleContains": "lining-2025",
+  "expectTextContains": "298亿"
+ },
+ {
+  "query": "李宁跑鞋卖了多少双",
+  "expectTitleContains": "lining-2025",
+  "expectTextContains": "1200万双"
+ },
+ {
+  "query": "李宁篮球品类为什么下滑",
+  "expectTitleContains": "lining-2025",
+  "expectTextContains": "下滑8%"
+ },
+ {
+  "query": "李宁库销比",
+  "expectTitleContains": "lining-2025",
+  "expectTextContains": "3.8个月"
+ },
+ {
+  "query": "特步营收",
+  "expectTitleContains": "xtep-2025",
+  "expectTextContains": "158亿"
+ },
+ {
+  "query": "马拉松高手最爱穿的国产跑鞋",
+  "expectTitleContains": "xtep-2025",
+  "expectTextContains": "34%"
+ },
+ {
+  "query": "索康尼在中国卖得怎么样",
+  "expectTitleContains": "xtep-2025",
+  "expectTextContains": "增长58%"
+ },
+ {
+  "query": "特步童装收入",
+  "expectTitleContains": "xtep-2025",
+  "expectTextContains": "28亿"
+ },
+ {
+  "query": "国航营收",
+  "expectTitleContains": "airchina-2025",
+  "expectTextContains": "1680亿"
+ },
+ {
+  "query": "国航国际航线恢复程度",
+  "expectTitleContains": "airchina-2025",
+  "expectTextContains": "95%"
+ },
+ {
+  "query": "国航有多少架C919",
+  "expectTitleContains": "airchina-2025",
+  "expectTextContains": "12架"
+ },
+ {
+  "query": "国航客座率",
+  "expectTitleContains": "airchina-2025",
+  "expectTextContains": "81%"
+ },
+ {
+  "query": "春秋航空净利润",
+  "expectTitleContains": "springair-2025",
+  "expectTextContains": "28亿"
+ },
+ {
+  "query": "客座率最高的航空公司",
+  "expectTitleContains": "springair-2025",
+  "expectTextContains": "92.1%"
+ },
+ {
+  "query": "最会赚钱的国内航司",
+  "expectTitleContains": "springair-2025",
+  "expectTextContains": "盈利第一"
+ },
+ {
+  "query": "春秋的飞机都是什么型号",
+  "expectTitleContains": "springair-2025",
+  "expectTextContains": "A320系列"
+ },
+ {
+  "query": "宁德时代营收",
+  "expectTitleContains": "catl-2025",
+  "expectTextContains": "4120亿"
+ },
+ {
+  "query": "动力电池全球老大",
+  "expectTitleContains": "catl-2025",
+  "expectTextContains": "37%"
+ },
+ {
+  "query": "充5分钟跑300公里的电池",
+  "expectTitleContains": "catl-2025",
+  "expectTextContains": "神行超充"
+ },
+ {
+  "query": "宁德储能出货量",
+  "expectTitleContains": "catl-2025",
+  "expectTextContains": "128GWh"
+ },
+ {
+  "query": "隆基营收",
+  "expectTitleContains": "longi-2025",
+  "expectTextContains": "892亿"
+ },
+ {
+  "query": "光伏电池效率最高的组件",
+  "expectTitleContains": "longi-2025",
+  "expectTextContains": "24.8%"
+ },
+ {
+  "query": "隆基的氢能订单",
+  "expectTitleContains": "longi-2025",
+  "expectTextContains": "2.1GW"
+ },
+ {
+  "query": "隆基扭亏了吗",
+  "expectTitleContains": "longi-2025",
+  "expectTextContains": "四季度单季扭亏"
+ }
+]
