@@ -902,6 +902,7 @@ impl KnowledgeService {
             index: self.index.clone(),
             paths: self.paths.clone(),
             embedder: self.embedder.clone(),
+            reranker: crate::kb::rerank::KbReranker::from_config(),
         }
     }
 

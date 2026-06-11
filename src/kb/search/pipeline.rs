@@ -71,6 +71,10 @@ pub struct SearchCtx {
     pub index: Arc<KbIndex>,
     pub paths: Arc<KbPaths>,
     pub embedder: Arc<dyn KbEmbedder>,
+    /// Optional cross-encoder rerank stage (`kb.rerank` config). Applied to
+    /// the fused top-N between fusion and MMR; `None` keeps the pipeline
+    /// byte-identical to the pre-rerank behaviour.
+    pub reranker: Option<Arc<crate::kb::rerank::KbReranker>>,
 }
 
 impl SearchCtx {
@@ -193,6 +197,60 @@ impl SearchCtx {
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then(a.0.cmp(&b.0))
             });
+        }
+
+        // 5c. Optional cross-encoder rerank over the fused top-N window.
+        //     Replaces fused scores with min-max-normalized reranker
+        //     relevance and DROPS candidates below the window (top_n >= k
+        //     by construction, and a candidate the reranker ranked out is
+        //     a worse bet than one it kept). Best-effort: any endpoint
+        //     failure logs and falls back to the fused order.
+        if let Some(rr) = &self.reranker {
+            let n = rr.top_n.min(fused.len());
+            if n >= 2 && n >= req.k {
+                let docs: Vec<&str> = fused[..n]
+                    .iter()
+                    .map(|(cid, _)| {
+                        materialised
+                            .get(cid)
+                            .map(|(c, _)| c.indexed_text.as_str())
+                            .unwrap_or("")
+                    })
+                    .collect();
+                match rr.rerank(&req.query, &docs) {
+                    Ok(scores) => {
+                        let finite: Vec<f32> =
+                            scores.iter().copied().filter(|s| s.is_finite()).collect();
+                        let lo = finite.iter().copied().fold(f32::INFINITY, f32::min);
+                        let hi = finite.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        let span = (hi - lo).max(f32::EPSILON);
+                        let mut reranked: Vec<(String, f32)> = fused[..n]
+                            .iter()
+                            .zip(scores.iter())
+                            .map(|((cid, fused_score), s)| {
+                                // Unscored entries (endpoint omitted the index)
+                                // sink to the bottom of the window but stay
+                                // above nothing — keep their fused tiebreak.
+                                let norm = if s.is_finite() {
+                                    (s - lo) / span
+                                } else {
+                                    f32::MIN_POSITIVE * fused_score.max(0.0)
+                                };
+                                (cid.clone(), norm)
+                            })
+                            .collect();
+                        reranked.sort_by(|a, b| {
+                            b.1.partial_cmp(&a.1)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                                .then(a.0.cmp(&b.0))
+                        });
+                        fused = reranked;
+                    }
+                    Err(e) => {
+                        tracing::warn!("kb rerank failed; using fused order: {e:#}");
+                    }
+                }
+            }
         }
 
         // 6. MMR.
@@ -335,6 +393,7 @@ mod tests {
                 index,
                 paths,
                 embedder,
+                reranker: None,
             },
         )
     }

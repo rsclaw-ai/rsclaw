@@ -1089,6 +1089,7 @@ fn search_ctx(h: &Handles) -> SearchCtx {
         index: h.index.clone(),
         paths: h.paths.clone(),
         embedder: h.embedder.clone(),
+        reranker: crate::kb::rerank::KbReranker::from_config(),
     }
 }
 

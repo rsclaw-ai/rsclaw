@@ -2337,6 +2337,13 @@ pub struct KbConfig {
     /// GPU-fleet Qwen3 while memory stays on a fast local BGE. Changing it on a
     /// populated KB requires a reindex (KB does not auto-migrate like memory).
     pub embed: Option<EmbedConfig>,
+    /// Optional cross-encoder rerank stage. When set, the search pipeline
+    /// sends the fused top-N candidates to an OpenAI/Jina-compatible
+    /// `/v1/rerank` endpoint (llama.cpp `--reranking`) and reorders by
+    /// relevance before MMR. Best-effort: endpoint failures fall back to the
+    /// fused order, never fail the search. Query-time only — no reindex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank: Option<KbRerankConfig>,
     /// DEPRECATED (unused): superseded by `embed`. Kept only so existing
     /// configs that still set it continue to parse (deny_unknown_fields). No
     /// code reads it — embedder selection goes through `embed` /
@@ -2364,6 +2371,27 @@ pub struct KbConfig {
     /// defense-in-depth bound on an arbitrary-file-read surface; widen it only
     /// if you trust every local process that can reach the gateway.
     pub allowed_upload_roots: Option<Vec<String>>,
+}
+
+/// Cross-encoder rerank endpoint for the KB search pipeline (`kb.rerank`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KbRerankConfig {
+    /// API root of an OpenAI/Jina-compatible rerank server, e.g.
+    /// `http://117.50.139.244:5556/v1` (llama.cpp with `--reranking`).
+    /// `/rerank` is appended at request time.
+    pub base_url: String,
+    /// Model name sent in the request body. Optional — single-model
+    /// llama.cpp servers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Fused candidates sent to the reranker (and kept afterwards —
+    /// everything below the window is dropped). Default 20.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_n: Option<usize>,
+    /// Kill-switch without deleting the block. Default true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2431,6 +2459,37 @@ pub struct AstockConfig {
     /// listed filter and pushes IM notifications on `hit` events for
     /// codes any peer is watching.
     pub sse: Option<AstockSseConfig>,
+    /// Daily briefing scheduler config. When present, overrides the
+    /// hardcoded 07:50 / 12:05 / 18:30 (Asia/Shanghai) slot times.
+    /// Change requires a gateway restart — the scheduler captures
+    /// the schedule at spawn time.
+    pub briefing: Option<AstockBriefingConfig>,
+}
+
+/// Configurable wallclock times for the three briefing slots. Each
+/// value is `"HH:MM"` (24-hour, Asia/Shanghai). Missing keys keep
+/// the hardcoded default for that slot.
+///
+/// Example (`~/.rsclaw/rsclaw.json5`):
+/// ```json5
+/// astock: {
+///   briefing: {
+///     slots: {
+///       premarket:  "07:55",
+///       midday:     "12:10",
+///       postmarket: "18:30",
+///     }
+///   }
+/// }
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AstockBriefingConfig {
+    /// Map of slot slug → "HH:MM". Keys: `premarket`, `midday`,
+    /// `postmarket`. Unrecognised keys are silently ignored;
+    /// malformed "HH:MM" values log a warn and fall back to the
+    /// hardcoded default.
+    pub slots: Option<std::collections::HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
