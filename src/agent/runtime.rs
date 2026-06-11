@@ -9738,7 +9738,57 @@ impl AgentRuntime {
             }
         };
         let trace_id = format!("recall_{}", Uuid::new_v4());
-        recall_bundle_from_docs(docs, max_tokens, &trace_id)
+        let mut bundle = recall_bundle_from_docs(docs, max_tokens, &trace_id);
+
+        // KB auto-recall: surface the user's own corpus without requiring
+        // the model to think of calling `knowledge_base` — the model is
+        // worst at knowing what it doesn't know. Bounded: top-3 hits,
+        // 600-token cap, gated on the KB actually having content and the
+        // query being non-trivial (skips greetings/acks). KB doc ids are
+        // intentionally NOT added to metadata.doc_ids — that list feeds
+        // the memory importance feedback loop (Loop A), not KB.
+        const KB_RECALL_K: usize = 3;
+        const KB_RECALL_MAX_TOKENS: usize = 600;
+        let kb_enabled = memory_cfg.and_then(|m| m.kb_auto_recall).unwrap_or(true);
+        if kb_enabled
+            && query.trim().chars().count() >= 6
+            && let Some(kb) = crate::kb::global_service()
+            && kb.has_content()
+        {
+            let q = query.trim().to_owned();
+            // KnowledgeService::search is synchronous and CPU-heavy (embed +
+            // HNSW + tantivy) — same off-executor treatment as the kb tool.
+            match tokio::task::spawn_blocking(move || kb.search(&q, &[], KB_RECALL_K, 0.0)).await {
+                Ok(Ok(hits)) if !hits.is_empty() => {
+                    let block = format_kb_recall_block(&hits, KB_RECALL_MAX_TOKENS);
+                    if !block.is_empty() {
+                        match bundle.as_mut() {
+                            Some(b) => {
+                                b.context.push_str("\n\n");
+                                b.context.push_str(&block);
+                                b.metadata.hash = recall_context_hash(&b.context);
+                            }
+                            None => {
+                                let hash = recall_context_hash(&block);
+                                bundle = Some(RecallBundle {
+                                    context: block,
+                                    metadata: crate::provider::RecallMetadata {
+                                        source: "kb".to_owned(),
+                                        trace_id: Some(trace_id.clone()),
+                                        hash,
+                                        ..Default::default()
+                                    },
+                                });
+                            }
+                        }
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::debug!(error = %e, "kb auto recall search failed"),
+                Err(e) => tracing::debug!(error = %e, "kb auto recall task failed"),
+            }
+        }
+        bundle
     }
 
     /// A2A v1.0 INPUT_REQUIRED / AUTH_REQUIRED bridge tool.
@@ -10886,6 +10936,42 @@ fn default_memory_doc_tier(kind: &str) -> MemDocTier {
     }
 }
 
+/// sha256 of a recall context in the canonical `sha256:<hex>` wire form.
+fn recall_context_hash(context: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("sha256:{:x}", Sha256::digest(context.as_bytes()))
+}
+
+/// Render KB auto-recall hits as a compact, token-budgeted block the model
+/// can cite from. Returns an empty string when nothing fits.
+fn format_kb_recall_block(hits: &[crate::kb::service::SearchHit], max_tokens: usize) -> String {
+    let header = "[Knowledge base — excerpts that MAY be relevant. Use only what actually \
+                  answers the question and cite the source title; ignore the rest.]";
+    let mut lines: Vec<String> = vec![header.to_owned()];
+    let mut used_tokens = estimate_tokens(header);
+    for h in hits {
+        let title = h.source_title.trim();
+        let title = if title.is_empty() { "untitled" } else { title };
+        let line = format!("- ({title}) {}", h.chunk_text.trim());
+        let line_tokens = estimate_tokens(&line);
+        if used_tokens + line_tokens > max_tokens {
+            // Always keep at least one (clipped) hit so a single long chunk
+            // can't blank the whole block.
+            if lines.len() == 1 {
+                let char_limit = max_tokens.saturating_mul(2).max(64);
+                lines.push(line.chars().take(char_limit).collect());
+            }
+            break;
+        }
+        used_tokens += line_tokens;
+        lines.push(line);
+    }
+    if lines.len() == 1 {
+        return String::new();
+    }
+    lines.join("\n")
+}
+
 fn recall_bundle_from_docs(
     docs: Vec<MemoryDoc>,
     max_tokens: usize,
@@ -11581,6 +11667,35 @@ mod tests {
         assert_eq!(normalize_memory_scope("main", "main"), "agent:main");
         assert_eq!(normalize_memory_scope("agent:main", "main"), "agent:main");
         assert_eq!(normalize_memory_scope("global", "main"), "global");
+    }
+
+    #[test]
+    fn format_kb_recall_block_budgets_and_cites_titles() {
+        let hit = |title: &str, text: &str| crate::kb::service::SearchHit {
+            doc_id: "d1".into(),
+            collection_id: None,
+            collection_name: None,
+            source_title: title.into(),
+            chunk_text: text.into(),
+            score: 0.5,
+        };
+        // Normal case: titles present, both hits fit.
+        let block = format_kb_recall_block(
+            &[hit("年报2025", "营收增长12%"), hit("", "无标题文档的内容")],
+            600,
+        );
+        assert!(block.contains("(年报2025) 营收增长12%"), "{block}");
+        assert!(block.contains("(untitled) 无标题文档的内容"), "{block}");
+
+        // Tight budget: a single oversized hit is clipped, not dropped —
+        // otherwise one long chunk blanks the whole block.
+        let long = "很".repeat(2000);
+        let clipped = format_kb_recall_block(&[hit("长文", &long)], 64);
+        assert!(!clipped.is_empty());
+        assert!(clipped.len() < long.len());
+
+        // No hits → empty string (caller skips injection entirely).
+        assert_eq!(format_kb_recall_block(&[], 600), "");
     }
 
     #[test]

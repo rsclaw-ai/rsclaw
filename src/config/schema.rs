@@ -2185,6 +2185,12 @@ pub struct MemoryConfig {
     pub recall_top_k: Option<usize>,
     /// Number of final results after RRF fusion. Default 5.
     pub recall_final_k: Option<usize>,
+    /// Also search the knowledge base during auto-recall and append the top
+    /// hits (with source titles for citation) to the turn-local recall
+    /// context. Default true; only fires when the KB actually has indexed
+    /// content. Set false to keep auto-recall memory-only (the explicit
+    /// `knowledge_base` tool is unaffected).
+    pub kb_auto_recall: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

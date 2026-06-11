@@ -529,6 +529,12 @@ impl KnowledgeService {
         Ok(())
     }
 
+    /// O(1) check for "is there anything searchable at all" — gates the
+    /// auto-recall path so empty-KB deployments never pay a query embed.
+    pub fn has_content(&self) -> bool {
+        !self.index.hnsw.is_empty()
+    }
+
     /// Semantic search over one or more collections (empty = all). Hits below
     /// `score_threshold` are dropped. Reuses the KB hybrid search pipeline.
     pub fn search(
