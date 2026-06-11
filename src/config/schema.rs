@@ -2449,7 +2449,8 @@ pub struct AstockConfig {
     /// Bearer token for astock's x402 paywall (or session-init flow).
     /// `None` when astock runs paywall-disabled (dev mode) — the
     /// client just skips the Authorization header.
-    pub auth_token: Option<String>,
+    /// Supports `SecretOrString` — plain string or `{ source: "env", id: "VAR_NAME" }`.
+    pub auth_token: Option<SecretOrString>,
     /// In-process response caches. Saves astock credits + latency for
     /// the typical "LLM repeatedly asks the same quote in one turn"
     /// pattern. Each field is TTL in seconds; `0` disables the cache

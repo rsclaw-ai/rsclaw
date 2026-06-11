@@ -274,7 +274,11 @@ impl AstockClient {
         Ok(Self {
             http,
             base_url: base,
-            auth_token: cfg.auth_token.clone().filter(|s| !s.trim().is_empty()),
+            auth_token: cfg
+                .auth_token
+                .as_ref()
+                .and_then(|s| s.resolve_early())
+                .filter(|s| !s.trim().is_empty()),
             quote_cache: TtlCache::new(quote_ttl),
             kline_cache: TtlCache::new(kline_ttl),
             snapshot_cache: TtlCache::new(snapshot_ttl),
@@ -552,7 +556,14 @@ fn normalize_code(s: &str) -> String {
         .split_once('.')
         .map(|(head, _)| head)
         .unwrap_or(s);
-    s.trim().to_owned()
+    let s = s.trim().to_owned();
+    // Validate: must be non-empty and exactly 6 digits for A-share codes.
+    if s.len() != 6 || !s.chars().all(|c| c.is_ascii_digit()) {
+        // Return the original trimmed input so astock can produce a
+        // meaningful 404 instead of silently failing with an empty path.
+        return s.trim().to_owned();
+    }
+    s
 }
 
 #[cfg(test)]

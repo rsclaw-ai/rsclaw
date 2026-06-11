@@ -88,7 +88,7 @@ pub fn spawn_listeners(cfg: &AstockConfig) {
         .and_then(|s| s.filters.clone())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| DEFAULT_FILTERS.iter().map(|s| (*s).to_owned()).collect());
-    let token = cfg.auth_token.clone();
+    let token = cfg.auth_token.as_ref().and_then(|s| s.resolve_early());
     let base_url = base_url.trim_end_matches('/').to_owned();
 
     for filter in filters {
