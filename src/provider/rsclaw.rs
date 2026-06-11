@@ -297,6 +297,82 @@ fn parse_max_age(cache_control: Option<&str>) -> Option<Duration> {
     max_age.map(Duration::from_secs)
 }
 
+/// Consume an SSE response until the first terminal event and return
+/// `(event_name, data)`. Used by `replay()` for the server's keep-alive
+/// variant of `/sessions/replay`: comment heartbeats (`: ...`) arrive
+/// every 3s while the server works, then exactly one `result` or
+/// `error` event terminates the stream.
+///
+/// Liveness: each read is bounded by a 45s idle timeout — 15 missed
+/// heartbeats means the connection is dead even though TCP hasn't
+/// noticed. Total-duration capping is the caller's job.
+async fn read_sse_terminal_event(resp: reqwest::Response) -> Result<(String, String)> {
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut parser = SseTerminalParser::default();
+
+    loop {
+        let chunk = tokio::time::timeout(Duration::from_secs(45), stream.next())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("rsclaw replay: SSE idle for 45s (heartbeats stopped)")
+            })?;
+        let Some(chunk) = chunk else {
+            anyhow::bail!("rsclaw replay: SSE stream ended without a terminal event");
+        };
+        let chunk = chunk.context("rsclaw replay: SSE read error")?;
+        buf.extend_from_slice(&chunk);
+
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+            let line_owned = String::from_utf8_lossy(&line_bytes).into_owned();
+            if let Some(terminal) = parser.push_line(line_owned.trim_end_matches(['\n', '\r'])) {
+                return Ok(terminal);
+            }
+        }
+    }
+}
+
+/// Line-level state machine behind [`read_sse_terminal_event`]: feed
+/// decoded SSE lines (no trailing newline), get `Some((event, data))`
+/// back when a terminal `result` / `error` event completes. Comments
+/// (heartbeats) and any non-terminal events are swallowed.
+#[derive(Default)]
+struct SseTerminalParser {
+    event_name: String,
+    data: String,
+}
+
+impl SseTerminalParser {
+    fn push_line(&mut self, line: &str) -> Option<(String, String)> {
+        if line.is_empty() {
+            // Blank line = event boundary. Heartbeat comments produce
+            // empty events — skip those, return the first terminal event.
+            if self.event_name == "result" || self.event_name == "error" {
+                return Some((
+                    std::mem::take(&mut self.event_name),
+                    std::mem::take(&mut self.data),
+                ));
+            }
+            self.event_name.clear();
+            self.data.clear();
+            return None;
+        }
+        if line.starts_with(':') {
+            return None; // SSE comment — the keep-alive heartbeat
+        }
+        if let Some(v) = line.strip_prefix("event:") {
+            self.event_name = v.trim().to_owned();
+        } else if let Some(v) = line.strip_prefix("data:") {
+            if !self.data.is_empty() {
+                self.data.push('\n');
+            }
+            self.data.push_str(v.strip_prefix(' ').unwrap_or(v));
+        }
+        None
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SessionEntry {
     /// Server-issued, format `rs_<instance>_<random>`.
@@ -1078,12 +1154,18 @@ impl RsclawProvider {
     /// retry that crossed the wire twice doesn't create two sessions.
     /// The server is expected to cache the response by key within a
     /// short TTL (5 min) and return the cached result on duplicate.
+    /// `accept_sse` adds `Accept: text/event-stream` on every hop,
+    /// opting in to the server's keep-alive variant of long-running
+    /// endpoints (currently `/sessions/replay`). Servers that predate
+    /// the SSE path ignore the header and answer plain JSON — callers
+    /// must dispatch on the response Content-Type.
     async fn send_following_redirects<B: Serialize>(
         &self,
         path: &str,
         body: &B,
         builder_timeout: Option<Duration>,
         idempotency_key: Option<&str>,
+        accept_sse: bool,
     ) -> Result<reqwest::Response> {
         let mut current_url = self.resolve_url(path);
         let mut hops = 0;
@@ -1095,6 +1177,9 @@ impl RsclawProvider {
             }
             if let Some(key) = idempotency_key {
                 builder = builder.header("Idempotency-Key", key);
+            }
+            if accept_sse {
+                builder = builder.header("Accept", "text/event-stream");
             }
             if let Some((k, v)) = self.auth_header() {
                 builder = builder.header(k, v);
@@ -1207,7 +1292,7 @@ impl RsclawProvider {
         // so a redirected open still gets the full budget against the
         // ultimate target rather than splitting it.
         let resp = self
-            .send_following_redirects("/sessions", &body, Some(Duration::from_secs(180)), None)
+            .send_following_redirects("/sessions", &body, Some(Duration::from_secs(180)), None, false)
             .await?;
         let status = resp.status();
         if !status.is_success() {
@@ -1270,12 +1355,20 @@ impl RsclawProvider {
             history,
             options: Some(split.options.clone()),
         };
-        // 300s — replay re-decodes prefix + full history, which is
-        // strictly slower than open()'s prefix-only decode (180s).
-        // Without an explicit timeout reqwest hangs forever on a
-        // stalled server (connect_timeout only covers TCP setup).
-        // Deadline applies per redirect hop so a redirected replay
-        // still gets the full budget against the ultimate target.
+        // Replay re-decodes prefix + full history and may sit minutes
+        // in the worker's warm→hot hydrate, so we opt in to the
+        // server's SSE keep-alive variant (Accept: text/event-stream):
+        // comment heartbeats every 3s, then exactly one terminal
+        // `result` / `error` event. Liveness is enforced by a 45s
+        // read-idle timeout (15 missed heartbeats) plus a 30min total
+        // cap, instead of one big request deadline that a slow-but-
+        // healthy hydrate would trip. Old servers ignore the Accept
+        // header and answer plain JSON — that path keeps the previous
+        // 300s body deadline.
+        //
+        // No builder timeout: reqwest's `timeout()` covers the whole
+        // body phase, which for SSE is exactly the long wait we're
+        // keeping alive. The headers phase is guarded externally below.
         //
         // Idempotency-Key: per-call UUID so a transport retry (transient
         // timeout, 503) that may have actually reached the server is
@@ -1283,22 +1376,60 @@ impl RsclawProvider {
         // for the same gateway turn. Server caches the response by key
         // for 5 minutes (rsclaw-server agent_proxy::IDEMPOTENCY_TTL).
         let idem_key = uuid::Uuid::new_v4().to_string();
-        let resp = self
-            .send_following_redirects(
+        let resp = tokio::time::timeout(
+            Duration::from_secs(60),
+            self.send_following_redirects(
                 "/sessions/replay",
                 &body,
-                Some(Duration::from_secs(300)),
+                None,
                 Some(&idem_key),
-            )
-            .await?;
+                true,
+            ),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("rsclaw replay: no response headers within 60s"))??;
         let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("rsclaw replay failed {status}: {body}");
+        let is_sse = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.contains("text/event-stream"))
+            .unwrap_or(false);
+
+        if !is_sse {
+            // Pre-SSE server: plain JSON, restore the old 300s body
+            // deadline so a stalled body read can't hang forever.
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("rsclaw replay failed {status}: {body}");
+            }
+            return tokio::time::timeout(Duration::from_secs(300), resp.json::<CreateSessionResp>())
+                .await
+                .map_err(|_| anyhow::anyhow!("rsclaw replay: body read timed out after 300s"))?
+                .context("rsclaw replay: parse response");
         }
-        resp.json::<CreateSessionResp>()
-            .await
-            .context("rsclaw replay: parse response")
+
+        let (event, data) = tokio::time::timeout(
+            Duration::from_secs(30 * 60),
+            read_sse_terminal_event(resp),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("rsclaw replay: SSE total deadline (30min) exceeded"))??;
+
+        if event == "result" {
+            return serde_json::from_str::<CreateSessionResp>(&data)
+                .context("rsclaw replay: parse SSE result event");
+        }
+        // `error` event: data = {"status": <code>, "body": <upstream error>}.
+        // Keep the bail message in the same shape as the plain-JSON error
+        // path so failover classification treats both identically.
+        let parsed: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
+        let code = parsed.get("status").and_then(Value::as_u64).unwrap_or(0);
+        let detail = parsed
+            .get("body")
+            .map(Value::to_string)
+            .unwrap_or(data);
+        anyhow::bail!("rsclaw replay failed {code}: {detail}");
     }
 
     /// In-place compact splice (protocol §2.4). Issues
@@ -1352,7 +1483,7 @@ impl RsclawProvider {
             expected_msgs_count,
         };
         let resp = self
-            .send_following_redirects(&path, &body, Some(self.compact_timeout), None)
+            .send_following_redirects(&path, &body, Some(self.compact_timeout), None, false)
             .await?;
         let status = resp.status();
         // 409 msg_count_mismatch is optimistic-concurrency, NOT a hard
@@ -1473,7 +1604,7 @@ impl RsclawProvider {
         // LB benefits from the same per-origin caching as the primary
         // pool.
         let resp = self
-            .send_following_redirects(path, &body, Some(Duration::from_secs(60)), None)
+            .send_following_redirects(path, &body, Some(Duration::from_secs(60)), None, false)
             .await?;
         let status = resp.status();
         if !status.is_success() {
@@ -1555,7 +1686,7 @@ impl RsclawProvider {
         const RETRY_BACKOFFS: [Duration; 2] = [Duration::from_millis(500), Duration::from_secs(2)];
         let mut attempt: usize = 0;
         let resp = loop {
-            let send_fut = self.send_following_redirects(&path, &body, None, None);
+            let send_fut = self.send_following_redirects(&path, &body, None, None, false);
             let resp = match tokio::time::timeout(TURN_HEADERS_TIMEOUT, send_fut).await {
                 Ok(r) => r?,
                 Err(_) => anyhow::bail!(
@@ -3284,6 +3415,51 @@ fn is_session_evicted(status: StatusCode, body: &str) -> bool {
 mod tests {
     use super::*;
     use crate::provider::ToolDef;
+
+    fn feed_sse(parser: &mut SseTerminalParser, raw: &str) -> Option<(String, String)> {
+        for line in raw.split('\n') {
+            if let Some(t) = parser.push_line(line.trim_end_matches('\r')) {
+                return Some(t);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn sse_parser_skips_heartbeats_and_returns_result() {
+        let mut p = SseTerminalParser::default();
+        let raw = ": replay-keepalive\n\n: replay-keepalive\n\nevent: result\ndata: {\"session_id\":\"rs_x\"}\n\n";
+        let (ev, data) = feed_sse(&mut p, raw).expect("terminal event");
+        assert_eq!(ev, "result");
+        assert_eq!(data, "{\"session_id\":\"rs_x\"}");
+    }
+
+    #[test]
+    fn sse_parser_returns_error_event_with_status() {
+        let mut p = SseTerminalParser::default();
+        let raw = ": hb\n\nevent: error\ndata: {\"status\":503,\"body\":{\"error\":\"no capacity\"}}\n\n";
+        let (ev, data) = feed_sse(&mut p, raw).expect("terminal event");
+        assert_eq!(ev, "error");
+        let v: Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(v["status"], 503);
+    }
+
+    #[test]
+    fn sse_parser_joins_multi_line_data() {
+        let mut p = SseTerminalParser::default();
+        let raw = "event: result\ndata: line1\ndata: line2\n\n";
+        let (ev, data) = feed_sse(&mut p, raw).expect("terminal event");
+        assert_eq!(ev, "result");
+        assert_eq!(data, "line1\nline2");
+    }
+
+    #[test]
+    fn sse_parser_ignores_unknown_events() {
+        let mut p = SseTerminalParser::default();
+        assert!(feed_sse(&mut p, "event: progress\ndata: 42\n\n").is_none());
+        let (ev, _) = feed_sse(&mut p, "event: result\ndata: {}\n\n").expect("terminal");
+        assert_eq!(ev, "result");
+    }
 
     #[test]
     fn origin_of_extracts_origin() {
