@@ -77,4 +77,23 @@ pub enum KbCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Evaluate retrieval quality against a golden-case file.
+    ///
+    /// The file is a JSON array of cases; each case has a "query" plus one
+    /// or more expectations a single hit must satisfy:
+    ///   [{"query": "蒙牛营收增长", "expectTitleContains": "蒙牛"},
+    ///    {"query": "...", "expectDocId": "abc123"},
+    ///    {"query": "...", "expectTextContains": "12%"}]
+    /// Reports hit@1 / hit@k / MRR and prints every miss with its actual
+    /// top hits. Run it BEFORE and AFTER any retrieval-pipeline change
+    /// (embedder swap, chunking, reranker) — no ruler, no surgery.
+    Eval {
+        /// Path to the golden JSON file.
+        golden: std::path::PathBuf,
+        #[arg(short, long, default_value_t = 5)]
+        k: usize,
+        /// Print every case, not just misses.
+        #[arg(long)]
+        verbose: bool,
+    },
 }
