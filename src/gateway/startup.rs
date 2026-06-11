@@ -1958,6 +1958,79 @@ fn spawn_agent_tasks(
                         channel: None,
                     });
                 }
+                // /goal — completion-driven turn loop. See
+                // `src/agent/goal.rs`. After every turn, if the
+                // session has an active goal we either:
+                //   * append a terminal status (✅/❌/⚠) to the reply
+                //     text so the user sees it in the same chat
+                //     bubble, AND clear the goal state, OR
+                //   * schedule the next iteration via the task queue.
+                //
+                // Mutating `reply.text` is safe because nothing on the
+                // path from here to the channel send re-evaluates the
+                // text against goal markers — the hook ran, the
+                // decision is made. Submitting the next turn happens
+                // INSIDE this match arm (not via reply_tx) because the
+                // channel reply path delivers `reply` to the user; the
+                // next /goal turn is a separate enqueued message that
+                // arrives through the normal worker loop.
+                let mut reply = reply;
+                if !turn_errored
+                    && let Some(reaction) =
+                        crate::agent::goal::check_after_turn(&session_key, &reply.text).await
+                {
+                    use crate::agent::goal::Reaction;
+                    match reaction {
+                        Reaction::Done(status_line) => {
+                            // Strip the GOAL_ marker line itself so it
+                            // doesn't read as machine output in the
+                            // user's chat — the human-friendly status
+                            // line we append takes its place.
+                            reply.text = strip_trailing_goal_marker(&reply.text);
+                            if !reply.text.is_empty() {
+                                reply.text.push_str("\n\n");
+                            }
+                            reply.text.push_str(&status_line);
+                            reply.is_empty = reply.text.is_empty()
+                                && reply.images.is_empty()
+                                && reply.files.is_empty();
+                        }
+                        Reaction::Continue(next_prompt) => {
+                            // Strip the user-visible reply of any
+                            // accidentally-leaked GOAL_* marker
+                            // (parse_terminal said Continue, so there
+                            // can't be one — but defensive).
+                            if let Some(tq) =
+                                crate::gateway::task_queue::get_task_queue()
+                            {
+                                let delivery_channel: &str =
+                                    if channel == "ws" { "desktop" } else { &channel };
+                                if let Err(e) =
+                                    crate::gateway::task_queue::submit_to_queue(
+                                        &tq,
+                                        &session_key,
+                                        &next_prompt,
+                                        delivery_channel,
+                                        &peer_id,
+                                        &peer_id,
+                                        false,
+                                        crate::gateway::task_queue::Priority::Cron,
+                                    )
+                                {
+                                    warn!(
+                                        session = %session_key,
+                                        error = %e,
+                                        "/goal: failed to enqueue continuation turn"
+                                    );
+                                }
+                            } else {
+                                warn!(
+                                    "/goal: task_queue not installed; cannot enqueue continuation"
+                                );
+                            }
+                        }
+                    }
+                }
                 // receiver may have been dropped (e.g. channel timeout)
                 let _ = reply_tx.send(reply);
             }
@@ -1969,6 +2042,40 @@ fn spawn_agent_tasks(
 // ---------------------------------------------------------------------------
 // Bind address helper
 // ---------------------------------------------------------------------------
+
+/// Drop the trailing `GOAL_ACHIEVED` / `GOAL_FAILED ...` line from a
+/// reply when it terminated a `/goal` loop. Anything after the marker
+/// on the same line is also dropped (per spec the marker must be the
+/// last non-blank line). We then trim any leftover trailing blank
+/// lines so the appended "✅ Goal achieved" status reads as a clean
+/// continuation, not as a margin-floating block.
+fn strip_trailing_goal_marker(text: &str) -> String {
+    let mut lines: Vec<&str> = text.lines().collect();
+    // Find the last non-blank line. If it carries a marker, remove it
+    // plus any blank lines that immediately precede it.
+    while let Some(last) = lines.last() {
+        if last.trim().is_empty() {
+            lines.pop();
+            continue;
+        }
+        break;
+    }
+    if let Some(last) = lines.last() {
+        let t = last.trim();
+        if t == "GOAL_ACHIEVED" || t.starts_with("GOAL_FAILED") {
+            lines.pop();
+            // Strip any blank lines now trailing.
+            while let Some(last) = lines.last() {
+                if last.trim().is_empty() {
+                    lines.pop();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    lines.join("\n")
+}
 
 fn resolve_bind_addr(config: &RuntimeConfig) -> SocketAddr {
     let port = config.gateway.port;

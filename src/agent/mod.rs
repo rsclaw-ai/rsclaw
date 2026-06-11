@@ -15,6 +15,7 @@ pub mod direct_apis;
 pub mod doc;
 pub mod evolution;
 pub mod exec_pool;
+pub mod goal;
 pub mod install_hints;
 pub mod loop_detection;
 pub mod memory;

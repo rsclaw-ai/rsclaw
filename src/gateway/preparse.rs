@@ -1263,6 +1263,33 @@ $g.Dispose();$b.Dispose()"#
     //   snapshot [code...]
     //   chart <code> [period] [count]
     // 不进 LLM，直接调 astock 子模块。
+    // /goal — result-driven turn loop. See src/agent/goal.rs.
+    //
+    //   /goal <condition>             # set + start
+    //   /goal                         # status
+    //   /goal clear                   # abort
+    //   /goal <cond> --max <N>        # override default iter cap
+    if lower == "/goal" {
+        return Some(txt(goal_status_handler(handle, channel, peer_id).await));
+    }
+    if let Some(rest_raw) = t.strip_prefix("/goal ") {
+        let rest = rest_raw.trim();
+        if rest.is_empty() {
+            return Some(txt(goal_status_handler(handle, channel, peer_id).await));
+        }
+        if rest.eq_ignore_ascii_case("clear")
+            || rest.eq_ignore_ascii_case("stop")
+            || rest.eq_ignore_ascii_case("abort")
+        {
+            return Some(txt(goal_clear_handler(handle, channel, peer_id).await));
+        }
+        if rest.eq_ignore_ascii_case("status") {
+            return Some(txt(goal_status_handler(handle, channel, peer_id).await));
+        }
+        return Some(txt(
+            goal_set_handler(handle, channel, peer_id, account, rest).await,
+        ));
+    }
     if lower == "/astock" || lower == "/astock help" || lower == "/astock -h" || lower == "/astock --help" {
         return Some(txt(astock_help_text()));
     }
@@ -1300,6 +1327,137 @@ $g.Dispose();$b.Dispose()"#
 // the fast preparse path can use). Chart sub-command returns a
 // special marker token consumed by the higher-level wrapper —
 // see `dispatch_astock_chart` for the image-attachment path.
+
+// ---------------------------------------------------------------------------
+// /goal handlers — completion-driven turn loop.
+// ---------------------------------------------------------------------------
+//
+// The goal LOOP itself lives in `gateway/startup.rs` (post-`run_turn`
+// hook calling `crate::agent::goal::check_after_turn`). The slash
+// command here only manages the goal STATE (set / clear / status)
+// and kicks off the first turn via `submit_to_queue`.
+
+async fn goal_set_handler(
+    handle: &crate::agent::AgentHandle,
+    channel: &str,
+    peer_id: &str,
+    account: Option<&str>,
+    rest: &str,
+) -> String {
+    // Parse `<condition> [--max <N>]`. Last-token form so users can
+    // write `/goal cargo test 全过 --max 50` without quoting.
+    let (condition, max_iter) = parse_goal_args(rest);
+    if condition.is_empty() {
+        return "用法: /goal <condition> [--max <N>]\n例: /goal cargo test 全过 --max 50"
+            .to_owned();
+    }
+    let Some(mem) = crate::agent::memory::global_store() else {
+        return "_memory 未启用,/goal 无法持久化_".to_owned();
+    };
+    let session_key = preparse_session_key(handle, channel, peer_id, account);
+    if let Err(e) =
+        crate::agent::goal::set(&mem, &session_key, &condition, max_iter).await
+    {
+        return format!("/goal: 写入失败: {e:#}");
+    }
+    // Kick off the first turn via the task queue (same path the channel
+    // dispatcher uses), so the LLM sees a synthetic user message asking
+    // it to start working on the goal.
+    let Some(tq) = crate::gateway::task_queue::get_task_queue() else {
+        return format!(
+            "Goal set: {condition} (iter cap {max_iter})\n\
+             _任务队列未启用,首轮不会自动启动 — 请手动发一条消息触发_"
+        );
+    };
+    let prompt = crate::agent::goal::build_initial_prompt(&condition, max_iter);
+    let delivery_channel: &str = if channel == "ws" { "desktop" } else { channel };
+    if let Err(e) = crate::gateway::task_queue::submit_to_queue(
+        &tq,
+        &session_key,
+        &prompt,
+        delivery_channel,
+        peer_id,
+        peer_id,
+        false,
+        crate::gateway::task_queue::Priority::Cron,
+    ) {
+        return format!(
+            "Goal set: {condition} (iter cap {max_iter})\n\
+             _首轮 enqueue 失败: {e}_"
+        );
+    }
+    format!(
+        "🎯 Goal set: {condition}\n\
+         iter cap: {max_iter}\n\
+         首轮已 enqueue,稍候片刻。\n\n\
+         随时 `/goal clear` 中止,或 `/goal` 看进度。"
+    )
+}
+
+async fn goal_clear_handler(
+    handle: &crate::agent::AgentHandle,
+    channel: &str,
+    peer_id: &str,
+) -> String {
+    let Some(mem) = crate::agent::memory::global_store() else {
+        return "_memory 未启用_".to_owned();
+    };
+    let session_key = preparse_session_key(handle, channel, peer_id, None);
+    let active = crate::agent::goal::read(&mem, &session_key).await;
+    if let Err(e) = crate::agent::goal::clear(&mem, &session_key).await {
+        return format!("/goal clear: 失败: {e:#}");
+    }
+    match active {
+        Some(g) => format!(
+            "🛑 Goal cleared: {} (was iter {}/{})",
+            g.condition, g.iter, g.max_iter
+        ),
+        None => "_当前没有进行中的 goal_".to_owned(),
+    }
+}
+
+async fn goal_status_handler(
+    handle: &crate::agent::AgentHandle,
+    channel: &str,
+    peer_id: &str,
+) -> String {
+    let Some(mem) = crate::agent::memory::global_store() else {
+        return "_memory 未启用_".to_owned();
+    };
+    let session_key = preparse_session_key(handle, channel, peer_id, None);
+    match crate::agent::goal::read(&mem, &session_key).await {
+        Some(g) => {
+            let elapsed_secs = (chrono::Utc::now().timestamp() - g.started_at).max(0);
+            format!(
+                "🎯 Goal active: {}\niter: {}/{}\n已运行: {}s",
+                g.condition, g.iter, g.max_iter, elapsed_secs
+            )
+        }
+        None => "_当前没有进行中的 goal — 用 `/goal <condition>` 启动_".to_owned(),
+    }
+}
+
+/// Parse `<condition> [--max <N>]`. `--max` is the only recognised
+/// flag for now. Returns `(condition_text, max_iter)`. Missing or
+/// malformed `--max` falls back to `DEFAULT_MAX_ITER`.
+fn parse_goal_args(rest: &str) -> (String, u32) {
+    let toks: Vec<&str> = rest.split_whitespace().collect();
+    let mut max_iter: u32 = crate::agent::goal::DEFAULT_MAX_ITER;
+    let mut cond_toks: Vec<&str> = Vec::with_capacity(toks.len());
+    let mut i = 0;
+    while i < toks.len() {
+        if toks[i] == "--max" || toks[i] == "-m" {
+            if let Some(n) = toks.get(i + 1).and_then(|s| s.parse::<u32>().ok()) {
+                max_iter = n;
+                i += 2;
+                continue;
+            }
+        }
+        cond_toks.push(toks[i]);
+        i += 1;
+    }
+    (cond_toks.join(" ").trim().to_owned(), max_iter)
+}
 
 fn astock_help_text() -> String {
     "/astock — A股数据 & 调度 (本地快路径，不进 LLM)\n\n\
@@ -1797,7 +1955,7 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
         "/ls" | "/status" | "/version" | "/help" | "/?" | "/health" | "/uptime"
             | "/model" | "/models" | "/cron" | "/clear" | "/new" | "/abort" | "/sessions"
             | "/loop" | "/task" | "/watch" | "/plugin" | "/cap" | "/cap-exit" | "/cap-resume"
-            | "/astock"
+            | "/astock" | "/goal"
     )
     // Commands with optional/required args
     || lower.starts_with("/ls ")
@@ -1818,6 +1976,7 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
     || lower.starts_with("/cap ")
     || lower.starts_with("/cap-resume ")
     || lower.starts_with("/astock ")
+    || lower.starts_with("/goal ")
     // /task only short-circuits on help variants; non-help forms must NOT
     // bypass the queue (the task queue worker owns the multi-turn flow).
     || lower == "/task -h"
@@ -2025,6 +2184,7 @@ fn help_text(lang: &str) -> String {
          任务/调度\n\
          \u{0020}\u{0020}/task -h         多轮任务（详见 -h）\n\
          \u{0020}\u{0020}/loop -h         定时循环（详见 -h）\n\
+         \u{0020}\u{0020}/goal <cond>     盯一个结果型目标，模型自评 GOAL_ACHIEVED/FAILED 终止\n\
          \u{0020}\u{0020}/cron list       查看定时任务\n\n\
          A股 (astock)\n\
          \u{0020}\u{0020}/astock          A股数据 & 早报调度（详见 /astock help）\n\n\
@@ -2060,6 +2220,7 @@ fn help_text(lang: &str) -> String {
          Task / schedule\n\
          \u{0020}\u{0020}/task -h         multi-turn task (see -h)\n\
          \u{0020}\u{0020}/loop -h         repeat on a schedule (see -h)\n\
+         \u{0020}\u{0020}/goal <cond>     result-driven loop; model self-tags GOAL_ACHIEVED/FAILED to stop\n\
          \u{0020}\u{0020}/cron list       view cron jobs\n\n\
          A-shares (astock)\n\
          \u{0020}\u{0020}/astock          A-share data & briefing scheduler (see /astock help)\n\n\
