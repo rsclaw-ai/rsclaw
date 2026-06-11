@@ -33,6 +33,9 @@ use crate::channel::{
 const ILINK_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
 const DEFAULT_BOT_TYPE: &str = "3";
 const LONG_POLL_TIMEOUT_MS: u64 = 35_000;
+/// Consecutive get_updates failures before the loop escalates from
+/// debug to WARN — single long-poll timeouts are routine network noise.
+const CONSECUTIVE_ERR_WARN_THRESHOLD: u32 = 5;
 const SEND_TIMEOUT_MS: u64 = 15_000;
 
 /// Build the common ilink API headers.
@@ -551,9 +554,23 @@ impl WeChatPersonalChannel {
 
         info!("WeChat personal long-poll loop started");
 
+        // Long-poll timeouts are routine (held connection vs network jitter),
+        // so a single failure is debug-level noise. Consecutive failures are
+        // the real outage signal — tonight's 85-minute invisible outage hid
+        // inside hundreds of routine per-timeout WARNs. Escalate at the
+        // threshold once, then every 10th failure to keep the log scannable.
+        let mut consecutive_errs: u32 = 0;
+
         loop {
             match self.get_updates(&updates_buf).await {
                 Ok(resp) => {
+                    if consecutive_errs >= CONSECUTIVE_ERR_WARN_THRESHOLD {
+                        info!(
+                            after_failures = consecutive_errs,
+                            "wechat: long-poll recovered"
+                        );
+                    }
+                    consecutive_errs = 0;
                     if let Some(new_buf) = resp.get_updates_buf {
                         updates_buf = new_buf;
                     }
@@ -813,7 +830,18 @@ impl WeChatPersonalChannel {
                     }
                 }
                 Err(e) => {
-                    warn!("wechat getupdates error: {e:#}");
+                    consecutive_errs = consecutive_errs.saturating_add(1);
+                    if consecutive_errs == CONSECUTIVE_ERR_WARN_THRESHOLD
+                        || (consecutive_errs > CONSECUTIVE_ERR_WARN_THRESHOLD
+                            && consecutive_errs % 10 == 0)
+                    {
+                        warn!(
+                            consecutive = consecutive_errs,
+                            "wechat getupdates failing repeatedly: {e:#}"
+                        );
+                    } else {
+                        debug!(consecutive = consecutive_errs, "wechat getupdates error: {e:#}");
+                    }
                     sleep(Duration::from_secs(5)).await;
                 }
             }
