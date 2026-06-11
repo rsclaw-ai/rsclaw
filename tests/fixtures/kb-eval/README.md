@@ -40,22 +40,28 @@ rsclaw --profile <test> kb stats   # chunkCount must equal 54
 rsclaw --profile <test> kb eval tests/fixtures/kb-eval/golden.json -k 5
 ```
 
-## Reference scores (2026-06-11, hybrid BM25+dense, RRF+MMR, k=5)
+## Reference scores (2026-06-11, CJK-calibrated chunker, mixed 62-doc index, k=5)
 
-| embedder | hit@1 | MRR | notes |
+Short set (216 cases) / Long set (40 cases), hit@1 unless noted:
+
+| config | short hit@1 | long hit@1 | long hit@5 |
 |---|---|---|---|
-| bge-small-zh (512d, local) | 87.0% | 0.870 | reproduced twice; the default |
-| Qwen3-0.6B + query instruction (1024d, remote) | 82.9% | 0.829 | healthy deployment |
-| bge-base-zh (768d, local) | 81.9% | 0.819 | 3× params over small, loses anyway |
-| Qwen3-0.6B, no instruction | 79.6% | 0.796 | instruction is worth +3.3 |
+| bge-small + bge-reranker-v2-m3 | **96.8%** | 67.5% | 67.5% |
+| Qwen3-0.6B + instruction + reranker | 94.9% | **70.0%** | **87.5%** |
+| bge-small (no rerank) | 87.0% | 30.0% | 30.0% |
+| Qwen3-0.6B + instruction (no rerank) | 82.9% | 40.0% | 40.0% |
 
-Caveat on the Qwen3 rows: this corpus is short docs (~1 chunk each), so
-bge-small's 512-token input limit never bites. Real 研报 chunks at the
-512-token chunk target + title prefix DO exceed it (tail silently truncated
-at embed time) — that regime is where Qwen3 (32K input) should pull ahead
-and is NOT yet covered by this golden set. Add long-doc cases before
-treating bge-small as the final answer for production corpora.
+Production recommendation: bge-small local embeddings + remote
+bge-reranker-v2-m3 (kb.rerank). The reranker is the dominant lever
+(+10-12 short, 2x+ long); the embedder choice is secondary once the
+chunker is CJK-calibrated. Long-set absolute numbers are pessimistic —
+the synthetic long docs share identical filler paragraphs, which
+confuses every embedder; relative comparisons remain valid.
 
+History (pre-CJK-chunker, 54-doc index): bge-small 87.0 / bge-base 81.9 /
+qwen3+inst 82.9 / qwen3 79.6 on the short set. The pre-fix mixed index
+collapsed to 0.5% (giant-chunk hub vectors + RRF double-counting) —
+see git history for the full forensics.
 
 ## Long-doc set (`corpus-long/` + `golden-long.json`)
 
