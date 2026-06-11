@@ -25,6 +25,9 @@ use enigo::{
 };
 use image::{ImageFormat, RgbaImage};
 use tracing::{debug, warn};
+// xcap is dep-gated to non-Linux (Cargo.toml). On Linux,
+// `capture_primary_screen` returns an error rather than panicking.
+#[cfg(not(target_os = "linux"))]
 use xcap::Monitor;
 
 use crate::computer::{
@@ -138,6 +141,14 @@ impl Operator for NativeOperator {
 // ---------------------------------------------------------------------------
 
 /// Capture the primary monitor and encode as PNG.
+#[cfg(target_os = "linux")]
+fn capture_primary_screen() -> Result<Screenshot> {
+    Err(anyhow!(
+        "screen capture not supported on Linux (xcap disabled — pipewire/libspa build chain)"
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
 fn capture_primary_screen() -> Result<Screenshot> {
     let monitors = Monitor::all().map_err(|e| anyhow!("xcap::Monitor::all failed: {e}"))?;
     if monitors.is_empty() {

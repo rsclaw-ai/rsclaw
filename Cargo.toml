@@ -124,7 +124,6 @@ opus-decoder = "0.1"
 # with cross-platform native APIs — ~100x faster and removes the fork
 # overhead per action. See src/computer/operators/native.rs.
 enigo = "0.6"
-xcap = "0.9"
 display-info = "0.5"
 ogg = "0.9"
 lark-websocket-protobuf = "0.1"
@@ -172,18 +171,10 @@ once_cell  = "1"
 jieba-rs   = "0.7"
 mailparse = "0.16.1"
 
-# cap-rs — CLI Agent Protocol drivers.
-#
-# Path dep is great for local iteration but breaks CI (which only
-# checks out rsclaw, not cap-protocol). Pinning to a git rev gives
-# us both: reproducible CI builds AND the ability to bump to local
-# work-in-progress by swapping the rev. Re-pin to
-# `version = "0.1.x"` once a new release is cut on crates.io that
-# carries the features we use (currently: stream-json, codex, acp).
-#
-# For local iteration, swap this block back to:
+# cap-rs — CLI Agent Protocol drivers. Pinned to the published
+# 0.1.0 release on crates.io. For local iteration, swap to:
 #   cap-rs = { path = "../cap-protocol/crates/cap-rs", ...features }
-cap-rs = { git = "https://github.com/rsclaw-ai/cap-protocol.git", rev = "52aea033a7facd5c08d1f0366955363113d8ecc3", default-features = false, features = ["stream-json", "codex", "acp"] }
+cap-rs = { version = "0.1.0", default-features = false, features = ["stream-json", "codex", "acp"] }
 
 [features]
 default = ["openclaw-migrate"]
@@ -237,6 +228,15 @@ tokio-test = "0.4"
 tempfile   = "3"
 wiremock = "0.6"
 ctor = "0.4"
+
+# xcap pulled in pipewire → libspa → GLIBC 2.38 symbol chain on Linux,
+# which broke every release attempt this round. Linux server / headless
+# rsclaw doesn't need screen capture; the iphone-mirror path is already
+# macOS-only; native.rs falls back to a stub-error on Linux. Re-enable
+# once xcap drops pipewire or libspa bindings stabilise against older
+# spa headers.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+xcap = "0.9"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["handleapi", "processthreadsapi", "winnt"] }

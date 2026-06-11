@@ -14,6 +14,10 @@ use enigo::{
 };
 use image::{ImageFormat, RgbaImage};
 use tracing::warn;
+// xcap is gated to non-Linux at the dep level (Cargo.toml) — see the
+// long comment on the `xcap` line for the pipewire/libspa rationale.
+// Functions below fall back to a stub-error on Linux.
+#[cfg(not(target_os = "linux"))]
 use xcap::{Monitor, Window};
 
 use super::DesktopSession;
@@ -47,6 +51,16 @@ fn scale_for_input(x: u32, y: u32) -> (i32, i32) {
 }
 
 /// Capture a region of the primary monitor.
+#[cfg(target_os = "linux")]
+fn capture_region(_x: u32, _y: u32, _w: u32, _h: u32) -> Result<String, String> {
+    Err(
+        "screen capture not supported on Linux (xcap disabled — pipewire/libspa build chain). \
+         Use an alternative capture path or run on macOS/Windows."
+            .to_string(),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
 fn capture_region(x: u32, y: u32, w: u32, h: u32) -> Result<String, String> {
     let monitors = Monitor::all().map_err(|e| format!("xcap Monitor::all failed: {e}"))?;
     if monitors.is_empty() {
@@ -80,6 +94,12 @@ fn capture_region(x: u32, y: u32, w: u32, h: u32) -> Result<String, String> {
 }
 
 /// Capture the full primary monitor (fallback when window bounds unavailable).
+#[cfg(target_os = "linux")]
+fn capture_primary_monitor() -> Result<String, String> {
+    Err("screen capture not supported on Linux (xcap disabled)".to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
 fn capture_primary_monitor() -> Result<String, String> {
     let monitors = Monitor::all().map_err(|e| format!("xcap Monitor::all failed: {e}"))?;
     if monitors.is_empty() {
@@ -117,6 +137,12 @@ fn capture_primary_monitor() -> Result<String, String> {
 /// viewer): when the child is open it is frontmost and gets captured;
 /// otherwise the main window does. A 200x200 minimum filters out tooltips and
 /// other tiny helper windows. Returns a PNG data URI.
+#[cfg(target_os = "linux")]
+fn capture_app_window(_app_name: &str) -> Result<String, String> {
+    Err("window capture not supported on Linux (xcap disabled)".to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
 fn capture_app_window(app_name: &str) -> Result<String, String> {
     let windows = Window::all().map_err(|e| format!("xcap Window::all failed: {e}"))?;
     let win = windows
