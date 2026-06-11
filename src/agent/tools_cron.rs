@@ -167,6 +167,15 @@ impl super::runtime::AgentRuntime {
                     job["schedule"] =
                         json!({"kind": "every", "everyMs": interval_ms, "anchorMs": now_ms});
                 } else if let Some(sched) = schedule {
+                    // Validate BEFORE persisting — the WS path always did this,
+                    // but the tool path used to write bad expressions straight
+                    // to cron.json5 where they failed silently at reload. The
+                    // validator's message teaches the 5-field format (incl. the
+                    // "017 * * *" missing-space hint), so the model can fix the
+                    // expression on its next try.
+                    if let Err(msg) = crate::cron::validate_cron_expr(sched) {
+                        return Err(anyhow!("cron add: invalid schedule: {msg}"));
+                    }
                     // Standard cron expression or interval.
                     // Always include timezone. Use LLM-provided, config, or auto-detected.
                     let tz_val = tz
@@ -269,10 +278,32 @@ impl super::runtime::AgentRuntime {
                 }
 
                 let mut resp = json!({"added": id, "message": message});
+                // Echo back WHAT was scheduled in plain words. The two
+                // historical cron mistakes (one-time intent built as a
+                // forever-recurring job; systemEvent echoing an instruction
+                // instead of executing it) are both invisible in a bare
+                // {"added": id} ack — but obvious in this summary, so the
+                // model can remove+re-add in the same turn. This echo is
+                // what allowed the tool description to drop its 1.3k-token
+                // prevention manual.
                 if let Some(interval_ms) = every_ms {
                     resp["every_ms"] = json!(interval_ms);
+                    resp["fires"] = json!(format!(
+                        "every {}s, repeating forever — if the user wanted this once, remove and re-add with delay_ms",
+                        interval_ms / 1000
+                    ));
                 } else if let Some(s) = schedule {
                     resp["schedule"] = json!(s);
+                    resp["fires"] = json!(format!(
+                        "recurring per '{s}', repeating forever — if the user asked for ONE specific time (today/tomorrow), remove this and re-add with delay_ms"
+                    ));
+                } else {
+                    resp["fires"] = json!("once, then auto-removes");
+                }
+                if kind == "systemEvent" {
+                    resp["note"] = json!(
+                        "systemEvent delivers the message text VERBATIM each fire — no agent, no tools. If the message describes an action to perform (query/check/fetch), remove and re-add with kind=agentTurn."
+                    );
                 }
                 Ok(resp)
             }
@@ -396,6 +427,10 @@ impl super::runtime::AgentRuntime {
 
                 let id = jobs[idx]["id"].as_str().unwrap_or("?").to_string();
                 if let Some(schedule) = args["schedule"].as_str() {
+                    // Same teaching validation as the add path.
+                    if let Err(msg) = crate::cron::validate_cron_expr(schedule) {
+                        return Err(anyhow!("cron edit: invalid schedule: {msg}"));
+                    }
                     let tz = args["tz"].as_str();
                     if let Some(tz_val) = tz {
                         jobs[idx]["schedule"] =

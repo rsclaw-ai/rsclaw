@@ -4004,6 +4004,10 @@ impl AgentRuntime {
         // respond with text.
         let is_summarize_turn = session_key.starts_with("summarize:");
 
+        // Cold ToolDefs pulled out by the deferral below; handed to
+        // agent_loop, which splices them back into the live tool list when
+        // the model calls `request_tool`.
+        let mut deferred_tool_defs: Vec<crate::provider::ToolDef> = Vec::new();
         let tools = if !tools_enabled || is_summarize_turn {
             vec![]
         } else {
@@ -4156,6 +4160,40 @@ impl AgentRuntime {
                     true
                 }
             });
+
+            // Cold-tool deferral — non-rsclaw providers only. rsclaw's tools
+            // ride in the fleet's shared registry prefix where the KV cache
+            // makes them free at the margin; external providers pay the full
+            // tool defs on every request, so near-zero-usage tools (~2.8k
+            // tokens) collapse into the one-line `request_tool` stub. A
+            // per-agent `tools` whitelist is the user's explicit word — never
+            // defer those. Tools re-enabled earlier in this session stay live.
+            let primary_provider = model_cfg
+                .and_then(|m| m.primary_head())
+                .map(|m| self.providers.resolve_model(m).0.to_owned())
+                .unwrap_or_default();
+            if primary_provider != "rsclaw" && custom_tools.is_none() {
+                let enabled = self
+                    .handle
+                    .cold_enabled
+                    .read()
+                    .ok()
+                    .and_then(|g| g.get(session_key).cloned())
+                    .unwrap_or_default();
+                let deferred_names: Vec<&str> = crate::agent::tools_builder::COLD_TOOLS
+                    .iter()
+                    .copied()
+                    .filter(|n| !enabled.contains(*n) && all.iter().any(|t| t.name == *n))
+                    .collect();
+                if !deferred_names.is_empty() {
+                    let (cold, hot): (Vec<_>, Vec<_>) = all
+                        .into_iter()
+                        .partition(|t| deferred_names.contains(&t.name.as_str()));
+                    all = hot;
+                    all.push(crate::agent::tools_builder::request_tool_def(&deferred_names));
+                    deferred_tool_defs = cold;
+                }
+            }
 
             all
         };
@@ -4572,6 +4610,7 @@ impl AgentRuntime {
                 primary_chain_tail.clone(),
                 &system_prompt,
                 tools,
+                deferred_tool_defs,
                 extra_tools,
                 abort_flag.clone(),
             ),
@@ -5119,7 +5158,10 @@ impl AgentRuntime {
         model: &str,
         primary_chain_tail: Vec<String>,
         system_prompt: &str,
-        tools: Vec<ToolDef>,
+        mut tools: Vec<ToolDef>,
+        // Cold ToolDefs deferred behind the `request_tool` stub; spliced
+        // back into `tools` mid-loop once the model enables them.
+        mut deferred_tool_defs: Vec<ToolDef>,
         extra_tools: Vec<ToolDef>,
         abort_flag: Arc<AtomicBool>,
     ) -> Result<AgentReply> {
@@ -6015,6 +6057,21 @@ impl AgentRuntime {
             } else {
                 turn_recall
             };
+
+            // A request_tool call in the previous iteration re-enabled cold
+            // tools — splice the real defs back in so the model can call
+            // them within this same turn (one round-trip, not one turn).
+            if !deferred_tool_defs.is_empty()
+                && let Ok(g) = self.handle.cold_enabled.read()
+                && let Some(set) = g.get(&ctx.session_key)
+                && deferred_tool_defs.iter().any(|d| set.contains(&d.name))
+            {
+                let (live, still): (Vec<_>, Vec<_>) = std::mem::take(&mut deferred_tool_defs)
+                    .into_iter()
+                    .partition(|d| set.contains(&d.name));
+                deferred_tool_defs = still;
+                tools.extend(live);
+            }
 
             let req = LlmRequest {
                 fallback_models: primary_chain_tail.clone(),
@@ -8494,6 +8551,10 @@ impl AgentRuntime {
         if let Ok(mut g) = handle.plugin_overrides.write() {
             g.remove(session_key);
         }
+        // Cold-tool re-enables are session state too — /clear resets them.
+        if let Ok(mut g) = handle.cold_enabled.write() {
+            g.remove(session_key);
+        }
     }
 
     /// In-place mutate the session override for `(session_key, plugin)`,
@@ -9144,6 +9205,25 @@ impl AgentRuntime {
             "send_message" | "message" => return self.tool_message(args).await,
             "clarify" => return self.tool_clarify(args).await,
             "anycli" | "opencli" => return self.tool_anycli(args).await,
+            "request_tool" => {
+                // v1 leaks trailing whitespace into string args — trim before lookup.
+                let name = args["name"].as_str().unwrap_or("").trim().to_owned();
+                if !crate::agent::tools_builder::COLD_TOOLS.contains(&name.as_str()) {
+                    return Ok(json!({
+                        "error": format!("'{name}' is not a deferred tool"),
+                        "deferred": crate::agent::tools_builder::COLD_TOOLS,
+                    }));
+                }
+                if let Ok(mut g) = self.handle.cold_enabled.write() {
+                    g.entry(ctx.session_key.clone())
+                        .or_default()
+                        .insert(name.clone());
+                }
+                return Ok(json!({
+                    "enabled": name,
+                    "note": "Tool is now available for this session — call it directly."
+                }));
+            }
             "cron" => return self.tool_cron(args, ctx).await,
             "gateway" => return self.tool_gateway(args).await,
             "pairing" => return self.tool_pairing(args).await,
