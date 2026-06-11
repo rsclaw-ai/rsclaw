@@ -441,7 +441,11 @@ async fn handle_send_message(
         session_key: session_key.clone(),
         text,
         channel: "a2a".to_owned(),
-        peer_id: "a2a-client".to_owned(),
+        // A2A 已鉴权身份作为可信发送方(见 streaming.rs 同改)。
+        peer_id: caller
+            .as_ref()
+            .map(|c| c.id.clone())
+            .unwrap_or_else(|| "a2a-client".to_owned()),
         chat_id: String::new(),
         reply_tx,
         task_id: Some(task_id.clone()),

@@ -30,8 +30,20 @@ impl TaskStore {
         // half-migrated format the legacy upgrader couldn't fix — move it aside
         // and recreate fresh rather than crashing the gateway on boot. The bad
         // file is preserved as `.broken-<ts>` for recovery, never deleted.
-        let db = match Database::create(path) {
+        let builder = Database::builder();
+        let db = match crate::store::create_with_lock_retry(&builder, path) {
             Ok(db) => db,
+            // Still locked after the full retry window — a second gateway is
+            // genuinely running against this base dir. Do NOT fall through to
+            // the "move aside + recreate" path below: that resets task history.
+            // Surface the conflict instead so the operator can stop the dupe.
+            Err(redb::DatabaseError::DatabaseAlreadyOpen) => {
+                anyhow::bail!(
+                    "a2a task store at {} is locked by another process after retry; \
+                     refusing to reset (is a second gateway running on this base dir?)",
+                    path.display()
+                );
+            }
             Err(e) => {
                 let ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

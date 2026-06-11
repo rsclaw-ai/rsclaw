@@ -170,6 +170,16 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
             })
             .collect();
         body["tools"] = json!(tools);
+        // Set tool_choice explicitly. The real Anthropic API defaults this to
+        // {"type":"auto"} so it's a no-op for Claude — but anthropic-COMPATIBLE
+        // third parties (notably Kimi's api.kimi.com/coding endpoint) ignore the
+        // `tools` list entirely unless tool_choice is present, so the model never
+        // function-calls and instead tells the user to run commands themselves.
+        // The OpenAI-completions path encodes the same Kimi quirk (see
+        // `openai::build_request_body`); the anthropic path needs it too. Being
+        // explicit is safe for genuine Claude and fixes every compatible endpoint
+        // with this behavior.
+        body["tool_choice"] = json!({ "type": "auto" });
     }
 
     // Extended thinking: if budget > 0, enable thinking with the specified budget.
@@ -616,6 +626,41 @@ mod tests {
                 .as_str()
                 .expect("cache_control type is str"),
             "ephemeral"
+        );
+    }
+
+    /// Regression: when tools are present, the body must carry an explicit
+    /// `tool_choice: {"type":"auto"}`. Genuine Claude defaults to auto, but
+    /// anthropic-compatible endpoints (Kimi's api.kimi.com/coding) ignore the
+    /// tools list without it, so the model never function-calls.
+    #[test]
+    fn tool_choice_auto_set_when_tools_present() {
+        let req = LlmRequest {
+            fallback_models: Vec::new(),
+            tools: vec![crate::provider::ToolDef {
+                name: "shell".to_owned(),
+                description: "run a shell command".to_owned(),
+                parameters: serde_json::json!({"type": "object"}),
+            }],
+            ..make_request()
+        };
+        let body = build_request_body(&req).expect("build request body");
+        assert_eq!(
+            body["tool_choice"]["type"].as_str(),
+            Some("auto"),
+            "tool_choice must be set to auto when tools are present"
+        );
+        assert!(body["tools"].as_array().is_some_and(|t| t.len() == 1));
+    }
+
+    /// No tools → no `tool_choice` key (avoid sending it with an empty tools
+    /// list, which some endpoints reject).
+    #[test]
+    fn tool_choice_absent_when_no_tools() {
+        let body = build_request_body(&make_request()).expect("build request body");
+        assert!(
+            body.get("tool_choice").is_none(),
+            "tool_choice must be omitted when there are no tools"
         );
     }
 

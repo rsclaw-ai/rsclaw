@@ -1205,6 +1205,20 @@ impl super::runtime::AgentRuntime {
                 cmd.env("PATH", all.join(if cfg!(windows) { ";" } else { ":" }));
             }
         }
+        // Trusted caller identity for league/competition tooling: carry the
+        // CHANNEL-AUTHENTICATED sender (peer_id) into exec'd commands so tools
+        // like `leaguetool connect`/`submit` bind to the VERIFIED identity
+        // instead of an LLM-supplied (spoofable) value — closing Sybil/spoof
+        // even against prompt injection. Works for ALL channels:
+        //   wechat → openid, feishu → open_id, a2a → caller.id, …
+        if !ctx.peer_id.is_empty() {
+            cmd.env("RSCLAW_CALLER_ID", &ctx.peer_id);
+            cmd.env("RSCLAW_CALLER_CHANNEL", &ctx.channel);
+            // Back-compat alias for the earlier A2A-only env var.
+            if ctx.channel == "a2a" {
+                cmd.env("RSCLAW_A2A_CALLER", &ctx.peer_id);
+            }
+        }
         // Ensure the workspace exists before chdir. A dynamically-spawned
         // sub-agent's workspace (e.g. ~/.rsclaw/workspace/task-xxx) is only
         // recorded in the agent entry at spawn time, not created on disk —
