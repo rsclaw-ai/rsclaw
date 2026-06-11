@@ -1292,6 +1292,29 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         // signal to wait on. Cheap to set, narrows the window of any
         // future race introduction.
         cmd.env("RSCLAW_PARENT_PID", std::process::id().to_string());
+        // Re-attach stdio to the canonical gateway log. fd inheritance
+        // usually carries this through exec(), but the spawn() fallback —
+        // and an exec that failed mid-rebuild (ETXTBSY) — leaves the
+        // replacement logging into whatever pipe the restart requester
+        // happened to hold. Observed 2026-06-12: a post-restart instance
+        // logged nowhere for 85 minutes (wechat outage invisible).
+        // Explicit re-attach makes both paths deterministic; Rust's
+        // CommandExt::exec applies configured stdio before the exec.
+        {
+            let log_path = crate::config::loader::log_file();
+            if let Some(parent) = log_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                && let Ok(f2) = f.try_clone()
+            {
+                cmd.stdout(std::process::Stdio::from(f));
+                cmd.stderr(std::process::Stdio::from(f2));
+            }
+        }
         // Windows: suppress the console flash when re-execing from a GUI app.
         #[cfg(target_os = "windows")]
         {
