@@ -265,6 +265,9 @@ impl BrowserPool {
                 };
                 if alive {
                     let p = pooled.port;
+                    // Touch before releasing the lock so a reaper queued on
+                    // the mutex re-checks against a fresh clock.
+                    self.touch();
                     drop(guard);
                     return self.ws_url_for_port(p).await;
                 }
@@ -280,6 +283,9 @@ impl BrowserPool {
                 process: Some(process),
                 port,
             });
+            // Touch before releasing the lock so a reaper queued on the
+            // mutex re-checks against a fresh clock.
+            self.touch();
             port
         };
         self.ws_url_for_port(port).await
@@ -300,11 +306,14 @@ impl BrowserPool {
             process: None,
             port,
         });
+        self.touch();
         info!(port, "pool: using external Chrome");
         Ok(())
     }
 
     /// Ensure the shared Chrome is running. Returns the debug port.
+    /// Refreshes the idle clock on every success — a Chrome we just handed
+    /// out must not be reaped before the caller gets to use it.
     async fn ensure_chrome(&self) -> Result<u16> {
         let mut guard = self.chrome.lock().await;
 
@@ -317,6 +326,7 @@ impl BrowserPool {
                     // clear the entry and fall through to launching our own
                     // pool Chrome instead of wedging on a stale port.
                     if Self::port_alive(pooled.port).await {
+                        self.touch();
                         return Ok(pooled.port);
                     }
                     warn!(
@@ -330,6 +340,7 @@ impl BrowserPool {
                         warn!("pool: Chrome process exited, will restart");
                         *guard = None;
                     } else {
+                        self.touch();
                         return Ok(pooled.port);
                     }
                 }
@@ -373,6 +384,7 @@ impl BrowserPool {
             process: Some(process),
             port,
         });
+        self.touch();
         Ok(port)
     }
 
@@ -383,8 +395,11 @@ impl BrowserPool {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Update last activity timestamp.
-    fn touch(&self) {
+    /// Update last activity timestamp. Also called by `BrowserSession`s that
+    /// attached to the pool Chrome via `connect_existing` — their traffic
+    /// bypasses `acquire_tab()`, so without this the reaper would consider
+    /// the pool idle and kill a Chrome that is actively in use.
+    pub(crate) fn touch(&self) {
         self.last_activity.store(now_ms(), Ordering::Relaxed);
     }
 
@@ -401,6 +416,13 @@ impl BrowserPool {
             return;
         }
         let mut guard = self.chrome.lock().await;
+        // Re-check under the lock: ensure_chrome/ensure_owned_chrome may
+        // have launched a new Chrome (and touched the clock) while we
+        // waited for the mutex. Without this the reaper kills a freshly
+        // launched Chrome milliseconds after its launch releases the lock.
+        if !self.is_idle_expired() {
+            return;
+        }
         if guard.is_some() {
             info!("pool: idle timeout, shutting down shared Chrome");
             *guard = None; // ChromeProcess::Drop kills the process
@@ -516,4 +538,121 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    use super::*;
+
+    fn backdate_past_idle(pool: &BrowserPool) {
+        let stale = now_ms() - POOL_IDLE_TIMEOUT.as_millis() as u64 - 1_000;
+        pool.last_activity.store(stale, Ordering::Relaxed);
+        assert!(pool.is_idle_expired(), "precondition: pool must look idle");
+    }
+
+    /// Serves /json/version for a fake Chrome debug port.
+    async fn fake_chrome_endpoint() -> (MockServer, u16) {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        let body = json!({
+            "webSocketDebuggerUrl":
+                format!("ws://127.0.0.1:{port}/devtools/browser/test")
+        });
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        (server, port)
+    }
+
+    // Regression: the reaper killed a freshly registered/launched Chrome
+    // because nothing outside acquire_tab() refreshed last_activity, so a
+    // pool whose previous tab use was >10 min ago looked idle even while a
+    // BrowserSession was actively driving its Chrome.
+    #[tokio::test]
+    async fn set_chrome_ws_url_refreshes_idle_clock() {
+        let pool = BrowserPool::new();
+        backdate_past_idle(&pool);
+        pool.set_chrome_ws_url("ws://127.0.0.1:9222/devtools/browser/abc")
+            .await
+            .unwrap();
+        assert!(
+            !pool.is_idle_expired(),
+            "registering a Chrome must reset the idle clock"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_owned_chrome_reuse_refreshes_idle_clock() {
+        let (_server, port) = fake_chrome_endpoint().await;
+        let pool = BrowserPool::new();
+        *pool.chrome.lock().await = Some(PooledChrome {
+            process: None,
+            port,
+        });
+        backdate_past_idle(&pool);
+        pool.ensure_owned_chrome("/nonexistent-chrome", false, None)
+            .await
+            .unwrap();
+        assert!(
+            !pool.is_idle_expired(),
+            "handing out the pool Chrome must reset the idle clock"
+        );
+    }
+
+    // Regression: reap_if_idle checked the idle clock BEFORE acquiring the
+    // chrome lock. A reaper tick landing while ensure_owned_chrome held the
+    // lock launching a new Chrome would pass the stale pre-check, block on
+    // the mutex, then kill the freshly launched Chrome milliseconds after
+    // the launch released the lock (seen in gateway.log 22:04:50.030 launch
+    // -> .031 reap). The reaper must re-check idleness under the lock.
+    #[tokio::test]
+    async fn reap_rechecks_idle_clock_under_lock() {
+        let pool = std::sync::Arc::new(BrowserPool::new());
+        backdate_past_idle(&pool);
+
+        // Hold the chrome lock, simulating an in-flight Chrome launch.
+        let mut guard = pool.chrome.lock().await;
+
+        // Reaper ticks now: passes the stale pre-check, blocks on the lock.
+        let reaper = {
+            let pool = pool.clone();
+            tokio::spawn(async move { pool.reap_if_idle().await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Launch finishes while the reaper waits: register Chrome and
+        // refresh the idle clock, then release the lock.
+        *guard = Some(PooledChrome {
+            process: None,
+            port: 1,
+        });
+        pool.touch();
+        drop(guard);
+
+        reaper.await.unwrap();
+        assert!(
+            pool.chrome.lock().await.is_some(),
+            "reaper must not kill a Chrome launched while it waited for the lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn chrome_ws_url_reuse_refreshes_idle_clock() {
+        let (_server, port) = fake_chrome_endpoint().await;
+        let pool = BrowserPool::new();
+        *pool.chrome.lock().await = Some(PooledChrome {
+            process: None,
+            port,
+        });
+        backdate_past_idle(&pool);
+        pool.chrome_ws_url().await.unwrap();
+        assert!(
+            !pool.is_idle_expired(),
+            "handing out the pool Chrome must reset the idle clock"
+        );
+    }
 }

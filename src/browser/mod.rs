@@ -1184,7 +1184,22 @@ impl BrowserSession {
                     .ok()
                     .and_then(|v| v["webSocketDebuggerUrl"].as_str().map(String::from))
                     .unwrap_or(browser_ws),
-                Err(_) => browser_ws,
+                Err(_) => {
+                    // The registered Chrome is gone (pool reaped it, it
+                    // crashed, or the user closed it). Reconnecting to the
+                    // dead port can never succeed — ask the pool for a live
+                    // Chrome instead; it probes the current entry and
+                    // relaunches its own headless one when unreachable.
+                    warn!(
+                        port = self.debug_port,
+                        "external Chrome unreachable, re-acquiring from pool"
+                    );
+                    let ws = pool::BrowserPool::global().chrome_ws_url().await?;
+                    self.debug_port = parse_port_from_ws_url(&ws)?;
+                    // The old tab died with the old Chrome — nothing to close.
+                    self.owned_external_tab = None;
+                    ws
+                }
             };
             let browser_cdp = CdpClient::connect(&browser_ws_url).await?;
 
@@ -1255,6 +1270,12 @@ impl BrowserSession {
         }
 
         self.touch_activity();
+        // External Chrome is usually the shared pool's process; our CDP
+        // traffic bypasses the pool's acquire_tab(), so refresh its idle
+        // clock here or the reaper kills a Chrome that is actively in use.
+        if self.chrome.is_none() {
+            pool::BrowserPool::global().touch();
+        }
 
         // Drain events, then handle dialogs and fetch interceptions outside the lock.
         let (dialog_events, fetch_events): (Vec<Value>, Vec<Value>) = {
@@ -1428,7 +1449,9 @@ impl BrowserSession {
                 || !self.is_alive();
             if is_transport_error {
                 warn!("CDP transport error, restarting Chrome to recover");
-                let _ = self.restart().await;
+                if let Err(restart_err) = self.restart().await {
+                    warn!(error = %restart_err, "browser restart after transport error failed");
+                }
             }
         }
 
