@@ -761,6 +761,20 @@ pub struct ModelConfig {
     /// `plugin_invoke` lookup at zero prompt cost.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_tools_cap: Option<usize>,
+    /// Token budget for plugin tools in `dynamic_prefix.user_tools` (v2).
+    /// When set, replaces the count-based `user_tools_cap`: selections are
+    /// admitted in priority order (session inject/pin > config pin >
+    /// headline/group) until their summed token estimate hits this budget;
+    /// the overflow rides behind the `request_tool` stub instead of being
+    /// silently dropped. A 500-token tool now costs what it costs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_tools_budget: Option<usize>,
+    /// Pinned plugin tool GROUPS, entries `"<plugin>:<group>"` (v2
+    /// toolGroups). Members of a pinned group are injected as real
+    /// ToolDefs (budget permitting) even when not headline-tagged.
+    /// Session-level analog: `request_tool("<plugin>:<group>")`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_groups: Option<Vec<String>>,
     /// Context window size in tokens. Used to calculate history budget.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u32>,

@@ -81,6 +81,8 @@ pub struct WasmPlugin {
     pub common_tools: Vec<String>,
     /// Tools this plugin exposes.
     pub tools: Vec<WasmToolDef>,
+    /// v2 toolGroups metadata from the manifest: group name → description.
+    pub tool_groups: std::collections::HashMap<String, String>,
     /// Path to the `.wasm` file on disk.
     pub wasm_path: PathBuf,
     /// Wasmtime engine (shared across plugins).
@@ -121,6 +123,9 @@ pub struct WasmToolDef {
     /// `dynamic_prefix.user_tools` set.
     #[serde(default)]
     pub headline: bool,
+    /// Feature group (v2 toolGroups) — mirrors `PluginToolDef.group`.
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 /// Routing context for `host::notify` — when supplied by the agent
@@ -1979,6 +1984,7 @@ pub async fn load_wasm_plugin(
             description: t.description.clone(),
             parameters: t.input_schema.clone().unwrap_or(json!({"type": "object"})),
             headline: t.headline,
+            group: t.group.clone(),
         })
         .collect();
 
@@ -1989,6 +1995,7 @@ pub async fn load_wasm_plugin(
         summary: manifest.summary.clone(),
         common_tools: manifest.common_tools.clone(),
         tools,
+        tool_groups: manifest.tool_groups.clone(),
         wasm_path: path.to_path_buf(),
         engine: engine.clone(),
         component,

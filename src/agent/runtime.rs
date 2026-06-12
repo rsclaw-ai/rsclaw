@@ -252,6 +252,8 @@ pub(crate) struct PluginUserToolSelection {
     pub tool_name: String,
     pub description: String,
     pub input_schema: Value,
+    /// v2 toolGroups: feature group this tool belongs to, if declared.
+    pub group: Option<String>,
 }
 
 impl PluginUserToolSelection {
@@ -4002,7 +4004,11 @@ impl AgentRuntime {
         // Cold ToolDefs pulled out by the deferral below; handed to
         // agent_loop, which splices them back into the live tool list when
         // the model calls `request_tool`.
-        let mut deferred_tool_defs: Vec<crate::provider::ToolDef> = Vec::new();
+        // (enable_key, ToolDef): key is the builtin tool name for cold
+        // tools, `pg:<plugin>:<group>` for plugin tool groups.
+        let mut deferred_tool_defs: Vec<(String, crate::provider::ToolDef)> = Vec::new();
+        // Stub lines offered by request_tool: (enable name, display label).
+        let mut stub_entries: Vec<(String, String)> = Vec::new();
         let tools = if !tools_enabled || is_summarize_turn {
             vec![]
         } else {
@@ -4044,6 +4050,8 @@ impl AgentRuntime {
             let cap = model_cfg
                 .and_then(|m| m.user_tools_cap)
                 .unwrap_or(DEFAULT_USER_TOOLS_CAP);
+            // v2: token budget replaces the count cap when configured.
+            let budget = model_cfg.and_then(|m| m.user_tools_budget);
             let empty_vec: Vec<String> = Vec::new();
             let config_pin = model_cfg
                 .and_then(|m| m.plugin_tools.as_ref())
@@ -4058,14 +4066,46 @@ impl AgentRuntime {
                 .ok()
                 .and_then(|g| g.get(session_key).cloned())
                 .unwrap_or_default();
+            // v2 group pins: config `model.pluginGroups` ∪ session enables
+            // recorded by request_tool ("pg:<plugin>:<group>" markers in
+            // the cold_enabled map, namespace stripped here).
+            let mut group_pins: std::collections::BTreeSet<String> = model_cfg
+                .and_then(|m| m.plugin_groups.as_ref())
+                .map(|v| v.iter().cloned().collect())
+                .unwrap_or_default();
+            if let Ok(g) = self.handle.cold_enabled.read()
+                && let Some(set) = g.get(session_key)
+            {
+                for k in set {
+                    if let Some(rest) = k.strip_prefix("pg:") {
+                        group_pins.insert(rest.to_owned());
+                    }
+                }
+            }
             let selections = Self::select_user_tools_pure(
                 &self.wasm_plugins,
                 self.plugins.as_deref(),
                 &session_overrides,
                 config_pin,
                 config_unpin,
+                &group_pins,
                 cap,
+                budget,
             );
+            // v2: grouped tools that didn't make the live set ride behind
+            // the request_tool stub — for EVERY provider. Unlike builtin
+            // cold tools (rsclaw keeps those in its cached prefix), plugin
+            // tools live in the per-session user_tools segment, so the
+            // budget/stub math applies to rsclaw and external alike.
+            let (group_defs, group_lines) = Self::collect_deferred_group_tools(
+                &self.wasm_plugins,
+                self.plugins.as_deref(),
+                &selections,
+            );
+            for (key, label) in group_lines {
+                stub_entries.push((key, label));
+            }
+            deferred_tool_defs.extend(group_defs);
             for sel in selections {
                 let wire_name = sel.wire_name();
                 all.push(crate::provider::ToolDef {
@@ -4198,7 +4238,9 @@ impl AgentRuntime {
                     .collect();
                 if !deferred_names.is_empty() {
                     all.retain(|t| !deferred_names.contains(&t.name.as_str()));
-                    all.push(crate::agent::tools_builder::request_tool_def(&deferred_names));
+                    for n in &deferred_names {
+                        stub_entries.push(((*n).to_owned(), (*n).to_owned()));
+                    }
                 }
                 // Session-enabled cold tools that the toolset filter dropped
                 // (or that were just deferred): make sure their real defs are
@@ -4208,11 +4250,18 @@ impl AgentRuntime {
                         all.push(t.clone());
                     }
                 }
-                deferred_tool_defs = cold_pool
-                    .iter()
-                    .filter(|t| !enabled.contains(&t.name))
-                    .cloned()
-                    .collect();
+                deferred_tool_defs.extend(
+                    cold_pool
+                        .iter()
+                        .filter(|t| !enabled.contains(&t.name))
+                        .map(|t| (t.name.clone(), t.clone())),
+                );
+            }
+
+            // One stub covers both deferred tiers (cold builtins on
+            // non-rsclaw providers + plugin tool groups on every provider).
+            if !stub_entries.is_empty() {
+                all.push(crate::agent::tools_builder::request_tool_def(&stub_entries));
             }
 
             all
@@ -5180,9 +5229,10 @@ impl AgentRuntime {
         primary_chain_tail: Vec<String>,
         system_prompt: &str,
         mut tools: Vec<ToolDef>,
-        // Cold ToolDefs deferred behind the `request_tool` stub; spliced
+        // Deferred ToolDefs behind the `request_tool` stub, keyed by their
+        // enable name (cold builtin name or `pg:<plugin>:<group>`); spliced
         // back into `tools` mid-loop once the model enables them.
-        mut deferred_tool_defs: Vec<ToolDef>,
+        mut deferred_tool_defs: Vec<(String, ToolDef)>,
         extra_tools: Vec<ToolDef>,
         abort_flag: Arc<AtomicBool>,
     ) -> Result<AgentReply> {
@@ -6085,13 +6135,13 @@ impl AgentRuntime {
             if !deferred_tool_defs.is_empty()
                 && let Ok(g) = self.handle.cold_enabled.read()
                 && let Some(set) = g.get(&ctx.session_key)
-                && deferred_tool_defs.iter().any(|d| set.contains(&d.name))
+                && deferred_tool_defs.iter().any(|(k, _)| set.contains(k))
             {
                 let (live, still): (Vec<_>, Vec<_>) = std::mem::take(&mut deferred_tool_defs)
                     .into_iter()
-                    .partition(|d| set.contains(&d.name));
+                    .partition(|(k, _)| set.contains(k));
                 deferred_tool_defs = still;
-                tools.extend(live);
+                tools.extend(live.into_iter().map(|(_, d)| d));
             }
 
             let req = LlmRequest {
@@ -8430,8 +8480,17 @@ impl AgentRuntime {
         per_plugin: &std::collections::HashMap<String, PluginOverride>,
         config_pin: &[String],
         config_unpin: &[String],
+        // v2 toolGroups: pinned groups as "<plugin>:<group>" (config
+        // `model.pluginGroups` ∪ session `request_tool` enables). Members
+        // are included as if headline-tagged.
+        group_pins: &std::collections::BTreeSet<String>,
         cap: usize,
+        // v2: token budget. When Some, admission is by summed token
+        // estimate instead of count — greedy in manifest order, stops at
+        // the first selection that would cross the line (deterministic).
+        budget: Option<usize>,
     ) -> Vec<PluginUserToolSelection> {
+        let mut spent_tokens: usize = 0;
         // Bucket config-level pin/unpin by plugin so per-plugin lookup
         // is O(active tools) instead of O(config_entries × active_tools).
         let config_pin_by_plugin = bucket_qualified_names(config_pin);
@@ -8442,7 +8501,7 @@ impl AgentRuntime {
         // Inner helper closure: collect from one plugin's tool list,
         // honoring all five selection layers.
         let mut take_from_plugin = |plugin_name: &str,
-                                    tool_iter: Vec<(String, String, Value, bool)>|
+                                    tool_iter: Vec<(String, String, Value, bool, Option<String>)>|
          -> bool {
             // Returns `false` when cap was reached and the caller
             // should stop iterating further plugins.
@@ -8455,18 +8514,28 @@ impl AgentRuntime {
             // wire output is stable across runs (HashMap iteration is
             // not). Walk the plugin's declared tools in manifest order
             // and decide inclusion.
-            let base_names: std::collections::BTreeSet<String> =
+            let mut base_names: std::collections::BTreeSet<String> =
                 if session.map(|o| o.inject_all).unwrap_or(false) {
-                    tool_iter.iter().map(|(n, _, _, _)| n.clone()).collect()
+                    tool_iter.iter().map(|(n, _, _, _, _)| n.clone()).collect()
                 } else if let Some(o) = session.filter(|o| !o.inject.is_empty()) {
                     o.inject.iter().cloned().collect()
                 } else {
                     tool_iter
                         .iter()
-                        .filter(|(_, _, _, hl)| *hl)
-                        .map(|(n, _, _, _)| n.clone())
+                        .filter(|(_, _, _, hl, _)| *hl)
+                        .map(|(n, _, _, _, _)| n.clone())
                         .collect()
                 };
+            // v2: members of pinned groups join the base set.
+            if !group_pins.is_empty() {
+                for (n, _, _, _, g) in &tool_iter {
+                    if let Some(g) = g
+                        && group_pins.contains(&format!("{plugin_name}:{g}"))
+                    {
+                        base_names.insert(n.clone());
+                    }
+                }
+            }
 
             // pin: add (config + session)
             let mut effective = base_names;
@@ -8495,11 +8564,19 @@ impl AgentRuntime {
             }
 
             // Emit in manifest order so the wire bytes are stable.
-            for (name, description, input_schema, _) in tool_iter {
+            for (name, description, input_schema, _, group) in tool_iter {
                 if !effective.contains(&name) {
                     continue;
                 }
-                if selected.len() >= cap {
+                if let Some(b) = budget {
+                    let cost = estimate_tokens(&name)
+                        + estimate_tokens(&description)
+                        + estimate_tokens(&input_schema.to_string());
+                    if spent_tokens + cost > b {
+                        return false;
+                    }
+                    spent_tokens += cost;
+                } else if selected.len() >= cap {
                     return false;
                 }
                 selected.push(PluginUserToolSelection {
@@ -8507,6 +8584,7 @@ impl AgentRuntime {
                     tool_name: name,
                     description,
                     input_schema,
+                    group,
                 });
             }
             true
@@ -8514,7 +8592,7 @@ impl AgentRuntime {
 
         // WASM first (matches dispatch_tool's wasm-wins ordering).
         for wp in wasm_plugins {
-            let tools: Vec<(String, String, Value, bool)> = wp
+            let tools: Vec<(String, String, Value, bool, Option<String>)> = wp
                 .tools
                 .iter()
                 .map(|t| {
@@ -8523,6 +8601,7 @@ impl AgentRuntime {
                         t.description.clone(),
                         t.parameters.clone(),
                         t.headline,
+                        t.group.clone(),
                     )
                 })
                 .collect();
@@ -8532,7 +8611,7 @@ impl AgentRuntime {
         }
         if let Some(reg) = js_plugins {
             for (plugin_name, plugin) in reg.js_plugins_iter() {
-                let tools: Vec<(String, String, Value, bool)> = plugin
+                let tools: Vec<(String, String, Value, bool, Option<String>)> = plugin
                     .manifest
                     .tools
                     .iter()
@@ -8541,7 +8620,13 @@ impl AgentRuntime {
                             .input_schema
                             .clone()
                             .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
-                        (t.name.clone(), t.description.clone(), schema, t.headline)
+                        (
+                            t.name.clone(),
+                            t.description.clone(),
+                            schema,
+                            t.headline,
+                            t.group.clone(),
+                        )
                     })
                     .collect();
                 if !take_from_plugin(plugin_name, tools) {
@@ -8550,6 +8635,100 @@ impl AgentRuntime {
             }
         }
         selected
+    }
+
+    /// v2 toolGroups: collect grouped plugin tools that did NOT make the
+    /// live selection, as `(enable_key, ToolDef)` pairs ready for the
+    /// `request_tool` same-turn splice, plus one stub line per offerable
+    /// group ("plugin:group — desc (N tools)"). Enable keys are
+    /// namespaced `pg:<plugin>:<group>` to share the cold_enabled session
+    /// map with builtin cold tools without collisions.
+    pub(crate) fn collect_deferred_group_tools(
+        wasm_plugins: &[crate::plugin::wasm_runtime::WasmPlugin],
+        js_plugins: Option<&crate::plugin::PluginRegistry>,
+        live: &[PluginUserToolSelection],
+    ) -> (Vec<(String, crate::provider::ToolDef)>, Vec<(String, String)>) {
+        use std::collections::{BTreeMap, HashSet};
+        let live_names: HashSet<(&str, &str)> = live
+            .iter()
+            .map(|s| (s.plugin_name.as_str(), s.tool_name.as_str()))
+            .collect();
+        let mut defs: Vec<(String, crate::provider::ToolDef)> = Vec::new();
+        // group key → (group desc, member count not live)
+        let mut groups: BTreeMap<String, (String, usize)> = BTreeMap::new();
+
+        let mut visit = |plugin: &str,
+                         group_meta: &std::collections::HashMap<String, String>,
+                         tools: Vec<(String, String, Value, Option<String>)>| {
+            for (name, description, schema, group) in tools {
+                let Some(g) = group else { continue };
+                if live_names.contains(&(plugin, name.as_str())) {
+                    continue;
+                }
+                let key = format!("{plugin}:{g}");
+                let entry = groups
+                    .entry(key.clone())
+                    .or_insert_with(|| (group_meta.get(&g).cloned().unwrap_or_default(), 0));
+                entry.1 += 1;
+                defs.push((
+                    format!("pg:{key}"),
+                    crate::provider::ToolDef {
+                        name: format!("{plugin}{PLUGIN_TOOL_SEP}{name}"),
+                        description,
+                        parameters: schema,
+                    },
+                ));
+            }
+        };
+
+        for wp in wasm_plugins {
+            let tools = wp
+                .tools
+                .iter()
+                .map(|t| {
+                    (
+                        t.name.clone(),
+                        t.description.clone(),
+                        t.parameters.clone(),
+                        t.group.clone(),
+                    )
+                })
+                .collect();
+            visit(&wp.name, &wp.tool_groups, tools);
+        }
+        if let Some(reg) = js_plugins {
+            for (plugin_name, plugin) in reg.js_plugins_iter() {
+                let tools = plugin
+                    .manifest
+                    .tools
+                    .iter()
+                    .map(|t| {
+                        (
+                            t.name.clone(),
+                            t.description.clone(),
+                            t.input_schema
+                                .clone()
+                                .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+                            t.group.clone(),
+                        )
+                    })
+                    .collect();
+                visit(plugin_name, &plugin.manifest.tool_groups, tools);
+            }
+        }
+
+        let lines = groups
+            .into_iter()
+            .map(|(key, (desc, n))| {
+                let label = if desc.is_empty() {
+                    format!("{key} ({n} tools)")
+                } else {
+                    format!("{key} — {desc} ({n} tools)")
+                };
+                (key, label)
+            })
+            .collect();
+        (defs, lines)
     }
 
     /// Set or update a plugin override for a session. Called by the `/plugin`
@@ -9229,6 +9408,42 @@ impl AgentRuntime {
             "request_tool" => {
                 // v1 leaks trailing whitespace into string args — trim before lookup.
                 let name = args["name"].as_str().unwrap_or("").trim().to_owned();
+                // Plugin tool group: "<plugin>:<group>" (v2 toolGroups).
+                if name.contains(':') {
+                    let valid = name.split_once(':').is_some_and(|(pl, gr)| {
+                        self.wasm_plugins.iter().any(|wp| {
+                            wp.name == pl
+                                && wp.tools.iter().any(|t| t.group.as_deref() == Some(gr))
+                        }) || self
+                            .plugins
+                            .as_deref()
+                            .map(|reg| {
+                                reg.js_plugins_iter().any(|(n, p)| {
+                                    n == pl
+                                        && p.manifest
+                                            .tools
+                                            .iter()
+                                            .any(|t| t.group.as_deref() == Some(gr))
+                                })
+                            })
+                            .unwrap_or(false)
+                    });
+                    if !valid {
+                        return Ok(json!({
+                            "error": format!("'{name}' is not a known plugin tool group"),
+                            "hint": "Use a \"<plugin>:<group>\" entry exactly as listed in this tool's description."
+                        }));
+                    }
+                    if let Ok(mut g) = self.handle.cold_enabled.write() {
+                        g.entry(ctx.session_key.clone())
+                            .or_default()
+                            .insert(format!("pg:{name}"));
+                    }
+                    return Ok(json!({
+                        "enabled": name,
+                        "note": "Group tools are now available for this session — call them directly."
+                    }));
+                }
                 if !crate::agent::tools_builder::COLD_TOOLS.contains(&name.as_str()) {
                     return Ok(json!({
                         "error": format!("'{name}' is not a deferred tool"),
@@ -12515,6 +12730,7 @@ mod tests {
             tool_name: "publish".into(),
             description: String::new(),
             input_schema: json!({}),
+            group: None,
         };
         assert_eq!(sel.wire_name(), "douyin__publish");
     }

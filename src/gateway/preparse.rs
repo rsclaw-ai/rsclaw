@@ -1183,32 +1183,90 @@ $g.Dispose();$b.Dispose()"#
                 }
             }
             PluginCommand::SetState { plugin, action } => {
-                let new_override = match action {
-                    PluginAction::Off => PluginOverride {
+                let resolved: Result<PluginOverride, String> = match action {
+                    PluginAction::Off => Ok(PluginOverride {
                         disabled: true,
                         ..Default::default()
-                    },
-                    PluginAction::Default => PluginOverride::default(),
-                    PluginAction::All => PluginOverride {
+                    }),
+                    PluginAction::Default => Ok(PluginOverride::default()),
+                    PluginAction::All => Ok(PluginOverride {
                         inject_all: true,
                         ..Default::default()
-                    },
-                    PluginAction::Inject(tools) => PluginOverride {
-                        inject: tools,
-                        ..Default::default()
-                    },
+                    }),
+                    PluginAction::Inject(tools) => {
+                        // v2 toolGroups: `@<group>` entries expand to the
+                        // group's member tools from the on-disk manifest
+                        // (same source-of-truth rationale as
+                        // render_headlines_for_plugin).
+                        let mut expanded: Vec<String> = Vec::new();
+                        let mut manifest: Option<crate::plugin::manifest::PluginManifest> = None;
+                        let mut err: Option<String> = None;
+                        for spec in tools {
+                            let Some(group) = spec.strip_prefix('@') else {
+                                expanded.push(spec);
+                                continue;
+                            };
+                            if manifest.is_none() {
+                                let dir = crate::config::loader::base_dir()
+                                    .join("plugins")
+                                    .join(&plugin);
+                                manifest = crate::plugin::manifest::load_manifest(&dir).ok();
+                            }
+                            match &manifest {
+                                Some(m) => {
+                                    let members: Vec<String> = m
+                                        .tools
+                                        .iter()
+                                        .filter(|t| t.group.as_deref() == Some(group))
+                                        .map(|t| t.name.clone())
+                                        .collect();
+                                    if members.is_empty() {
+                                        err = Some(format!(
+                                            "{plugin}: group `@{group}` matches no tools \
+                                             (declare via the tool's `group` field in plugin.json5)"
+                                        ));
+                                        break;
+                                    }
+                                    expanded.extend(members);
+                                }
+                                None => {
+                                    err = Some(format!(
+                                        "{plugin}: cannot resolve `@{group}` — manifest not readable"
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                        match err {
+                            Some(e) => Err(e),
+                            None => Ok(PluginOverride {
+                                inject: expanded,
+                                ..Default::default()
+                            }),
+                        }
+                    }
                 };
-                let summary = if new_override.disabled {
-                    format!("{plugin}: OFF")
-                } else if new_override.inject_all {
-                    format!("{plugin}: inject ALL (capped at user_tools_cap)")
-                } else if new_override.inject.is_empty() {
-                    format!("{plugin}: default")
-                } else {
-                    format!("{plugin}: inject [{}]", new_override.inject.join(", "))
-                };
-                AgentRuntime::set_plugin_override(handle, &session_key, &plugin, new_override);
-                summary
+                match resolved {
+                    Err(msg) => msg,
+                    Ok(new_override) => {
+                        let summary = if new_override.disabled {
+                            format!("{plugin}: OFF")
+                        } else if new_override.inject_all {
+                            format!("{plugin}: inject ALL (capped at user_tools_cap)")
+                        } else if new_override.inject.is_empty() {
+                            format!("{plugin}: default")
+                        } else {
+                            format!("{plugin}: inject [{}]", new_override.inject.join(", "))
+                        };
+                        AgentRuntime::set_plugin_override(
+                            handle,
+                            &session_key,
+                            &plugin,
+                            new_override,
+                        );
+                        summary
+                    }
+                }
             }
             PluginCommand::Pin { plugin, tool } => {
                 // Additive: add `tool` to the session override's `pin` set

@@ -261,24 +261,35 @@ pub(crate) const COLD_TOOLS: &[&str] = &[
     "wait_input",
 ];
 
-/// One-line stub standing in for the deferred [`COLD_TOOLS`]. Calling it
-/// enables the named tool for the rest of the session (the runtime splices
-/// the real definition back into the live tool list before the next LLM
-/// iteration of the SAME turn, so the cost is one extra round-trip on
-/// first use).
-pub(crate) fn request_tool_def(deferred: &[&str]) -> ToolDef {
+/// One-line stub standing in for everything deferred: builtin
+/// [`COLD_TOOLS`] (entries are bare tool names) and plugin tool groups
+/// (entries are `<plugin>:<group>` with a descriptive label). Calling it
+/// enables the named tool/group for the rest of the session — the runtime
+/// splices the real definitions back into the live tool list before the
+/// next LLM iteration of the SAME turn, so the cost is one extra
+/// round-trip on first use.
+pub(crate) fn request_tool_def(entries: &[(String, String)]) -> ToolDef {
+    let lines: Vec<String> = entries
+        .iter()
+        .map(|(key, label)| {
+            if key == label {
+                format!("- {key}")
+            } else {
+                format!("- {label}")
+            }
+        })
+        .collect();
     ToolDef {
         name: "request_tool".to_owned(),
         description: format!(
-            "Enable a deferred tool, then call it. These tools exist but their full \
-             definitions are loaded on demand: {}. Call request_tool with the name, then \
-             call the tool itself.",
-            deferred.join(", ")
+            "Enable a deferred tool or tool group, then call the tool(s) directly. \
+             These exist but their full definitions load on demand:\n{}",
+            lines.join("\n")
         ),
         parameters: json!({
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Deferred tool name to enable"}
+                "name": {"type": "string", "description": "Tool name or <plugin>:<group> to enable"}
             },
             "required": ["name"]
         }),
@@ -2321,7 +2332,11 @@ mod plugin_catalog_tests {
         for cold in COLD_TOOLS {
             assert!(names.contains(cold), "COLD_TOOLS entry `{cold}` is not a builtin tool");
         }
-        let stub = request_tool_def(COLD_TOOLS);
+        let entries: Vec<(String, String)> = COLD_TOOLS
+            .iter()
+            .map(|n| ((*n).to_owned(), (*n).to_owned()))
+            .collect();
+        let stub = request_tool_def(&entries);
         assert_eq!(stub.name, "request_tool");
         for cold in COLD_TOOLS {
             assert!(stub.description.contains(cold), "stub must list `{cold}`");

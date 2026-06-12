@@ -86,6 +86,12 @@ pub struct PluginManifest {
     /// Additional tool definitions exposed by this plugin.
     #[serde(default)]
     pub tools: Vec<PluginToolDef>,
+    /// v2 toolGroups metadata: group name → one-line description, shown in
+    /// the `request_tool` stub so the model knows what enabling buys.
+    /// Tools opt into a group via their own `group` field; a name listed
+    /// here with no member tools is simply never offered.
+    #[serde(default, rename = "toolGroups")]
+    pub tool_groups: std::collections::HashMap<String, String>,
     /// Minimum interval between tool calls in milliseconds. The host enforces
     /// this for wasm plugins (replaces the old plugin-side `host::sleep` at
     /// the top of every dispatch). Default: 0 (no throttling).
@@ -172,6 +178,12 @@ pub struct PluginToolDef {
     /// tail — a missing `headline:` key never changes behavior.
     #[serde(default)]
     pub headline: bool,
+    /// Feature group this tool belongs to (v2 toolGroups). Groups are the
+    /// unit of on-demand exposure: the prompt carries a one-line stub per
+    /// group and `request_tool("<plugin>:<group>")` splices the group's
+    /// real ToolDefs in. Ungrouped tools keep headline/search behavior.
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 fn default_runtime() -> String {
