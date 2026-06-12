@@ -143,6 +143,39 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "de" => "Auswahl:\n1. Analysieren und behalten\n2. Analysieren und löschen\n3. Löschen",
     );
 
+    msg!("video_menu",
+        "en" => "Choose:\n1. Extract audio & transcribe\n2. Analyze frames (vision)\n3. Transcribe + analyze frames\n4. Delete",
+        "zh" => "请选择:\n1. 提取音频并转写\n2. 分析画面 (vision)\n3. 转写+画面分析\n4. 删除",
+        "ja" => "選択:\n1. 音声抽出して文字起こし\n2. フレーム分析 (vision)\n3. 文字起こし+フレーム分析\n4. 削除",
+        "ko" => "선택:\n1. 오디오 추출 및 전사\n2. 프레임 분석 (vision)\n3. 전사+프레임 분석\n4. 삭제",
+        "es" => "Elige:\n1. Extraer audio y transcribir\n2. Analizar fotogramas (vision)\n3. Transcribir + fotogramas\n4. Eliminar",
+        "ru" => "Выберите:\n1. Извлечь аудио и расшифровать\n2. Анализ кадров (vision)\n3. Расшифровка + кадры\n4. Удалить",
+        "fr" => "Choisissez :\n1. Extraire l'audio et transcrire\n2. Analyser les images (vision)\n3. Transcrire + images\n4. Supprimer",
+        "de" => "Auswahl:\n1. Audio extrahieren & transkribieren\n2. Frames analysieren (vision)\n3. Transkribieren + Frames\n4. Löschen",
+    );
+
+    msg!("video_deleted",
+        "en" => "Deleted: {names}",
+        "zh" => "已删除: {names}",
+        "ja" => "削除しました: {names}",
+        "ko" => "삭제됨: {names}",
+        "es" => "Eliminado: {names}",
+        "ru" => "Удалено: {names}",
+        "fr" => "Supprimé : {names}",
+        "de" => "Gelöscht: {names}",
+    );
+
+    msg!("video_no_ffmpeg",
+        "en" => "ffmpeg is required for video processing but could not be set up: {err}",
+        "zh" => "视频处理需要 ffmpeg，但安装失败: {err}",
+        "ja" => "動画処理には ffmpeg が必要ですが、セットアップに失敗しました: {err}",
+        "ko" => "비디오 처리에 ffmpeg가 필요하지만 설치에 실패했습니다: {err}",
+        "es" => "Se requiere ffmpeg para procesar video, pero falló la instalación: {err}",
+        "ru" => "Для обработки видео нужен ffmpeg, но установка не удалась: {err}",
+        "fr" => "ffmpeg est requis pour la vidéo mais l'installation a échoué : {err}",
+        "de" => "ffmpeg wird benötigt, konnte aber nicht eingerichtet werden: {err}",
+    );
+
     msg!("file_size_exceeded",
         "en" => "File size exceeds limit ({limit} MB). Rejected:",
         "zh" => "文件超出大小限制 ({limit} MB)。已拒绝:",

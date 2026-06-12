@@ -19,6 +19,7 @@ pub mod goal;
 pub mod install_hints;
 pub mod loop_detection;
 pub mod memory;
+pub mod video;
 pub mod memory_extractor;
 pub mod platform;
 pub mod preparse;

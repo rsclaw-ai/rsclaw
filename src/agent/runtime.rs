@@ -349,6 +349,11 @@ enum PendingStage {
         #[allow(dead_code)]
         estimated_tokens: usize,
     },
+    /// Video upload awaiting the 4-option processing menu (extract audio /
+    /// analyze frames / both / delete). `PendingFile.path` points at the
+    /// SAVED uploads copy (not a temp duplicate) so ffmpeg can read it and
+    /// "delete" removes the real file.
+    VideoMenu,
 }
 
 #[allow(dead_code)]
@@ -1625,6 +1630,222 @@ impl AgentRuntime {
     /// Fire a lifecycle hook on all plugins that subscribe to it.
     /// Errors from individual plugins are logged and swallowed — hooks must
     /// not interrupt the agent loop.
+    /// Handle a 1-4 reply to the pending VIDEO menu. Options 1/3 extract
+    /// the audio track and transcribe it; options 2/3 sample keyframes and
+    /// run them through the vision chain. Results feed a PendingAnalysis
+    /// (LLM digests transcript/description and answers in context); option
+    /// 4 deletes the saved upload. ffmpeg auto-installs on first use.
+    async fn handle_video_menu_choice(
+        &mut self,
+        choice: &str,
+        files: Vec<PendingFile>,
+        session_key: &str,
+        channel: &str,
+        peer_id: &str,
+        i18n_lang: &str,
+    ) -> Result<AgentReply> {
+        fn direct(text: String) -> AgentReply {
+            AgentReply {
+                text,
+                is_empty: false,
+                tool_calls: None,
+                images: vec![],
+                files: vec![],
+                pending_analysis: None,
+                needs_outer_done_emit: true,
+                outcome: crate::agent::registry::ReplyOutcome::Ok,
+            }
+        }
+
+        if choice == "4" {
+            let names: Vec<String> = files.iter().map(|f| f.filename.clone()).collect();
+            for f in &files {
+                let _ = std::fs::remove_file(&f.path);
+            }
+            return Ok(direct(crate::i18n::t_fmt(
+                "video_deleted",
+                i18n_lang,
+                &[("names", &names.join(", "))],
+            )));
+        }
+
+        let ffmpeg = match crate::agent::platform::ensure_ffmpeg().await {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(direct(crate::i18n::t_fmt(
+                    "video_no_ffmpeg",
+                    i18n_lang,
+                    &[("err", &format!("{e:#}"))],
+                )));
+            }
+        };
+        let want_audio = choice == "1" || choice == "3";
+        let want_frames = choice == "2" || choice == "3";
+
+        let mut sections: Vec<String> = Vec::new();
+        for f in &files {
+            if want_audio {
+                match crate::agent::video::extract_audio_wav(&ffmpeg, &f.path).await {
+                    Ok(wav) => {
+                        let client = reqwest::Client::new();
+                        match crate::channel::transcription::transcribe_audio(
+                            &client,
+                            &wav,
+                            "extracted.wav",
+                            "audio/wav",
+                        )
+                        .await
+                        {
+                            Ok(t) if !t.trim().is_empty() => sections.push(format!(
+                                "[Video transcript: {}]\n{}",
+                                f.filename,
+                                t.trim()
+                            )),
+                            Ok(_) => sections.push(format!(
+                                "[Video transcript: {} — empty/no speech]",
+                                f.filename
+                            )),
+                            Err(e) => sections.push(format!(
+                                "[Video transcript: {} — transcription failed: {e:#}]",
+                                f.filename
+                            )),
+                        }
+                    }
+                    Err(e) => sections.push(format!(
+                        "[Video audio: {} — {e:#}]",
+                        f.filename
+                    )),
+                }
+            }
+            if want_frames {
+                match crate::agent::video::extract_keyframes(&ffmpeg, &f.path, 6).await {
+                    Ok(frames) => {
+                        let described = self.vision_describe_frames(&frames).await;
+                        crate::agent::video::cleanup_frames(&frames);
+                        match described {
+                            Ok(desc) => sections.push(format!(
+                                "[Video frames: {} — {} keyframes]\n{}",
+                                f.filename,
+                                frames.len(),
+                                desc
+                            )),
+                            Err(e) => sections.push(format!(
+                                "[Video frames: {} — vision analysis failed: {e:#}]",
+                                f.filename
+                            )),
+                        }
+                    }
+                    Err(e) => sections.push(format!(
+                        "[Video frames: {} — {e:#}]",
+                        f.filename
+                    )),
+                }
+            }
+        }
+
+        // HTTP API has no async outbound sender — a PendingAnalysis result
+        // would be digested and then dropped. Return the raw material
+        // directly instead; chat channels keep the digest-and-push flow.
+        if channel == "api" {
+            return Ok(direct(sections.join("\n\n")));
+        }
+
+        let analysis = format!(
+            "The user uploaded video file(s) and chose to have them analyzed. \
+             Digest the material below and report to the user what the video \
+             contains/says, in their language.\n\n{}",
+            sections.join("\n\n")
+        );
+        Ok(AgentReply {
+            text: crate::i18n::t("analyzing", i18n_lang),
+            is_empty: false,
+            tool_calls: None,
+            images: vec![],
+            files: vec![],
+            pending_analysis: Some(crate::agent::PendingAnalysis {
+                text: analysis,
+                session_key: session_key.to_owned(),
+                channel: channel.to_owned(),
+                peer_id: peer_id.to_owned(),
+            }),
+            needs_outer_done_emit: true,
+            outcome: crate::agent::registry::ReplyOutcome::Ok,
+        })
+    }
+
+    /// Describe a set of keyframe JPEGs with the configured vision chain.
+    /// Compact one-shot — walks the chain manually (no FailoverManager,
+    /// same rationale as `tool_research_analyze_charts`).
+    async fn vision_describe_frames(&self, frames: &[std::path::PathBuf]) -> Result<String> {
+        use base64::Engine as _;
+        let chain = self.resolve_vision_chain();
+        if chain.is_empty() {
+            return Err(anyhow!("no vision model configured (model.vision)"));
+        }
+        let mut parts: Vec<ContentPart> = Vec::with_capacity(frames.len() + 1);
+        parts.push(ContentPart::Text {
+            text: format!(
+                "These are {} keyframes sampled in order (one every ~10s) from a user-uploaded \
+                 video. Describe what happens across the video: scene, people/objects, on-screen \
+                 text, and how it progresses frame to frame. Be concrete.",
+                frames.len()
+            ),
+        });
+        for f in frames {
+            let bytes = std::fs::read(f)
+                .map_err(|e| anyhow!("read frame {}: {e}", f.display()))?;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            parts.push(ContentPart::Image {
+                url: format!("data:image/jpeg;base64,{b64}"),
+            });
+        }
+        let req = LlmRequest {
+            model: chain[0].clone(),
+            fallback_models: vec![],
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Parts(parts),
+                rsclaw_hidden: None,
+            }],
+            max_tokens: Some(2048),
+            temperature: Some(0.2),
+            thinking_budget: Some(0),
+            ..Default::default()
+        };
+        let providers = Arc::clone(&self.providers);
+        let mut last_err = anyhow!("vision chain empty");
+        for model in &chain {
+            let (prov_name, model_id) = providers.resolve_model(model);
+            let provider = match providers.get(prov_name) {
+                Ok(p) => p,
+                Err(e) => {
+                    last_err = anyhow!("provider not found for {model}: {e}");
+                    continue;
+                }
+            };
+            let mut r = req.clone();
+            r.model = model_id.to_owned();
+            let fut = provider.stream(r);
+            match tokio::time::timeout(std::time::Duration::from_secs(90), fut).await {
+                Ok(Ok(mut stream)) => {
+                    let mut buf = String::new();
+                    while let Some(ev) = stream.next().await {
+                        if let Ok(StreamEvent::TextDelta(d)) = ev {
+                            buf.push_str(&d);
+                        }
+                    }
+                    if !buf.trim().is_empty() {
+                        return Ok(buf.trim().to_owned());
+                    }
+                    last_err = anyhow!("{model}: empty vision output");
+                }
+                Ok(Err(e)) => last_err = anyhow!("{model}: {e:#}"),
+                Err(_) => last_err = anyhow!("{model}: timed out after 90s"),
+            }
+        }
+        Err(last_err)
+    }
+
     async fn fire_hook(&self, hook: &str, params: Value) {
         let Some(ref reg) = self.plugins else { return };
         for plugin in reg.all() {
@@ -2600,10 +2821,28 @@ impl AgentRuntime {
             .unwrap_or("en");
 
         // ---------------------------------------------------------------
+        // Video menu: user replies 1-4 to a pending VIDEO upload.
+        //   1. 提取音频转写  2. 分析画面  3. 转写+画面  4. 删除
+        // ---------------------------------------------------------------
+        let pending_response = text.trim();
+        if matches!(pending_response, "1" | "2" | "3" | "4")
+            && self
+                .pending_files
+                .get(session_key)
+                .is_some_and(|fs| {
+                    !fs.is_empty() && fs.iter().all(|f| matches!(f.stage, PendingStage::VideoMenu))
+                })
+        {
+            let files = self.pending_files.remove(session_key).unwrap_or_default();
+            return self
+                .handle_video_menu_choice(pending_response, files, session_key, channel, peer_id, i18n_lang)
+                .await;
+        }
+
+        // ---------------------------------------------------------------
         // File action: user replies 1/2/3/4 to pending file prompt.
         //   1. 分析并保存  2. 分析后删除  3. 保存(已完成)  4. 删除
         // ---------------------------------------------------------------
-        let pending_response = text.trim();
         if (pending_response == "1" || pending_response == "2" || pending_response == "3")
             && let Some(files) = self.pending_files.remove(session_key)
             && !files.is_empty()
@@ -3687,17 +3926,26 @@ impl AgentRuntime {
 
                 file_info.push((std_name.clone(), size, has_text, est_tokens));
 
-                // Store pending for later analysis
-                let path =
-                    std::env::temp_dir().join(format!("rsclaw_pending_{}.bin", Uuid::new_v4()));
-                let _ = std::fs::write(&path, &file.data);
-                let stage = if let Some(ext_text) = extracted {
-                    PendingStage::TokenConfirm {
-                        extracted_text: ext_text,
-                        estimated_tokens: est_tokens,
-                    }
+                // Store pending for later analysis. Videos skip the temp
+                // duplicate (they're big and already saved to uploads/) and
+                // carry the real path for ffmpeg + the delete option.
+                let is_video =
+                    crate::channel::is_video_attachment(&file.mime_type, &file.filename);
+                let (path, stage) = if is_video {
+                    (dest.clone(), PendingStage::VideoMenu)
                 } else {
-                    PendingStage::SizeConfirm
+                    let path = std::env::temp_dir()
+                        .join(format!("rsclaw_pending_{}.bin", Uuid::new_v4()));
+                    let _ = std::fs::write(&path, &file.data);
+                    let stage = if let Some(ext_text) = extracted {
+                        PendingStage::TokenConfirm {
+                            extracted_text: ext_text,
+                            estimated_tokens: est_tokens,
+                        }
+                    } else {
+                        PendingStage::SizeConfirm
+                    };
+                    (path, stage)
                 };
                 self.pending_files
                     .entry(session_key.to_owned())
@@ -3740,7 +3988,15 @@ impl AgentRuntime {
                 format!("{} file(s) saved:", file_info.len())
             };
             let any_analyzable = file_info.iter().any(|(_, _, has_text, _)| *has_text);
-            let menu_msg = if any_analyzable {
+            let all_videos = self
+                .pending_files
+                .get(session_key)
+                .is_some_and(|fs| {
+                    !fs.is_empty() && fs.iter().all(|f| matches!(f.stage, PendingStage::VideoMenu))
+                });
+            let menu_msg = if all_videos {
+                crate::i18n::t("video_menu", i18n_lang)
+            } else if any_analyzable {
                 crate::i18n::t("file_menu", i18n_lang)
             } else {
                 // Binary only -- simplified menu.
