@@ -29,6 +29,9 @@ IMPORTANT:
 {"tool": "web_fetch", "url": "http://api.duoduoyun.work:8080/v1/matches?date=2026-06-11"}
 ```
 
+> **`date` 按北京(场馆)本地日期过滤**,凌晨开球的比赛也算在当天 —— `?date=<北京今天>` 即可拿全今天的场次,直接用。
+> **想看正在踢的比分:** `?status=live`(直接返回进行中比赛+实时比分),别用记忆。
+
 **比赛详情**:
 ```json
 {"tool": "web_fetch", "url": "http://api.duoduoyun.work:8080/v1/matches/wc2026-grp-001"}
