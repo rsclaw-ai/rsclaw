@@ -268,10 +268,30 @@ pub fn spawn_scheduler() {
 }
 
 /// Enumerate all (agent, channel, peer, codes) groups currently
-/// holding a non-empty watchlist, then submit one synthetic user
-/// turn per group. Failure of any one group is logged and the rest
-/// continue — a misconfigured peer should not block briefings to
-/// everyone else.
+/// holding a non-empty watchlist, pre-fetch their market data from
+/// astock, then submit one synthetic user turn per group with the
+/// data embedded in the prompt. Failure of any one group is logged
+/// and the rest continue.
+///
+/// Why pre-fetch in gateway instead of letting the LLM call
+/// `stock_quote` itself
+///
+/// The LLM-tool path (the original v1) had a latent honesty bug:
+/// when a peer received their second briefing of the day (e.g.
+/// midday after premarket), the LLM saw the premarket reply in
+/// session history (`msg_count` jumped from 30 → 70) and decided it
+/// already had enough data to write the recap — `tool_call_count=0`,
+/// reply produced from training memory + premarket prices. The
+/// "noon" prices in the midday briefing were therefore the SAME
+/// numbers as the premarket briefing.
+///
+/// Pre-fetching here makes the data deterministic: gateway calls
+/// astock directly, embeds the fresh JSON-shaped block in the
+/// prompt with a strict "use exactly these numbers, do not call any
+/// stock_* tool" instruction. The LLM can still call `web_search`
+/// for soft context (隔夜美股 / 板块情绪) when the prompt allows,
+/// but the price/snapshot/kline numbers are now 100% from astock at
+/// fire time.
 async fn dispatch_for_slot(slot: BriefingSlot) {
     let Some(mem) = crate::agent::memory::global_store() else {
         tracing::warn!("no memory store; skipping briefing");
@@ -289,13 +309,32 @@ async fn dispatch_for_slot(slot: BriefingSlot) {
         tracing::warn!("task queue not installed; skipping briefing");
         return;
     };
+    let arc = match crate::astock::global_client() {
+        Some(c) => c,
+        None => {
+            tracing::warn!(
+                slot = ?slot,
+                "astock client not initialized; skipping briefing (would have no data to embed)"
+            );
+            return;
+        }
+    };
     tracing::info!(
         slot = ?slot,
         peers = groups.len(),
         "dispatching briefings"
     );
     for group in groups {
-        let prompt = build_prompt(slot, &group);
+        let prefetch = prefetch_market_data(&arc, slot, &group.codes).await;
+        tracing::info!(
+            slot = ?slot,
+            peer = %group.peer_id,
+            quotes = prefetch.quotes.len(),
+            snapshot_rows = prefetch.snapshot.as_ref().map(|v| v.len()).unwrap_or(0),
+            klines = prefetch.klines.len(),
+            "briefing data prefetched"
+        );
+        let prompt = build_prompt(slot, &group, &prefetch);
         let session_key = format!(
             "agent:{}:{}:direct:{}",
             group.agent_id, group.channel, group.peer_id
@@ -395,33 +434,215 @@ fn parse_watchlist_scope(scope: &str) -> Option<(String, String, String)> {
     Some((parts[1].to_owned(), parts[3].to_owned(), parts[4].to_owned()))
 }
 
-/// Build the synthetic user message that will become the LLM's
-/// briefing turn. Goal: tell the LLM (1) it's a briefing call, not
-/// a user question, (2) the timeframe, (3) the watchlist, (4) the
-/// expected output shape. The LLM then calls stock_* tools as
-/// needed.
-fn build_prompt(slot: BriefingSlot, group: &WatchlistGroup) -> String {
+/// Gateway-prefetched data block carried to the LLM in the prompt.
+/// Filled by `prefetch_market_data` per slot — different slots
+/// surface different data shapes.
+struct PrefetchedData {
+    /// Always populated when astock is reachable. Empty Vec when
+    /// `quote_batch` failed (logged, briefing still fires).
+    quotes: Vec<crate::astock::Quote>,
+    /// MidDay only — full snapshot row including amount / turnover.
+    snapshot: Option<Vec<crate::astock::SnapshotRow>>,
+    /// PostMarket only — last 20 daily K-line bars per code (qfq).
+    klines: std::collections::HashMap<String, crate::astock::KlineResp>,
+}
+
+/// Pre-fetch the market data this slot wants the LLM to talk about.
+/// Each slot has a different data shape — see `format_data_block`
+/// for what ends up in the prompt:
+///   * PreMarket  — just `quote_batch` (latest tick before open)
+///   * MidDay     — `quote_batch` + `snapshot` (amount/turnover)
+///   * PostMarket — `quote_batch` + per-code 20-day K-line (qfq)
+///
+/// Errors are swallowed and logged — a flaky upstream upstream
+/// shouldn't kill the briefing. Empty data → the LLM gets the
+/// empty data block + a hint that "(数据拉取失败)" so it can write
+/// a graceful "data unavailable" reply.
+async fn prefetch_market_data(
+    arc: &crate::astock::AstockClient,
+    slot: BriefingSlot,
+    codes: &[String],
+) -> PrefetchedData {
+    let quotes = match arc.quote_batch(codes).await {
+        Ok(q) => q,
+        Err(e) => {
+            tracing::warn!(error = %e, "briefing prefetch: quote_batch failed");
+            Vec::new()
+        }
+    };
+    let snapshot = match slot {
+        BriefingSlot::MidDay => match arc.snapshot(None, None, codes, None).await {
+            Ok(r) => Some(r),
+            Err(e) => {
+                tracing::warn!(error = %e, "briefing prefetch: snapshot failed");
+                None
+            }
+        },
+        _ => None,
+    };
+    let klines = match slot {
+        BriefingSlot::PostMarket => {
+            let mut m = std::collections::HashMap::new();
+            for code in codes {
+                match arc
+                    .kline(code, Some("1d"), Some(20), Some(0), Some("qfq"))
+                    .await
+                {
+                    Ok(r) => {
+                        m.insert(code.clone(), r);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            code = %code,
+                            error = %e,
+                            "briefing prefetch: kline failed"
+                        );
+                    }
+                }
+            }
+            m
+        }
+        _ => std::collections::HashMap::new(),
+    };
+    PrefetchedData {
+        quotes,
+        snapshot,
+        klines,
+    }
+}
+
+/// Render the prefetched data into a markdown-ish block the LLM can
+/// read verbatim. Kept compact so the prompt token count stays under
+/// 1 KB per peer even with 50-code watchlists.
+fn format_data_block(data: &PrefetchedData) -> String {
+    let mut out = String::new();
+    if data.quotes.is_empty()
+        && data.snapshot.as_ref().map(|v| v.is_empty()).unwrap_or(true)
+        && data.klines.is_empty()
+    {
+        out.push_str("_(数据拉取失败,请在简报里如实说明)_\n");
+        return out;
+    }
+    if !data.quotes.is_empty() {
+        out.push_str("**实时报价 (quote):**\n");
+        for q in &data.quotes {
+            let pct = q.change_pct();
+            let sign = if pct >= 0.0 { "+" } else { "" };
+            out.push_str(&format!(
+                "- {} 现价 ¥{:.2} 涨跌 {}{:.2}% | 开 {:.2} 高 {:.2} 低 {:.2} 昨收 {:.2} | 成交 {} 手 / ¥{:.0}万\n",
+                q.code,
+                q.price,
+                sign,
+                pct,
+                q.open,
+                q.high,
+                q.low,
+                q.pre_close,
+                q.volume / 100,
+                q.amount / 10_000.0,
+            ));
+        }
+    }
+    if let Some(rows) = &data.snapshot
+        && !rows.is_empty()
+    {
+        out.push_str("\n**快照 (snapshot):**\n");
+        for r in rows {
+            let pct = if r.pre_close.abs() > f64::EPSILON {
+                (r.price - r.pre_close) / r.pre_close * 100.0
+            } else {
+                0.0
+            };
+            let sign = if pct >= 0.0 { "+" } else { "" };
+            out.push_str(&format!(
+                "- {} 价 {:.2} 涨跌 {}{:.2}% 量 {} 额 ¥{:.0}万\n",
+                r.code,
+                r.price,
+                sign,
+                pct,
+                r.volume / 100,
+                r.amount / 10_000.0,
+            ));
+        }
+    }
+    if !data.klines.is_empty() {
+        out.push_str("\n**近 20 日 K 线 (1d, qfq):**\n");
+        // Stable iteration order so the same prompt is reproducible
+        // across briefings — HashMap is unordered.
+        let mut codes: Vec<&String> = data.klines.keys().collect();
+        codes.sort();
+        for code in codes {
+            let Some(kr) = data.klines.get(code) else {
+                continue;
+            };
+            // Last 5 bars in chronological order (oldest → newest).
+            let bars: Vec<String> = kr
+                .klines
+                .iter()
+                .rev()
+                .take(5)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(|b| {
+                    let d = chrono::DateTime::from_timestamp(b.timestamp, 0)
+                        .map(|d| d.format("%m-%d").to_string())
+                        .unwrap_or_else(|| "?".to_owned());
+                    format!("{} 收{:.2}", d, b.close)
+                })
+                .collect();
+            // Range = first bar's open → last bar's close, plus high/low across the window.
+            let (lo, hi) = kr
+                .klines
+                .iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), b| {
+                    (lo.min(b.low), hi.max(b.high))
+                });
+            out.push_str(&format!(
+                "- {} 区间 {:.2}–{:.2} | 近5日: {}\n",
+                code,
+                lo,
+                hi,
+                bars.join(" → ")
+            ));
+        }
+    }
+    out
+}
+
+/// Build the synthetic user message that becomes the LLM's briefing
+/// turn. The prompt embeds gateway-pre-fetched data and tells the
+/// LLM to USE IT VERBATIM — no second-trip to `stock_*` tools.
+fn build_prompt(slot: BriefingSlot, group: &WatchlistGroup, data: &PrefetchedData) -> String {
     let label = slot.label();
     let codes_list = group.codes.join(", ");
+    let data_block = format_data_block(data);
     let body = match slot {
-        BriefingSlot::PreMarket => "请用 stock_quote / stock_ask 拉数据,然后:\n\
-            1. 简短列出每只股票的最新价 / 涨跌幅\n\
-            2. 给一句话开盘看点(隔夜美股 / 重要事件 / 板块情绪,允许调 web_search 补充)\n\
+        BriefingSlot::PreMarket => "任务:\n\
+            1. 简短列出每只股票的最新价 / 涨跌幅(数据用上面的报价区,不要自己调 stock_quote)\n\
+            2. 给一句话开盘看点(隔夜美股 / 重要事件 / 板块情绪 — 这一点允许调 web_search 补充)\n\
             3. 全篇控制在 200 字以内",
-        BriefingSlot::MidDay => "请用 stock_quote + stock_snapshot use_watchlist=true 拉数据,然后:\n\
-            1. 列出每只股票上午的表现(开盘价 → 上午收盘价 / 涨跌幅)\n\
+        BriefingSlot::MidDay => "任务:\n\
+            1. 列出每只股票上午的表现(用上面的报价 + 快照区,不要自己调 stock_quote 或 stock_snapshot)\n\
             2. 评一句话下午看点 / 关键支撑或压力位\n\
             3. 200 字以内",
-        BriefingSlot::PostMarket => "请用 stock_quote + stock_kline period=1d count=20 拉数据,然后:\n\
-            1. 当日每只股票收盘价 / 涨跌幅 / 关键变动\n\
+        BriefingSlot::PostMarket => "任务:\n\
+            1. 当日每只股票收盘价 / 涨跌幅 / 关键变动(数据用上面的报价 + K 线区,不要自己调 stock_quote 或 stock_kline)\n\
             2. 综合一句话总结今日盘面 + 明日值得关注的点\n\
-            3. 如果有研报或公告,提一下\n\
+            3. 如果有研报或公告,可以调 web_search 简单核查后提一下\n\
             4. 250 字以内",
     };
     format!(
         "[{label}] 现在是 {ts}。\n\n\
          你管理的关注列表: {codes_list}。\n\n\
+         === gateway 已为你拉好实时数据 (start) ===\n\
+         {data_block}\
+         === gateway 已为你拉好实时数据 (end) ===\n\n\
          {body}\n\n\
+         **严格要求**:\n\
+         - 所有价格、涨跌幅、成交量、K 线数字必须直接用上面 'gateway 已为你拉好' 块里的数,**严禁编造任何数字**。\n\
+         - 严禁再调任何 stock_* 工具拉一遍同样的数据 — 浪费 token 也不会更新。\n\
+         - 只有 web_search 在允许的子任务里可以用。\n\n\
          结尾追加一行免责声明:信息来自公开 A 股数据接口,仅供参考,不构成投资建议。",
         ts = chrono::Utc::now()
             .with_timezone(&Shanghai)
@@ -534,11 +755,19 @@ mod tests {
             peer_id: "ou_x".into(),
             codes: vec!["600519".into(), "000001".into()],
         };
-        let p = build_prompt(BriefingSlot::PreMarket, &g);
+        let empty = PrefetchedData {
+            quotes: vec![],
+            snapshot: None,
+            klines: std::collections::HashMap::new(),
+        };
+        let p = build_prompt(BriefingSlot::PreMarket, &g, &empty);
         assert!(p.contains("早盘前简报"));
         assert!(p.contains("600519"));
         assert!(p.contains("000001"));
         assert!(p.contains("不构成投资建议"));
+        // Empty prefetch should surface a graceful "数据拉取失败" line so the
+        // LLM doesn't silently produce a number-free reply.
+        assert!(p.contains("数据拉取失败"));
     }
 
     #[test]
