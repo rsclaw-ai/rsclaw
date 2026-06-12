@@ -38,6 +38,7 @@ pub fn run(ctx: &HandlerCtx, doc_id: &str, doc_version: u32) -> Result<()> {
         logical_source_id: &lsid,
         doc_id: &doc.id,
         doc_version: doc.version,
+        doc_title: &doc.title,
         markdown_body: &body,
         default_locator_kind: LocatorKind::MdSection,
     });

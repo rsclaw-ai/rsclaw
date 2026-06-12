@@ -257,6 +257,118 @@ fn canonicalize_writable_path(input: &str) -> Result<PathBuf, String> {
     ))
 }
 
+/// Canonicalize a saved plugin artifact path for read-only document
+/// extraction. In addition to workspace/plugin-var paths, this permits
+/// `~/Downloads/rsclaw`, which is where `allocate-artifact` stores files.
+fn canonicalize_plugin_artifact_path(input: &str) -> Result<PathBuf, String> {
+    let base = crate::config::loader::base_dir();
+    let workspace = base.join("workspace");
+    let plugins_var = base.join("var").join("plugins");
+    let downloads_rsclaw = dirs_next::download_dir()
+        .unwrap_or_else(|| {
+            dirs_next::home_dir()
+                .unwrap_or_else(crate::config::loader::base_dir)
+                .join("Downloads")
+        })
+        .join("rsclaw");
+    let canonical = crate::agent::runtime::canonicalize_external_path(input, &workspace);
+    if canonical.starts_with(&workspace)
+        || canonical.starts_with(&plugins_var)
+        || canonical.starts_with(&downloads_rsclaw)
+    {
+        return Ok(canonical);
+    }
+    Err(format!(
+        "artifact path '{}' resolves outside allowed dirs (workspace, var/plugins, or Downloads/rsclaw)",
+        input
+    ))
+}
+
+/// Extract readable text from a plugin-saved artifact.
+pub(crate) async fn extract_text_from_plugin_file(path: &str) -> Result<String, String> {
+    let canonical = canonicalize_plugin_artifact_path(path)?;
+    let bytes = tokio::fs::read(&canonical)
+        .await
+        .map_err(|e| format!("failed to read {}: {e}", canonical.display()))?;
+    let filename = canonical
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| canonical.to_string_lossy().into_owned());
+    match crate::agent::runtime::extract_file_text(&filename, &bytes).await {
+        Some(text) if !text.trim().is_empty() => Ok(text),
+        Some(_) => Err(format!(
+            "no readable text extracted from {}",
+            canonical.display()
+        )),
+        None => Err(format!(
+            "unsupported file type or extraction failed for {}",
+            canonical.display()
+        )),
+    }
+}
+
+/// Ingest a prepared document into the live knowledge base.
+pub(crate) async fn kb_ingest_document(
+    collection: &str,
+    title: &str,
+    content: &str,
+    mime: &str,
+) -> Result<String, String> {
+    let collection = collection.trim().to_owned();
+    let title = title.trim().to_owned();
+    let content = content.to_owned();
+    let mime = if mime.trim().is_empty() {
+        "text/markdown".to_owned()
+    } else {
+        mime.trim().to_owned()
+    };
+    if collection.is_empty() {
+        return Err("kb_ingest_document: collection is required".to_string());
+    }
+    if title.is_empty() {
+        return Err("kb_ingest_document: title is required".to_string());
+    }
+    if content.trim().is_empty() {
+        return Err("kb_ingest_document: content is required".to_string());
+    }
+    let kb = crate::kb::global_service()
+        .ok_or_else(|| "knowledge base is not available in this gateway".to_string())?;
+
+    tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let find = || -> Result<Option<crate::kb::model::KbCollection>, String> {
+            kb.list_collections()
+                .map_err(|e| e.to_string())
+                .map(|cols| {
+                    cols.into_iter()
+                        .find(|c| c.name.eq_ignore_ascii_case(&collection))
+                })
+        };
+        let collection_id = if let Some(c) = find()? {
+            c.id
+        } else {
+            match kb.create_collection(&collection, None, None) {
+                Ok(c) => c.id,
+                Err(crate::kb::KnowledgeError::DuplicateName) => find()?
+                    .map(|c| c.id)
+                    .ok_or_else(|| "collection vanished after duplicate".to_string())?,
+                Err(e) => return Err(e.to_string()),
+            }
+        };
+
+        let (doc_id, noop) = kb
+            .ingest(&collection_id, &title, content.as_bytes(), Some(&mime))
+            .map_err(|e| e.to_string())?;
+        Ok(json!({
+            "docId": doc_id,
+            "collectionId": collection_id,
+            "status": if noop { "duplicate" } else { "indexed" },
+        })
+        .to_string())
+    })
+    .await
+    .map_err(|e| format!("kb ingest task failed: {e}"))?
+}
+
 impl rsclaw::plugin::host_browser::Host for HostState {
     async fn browser_open(&mut self, url: String) -> HostTrapResult<Result<String, String>> {
         Ok(self.browser_action("open", json!({"url": url})).await)
@@ -558,6 +670,16 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
         }
     }
 
+    async fn kb_ingest_document(
+        &mut self,
+        collection: String,
+        title: String,
+        content: String,
+        mime: String,
+    ) -> HostTrapResult<Result<String, String>> {
+        Ok(kb_ingest_document(&collection, &title, &content, &mime).await)
+    }
+
     async fn read_file(&mut self, path: String) -> HostTrapResult<Result<String, String>> {
         let canonical = match canonicalize_plugin_path(&path) {
             Ok(p) => p,
@@ -567,6 +689,10 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
             Ok(contents) => Ok(Ok(contents)),
             Err(e) => Ok(Err(format!("failed to read {}: {e}", canonical.display()))),
         }
+    }
+
+    async fn extract_file_text(&mut self, path: String) -> HostTrapResult<Result<String, String>> {
+        Ok(extract_text_from_plugin_file(&path).await)
     }
 
     async fn write_file(

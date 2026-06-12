@@ -798,12 +798,13 @@ impl AgentRuntime {
                     .to_owned()
             });
 
-        // Upgrade http -> https.
-        let fetch_url = if url.starts_with("http://") {
-            url.replacen("http://", "https://", 1)
-        } else {
-            url.to_owned()
-        };
+        // Honor the caller's scheme — do NOT force http→https. Forcing the
+        // upgrade breaks http-only services (e.g. internal APIs on a non-443
+        // port like `:8080`): the TLS handshake fails and the whole fetch
+        // errors out. Sites that want TLS redirect http→https on their own,
+        // and the same-host redirect policy below follows that for GETs, so the
+        // common "model emitted http:// for an https site" case still works.
+        let fetch_url = url.to_owned();
 
         // Cache lookup is GET-only. POST/PUT/PATCH/DELETE skip the cache
         // since they may have side effects, carry per-call auth, or be

@@ -233,6 +233,58 @@ pub(crate) fn build_plugins_system(
     ))
 }
 
+/// Builtin tools with near-zero observed production usage (tool-dispatch
+/// frequency over the gateway log, 2026-06). On non-rsclaw providers these
+/// are deferred behind the [`request_tool_def`] stub instead of paying their
+/// full definitions (~2.8k tokens) on every request. rsclaw protocol is
+/// exempt — its tools ride in the shared registry prefix, where the fleet's
+/// KV cache makes them free at the margin.
+///
+/// Deliberately NOT in this list despite low usage: `web_download` (the
+/// web_fetch/web_browser guides route downloads here by name), `channel` /
+/// `send_message` (hub deployments use them even though desktop never does),
+/// and anything plugin_* (separate discovery path).
+pub(crate) const COLD_TOOLS: &[&str] = &[
+    "doc",
+    "cap_bind_sticky",
+    "cap_unbind_sticky",
+    "video_gen",
+    "create_docx",
+    "create_pdf",
+    "create_pptx",
+    "create_xlsx",
+    "text_to_voice",
+    "pairing",
+    "gateway",
+    "session",
+    "skill_remove",
+    "wait_input",
+];
+
+/// One-line stub standing in for the deferred [`COLD_TOOLS`]. Calling it
+/// enables the named tool for the rest of the session (the runtime splices
+/// the real definition back into the live tool list before the next LLM
+/// iteration of the SAME turn, so the cost is one extra round-trip on
+/// first use).
+pub(crate) fn request_tool_def(deferred: &[&str]) -> ToolDef {
+    ToolDef {
+        name: "request_tool".to_owned(),
+        description: format!(
+            "Enable a deferred tool, then call it. These tools exist but their full \
+             definitions are loaded on demand: {}. Call request_tool with the name, then \
+             call the tool itself.",
+            deferred.join(", ")
+        ),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Deferred tool name to enable"}
+            },
+            "required": ["name"]
+        }),
+    }
+}
+
 /// Compute the set of allowed tool names based on toolset level + custom tools.
 /// Returns None for "full" (no filtering), Some(set) for others.
 pub(crate) fn toolset_allowed_names(
@@ -271,6 +323,7 @@ pub(crate) fn toolset_allowed_names(
         "list_dir",
         "search_file",
         "memory",
+        "todo",
         "skill_use",
     ];
     const CODE: &[&str] = &[
@@ -293,6 +346,9 @@ pub(crate) fn toolset_allowed_names(
         "memory",
         "knowledge_base",
         "skill_use",
+        // Working-plan checklist — multi-step coding tasks are exactly where
+        // plan tracking pays off (and where compaction loses implicit plans).
+        "todo",
         // Pre-compaction history search (multi-turn coding sessions hit this often)
         "read_session_archive",
         // Coding-agent escalation — dispatch big tasks to an external CLI
@@ -326,6 +382,7 @@ pub(crate) fn toolset_allowed_names(
         "web_search",
         "web_fetch",
         "memory",
+        "todo",
         "web_browser",
         "image_gen",
         "video_gen",
@@ -352,6 +409,8 @@ pub(crate) fn toolset_allowed_names(
         "stock_query",
         "stock_chart",
         "stock_watchlist",
+        "research_ingest_wechat",
+        "research_analyze_charts",
     ];
 
     let base: Option<&[&str]> = match toolset {
@@ -414,6 +473,39 @@ pub fn build_tool_list(
                 "top_k":  {"type": "integer", "default": 5, "description": "Max results (search)."}
             },
             "required": ["action"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "todo".to_owned(),
+        description: "Maintain this session's working plan as a status checklist. \
+            FULL-REPLACE semantics: every call must send the COMPLETE updated list \
+            (include finished items with status done); an empty items array clears the plan.\n\
+            When to use: any task needing 3+ steps or multiple tool calls — write the plan \
+            FIRST, keep exactly ONE item in_progress, flip it to done IMMEDIATELY after the \
+            step lands, then promote the next. Skip it for single-step requests and chat.\n\
+            The plan is persisted outside the conversation: it survives context compaction, \
+            so an accurate list is your recovery anchor in long sessions.\n\
+            Example: {\"items\":[{\"text\":\"Read the config loader\",\"status\":\"done\"},\
+            {\"text\":\"Add the provider flag\",\"status\":\"in_progress\"},\
+            {\"text\":\"Run cargo test\",\"status\":\"pending\"}]}"
+            .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "description": "The complete plan, in execution order (full replace). Empty array clears it.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "text":   {"type": "string", "description": "One concrete step."},
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "done"], "description": "Defaults to pending."}
+                        },
+                        "required": ["text"]
+                    }
+                }
+            },
+            "required": ["items"]
         }),
     });
     tools.extend(build_plugin_meta_tool_defs());
@@ -584,11 +676,7 @@ pub fn build_tool_list(
             - Asking the user a clarifying question is NOT completion=full — use\n\
               recommend=needs_human and put the question in blocked_on.\n\
             - completion=full with empty accomplished is rejected.\n\
-            \n\
-            This tool only RECORDS the outcome. Worker dispatch wiring is being built — \
-            for now the auto-continue supervisor still falls back to its string classifier \
-            if task_finish is omitted, but adopting it now ensures correct routing once \
-            wiring lands.".to_owned(),
+            ".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -957,6 +1045,69 @@ pub fn build_tool_list(
         }),
     });
     tools.push(ToolDef {
+        name: "research_analyze_charts".to_owned(),
+        description: "Run a vision LLM over a batch of chart image URLs and \
+            extract structured data (chart type, title, key numbers, trend). \
+            Use this AS A FOLLOW-UP to `research_ingest_wechat` when the \
+            ingested article is chart-heavy (TGB湖南人 复盘 series, 金融界 \
+            morning reports, 卖方研究 stat sheets) — the text-only ingest \
+            pulls section headers but not the numbers inside the charts. \
+            Pass the `image_urls` array straight from the ingest tool's \
+            response.\n\
+            \n\
+            Each image is fetched in parallel (with WeChat Referer to dodge \
+            anti-hotlink), base64-encoded, sent in a single multimodal call. \
+            Vision chain falls back per `agents.defaults.model.vision` \
+            config. The LLM is instructed NOT to give investment advice — \
+            just structured extraction.\n\
+            \n\
+            Returns `analysis` (markdown per chart) + `skipped` (per-image \
+            failures, mostly 403/404). Save the analysis back into the KB \
+            doc with `knowledge_base` add if you want it searchable.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "image_urls": {"type": "array", "items": {"type": "string"},
+                               "description": "Chart image URLs (typically from `research_ingest_wechat`'s `image_urls` field)."},
+                "max_images": {"type": "integer", "default": 8, "minimum": 1, "maximum": 10,
+                               "description": "Cap how many images to send in one call. More charts = larger context = slower call."},
+                "extra_prompt": {"type": "string", "description": "Optional extra instructions appended to the per-chart prompt (e.g. \"focus on 涨幅 vs 板块\")."}
+            },
+            "required": ["image_urls"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "research_ingest_wechat".to_owned(),
+        description: "Fetch a WeChat 公众号 article by URL and ingest the title \
+            / author / body / chart image URLs into the user's knowledge base. \
+            Works on any `https://mp.weixin.qq.com/s/...` link the user pastes \
+            or forwards — no browser, no OCR, no anti-bot dance. The body is \
+            inlined in WeChat's response as a JS variable; we parse it server-\
+            side. Charts come back as a separate URL list so a follow-up vision \
+            LLM pass can extract data from them.\n\
+            \n\
+            Use when:\n\
+            - User pastes / forwards a `mp.weixin.qq.com/s/...` URL\n\
+            - User asks to \"save / collect this research / 收藏这篇\"\n\
+            - You see a 研报 / 复盘 / 卖方报告 URL during a conversation\n\
+            \n\
+            The article lands in the knowledge base under `collection` \
+            (default `research`), tagged `wechat_official_account`, account \
+            name (e.g. `TGB湖南人`), and account id (e.g. `gh_xxx`). Later \
+            `knowledge_base` searches can filter or rank by those tags.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "WeChat article URL (https://mp.weixin.qq.com/s/...)"},
+                "collection": {"type": "string", "default": "research",
+                               "description": "KB collection name. Created on demand."},
+                "extra_tags": {"type": "array", "items": {"type": "string"},
+                               "description": "Optional extra tags (e.g. 板块名, 个股代码) to attach for later filtering."}
+            },
+            "required": ["url"]
+        }),
+    });
+    tools.push(ToolDef {
         name: "stock_query".to_owned(),
         description: "Read-only SQL against astock's DuckDB. ESCAPE HATCH only — \
             use when `stock_ask` / `stock_snapshot` / `stock_kline` genuinely \
@@ -1127,34 +1278,23 @@ pub fn build_tool_list(
         // PowerShell edition quirks) live in the per-session `user_system`
         // "Platform" section (see prompt_builder::build_user_system), which
         // reflects the CLIENT's real OS and never enters the base hash.
-        description: format!("Run a shell command. Your OS, shell, package manager, and \
-             shell-specific syntax (command chaining, quoting, encoding) are described in \
-             the system prompt's \"Platform\" section — follow those.\n\
-             IMPORTANT: For file listing use `list_dir`, for file search use `search_file`, for content search use `search_content`, for tool install use `install_tool`, for HTTP/API requests use `web_fetch`. Only use shell for commands that have no dedicated tool.\n\
-             Use shell for: git operations, running scripts (node/python/cargo), system info, package management, process management.\n\
-             Do NOT use shell for HTTP requests (curl/wget) or file downloads — use `web_fetch` / `web_download` instead.\n\
-             \n\
-             Tool selection: shell for file/text/system ops; python for data processing (CSV/JSON/automation).\n\
-             Check tool availability first (e.g. `which python3` / `Get-Command python`). Use `install_tool` for system tools.\n\
-             \n\
-             Best practices: pipe large output through a head/limit, use wait=false for long tasks, never run destructive commands on personal dirs.\n\
-             If a command fails, do NOT retry with the same arguments. Try a different approach or ask the user.\n\
-             \n\
-             Multiple commands:\n\
-             - Independent → emit MULTIPLE shell tool calls in ONE message for parallelism.\n\
-             - Dependent → a single shell call chained with the OS-appropriate operator (see the Platform section).\n\
-             - Do NOT use newlines to separate commands — use chaining or separate calls.\n\
-             \n\
-             Sleep is rarely the right answer:\n\
-             - Don't sleep between commands that can run back-to-back.\n\
-             - Don't sleep-poll a background task you started with `wait=false` — task results are delivered on your next turn automatically.\n\
-             - Don't sleep-retry a failing command — find the actual cause and change something.\n\
-             \n\
+        description: format!("Run a shell command. OS, shell, package manager, and chaining/\
+             quoting syntax are in the system prompt's \"Platform\" section — follow those.\n\
+             Prefer the dedicated tool when one exists: list_dir, search_file, \
+             search_content, install_tool, web_fetch (HTTP), web_download (files). Shell is \
+             for git, running scripts (node/python/cargo), system/process/package ops.\n\
+             Pipe large output through head/tail; wait=false for long tasks; never run \
+             destructive commands on personal dirs; on failure do NOT retry the same args — \
+             change something or ask.\n\
+             Multiple commands: independent → multiple shell calls in ONE message; \
+             dependent → one call chained with the Platform operator. Never newline-separate.\n\
+             Don't sleep: not between back-to-back commands, not to poll a wait=false task \
+             (results are pushed to your next turn), not to retry a failure.\n\
              Git safety:\n\
-             - NEVER force-push to main / master.\n\
-             - NEVER `--no-verify`, `--no-gpg-sign`, or `-c commit.gpgsign=false` unless the user explicitly asks — fix the hook failure instead.\n\
-             - AVOID `git add -A` / `git add .` — stage specific files so you don't leak `.env`, credentials, or build artifacts.\n\
-             - Prefer NEW commits over `--amend`; amending after a pre-commit-hook failure can destroy work because the failed commit never landed.\n\n{shell_guide}",
+             - NEVER force-push to main/master.\n\
+             - NEVER `--no-verify` / `--no-gpg-sign` unless the user explicitly asks — fix the hook failure instead.\n\
+             - AVOID `git add -A` / `git add .` — stage specific files (don't leak .env/credentials/artifacts).\n\
+             - Prefer NEW commits over `--amend`; amending after a hook failure destroys work.\n\n{shell_guide}",
             shell_guide = crate::agent::bootstrap::shell_guide()),
         parameters: json!({
             "type": "object",
@@ -1169,62 +1309,25 @@ pub fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "agent".to_owned(),
-        description: "Manage agents. You are the architect — delegate work, never block.\n\
-            Actions:\n\
-            - task: Create a task agent for a one-shot job. Returns immediately with task_id. The task agent runs independently and delivers results when done.\n\
-            - spawn: Create a persistent agent (survives across turns).\n\
-            - send: Send a message to an existing agent (async, result delivered when done).\n\
-            - list: List all registered agents.\n\
-            - update: Edit a named agent's config (model, name). Pass model=\"\" to remove and fall back to defaults. Hot-reloads automatically.\n\
-            - kill: Stop an agent.\n\
-            Tips:\n\
-            - Use task for independent, parallelizable work. You can dispatch multiple tasks at once.\n\
-            - Always specify toolset matching the task (web for search, code for file ops).\n\
-            - After dispatching, tell the user what you delegated and continue with other work.\n\
-            \n\
-            CRITICAL: When the user names a CLI coding agent (claude, claudecode, openclaude,\n\
-            opencode, codex), dispatch via `cap(agent=..., task=...)` — NOT this `agent` tool.\n\
-            This tool's `task` action creates an INTERNAL background sub-agent; it does not\n\
-            spawn any external coding CLI and will never produce the output the user expects.\n\
-            - User says \"让opencode去...\" -> `cap(agent=\"opencode\", task=...)`\n\
-            - User says \"用claudecode...\" -> `cap(agent=\"claudecode\", task=...)`\n\
-            - User names multiple agents in one request -> issue multiple `cap` calls, one per agent.\n\
-            \n\
-            [HARD RULE - DECEPTION]\n\
-            Claiming \"已委托opencode\" / \"已派发给四个 coding agent\" / similar WITHOUT a `cap`\n\
-            tool_call is LYING. If you say these words, there MUST be a `cap` call in this turn\n\
-            for each named agent. No tool call + claim of delegation = you are deceiving the user.\n\
-            This is worse than admitting \"I didn't call it\" - trust is destroyed.\n\
-            \n\
-            DO NOT delegate these tasks — handle them yourself directly:\n\
-            - Any GUI/desktop automation (WeChat, Finder, Safari, system apps, etc.)\n\
-            - Anything using `computer_use` (screenshot, click, key, type)\n\
-            - AppleScript/osascript workflows that control another application\n\
-            - Visual verification (\"did the window appear?\", \"is the button there?\")\n\
-            Reason: GUI tasks depend on live state (frontmost window, mouse position, display\n\
-            focus) and the current session's permission grants. Sub-agents start fresh with\n\
-            no visual context and frequently fail on first attempts, creating loops. The\n\
-            main agent that already has the screenshot/context should complete these tasks.\n\
-            \n\
-            DON'T PEEK / DON'T RACE (for action=task):\n\
-            - After dispatching a task agent, do NOT call action=list, action=send, or any\n\
-              other status probe in the same conversation just to check progress. You will\n\
-              be notified when the task completes — polling burns turns and pollutes context.\n\
-            - Do NOT predict, summarize, or fabricate the task's findings before the\n\
-              notification arrives. If the user asks mid-flight, say it's still running.\n\
-            - If you need the result before you can proceed, you delegated wrong — either\n\
-              do the work inline, or accept this turn ends here and resume in a later turn.\n\
-            \n\
-            WRITING THE TASK PROMPT (the single biggest quality lever):\n\
-            - Brief the task agent like a colleague who just walked in. It has zero context\n\
-              from this conversation — no idea what you've tried, what's been ruled out, or\n\
-              why the work matters.\n\
-            - Include: the goal, what you already know, what the agent should NOT do (so it\n\
-              doesn't duplicate your work), the exit criterion (\"report under 200 words\",\n\
-              \"return the diff\", \"give a yes/no with one sentence of evidence\").\n\
-            - For lookups, hand over the exact command. For investigations, hand over the\n\
-              question — prescribed steps die when the premise is wrong.\n\
-            - Terse one-line prompts produce shallow generic work. Spend the tokens up front.".to_owned(),
+        description: "Manage internal sub-agents. Actions: task (one-shot job, returns \
+            task_id immediately, result delivered when done), spawn (persistent agent), \
+            send (message an existing agent), list, update (model/name; model=\"\" resets), \
+            kill. Use task for independent parallelizable work; pick a `toolset` matching \
+            the job; after dispatching, tell the user and move on.\n\
+            CRITICAL: when the user NAMES a CLI coding agent (claude/claudecode/openclaude/\
+            opencode/codex), dispatch via `cap(agent=..., task=...)` — NOT this tool; \
+            action=task creates an internal sub-agent and will never spawn the external CLI. \
+            Claiming \"已委托 X\" without an actual `cap` call in the same turn is deception.\n\
+            Do NOT delegate GUI/desktop automation, `computer_use` work, or visual \
+            verification — sub-agents start without the live screen state and loop on \
+            failure; do those yourself.\n\
+            After dispatching a task, do NOT poll (list/send) or predict its findings — \
+            completion is pushed to you. If you need the result to proceed, you delegated \
+            wrong: do it inline.\n\
+            Task prompt = the quality lever: brief it like a colleague with zero context — \
+            goal, what you know, what NOT to redo, and an explicit exit criterion. For \
+            lookups hand over the exact command; for investigations hand over the question. \
+            One-line prompts produce shallow work.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -1361,42 +1464,22 @@ pub fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "web_fetch".to_owned(),
-        description: format!("PREFERRED tool for HTTP requests — web pages, REST APIs, documentation, articles.\n\
-            Do NOT use shell with curl/wget/Invoke-WebRequest — use web_fetch instead.\n\
-            - URL must be fully-formed (https://...)\n\
-            - HTTP auto-upgraded to HTTPS\n\
-            - HTML pages are dehydrated to clean text/markdown\n\
-            - JSON / plain-text / non-HTML responses are returned as-is (raw body)\n\
-            - Falls back to browser rendering for JS-heavy pages and CAPTCHA-blocked sites (GET only)\n\
-            - GET responses without headers/body are cached 15 minutes; non-GET bypasses cache\n\
-            - For large pages, pass 'prompt' to LLM-extract specific information\n\
-            - DO NOT pass 'prompt' for compact structured responses (JSON APIs, RSS, \
-              <2KB text). Passing 'prompt' triggers an internal LLM summarize pass \
-              (extra ~30-60 s + tokens). For api.* / *.json / arxiv Atom / RSS / \
-              search-result JSON, omit 'prompt' — read the raw response directly.\n\
-            \n\
-            METHODS, HEADERS, BODY — supports the full HTTP surface:\n\
-              - method: GET (default), POST, PUT, PATCH, DELETE\n\
-              - headers: object — Authorization, X-API-Key, Cookie, custom Content-Type, etc.\n\
-              - body: string (raw) OR object/array (auto JSON-serialized + Content-Type set)\n\
-            \n\
-            FALL BACK to shell + curl only when you need:\n\
-              - File upload via multipart/form-data\n\
-              - Streaming responses (SSE, chunked transfers consumed incrementally)\n\
-              - Sites behind interactive login (use web_browser when interaction is needed)\n\
-            \n\
-            GitHub URLs — prefer `gh` CLI via shell over web_fetch:\n\
-              - `gh pr view <num> --json title,body,state,...` returns structured JSON\n\
-              - `gh issue view <num> --json ...` same for issues\n\
-              - `gh api repos/<owner>/<repo>/...` for arbitrary GitHub API\n\
-              Web-fetching github.com HTML pages gives you a dehydrated UI rendering;\n\
-              `gh` returns the underlying data directly. Only fall back to web_fetch when\n\
-              `gh` is not installed or the target isn't an API/UI endpoint.\n\
-            \n\
-            Redirects: if the response indicates the URL redirected to a DIFFERENT host,\n\
-            issue a fresh web_fetch on the redirect URL — do not assume the original URL\n\
-            content was served. GET responses are cached for ~15 min keyed on the final\n\
-            URL, so re-fetching after a redirect is cheap.\n\n{}", crate::agent::bootstrap::web_fetch_guide()),
+        description: format!("PREFERRED tool for HTTP — web pages, REST APIs, docs. Never \
+            shell out to curl/wget/Invoke-WebRequest for plain requests.\n\
+            Full URL required; HTML is dehydrated to clean text; JSON/plain-text returned \
+            as-is; JS-heavy or CAPTCHA-blocked pages auto-fall-back to browser rendering \
+            (GET only); plain GETs cached ~15 min.\n\
+            `prompt`: pass ONLY for large HTML pages to LLM-extract specific info. For \
+            compact structured responses (JSON APIs / RSS / <2KB text) OMIT it — it adds \
+            a 30-60s summarize pass for nothing.\n\
+            method GET/POST/PUT/PATCH/DELETE; headers object for auth; body string raw or \
+            object auto-JSON-serialized.\n\
+            Fall back to shell+curl only for multipart upload or incremental SSE/chunked \
+            streaming; interactive-login sites need web_browser.\n\
+            GitHub: prefer `gh` CLI via shell (gh pr view / gh issue view / gh api) — it \
+            returns structured data where fetching github.com HTML gives a dehydrated UI.\n\
+            If the response shows a redirect to a DIFFERENT host, re-fetch the redirect \
+            URL — don't assume the original content was served.\n\n{}", crate::agent::bootstrap::web_fetch_guide()),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -1430,48 +1513,33 @@ pub fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "web_browser".to_owned(),
-        description: format!("Control a web browser. Core workflow:\n\
-            1. `open` — navigate to a URL\n\
-            2. `snapshot` — get page structure with interactive element refs (@e1, @e2...). Use `interactive: true` to only get actionable elements (saves tokens). Use `interactive: true, annotate: true` to also get a screenshot with colorful borders + numbered labels overlaid on each element — the model sees both structured text and visual markers for better grounding.\n\
-            3. `click` ref=@e1 / `fill` ref=@e2 text='...' — interact using refs\n\
-            4. Re-snapshot after any page change to get updated refs\n\
-            Autocomplete inputs (Ctrip/Fliggy/Qunar city pickers, Google/Baidu search, flight/hotel/movie pickers, any input that pops a dropdown of suggestions): ALWAYS use `pick` ref=@eN query='武汉' in a single call — it focuses, types, waits for the popup, and clicks the first visible candidate. DO NOT build it yourself out of click+type+wait+screenshot loops; that wastes 5-7 iterations per field and the dropdown often dismisses before you re-screenshot. `pick` handles IME/React-controlled inputs that silently drop programmatic values.\n\
-            Interaction: hover (triggers menus/tooltips), dblclick, drag (from=@e1 to=@e2, for sliders), focus, scrollintoview.\n\
-            Quick search: `search` — auto-find search box on ANY site, fill text, submit, return results.\n\
-            `clickAt` ref=@e1 or x=100 y=200 — real mouse click via CDP (for file dialogs, anti-bot sites).\n\
-            Semantic locators: `getbytext` value='Submit', `getbyrole` value='button', `getbylabel` value='Email' — find elements without @ref.\n\
-            Frame: `frame` selector=@e1 (switch to iframe), `mainframe` (switch back).\n\
-            Console: `console` — get browser console messages (log/warn/error).\n\
-            Content: `content` — get full page HTML.\n\
-            WaitForUrl: `waitforurl` url='dashboard' — wait for URL change (after login/redirect).\n\
-            Other: type, select, check, scroll, screenshot, pdf, press, back, forward, reload, wait, evaluate, cookies, get_text, get_url, get_title, find, get_article, upload, new_tab, switch_tab, close_tab.\n\
-            IMPORTANT: Always snapshot BEFORE clicking/filling. Element refs change after page updates.\n\n\
-            Site-rules — platform-specific DOM selectors, URL routes, and gotchas live under \
-            `~/.rsclaw/tools/web_browser/site-rules/`. Two layouts coexist:\n\
-            - `<domain>.md` — flat, single-file (e.g. `douyin.md`, `kuaishou.md`, \
-              `xiaohongshu.md`, `bilibili.md`)\n\
-            - `<domain>/<task>.md` — nested per-task (e.g. `amazon/product-search.md`, \
-              `tiktok/upload.md`, `linkedin/connect.md`)\n\
-            When you `open` a URL whose host matches either layout, read_file the matching \
-            file FIRST so you use the verified selectors instead of guessing them per-session. \
-            Saves 5+ snapshot/click iterations and avoids stale-selector breakage.\n\n\
-            BEFORE reading any nested `<domain>/<task>.md` (which may have been imported from \
-            browser-use/browser-harness and use Python helper syntax), read \
-            `~/.rsclaw/tools/web_browser/site-rules/_VOCABULARY.md` once per session — it maps \
-            their `click_at_xy` / `type_text` / `js(...)` etc. to your `clickAt` / `type` / \
-            `evaluate` actions so you can translate the procedural code on the fly.\n\n\
-            Screenshot routing — do NOT call `action=screenshot` without a target:\n\
-            - Web page screenshot (user gave a URL): pass it inline,\n\
-              `action=screenshot url=https://example.com` — this navigates\n\
-              first then captures, single call. This is the one-shot equivalent\n\
-              of `/webshot`.\n\
-            - Desktop / system screenshot (no URL, user just says \"screenshot\"\n\
-              or \"截图\"): you cannot do this from web_browser. Tell the user\n\
-              to type `/ss` or `/screenshot` (preparse fast path → macOS\n\
-              `screencapture` / Windows / Linux equivalent).\n\
-            - Plain `action=screenshot` (no url) only captures what's already\n\
-              in the persistent browser session — usually a blank Chrome new\n\
-              tab → near-black PNG. Don't do this.\n\n{}", crate::agent::bootstrap::web_browser_guide()),
+        description: format!("Control a web browser. Workflow: `open` URL → `snapshot` \
+            (returns interactive element refs @e1, @e2…; `interactive: true` = actionable \
+            elements only, saves tokens; add `annotate: true` for a labeled screenshot \
+            alongside) → `click` ref=@e1 / `fill` ref=@e2 text='…' → re-snapshot after any \
+            page change (refs go stale).\n\
+            Autocomplete inputs (city pickers, search boxes, anything that pops a suggestion \
+            dropdown): ALWAYS one `pick` ref=@eN query='武汉' call — it types, waits for the \
+            popup, clicks the first candidate, and survives IME/React inputs. NEVER hand-roll \
+            click+type+wait+screenshot loops for these; the dropdown dismisses before you \
+            re-screenshot.\n\
+            More actions: hover/dblclick/drag(from,to)/focus/scrollintoview; `search` \
+            (auto-find any site's search box, fill, submit); `clickAt` (real CDP mouse click \
+            — file dialogs, anti-bot); getbytext/getbyrole/getbylabel (locate without @ref); \
+            frame/mainframe (iframes); console; content (full HTML); waitforurl; plus type, \
+            select, check, scroll, screenshot, pdf, press, back, forward, reload, wait, \
+            evaluate, cookies, get_text, get_url, get_title, find, get_article, upload, \
+            new_tab, switch_tab, close_tab.\n\
+            Site-rules: verified per-site selectors/routes/gotchas live under \
+            `~/.rsclaw/tools/web_browser/site-rules/` as `<domain>.md` or \
+            `<domain>/<task>.md`. When opening a matching host, read_file the rule FIRST \
+            instead of guessing selectors. Before using a nested `<domain>/<task>.md`, read \
+            `site-rules/_VOCABULARY.md` once per session — it maps imported helper syntax \
+            (click_at_xy/type_text/js) to your actions.\n\
+            Screenshot routing: web page → `action=screenshot url=…` (navigates then \
+            captures, one call). Desktop screenshot → NOT this tool; tell the user to type \
+            `/ss`. Bare `action=screenshot` with no url captures the persistent session — \
+            usually a blank tab; don't.\n\n{}", crate::agent::bootstrap::web_browser_guide()),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -1489,17 +1557,17 @@ pub fn build_tool_list(
                 ]},
                 "url":        {"type": "string", "description": "URL for open/navigate"},
                 "interactive":{"type": "boolean", "description": "For snapshot: only return actionable elements (saves ~80% tokens). Default: false"},
-                "annotate":   {"type": "boolean", "description": "For snapshot: overlay colorful borders + numbered labels on interactive elements and return a screenshot alongside the structured text. Helps the model visually locate elements. Only works with interactive=true."},
+                "annotate":   {"type": "boolean", "description": "For snapshot (with interactive=true): overlay numbered labels on elements and return a screenshot + legend alongside the structured text."},
                 "ref":        {"type": "string", "description": "Element ref like @e3 from snapshot"},
                 "from":       {"type": "string", "description": "Source element ref for drag"},
                 "to":         {"type": "string", "description": "Target element ref for drag"},
                 "x":          {"type": "number", "description": "X pixel coordinate for clickAt"},
                 "y":          {"type": "number", "description": "Y pixel coordinate for clickAt"},
                 "text":       {"type": "string", "description": "Text for fill/type/click-by-text/clipboard/dialog"},
-                "query":      {"type": "string", "description": "Query text for pick (typed into input and used to match dropdown candidates)"},
-                "index":      {"type": "integer", "description": "For pick: zero-based candidate index when multiple match (default 0)"},
-                "timeout_ms": {"type": "integer", "description": "For pick: total time to wait for dropdown and click target in ms (default 5000)"},
-                "value":      {"type": "string", "description": "Value for select, or sub-action for cookies/state/dialog/network/clipboard/context/emulate/diff/record"},
+                "query":      {"type": "string", "description": "Pick: text to type and match against dropdown candidates"},
+                "index":      {"type": "integer", "description": "Pick: candidate index, 0-based (default 0)"},
+                "timeout_ms": {"type": "integer", "description": "Pick: dropdown wait in ms (default 5000)"},
+                "value":      {"type": "string", "description": "Select value, or sub-action for cookies/state/dialog/network/clipboard/context/emulate/diff/record"},
                 "key":        {"type": "string", "description": "Key name for press (Enter, Tab, Escape, etc.)"},
                 "direction":  {"type": "string", "enum": ["up", "down", "left", "right"], "description": "Scroll direction"},
                 "amount":     {"type": "integer", "description": "Scroll distance in pixels (default 500)"},
@@ -1510,7 +1578,6 @@ pub fn build_tool_list(
                 "format":     {"type": "string", "enum": ["png", "jpeg"], "description": "Screenshot format"},
                 "quality":    {"type": "integer", "description": "JPEG quality (1-100)"},
                 "full_page":  {"type": "boolean", "description": "Capture full scrollable page"},
-                "annotate":   {"type": "boolean", "description": "Overlay colorful borders + numbered labels on interactive elements and return a legend mapping numbers to refs. For snapshot+annotate, use snapshot action with annotate=true instead."},
                 "width":      {"type": "integer", "description": "Viewport width for set_viewport"},
                 "height":     {"type": "integer", "description": "Viewport height for set_viewport"},
                 "scale":      {"type": "number", "description": "Device scale factor for set_viewport"},
@@ -1531,7 +1598,7 @@ pub fn build_tool_list(
                 "permissions":{"type": "array", "items": {"type": "string"}, "description": "Browser permissions to grant"},
                 "action_type":{"type": "string", "description": "Intercept action: block or mock"},
                 "body":       {"type": "string", "description": "Mock response body for network intercept"},
-                "headed":     {"type": "boolean", "description": "true=foreground (visible window), false=background (headless). Default: auto-detect based on display availability. Omit this field to use the default."}
+                "headed":     {"type": "boolean", "description": "true=visible window, false=headless. Omit to auto-detect."}
             },
             "required": ["action"]
         }),
@@ -1550,7 +1617,7 @@ pub fn build_tool_list(
                     "cursor_position", "get_active_window", "ui_tree",
                     "list_app_rules", "get_app_rule", "wait",
                     "vlm_drive"
-                ], "description": "Action to perform. ui_tree returns the accessibility tree of the focused window (interactive elements with role/label/coordinates). list_app_rules/get_app_rule load per-app desktop automation playbooks from ~/.rsclaw/tools/computer_use/app-rules/. vlm_drive runs an end-to-end agent loop using the configured VLM — pass an instruction and it handles screenshot/analysis/execution internally."},
+                ], "description": "ui_tree = accessibility tree of focused window. list_app_rules/get_app_rule = per-app automation playbooks. vlm_drive = end-to-end VLM loop driven by `instruction`."},
                 "x":         {"type": "number", "description": "X coordinate (mouse actions, drag start) in physical pixels"},
                 "y":         {"type": "number", "description": "Y coordinate (mouse actions, drag start) in physical pixels"},
                 "to_x":      {"type": "number", "description": "Drag destination X (physical pixels)"},
@@ -1563,16 +1630,16 @@ pub fn build_tool_list(
                 "amount":    {"type": "integer", "description": "Scroll clicks (default: 3)"},
                 "ms":        {"type": "integer", "description": "Wait duration in milliseconds (max 10000)"},
                 "name":      {"type": "string", "description": "App-rule name (for get_app_rule action)"},
-                "region":    {"type": "object", "description": "Optional screenshot region in physical pixels. Use after a full screenshot to zoom in on a specific area without recapturing the whole screen.", "properties": {
+                "region":    {"type": "object", "description": "Screenshot sub-region in physical pixels (zoom-in after a full shot).", "properties": {
                     "x":      {"type": "number"},
                     "y":      {"type": "number"},
                     "width":  {"type": "number"},
                     "height": {"type": "number"}
                 }, "required": ["x", "y", "width", "height"]},
-                "max_long_edge_px": {"type": "integer", "description": "Screenshot resize cap: longest edge of returned image. Default 1024 (XGA). Range 64-8192. Larger values = more detail + more tokens."},
-                "instruction": {"type": "string", "description": "NATURAL-LANGUAGE task instruction for the vlm_drive end-to-end agent loop. Example: 'Open WeChat, search for RsClaw研发群, and send a greeting message'. The configured VLM will drive screenshot->analyze->execute internally. ONLY used with action=vlm_drive."},
+                "max_long_edge_px": {"type": "integer", "description": "Screenshot longest-edge cap, 64-8192 (default 1024). Larger = more detail + tokens."},
+                "instruction": {"type": "string", "description": "vlm_drive only: natural-language task (e.g. 'Open WeChat, find group X, send a greeting')."},
                 "max_steps": {"type": "integer", "description": "Maximum steps for the vlm_drive loop (default: 30). ONLY used with action=vlm_drive."},
-                "async": {"type": "boolean", "description": "Run vlm_drive in the background instead of blocking the current turn. STRONGLY RECOMMENDED for any task expected to take >30 seconds (WeChat group monitoring, video downloads, multi-step automations). With async=true the call returns a `task_id` immediately and you should reply to the user with an acknowledgement (e.g. '我已经开始处理'); the actual outcome arrives as a separate message when the task finishes. Without async (default false), the tool blocks for up to 4 minutes — suitable only for quick visual queries (e.g. 'screenshot and tell me what's on screen'). ONLY used with action=vlm_drive."}
+                "async": {"type": "boolean", "description": "vlm_drive only: true = background, returns task_id immediately (use for anything >30s; acknowledge the user, outcome arrives later). false (default) blocks up to 4 min — quick visual queries only."}
             },
             "required": ["action"]
         }),
@@ -1659,76 +1726,32 @@ pub fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "cron".to_owned(),
-        description: "List, add, edit, remove, enable or disable cron jobs.\n\
-            Supports recurring (cron expression OR fixed interval) and one-shot (delay_ms) schedules.\n\
-            \n\
-            CHOOSING ONE-SHOT vs RECURRING — read carefully, this is the most common mistake:\n\
-              ONE-SHOT (set `delay_ms`):\n\
-                Use when the user names a SPECIFIC time/date that fires ONCE.\n\
-                  - \"22:04截图给我\" / \"晚上 8 点提醒我\" / \"15分钟后\" / \"明天下午3点\"\n\
-                Compute milliseconds from now until the target moment, set delay_ms.\n\
-                Auto-removes after firing — exactly what \"once\" means.\n\
-              RECURRING (set `schedule` cron expr or `every_seconds`):\n\
-                Use ONLY when the user explicitly says repetition: 每天 / 每周 / 每小时 /\n\
-                  every day / every Monday / 每隔 N 分钟 / weekly / hourly.\n\
-              DO NOT pick a daily cron expr like \"4 22 * * *\" when the user asked for ONE\n\
-              specific time today (\"22:04截图发我\"). That creates a job that fires every day\n\
-              at 22:04 forever — the user has to manually delete it. The cron tool DOES NOT\n\
-              auto-collapse \"today only\" intent into one-shot; you must do it.\n\
-            \n\
-            One-shot jobs auto-remove after execution.\n\
-            For edit/remove/enable/disable, prefer using `index` from the list output instead of `id`.\n\
-            \n\
-            KIND — what should fire when the schedule triggers:\n\
-              agentTurn (DEFAULT — pick this unless you are CERTAIN systemEvent applies):\n\
-                Dispatch `message` to the agent at fire time. The agent runs LLM + tools\n\
-                and delivers the result. Required for ANY task whose answer changes between\n\
-                runs or depends on outside information: weather, prices, news, comments,\n\
-                emails, system status, file/page contents, conditional logic, summaries.\n\
-              systemEvent: deliver `message` text VERBATIM to the user. NO LLM, NO TOOLS,\n\
-                NO QUERIES — every fire produces the exact same string you wrote in `message`.\n\
-                Use ONLY when the message is a fixed text reminder whose content never\n\
-                needs to be computed (e.g. \"drink water\", \"stand up\", \"daily 9am: standup\").\n\
-              Disqualifying signal: if `message` describes an action to perform (\"check X\",\n\
-                \"query Y\", \"fetch Z\", \"每N分钟查/取/看…\") rather than literal text to display,\n\
-                it MUST be agentTurn. Picking systemEvent here means every fire just echoes\n\
-                the instruction back to the user instead of executing it — a real, observed\n\
-                failure mode. Token cost is not a reason to downgrade to systemEvent; a\n\
-                useless echo is more expensive than a correct LLM call.\n\
-            \n\
-            CRON FORMAT (schedule field) — EXACTLY 5 fields separated by spaces:\n\
-              minute hour day month weekday\n\
-            Common examples:\n\
-              \"*/5 * * * *\"    every 5 minutes\n\
-              \"0 * * * *\"      every hour on the hour\n\
-              \"0 17 * * *\"     5:00 PM daily  (NOT \"017 * * *\" — needs the space!)\n\
-              \"30 8 * * 1-5\"   8:30 AM on weekdays\n\
-              \"0 9 1 * *\"      9:00 AM on the 1st of each month\n\
-            Pitfall: '0 17 * * *' is FIVE fields. Writing '017 * * *' (no space after 0) is\n\
-            only FOUR fields and will be rejected. Always check your expression has exactly\n\
-            5 whitespace-separated tokens.\n\
-            \n\
-            ITER (round-robin) — set when the user wants to rotate through a list,\n\
-            ONE item per firing (e.g. \"按顺序轮流查询东京、曼谷、迪拜的天气\").\n\
-            Pass `iter` as a JSON array of items, and use `{current}` (and optionally\n\
-            `{next}`, `{index}`, `{total}`) as placeholders inside `message`. The\n\
-            scheduler advances the cursor every fire and persists it — the agent\n\
-            never has to remember progress, and a restart can never repeat or skip.\n\
-            Example: message=\"查询{current}的当前天气\", iter=[\"东京\",\"曼谷\",\"迪拜\"].\n\
-            Without iter the LLM must track its own progress in memory, which is\n\
-            unreliable across restarts and embedding-model swaps — prefer iter when rotation is intended.\n\
-            \n\
-            ROTATE vs BATCH — disambiguate before reaching for iter:\n\
-              ROTATE (use iter): the user wants ONE item per fire, cycling. Trigger\n\
-                phrases: \"轮流\" / \"按顺序\" / \"依次\" / \"each time\" / \"one at a time\" /\n\
-                \"rotate\" / \"cycle through\" / \"每次只查一个\".\n\
-              BATCH (do NOT use iter): the user wants ALL items reported together each\n\
-                fire. Phrases: \"每 N 分钟报一次 A、B、C 的价格\" / \"every N min give me\n\
-                the prices of A, B, C\" / lists with no rotation signal. Build a single\n\
-                cron whose message names every item — the agent fans out tool calls in\n\
-                one turn and replies with the combined result.\n\
-              When in doubt, BATCH is the safer default: a single late report is much\n\
-              less surprising than silently dropping items every cycle.".to_owned(),
+        // Deliberately terse: the decision rules below are HEADS only.
+        // Enforcement moved to the add-path — validate_cron_expr rejects
+        // bad expressions with a teaching message, and the add result
+        // echoes back what was scheduled (one-shot vs forever, verbatim
+        // vs agent run) so the model can self-correct in the same turn.
+        // History: this desc was a 1.3k-token decision-tree manual; the
+        // add-result echo made the prevention prose redundant.
+        description: "Schedule jobs. Actions: list, add, edit, remove, enable, disable \
+            (address jobs by `index` from list output).\n\
+            Schedule — pick by user intent:\n\
+            - ONE-SHOT `delay_ms`: a specific time that fires ONCE (\"晚上8点提醒我\", \
+            \"15分钟后\", \"明天下午3点\"). Compute ms from now. Auto-removes after firing. \
+            NEVER express one-time intent as a recurring expr — it fires every day forever.\n\
+            - RECURRING `schedule` (5-field cron expr: minute hour day month weekday, \
+            e.g. \"30 8 * * 1-5\") or `every_seconds` — ONLY when the user says \
+            每天/每周/每隔/every/hourly/weekly.\n\
+            `kind`: agentTurn (default) runs the agent with tools at fire time — required \
+            whenever `message` is something to DO (query/check/fetch). systemEvent delivers \
+            `message` text verbatim, no LLM — only for fixed reminder text.\n\
+            `iter` (rotate): user wants ONE item per fire, cycling (轮流/依次/one at a time) \
+            — pass the items array and use {current} in `message`. A list WITHOUT a rotation \
+            signal = one job naming all items, not iter.\n\
+            Cancelling: \"停掉/取消/cancel X\" → list, then remove. The job keeps firing \
+            until actually removed — never just acknowledge.\n\
+            /loop self-termination: when fired by a `cron:loop-<12hex>` session and the \
+            loop's goal is met, call cron(action=\"remove\", id=\"loop-<12hex>\").".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -1737,13 +1760,13 @@ pub fn build_tool_list(
                 "every_seconds": {"type": "number", "description": "Fire every N seconds (for add). Use for fixed intervals like 45 minutes (every_seconds=2700) that cannot be expressed as a 5-field cron expression."},
                 "delay_ms":      {"type": "number", "description": "Delay in milliseconds for one-shot timer (e.g., 1200000 = 20 min). Use instead of schedule for reminders/timers."},
                 "message":       {"type": "string", "description": "Message or task to run (for add, edit)"},
-                "kind":          {"type": "string", "enum": ["agentTurn", "systemEvent"], "description": "What fires when the schedule triggers. agentTurn (default) = run agent (LLM+tools) so the answer reflects current state. systemEvent = deliver `message` verbatim with NO agent run — only valid when `message` is fixed display text whose content never needs to be computed. If the user wants something queried/fetched/checked on a schedule, use agentTurn."},
+                "kind":          {"type": "string", "enum": ["agentTurn", "systemEvent"], "description": "agentTurn (default) = run agent at fire time. systemEvent = deliver `message` verbatim, no agent run."},
                 "index":         {"type": "number", "description": "Job index from list (1-based, for edit/remove/enable/disable - preferred)"},
                 "id":            {"type": "string", "description": "Job ID (for edit/remove/enable/disable - use index instead if possible)"},
                 "name":          {"type": "string", "description": "Job name (for add, edit)"},
                 "tz":            {"type": "string", "description": "Timezone IANA name. Auto-detected if omitted. Only set if user explicitly requests a different timezone."},
                 "agentId":       {"type": "string", "description": "Agent ID to run the job (for add, edit, default: main)"},
-                "iter":          {"type": "array", "items": {"type": "string"}, "description": "Round-robin items the scheduler cycles through, one per firing. Use `{current}` (and optionally `{next}`, `{index}`, `{total}`) as placeholders in `message`. Set this whenever the user asks for rotating tasks (e.g. 'cycle through cities'); leaves the agent free of progress-tracking duties. On `edit`: pass a new array to replace items; pass `null` or `[]` to clear iter mode."},
+                "iter":          {"type": "array", "items": {"type": "string"}, "description": "Round-robin items, one per firing; placeholders {current}/{next}/{index}/{total} in `message`. On edit: new array replaces items, [] clears."},
                 "iter_cursor":   {"type": "number", "description": "On `edit`: explicitly set the iter cursor (0-based). Use to reset rotation back to the start, or to jump to a specific item. Without `iter`, requires the job to already have iter configured."}
             },
             "required": ["action"]
@@ -1797,7 +1820,7 @@ pub fn build_tool_list(
             "properties": {
                 "agent": {
                     "type": "string",
-                    "enum": ["claudecode", "openclaude", "opencode", "codex"],
+                    "enum": ["claudecode", "openclaude", "opencode", "codex", "qoder"],
                     "description": "Which CLI coding agent to dispatch to. A session is locked \
                         to one agent — you can't pass session_id from a codex call to a \
                         claudecode call."
@@ -1849,7 +1872,7 @@ pub fn build_tool_list(
             "properties": {
                 "agent": {
                     "type": "string",
-                    "enum": ["claudecode", "openclaude", "opencode", "codex"],
+                    "enum": ["claudecode", "openclaude", "opencode", "codex", "qoder"],
                     "description": "Which CLI coding agent to bind the IM session to."
                 },
                 "cwd": {
@@ -1875,14 +1898,14 @@ pub fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "cap".to_owned(),
-        description: "Dispatch a coding task to a CLI coding agent. Pick one of four agents via `agent`.".to_owned(),
+        description: "Dispatch a coding task to a CLI coding agent. Pick one of five agents via `agent`.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "agent": {
                     "type": "string",
-                    "enum": ["claudecode", "openclaude", "opencode", "codex"],
-                    "description": "claudecode — Anthropic Claude Code (general-purpose, strongest tool use). openclaude — OpenClaude (Claude-compatible OSS fork). opencode — OpenCode (TUI-native, fast iteration). codex — OpenAI Codex (reasoning-heavy, slower)."
+                    "enum": ["claudecode", "openclaude", "opencode", "codex", "qoder"],
+                    "description": "claudecode — Anthropic Claude Code (general-purpose, strongest tool use). openclaude — OpenClaude (Claude-compatible OSS fork). opencode — OpenCode (TUI-native, fast iteration). codex — OpenAI Codex (reasoning-heavy, slower). qoder — Qoder CLI (Claude Code compatible)."
                 },
                 "task":  { "type": "string", "description": "Task prompt for the agent." },
                 "cwd":   { "type": "string", "description": "Optional working directory; defaults to the agent workspace." }
@@ -2004,7 +2027,7 @@ pub fn build_tool_list(
                 "path":    {"type": "string", "description": "File path, e.g. 'report.docx'"},
                 "content": {"type": "string", "description": "Document content. Use # for headings, - for lists, blank lines for paragraphs."},
                 "title":   {"type": "string", "description": "Document title (optional, displayed at top)"},
-                "explanation": {"type": "string", "description": "Brief explanation of what you are creating and why, to help organize your thoughts before writing content."}
+                "explanation": {"type": "string", "description": "One line: what you are creating and why."}
             },
             "required": ["path", "content"]
         }),
@@ -2018,7 +2041,7 @@ pub fn build_tool_list(
                 "path":    {"type": "string", "description": "File path, e.g. 'report.pdf'"},
                 "content": {"type": "string", "description": "Document content. Use # for headings, - for lists, blank lines for paragraphs."},
                 "title":   {"type": "string", "description": "Document title (optional, displayed at top)"},
-                "explanation": {"type": "string", "description": "Brief explanation of what you are creating and why, to help organize your thoughts before writing content."}
+                "explanation": {"type": "string", "description": "One line: what you are creating and why."}
             },
             "required": ["path", "content"]
         }),
@@ -2037,7 +2060,7 @@ pub fn build_tool_list(
                         "rows":    {"type": "array", "items": {"type": "array"}, "description": "Data rows, each an array of cell values in column order."}
                     }}
                 },
-                "explanation": {"type": "string", "description": "Brief explanation of what you are creating and why, to help organize your thoughts before writing content."}
+                "explanation": {"type": "string", "description": "One line: what you are creating and why."}
             },
             "required": ["path", "sheets"]
         }),
@@ -2055,7 +2078,7 @@ pub fn build_tool_list(
                         "body":  {"type": "string", "description": "Slide body text. Use newlines to separate bullet points."}
                     }}
                 },
-                "explanation": {"type": "string", "description": "Brief explanation of what you are creating and why, to help organize your thoughts before writing content."}
+                "explanation": {"type": "string", "description": "One line: what you are creating and why."}
             },
             "required": ["path", "slides"]
         }),
@@ -2285,6 +2308,25 @@ mod plugin_catalog_tests {
     use crate::{
         agent::registry::AgentRegistry, config::schema::A2aPeerConfig, skill::SkillRegistry,
     };
+
+    #[test]
+    fn cold_tools_all_exist_and_stub_lists_them() {
+        // Every COLD_TOOLS entry must name a real builtin — a renamed or
+        // removed tool silently un-deferring (or a stub advertising a tool
+        // that no longer exists) is exactly the drift this guards against.
+        let skills = SkillRegistry::new();
+        let all = build_tool_list(&skills, None, "main", &[]);
+        let names: std::collections::HashSet<&str> =
+            all.iter().map(|t| t.name.as_str()).collect();
+        for cold in COLD_TOOLS {
+            assert!(names.contains(cold), "COLD_TOOLS entry `{cold}` is not a builtin tool");
+        }
+        let stub = request_tool_def(COLD_TOOLS);
+        assert_eq!(stub.name, "request_tool");
+        for cold in COLD_TOOLS {
+            assert!(stub.description.contains(cold), "stub must list `{cold}`");
+        }
+    }
 
     #[test]
     fn skill_list_schema_supports_filter_and_pagination() {

@@ -179,7 +179,7 @@ impl AgentRuntime {
                 .await
                 .defaults
                 .context_tokens
-                .unwrap_or(64_000) as usize
+                .unwrap_or(128_000) as usize
         };
         // Used later to pick the splice strategy (mode 2 = rsclaw stateful).
         //
@@ -468,6 +468,18 @@ impl AgentRuntime {
         //             →  no KV cache assumption — always standalone
         //                `compact_single` (or chunked variant). Same as
         //                pre-incremental behavior.
+        // Keep the working plan visible to the summarizer even when the todo
+        // tool result has been sketched out of the transcript. The template's
+        // "## Plan" slot tells the model where to carry it. (The kv_cache_mode=2
+        // path injects inside compact_with_kv_cache — its transcript lives on
+        // the worker, not in old_text.)
+        let old_text = match self.load_todo_rendered(session_key) {
+            Some(plan) => {
+                format!("{old_text}\n\n[CURRENT PLAN — todo tool state at compaction]\n{plan}")
+            }
+            None => old_text,
+        };
+
         let summary = if kv_cache_mode == 2 {
             match self
                 .compact_with_kv_cache(
@@ -985,6 +997,16 @@ impl AgentRuntime {
             )
         };
 
+        // The working plan lives in kv, not in the transcript the worker has
+        // cached — surface it so the summary's "## Plan" slot gets filled.
+        let instruction = match self.load_todo_rendered(session_key) {
+            Some(plan) => format!(
+                "{instruction}\n\nCURRENT PLAN (todo tool state — carry into \"## Plan\", \
+                 updating statuses the conversation shows changed):\n{plan}"
+            ),
+            None => instruction,
+        };
+
         // Append summary instruction as the last user message
         messages.push(Message {
             role: Role::User,
@@ -1092,6 +1114,9 @@ impl AgentRuntime {
          ## Completed\n[Numbered list: N. ACTION target - outcome]\n\n\
          ## Active State\n[Modified files, test status, running processes, branch]\n\n\
          ## In Progress\n[Work underway when compaction fired]\n\n\
+         ## Plan\n[The current working-plan checklist if one was provided — copy the \
+         [x]/[>]/[ ] lines verbatim, updating statuses the conversation shows changed. \
+         If none: (none)]\n\n\
          ## Key Data\n[Exact values verbatim: file paths, URLs, IDs, phone numbers]\n\n\
          ## Decisions\n[Technical decisions and WHY]\n\n\
          ## Pending\n[Blocked items or awaiting user]\n\n\

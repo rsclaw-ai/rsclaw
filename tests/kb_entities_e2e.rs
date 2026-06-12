@@ -57,6 +57,7 @@ async fn entities_extracted_and_queryable() -> Result<()> {
         index,
         paths,
         embedder,
+        reranker: None
     };
     let url_hits = kb_search_entities::run(
         &ctx,
@@ -175,6 +176,7 @@ async fn require_entities_filters_to_chunks_with_mention() -> Result<()> {
         index,
         paths,
         embedder,
+        reranker: None
     };
     let alice_id = canonical_id(EntityKind::Person, "alice");
 

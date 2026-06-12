@@ -115,6 +115,13 @@ const TOOLS: &[ToolDef] = &[
         local_bin: "aider",
         optional: true,
     },
+    ToolDef {
+        name: "qoder",
+        display: "Qoder CLI (AI coding agent, optional)",
+        detect_cmd: &["qodercli", "qoder"],
+        local_bin: "qoder",
+        optional: true,
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -350,6 +357,19 @@ fn sync_tool_shims_unix() {
                     );
                 }
             }
+            // qoder (@qoder-ai/qodercli) uses the same native-subpackage
+            // layout as claude-code.
+            if def.name == "qoder" {
+                let subpkg = native_claude_subpkg();
+                if !subpkg.is_empty() {
+                    candidates.push(
+                        sub.join("node_modules")
+                            .join("@qoder-ai")
+                            .join(format!("qodercli-{subpkg}"))
+                            .join(name),
+                    );
+                }
+            }
             candidates.push(sub.join(name));
             candidates.push(sub.join("bin").join(name));
             let Some(target) = candidates.into_iter().find(|p| is_executable_file(p)) else {
@@ -380,7 +400,7 @@ fn sync_tool_shims_unix() {
 /// Command names cap-rs spawns for the coding agents. `claude` is the
 /// Claudecode driver's default bin; the rest match their drivers.
 #[cfg(unix)]
-const CODING_AGENT_NAMES: &[&str] = &["opencode", "claude", "openclaude", "codex", "aider"];
+const CODING_AGENT_NAMES: &[&str] = &["opencode", "claude", "openclaude", "codex", "aider", "qodercli", "qoder"];
 
 /// Subpackage tag for `@anthropic-ai/claude-code-<tag>` matching this host.
 /// Empty string on unsupported platforms (probe falls back to generic paths).
@@ -677,6 +697,7 @@ fn resolve_tool_name(name: &str) -> &str {
         "nodejs" | "node.js" => "node",
         "open-code" | "opencode-cli" => "opencode",
         "claude" | "claude-agent" | "claudecode" => "claude-code",
+        "qodercli" | "qoder-cli" => "qoder",
         _ => name,
     }
 }
@@ -778,6 +799,8 @@ pub async fn cmd_install(name: &str, force: bool) -> Result<()> {
         // npm-based tools: install via npm --prefix instead of downloading binary.
         let npm_package = match *tool_name {
             "claude-code" => Some("@anthropic-ai/claude-code"),
+            "qoder" => Some("@qoder-ai/qodercli"),
+            "codex" => Some("@openai/codex"),
             _ => None,
         };
         if let Some(pkg) = npm_package {

@@ -2266,9 +2266,9 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
     );
 
     msg!("agent_max_iterations",
-        "en" => "Task too complex or stuck in a loop. Please try a simpler request or send /clear to start over.",
-        "zh" => "任务过于复杂或陷入循环，请尝试简化请求，或发送 /clear 重新开始。",
-        "ja" => "タスクが複雑すぎるかループしています。リクエストを簡略化するか、/clear で最初からやり直してください。",
+        "en" => "No new progress after {iterations} steps (last: {tool}). You can continue the conversation and I'll try a different approach.",
+        "zh" => "已执行 {iterations} 步但连续没有新进展（最后操作：{tool}）。你可以继续对话，我会尝试换种方式处理。",
+        "ja" => "{iterations}ステップ実行したが進捗なし（最後: {tool}）。会話を続けると別の方法を試します。",
     );
 
     msg!("agent_loop_detected",
@@ -2283,6 +2283,12 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
         "ru" => "Обнаружено повторение одинаковой операции без прогресса. Пробую другой подход.",
         "th" => "ตรวจพบการทำงานซ้ำโดยไม่มีความคืบหน้า กำลังลองวิธีอื่น",
         "vi" => "Phat hien thao tac lap lai khong tien trien. Thu cach tiep can khac.",
+    );
+
+    msg!("agent_tool_errors",
+        "en" => "Tools failed consecutively. Last error: {error}",
+        "zh" => "工具连续执行失败。最后错误：{error}",
+        "ja" => "ツールが連続して失敗しました。最後のエラー: {error}",
     );
 
     msg!("cron_run_success",
@@ -2380,8 +2386,8 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
     // cap_live sticky direct mode (Phase 2a, 2026-05-31)
     // -----------------------------------------------------------------
     msg!("cap_help",
-        "en" => "/cap <agent> [path] — bind this chat to a coding agent (claudecode | openclaude | opencode | codex), optionally rooting the session at <path> (must be under $HOME; default: rsclaw workspace)\n/cap-exit             — release the binding",
-        "zh" => "/cap <代理> [路径] — 把当前会话直连到一个编程代理（claudecode | openclaude | opencode | codex），可选指定工作目录 [路径]（必须在 $HOME 之下，默认使用 rsclaw 工作区）\n/cap-exit             — 释放绑定，恢复主 LLM",
+        "en" => "/cap <agent> [path] — bind this chat to a coding agent (claudecode | openclaude | opencode | codex | qoder), optionally rooting the session at <path> (must be under $HOME; default: rsclaw workspace)\n/cap-exit             — release the binding",
+        "zh" => "/cap <代理> [路径] — 把当前会话直连到一个编程代理（claudecode | openclaude | opencode | codex | qoder），可选指定工作目录 [路径]（必须在 $HOME 之下，默认使用 rsclaw 工作区）\n/cap-exit             — 释放绑定，恢复主 LLM",
     );
 
     msg!("cap_bound",
@@ -2390,8 +2396,8 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
     );
 
     msg!("cap_unknown_agent",
-        "en" => "/cap: unknown agent `{agent}` (try: claudecode, openclaude, opencode, codex)",
-        "zh" => "/cap：未知代理 `{agent}`（可选：claudecode、openclaude、opencode、codex）",
+        "en" => "/cap: unknown agent `{agent}` (try: claudecode, openclaude, opencode, codex, qoder)",
+        "zh" => "/cap：未知代理 `{agent}`（可选：claudecode、openclaude、opencode、codex、qoder）",
     );
 
     msg!("cap_not_initialised",
@@ -2402,6 +2408,21 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
     msg!("cap_open_failed",
         "en" => "/cap: failed to open session: {err}",
         "zh" => "/cap：打开会话失败：{err}",
+    );
+
+    msg!("cap_install_hint_npm",
+        "en" => "{agent} not found. Run `rsclaw tools install {cmd}` to install it.",
+        "zh" => "未找到 {agent}，请运行 `rsclaw tools install {cmd}` 安装。",
+    );
+
+    msg!("cap_install_hint_go",
+        "en" => "{agent} not found. Install it from https://github.com/opencode-ai/opencode then retry /cap {cmd}.",
+        "zh" => "未找到 {agent}，请从 https://github.com/opencode-ai/opencode 安装后重试 /cap {cmd}。",
+    );
+
+    msg!("cap_fallback_protocol",
+        "en" => "{agent} connected via {protocol} (stream-json not available)",
+        "zh" => "{agent} 通过 {protocol} 连接（stream-json 不可用）",
     );
 
     msg!("cap_bad_workspace",

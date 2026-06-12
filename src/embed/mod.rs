@@ -514,6 +514,30 @@ pub fn format_query(instruction: Option<&str>, query: &str) -> String {
     }
 }
 
+/// Default query-side instruction for instruction-aware embedding models.
+/// Wording follows the Qwen3-Embedding model card's retrieval default.
+pub const QWEN3_DEFAULT_QUERY_INSTRUCTION: &str =
+    "Given a web search query, retrieve relevant passages that answer the query";
+
+/// Resolve the effective query instruction for an embed config: an explicit
+/// `queryInstruction` always wins; otherwise instruction-aware models
+/// (Qwen3-Embedding) get [`QWEN3_DEFAULT_QUERY_INSTRUCTION`] automatically.
+/// Symmetric embedders (BGE, OpenAI text-embedding-*) stay unprefixed —
+/// a query instruction they weren't trained for would hurt recall.
+///
+/// Doc-side embeddings are NEVER prefixed, so existing indexes stay valid;
+/// flipping this on is purely a query-time change.
+pub fn resolve_query_instruction(
+    explicit: Option<String>,
+    model: Option<&str>,
+) -> Option<String> {
+    explicit.or_else(|| {
+        model
+            .filter(|m| m.to_lowercase().contains("qwen3"))
+            .map(|_| QWEN3_DEFAULT_QUERY_INSTRUCTION.to_owned())
+    })
+}
+
 #[cfg(test)]
 mod query_instruction_tests {
     use super::*;
@@ -539,5 +563,30 @@ mod query_instruction_tests {
         // A configured-but-empty instruction must not produce a malformed
         // "Instruct: \nQuery: ..." prefix that pollutes the embedding.
         assert_eq!(format_query(Some(""), "梯度下降"), "梯度下降");
+    }
+
+    #[test]
+    fn resolve_defaults_qwen3_and_leaves_symmetric_models_alone() {
+        // Explicit instruction always wins.
+        assert_eq!(
+            resolve_query_instruction(Some("自定义指令".into()), Some("Qwen3-Embedding-0.6B")),
+            Some("自定义指令".to_owned())
+        );
+        // Qwen3-Embedding without an explicit instruction gets the default
+        // (model-name match is case-insensitive — fleet configs vary).
+        assert_eq!(
+            resolve_query_instruction(None, Some("Qwen3-Embedding-0.6B")),
+            Some(QWEN3_DEFAULT_QUERY_INSTRUCTION.to_owned())
+        );
+        assert_eq!(
+            resolve_query_instruction(None, Some("qwen3-embedding")),
+            Some(QWEN3_DEFAULT_QUERY_INSTRUCTION.to_owned())
+        );
+        // Symmetric embedders stay unprefixed.
+        assert_eq!(
+            resolve_query_instruction(None, Some("text-embedding-3-small")),
+            None
+        );
+        assert_eq!(resolve_query_instruction(None, None), None);
     }
 }

@@ -67,6 +67,9 @@ pub struct WorkspaceContext {
     pub memory_long: Option<String>,
     /// `memory/YYYY-MM-DD.md` — today's daily memory log.
     pub memory_today: Option<String>,
+    /// memory/lessons.md — top user-correction lessons, auto-maintained by
+    /// the meditation cycle. Always re-read (meditation rewrites it).
+    pub lessons: Option<String>,
     /// `memory/YYYY-MM-DD.md` — yesterday's daily memory log.
     pub memory_yesterday: Option<String>,
     /// Workspace root directory.
@@ -179,6 +182,12 @@ impl WorkspaceContext {
             &mut total_chars,
             total_max_chars,
         );
+        ctx.lessons = read_optional_file(
+            &workspace.join("memory").join("lessons.md"),
+            max_chars_per_file,
+            &mut total_chars,
+            total_max_chars,
+        );
 
         debug!(
             workspace = %workspace.display(),
@@ -225,6 +234,7 @@ impl WorkspaceContext {
         append!(self.memory_long, "MEMORY.md");
         append!(self.memory_today, "Memory (today)");
         append!(self.memory_yesterday, "Memory (yesterday)");
+        append!(self.lessons, "Learned Rules");
 
         parts.join("\n\n---\n\n")
     }
@@ -388,6 +398,12 @@ impl WorkspaceCache {
                 .workspace
                 .join("memory")
                 .join(format!("{yesterday}.md")),
+            max_chars_per_file,
+            &mut total_chars,
+            total_max_chars,
+        );
+        ctx.lessons = read_optional_file(
+            &self.workspace.join("memory").join("lessons.md"),
             max_chars_per_file,
             &mut total_chars,
             total_max_chars,

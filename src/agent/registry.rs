@@ -86,6 +86,12 @@ pub struct AgentHandle {
     pub plugin_overrides: Arc<
         std::sync::RwLock<HashMap<String, HashMap<String, crate::agent::runtime::PluginOverride>>>,
     >,
+    /// Per-session re-enabled cold tools: `session_key → {tool_name}`.
+    /// Cold builtin tools (near-zero observed usage) are deferred behind the
+    /// `request_tool` stub on non-rsclaw providers; calling the stub records
+    /// the name here and the runtime splices the real ToolDef back into the
+    /// live tool list (same turn) and every later turn of the session.
+    pub cold_enabled: Arc<std::sync::RwLock<HashMap<String, std::collections::HashSet<String>>>>,
     /// When this agent handle was created (for /status uptime).
     pub started_at: Instant,
     /// Number of active sessions (updated after each turn for /status).
@@ -179,11 +185,11 @@ impl AgentHandle {
         // Resolution chain (already done at AgentHandle construction):
         //   1. agent.model.contextTokens
         //   2. agents.defaults.contextTokens
-        //   3. fallback 64000 below when both are unset (handle.context_window == 0).
+        //   3. fallback 128000 below when both are unset (handle.context_window == 0).
         let ctx_limit = if self.context_window > 0 {
             self.context_window
         } else {
-            64000
+            128000
         };
 
         let mut ctx_lines = String::new();
@@ -775,6 +781,7 @@ impl AgentRegistry {
                     abort_flags: Arc::new(std::sync::RwLock::new(HashMap::new())),
                     cancel_tokens: Arc::new(std::sync::RwLock::new(HashMap::new())),
                     plugin_overrides: Arc::new(std::sync::RwLock::new(HashMap::new())),
+                    cold_enabled: Arc::new(std::sync::RwLock::new(HashMap::new())),
                     started_at: Instant::now(),
                     session_count: Arc::new(AtomicUsize::new(0)),
                     session_tokens: Arc::new(std::sync::RwLock::new(HashMap::new())),

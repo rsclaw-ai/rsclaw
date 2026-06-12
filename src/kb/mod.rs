@@ -40,6 +40,7 @@ pub mod model;
 pub mod paths;
 pub mod pipeline;
 pub mod search;
+pub mod rerank;
 pub mod service;
 pub mod store;
 pub mod sync;

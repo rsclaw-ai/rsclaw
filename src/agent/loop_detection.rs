@@ -490,6 +490,13 @@ impl LoopDetector {
         self.error_streak.clear();
         self.any_failure_streak.clear();
     }
+
+    /// Return the result_hash of the most recent tool call, if available.
+    /// Used by the stagnation budget system to detect whether consecutive
+    /// tool calls are producing the same or different output.
+    pub fn last_result_hash(&self) -> Option<&str> {
+        self.history.back().and_then(|r| r.result_hash.as_deref())
+    }
 }
 
 impl Default for LoopDetector {

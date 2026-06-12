@@ -361,6 +361,7 @@ pub(crate) fn compress_image_for_llm(data_uri: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// An entity detected in text that should be pinned to memory.
+#[derive(Debug)]
 pub struct KeyEntity {
     /// Human-readable type label, e.g. "phone_number".
     pub kind: &'static str,
@@ -594,14 +595,49 @@ pub(crate) fn extract_key_entities(text: &str) -> Vec<KeyEntity> {
                     .map(|(i, _)| i)
                     .unwrap_or(0);
                 let candidate = addr_parts[min_idx];
-                // Name heuristic: 2-4 CJK chars, no address markers
+                // Name heuristic: 2-4 CJK chars, no address markers, and not
+                // a conversational filler — "记住：我住在..." otherwise gets
+                // "记住" captured as the recipient name (seen live).
+                const NOT_NAMES: &[&str] = &[
+                    "记住", "记一下", "记下", "保存", "请", "帮我", "我的",
+                    "这是", "新的", "现在", "改成", "更新", "对了", "另外",
+                ];
                 let char_count = candidate.chars().count();
                 let has_marker = ADDR_MARKERS.iter().any(|m| candidate.contains(m));
-                if char_count >= 2 && char_count <= 4 && !has_marker {
+                let is_filler = NOT_NAMES.contains(&candidate);
+                if char_count >= 2 && char_count <= 4 && !has_marker && !is_filler {
                     addr_name = candidate.to_owned();
                     addr_parts.remove(min_idx);
                 }
             }
+
+            // Strip leading narration glued to the address ("我住在上海市..."
+            // → "上海市..."): conversational verbs are not part of the value.
+            const ADDR_NARRATION: &[&str] = &[
+                "我住在", "我家在", "我搬到了", "我搬到", "我现在住在",
+                "现在住在", "我在", "家住", "住在", "搬到了", "搬到",
+                "记住", "记一下",
+                // Workplace variants — "我的工位在B栋7楼706室" kept the
+                // whole phrase as the entity value (seen live 2026-06-12).
+                // Compounds listed explicitly: the stripper is prefix-based,
+                // so "工位在" alone never matches "我的工位在".
+                "我的工位在", "工位在", "我的办公室在", "办公室在",
+                "我的公司在", "公司在", "我的家在",
+            ];
+            let addr_parts: Vec<String> = addr_parts
+                .into_iter()
+                .filter_map(|p| {
+                    let mut p = p.to_owned();
+                    loop {
+                        match ADDR_NARRATION.iter().find(|n| p.starts_with(*n)) {
+                            Some(n) => p = p[n.len()..].to_owned(),
+                            None => break,
+                        }
+                    }
+                    if p.is_empty() { None } else { Some(p) }
+                })
+                .collect();
+            let addr_parts: Vec<&str> = addr_parts.iter().map(String::as_str).collect();
 
             let addr_text = addr_parts.join("");
             if addr_text.is_empty() {
@@ -658,6 +694,29 @@ pub(crate) async fn write_entity_memories(
     }
     let mut written = Vec::new();
     for entity in entities {
+        // Supersede stale values of the same attribute FIRST (before the
+        // exact-dup early-out, so re-stating the current value still demotes
+        // older conflicting ones). Entity texts follow the fixed
+        // "标签: 值" format, so the label prefix identifies the attribute:
+        // "用户地址: 上海" must stop outranking "用户地址: 杭州" the moment
+        // the user moves. Old values are demoted, not deleted.
+        if let Some((label, _)) = entity.memory_text.split_once(':') {
+            let prefix = format!("{}:", label.trim());
+            let mut guard = mem.lock().await;
+            match guard.supersede_label_entities(scope, &prefix, &entity.memory_text) {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(
+                    kind = entity.kind,
+                    value = entity.value,
+                    superseded = n,
+                    "stale entity values demoted"
+                ),
+                Err(e) => {
+                    tracing::warn!(kind = entity.kind, "entity supersede failed: {e:#}");
+                }
+            }
+        }
+
         // Dedup: skip if memory already contains this exact entity value.
         let already_exact = {
             let guard = mem.lock().await;
@@ -1083,5 +1142,51 @@ pub(crate) fn describe_file(filename: &str, mime_type: &str) -> String {
         format!("[文件: {filename}] (文档，可用 doc 工具读取)")
     } else {
         format!("[文件: {filename}] ({mime_type})")
+    }
+}
+
+#[cfg(test)]
+mod entity_extraction_tests {
+    use super::*;
+
+    #[test]
+    fn address_strips_conversational_narration() {
+        // Live bug: "记住：我住在..." captured "记住" as the recipient name
+        // and kept "我住在" glued to the address value.
+        let es = extract_key_entities("记住：我住在上海市浦东新区张江路100号");
+        let addr: Vec<&KeyEntity> = es.iter().filter(|e| e.kind == "address").collect();
+        assert_eq!(addr.len(), 1, "{es:?}");
+        assert!(
+            addr[0].value.starts_with("上海市"),
+            "narration leaked into value: {:?}",
+            addr[0].value
+        );
+        assert!(!addr[0].value.contains("记住"));
+        assert!(!addr[0].value.contains("我住在"));
+    }
+
+    #[test]
+    fn address_strips_workplace_narration() {
+        // Live 2026-06-12: "我的工位在B栋7楼706室" landed verbatim as the
+        // entity value, lead-in and all.
+        let es = extract_key_entities("记住：我的工位在B栋7楼706室");
+        let addr: Vec<&KeyEntity> = es.iter().filter(|e| e.kind == "address").collect();
+        assert_eq!(addr.len(), 1, "{es:?}");
+        assert!(
+            addr[0].value.starts_with("B栋"),
+            "narration leaked into value: {:?}",
+            addr[0].value
+        );
+        assert!(!addr[0].value.contains("工位在"));
+    }
+
+    #[test]
+    fn address_keeps_real_recipient_name() {
+        // A genuine shipping line must still pick up the name.
+        let es = extract_key_entities("收货人：张三，13900001234，杭州市西湖区文三路50号");
+        let addr: Vec<&KeyEntity> = es.iter().filter(|e| e.kind == "address").collect();
+        assert_eq!(addr.len(), 1, "{es:?}");
+        assert!(addr[0].value.contains("张三"), "{:?}", addr[0].value);
+        assert!(addr[0].value.contains("杭州市西湖区文三路50号"));
     }
 }

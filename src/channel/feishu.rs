@@ -684,7 +684,9 @@ impl FeishuChannel {
                     break;
                 }
                 Err(_) => {
-                    warn!(
+                    // Routine: feishu drops idle connections; the outer loop
+                    // reconnects immediately. Not a warning-worthy event.
+                    info!(
                         "feishu: WS idle timeout ({}s), reconnecting",
                         WS_IDLE_TIMEOUT.as_secs()
                     );
@@ -1068,7 +1070,7 @@ impl FeishuChannel {
                     }
                     Err(e) => {
                         warn!(error = format!("{e:#}"), "feishu: video download failed");
-                        "__DIRECT_REPLY__视频下载失败（可能下载超时或连接中断）。请重试或改用更小的文件。".to_owned()
+                        "__DIRECT_REPLY__Video download failed (timeout or connection issue). Please retry or use a smaller file.".to_owned()
                     }
                 }
             }
@@ -1174,7 +1176,7 @@ impl FeishuChannel {
                             // real reqwest cause (timeout vs reset vs decode) is
                             // invisible and the agent just hallucinates "no file".
                             warn!(name = file_name, error = format!("{e:#}"), "feishu: file download failed");
-                            "__DIRECT_REPLY__文件下载失败（可能下载超时或连接中断）。请重试，或改用更小的文件 / 公网链接。".to_owned()
+                            "__DIRECT_REPLY__File download failed (timeout or connection issue). Please retry, use a smaller file, or provide a public URL.".to_owned()
                         }
                     }
                 }
@@ -1809,10 +1811,36 @@ impl Channel for FeishuChannel {
         Box::pin(async move {
             info!("feishu: starting WebSocket mode");
             let delay = self.ws_reconnect_delay_secs;
+            // Reconnects are routine (feishu drops idle WS regularly); a
+            // single failure is debug-level weather. Consecutive failures
+            // are the outage signal — same escalation contract as the
+            // wechat long-poll loop (warn at 5, then every 10th).
+            let mut consecutive_errs: u32 = 0;
             loop {
                 match self.ws_connect_loop().await {
-                    Ok(_) => info!("feishu: WS connection ended, reconnecting..."),
-                    Err(e) => warn!("feishu: WS error: {e:#}, reconnecting in {delay}s"),
+                    Ok(_) => {
+                        if consecutive_errs >= 5 {
+                            info!(after_failures = consecutive_errs, "feishu: WS recovered");
+                        }
+                        consecutive_errs = 0;
+                        info!("feishu: WS connection ended, reconnecting...");
+                    }
+                    Err(e) => {
+                        consecutive_errs = consecutive_errs.saturating_add(1);
+                        if consecutive_errs == 5
+                            || (consecutive_errs > 5 && consecutive_errs % 10 == 0)
+                        {
+                            warn!(
+                                consecutive = consecutive_errs,
+                                "feishu: WS failing repeatedly: {e:#}, reconnecting in {delay}s"
+                            );
+                        } else {
+                            debug!(
+                                consecutive = consecutive_errs,
+                                "feishu: WS error: {e:#}, reconnecting in {delay}s"
+                            );
+                        }
+                    }
                 }
                 sleep(Duration::from_secs(delay)).await;
             }

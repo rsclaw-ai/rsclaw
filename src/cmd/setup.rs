@@ -170,7 +170,7 @@ fn default_config(lang: &str) -> String {
   agents: {{
     defaults: {{
       model: {{ primary: "rsclaw/rsclaw-agent-v1" }},
-      contextTokens: 64000,          // max context window tokens
+      contextTokens: 128000,         // max context window tokens
       stripThinkTags: false,         // strip <think> tags (auto when thinking disabled)
       frequencyPenalty: 0.3,         // reduce repetition (0.0-2.0)
       thinking: {{ budget: 0 }},       // set > 0 to enable model reasoning

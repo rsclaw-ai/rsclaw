@@ -180,6 +180,10 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                         Some(secs) => provider.with_compact_timeout_secs(secs),
                         None => provider,
                     };
+                    let provider = match provider_cfg.constrain_tool_calls {
+                        Some(enabled) => provider.with_constrain_tool_calls(enabled),
+                        None => provider,
+                    };
                     Arc::new(provider)
                 }
                 _ => {

@@ -178,6 +178,9 @@ pub struct MeditationDeps {
     /// Runtime config — used to resolve per-agent flash model with fallback
     /// to global defaults.
     pub config: Arc<crate::config::runtime::RuntimeConfig>,
+    /// redb handle for skill usage stats — drives the disuse-retirement
+    /// pass over auto-crystallized skills.
+    pub db: Arc<crate::store::redb_store::RedbStore>,
 }
 
 /// Heartbeat runner — scans agent workspaces and spawns per-agent heartbeat
@@ -475,6 +478,36 @@ impl HeartbeatRunner {
                     warn!(agent_id, "crystallize phase failed: {e:#}");
                 }
             }
+
+            // Retirement pass: auto-crystallized skills with no activation
+            // inside the disuse window move to skills/.retired/ — closes
+            // the generate→use→retire loop so bad or obsolete auto-skills
+            // stop occupying the prompt's skill list forever.
+            match crate::skill::retire_unused_auto_skills(&deps.db, &skills_dir) {
+                Ok(retired) if !retired.is_empty() => {
+                    info!(agent_id, ?retired, "retired unused auto-skills");
+                }
+                Ok(_) => {}
+                Err(e) => warn!(agent_id, "skill retirement failed: {e:#}"),
+            }
+        }
+
+        // Lessons phase: publish standing behavioural rules (kind=lesson,
+        // importance >= 0.6) into the workspace's memory/lessons.md so the
+        // system prompt's "Learned Rules" section carries them every turn —
+        // corrections must not depend on vector-recall luck.
+        match self.registry.get(agent_id) {
+            Ok(handle) => {
+                if let Some(ws) = handle.config.workspace.as_deref() {
+                    let ws = crate::config::loader::expand_tilde_path_pub(ws);
+                    let store = mem.lock().await;
+                    match meditation::lessons_phase(&store, &scope, &ws, 8) {
+                        Ok(n) => report.lessons_published = n,
+                        Err(e) => warn!(agent_id, "lessons phase failed: {e:#}"),
+                    }
+                }
+            }
+            Err(e) => warn!(agent_id, "lessons phase: agent handle missing: {e:#}"),
         }
 
         info!(
@@ -482,6 +515,7 @@ impl HeartbeatRunner {
             merged = report.duplicates_merged,
             cleaned = report.crystallized_cleaned,
             crystallized = report.skills_crystallized,
+            lessons = report.lessons_published,
             processed = report.total_processed,
             "meditation cycle complete"
         );

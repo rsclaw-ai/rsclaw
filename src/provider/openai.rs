@@ -40,6 +40,26 @@ const TOOL_NAME_PREFIX: &str = "rc_";
 /// different local tool than the one advertised. The `rc_` prefix marks
 /// names that used this encoding; unprefixed legacy/raw names pass through.
 pub(crate) fn sanitize_tool_name(name: &str) -> String {
+    // Pass through names that are already valid for the OpenAI/Anthropic tool
+    // name regex (^[a-zA-Z0-9_-]{1,64}$) UNCHANGED. Built-in tools (`shell`,
+    // `web_fetch`, `video_gen`, …) are all already valid, so they must reach the
+    // model with their real names — otherwise the wire list (`rc_web_u_fetch`)
+    // mismatches the system prompt (which refers to `web_fetch`), and weaker
+    // models (Kimi) mis-select or describe tools wrongly. Only names with
+    // out-of-charset chars (plugin tools like `wechat.send_text`) get encoded.
+    //
+    // Names that already start with the `rc_` escape prefix are ALSO encoded
+    // even when otherwise valid, so `restore_tool_name` can tell an
+    // intentionally-prefixed wire name from a real `rc_*` tool and round-trip
+    // it without collision.
+    let needs_encoding = name.starts_with(TOOL_NAME_PREFIX)
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !needs_encoding {
+        return name.to_owned();
+    }
+
     let mut out = String::with_capacity(name.len() + TOOL_NAME_PREFIX.len() + 2);
     out.push_str(TOOL_NAME_PREFIX);
     for c in name.chars() {
@@ -109,7 +129,14 @@ pub(crate) fn restore_tool_name(name: &str) -> String {
 #[cfg(test)]
 #[test]
 fn tool_name_roundtrip() {
-    assert_eq!(sanitize_tool_name("read_file"), "rc_read_u_file");
+    // Already-valid names pass through unchanged so the wire name matches the
+    // real name the system prompt uses.
+    assert_eq!(sanitize_tool_name("read_file"), "read_file");
+    assert_eq!(sanitize_tool_name("shell"), "shell");
+    assert_eq!(sanitize_tool_name("video_gen"), "video_gen");
+    assert_eq!(sanitize_tool_name("douyin__publish"), "douyin__publish");
+    assert_eq!(restore_tool_name("read_file"), "read_file");
+    // Dotted plugin names still get encoded (dot is out of charset).
     assert_eq!(
         sanitize_tool_name("wechat.send_text"),
         "rc_wechat_d_send_u_text"
@@ -118,9 +145,11 @@ fn tool_name_roundtrip() {
         restore_tool_name("rc_wechat_d_send_u_text"),
         "wechat.send_text"
     );
-    assert_eq!(restore_tool_name("read_file"), "read_file");
     // forbidden char fallback
     assert_eq!(sanitize_tool_name("ns:tool"), "rc_ns_x3A_tool");
+    // A real tool literally named with the rc_ prefix must round-trip without
+    // colliding with the escape scheme.
+    assert_eq!(restore_tool_name(&sanitize_tool_name("rc_weird")), "rc_weird");
 }
 
 #[cfg(test)]
@@ -1563,12 +1592,20 @@ fn parse_event(data: &str) -> Vec<StreamEvent> {
 // ---------------------------------------------------------------------------
 
 fn build_responses_body(req: &LlmRequest, file_id_map: &HashMap<String, String>) -> Result<Value> {
-    let input: Vec<Value> = req
+    let mut input: Vec<Value> = req
         .messages
         .iter()
         .filter(|m| m.role != Role::System)
         .flat_map(|m| serialize_input_items(m, file_id_map))
         .collect();
+    // Pair every `function_call` with its `function_call_output` (by call_id),
+    // reorder so the output immediately follows the call, and drop orphans in
+    // both directions. The Responses API is strict about this pairing; parallel
+    // tool execution and compaction can scatter or orphan the items in session
+    // history, which makes the model go off-topic or the API reject the request.
+    // The /chat/completions path does the equivalent via fix_tool_call_pairing +
+    // reorder_tool_messages; the Responses path needs the item-format version.
+    normalize_responses_items(&mut input);
 
     let mut body = json!({
         "model":  req.model,
@@ -1619,6 +1656,74 @@ fn build_responses_body(req: &LlmRequest, file_id_map: &HashMap<String, String>)
     }
 
     Ok(body)
+}
+
+/// Pair/reorder Responses-API `input` items so every `function_call` is
+/// immediately followed by its matching `function_call_output` (by `call_id`),
+/// dropping orphans in both directions:
+///   - a `function_call_output` with no matching `function_call` is dropped,
+///   - a `function_call` with no matching output is dropped (the API would
+///     otherwise reject the turn waiting for a result).
+///
+/// Mirrors the chat path's `fix_tool_call_pairing` + `reorder_tool_messages`,
+/// but for the Responses item format where calls and outputs are separate
+/// top-level items rather than `tool_calls`/`role:"tool"` messages.
+fn normalize_responses_items(items: &mut Vec<Value>) {
+    use std::collections::{HashMap, HashSet};
+
+    let item_type = |v: &Value| v.get("type").and_then(|t| t.as_str()).map(str::to_owned);
+    let call_id = |v: &Value| v.get("call_id").and_then(|c| c.as_str()).map(str::to_owned);
+
+    let mut have_call: HashSet<String> = HashSet::new();
+    let mut have_output: HashSet<String> = HashSet::new();
+    for it in items.iter() {
+        match item_type(it).as_deref() {
+            Some("function_call") => {
+                if let Some(id) = call_id(it) {
+                    have_call.insert(id);
+                }
+            }
+            Some("function_call_output") => {
+                if let Some(id) = call_id(it) {
+                    have_output.insert(id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Bucket outputs by call_id; keep everything else (incl. function_call) in
+    // original order. Drop orphaned outputs and unanswered calls here.
+    let mut outputs: HashMap<String, Vec<Value>> = HashMap::new();
+    let mut rest: Vec<Value> = Vec::new();
+    for it in items.drain(..) {
+        match item_type(&it).as_deref() {
+            Some("function_call_output") => match call_id(&it) {
+                Some(id) if have_call.contains(&id) => {
+                    outputs.entry(id).or_default().push(it);
+                }
+                _ => {} // orphaned output → drop
+            },
+            Some("function_call") => match call_id(&it) {
+                Some(id) if have_output.contains(&id) => rest.push(it),
+                _ => {} // unanswered call → drop
+            },
+            _ => rest.push(it),
+        }
+    }
+
+    // Rebuild: each function_call immediately followed by its output(s).
+    for it in rest {
+        if item_type(&it).as_deref() == Some("function_call") {
+            let id = call_id(&it);
+            items.push(it);
+            if let Some(outs) = id.and_then(|id| outputs.remove(&id)) {
+                items.extend(outs);
+            }
+        } else {
+            items.push(it);
+        }
+    }
 }
 
 /// Serialize a Message into one or more Responses API input items.
@@ -2022,6 +2127,36 @@ mod tests {
         let req = make_request();
         let body = build_request_body(&req).unwrap();
         assert_eq!(body["model"].as_str().unwrap(), "gpt-4o");
+    }
+
+    #[test]
+    fn responses_items_pair_reorder_and_drop_orphans() {
+        // Scattered/orphaned items, as compaction or parallel exec can leave them:
+        //   call(A), orphan-output(Z), output(A), call(B-unanswered), user msg
+        let mut items = vec![
+            serde_json::json!({"type":"function_call","call_id":"A","name":"shell"}),
+            serde_json::json!({"type":"function_call_output","call_id":"Z","output":"orphan"}),
+            serde_json::json!({"type":"function_call_output","call_id":"A","output":"ok"}),
+            serde_json::json!({"type":"function_call","call_id":"B","name":"shell"}),
+            serde_json::json!({"role":"user","content":[{"type":"input_text","text":"hi"}]}),
+        ];
+        normalize_responses_items(&mut items);
+
+        // A's call is immediately followed by A's output; Z and B are dropped;
+        // the user message survives.
+        let types: Vec<String> = items
+            .iter()
+            .map(|i| {
+                i.get("type")
+                    .and_then(|t| t.as_str())
+                    .or_else(|| i.get("role").and_then(|r| r.as_str()))
+                    .unwrap_or("")
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(types, vec!["function_call", "function_call_output", "user"]);
+        assert_eq!(items[0]["call_id"].as_str(), Some("A"));
+        assert_eq!(items[1]["call_id"].as_str(), Some("A"));
     }
 
     #[test]

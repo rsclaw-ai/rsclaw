@@ -22,7 +22,7 @@ static SHARED_SYSTEM_PREFIX: LazyLock<String> = LazyLock::new(build_shared_syste
 /// allowedCommands).
 pub(crate) const READONLY_COMMANDS: &[&str] = &[
     "/help", "/version", "/status", "/health", "/uptime", "/models", "/btw", "/clear", "/compact",
-    "/history", "/cron", "/abort", "/loop", "/task", "/plugin",
+    "/history", "/cron", "/abort", "/loop", "/task", "/plugin", "/astock", "/goal",
 ];
 
 /// Format a Duration as human-readable string.
@@ -569,6 +569,12 @@ fn build_shared_system_prefix_uncached() -> String {
          - Have enough info to answer? STOP and reply immediately.\n\
          - Do NOT repeat a tool call that already returned useful results.\n\
          - One successful search/fetch is usually enough. Two is the maximum.\n\
+         ### Plan Tracking (todo)\n\
+         For any task needing 3+ steps or multiple tool calls: call `todo` FIRST with the \
+         full step list, keep exactly ONE item in_progress, mark it done IMMEDIATELY after \
+         the step lands. Every call sends the COMPLETE list (full replace). The plan \
+         survives context compaction — it is your recovery anchor in long sessions. \
+         Skip it for single-step requests and chat.\n\
          ### Agent & Task Delegation\n\
          Delegate work to sub-agents for parallelism, never block.\n\
          - `agent` action=task for background sub-tasks. Specify `toolset` matching the task.\n\
@@ -1022,6 +1028,7 @@ fn build_coding_mode_block() -> String {
 /// `RSCLAW_DUMP_PROMPT` debug payload.
 pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "memory",
+    "todo",
     "skill_use",
     "task",
     "task_finish",
@@ -1184,7 +1191,7 @@ mod tests {
     fn user_system_includes_cap_block_when_available() {
         let prompt = empty_user_system(true);
         assert!(
-            prompt.contains("## Coding agents (via `tool_cap`)"),
+            prompt.contains("## Coding agents (via `cap` and `cap_live`)"),
             "expected cap block in: {prompt}"
         );
         // All 4 agent kinds named.
@@ -1194,14 +1201,14 @@ mod tests {
         assert!(prompt.contains("`codex`"));
         // Async-submission semantics are documented so the LLM doesn't
         // wait for the result in the same turn.
-        assert!(prompt.contains("returns `{status: \"submitted\"}` immediately"));
+        assert!(prompt.contains("returns `{status: submitted}` immediately"));
     }
 
     #[test]
     fn user_system_omits_cap_block_when_unavailable() {
         let prompt = empty_user_system(false);
         assert!(
-            !prompt.contains("tool_cap"),
+            !prompt.contains("## Coding agents"),
             "cap block leaked when manager unavailable: {prompt}"
         );
     }

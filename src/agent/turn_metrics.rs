@@ -21,9 +21,9 @@ pub struct TurnMetrics {
     pub tool_errors: usize,
     pub same_call_streak_max: usize,
     pub final_text_len: usize,
-    /// Raw transcript of tool calls in execution order: (name, args_json,
-    /// result_summary, is_error). Bounded length per result so we don't
-    /// keep megabytes of screenshots in memory.
+    /// Remaining stagnation budget. Starts at 50 (simple) or 100 (complex);
+    /// depletes when tool calls show no progress. See runtime.rs agent_loop.
+    pub stagnation_budget: i32,
     pub tool_log: Vec<TurnToolEntry>,
 }
 
@@ -50,6 +50,7 @@ impl TurnMetrics {
             tool_errors: 0,
             same_call_streak_max: 0,
             final_text_len: 0,
+            stagnation_budget: 0,
             tool_log: Vec::new(),
         }
     }

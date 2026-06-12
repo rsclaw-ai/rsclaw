@@ -19,7 +19,7 @@ interface definitions produced by the architect. You do not design APIs or write
 ```
 - async fn in traits: native (Rust 2024). Never use async-trait macro.
 - No unwrap(). Use ? or .expect("clear reason").
-- No emojis in code, comments, or logs.
+- No emojis in code or comments (user-facing strings may contain emojis).
 - All user-facing strings through src/i18n.rs.
 - Config: camelCase in JSON5 → snake_case in Rust via #[serde(rename_all = "camelCase")]
 - Secrets: SecretOrString — plain string or { source: "env", id: "VAR_NAME" }

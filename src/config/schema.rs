@@ -456,8 +456,9 @@ pub struct AgentDefaults {
     pub media: Option<Value>,
     pub embedded: Option<Value>,
     pub archive: Option<Value>,
-    /// Max tool-call iterations per turn. Simple tasks default to 10, complex
-    /// (browser) to 100.
+    /// Stagnation budget per turn (progress-aware). Simple tasks: 50, complex
+    /// (browser/shell/cap): 100. Budget depletes on stagnation/errors, not on
+    /// productive iterations. Set to 0 to use built-in defaults.
     pub max_iterations: Option<u32>,
     /// Send intermediate text to user during multi-step tool calls. Default:
     /// true.
@@ -1055,6 +1056,15 @@ pub struct ProviderConfig {
     /// omitted. Ignored for non-rsclaw `api` formats.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact_timeout_secs: Option<u64>,
+    /// `rsclaw` providers only: send `options.constrain_tool_calls` on every
+    /// turn so the worker constrains tool-call decoding with the lazy GBNF
+    /// grammar it derived from the session's tools at create/replay time.
+    /// Eliminates malformed tool-call JSON/XML at the decode stage. Requires
+    /// workers that advertise `supports_constrained_tool_calls`; older
+    /// workers ignore the option. Defaults to false (off) while the fleet
+    /// rolls out. Ignored for non-rsclaw `api` formats.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constrain_tool_calls: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -2175,6 +2185,20 @@ pub struct MemoryConfig {
     pub recall_top_k: Option<usize>,
     /// Number of final results after RRF fusion. Default 5.
     pub recall_final_k: Option<usize>,
+    /// Also search the knowledge base during auto-recall and append the top
+    /// hits (with source titles for citation) to the turn-local recall
+    /// context. Default true; only fires when the KB actually has indexed
+    /// content. Set false to keep auto-recall memory-only (the explicit
+    /// `knowledge_base` tool is unaffected).
+    pub kb_auto_recall: Option<bool>,
+    /// Deliver auto-recall (memory + KB + working plan) to NON-rsclaw
+    /// providers too, by injecting it as turn-local text into the request
+    /// copy of the user message (never persisted — session history stays
+    /// clean). Default true. The cost on paid APIs is the recall budget
+    /// (~1.8K tokens max per recall-bearing turn) plus losing prefix-cache
+    /// reuse of the final exchange each turn. Set false to restore the old
+    /// rsclaw-only behaviour.
+    pub recall_external_providers: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -2321,6 +2345,13 @@ pub struct KbConfig {
     /// GPU-fleet Qwen3 while memory stays on a fast local BGE. Changing it on a
     /// populated KB requires a reindex (KB does not auto-migrate like memory).
     pub embed: Option<EmbedConfig>,
+    /// Optional cross-encoder rerank stage. When set, the search pipeline
+    /// sends the fused top-N candidates to an OpenAI/Jina-compatible
+    /// `/v1/rerank` endpoint (llama.cpp `--reranking`) and reorders by
+    /// relevance before MMR. Best-effort: endpoint failures fall back to the
+    /// fused order, never fail the search. Query-time only — no reindex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank: Option<KbRerankConfig>,
     /// DEPRECATED (unused): superseded by `embed`. Kept only so existing
     /// configs that still set it continue to parse (deny_unknown_fields). No
     /// code reads it — embedder selection goes through `embed` /
@@ -2348,6 +2379,27 @@ pub struct KbConfig {
     /// defense-in-depth bound on an arbitrary-file-read surface; widen it only
     /// if you trust every local process that can reach the gateway.
     pub allowed_upload_roots: Option<Vec<String>>,
+}
+
+/// Cross-encoder rerank endpoint for the KB search pipeline (`kb.rerank`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KbRerankConfig {
+    /// API root of an OpenAI/Jina-compatible rerank server, e.g.
+    /// `http://117.50.139.244:5556/v1` (llama.cpp with `--reranking`).
+    /// `/rerank` is appended at request time.
+    pub base_url: String,
+    /// Model name sent in the request body. Optional — single-model
+    /// llama.cpp servers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Fused candidates sent to the reranker (and kept afterwards —
+    /// everything below the window is dropped). Default 20.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_n: Option<usize>,
+    /// Kill-switch without deleting the block. Default true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2397,7 +2449,8 @@ pub struct AstockConfig {
     /// Bearer token for astock's x402 paywall (or session-init flow).
     /// `None` when astock runs paywall-disabled (dev mode) — the
     /// client just skips the Authorization header.
-    pub auth_token: Option<String>,
+    /// Supports `SecretOrString` — plain string or `{ source: "env", id: "VAR_NAME" }`.
+    pub auth_token: Option<SecretOrString>,
     /// In-process response caches. Saves astock credits + latency for
     /// the typical "LLM repeatedly asks the same quote in one turn"
     /// pattern. Each field is TTL in seconds; `0` disables the cache
@@ -2410,6 +2463,57 @@ pub struct AstockConfig {
     /// stock data. Compliance gate — keep it explicit so users can't
     /// rely on the LLM remembering to add it.
     pub disclaimer_suffix: Option<String>,
+    /// SSE bridge config. When present + enabled, gateway opens one
+    /// long-lived `GET /v1/stream/quick?filter=<f>` connection per
+    /// listed filter and pushes IM notifications on `hit` events for
+    /// codes any peer is watching.
+    pub sse: Option<AstockSseConfig>,
+    /// Daily briefing scheduler config. When present, overrides the
+    /// hardcoded 07:50 / 12:05 / 18:30 (Asia/Shanghai) slot times.
+    /// Change requires a gateway restart — the scheduler captures
+    /// the schedule at spawn time.
+    pub briefing: Option<AstockBriefingConfig>,
+}
+
+/// Configurable wallclock times for the three briefing slots. Each
+/// value is `"HH:MM"` (24-hour, Asia/Shanghai). Missing keys keep
+/// the hardcoded default for that slot.
+///
+/// Example (`~/.rsclaw/rsclaw.json5`):
+/// ```json5
+/// astock: {
+///   briefing: {
+///     slots: {
+///       premarket:  "07:55",
+///       midday:     "12:10",
+///       postmarket: "18:30",
+///     }
+///   }
+/// }
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AstockBriefingConfig {
+    /// Map of slot slug → "HH:MM". Keys: `premarket`, `midday`,
+    /// `postmarket`. Unrecognised keys are silently ignored;
+    /// malformed "HH:MM" values log a warn and fall back to the
+    /// hardcoded default.
+    pub slots: Option<std::collections::HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AstockSseConfig {
+    /// Default true when the `sse` block is present at all. Set
+    /// `false` to bench / disable the bridge without removing the
+    /// listener config.
+    pub enabled: Option<bool>,
+    /// astock `quick_*` filter slugs to subscribe to. Common
+    /// values: `quick_rally`, `quick_goldcross`, `quick_cow_catch`,
+    /// `quick_deadtogold`. Unknown filters render with a generic
+    /// "异动" label in IM notifications. Omitted / empty defaults
+    /// to `[quick_rally, quick_goldcross, quick_cow_catch]`.
+    pub filters: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]

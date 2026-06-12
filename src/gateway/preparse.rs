@@ -514,11 +514,30 @@ pub(crate) async fn try_preparse_locally_with_account(
             }
             Err(e) => {
                 let err = e.to_string();
-                return Some(txt(crate::i18n::t_fmt(
-                    "cap_open_failed",
-                    lang,
-                    &[("err", &err)],
-                )));
+                let is_binary_missing = err.contains("binary not found on PATH");
+                let hint = if is_binary_missing {
+                    match kind {
+                        crate::cap::AgentKind::Opencode => crate::i18n::t_fmt(
+                            "cap_install_hint_go",
+                            lang,
+                            &[
+                                ("agent", kind.display_name()),
+                                ("cmd", kind.as_str()),
+                            ],
+                        ),
+                        _ => crate::i18n::t_fmt(
+                            "cap_install_hint_npm",
+                            lang,
+                            &[
+                                ("agent", kind.display_name()),
+                                ("cmd", kind.as_str()),
+                            ],
+                        ),
+                    }
+                } else {
+                    crate::i18n::t_fmt("cap_open_failed", lang, &[("err", &err)])
+                };
+                return Some(txt(hint));
             }
         }
     }
@@ -589,11 +608,30 @@ pub(crate) async fn try_preparse_locally_with_account(
             }
             Err(e) => {
                 let err = e.to_string();
-                return Some(txt(crate::i18n::t_fmt(
-                    "cap_open_failed",
-                    lang,
-                    &[("err", &err)],
-                )));
+                let is_binary_missing = err.contains("binary not found on PATH");
+                let hint = if is_binary_missing {
+                    match kind {
+                        crate::cap::AgentKind::Opencode => crate::i18n::t_fmt(
+                            "cap_install_hint_go",
+                            lang,
+                            &[
+                                ("agent", kind.display_name()),
+                                ("cmd", kind.as_str()),
+                            ],
+                        ),
+                        _ => crate::i18n::t_fmt(
+                            "cap_install_hint_npm",
+                            lang,
+                            &[
+                                ("agent", kind.display_name()),
+                                ("cmd", kind.as_str()),
+                            ],
+                        ),
+                    }
+                } else {
+                    crate::i18n::t_fmt("cap_open_failed", lang, &[("err", &err)])
+                };
+                return Some(txt(hint));
             }
         }
     }
@@ -1256,7 +1294,691 @@ $g.Dispose();$b.Dispose()"#
         };
         return Some(txt(reply));
     }
+    // /astock — A股数据/调度快路径。子命令:
+    //   briefing list / next / run <slot>
+    //   watchlist list / add <code...> / remove <code...> / clear
+    //   quote <code>
+    //   snapshot [code...]
+    //   chart <code> [period] [count]
+    // 不进 LLM，直接调 astock 子模块。
+    // /goal — result-driven turn loop. See src/agent/goal.rs.
+    //
+    //   /goal <condition>             # set + start
+    //   /goal                         # status
+    //   /goal clear                   # abort
+    //   /goal <cond> --max <N>        # override default iter cap
+    if lower == "/goal" {
+        return Some(txt(goal_status_handler(handle, channel, peer_id).await));
+    }
+    if let Some(rest_raw) = t.strip_prefix("/goal ") {
+        let rest = rest_raw.trim();
+        if rest.is_empty() {
+            return Some(txt(goal_status_handler(handle, channel, peer_id).await));
+        }
+        if rest.eq_ignore_ascii_case("clear")
+            || rest.eq_ignore_ascii_case("stop")
+            || rest.eq_ignore_ascii_case("abort")
+        {
+            return Some(txt(goal_clear_handler(handle, channel, peer_id).await));
+        }
+        if rest.eq_ignore_ascii_case("status") {
+            return Some(txt(goal_status_handler(handle, channel, peer_id).await));
+        }
+        return Some(txt(
+            goal_set_handler(handle, channel, peer_id, account, rest).await,
+        ));
+    }
+    if lower == "/astock" || lower == "/astock help" || lower == "/astock -h" || lower == "/astock --help" {
+        return Some(txt(astock_help_text()));
+    }
+    if let Some(rest) = lower.strip_prefix("/astock ") {
+        let raw_rest = t.strip_prefix("/astock ").unwrap_or(rest).trim();
+        // chart needs to attach the rendered PNG, so it bypasses the
+        // text-only `txt` helper and builds its own OutboundMessage.
+        // All other sub-commands stay text-only.
+        let first_word = raw_rest
+            .split_whitespace()
+            .next()
+            .map(str::to_lowercase)
+            .unwrap_or_default();
+        if first_word == "chart" {
+            let chart_args: Vec<String> = raw_rest
+                .split_whitespace()
+                .skip(1)
+                .map(str::to_owned)
+                .collect();
+            return Some(astock_chart_outbound(chart_args).await);
+        }
+        return Some(txt(
+            handle_astock_command(handle, channel, peer_id, raw_rest).await,
+        ));
+    }
     None
+}
+
+// ---------------------------------------------------------------------------
+// /astock dispatcher
+// ---------------------------------------------------------------------------
+//
+// Routes the `/astock <sub> <args...>` form to the appropriate
+// astock helper. Returns a single plain-text reply (the only shape
+// the fast preparse path can use). Chart sub-command returns a
+// special marker token consumed by the higher-level wrapper —
+// see `dispatch_astock_chart` for the image-attachment path.
+
+// ---------------------------------------------------------------------------
+// /goal handlers — completion-driven turn loop.
+// ---------------------------------------------------------------------------
+//
+// The goal LOOP itself lives in `gateway/startup.rs` (post-`run_turn`
+// hook calling `crate::agent::goal::check_after_turn`). The slash
+// command here only manages the goal STATE (set / clear / status)
+// and kicks off the first turn via `submit_to_queue`.
+
+async fn goal_set_handler(
+    handle: &crate::agent::AgentHandle,
+    channel: &str,
+    peer_id: &str,
+    account: Option<&str>,
+    rest: &str,
+) -> String {
+    // Parse `<condition> [--max <N>]`. Last-token form so users can
+    // write `/goal cargo test 全过 --max 50` without quoting.
+    let (condition, max_iter) = parse_goal_args(rest);
+    if condition.is_empty() {
+        return "用法: /goal <condition> [--max <N>]\n例: /goal cargo test 全过 --max 50"
+            .to_owned();
+    }
+    let Some(mem) = crate::agent::memory::global_store() else {
+        return "_memory 未启用,/goal 无法持久化_".to_owned();
+    };
+    let session_key = preparse_session_key(handle, channel, peer_id, account);
+    if let Err(e) =
+        crate::agent::goal::set(&mem, &session_key, &condition, max_iter).await
+    {
+        return format!("/goal: 写入失败: {e:#}");
+    }
+    // Kick off the first turn via the task queue (same path the channel
+    // dispatcher uses), so the LLM sees a synthetic user message asking
+    // it to start working on the goal.
+    let Some(tq) = crate::gateway::task_queue::get_task_queue() else {
+        return format!(
+            "Goal set: {condition} (iter cap {max_iter})\n\
+             _任务队列未启用,首轮不会自动启动 — 请手动发一条消息触发_"
+        );
+    };
+    let prompt = crate::agent::goal::build_initial_prompt(&condition, max_iter);
+    let delivery_channel: &str = if channel == "ws" { "desktop" } else { channel };
+    if let Err(e) = crate::gateway::task_queue::submit_to_queue(
+        &tq,
+        &session_key,
+        &prompt,
+        delivery_channel,
+        peer_id,
+        peer_id,
+        false,
+        crate::gateway::task_queue::Priority::Cron,
+    ) {
+        return format!(
+            "Goal set: {condition} (iter cap {max_iter})\n\
+             _首轮 enqueue 失败: {e}_"
+        );
+    }
+    format!(
+        "🎯 Goal set: {condition}\n\
+         iter cap: {max_iter}\n\
+         首轮已 enqueue,稍候片刻。\n\n\
+         随时 `/goal clear` 中止,或 `/goal` 看进度。"
+    )
+}
+
+async fn goal_clear_handler(
+    handle: &crate::agent::AgentHandle,
+    channel: &str,
+    peer_id: &str,
+) -> String {
+    let Some(mem) = crate::agent::memory::global_store() else {
+        return "_memory 未启用_".to_owned();
+    };
+    let session_key = preparse_session_key(handle, channel, peer_id, None);
+    let active = crate::agent::goal::read(&mem, &session_key).await;
+    if let Err(e) = crate::agent::goal::clear(&mem, &session_key).await {
+        return format!("/goal clear: 失败: {e:#}");
+    }
+    match active {
+        Some(g) => format!(
+            "🛑 Goal cleared: {} (was iter {}/{})",
+            g.condition, g.iter, g.max_iter
+        ),
+        None => "_当前没有进行中的 goal_".to_owned(),
+    }
+}
+
+async fn goal_status_handler(
+    handle: &crate::agent::AgentHandle,
+    channel: &str,
+    peer_id: &str,
+) -> String {
+    let Some(mem) = crate::agent::memory::global_store() else {
+        return "_memory 未启用_".to_owned();
+    };
+    let session_key = preparse_session_key(handle, channel, peer_id, None);
+    match crate::agent::goal::read(&mem, &session_key).await {
+        Some(g) => {
+            let elapsed_secs = (chrono::Utc::now().timestamp() - g.started_at).max(0);
+            format!(
+                "🎯 Goal active: {}\niter: {}/{}\n已运行: {}s",
+                g.condition, g.iter, g.max_iter, elapsed_secs
+            )
+        }
+        None => "_当前没有进行中的 goal — 用 `/goal <condition>` 启动_".to_owned(),
+    }
+}
+
+/// Parse `<condition> [--max <N>]`. `--max` is the only recognised
+/// flag for now. Returns `(condition_text, max_iter)`. Missing or
+/// malformed `--max` falls back to `DEFAULT_MAX_ITER`.
+fn parse_goal_args(rest: &str) -> (String, u32) {
+    let toks: Vec<&str> = rest.split_whitespace().collect();
+    let mut max_iter: u32 = crate::agent::goal::DEFAULT_MAX_ITER;
+    let mut cond_toks: Vec<&str> = Vec::with_capacity(toks.len());
+    let mut i = 0;
+    while i < toks.len() {
+        if toks[i] == "--max" || toks[i] == "-m" {
+            if let Some(n) = toks.get(i + 1).and_then(|s| s.parse::<u32>().ok()) {
+                max_iter = n;
+                i += 2;
+                continue;
+            }
+        }
+        cond_toks.push(toks[i]);
+        i += 1;
+    }
+    (cond_toks.join(" ").trim().to_owned(), max_iter)
+}
+
+fn astock_help_text() -> String {
+    "/astock — A股数据 & 调度 (本地快路径，不进 LLM)\n\n\
+     调度\n\
+       /astock briefing list                 三个时段 + 下次 fire\n\
+       /astock briefing next                 只看下次\n\
+       /astock briefing run <slot>           立即补发 (premarket|midday|postmarket)\n\n\
+     自选股\n\
+       /astock watchlist list                当前自选股\n\
+       /astock watchlist add <code> [...]    加入 (支持批量)\n\
+       /astock watchlist remove <code> [...] 删除\n\
+       /astock watchlist clear               清空\n\n\
+     即时数据\n\
+       /astock quote <code> [<code>...]      实时报价\n\
+       /astock snapshot [<code>...]          快照 (空参 = 自选股)\n\
+       /astock chart <code> [period] [count] K 线图 (会推送到当前会话)\n\
+       /astock screen <filter> [limit]       异动筛选 (quick_rally / quick_goldcross / ...)\n\n\
+     备注: astock 未启用时所有子命令静默回 '_astock 未启用_'。"
+        .to_owned()
+}
+
+async fn handle_astock_command(
+    handle: &crate::agent::AgentHandle,
+    channel: &str,
+    peer_id: &str,
+    rest: &str,
+) -> String {
+    let mut parts = rest.split_whitespace();
+    let Some(sub) = parts.next() else {
+        return astock_help_text();
+    };
+    let args: Vec<String> = parts.map(str::to_owned).collect();
+    match sub.to_lowercase().as_str() {
+        "briefing" => astock_briefing(args).await,
+        "watchlist" => astock_watchlist(handle, channel, peer_id, args).await,
+        "quote" => astock_quote(args).await,
+        "snapshot" => astock_snapshot(handle, channel, peer_id, args).await,
+        "screen" => astock_screen(args).await,
+        // `chart` is handled directly at the slash callsite so the
+        // PNG can be attached as an image — it never reaches this
+        // dispatcher. Document the case for the reader.
+        "chart" => "internal error: chart should be handled at the slash callsite".to_owned(),
+        other => format!("/astock: 未知子命令 `{other}`。看 `/astock help`"),
+    }
+}
+
+async fn astock_briefing(args: Vec<String>) -> String {
+    let action = args
+        .first()
+        .map(|s| s.to_lowercase())
+        .unwrap_or_else(|| "list".to_owned());
+    match action.as_str() {
+        "list" | "" => {
+            let snapshot = crate::astock::briefing::schedule_snapshot();
+            let mut lines = vec!["**早报调度**".to_owned()];
+            for (slot, when) in snapshot {
+                lines.push(format!(
+                    "  {}  ·  {}  →  {}",
+                    slot.slug(),
+                    slot.label(),
+                    when.format("%Y-%m-%d %H:%M %Z")
+                ));
+            }
+            lines.push(String::new());
+            lines.push(
+                "提示: 调度写在 src/astock/briefing.rs，时间表硬编码。\
+                 改时间需 rebuild + `cargo run -- gateway restart`。"
+                    .to_owned(),
+            );
+            lines.join("\n")
+        }
+        "next" => {
+            let snapshot = crate::astock::briefing::schedule_snapshot();
+            // schedule_snapshot returns slots in wallclock order; find
+            // the earliest absolute time among them — that's "next".
+            match snapshot.into_iter().min_by_key(|(_, w)| *w) {
+                Some((slot, when)) => format!(
+                    "下次: {} ({}) @ {}",
+                    slot.slug(),
+                    slot.label(),
+                    when.format("%Y-%m-%d %H:%M %Z")
+                ),
+                None => "_无可用 slot_".to_owned(),
+            }
+        }
+        "run" => {
+            let Some(slug) = args.get(1) else {
+                return "用法: /astock briefing run <premarket|midday|postmarket>".to_owned();
+            };
+            let Some(slot) = crate::astock::briefing::BriefingSlot::from_slug(slug) else {
+                return format!(
+                    "未知 slot `{slug}`，可选: premarket | midday | postmarket"
+                );
+            };
+            // Fire-and-forget — the dispatch path drops a synthetic
+            // user turn onto the task queue, which the agent runtime
+            // handles asynchronously. The reply we return below is
+            // immediate; the briefing itself arrives a few seconds
+            // later via the normal channel send path.
+            tokio::spawn(async move {
+                crate::astock::briefing::dispatch_one(slot).await;
+            });
+            format!("已触发 {} ({})，几秒内到达。", slot.slug(), slot.label())
+        }
+        other => format!("briefing: 未知动作 `{other}`，可选: list | next | run"),
+    }
+}
+
+async fn astock_watchlist(
+    handle: &crate::agent::AgentHandle,
+    channel: &str,
+    peer_id: &str,
+    args: Vec<String>,
+) -> String {
+    let action = args
+        .first()
+        .map(|s| s.to_lowercase())
+        .unwrap_or_else(|| "list".to_owned());
+    let Some(mem) = crate::agent::memory::global_store() else {
+        return "_memory 未启用，自选股无法持久化_".to_owned();
+    };
+    let scope = crate::agent::tools_stock::watchlist_scope(&handle.id, channel, peer_id);
+    let result = match action.as_str() {
+        "list" | "" => crate::agent::tools_stock::watchlist_list(&mem, &scope).await,
+        "add" => {
+            let codes: Vec<String> = args.iter().skip(1).cloned().collect();
+            crate::agent::tools_stock::watchlist_add(&mem, &scope, codes).await
+        }
+        "remove" | "rm" | "delete" | "del" => {
+            let codes: Vec<String> = args.iter().skip(1).cloned().collect();
+            crate::agent::tools_stock::watchlist_remove(&mem, &scope, codes).await
+        }
+        "clear" => crate::agent::tools_stock::watchlist_clear(&mem, &scope).await,
+        other => {
+            return format!(
+                "watchlist: 未知动作 `{other}`，可选: list | add | remove | clear"
+            );
+        }
+    };
+    let v = match result {
+        Ok(v) => v,
+        Err(e) => return format!("/astock watchlist 出错: {e:#}"),
+    };
+    // For `list`, enrich with display names so the reply reads as
+    // `600519 贵州茅台 / 000001 平安银行` instead of bare codes.
+    // The name resolver caches aggressively (1h) so this is a noop
+    // round trip after the first call.
+    if matches!(action.as_str(), "list" | "") {
+        if let Some(arc) = crate::astock::global_client() {
+            let codes: Vec<String> = v
+                .get("codes")
+                .and_then(|x| x.as_array())
+                .map(|arr| arr.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect())
+                .unwrap_or_default();
+            if !codes.is_empty() {
+                let names = arc.resolve_names(&codes).await;
+                return format_watchlist_list_with_names(&codes, &names);
+            }
+        }
+    }
+    format_watchlist_reply(&action, &v)
+}
+
+fn format_watchlist_list_with_names(
+    codes: &[String],
+    names: &std::collections::HashMap<String, String>,
+) -> String {
+    if codes.is_empty() {
+        return "_自选股为空 — `/astock watchlist add <code>` 加一只_".to_owned();
+    }
+    let mut lines = vec![format!("自选股 ({})", codes.len())];
+    for c in codes {
+        let name = names.get(c).map(String::as_str).unwrap_or("");
+        if name.is_empty() {
+            lines.push(format!("- {c}"));
+        } else {
+            lines.push(format!("- {c} {name}"));
+        }
+    }
+    lines.join("\n")
+}
+
+fn format_watchlist_reply(action: &str, v: &serde_json::Value) -> String {
+    let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
+    if !ok {
+        return v
+            .get("error")
+            .and_then(|x| x.as_str())
+            .unwrap_or("_出错_")
+            .to_owned();
+    }
+    match action {
+        "list" | "" => {
+            let codes: Vec<&str> = v
+                .get("codes")
+                .and_then(|x| x.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            if codes.is_empty() {
+                "_自选股为空 — `/astock watchlist add <code>` 加一只_".to_owned()
+            } else {
+                format!(
+                    "自选股 ({}): {}",
+                    codes.len(),
+                    codes.join(", ")
+                )
+            }
+        }
+        "add" => {
+            let added: Vec<&str> = v
+                .get("added")
+                .and_then(|x| x.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            let total = v.get("total").and_then(|x| x.as_u64()).unwrap_or(0);
+            if added.is_empty() {
+                format!("已存在或无新代码 (当前 {total} 只)")
+            } else {
+                format!(
+                    "已加入 {}: {}  (当前 {} 只)",
+                    added.len(),
+                    added.join(", "),
+                    total
+                )
+            }
+        }
+        "remove" | "rm" | "delete" | "del" => {
+            let removed = v.get("removed").and_then(|x| x.as_u64()).unwrap_or(0);
+            let requested = v.get("requested").and_then(|x| x.as_u64()).unwrap_or(0);
+            format!("删除 {removed}/{requested}")
+        }
+        "clear" => {
+            let removed = v.get("removed").and_then(|x| x.as_u64()).unwrap_or(0);
+            format!("已清空 (删除 {removed} 只)")
+        }
+        _ => v.to_string(),
+    }
+}
+
+async fn astock_quote(args: Vec<String>) -> String {
+    let codes: Vec<String> = args
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+    if codes.is_empty() {
+        return "用法: /astock quote <code> [<code>...]".to_owned();
+    }
+    let Some(arc) = crate::astock::global_client() else {
+        return "_astock 未启用_".to_owned();
+    };
+    let quote_codes = codes.clone();
+    let names_codes = codes;
+    // Fetch quotes + names in parallel. Names are best-effort —
+    // we render code-only if resolution times out / fails.
+    let quotes_fut = async {
+        if quote_codes.len() == 1 {
+            arc.quote(&quote_codes[0]).await.map(|q| vec![q])
+        } else {
+            arc.quote_batch(&quote_codes).await
+        }
+    };
+    let names_fut = arc.resolve_names(&names_codes);
+    let (quotes_res, names) = tokio::join!(quotes_fut, names_fut);
+    let quotes = match quotes_res {
+        Ok(q) => q,
+        Err(e) => return format!("astock quote: {e}"),
+    };
+    crate::agent::tools_stock::render_quotes_markdown_with_names(&quotes, Some(&names))
+}
+
+async fn astock_screen(args: Vec<String>) -> String {
+    let filter = match args.first() {
+        Some(f) if !f.is_empty() => f.clone(),
+        _ => {
+            return "用法: /astock screen <quick_filter> [limit]\n\
+                    可选 filter: quick_rally | quick_goldcross | \
+                    quick_cow_catch | quick_deadtogold"
+                .to_owned();
+        }
+    };
+    let limit = args.get(1).and_then(|s| s.parse::<u32>().ok()).or(Some(10));
+    let Some(arc) = crate::astock::global_client() else {
+        return "_astock 未启用_".to_owned();
+    };
+    let resp = match arc.screen_quick(&filter, limit).await {
+        Ok(v) => v,
+        Err(e) => return format!("astock screen: {e}"),
+    };
+    format_screen_reply(&filter, &resp)
+}
+
+/// Render the screen-quick JSON tree as IM-friendly markdown.
+///
+/// Astock's response shape (verified live against quick_rally at
+/// 2026-06-11 13:39):
+///   {
+///     "as_of_ts": null,
+///     "computed_at": "2026-06-11T13:39:30+08:00",
+///     "cost_credits": 85,
+///     "count": 0,
+///     "filters_applied": [...],
+///     "limit": 50,
+///     "results": [...],
+///     "total_matched": 0
+///   }
+///
+/// Each entry in `results` is per-filter — we surface code/name when
+/// present and otherwise dump the row as compact JSON. Defensive on
+/// shape because astock's filters expose different telemetry per
+/// type (rally has pct_change, goldcross has ma cross series, ...).
+fn format_screen_reply(filter: &str, v: &serde_json::Value) -> String {
+    let total = v
+        .get("total_matched")
+        .and_then(|x| x.as_u64())
+        .or_else(|| v.get("count").and_then(|x| x.as_u64()))
+        .unwrap_or(0);
+    let cost = v
+        .get("cost_credits")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    let computed = v
+        .get("computed_at")
+        .and_then(|x| x.as_str())
+        .unwrap_or("?");
+    let results = v
+        .get("results")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut lines = vec![format!(
+        "**{}** · {} 命中 · {} 积分 · {}",
+        filter, total, cost, computed
+    )];
+    if results.is_empty() {
+        lines.push("_无命中_".to_owned());
+        return lines.join("\n");
+    }
+    for row in results.iter().take(20) {
+        let code = row
+            .get("code")
+            .and_then(|x| x.as_str())
+            .unwrap_or("?");
+        let name = row
+            .get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        // Best-effort: surface whichever metric column the filter
+        // chose to highlight, falling back to a compact JSON dump.
+        let metric = row
+            .get("pct_change")
+            .or_else(|| row.get("change_pct"))
+            .or_else(|| row.get("score"))
+            .or_else(|| row.get("rally"))
+            .and_then(|x| x.as_f64())
+            .map(|p| format!("{:+.2}%", p))
+            .unwrap_or_else(|| {
+                serde_json::to_string(row)
+                    .map(|s| {
+                        if s.len() > 60 {
+                            // CJK-safe truncate — `&s[..60]` can
+                            // panic mid-codepoint. See
+                            // crate::util::truncate_str.
+                            format!("{}…", crate::util::truncate_str(&s, 60))
+                        } else {
+                            s
+                        }
+                    })
+                    .unwrap_or_default()
+            });
+        let head = if name.is_empty() {
+            code.to_owned()
+        } else {
+            format!("{} {}", code, name)
+        };
+        lines.push(format!("- {}  {}", head, metric));
+    }
+    if results.len() > 20 {
+        lines.push(format!("_…剩余 {} 行_", results.len() - 20));
+    }
+    lines.join("\n")
+}
+
+async fn astock_snapshot(
+    handle: &crate::agent::AgentHandle,
+    channel: &str,
+    peer_id: &str,
+    args: Vec<String>,
+) -> String {
+    let mut codes: Vec<String> = args
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+    let Some(arc) = crate::astock::global_client() else {
+        return "_astock 未启用_".to_owned();
+    };
+    let mut used_watchlist = false;
+    if codes.is_empty() {
+        // No explicit args → fall back to the caller's watchlist
+        // (matches `tool_stock_snapshot`'s `use_watchlist` default).
+        if let Some(mem) = crate::agent::memory::global_store() {
+            let scope = crate::agent::tools_stock::watchlist_scope(&handle.id, channel, peer_id);
+            let store = mem.lock().await;
+            codes = store
+                .list_active()
+                .into_iter()
+                .filter(|d| d.scope == scope && d.kind == "watchlist")
+                .map(|d| d.text)
+                .collect();
+            drop(store);
+            used_watchlist = !codes.is_empty();
+        }
+    }
+    if codes.is_empty() {
+        return "_无代码且自选股为空 — `/astock watchlist add <code>` 先加一只_".to_owned();
+    }
+    let rows = match arc.snapshot(None, None, &codes, None).await {
+        Ok(r) => r,
+        Err(e) => return format!("astock snapshot: {e}"),
+    };
+    crate::agent::tools_stock::render_snapshot_markdown(&rows, used_watchlist, "amount")
+}
+
+/// Render a chart and return an `OutboundMessage` with the PNG
+/// attached as a base64 data URI. The channel sender (feishu/wechat)
+/// already knows how to upload `data:image/png;base64,...` payloads
+/// from the `images` field — see `feishu.rs::send_text_with_images`.
+async fn astock_chart_outbound(args: Vec<String>) -> OutboundMessage {
+    let code = match args.first() {
+        Some(c) if !c.is_empty() => c.clone(),
+        _ => {
+            return OutboundMessage {
+                text: "用法: /astock chart <code> [period] [count]".to_owned(),
+                ..Default::default()
+            };
+        }
+    };
+    let period = args.get(1).cloned().unwrap_or_else(|| "1d".to_owned());
+    let count_n = args.get(2).and_then(|s| s.parse::<u32>().ok()).unwrap_or(60);
+    let input = crate::agent::tools_stock::ChartRenderInput {
+        code: &code,
+        period: &period,
+        count: count_n,
+        adjust: "qfq",
+        ma_periods: vec![5, 10, 20, 60],
+        name_hint: None,
+    };
+    let out = match crate::agent::tools_stock::render_chart_for_code(input).await {
+        Ok(o) => o,
+        Err(crate::agent::tools_stock::ChartRenderError::Dormant) => {
+            return OutboundMessage {
+                text: "_astock 未启用_".to_owned(),
+                ..Default::default()
+            };
+        }
+        Err(crate::agent::tools_stock::ChartRenderError::Soft(msg)) => {
+            return OutboundMessage {
+                text: msg,
+                ..Default::default()
+            };
+        }
+    };
+    // PNG → base64 data URI. Same shape as
+    // `server::resolve_media_to_image_data` and what the feishu
+    // sender expects from `OutboundMessage::images`.
+    use base64::Engine;
+    let bytes = match tokio::fs::read(&out.path).await {
+        Ok(b) => b,
+        Err(e) => {
+            return OutboundMessage {
+                text: format!("chart 渲染成功但读取失败: {e}"),
+                ..Default::default()
+            };
+        }
+    };
+    let data_uri = format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    );
+    OutboundMessage {
+        text: out.title,
+        images: vec![data_uri],
+        ..Default::default()
+    }
 }
 
 /// Check if a message is a fast preparse command that should bypass the
@@ -1271,6 +1993,7 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
         "/ls" | "/status" | "/version" | "/help" | "/?" | "/health" | "/uptime"
             | "/model" | "/models" | "/cron" | "/clear" | "/new" | "/abort" | "/sessions"
             | "/loop" | "/task" | "/watch" | "/plugin" | "/cap" | "/cap-exit" | "/cap-resume"
+            | "/astock" | "/goal"
     )
     // Commands with optional/required args
     || lower.starts_with("/ls ")
@@ -1290,6 +2013,8 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
     || lower.starts_with("/watch ")
     || lower.starts_with("/cap ")
     || lower.starts_with("/cap-resume ")
+    || lower.starts_with("/astock ")
+    || lower.starts_with("/goal ")
     // /task only short-circuits on help variants; non-help forms must NOT
     // bypass the queue (the task queue worker owns the multi-turn flow).
     || lower == "/task -h"
@@ -1335,26 +2060,26 @@ fn resolve_cap_workspace(
     let expanded = if let Some(rest) = input.strip_prefix("~/") {
         match dirs_next::home_dir() {
             Some(h) => h.join(rest),
-            None => return Err("HOME 不可用，无法展开 ~".to_string()),
+            None => return Err("HOME not available, cannot expand ~".to_string()),
         }
     } else if input == "~" {
         match dirs_next::home_dir() {
             Some(h) => h,
-            None => return Err("HOME 不可用，无法展开 ~".to_string()),
+            None => return Err("HOME not available, cannot expand ~".to_string()),
         }
     } else {
         std::path::PathBuf::from(input)
     };
     let canon = std::fs::canonicalize(&expanded)
-        .map_err(|e| format!("路径不可达 ({e})"))?;
+        .map_err(|e| format!("path not accessible ({e})"))?;
     if !canon.is_dir() {
-        return Err("不是目录".to_string());
+        return Err("not a directory".to_string());
     }
-    let home = dirs_next::home_dir().ok_or_else(|| "HOME 不可用".to_string())?;
+    let home = dirs_next::home_dir().ok_or_else(|| "HOME not available".to_string())?;
     let home_canon = std::fs::canonicalize(&home).unwrap_or(home);
     if !canon.starts_with(&home_canon) {
         return Err(format!(
-            "路径必须在 {} 之下",
+            "path must be under {}",
             home_canon.display()
         ));
     }
@@ -1497,7 +2222,10 @@ fn help_text(lang: &str) -> String {
          任务/调度\n\
          \u{0020}\u{0020}/task -h         多轮任务（详见 -h）\n\
          \u{0020}\u{0020}/loop -h         定时循环（详见 -h）\n\
+         \u{0020}\u{0020}/goal <cond>     盯一个结果型目标，模型自评 GOAL_ACHIEVED/FAILED 终止\n\
          \u{0020}\u{0020}/cron list       查看定时任务\n\n\
+         A股 (astock)\n\
+         \u{0020}\u{0020}/astock          A股数据 & 早报调度（详见 /astock help）\n\n\
          文件/截图\n\
          \u{0020}\u{0020}/ls [path]       列出工作区目录\n\
          \u{0020}\u{0020}/cat <file>      查看文件内容\n\
@@ -1530,7 +2258,10 @@ fn help_text(lang: &str) -> String {
          Task / schedule\n\
          \u{0020}\u{0020}/task -h         multi-turn task (see -h)\n\
          \u{0020}\u{0020}/loop -h         repeat on a schedule (see -h)\n\
+         \u{0020}\u{0020}/goal <cond>     result-driven loop; model self-tags GOAL_ACHIEVED/FAILED to stop\n\
          \u{0020}\u{0020}/cron list       view cron jobs\n\n\
+         A-shares (astock)\n\
+         \u{0020}\u{0020}/astock          A-share data & briefing scheduler (see /astock help)\n\n\
          File / screenshot\n\
          \u{0020}\u{0020}/ls [path]       list workspace directory\n\
          \u{0020}\u{0020}/cat <file>      view file contents\n\

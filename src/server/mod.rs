@@ -782,6 +782,19 @@ async fn list_acp_connections(State(state): State<AppState>) -> impl IntoRespons
 // ---------------------------------------------------------------------------
 
 /// POST /api/v1/message/send — send a message to a channel target.
+///
+/// Body fields:
+///   - `target`  (required): channel-native target id (feishu open_id, wechat
+///     openid, etc.)
+///   - `channel` (required): channel brand (feishu / wechat / …)
+///   - `message` (required unless `media` is supplied): text body
+///   - `media`   (optional): single attachment, can be:
+///       * a local file path  (`/abs/path.png` or `~/...` expanded)
+///       * an http/https URL  (downstream channel downloads it)
+///       * a `data:image/...;base64,...` URI (passed through)
+///     File-path PNG/JPEG/WEBP are slurped + base64-encoded into a data URI
+///     here so the channel sender only deals with URI / URL forms.
+///   - `replyTo` (optional): channel-native reply-anchor id
 async fn message_send(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
@@ -789,20 +802,37 @@ async fn message_send(
     let target = body["target"].as_str().unwrap_or("");
     let text = body["message"].as_str().unwrap_or("");
     let channel = body["channel"].as_str().unwrap_or("");
+    let media = body["media"].as_str().unwrap_or("");
 
-    if target.is_empty() || text.is_empty() || channel.is_empty() {
+    if target.is_empty() || channel.is_empty() || (text.is_empty() && media.is_empty()) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "missing required fields: target, message, channel"})),
+            Json(serde_json::json!({
+                "error": "missing required fields: target, channel, and (message or media)"
+            })),
         );
     }
+
+    let images = if media.is_empty() {
+        vec![]
+    } else {
+        match resolve_media_to_image_data(media).await {
+            Ok(uri) => vec![uri],
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("media resolve failed: {e}")})),
+                );
+            }
+        }
+    };
 
     let out = crate::channel::OutboundMessage {
         target_id: target.to_string(),
         is_group: false,
         text: text.to_string(),
         reply_to: body["replyTo"].as_str().map(str::to_owned),
-        images: vec![],
+        images,
         files: vec![],
         channel: Some(channel.to_string()),
         account: None,
@@ -815,6 +845,49 @@ async fn message_send(
             Json(serde_json::json!({"error": format!("send failed: {e}")})),
         ),
     }
+}
+
+/// Resolve a `media` body field into a channel-friendly image reference.
+///
+/// Returns the input unchanged for `data:` URIs and `http(s)://` URLs (the
+/// feishu sender already handles both). File paths are read, base64-encoded
+/// and reformatted as `data:image/<mime>;base64,<...>`; the channel sender
+/// only knows about URI/URL forms, so this is where the path → URI bridge
+/// lives.
+async fn resolve_media_to_image_data(media: &str) -> anyhow::Result<String> {
+    if media.starts_with("data:") || media.starts_with("http://") || media.starts_with("https://") {
+        return Ok(media.to_string());
+    }
+
+    // Local file path. Expand `~` for ergonomics so callers can pass
+    // `~/.rsclaw/var/charts/foo.png` from a shell.
+    let expanded = if let Some(stripped) = media.strip_prefix("~/") {
+        match dirs_next::home_dir() {
+            Some(home) => home.join(stripped),
+            None => std::path::PathBuf::from(media),
+        }
+    } else {
+        std::path::PathBuf::from(media)
+    };
+
+    let bytes = tokio::fs::read(&expanded)
+        .await
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", expanded.display()))?;
+
+    let mime = match expanded
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        _ => "image/png",
+    };
+
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:{mime};base64,{b64}"))
 }
 
 /// GET /api/v1/message/read — read recent messages from a session.

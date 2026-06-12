@@ -14,7 +14,11 @@ use enigo::{
 };
 use image::{ImageFormat, RgbaImage};
 use tracing::warn;
-use xcap::Monitor;
+// xcap is gated to non-Linux at the dep level (Cargo.toml) — see the
+// long comment on the `xcap` line for the pipewire/libspa rationale.
+// Functions below fall back to a stub-error on Linux.
+#[cfg(not(target_os = "linux"))]
+use xcap::{Monitor, Window};
 
 use super::DesktopSession;
 
@@ -47,6 +51,16 @@ fn scale_for_input(x: u32, y: u32) -> (i32, i32) {
 }
 
 /// Capture a region of the primary monitor.
+#[cfg(target_os = "linux")]
+fn capture_region(_x: u32, _y: u32, _w: u32, _h: u32) -> Result<String, String> {
+    Err(
+        "screen capture not supported on Linux (xcap disabled — pipewire/libspa build chain). \
+         Use an alternative capture path or run on macOS/Windows."
+            .to_string(),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
 fn capture_region(x: u32, y: u32, w: u32, h: u32) -> Result<String, String> {
     let monitors = Monitor::all().map_err(|e| format!("xcap Monitor::all failed: {e}"))?;
     if monitors.is_empty() {
@@ -80,6 +94,12 @@ fn capture_region(x: u32, y: u32, w: u32, h: u32) -> Result<String, String> {
 }
 
 /// Capture the full primary monitor (fallback when window bounds unavailable).
+#[cfg(target_os = "linux")]
+fn capture_primary_monitor() -> Result<String, String> {
+    Err("screen capture not supported on Linux (xcap disabled)".to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
 fn capture_primary_monitor() -> Result<String, String> {
     let monitors = Monitor::all().map_err(|e| format!("xcap Monitor::all failed: {e}"))?;
     if monitors.is_empty() {
@@ -95,6 +115,48 @@ fn capture_primary_monitor() -> Result<String, String> {
         .capture_image()
         .map_err(|e| format!("xcap capture_image failed: {e}"))?;
 
+    let mut png_bytes = Vec::new();
+    {
+        let mut cursor = std::io::Cursor::new(&mut png_bytes);
+        img.write_to(&mut cursor, ImageFormat::Png)
+            .map_err(|e| format!("PNG encode failed: {e}"))?;
+    }
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+    Ok(format!("data:image/png;base64,{b64}"))
+}
+
+/// Capture an app window's content directly by window backing store
+/// (`CGWindowListCreateImage` under xcap). Overlap-proof — works even when
+/// other windows cover it and without bringing the app frontmost — and does
+/// NOT trigger any app-side screenshot UI (so it never pollutes a chat input
+/// box the way WeChat's Ctrl+Cmd+A capture does).
+///
+/// `Window::all()` is ordered front-to-back, so the first matching window is
+/// the frontmost. Capturing the frontmost window lets one call serve both the
+/// main window and a transient child window (e.g. WeChat's merged-record
+/// viewer): when the child is open it is frontmost and gets captured;
+/// otherwise the main window does. A 200x200 minimum filters out tooltips and
+/// other tiny helper windows. Returns a PNG data URI.
+#[cfg(target_os = "linux")]
+fn capture_app_window(_app_name: &str) -> Result<String, String> {
+    Err("window capture not supported on Linux (xcap disabled)".to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn capture_app_window(app_name: &str) -> Result<String, String> {
+    let windows = Window::all().map_err(|e| format!("xcap Window::all failed: {e}"))?;
+    let win = windows
+        .iter()
+        .find(|w| {
+            w.app_name().map(|n| n == app_name).unwrap_or(false)
+                && !w.is_minimized().unwrap_or(true)
+                && w.width().unwrap_or(0) >= 200
+                && w.height().unwrap_or(0) >= 200
+        })
+        .ok_or_else(|| format!("no on-screen window for app '{app_name}'"))?;
+    let img: RgbaImage = win
+        .capture_image()
+        .map_err(|e| format!("xcap window capture_image failed: {e}"))?;
     let mut png_bytes = Vec::new();
     {
         let mut cursor = std::io::Cursor::new(&mut png_bytes);
@@ -526,9 +588,19 @@ end tell"#,
     }
 
     async fn screenshot_window(&self, bundle_id: &str) -> Result<String, String> {
-        // Try to get the main window bounds, then screenshot that region.
-        // Fall back to primary monitor if window query fails (e.g. missing
-        // Accessibility permissions on macOS).
+        // Primary path: direct window-backing-store capture (overlap-proof,
+        // no app-side screenshot UI, so it never pollutes a chat input box).
+        let app_name = bundle_to_app_name(bundle_id);
+        match tokio::task::spawn_blocking(move || capture_app_window(&app_name))
+            .await
+            .map_err(|e| format!("screenshot_window join failed: {e}"))?
+        {
+            Ok(image) => return Ok(image),
+            Err(e) => warn!("capture_app_window failed ({e}); falling back to region capture"),
+        }
+        // Fallback: main window bounds + region crop, then primary monitor.
+        // (region crop captures whatever is on top of the rect, so it is less
+        // reliable when other windows overlap — used only if direct fails.)
         match self.get_main_window(bundle_id).await {
             Ok(bounds) => {
                 let parsed: serde_json::Value = serde_json::from_str(&bounds)

@@ -26,11 +26,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux runners pinned to 22.04 (glibc 2.35) so the system
+          # libc headers don't expose C23 `__isoc23_*` symbols that the
+          # zigbuild 2.34 pin can't resolve. The 24.04 runners pulled
+          # those in via system libs and broke linking with
+          # `__isoc23_strtoull@GLIBC_2.38` and friends on 2026-06-11.
+          # Switch back once cargo-zigbuild handles the C23 leak.
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-24.04
+            os: ubuntu-22.04
             archive: tar.gz
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
+            os: ubuntu-22.04-arm
             archive: tar.gz
           - target: x86_64-apple-darwin
             os: macos-14
@@ -80,8 +86,15 @@ jobs:
 
       # Linux glibc pinning via cargo-zigbuild + zig as the linker. Without
       # this, binaries built on ubuntu-24.04 link against glibc 2.39 and fail
-      # at runtime on Ubuntu 22.04 / Debian 11 boxes ("GLIBC_2.39 not found").
-      # Pinning to 2.31 covers Ubuntu 20.04 / Debian 11 and newer.
+      # at runtime on Ubuntu 22.04 boxes ("GLIBC_2.39 not found").
+      #
+      # Pin = 2.34 — covers Ubuntu 22.04 / Debian 12 / RHEL 9 / Fedora 35+.
+      # Bumped from 2.31 on 2026-06-11 because `libpipewire-0.3.so` (pulled
+      # in transitively by `xcap` for Wayland screen-capture support on
+      # Linux runners) references `dlclose@GLIBC_2.34`, `pthread_once@GLIBC_2.34`,
+      # `pthread_attr_setstacksize@GLIBC_2.34`. The 2.31 pin made these
+      # undefined and ld.lld failed the link with `--no-allow-shlib-undefined`.
+      # Ubuntu 20.04 went EOL in 2025-04 so dropping it is acceptable.
       - name: Install zigbuild (Linux only)
         if: runner.os == 'Linux'
         run: |
@@ -90,7 +103,7 @@ jobs:
 
       - name: Build (Linux, glibc-pinned via zigbuild)
         if: runner.os == 'Linux'
-        run: cargo zigbuild --release --target ${{ matrix.target }}.2.31
+        run: cargo zigbuild --release --target ${{ matrix.target }}.2.34
 
       - name: Build (macOS)
         if: runner.os == 'macOS'
