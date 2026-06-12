@@ -22,8 +22,13 @@ pub async fn cmd_docs(query: Vec<String>) -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
+        // CREATE_NO_WINDOW = 0x08000000 — without this the `cmd /C start`
+        // wrapper flashes a console window for ~50ms before handing off
+        // to ShellExecute (the thing that actually opens the browser).
+        use std::os::windows::process::CommandExt;
         let _ = std::process::Command::new("cmd")
             .args(["/C", "start", &url])
+            .creation_flags(0x08000000)
             .spawn();
     }
 

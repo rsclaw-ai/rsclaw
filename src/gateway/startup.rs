@@ -1498,6 +1498,12 @@ fn parent_alive(pid: i32) -> bool {
         // Windows fallback: `tasklist /FI "PID eq <n>" /NH` prints a
         // single matching row when the pid is alive, or "INFO: No
         // tasks ..." when it's gone. Cheap and dependency-free.
+        //
+        // CREATE_NO_WINDOW = 0x08000000 — without it the tasklist
+        // process briefly flashes a console window. Every gateway
+        // restart's parent-PID wait would otherwise pop a momentary
+        // window each iteration.
+        use std::os::windows::process::CommandExt;
         match std::process::Command::new("tasklist")
             .args([
                 "/FI",
@@ -1506,6 +1512,7 @@ fn parent_alive(pid: i32) -> bool {
                 "/FO",
                 "CSV",
             ])
+            .creation_flags(0x08000000)
             .output()
         {
             Ok(out) => {

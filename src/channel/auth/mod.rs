@@ -48,10 +48,15 @@ pub fn display_qr_terminal(url: &str) -> Result<()> {
         let png_path = save_qr_png(&code);
 
         // On Windows, open the PNG directly (terminal fonts distort Unicode QR).
+        // CREATE_NO_WINDOW = 0x08000000 — without it the `cmd /C start`
+        // wrapper flashes a console window before ShellExecute hands off
+        // to the registered image viewer.
         #[cfg(target_os = "windows")]
         if let Some(ref path) = png_path {
+            use std::os::windows::process::CommandExt;
             let _ = std::process::Command::new("cmd")
                 .args(["/C", "start", "", &path.display().to_string()])
+                .creation_flags(0x08000000)
                 .spawn();
             println!("  QR code opened in image viewer.");
         }
