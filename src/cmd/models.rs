@@ -407,6 +407,9 @@ struct ModelDef {
     dir: &'static str,
     /// Download URL (ZIP or tar.bz2).
     url: &'static str,
+    /// Upstream origin tried when the gitfast mirror 404s/fails — keeps
+    /// agent self-install working when the mirror cache lacks the file.
+    fallback_url: Option<&'static str>,
 }
 
 const AVAILABLE_MODELS: &[ModelDef] = &[
@@ -415,30 +418,35 @@ const AVAILABLE_MODELS: &[ModelDef] = &[
         label: "BGE-Small-ZH (Chinese embeddings, ~91MB)",
         dir: "bge-small-zh",
         url: "https://gitfast.org/tools/models/bge-small-zh-v1.5.zip",
+        fallback_url: None,
     },
     ModelDef {
         names: &["bge-base-zh"],
         label: "BGE-Base-ZH (Chinese embeddings, higher quality, ~400MB)",
         dir: "bge-base-zh",
         url: "https://gitfast.org/tools/models/bge-base-zh-v1.5.zip",
+        fallback_url: None,
     },
     ModelDef {
         names: &["bge-small-en"],
         label: "BGE-Small-EN (English embeddings, ~127MB)",
         dir: "bge-small-en",
         url: "https://gitfast.org/tools/models/bge-small-en-v1.5.zip",
+        fallback_url: None,
     },
     ModelDef {
         names: &["whisper", "whisper-tiny"],
         label: "Whisper-Tiny (STT lightweight, ~110MB)",
         dir: "whisper-tiny",
         url: "https://gitfast.org/tools/models/sherpa-onnx-whisper-tiny.tar.bz2",
+        fallback_url: Some("https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-tiny.tar.bz2"),
     },
     ModelDef {
         names: &["whisper-turbo"],
         label: "Whisper-Turbo (STT Chinese recommended, ~537MB)",
         dir: "whisper-turbo",
         url: "https://gitfast.org/tools/models/sherpa-onnx-whisper-turbo.tar.bz2",
+        fallback_url: Some("https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-turbo.tar.bz2"),
     },
     ModelDef {
         names: &["paraformer-zh", "paraformer", "paraformer-zh-int8"],
@@ -449,6 +457,7 @@ const AVAILABLE_MODELS: &[ModelDef] = &[
         // guess `sherpa-onnx-paraformer-zh-2023-09-14-int8.tar.bz2`
         // returns 404 from sherpa-onnx GitHub releases.
         url: "https://gitfast.org/tools/models/sherpa-onnx-paraformer-zh-int8-2025-10-07.tar.bz2",
+        fallback_url: Some("https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-paraformer-zh-int8-2025-10-07.tar.bz2"),
     },
     ModelDef {
         names: &["paraformer-zh-full", "paraformer-full"],
@@ -456,6 +465,7 @@ const AVAILABLE_MODELS: &[ModelDef] = &[
         dir: "paraformer-zh-full",
         // Aligned with int8 release date (2025-10-07) for consistency.
         url: "https://gitfast.org/tools/models/sherpa-onnx-paraformer-zh-2025-10-07.tar.bz2",
+        fallback_url: Some("https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-paraformer-zh-2025-10-07.tar.bz2"),
     },
     ModelDef {
         names: &[
@@ -469,12 +479,14 @@ const AVAILABLE_MODELS: &[ModelDef] = &[
         label: "MeloTTS-ZH (Chinese+English TTS, default, ~300MB)",
         dir: "vits-melo-tts-zh_en",
         url: "https://gitfast.org/tools/models/vits-melo-tts-zh_en.tar.bz2",
+        fallback_url: None,
     },
     ModelDef {
         names: &["vits-theresa", "theresa"],
         label: "VITS-Theresa (Chinese TTS female voice, lightweight, ~115MB)",
         dir: "vits-theresa",
         url: "https://gitfast.org/tools/models/vits-zh-hf-theresa.tar.bz2",
+        fallback_url: None,
     },
 ];
 
@@ -504,7 +516,16 @@ async fn cmd_download_embedding(model: Option<String>) -> Result<()> {
         return Ok(());
     }
 
-    download_archive(def.label, &model_dir, def.url).await
+    match download_archive(def.label, &model_dir, def.url).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let Some(fb) = def.fallback_url else {
+                return Err(e);
+            };
+            warn_msg(&format!("mirror failed ({e:#}); trying upstream"));
+            download_archive(def.label, &model_dir, fb).await
+        }
+    }
 }
 
 fn cmd_list_installed() {
