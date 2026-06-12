@@ -37,6 +37,8 @@
 use std::sync::Arc;
 
 use chrono::{Datelike, Duration as ChronoDuration, NaiveTime, TimeZone, Weekday};
+#[cfg(test)]
+use chrono::Timelike;
 use chrono_tz::Asia::Shanghai;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
