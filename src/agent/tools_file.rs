@@ -687,7 +687,7 @@ impl super::runtime::AgentRuntime {
             cmd.stderr(std::process::Stdio::null());
             tokio::time::timeout(Duration::from_secs(15), cmd.output())
                 .await
-                .map_err(|_| anyhow!("search_content: timed out"))?
+                .map_err(|_| anyhow!("search_content: grep timed out after 15s. Narrow `path` to a smaller directory or add an `include` filter, then retry."))?
                 .map_err(|e| anyhow!("search_content: {e}"))?
         };
 
@@ -719,7 +719,7 @@ impl super::runtime::AgentRuntime {
             }
             tokio::time::timeout(Duration::from_secs(15), cmd.output())
                 .await
-                .map_err(|_| anyhow!("search_content: timed out"))?
+                .map_err(|_| anyhow!("search_content: Select-String timed out after 15s. Narrow `path` to a smaller directory or add an `include` filter, then retry."))?
                 .map_err(|e| anyhow!("search_content: {e}"))?
         };
 
@@ -821,7 +821,10 @@ impl super::runtime::AgentRuntime {
             if let Some(text) = crate::channel::extract_office_text(path, &bytes) {
                 return Ok(json!({"content": text, "path": path}));
             }
-            anyhow::bail!("read `{}`: failed to extract office text", full.display());
+            anyhow::bail!(
+                "read `{}`: could not extract text — the file may be corrupt, password-protected, or not a real OOXML document. Verify with exec `file <path>`, or tell the user this file cannot be parsed.",
+                full.display()
+            );
         }
 
         let content = tokio::fs::read_to_string(&full)
@@ -1093,7 +1096,7 @@ impl super::runtime::AgentRuntime {
                     bail!("[blocked] {reason}");
                 }
                 crate::agent::preparse::SafetyCheck::Confirm(reason) => {
-                    bail!("[needs confirmation] {reason}. Command: {command}");
+                    bail!("[needs confirmation] {reason}. Command: {command}. Do not retry on your own — ask the user to explicitly approve this command, and re-run it only after they confirm.");
                 }
             }
         }
@@ -1167,7 +1170,10 @@ impl super::runtime::AgentRuntime {
                         resolved.clone()
                     };
                     if !canon.starts_with(&ws_canon) {
-                        bail!("[sandbox] access denied: path `{token}` is outside workspace");
+                        bail!(
+                            "[sandbox] access denied: `{token}` is outside the workspace `{}`. Use paths under the workspace, or ask the user to relax `tools.exec.safety` if outside access is intended.",
+                            ws_canon.display()
+                        );
                     }
                 }
             }
@@ -1288,7 +1294,7 @@ impl super::runtime::AgentRuntime {
             .map_err(|_| {
                 tracing::warn!(command = %command, timeout_secs, "exec: timed out");
                 anyhow!(
-                    "Command timed out after {timeout_secs}s. Use wait=false (default) for long-running commands."
+                    "Command timed out after {timeout_secs}s. Re-run with `wait: false` to run it in the background (results arrive next turn), or pass a larger `timeout` (up to 300s)."
                 )
             })?
             .map_err(|e| anyhow!("exec `{command}`: {e}"))?;
@@ -1543,7 +1549,7 @@ async fn run_ripgrep(
 
     let output = tokio::time::timeout(Duration::from_secs(15), cmd.output())
         .await
-        .map_err(|_| anyhow!("search_content: timed out"))?
+        .map_err(|_| anyhow!("search_content: ripgrep timed out after 15s. Narrow `path` to a smaller directory or add an `include` glob, then retry."))?
         .map_err(|e| anyhow!("search_content: {e}"))?;
 
     let text = String::from_utf8_lossy(&output.stdout);

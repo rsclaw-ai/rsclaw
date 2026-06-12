@@ -466,7 +466,11 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                 anyhow!(self
                     .resolve_vision_model_name()
                     .err()
-                    .unwrap_or_else(|| "no vision model configured".to_owned()))
+                    .unwrap_or_else(|| {
+                        "no vision model configured — vlm_drive needs a vision-capable model; \
+                         ask the user to set one in the agent config (vision model / vision chain), then retry"
+                            .to_owned()
+                    }))
             })?;
         let (prov_name, _model_id) = self.providers.resolve_model(&model_name);
         let provider = self.providers.get(prov_name)?;
@@ -615,7 +619,7 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                         );
                         DriverOutcome::OperatorError {
                             message: format!(
-                                "async vlm_drive exceeded the {ASYNC_VLM_DRIVE_HARD_TIMEOUT_SECS}s hard timeout"
+                                "async vlm_drive was aborted after exceeding the {ASYNC_VLM_DRIVE_HARD_TIMEOUT_SECS}s hard timeout (partial progress may have been made); split the instruction into smaller sub-tasks and run them separately"
                             ),
                             steps: 0,
                         }
@@ -648,9 +652,16 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                         )
                     }
                     DriverOutcome::OperatorError { message, steps } => {
-                        format!(
-                            "[vlm_drive task {task_id_for_log}] failed after {steps} steps: {message}"
-                        )
+                        // steps == 0 usually means "step count unknown"
+                        // (timeout/driver error paths don't track it) —
+                        // don't render a misleading "failed after 0 steps".
+                        if *steps == 0 {
+                            format!("[vlm_drive task {task_id_for_log}] failed: {message}")
+                        } else {
+                            format!(
+                                "[vlm_drive task {task_id_for_log}] failed after {steps} steps: {message}"
+                            )
+                        }
                     }
                 };
 
@@ -918,7 +929,8 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                 "outcome_kind": "max_loop",
                 "completion_verified": false,
                 "steps_taken": steps,
-                "error": "max_loop reached",
+                "error": "hit max_steps without finishing — the task may be partially done",
+                "hint": "take a screenshot to check progress, then retry with a higher `max_steps` or split the instruction into smaller sub-tasks",
             }),
             DriverOutcome::UserAbort { steps } => json!({
                 "action": "vlm_drive",
@@ -936,7 +948,8 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                 "outcome_kind": "permission_denied",
                 "completion_verified": false,
                 "steps_taken": 0,
-                "error": "permission denied",
+                "error": "user declined the computer-control permission prompt",
+                "hint": "do not retry automatically; tell the user the action was blocked and ask how to proceed",
             }),
             DriverOutcome::OperatorError { message, steps } => json!({
                 "action": "vlm_drive",
@@ -1096,7 +1109,7 @@ async fn triple_click(args: &Value) -> Result<Value> {
             .arg(&arg)
             .output()
             .await
-            .map_err(|e| anyhow!("cliclick triple_click: {e}"))?;
+            .map_err(|e| anyhow!("cliclick triple_click failed: {e} — if the binary is missing (os error 2), ask the user to install it with `brew install cliclick`"))?;
     } else if is_windows {
         super::platform::win_mouse_click(lx, ly, "left", 3).await?;
     } else {
@@ -1129,7 +1142,7 @@ async fn cursor_position() -> Result<Value> {
             .arg("p:.")
             .output()
             .await
-            .map_err(|e| anyhow!("cliclick: {e}"))?;
+            .map_err(|e| anyhow!("cursor_position via cliclick failed: {e} — if the binary is missing, ask the user to install it with `brew install cliclick`"))?;
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     } else if is_windows {
         let output = powershell_hidden()

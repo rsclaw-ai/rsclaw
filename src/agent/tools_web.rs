@@ -444,7 +444,11 @@ impl AgentRuntime {
                     .await?;
                 parse_sogou_results(&html, limit)
             }
-            other => return Err(anyhow!("web_search: unknown provider `{other}`")),
+            other => {
+                return Err(anyhow!(
+                    "web_search: unknown provider `{other}`. Valid: serper, google, brave, bing, duckduckgo-free, bing-free, baidu-free, sogou-free — or omit `provider` to auto-detect"
+                ));
+            }
         };
 
         // Fallback: if DDG returned empty (captcha), try bing-free
@@ -959,7 +963,9 @@ impl AgentRuntime {
         // Enforce 10 MB content-length limit.
         if let Some(len) = response.content_length() {
             if len > 10 * 1024 * 1024 {
-                bail!("web_fetch: content too large ({} bytes, max 10MB)", len);
+                bail!(
+                    "web_fetch: content too large ({len} bytes, max 10MB). web_fetch reads pages into context — use web_download to save this URL to a file instead"
+                );
             }
         }
 
@@ -1524,7 +1530,10 @@ impl AgentRuntime {
             .map_err(|e| anyhow!("web_download: request failed: {e}"))?;
 
         if !resp.status().is_success() && resp.status().as_u16() != 206 {
-            bail!("web_download: HTTP {} for {url}", resp.status());
+            bail!(
+                "web_download: HTTP {} for {url}. For 401/403 retry with use_browser_cookies=true (or pass `cookies`/`referer`); for 404 re-verify the URL — CDN links expire, re-capture via web_browser capture_video if it was a video URL",
+                resp.status()
+            );
         }
 
         // Warn if response is HTML (likely a redirect/login page, not the actual file).
@@ -1536,7 +1545,7 @@ impl AgentRuntime {
             .to_lowercase();
         if content_type.contains("text/html") {
             bail!(
-                "web_download: server returned HTML instead of file. The URL may require different cookies or is a redirect page. Content-Type: {content_type}"
+                "web_download: server returned HTML instead of a file (Content-Type: {content_type}) — likely a login or redirect page. Retry with use_browser_cookies=true, or open the URL with web_browser to locate the real file link"
             );
         }
 
@@ -1564,7 +1573,11 @@ impl AgentRuntime {
         };
         let mut downloaded: u64 = 0;
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| anyhow!("web_download: stream error: {e}"))?;
+            let chunk = chunk.map_err(|e| {
+                anyhow!(
+                    "web_download: stream interrupted: {e}. The partial file was kept — re-run the same web_download call with the same `path` to resume via Range request"
+                )
+            })?;
             file.write_all(&chunk).await?;
             downloaded += chunk.len() as u64;
         }

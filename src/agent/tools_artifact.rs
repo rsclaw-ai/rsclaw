@@ -192,7 +192,13 @@ impl AgentRuntime {
             .as_str()
             .or_else(|| args["id"].as_str())
             .map(str::trim)
-            .ok_or_else(|| anyhow!("read_artifact: `tool_result_id` required"))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "read_artifact: `tool_result_id` must be a JSON string (missing or \
+                     non-string value given). Pass the id exactly as it appears in the \
+                     truncation marker, e.g. tool_result_id=\"tr_abc123\"."
+                )
+            })?;
         let id = ArtifactId::parse(id_str)?;
 
         let mode = args["mode"].as_str().unwrap_or("full").trim();

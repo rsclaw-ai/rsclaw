@@ -77,7 +77,8 @@ impl AgentRuntime {
             _ => {
                 return Ok(json!({
                     "ok": false,
-                    "error": "`url` (string) is required"
+                    "error": "`url` must be a non-empty string",
+                    "hint": "pass the WeChat article link, e.g. https://mp.weixin.qq.com/s/<id>"
                 }));
             }
         };
@@ -94,7 +95,8 @@ impl AgentRuntime {
                 return Ok(json!({
                     "ok": false,
                     "code": "kb_unavailable",
-                    "error": "knowledge base subsystem not initialised — cannot ingest"
+                    "error": "knowledge base subsystem not initialised — cannot ingest",
+                    "hint": "do not retry; tell the user to enable the knowledge base in config and restart the gateway"
                 }));
             }
         };
@@ -116,7 +118,8 @@ impl AgentRuntime {
                 return Ok(json!({
                     "ok": false,
                     "code": "parse_failed",
-                    "error": "could not find window.cgiDataNew in page — WeChat may have changed format or returned the 环境异常 verification page",
+                    "error": "could not find window.cgiDataNew in page — WeChat changed format or served the 环境异常 verification wall (usually an IP-rate trip)",
+                    "hint": "retry once after a pause or from another network; otherwise ask the user to open the link in WeChat and report back",
                     "url": url,
                 }));
             }
@@ -266,7 +269,8 @@ impl AgentRuntime {
         if urls.is_empty() {
             return Ok(json!({
                 "ok": false,
-                "error": "`image_urls` (non-empty array of URLs) is required"
+                "error": "`image_urls` must be a non-empty array of URL strings (non-string entries are dropped)",
+                "hint": "pass the image_urls field returned by research_ingest_wechat"
             }));
         }
         let max = args
@@ -447,6 +451,7 @@ impl AgentRuntime {
                 "ok": false,
                 "code": "empty_response",
                 "error": "vision LLM returned empty content",
+                "hint": "retry once; if it repeats, the configured model likely lacks image support — tell the user to set a multimodal model in agents.defaults.model.vision",
                 "model": used_model,
             }));
         }
@@ -568,11 +573,14 @@ async fn fetch_wechat_html(url: &str) -> Result<String> {
         .build()?;
     let resp = client.get(url).send().await?.error_for_status()?;
     // Length-cap defensively: WeChat articles are typically 100-400 KB.
-    // Anything >2 MB is suspicious (or a video page); refuse so we don't
+    // Anything >4 MiB is suspicious (or a video page); refuse so we don't
     // OOM on a runaway response.
     let bytes = resp.bytes().await?;
     if bytes.len() > 4 * 1024 * 1024 {
-        anyhow::bail!("WeChat response too large ({} bytes)", bytes.len());
+        anyhow::bail!(
+            "WeChat response too large ({} bytes, 4 MiB cap) — likely a video/live page rather than a text article; verify the URL is a normal /s/<id> article before retrying",
+            bytes.len()
+        );
     }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }

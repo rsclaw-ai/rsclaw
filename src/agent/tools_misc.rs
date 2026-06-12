@@ -293,7 +293,7 @@ $synth.Speak('{}')
                         .args(["-w", &out_path_str, "--", text])
                         .output()
                         .await
-                        .map_err(|e| anyhow!("tts: neither espeak nor pico2wave available: {e}"))?;
+                        .map_err(|e| anyhow!("tts: espeak failed or is missing, and pico2wave could not be run: {e}. Install espeak (e.g. `apt install espeak`) or report TTS as unsupported on this host"))?;
                     if !output.status.success() {
                         let stderr = String::from_utf8_lossy(&output.stderr);
                         return Err(anyhow!("tts: pico2wave failed: {stderr}"));
@@ -351,7 +351,9 @@ $synth.Speak('{}')
                 let body = r.text().await.unwrap_or_default();
                 Err(anyhow!("message: gateway returned {status}: {body}"))
             }
-            Err(e) => Err(anyhow!("message: failed to reach gateway: {e}")),
+            Err(e) => Err(anyhow!(
+                "message: cannot reach local gateway at 127.0.0.1:{port}: {e}. The gateway HTTP listener appears down — restart it with `rsclaw gateway restart` or verify the configured port"
+            )),
         }
     }
 
@@ -467,11 +469,13 @@ $synth.Speak('{}')
                     .ok_or_else(|| anyhow!("anycli install: `name` required"))?;
                 let hub = anycli::Hub::new()?;
                 let dir = anycli::hub::default_adapters_dir()
-                    .ok_or_else(|| anyhow!("cannot determine home directory"))?;
+                    .ok_or_else(|| anyhow!("anycli install: cannot determine adapters directory (home dir unresolved — is $HOME/%USERPROFILE% unset?). Set HOME or install manually with `rsclaw anycli install <name>`"))?;
                 let path = hub.install(name, &dir).await?;
                 Ok(json!({"installed": name, "path": path.display().to_string()}))
             }
-            other => Err(anyhow!("anycli: unknown action `{other}`")),
+            other => Err(anyhow!(
+                "anycli: unknown action `{other}` — valid actions: list, info, run, search, install"
+            )),
         }
     }
 
@@ -670,7 +674,7 @@ $synth.Speak('{}')
                     pdf_cmd.creation_flags(0x08000000);
                 }
                 let output = pdf_cmd.output().await
-                    .map_err(|e2| anyhow!("pdf: extraction failed: {e}, pdftotext: {e2}"))?;
+                    .map_err(|e2| anyhow!("pdf: built-in extraction failed ({e}) and the pdftotext fallback could not be run ({e2} — likely poppler-utils not installed). Install poppler-utils, or the PDF may be scanned/image-only and need OCR"))?;
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     return Err(anyhow!("pdf: extraction failed: {e}, pdftotext: {stderr}"));

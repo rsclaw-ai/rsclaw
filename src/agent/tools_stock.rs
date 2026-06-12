@@ -417,7 +417,8 @@ impl AgentRuntime {
             return Ok(json!({
                 "ok": false,
                 "code": "memory_unavailable",
-                "error": "memory store not initialised — cannot persist watchlist"
+                "error": "memory store not initialised — cannot persist watchlist",
+                "hint": "watchlist needs the memory subsystem; ask the user to enable memory in the agent config. quote/snapshot/kline tools still work without it."
             }));
         };
         let scope = watchlist_scope(&ctx.agent_id, &ctx.channel, &ctx.peer_id);
@@ -512,7 +513,8 @@ pub(crate) async fn render_chart_for_code(
     };
     if kr.klines.is_empty() {
         return Err(ChartRenderError::Soft(format!(
-            "astock returned 0 bars for {code} ({period})"
+            "astock returned 0 bars for {code} ({period}) — code may be mistyped, delisted, \
+             suspended, or too newly listed. Verify with stock_quote first, or retry with period=\"1d\"."
         )));
     }
     let quote = quote_res.ok();
@@ -601,7 +603,12 @@ pub(crate) async fn render_chart_for_code(
         ..Default::default()
     };
     let size = crate::astock::chart::render_kline_png(&kr.klines, &opts, &path)
-        .map_err(|e| ChartRenderError::Soft(format!("render_kline_png: {e:#}")))?;
+        .map_err(|e| {
+            ChartRenderError::Soft(format!(
+                "render_kline_png: {e:#} — local rendering issue (not bad market data); \
+                 fall back to stock_kline and reply with its markdown summary instead of a chart"
+            ))
+        })?;
 
     Ok(ChartRenderOutput {
         path,
@@ -776,10 +783,13 @@ pub(crate) async fn watchlist_add(
         .map(|d| d.text)
         .collect();
     let current_count = existing.len();
+    let wanted_count = wanted.len();
     let to_add: Vec<String> = wanted
         .into_iter()
         .filter(|c| !existing.contains(c))
         .collect();
+    // Codes asked for but already on the watchlist.
+    let skipped_duplicates = wanted_count - to_add.len();
     if current_count + to_add.len() > WATCHLIST_CAP {
         return Ok(json!({
             "ok": false,
@@ -825,7 +835,8 @@ pub(crate) async fn watchlist_add(
     Ok(json!({
         "ok": true,
         "added": added,
-        "skipped_duplicates": current_count, // before-state count for context
+        "skipped_duplicates": skipped_duplicates,
+        "existing_before": current_count,
         "total": existing.len() + added.len(),
     }))
 }
@@ -838,7 +849,8 @@ pub(crate) async fn watchlist_remove(
     if raw_codes.is_empty() {
         return Ok(json!({
             "ok": false,
-            "error": "no codes provided"
+            "error": "no codes provided — pass `code: \"600519\"` or `codes: [\"600519\", ...]`",
+            "hint": "use action=list to see what's on the watchlist"
         }));
     }
     let targets: std::collections::HashSet<String> = raw_codes
