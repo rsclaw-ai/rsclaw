@@ -44,14 +44,27 @@ impl KbReranker {
         if !rr.enabled.unwrap_or(true) {
             return None;
         }
-        let base = rr.base_url.trim_end_matches('/');
-        if base.is_empty() {
-            return None;
-        }
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(RERANK_TIMEOUT_SECS))
-            .build()
-            .ok()?;
+        // base_url empty + rsclaw-* model → fleet API; mirrors the
+        // embedder's convention-over-config base resolution.
+        let model_is_rsclaw = rr
+            .model
+            .as_deref()
+            .map(crate::embed::is_rsclaw_model)
+            .unwrap_or(false);
+        let base_raw = rr.base_url.trim();
+        let base = if base_raw.is_empty() {
+            if model_is_rsclaw {
+                crate::embed::RSCLAW_API_BASE_URL.to_owned()
+            } else {
+                return None;
+            }
+        } else {
+            base_raw.trim_end_matches('/').to_owned()
+        };
+        // Disable idle-pool reuse for the same reason as the embedder: a
+        // slow rerank endpoint's keep-alive connection gets reaped between
+        // calls and reqwest would otherwise hand back the dead socket.
+        let client = crate::embed::build_remote_client(RERANK_TIMEOUT_SECS);
         Some(std::sync::Arc::new(Self {
             client,
             url: format!("{base}/rerank"),
@@ -67,6 +80,11 @@ impl KbReranker {
         let mut body = serde_json::json!({
             "query": query,
             "documents": docs,
+            // Cohere-style hints: cap the returned set and skip echoing the
+            // documents back (we only consume scores by index). Harmless to
+            // endpoints that ignore them.
+            "top_n": self.top_n.min(docs.len()).max(1),
+            "return_documents": false,
         });
         if let Some(m) = &self.model {
             body["model"] = serde_json::json!(m);

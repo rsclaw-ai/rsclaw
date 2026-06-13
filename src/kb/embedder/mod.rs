@@ -44,7 +44,18 @@ pub fn resolve_embedder(kb_root: &std::path::Path) -> std::sync::Arc<dyn KbEmbed
     let embed_cfg = effective_embed_config();
 
     if let Some(cfg) = embed_cfg.as_ref() {
-        match cfg.provider.as_deref() {
+        // A `rsclaw-*` model implies the remote OpenAI-compatible path even
+        // when `provider` is unset — convention over config.
+        let model_is_rsclaw = cfg
+            .model
+            .as_deref()
+            .map(crate::embed::is_rsclaw_model)
+            .unwrap_or(false);
+        let effective_provider = match cfg.provider.as_deref() {
+            None if model_is_rsclaw => Some("openai"),
+            other => other,
+        };
+        match effective_provider {
             Some("openai") => {
                 let model = cfg
                     .model
@@ -59,10 +70,9 @@ pub fn resolve_embedder(kb_root: &std::path::Path) -> std::sync::Arc<dyn KbEmbed
                     .dimensions
                     .unwrap_or_else(|| crate::embed::openai_model_dim(&model))
                     as usize;
-                let base_url = cfg
-                    .base_url
-                    .clone()
-                    .unwrap_or_else(|| crate::embed::OPENAI_DEFAULT_BASE_URL.to_owned());
+                // base_url empty + rsclaw-* model → fleet API; else OpenAI.
+                let base_url =
+                    crate::embed::resolve_embed_base_url(cfg.base_url.as_deref(), &model);
                 tracing::info!(model = %model, dim, base_url = %base_url, "kb: using remote OpenAI-compatible embedder");
                 return Arc::new(LocalKbEmbedder::remote_openai(
                     base_url, model, api_key, dim,

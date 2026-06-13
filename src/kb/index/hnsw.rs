@@ -155,6 +155,7 @@ impl HnswCache {
         let mut id_to_chunk: Vec<String> = Vec::new();
         let mut chunk_to_id: HashMap<String, usize> = HashMap::new();
         let mut vectors: Vec<Vec<f32>> = Vec::new();
+        let mut dim_skipped = 0usize;
         {
             use redb::ReadableTable;
 
@@ -167,6 +168,7 @@ impl HnswCache {
                 let (_, v) = entry?;
                 let c: KbChunk = decode(v.value())?;
                 if c.vector.len() != self.dimension {
+                    dim_skipped += 1;
                     continue;
                 }
                 let seq = id_to_chunk.len();
@@ -174,6 +176,21 @@ impl HnswCache {
                 id_to_chunk.push(c.id.clone());
                 vectors.push(c.vector);
             }
+        }
+        // Dimension-mismatched chunks are dropped above. A WHOLESALE drop
+        // means the dense leg is dead and hybrid silently degrades to
+        // bm25-only — exactly what a flaky remote embedder produces
+        // (zero/short vectors persisted, rebuild quietly yields n=0).
+        // Surface it loudly instead of letting recall rot in silence.
+        if dim_skipped > 0 {
+            tracing::warn!(
+                dim_skipped,
+                kept = vectors.len(),
+                expected_dim = self.dimension,
+                "kb hnsw: dropped chunks with wrong vector dimension — dense recall degraded; \
+                 likely a remote embedder returned bad vectors during ingest (re-ingest once \
+                 the endpoint is healthy)"
+            );
         }
         let capacity = INITIAL_CAPACITY.max(vectors.len() * 2);
         let hnsw = Hnsw::<'static, f32, DistCosine>::new(

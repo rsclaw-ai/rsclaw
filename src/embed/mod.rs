@@ -16,9 +16,35 @@
 //! working.
 
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tracing::warn;
+
+/// Shared HTTP client for remote embedding/rerank endpoints.
+///
+/// `pool_max_idle_per_host(0)` is load-bearing, not a tweak: a slow
+/// embedding model (e.g. Qwen3-Embedding-4B at several seconds/request)
+/// leaves a keep-alive connection idle long enough for the server to
+/// reap it, and reqwest's default pool then hands that dead socket to the
+/// next request — surfacing as `connection closed before message
+/// completed` on ~every chunk of a bulk ingest (observed live: 85/86
+/// chunks failed, dense index silently rebuilt to n=0). Disabling idle
+/// reuse forces a fresh connection per request; the cost is one extra
+/// handshake, paid only on remote embedders, dwarfed by model latency.
+pub(crate) fn build_remote_client(timeout_secs: u64) -> reqwest::Client {
+    reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Attempts for a remote embed request. Connection-closed / transient
+/// network errors are idempotent for embeddings, so a couple of retries
+/// clear the pool-reuse race even when it slips past idle-pool disabling.
+const EMBED_ATTEMPTS: usize = 3;
 
 /// Fallback embedding dimension when no model is loaded (FNV).
 pub const DEFAULT_EMBED_DIM: i32 = 384;
@@ -27,6 +53,27 @@ pub const OPENAI_DEFAULT_MODEL: &str = "text-embedding-3-small";
 /// Default OpenAI-compatible API root. Override to point at a GPU fleet
 /// serving `/v1/embeddings` (vLLM / SGLang / TEI / infinity).
 pub const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+/// RsClaw fleet's OpenAI/Cohere-compatible API root (embeddings, rerank,
+/// ocr). Convention-over-config: a `rsclaw-*` model name with no explicit
+/// base_url resolves here, mirroring the rsclaw chat provider's treatment.
+pub const RSCLAW_API_BASE_URL: &str = "https://api.rsclaw.ai/v1";
+
+/// True for first-party fleet model names (`rsclaw-embedding-v1`,
+/// `rsclaw-reranker-v1`, `rsclaw-ocr-v1`, …).
+pub fn is_rsclaw_model(model: &str) -> bool {
+    model.starts_with("rsclaw-")
+}
+
+/// Resolve the effective API root: an explicit `base_url` always wins;
+/// otherwise a `rsclaw-*` model defaults to the fleet, and anything else
+/// to OpenAI. Empty/whitespace base_url counts as unset.
+pub fn resolve_embed_base_url(base_url: Option<&str>, model: &str) -> String {
+    match base_url.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(b) => b.to_owned(),
+        None if is_rsclaw_model(model) => RSCLAW_API_BASE_URL.to_owned(),
+        None => OPENAI_DEFAULT_BASE_URL.to_owned(),
+    }
+}
 /// Default Ollama embedding model.
 pub const OLLAMA_DEFAULT_MODEL: &str = "nomic-embed-text";
 /// Default Ollama REST base URL.
@@ -291,7 +338,7 @@ impl OpenAiEmbedder {
         let dim = dim_override.unwrap_or_else(|| openai_model_dim(&model));
         let base_url = base_url.unwrap_or_else(|| OPENAI_DEFAULT_BASE_URL.to_owned());
         Self {
-            client: reqwest::Client::new(),
+            client: build_remote_client(120),
             api_key,
             model,
             dim,
@@ -306,38 +353,43 @@ impl OpenAiEmbedder {
             "input": text,
         });
 
-        let rt = tokio::runtime::Handle::try_current();
-        let response_text = match rt {
-            Ok(handle) => tokio::task::block_in_place(|| {
-                handle.block_on(async {
-                    self.client
-                        .post(url.as_str())
-                        .header("Authorization", format!("Bearer {}", self.api_key))
-                        .json(&body)
-                        .send()
-                        .await?
-                        .text()
-                        .await
-                })
-            })
-            .context("OpenAI embeddings request failed")?,
-            Err(_) => {
-                let tmp_rt = tokio::runtime::Runtime::new()
-                    .context("failed to create temp runtime for OpenAI embed")?;
-                tmp_rt
-                    .block_on(async {
-                        self.client
-                            .post(url.as_str())
-                            .header("Authorization", format!("Bearer {}", self.api_key))
-                            .json(&body)
-                            .send()
-                            .await?
-                            .text()
-                            .await
-                    })
-                    .context("OpenAI embeddings request failed")?
-            }
+        let send = || async {
+            self.client
+                .post(url.as_str())
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .json(&body)
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await
         };
+        // Retry transient transport errors (idempotent for embeddings).
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut response_text: Option<String> = None;
+        for attempt in 0..EMBED_ATTEMPTS {
+            let r = match tokio::runtime::Handle::try_current() {
+                Ok(handle) => tokio::task::block_in_place(|| handle.block_on(send())),
+                Err(_) => tokio::runtime::Runtime::new()
+                    .context("failed to create temp runtime for OpenAI embed")?
+                    .block_on(send()),
+            };
+            match r {
+                Ok(t) => {
+                    response_text = Some(t);
+                    break;
+                }
+                Err(e) => {
+                    if attempt + 1 < EMBED_ATTEMPTS {
+                        std::thread::sleep(Duration::from_millis(200 * (attempt as u64 + 1)));
+                    }
+                    last_err = Some(anyhow::Error::new(e));
+                }
+            }
+        }
+        let response_text = response_text.ok_or_else(|| {
+            last_err.unwrap_or_else(|| anyhow::anyhow!("OpenAI embed: no response"))
+        })?;
 
         let parsed: serde_json::Value = serde_json::from_str(&response_text)
             .context("OpenAI embeddings: invalid JSON response")?;
@@ -381,6 +433,9 @@ pub fn openai_model_dim(model: &str) -> i32 {
         // `memorySearch.dimensions` explicitly to be safe; this is a
         // best-effort default for the common 0.6B/4B 1024-dim case.
         m if m.starts_with("Qwen3-Embedding") || m.starts_with("qwen3-embedding") => 1024,
+        // RsClaw first-party embedding model. Native dim; override with
+        // `dimensions` for Matryoshka truncation.
+        "rsclaw-embedding-v1" => 1024,
         _ => 1536,
     }
 }
@@ -403,7 +458,7 @@ impl OllamaEmbedder {
         let base_url = base_url.unwrap_or_else(|| OLLAMA_DEFAULT_URL.to_owned());
         let default_dim = ollama_model_dim(&model);
         Self {
-            client: reqwest::Client::new(),
+            client: build_remote_client(120),
             base_url,
             model,
             dim: std::sync::Mutex::new(None),
