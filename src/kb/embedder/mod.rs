@@ -51,7 +51,13 @@ pub fn resolve_embedder(kb_root: &std::path::Path) -> std::sync::Arc<dyn KbEmbed
             .as_deref()
             .map(crate::embed::is_rsclaw_model)
             .unwrap_or(false);
+        // `rsclaw` is a semantic alias for the openai-compatible remote
+        // path (the fleet speaks the OpenAI embeddings shape); writing
+        // `provider: "openai"` for a first-party model reads wrong. An
+        // unset provider with a `rsclaw-*` model also takes the remote
+        // path — both resolve the base URL via `resolve_embed_base_url`.
         let effective_provider = match cfg.provider.as_deref() {
+            Some("rsclaw") => Some("openai"),
             None if model_is_rsclaw => Some("openai"),
             other => other,
         };
