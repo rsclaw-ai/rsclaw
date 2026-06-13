@@ -158,7 +158,7 @@ impl super::runtime::AgentRuntime {
                             "tool_image: post-billing failure — NOT advancing chain"
                         );
                         return Err(anyhow!(
-                            "image_gen: provider {chain_model} was billed but did not return a usable image: {e:#}"
+                            "image_gen: provider {chain_model} was billed but did not return a usable image: {e:#}. Do NOT retry this tool automatically (each attempt is billed) — report the failure to the user and let them decide whether to retry"
                         ));
                     }
                     tracing::warn!(
@@ -173,13 +173,19 @@ impl super::runtime::AgentRuntime {
             }
         }
 
-        Err(anyhow!(
-            "image_gen: all {} model(s) failed. Last error: {}",
-            attempt_models.len(),
-            last_error
-                .map(|e| format!("{e:#}"))
-                .unwrap_or_else(|| "no callable models".to_owned())
-        ))
+        Err(match last_error {
+            Some(e) => anyhow!(
+                "image_gen: all {} model(s) failed. Last error: {e:#}",
+                attempt_models.len()
+            ),
+            // last_error == None means every chain entry was skipped as
+            // Disabled/Cooling — nothing was actually attempted, so
+            // "all failed" would misdiagnose.
+            None => anyhow!(
+                "image_gen: all {} configured image model(s) are currently Disabled or Cooling (recent failures) — none were attempted. Check /api/v1/models/health, wait for cooldown, or pass an explicit `model` argument to force one attempt",
+                attempt_models.len()
+            ),
+        })
     }
 
     /// One attempt for a single configured image model id. Called per
@@ -225,7 +231,7 @@ impl super::runtime::AgentRuntime {
         // the cost gate: do not silently fall back to another paid provider
         // just because an API key happens to be configured.
         let image_providers = ["doubao", "bytedance", "openai", "qwen", "minimax", "gemini", "rsclaw"];
-        let (img_url, img_key, img_prov) = if image_providers.contains(&prov_name) {
+        let (img_url, img_key, img_prov, img_env_var) = if image_providers.contains(&prov_name) {
             // rsclaw's LLM default in defaults.toml ends in `/v1/agent`;
             // the gen surface lives off the host root. `gen_host_base`
             // normalises both shapes; we append `/v1` for the OAI mount.
@@ -238,17 +244,18 @@ impl super::runtime::AgentRuntime {
             } else {
                 raw
             };
-            let env_key = match prov_name {
-                "doubao" | "bytedance" => std::env::var("ARK_API_KEY").ok(),
-                "qwen" => std::env::var("DASHSCOPE_API_KEY").ok(),
-                "minimax" => std::env::var("MINIMAX_API_KEY").ok(),
-                "gemini" => std::env::var("GEMINI_API_KEY").ok(),
-                "openai" => std::env::var("OPENAI_API_KEY").ok(),
-                "rsclaw" => std::env::var("RSCLAW_API_KEY").ok(),
+            let env_var = match prov_name {
+                "doubao" | "bytedance" => Some("ARK_API_KEY"),
+                "qwen" => Some("DASHSCOPE_API_KEY"),
+                "minimax" => Some("MINIMAX_API_KEY"),
+                "gemini" => Some("GEMINI_API_KEY"),
+                "openai" => Some("OPENAI_API_KEY"),
+                "rsclaw" => Some("RSCLAW_API_KEY"),
                 _ => None,
             };
+            let env_key = env_var.and_then(|v| std::env::var(v).ok());
             let key = cfg_key.or(env_key);
-            (url, key, prov_name)
+            (url, key, prov_name, env_var)
         } else {
             return Ok(json!({
                 "error": format!(
@@ -262,8 +269,10 @@ impl super::runtime::AgentRuntime {
             // missing-key entry would short-circuit as Ok and silently
             // skip the user's configured fallbacks.
             return Err(anyhow!(
-                "image_gen: no API key for {} (set provider config or env var, or configure a working fallback)",
-                img_prov
+                "image_gen: no API key for {img_prov} — set models.providers.{img_prov}.api_key in config{}, or configure a working fallback in agents.defaults.model.image",
+                img_env_var
+                    .map(|v| format!(" or export {v}"))
+                    .unwrap_or_default()
             ));
         };
 
@@ -330,7 +339,12 @@ impl super::runtime::AgentRuntime {
                     post_billing(format!("parse error: {e} (body preview: {preview})"))
                 })
             } else {
-                Ok(serde_json::from_slice::<Value>(bytes).unwrap_or(Value::Null))
+                // Non-2xx with a non-JSON body (HTML error page, plain
+                // text from a proxy, …): keep the raw text so the error
+                // site can show a preview instead of "unknown error".
+                Ok(serde_json::from_slice::<Value>(bytes).unwrap_or_else(|_| {
+                    Value::String(String::from_utf8_lossy(bytes).into_owned())
+                }))
             }
         }
         let (resp_status, resp_body) = if is_qwen {
@@ -518,11 +532,16 @@ impl super::runtime::AgentRuntime {
         };
 
         if !resp_status.is_success() {
+            let raw = resp_body.to_string();
             let err_msg = resp_body["error"]["message"]
                 .as_str()
                 .or_else(|| resp_body["message"].as_str())
-                .unwrap_or("unknown error");
-            return Err(anyhow!("image: API error: {err_msg}"));
+                // Non-JSON bodies are preserved as Value::String by
+                // parse_response_body; fall back to a raw preview so
+                // 401/429/400 are distinguishable.
+                .or_else(|| resp_body.as_str().map(|s| crate::util::truncate_str(s, 200)))
+                .unwrap_or_else(|| crate::util::truncate_str(&raw, 200));
+            return Err(anyhow!("image: API error (HTTP {resp_status}): {err_msg}"));
         }
 
         // Extract image URL/base64 — different response formats per provider
@@ -557,7 +576,25 @@ impl super::runtime::AgentRuntime {
                     }
                 }
             }
-            return Err(post_billing("no image data in Gemini response"));
+            // A 200 with no inlineData is most often a safety block —
+            // surface finishReason / blockReason and any text part so the
+            // model can tell a refusal from API format drift.
+            let finish_reason = resp_body
+                .pointer("/candidates/0/finishReason")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    resp_body
+                        .pointer("/promptFeedback/blockReason")
+                        .and_then(|v| v.as_str())
+                })
+                .unwrap_or("unknown");
+            let refusal_text = parts
+                .and_then(|ps| ps.iter().find_map(|p| p.get("text").and_then(|v| v.as_str())))
+                .unwrap_or("");
+            return Err(post_billing(format!(
+                "no image data in Gemini response (finishReason: {finish_reason}, text: {}) — likely safety-filtered; rephrase the prompt to avoid policy-sensitive content",
+                crate::util::truncate_str(refusal_text, 200)
+            )));
         }
 
         // Each provider may return either a fetchable URL or inline base64.
@@ -591,7 +628,10 @@ impl super::runtime::AgentRuntime {
         };
 
         let Some(img_ref) = img_ref else {
-            return Err(post_billing("no image data in response"));
+            return Err(post_billing(format!(
+                "no image data in response (no url/base64 image field; body preview: {})",
+                crate::util::truncate_str(&resp_body.to_string(), 200)
+            )));
         };
 
         // Resolve `img_ref` → bytes + mime.  Three shapes are accepted:

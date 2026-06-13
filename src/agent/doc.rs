@@ -130,7 +130,10 @@ pub async fn handle(args: &Value, full_path: &Path) -> Result<Value> {
         "edit_word" => edit_word(&args, &path),
         "edit_pdf" => edit_pdf(&args, &path),
         "read_doc" => read_doc(&path),
-        other => Ok(json!({"error": format!("doc: unknown action '{other}'")})),
+        other => Ok(json!({
+            "error": format!("doc: unknown action '{other}'"),
+            "hint": "Valid actions: create_excel, create_word, create_pdf, create_ppt, edit_excel, edit_word, edit_pdf, read_doc. Retry with one of these.",
+        })),
     })
     .await
     .map_err(|e| anyhow!("doc: spawn_blocking failed: {e}"))??;
@@ -693,7 +696,12 @@ fn edit_excel(args: &Value, path: &Path) -> Result<Value> {
     use rust_xlsxwriter::*;
 
     let mut wb_reader: Xlsx<_> = open_workbook(path)
-        .map_err(|e| anyhow!("edit_excel: cannot open '{}': {e}", path.display()))?;
+        .map_err(|e| {
+            anyhow!(
+                "edit_excel: cannot open '{}': {e}. If the file does not exist yet, use action 'create_excel' instead; otherwise verify the path with read_doc.",
+                path.display()
+            )
+        })?;
 
     // Read all existing sheets into memory: Vec<(name, headers_opt, rows)>.
     let sheet_names: Vec<String> = wb_reader.sheet_names().to_vec();
@@ -908,7 +916,12 @@ fn edit_word(args: &Value, path: &Path) -> Result<Value> {
     let append_text = append_text.expect("append_text checked above");
 
     let file = std::fs::File::open(path)
-        .map_err(|e| anyhow!("edit_word: cannot open '{}': {e}", path.display()))?;
+        .map_err(|e| {
+            anyhow!(
+                "edit_word: cannot open '{}': {e}. If the file does not exist yet, use action 'create_word' instead; otherwise verify the path.",
+                path.display()
+            )
+        })?;
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| anyhow!("edit_word: invalid docx zip: {e}"))?;
 
@@ -1001,7 +1014,12 @@ fn edit_pdf(args: &Value, path: &Path) -> Result<Value> {
     }
 
     let mut doc = Document::load(path)
-        .map_err(|e| anyhow!("edit_pdf: cannot open '{}': {e}", path.display()))?;
+        .map_err(|e| {
+            anyhow!(
+                "edit_pdf: cannot open '{}': {e}. If the file does not exist yet, use action 'create_pdf' instead; otherwise verify the path.",
+                path.display()
+            )
+        })?;
 
     let mut actions_done = Vec::new();
 
@@ -1227,7 +1245,10 @@ fn read_docx(path: &Path) -> Result<Value> {
     if let Ok(mut entry) = archive.by_name("word/document.xml") {
         entry.read_to_string(&mut xml)?;
     } else {
-        return Err(anyhow!("read_doc: word/document.xml not found in docx"));
+        return Err(anyhow!(
+            "read_doc: '{}' is a zip archive but has no word/document.xml — not a valid .docx (possibly an .xlsx/.pptx or renamed file). Check the real format and retry with the matching extension, or re-create it with 'create_word'.",
+            path.display()
+        ));
     }
 
     // Extract text from <w:t> tags.

@@ -36,7 +36,8 @@ docs/superpowers/
 # Sub-agent worktrees
 /.worktrees/
 /.claude/worktrees/
-*.sh
+# Root-level stray scripts only — scripts/ and ui/scripts/ are tracked.
+/*.sh
 ui/src-tauri/gen/
 
 # Ephemeral state files that shouldn't be committed.

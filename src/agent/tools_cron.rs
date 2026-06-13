@@ -20,7 +20,9 @@ impl super::runtime::AgentRuntime {
     ) -> Result<Value> {
         let action = args["action"]
             .as_str()
-            .ok_or_else(|| anyhow!("cron: `action` required"))?;
+            .ok_or_else(|| {
+                anyhow!("cron: `action` must be a string — one of: list, add, edit, remove, enable, disable")
+            })?;
 
         let cron_dir = crate::config::loader::base_dir();
         let cron_path = cron_dir.join("cron.json5");
@@ -197,7 +199,7 @@ impl super::runtime::AgentRuntime {
                     job["schedule"] = json!({"kind": "cron", "expr": sched, "tz": tz_val});
                 } else {
                     return Err(anyhow!(
-                        "cron add: `schedule`, `every_seconds`/`every_ms`, or `delay_ms` required"
+                        "cron add: no schedule found — pass exactly one of `schedule` (cron expr string), `every_seconds`/`every_ms`, or `delay_ms`. Numeric fields must be JSON numbers, not quoted strings; if you already passed one, fix its type and retry"
                     ));
                 }
                 // `kind` decides what fires at schedule time:
@@ -316,7 +318,7 @@ impl super::runtime::AgentRuntime {
                     let idx = index as usize;
                     if idx == 0 || idx > jobs.len() {
                         return Err(anyhow!(
-                            "cron remove: invalid index {} (valid: 1-{})",
+                            "cron remove: index {} out of range — {} job(s) exist; run action=list to get fresh 1-based indexes (if 0 jobs, there is nothing to remove)",
                             index,
                             jobs.len()
                         ));
@@ -329,7 +331,10 @@ impl super::runtime::AgentRuntime {
                     jobs.retain(|j| j["id"].as_str() != Some(id));
                     let removed = before - jobs.len();
                     if removed == 0 {
-                        return Err(anyhow!("cron remove: job not found with id={}", id));
+                        return Err(anyhow!(
+                            "cron remove: no job with id={} — ids are often truncated in chat; run action=list and remove by `index` instead",
+                            id
+                        ));
                     }
                     write_cron_jobs(&cron_path, &jobs).await?;
                     json!({"id": id, "count": removed})
@@ -361,7 +366,7 @@ impl super::runtime::AgentRuntime {
                     let idx = index as usize;
                     if idx == 0 || idx > jobs.len() {
                         return Err(anyhow!(
-                            "cron {}: invalid index {} (valid: 1-{})",
+                            "cron {}: index {} out of range — {} job(s) exist; run action=list to get fresh 1-based indexes",
                             action,
                             index,
                             jobs.len()
@@ -408,7 +413,7 @@ impl super::runtime::AgentRuntime {
                     let idx = index as usize;
                     if idx == 0 || idx > jobs.len() {
                         return Err(anyhow!(
-                            "cron edit: invalid index {} (valid: 1-{})",
+                            "cron edit: index {} out of range — {} job(s) exist; run action=list to get fresh 1-based indexes",
                             index,
                             jobs.len()
                         ));

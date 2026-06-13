@@ -48,7 +48,9 @@ impl AgentRuntime {
         let spawner = self
             .spawner
             .as_ref()
-            .ok_or_else(|| anyhow!("agent_spawn: spawner not available"))?;
+            .ok_or_else(|| {
+                anyhow!("agent_spawn: spawner not initialized in this gateway instance; agent spawning is disabled here — do not retry, inform the user")
+            })?;
 
         let id = args["id"]
             .as_str()
@@ -172,7 +174,9 @@ impl AgentRuntime {
         let spawner = self
             .spawner
             .as_ref()
-            .ok_or_else(|| anyhow!("agent_task: spawner not available"))?;
+            .ok_or_else(|| {
+                anyhow!("agent_task: spawner not initialized in this gateway instance; agent tasks are disabled here — do not retry, inform the user")
+            })?;
 
         let default_task_model = self.resolve_flash_model_name();
         let model = args["model"]
@@ -252,7 +256,9 @@ impl AgentRuntime {
         let registry = self
             .agents
             .as_ref()
-            .ok_or_else(|| anyhow!("agent_task: agent registry not available"))?;
+            .ok_or_else(|| {
+                anyhow!("agent_task: agent registry not initialized in this gateway instance; agent tasks are disabled here — do not retry, inform the user")
+            })?;
         let target = registry.get(&id)?;
         let task_session = format!("{}:task:{short_id}", ctx.session_key);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<AgentReply>();
@@ -277,7 +283,9 @@ impl AgentRuntime {
             .tx
             .send(msg)
             .await
-            .map_err(|_| anyhow!("agent_task: agent inbox closed"))?;
+            .map_err(|_| {
+                anyhow!("agent_task: task agent '{id}' exited before accepting the message (likely crashed on startup); retry agent action=task once — if it recurs, report to the user and check gateway logs")
+            })?;
 
         // Spawn background worker to wait for reply, store result, then wake
         // the parent agent so it can process and respond to the user.
@@ -302,8 +310,12 @@ impl AgentRuntime {
             let result_text =
                 match tokio::time::timeout(Duration::from_secs(task_timeout), reply_rx).await {
                     Ok(Ok(reply)) => reply.text,
-                    Ok(Err(_)) => "[task agent channel closed unexpectedly]".to_owned(),
-                    Err(_) => format!("[task {task_id} timed out after {task_timeout}s]"),
+                    Ok(Err(_)) => format!(
+                        "[task {task_id} failed: sub-agent exited without replying (likely crashed mid-run); no result was produced. Retry with agent action=task, or do the work yourself and tell the user the sub-task failed.]"
+                    ),
+                    Err(_) => format!(
+                        "[task {task_id} timed out after {task_timeout}s — no result. Split it into smaller tasks, or ask the user to raise agents.defaults.timeout_seconds.]"
+                    ),
                 };
 
             // Store result for main agent to pick up when run_turn fires.
@@ -409,7 +421,9 @@ impl AgentRuntime {
         let registry = self
             .agents
             .as_ref()
-            .ok_or_else(|| anyhow!("agent_send: agent registry not available"))?;
+            .ok_or_else(|| {
+                anyhow!("agent_send: agent registry not initialized in this gateway instance; agent messaging is disabled here — do not retry, inform the user")
+            })?;
         let target = registry.get(&target_id)?;
 
         let short_id = &uuid::Uuid::new_v4().to_string()[..8];
@@ -436,7 +450,9 @@ impl AgentRuntime {
             .tx
             .send(msg)
             .await
-            .map_err(|_| anyhow!("agent_send: agent '{target_id}' inbox closed"))?;
+            .map_err(|_| {
+                anyhow!("agent_send: agent '{target_id}' is no longer accepting messages (it has exited); run agent action=list to see live agents, or respawn it with agent action=spawn before resending")
+            })?;
 
         // Background: wait for reply, store result, then wake parent agent.
         let pending = Arc::clone(&self.pending_task_results);
@@ -461,8 +477,12 @@ impl AgentRuntime {
             let result_text =
                 match tokio::time::timeout(Duration::from_secs(send_timeout), reply_rx).await {
                     Ok(Ok(reply)) => reply.text,
-                    Ok(Err(_)) => format!("[agent {target_id_bg} channel closed]"),
-                    Err(_) => format!("[agent {target_id_bg} timed out after {send_timeout}s]"),
+                    Ok(Err(_)) => format!(
+                        "[agent {target_id_bg} exited before replying — the message may not have been processed. Run agent action=list to check if it is still alive; respawn and resend if needed.]"
+                    ),
+                    Err(_) => format!(
+                        "[agent {target_id_bg} timed out after {send_timeout}s — no result. Split the request into smaller messages, or ask the user to raise agents.defaults.timeout_seconds.]"
+                    ),
                 };
             if let Ok(mut guard) = pending.lock() {
                 guard.push((send_id_bg.clone(), session_key.clone(), result_text));

@@ -5719,6 +5719,20 @@ impl AgentRuntime {
         const MAX_SAME_CALL_STREAK: usize = 5;
         // Track consecutive tool errors — stop early when tools keep failing.
         let mut error_streak: usize = 0;
+        // Identical-failing-call ledger: hash(tool_name + canonical args) →
+        // failure count. An identical call that already failed is
+        // deterministic for validation-type errors; catching the repeat at
+        // count 1 (warn) / count 2 (refuse to execute) breaks retry loops
+        // three iterations earlier than the error_streak=5 turn breaker.
+        let mut failed_calls: std::collections::HashMap<u64, u32> =
+            std::collections::HashMap::new();
+        fn call_hash(name: &str, input: &Value) -> u64 {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            name.hash(&mut h);
+            input.to_string().hash(&mut h);
+            h.finish()
+        }
         const MAX_ERROR_STREAK: usize = 5;
         // Store last error info so we can surface it when the loop breaks.
         let mut last_error_info: Option<String> = None;
@@ -7386,6 +7400,36 @@ impl AgentRuntime {
                 });
             }
 
+            // ---- Phase 2a-pre: schema-driven arg repair ----
+            // Unambiguous mismatches (object for a string param, "3" for an
+            // integer, enum with a leaked trailing \n) are repaired silently
+            // instead of bounced — an error the model can't act on tends to
+            // become an identical-retry loop.
+            for p in &mut to_dispatch {
+                if let Some(def) = tools.iter().find(|t| t.name == p.tool_name) {
+                    let notes =
+                        crate::agent::args_sanitizer::sanitize_args(&def.parameters, &mut p.tool_input);
+                    if !notes.is_empty() {
+                        debug!(tool = %p.tool_name, repairs = ?notes, "sanitize_args repaired call");
+                    }
+                }
+            }
+
+            // ---- Identical-failure circuit breaker (post-repair hashes) ----
+            // 1 prior failure of this exact call → execute, but the result
+            // gains a hard warning; 2+ → refuse to execute and return a stop
+            // instruction. Breaks deterministic retry loops three iterations
+            // earlier than the error_streak=5 turn breaker.
+            let repeat_counts: Vec<u32> = to_dispatch
+                .iter()
+                .map(|p| {
+                    failed_calls
+                        .get(&call_hash(&p.tool_name, &p.tool_input))
+                        .copied()
+                        .unwrap_or(0)
+                })
+                .collect();
+
             // ---- Phase 2a: serial pre-dispatch side effects ----
             for p in &to_dispatch {
                 info!(tool = %p.tool_name, "dispatching tool call");
@@ -7429,6 +7473,9 @@ impl AgentRuntime {
                     let agent_id = ctx.agent_id.clone();
                     let tool_name = p.tool_name.clone();
                     let tool_input_str = p.tool_input_str.clone();
+                    // Futures are lazy: building `fut` runs nothing, so a
+                    // refusal below simply never awaits it.
+                    let refused = repeat_counts[idx] >= 2;
                     let fut =
                         self.dispatch_tool(ctx, &p.tool_id, &p.tool_name, p.tool_input.clone());
                     // Snapshot the live_status arc so the dispatch future
@@ -7477,6 +7524,20 @@ impl AgentRuntime {
                             tool: tool_name.clone(),
                             started,
                         };
+                        if refused {
+                            // Deterministic repeat of a call that already
+                            // failed twice this turn — don't execute it a
+                            // third time, hand back a hard stop instead.
+                            warn!(tool = %tool_name, "identical failing call repeated; execution refused");
+                            return (
+                                idx,
+                                Ok(Ok(json!({
+                                    "error": "REFUSED: this exact call (same tool, same arguments) already failed twice this turn.",
+                                    "retryable": false,
+                                    "hint": "Hard stop. Change the arguments or the approach, or tell the user what is blocking you."
+                                }))),
+                            );
+                        }
                         let slow_warn_emitted = std::sync::Arc::new(
                             std::sync::atomic::AtomicBool::new(false),
                         );
@@ -7663,7 +7724,11 @@ impl AgentRuntime {
                 .collect();
 
             // ---- Phase 3: serial post-processing in LLM emit order ----
-            for (pending, timed_result) in to_dispatch.into_iter().zip(timed_results.into_iter()) {
+            for (dispatch_idx, (pending, timed_result)) in to_dispatch
+                .into_iter()
+                .zip(timed_results.into_iter())
+                .enumerate()
+            {
                 let PendingDispatch {
                     tool_id,
                     tool_name,
@@ -7690,6 +7755,7 @@ impl AgentRuntime {
                 )
                 .await;
 
+                let mut error_repeats_once = false;
                 let (mut result_text, result_images) = match result {
                     Ok(v) => {
                         // Reset parse error counter on successful tool execution
@@ -7723,6 +7789,13 @@ impl AgentRuntime {
                         if has_error {
                             error_streak += 1;
                             last_error_info = Some(v.to_string());
+                            // Feed the identical-failure ledger; the count
+                            // gates next iteration's warning/refusal.
+                            let entry = failed_calls
+                                .entry(call_hash(&tool_name, &tool_input_for_metrics))
+                                .or_insert(0);
+                            *entry += 1;
+                            error_repeats_once = repeat_counts[dispatch_idx] == 1 && *entry >= 2;
                         } else {
                             error_streak = 0;
                             last_error_info = None;
@@ -7922,6 +7995,14 @@ impl AgentRuntime {
                         warn!(tool = %tool_name, "tool error: {}", err_chain);
                         // Store error info for user feedback when breaking loop
                         last_error_info = Some(err_chain.clone());
+                        // Err-path failures feed the identical-failure ledger
+                        // too (Ok-with-error-field is handled in the Ok arm).
+                        let entry = failed_calls
+                            .entry(call_hash(&tool_name, &tool_input_for_metrics))
+                            .or_insert(0);
+                        *entry += 1;
+                        error_repeats_once = repeat_counts[dispatch_idx] == 1 && *entry >= 2;
+                        error_streak += 1;
                         // Record error result for loop detection (errors count as results too).
                         ctx.loop_detector
                             .record_result(&serde_json::json!({"error": err_chain.clone()}));
@@ -8324,6 +8405,16 @@ impl AgentRuntime {
                     format!(
                         "{session_text}\n\n[HINT: This result contains substantial content. \
                          If it answers the user's question, reply directly without further tool calls.]"
+                    )
+                } else {
+                    session_text
+                };
+
+                let session_text = if error_repeats_once {
+                    format!(
+                        "{session_text}\n[WARNING: this exact call already failed once this turn \
+                         with the same arguments. Do NOT retry it unchanged — a third identical \
+                         attempt will be refused. Change the arguments or the approach.]"
                     )
                 } else {
                     session_text

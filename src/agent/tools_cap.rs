@@ -23,7 +23,12 @@ impl super::runtime::AgentRuntime {
             .as_str()
             .ok_or_else(|| anyhow!("tool_cap: `agent` required"))?;
         let kind = AgentKind::from_str(agent_str)
-            .ok_or_else(|| anyhow!("tool_cap: unknown agent `{agent_str}`"))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "tool_cap: unknown agent `{agent_str}` — must be one of: claudecode, \
+                     openclaude, opencode, codex, qoder. Retry with a valid value."
+                )
+            })?;
         let task = args["task"]
             .as_str()
             .ok_or_else(|| anyhow!("tool_cap: `task` required"))?;
@@ -35,7 +40,13 @@ impl super::runtime::AgentRuntime {
         let manager: &CapAgentManager = self
             .cap_manager
             .as_ref()
-            .ok_or_else(|| anyhow!("tool_cap: CapAgentManager not initialised"))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "tool_cap: cap agent manager not initialised — coding-agent dispatch is \
+                     unavailable in this runtime. Do not retry; tell the user cap tools are \
+                     disabled in this session."
+                )
+            })?;
 
         // Resolve language for IM notifications. Same logic as the old
         // tools_acp implementation — defaults to "en".
@@ -113,7 +124,12 @@ impl super::runtime::AgentRuntime {
             .as_str()
             .ok_or_else(|| anyhow!("tool_cap_live: `agent` required"))?;
         let kind = AgentKind::from_str(agent_str)
-            .ok_or_else(|| anyhow!("tool_cap_live: unknown agent `{agent_str}`"))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "tool_cap_live: unknown agent `{agent_str}` — must be one of: claudecode, \
+                     openclaude, opencode, codex, qoder. Retry with a valid value."
+                )
+            })?;
         let task = args["task"]
             .as_str()
             .ok_or_else(|| anyhow!("tool_cap_live: `task` required"))?;
@@ -133,7 +149,13 @@ impl super::runtime::AgentRuntime {
         let manager: &CapLiveManager = self
             .cap_live_manager
             .as_ref()
-            .ok_or_else(|| anyhow!("tool_cap_live: CapLiveManager not initialised"))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "tool_cap_live: live cap manager not initialised — interactive cap sessions \
+                     are unavailable in this runtime. Do not retry; tell the user cap tools are \
+                     disabled in this session."
+                )
+            })?;
 
         let lang = self
             .config
@@ -183,11 +205,22 @@ impl super::runtime::AgentRuntime {
     pub(crate) async fn tool_cap_live_end(&self, _ctx: &RunContext, args: Value) -> Result<Value> {
         let session_id = args["session_id"]
             .as_str()
-            .ok_or_else(|| anyhow!("tool_cap_live_end: `session_id` required"))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "tool_cap_live_end: `session_id` required — pass the session_id returned by \
+                     a previous cap_live/cap_bind_sticky call. If you have none, there is no \
+                     session to close."
+                )
+            })?;
         let manager: &CapLiveManager = self
             .cap_live_manager
             .as_ref()
-            .ok_or_else(|| anyhow!("tool_cap_live_end: CapLiveManager not initialised"))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "tool_cap_live_end: live cap manager not initialised — there are no live cap \
+                     sessions in this runtime, nothing to close. Do not retry."
+                )
+            })?;
         manager.end_session(session_id).await?;
         Ok(json!({ "session_id": session_id, "status": "closed" }))
     }
@@ -213,7 +246,12 @@ impl super::runtime::AgentRuntime {
             .as_str()
             .ok_or_else(|| anyhow!("tool_cap_bind_sticky: `agent` required"))?;
         let kind = AgentKind::from_str(agent_str)
-            .ok_or_else(|| anyhow!("tool_cap_bind_sticky: unknown agent `{agent_str}`"))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "tool_cap_bind_sticky: unknown agent `{agent_str}` — must be one of: \
+                     claudecode, openclaude, opencode, codex, qoder. Retry with a valid value."
+                )
+            })?;
         let cwd = args["cwd"]
             .as_str()
             .map(|s| std::path::PathBuf::from(crate::agent::runtime::expand_tilde(s)))
@@ -222,7 +260,13 @@ impl super::runtime::AgentRuntime {
         let manager: &CapLiveManager = self
             .cap_live_manager
             .as_ref()
-            .ok_or_else(|| anyhow!("tool_cap_bind_sticky: CapLiveManager not initialised"))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "tool_cap_bind_sticky: live cap manager not initialised — sticky cap binding \
+                     is unavailable in this runtime. Do not retry; tell the user cap handoff is \
+                     disabled in this session."
+                )
+            })?;
 
         if ctx.session_key.is_empty() {
             return Err(anyhow!(
@@ -281,7 +325,12 @@ impl super::runtime::AgentRuntime {
         let manager: &CapLiveManager = self
             .cap_live_manager
             .as_ref()
-            .ok_or_else(|| anyhow!("tool_cap_unbind_sticky: CapLiveManager not initialised"))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "tool_cap_unbind_sticky: live cap manager not initialised — no sticky \
+                     binding can exist in this runtime, nothing to release. Do not retry."
+                )
+            })?;
         let lang = self
             .config
             .raw

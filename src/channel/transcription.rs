@@ -517,7 +517,12 @@ async fn transcribe_local(audio_bytes: &[u8], file_name: &str) -> Result<String>
 
     // Determine model path
     let model = find_whisper_model()
-        .context("no whisper model found (download one or set WHISPER_MODEL=/path/to/model.bin)")?;
+        .context(
+            "no offline STT model installed. Self-install (agent may run these with user \
+             approval): `rsclaw tools install sherpa-onnx` then `rsclaw models download \
+             paraformer-zh` (Chinese, 70MB; or `whisper` for multilingual, 110MB). \
+             Alternative: set WHISPER_MODEL=/path/to/ggml-model.bin for whisper-cli.",
+        )?;
 
     // Run whisper
     // Use WHISPER_LANGUAGE env (default: "zh" for Chinese).

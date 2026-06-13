@@ -109,14 +109,28 @@ impl ExecPool {
                 }
                 Ok(Err(e)) => {
                     tracing::error!(task_id = %tid, "exec background spawn failed: {}", e);
-                    (None, String::new(), format!("spawn error: {}", e))
+                    (
+                        None,
+                        String::new(),
+                        format!(
+                            "failed to start shell process - the command never ran: {}. \
+                             If the error is 'No such file or directory', the working directory \
+                             likely does not exist; verify the cwd path or retry without a cwd override",
+                            e
+                        ),
+                    )
                 }
                 Err(_) => {
                     tracing::warn!(task_id = %tid, timeout_secs, "exec background timed out");
                     (
                         None,
                         String::new(),
-                        format!("timed out after {} seconds", timeout_secs),
+                        format!(
+                            "command killed after exceeding the {}s timeout; any partial output \
+                             was discarded. Re-run with a larger timeout, or split the command \
+                             into smaller steps",
+                            timeout_secs
+                        ),
                     )
                 }
             };

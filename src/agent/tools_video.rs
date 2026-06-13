@@ -25,7 +25,9 @@ impl super::runtime::AgentRuntime {
     ) -> Result<Value> {
         let prompt = args["prompt"]
             .as_str()
-            .ok_or_else(|| anyhow!("video_gen: `prompt` required"))?;
+            .ok_or_else(|| {
+                anyhow!("video_gen: `prompt` is missing or not a string — pass the video description as a string in `prompt`")
+            })?;
         let duration = args["duration"].as_u64().unwrap_or(5);
         let aspect_ratio = args["aspect_ratio"].as_str().unwrap_or("16:9");
 
@@ -176,7 +178,9 @@ impl super::runtime::AgentRuntime {
                     )
                     .await
                     .map(|id| ("seedance", id)),
-                    None => Err(anyhow!("video_gen: no API key for doubao/Seedance")),
+                    None => Err(anyhow!(
+                        "video_gen: no API key for doubao/Seedance. Set `model.models.providers.doubao.apiKey` in rsclaw.json5 or export ARK_API_KEY, then retry — or tell the user the doubao key is missing."
+                    )),
                 },
                 "minimax" => match resolve_key("minimax", "MINIMAX_API_KEY") {
                     Some(key) => crate::gateway::external_jobs_worker::submit_minimax(
@@ -189,7 +193,9 @@ impl super::runtime::AgentRuntime {
                     )
                     .await
                     .map(|id| ("minimax", id)),
-                    None => Err(anyhow!("video_gen: no API key for MiniMax")),
+                    None => Err(anyhow!(
+                        "video_gen: no API key for MiniMax. Set `model.models.providers.minimax.apiKey` in rsclaw.json5 or export MINIMAX_API_KEY, then retry — or tell the user the MiniMax key is missing."
+                    )),
                 },
                 "kling" => {
                     let ak = resolve_key("kling", "KLING_ACCESS_KEY");
@@ -235,7 +241,9 @@ impl super::runtime::AgentRuntime {
                     )
                     .await
                     .map(|id| ("rsclaw", id)),
-                    None => Err(anyhow!("video_gen: no API key for rsclaw")),
+                    None => Err(anyhow!(
+                        "video_gen: no API key for rsclaw. Set `model.models.providers.rsclaw.apiKey` in rsclaw.json5 or export RSCLAW_API_KEY, then retry — or tell the user the rsclaw key is missing."
+                    )),
                 },
                 other => Err(anyhow!("video_gen: unsupported provider {other}")),
             };
@@ -274,13 +282,19 @@ impl super::runtime::AgentRuntime {
         let (provider_key, task_id, _winning_model) = match chosen {
             Some(c) => c,
             None => {
-                return Err(anyhow!(
-                    "video_gen: all {} model(s) failed at submit. Last error: {}",
-                    attempt_models.len(),
-                    last_error
-                        .map(|e| format!("{e:#}"))
-                        .unwrap_or_else(|| "no callable models".to_owned())
-                ));
+                return Err(match last_error {
+                    Some(e) => anyhow!(
+                        "video_gen: all {} model(s) failed at submit. Last error: {e:#}",
+                        attempt_models.len(),
+                    ),
+                    // Every candidate was skipped by the health gate — no
+                    // submit was attempted at all, so don't claim a
+                    // submit failure.
+                    None => anyhow!(
+                        "video_gen: no submit attempted — all {} candidate model(s) are marked Disabled/Cooling in the model health table from earlier failures (e.g. auth/balance errors). Check GET /api/v1/models/health, fix the provider key/balance or wait for cooldown, then retry.",
+                        attempt_models.len(),
+                    ),
+                });
             }
         };
 
@@ -362,11 +376,15 @@ async fn submit_rsclaw_video(
 
     if !status.is_success() {
         let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        // Non-JSON bodies (HTML/text LB error pages on 5xx) are the
+        // actual diagnostic — surface a truncated raw snippet instead of
+        // a useless "unknown error" literal.
+        let raw = String::from_utf8_lossy(&bytes);
         let msg = v
             .pointer("/error/message")
             .and_then(|v| v.as_str())
             .or_else(|| v.get("message").and_then(|v| v.as_str()))
-            .unwrap_or("unknown error");
+            .unwrap_or_else(|| crate::util::truncate_str(&raw, 200));
         return Err(anyhow!("video_gen: rsclaw API {status}: {msg}"));
     }
     let v: Value = serde_json::from_slice(&bytes)
