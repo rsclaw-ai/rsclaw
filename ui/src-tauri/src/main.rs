@@ -350,6 +350,119 @@ fn run_setup() -> Result<String, String> {
     run_rsclaw_command(&["setup", "--non-interactive"])
 }
 
+/// First-launch convenience: make the bundled `rsclaw` sidecar reachable as a
+/// plain `rsclaw` command in the user's terminal, so e.g.
+/// `rsclaw skills install <slug>` works without hunting down the app-bundled
+/// binary path. The desktop sidecar otherwise lives inside the .app /
+/// install dir, which isn't on PATH — users hit "command not found".
+///
+/// Runs once (guarded by a marker under the base dir) and is fully
+/// best-effort: every failure is logged and ignored, never blocks startup.
+/// It never overwrites an existing `rsclaw` — if the user already installed
+/// the CLI, we leave their copy alone.
+///
+/// - macOS/Linux: symlink the sidecar into /usr/local/bin (standard PATH);
+///   fall back to ~/.local/bin if that dir isn't writable.
+/// - Windows: append the sidecar's directory to the user PATH (HKCU) via
+///   PowerShell, only if it isn't already present.
+fn ensure_rsclaw_on_path() {
+    let marker = rsclaw_base_dir().join(".path-setup-done");
+    if marker.exists() {
+        return;
+    }
+
+    let sidecar = match std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    {
+        Some(dir) => dir.join(if cfg!(target_os = "windows") {
+            "rsclaw.exe"
+        } else {
+            "rsclaw"
+        }),
+        None => return,
+    };
+    if !sidecar.exists() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(rsclaw_base_dir());
+
+    #[cfg(unix)]
+    {
+        let usr_local = std::path::Path::new("/usr/local/bin/rsclaw");
+        if usr_local.exists() {
+            // Respect a user's own rsclaw — don't clobber it.
+            let _ = std::fs::write(&marker, "rsclaw already present in /usr/local/bin");
+            return;
+        }
+        if std::path::Path::new("/usr/local/bin").is_dir() {
+            match std::os::unix::fs::symlink(&sidecar, usr_local) {
+                Ok(()) => {
+                    let _ = std::fs::write(
+                        &marker,
+                        format!("symlinked {} -> {}", sidecar.display(), usr_local.display()),
+                    );
+                    eprintln!("[setup] linked rsclaw into /usr/local/bin");
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("[setup] /usr/local/bin symlink failed ({e}); trying ~/.local/bin");
+                }
+            }
+        }
+        if let Some(home) = dirs::home_dir() {
+            let local_bin = home.join(".local/bin");
+            let _ = std::fs::create_dir_all(&local_bin);
+            let target = local_bin.join("rsclaw");
+            if !target.exists() {
+                match std::os::unix::fs::symlink(&sidecar, &target) {
+                    Ok(()) => {
+                        let _ = std::fs::write(
+                            &marker,
+                            "symlinked to ~/.local/bin (add it to PATH if missing)",
+                        );
+                        eprintln!("[setup] linked rsclaw into ~/.local/bin");
+                    }
+                    Err(e) => eprintln!("[setup] ~/.local/bin symlink failed: {e}"),
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let Some(dir) = sidecar.parent().map(|d| d.to_string_lossy().to_string()) else {
+            return;
+        };
+        // Single-quote escape for the PS string literal (paths rarely contain
+        // one, but be safe). Append to the user PATH only when absent.
+        let dir_ps = dir.replace('\'', "''");
+        let ps = format!(
+            "$d='{dir_ps}'; $p=[Environment]::GetEnvironmentVariable('PATH','User'); \
+             if (-not $p) {{ $p='' }}; \
+             if (($p -split ';') -notcontains $d) {{ \
+               [Environment]::SetEnvironmentVariable('PATH', ($d + ';' + $p), 'User') }}"
+        );
+        let status = hide_window(
+            std::process::Command::new("powershell").args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                &ps,
+            ]),
+        )
+        .status();
+        match status {
+            Ok(s) if s.success() => {
+                let _ = std::fs::write(&marker, format!("added {dir} to user PATH"));
+                eprintln!("[setup] added rsclaw dir to user PATH");
+            }
+            other => eprintln!("[setup] user PATH update failed: {other:?}"),
+        }
+    }
+}
+
 /// Copy the bundled BGE-small-zh model (shipped via tauri.conf.json
 /// `bundle.resources`) into `~/.rsclaw/models/bge-small-zh/` so the gateway
 /// finds it on its standard search path.
@@ -2278,6 +2391,12 @@ fn main() {
                     eprintln!("[setup] BGE model seeding failed (gateway will fall back to download): {e:#}");
                 }
             });
+
+            // First-launch: link the bundled rsclaw sidecar onto PATH so the
+            // user can run `rsclaw ...` in a terminal. Best-effort, once-only,
+            // off the UI thread (symlink is instant; the Windows PowerShell
+            // path-edit can take a moment).
+            tauri::async_runtime::spawn_blocking(ensure_rsclaw_on_path);
 
             // Build system tray. Labels are localized off `gateway.language`
             // (rsclaw.json5) with system-locale + English fallbacks; IDs stay
