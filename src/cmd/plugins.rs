@@ -173,8 +173,35 @@ async fn plugins_install(spec: &str) -> Result<()> {
         install_from_zip(std::path::Path::new(spec))
     } else if spec.ends_with(".tar.gz") || spec.ends_with(".tgz") {
         install_from_tarball(std::path::Path::new(spec))
-    } else {
+    } else if std::path::Path::new(spec).exists() {
         install_from_path(std::path::Path::new(spec))
+    } else {
+        // Not a URL, archive, or local path → treat as a hub slug.
+        // The desktop "Skills & Tools → Plugins" list is built from the
+        // audited allowlist (GET /api/v1/hub/plugins → build_plugin_catalog
+        // → allowlist::plugins_sorted), so the only thing it can hand the
+        // install command is a bare slug like "travel". Previously that
+        // fell through to install_from_path and bailed "path not found:
+        // travel" — every install from the GUI list failed. Resolve the
+        // slug to its audited zip URL the same way `skills install <slug>`
+        // resolves through the allowlist, then install from that URL.
+        if crate::skill::allowlist::snapshot().counts().1 == 0 {
+            let _ = crate::skill::allowlist::refresh().await; // lazy; fail-open
+        }
+        match crate::skill::allowlist::snapshot().lookup_plugin(spec) {
+            Some(entry) if !entry.url.is_empty() => {
+                println!("  {} {} {}", dim("resolving"), cyan(spec), dim("via hub allowlist"));
+                install_from_url(&entry.url).await
+            }
+            Some(_) => bail!(
+                "plugin `{spec}` is in the hub allowlist but has no download URL — \
+                 the hub manifest may be stale"
+            ),
+            None => bail!(
+                "`{spec}` is not a local path, URL, or known hub plugin slug. \
+                 Browse available plugins with `rsclaw plugins marketplace`."
+            ),
+        }
     }
 }
 
