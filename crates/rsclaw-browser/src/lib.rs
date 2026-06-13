@@ -411,7 +411,7 @@ fn same_origin(a: &str, b: &str) -> bool {
 
 /// Try to connect to an already-running Chrome with remote debugging.
 /// Probes the given ports and returns the browser WebSocket URL if found.
-pub(crate) async fn detect_existing_chrome(ports: &[u16]) -> Option<String> {
+pub async fn detect_existing_chrome(ports: &[u16]) -> Option<String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(1))
         .build()
@@ -568,7 +568,7 @@ pub(crate) fn default_profile_in_use() -> bool {
 ///   Chrome (different profile) never counts, so `pool_pid` is unused.
 /// - windows: Chrome has no SingletonLock symlink, so fall back to a process
 ///   scan that excludes the pool's own (invisible) Chrome by PID.
-pub(crate) fn default_profile_blocked(pool_pid: Option<u32>) -> bool {
+pub fn default_profile_blocked(pool_pid: Option<u32>) -> bool {
     #[cfg(unix)]
     {
         let _ = pool_pid;
@@ -953,13 +953,13 @@ impl BrowserSession {
 
     /// Connect to an existing Chrome instance (user's daily browser).
     /// Does NOT launch or own a Chrome process -- will not kill it on drop.
-    pub(crate) async fn connect_existing(browser_ws_url: &str) -> Result<Self> {
+    pub async fn connect_existing(browser_ws_url: &str) -> Result<Self> {
         Self::connect_existing_inner(browser_ws_url, false).await
     }
 
     /// Connect to existing Chrome, reusing the active tab instead of creating a
     /// new one.
-    pub(crate) async fn connect_existing_reuse(browser_ws_url: &str) -> Result<Self> {
+    pub async fn connect_existing_reuse(browser_ws_url: &str) -> Result<Self> {
         Self::connect_existing_inner(browser_ws_url, true).await
     }
 
