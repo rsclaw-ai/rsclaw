@@ -27,6 +27,27 @@ Per-crate commit discipline: every crate is its own commit so any bad
 extraction can be reverted or converted to incremental without losing the rest.
 Validate each with `cargo metadata --no-deps` (manifest parse only, NOT a build).
 
+## STATUS: GREEN + e2e PASS
+
+- Full workspace `cargo check` GREEN (root + 11 crates, 1m08s).
+- compute-use e2e: `cargo test --test computer_e2e -- --include-ignored` =
+  **3 passed / 0 failed** incl. the real-display screenshot test
+  (2880x1800 @2x, 1.56MB PNG). The split did not break runtime behaviour.
+
+Pipeline stages 全部拆完(clean extent)→编译→修错→编译成功→e2e compute-use: DONE.
+
+11 crates extracted, all committed, the WHOLE workspace compiles (0 errors).
+Post-extraction root errors were trivial: 2 missing-dep batches in the new
+crates' Cargo.toml, and 11 E0603 visibility errors (pub(crate)->pub for items
+now crossing crate lines via re-export shims). Both fixed + committed.
+
+What remains in the root `rsclaw` crate is the **runtime knot + its tight
+dependents** — agent, gateway, server, ws, a2a, acp, heartbeat, cap, cron,
+astock, desktop, migrate (the knot the plan keeps together), plus store/kb/
+channel/skill/hooks/plugin/cmd/cli/browser/computer which are tightly coupled
+to agent/store/server and need dependency inversion (plan step 12, "only if
+still the bottleneck") to extract. The clean, no-inversion separation is done.
+
 ## DONE (committed on feat/crate-split)
 
 | crate | source | commit | notes |
