@@ -37,6 +37,8 @@ Validate each with `cargo metadata --no-deps` (manifest parse only, NOT a build)
 | rsclaw-events | src/events.rs | 921dc3e6 | AgentEvent + serde DTOs. deps: serde,serde_json,base64 |
 | rsclaw-types | (lifted) | b7a3c4e8 | AgentKind{Main,Named,Sub,Task}, ImageAttachment, FileAttachment, OutboundMessage. deps: serde |
 | rsclaw-config | src/config/ | 2fb0e213 | clean root, no first-party deps |
+| rsclaw-retry | src/channel/retry.rs | 30e875fc | SendRetry; channel re-exports `as retry` |
+| rsclaw-embed | src/embed/ | db956f06 | also sank estimate_tokens -> rsclaw-util |
 
 Namespace sweep already applied across whole `src/`:
 `crate::{util,sys,i18n,events}::` → `rsclaw_{util,platform,i18n,events}::`.
@@ -60,12 +62,10 @@ Root `src/lib.rs` re-exports: events, i18n, sys(=platform), util, config.
   store. To extract store cleanly, lift those records to rsclaw-types FIRST
   (same re-export pattern), which breaks store→gateway.
 
-## REMAINING ORDER (bottom-up)
+## REMAINING ORDER (bottom-up)  — resume at rsclaw-provider
 
-1. **rsclaw-retry** ← src/channel/retry.rs (SendRetry, send_with_retry). Single
-   file. Leave `pub use rsclaw_retry as retry;` where `mod retry;` was in
-   channel/mod.rs. Provider keeps its own inline 1-shot retry.
-2. **rsclaw-embed** ← src/embed/ (~3 agent refs — check & break or inject).
+1. ~~rsclaw-retry~~ DONE (30e875fc)
+2. ~~rsclaw-embed~~ DONE (db956f06)
 3. **rsclaw-provider** ← src/provider/ (13K). deps: config, util, types, events.
    Repoint provider's refs to agent attachment types → rsclaw_types::. Keep wire
    DTOs in-crate. root lib.rs: `pub use rsclaw_provider as provider;`.
