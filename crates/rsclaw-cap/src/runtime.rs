@@ -19,12 +19,12 @@ use cap_rs::driver::Driver;
 use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 
 use super::{bridge, permission};
-use crate::channel::OutboundMessage;
+use rsclaw_types::OutboundMessage;
 use rsclaw_i18n as i18n;
 
 /// Which coding agent a `tool_cap` call dispatches to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum AgentKind {
+pub enum AgentKind {
     Claudecode,
     Openclaude,
     Opencode,
@@ -33,7 +33,7 @@ pub(crate) enum AgentKind {
 }
 
 impl AgentKind {
-    pub(crate) fn from_str(s: &str) -> Option<Self> {
+    pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "claudecode" => Some(Self::Claudecode),
             "openclaude" => Some(Self::Openclaude),
@@ -44,7 +44,7 @@ impl AgentKind {
         }
     }
 
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Claudecode => "claudecode",
             Self::Openclaude => "openclaude",
@@ -55,7 +55,7 @@ impl AgentKind {
     }
 
     /// Display name used in i18n strings (e.g. "OpenCode", "Claude Code").
-    pub(crate) fn display_name(self) -> &'static str {
+    pub fn display_name(self) -> &'static str {
         match self {
             Self::Claudecode => "Claude Code",
             Self::Openclaude => "OpenClaude",
@@ -69,7 +69,7 @@ impl AgentKind {
 /// IM channel routing for live progress + completion notifications.
 /// `lang` is a static i18n key (e.g. "en", "zh") — see `rsclaw_i18n::resolve_lang`.
 #[derive(Clone)]
-pub(crate) struct NotifTarget {
+pub struct NotifTarget {
     pub tx: broadcast::Sender<OutboundMessage>,
     pub target_id: String,
     pub is_group: bool,
@@ -82,8 +82,7 @@ pub(crate) struct NotifTarget {
 /// `:cap-followup` sub-session to avoid re-activating the user-visible
 /// session.
 #[derive(Clone)]
-pub(crate) struct InboxTarget {
-    pub agent_tx: mpsc::Sender<crate::agent::registry::AgentMessage>,
+pub struct InboxTarget {
     pub session_key: String,
     pub channel: String,
     pub peer_id: String,
@@ -91,11 +90,11 @@ pub(crate) struct InboxTarget {
 }
 
 /// Returned to the LLM immediately after the prompt is queued.
-pub(crate) struct Submitted {
+pub struct Submitted {
     pub session_id: String,
 }
 
-pub(crate) enum ToolCapRequest {
+pub enum ToolCapRequest {
     Prompt {
         task: String,
         notif: Option<NotifTarget>,
@@ -119,7 +118,7 @@ pub struct CapAgentManager {
 }
 
 impl CapAgentManager {
-    pub(crate) fn new(bus: broadcast::Sender<rsclaw_events::AgentEvent>) -> Self {
+    pub fn new(bus: broadcast::Sender<rsclaw_events::AgentEvent>) -> Self {
         Self {
             claudecode: Arc::new(RwLock::new(None)),
             openclaude: Arc::new(RwLock::new(None)),
@@ -144,7 +143,7 @@ impl CapAgentManager {
     /// initial notification fires; the actual driver run + completion
     /// happens asynchronously and is delivered via `notif` (IM live
     /// progress) and `inbox` (agent inbox reinjection on Done).
-    pub(crate) async fn dispatch_async(
+    pub async fn dispatch_async(
         &self,
         kind: AgentKind,
         task: String,
@@ -191,7 +190,7 @@ impl CapAgentManager {
     }
 }
 
-pub(crate) async fn spawn_driver(
+pub async fn spawn_driver(
     kind: AgentKind,
     cwd: &std::path::Path,
 ) -> Result<Box<dyn Driver>> {
@@ -211,7 +210,7 @@ pub(crate) async fn spawn_driver(
 /// If the id doesn't match a stored session for that agent the CLI
 /// errors out at spawn — cap-rs surfaces the error to the actor which
 /// propagates it back to /cap-resume's caller.
-pub(crate) async fn spawn_driver_resume(
+pub async fn spawn_driver_resume(
     kind: AgentKind,
     cwd: &std::path::Path,
     agent_session_id: &str,
@@ -222,7 +221,7 @@ pub(crate) async fn spawn_driver_resume(
 /// Spawn a driver that resumes the MOST RECENT saved session for
 /// this agent in `cwd`. Equivalent to `claude --continue` / `opencode
 /// run --continue` / `codex exec resume --last`.
-pub(crate) async fn spawn_driver_continue_last(
+pub async fn spawn_driver_continue_last(
     kind: AgentKind,
     cwd: &std::path::Path,
 ) -> Result<Box<dyn Driver>> {
@@ -343,7 +342,7 @@ async fn spawn_driver_inner(
 /// Send a notification to the IM channel, if a target is configured.
 /// Logs at warn! on send error so a transient channel issue doesn't kill
 /// the whole turn.
-pub(crate) fn push_notif(target: &NotifTarget, text: String) {
+pub fn push_notif(target: &NotifTarget, text: String) {
     let msg = OutboundMessage {
         target_id: target.target_id.clone(),
         is_group: target.is_group,
@@ -505,50 +504,14 @@ async fn actor_loop(
     *g = None;
 }
 
-/// Reinject the agent run summary back into the originating agent's
-/// inbox as a follow-up message so the LLM can act on it (e.g. call
-/// `send_file`, post a summary, schedule follow-ups). The follow-up
-/// runs on a `:cap-followup` sub-session so the live user-visible
-/// session does not get re-activated.
-#[allow(dead_code)] // see comment in actor where it used to be called
-fn inject_followup(inbox: &InboxTarget, display: &str, summary: &str) {
-    let followup_session = format!("{}:cap-followup", inbox.session_key);
-    let text = if summary.is_empty() {
-        format!("[{display} completed] Task finished.")
-    } else {
-        format!("[{display} completed] {summary}")
-    };
-    let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
-    let msg = crate::agent::registry::AgentMessage {
-        session_key: followup_session,
-        text,
-        channel: inbox.channel.clone(),
-        peer_id: inbox.peer_id.clone(),
-        chat_id: inbox.chat_id.clone(),
-        reply_tx,
-        task_id: None,
-        context_id: None,
-        event_tx: None,
-        cancel_token: None,
-        input_request_tx: None,
-        extra_tools: vec![],
-        images: vec![],
-        files: vec![],
-        account: None,
-    };
-    let agent_tx = inbox.agent_tx.clone();
-    // mpsc::Sender::send is async; the actor task is not blocked on a
-    // tokio runtime that requires a different reactor, so a fresh spawn
-    // is the safest way to forward without awaiting in the middle of
-    // notification dispatch.
-    tokio::spawn(async move {
-        if let Err(e) = agent_tx.send(msg).await {
-            tracing::warn!(target: "cap", err = %e, "cap followup inject failed");
-        }
-    });
-}
+// `inject_followup` (cap → agent inbox re-injection) was dead code
+// (#[allow(dead_code)], "intentionally NOT called" — see actor_loop). Removed
+// during crate-split: it was the only constructor of agent::registry::AgentMessage
+// in cap, and dropping it lets cap become a lower crate (agent depends on cap,
+// not vice versa). If follow-up re-injection is revived, do it via a trait
+// injected from the runtime (FollowupSink), not a direct AgentMessage build.
 
-pub(crate) async fn run_turn(
+pub async fn run_turn(
     driver: &mut dyn Driver,
     bus: &broadcast::Sender<rsclaw_events::AgentEvent>,
     session_id: &str,

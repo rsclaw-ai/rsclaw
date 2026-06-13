@@ -21,6 +21,7 @@ rsclaw-config = { path = "crates/rsclaw-config" }
 rsclaw-artifact = { path = "crates/rsclaw-artifact" }
 rsclaw-mcp = { path = "crates/rsclaw-mcp" }
 rsclaw-astock = { path = "crates/rsclaw-astock" }
+rsclaw-cap = { path = "crates/rsclaw-cap" }
 rsclaw-desktop = { path = "crates/rsclaw-desktop" }
 rsclaw-evolution = { path = "crates/rsclaw-evolution" }
 rsclaw-memory = { path = "crates/rsclaw-memory" }

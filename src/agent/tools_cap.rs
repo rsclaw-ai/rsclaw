@@ -81,7 +81,6 @@ impl super::runtime::AgentRuntime {
         // the agent's inbox. The `:cap-followup` sub-session keeps the
         // live user-visible session settled.
         let inbox = Some(InboxTarget {
-            agent_tx: self.handle.tx.clone(),
             session_key: ctx.session_key.clone(),
             channel: ctx.channel.clone(),
             peer_id: ctx.peer_id.clone(),

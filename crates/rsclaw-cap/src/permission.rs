@@ -5,7 +5,7 @@ use cap_rs::core::{ClientFrame, PermissionDecision, RiskLevel};
 /// Always returns AllowOnce. Logs at info! so an operator can audit
 /// approvals by tail-grepping the gateway log. P2 (conversation mode)
 /// will replace this with a real user-in-the-loop handler.
-pub(crate) fn auto_approve(req_id: &str, tool: &str, risk: RiskLevel) -> ClientFrame {
+pub fn auto_approve(req_id: &str, tool: &str, risk: RiskLevel) -> ClientFrame {
     tracing::info!(
         target: "cap.permission",
         req_id,

@@ -91,7 +91,7 @@ pub struct CapLiveManager {
     /// once `AgentEvent::Ready` lands in the actor). `None` in test /
     /// embedded contexts that don't have a channel layer.
     notification_tx:
-        Option<broadcast::Sender<crate::channel::OutboundMessage>>,
+        Option<broadcast::Sender<rsclaw_types::OutboundMessage>>,
     max_sessions: usize,
     idle_timeout: Duration,
 }
@@ -143,14 +143,14 @@ enum LiveRequest {
     Shutdown,
 }
 
-pub(crate) struct LiveDispatchResult {
+pub struct LiveDispatchResult {
     pub session_id: String,
     pub agent_kind: AgentKind,
     pub output: String,
 }
 
 impl CapLiveManager {
-    pub(crate) fn new(bus: broadcast::Sender<rsclaw_events::AgentEvent>) -> Self {
+    pub fn new(bus: broadcast::Sender<rsclaw_events::AgentEvent>) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             sticky: Arc::new(RwLock::new(HashMap::new())),
@@ -164,18 +164,18 @@ impl CapLiveManager {
 
     /// Late-set the outbound notification channel. Called once from
     /// `gateway::startup` after the broadcast channel is created.
-    pub(crate) fn set_notification_tx(
+    pub fn set_notification_tx(
         &mut self,
-        tx: broadcast::Sender<crate::channel::OutboundMessage>,
+        tx: broadcast::Sender<rsclaw_types::OutboundMessage>,
     ) {
         self.notification_tx = Some(tx);
     }
 
     /// Cheap clone of the outbound notification sender, for preparse-
     /// side follow-up dispatches (e.g. resume-id hint after /cap).
-    pub(crate) fn notification_tx(
+    pub fn notification_tx(
         &self,
-    ) -> Option<broadcast::Sender<crate::channel::OutboundMessage>> {
+    ) -> Option<broadcast::Sender<rsclaw_types::OutboundMessage>> {
         self.notification_tx.clone()
     }
 
@@ -186,7 +186,7 @@ impl CapLiveManager {
     /// "resume warm driver" semantic is what makes
     /// `/cap claudecode → /cap codex → /cap claudecode` preserve the
     /// first claudecode session's conversation context.
-    pub(crate) async fn acquire_session(
+    pub async fn acquire_session(
         &self,
         im_session_key: &str,
         kind: AgentKind,
@@ -228,7 +228,7 @@ impl CapLiveManager {
     /// Used by the IM `/cap <agent>` slash command which wants to open
     /// a session and bind it sticky before any user message arrives.
     /// Returns the freshly minted `session_id`.
-    pub(crate) async fn open_session(
+    pub async fn open_session(
         &self,
         kind: AgentKind,
         cwd: std::path::PathBuf,
@@ -247,7 +247,7 @@ impl CapLiveManager {
     /// uuid of an earlier conversation (from `claude /sessions` or the
     /// last-bind reply) and wants to continue it as if no time had
     /// passed.
-    pub(crate) async fn open_session_resume(
+    pub async fn open_session_resume(
         &self,
         kind: AgentKind,
         cwd: std::path::PathBuf,
@@ -264,7 +264,7 @@ impl CapLiveManager {
     /// / `opencode --continue` / `codex exec resume --last`.
     /// Use case: `/cap-resume claudecode` (no id) — user wants to
     /// pick up where they left off without typing the uuid.
-    pub(crate) async fn open_session_continue_last(
+    pub async fn open_session_continue_last(
         &self,
         kind: AgentKind,
         cwd: std::path::PathBuf,
@@ -284,7 +284,7 @@ impl CapLiveManager {
     /// SAME `(im_key, old_kind)` we're about to park, the older one
     /// is torn down (one slot per agent per IM session — can't keep
     /// an infinite history).
-    pub(crate) async fn bind_sticky(
+    pub async fn bind_sticky(
         &self,
         im_session_key: String,
         live_session_id: String,
@@ -345,7 +345,7 @@ impl CapLiveManager {
 
     /// Remove a sticky binding. Returns the previously bound
     /// `(live_session_id, kind)` if there was one.
-    pub(crate) async fn unbind_sticky(
+    pub async fn unbind_sticky(
         &self,
         im_session_key: &str,
     ) -> Option<(String, AgentKind)> {
@@ -356,7 +356,7 @@ impl CapLiveManager {
     /// Look up the live session bound to this IM key. Returns
     /// `None` if the binding doesn't exist OR if the underlying live
     /// session is gone (in which case the stale entry is also evicted).
-    pub(crate) async fn resolve_sticky(
+    pub async fn resolve_sticky(
         &self,
         im_session_key: &str,
     ) -> Option<(String, AgentKind)> {
@@ -384,7 +384,7 @@ impl CapLiveManager {
     /// new session is spawned; if `Some`, the existing session is reused
     /// (and must match `kind` — agents are not interchangeable mid-thread).
     /// The call awaits the driver's full response before returning.
-    pub(crate) async fn dispatch_sync(
+    pub async fn dispatch_sync(
         &self,
         kind: AgentKind,
         session_id: Option<String>,
@@ -461,7 +461,7 @@ impl CapLiveManager {
     /// Returns an empty vec when the sticky lock is held by another
     /// task (rare; we'd rather render an empty section than block
     /// the status reply).
-    pub(crate) fn snapshot_sticky_blocking(&self) -> Vec<(String, String, AgentKind)> {
+    pub fn snapshot_sticky_blocking(&self) -> Vec<(String, String, AgentKind)> {
         match self.sticky.try_read() {
             Ok(g) => g
                 .iter()
@@ -477,7 +477,7 @@ impl CapLiveManager {
     /// path uses this to decide whether to prepend a memory recall
     /// bundle to the outgoing prompt — only on the first turn, since
     /// the driver process keeps its own history across turns.
-    pub(crate) async fn try_take_pending_memory_inject(&self, sid: &str) -> bool {
+    pub async fn try_take_pending_memory_inject(&self, sid: &str) -> bool {
         let g = self.sessions.read().await;
         match g.get(sid) {
             Some(h) => h
@@ -493,7 +493,7 @@ impl CapLiveManager {
     /// finished capturing Ready). Returns None for a live session
     /// whose Ready event hasn't landed yet OR if the sessions lock
     /// is contended.
-    pub(crate) fn agent_session_id_blocking(&self, sid: &str) -> Option<String> {
+    pub fn agent_session_id_blocking(&self, sid: &str) -> Option<String> {
         let g = self.sessions.try_read().ok()?;
         let h = g.get(sid)?;
         h.agent_session_id.lock().ok().and_then(|s| s.clone())
@@ -506,7 +506,7 @@ impl CapLiveManager {
     /// — they read different maps and a tiny inconsistency window
     /// (entry just moved from active → suspended) is harmless for a
     /// human-readable status line.
-    pub(crate) fn snapshot_suspended_blocking(&self) -> Vec<(String, AgentKind, String)> {
+    pub fn snapshot_suspended_blocking(&self) -> Vec<(String, AgentKind, String)> {
         match self.suspended.try_read() {
             Ok(g) => g
                 .iter()
@@ -518,7 +518,7 @@ impl CapLiveManager {
 
     /// Force-close a live session. Idempotent — returns Ok even if the
     /// session was already gone.
-    pub(crate) async fn end_session(&self, session_id: &str) -> Result<()> {
+    pub async fn end_session(&self, session_id: &str) -> Result<()> {
         let handle = {
             let mut g = self.sessions.write().await;
             g.remove(session_id)
@@ -533,7 +533,7 @@ impl CapLiveManager {
     /// `/cap-list` UIs and debug surfaces. Phase 1 has no caller yet —
     /// wired up in Phase 2 along with the `/cap` IM sticky command.
     #[allow(dead_code)]
-    pub(crate) async fn list(&self) -> Vec<(String, AgentKind)> {
+    pub async fn list(&self) -> Vec<(String, AgentKind)> {
         let g = self.sessions.read().await;
         g.iter().map(|(k, h)| (k.clone(), h.agent_kind)).collect()
     }
@@ -610,7 +610,7 @@ impl CapLiveManager {
     /// (claudecode/opencode/codex with heavy startup hooks can take
     /// 10-30s to emit init). Callers SHOULD retry / poll if they need
     /// the id immediately after spawn.
-    pub(crate) async fn get_agent_session_id(&self, sid: &str) -> Option<String> {
+    pub async fn get_agent_session_id(&self, sid: &str) -> Option<String> {
         let g = self.sessions.read().await;
         g.get(sid).and_then(|h| h.agent_session_id.lock().ok().and_then(|s| s.clone()))
     }
@@ -620,7 +620,7 @@ impl CapLiveManager {
     /// time (and are willing to wait a bit) get a result. Returns
     /// `None` if the timeout elapses.
     #[allow(dead_code)]
-    pub(crate) async fn wait_agent_session_id(
+    pub async fn wait_agent_session_id(
         &self,
         sid: &str,
         timeout: std::time::Duration,

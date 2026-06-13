@@ -18,7 +18,7 @@ use super::runtime::NotifTarget;
 /// dispatch function serves tool-mode (live IM progress + WS bus +
 /// reply collector) and the future P2 conversation mode.
 #[allow(dead_code)]
-pub(crate) struct Sinks<'a> {
+pub struct Sinks<'a> {
     pub notif: Option<&'a NotifTarget>,
     pub agent_event: Option<&'a broadcast::Sender<rsclaw_events::AgentEvent>>,
     pub reply: Option<&'a mut String>,
@@ -45,7 +45,7 @@ pub(crate) struct Sinks<'a> {
 /// - `Done` → returns `true`. Final summary push is the actor's job
 ///   (it has the full `reply` text at that point).
 #[allow(dead_code)]
-pub(crate) fn dispatch(event: &AgentEvent, sinks: &mut Sinks<'_>) -> bool {
+pub fn dispatch(event: &AgentEvent, sinks: &mut Sinks<'_>) -> bool {
     match event {
         AgentEvent::TextChunk { text, channel, .. } => {
             // cap-rs TextChannel has Assistant, Thought, System.

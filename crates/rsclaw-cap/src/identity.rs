@@ -35,7 +35,7 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
-use crate::agent::memory::{MemDocTier, MemoryDoc, global_store};
+use rsclaw_memory::{MemDocTier, MemoryDoc, global_store};
 
 /// Marker bracketing the auto-managed USER profile slice inside
 /// `AGENTS.md`. The runtime replaces the content **between** these
@@ -73,8 +73,8 @@ pub fn is_default_workspace(cwd: &Path) -> bool {
 }
 
 fn default_workspace_path() -> PathBuf {
-    let base = crate::config::loader::base_dir();
-    if let Ok(cfg) = crate::config::load()
+    let base = rsclaw_config::loader::base_dir();
+    if let Ok(cfg) = rsclaw_config::load()
         && let Some(ws) = cfg
             .raw
             .agents

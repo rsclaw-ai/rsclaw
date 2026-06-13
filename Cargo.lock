@@ -7528,6 +7528,7 @@ dependencies = [
  "rsclaw-artifact",
  "rsclaw-astock",
  "rsclaw-browser",
+ "rsclaw-cap",
  "rsclaw-channel",
  "rsclaw-computer",
  "rsclaw-config",
@@ -7652,6 +7653,26 @@ dependencies = [
  "tracing",
  "url",
  "wiremock",
+]
+
+[[package]]
+name = "rsclaw-cap"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cap-rs",
+ "futures",
+ "rsclaw-config",
+ "rsclaw-events",
+ "rsclaw-i18n",
+ "rsclaw-memory",
+ "rsclaw-types",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
