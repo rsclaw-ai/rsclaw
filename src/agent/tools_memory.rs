@@ -354,7 +354,6 @@ impl AgentRuntime {
         bundle
     }
 
-
     pub(crate) async fn tool_memory_get(&self, args: Value) -> Result<Value> {
         let id = args["id"].as_str().unwrap_or("").to_owned();
         let Some(ref mem) = self.memory else {
@@ -366,7 +365,6 @@ impl AgentRuntime {
             None => Ok(json!({"error": "not found", "id": id})),
         }
     }
-
 
     pub(crate) async fn tool_memory_put(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         let text = args["text"].as_str().unwrap_or("").trim().to_owned();
@@ -511,8 +509,6 @@ impl AgentRuntime {
         }
         Ok(json!({"deleted": true, "id": id}))
     }
-
-
 }
 
 // ---------------------------------------------------------------------------
@@ -574,7 +570,6 @@ fn rrf_fuse(
     ranked.into_iter().take(top_k).map(|(_, doc)| doc).collect()
 }
 
-
 pub(crate) fn default_memory_scope(agent_id: &str, channel: &str) -> String {
     if matches!(channel, "heartbeat" | "cron" | "system") {
         format!("agent:{agent_id}:{channel}")
@@ -582,7 +577,6 @@ pub(crate) fn default_memory_scope(agent_id: &str, channel: &str) -> String {
         format!("agent:{agent_id}")
     }
 }
-
 
 /// Resolve a KB collection by name, creating it if absent. Returns
 /// `(id, name, created)`. Used by the `knowledge_base` write actions so the
@@ -668,7 +662,10 @@ fn recall_context_hash(context: &str) -> String {
 
 /// Render KB auto-recall hits as a compact, token-budgeted block the model
 /// can cite from. Returns an empty string when nothing fits.
-pub(crate) fn format_kb_recall_block(hits: &[crate::kb::service::SearchHit], max_tokens: usize) -> String {
+pub(crate) fn format_kb_recall_block(
+    hits: &[crate::kb::service::SearchHit],
+    max_tokens: usize,
+) -> String {
     let header = "[Knowledge base — excerpts that MAY be relevant. Use only what actually \
                   answers the question and cite the source title; ignore the rest.]";
     let mut lines: Vec<String> = vec![header.to_owned()];
@@ -753,4 +750,3 @@ pub(crate) fn recall_bundle_from_docs(
         },
     })
 }
-
