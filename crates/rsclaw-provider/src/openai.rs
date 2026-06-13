@@ -16,7 +16,7 @@ use super::{
     TokenUsage,
 };
 
-pub(crate) const OPENAI_API_BASE: &str = "https://api.openai.com/v1";
+pub const OPENAI_API_BASE: &str = "https://api.openai.com/v1";
 #[allow(dead_code)]
 const DEFAULT_MAX_TOKENS: u32 = 65536;
 const TOOL_NAME_PREFIX: &str = "rc_";
@@ -86,7 +86,7 @@ pub(crate) fn sanitize_tool_name(name: &str) -> String {
 /// Idempotent: calling it on a name without the `rc_` prefix returns the
 /// input unchanged. That makes it safe to call from a provider-agnostic
 /// dispatch site once the streamed name is fully accumulated.
-pub(crate) fn restore_tool_name(name: &str) -> String {
+pub fn restore_tool_name(name: &str) -> String {
     let Some(encoded) = name.strip_prefix(TOOL_NAME_PREFIX) else {
         return name.to_owned();
     };

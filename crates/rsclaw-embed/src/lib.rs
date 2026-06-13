@@ -32,7 +32,7 @@ use tracing::warn;
 /// chunks failed, dense index silently rebuilt to n=0). Disabling idle
 /// reuse forces a fresh connection per request; the cost is one extra
 /// handshake, paid only on remote embedders, dwarfed by model latency.
-pub(crate) fn build_remote_client(timeout_secs: u64) -> reqwest::Client {
+pub fn build_remote_client(timeout_secs: u64) -> reqwest::Client {
     reqwest::Client::builder()
         .pool_max_idle_per_host(0)
         .connect_timeout(Duration::from_secs(10))

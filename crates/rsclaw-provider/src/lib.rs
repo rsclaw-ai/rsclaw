@@ -20,7 +20,7 @@ use std::pin::Pin;
 use anyhow::Result;
 
 /// Default User-Agent for all LLM provider HTTP requests.
-pub(crate) const DEFAULT_USER_AGENT: &str = concat!("rsclaw/", env!("CARGO_PKG_VERSION"));
+pub const DEFAULT_USER_AGENT: &str = concat!("rsclaw/", env!("CARGO_PKG_VERSION"));
 
 /// Warn (at most once per `(provider, session_key)` pair across the
 /// process lifetime) when a non-`rsclaw` provider receives a request
