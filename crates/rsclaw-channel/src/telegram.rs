@@ -21,7 +21,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 use super::{Channel, OutboundMessage};
-use crate::channel::chunker::{ChunkConfig, chunk_text, platform_chunk_limit};
+use crate::chunker::{ChunkConfig, chunk_text, platform_chunk_limit};
 
 // ---------------------------------------------------------------------------
 // Telegram API types
@@ -169,8 +169,8 @@ pub struct TelegramChannel {
                 i64,
                 bool,
                 Option<i64>,
-                Vec<crate::agent::registry::ImageAttachment>,
-                Vec<crate::agent::registry::FileAttachment>,
+                Vec<rsclaw_types::ImageAttachment>,
+                Vec<rsclaw_types::FileAttachment>,
             ) + Send
             + Sync,
     >,
@@ -188,8 +188,8 @@ impl TelegramChannel {
                     i64,
                     bool,
                     Option<i64>,
-                    Vec<crate::agent::registry::ImageAttachment>,
-                    Vec<crate::agent::registry::FileAttachment>,
+                    Vec<rsclaw_types::ImageAttachment>,
+                    Vec<rsclaw_types::FileAttachment>,
                 ) + Send
                 + Sync,
         >,
@@ -197,7 +197,7 @@ impl TelegramChannel {
         Self {
             token: token.into(),
             api_base: api_base.unwrap_or_else(|| "https://api.telegram.org".to_owned()),
-            client: crate::config::build_proxy_client()
+            client: rsclaw_config::build_proxy_client()
                 .timeout(Duration::from_secs(35))
                 .build()
                 .expect("reqwest client"),
@@ -517,7 +517,7 @@ impl TelegramChannel {
         let audio_bytes = self.download_file(file_id).await?;
 
         // 3. Transcribe via shared multi-provider module.
-        crate::channel::transcription::transcribe_audio(
+        crate::transcription::transcribe_audio(
             &self.client,
             &audio_bytes,
             "voice.ogg",
@@ -694,7 +694,7 @@ impl Channel for TelegramChannel {
                     && !filename.ends_with(".opus")
                 {
                     let ext = filename.rsplit('.').next().unwrap_or("mp3");
-                    match crate::channel::transcription::encode_audio_to_ogg_opus(&bytes, Some(ext))
+                    match crate::transcription::encode_audio_to_ogg_opus(&bytes, Some(ext))
                     {
                         Ok(opus_bytes) => {
                             let ogg_name = filename
@@ -772,7 +772,7 @@ impl Channel for TelegramChannel {
 
                             if let Some(msg) = &update.message {
                                 let mut tg_file_attachments: Vec<
-                                    crate::agent::registry::FileAttachment,
+                                    rsclaw_types::FileAttachment,
                                 > = Vec::new();
                                 // Try text first, then voice/audio transcription, then caption.
                                 let text = if let Some(t) =
@@ -808,7 +808,7 @@ impl Channel for TelegramChannel {
                                         Ok(bytes) => {
                                             info!(size = bytes.len(), "telegram: video downloaded");
                                             tg_file_attachments.push(
-                                                crate::agent::registry::FileAttachment {
+                                                rsclaw_types::FileAttachment {
                                                     filename: "video.mp4".to_owned(),
                                                     data: bytes,
                                                     mime_type: "video/mp4".to_owned(),
@@ -844,7 +844,7 @@ impl Channel for TelegramChannel {
                                     match self.download_file(&doc.file_id).await {
                                         Ok(bytes) => {
                                             tg_file_attachments.push(
-                                                crate::agent::registry::FileAttachment {
+                                                rsclaw_types::FileAttachment {
                                                     filename: filename.to_owned(),
                                                     data: bytes,
                                                     mime_type: "application/octet-stream"
@@ -896,7 +896,7 @@ impl Channel for TelegramChannel {
                                                     let data_url =
                                                         format!("data:{final_mime};base64,{b64}");
                                                     images.push(
-                                                        crate::agent::registry::ImageAttachment {
+                                                        rsclaw_types::ImageAttachment {
                                                             data: data_url,
                                                             mime_type: final_mime,
                                                             source_path: None,

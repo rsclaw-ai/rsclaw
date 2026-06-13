@@ -29,7 +29,7 @@ const DISCORD_PREVIEW_THRESHOLD: usize = 200;
 const DISCORD_EDIT_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
 use super::{Channel, OutboundMessage};
-use crate::channel::{
+use crate::{
     attachments::{mime_to_ext, parse_data_url, pick_file_mime},
     chunker::{BreakPreference, ChunkConfig, chunk_text, platform_chunk_limit},
     telegram::RetryConfig,
@@ -82,8 +82,8 @@ pub struct DiscordChannel {
                 String,
                 String,
                 bool,
-                Vec<crate::agent::registry::ImageAttachment>,
-                Vec<crate::agent::registry::FileAttachment>,
+                Vec<rsclaw_types::ImageAttachment>,
+                Vec<rsclaw_types::FileAttachment>,
             ) + Send
             + Sync,
     >,
@@ -110,8 +110,8 @@ impl DiscordChannel {
                     String,
                     String,
                     bool,
-                    Vec<crate::agent::registry::ImageAttachment>,
-                    Vec<crate::agent::registry::FileAttachment>,
+                    Vec<rsclaw_types::ImageAttachment>,
+                    Vec<rsclaw_types::FileAttachment>,
                 ) + Send
                 + Sync,
         >,
@@ -120,7 +120,7 @@ impl DiscordChannel {
     ) -> Self {
         Self {
             token: token.into(),
-            client: crate::config::build_proxy_client()
+            client: rsclaw_config::build_proxy_client()
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("reqwest client"),
@@ -460,9 +460,9 @@ impl DiscordChannel {
                             // gets a chance to fire (analyze vs save prompt).
                             // Other files go into `files` for the same reason.
                             // Audio/video still get auto-transcribed inline.
-                            let mut images: Vec<crate::agent::registry::ImageAttachment> =
+                            let mut images: Vec<rsclaw_types::ImageAttachment> =
                                 Vec::new();
-                            let mut files: Vec<crate::agent::registry::FileAttachment> = Vec::new();
+                            let mut files: Vec<rsclaw_types::FileAttachment> = Vec::new();
                             if let Some(attachments) = d["attachments"].as_array() {
                                 for att in attachments {
                                     let url = att["url"].as_str().unwrap_or("");
@@ -484,7 +484,7 @@ impl DiscordChannel {
                                         if content_type.starts_with("audio/")
                                             || content_type.starts_with("video/")
                                         {
-                                            match crate::channel::transcription::transcribe_audio(
+                                            match crate::transcription::transcribe_audio(
                                                 &self.client,
                                                 &bytes,
                                                 filename,
@@ -533,7 +533,7 @@ impl DiscordChannel {
                                                 });
                                             let b64 = base64::engine::general_purpose::STANDARD
                                                 .encode(&final_bytes);
-                                            images.push(crate::agent::registry::ImageAttachment {
+                                            images.push(rsclaw_types::ImageAttachment {
                                                 data: format!("data:{final_mime};base64,{b64}"),
                                                 mime_type: final_mime,
                                                 source_path: None,
@@ -552,7 +552,7 @@ impl DiscordChannel {
                                             // (PDF/Office/text) so plain Q&A
                                             // works without two roundtrips.
                                             let processed = discord_process_file(filename, &bytes);
-                                            files.push(crate::agent::registry::FileAttachment {
+                                            files.push(rsclaw_types::FileAttachment {
                                                 filename: filename.to_owned(),
                                                 data: bytes.clone(),
                                                 mime_type: if content_type.is_empty() {
@@ -809,7 +809,7 @@ fn discord_is_text_file(name: &str) -> bool {
 fn discord_process_file(filename: &str, bytes: &[u8]) -> String {
     let lower = filename.to_lowercase();
     if lower.ends_with(".pdf") {
-        if let Ok(text) = crate::agent::doc::safe_extract_pdf_from_mem(bytes) {
+        if let Ok(text) = rsclaw_doc::safe_extract_pdf_from_mem(bytes) {
             return format!(
                 "[PDF: {filename}]\n{}",
                 rsclaw_util::truncate_str(&text, 20000)
@@ -836,7 +836,7 @@ fn discord_process_file(filename: &str, bytes: &[u8]) -> String {
             format!("[file: {filename}]")
         }
     } else if lower.ends_with(".docx") || lower.ends_with(".xlsx") || lower.ends_with(".pptx") {
-        if let Some(text) = crate::channel::extract_office_text(filename, bytes) {
+        if let Some(text) = crate::extract_office_text(filename, bytes) {
             let label = if lower.ends_with(".docx") {
                 "Word"
             } else if lower.ends_with(".xlsx") {
@@ -865,7 +865,7 @@ fn discord_process_file(filename: &str, bytes: &[u8]) -> String {
             rsclaw_util::truncate_str(&text, 20000)
         )
     } else {
-        let ws = crate::config::loader::base_dir().join("workspace/uploads");
+        let ws = rsclaw_config::loader::base_dir().join("workspace/uploads");
         let _ = std::fs::create_dir_all(&ws);
         let dest = ws.join(filename);
         let _ = std::fs::write(&dest, bytes);

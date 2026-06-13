@@ -22,7 +22,7 @@ use tokio::{sync::RwLock, time::sleep};
 use tracing::{debug, info, warn};
 
 use super::{Channel, OutboundMessage};
-use crate::channel::{
+use crate::{
     chunker::{ChunkConfig, chunk_text, platform_chunk_limit},
     retry::{SendRetry, send_with_retry},
     transcription::transcribe_audio,
@@ -164,8 +164,8 @@ pub struct FeishuChannel {
                 String,
                 String,
                 bool,
-                Vec<crate::agent::registry::ImageAttachment>,
-                Vec<crate::agent::registry::FileAttachment>,
+                Vec<rsclaw_types::ImageAttachment>,
+                Vec<rsclaw_types::FileAttachment>,
             ) + Send
             + Sync,
     >,
@@ -349,8 +349,8 @@ impl FeishuChannel {
                     String,
                     String,
                     bool,
-                    Vec<crate::agent::registry::ImageAttachment>,
-                    Vec<crate::agent::registry::FileAttachment>,
+                    Vec<rsclaw_types::ImageAttachment>,
+                    Vec<rsclaw_types::FileAttachment>,
                 ) + Send
                 + Sync,
         >,
@@ -368,7 +368,7 @@ impl FeishuChannel {
             // pool_idle_timeout: 60s — keep auth/im connections warm
             // between the bursty token-refresh + send pattern so the
             // next call doesn't pay TLS handshake again.
-            client: crate::config::build_proxy_client()
+            client: rsclaw_config::build_proxy_client()
                 .timeout(Duration::from_secs(30))
                 .connect_timeout(Duration::from_secs(10))
                 .pool_idle_timeout(Duration::from_secs(60))
@@ -924,8 +924,8 @@ impl FeishuChannel {
         }
 
         // Extract text content (text or voice/audio transcription), images, and files
-        let mut images: Vec<crate::agent::registry::ImageAttachment> = Vec::new();
-        let mut file_attachments: Vec<crate::agent::registry::FileAttachment> = Vec::new();
+        let mut images: Vec<rsclaw_types::ImageAttachment> = Vec::new();
+        let mut file_attachments: Vec<rsclaw_types::FileAttachment> = Vec::new();
         let text = match msg_type {
             "text" => {
                 let content_str = message
@@ -1015,7 +1015,7 @@ impl FeishuChannel {
                             let b64 =
                                 base64::engine::general_purpose::STANDARD.encode(&final_bytes);
                             let data_url = format!("data:{final_mime};base64,{b64}");
-                            images.push(crate::agent::registry::ImageAttachment {
+                            images.push(rsclaw_types::ImageAttachment {
                                 data: data_url,
                                 mime_type: final_mime,
                                 source_path: None,
@@ -1061,7 +1061,7 @@ impl FeishuChannel {
                     Ok(bytes) => {
                         // Send as FileAttachment — runtime decides vision vs transcription
                         info!(size = bytes.len(), "feishu: video downloaded");
-                        file_attachments.push(crate::agent::registry::FileAttachment {
+                        file_attachments.push(rsclaw_types::FileAttachment {
                             filename: "video.mp4".to_owned(),
                             data: bytes,
                             mime_type: "video/mp4".to_owned(),
@@ -1137,7 +1137,7 @@ impl FeishuChannel {
                                         .encode(&final_bytes);
                                     let data_url =
                                         format!("data:{final_mime};base64,{b64}");
-                                    images.push(crate::agent::registry::ImageAttachment {
+                                    images.push(rsclaw_types::ImageAttachment {
                                         data: data_url,
                                         mime_type: final_mime,
                                         source_path: None,
@@ -1154,7 +1154,7 @@ impl FeishuChannel {
                                 }
                             }
                         } else {
-                            file_attachments.push(crate::agent::registry::FileAttachment {
+                            file_attachments.push(rsclaw_types::FileAttachment {
                                 filename: file_name.to_owned(),
                                 data: bytes,
                                 mime_type: "application/octet-stream".to_owned(),
@@ -1225,7 +1225,7 @@ impl FeishuChannel {
         // transfers slowly-but-steadily must not be killed mid-download (the old
         // 300s total cap failed any 58MB+ file on a slow link). `read_timeout`
         // only fires when the body stalls for this long between chunks.
-        let dl_client = crate::config::build_proxy_client()
+        let dl_client = rsclaw_config::build_proxy_client()
             .connect_timeout(Duration::from_secs(30))
             .read_timeout(Duration::from_secs(self.download_timeout_secs))
             .build()
@@ -1620,7 +1620,7 @@ impl Channel for FeishuChannel {
                     && !filename.ends_with(".opus")
                 {
                     let ext = filename.rsplit('.').next().unwrap_or("mp3");
-                    match crate::channel::transcription::encode_audio_to_ogg_opus(&bytes, Some(ext))
+                    match crate::transcription::encode_audio_to_ogg_opus(&bytes, Some(ext))
                     {
                         Ok(opus_bytes) => {
                             let opus_name = filename
@@ -1853,7 +1853,7 @@ impl Channel for FeishuChannel {
 // crate::cap::notification; re-exported here for backward-compat.
 // ---------------------------------------------------------------------------
 
-pub use crate::cap::notification::{Notification, NotificationPriority, NotificationSink};
+pub use rsclaw_types::{Notification, NotificationPriority, NotificationSink};
 
 // ---------------------------------------------------------------------------
 // FeishuNotifier implementation

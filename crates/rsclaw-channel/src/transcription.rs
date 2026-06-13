@@ -83,7 +83,7 @@ pub async fn transcribe_audio(
     // doing.
     if provider != "sherpa"
         && std::env::var("TRANSCRIPTION_PROVIDER").is_err()
-        && crate::agent::install_hints::claim_first_hint("stt-sherpa")
+        && rsclaw_platform::install_hints::claim_first_hint("stt-sherpa")
     {
         if let Ok(text) = result {
             let lang = rsclaw_i18n::default_lang();
@@ -189,7 +189,7 @@ fn detect_provider() -> String {
     }
 
     // 2. Candle whisper model (pure Rust, no external deps)
-    let model_dir = crate::config::loader::base_dir().join("models/whisper-tiny");
+    let model_dir = rsclaw_config::loader::base_dir().join("models/whisper-tiny");
     if model_dir.join("config.json").exists() {
         return "candle".to_owned();
     }
@@ -402,7 +402,7 @@ async fn transcribe_openai(
 /// Find whisper binary: `whisper-cli`, `whisper`, or `whisper.cpp`
 fn which_whisper() -> Option<String> {
     // 1. Check ~/.rsclaw/tools/whisper-cpp/ first
-    let tools_dir = crate::config::loader::base_dir().join("tools/whisper-cpp");
+    let tools_dir = rsclaw_config::loader::base_dir().join("tools/whisper-cpp");
     if tools_dir.exists() {
         for name in &["whisper-cli", "whisper", "main"] {
             let bin = tools_dir.join(name);
@@ -988,7 +988,7 @@ fn decode_audio_to_pcm_ext(audio_bytes: &[u8], file_ext: Option<&str>) -> Result
 
 /// Resolve ffmpeg binary: ~/.rsclaw/tools/ffmpeg/ first, then system PATH.
 fn which_ffmpeg() -> String {
-    crate::agent::platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned())
+    rsclaw_platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned())
 }
 
 /// Fallback: use ffmpeg CLI to convert any audio/video to 16kHz mono WAV, then
@@ -1490,7 +1490,7 @@ fn write_wav_from_pcm(samples: &[f32], sample_rate: u32) -> Vec<u8> {
 /// Download: `huggingface-cli download openai/whisper-tiny --local-dir
 /// ~/.rsclaw/models/whisper-tiny`
 async fn transcribe_candle(audio_bytes: &[u8]) -> Result<String> {
-    let model_dir = crate::config::loader::base_dir().join("models/whisper-tiny");
+    let model_dir = rsclaw_config::loader::base_dir().join("models/whisper-tiny");
     if !model_dir.join("config.json").exists() {
         anyhow::bail!(
             "candle whisper model not found at {}\n\
@@ -1539,7 +1539,7 @@ async fn transcribe_candle(audio_bytes: &[u8]) -> Result<String> {
 /// Locate the sherpa-onnx-offline binary. Prefers the bundled copy under
 /// `<base_dir>/tools/sherpa-onnx/bin/`, falls back to `$PATH`.
 fn find_sherpa_offline_bin() -> Option<std::path::PathBuf> {
-    let bundled = crate::config::loader::base_dir()
+    let bundled = rsclaw_config::loader::base_dir()
         .join("tools")
         .join("sherpa-onnx")
         .join("bin")
@@ -1581,7 +1581,7 @@ enum SherpaSttSetup {
 
 fn find_sherpa_stt_setup() -> Option<SherpaSttSetup> {
     let bin = find_sherpa_offline_bin()?;
-    let models_root = crate::config::loader::base_dir().join("models");
+    let models_root = rsclaw_config::loader::base_dir().join("models");
 
     // Search order: full-precision paraformer first (user installed it
     // explicitly so they want the better quality), then int8 paraformer

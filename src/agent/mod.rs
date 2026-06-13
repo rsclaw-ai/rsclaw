@@ -49,7 +49,7 @@ pub mod tools_stock;
 pub mod tools_video;
 pub mod tools_web;
 pub mod trace_capture;
-pub mod turn_metrics;
+pub use rsclaw_types::turn_metrics;
 pub mod web_parsers;
 pub mod workspace;
 

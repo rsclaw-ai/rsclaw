@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 
 use super::{Channel, OutboundMessage};
 use crate::{
-    channel::retry::{SendRetry, send_with_retry},
+    retry::{SendRetry, send_with_retry},
     config::schema::CustomChannelConfig,
 };
 
@@ -271,19 +271,19 @@ pub struct CustomWebhookChannel {
     client: Client,
     #[allow(clippy::type_complexity)]
     on_message:
-        Arc<dyn Fn(String, String, String, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>, bool) + Send + Sync>,
+        Arc<dyn Fn(String, String, String, Vec<rsclaw_types::ImageAttachment>, Vec<rsclaw_types::FileAttachment>, bool) + Send + Sync>,
 }
 
 impl CustomWebhookChannel {
     pub fn new(
         cfg: CustomChannelConfig,
         on_message: Arc<
-            dyn Fn(String, String, String, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>, bool) + Send + Sync,
+            dyn Fn(String, String, String, Vec<rsclaw_types::ImageAttachment>, Vec<rsclaw_types::FileAttachment>, bool) + Send + Sync,
         >,
     ) -> Self {
         Self {
             cfg,
-            client: crate::config::build_proxy_client()
+            client: rsclaw_config::build_proxy_client()
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("reqwest client"),
@@ -441,7 +441,7 @@ pub struct CustomWebSocketChannel {
     client: Client,
     #[allow(clippy::type_complexity)]
     on_message:
-        Arc<dyn Fn(String, String, String, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>, bool) + Send + Sync>,
+        Arc<dyn Fn(String, String, String, Vec<rsclaw_types::ImageAttachment>, Vec<rsclaw_types::FileAttachment>, bool) + Send + Sync>,
     /// Sender half for outbound messages.
     ws_tx: Mutex<Option<mpsc::Sender<String>>>,
 }
@@ -450,11 +450,11 @@ impl CustomWebSocketChannel {
     pub fn new(
         cfg: CustomChannelConfig,
         on_message: Arc<
-            dyn Fn(String, String, String, Vec<crate::agent::registry::ImageAttachment>, Vec<crate::agent::registry::FileAttachment>, bool) + Send + Sync,
+            dyn Fn(String, String, String, Vec<rsclaw_types::ImageAttachment>, Vec<rsclaw_types::FileAttachment>, bool) + Send + Sync,
         >,
     ) -> Self {
         Self {
-            client: crate::config::build_proxy_client()
+            client: rsclaw_config::build_proxy_client()
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("reqwest client"),
@@ -880,7 +880,7 @@ async fn download_remote_attachment(_client: &Client, url: &str) -> Result<Vec<u
     // Build a per-request client pinned to the validated address set. After
     // this call reqwest will only TCP-connect to one of `addrs`; a malicious
     // resolver flipping records before the request fires cannot redirect us.
-    let client = crate::config::build_proxy_client()
+    let client = rsclaw_config::build_proxy_client()
         .timeout(Duration::from_secs(30))
         .resolve_to_addrs(&host, &addrs)
         .build()
@@ -918,7 +918,7 @@ async fn download_remote_attachment(_client: &Client, url: &str) -> Result<Vec<u
 async fn download_and_package_image(
     client: &Client,
     url: &str,
-) -> Option<crate::agent::registry::ImageAttachment> {
+) -> Option<rsclaw_types::ImageAttachment> {
     let bytes = download_remote_attachment(client, url).await.ok()?;
     if bytes.is_empty() {
         return None;
@@ -929,7 +929,7 @@ async fn download_and_package_image(
             .unwrap_or_else(|_| (bytes, mime));
     let b64 = base64::engine::general_purpose::STANDARD.encode(&final_bytes);
     let data_url = format!("data:{final_mime};base64,{b64}");
-    Some(crate::agent::registry::ImageAttachment {
+    Some(rsclaw_types::ImageAttachment {
         data: data_url,
         mime_type: final_mime,
         source_path: None,
@@ -940,7 +940,7 @@ async fn download_and_package_image(
 async fn download_images(
     client: &Client,
     urls: &[String],
-) -> Vec<crate::agent::registry::ImageAttachment> {
+) -> Vec<rsclaw_types::ImageAttachment> {
     let mut images = Vec::new();
     for url in urls {
         if let Some(img) = download_and_package_image(client, url).await {
@@ -955,14 +955,14 @@ async fn download_and_package_file(
     client: &Client,
     file_url: &Option<String>,
     filename: &str,
-) -> Vec<crate::agent::registry::FileAttachment> {
+) -> Vec<rsclaw_types::FileAttachment> {
     let Some(url) = file_url else { return vec![] };
     match download_remote_attachment(client, url).await {
         Ok(bytes) if !bytes.is_empty() => {
             let mime = mime_guess::from_path(filename)
                 .first_or_octet_stream()
                 .to_string();
-            vec![crate::agent::registry::FileAttachment {
+            vec![rsclaw_types::FileAttachment {
                 filename: filename.to_owned(),
                 data: bytes,
                 mime_type: mime,

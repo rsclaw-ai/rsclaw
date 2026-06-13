@@ -183,8 +183,7 @@ impl HostMethodRegistry {
 
         if guard.is_none() {
             tracing::info!("JS plugin: auto-starting browser session");
-            let chrome_path = crate::agent::platform::ensure_chrome()
-                .await
+            let chrome_path = rsclaw_platform::detect_chrome().ok_or_else(|| anyhow::anyhow!("Chrome not found; run: rsclaw tools install chrome"))
                 .map_err(|e| anyhow::anyhow!("failed to obtain Chrome: {e:#}"))?;
             let session = BrowserSession::start(&chrome_path, true, Some(PROFILE))
                 .await

@@ -25,7 +25,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tracing::{debug, error, info, warn};
 
 use super::{Channel, OutboundMessage};
-use crate::channel::{
+use crate::{
     chunker::{BreakPreference, ChunkConfig, chunk_text},
     telegram::RetryConfig,
 };
@@ -104,7 +104,7 @@ pub struct DingTalkChannel {
     /// Callback: (sender_id, text, conversation_id, is_group, images).
     #[allow(clippy::type_complexity)]
     on_message: Arc<
-        dyn Fn(String, String, String, bool, Vec<crate::agent::registry::ImageAttachment>)
+        dyn Fn(String, String, String, bool, Vec<rsclaw_types::ImageAttachment>)
             + Send
             + Sync,
     >,
@@ -118,7 +118,7 @@ impl DingTalkChannel {
         api_base: Option<String>,
         oapi_base: Option<String>,
         on_message: Arc<
-            dyn Fn(String, String, String, bool, Vec<crate::agent::registry::ImageAttachment>)
+            dyn Fn(String, String, String, bool, Vec<rsclaw_types::ImageAttachment>)
                 + Send
                 + Sync,
         >,
@@ -129,7 +129,7 @@ impl DingTalkChannel {
             robot_code: robot_code.into(),
             api_base: api_base.unwrap_or_else(|| DINGTALK_API_BASE.to_owned()),
             oapi_base: oapi_base.unwrap_or_else(|| DINGTALK_OAPI_BASE.to_owned()),
-            client: crate::config::build_proxy_client()
+            client: rsclaw_config::build_proxy_client()
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("reqwest client"),
@@ -348,7 +348,7 @@ impl DingTalkChannel {
     async fn transcribe_voice(&self, download_code: &str) -> Result<String> {
         let audio_bytes = self.download_voice(download_code).await?;
 
-        crate::channel::transcription::transcribe_audio(
+        crate::transcription::transcribe_audio(
             &self.client,
             &audio_bytes,
             "voice.amr",
@@ -497,7 +497,7 @@ impl DingTalkChannel {
             .and_then(|v| v.as_str())
             .unwrap_or("text");
 
-        let mut images: Vec<crate::agent::registry::ImageAttachment> = Vec::new();
+        let mut images: Vec<rsclaw_types::ImageAttachment> = Vec::new();
 
         let text = match msg_type {
             "text" => {
@@ -547,7 +547,7 @@ impl DingTalkChannel {
                         Ok(bytes) => {
                             use base64::Engine;
                             let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                            images.push(crate::agent::registry::ImageAttachment {
+                            images.push(rsclaw_types::ImageAttachment {
                                 data: format!("data:image/png;base64,{b64}"),
                                 mime_type: "image/png".to_owned(),
                                 source_path: None,
@@ -569,7 +569,7 @@ impl DingTalkChannel {
                             })
                             .and_then(|v| v.as_str());
                         match pic_url {
-                            Some(url) => match crate::channel::transcription::download_file(
+                            Some(url) => match crate::transcription::download_file(
                                 &self.client,
                                 url,
                             )
@@ -579,7 +579,7 @@ impl DingTalkChannel {
                                     use base64::Engine;
                                     let b64 =
                                         base64::engine::general_purpose::STANDARD.encode(&bytes);
-                                    images.push(crate::agent::registry::ImageAttachment {
+                                    images.push(rsclaw_types::ImageAttachment {
                                         data: format!("data:image/png;base64,{b64}"),
                                         mime_type: "image/png".to_owned(),
                                         source_path: None,
@@ -1194,7 +1194,7 @@ async fn dingtalk_extract_audio_and_transcribe(
 
     std::fs::write(&video_path, video_bytes)?;
 
-    let ffmpeg_bin = crate::agent::platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned());
+    let ffmpeg_bin = rsclaw_platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned());
     let status = tokio::process::Command::new(&ffmpeg_bin)
         .args([
             "-y",
@@ -1220,7 +1220,7 @@ async fn dingtalk_extract_audio_and_transcribe(
     let audio_bytes = std::fs::read(&audio_path)?;
     let _ = std::fs::remove_file(&audio_path);
 
-    crate::channel::transcription::transcribe_audio(
+    crate::transcription::transcribe_audio(
         client,
         &audio_bytes,
         "video_audio.ogg",

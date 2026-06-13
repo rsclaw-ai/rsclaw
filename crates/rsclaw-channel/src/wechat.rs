@@ -25,7 +25,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 use super::{Channel, OutboundMessage};
-use crate::channel::{
+use crate::{
     chunker::{ChunkConfig, chunk_text},
     retry::{SendRetry, send_with_retry},
 };
@@ -265,8 +265,8 @@ pub struct WeChatPersonalChannel {
         dyn Fn(
                 String,
                 String,
-                Vec<crate::agent::registry::ImageAttachment>,
-                Vec<crate::agent::registry::FileAttachment>,
+                Vec<rsclaw_types::ImageAttachment>,
+                Vec<rsclaw_types::FileAttachment>,
             ) + Send
             + Sync,
     >,
@@ -286,8 +286,8 @@ impl WeChatPersonalChannel {
             dyn Fn(
                     String,
                     String,
-                    Vec<crate::agent::registry::ImageAttachment>,
-                    Vec<crate::agent::registry::FileAttachment>,
+                    Vec<rsclaw_types::ImageAttachment>,
+                    Vec<rsclaw_types::FileAttachment>,
                 ) + Send
                 + Sync,
         >,
@@ -295,7 +295,7 @@ impl WeChatPersonalChannel {
         Self {
             base_url: ILINK_BASE_URL.to_owned(),
             bot_token,
-            client: crate::config::build_proxy_client()
+            client: rsclaw_config::build_proxy_client()
                 .timeout(Duration::from_millis(LONG_POLL_TIMEOUT_MS + 5000))
                 .build()
                 .expect("http client"),
@@ -347,7 +347,7 @@ impl WeChatPersonalChannel {
     /// or Unicode fallback). Returns (qrcode_url, session_qrcode) for polling.
     pub async fn start_qr_login(client: &Client) -> Result<(String, String)> {
         let (qrcode_url, qrcode) = Self::fetch_qr_login(client).await?;
-        crate::channel::auth::display_qr_terminal(&qrcode_url)?;
+        crate::auth::display_qr_terminal(&qrcode_url)?;
         Ok((qrcode_url, qrcode))
     }
 
@@ -359,7 +359,7 @@ impl WeChatPersonalChannel {
     /// and the desktop UI displays the PNG itself.
     pub async fn start_qr_login_silent(client: &Client) -> Result<(String, String)> {
         let (qrcode_url, qrcode) = Self::fetch_qr_login(client).await?;
-        crate::channel::auth::save_qr_to_path(&qrcode_url)?;
+        crate::auth::save_qr_to_path(&qrcode_url)?;
         Ok((qrcode_url, qrcode))
     }
 
@@ -392,7 +392,7 @@ impl WeChatPersonalChannel {
                     info!(bot_id = %bot_id, "WeChat login confirmed");
 
                     // Save token
-                    crate::channel::auth::save_token(
+                    crate::auth::save_token(
                         "wechat",
                         &json!({
                             "bot_token": token,
@@ -446,7 +446,7 @@ impl WeChatPersonalChannel {
                     .ilink_bot_id
                     .context("no ilink_bot_id after confirmed")?;
 
-                crate::channel::auth::save_token(
+                crate::auth::save_token(
                     "wechat",
                     &json!({
                         "bot_token": token,
@@ -542,7 +542,7 @@ impl WeChatPersonalChannel {
         let mut updates_buf = String::new();
 
         // Try to load saved state
-        if let Some(saved) = crate::channel::auth::load_token("wechat")
+        if let Some(saved) = crate::auth::load_token("wechat")
             && let Some(buf) = saved.get("get_updates_buf").and_then(|v| v.as_str())
         {
             updates_buf = buf.to_owned();
@@ -641,7 +641,7 @@ impl WeChatPersonalChannel {
                                     let audio = self.download_media_source(&src).await;
                                     match audio {
                                         Ok(bytes) => {
-                                            match crate::channel::transcription::transcribe_audio(
+                                            match crate::transcription::transcribe_audio(
                                                 &self.client,
                                                 &bytes,
                                                 "voice.silk",
@@ -710,7 +710,7 @@ impl WeChatPersonalChannel {
                                             let data_url =
                                                 format!("data:{final_mime};base64,{b64}");
                                             let images =
-                                                vec![crate::agent::registry::ImageAttachment {
+                                                vec![rsclaw_types::ImageAttachment {
                                                     data: data_url,
                                                     mime_type: final_mime,
                                                     source_path: None,
@@ -750,7 +750,7 @@ impl WeChatPersonalChannel {
                                                 size = bytes.len(),
                                                 fname, "wechat: file received, routing to agent"
                                             );
-                                            let fa = crate::agent::registry::FileAttachment {
+                                            let fa = rsclaw_types::FileAttachment {
                                                 filename: fname.to_owned(),
                                                 data: bytes,
                                                 mime_type: "application/octet-stream".to_owned(),
@@ -793,12 +793,12 @@ impl WeChatPersonalChannel {
                                                     .encode(&bytes);
                                                 let data_uri =
                                                     format!("data:video/mp4;base64,{b64}");
-                                                let img = crate::agent::registry::ImageAttachment {
+                                                let img = rsclaw_types::ImageAttachment {
                                                     data: data_uri,
                                                     mime_type: "video/mp4".to_owned(),
                                                     source_path: None,
                                                 };
-                                                let fa = crate::agent::registry::FileAttachment {
+                                                let fa = rsclaw_types::FileAttachment {
                                                     filename: "video.mp4".to_owned(),
                                                     data: bytes,
                                                     mime_type: "video/mp4".to_owned(),
@@ -1001,7 +1001,7 @@ impl WeChatPersonalChannel {
     async fn download_media_source(&self, src: &MediaSource) -> Result<Vec<u8>> {
         match src {
             MediaSource::Url(url) => {
-                crate::channel::transcription::download_file(&self.client, url).await
+                crate::transcription::download_file(&self.client, url).await
             }
             MediaSource::Cdn {
                 encrypt_query_param,
@@ -1331,7 +1331,7 @@ impl WeChatPersonalChannel {
                 .context("decode base64 image payload")?
         } else {
             // Treat as URL -- download it
-            crate::channel::transcription::download_file(&self.client, image_data_uri).await?
+            crate::transcription::download_file(&self.client, image_data_uri).await?
         };
 
         if image_bytes.is_empty() {
@@ -1424,7 +1424,7 @@ impl WeChatPersonalChannel {
 
         // ffmpeg: decode to raw PCM s16le mono 24kHz
         let ffmpeg_bin =
-            crate::agent::platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned());
+            rsclaw_platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned());
         let output = std::process::Command::new(&ffmpeg_bin)
             .args([
                 "-i",
@@ -1803,7 +1803,7 @@ impl Channel for WeChatPersonalChannel {
                 // wrap the audio in a minimal black-frame MP4 and send as
                 // video. WeChat plays MP4s inline with full transport
                 // controls so the user effectively gets a playable bubble.
-                let is_audio = crate::channel::is_audio_attachment(mime, filename);
+                let is_audio = crate::is_audio_attachment(mime, filename);
                 if is_audio {
                     let mp4_result = audio_to_video_mp4(&bytes, filename).await;
                     let video_sent = match mp4_result {
@@ -1999,8 +1999,8 @@ mod tests {
         let on_message = Arc::new(
             move |_from: String,
                   text: String,
-                  _images: Vec<crate::agent::registry::ImageAttachment>,
-                  _files: Vec<crate::agent::registry::FileAttachment>| {
+                  _images: Vec<rsclaw_types::ImageAttachment>,
+                  _files: Vec<rsclaw_types::FileAttachment>| {
                 rx.lock().unwrap().push(text);
             },
         );

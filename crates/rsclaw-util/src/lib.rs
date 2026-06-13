@@ -132,3 +132,48 @@ mod tests {
         assert_eq!(truncate_str("hello world", 5), "hello");
     }
 }
+
+// Path helpers (crate-split): expand_tilde + canonicalize_external_path lifted
+// from agent/runtime.rs so plugin/tools can normalize paths without the agent knot.
+/// Expand a leading `~/` to the user's home directory.
+pub fn expand_tilde(p: &str) -> std::path::PathBuf {
+    if let Some(rest) = p.strip_prefix("~/").or_else(|| p.strip_prefix("~\\")) {
+        dirs_next::home_dir().unwrap_or_default().join(rest)
+    } else if p == "~" {
+        dirs_next::home_dir().unwrap_or_default()
+    } else {
+        std::path::PathBuf::from(p)
+    }
+}/// Canonicalize a path received from an external source (tool output, plugin
+/// result, LLM-generated argument). Performs:
+///   1. `~/...` expansion via [`expand_tilde`]
+///   2. If still relative, joins with `workspace`
+///   3. Collapses `.` and `..` components without requiring filesystem access
+///      (does NOT follow symlinks — this is a pure lexical normalization).
+///
+/// This is the single entry point for turning untrusted path strings into
+/// filesystem paths the host will actually read/write. Call this instead of
+/// `PathBuf::from(s)` at module boundaries.
+pub fn canonicalize_external_path(
+    input: &str,
+    workspace: &std::path::Path,
+) -> std::path::PathBuf {
+    use std::path::Component;
+    let expanded = expand_tilde(input);
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        workspace.join(expanded)
+    };
+    let mut out = std::path::PathBuf::new();
+    for c in absolute.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}

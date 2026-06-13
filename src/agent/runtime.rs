@@ -3764,7 +3764,7 @@ impl AgentRuntime {
             }
             let mut transcriptions = Vec::new();
             for mf in &media_files {
-                if let Some(t) = extract_audio_text(&mf.data, &mf.filename.to_lowercase()).await {
+                if let Some(t) = rsclaw_channel::extract_audio_text(&mf.data, &mf.filename.to_lowercase()).await {
                     info!(chars = t.len(), file = %mf.filename, "media transcribed from file attachment");
                     transcriptions.push(format!("[{}]\n{}", mf.filename, t));
                 } else {
@@ -3919,7 +3919,7 @@ impl AgentRuntime {
                 {
                     None
                 } else {
-                    extract_file_text(&file.filename, &file.data).await
+                    rsclaw_channel::extract_file_text(&file.filename, &file.data).await
                 };
                 let has_text = extracted.is_some();
                 let est_tokens = extracted.as_ref().map(|t| estimate_tokens(t)).unwrap_or(0);
@@ -11091,16 +11091,8 @@ impl AgentRuntime {
 // Path helpers
 // ---------------------------------------------------------------------------
 
-/// Expand a leading `~/` to the user's home directory.
-pub(crate) fn expand_tilde(p: &str) -> std::path::PathBuf {
-    if let Some(rest) = p.strip_prefix("~/").or_else(|| p.strip_prefix("~\\")) {
-        dirs_next::home_dir().unwrap_or_default().join(rest)
-    } else if p == "~" {
-        dirs_next::home_dir().unwrap_or_default()
-    } else {
-        std::path::PathBuf::from(p)
-    }
-}
+// expand_tilde + canonicalize_external_path lifted to rsclaw-util (crate-split); re-exported.
+pub(crate) use rsclaw_util::{expand_tilde, canonicalize_external_path};
 
 /// Single source of truth for the per-agent default workspace path used by
 /// file tools (`list_dir`, `search_file`, `search_content`, `read_file`,
@@ -11142,132 +11134,14 @@ fn resolve_request_max_tokens(
     (resolved > 0).then_some(resolved)
 }
 
-/// Canonicalize a path received from an external source (tool output, plugin
-/// result, LLM-generated argument). Performs:
-///   1. `~/...` expansion via [`expand_tilde`]
-///   2. If still relative, joins with `workspace`
-///   3. Collapses `.` and `..` components without requiring filesystem access
-///      (does NOT follow symlinks — this is a pure lexical normalization).
-///
-/// This is the single entry point for turning untrusted path strings into
-/// filesystem paths the host will actually read/write. Call this instead of
-/// `PathBuf::from(s)` at module boundaries.
-pub(crate) fn canonicalize_external_path(
-    input: &str,
-    workspace: &std::path::Path,
-) -> std::path::PathBuf {
-    use std::path::Component;
-    let expanded = expand_tilde(input);
-    let absolute = if expanded.is_absolute() {
-        expanded
-    } else {
-        workspace.join(expanded)
-    };
-    let mut out = std::path::PathBuf::new();
-    for c in absolute.components() {
-        match c {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
-}
 
 // ---------------------------------------------------------------------------
 // File extraction helpers (FileAttachment gate)
 // ---------------------------------------------------------------------------
 
-/// Attempt to extract readable text from a file based on extension.
-/// Returns `None` for binary/unrecognized formats.
-pub(crate) async fn extract_file_text(filename: &str, bytes: &[u8]) -> Option<String> {
-    let lower = filename.to_lowercase();
-    if lower.ends_with(".pdf") {
-        match crate::agent::doc::safe_extract_pdf_from_mem(bytes) {
-            Ok(text) => return Some(text),
-            Err(_) => {}
-        }
-        // Fallback to pdftotext CLI
-        let tmp = std::env::temp_dir().join(format!("rsclaw_extract_{}", uuid::Uuid::new_v4()));
-        std::fs::write(&tmp, bytes).ok()?;
-        #[allow(unused_mut)]
-        let mut pdf_cmd = std::process::Command::new("pdftotext");
-        pdf_cmd.args([tmp.to_str().unwrap_or(""), "-"]);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            pdf_cmd.creation_flags(0x08000000);
-        }
-        let output = pdf_cmd.output();
-        let _ = std::fs::remove_file(&tmp);
-        output
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-    } else if lower.ends_with(".docx") || lower.ends_with(".xlsx") || lower.ends_with(".pptx") {
-        crate::channel::extract_office_text(filename, bytes)
-    } else if is_likely_text_file(&lower) {
-        Some(String::from_utf8_lossy(bytes).to_string())
-    } else if is_audio_or_video(&lower) {
-        extract_audio_text(bytes, &lower).await
-    } else {
-        None
-    }
-}
 
-fn is_audio_or_video(lower: &str) -> bool {
-    [
-        ".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv", ".mp3", ".wav", ".ogg", ".m4a",
-        ".aac", ".flac", ".wma", ".opus",
-    ]
-    .iter()
-    .any(|e| lower.ends_with(e))
-}
 
-/// Extract text from audio/video by running ffmpeg -> whisper.
-async fn extract_audio_text(bytes: &[u8], lower_filename: &str) -> Option<String> {
-    let ext = lower_filename.rsplit('.').next().unwrap_or("mp4");
-    let mime = match ext {
-        "mp4" | "m4a" | "m4v" => "video/mp4",
-        "ogg" | "oga" | "opus" => "audio/ogg",
-        "mp3" => "audio/mpeg",
-        "wav" => "audio/wav",
-        "flac" => "audio/flac",
-        "amr" => "audio/amr",
-        "webm" => "video/webm",
-        _ => "application/octet-stream",
-    };
 
-    tracing::info!(file = %lower_filename, bytes = bytes.len(), "extract_audio_text: starting");
-
-    let client = reqwest::Client::new();
-    let result =
-        crate::channel::transcription::transcribe_audio(&client, bytes, lower_filename, mime).await;
-
-    match result {
-        Ok(text) if !text.trim().is_empty() => Some(format!(
-            "[Audio transcription from {ext} file]\n{}",
-            text.trim()
-        )),
-        Ok(_) => None,
-        Err(e) => {
-            tracing::warn!("extract_audio_text: transcription failed: {e:#}");
-            None
-        }
-    }
-}
-
-fn is_likely_text_file(lower: &str) -> bool {
-    [
-        ".txt", ".md", ".csv", ".json", ".toml", ".yaml", ".yml", ".xml", ".html", ".rs", ".py",
-        ".js", ".ts", ".go", ".sh", ".log", ".conf", ".cfg", ".c", ".h", ".java", ".css", ".sql",
-        ".rb", ".php", ".swift", ".kt", ".lua",
-    ]
-    .iter()
-    .any(|e| lower.ends_with(e))
-}
 
 /// Format a tool call result as human-readable markdown.
 /// Walk a `Value` and replace any string longer than `max_chars` with a

@@ -323,7 +323,7 @@ fn render_ascii(code: &QrCode) {
 ///   - Feishu:   app_id -> appId, app_secret -> appSecret
 ///   - DingTalk: access_token -> accessToken, refresh_token -> refreshToken
 pub fn save_token(platform: &str, token_data: &serde_json::Value) -> Result<()> {
-    let config_path = crate::config::loader::detect_config_path()
+    let config_path = rsclaw_config::loader::detect_config_path()
         .ok_or_else(|| anyhow::anyhow!("no config file found"))?;
 
     let raw = std::fs::read_to_string(&config_path)?;
@@ -405,7 +405,7 @@ pub fn save_token(platform: &str, token_data: &serde_json::Value) -> Result<()> 
 /// Falls back to legacy `auth/{platform}.json` for backward compatibility.
 pub fn load_token(platform: &str) -> Option<serde_json::Value> {
     // 1. Try reading from rsclaw.json5 config
-    if let Some(config_path) = crate::config::loader::detect_config_path() {
+    if let Some(config_path) = rsclaw_config::loader::detect_config_path() {
         if let Ok(raw) = std::fs::read_to_string(&config_path) {
             if let Ok(config) = json5::from_str::<serde_json::Value>(&raw) {
                 if let Some(section) = config.get("channels").and_then(|c| c.get(platform)) {

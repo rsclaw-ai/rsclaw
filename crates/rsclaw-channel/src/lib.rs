@@ -24,6 +24,17 @@
 //!   - `matrix`   — Matrix Client-Server API (long-poll sync)
 //!   - `cli`      — CLI interactive channel
 
+// crate-split: root aliases so grouped `use crate::{config::.., provider::.., retry::..}`
+// imports resolve to the extracted crates.
+use rsclaw_config as config;
+use rsclaw_provider as provider;
+use rsclaw_store as store;
+use rsclaw_util as util;
+use rsclaw_i18n as i18n;
+use rsclaw_events as events;
+use rsclaw_platform as sys;
+use rsclaw_embed as embed;
+
 pub mod attachments;
 pub mod auth;
 pub mod chunker;
@@ -36,7 +47,7 @@ pub mod line;
 pub mod matrix;
 pub mod qq;
 // retry helpers extracted to rsclaw-retry (crate-split); re-exported so
-// crate::channel::retry::{SendRetry, send_with_retry} keeps resolving.
+// crate::retry::{SendRetry, send_with_retry} keeps resolving.
 pub use rsclaw_retry as retry;
 pub mod signal;
 pub mod slack;
@@ -89,7 +100,7 @@ pub mod outbound_kind {
 }
 
 // `OutboundMessage` lifted to `rsclaw-types` (crate-split); re-exported here so
-// existing `crate::channel::OutboundMessage` paths keep resolving.
+// existing `crate::OutboundMessage` paths keep resolving.
 pub use rsclaw_types::OutboundMessage;
 
 // ---------------------------------------------------------------------------
@@ -230,7 +241,7 @@ pub struct DmPolicyEnforcer {
     allow_from: HashSet<String>,
     pairing: Mutex<PairingStore>,
     channel_name: String,
-    store: Option<Arc<crate::store::redb_store::RedbStore>>,
+    store: Option<Arc<rsclaw_store::redb_store::RedbStore>>,
 }
 
 /// Outcome of a dmPolicy check.
@@ -258,7 +269,7 @@ impl DmPolicyEnforcer {
     pub fn with_persistence(
         mut self,
         channel: &str,
-        store: Arc<crate::store::redb_store::RedbStore>,
+        store: Arc<rsclaw_store::redb_store::RedbStore>,
     ) -> Self {
         self.channel_name = channel.to_owned();
         // Load previously approved peers from redb.
@@ -318,7 +329,7 @@ impl DmPolicyEnforcer {
         let peer = self.pairing.lock().await.approve(code);
         // Persist to redb.
         if let (Some(peer_id), Some(db)) = (&peer, &self.store) {
-            let state = crate::store::redb_store::PairingState::Approved;
+            let state = rsclaw_store::redb_store::PairingState::Approved;
             if let Err(e) = db.put_pairing(&self.channel_name, peer_id, &state) {
                 warn!(channel = %self.channel_name, peer_id, error = %e, "failed to persist pairing approval");
             }
@@ -634,7 +645,7 @@ pub fn resolve_file_refs(text: &str, workspace: &std::path::Path) -> ResolvedRef
 // ChannelManager — concurrent channel limit (AGENTS.md §18)
 // ---------------------------------------------------------------------------
 
-use crate::MemoryTier;
+use rsclaw_platform::MemoryTier;
 
 pub struct ChannelManager {
     channels: HashMap<String, Arc<dyn Channel>>,
@@ -910,4 +921,95 @@ mod tests {
         }
         assert!(mgr.register(Arc::new(Dummy("ch4".into()))).is_err());
     }
+}
+
+// File-text extraction (crate-split): lifted from agent/runtime.rs. Belongs in
+// channel — PDF via rsclaw_doc, office via self, audio via self transcription.
+/// Attempt to extract readable text from a file based on extension.
+/// Returns `None` for binary/unrecognized formats.
+pub async fn extract_file_text(filename: &str, bytes: &[u8]) -> Option<String> {
+    let lower = filename.to_lowercase();
+    if lower.ends_with(".pdf") {
+        match rsclaw_doc::safe_extract_pdf_from_mem(bytes) {
+            Ok(text) => return Some(text),
+            Err(_) => {}
+        }
+        // Fallback to pdftotext CLI
+        let tmp = std::env::temp_dir().join(format!("rsclaw_extract_{}", uuid::Uuid::new_v4()));
+        std::fs::write(&tmp, bytes).ok()?;
+        #[allow(unused_mut)]
+        let mut pdf_cmd = std::process::Command::new("pdftotext");
+        pdf_cmd.args([tmp.to_str().unwrap_or(""), "-"]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            pdf_cmd.creation_flags(0x08000000);
+        }
+        let output = pdf_cmd.output();
+        let _ = std::fs::remove_file(&tmp);
+        output
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+    } else if lower.ends_with(".docx") || lower.ends_with(".xlsx") || lower.ends_with(".pptx") {
+        crate::extract_office_text(filename, bytes)
+    } else if is_likely_text_file(&lower) {
+        Some(String::from_utf8_lossy(bytes).to_string())
+    } else if is_audio_or_video(&lower) {
+        extract_audio_text(bytes, &lower).await
+    } else {
+        None
+    }
+}
+
+fn is_audio_or_video(lower: &str) -> bool {
+    [
+        ".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv", ".mp3", ".wav", ".ogg", ".m4a",
+        ".aac", ".flac", ".wma", ".opus",
+    ]
+    .iter()
+    .any(|e| lower.ends_with(e))
+}
+
+/// Extract text from audio/video by running ffmpeg -> whisper.
+pub async fn extract_audio_text(bytes: &[u8], lower_filename: &str) -> Option<String> {
+    let ext = lower_filename.rsplit('.').next().unwrap_or("mp4");
+    let mime = match ext {
+        "mp4" | "m4a" | "m4v" => "video/mp4",
+        "ogg" | "oga" | "opus" => "audio/ogg",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "amr" => "audio/amr",
+        "webm" => "video/webm",
+        _ => "application/octet-stream",
+    };
+
+    tracing::info!(file = %lower_filename, bytes = bytes.len(), "extract_audio_text: starting");
+
+    let client = reqwest::Client::new();
+    let result =
+        crate::transcription::transcribe_audio(&client, bytes, lower_filename, mime).await;
+
+    match result {
+        Ok(text) if !text.trim().is_empty() => Some(format!(
+            "[Audio transcription from {ext} file]\n{}",
+            text.trim()
+        )),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!("extract_audio_text: transcription failed: {e:#}");
+            None
+        }
+    }
+}
+
+fn is_likely_text_file(lower: &str) -> bool {
+    [
+        ".txt", ".md", ".csv", ".json", ".toml", ".yaml", ".yml", ".xml", ".html", ".rs", ".py",
+        ".js", ".ts", ".go", ".sh", ".log", ".conf", ".cfg", ".c", ".h", ".java", ".css", ".sql",
+        ".rb", ".php", ".swift", ".kt", ".lua",
+    ]
+    .iter()
+    .any(|e| lower.ends_with(e))
 }

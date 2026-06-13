@@ -18,7 +18,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tracing::{debug, error, info, warn};
 
 use super::{Channel, OutboundMessage};
-use crate::channel::chunker::{BreakPreference, ChunkConfig, chunk_text, platform_chunk_limit};
+use crate::chunker::{BreakPreference, ChunkConfig, chunk_text, platform_chunk_limit};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -67,8 +67,8 @@ pub struct WeComChannel {
                 String,
                 String,
                 bool,
-                Vec<crate::agent::registry::ImageAttachment>,
-                Vec<crate::agent::registry::FileAttachment>,
+                Vec<rsclaw_types::ImageAttachment>,
+                Vec<rsclaw_types::FileAttachment>,
             ) + Send
             + Sync,
     >,
@@ -92,8 +92,8 @@ impl WeComChannel {
                     String,
                     String,
                     bool,
-                    Vec<crate::agent::registry::ImageAttachment>,
-                    Vec<crate::agent::registry::FileAttachment>,
+                    Vec<rsclaw_types::ImageAttachment>,
+                    Vec<rsclaw_types::FileAttachment>,
                 ) + Send
                 + Sync,
         >,
@@ -103,7 +103,7 @@ impl WeComChannel {
             bot_id: bot_id.into(),
             secret: secret.into(),
             ws_url: ws_url.unwrap_or_else(|| DEFAULT_WS_URL.to_owned()),
-            client: crate::config::build_proxy_client()
+            client: rsclaw_config::build_proxy_client()
                 .timeout(Duration::from_secs(60))
                 .build()
                 .expect("reqwest client"),
@@ -362,8 +362,8 @@ impl WeComChannel {
         info!(msgtype = %msgtype, keys = ?body_keys, "WeCom: message received");
 
         let mut text = String::new();
-        let mut images: Vec<crate::agent::registry::ImageAttachment> = Vec::new();
-        let mut files: Vec<crate::agent::registry::FileAttachment> = Vec::new();
+        let mut images: Vec<rsclaw_types::ImageAttachment> = Vec::new();
+        let mut files: Vec<rsclaw_types::FileAttachment> = Vec::new();
 
         match msgtype {
             "text" => {
@@ -397,7 +397,7 @@ impl WeComChannel {
                     if !url.is_empty() {
                         match self.download_media(url, aeskey).await {
                             Ok(bytes) => {
-                                files.push(crate::agent::registry::FileAttachment {
+                                files.push(rsclaw_types::FileAttachment {
                                     filename: "voice.amr".to_owned(),
                                     data: bytes,
                                     mime_type: "audio/amr".to_owned(),
@@ -442,7 +442,7 @@ impl WeComChannel {
                             let b64 =
                                 base64::engine::general_purpose::STANDARD.encode(&final_bytes);
                             let data_url = format!("data:{final_mime};base64,{b64}");
-                            images.push(crate::agent::registry::ImageAttachment {
+                            images.push(rsclaw_types::ImageAttachment {
                                 data: data_url,
                                 mime_type: final_mime,
                                 source_path: None,
@@ -480,11 +480,11 @@ impl WeComChannel {
                         Ok(bytes) => {
                             let mime = guess_mime(filename);
                             // Detect images sent as file attachments.
-                            if crate::channel::is_image_attachment(&mime, filename) {
+                            if crate::is_image_attachment(&mime, filename) {
                                 use base64::Engine;
                                 let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                                 let data_url = format!("data:{mime};base64,{b64}");
-                                images.push(crate::agent::registry::ImageAttachment {
+                                images.push(rsclaw_types::ImageAttachment {
                                     data: data_url,
                                     mime_type: mime.clone(),
                                     source_path: None,
@@ -496,7 +496,7 @@ impl WeComChannel {
                                     );
                                 }
                             } else {
-                                files.push(crate::agent::registry::FileAttachment {
+                                files.push(rsclaw_types::FileAttachment {
                                     filename: filename.to_owned(),
                                     data: bytes,
                                     mime_type: mime,
@@ -527,7 +527,7 @@ impl WeComChannel {
                 if !url.is_empty() {
                     match self.download_media(url, aeskey).await {
                         Ok(bytes) => {
-                            files.push(crate::agent::registry::FileAttachment {
+                            files.push(rsclaw_types::FileAttachment {
                                 filename: "video.mp4".to_owned(),
                                 data: bytes,
                                 mime_type: "video/mp4".to_owned(),
@@ -583,7 +583,7 @@ impl WeComChannel {
                                             let b64 = base64::engine::general_purpose::STANDARD
                                                 .encode(&bytes);
                                             let data_url = format!("data:image/jpeg;base64,{b64}");
-                                            images.push(crate::agent::registry::ImageAttachment {
+                                            images.push(rsclaw_types::ImageAttachment {
                                                 data: data_url,
                                                 mime_type: "image/jpeg".to_string(),
                                                 source_path: None,

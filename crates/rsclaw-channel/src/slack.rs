@@ -18,7 +18,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tracing::{info, warn};
 
 use super::{Channel, OutboundMessage};
-use crate::channel::{
+use crate::{
     attachments::{mime_to_ext, parse_data_url, pick_file_mime},
     chunker::{BreakPreference, ChunkConfig, chunk_text, platform_chunk_limit},
     telegram::RetryConfig,
@@ -44,8 +44,8 @@ pub struct SlackChannel {
                 String,
                 String,
                 bool,
-                Vec<crate::agent::registry::ImageAttachment>,
-                Vec<crate::agent::registry::FileAttachment>,
+                Vec<rsclaw_types::ImageAttachment>,
+                Vec<rsclaw_types::FileAttachment>,
             ) + Send
             + Sync,
     >,
@@ -64,8 +64,8 @@ impl SlackChannel {
                     String,
                     String,
                     bool,
-                    Vec<crate::agent::registry::ImageAttachment>,
-                    Vec<crate::agent::registry::FileAttachment>,
+                    Vec<rsclaw_types::ImageAttachment>,
+                    Vec<rsclaw_types::FileAttachment>,
                 ) + Send
                 + Sync,
         >,
@@ -74,7 +74,7 @@ impl SlackChannel {
             bot_token: bot_token.into(),
             app_token,
             api_base: api_base.unwrap_or_else(|| SLACK_API_BASE.to_owned()),
-            client: crate::config::build_proxy_client()
+            client: rsclaw_config::build_proxy_client()
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("reqwest client"),
@@ -366,8 +366,8 @@ impl SlackChannel {
                         // pending_files (analyze vs save) can fire. Other
                         // files go into `file_attachments` for the same
                         // reason. Audio/video still get inline-transcribed.
-                        let mut images: Vec<crate::agent::registry::ImageAttachment> = Vec::new();
-                        let mut file_attachments: Vec<crate::agent::registry::FileAttachment> =
+                        let mut images: Vec<rsclaw_types::ImageAttachment> = Vec::new();
+                        let mut file_attachments: Vec<rsclaw_types::FileAttachment> =
                             Vec::new();
                         if let Some(files) = event["files"].as_array() {
                             for file in files {
@@ -395,7 +395,7 @@ impl SlackChannel {
                                     if mimetype.starts_with("audio/")
                                         || mimetype.starts_with("video/")
                                     {
-                                        match crate::channel::transcription::transcribe_audio(
+                                        match crate::transcription::transcribe_audio(
                                             &self.client,
                                             &bytes,
                                             filename,
@@ -444,7 +444,7 @@ impl SlackChannel {
                                             });
                                         let b64 = base64::engine::general_purpose::STANDARD
                                             .encode(&final_bytes);
-                                        images.push(crate::agent::registry::ImageAttachment {
+                                        images.push(rsclaw_types::ImageAttachment {
                                             data: format!("data:{final_mime};base64,{b64}"),
                                             mime_type: final_mime,
                                             source_path: None,
@@ -453,7 +453,7 @@ impl SlackChannel {
                                     } else {
                                         let processed = slack_process_file(filename, &bytes);
                                         file_attachments.push(
-                                            crate::agent::registry::FileAttachment {
+                                            rsclaw_types::FileAttachment {
                                                 filename: filename.to_owned(),
                                                 data: bytes.clone(),
                                                 mime_type: if mimetype.is_empty() {
@@ -684,7 +684,7 @@ fn slack_is_text_file(name: &str) -> bool {
 fn slack_process_file(filename: &str, bytes: &[u8]) -> String {
     let lower = filename.to_lowercase();
     if lower.ends_with(".pdf") {
-        if let Ok(text) = crate::agent::doc::safe_extract_pdf_from_mem(bytes) {
+        if let Ok(text) = rsclaw_doc::safe_extract_pdf_from_mem(bytes) {
             return format!(
                 "[PDF: {filename}]\n{}",
                 rsclaw_util::truncate_str(&text, 20000)
@@ -711,7 +711,7 @@ fn slack_process_file(filename: &str, bytes: &[u8]) -> String {
             format!("[file: {filename}]")
         }
     } else if lower.ends_with(".docx") || lower.ends_with(".xlsx") || lower.ends_with(".pptx") {
-        if let Some(text) = crate::channel::extract_office_text(filename, bytes) {
+        if let Some(text) = crate::extract_office_text(filename, bytes) {
             let label = if lower.ends_with(".docx") {
                 "Word"
             } else if lower.ends_with(".xlsx") {
@@ -740,7 +740,7 @@ fn slack_process_file(filename: &str, bytes: &[u8]) -> String {
             rsclaw_util::truncate_str(&text, 20000)
         )
     } else {
-        let ws = crate::config::loader::base_dir().join("workspace/uploads");
+        let ws = rsclaw_config::loader::base_dir().join("workspace/uploads");
         let _ = std::fs::create_dir_all(&ws);
         let dest = ws.join(filename);
         let _ = std::fs::write(&dest, bytes);

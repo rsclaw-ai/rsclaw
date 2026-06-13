@@ -13,7 +13,7 @@ use serde_json::json;
 use tracing::{debug, info, warn};
 
 use super::{Channel, OutboundMessage};
-use crate::channel::chunker::{BreakPreference, ChunkConfig, chunk_text, platform_chunk_limit};
+use crate::chunker::{BreakPreference, ChunkConfig, chunk_text, platform_chunk_limit};
 
 const ZALO_API_BASE: &str = "https://openapi.zalo.me/v3.0/oa";
 
@@ -65,14 +65,14 @@ pub struct ZaloChannel {
     client: Client,
     #[allow(clippy::type_complexity)]
     on_message:
-        Arc<dyn Fn(String, String, Vec<crate::agent::registry::ImageAttachment>) + Send + Sync>,
+        Arc<dyn Fn(String, String, Vec<rsclaw_types::ImageAttachment>) + Send + Sync>,
 }
 
 impl ZaloChannel {
     pub fn new(
         access_token: impl Into<String>,
         on_message: Arc<
-            dyn Fn(String, String, Vec<crate::agent::registry::ImageAttachment>) + Send + Sync,
+            dyn Fn(String, String, Vec<rsclaw_types::ImageAttachment>) + Send + Sync,
         >,
     ) -> Self {
         Self::with_api_base(access_token, None, on_message)
@@ -82,13 +82,13 @@ impl ZaloChannel {
         access_token: impl Into<String>,
         api_base: Option<String>,
         on_message: Arc<
-            dyn Fn(String, String, Vec<crate::agent::registry::ImageAttachment>) + Send + Sync,
+            dyn Fn(String, String, Vec<rsclaw_types::ImageAttachment>) + Send + Sync,
         >,
     ) -> Self {
         Self {
             access_token: access_token.into(),
             api_base: api_base.unwrap_or_else(|| ZALO_API_BASE.to_owned()),
-            client: crate::config::build_proxy_client()
+            client: rsclaw_config::build_proxy_client()
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("reqwest client"),
@@ -113,7 +113,7 @@ impl ZaloChannel {
         }
 
         let mut text = String::new();
-        let mut images: Vec<crate::agent::registry::ImageAttachment> = Vec::new();
+        let mut images: Vec<rsclaw_types::ImageAttachment> = Vec::new();
 
         match event {
             "user_send_text" => {
@@ -136,11 +136,11 @@ impl ZaloChannel {
                 });
 
                 if let Some(url) = url {
-                    match crate::channel::transcription::download_file(&self.client, url).await {
+                    match crate::transcription::download_file(&self.client, url).await {
                         Ok(bytes) => {
                             use base64::Engine;
                             let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                            images.push(crate::agent::registry::ImageAttachment {
+                            images.push(rsclaw_types::ImageAttachment {
                                 data: format!("data:image/jpeg;base64,{b64}"),
                                 mime_type: "image/jpeg".to_owned(),
                                 source_path: None,
@@ -167,9 +167,9 @@ impl ZaloChannel {
                 });
 
                 if let Some(url) = url {
-                    match crate::channel::transcription::download_file(&self.client, url).await {
+                    match crate::transcription::download_file(&self.client, url).await {
                         Ok(bytes) => {
-                            match crate::channel::transcription::transcribe_audio(
+                            match crate::transcription::transcribe_audio(
                                 &self.client,
                                 &bytes,
                                 "voice.mp3",
@@ -210,7 +210,7 @@ impl ZaloChannel {
                 });
 
                 if let Some(url) = url {
-                    match crate::channel::transcription::download_file(&self.client, url).await {
+                    match crate::transcription::download_file(&self.client, url).await {
                         Ok(bytes) => {
                             match zalo_extract_audio_and_transcribe(&self.client, &bytes).await {
                                 Ok(t) if !t.is_empty() => {
@@ -260,7 +260,7 @@ impl ZaloChannel {
                     .unwrap_or((None, "file"));
 
                 if let Some(url) = url {
-                    match crate::channel::transcription::download_file(&self.client, url).await {
+                    match crate::transcription::download_file(&self.client, url).await {
                         Ok(bytes) => {
                             if is_text_file(filename) {
                                 if let Ok(content) = String::from_utf8(bytes) {
@@ -481,7 +481,7 @@ async fn zalo_extract_audio_and_transcribe(
 
     std::fs::write(&video_path, video_bytes)?;
 
-    let ffmpeg_bin = crate::agent::platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned());
+    let ffmpeg_bin = rsclaw_platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned());
     let status = tokio::process::Command::new(&ffmpeg_bin)
         .args([
             "-y",
@@ -507,7 +507,7 @@ async fn zalo_extract_audio_and_transcribe(
     let audio_bytes = std::fs::read(&audio_path)?;
     let _ = std::fs::remove_file(&audio_path);
 
-    crate::channel::transcription::transcribe_audio(
+    crate::transcription::transcribe_audio(
         client,
         &audio_bytes,
         "video_audio.ogg",

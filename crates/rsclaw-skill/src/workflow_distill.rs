@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use crate::agent::turn_metrics::TurnMetrics;
+use rsclaw_types::turn_metrics::TurnMetrics;
 use rsclaw_provider::registry::ProviderRegistry;
 
 /// Build the LLM prompt for workflow distillation. Receives the raw turn
@@ -224,7 +224,7 @@ pub async fn crystallize_workflow(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::turn_metrics::TurnMetrics;
+    use rsclaw_types::turn_metrics::TurnMetrics;
 
     #[test]
     fn prompt_includes_tool_log() {

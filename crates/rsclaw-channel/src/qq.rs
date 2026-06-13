@@ -28,7 +28,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use super::{Channel, OutboundMessage};
-use crate::channel::{
+use crate::{
     chunker::{ChunkConfig, chunk_text, platform_chunk_limit},
     retry::{SendRetry, send_with_retry},
 };
@@ -120,8 +120,8 @@ pub struct QQBotChannel {
                 String,
                 bool,
                 String,
-                Vec<crate::agent::registry::ImageAttachment>,
-                Vec<crate::agent::registry::FileAttachment>,
+                Vec<rsclaw_types::ImageAttachment>,
+                Vec<rsclaw_types::FileAttachment>,
             ) + Send
             + Sync,
     >,
@@ -141,8 +141,8 @@ impl QQBotChannel {
                     String,
                     bool,
                     String,
-                    Vec<crate::agent::registry::ImageAttachment>,
-                    Vec<crate::agent::registry::FileAttachment>,
+                    Vec<rsclaw_types::ImageAttachment>,
+                    Vec<rsclaw_types::FileAttachment>,
                 ) + Send
                 + Sync,
         >,
@@ -163,8 +163,8 @@ impl QQBotChannel {
                     String,
                     bool,
                     String,
-                    Vec<crate::agent::registry::ImageAttachment>,
-                    Vec<crate::agent::registry::FileAttachment>,
+                    Vec<rsclaw_types::ImageAttachment>,
+                    Vec<rsclaw_types::FileAttachment>,
                 ) + Send
                 + Sync,
         >,
@@ -183,7 +183,7 @@ impl QQBotChannel {
             }),
             token_url: token_url_override.unwrap_or_else(|| TOKEN_URL.to_owned()),
             intents: intents.unwrap_or(DEFAULT_INTENTS),
-            client: crate::config::build_proxy_client()
+            client: rsclaw_config::build_proxy_client()
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("http client"),
@@ -593,11 +593,11 @@ impl QQBotChannel {
         data: &Value,
         text: &mut String,
     ) -> (
-        Vec<crate::agent::registry::ImageAttachment>,
-        Vec<crate::agent::registry::FileAttachment>,
+        Vec<rsclaw_types::ImageAttachment>,
+        Vec<rsclaw_types::FileAttachment>,
     ) {
         let mut images = Vec::new();
-        let mut file_attachments: Vec<crate::agent::registry::FileAttachment> = Vec::new();
+        let mut file_attachments: Vec<rsclaw_types::FileAttachment> = Vec::new();
         let attachments = match data.get("attachments").and_then(|v| v.as_array()) {
             Some(a) => a,
             None => return (images, file_attachments),
@@ -625,11 +625,11 @@ impl QQBotChannel {
 
             if super::is_image_attachment(content_type, filename) {
                 // Download and encode for vision
-                match crate::channel::transcription::download_file(&self.client, &full_url).await {
+                match crate::transcription::download_file(&self.client, &full_url).await {
                     Ok(bytes) => {
                         use base64::Engine;
                         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                        images.push(crate::agent::registry::ImageAttachment {
+                        images.push(rsclaw_types::ImageAttachment {
                             data: format!("data:{content_type};base64,{b64}"),
                             mime_type: content_type.to_owned(),
                             source_path: None,
@@ -642,9 +642,9 @@ impl QQBotChannel {
                 }
             } else if super::is_audio_attachment(content_type, filename) {
                 // Transcribe voice message
-                match crate::channel::transcription::download_file(&self.client, &full_url).await {
+                match crate::transcription::download_file(&self.client, &full_url).await {
                     Ok(bytes) => {
-                        match crate::channel::transcription::transcribe_audio(
+                        match crate::transcription::transcribe_audio(
                             &self.client,
                             &bytes,
                             "voice.ogg",
@@ -664,10 +664,10 @@ impl QQBotChannel {
                 }
             } else if super::is_video_attachment(content_type, filename) {
                 // Send as FileAttachment — runtime decides vision vs transcription
-                match crate::channel::transcription::download_file(&self.client, &full_url).await {
+                match crate::transcription::download_file(&self.client, &full_url).await {
                     Ok(bytes) => {
                         info!(size = bytes.len(), "qq: video downloaded");
-                        file_attachments.push(crate::agent::registry::FileAttachment {
+                        file_attachments.push(rsclaw_types::FileAttachment {
                             filename: filename.to_owned(),
                             data: bytes,
                             mime_type: content_type.to_owned(),
@@ -682,7 +682,7 @@ impl QQBotChannel {
                 } else {
                     filename
                 };
-                match crate::channel::transcription::download_file(&self.client, &full_url).await {
+                match crate::transcription::download_file(&self.client, &full_url).await {
                     Ok(bytes) => {
                         info!(size = bytes.len(), fname, "qq: file downloaded");
                         let mime = if content_type == "file" || content_type.is_empty() {
@@ -690,7 +690,7 @@ impl QQBotChannel {
                         } else {
                             content_type
                         };
-                        file_attachments.push(crate::agent::registry::FileAttachment {
+                        file_attachments.push(rsclaw_types::FileAttachment {
                             filename: fname.to_owned(),
                             data: bytes,
                             mime_type: mime.to_owned(),
@@ -1058,7 +1058,7 @@ async fn extract_audio_and_transcribe(client: &Client, video_bytes: &[u8]) -> Re
 
     std::fs::write(&video_path, video_bytes)?;
 
-    let ffmpeg_bin = crate::agent::platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned());
+    let ffmpeg_bin = rsclaw_platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned());
     let status = tokio::process::Command::new(&ffmpeg_bin)
         .args([
             "-y",
@@ -1084,7 +1084,7 @@ async fn extract_audio_and_transcribe(client: &Client, video_bytes: &[u8]) -> Re
     let audio_bytes = std::fs::read(&audio_path)?;
     let _ = std::fs::remove_file(&audio_path);
 
-    crate::channel::transcription::transcribe_audio(
+    crate::transcription::transcribe_audio(
         client,
         &audio_bytes,
         "video_audio.ogg",

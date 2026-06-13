@@ -31,7 +31,7 @@ use tracing::{debug, info, warn};
 #[cfg(feature = "channel-matrix")]
 use super::{Channel, OutboundMessage};
 #[cfg(feature = "channel-matrix")]
-use crate::channel::chunker::{BreakPreference, ChunkConfig, chunk_text, platform_chunk_limit};
+use crate::chunker::{BreakPreference, ChunkConfig, chunk_text, platform_chunk_limit};
 
 #[cfg(feature = "channel-matrix")]
 pub struct MatrixChannel {
@@ -47,8 +47,8 @@ pub struct MatrixChannel {
                 String,
                 String,
                 bool,
-                Vec<crate::agent::registry::ImageAttachment>,
-                Vec<crate::agent::registry::FileAttachment>,
+                Vec<rsclaw_types::ImageAttachment>,
+                Vec<rsclaw_types::FileAttachment>,
             ) + Send
             + Sync,
     >,
@@ -67,13 +67,13 @@ impl MatrixChannel {
                     String,
                     String,
                     bool,
-                    Vec<crate::agent::registry::ImageAttachment>,
-                    Vec<crate::agent::registry::FileAttachment>,
+                    Vec<rsclaw_types::ImageAttachment>,
+                    Vec<rsclaw_types::FileAttachment>,
                 ) + Send
                 + Sync,
         >,
     ) -> Self {
-        let base = crate::config::loader::base_dir();
+        let base = rsclaw_config::loader::base_dir();
         Self {
             homeserver: homeserver.into().trim_end_matches('/').to_owned(),
             access_token: access_token.into(),
@@ -355,7 +355,7 @@ impl Channel for MatrixChannel {
                                     info!(from = %sender, room = %room_id, from_bytes = orig_len, to_bytes = final_bytes.len(), "Matrix: image downloaded (SDK)");
                                     on_msg(
                                         sender, rsclaw_i18n::t("describe_image", rsclaw_i18n::default_lang()), room_id, is_group,
-                                        vec![crate::agent::registry::ImageAttachment {
+                                        vec![rsclaw_types::ImageAttachment {
                                             data: data_url,
                                             mime_type: final_mime,
                                             source_path: None,
@@ -380,7 +380,7 @@ impl Channel for MatrixChannel {
                                     let mime = audio.info.as_ref()
                                         .and_then(|i| i.mimetype.as_deref())
                                         .unwrap_or("audio/ogg");
-                                    match crate::channel::transcription::transcribe_audio(
+                                    match crate::transcription::transcribe_audio(
                                         &reqwest::Client::new(), &bytes, "voice.ogg", mime,
                                     ).await {
                                         Ok(text) => {
@@ -409,7 +409,7 @@ impl Channel for MatrixChannel {
                             ).await {
                                 Ok(bytes) => {
                                     // Try transcribing the video's audio track
-                                    match crate::channel::transcription::transcribe_audio(
+                                    match crate::transcription::transcribe_audio(
                                         &reqwest::Client::new(), &bytes, "video.mp4", "video/mp4",
                                     ).await {
                                         Ok(text) => {
@@ -441,7 +441,7 @@ impl Channel for MatrixChannel {
                             ).await {
                                 Ok(bytes) => {
                                     info!(from = %sender, room = %room_id, size = bytes.len(), fname = %filename, "Matrix: file downloaded (SDK)");
-                                    let file_attachment = crate::agent::registry::FileAttachment {
+                                    let file_attachment = rsclaw_types::FileAttachment {
                                         filename: filename.clone(),
                                         data: bytes,
                                         mime_type: mime.clone(),
@@ -536,7 +536,7 @@ use tracing::{debug, info, warn};
 #[cfg(not(feature = "channel-matrix"))]
 use super::{Channel, OutboundMessage};
 #[cfg(not(feature = "channel-matrix"))]
-use crate::channel::chunker::{ChunkConfig, chunk_text, platform_chunk_limit};
+use crate::chunker::{ChunkConfig, chunk_text, platform_chunk_limit};
 
 #[cfg(not(feature = "channel-matrix"))]
 pub struct MatrixChannel {
@@ -550,8 +550,8 @@ pub struct MatrixChannel {
                 String,
                 String,
                 bool,
-                Vec<crate::agent::registry::ImageAttachment>,
-                Vec<crate::agent::registry::FileAttachment>,
+                Vec<rsclaw_types::ImageAttachment>,
+                Vec<rsclaw_types::FileAttachment>,
             ) + Send
             + Sync,
     >,
@@ -570,8 +570,8 @@ impl MatrixChannel {
                     String,
                     String,
                     bool,
-                    Vec<crate::agent::registry::ImageAttachment>,
-                    Vec<crate::agent::registry::FileAttachment>,
+                    Vec<rsclaw_types::ImageAttachment>,
+                    Vec<rsclaw_types::FileAttachment>,
                 ) + Send
                 + Sync,
         >,
@@ -580,7 +580,7 @@ impl MatrixChannel {
             homeserver: homeserver.into().trim_end_matches('/').to_owned(),
             access_token: access_token.into(),
             user_id: user_id.into(),
-            client: crate::config::build_proxy_client()
+            client: rsclaw_config::build_proxy_client()
                 .timeout(Duration::from_secs(60))
                 .build()
                 .expect("reqwest client"),
@@ -960,7 +960,7 @@ impl Channel for MatrixChannel {
                                                                         rsclaw_i18n::t("describe_image", rsclaw_i18n::default_lang()),
                                                                         room_id.clone(),
                                                                         true,
-                                                                        vec![crate::agent::registry::ImageAttachment {
+                                                                        vec![rsclaw_types::ImageAttachment {
                                                                             data: data_url,
                                                                             mime_type: final_mime,
                                                                             source_path: None,
@@ -1023,7 +1023,7 @@ impl Channel for MatrixChannel {
                                                                         })
                                                                         .and_then(|v| v.as_str())
                                                                         .unwrap_or("audio/ogg");
-                                                                    match crate::channel::transcription::transcribe_audio(
+                                                                    match crate::transcription::transcribe_audio(
                                                                         &self.client, &bytes, "voice.ogg", mime,
                                                                     ).await {
                                                                         Ok(text) => {

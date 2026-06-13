@@ -1260,8 +1260,7 @@ impl HostState {
         // Auto-start browser if not initialized.
         if guard.is_none() {
             tracing::info!("WASM plugin: auto-starting browser session");
-            let chrome_path = crate::agent::platform::ensure_chrome()
-                .await
+            let chrome_path = rsclaw_platform::detect_chrome().ok_or_else(|| anyhow::anyhow!("Chrome not found; run: rsclaw tools install chrome"))
                 .map_err(|e| format!("failed to obtain Chrome: {e:#}"))?;
             // All plugins share one Chrome profile so that auth state
             // (cookies, localStorage) is reused across the session — e.g.

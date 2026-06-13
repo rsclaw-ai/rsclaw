@@ -17,7 +17,7 @@ use serde_json::json;
 use tracing::{debug, info, warn};
 
 use super::{Channel, OutboundMessage};
-use crate::channel::chunker::{BreakPreference, ChunkConfig, chunk_text, platform_chunk_limit};
+use crate::chunker::{BreakPreference, ChunkConfig, chunk_text, platform_chunk_limit};
 
 const WHATSAPP_API_BASE: &str = "https://graph.facebook.com/v19.0";
 
@@ -82,7 +82,7 @@ pub struct WhatsAppChannel {
     client: Client,
     #[allow(clippy::type_complexity)]
     on_message:
-        Arc<dyn Fn(String, String, Vec<crate::agent::registry::ImageAttachment>) + Send + Sync>,
+        Arc<dyn Fn(String, String, Vec<rsclaw_types::ImageAttachment>) + Send + Sync>,
     // (from_number, text, images)
 }
 
@@ -91,7 +91,7 @@ impl WhatsAppChannel {
         phone_number_id: impl Into<String>,
         access_token: impl Into<String>,
         on_message: Arc<
-            dyn Fn(String, String, Vec<crate::agent::registry::ImageAttachment>) + Send + Sync,
+            dyn Fn(String, String, Vec<rsclaw_types::ImageAttachment>) + Send + Sync,
         >,
     ) -> Self {
         Self::with_api_base(phone_number_id, access_token, None, on_message)
@@ -102,14 +102,14 @@ impl WhatsAppChannel {
         access_token: impl Into<String>,
         api_base: Option<String>,
         on_message: Arc<
-            dyn Fn(String, String, Vec<crate::agent::registry::ImageAttachment>) + Send + Sync,
+            dyn Fn(String, String, Vec<rsclaw_types::ImageAttachment>) + Send + Sync,
         >,
     ) -> Self {
         Self {
             phone_number_id: phone_number_id.into(),
             access_token: access_token.into(),
             api_base: api_base.unwrap_or_else(|| WHATSAPP_API_BASE.to_owned()),
-            client: crate::config::build_proxy_client()
+            client: rsclaw_config::build_proxy_client()
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("reqwest client"),
@@ -152,7 +152,7 @@ impl WhatsAppChannel {
                 if let Some(messages) = &change.value.messages {
                     for msg in messages {
                         let mut text = String::new();
-                        let mut images: Vec<crate::agent::registry::ImageAttachment> = Vec::new();
+                        let mut images: Vec<rsclaw_types::ImageAttachment> = Vec::new();
 
                         match msg.kind.as_str() {
                             "text" => {
@@ -169,7 +169,7 @@ impl WhatsAppChannel {
                                             use base64::Engine;
                                             let b64 = base64::engine::general_purpose::STANDARD
                                                 .encode(&bytes);
-                                            images.push(crate::agent::registry::ImageAttachment {
+                                            images.push(rsclaw_types::ImageAttachment {
                                                 data: format!("data:{mime};base64,{b64}"),
                                                 mime_type: mime.to_owned(),
                                                 source_path: None,
@@ -193,7 +193,7 @@ impl WhatsAppChannel {
                                         Ok(bytes) => {
                                             let mime =
                                                 media.mime_type.as_deref().unwrap_or("audio/ogg");
-                                            match crate::channel::transcription::transcribe_audio(
+                                            match crate::transcription::transcribe_audio(
                                                 &self.client,
                                                 &bytes,
                                                 "voice.ogg",
@@ -503,7 +503,7 @@ async fn whatsapp_extract_audio_and_transcribe(
 
     std::fs::write(&video_path, video_bytes)?;
 
-    let ffmpeg_bin = crate::agent::platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned());
+    let ffmpeg_bin = rsclaw_platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned());
     let status = tokio::process::Command::new(&ffmpeg_bin)
         .args([
             "-y",
@@ -529,7 +529,7 @@ async fn whatsapp_extract_audio_and_transcribe(
     let audio_bytes = std::fs::read(&audio_path)?;
     let _ = std::fs::remove_file(&audio_path);
 
-    crate::channel::transcription::transcribe_audio(
+    crate::transcription::transcribe_audio(
         client,
         &audio_bytes,
         "video_audio.ogg",

@@ -13,7 +13,7 @@ use serde_json::json;
 use tracing::{debug, info, warn};
 
 use super::{Channel, OutboundMessage};
-use crate::channel::chunker::{BreakPreference, ChunkConfig, chunk_text, platform_chunk_limit};
+use crate::chunker::{BreakPreference, ChunkConfig, chunk_text, platform_chunk_limit};
 
 const LINE_API_BASE: &str = "https://api.line.me/v2/bot";
 const LINE_API_DATA_BASE: &str = "https://api-data.line.me/v2/bot";
@@ -67,7 +67,7 @@ pub struct LineChannel {
     client: Client,
     #[allow(clippy::type_complexity)]
     on_message: Arc<
-        dyn Fn(String, String, bool, Vec<crate::agent::registry::ImageAttachment>) + Send + Sync,
+        dyn Fn(String, String, bool, Vec<rsclaw_types::ImageAttachment>) + Send + Sync,
     >,
 }
 
@@ -75,7 +75,7 @@ impl LineChannel {
     pub fn new(
         channel_access_token: impl Into<String>,
         on_message: Arc<
-            dyn Fn(String, String, bool, Vec<crate::agent::registry::ImageAttachment>)
+            dyn Fn(String, String, bool, Vec<rsclaw_types::ImageAttachment>)
                 + Send
                 + Sync,
         >,
@@ -87,7 +87,7 @@ impl LineChannel {
         channel_access_token: impl Into<String>,
         api_base: Option<String>,
         on_message: Arc<
-            dyn Fn(String, String, bool, Vec<crate::agent::registry::ImageAttachment>)
+            dyn Fn(String, String, bool, Vec<rsclaw_types::ImageAttachment>)
                 + Send
                 + Sync,
         >,
@@ -106,7 +106,7 @@ impl LineChannel {
             channel_access_token: channel_access_token.into(),
             api_base: base,
             api_data_base: data_base,
-            client: crate::config::build_proxy_client()
+            client: rsclaw_config::build_proxy_client()
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("reqwest client"),
@@ -136,7 +136,7 @@ impl LineChannel {
             let is_group = source.source_type == "group";
 
             let mut text = String::new();
-            let mut images: Vec<crate::agent::registry::ImageAttachment> = Vec::new();
+            let mut images: Vec<rsclaw_types::ImageAttachment> = Vec::new();
 
             match msg.message_type.as_str() {
                 "text" => {
@@ -162,7 +162,7 @@ impl LineChannel {
                                 (bytes, "image/jpeg".to_owned())
                             });
                         let b64 = base64::engine::general_purpose::STANDARD.encode(&final_bytes);
-                        images.push(crate::agent::registry::ImageAttachment {
+                        images.push(rsclaw_types::ImageAttachment {
                             data: format!("data:{final_mime};base64,{b64}"),
                             mime_type: final_mime,
                             source_path: None,
@@ -177,7 +177,7 @@ impl LineChannel {
                 },
                 "audio" => match self.download_line_content(&msg.id).await {
                     Ok(bytes) => {
-                        match crate::channel::transcription::transcribe_audio(
+                        match crate::transcription::transcribe_audio(
                             &self.client,
                             &bytes,
                             "voice.m4a",
@@ -459,7 +459,7 @@ async fn line_extract_audio_and_transcribe(
 
     std::fs::write(&video_path, video_bytes)?;
 
-    let ffmpeg_bin = crate::agent::platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned());
+    let ffmpeg_bin = rsclaw_platform::detect_ffmpeg().unwrap_or_else(|| "ffmpeg".to_owned());
     let status = tokio::process::Command::new(&ffmpeg_bin)
         .args([
             "-y",
@@ -485,7 +485,7 @@ async fn line_extract_audio_and_transcribe(
     let audio_bytes = std::fs::read(&audio_path)?;
     let _ = std::fs::remove_file(&audio_path);
 
-    crate::channel::transcription::transcribe_audio(
+    crate::transcription::transcribe_audio(
         client,
         &audio_bytes,
         "video_audio.ogg",
