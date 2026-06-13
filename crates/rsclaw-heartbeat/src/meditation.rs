@@ -11,10 +11,8 @@ use std::{collections::HashSet, sync::Arc};
 
 use anyhow::Result;
 
-use crate::{
-    agent::memory::{MemDocTier, MemoryStore},
-    provider::registry::ProviderRegistry,
-};
+use rsclaw_memory::{MemDocTier, MemoryStore};
+use rsclaw_provider::registry::ProviderRegistry;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -34,7 +32,7 @@ impl Default for MeditationConfig {
     fn default() -> Self {
         // Pick up live values from the evolution config (matches the
         // previous hardcoded constants when no override is set).
-        let evo = crate::agent::evolution::evolution_config();
+        let evo = rsclaw_evolution::evolution_config();
         Self {
             dedup_threshold: evo.meditation.dedup_threshold,
             batch_size: 50,
@@ -192,7 +190,7 @@ pub async fn crystallize_phase(
     primary_model: &str,
     skills_dir: &std::path::Path,
 ) -> Result<usize> {
-    let max_per_cycle = crate::agent::evolution::evolution_config()
+    let max_per_cycle = rsclaw_evolution::evolution_config()
         .meditation
         .max_per_cycle;
 
@@ -209,7 +207,7 @@ pub async fn crystallize_phase(
 
     let mut written = 0usize;
     for doc_id in candidates {
-        match crate::skill::crystallizer::crystallize_one(
+        match rsclaw_skill::crystallizer::crystallize_one(
             store,
             &doc_id,
             scope,
@@ -285,7 +283,7 @@ async fn cleanup_phase(
 /// 0.6), rendered as bullets. No qualifying lessons → the file is removed
 /// so stale rules never linger.
 pub fn lessons_phase(
-    store: &crate::agent::memory::MemoryStore,
+    store: &rsclaw_memory::MemoryStore,
     scope: &str,
     workspace: &std::path::Path,
     max: usize,
@@ -321,7 +319,7 @@ Follow them unless the user says otherwise.\n\n{}\n",
 #[cfg(test)]
 mod lessons_tests {
     use super::*;
-    use crate::agent::memory::{MemDocTier, MemoryDoc, MemoryStore};
+    use rsclaw_memory::{MemDocTier, MemoryDoc, MemoryStore};
     use crate::MemoryTier;
 
     fn lesson(id: &str, text: &str, importance: f32) -> MemoryDoc {

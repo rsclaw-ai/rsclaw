@@ -14,10 +14,31 @@ use chrono_tz::Tz;
 use state::{HeartbeatState, HeartbeatStore};
 use tracing::{info, warn};
 
-use crate::{
-    agent::registry::{AgentMessage, AgentRegistry},
-    config::loader::base_dir,
-};
+use rsclaw_config::loader::base_dir;
+
+/// Host abstraction (crate-split trait inversion): lets heartbeat reach the
+/// agent registry + graceful-shutdown coordinator WITHOUT depending on the
+/// agent/gateway runtime crates. Root implements this over AgentRegistry +
+/// ShutdownCoordinator and injects it at startup. Keeps AgentMessage
+/// construction + resolve_flash_model_for on the root side.
+#[async_trait::async_trait]
+pub trait HeartbeatHost: Send + Sync {
+    /// Flash model name for an agent (registry.get + resolve_flash_model_for,
+    /// with the configured default fallback applied root-side).
+    fn agent_flash_model(&self, agent_id: &str) -> Option<String>;
+    /// Provider registry for an agent (crystallize-phase LLM calls).
+    fn agent_providers(&self, agent_id: &str) -> Option<std::sync::Arc<rsclaw_provider::registry::ProviderRegistry>>;
+    /// Agent workspace dir (lessons-phase target).
+    fn agent_workspace(&self, agent_id: &str) -> Option<String>;
+    /// Send a heartbeat message to the agent and await its reply (or timeout).
+    async fn send_heartbeat(&self, agent_id: &str, session_key: &str, text: &str) -> anyhow::Result<()>;
+    /// Whether the runtime is draining (graceful shutdown in progress).
+    fn is_draining(&self) -> bool;
+    /// Register an in-flight unit of work; the returned opaque guard
+    /// decrements the count on drop so a graceful restart waits for the
+    /// tick. Returns `None` when no shutdown coordinator is wired.
+    fn begin_work(&self) -> Option<Box<dyn std::any::Any + Send>>;
+}
 
 /// Type of heartbeat action.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -106,7 +127,7 @@ pub fn parse_heartbeat_md(raw: &str) -> Result<HeartbeatSpec> {
         .transpose()?;
 
     let timezone: Tz = match timezone_raw.as_deref() {
-        Some("auto") | None => crate::config::system_tz(),
+        Some("auto") | None => rsclaw_config::system_tz(),
         Some(tz_str) => tz_str
             .parse()
             .map_err(|_| anyhow!("Unknown timezone: '{}'", tz_str))?,
@@ -177,55 +198,41 @@ fn parse_time_range(s: &str) -> Result<(NaiveTime, NaiveTime)> {
 pub struct MeditationDeps {
     /// Runtime config — used to resolve per-agent flash model with fallback
     /// to global defaults.
-    pub config: Arc<crate::config::runtime::RuntimeConfig>,
+    pub config: Arc<rsclaw_config::runtime::RuntimeConfig>,
     /// redb handle for skill usage stats — drives the disuse-retirement
     /// pass over auto-crystallized skills.
-    pub db: Arc<crate::store::redb_store::RedbStore>,
+    pub db: Arc<rsclaw_store::redb_store::RedbStore>,
 }
 
 /// Heartbeat runner — scans agent workspaces and spawns per-agent heartbeat
 /// loops. Periodically rescans to discover new HEARTBEAT.md files from
 /// dynamically created agents.
 pub struct HeartbeatRunner {
-    registry: Arc<AgentRegistry>,
+    host: Arc<dyn HeartbeatHost>,
     store: Arc<HeartbeatStore>,
     /// Tracks which agents already have a running heartbeat loop.
     active: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Shared memory store (used by meditation heartbeat type).
-    memory: Option<Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>>,
-    /// Optional graceful-shutdown coordinator. Per-agent loops exit at the
-    /// next tick when draining; the rescan loop also stops scheduling new
-    /// agent loops.
-    shutdown: Option<crate::gateway::ShutdownCoordinator>,
+    memory: Option<Arc<tokio::sync::Mutex<rsclaw_memory::MemoryStore>>>,
     /// Optional deps for the meditation crystallization phase. When `None`,
     /// meditation runs with dedup + cleanup only (back-compat).
     meditation_deps: Option<MeditationDeps>,
 }
 
 impl HeartbeatRunner {
-    /// Create a new heartbeat runner without a shutdown coordinator.
+    /// Create a new heartbeat runner. The host abstracts the agent registry
+    /// and (optional) graceful-shutdown coordinator (crate-split inversion).
     pub fn new(
-        registry: Arc<AgentRegistry>,
+        host: Arc<dyn HeartbeatHost>,
         data_dir: &Path,
-        memory: Option<Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>>,
-    ) -> Self {
-        Self::new_with_shutdown(registry, data_dir, memory, None)
-    }
-
-    /// Create a new heartbeat runner with an explicit shutdown coordinator.
-    pub fn new_with_shutdown(
-        registry: Arc<AgentRegistry>,
-        data_dir: &Path,
-        memory: Option<Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>>,
-        shutdown: Option<crate::gateway::ShutdownCoordinator>,
+        memory: Option<Arc<tokio::sync::Mutex<rsclaw_memory::MemoryStore>>>,
     ) -> Self {
         let state_path = data_dir.join("heartbeat").join("state.json");
         Self {
-            registry,
+            host,
             store: Arc::new(HeartbeatStore::new(state_path)),
             active: std::sync::Mutex::new(std::collections::HashSet::new()),
             memory,
-            shutdown,
             meditation_deps: None,
         }
     }
@@ -248,11 +255,9 @@ impl HeartbeatRunner {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
-                if let Some(s) = &runner.shutdown {
-                    if s.is_draining() {
+                if runner.host.is_draining() {
                         info!("heartbeat rescan: drain signaled, stopping");
                         break;
-                    }
                 }
                 runner.scan_and_spawn();
             }
@@ -341,11 +346,9 @@ impl HeartbeatRunner {
         tokio::time::sleep(delay).await;
 
         loop {
-            if let Some(s) = &self.shutdown {
-                if s.is_draining() {
-                    info!(agent_id, "heartbeat: drain signaled, stopping");
-                    return;
-                }
+            if self.host.is_draining() {
+                info!(agent_id, "heartbeat: drain signaled, stopping");
+                return;
             }
 
             // Re-read HEARTBEAT.md each tick (auto hot-reload).
@@ -371,7 +374,7 @@ impl HeartbeatRunner {
 
             // Track this tick in the gateway's inflight count so a graceful
             // restart waits for it before exiting.
-            let _inflight_guard = self.shutdown.as_ref().map(|s| s.begin_work());
+            let _inflight_guard = self.host.begin_work();
 
             // Execute heartbeat action based on type.
             let result = match spec.spec_type {
@@ -446,25 +449,21 @@ impl HeartbeatRunner {
         // dedup so duplicate Core docs don't waste LLM calls on overlapping
         // clusters.
         if let Some(deps) = &self.meditation_deps {
-            let handle = match self.registry.get(agent_id) {
-                Ok(h) => h,
-                Err(e) => {
-                    warn!(agent_id, "crystallize phase: agent handle missing: {e:#}");
-                    return Ok(());
-                }
+            let Some(providers) = self.host.agent_providers(agent_id) else {
+                warn!(agent_id, "crystallize phase: agent handle missing");
+                return Ok(());
             };
-            let primary_model = crate::agent::runtime::resolve_flash_model_for(
-                &handle.config,
-                &deps.config.agents.defaults,
-            )
-            .unwrap_or_else(|| "rsclaw/rsclaw-agent-v1".to_owned());
-            let skills_dir = crate::skill::default_global_skills_dir()
-                .unwrap_or_else(|| crate::config::loader::base_dir().join("skills"));
+            let primary_model = self
+                .host
+                .agent_flash_model(agent_id)
+                .unwrap_or_else(|| "rsclaw/rsclaw-agent-v1".to_owned());
+            let skills_dir = rsclaw_skill::default_global_skills_dir()
+                .unwrap_or_else(|| rsclaw_config::loader::base_dir().join("skills"));
 
             match meditation::crystallize_phase(
                 mem,
                 &scope,
-                &handle.providers,
+                &providers,
                 &primary_model,
                 &skills_dir,
             )
@@ -483,7 +482,7 @@ impl HeartbeatRunner {
             // inside the disuse window move to skills/.retired/ — closes
             // the generate→use→retire loop so bad or obsolete auto-skills
             // stop occupying the prompt's skill list forever.
-            match crate::skill::retire_unused_auto_skills(&deps.db, &skills_dir) {
+            match rsclaw_skill::retire_unused_auto_skills(&deps.db, &skills_dir) {
                 Ok(retired) if !retired.is_empty() => {
                     info!(agent_id, ?retired, "retired unused auto-skills");
                 }
@@ -496,18 +495,16 @@ impl HeartbeatRunner {
         // importance >= 0.6) into the workspace's memory/lessons.md so the
         // system prompt's "Learned Rules" section carries them every turn —
         // corrections must not depend on vector-recall luck.
-        match self.registry.get(agent_id) {
-            Ok(handle) => {
-                if let Some(ws) = handle.config.workspace.as_deref() {
-                    let ws = crate::config::loader::expand_tilde_path_pub(ws);
-                    let store = mem.lock().await;
-                    match meditation::lessons_phase(&store, &scope, &ws, 8) {
-                        Ok(n) => report.lessons_published = n,
-                        Err(e) => warn!(agent_id, "lessons phase failed: {e:#}"),
-                    }
+        match self.host.agent_workspace(agent_id) {
+            Some(ws) => {
+                let ws = rsclaw_config::loader::expand_tilde_path_pub(&ws);
+                let store = mem.lock().await;
+                match meditation::lessons_phase(&store, &scope, &ws, 8) {
+                    Ok(n) => report.lessons_published = n,
+                    Err(e) => warn!(agent_id, "lessons phase failed: {e:#}"),
                 }
             }
-            Err(e) => warn!(agent_id, "lessons phase: agent handle missing: {e:#}"),
+            None => warn!(agent_id, "lessons phase: agent workspace unavailable"),
         }
 
         info!(
@@ -523,53 +520,14 @@ impl HeartbeatRunner {
     }
 
     /// Send a heartbeat message to the agent and wait for reply.
+    ///
+    /// Delegates to the host (crate-split): AgentMessage construction, the
+    /// agent mpsc send, and the 300s reply-wait timeout all live root-side in
+    /// the `HeartbeatHost` impl. The `heartbeat:` session-key prefix is
+    /// preserved (first-segment match for is_internal_session routing).
     async fn send_heartbeat(&self, agent_id: &str, state_key: &str, content: &str) -> Result<()> {
-        // No state_key validation here. The R2 I4 reviewer worried that
-        // `:` in state_key would break is_internal_session — but that
-        // check is a literal `starts_with("heartbeat:")` (first-segment
-        // prefix match), so any number of additional `:` segments past
-        // the prefix are routed correctly. Session keys throughout this
-        // codebase routinely chain multiple `:` segments (e.g.
-        // `agent:main:feishu:direct:ou_xxx`), so banning `:` here was
-        // both unnecessary and broke heartbeat permanently — the
-        // adjacent agent_loop builds `state_key = "{agent_id}:{file}"`,
-        // which the old validator then rejected at every tick.
-        let handle = self
-            .registry
-            .get(agent_id)
-            .map_err(|e| anyhow!("agent not found: {e:#}"))?;
-
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let msg = AgentMessage {
-            session_key: format!("heartbeat:{state_key}"),
-            text: content.to_owned(),
-            channel: "heartbeat".to_owned(),
-            peer_id: "heartbeat".to_owned(),
-            chat_id: String::new(),
-            reply_tx,
-            task_id: None,
-            context_id: None,
-            event_tx: None,
-            cancel_token: None,
-            input_request_tx: None,
-            extra_tools: vec![],
-            images: vec![],
-            files: vec![],
-            account: None,
-        };
-
-        handle
-            .tx
-            .send(msg)
-            .await
-            .map_err(|_| anyhow!("heartbeat send failed: agent channel closed"))?;
-
-        // Wait for reply with timeout (5 minutes).
-        match tokio::time::timeout(Duration::from_secs(300), reply_rx).await {
-            Ok(Ok(_reply)) => Ok(()),
-            Ok(Err(_)) => Ok(()), // reply_tx dropped — agent finished without explicit reply
-            Err(_) => bail!("heartbeat timed out after 300s"),
-        }
+        let session_key = format!("heartbeat:{state_key}");
+        self.host.send_heartbeat(agent_id, &session_key, content).await
     }
 }
 

@@ -18,6 +18,7 @@ pub mod session;
 pub mod shutdown;
 pub mod startup;
 pub mod desktop_channel;
+pub mod heartbeat_host;
 pub mod task_queue;
 pub mod watch;
 

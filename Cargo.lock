@@ -7537,6 +7537,7 @@ dependencies = [
  "rsclaw-embed",
  "rsclaw-events",
  "rsclaw-evolution",
+ "rsclaw-heartbeat",
  "rsclaw-i18n",
  "rsclaw-kb",
  "rsclaw-mcp",
@@ -7849,6 +7850,27 @@ dependencies = [
  "rsclaw-config",
  "serde",
  "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "rsclaw-heartbeat"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "chrono-tz",
+ "rsclaw-config",
+ "rsclaw-evolution",
+ "rsclaw-memory",
+ "rsclaw-provider",
+ "rsclaw-skill",
+ "rsclaw-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
  "tracing",
 ]
 

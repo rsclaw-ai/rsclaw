@@ -22,6 +22,7 @@ rsclaw-artifact = { path = "crates/rsclaw-artifact" }
 rsclaw-mcp = { path = "crates/rsclaw-mcp" }
 rsclaw-astock = { path = "crates/rsclaw-astock" }
 rsclaw-cap = { path = "crates/rsclaw-cap" }
+rsclaw-heartbeat = { path = "crates/rsclaw-heartbeat" }
 rsclaw-desktop = { path = "crates/rsclaw-desktop" }
 rsclaw-evolution = { path = "crates/rsclaw-evolution" }
 rsclaw-memory = { path = "crates/rsclaw-memory" }
