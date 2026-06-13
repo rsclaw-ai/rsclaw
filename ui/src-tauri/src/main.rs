@@ -1366,6 +1366,16 @@ fn search_skills(query: String) -> Result<serde_json::Value, String> {
             continue;
         }
 
+        // Explicit footer guard. The blank-line break above only fires
+        // after at least one result, and only if a blank line actually
+        // precedes the footer. For zero-result searches (no blank line,
+        // or footer directly under the header) the hint line would slip
+        // through and be scraped as a fake "Install" entry. Stop at it
+        // unconditionally — nothing useful follows the hint.
+        if trimmed.starts_with("Install with") {
+            break;
+        }
+
         // First non-empty line is the header. Use it to fix column count.
         if has_stats.is_none() {
             let cols: Vec<&str> = trimmed.split_whitespace().collect();
