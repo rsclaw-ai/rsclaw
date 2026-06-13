@@ -915,7 +915,22 @@ pub fn build_user_system(
                 None => format!("- {name} (version unknown)"),
             })
             .collect();
-        parts.push(format!("## Installed Tools\n\n{}", lines.join("\n")));
+        // Usage guidance — the exec tool prepends ~/.rsclaw/tools/*/bin (and
+        // node_modules/.bin) to PATH, so the agent invokes these directly by
+        // name; it does NOT need absolute paths and these copies win over any
+        // system install. The npm/npx note matters because they are the
+        // most common stumbling block: on Windows the exec shell already
+        // passes -ExecutionPolicy Bypass so the .ps1 wrappers run; missing
+        // tools are installed with `rsclaw tools install <name>`.
+        let usage = "\n\nThese are on your PATH — invoke them directly by name \
+            (`node`, `npm`, `npx`, `python`, `pip`, `bun`); no absolute paths, and \
+            these versions take precedence over any system install. `npm install` / \
+            `pip install` work as normal for project deps. If a runtime you need \
+            isn't listed, install it with `rsclaw tools install <node|python|bun|...>`.";
+        parts.push(format!(
+            "## Installed Tools\n\n{}{usage}",
+            lines.join("\n")
+        ));
     }
 
     // ws_segment last — its memory_today / memory_yesterday blocks roll

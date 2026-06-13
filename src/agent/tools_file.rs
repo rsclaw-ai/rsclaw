@@ -1103,8 +1103,15 @@ impl super::runtime::AgentRuntime {
 
         // Always run via shell to support pipes, redirects, &&, etc.
         let (shell, shell_args) = if cfg!(target_os = "windows") {
-            // PowerShell: better compatibility, supports pipes, redirects, && via -Command
-            ("powershell", vec!["-NoProfile", "-Command"])
+            // PowerShell: better compatibility, supports pipes, redirects, && via -Command.
+            // -ExecutionPolicy Bypass is essential for the agent to run the
+            // language tooling rsclaw installs: `npm` / `npx` resolve to
+            // npm.ps1 / npx.ps1 under PowerShell, and on a machine with the
+            // default Restricted policy those .ps1 wrappers refuse to run
+            // ("running scripts is disabled on this system"). Bypass applies
+            // ONLY to this child process — it never changes the machine's
+            // persistent policy. Without it `npm install` etc. just fails.
+            ("powershell", vec!["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"])
         } else {
             ("sh", vec!["-c"])
         };
@@ -1205,9 +1212,14 @@ impl super::runtime::AgentRuntime {
                 for entry in entries.flatten() {
                     let p = entry.path();
                     if p.is_dir() {
-                        // Add the dir itself, bin/, and node_modules/.bin/ subdirectories.
+                        // Add the dir itself, bin/, node_modules/.bin/, and
+                        // Scripts/. The last is where pip drops console-script
+                        // shims on Windows (tools/python/Scripts/<tool>.exe),
+                        // so a `pip install <cli>` followed by running that cli
+                        // resolves. Harmless on Unix where Scripts/ won't exist.
                         extra_paths.push(p.join("node_modules").join(".bin"));
                         extra_paths.push(p.join("bin"));
+                        extra_paths.push(p.join("Scripts"));
                         extra_paths.push(p.clone());
                     }
                 }

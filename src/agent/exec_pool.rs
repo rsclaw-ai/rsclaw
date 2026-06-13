@@ -68,9 +68,13 @@ impl ExecPool {
         tokio::spawn(async move {
             let completed_at = Instant::now();
 
-            // Determine shell based on platform
+            // Determine shell based on platform.
+            // -ExecutionPolicy Bypass: same rationale as the foreground exec
+            // tool — npm/npx resolve to .ps1 wrappers that the default
+            // Restricted policy blocks. Per-process only; doesn't touch the
+            // machine policy. Keep these two shell selections in sync.
             let (shell, shell_args) = if cfg!(target_os = "windows") {
-                ("powershell", vec!["-NoProfile", "-Command"])
+                ("powershell", vec!["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"])
             } else {
                 ("sh", vec!["-c"])
             };
