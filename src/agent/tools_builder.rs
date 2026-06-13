@@ -599,12 +599,16 @@ pub fn build_tool_list(
         name: "skill_install".to_owned(),
         description: "Install a skill by slug (from skill_search results) into the local \
             skills store. Usable immediately via skill_use. Only install skills the \
-            user's task clearly needs."
+            user's task clearly needs. Audited skills install directly; if a skill \
+            is NOT on the audited allowlist the call returns needs_confirmation — ask \
+            the user whether they trust it, and only on a clear yes retry with \
+            confirmed=true. Never set confirmed=true without the user's explicit ok."
             .to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Skill slug to install (from skill_search)."}
+                "name": {"type": "string", "description": "Skill slug to install (from skill_search)."},
+                "confirmed": {"type": "boolean", "description": "Set true ONLY after the user explicitly approved installing an off-allowlist (unaudited) skill. Ignored for audited skills."}
             },
             "required": ["name"]
         }),
