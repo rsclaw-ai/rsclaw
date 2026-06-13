@@ -1,0 +1,25 @@
+[package]
+name = "rsclaw-memory"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tracing = "0.1"
+tokio = { version = "1", features = ["full"] }
+chrono = { version = "0.4", features = ["serde"] }
+rsclaw-types = { path = "../rsclaw-types" }
+rsclaw-config = { path = "../rsclaw-config" }
+rsclaw-util = { path = "../rsclaw-util" }
+rsclaw-i18n = { path = "../rsclaw-i18n" }
+rsclaw-events = { path = "../rsclaw-events" }
+rsclaw-store = { path = "../rsclaw-store" }
+rsclaw-embed = { path = "../rsclaw-embed" }
+rsclaw-evolution = { path = "../rsclaw-evolution" }
+rsclaw-platform = { path = "../rsclaw-platform" }
+redb = "4.1"
+hnsw_rs = "0.3"

@@ -125,7 +125,7 @@ impl std::fmt::Debug for RedbStore {
 ///   …) → return `Ok(())` so the caller's own `Database::open` surfaces the
 ///   true root cause rather than being masked by a confusing "legacy upgrade
 ///   failed" wrapper.
-pub(crate) fn upgrade_legacy_if_needed(path: &Path) -> Result<()> {
+pub fn upgrade_legacy_if_needed(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }

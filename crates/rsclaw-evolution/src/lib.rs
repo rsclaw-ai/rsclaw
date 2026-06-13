@@ -131,7 +131,7 @@ impl EvolutionConfig {
 
     /// Build from raw schema. Preset (if any) sets the base; individual
     /// fields override on top of that base.
-    pub fn from_raw(raw: Option<&crate::config::schema::EvolutionConfig>) -> Self {
+    pub fn from_raw(raw: Option<&rsclaw_config::schema::EvolutionConfig>) -> Self {
         let raw = match raw {
             Some(r) => r,
             None => return Self::default(),
@@ -257,10 +257,10 @@ mod tests {
     fn from_raw_preset_then_override() {
         // Build a raw config with preset = "test" and an explicit override
         // on min_size to verify the layering order.
-        let raw = crate::config::schema::EvolutionConfig {
+        let raw = rsclaw_config::schema::EvolutionConfig {
             enabled: None,
             preset: Some("test".to_owned()),
-            cluster: Some(crate::config::schema::EvolutionClusterConfig {
+            cluster: Some(rsclaw_config::schema::EvolutionClusterConfig {
                 min_size: Some(7),          // override even after preset
                 similarity_threshold: None, // keep preset's 0.5
             }),

@@ -18,7 +18,8 @@ use hnsw_rs::{hnsw::Hnsw, prelude::DistCosine};
 use redb::ReadableDatabase;
 use tracing::{debug, info, warn};
 
-use crate::{MemoryTier, config::schema::MemorySearchConfig};
+use rsclaw_platform::MemoryTier;
+use rsclaw_config::schema::MemorySearchConfig;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -28,10 +29,10 @@ const HNSW_MAX_NB_CONN: usize = 16; // M parameter
 const HNSW_EF_CONSTRUCTION: usize = 200;
 
 // Embedder stack (trait + Fnv/LocalBge/OpenAi/Ollama backends + the
-// per-provider default constants) now lives in `crate::embed` so the
+// per-provider default constants) now lives in `rsclaw_embed` so the
 // knowledge base can reuse it. Re-export for backward compatibility:
-// existing `crate::agent::memory::EmbedderBackend` paths still resolve.
-pub use crate::embed::{
+// existing `EmbedderBackend` paths still resolve.
+pub use rsclaw_embed::{
     DEFAULT_EMBED_DIM, Embedder, EmbedderBackend, FnvEmbedder, LocalBgeEmbedder,
     OLLAMA_DEFAULT_MODEL, OLLAMA_DEFAULT_URL, OPENAI_DEFAULT_BASE_URL, OPENAI_DEFAULT_MODEL,
     OllamaEmbedder, OpenAiEmbedder,
@@ -55,7 +56,7 @@ static GLOBAL_STORE: std::sync::OnceLock<Arc<tokio::sync::Mutex<MemoryStore>>> =
     std::sync::OnceLock::new();
 
 /// Register the live `MemoryStore`. Idempotent — second + calls are
-/// silently dropped, matching `crate::kb::set_global_service` so the
+/// silently dropped, matching `kb::set_global_service (root)` so the
 /// callsite contract is uniform across stores. Called once from gateway
 /// startup.
 pub fn set_global_store(store: Arc<tokio::sync::Mutex<MemoryStore>>) {
@@ -74,7 +75,7 @@ pub fn global_store() -> Option<Arc<tokio::sync::Mutex<MemoryStore>>> {
 // ---------------------------------------------------------------------------
 
 /// Memory document tier for decay and priority control.
-/// Named `MemDocTier` to avoid conflict with `crate::MemoryTier` (system RAM).
+/// Named `MemDocTier` to avoid conflict with `rsclaw_platform::MemoryTier` (system RAM).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub enum MemDocTier {
     /// Identity-level facts, decay floor = 0.9
@@ -204,7 +205,7 @@ impl MemoryDoc {
         // The previous AND-gate (>=10 AND >=0.8) made promotion compound-rare,
         // which combined with cluster_size >= 3 effectively starved the
         // crystallization pipeline.
-        let promo = &crate::agent::evolution::evolution_config().promotion;
+        let promo = &rsclaw_evolution::evolution_config().promotion;
         if self.access_count >= promo.access_only
             || self.importance >= promo.importance_only
             || (self.access_count >= promo.both_access && self.importance >= promo.both_importance)
@@ -374,7 +375,7 @@ pub struct MemoryStore {
     /// `merge` also writes/removes from BM25 so extractor + WS + CLI memories
     /// land in keyword search, not just vector. `None` means BM25 is unwired
     /// (CLI one-shots that didn't open a `Store`).
-    search: Option<Arc<crate::store::SearchIndex>>,
+    search: Option<Arc<rsclaw_store::SearchIndex>>,
 }
 
 impl MemoryStore {
@@ -399,7 +400,7 @@ impl MemoryStore {
         let mem_dir = data_dir.join("memory");
         std::fs::create_dir_all(&mem_dir)?;
         let db_path = mem_dir.join("memory.redb");
-        crate::store::upgrade_legacy_if_needed(&db_path)?;
+        rsclaw_store::upgrade_legacy_if_needed(&db_path)?;
         let db = redb::Database::create(&db_path).context("open memory redb")?;
         Self::open_with_db(db, model_dir, search_cfg).await
     }
@@ -415,7 +416,7 @@ impl MemoryStore {
         if !db_path.exists() {
             anyhow::bail!("memory database not found at {}", db_path.display());
         }
-        crate::store::upgrade_legacy_if_needed(&db_path)?;
+        rsclaw_store::upgrade_legacy_if_needed(&db_path)?;
         let db = redb::Database::open(&db_path).context("open memory redb (readonly)")?;
         Self::open_with_db(db, model_dir, search_cfg).await
     }
@@ -514,7 +515,7 @@ impl MemoryStore {
             swap: None,
             pending_migration: skipped,
             query_instruction: search_cfg.and_then(|c| {
-                crate::embed::resolve_query_instruction(
+                rsclaw_embed::resolve_query_instruction(
                     c.query_instruction.clone(),
                     c.model.as_deref(),
                 )
@@ -529,7 +530,7 @@ impl MemoryStore {
     /// (`add_pre_embedded`, `delete`) keep BM25 in sync; `search_hybrid`
     /// fuses BM25 + vector hits. Gateway startup attaches `Store::search`
     /// here and then calls `reindex_bm25` once so existing docs land too.
-    pub fn set_search_index(&mut self, search: Arc<crate::store::SearchIndex>) {
+    pub fn set_search_index(&mut self, search: Arc<rsclaw_store::SearchIndex>) {
         self.search = Some(search);
     }
 
@@ -819,7 +820,7 @@ impl MemoryStore {
             return Ok(vec![]);
         }
 
-        let q_text = crate::embed::format_query(self.query_instruction.as_deref(), query);
+        let q_text = rsclaw_embed::format_query(self.query_instruction.as_deref(), query);
         let q_vec = self.embedder.embed(&q_text);
         // Search more than top_k to account for filtered/deleted docs.
         let ef_search = (top_k * 4).max(32);
@@ -1928,7 +1929,7 @@ mod swap_tests {
         let (mut store, tmp) = open_temp_store().await;
         let search_dir = tmp.path().join("bm25");
         let search = Arc::new(
-            crate::store::SearchIndex::open(&search_dir, MemoryTier::Low).expect("search open"),
+            rsclaw_store::SearchIndex::open(&search_dir, MemoryTier::Low).expect("search open"),
         );
         store.set_search_index(Arc::clone(&search));
 
@@ -1958,7 +1959,7 @@ mod swap_tests {
         store.add(doc("legacy", "ancient sentinel token")).await.unwrap();
 
         let search = Arc::new(
-            crate::store::SearchIndex::open(&tmp.path().join("bm25"), MemoryTier::Low)
+            rsclaw_store::SearchIndex::open(&tmp.path().join("bm25"), MemoryTier::Low)
                 .expect("search open"),
         );
         store.set_search_index(Arc::clone(&search));
@@ -1975,7 +1976,7 @@ mod swap_tests {
     async fn delete_also_removes_from_bm25() {
         let (mut store, tmp) = open_temp_store().await;
         let search = Arc::new(
-            crate::store::SearchIndex::open(&tmp.path().join("bm25"), MemoryTier::Low)
+            rsclaw_store::SearchIndex::open(&tmp.path().join("bm25"), MemoryTier::Low)
                 .expect("search open"),
         );
         store.set_search_index(Arc::clone(&search));

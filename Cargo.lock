@@ -7533,10 +7533,12 @@ dependencies = [
  "rsclaw-desktop",
  "rsclaw-embed",
  "rsclaw-events",
+ "rsclaw-evolution",
  "rsclaw-hooks",
  "rsclaw-i18n",
  "rsclaw-kb",
  "rsclaw-mcp",
+ "rsclaw-memory",
  "rsclaw-platform",
  "rsclaw-plugin",
  "rsclaw-provider",
@@ -7744,6 +7746,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsclaw-evolution"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rsclaw-config",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "rsclaw-hooks"
 version = "0.1.0"
 dependencies = [
@@ -7800,6 +7813,29 @@ dependencies = [
  "anyhow",
  "rsclaw-config",
  "rsclaw-provider",
+ "rsclaw-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rsclaw-memory"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "hnsw_rs",
+ "redb 4.1.0",
+ "rsclaw-config",
+ "rsclaw-embed",
+ "rsclaw-events",
+ "rsclaw-evolution",
+ "rsclaw-i18n",
+ "rsclaw-platform",
+ "rsclaw-store",
+ "rsclaw-types",
  "rsclaw-util",
  "serde",
  "serde_json",

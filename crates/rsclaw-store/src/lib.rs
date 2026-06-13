@@ -12,7 +12,7 @@ pub mod search;
 use std::{path::Path, sync::Arc};
 
 use anyhow::Result;
-pub(crate) use redb_store::upgrade_legacy_if_needed;
+pub use redb_store::upgrade_legacy_if_needed;
 pub use redb_store::{
     LEGACY_REDB_UPGRADE_HELPER_ENV, RedbStore, create_with_lock_retry,
     run_legacy_redb_upgrade_helper,
