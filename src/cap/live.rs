@@ -67,6 +67,23 @@ pub struct CapLiveManager {
     /// whenever a live session ends (actor exit, idle GC) so a stale
     /// binding never points at a dead driver.
     sticky: Arc<RwLock<HashMap<String, (String, AgentKind)>>>,
+    /// Suspended driver pool: (IM session_key, AgentKind) → live_sid.
+    ///
+    /// When the user switches `/cap claudecode → /cap codex → /cap
+    /// claudecode`, the FIRST claudecode driver isn't torn down —
+    /// it's parked here while codex takes the wheel. Coming back to
+    /// claudecode pulls the same warm driver out of the pool so the
+    /// conversation context (everything the agent saw in turn 1) is
+    /// preserved.
+    ///
+    /// Capacity: one entry per (im_key, kind). Re-binding the same
+    /// pair tears down the older parked driver (you can't have two
+    /// claudecode subprocesses for the same chat).
+    ///
+    /// Lifetime: idle GC sweeps pool entries the same way it sweeps
+    /// active sessions; the pool only holds live_sids, never owns
+    /// the driver subprocess directly (the actor in `sessions` does).
+    suspended: Arc<RwLock<HashMap<(String, AgentKind), String>>>,
     bus: broadcast::Sender<crate::events::AgentEvent>,
     /// Outbound notification channel — when set, preparse can post
     /// asynchronous follow-up messages to IM after `/cap` returns its
@@ -137,6 +154,7 @@ impl CapLiveManager {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             sticky: Arc::new(RwLock::new(HashMap::new())),
+            suspended: Arc::new(RwLock::new(HashMap::new())),
             bus,
             notification_tx: None,
             max_sessions: DEFAULT_MAX_SESSIONS,
@@ -159,6 +177,51 @@ impl CapLiveManager {
         &self,
     ) -> Option<broadcast::Sender<crate::channel::OutboundMessage>> {
         self.notification_tx.clone()
+    }
+
+    /// Pull a warm driver out of the suspended pool for (`im_key`, `kind`),
+    /// OR spawn a fresh one if the pool is empty (or the entry's driver
+    /// died while parked). The caller is expected to follow with
+    /// `bind_sticky(im_key, returned_sid, kind)` to wire it up; the
+    /// "resume warm driver" semantic is what makes
+    /// `/cap claudecode → /cap codex → /cap claudecode` preserve the
+    /// first claudecode session's conversation context.
+    pub(crate) async fn acquire_session(
+        &self,
+        im_session_key: &str,
+        kind: AgentKind,
+        cwd: std::path::PathBuf,
+    ) -> Result<String> {
+        // Pool fast-path: take the parked sid out of the map.
+        let resumed = {
+            let mut pool = self.suspended.write().await;
+            pool.remove(&(im_session_key.to_owned(), kind))
+        };
+        if let Some(sid) = resumed {
+            // Verify the parked driver actually survived (idle GC could
+            // have reaped it while it was suspended). If it did, perfect
+            // — return its sid for `bind_sticky` to use.
+            let alive = self.sessions.read().await.contains_key(&sid);
+            if alive {
+                tracing::info!(
+                    target: "cap",
+                    im_session_key,
+                    agent = kind.as_str(),
+                    session_id = %sid,
+                    "cap_live resumed driver from suspended pool"
+                );
+                return Ok(sid);
+            }
+            tracing::debug!(
+                target: "cap",
+                im_session_key,
+                agent = kind.as_str(),
+                stale_sid = %sid,
+                "cap_live suspended pool entry expired; spawning fresh"
+            );
+        }
+        // Cold path: nothing parked, or the parked driver died → fresh.
+        self.open_session(kind, cwd).await
     }
 
     /// Spawn a new live session WITHOUT sending an initial prompt.
@@ -212,22 +275,15 @@ impl CapLiveManager {
         Ok(sid)
     }
 
-    /// Bind an IM session key to a live cap session, tearing down any
-    /// prior binding's driver as a side effect.
+    /// Bind an IM session key to a live cap session, **parking** any
+    /// prior binding's driver in the suspended pool (not tearing it
+    /// down). Resume semantics: a later `acquire_session` for the
+    /// parked `(im_key, old_kind)` pulls the same warm driver back.
     ///
-    /// Was: idempotent overwrite that LEAKED the old driver subprocess
-    /// until idle GC (10 min). Real-world flow: user types
-    /// `/cap claudecode` → tests it → `/cap codex` to switch. Without
-    /// this teardown, the claudecode driver kept running in the
-    /// background until the 10-min idle reap, eating an active-session
-    /// slot (cap of 8) and burning memory/CPU. Worse, the user has no
-    /// visibility into it from `/status` (today) — silent resource
-    /// leak.
-    ///
-    /// Now: returns the prior `(live_session_id, kind)` if any, so the
-    /// caller can also wait on `end_session` if it wants strict
-    /// teardown ordering. The internal `end_session` call is fire-and-
-    /// forget through the actor's mpsc Shutdown.
+    /// Pool-collision: if there's already a parked driver for the
+    /// SAME `(im_key, old_kind)` we're about to park, the older one
+    /// is torn down (one slot per agent per IM session — can't keep
+    /// an infinite history).
     pub(crate) async fn bind_sticky(
         &self,
         im_session_key: String,
@@ -236,17 +292,53 @@ impl CapLiveManager {
     ) -> Option<(String, AgentKind)> {
         let prior = {
             let mut g = self.sticky.write().await;
-            g.insert(im_session_key, (live_session_id, kind))
+            g.insert(im_session_key.clone(), (live_session_id, kind))
         };
         if let Some((old_sid, old_kind)) = &prior {
-            tracing::info!(
-                target: "cap",
-                old_session_id = %old_sid,
-                old_agent = old_kind.as_str(),
-                new_agent = kind.as_str(),
-                "cap_live sticky rebind — tearing down previous driver"
-            );
-            let _ = self.end_session(old_sid).await;
+            // Same-agent rebind is a noop on the pool — the new sid
+            // already takes the active slot, no parking needed.
+            // (Callers SHOULD detect this case BEFORE bind_sticky and
+            // short-circuit, but we defend here too.)
+            if *old_kind == kind {
+                tracing::info!(
+                    target: "cap",
+                    old_session_id = %old_sid,
+                    new_session_id = ?prior.as_ref().map(|p| &p.0),
+                    agent = kind.as_str(),
+                    "cap_live same-agent rebind — ending prior driver"
+                );
+                let _ = self.end_session(old_sid).await;
+            } else {
+                // Different agent → park the prior driver for resume.
+                let park_key = (im_session_key, *old_kind);
+                let evicted = {
+                    let mut pool = self.suspended.write().await;
+                    pool.insert(park_key, old_sid.clone())
+                };
+                tracing::info!(
+                    target: "cap",
+                    old_session_id = %old_sid,
+                    old_agent = old_kind.as_str(),
+                    new_agent = kind.as_str(),
+                    "cap_live sticky rebind — parked prior driver in suspended pool"
+                );
+                // If the pool already had a parked driver for this
+                // (im_key, old_kind), we just orphaned its sid by
+                // overwriting the map entry — tear it down now so we
+                // don't leak it. (Realistically rare: would require
+                // /cap A → /cap B → /cap A → /cap B → /cap A within
+                // 10 min.)
+                if let Some(evicted_sid) = evicted {
+                    if evicted_sid != *old_sid {
+                        tracing::info!(
+                            target: "cap",
+                            evicted_session_id = %evicted_sid,
+                            "cap_live pool collision — ending evicted driver"
+                        );
+                        let _ = self.end_session(&evicted_sid).await;
+                    }
+                }
+            }
         }
         prior
     }
@@ -407,6 +499,23 @@ impl CapLiveManager {
         h.agent_session_id.lock().ok().and_then(|s| s.clone())
     }
 
+    /// Same idea as `snapshot_sticky_blocking` but for the suspended
+    /// pool. Returns `(im_key, agent_kind, parked_sid)` tuples so
+    /// `/status` can render "Suspended cap: feishu:… → codex (abc)".
+    /// Caller doesn't need to coordinate with `snapshot_sticky_blocking`
+    /// — they read different maps and a tiny inconsistency window
+    /// (entry just moved from active → suspended) is harmless for a
+    /// human-readable status line.
+    pub(crate) fn snapshot_suspended_blocking(&self) -> Vec<(String, AgentKind, String)> {
+        match self.suspended.try_read() {
+            Ok(g) => g
+                .iter()
+                .map(|((im_key, kind), sid)| (im_key.clone(), *kind, sid.clone()))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Force-close a live session. Idempotent — returns Ok even if the
     /// session was already gone.
     pub(crate) async fn end_session(&self, session_id: &str) -> Result<()> {
@@ -464,6 +573,7 @@ impl CapLiveManager {
         let bus = self.bus.clone();
         let sessions_for_gc = Arc::clone(&self.sessions);
         let sticky_for_gc = Arc::clone(&self.sticky);
+        let suspended_for_gc = Arc::clone(&self.suspended);
         let sid_owned = session_id.to_owned();
         let agent_sid_slot = Arc::clone(&agent_session_id);
         tokio::spawn(actor_loop(
@@ -474,6 +584,7 @@ impl CapLiveManager {
             bus,
             sessions_for_gc,
             sticky_for_gc,
+            suspended_for_gc,
             agent_sid_slot,
         ));
         // Only inject memory on a FRESH bind. `/cap-resume` and
@@ -563,6 +674,12 @@ impl CapLiveManager {
         // the map size bounded under high churn).
         let mut sg = self.sticky.write().await;
         sg.retain(|_, (sid, _)| !to_remove.contains(sid));
+        drop(sg);
+        // Sweep suspended-pool entries that point at reaped drivers.
+        // Without this the pool would hand out dead sids; acquire_session
+        // has a self-heal fast-path but the map would still bloat.
+        let mut pg = self.suspended.write().await;
+        pg.retain(|_, sid| !to_remove.contains(sid));
     }
 }
 
@@ -627,6 +744,7 @@ async fn actor_loop(
     bus: broadcast::Sender<crate::events::AgentEvent>,
     sessions: Arc<RwLock<HashMap<String, LiveSessionHandle>>>,
     sticky: Arc<RwLock<HashMap<String, (String, AgentKind)>>>,
+    suspended: Arc<RwLock<HashMap<(String, AgentKind), String>>>,
     agent_sid_slot: Arc<StdMutex<Option<String>>>,
 ) {
     tracing::info!(
@@ -751,6 +869,14 @@ async fn actor_loop(
     {
         let mut sg = sticky.write().await;
         sg.retain(|_, (s, _)| s != &sid);
+    }
+    // Also drop any suspended-pool entry pointing at this session so a
+    // subsequent /cap <same-agent> doesn't try to resume a dead driver
+    // (acquire_session has a self-heal, but cleaning the source is
+    // tidier).
+    {
+        let mut pg = suspended.write().await;
+        pg.retain(|_, s| s != &sid);
     }
     tracing::info!(
         target: "cap",
