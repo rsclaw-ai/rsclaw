@@ -1041,77 +1041,9 @@ fn build_coding_mode_block() -> String {
 /// `dynamic_prefix.tools` (the shared, cacheable subset) versus top-level
 /// `user_tools` (the per-client subset). Also dumped in the
 /// `RSCLAW_DUMP_PROMPT` debug payload.
-pub const BUILTIN_TOOL_NAMES: &[&str] = &[
-    "memory",
-    "todo",
-    "skill_use",
-    "task",
-    "task_finish",
-    "read_file",
-    "write_file",
-    "edit_file",
-    "send_file",
-    "shell",
-    "agent",
-    "ask_user",
-    "install_tool",
-    "list_dir",
-    "search_file",
-    "search_content",
-    "web_search",
-    "web_fetch",
-    "web_download",
-    "web_browser",
-    "computer_use",
-    "image_gen",
-    "video_gen",
-    "pdf",
-    "text_to_voice",
-    "send_message",
-    "cron",
-    "session",
-    "gateway",
-    "cap",
-    "cap_live",
-    "cap_live_end",
-    "cap_bind_sticky",
-    "cap_unbind_sticky",
-    "channel",
-    "anycli",
-    "clarify",
-    "pairing",
-    "create_docx",
-    "create_pdf",
-    "create_xlsx",
-    "create_pptx",
-    "doc",
-    // Context-recovery tools: static, byte-identical for every client of
-    // this prefix version, so they belong in the cacheable builtin prefix.
-    // Previously misclassified as user_tools, which under prefix_id mode
-    // (dynamic_prefix omitted) meant they were NEVER sent to the model —
-    // so the model could never call read_session_archive despite the
-    // summary/system-prompt telling it to.
-    "read_session_archive",
-    "read_artifact",
-    "knowledge_base",
-    // A2A-only tool, but unconditionally registered in build_tool_list and
-    // byte-identical across clients — same builtin class. Errors gracefully
-    // if called on a non-A2A turn.
-    "wait_input",
-    // Self-service skill management (discover → install → use → remove).
-    "skill_list",
-    "skill_search",
-    "skill_install",
-    "skill_remove",
-    // Plugin meta tools (the 4 dispatchers): byte-identical for every client
-    // of this version, so they belong in the cacheable builtin prefix. Live
-    // per-plugin tool schemas are NOT registered here — they're rendered as
-    // text into user_system (KV-cache friendly) by `render_active_plugin_tools_text`.
-    "plugin_list",
-    "plugin_search",
-    "plugin_describe",
-    "plugin_invoke",
-];
+// BUILTIN_TOOL_NAMES lifted to rsclaw-types (crate-split); re-exported here so
+// existing crate::agent::prompt_builder::BUILTIN_TOOL_NAMES paths keep working.
+pub use rsclaw_types::BUILTIN_TOOL_NAMES;
 
 /// Build a minimal system prompt for internal sessions (heartbeat/cron/system).
 ///

@@ -19,6 +19,7 @@ path = "src/main.rs"
 rsclaw-types = { path = "crates/rsclaw-types" }
 rsclaw-config = { path = "crates/rsclaw-config" }
 rsclaw-embed = { path = "crates/rsclaw-embed" }
+rsclaw-provider = { path = "crates/rsclaw-provider" }
 rsclaw-retry = { path = "crates/rsclaw-retry" }
 rsclaw-util = { path = "crates/rsclaw-util" }
 rsclaw-platform = { path = "crates/rsclaw-platform" }

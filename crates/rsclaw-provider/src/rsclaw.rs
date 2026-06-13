@@ -2357,7 +2357,7 @@ fn dump_turn_for_debug(
         .chars()
         .take(8)
         .collect();
-    let dir = crate::config::loader::base_dir().join("debug");
+    let dir = rsclaw_config::loader::base_dir().join("debug");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         tracing::warn!(error = %e, "RSCLAW_DUMP_TURN: create_dir_all failed");
         return;
@@ -2465,7 +2465,7 @@ fn split_request<'a>(
     let mut dynamic_tools: Vec<Value> = Vec::new();
     let mut dynamic_user_tools: Vec<Value> = Vec::new();
     for t in &req.tools {
-        if crate::agent::prompt_builder::BUILTIN_TOOL_NAMES.contains(&t.name.as_str()) {
+        if rsclaw_types::BUILTIN_TOOL_NAMES.contains(&t.name.as_str()) {
             dynamic_tools.push(tool_json(t));
         } else {
             dynamic_user_tools.push(tool_json(t));
@@ -3414,7 +3414,7 @@ fn is_session_evicted(status: StatusCode, body: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::ToolDef;
+    use crate::ToolDef;
 
     fn feed_sse(parser: &mut SseTerminalParser, raw: &str) -> Option<(String, String)> {
         for line in raw.split('\n') {
@@ -3995,7 +3995,7 @@ data: {"type":"block_stop","index":0}
         let msg = Message {
             role: Role::User,
             content: MessageContent::Text("我的手机号是什么?".into()),
-            rsclaw_hidden: Some(crate::provider::RsclawHidden {
+            rsclaw_hidden: Some(crate::RsclawHidden {
                 recall_context: "- 用户手机号: 13900001234".into(),
                 recall_format: "xml".into(),
                 recall_mode: "committed".into(),
@@ -4731,7 +4731,7 @@ data: {"type":"block_stop","index":0}
         // same `tool_json` closure for both arrays, so testing one array
         // covers the other.
         let mut req = req_with(vec![], 2, Some("k"));
-        req.tools = vec![crate::provider::ToolDef {
+        req.tools = vec![crate::ToolDef {
             name: "search".into(), // not in BUILTIN_TOOL_NAMES → user_tools
             description: "look stuff up".into(),
             parameters: json!({
@@ -5326,9 +5326,9 @@ data: {"type":"block_stop","index":0}
             2,
             Some("k"),
         );
-        req.recall = Some(crate::provider::RecallBundle {
+        req.recall = Some(crate::RecallBundle {
             context: "用户手机号: 13900001234".into(),
-            metadata: crate::provider::RecallMetadata {
+            metadata: crate::RecallMetadata {
                 mode: "committed".into(),
                 format: "xml".into(),
                 source: "server".into(),
@@ -5371,9 +5371,9 @@ data: {"type":"block_stop","index":0}
             2,
             Some("k"),
         );
-        req.recall = Some(crate::provider::RecallBundle {
+        req.recall = Some(crate::RecallBundle {
             context: "  ".into(),
-            metadata: crate::provider::RecallMetadata::default(),
+            metadata: crate::RecallMetadata::default(),
         });
         let delta = TurnDelta::from_request(&req).unwrap();
         let recall = req.recall.as_ref().filter(|r| !r.context.trim().is_empty());
@@ -6029,7 +6029,7 @@ data: {"type":"block_stop","index":0}
             2,
             Some("k"),
         );
-        req.tools = vec![crate::provider::ToolDef {
+        req.tools = vec![crate::ToolDef {
             name: "read_file".into(),
             description: "read".into(),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
@@ -6419,7 +6419,7 @@ data: {"type":"block_stop","index":0}
         // Trait-level default impl: non-rsclaw providers should bail
         // with a "not supported" error so callers can fall back cleanly.
         // Sanity-check on a placeholder provider via the public trait.
-        use crate::provider::LlmProvider;
+        use crate::LlmProvider;
         struct StubProvider;
         impl LlmProvider for StubProvider {
             fn name(&self) -> &str {
@@ -6427,8 +6427,8 @@ data: {"type":"block_stop","index":0}
             }
             fn stream(
                 &self,
-                _req: crate::provider::LlmRequest,
-            ) -> futures::future::BoxFuture<'_, anyhow::Result<crate::provider::LlmStream>>
+                _req: crate::LlmRequest,
+            ) -> futures::future::BoxFuture<'_, anyhow::Result<crate::LlmStream>>
             {
                 Box::pin(async { anyhow::bail!("stub provider has no streaming") })
             }
@@ -6449,7 +6449,7 @@ data: {"type":"block_stop","index":0}
         // SessionEntry for `session_key` is missing — no point splicing
         // a session we don't think is open. Caller (compact_inner)
         // observes the Err and falls back to replay path.
-        use crate::provider::LlmProvider;
+        use crate::LlmProvider;
         let provider = RsclawProvider::new("http://nonexistent-host.invalid", None);
         let err = provider
             .compact_splice("missing-key", 2, "summary", 10, None)
@@ -6474,7 +6474,7 @@ data: {"type":"block_stop","index":0}
             matchers::{method, path},
         };
 
-        use crate::provider::LlmProvider;
+        use crate::LlmProvider;
 
         let mock_server = MockServer::start().await;
         let session_id = "rs_w7_abc";
@@ -6552,7 +6552,7 @@ data: {"type":"block_stop","index":0}
             matchers::{method, path},
         };
 
-        use crate::provider::LlmProvider;
+        use crate::LlmProvider;
 
         let mock_server = MockServer::start().await;
         let session_id = "rs_w7_retry";

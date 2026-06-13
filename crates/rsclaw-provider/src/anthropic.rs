@@ -163,7 +163,7 @@ fn build_request_body(req: &LlmRequest) -> Result<Value> {
             .iter()
             .map(|t| {
                 json!({
-                    "name":         crate::provider::openai::sanitize_tool_name(&t.name),
+                    "name":         crate::openai::sanitize_tool_name(&t.name),
                     "description":  t.description,
                     "input_schema": t.parameters,
                 })
@@ -301,7 +301,7 @@ fn serialize_part(part: &ContentPart) -> Value {
             // Echo the wire-encoded name so Anthropic accepts the
             // history block. The runtime stores names in their
             // original (restored) form, so re-sanitize on serialize.
-            "name":  crate::provider::openai::sanitize_tool_name(name),
+            "name":  crate::openai::sanitize_tool_name(name),
             "input": input,
         }),
         ContentPart::ToolResult {
@@ -637,7 +637,7 @@ mod tests {
     fn tool_choice_auto_set_when_tools_present() {
         let req = LlmRequest {
             fallback_models: Vec::new(),
-            tools: vec![crate::provider::ToolDef {
+            tools: vec![crate::ToolDef {
                 name: "shell".to_owned(),
                 description: "run a shell command".to_owned(),
                 parameters: serde_json::json!({"type": "object"}),

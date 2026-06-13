@@ -66,7 +66,7 @@ fn toml_providers() -> &'static HashMap<String, String> {
             providers: Vec<ProvEntry>,
         }
 
-        let raw = crate::config::loader::load_defaults_toml();
+        let raw = rsclaw_config::loader::load_defaults_toml();
         let defs: Defs = toml::from_str(&raw).unwrap_or_default();
 
         defs.providers

@@ -81,7 +81,6 @@ pub mod kb;
 pub mod mcp;
 pub mod migrate;
 pub mod plugin;
-pub mod provider;
 pub mod server;
 pub mod skill;
 pub mod store;
@@ -93,6 +92,7 @@ pub use rsclaw_config as config;
 pub use rsclaw_embed as embed;
 pub use rsclaw_events as events;
 pub use rsclaw_i18n as i18n;
+pub use rsclaw_provider as provider;
 pub use rsclaw_platform as sys;
 pub use rsclaw_util as util;
 

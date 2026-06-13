@@ -499,7 +499,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             vec![],
-            crate::provider::health::ProviderHealthRegistry::default(),
+            crate::health::ProviderHealthRegistry::default(),
         );
         mgr.set_cooldown("kimi", "default", Duration::from_secs(60));
         assert!(
@@ -522,7 +522,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             vec![],
-            crate::provider::health::ProviderHealthRegistry::default(),
+            crate::health::ProviderHealthRegistry::default(),
         );
         mgr.set_cooldown("kimi", "default", Duration::from_millis(1));
         mgr.set_cooldown("kimi", "default", Duration::from_millis(1));
