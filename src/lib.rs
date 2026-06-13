@@ -66,28 +66,28 @@ pub mod a2a;
 pub mod astock;
 pub(crate) mod cap;
 pub mod agent;
-pub mod browser;
-pub mod channel;
 pub mod cli;
 pub mod cmd;
-pub mod computer;
 pub mod cron;
-pub mod desktop;
 pub mod gateway;
 pub mod heartbeat;
-pub mod hooks;
-pub mod kb;
 pub mod migrate;
-pub mod plugin;
 pub mod server;
-pub mod skill;
-pub mod store;
 pub mod ws;
 
 // Extracted base crates — re-exported under their historical module paths so
 // in-crate `crate::i18n::` / `crate::util::` etc. still resolve during the split.
 pub use rsclaw_config as config;
 pub use rsclaw_artifact as artifact;
+pub use rsclaw_desktop as desktop;
+pub use rsclaw_browser as browser;
+pub use rsclaw_channel as channel;
+pub use rsclaw_computer as computer;
+pub use rsclaw_hooks as hooks;
+pub use rsclaw_kb as kb;
+pub use rsclaw_plugin as plugin;
+pub use rsclaw_skill as skill;
+pub use rsclaw_store as store;
 pub use rsclaw_embed as embed;
 pub use rsclaw_events as events;
 pub use rsclaw_i18n as i18n;

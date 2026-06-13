@@ -774,7 +774,7 @@ impl RedbStore {
     // -----------------------------------------------------------------------
 
     /// Enqueue a task. Returns `Ok(())` on success.
-    pub fn enqueue_task(&self, task: &crate::gateway::task_queue::QueuedTask) -> Result<()> {
+    pub fn enqueue_task(&self, task: &rsclaw_types::QueuedTask) -> Result<()> {
         let json = serde_json::to_string(task)?;
         let write = self.db.begin_write()?;
         {
@@ -787,18 +787,18 @@ impl RedbStore {
 
     /// Dequeue the highest-priority pending task (lowest priority number,
     /// oldest first). Atomically changes status from Pending to Running.
-    pub fn dequeue_task(&self) -> Result<Option<crate::gateway::task_queue::QueuedTask>> {
-        use crate::gateway::task_queue::TaskStatus;
+    pub fn dequeue_task(&self) -> Result<Option<rsclaw_types::QueuedTask>> {
+        use rsclaw_types::TaskStatus;
 
         let write = self.db.begin_write()?;
         let result = {
             let mut table = write.open_table(TASK_QUEUE)?;
-            let mut best: Option<crate::gateway::task_queue::QueuedTask> = None;
+            let mut best: Option<rsclaw_types::QueuedTask> = None;
 
             // Scan all tasks to find the best candidate.
             for entry in table.iter()? {
                 let (_k, v) = entry?;
-                let task: crate::gateway::task_queue::QueuedTask = serde_json::from_str(v.value())?;
+                let task: rsclaw_types::QueuedTask = serde_json::from_str(v.value())?;
                 if task.status != TaskStatus::Pending {
                     continue;
                 }
@@ -830,7 +830,7 @@ impl RedbStore {
     /// the count of tasks revived. Does NOT increment retries — the previous
     /// process simply died, the agent itself didn't fail.
     pub fn requeue_running_tasks(&self) -> Result<usize> {
-        use crate::gateway::task_queue::TaskStatus;
+        use rsclaw_types::TaskStatus;
 
         let write = self.db.begin_write()?;
         let count = {
@@ -838,7 +838,7 @@ impl RedbStore {
             let mut to_revive = Vec::new();
             for entry in table.iter()? {
                 let (_k, v) = entry?;
-                let task: crate::gateway::task_queue::QueuedTask = serde_json::from_str(v.value())?;
+                let task: rsclaw_types::QueuedTask = serde_json::from_str(v.value())?;
                 if task.status == TaskStatus::Running {
                     to_revive.push(task);
                 }
@@ -865,7 +865,7 @@ impl RedbStore {
             let guard = table
                 .get(task_id)?
                 .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
-            let mut task: crate::gateway::task_queue::QueuedTask =
+            let mut task: rsclaw_types::QueuedTask =
                 serde_json::from_str(guard.value())?;
             drop(guard);
             task.turns = turn;
@@ -886,7 +886,7 @@ impl RedbStore {
             let guard = table
                 .get(task_id)?
                 .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
-            let mut task: crate::gateway::task_queue::QueuedTask =
+            let mut task: rsclaw_types::QueuedTask =
                 serde_json::from_str(guard.value())?;
             drop(guard);
             task.last_reply = Some(text.to_owned());
@@ -907,7 +907,7 @@ impl RedbStore {
             let guard = table
                 .get(task_id)?
                 .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
-            let mut task: crate::gateway::task_queue::QueuedTask =
+            let mut task: rsclaw_types::QueuedTask =
                 serde_json::from_str(guard.value())?;
             drop(guard);
             task.notified = true;
@@ -923,7 +923,7 @@ impl RedbStore {
     pub fn update_task_status(
         &self,
         task_id: &str,
-        status: crate::gateway::task_queue::TaskStatus,
+        status: rsclaw_types::TaskStatus,
     ) -> Result<()> {
         let write = self.db.begin_write()?;
         {
@@ -931,7 +931,7 @@ impl RedbStore {
             let guard = table
                 .get(task_id)?
                 .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
-            let mut task: crate::gateway::task_queue::QueuedTask =
+            let mut task: rsclaw_types::QueuedTask =
                 serde_json::from_str(guard.value())?;
             drop(guard);
             task.status = status;
@@ -949,8 +949,8 @@ impl RedbStore {
         &self,
         task_id: &str,
         max_retries: u32,
-    ) -> Result<crate::gateway::task_queue::TaskStatus> {
-        use crate::gateway::task_queue::TaskStatus;
+    ) -> Result<rsclaw_types::TaskStatus> {
+        use rsclaw_types::TaskStatus;
 
         let write = self.db.begin_write()?;
         let status = {
@@ -958,7 +958,7 @@ impl RedbStore {
             let guard = table
                 .get(task_id)?
                 .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
-            let mut task: crate::gateway::task_queue::QueuedTask =
+            let mut task: rsclaw_types::QueuedTask =
                 serde_json::from_str(guard.value())?;
             drop(guard);
             task.retries += 1;
@@ -981,7 +981,7 @@ impl RedbStore {
     pub fn get_task(
         &self,
         task_id: &str,
-    ) -> Result<Option<crate::gateway::task_queue::QueuedTask>> {
+    ) -> Result<Option<rsclaw_types::QueuedTask>> {
         let read = self.db.begin_read()?;
         let table = read.open_table(TASK_QUEUE)?;
         match table.get(task_id)? {
@@ -996,14 +996,14 @@ impl RedbStore {
     /// List tasks, optionally filtered by status.
     pub fn list_tasks(
         &self,
-        status: Option<crate::gateway::task_queue::TaskStatus>,
-    ) -> Result<Vec<crate::gateway::task_queue::QueuedTask>> {
+        status: Option<rsclaw_types::TaskStatus>,
+    ) -> Result<Vec<rsclaw_types::QueuedTask>> {
         let read = self.db.begin_read()?;
         let table = read.open_table(TASK_QUEUE)?;
         let mut tasks = Vec::new();
         for entry in table.iter()? {
             let (_k, v) = entry?;
-            let task: crate::gateway::task_queue::QueuedTask = serde_json::from_str(v.value())?;
+            let task: rsclaw_types::QueuedTask = serde_json::from_str(v.value())?;
             if let Some(ref s) = status {
                 if task.status != *s {
                     continue;
@@ -1022,7 +1022,7 @@ impl RedbStore {
             let mut expired_ids = Vec::new();
             for entry in table.iter()? {
                 let (_k, v) = entry?;
-                let task: crate::gateway::task_queue::QueuedTask = serde_json::from_str(v.value())?;
+                let task: rsclaw_types::QueuedTask = serde_json::from_str(v.value())?;
                 if task.is_expired() {
                     expired_ids.push(task.id);
                 }
@@ -1040,13 +1040,13 @@ impl RedbStore {
     /// Check if there is a pending task for the same session_key with the
     /// same content hash (dedup guard).
     pub fn has_duplicate(&self, session_key: &str, content_hash: &str) -> Result<bool> {
-        use crate::gateway::task_queue::TaskStatus;
+        use rsclaw_types::TaskStatus;
 
         let read = self.db.begin_read()?;
         let table = read.open_table(TASK_QUEUE)?;
         for entry in table.iter()? {
             let (_k, v) = entry?;
-            let task: crate::gateway::task_queue::QueuedTask = serde_json::from_str(v.value())?;
+            let task: rsclaw_types::QueuedTask = serde_json::from_str(v.value())?;
             if task.session_key == session_key
                 && task.content_hash == content_hash
                 && task.status == TaskStatus::Pending
@@ -1062,9 +1062,9 @@ impl RedbStore {
     pub fn merge_into_pending(
         &self,
         session_key: &str,
-        message: &crate::gateway::task_queue::QueuedMessage,
+        message: &rsclaw_types::QueuedMessage,
     ) -> Result<bool> {
-        use crate::gateway::task_queue::TaskStatus;
+        use rsclaw_types::TaskStatus;
 
         let write = self.db.begin_write()?;
         let merged = {
@@ -1073,7 +1073,7 @@ impl RedbStore {
 
             for entry in table.iter()? {
                 let (_k, v) = entry?;
-                let task: crate::gateway::task_queue::QueuedTask = serde_json::from_str(v.value())?;
+                let task: rsclaw_types::QueuedTask = serde_json::from_str(v.value())?;
                 if task.session_key == session_key && task.status == TaskStatus::Pending {
                     target_id = Some(task.id);
                     break;
@@ -1084,7 +1084,7 @@ impl RedbStore {
                 let guard = table
                     .get(id.as_str())?
                     .ok_or_else(|| anyhow::anyhow!("task disappeared: {id}"))?;
-                let mut task: crate::gateway::task_queue::QueuedTask =
+                let mut task: rsclaw_types::QueuedTask =
                     serde_json::from_str(guard.value())?;
                 drop(guard);
                 task.messages.push(message.clone());
@@ -1290,7 +1290,7 @@ impl RedbStore {
     /// Insert a freshly-submitted external job.
     pub fn enqueue_external_job(
         &self,
-        job: &crate::gateway::external_jobs::ExternalJob,
+        job: &rsclaw_types::ExternalJob,
     ) -> Result<()> {
         let json = serde_json::to_string(job)?;
         let write = self.db.begin_write()?;
@@ -1307,7 +1307,7 @@ impl RedbStore {
     /// concurrent delete and abandon the update.
     pub fn update_external_job(
         &self,
-        job: &crate::gateway::external_jobs::ExternalJob,
+        job: &rsclaw_types::ExternalJob,
     ) -> Result<()> {
         let json = serde_json::to_string(job)?;
         let write = self.db.begin_write()?;
@@ -1326,7 +1326,7 @@ impl RedbStore {
     pub fn get_external_job(
         &self,
         job_id: &str,
-    ) -> Result<Option<crate::gateway::external_jobs::ExternalJob>> {
+    ) -> Result<Option<rsclaw_types::ExternalJob>> {
         let read = self.db.begin_read()?;
         let table = read.open_table(EXTERNAL_JOBS)?;
         match table.get(job_id)? {
@@ -1347,13 +1347,13 @@ impl RedbStore {
     pub fn due_external_jobs(
         &self,
         now: i64,
-    ) -> Result<Vec<crate::gateway::external_jobs::ExternalJob>> {
+    ) -> Result<Vec<rsclaw_types::ExternalJob>> {
         let read = self.db.begin_read()?;
         let table = read.open_table(EXTERNAL_JOBS)?;
         let mut due = Vec::new();
         for entry in table.iter()? {
             let (_k, v) = entry?;
-            let job: crate::gateway::external_jobs::ExternalJob = serde_json::from_str(v.value())?;
+            let job: rsclaw_types::ExternalJob = serde_json::from_str(v.value())?;
             if job.next_poll_at > now {
                 continue;
             }
@@ -1362,12 +1362,12 @@ impl RedbStore {
             // (cleanup_finished_external_jobs handles them).
             let needs_action = matches!(
                 job.status,
-                crate::gateway::external_jobs::ExternalJobStatus::Pending
-                    | crate::gateway::external_jobs::ExternalJobStatus::Polling
+                rsclaw_types::ExternalJobStatus::Pending
+                    | rsclaw_types::ExternalJobStatus::Polling
             ) || job.needs_delivery();
             if needs_action
                 && job.delivery_attempts
-                    < crate::gateway::external_jobs::ExternalJob::MAX_DELIVERY_ATTEMPTS
+                    < rsclaw_types::ExternalJob::MAX_DELIVERY_ATTEMPTS
             {
                 due.push(job);
             }
@@ -1393,7 +1393,7 @@ impl RedbStore {
     /// Undelivered terminal rows that haven't exhausted retries stay so
     /// the worker keeps trying.
     pub fn cleanup_finished_external_jobs(&self, retention_secs: i64) -> Result<usize> {
-        use crate::gateway::external_jobs::{ExternalJob, ExternalJobStatus};
+        use rsclaw_types::{ExternalJob, ExternalJobStatus};
 
         let cutoff = chrono::Utc::now().timestamp() - retention_secs;
         let write = self.db.begin_write()?;

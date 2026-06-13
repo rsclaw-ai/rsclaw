@@ -7526,14 +7526,23 @@ dependencies = [
  "regex",
  "reqwest",
  "rsclaw-artifact",
+ "rsclaw-browser",
+ "rsclaw-channel",
+ "rsclaw-computer",
  "rsclaw-config",
+ "rsclaw-desktop",
  "rsclaw-embed",
  "rsclaw-events",
+ "rsclaw-hooks",
  "rsclaw-i18n",
+ "rsclaw-kb",
  "rsclaw-mcp",
  "rsclaw-platform",
+ "rsclaw-plugin",
  "rsclaw-provider",
  "rsclaw-retry",
+ "rsclaw-skill",
+ "rsclaw-store",
  "rsclaw-types",
  "rsclaw-util",
  "rusqlite",
@@ -7594,6 +7603,74 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsclaw-browser"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "futures",
+ "reqwest",
+ "rsclaw-config",
+ "rsclaw-events",
+ "rsclaw-i18n",
+ "rsclaw-platform",
+ "rsclaw-types",
+ "rsclaw-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.29.0",
+ "tracing",
+]
+
+[[package]]
+name = "rsclaw-channel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "futures",
+ "reqwest",
+ "rsclaw-config",
+ "rsclaw-events",
+ "rsclaw-i18n",
+ "rsclaw-platform",
+ "rsclaw-provider",
+ "rsclaw-retry",
+ "rsclaw-store",
+ "rsclaw-types",
+ "rsclaw-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rsclaw-computer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "display-info",
+ "enigo",
+ "image 0.25.10",
+ "rsclaw-config",
+ "rsclaw-events",
+ "rsclaw-i18n",
+ "rsclaw-platform",
+ "rsclaw-provider",
+ "rsclaw-store",
+ "rsclaw-types",
+ "rsclaw-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rsclaw-config"
 version = "0.1.0"
 dependencies = [
@@ -7613,6 +7690,21 @@ dependencies = [
  "toml 1.1.0+spec-1.1.0",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "rsclaw-desktop"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "enigo",
+ "image 0.25.10",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "xcap",
 ]
 
 [[package]]
@@ -7642,8 +7734,54 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsclaw-hooks"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rsclaw-config",
+ "rsclaw-events",
+ "rsclaw-i18n",
+ "rsclaw-platform",
+ "rsclaw-provider",
+ "rsclaw-types",
+ "rsclaw-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rsclaw-i18n"
 version = "0.1.0"
+
+[[package]]
+name = "rsclaw-kb"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "hnsw_rs",
+ "jieba-rs",
+ "once_cell",
+ "reqwest",
+ "rsclaw-config",
+ "rsclaw-embed",
+ "rsclaw-events",
+ "rsclaw-i18n",
+ "rsclaw-platform",
+ "rsclaw-provider",
+ "rsclaw-store",
+ "rsclaw-types",
+ "rsclaw-util",
+ "serde",
+ "serde_json",
+ "tantivy",
+ "tokio",
+ "tracing",
+ "ulid",
+ "url",
+]
 
 [[package]]
 name = "rsclaw-mcp"
@@ -7664,9 +7802,35 @@ name = "rsclaw-platform"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dirs-next",
  "libc",
  "sys-info",
  "tokio",
+ "which 7.0.3",
+]
+
+[[package]]
+name = "rsclaw-plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rsclaw-browser",
+ "rsclaw-channel",
+ "rsclaw-config",
+ "rsclaw-events",
+ "rsclaw-i18n",
+ "rsclaw-kb",
+ "rsclaw-platform",
+ "rsclaw-provider",
+ "rsclaw-store",
+ "rsclaw-types",
+ "rsclaw-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "wasmtime",
+ "wasmtime-wasi",
 ]
 
 [[package]]
@@ -7708,10 +7872,56 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsclaw-skill"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "reqwest",
+ "rsclaw-config",
+ "rsclaw-events",
+ "rsclaw-i18n",
+ "rsclaw-platform",
+ "rsclaw-provider",
+ "rsclaw-store",
+ "rsclaw-types",
+ "rsclaw-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rsclaw-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "md-5",
+ "redb 4.1.0",
+ "rsclaw-config",
+ "rsclaw-events",
+ "rsclaw-i18n",
+ "rsclaw-platform",
+ "rsclaw-types",
+ "rsclaw-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "rsclaw-types"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "hex",
+ "md-5",
  "serde",
+ "uuid",
 ]
 
 [[package]]

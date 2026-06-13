@@ -152,3 +152,344 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "plugin_describe",
     "plugin_invoke",
 ];
+
+// ============================================================================
+// Gateway persistence records (crate-split): lifted from gateway/{task_queue,
+// external_jobs}.rs so rsclaw-store can depend on them without depending on the
+// gateway runtime. Re-exported at their original paths.
+// ============================================================================
+use serde::{Serialize, Deserialize};
+use md5::Md5;
+use md5::Digest as _;
+
+/// Task priority. Lower numeric value = higher priority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum Priority {
+    /// Internal system tasks (highest).
+    System = 0,
+    /// Scheduled / cron tasks.
+    Cron = 1,
+    /// User-initiated messages (default).
+    User = 2,
+}
+
+/// Lifecycle status of a queued task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TaskStatus {
+    Pending,
+    Running,
+    Done,
+    Failed,
+    /// Exceeded max retries — dead-letter.
+    Dead,
+}
+
+/// A file attachment staged on disk for queue persistence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedFile {
+    /// Original filename from the channel.
+    pub filename: String,
+    /// Path to the staged file on disk (under `var/data/queue/staging/`).
+    pub path: String,
+    /// MIME type.
+    pub mime_type: String,
+}
+
+/// A message captured for later processing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedMessage {
+    pub text: String,
+    pub sender: String,
+    pub channel: String,
+    /// Multi-account tag (e.g. feishu account name) so a queued task's reply
+    /// is sent back via the same account that received it. None =
+    /// single-account channel; the bare `{channel}` sender is used.
+    #[serde(default)]
+    pub account: Option<String>,
+    /// Platform-specific chat/conversation ID (e.g. Telegram chat_id).
+    pub chat_id: String,
+    /// Whether this message originated from a group conversation.
+    pub is_group: bool,
+    /// Platform message ID for reply quoting (e.g. QQ msg_id).
+    #[serde(default)]
+    pub reply_to: Option<String>,
+    pub timestamp: i64,
+    /// Base64-encoded images or file-system paths.
+    pub images: Vec<String>,
+    /// File attachments staged on disk.
+    pub files: Vec<QueuedFile>,
+}
+
+/// A task sitting in the persistent queue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedTask {
+    pub id: String,
+    pub session_key: String,
+    pub messages: Vec<QueuedMessage>,
+    pub priority: Priority,
+    pub status: TaskStatus,
+    pub retries: u32,
+    pub max_retries: u32,
+    /// How many agent turns have been executed for this task.
+    #[serde(default)]
+    pub turns: u32,
+    /// Max agent turns before giving up (0 = single turn, no auto-continue).
+    #[serde(default = "default_max_turns")]
+    pub max_turns: u32,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// Time-to-live in seconds. 0 means no expiry.
+    pub ttl_secs: u64,
+    /// MD5 hash of the first message text (for dedup).
+    pub content_hash: String,
+    /// Last error message, if any.
+    pub error: Option<String>,
+    /// Whether the final reply was confirmed delivered to the channel. Used
+    /// by WS reconnect (and any other channel that re-attaches) to replay
+    /// completions that fired while the client was offline.
+    #[serde(default)]
+    pub notified: bool,
+    /// Most recent agent reply text — captured per turn so reconnect-replay
+    /// can re-deliver the answer without consulting the chat-history index.
+    #[serde(default)]
+    pub last_reply: Option<String>,
+}
+
+impl QueuedTask {
+    /// Create a new pending task from a single inbound message.
+    pub fn new(session_key: String, message: QueuedMessage, priority: Priority) -> Self {
+        let now = chrono::Utc::now().timestamp();
+        let hash = compute_hash(&message.text);
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_key,
+            messages: vec![message],
+            priority,
+            status: TaskStatus::Pending,
+            retries: 0,
+            max_retries: 3,
+            turns: 0,
+            max_turns: default_max_turns(),
+            created_at: now,
+            updated_at: now,
+            ttl_secs: 3600,
+            content_hash: hash,
+            error: None,
+            notified: false,
+            last_reply: None,
+        }
+    }
+
+    /// Whether this task has exceeded its TTL.
+    pub fn is_expired(&self) -> bool {
+        if self.ttl_secs == 0 {
+            return false;
+        }
+        let now = chrono::Utc::now().timestamp();
+        now - self.created_at > self.ttl_secs as i64
+    }
+
+    /// Combine all queued messages into a single prompt string.
+    pub fn merged_text(&self) -> String {
+        if self.messages.len() == 1 {
+            return self.messages[0].text.clone();
+        }
+        self.messages
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n")
+    }
+}
+
+/// Default max turns for regular messages (no auto-continue).
+pub fn default_max_turns() -> u32 {
+    0
+}
+
+/// Compute an MD5 hex digest of `text` (for content dedup, not security).
+pub fn compute_hash(text: &str) -> String {
+    let hash = Md5::digest(text.as_bytes());
+    hex::encode(hash)
+}/// What kind of artifact the job will produce when it finishes. Used by the
+/// worker's delivery step to pick the right channel formatting (e.g. video
+/// vs image attachment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExternalJobKind {
+    /// Provider generated a video (URL → download → channel attachment).
+    VideoGen,
+    /// Provider generated an image (URL → download → channel attachment).
+    ImageGen,
+}
+
+/// What initiated the job. Drives the delivery decision: agent-originated
+/// jobs may carry a `reply_to`, cron-originated jobs are pushed as a fresh
+/// notification, user-direct (REST) jobs return through their HTTP handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExternalJobOrigin {
+    Agent,
+    Cron,
+    UserDirect,
+}
+
+/// Lifecycle of an external job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExternalJobStatus {
+    /// Submitted to provider, never polled yet.
+    Pending,
+    /// Worker is actively polling (status persisted in case the worker
+    /// crashes between poll and update — recovery treats it the same as
+    /// `Pending`).
+    Polling,
+    /// Provider reported success and the artifact has been delivered.
+    Done,
+    /// Provider reported a non-recoverable error.
+    Failed,
+    /// Worker exhausted the timeout budget without a terminal status.
+    TimedOut,
+}
+
+/// Routing context for delivering the artifact when polling completes.
+/// Mirrors the fields of `OutboundMessage` that depend on the originating
+/// message rather than the job result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalJobDelivery {
+    pub channel: String,
+    pub target_id: String,
+    pub is_group: bool,
+    pub reply_to: Option<String>,
+}
+
+/// A provider job sitting in the persistent queue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalJob {
+    /// Internal UUID — primary key in the redb table.
+    pub id: String,
+    /// Originating session_key so the result can be appended to the right
+    /// conversation history.
+    pub session_key: String,
+    /// Where to push the finished artifact.
+    pub delivery: ExternalJobDelivery,
+    /// What kicked off the job (agent / cron / direct).
+    pub origin: ExternalJobOrigin,
+    /// Provider name, matching the dispatch keys used by the worker
+    /// (e.g. "seedance", "minimax").
+    pub provider: String,
+    /// Provider's own task identifier.
+    pub external_task_id: String,
+    /// What kind of artifact to expect.
+    pub kind: ExternalJobKind,
+    /// Original prompt — kept so the delivery message can give the user
+    /// context ("Your video for: <prompt>") without re-fetching from
+    /// chat history.
+    pub prompt: String,
+    /// Wall-clock submission time (Unix seconds).
+    pub submitted_at: i64,
+    /// Earliest wall-clock time at which the worker should poll again.
+    pub next_poll_at: i64,
+    /// How many times we've polled this job — drives the back-off.
+    pub poll_count: u32,
+    /// Hard deadline; once `now() > timeout_at` the worker marks the row
+    /// `TimedOut` regardless of provider state.
+    pub timeout_at: i64,
+    /// Current lifecycle state.
+    pub status: ExternalJobStatus,
+    /// Last error message (transient or terminal).
+    pub error: Option<String>,
+    /// Result URL from the provider (set when Done).
+    pub result_url: Option<String>,
+    /// Local file path after download (set when Done — so reconnect-replay
+    /// can re-deliver the saved artifact instead of re-downloading).
+    pub result_path: Option<String>,
+    /// Wall-clock time the artifact (or failure notice) was successfully
+    /// pushed via `notification_tx`. While `None`, the worker treats the
+    /// row as "needs delivery" and will retry each tick — protects against
+    /// `notification_tx.send` failing on a full broadcast or transient
+    /// channel-handler issue.
+    #[serde(default)]
+    pub delivered_at: Option<i64>,
+    /// Number of delivery attempts so far. Drives the next-retry back-off
+    /// in worker.rs and bounds the retry budget.
+    #[serde(default)]
+    pub delivery_attempts: u32,
+}
+
+/// Default per-job timeout — 30 minutes covers Seedance / MiniMax / Kling
+/// in the worst case while still bounding redb row lifetime.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 30 * 60;
+
+/// Default polling cadence used by `next_poll_delay_secs` for the first
+/// dense window; afterwards the worker switches to `LATE_POLL_INTERVAL_SECS`.
+pub const EARLY_POLL_INTERVAL_SECS: u64 = 10;
+
+pub const LATE_POLL_INTERVAL_SECS: u64 = 60;
+
+pub const EARLY_POLL_BUDGET: u32 = 12; // 12 polls × 10s = first 2 minutes
+
+impl ExternalJob {
+    /// Build a freshly-submitted job ready to be enqueued.
+    pub fn new_submitted(
+        session_key: impl Into<String>,
+        delivery: ExternalJobDelivery,
+        origin: ExternalJobOrigin,
+        provider: impl Into<String>,
+        external_task_id: impl Into<String>,
+        kind: ExternalJobKind,
+        prompt: impl Into<String>,
+    ) -> Self {
+        let now = chrono::Utc::now().timestamp();
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_key: session_key.into(),
+            delivery,
+            origin,
+            provider: provider.into(),
+            external_task_id: external_task_id.into(),
+            kind,
+            prompt: prompt.into(),
+            submitted_at: now,
+            next_poll_at: now + EARLY_POLL_INTERVAL_SECS as i64,
+            poll_count: 0,
+            timeout_at: now + DEFAULT_TIMEOUT_SECS as i64,
+            status: ExternalJobStatus::Pending,
+            error: None,
+            result_url: None,
+            result_path: None,
+            delivered_at: None,
+            delivery_attempts: 0,
+        }
+    }
+
+    /// True when the job is in a terminal state (`Done` / `Failed` /
+    /// `TimedOut`) but the result has not yet been pushed via the
+    /// notification channel. Used by the worker's delivery-retry sweep.
+    pub fn needs_delivery(&self) -> bool {
+        matches!(
+            self.status,
+            ExternalJobStatus::Done | ExternalJobStatus::Failed | ExternalJobStatus::TimedOut
+        ) && self.delivered_at.is_none()
+    }
+
+    /// Max delivery retries before we give up. After this the job is
+    /// considered abandoned (logged) and GC-eligible regardless of
+    /// `delivered_at` so the table doesn't grow forever on a permanently
+    /// broken channel sink.
+    pub const MAX_DELIVERY_ATTEMPTS: u32 = 60; // ~30 min at 30s back-off
+
+    /// Compute the next polling delay using a coarse two-step back-off:
+    /// dense (10 s) for the first ~2 minutes — when most jobs finish — then
+    /// sparse (60 s) for the long tail.
+    pub fn next_poll_delay_secs(&self) -> u64 {
+        if self.poll_count < EARLY_POLL_BUDGET {
+            EARLY_POLL_INTERVAL_SECS
+        } else {
+            LATE_POLL_INTERVAL_SECS
+        }
+    }
+
+    /// Whether the worker should treat this job as exhausted.
+    pub fn is_timed_out(&self) -> bool {
+        chrono::Utc::now().timestamp() > self.timeout_at
+    }
+}

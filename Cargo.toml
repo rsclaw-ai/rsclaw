@@ -20,6 +20,15 @@ rsclaw-types = { path = "crates/rsclaw-types" }
 rsclaw-config = { path = "crates/rsclaw-config" }
 rsclaw-artifact = { path = "crates/rsclaw-artifact" }
 rsclaw-mcp = { path = "crates/rsclaw-mcp" }
+rsclaw-desktop = { path = "crates/rsclaw-desktop" }
+rsclaw-browser = { path = "crates/rsclaw-browser" }
+rsclaw-channel = { path = "crates/rsclaw-channel" }
+rsclaw-computer = { path = "crates/rsclaw-computer" }
+rsclaw-hooks = { path = "crates/rsclaw-hooks" }
+rsclaw-kb = { path = "crates/rsclaw-kb" }
+rsclaw-plugin = { path = "crates/rsclaw-plugin" }
+rsclaw-skill = { path = "crates/rsclaw-skill" }
+rsclaw-store = { path = "crates/rsclaw-store" }
 rsclaw-embed = { path = "crates/rsclaw-embed" }
 rsclaw-provider = { path = "crates/rsclaw-provider" }
 rsclaw-retry = { path = "crates/rsclaw-retry" }

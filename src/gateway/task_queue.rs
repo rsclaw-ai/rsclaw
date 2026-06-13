@@ -26,28 +26,9 @@ use crate::{
 // Types
 // ---------------------------------------------------------------------------
 
-/// Task priority. Lower numeric value = higher priority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[repr(u8)]
-pub enum Priority {
-    /// Internal system tasks (highest).
-    System = 0,
-    /// Scheduled / cron tasks.
-    Cron = 1,
-    /// User-initiated messages (default).
-    User = 2,
-}
+// Records lifted to rsclaw-types (crate-split); re-exported.
+pub use rsclaw_types::{Priority, TaskStatus, QueuedFile, QueuedMessage, QueuedTask, default_max_turns, compute_hash};
 
-/// Lifecycle status of a queued task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TaskStatus {
-    Pending,
-    Running,
-    Done,
-    Failed,
-    /// Exceeded max retries — dead-letter.
-    Dead,
-}
 
 /// Outcome of a single agent turn, used by the auto-continue supervisor.
 ///
@@ -288,128 +269,10 @@ pub fn drain_pending_outcome(session_key: &str) -> Option<StructuredOutcome> {
     pending_outcomes_map().lock().ok()?.remove(session_key)
 }
 
-/// A file attachment staged on disk for queue persistence.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueuedFile {
-    /// Original filename from the channel.
-    pub filename: String,
-    /// Path to the staged file on disk (under `var/data/queue/staging/`).
-    pub path: String,
-    /// MIME type.
-    pub mime_type: String,
-}
 
-/// A message captured for later processing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueuedMessage {
-    pub text: String,
-    pub sender: String,
-    pub channel: String,
-    /// Multi-account tag (e.g. feishu account name) so a queued task's reply
-    /// is sent back via the same account that received it. None =
-    /// single-account channel; the bare `{channel}` sender is used.
-    #[serde(default)]
-    pub account: Option<String>,
-    /// Platform-specific chat/conversation ID (e.g. Telegram chat_id).
-    pub chat_id: String,
-    /// Whether this message originated from a group conversation.
-    pub is_group: bool,
-    /// Platform message ID for reply quoting (e.g. QQ msg_id).
-    #[serde(default)]
-    pub reply_to: Option<String>,
-    pub timestamp: i64,
-    /// Base64-encoded images or file-system paths.
-    pub images: Vec<String>,
-    /// File attachments staged on disk.
-    pub files: Vec<QueuedFile>,
-}
 
-/// A task sitting in the persistent queue.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueuedTask {
-    pub id: String,
-    pub session_key: String,
-    pub messages: Vec<QueuedMessage>,
-    pub priority: Priority,
-    pub status: TaskStatus,
-    pub retries: u32,
-    pub max_retries: u32,
-    /// How many agent turns have been executed for this task.
-    #[serde(default)]
-    pub turns: u32,
-    /// Max agent turns before giving up (0 = single turn, no auto-continue).
-    #[serde(default = "default_max_turns")]
-    pub max_turns: u32,
-    pub created_at: i64,
-    pub updated_at: i64,
-    /// Time-to-live in seconds. 0 means no expiry.
-    pub ttl_secs: u64,
-    /// MD5 hash of the first message text (for dedup).
-    pub content_hash: String,
-    /// Last error message, if any.
-    pub error: Option<String>,
-    /// Whether the final reply was confirmed delivered to the channel. Used
-    /// by WS reconnect (and any other channel that re-attaches) to replay
-    /// completions that fired while the client was offline.
-    #[serde(default)]
-    pub notified: bool,
-    /// Most recent agent reply text — captured per turn so reconnect-replay
-    /// can re-deliver the answer without consulting the chat-history index.
-    #[serde(default)]
-    pub last_reply: Option<String>,
-}
 
-impl QueuedTask {
-    /// Create a new pending task from a single inbound message.
-    pub fn new(session_key: String, message: QueuedMessage, priority: Priority) -> Self {
-        let now = chrono::Utc::now().timestamp();
-        let hash = compute_hash(&message.text);
-        Self {
-            id: uuid::Uuid::new_v4().to_string(),
-            session_key,
-            messages: vec![message],
-            priority,
-            status: TaskStatus::Pending,
-            retries: 0,
-            max_retries: 3,
-            turns: 0,
-            max_turns: default_max_turns(),
-            created_at: now,
-            updated_at: now,
-            ttl_secs: 3600,
-            content_hash: hash,
-            error: None,
-            notified: false,
-            last_reply: None,
-        }
-    }
 
-    /// Whether this task has exceeded its TTL.
-    pub fn is_expired(&self) -> bool {
-        if self.ttl_secs == 0 {
-            return false;
-        }
-        let now = chrono::Utc::now().timestamp();
-        now - self.created_at > self.ttl_secs as i64
-    }
-
-    /// Combine all queued messages into a single prompt string.
-    pub fn merged_text(&self) -> String {
-        if self.messages.len() == 1 {
-            return self.messages[0].text.clone();
-        }
-        self.messages
-            .iter()
-            .map(|m| m.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n---\n\n")
-    }
-}
-
-/// Default max turns for regular messages (no auto-continue).
-fn default_max_turns() -> u32 {
-    0
-}
 
 /// Default max turns for /task mode.
 pub const TASK_DEFAULT_MAX_TURNS: u32 = 10;
@@ -511,11 +374,6 @@ fn parse_duration_str(s: &str) -> Option<u64> {
     if total > 0 { Some(total) } else { None }
 }
 
-/// Compute an MD5 hex digest of `text` (for content dedup, not security).
-fn compute_hash(text: &str) -> String {
-    let hash = Md5::digest(text.as_bytes());
-    hex::encode(hash)
-}
 
 // ---------------------------------------------------------------------------
 // Queue stats
