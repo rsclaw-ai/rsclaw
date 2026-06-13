@@ -18,7 +18,7 @@ use std::{
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-use crate::config::schema::AstockConfig;
+use rsclaw_config::schema::AstockConfig;
 
 /// Conservative defaults applied when the user didn't specify a
 /// cache TTL. Quotes change every tick during trading hours but

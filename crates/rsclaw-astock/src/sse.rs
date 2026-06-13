@@ -45,9 +45,9 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
-use crate::agent::memory::MemoryStore;
-use crate::channel::OutboundMessage;
-use crate::config::schema::AstockConfig;
+use rsclaw_memory::MemoryStore;
+use rsclaw_types::OutboundMessage;
+use rsclaw_config::schema::AstockConfig;
 
 /// Reasonable defaults when `config.astock.sse` is missing entries.
 const DEFAULT_FILTERS: &[&str] = &[
@@ -298,7 +298,7 @@ async fn dispatch_event(
 /// `agent:{id}:watchlist:{channel}:{peer}` that `stock_watchlist`
 /// writes to.
 async fn handle_hit(evt: HitEvent, filter: &str, dedupe: &Arc<Mutex<DedupeLru>>) {
-    let Some(mem) = crate::agent::memory::global_store() else {
+    let Some(mem) = rsclaw_memory::global_store() else {
         return;
     };
     let groups = collect_peers_watching_code(&mem, &evt.code).await;
@@ -332,11 +332,11 @@ async fn handle_hit(evt: HitEvent, filter: &str, dedupe: &Arc<Mutex<DedupeLru>>)
             channel: Some(channel.clone()),
             account: account.clone(),
         };
-        if let Err(e) = crate::gateway::task_queue::push_outbound(
-            &channel,
-            account.as_deref(),
-            msg,
-        ) {
+        let push_result = match crate::global_briefing_sink() {
+            Some(sink) => sink.push_outbound(&channel, account.as_deref(), msg),
+            None => Err("briefing sink not installed".to_string()),
+        };
+        if let Err(e) = push_result {
             tracing::warn!(
                 channel = %channel,
                 peer = %peer_id,

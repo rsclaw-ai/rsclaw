@@ -524,3 +524,31 @@ pub trait NotificationSink: Send + Sync {
 }
 
 pub mod turn_metrics;
+
+// ============================================================================
+// BriefingSink (crate-split): trait inversion so rsclaw-astock can submit to the
+// gateway task queue + push outbound WITHOUT depending on the gateway runtime.
+// Root's gateway implements this and injects it at startup.
+// ============================================================================
+pub trait BriefingSink: Send + Sync {
+    /// Submit a briefing prompt to the agent task queue.
+    /// Returns (task_id, merged_into_existing).
+    fn submit_briefing(
+        &self,
+        session_key: &str,
+        text: &str,
+        channel: &str,
+        peer_id: &str,
+        chat_id: &str,
+        is_group: bool,
+        priority: Priority,
+    ) -> anyhow::Result<(String, bool)>;
+
+    /// Push an outbound message directly to a channel sender.
+    fn push_outbound(
+        &self,
+        channel: &str,
+        account: Option<&str>,
+        msg: OutboundMessage,
+    ) -> Result<(), String>;
+}

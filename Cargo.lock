@@ -7526,6 +7526,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rsclaw-artifact",
+ "rsclaw-astock",
  "rsclaw-browser",
  "rsclaw-channel",
  "rsclaw-computer",
@@ -7602,6 +7603,28 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "rsclaw-astock"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "chrono-tz",
+ "futures",
+ "plotters",
+ "reqwest",
+ "rsclaw-config",
+ "rsclaw-i18n",
+ "rsclaw-memory",
+ "rsclaw-types",
+ "rsclaw-util",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

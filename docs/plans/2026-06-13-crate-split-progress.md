@@ -51,3 +51,24 @@ cannot be split without trait/event-bus inversion (separate effort).
 - memory↔kb "cycle" was a doc-comment, not real — no cycle.
 - WIT bindgen path in plugin (src/plugin/wit → src/wit after move).
 - gateway cannot be extracted alone (agent↔gateway bidirectional, ~103+108 refs).
+
+## Knot re-analysis (2026-06-14): 5 of 6 'knot' modules ARE extractable
+Prior classification was too coarse. Verdicts:
+- **heartbeat**: EXTRACTABLE_VIA_TRAIT (effort M)
+  - traits: ['Trait: AgentRegistryApi defined in rsclaw-heartbeat { fn get_agent(&self, id: &str) -> Result<AgentHandleProxy>; }. Root (src/agent/registry.rs) provides impl wrapping AgentRegistry -> AgentHandle.']
+  - CLEAN EXTRACTION PATH: heartbeat is a self-contained meditation/scheduled-message loop spawned once at gateway startup. Zero reverse edges (gateway only calls it once to spawn, never calls back). All 
+- **astock**: EXTRACTABLE_VIA_TRAIT (effort M)
+  - traits: ['TRAIT: QueueSubmit — define in new rsclaw-gateway-api crate or extend rsclaw-channel; two methods:']
+  - ANALYSIS: astock is a pure A-share market data client + briefing scheduler + SSE notification bridge. It has zero bidirectional dependencies and all reverse edges are one-way (startup init, read-only 
+- **cron**: EXTRACTABLE_VIA_SINK (effort L)
+  - traits: ['Define Preparser trait in rsclaw-cron-types: trait Preparser { async fn try_preparse(...) -> Option<Reply> }; ROOT (gateway) implements Preparser; CronRunner calls via Arc<dyn Preparser>. This breaks the gateway::preparse circular dependency.']
+  - EXTRACTABLE_VIA_SINK verdict: The core cycle is cron↔agent (CronRunner needs AgentRegistry/AgentMessage; agent::tools_cron needs validate_cron_expr + load/save + cron_store). Split strategy: (1) Extra
+- **a2a**: EXTRACTABLE_VIA_SINK (effort L)
+  - traits: ['Define trait A2aEventEmitter in rsclaw-a2a-types with method emit_agent_event(event: AgentEvent). rsclaw-agent impls for AgentMessage.event_tx. a2a/streaming.rs, a2a/server.rs call through this trait instead of Option::is_some checks.']
+  - CRITICAL FINDING: a2a is CLEANLY EXTRACTABLE via 2-3 straightforward sinks, NOT a true cycle. AgentMessage does NOT embed AgentEvent directly — it only has an optional mpsc::Sender<AgentEvent> field s
+- **cap**: EXTRACTABLE_VIA_SINK (effort M)
+  - traits: []
+  - The critical finding: AgentMessage coupling is not a true blocker because inject_followup() is DEAD CODE (marked #[allow(dead_code)], never called in production, commented as "intentionally NOT called
+- **ws**: TRUE_CYCLE_LEAVE_ROOT (effort L)
+  - traits: ['No trait inversions possible for full extraction: AppState aggregates 30+ runtime subsystems (agents, store, event_bus, computer_permission, shutdown, memory, knowledge, task_store, etc.) and every ws handler method depends on multiple fields. Defining a trait would require 15-20+ accessors and is artificial since AppState IS fundamentally the handler context.']
+  - VERDICT: ws is NOT EXTRACTABLE to a standalone crate without creating artificial trait seams. The core blocker is that EVERY ws method handler (50+ functions across 10 modules) has signature `async fn

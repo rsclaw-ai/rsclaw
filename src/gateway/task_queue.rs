@@ -1748,3 +1748,35 @@ mod tests {
         assert!(matches!(classify_outcome(&reply), TaskOutcome::Done));
     }
 }
+
+/// Root-side implementation of `rsclaw_types::BriefingSink` (crate-split
+/// trait inversion). Lets `rsclaw-astock` submit briefings + push outbound
+/// through the gateway task queue without depending on the gateway crate.
+/// Injected into astock at startup via `astock::set_global_briefing_sink`.
+pub struct GatewayBriefingSink;
+
+impl rsclaw_types::BriefingSink for GatewayBriefingSink {
+    fn submit_briefing(
+        &self,
+        session_key: &str,
+        text: &str,
+        channel: &str,
+        peer_id: &str,
+        chat_id: &str,
+        is_group: bool,
+        priority: Priority,
+    ) -> anyhow::Result<(String, bool)> {
+        let tq = get_task_queue()
+            .ok_or_else(|| anyhow::anyhow!("task queue not installed"))?;
+        submit_to_queue(&tq, session_key, text, channel, peer_id, chat_id, is_group, priority)
+    }
+
+    fn push_outbound(
+        &self,
+        channel: &str,
+        account: Option<&str>,
+        msg: OutboundMessage,
+    ) -> Result<(), String> {
+        push_outbound(channel, account, msg)
+    }
+}

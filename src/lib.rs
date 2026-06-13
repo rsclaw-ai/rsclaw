@@ -63,7 +63,6 @@
 )]
 
 pub mod a2a;
-pub mod astock;
 pub(crate) mod cap;
 pub mod agent;
 pub mod cli;
@@ -80,6 +79,7 @@ pub mod ws;
 // in-crate `crate::i18n::` / `crate::util::` etc. still resolve during the split.
 pub use rsclaw_config as config;
 pub use rsclaw_artifact as artifact;
+pub use rsclaw_astock as astock;
 pub use rsclaw_desktop as desktop;
 pub use rsclaw_browser as browser;
 pub use rsclaw_channel as channel;

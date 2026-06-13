@@ -43,7 +43,7 @@ use chrono_tz::Asia::Shanghai;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::agent::memory::MemoryStore;
+use rsclaw_memory::MemoryStore;
 
 /// Three briefing slots. Distinct types (not just a time) so the
 /// prompt template can differ per slot.
@@ -92,7 +92,7 @@ impl BriefingSlot {
     }
 
     fn config_wallclock(&self) -> Option<NaiveTime> {
-        let cfg = crate::config::load().ok()?;
+        let cfg = rsclaw_config::load().ok()?;
         let slots = cfg.raw.astock.as_ref()?.briefing.as_ref()?.slots.as_ref()?;
         let raw = slots.get(self.slug())?;
         match NaiveTime::parse_from_str(raw.trim(), "%H:%M") {
@@ -295,7 +295,7 @@ pub fn spawn_scheduler() {
 /// but the price/snapshot/kline numbers are now 100% from astock at
 /// fire time.
 async fn dispatch_for_slot(slot: BriefingSlot) {
-    let Some(mem) = crate::agent::memory::global_store() else {
+    let Some(mem) = rsclaw_memory::global_store() else {
         tracing::warn!("no memory store; skipping briefing");
         return;
     };
@@ -307,11 +307,11 @@ async fn dispatch_for_slot(slot: BriefingSlot) {
         );
         return;
     }
-    let Some(tq) = crate::gateway::task_queue::get_task_queue() else {
-        tracing::warn!("task queue not installed; skipping briefing");
+    let Some(sink) = crate::global_briefing_sink() else {
+        tracing::warn!("briefing sink not installed; skipping briefing");
         return;
     };
-    let arc = match crate::astock::global_client() {
+    let arc = match crate::global_client() {
         Some(c) => c,
         None => {
             tracing::warn!(
@@ -341,15 +341,14 @@ async fn dispatch_for_slot(slot: BriefingSlot) {
             "agent:{}:{}:direct:{}",
             group.agent_id, group.channel, group.peer_id
         );
-        match crate::gateway::task_queue::submit_to_queue(
-            &tq,
+        match sink.submit_briefing(
             &session_key,
             &prompt,
             &group.channel,
             &group.peer_id,
             &group.peer_id,
             false,
-            crate::gateway::task_queue::Priority::Cron,
+            rsclaw_types::Priority::Cron,
         ) {
             Ok((task_id, merged)) => {
                 tracing::info!(
@@ -442,11 +441,11 @@ fn parse_watchlist_scope(scope: &str) -> Option<(String, String, String)> {
 struct PrefetchedData {
     /// Always populated when astock is reachable. Empty Vec when
     /// `quote_batch` failed (logged, briefing still fires).
-    quotes: Vec<crate::astock::Quote>,
+    quotes: Vec<crate::Quote>,
     /// MidDay only — full snapshot row including amount / turnover.
-    snapshot: Option<Vec<crate::astock::SnapshotRow>>,
+    snapshot: Option<Vec<crate::SnapshotRow>>,
     /// PostMarket only — last 20 daily K-line bars per code (qfq).
-    klines: std::collections::HashMap<String, crate::astock::KlineResp>,
+    klines: std::collections::HashMap<String, crate::KlineResp>,
 }
 
 /// Pre-fetch the market data this slot wants the LLM to talk about.
@@ -461,7 +460,7 @@ struct PrefetchedData {
 /// empty data block + a hint that "(数据拉取失败)" so it can write
 /// a graceful "data unavailable" reply.
 async fn prefetch_market_data(
-    arc: &crate::astock::AstockClient,
+    arc: &crate::AstockClient,
     slot: BriefingSlot,
     codes: &[String],
 ) -> PrefetchedData {

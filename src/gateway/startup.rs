@@ -352,6 +352,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             match crate::astock::AstockClient::from_config(config.raw.astock.as_ref()) {
                 Ok(c) => {
                     crate::astock::set_global_client(Arc::new(c));
+                    crate::astock::set_global_briefing_sink(Arc::new(crate::gateway::task_queue::GatewayBriefingSink));
                     info!("astock client initialized");
                     // Spin up the daily-briefing scheduler — it's
                     // cheap (one tokio task) and silently no-ops if

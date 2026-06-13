@@ -47,3 +47,17 @@ pub fn set_global_client(client: std::sync::Arc<AstockClient>) {
 pub fn global_client() -> Option<std::sync::Arc<AstockClient>> {
     GLOBAL_CLIENT.get().cloned()
 }
+
+/// Process-wide briefing sink (trait-inverted gateway queue access).
+/// Set by gateway startup; read by briefing/sse to submit tasks + push
+/// outbound without depending on the gateway runtime crate.
+static GLOBAL_SINK: std::sync::OnceLock<std::sync::Arc<dyn rsclaw_types::BriefingSink>> =
+    std::sync::OnceLock::new();
+
+pub fn set_global_briefing_sink(sink: std::sync::Arc<dyn rsclaw_types::BriefingSink>) {
+    let _ = GLOBAL_SINK.set(sink);
+}
+
+pub fn global_briefing_sink() -> Option<std::sync::Arc<dyn rsclaw_types::BriefingSink>> {
+    GLOBAL_SINK.get().cloned()
+}
