@@ -7533,6 +7533,7 @@ dependencies = [
  "rsclaw-cli",
  "rsclaw-computer",
  "rsclaw-config",
+ "rsclaw-cron",
  "rsclaw-desktop",
  "rsclaw-doc",
  "rsclaw-embed",
@@ -7791,6 +7792,25 @@ dependencies = [
  "toml 1.1.0+spec-1.1.0",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "rsclaw-cron"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "chrono-tz",
+ "json5",
+ "regex",
+ "rsclaw-config",
+ "rsclaw-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
