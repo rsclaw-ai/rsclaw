@@ -36,7 +36,9 @@ pub mod feishu;
 pub mod line;
 pub mod matrix;
 pub mod qq;
-pub mod retry;
+// retry helpers extracted to rsclaw-retry (crate-split); re-exported so
+// crate::channel::retry::{SendRetry, send_with_retry} keeps resolving.
+pub use rsclaw_retry as retry;
 pub mod signal;
 pub mod slack;
 pub mod telegram;
