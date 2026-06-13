@@ -71,6 +71,55 @@ fn host_of(url: &str) -> Option<String> {
     Some(host.strip_prefix("www.").unwrap_or(host).to_owned())
 }
 
+/// Whether an env var name may be interpolated into a web_fetch arg.
+/// ALLOWLIST ONLY (prefix-based): lets an agent reference a secret it must
+/// never see in plaintext (e.g. a league participant `LEAGUE_TOKEN`) while
+/// making it impossible to exfiltrate arbitrary env (API keys, etc.) via a
+/// crafted `${VAR}` in a URL — prompt-injection-safe by construction.
+fn fetch_env_allowed(name: &str) -> bool {
+    name.starts_with("LEAGUE_") || name.starts_with("FOOTBALL_")
+}
+
+/// Substitute `${NAME}` from process env for allowlisted names only, at fetch
+/// time. Disallowed / unset placeholders are left VERBATIM (so a typo doesn't
+/// silently become empty, and non-allowlisted names can't leak). Applied to
+/// the OUTBOUND request only (fetch URL, header values, body) — never to the
+/// echoed response, so the resolved secret never returns to the LLM. UTF-8
+/// safe (slices at byte offsets from `find`, which land on char boundaries).
+fn expand_fetch_env(input: &str) -> String {
+    if !input.contains("${") {
+        return input.to_owned();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        if let Some(end) = after.find('}') {
+            let name = &after[..end];
+            let resolved = (!name.is_empty()
+                && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                && fetch_env_allowed(name))
+            .then(|| std::env::var(name).ok())
+            .flatten();
+            match resolved {
+                Some(val) => out.push_str(&val),
+                None => {
+                    out.push_str("${");
+                    out.push_str(name);
+                    out.push('}');
+                }
+            }
+            rest = &after[end + 1..];
+        } else {
+            out.push_str("${");
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// LRU cache of hosts that already had their site rule surfaced to the
 /// agent recently. Entries expire after 5 minutes so a long conversation
 /// that revisits a host eventually re-surfaces the rule, but back-to-back
@@ -765,12 +814,15 @@ impl AgentRuntime {
                 if RESERVED.iter().any(|r| r.eq_ignore_ascii_case(k)) {
                     continue;
                 }
-                let Some(val_str) = v.as_str() else {
+                let Some(val_raw) = v.as_str() else {
                     bail!("web_fetch: header `{k}` value must be a string");
                 };
+                // Allowlisted env interpolation (e.g. `Bearer ${LEAGUE_TOKEN}`)
+                // so the agent can auth with a secret it never sees in plaintext.
+                let val_str = expand_fetch_env(val_raw);
                 let name = reqwest::header::HeaderName::try_from(k.as_str())
                     .map_err(|_| anyhow!("web_fetch: invalid header name `{k}`"))?;
-                let val = reqwest::header::HeaderValue::try_from(val_str)
+                let val = reqwest::header::HeaderValue::try_from(val_str.as_str())
                     .map_err(|_| anyhow!("web_fetch: invalid value for header `{k}`"))?;
                 headers.insert(name, val);
             }
@@ -808,7 +860,10 @@ impl AgentRuntime {
         // errors out. Sites that want TLS redirect http→https on their own,
         // and the same-host redirect policy below follows that for GETs, so the
         // common "model emitted http:// for an https site" case still works.
-        let fetch_url = url.to_owned();
+        // Interpolate allowlisted ${LEAGUE_*}/${FOOTBALL_*} env into the OUTBOUND
+        // url only (the echoed `url` stays literal, so a resolved token never
+        // returns to the LLM). See expand_fetch_env.
+        let fetch_url = expand_fetch_env(url);
 
         // Cache lookup is GET-only. POST/PUT/PATCH/DELETE skip the cache
         // since they may have side effects, carry per-call auth, or be
