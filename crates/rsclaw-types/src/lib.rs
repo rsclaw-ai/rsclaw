@@ -493,3 +493,32 @@ impl ExternalJob {
         chrono::Utc::now().timestamp() > self.timeout_at
     }
 }
+// ============================================================================
+// Notification sink (crate-split): lifted from cap/notification.rs so channel
+// and other crates can implement/route notifications without depending on cap.
+// ============================================================================
+use futures::future::BoxFuture as _NotifBoxFuture;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationPriority {
+    Low = 0,
+    Medium = 1,
+    High = 2,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Notification {
+    pub session_id: Option<String>,
+    pub priority: NotificationPriority,
+    pub title: String,
+    pub body: String,
+    pub burn_after_read: bool,
+}
+
+pub trait NotificationSink: Send + Sync {
+    fn name(&self) -> &str;
+    fn priority_filter(&self) -> NotificationPriority;
+    fn send(&self, notification: &Notification) -> _NotifBoxFuture<'_, anyhow::Result<()>>;
+}

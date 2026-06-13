@@ -200,7 +200,7 @@ impl ChromeProcess {
             // launch times out waiting for the WebSocket URL. A dedicated
             // persistent dir is debuggable and keeps login state warm across
             // restarts (the user logs into each site once).
-            let profile_dir = crate::config::loader::base_dir()
+            let profile_dir = rsclaw_config::loader::base_dir()
                 .join("browser-profiles")
                 .join(profile_name);
             std::fs::create_dir_all(&profile_dir).ok();
@@ -805,7 +805,7 @@ impl Drop for BrowserSession {
 /// our self-managed Testing build doesn't have the user's cookies
 /// anyway, so reusing its profile defeats the purpose.
 fn is_system_chrome(chrome_path: &str) -> bool {
-    let managed_prefix = crate::config::loader::base_dir().join("tools");
+    let managed_prefix = rsclaw_config::loader::base_dir().join("tools");
     !chrome_path.starts_with(&*managed_prefix.to_string_lossy())
 }
 
@@ -820,7 +820,7 @@ fn is_system_chrome(chrome_path: &str) -> bool {
 /// and triggers verification dialogs, so reusing an existing chrome on
 /// the same profile keeps the session warm.
 async fn find_chrome_by_profile(profile_name: &str) -> Option<String> {
-    let profile_dir = crate::config::loader::base_dir()
+    let profile_dir = rsclaw_config::loader::base_dir()
         .join("browser-profiles")
         .join(profile_name);
     let port_file = profile_dir.join("DevToolsActivePort");
@@ -1471,7 +1471,7 @@ impl BrowserSession {
         if let Ok(current_val) = self.cmd_get_url().await {
             if let Some(current) = current_val.get("url").and_then(|v| v.as_str()) {
                 if current == url || current.starts_with(url) || url.starts_with(current) {
-                    let skills = crate::config::loader::applicable_site_rules(&url);
+                    let skills = rsclaw_config::loader::applicable_site_rules(&url);
                     let mut result = json!({
                         "action": "open",
                         "url": url,
@@ -1479,7 +1479,7 @@ impl BrowserSession {
                     });
                     if !skills.is_empty() {
                         result["applicable_site_rules"] = json!(skills);
-                        if let Some(body) = crate::config::loader::applicable_site_rules_body(&url) {
+                        if let Some(body) = rsclaw_config::loader::applicable_site_rules_body(&url) {
                             result["site_rule"] = json!(body);
                         }
                         result["site_rules_hint"] = json!(
@@ -1551,7 +1551,7 @@ impl BrowserSession {
         // playbook for this host before snapshotting / clicking. Inline
         // the rule body directly — a hint pointing at file paths gets
         // ignored, the actual content sitting in the response doesn't.
-        let skills = crate::config::loader::applicable_site_rules(&url);
+        let skills = rsclaw_config::loader::applicable_site_rules(&url);
         let mut result = json!({
             "action": "open",
             "url": url,
@@ -1559,7 +1559,7 @@ impl BrowserSession {
         });
         if !skills.is_empty() {
             result["applicable_site_rules"] = json!(skills);
-            if let Some(body) = crate::config::loader::applicable_site_rules_body(&url) {
+            if let Some(body) = rsclaw_config::loader::applicable_site_rules_body(&url) {
                 result["site_rule"] = json!(body);
             }
             result["site_rules_hint"] = json!(
@@ -4467,7 +4467,7 @@ async fn save_screenshot_bytes(b64_data: &str, format: &str) -> Result<String> {
     let save_dir = dirs_next::download_dir()
         .unwrap_or_else(|| {
             dirs_next::home_dir()
-                .unwrap_or_else(crate::config::loader::base_dir)
+                .unwrap_or_else(rsclaw_config::loader::base_dir)
                 .join("Downloads")
         })
         .join("rsclaw")

@@ -7608,7 +7608,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "chrono",
+ "dirs-next",
  "futures",
+ "libc",
  "reqwest",
  "rsclaw-config",
  "rsclaw-events",
@@ -7618,9 +7621,12 @@ dependencies = [
  "rsclaw-util",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-tungstenite 0.29.0",
  "tracing",
+ "url",
+ "wiremock",
 ]
 
 [[package]]
@@ -7653,8 +7659,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "chrono",
  "display-info",
  "enigo",
+ "futures",
  "image 0.25.10",
  "rsclaw-config",
  "rsclaw-events",
@@ -7666,8 +7674,10 @@ dependencies = [
  "rsclaw-util",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
+ "xcap",
 ]
 
 [[package]]
@@ -7804,6 +7814,7 @@ dependencies = [
  "anyhow",
  "dirs-next",
  "libc",
+ "rsclaw-config",
  "sys-info",
  "tokio",
  "which 7.0.3",
@@ -7899,6 +7910,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "md-5",
+ "redb 2.6.3",
  "redb 4.1.0",
  "rsclaw-config",
  "rsclaw-events",
@@ -7908,6 +7920,8 @@ dependencies = [
  "rsclaw-util",
  "serde",
  "serde_json",
+ "tantivy",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",
@@ -7917,7 +7931,9 @@ dependencies = [
 name = "rsclaw-types"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chrono",
+ "futures",
  "hex",
  "md-5",
  "serde",

@@ -22,7 +22,7 @@ use tantivy::{
 };
 use tracing::debug;
 
-use crate::MemoryTier;
+use rsclaw_platform::MemoryTier;
 
 // ---------------------------------------------------------------------------
 // Schema field names

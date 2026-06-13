@@ -29,7 +29,7 @@ use enigo::{
 use image::{ImageFormat, RgbaImage};
 use tracing::{debug, warn};
 
-use crate::computer::{
+use crate::{
     action::{Action, ActionSpec, ExecCtx, MouseButton, Screenshot, ScrollDir},
     operator::{ActionFut, ActionOutput, Operator, ScreenshotFut},
 };

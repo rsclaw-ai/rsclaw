@@ -20,7 +20,7 @@ pub use redb_store::{
 pub use search::SearchIndex;
 use tracing::info;
 
-use crate::MemoryTier;
+use rsclaw_platform::MemoryTier;
 
 /// Unified storage facade — combines hot KV (redb) and BM25 FTS (tantivy).
 ///

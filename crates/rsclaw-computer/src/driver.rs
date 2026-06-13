@@ -22,7 +22,7 @@
 //!
 //! The driver is fully model-agnostic — it works with any vision model
 //! that follows the Thought/Action format the prompt asks for. Providers
-//! are addressed via the existing [`crate::provider::LlmProvider`]
+//! are addressed via the existing [`rsclaw_provider::LlmProvider`]
 //! abstraction, so any registered VLM (UI-TARS, Doubao-vision, GPT-4o,
 //! Claude vision, Qwen-VL, …) can drive it.
 
@@ -48,7 +48,7 @@ use super::{
     prompt::{PromptInputs, build_system_prompt},
     status::ComputerUseStatus,
 };
-use crate::provider::{
+use rsclaw_provider::{
     AgentEndpoint, ContentPart, LlmProvider, LlmRequest, Message, MessageContent, Role, StreamEvent,
 };
 
@@ -999,7 +999,7 @@ const _: fn() -> BTreeMap<String, String> = BTreeMap::new;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::computer::action::ParsedAction;
+    use crate::action::ParsedAction;
 
     fn pa(action_type: &str, args: &[(&str, &str)]) -> ParsedAction {
         let mut raw_args = BTreeMap::new();

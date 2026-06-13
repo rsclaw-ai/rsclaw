@@ -11,4 +11,5 @@ libc = "0.2"
 sys-info = "0.9"
 which = "7"
 dirs-next = "2"
+rsclaw-config = { path = "../rsclaw-config" }
 tokio = { version = "1", features = ["full"] }

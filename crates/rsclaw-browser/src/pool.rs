@@ -26,7 +26,7 @@ use tracing::{debug, info, warn};
 
 
 use super::{CdpClient, ChromeProcess, can_launch_chrome};
-use crate::agent::platform::detect_chrome;
+use rsclaw_platform::detect_chrome;
 
 /// Maximum concurrent tabs per Chrome instance.
 const MAX_TABS_PER_INSTANCE: usize = 8;
@@ -364,8 +364,8 @@ impl BrowserPool {
         let profile = {
             let mut profile_guard = self.profile.lock().await;
             if profile_guard.is_none() {
-                let config_path = crate::config::loader::base_dir().join("rsclaw.json5");
-                let cfg_profile = crate::config::loader::load_json5(&config_path)
+                let config_path = rsclaw_config::loader::base_dir().join("rsclaw.json5");
+                let cfg_profile = rsclaw_config::loader::load_json5(&config_path)
                     .ok()
                     .and_then(|c| c.tools)
                     .and_then(|t| t.web_browser)

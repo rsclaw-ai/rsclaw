@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, oneshot};
 use tracing::{info, warn};
 
-use crate::store::redb_store::RedbStore;
+use rsclaw_store::redb_store::RedbStore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -441,7 +441,7 @@ impl PermissionStore for RedbPermissionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MemoryTier;
+    use rsclaw_platform::MemoryTier;
 
     fn open_store(bypass: bool) -> (RedbPermissionStore, Arc<RedbStore>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");

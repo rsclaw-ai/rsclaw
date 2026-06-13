@@ -30,7 +30,7 @@ use tracing::{debug, warn};
 #[cfg(not(target_os = "linux"))]
 use xcap::Monitor;
 
-use crate::computer::{
+use crate::{
     action::{Action, ActionSpec, ExecCtx, MouseButton, Screenshot, ScrollDir},
     operator::{ActionFut, ActionOutput, Operator, ScreenshotFut},
 };

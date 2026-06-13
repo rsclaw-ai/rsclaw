@@ -20,7 +20,7 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Serialize, de::DeserializeOwned};
 use tracing::debug;
 
-use crate::MemoryTier;
+use rsclaw_platform::MemoryTier;
 
 pub const LEGACY_REDB_UPGRADE_HELPER_ENV: &str = "RSCLAW_INTERNAL_REDB_LEGACY_UPGRADE";
 

@@ -23,3 +23,14 @@ base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 enigo = "0.6"
 display-info = "0.5"
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+
+# xcap pulled in pipewire → libspa → GLIBC symbol chain on Linux; native.rs
+# gates the `use xcap::Monitor` behind cfg(not(target_os = "linux")) and falls
+# back to a stub-error on Linux. Match the root crate's target-gated dep.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+xcap = "0.9"
+
+[dev-dependencies]
+tempfile = "3"

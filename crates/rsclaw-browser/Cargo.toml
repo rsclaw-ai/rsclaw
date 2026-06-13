@@ -21,3 +21,11 @@ base64 = "0.22"
 futures = "0.3"
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 reqwest = { version = "0.12", features = ["json", "stream", "multipart", "blocking", "rustls-tls-webpki-roots-no-provider", "socks"], default-features = false }
+chrono = { version = "0.4", features = ["serde"] }
+dirs-next = "2"
+libc = "0.2"
+url = "2"
+tempfile = "3"
+
+[dev-dependencies]
+wiremock = "0.6"

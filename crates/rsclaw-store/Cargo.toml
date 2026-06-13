@@ -18,6 +18,11 @@ rsclaw-i18n = { path = "../rsclaw-i18n" }
 rsclaw-events = { path = "../rsclaw-events" }
 rsclaw-platform = { path = "../rsclaw-platform" }
 redb = "4.1"
+redb_legacy = { package = "redb", version = "2.6" }
+tantivy = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 md-5 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

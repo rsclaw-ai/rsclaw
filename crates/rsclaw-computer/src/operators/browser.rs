@@ -6,7 +6,7 @@
 //! the higher-impact one and this is just an adapter on top of code we
 //! already have in `tools_web` / browser pool.
 
-use crate::computer::{
+use crate::{
     action::{Action, ActionSpec, ExecCtx},
     operator::{ActionFut, ActionOutput, Operator, ScreenshotFut},
 };

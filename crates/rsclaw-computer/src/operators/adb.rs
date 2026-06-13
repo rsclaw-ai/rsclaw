@@ -25,10 +25,10 @@ use anyhow::{anyhow, Context as _, Result};
 use tokio::io::AsyncReadExt;
 use tracing::{debug, warn};
 
-use crate::computer::action::{
+use crate::action::{
     Action, ActionSpec, ExecCtx, MouseButton, Screenshot, ScrollDir,
 };
-use crate::computer::operator::{ActionFut, ActionOutput, Operator, ScreenshotFut};
+use crate::operator::{ActionFut, ActionOutput, Operator, ScreenshotFut};
 
 /// Android operator. Constructed with an optional device serial — when
 /// `None` adb picks the only attached device, otherwise we pass
