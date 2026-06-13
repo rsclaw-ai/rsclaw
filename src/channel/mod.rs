@@ -87,32 +87,9 @@ pub mod outbound_kind {
     pub const ASYNC_SEND: &str = "async_send";
 }
 
-/// A reply message ready to be sent to a channel.
-#[derive(Debug, Clone, Default)]
-pub struct OutboundMessage {
-    /// Destination peer/group ID.
-    pub target_id: String,
-    /// Whether `target_id` is a group.
-    pub is_group: bool,
-    /// Text content.
-    pub text: String,
-    /// Optional reply-to message ID (platform-specific).
-    pub reply_to: Option<String>,
-    /// Image attachments (base64 data URIs).
-    pub images: Vec<String>,
-    /// File attachments: Vec<(filename, mime_type, file_path_or_url)>.
-    /// Supported by channels that can send files (feishu, telegram, etc.).
-    pub files: Vec<(String, String, String)>,
-    /// Channel name to use for sending (e.g., "feishu", "telegram").
-    /// Used by background tasks (opencode, claudecode) to route notifications.
-    pub channel: Option<String>,
-    /// Multi-account routing tag — which account in this channel received
-    /// the inbound message that produced this reply. Set by inbound parsers
-    /// that support multiple credentials (e.g. feishu accounts.<name>) so
-    /// the outbound dispatcher can send via the same account's API token.
-    /// `None` = single-account / bare `{channel}` lookup.
-    pub account: Option<String>,
-}
+// `OutboundMessage` lifted to `rsclaw-types` (crate-split); re-exported here so
+// existing `crate::channel::OutboundMessage` paths keep resolving.
+pub use rsclaw_types::OutboundMessage;
 
 // ---------------------------------------------------------------------------
 // Channel trait

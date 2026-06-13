@@ -27,19 +27,10 @@ const DEFAULT_MAX_CONCURRENT: u32 = 4;
 // AgentHandle
 // ---------------------------------------------------------------------------
 
-/// The four kinds of agent in the system.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub enum AgentKind {
-    /// The default entry point. Cannot be deleted. `default: true` in config.
-    Main,
-    /// User-created persistent agent. Saved to config file, survives restarts.
-    Named,
-    /// LLM-spawned temporary agent (`persistent: false`). Lives in memory, gone
-    /// on restart.
-    Sub,
-    /// One-shot task agent. Automatically destroyed after completion.
-    Task,
-}
+// `AgentKind` lifted to `rsclaw-types` (crate-split); re-exported here so
+// existing `crate::agent::registry::AgentKind` / `crate::agent::AgentKind`
+// paths keep resolving.
+pub use rsclaw_types::AgentKind;
 
 /// A lightweight handle to a running agent.
 ///
@@ -308,30 +299,10 @@ impl AgentHandle {
     }
 }
 
-/// An image attachment sent by the user.
-#[derive(Debug, Clone)]
-pub struct ImageAttachment {
-    /// Base64-encoded data URI or URL.
-    pub data: String,
-    /// MIME type (e.g. "image/png", "image/jpeg").
-    pub mime_type: String,
-    /// Best-effort original on-disk source path, when the image came from a
-    /// path-referencing client (e.g. `[file:/abs/path]` from desktop, or a
-    /// channel that downloaded to a known cache location). `None` for
-    /// inline-only attachments (e.g. pasted base64).
-    ///
-    /// Surfaced in vision-failure fallback messages so the user can re-attach
-    /// or the agent can retry with the same file via a different tool.
-    pub source_path: Option<String>,
-}
-
-/// A file attachment sent by the user (raw bytes, not yet processed).
-#[derive(Debug, Clone)]
-pub struct FileAttachment {
-    pub filename: String,
-    pub data: Vec<u8>,
-    pub mime_type: String,
-}
+// `ImageAttachment` / `FileAttachment` lifted to `rsclaw-types` (crate-split);
+// re-exported here so existing `crate::agent::registry::{ImageAttachment,
+// FileAttachment}` paths keep resolving.
+pub use rsclaw_types::{FileAttachment, ImageAttachment};
 
 /// Per-turn observability + control wires that an A2A caller threads into the
 /// runtime. Built from the three optional channels on `AgentMessage` plus the
