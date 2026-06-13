@@ -97,7 +97,32 @@ pub async fn cmd_skills(sub: SkillsCommand) -> Result<()> {
             } else {
                 print!("Installing '{}'... ", cyan(&name));
             }
-            let locked = match client.install_with_fallback(&name, &global_dir).await {
+            // Resolve audited-allowlist slugs to their pinned URL first. The
+            // desktop "recommended skills" list is built from the allowlist,
+            // and some entries (e.g. Anthropic's `pptx`) live ONLY there — no
+            // matching slug exists in the public registries, so
+            // install_with_fallback would report "not found on clawhub,
+            // skillhub, or iwencai". Mirror the plugins-install path: when the
+            // bare name is an allowlist slug with a download url, install from
+            // that audited url instead. A url/owner-repo/`@` spec the user
+            // typed bypasses this and resolves as before.
+            let install_spec: String = {
+                let looks_like_plain_slug =
+                    !name.contains('/') && !name.contains('@') && !name.starts_with("http");
+                if looks_like_plain_slug {
+                    if crate::skill::allowlist::snapshot().counts().0 == 0 {
+                        let _ = crate::skill::allowlist::refresh().await; // lazy; fail-open
+                    }
+                    crate::skill::allowlist::snapshot()
+                        .lookup_skill(&name)
+                        .filter(|e| !e.url.is_empty())
+                        .map(|e| e.url)
+                        .unwrap_or_else(|| name.clone())
+                } else {
+                    name.clone()
+                }
+            };
+            let locked = match client.install_with_fallback(&install_spec, &global_dir).await {
                 Ok(l) => l,
                 Err(e) => {
                     // A failed install can leave an empty skill dir behind
