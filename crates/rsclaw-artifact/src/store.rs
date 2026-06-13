@@ -77,7 +77,7 @@ pub struct ArtifactStore {
 impl ArtifactStore {
     /// Default store under `~/.rsclaw/artifacts/`.
     pub fn default_store() -> Self {
-        let root = crate::config::loader::base_dir().join(ARTIFACT_SUBDIR);
+        let root = rsclaw_config::loader::base_dir().join(ARTIFACT_SUBDIR);
         Self { root }
     }
 

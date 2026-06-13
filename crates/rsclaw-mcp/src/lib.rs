@@ -30,7 +30,8 @@ use tokio::{
 };
 use tracing::{debug, info};
 
-use crate::{config::schema::McpServerConfig, provider::ToolDef};
+use rsclaw_config::schema::McpServerConfig;
+use rsclaw_provider::ToolDef;
 
 const MCP_CALL_TIMEOUT_SECS: u64 = 60;
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";

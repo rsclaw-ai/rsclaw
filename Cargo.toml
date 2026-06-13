@@ -18,6 +18,8 @@ path = "src/main.rs"
 # Extracted workspace crates (crate-split, feat/crate-split)
 rsclaw-types = { path = "crates/rsclaw-types" }
 rsclaw-config = { path = "crates/rsclaw-config" }
+rsclaw-artifact = { path = "crates/rsclaw-artifact" }
+rsclaw-mcp = { path = "crates/rsclaw-mcp" }
 rsclaw-embed = { path = "crates/rsclaw-embed" }
 rsclaw-provider = { path = "crates/rsclaw-provider" }
 rsclaw-retry = { path = "crates/rsclaw-retry" }

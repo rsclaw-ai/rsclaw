@@ -7525,10 +7525,12 @@ dependencies = [
  "redb 4.1.0",
  "regex",
  "reqwest",
+ "rsclaw-artifact",
  "rsclaw-config",
  "rsclaw-embed",
  "rsclaw-events",
  "rsclaw-i18n",
+ "rsclaw-mcp",
  "rsclaw-platform",
  "rsclaw-provider",
  "rsclaw-retry",
@@ -7573,6 +7575,22 @@ dependencies = [
  "xcap",
  "xz2",
  "zip 2.4.2",
+]
+
+[[package]]
+name = "rsclaw-artifact"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "regex",
+ "rsclaw-config",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -7626,6 +7644,20 @@ dependencies = [
 [[package]]
 name = "rsclaw-i18n"
 version = "0.1.0"
+
+[[package]]
+name = "rsclaw-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rsclaw-config",
+ "rsclaw-provider",
+ "rsclaw-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "rsclaw-platform"

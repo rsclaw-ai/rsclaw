@@ -9,7 +9,7 @@
 
 use serde_json::{Value, json};
 
-use crate::artifact::{
+use crate::{
     store::ArtifactStore,
     text::{head_tail_with_marker, normalize_lines, strip_ansi},
 };
@@ -263,7 +263,7 @@ mod tests {
         assert!(preview.contains("read_artifact"));
         assert!(preview.contains(&id));
         // Full text recoverable from store.
-        let full = s.read("sess", &crate::artifact::ArtifactId(id)).unwrap();
+        let full = s.read("sess", &crate::ArtifactId(id)).unwrap();
         assert_eq!(full, big);
     }
 
@@ -316,7 +316,7 @@ mod tests {
         let big = "x".repeat(200_000);
         let (_preview, id) = compact_text(&s, "sess", &big, PreviewBudget::DEFAULT);
         let id = id.expect("artifact written");
-        let full = s.read("sess", &crate::artifact::ArtifactId(id)).unwrap();
+        let full = s.read("sess", &crate::ArtifactId(id)).unwrap();
         assert_eq!(full.len(), 200_000);
     }
 
