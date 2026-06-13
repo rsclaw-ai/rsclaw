@@ -25,7 +25,7 @@ use hnsw_rs::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::kb::store::KbStore;
+use crate::store::KbStore;
 
 /// Default vector dimension when none is supplied (matches
 /// `StubEmbedder`). Real embedders pass their own: bge-small-zh=512,
@@ -159,7 +159,7 @@ impl HnswCache {
         {
             use redb::ReadableTable;
 
-            use crate::kb::{
+            use crate::{
                 model::KbChunk,
                 store::{codec::decode, schema::KB_CHUNKS},
             };
@@ -335,7 +335,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::kb::{
+    use crate::{
         canonicalize::{CanonicalizeInput, canonicalize_by_mime},
         embedder::{KbEmbedder, StubEmbedder},
         paths::KbPaths,
@@ -374,7 +374,7 @@ mod tests {
             },
         )
         .unwrap();
-        let index = Arc::new(crate::kb::index::KbIndex::open(&paths).unwrap());
+        let index = Arc::new(crate::index::KbIndex::open(&paths).unwrap());
         let ctx = HandlerCtx {
             store: store.clone(),
             paths,

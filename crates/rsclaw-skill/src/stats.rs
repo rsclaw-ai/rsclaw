@@ -17,7 +17,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::store::redb_store::RedbStore;
+use rsclaw_store::redb_store::RedbStore;
 
 /// Disuse window: an auto-skill not activated for this many days (and old
 /// enough to have had the chance) is retired.
@@ -131,7 +131,7 @@ mod tests {
 
     fn store() -> (RedbStore, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
-        let db = RedbStore::open(&tmp.path().join("kv.redb"), crate::MemoryTier::High).unwrap();
+        let db = RedbStore::open(&tmp.path().join("kv.redb"), rsclaw_platform::MemoryTier::High).unwrap();
         (db, tmp)
     }
 

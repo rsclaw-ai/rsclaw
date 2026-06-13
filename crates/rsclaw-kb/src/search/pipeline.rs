@@ -5,7 +5,7 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::Result;
 use serde::Serialize;
 
-use crate::kb::{
+use crate::{
     content_store::read::read_doc_range,
     embedder::KbEmbedder,
     index::KbIndex,
@@ -74,7 +74,7 @@ pub struct SearchCtx {
     /// Optional cross-encoder rerank stage (`kb.rerank` config). Applied to
     /// the fused top-N between fusion and MMR; `None` keeps the pipeline
     /// byte-identical to the pre-rerank behaviour.
-    pub reranker: Option<Arc<crate::kb::rerank::KbReranker>>,
+    pub reranker: Option<Arc<crate::rerank::KbReranker>>,
 }
 
 impl SearchCtx {
@@ -88,7 +88,7 @@ impl SearchCtx {
                 // Dense side applies the asymmetric query instruction if set;
                 // BM25 (below) always uses the raw query.
                 let dense_query =
-                    crate::embed::format_query(req.query_instruction.as_deref(), &req.query);
+                    rsclaw_embed::format_query(req.query_instruction.as_deref(), &req.query);
                 let qv = self.embedder.embed_batch(&[dense_query])?;
                 match qv.first() {
                     Some(qvec) => self.index.hnsw.search(qvec, recall_k),
@@ -315,7 +315,7 @@ impl SearchCtx {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::warn!(
-                        chunk = %crate::kb::redact(&chunk_id),
+                        chunk = %crate::redact(&chunk_id),
                         path = %abs.display(),
                         "kb search: chunk body read failed: {e}"
                     );
@@ -355,7 +355,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::kb::{
+    use crate::{
         canonicalize::{CanonicalizeInput, canonicalize_by_mime},
         embedder::{KbEmbedder, StubEmbedder},
         model::KbVisibility,
@@ -477,7 +477,7 @@ mod tests {
         let all: Vec<KbDoc> = {
             use redb::ReadableTable;
 
-            use crate::kb::store::{codec::decode, schema::KB_DOCS};
+            use crate::store::{codec::decode, schema::KB_DOCS};
             let tbl = rtx.open_table(KB_DOCS).unwrap();
             let mut out = Vec::new();
             for e in tbl.iter().unwrap() {
@@ -492,7 +492,7 @@ mod tests {
         d.owner_user_id = Some("u1".into());
         {
             let wtx = ctx.store.begin_write().unwrap();
-            crate::kb::store::docs::put(&wtx, &d).unwrap();
+            crate::store::docs::put(&wtx, &d).unwrap();
             wtx.commit().unwrap();
         }
         let req = SearchRequest {

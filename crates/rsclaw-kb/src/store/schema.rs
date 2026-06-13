@@ -42,8 +42,8 @@ pub fn open_db(path: &std::path::Path) -> anyhow::Result<redb::Database> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    crate::store::upgrade_legacy_if_needed(path)?;
-    let db = crate::store::create_with_lock_retry(&redb::Database::builder(), path)?;
+    rsclaw_store::upgrade_legacy_if_needed(path)?;
+    let db = rsclaw_store::create_with_lock_retry(&redb::Database::builder(), path)?;
     let wtx = db.begin_write()?;
     // Open all tables to ensure they exist.
     let _ = wtx.open_table(KB_DOCS)?;

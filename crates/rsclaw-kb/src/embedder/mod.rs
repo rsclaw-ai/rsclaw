@@ -4,7 +4,7 @@
 //!   idempotency is trivial to assert.
 //! - `LocalKbEmbedder` (`local`): candle BGE adapter reusing the model loader
 //!   already shipped for memory search
-//!   (`crate::agent::memory::LocalBgeEmbedder`). Default in production when a
+//!   (`rsclaw_embed::LocalBgeEmbedder`). Default in production when a
 //!   model is present (bge-small-zh = 512-dim).
 //!
 //! Remote (OpenAI-compatible `/v1/embeddings` against the GPU fleet
@@ -49,7 +49,7 @@ pub fn resolve_embedder(kb_root: &std::path::Path) -> std::sync::Arc<dyn KbEmbed
         let model_is_rsclaw = cfg
             .model
             .as_deref()
-            .map(crate::embed::is_rsclaw_model)
+            .map(rsclaw_embed::is_rsclaw_model)
             .unwrap_or(false);
         // `rsclaw` is a semantic alias for the openai-compatible remote
         // path (the fleet speaks the OpenAI embeddings shape); writing
@@ -66,7 +66,7 @@ pub fn resolve_embedder(kb_root: &std::path::Path) -> std::sync::Arc<dyn KbEmbed
                 let model = cfg
                     .model
                     .clone()
-                    .unwrap_or_else(|| crate::embed::OPENAI_DEFAULT_MODEL.to_owned());
+                    .unwrap_or_else(|| rsclaw_embed::OPENAI_DEFAULT_MODEL.to_owned());
                 let api_key = cfg
                     .api_key
                     .as_ref()
@@ -74,11 +74,11 @@ pub fn resolve_embedder(kb_root: &std::path::Path) -> std::sync::Arc<dyn KbEmbed
                     .or_else(|| std::env::var("OPENAI_API_KEY").ok());
                 let dim = cfg
                     .dimensions
-                    .unwrap_or_else(|| crate::embed::openai_model_dim(&model))
+                    .unwrap_or_else(|| rsclaw_embed::openai_model_dim(&model))
                     as usize;
                 // base_url empty + rsclaw-* model → fleet API; else OpenAI.
                 let base_url =
-                    crate::embed::resolve_embed_base_url(cfg.base_url.as_deref(), &model);
+                    rsclaw_embed::resolve_embed_base_url(cfg.base_url.as_deref(), &model);
                 tracing::info!(model = %model, dim, base_url = %base_url, "kb: using remote OpenAI-compatible embedder");
                 return Arc::new(LocalKbEmbedder::remote_openai(
                     base_url, model, api_key, dim,
@@ -130,8 +130,8 @@ pub fn resolve_embedder(kb_root: &std::path::Path) -> std::sync::Arc<dyn KbEmbed
 /// The embed config KB should use: `kb.embed` override if present, else the
 /// shared `memorySearch`. Centralized so embedder selection and the asymmetric
 /// `queryInstruction` (in `KnowledgeService`) read the same source.
-pub fn effective_embed_config() -> Option<crate::config::schema::EmbedConfig> {
-    let cfg = crate::config::load().ok()?;
+pub fn effective_embed_config() -> Option<rsclaw_config::schema::EmbedConfig> {
+    let cfg = rsclaw_config::load().ok()?;
     cfg.raw
         .kb
         .as_ref()

@@ -6,7 +6,7 @@
 use lol_html::{HtmlRewriter, Settings, element};
 
 use super::*;
-use crate::kb::content_store::atomic::sha256_hex;
+use crate::content_store::atomic::sha256_hex;
 
 pub struct HtmlCanonicalizer;
 

@@ -17,6 +17,7 @@ pub mod router;
 pub mod session;
 pub mod shutdown;
 pub mod startup;
+pub mod desktop_channel;
 pub mod task_queue;
 pub mod watch;
 

@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 pub use compose::{FrontMatter, Parsed, compose_doc_file, parse_doc_file};
 pub use read::{read_doc_body, read_doc_range, verify_doc_sha};
 
-use crate::kb::{model::KbSourceKind, paths::KbPaths};
+use crate::{model::KbSourceKind, paths::KbPaths};
 
 #[derive(Debug, Clone)]
 pub struct StagedDoc {

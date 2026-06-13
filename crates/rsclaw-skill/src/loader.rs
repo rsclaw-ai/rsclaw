@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use tracing::{debug, warn};
 
 use super::manifest::{SkillManifest, parse_skill_md};
-use crate::config::schema::SkillsConfig;
+use rsclaw_config::schema::SkillsConfig;
 
 // ---------------------------------------------------------------------------
 // SkillRegistry
@@ -143,11 +143,11 @@ fn scan_dir(dir: &Path, registry: &mut SkillRegistry) -> Result<()> {
 
 /// Default global skill directory: `<base_dir>/skills/`.
 ///
-/// Resolves through `crate::config::loader::base_dir()` so `--dev`,
+/// Resolves through `rsclaw_config::loader::base_dir()` so `--dev`,
 /// `--profile`, and `RSCLAW_BASE_DIR` all route skill installs into the
 /// matching profile dir instead of always landing in `~/.rsclaw/skills/`.
 pub fn default_global_skills_dir() -> Option<PathBuf> {
-    Some(crate::config::loader::base_dir().join("skills"))
+    Some(rsclaw_config::loader::base_dir().join("skills"))
 }
 
 // ---------------------------------------------------------------------------
@@ -211,7 +211,7 @@ mod tests {
 
     #[test]
     fn config_disables_skill() {
-        use crate::config::schema::{SkillEntryConfig, SkillsConfig};
+        use rsclaw_config::schema::{SkillEntryConfig, SkillsConfig};
 
         let tmp = tempfile::tempdir().expect("tempdir");
         make_skill(tmp.path(), "gamma", false);

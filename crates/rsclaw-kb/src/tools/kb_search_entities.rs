@@ -3,7 +3,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::kb::{
+use crate::{
     model::{CallerScope, EntityKind},
     search::SearchCtx,
     store::entities,

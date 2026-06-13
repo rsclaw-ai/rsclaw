@@ -1990,10 +1990,10 @@ async fn extract_and_upload_cover(
     api_base: &str,
     token: &str,
 ) -> Option<String> {
-    let ffmpeg_bin = match crate::agent::platform::ensure_ffmpeg().await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!("feishu: skipping video cover — ffmpeg unavailable: {e:#}");
+    let ffmpeg_bin = match rsclaw_platform::detect_ffmpeg() {
+        Some(p) => p,
+        None => {
+            tracing::warn!("feishu: skipping video cover — ffmpeg not found (run: rsclaw tools install ffmpeg)");
             return None;
         }
     };

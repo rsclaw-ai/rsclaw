@@ -31,7 +31,7 @@ pub use slots::{ContextEngineSlot, MemoryItem, MemorySlot, MemoryStoreSlot, Slot
 use tracing::{info, warn};
 pub use wasm_runtime::{WasmPlugin, WasmToolDef, load_wasm_plugin};
 
-use crate::config::schema::PluginsConfig;
+use rsclaw_config::schema::PluginsConfig;
 
 // ---------------------------------------------------------------------------
 // PluginRegistry
@@ -120,9 +120,9 @@ impl Default for PluginRegistry {
 pub async fn load_all_plugins(
     plugins_dir: &std::path::Path,
     config: Option<&PluginsConfig>,
-    wasm_browser: Arc<tokio::sync::Mutex<Option<crate::browser::BrowserSession>>>,
-    notify_tx: Option<tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>>,
-    providers: Option<Arc<crate::provider::registry::ProviderRegistry>>,
+    wasm_browser: Arc<tokio::sync::Mutex<Option<rsclaw_browser::BrowserSession>>>,
+    notify_tx: Option<tokio::sync::broadcast::Sender<rsclaw_channel::OutboundMessage>>,
+    providers: Option<Arc<rsclaw_provider::registry::ProviderRegistry>>,
     vision_model: Option<String>,
 ) -> Result<PluginRegistry> {
     let manifests = scan_plugins(plugins_dir)?;

@@ -5,7 +5,7 @@
 use anyhow::Result;
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
-use crate::kb::{
+use crate::{
     model::{KbDoc, VersionPointer},
     store::{
         codec::{decode, encode},
@@ -141,7 +141,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::kb::{
+    use crate::{
         model::{KbSource, KbSourceKind, KbStatus, KbVisibility},
         store::open_db,
     };

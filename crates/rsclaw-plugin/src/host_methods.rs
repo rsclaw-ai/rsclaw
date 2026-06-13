@@ -14,7 +14,8 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast};
 use tracing::{debug, warn};
 
-use crate::{browser::BrowserSession, channel::OutboundMessage};
+use rsclaw_browser::BrowserSession;
+use rsclaw_channel::OutboundMessage;
 
 /// All dependencies a host method might need. Cloned cheaply (everything is
 /// behind Arc) and shared across plugin spawns.
@@ -356,7 +357,7 @@ impl HostMethodRegistry {
             .and_then(|v| v.as_u64())
             .unwrap_or(1)
             .max(1) as usize;
-        match crate::plugin::wasm_runtime::allocate_dl_paths(filename, count) {
+        match crate::wasm_runtime::allocate_dl_paths(filename, count) {
             Ok(paths) => {
                 if count == 1 {
                     Ok(serde_json::json!({ "path": paths.into_iter().next().unwrap_or_default() }))
@@ -374,7 +375,7 @@ impl HostMethodRegistry {
         let path = params["path"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("extract_file_text: `path` required"))?;
-        match crate::plugin::wasm_runtime::extract_text_from_plugin_file(path).await {
+        match crate::wasm_runtime::extract_text_from_plugin_file(path).await {
             Ok(text) => Ok(Value::String(text)),
             Err(e) => Err(anyhow::anyhow!("{e}")),
         }
@@ -394,7 +395,7 @@ impl HostMethodRegistry {
             .ok_or_else(|| anyhow::anyhow!("kb_ingest_document: `content` required"))?;
         let mime = params["mime"].as_str().unwrap_or("text/markdown");
         let out =
-            crate::plugin::wasm_runtime::kb_ingest_document(collection, title, content, mime)
+            crate::wasm_runtime::kb_ingest_document(collection, title, content, mime)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
         serde_json::from_str(&out).map_err(|e| anyhow::anyhow!("kb ingest result JSON: {e}"))
@@ -409,14 +410,14 @@ impl HostMethodRegistry {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("extract_audio: `input_path` required"))?;
 
-        let ffmpeg_bin = match crate::agent::platform::detect_ffmpeg() {
+        let ffmpeg_bin = match rsclaw_platform::detect_ffmpeg() {
             Some(p) => p,
             None => {
                 return Ok(json!({"error": "ffmpeg not found. Run: rsclaw tools install ffmpeg"}));
             }
         };
 
-        let out_path = match crate::plugin::wasm_runtime::allocate_dl_paths("audio.wav", 1) {
+        let out_path = match crate::wasm_runtime::allocate_dl_paths("audio.wav", 1) {
             Ok(mut p) => p.pop().unwrap_or_default(),
             Err(e) => return Ok(json!({"error": e})),
         };
@@ -469,7 +470,7 @@ impl HostMethodRegistry {
         };
 
         let client = reqwest::Client::new();
-        match crate::channel::transcription::transcribe_audio(&client, &bytes, audio_path, mime)
+        match rsclaw_channel::transcription::transcribe_audio(&client, &bytes, audio_path, mime)
             .await
         {
             Ok(text) => Ok(json!({"text": text})),
@@ -486,14 +487,14 @@ impl HostMethodRegistry {
             .ok_or_else(|| anyhow::anyhow!("extract_keyframes: `video_path` required"))?;
         let count = params["count"].as_u64().unwrap_or(5).max(1).min(20) as usize;
 
-        let ffmpeg_bin = match crate::agent::platform::detect_ffmpeg() {
+        let ffmpeg_bin = match rsclaw_platform::detect_ffmpeg() {
             Some(p) => p,
             None => {
                 return Ok(json!({"error": "ffmpeg not found. Run: rsclaw tools install ffmpeg"}));
             }
         };
 
-        let out_paths = match crate::plugin::wasm_runtime::allocate_dl_paths("frame.png", count) {
+        let out_paths = match crate::wasm_runtime::allocate_dl_paths("frame.png", count) {
             Ok(p) => p,
             Err(e) => return Ok(json!({"error": e})),
         };

@@ -19,12 +19,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt as _;
 use tokio::sync::Semaphore;
 
-use crate::{
-    agent::memory::{MemDocTier, MemoryDoc, MemoryStore},
-    provider::{
-        LlmProvider, LlmRequest, Message, MessageContent, Role, StreamEvent,
-        registry::ProviderRegistry,
-    },
+use rsclaw_memory::{MemDocTier, MemoryDoc, MemoryStore};
+use rsclaw_provider::{
+    LlmProvider, LlmRequest, Message, MessageContent, Role, StreamEvent,
+    registry::ProviderRegistry,
 };
 
 // ---------------------------------------------------------------------------
@@ -98,7 +96,7 @@ pub async fn acquire_distill_permit() -> Result<tokio::sync::SemaphorePermit<'st
 }
 
 // Cluster thresholds are now read from the live evolution config — see
-// `crate::agent::evolution::evolution_config()`. Defaults (3 docs / 0.75
+// `rsclaw_evolution::evolution_config()`. Defaults (3 docs / 0.75
 // cosine) match the original hardcoded constants.
 
 /// Find a cluster of related Core-tier memories around the given document.
@@ -112,7 +110,7 @@ pub fn find_cluster(
     doc_id: &str,
     scope: &str,
 ) -> Result<Option<Vec<MemoryDoc>>> {
-    let evo = crate::agent::evolution::evolution_config();
+    let evo = rsclaw_evolution::evolution_config();
     let source = store
         .get_sync(doc_id)
         .context("source doc not found in store")?
@@ -658,7 +656,7 @@ pub async fn crystallize_one(
     skills_dir: &Path,
 ) -> Result<Option<PathBuf>> {
     // 0. Master kill-switch.
-    if !crate::agent::evolution::evolution_config().enabled {
+    if !rsclaw_evolution::evolution_config().enabled {
         return Ok(None);
     }
 

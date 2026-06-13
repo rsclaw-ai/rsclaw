@@ -17,7 +17,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
-pub use crate::skill::registry::SearchResult;
+pub use crate::registry::SearchResult;
 
 // ---------------------------------------------------------------------------
 // Lock file
@@ -115,7 +115,7 @@ fn skillhub_urls() -> SkillhubUrls {
             #[serde(default)]
             skill_registries: std::collections::HashMap<String, toml::Value>,
         }
-        let defaults_str = crate::config::loader::load_defaults_toml();
+        let defaults_str = rsclaw_config::loader::load_defaults_toml();
         let defs: Defs = toml::from_str(&defaults_str).unwrap_or_default();
         if let Some(sh) = defs.skill_registries.get("skillhub") {
             SkillhubUrls {
@@ -172,7 +172,7 @@ fn iwencai_urls() -> IwencaiUrls {
             #[serde(default)]
             skill_registries: std::collections::HashMap<String, toml::Value>,
         }
-        let defaults_str = crate::config::loader::load_defaults_toml();
+        let defaults_str = rsclaw_config::loader::load_defaults_toml();
         let defs: Defs = toml::from_str(&defaults_str).unwrap_or_default();
         let entry = defs.skill_registries.get("iwencai");
         let install_template = entry
@@ -743,7 +743,7 @@ impl ClawhubClient {
     /// CN locale: skills.sh + skillhub in parallel.
     /// Other:     skills.sh + clawhub.ai in parallel.
     pub async fn search_with_fallback(&self, query: &str) -> Result<Vec<SearchResult>> {
-        use crate::skill::registry::{Registry, search_concurrent};
+        use crate::registry::{Registry, search_concurrent};
 
         let sh = skillhub_urls();
         let iw = iwencai_urls();

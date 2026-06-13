@@ -3,7 +3,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::kb::{
+use crate::{
     model::{CallerScope, KbSourceKind},
     search::{
         SearchCtx,
@@ -68,7 +68,7 @@ pub fn run(
         if !cursor_key.is_empty() && key == cursor_key {
             continue;
         }
-        let d: crate::kb::model::KbDoc = decode(v.value())?;
+        let d: crate::model::KbDoc = decode(v.value())?;
         if !keep_doc(&d, scope, &filter) {
             continue;
         }

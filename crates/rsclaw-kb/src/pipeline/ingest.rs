@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::kb::{
+use crate::{
     canonicalize::CanonicalizedSource,
     content_store::{
         StageInput, atomic::sha256_hex, compose::FrontMatter, paths::slugify, stage_doc,
@@ -55,7 +55,7 @@ pub fn ingest_canonicalized(store: &KbStore, input: IngestInput<'_>) -> Result<I
             if let Some(existing) = docs::get(&rtx, &existing_doc_id)? {
                 if existing.status == KbStatus::Active {
                     tracing::info!(
-                        doc = %crate::kb::redact(&existing_doc_id),
+                        doc = %crate::redact(&existing_doc_id),
                         "kb ingest: noop (fast path)"
                     );
                     return Ok(IngestOutput {
@@ -107,7 +107,7 @@ pub fn ingest_canonicalized(store: &KbStore, input: IngestInput<'_>) -> Result<I
             if existing.status == KbStatus::Active {
                 drop(wtx);
                 tracing::info!(
-                    doc = %crate::kb::redact(&existing_doc_id),
+                    doc = %crate::redact(&existing_doc_id),
                     "kb ingest: noop (lost race; staged files left for compactor)"
                 );
                 return Ok(IngestOutput {
@@ -123,7 +123,7 @@ pub fn ingest_canonicalized(store: &KbStore, input: IngestInput<'_>) -> Result<I
             docs::put(&wtx, &existing)?;
             wtx.commit()?;
             tracing::info!(
-                doc = %crate::kb::redact(&existing_doc_id),
+                doc = %crate::redact(&existing_doc_id),
                 "kb ingest: resurrected tombstoned doc"
             );
             return Ok(IngestOutput {
@@ -231,7 +231,7 @@ pub fn ingest_canonicalized(store: &KbStore, input: IngestInput<'_>) -> Result<I
     wtx.commit()?;
 
     tracing::info!(
-        doc = %crate::kb::redact(&doc_id),
+        doc = %crate::redact(&doc_id),
         version = next_version,
         "kb ingest: committed"
     );
@@ -248,7 +248,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::kb::{
+    use crate::{
         canonicalize::{CanonicalizeInput, canonicalize_by_mime},
         content_store::atomic::sha256_hex,
         jobs::JobStatus,
@@ -375,7 +375,7 @@ mod tests {
     #[test]
     fn reingest_different_bytes_bumps_version() {
         let (_tmp, store, paths) = fixture();
-        use crate::kb::{canonicalize::CanonicalizeInput, model::LogicalSourceId};
+        use crate::{canonicalize::CanonicalizeInput, model::LogicalSourceId};
         let lsid = LogicalSourceId("file:custom:x".into());
         let c1 = canonicalize_by_mime(CanonicalizeInput {
             bytes: b"version 1",
@@ -460,7 +460,7 @@ mod tests {
             let rtx = store.begin_read().unwrap();
             let mut d = docs::get(&rtx, &first.doc_id).unwrap().unwrap();
             drop(rtx);
-            d.status = crate::kb::model::KbStatus::Tombstoned;
+            d.status = crate::model::KbStatus::Tombstoned;
             let wtx = store.begin_write().unwrap();
             docs::put(&wtx, &d).unwrap();
             wtx.commit().unwrap();
@@ -484,7 +484,7 @@ mod tests {
         assert!(!second.noop, "resurrection isn't a NOOP");
         let rtx = store.begin_read().unwrap();
         let d = docs::get(&rtx, &second.doc_id).unwrap().unwrap();
-        assert_eq!(d.status, crate::kb::model::KbStatus::Active);
+        assert_eq!(d.status, crate::model::KbStatus::Active);
     }
 
     #[test]

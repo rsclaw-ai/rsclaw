@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use anyhow::Result;
 use redb::ReadTransaction;
 
-use crate::kb::{
+use crate::{
     model::{CallerScope, KbDoc, KbStatus},
     store::docs,
 };
@@ -16,7 +16,7 @@ use crate::kb::{
 #[derive(Clone, Debug, Default)]
 pub struct SearchFilter {
     pub tags: Vec<String>,
-    pub source_kind: Option<crate::kb::model::KbSourceKind>,
+    pub source_kind: Option<crate::model::KbSourceKind>,
     pub doc_ids: Option<HashSet<String>>,
     pub require_entities: Vec<String>,
 }
@@ -62,7 +62,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::kb::{
+    use crate::{
         model::{KbSource, KbSourceKind, KbStatus, KbVisibility, VersionPointer},
         store::open_db,
     };
@@ -151,7 +151,7 @@ mod tests {
         let db = open_db(&tmp.path().join("kb.redb")).unwrap();
         {
             let wtx = db.begin_write().unwrap();
-            crate::kb::store::docs::set_latest_version(
+            crate::store::docs::set_latest_version(
                 &wtx,
                 "lsid",
                 &VersionPointer {

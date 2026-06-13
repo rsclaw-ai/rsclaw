@@ -48,7 +48,7 @@ const SHARED_BROWSER_PROFILE: &str = "rsclaw";
 
 type HostTrapResult<T> = std::result::Result<T, wasmtime::Error>;
 
-use crate::browser::BrowserSession;
+use rsclaw_browser::BrowserSession;
 
 // ---------------------------------------------------------------------------
 // WIT bindgen — generates host trait and typed export accessors
@@ -96,14 +96,14 @@ pub struct WasmPlugin {
     /// CDN routing rules declared by this plugin — applied when the plugin
     /// invokes `host::browser_download(url, ...)` so the host doesn't need
     /// to hardcode per-platform auth quirks.
-    browser_cdn_rules: Vec<crate::plugin::manifest::CdnDownloadRule>,
+    browser_cdn_rules: Vec<crate::manifest::CdnDownloadRule>,
     /// Minimum gap between successive `call_tool` invocations on this plugin
     /// (host-enforced rate limit). 0 disables throttling.
     min_call_interval: Duration,
     /// Last `call_tool` start time, used to compute the throttle delay.
     last_call: Mutex<Option<Instant>>,
     /// Optional provider registry for host-vlm interface.
-    providers: Option<Arc<crate::provider::registry::ProviderRegistry>>,
+    providers: Option<Arc<rsclaw_provider::registry::ProviderRegistry>>,
     /// Default vision model name for host-vlm interface.
     vision_model: Option<String>,
 }
@@ -134,7 +134,7 @@ pub struct WasmToolDef {
 /// trace-logged only.
 #[derive(Clone)]
 pub struct WasmNotifyCtx {
-    pub tx: tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>,
+    pub tx: tokio::sync::broadcast::Sender<rsclaw_channel::OutboundMessage>,
     pub target_id: String,
     pub channel: String,
 }
@@ -148,14 +148,14 @@ struct HostState {
     notify_ctx: Option<WasmNotifyCtx>,
     /// CDN download rules from the calling plugin's manifest. Consulted by
     /// `browser_download` to attach a Referer when the URL matches.
-    cdn_rules: Vec<crate::plugin::manifest::CdnDownloadRule>,
+    cdn_rules: Vec<crate::manifest::CdnDownloadRule>,
     /// Plugin name — used to scope per-plugin resources (SQLite DB path, etc.).
     plugin_name: String,
     /// Desktop session for host-desktop interface (input synthesis,
     /// screenshots).
-    desktop: Box<dyn crate::desktop::DesktopSession>,
+    desktop: Box<dyn rsclaw_desktop::DesktopSession>,
     /// Optional provider registry for host-vlm interface.
-    providers: Option<Arc<crate::provider::registry::ProviderRegistry>>,
+    providers: Option<Arc<rsclaw_provider::registry::ProviderRegistry>>,
     /// Default vision model name for host-vlm interface.
     vision_model: Option<String>,
     /// ADB device serial (`RSCLAW_ANDROID_SERIAL` env var). Passed `-s
@@ -167,9 +167,9 @@ struct HostState {
 fn new_host_state(
     browser: Arc<Mutex<Option<BrowserSession>>>,
     notify_ctx: Option<WasmNotifyCtx>,
-    cdn_rules: Vec<crate::plugin::manifest::CdnDownloadRule>,
+    cdn_rules: Vec<crate::manifest::CdnDownloadRule>,
     plugin_name: String,
-    providers: Option<Arc<crate::provider::registry::ProviderRegistry>>,
+    providers: Option<Arc<rsclaw_provider::registry::ProviderRegistry>>,
     vision_model: Option<String>,
 ) -> HostState {
     HostState {
@@ -182,7 +182,7 @@ fn new_host_state(
         notify_ctx,
         cdn_rules,
         plugin_name,
-        desktop: crate::desktop::create_session(),
+        desktop: rsclaw_desktop::create_session(),
         providers,
         vision_model,
         android_serial: std::env::var("RSCLAW_ANDROID_SERIAL").ok(),
@@ -195,9 +195,9 @@ fn new_sandboxed_store(
     engine: &Engine,
     browser: Arc<Mutex<Option<BrowserSession>>>,
     notify_ctx: Option<WasmNotifyCtx>,
-    cdn_rules: Vec<crate::plugin::manifest::CdnDownloadRule>,
+    cdn_rules: Vec<crate::manifest::CdnDownloadRule>,
     plugin_name: String,
-    providers: Option<Arc<crate::provider::registry::ProviderRegistry>>,
+    providers: Option<Arc<rsclaw_provider::registry::ProviderRegistry>>,
     vision_model: Option<String>,
 ) -> Store<HostState> {
     let mut store = Store::new(
@@ -234,7 +234,7 @@ impl wasmtime_wasi::WasiView for HostState {
 /// in the input are tolerated *only* if the canonical result still lives
 /// under the workspace dir — otherwise the call is rejected.
 fn canonicalize_plugin_path(input: &str) -> Result<PathBuf, String> {
-    let workspace = crate::config::loader::base_dir().join("workspace");
+    let workspace = rsclaw_config::loader::base_dir().join("workspace");
     let canonical = crate::agent::runtime::canonicalize_external_path(input, &workspace);
     if !canonical.starts_with(&workspace) {
         return Err(format!(
@@ -249,7 +249,7 @@ fn canonicalize_plugin_path(input: &str) -> Result<PathBuf, String> {
 /// Same as `canonicalize_plugin_path` but also permits paths under
 /// `~/.rsclaw/var/plugins/` so plugins can persist databases and config.
 fn canonicalize_writable_path(input: &str) -> Result<PathBuf, String> {
-    let base = crate::config::loader::base_dir();
+    let base = rsclaw_config::loader::base_dir();
     let workspace = base.join("workspace");
     let plugins_var = base.join("var").join("plugins");
     let canonical = crate::agent::runtime::canonicalize_external_path(input, &workspace);
@@ -266,13 +266,13 @@ fn canonicalize_writable_path(input: &str) -> Result<PathBuf, String> {
 /// extraction. In addition to workspace/plugin-var paths, this permits
 /// `~/Downloads/rsclaw`, which is where `allocate-artifact` stores files.
 fn canonicalize_plugin_artifact_path(input: &str) -> Result<PathBuf, String> {
-    let base = crate::config::loader::base_dir();
+    let base = rsclaw_config::loader::base_dir();
     let workspace = base.join("workspace");
     let plugins_var = base.join("var").join("plugins");
     let downloads_rsclaw = dirs_next::download_dir()
         .unwrap_or_else(|| {
             dirs_next::home_dir()
-                .unwrap_or_else(crate::config::loader::base_dir)
+                .unwrap_or_else(rsclaw_config::loader::base_dir)
                 .join("Downloads")
         })
         .join("rsclaw");
@@ -336,11 +336,11 @@ pub(crate) async fn kb_ingest_document(
     if content.trim().is_empty() {
         return Err("kb_ingest_document: content is required".to_string());
     }
-    let kb = crate::kb::global_service()
+    let kb = rsclaw_kb::global_service()
         .ok_or_else(|| "knowledge base is not available in this gateway".to_string())?;
 
     tokio::task::spawn_blocking(move || -> Result<String, String> {
-        let find = || -> Result<Option<crate::kb::model::KbCollection>, String> {
+        let find = || -> Result<Option<rsclaw_kb::model::KbCollection>, String> {
             kb.list_collections()
                 .map_err(|e| e.to_string())
                 .map(|cols| {
@@ -353,7 +353,7 @@ pub(crate) async fn kb_ingest_document(
         } else {
             match kb.create_collection(&collection, None, None) {
                 Ok(c) => c.id,
-                Err(crate::kb::KnowledgeError::DuplicateName) => find()?
+                Err(rsclaw_kb::KnowledgeError::DuplicateName) => find()?
                     .map(|c| c.id)
                     .ok_or_else(|| "collection vanished after duplicate".to_string())?,
                 Err(e) => return Err(e.to_string()),
@@ -548,7 +548,7 @@ impl rsclaw::plugin::host_browser::Host for HostState {
         // /etc/passwd etc.), upload paths are typically user-supplied via
         // the LLM ("upload ~/Downloads/cat.png") so we tolerate any path
         // the user has access to. Just expand `~` and normalize.
-        let workspace = crate::config::loader::base_dir().join("workspace");
+        let workspace = rsclaw_config::loader::base_dir().join("workspace");
         let canonical = crate::agent::runtime::canonicalize_external_path(&filepath, &workspace);
         // Note: cmd_upload expects `files: [path]` (array), not `filepath: path`.
         Ok(self
@@ -590,7 +590,7 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
     async fn notify(&mut self, message: String) -> HostTrapResult<Result<String, String>> {
         tracing::info!(target: "wasm_plugin_notify", "{message}");
         if let Some(ctx) = &self.notify_ctx {
-            let _ = ctx.tx.send(crate::channel::OutboundMessage {
+            let _ = ctx.tx.send(rsclaw_channel::OutboundMessage {
                 target_id: ctx.target_id.clone(),
                 is_group: false,
                 text: message,
@@ -613,7 +613,7 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
     ) -> HostTrapResult<Result<String, String>> {
         tracing::info!(target: "wasm_plugin_notify", "{message}");
         if let Some(ctx) = &self.notify_ctx {
-            match ctx.tx.send(crate::channel::OutboundMessage {
+            match ctx.tx.send(rsclaw_channel::OutboundMessage {
                 target_id: ctx.target_id.clone(),
                 is_group: false,
                 text: message,
@@ -657,7 +657,7 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "file".to_string());
             let path_str = canonical.to_string_lossy().into_owned();
-            match ctx.tx.send(crate::channel::OutboundMessage {
+            match ctx.tx.send(rsclaw_channel::OutboundMessage {
                 target_id: ctx.target_id.clone(),
                 is_group: false,
                 text: message,
@@ -838,7 +838,7 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
 
 /// Return the SQLite database path for a given plugin name.
 fn plugin_db_path(plugin_name: &str) -> PathBuf {
-    crate::config::loader::base_dir()
+    rsclaw_config::loader::base_dir()
         .join("var")
         .join("plugins")
         .join(plugin_name)
@@ -872,7 +872,7 @@ impl rsclaw::plugin::host_media::Host for HostState {
         &mut self,
         input_path: String,
     ) -> HostTrapResult<Result<String, String>> {
-        let ffmpeg_bin = match crate::agent::platform::detect_ffmpeg() {
+        let ffmpeg_bin = match rsclaw_platform::detect_ffmpeg() {
             Some(p) => p,
             None => {
                 return Ok(Err(
@@ -930,7 +930,7 @@ impl rsclaw::plugin::host_media::Host for HostState {
         };
 
         let client = reqwest::Client::new();
-        match crate::channel::transcription::transcribe_audio(&client, &bytes, &audio_path, mime)
+        match rsclaw_channel::transcription::transcribe_audio(&client, &bytes, &audio_path, mime)
             .await
         {
             Ok(text) => Ok(Ok(text)),
@@ -943,7 +943,7 @@ impl rsclaw::plugin::host_media::Host for HostState {
         video_path: String,
         count: u32,
     ) -> HostTrapResult<Result<Vec<String>, String>> {
-        let ffmpeg_bin = match crate::agent::platform::detect_ffmpeg() {
+        let ffmpeg_bin = match rsclaw_platform::detect_ffmpeg() {
             Some(p) => p,
             None => {
                 return Ok(Err(
@@ -1029,12 +1029,12 @@ pub(crate) fn allocate_dl_paths(filename: &str, count: usize) -> Result<Vec<Stri
         .and_then(|e| e.to_str())
         .unwrap_or("bin")
         .to_ascii_lowercase();
-    let kind = crate::channel::kind_from_extension(&ext);
-    let category = crate::channel::category_for_kind(kind);
+    let kind = rsclaw_channel::kind_from_extension(&ext);
+    let category = rsclaw_channel::category_for_kind(kind);
     let dir = dirs_next::download_dir()
         .unwrap_or_else(|| {
             dirs_next::home_dir()
-                .unwrap_or_else(crate::config::loader::base_dir)
+                .unwrap_or_else(rsclaw_config::loader::base_dir)
                 .join("Downloads")
         })
         .join("rsclaw")
@@ -1459,18 +1459,18 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
             }
         };
 
-        let messages = vec![crate::provider::Message {
-            role: crate::provider::Role::User,
-            content: crate::provider::MessageContent::Parts(vec![
-                crate::provider::ContentPart::Text { text: prompt },
-                crate::provider::ContentPart::Image {
+        let messages = vec![rsclaw_provider::Message {
+            role: rsclaw_provider::Role::User,
+            content: rsclaw_provider::MessageContent::Parts(vec![
+                rsclaw_provider::ContentPart::Text { text: prompt },
+                rsclaw_provider::ContentPart::Image {
                     url: image_data_uri,
                 },
             ]),
             rsclaw_hidden: None,
         }];
 
-        let req = crate::provider::LlmRequest {
+        let req = rsclaw_provider::LlmRequest {
             fallback_models: Vec::new(),
             model: format!("{provider_name}/{model_id}"),
             messages,
@@ -1480,7 +1480,7 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
             temperature: Some(0.0),
             frequency_penalty: None,
             thinking_budget: None,
-            endpoint: crate::provider::AgentEndpoint::Vision,
+            endpoint: rsclaw_provider::AgentEndpoint::Vision,
             kv_cache_mode: 0,
             session_key: None,
             system_shared: None,
@@ -1495,13 +1495,13 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
                 use futures::StreamExt;
                 while let Some(event) = stream.next().await {
                     match event {
-                        Ok(crate::provider::StreamEvent::TextDelta(d)) => text.push_str(&d),
-                        Ok(crate::provider::StreamEvent::ReasoningDelta(d)) => {
+                        Ok(rsclaw_provider::StreamEvent::TextDelta(d)) => text.push_str(&d),
+                        Ok(rsclaw_provider::StreamEvent::ReasoningDelta(d)) => {
                             reasoning.push_str(&d)
                         }
-                        Ok(crate::provider::StreamEvent::Done { .. }) => break,
-                        Ok(crate::provider::StreamEvent::ToolCall { .. }) => {}
-                        Ok(crate::provider::StreamEvent::Error(e)) => {
+                        Ok(rsclaw_provider::StreamEvent::Done { .. }) => break,
+                        Ok(rsclaw_provider::StreamEvent::ToolCall { .. }) => {}
+                        Ok(rsclaw_provider::StreamEvent::Error(e)) => {
                             return Ok(Err(format!("vlm_parse stream error: {e}")));
                         }
                         Err(e) => {
@@ -1963,7 +1963,7 @@ pub async fn load_wasm_plugin(
     manifest: &super::manifest::PluginManifest,
     engine: &Engine,
     browser: Arc<Mutex<Option<BrowserSession>>>,
-    providers: Option<Arc<crate::provider::registry::ProviderRegistry>>,
+    providers: Option<Arc<rsclaw_provider::registry::ProviderRegistry>>,
     vision_model: Option<String>,
 ) -> Result<WasmPlugin> {
     let path = manifest.entry_path();

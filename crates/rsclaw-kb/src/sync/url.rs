@@ -7,7 +7,7 @@ use std::time::Duration;
 use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 
 use super::{KbSourceSyncer, SyncContext, SyncError, SyncOutcome, SyncReason};
-use crate::kb::{
+use crate::{
     canonicalize::{CanonicalizeInput, canonicalize_by_mime, canonicalize_url, detect_mime},
     content_store::atomic::sha256_hex,
     model::{KbSource, KbSourceKind},

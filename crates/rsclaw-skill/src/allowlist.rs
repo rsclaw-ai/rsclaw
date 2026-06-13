@@ -123,7 +123,7 @@ fn set(a: Allowlist) {
 }
 
 fn cache_dir() -> PathBuf {
-    crate::config::loader::base_dir().join("allowlist")
+    rsclaw_config::loader::base_dir().join("allowlist")
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -165,7 +165,7 @@ pub fn load_cached() -> (usize, usize) {
 /// lists they pin) are authentic.
 fn verify_meta_signature(meta: &str) -> Result<()> {
     let m: Meta = serde_json::from_str(meta).context("parse allowlist meta.json")?;
-    crate::skill::sig::verify_meta_sig(
+    crate::sig::verify_meta_sig(
         &m.version,
         &m.sha256.skills,
         &m.sha256.plugins,

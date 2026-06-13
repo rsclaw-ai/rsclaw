@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 
-use crate::kb::store::{
+use crate::store::{
     KbStore,
     seen::{SyncState, get_sync_state, put_sync_state},
 };

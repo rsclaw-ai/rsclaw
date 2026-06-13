@@ -3,7 +3,7 @@
 use anyhow::Result;
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
-use crate::kb::{
+use crate::{
     model::KbChunk,
     store::{
         codec::{decode, encode},
@@ -143,7 +143,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::kb::{
+    use crate::{
         model::{ChunkStatus, KbLocator, LogicalSourceId, chunk_id},
         store::open_db,
     };

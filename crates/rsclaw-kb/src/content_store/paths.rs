@@ -6,7 +6,7 @@
 
 use sha2::Digest;
 
-use crate::kb::model::KbSourceKind;
+use crate::model::KbSourceKind;
 
 /// Slugify a title for path use. Keeps alphanumerics + CJK, lowercases
 /// Latin, collapses runs of non-keepers into single dashes, trims

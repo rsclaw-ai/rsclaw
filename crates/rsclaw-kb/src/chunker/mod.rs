@@ -11,7 +11,7 @@ pub mod tokens;
 use splitter::split_paragraphs;
 use tokens::approx_token_count;
 
-use crate::kb::{
+use crate::{
     canonicalize::md::heading_path_at,
     model::{ChunkStatus, KbChunk, KbLocator, LogicalSourceId, chunk_id, hamming64, simhash64},
 };

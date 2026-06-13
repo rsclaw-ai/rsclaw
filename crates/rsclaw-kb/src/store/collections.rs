@@ -6,7 +6,7 @@
 use anyhow::Result;
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
-use crate::kb::{
+use crate::{
     model::KbCollection,
     store::{
         codec::{decode, encode},
@@ -83,7 +83,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::kb::store::schema::open_db;
+    use crate::store::schema::open_db;
 
     fn col(id: &str, name: &str) -> KbCollection {
         KbCollection {

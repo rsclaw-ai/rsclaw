@@ -7531,6 +7531,7 @@ dependencies = [
  "rsclaw-computer",
  "rsclaw-config",
  "rsclaw-desktop",
+ "rsclaw-doc",
  "rsclaw-embed",
  "rsclaw-events",
  "rsclaw-evolution",
@@ -7720,6 +7721,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsclaw-doc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "calamine",
+ "docx-rs",
+ "krilla",
+ "lopdf 0.34.0",
+ "pdf-extract",
+ "rust_xlsxwriter",
+ "serde_json",
+ "tokio",
+ "zip 2.4.2",
+]
+
+[[package]]
 name = "rsclaw-embed"
 version = "0.1.0"
 dependencies = [
@@ -7783,10 +7800,19 @@ name = "rsclaw-kb"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "calamine",
  "chrono",
+ "dirs-next",
  "hnsw_rs",
  "jieba-rs",
+ "lol_html",
+ "mailparse",
  "once_cell",
+ "pdf-extract",
+ "redb 4.1.0",
+ "regex",
  "reqwest",
  "rsclaw-config",
  "rsclaw-embed",
@@ -7797,13 +7823,19 @@ dependencies = [
  "rsclaw-store",
  "rsclaw-types",
  "rsclaw-util",
+ "rust_xlsxwriter",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
+ "sha2",
  "tantivy",
+ "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "ulid",
  "url",
+ "zip 2.4.2",
 ]
 
 [[package]]
@@ -7851,8 +7883,11 @@ dependencies = [
  "dirs-next",
  "libc",
  "rsclaw-config",
+ "serde",
+ "serde_json",
  "sys-info",
  "tokio",
+ "tracing",
  "which 7.0.3",
 ]
 
@@ -7861,21 +7896,30 @@ name = "rsclaw-plugin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "dirs-next",
+ "futures",
+ "json5",
+ "reqwest",
  "rsclaw-browser",
  "rsclaw-channel",
  "rsclaw-config",
+ "rsclaw-desktop",
  "rsclaw-events",
  "rsclaw-i18n",
  "rsclaw-kb",
+ "rsclaw-memory",
  "rsclaw-platform",
  "rsclaw-provider",
  "rsclaw-store",
  "rsclaw-types",
  "rsclaw-util",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
+ "uuid",
  "wasmtime",
  "wasmtime-wasi",
 ]
@@ -7923,11 +7967,17 @@ name = "rsclaw-skill"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
+ "ed25519-dalek",
+ "flate2",
+ "futures",
  "reqwest",
  "rsclaw-config",
  "rsclaw-events",
+ "rsclaw-evolution",
  "rsclaw-i18n",
+ "rsclaw-memory",
  "rsclaw-platform",
  "rsclaw-provider",
  "rsclaw-store",
@@ -7935,8 +7985,15 @@ dependencies = [
  "rsclaw-util",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
+ "sha2",
+ "tar",
+ "tempfile",
  "tokio",
+ "toml 1.1.0+spec-1.1.0",
  "tracing",
+ "which 7.0.3",
+ "zip 2.4.2",
 ]
 
 [[package]]

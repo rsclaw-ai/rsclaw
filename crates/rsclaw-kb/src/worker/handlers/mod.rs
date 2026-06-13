@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::kb::{
+use crate::{
     embedder::KbEmbedder, index::KbIndex, jobs::JobKind, paths::KbPaths, store::KbStore,
 };
 

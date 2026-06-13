@@ -1,7 +1,7 @@
 //! MIME detection + dispatch to the right canonicalizer.
 
 use super::*;
-use crate::kb::canonicalize::{
+use crate::canonicalize::{
     email::{EML_MIME, EmlCanonicalizer, MBOX_MIME, MboxCanonicalizer},
     html::HtmlCanonicalizer,
     image::ImageCanonicalizer,

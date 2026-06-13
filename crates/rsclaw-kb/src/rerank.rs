@@ -39,7 +39,7 @@ impl KbReranker {
     /// Build from the effective `kb.rerank` config block. Returns `None`
     /// when the block is absent or explicitly disabled.
     pub fn from_config() -> Option<std::sync::Arc<Self>> {
-        let cfg = crate::config::load().ok()?;
+        let cfg = rsclaw_config::load().ok()?;
         let rr = cfg.raw.kb.as_ref()?.rerank.clone()?;
         if !rr.enabled.unwrap_or(true) {
             return None;
@@ -49,12 +49,12 @@ impl KbReranker {
         let model_is_rsclaw = rr
             .model
             .as_deref()
-            .map(crate::embed::is_rsclaw_model)
+            .map(rsclaw_embed::is_rsclaw_model)
             .unwrap_or(false);
         let base_raw = rr.base_url.trim();
         let base = if base_raw.is_empty() {
             if model_is_rsclaw {
-                crate::embed::RSCLAW_API_BASE_URL.to_owned()
+                rsclaw_embed::RSCLAW_API_BASE_URL.to_owned()
             } else {
                 return None;
             }
@@ -64,7 +64,7 @@ impl KbReranker {
         // Disable idle-pool reuse for the same reason as the embedder: a
         // slow rerank endpoint's keep-alive connection gets reaped between
         // calls and reqwest would otherwise hand back the dead socket.
-        let client = crate::embed::build_remote_client(RERANK_TIMEOUT_SECS);
+        let client = rsclaw_embed::build_remote_client(RERANK_TIMEOUT_SECS);
         Some(std::sync::Arc::new(Self {
             client,
             url: format!("{base}/rerank"),

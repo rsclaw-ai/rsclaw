@@ -4,7 +4,7 @@
 use anyhow::Result;
 
 use super::KbIndex;
-use crate::kb::store::KbStore;
+use crate::store::KbStore;
 
 pub fn from_redb(idx: &KbIndex, store: &KbStore) -> Result<()> {
     idx.hnsw.rebuild(store)?;

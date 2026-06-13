@@ -63,7 +63,7 @@ impl JsPlugin {
     /// incoming lines into pending-request fulfillment or host method dispatch.
     pub async fn spawn(
         manifest: &PluginManifest,
-        host_dispatch: Arc<crate::plugin::host_methods::HostMethodRegistry>,
+        host_dispatch: Arc<crate::host_methods::HostMethodRegistry>,
     ) -> Result<Self> {
         let runtime = resolve_runtime(&manifest.runtime)?;
         let entry = manifest.dir.join(&manifest.entry);
@@ -247,7 +247,7 @@ async fn handle_incoming(
     line: &str,
     pending: &Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>,
     stdin: Arc<Mutex<ChildStdin>>,
-    host_dispatch: &Arc<crate::plugin::host_methods::HostMethodRegistry>,
+    host_dispatch: &Arc<crate::host_methods::HostMethodRegistry>,
     plugin_name: &str,
 ) -> Result<()> {
     let msg: Value = serde_json::from_str(line)
@@ -343,7 +343,7 @@ fn resolve_runtime(runtime: &str) -> Result<String> {
         other => vec![other],
     };
 
-    let base = crate::config::loader::base_dir();
+    let base = rsclaw_config::loader::base_dir();
 
     // 1. Check ~/.rsclaw/tools/<rt>/bin/<rt> first — the bundled-runtime layout
     //    from `rsclaw tools install` (node: tools/node/bin/node; bun:
@@ -397,7 +397,7 @@ pub struct Plugin {
 impl Plugin {
     pub async fn spawn(
         manifest: PluginManifest,
-        host_dispatch: Arc<crate::plugin::host_methods::HostMethodRegistry>,
+        host_dispatch: Arc<crate::host_methods::HostMethodRegistry>,
     ) -> Result<Self> {
         let inner = JsPlugin::spawn(&manifest, host_dispatch).await?;
         Ok(Self { inner, manifest })

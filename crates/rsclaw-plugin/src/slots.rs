@@ -122,11 +122,11 @@ impl SlotRegistry {
 /// Wraps the built-in `MemoryStore` so it can fill the `memory` slot
 /// and be used by external plugins that call through `SlotRegistry`.
 pub struct MemoryStoreSlot {
-    inner: Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>,
+    inner: Arc<tokio::sync::Mutex<rsclaw_memory::MemoryStore>>,
 }
 
 impl MemoryStoreSlot {
-    pub fn new(store: Arc<tokio::sync::Mutex<crate::agent::memory::MemoryStore>>) -> Self {
+    pub fn new(store: Arc<tokio::sync::Mutex<rsclaw_memory::MemoryStore>>) -> Self {
         Self { inner: store }
     }
 }
@@ -140,7 +140,7 @@ impl MemorySlot for MemoryStoreSlot {
     ) -> BoxFuture<'a, Result<String>> {
         Box::pin(async move {
             let id = uuid::Uuid::new_v4().to_string();
-            let doc = crate::agent::memory::MemoryDoc {
+            let doc = rsclaw_memory::MemoryDoc {
                 id: id.clone(),
                 scope: scope.to_owned(),
                 kind: "note".to_owned(),

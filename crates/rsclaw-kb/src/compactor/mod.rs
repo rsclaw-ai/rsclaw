@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::Result;
 
-use crate::kb::{
+use crate::{
     ledger::LedgerStatus,
     model::KbDoc,
     paths::KbPaths,
@@ -209,8 +209,8 @@ mod tests {
         let doc = KbDoc {
             id: "d1".into(),
             logical_source_id: "lsid".into(),
-            source: crate::kb::model::KbSource::Doc { path: "/x".into() },
-            source_kind: crate::kb::model::KbSourceKind::Doc,
+            source: crate::model::KbSource::Doc { path: "/x".into() },
+            source_kind: crate::model::KbSourceKind::Doc,
             title: "T".into(),
             mime: "text/markdown".into(),
             raw_sha256: "sha".into(),
@@ -221,14 +221,14 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             version: 1,
-            status: crate::kb::model::KbStatus::Active,
-            visibility: crate::kb::model::KbVisibility::Global,
+            status: crate::model::KbStatus::Active,
+            visibility: crate::model::KbVisibility::Global,
             tags: vec![],
             meta: serde_json::Value::Null,
         };
         {
             let wtx = store.begin_write().unwrap();
-            crate::kb::store::docs::put(&wtx, &doc).unwrap();
+            crate::store::docs::put(&wtx, &doc).unwrap();
             wtx.commit().unwrap();
         }
         let now = chrono::Utc::now().timestamp_millis() + 86_400_000;

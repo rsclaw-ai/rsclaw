@@ -15,7 +15,7 @@ use std::{
 use anyhow::Result;
 use tokio::task::JoinHandle;
 
-use crate::kb::{
+use crate::{
     store::{KbStore, jobs},
     worker::handlers::{DefaultDispatcher, HandlerCtx, JobHandler},
 };
@@ -182,7 +182,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::kb::{
+    use crate::{
         canonicalize::{CanonicalizeInput, canonicalize_by_mime},
         embedder::{KbEmbedder, StubEmbedder},
         jobs::JobStatus,
@@ -223,7 +223,7 @@ mod tests {
         )
         .unwrap();
 
-        let index = Arc::new(crate::kb::index::KbIndex::open(&paths).unwrap());
+        let index = Arc::new(crate::index::KbIndex::open(&paths).unwrap());
         let ctx = HandlerCtx {
             store,
             paths,
@@ -271,7 +271,7 @@ mod tests {
         cfg.max_attempts = 2;
         struct AlwaysFails;
         impl JobHandler for AlwaysFails {
-            fn handle(&self, _: &HandlerCtx, _: &crate::kb::jobs::JobKind) -> Result<()> {
+            fn handle(&self, _: &HandlerCtx, _: &crate::jobs::JobKind) -> Result<()> {
                 Err(anyhow::anyhow!("nope"))
             }
         }
@@ -296,7 +296,7 @@ mod tests {
         cfg.max_attempts = 1;
         struct Panics;
         impl JobHandler for Panics {
-            fn handle(&self, _: &HandlerCtx, _: &crate::kb::jobs::JobKind) -> Result<()> {
+            fn handle(&self, _: &HandlerCtx, _: &crate::jobs::JobKind) -> Result<()> {
                 panic!("boom from handler");
             }
         }

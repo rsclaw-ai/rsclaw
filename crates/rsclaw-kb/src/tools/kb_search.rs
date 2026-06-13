@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::kb::{
+use crate::{
     entities::extract::{canonical_id, extract_entities},
     model::{CallerScope, KbSourceKind},
     search::{Diversity, RetrievalHit, SearchCtx, SearchFilter, SearchMode, SearchRequest},

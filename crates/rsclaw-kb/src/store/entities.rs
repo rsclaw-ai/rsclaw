@@ -14,7 +14,7 @@
 use anyhow::Result;
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
-use crate::kb::{
+use crate::{
     model::{EntityKind, KbEntity, KbEntityIndex},
     store::{
         codec::{decode, encode},
@@ -103,7 +103,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::kb::store::open_db;
+    use crate::store::open_db;
 
     fn sample_entity(canonical_id: &str, surfaces: &[&str], kind: EntityKind) -> KbEntity {
         KbEntity {

@@ -12,7 +12,8 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use crate::{agent::turn_metrics::TurnMetrics, provider::registry::ProviderRegistry};
+use crate::agent::turn_metrics::TurnMetrics;
+use rsclaw_provider::registry::ProviderRegistry;
 
 /// Build the LLM prompt for workflow distillation. Receives the raw turn
 /// transcript so the model can extract the steps, errors, and recovery
@@ -108,7 +109,7 @@ pub async fn crystallize_workflow(
     primary_model: &str,
     skills_dir: &Path,
 ) -> Result<Option<PathBuf>> {
-    if !crate::agent::evolution::evolution_config().enabled {
+    if !rsclaw_evolution::evolution_config().enabled {
         return Ok(None);
     }
     if primary_model.is_empty() {
@@ -130,7 +131,7 @@ pub async fn crystallize_workflow(
         }
     };
 
-    let _permit = match crate::skill::crystallizer::acquire_distill_permit().await {
+    let _permit = match crate::crystallizer::acquire_distill_permit().await {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!("workflow distill: failed to acquire permit: {e:#}");
@@ -138,7 +139,7 @@ pub async fn crystallize_workflow(
         }
     };
 
-    let skill_md = match crate::skill::crystallizer::distill_with_llm(
+    let skill_md = match crate::crystallizer::distill_with_llm(
         &prompt,
         Arc::clone(&provider_arc),
         model_id.to_owned(),
@@ -156,8 +157,8 @@ pub async fn crystallize_workflow(
     // auto-repair first so common LLM mistakes (wrapping ``` fence, missing
     // closing `---`, unquoted multi-line description) don't cost an extra
     // LLM round-trip.
-    let repaired = crate::skill::crystallizer::repair_skill_md(&skill_md);
-    let skill_md = match crate::skill::crystallizer::validate_skill_md_and_body(&repaired) {
+    let repaired = crate::crystallizer::repair_skill_md(&skill_md);
+    let skill_md = match crate::crystallizer::validate_skill_md_and_body(&repaired) {
         Ok(()) => repaired,
         Err(first_err) => {
             tracing::warn!("workflow distill: first attempt failed ({first_err:#}), retrying");
@@ -172,7 +173,7 @@ pub async fn crystallize_workflow(
                  (5) the output contains no prompt instructions, only the skill content.\n\n\
                  Original task:\n{prompt}"
             );
-            match crate::skill::crystallizer::distill_with_llm(
+            match crate::crystallizer::distill_with_llm(
                 &fixup_prompt,
                 Arc::clone(&provider_arc),
                 model_id.to_owned(),
@@ -180,8 +181,8 @@ pub async fn crystallize_workflow(
             .await
             {
                 Ok(second_md) => {
-                    let second_repaired = crate::skill::crystallizer::repair_skill_md(&second_md);
-                    match crate::skill::crystallizer::validate_skill_md_and_body(&second_repaired) {
+                    let second_repaired = crate::crystallizer::repair_skill_md(&second_md);
+                    match crate::crystallizer::validate_skill_md_and_body(&second_repaired) {
                         Ok(()) => second_repaired,
                         Err(second_err) => {
                             tracing::warn!(
@@ -200,13 +201,13 @@ pub async fn crystallize_workflow(
     };
 
     let fallback = format!("flow-{signature:08x}");
-    let raw_slug = crate::skill::crystallizer::extract_skill_slug(&skill_md, &fallback);
+    let raw_slug = crate::crystallizer::extract_skill_slug(&skill_md, &fallback);
     let slug = if raw_slug.starts_with("flow-") {
         format!("auto-{raw_slug}")
     } else {
         format!("auto-flow-{raw_slug}")
     };
-    let path = crate::skill::crystallizer::write_skill(skills_dir, &slug, &skill_md)
+    let path = crate::crystallizer::write_skill(skills_dir, &slug, &skill_md)
         .with_context(|| format!("write_skill failed for slug '{slug}'"))?;
 
     tracing::info!(

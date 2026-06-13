@@ -301,3 +301,4 @@ pub fn detect_ffmpeg() -> Option<String> {
     }
     None
 }
+pub mod install_hints;

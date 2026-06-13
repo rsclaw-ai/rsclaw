@@ -6,7 +6,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::kb::content_store::{atomic::sha256_hex, compose::parse_doc_file};
+use crate::content_store::{atomic::sha256_hex, compose::parse_doc_file};
 
 pub fn read_doc_body(abs: &Path) -> Result<String> {
     let s = std::fs::read_to_string(abs).with_context(|| format!("read {}", abs.display()))?;
@@ -41,7 +41,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::kb::content_store::{
+    use crate::content_store::{
         atomic::write_if_new,
         compose::{FrontMatter, compose_doc_file},
     };

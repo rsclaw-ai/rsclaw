@@ -3,7 +3,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::kb::{
+use crate::{
     content_store::read::{read_doc_body, read_doc_range},
     model::CallerScope,
     search::{

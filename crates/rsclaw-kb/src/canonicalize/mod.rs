@@ -22,7 +22,7 @@ pub use mime::{canonicalize_by_mime, detect_mime};
 use serde::{Deserialize, Serialize};
 pub use url_canon::canonicalize_url;
 
-use crate::kb::model::{KbSourceKind, LogicalSourceId};
+use crate::model::{KbSourceKind, LogicalSourceId};
 
 #[derive(Debug, Clone)]
 pub struct CanonicalizedSource {
@@ -61,7 +61,7 @@ pub trait Canonicalizer: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kb::canonicalize::text::TextCanonicalizer;
+    use crate::canonicalize::text::TextCanonicalizer;
 
     #[test]
     fn trait_dispatch() {

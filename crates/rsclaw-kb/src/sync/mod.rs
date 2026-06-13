@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 pub use state::SyncRegistry;
 pub use url::UrlSyncer;
 
-use crate::kb::{
+use crate::{
     embedder::KbEmbedder, index::KbIndex, model::KbSourceKind, paths::KbPaths, store::KbStore,
 };
 

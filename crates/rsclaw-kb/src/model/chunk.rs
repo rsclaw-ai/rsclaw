@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::kb::model::{KbLocator, LogicalSourceId};
+use crate::model::{KbLocator, LogicalSourceId};
 
 /// Deterministic chunk id.
 ///

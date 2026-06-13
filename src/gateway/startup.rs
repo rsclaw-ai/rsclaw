@@ -847,7 +847,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 
     // Register desktop channel — routes cron delivery to connected WS clients.
     {
-        let desktop_ch = Arc::new(crate::channel::desktop::DesktopChannel::new(Arc::clone(
+        let desktop_ch = Arc::new(crate::gateway::desktop_channel::DesktopChannel::new(Arc::clone(
             &ws_conns,
         )));
         // Bridge the notification_tx → DesktopChannel path so AgentRuntime

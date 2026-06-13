@@ -25,7 +25,7 @@ struct HintsFile {
 }
 
 fn hints_path() -> PathBuf {
-    crate::config::loader::base_dir().join(HINTS_FILE)
+    rsclaw_config::loader::base_dir().join(HINTS_FILE)
 }
 
 fn load() -> HintsFile {

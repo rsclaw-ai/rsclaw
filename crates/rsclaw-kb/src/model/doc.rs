@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::kb::model::{KbSource, KbSourceKind};
+use crate::model::{KbSource, KbSourceKind};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

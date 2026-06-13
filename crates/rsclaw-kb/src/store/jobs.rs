@@ -10,7 +10,7 @@
 use anyhow::Result;
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
-use crate::kb::{
+use crate::{
     jobs::{ClaimToken, Job, JobStatus, status_priority_key},
     store::{
         codec::{decode, encode},
@@ -271,7 +271,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::kb::{
+    use crate::{
         jobs::{Job, JobKind},
         store::open_db,
     };

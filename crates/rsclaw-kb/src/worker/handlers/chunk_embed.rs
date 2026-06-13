@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 
-use crate::kb::{
+use crate::{
     chunker::{ChunkerInput, LocatorKind, chunk_markdown},
     content_store::read::read_doc_body,
     entities::extract::{canonical_id, extract_entities},
@@ -23,7 +23,7 @@ pub fn run(ctx: &HandlerCtx, doc_id: &str, doc_version: u32) -> Result<()> {
     };
     if doc.version != doc_version {
         tracing::warn!(
-            doc = %crate::kb::redact(doc_id),
+            doc = %crate::redact(doc_id),
             "kb worker: doc version mismatch (job v{doc_version} vs current v{}); skipping",
             doc.version
         );
@@ -74,7 +74,7 @@ pub fn run(ctx: &HandlerCtx, doc_id: &str, doc_version: u32) -> Result<()> {
             chunks::delete_for_doc_version_below(&wtx, &doc.logical_source_id, doc.version)?;
         if removed > 0 {
             tracing::info!(
-                doc = %crate::kb::redact(doc_id),
+                doc = %crate::redact(doc_id),
                 old_chunks = removed,
                 "kb worker: removed stale chunks from prior version"
             );
@@ -115,7 +115,7 @@ pub fn run(ctx: &HandlerCtx, doc_id: &str, doc_version: u32) -> Result<()> {
             }
             None => {
                 tracing::debug!(
-                    doc = %crate::kb::redact(&doc.id),
+                    doc = %crate::redact(&doc.id),
                     "kb worker: no Pending ledger row for doc — treating as idempotent rerun"
                 );
             }
@@ -132,7 +132,7 @@ pub fn run(ctx: &HandlerCtx, doc_id: &str, doc_version: u32) -> Result<()> {
     ctx.index.commit()?;
 
     tracing::info!(
-        doc = %crate::kb::redact(doc_id),
+        doc = %crate::redact(doc_id),
         n_chunks = chunks_with_vec.len(),
         "kb worker: chunk_embed + index update complete"
     );
@@ -146,7 +146,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::kb::{
+    use crate::{
         canonicalize::{CanonicalizeInput, canonicalize_by_mime},
         embedder::{KbEmbedder, StubEmbedder},
         paths::KbPaths,
@@ -160,7 +160,7 @@ mod tests {
         let paths = Arc::new(KbPaths::new(tmp.path().join("kb")));
         paths.ensure_layout().unwrap();
         let embedder: Arc<dyn KbEmbedder> = Arc::new(StubEmbedder::default());
-        let index = Arc::new(crate::kb::index::KbIndex::open(&paths).unwrap());
+        let index = Arc::new(crate::index::KbIndex::open(&paths).unwrap());
 
         let bytes = b"# Hi\n\nbody one.\n\nbody two.";
         let canon = canonicalize_by_mime(CanonicalizeInput {
@@ -265,14 +265,14 @@ mod tests {
 
     #[test]
     fn new_version_drops_old_chunks() {
-        use crate::kb::{canonicalize::CanonicalizeInput, model::LogicalSourceId};
+        use crate::{canonicalize::CanonicalizeInput, model::LogicalSourceId};
 
         let tmp = TempDir::new().unwrap();
         let store = Arc::new(KbStore::open(&tmp.path().join("kb.redb")).unwrap());
         let paths = Arc::new(KbPaths::new(tmp.path().join("kb")));
         paths.ensure_layout().unwrap();
         let embedder: Arc<dyn KbEmbedder> = Arc::new(StubEmbedder::default());
-        let index = Arc::new(crate::kb::index::KbIndex::open(&paths).unwrap());
+        let index = Arc::new(crate::index::KbIndex::open(&paths).unwrap());
         let ctx = HandlerCtx {
             store: store.clone(),
             paths: paths.clone(),
@@ -282,7 +282,7 @@ mod tests {
 
         let lsid = LogicalSourceId("file:custom:rotate".into());
         let mk = |bytes: &[u8]| {
-            crate::kb::canonicalize::canonicalize_by_mime(CanonicalizeInput {
+            crate::canonicalize::canonicalize_by_mime(CanonicalizeInput {
                 bytes,
                 mime: "text/markdown",
                 hint_title: Some("rotate"),

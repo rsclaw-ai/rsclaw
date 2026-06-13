@@ -12,7 +12,7 @@ use std::io::Cursor;
 use calamine::{Data, Reader, open_workbook_auto_from_rs};
 
 use super::*;
-use crate::kb::content_store::atomic::sha256_hex;
+use crate::content_store::atomic::sha256_hex;
 
 pub const XLSX_MIME: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 pub const XLS_MIME: &str = "application/vnd.ms-excel";

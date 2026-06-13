@@ -13,7 +13,7 @@
 use std::io::{Cursor, Read};
 
 use super::*;
-use crate::kb::content_store::atomic::sha256_hex;
+use crate::content_store::atomic::sha256_hex;
 
 /// Extract the inner text of every `<tag ...>...</tag>` occurrence in `xml`,
 /// in document order, with the basic XML entities decoded. Empty captures are

@@ -16,7 +16,7 @@ use tantivy::{
     },
 };
 
-use crate::kb::{index::cjk::JiebaTokenizer, store::KbStore};
+use crate::{index::cjk::JiebaTokenizer, store::KbStore};
 
 const CJK_TOKENIZER: &str = "cjk";
 
@@ -142,11 +142,11 @@ impl TantivyIndex {
         }
         let rtx = store.begin_read()?;
         use redb::ReadableTable;
-        let tbl = rtx.open_table(crate::kb::store::schema::KB_CHUNKS)?;
+        let tbl = rtx.open_table(crate::store::schema::KB_CHUNKS)?;
         let mut n = 0;
         for entry in tbl.iter()? {
             let (_, v) = entry?;
-            let c: crate::kb::model::KbChunk = crate::kb::store::codec::decode(v.value())?;
+            let c: crate::model::KbChunk = crate::store::codec::decode(v.value())?;
             self.upsert(&c.id, &c.doc_id, &c.indexed_text)?;
             n += 1;
         }

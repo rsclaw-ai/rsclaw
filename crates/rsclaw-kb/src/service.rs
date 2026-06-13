@@ -17,7 +17,7 @@ use std::{
 use redb::ReadableTable;
 use tokio::sync::broadcast;
 
-use crate::kb::{
+use crate::{
     KbEmbedder, KbIndex, KbPaths, KbStore,
     canonicalize::{CanonicalizeInput, canonicalize_by_mime, detect_mime},
     compactor::{CompactStats, run_compactor_tick},
@@ -176,12 +176,12 @@ impl KnowledgeService {
         let dim = embedder.dimension();
         let index = Arc::new(KbIndex::open_and_rebuild_with_dim(&paths, &store, dim)?);
         let (events, _) = broadcast::channel(256);
-        let cfg = crate::config::load().ok();
+        let cfg = rsclaw_config::load().ok();
         // queryInstruction comes from the SAME effective embed config the
         // embedder was resolved from (`kb.embed` override, else `memorySearch`),
         // so a KB-specific asymmetric model uses its own instruction.
-        let query_instruction = crate::kb::embedder::effective_embed_config().and_then(|m| {
-            crate::embed::resolve_query_instruction(m.query_instruction, m.model.as_deref())
+        let query_instruction = crate::embedder::effective_embed_config().and_then(|m| {
+            rsclaw_embed::resolve_query_instruction(m.query_instruction, m.model.as_deref())
         });
         // kb.maxDocMb → bytes; default 50 MB, clamp negatives/zero to default.
         let max_doc_bytes = cfg
@@ -283,7 +283,7 @@ impl KnowledgeService {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let max_attempts = WorkerConfig::default().max_attempts;
         let wtx = self.store.begin_write()?;
-        let n = crate::kb::store::jobs::reclaim_stale(&wtx, now_ms, max_attempts)?.len();
+        let n = crate::store::jobs::reclaim_stale(&wtx, now_ms, max_attempts)?.len();
         wtx.commit()?;
         Ok(n)
     }
@@ -435,8 +435,8 @@ impl KnowledgeService {
         &self,
         collection_id: &str,
         url: &str,
-    ) -> Result<crate::kb::sync::SyncOutcome, crate::kb::sync::SyncError> {
-        use crate::kb::sync::{KbSourceSyncer, SyncContext, SyncReason, UrlSyncer};
+    ) -> Result<crate::sync::SyncOutcome, crate::sync::SyncError> {
+        use crate::sync::{KbSourceSyncer, SyncContext, SyncReason, UrlSyncer};
         let syncer = UrlSyncer {
             url: url.to_string(),
             tags: vec![collection_tag(collection_id)],
@@ -512,7 +512,7 @@ impl KnowledgeService {
             doc_version: d.version,
         });
         let wtx = self.store.begin_write()?;
-        crate::kb::store::jobs::enqueue(&wtx, &job)?;
+        crate::store::jobs::enqueue(&wtx, &job)?;
         wtx.commit().map_err(anyhow::Error::from)?;
         Ok(())
     }
@@ -711,7 +711,7 @@ impl KnowledgeService {
     pub fn set_doc_visibility(
         &self,
         doc_id: &str,
-        visibility: crate::kb::model::KbVisibility,
+        visibility: crate::model::KbVisibility,
     ) -> KResult<()> {
         let rtx = self.store.begin_read()?;
         let mut d = docs::get(&rtx, doc_id)?
@@ -742,7 +742,7 @@ impl KnowledgeService {
             .filter(|d| d.status == KbStatus::Active)
             .ok_or(KnowledgeError::DocNotFound)?;
         let mut chunks: Vec<KbChunk> =
-            crate::kb::store::chunks::chunks_for_logical(&rtx, &d.logical_source_id)
+            crate::store::chunks::chunks_for_logical(&rtx, &d.logical_source_id)
                 .map_err(KnowledgeError::Internal)?
                 .into_iter()
                 .filter(|c| c.doc_id == d.id && c.status == ChunkStatus::Active)
@@ -760,11 +760,11 @@ impl KnowledgeService {
         source_kind: Option<String>,
         limit: usize,
         cursor: Option<String>,
-    ) -> KResult<crate::kb::tools::kb_list_docs::KbListDocsOutput> {
+    ) -> KResult<crate::tools::kb_list_docs::KbListDocsOutput> {
         let ctx = self.search_ctx();
-        crate::kb::tools::kb_list_docs::run(
+        crate::tools::kb_list_docs::run(
             &ctx,
-            crate::kb::tools::kb_list_docs::KbListDocsInput {
+            crate::tools::kb_list_docs::KbListDocsInput {
                 tags,
                 source_kind,
                 limit,
@@ -787,7 +787,7 @@ impl KnowledgeService {
         dry_run: bool,
     ) -> KResult<serde_json::Value> {
         use redb::ReadableTable;
-        use crate::kb::{
+        use crate::{
             canonicalize::canonicalize_url,
             store::{schema::KB_DOCS, seen::get_sync_state},
             sync::{KbSourceSyncer, SyncContext, SyncReason, UrlSyncer},
@@ -805,7 +805,7 @@ impl KnowledgeService {
                     continue;
                 }
                 let url = match &d.source {
-                    crate::kb::model::KbSource::Url { url, .. } => url.clone(),
+                    crate::model::KbSource::Url { url, .. } => url.clone(),
                     _ => continue,
                 };
                 let canonical = canonicalize_url(&url).unwrap_or(url);
@@ -902,7 +902,7 @@ impl KnowledgeService {
             index: self.index.clone(),
             paths: self.paths.clone(),
             embedder: self.embedder.clone(),
-            reranker: crate::kb::rerank::KbReranker::from_config(),
+            reranker: crate::rerank::KbReranker::from_config(),
         }
     }
 
@@ -954,7 +954,7 @@ impl KnowledgeService {
         rtx: &redb::ReadTransaction,
     ) -> anyhow::Result<HashSet<(String, u32)>> {
         let mut out = HashSet::new();
-        for job in crate::kb::store::jobs::list_by_status(rtx, JobStatus::Failed)? {
+        for job in crate::store::jobs::list_by_status(rtx, JobStatus::Failed)? {
             if let JobKind::ChunkAndEmbed {
                 doc_id,
                 doc_version,
@@ -1120,7 +1120,7 @@ mod tests {
 
         // Use ingest_canonicalized directly so the job stays pending
         // (s.ingest() now drains synchronously).
-        use crate::kb::{
+        use crate::{
             canonicalize::{CanonicalizeInput, canonicalize_by_mime},
             paths::KbPaths,
             pipeline::{IngestInput, ingest_canonicalized},
@@ -1136,7 +1136,7 @@ mod tests {
         canon
             .metadata
             .tags
-            .push(crate::kb::model::collection_tag(&c.id));
+            .push(crate::model::collection_tag(&c.id));
         let paths = KbPaths::new(s.kb_root().to_path_buf());
         let out = ingest_canonicalized(
             s.store(),
@@ -1159,7 +1159,7 @@ mod tests {
         // Simulate the worker giving up: claim the enqueued ChunkAndEmbed job
         // and mark it Failed (what run_one_blocking does at max_attempts).
         {
-            use crate::kb::store::jobs;
+            use crate::store::jobs;
             let now = chrono::Utc::now().timestamp_millis();
             let wtx = s.store().begin_write().unwrap();
             let (job, token) = jobs::claim_next(&wtx, "test", now, 60_000)
@@ -1202,7 +1202,7 @@ mod tests {
 
         // Use ingest_canonicalized directly (s.ingest() now drains
         // synchronously) so we can verify drain_once processes the job.
-        use crate::kb::{
+        use crate::{
             canonicalize::{CanonicalizeInput, canonicalize_by_mime},
             paths::KbPaths,
             pipeline::{IngestInput, ingest_canonicalized},

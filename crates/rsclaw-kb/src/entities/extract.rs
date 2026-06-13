@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-use crate::kb::model::EntityKind;
+use crate::model::EntityKind;
 
 const MAX_MENTIONS_PER_CHUNK: usize = 64;
 

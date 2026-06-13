@@ -4,7 +4,7 @@ use anyhow::Result;
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 use serde::{Deserialize, Serialize};
 
-use crate::kb::store::{
+use crate::store::{
     codec::{decode, encode},
     schema::{KB_SEEN_ITEMS, KB_SYNC_STATE},
 };
@@ -94,7 +94,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::kb::store::open_db;
+    use crate::store::open_db;
 
     #[test]
     fn mark_then_query() {

@@ -12,7 +12,7 @@ pub use cjk::JiebaTokenizer;
 pub use hnsw::HnswCache;
 pub use tantivy::TantivyIndex;
 
-use crate::kb::{paths::KbPaths, store::KbStore};
+use crate::{paths::KbPaths, store::KbStore};
 
 pub struct KbIndex {
     pub hnsw: HnswCache,
@@ -67,7 +67,7 @@ impl KbIndex {
 
     /// Upsert a chunk into both indexes. Caller wraps multiple upserts
     /// in `commit()` to batch tantivy IO.
-    pub fn upsert_chunk(&self, c: &crate::kb::model::KbChunk) -> Result<()> {
+    pub fn upsert_chunk(&self, c: &crate::model::KbChunk) -> Result<()> {
         self.hnsw.insert(&c.id, &c.vector)?;
         self.tantivy.upsert(&c.id, &c.doc_id, &c.indexed_text)?;
         Ok(())
@@ -87,7 +87,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::kb::{
+    use crate::{
         canonicalize::{CanonicalizeInput, canonicalize_by_mime},
         embedder::{KbEmbedder, StubEmbedder},
         pipeline::{IngestInput, ingest_canonicalized},

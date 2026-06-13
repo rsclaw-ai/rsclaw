@@ -37,6 +37,7 @@ pub mod index;
 pub mod jobs;
 pub mod ledger;
 pub mod model;
+pub mod ocr;
 pub mod paths;
 pub mod pipeline;
 pub mod search;
@@ -71,6 +72,7 @@ pub use model::{
     KbSource, KbSourceKind, KbStatus, KbVisibility, LogicalSourceId, MailSource, VersionPointer,
     chunk_id, hamming64, simhash64,
 };
+pub use ocr::OcrClient;
 pub use paths::KbPaths;
 pub use pipeline::{IngestInput, IngestOutput, ingest_canonicalized};
 pub use service::{KnowledgeError, KnowledgeService};

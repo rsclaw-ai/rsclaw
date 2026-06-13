@@ -1,4 +1,4 @@
-//! Adapter from the shared `crate::embed` backends to the KB's
+//! Adapter from the shared `rsclaw_embed` backends to the KB's
 //! `KbEmbedder` trait. One adapter wraps any `EmbedderBackend`
 //! (Local BGE / OpenAi-compatible REST / Ollama), so the KB gets all
 //! of them — including the remote-API path (point an OpenAi backend
@@ -15,7 +15,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use super::KbEmbedder;
-use crate::embed::{Embedder, EmbedderBackend, LocalBgeEmbedder, OpenAiEmbedder};
+use rsclaw_embed::{Embedder, EmbedderBackend, LocalBgeEmbedder, OpenAiEmbedder};
 
 pub struct LocalKbEmbedder {
     backend: EmbedderBackend,

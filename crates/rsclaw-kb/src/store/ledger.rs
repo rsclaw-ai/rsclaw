@@ -3,7 +3,7 @@
 use anyhow::Result;
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
-use crate::kb::{
+use crate::{
     ledger::{IngestLedgerEntry, LedgerStatus},
     store::{
         codec::{decode, encode},
@@ -99,7 +99,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::kb::{
+    use crate::{
         ledger::{LedgerOp, LedgerStatus},
         store::open_db,
     };

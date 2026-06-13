@@ -23,6 +23,7 @@ rsclaw-mcp = { path = "crates/rsclaw-mcp" }
 rsclaw-desktop = { path = "crates/rsclaw-desktop" }
 rsclaw-evolution = { path = "crates/rsclaw-evolution" }
 rsclaw-memory = { path = "crates/rsclaw-memory" }
+rsclaw-doc = { path = "crates/rsclaw-doc" }
 rsclaw-browser = { path = "crates/rsclaw-browser" }
 rsclaw-channel = { path = "crates/rsclaw-channel" }
 rsclaw-computer = { path = "crates/rsclaw-computer" }

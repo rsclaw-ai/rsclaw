@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use super::{KbSourceSyncer, SyncContext, SyncError, SyncOutcome, SyncReason};
-use crate::kb::{
+use crate::{
     canonicalize::{CanonicalizeInput, canonicalize_by_mime, detect_mime},
     model::KbSourceKind,
     pipeline::{IngestInput, ingest_canonicalized},

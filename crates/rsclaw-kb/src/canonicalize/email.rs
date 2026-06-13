@@ -15,7 +15,7 @@
 use mailparse::{MailHeaderMap, ParsedMail, parse_mail};
 
 use super::*;
-use crate::kb::{canonicalize::html::HtmlCanonicalizer, content_store::atomic::sha256_hex};
+use crate::{canonicalize::html::HtmlCanonicalizer, content_store::atomic::sha256_hex};
 
 /// `Content-Type` for a single RFC822 message (`.eml`).
 pub const EML_MIME: &str = "message/rfc822";

@@ -12,7 +12,8 @@ use anyhow::Result;
 use futures::future::BoxFuture;
 use tracing::debug;
 
-use super::{Channel, OutboundMessage};
+use rsclaw_channel::Channel;
+use rsclaw_types::OutboundMessage;
 use crate::ws::{ConnRegistry, types::EventFrame};
 
 /// A channel that delivers outbound messages to the desktop UI via WebSocket
