@@ -61,7 +61,7 @@ impl super::runtime::AgentRuntime {
         // quietly routes to a paid endpoint. Message is localised.
         if video_chain.is_empty() {
             return Ok(json!({
-                "error": crate::i18n::t("video_gen_no_model", crate::i18n::default_lang())
+                "error": rsclaw_i18n::t("video_gen_no_model", rsclaw_i18n::default_lang())
             }));
         }
 
@@ -263,7 +263,7 @@ impl super::runtime::AgentRuntime {
                 Err(e) => {
                     let kind = crate::provider::health::classify_error(&e);
                     let body = format!("{e:#}");
-                    let truncated = crate::util::truncate_str(&body, 200).to_owned();
+                    let truncated = rsclaw_util::truncate_str(&body, 200).to_owned();
                     self.model_health.ensure(&[model_id.clone()]);
                     self.model_health.record_failure(model_id, kind.clone(), truncated);
                     tracing::warn!(
@@ -384,7 +384,7 @@ async fn submit_rsclaw_video(
             .pointer("/error/message")
             .and_then(|v| v.as_str())
             .or_else(|| v.get("message").and_then(|v| v.as_str()))
-            .unwrap_or_else(|| crate::util::truncate_str(&raw, 200));
+            .unwrap_or_else(|| rsclaw_util::truncate_str(&raw, 200));
         return Err(anyhow!("video_gen: rsclaw API {status}: {msg}"));
     }
     let v: Value = serde_json::from_slice(&bytes)

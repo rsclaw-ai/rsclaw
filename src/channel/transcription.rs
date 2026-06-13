@@ -86,9 +86,9 @@ pub async fn transcribe_audio(
         && crate::agent::install_hints::claim_first_hint("stt-sherpa")
     {
         if let Ok(text) = result {
-            let lang = crate::i18n::default_lang();
+            let lang = rsclaw_i18n::default_lang();
             let hint =
-                crate::i18n::t_fmt("install_hint_stt_sherpa", lang, &[("provider", &provider)]);
+                rsclaw_i18n::t_fmt("install_hint_stt_sherpa", lang, &[("provider", &provider)]);
             return Ok(format!("{text}{hint}"));
         }
     }
@@ -559,7 +559,7 @@ async fn transcribe_local(audio_bytes: &[u8], file_name: &str) -> Result<String>
     if !stderr_str.is_empty() {
         debug!(
             "whisper stderr: {}",
-            crate::util::truncate_str(&stderr_str, 500)
+            rsclaw_util::truncate_str(&stderr_str, 500)
         );
     }
 

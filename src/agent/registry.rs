@@ -511,7 +511,7 @@ pub fn extract_file_refs(text: &str) -> (String, Vec<ImageAttachment>, Vec<FileA
                 "image/jpeg"
             };
             let orig_len = data.len();
-            let (final_bytes, final_mime) = match crate::util::downscale_image_for_vision(
+            let (final_bytes, final_mime) = match rsclaw_util::downscale_image_for_vision(
                 &data,
                 orig_mime,
                 DOWNSCALE_BYTE_THRESHOLD,

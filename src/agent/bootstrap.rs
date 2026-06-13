@@ -384,7 +384,7 @@ pub fn seed_workspace(workspace: &Path) -> Result<usize> {
 pub fn seed_workspace_with_lang(workspace: &Path, lang: Option<&str>) -> Result<usize> {
     std::fs::create_dir_all(workspace)?;
 
-    let resolved = lang.map(crate::i18n::resolve_lang).unwrap_or("en");
+    let resolved = lang.map(rsclaw_i18n::resolve_lang).unwrap_or("en");
     let zh = resolved == "zh";
 
     let files: &[(&str, &str)] = if zh {

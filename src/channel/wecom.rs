@@ -282,7 +282,7 @@ impl WeComChannel {
         let raw_preview = frame.to_string();
         debug!(
             cmd,
-            raw = crate::util::truncate_str(&raw_preview, 300),
+            raw = rsclaw_util::truncate_str(&raw_preview, 300),
             "WeCom WS: frame received"
         );
 
@@ -428,7 +428,7 @@ impl WeComChannel {
                         Ok(bytes) => {
                             use base64::Engine;
                             let (final_bytes, final_mime) =
-                                crate::util::downscale_image_for_vision(
+                                rsclaw_util::downscale_image_for_vision(
                                     &bytes,
                                     "image/jpeg",
                                     1 * 1024 * 1024,
@@ -449,7 +449,7 @@ impl WeComChannel {
                             });
                             if text.is_empty() {
                                 text =
-                                    crate::i18n::t("describe_image", crate::i18n::default_lang());
+                                    rsclaw_i18n::t("describe_image", rsclaw_i18n::default_lang());
                             }
                         }
                         Err(e) => {
@@ -490,9 +490,9 @@ impl WeComChannel {
                                     source_path: None,
                                 });
                                 if text.is_empty() {
-                                    text = crate::i18n::t(
+                                    text = rsclaw_i18n::t(
                                         "describe_image",
-                                        crate::i18n::default_lang(),
+                                        rsclaw_i18n::default_lang(),
                                     );
                                 }
                             } else {
@@ -601,7 +601,7 @@ impl WeComChannel {
                         }
                     }
                     if text.is_empty() && !images.is_empty() {
-                        text = crate::i18n::t("describe_image", crate::i18n::default_lang());
+                        text = rsclaw_i18n::t("describe_image", rsclaw_i18n::default_lang());
                     }
                 }
             }

@@ -925,7 +925,7 @@ async fn download_and_package_image(
     }
     let mime = mime_guess::from_path(url).first_or_octet_stream().to_string();
     let (final_bytes, final_mime) =
-        crate::util::downscale_image_for_vision(&bytes, &mime, 1 * 1024 * 1024, 1920, 85)
+        rsclaw_util::downscale_image_for_vision(&bytes, &mime, 1 * 1024 * 1024, 1920, 85)
             .unwrap_or_else(|_| (bytes, mime));
     let b64 = base64::engine::general_purpose::STANDARD.encode(&final_bytes);
     let data_url = format!("data:{final_mime};base64,{b64}");

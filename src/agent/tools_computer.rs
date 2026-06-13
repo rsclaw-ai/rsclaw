@@ -843,7 +843,7 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                 Ok(Err(e)) => {
                     let kind = crate::provider::health::classify_error(&e);
                     let body = format!("{e:#}");
-                    let truncated = crate::util::truncate_str(&body, 200).to_owned();
+                    let truncated = rsclaw_util::truncate_str(&body, 200).to_owned();
                     self.model_health.ensure(&[attempt_model.clone()]);
                     self.model_health.record_failure(
                         attempt_model,

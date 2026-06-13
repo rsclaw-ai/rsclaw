@@ -95,7 +95,7 @@ async fn cmd_security_audit(args: crate::cli::SecurityAuditArgs) -> Result<()> {
                     "{}:{} may contain a plaintext secret: {}",
                     cfg_path.display(),
                     lineno + 1,
-                    crate::util::truncate_str(&line, 60)
+                    rsclaw_util::truncate_str(&line, 60)
                 ));
             }
         }

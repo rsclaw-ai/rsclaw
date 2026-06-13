@@ -20,7 +20,7 @@ use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 
 use super::{bridge, permission};
 use crate::channel::OutboundMessage;
-use crate::i18n;
+use rsclaw_i18n as i18n;
 
 /// Which coding agent a `tool_cap` call dispatches to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -67,7 +67,7 @@ impl AgentKind {
 }
 
 /// IM channel routing for live progress + completion notifications.
-/// `lang` is a static i18n key (e.g. "en", "zh") — see `crate::i18n::resolve_lang`.
+/// `lang` is a static i18n key (e.g. "en", "zh") — see `rsclaw_i18n::resolve_lang`.
 #[derive(Clone)]
 pub(crate) struct NotifTarget {
     pub tx: broadcast::Sender<OutboundMessage>,
@@ -115,11 +115,11 @@ pub struct CapAgentManager {
     opencode: Slot,
     codex: Slot,
     qoder: Slot,
-    bus: broadcast::Sender<crate::events::AgentEvent>,
+    bus: broadcast::Sender<rsclaw_events::AgentEvent>,
 }
 
 impl CapAgentManager {
-    pub(crate) fn new(bus: broadcast::Sender<crate::events::AgentEvent>) -> Self {
+    pub(crate) fn new(bus: broadcast::Sender<rsclaw_events::AgentEvent>) -> Self {
         Self {
             claudecode: Arc::new(RwLock::new(None)),
             openclaude: Arc::new(RwLock::new(None)),
@@ -363,7 +363,7 @@ async fn actor_loop(
     kind: AgentKind,
     mut driver: Box<dyn Driver>,
     mut rx: mpsc::Receiver<ToolCapRequest>,
-    bus: broadcast::Sender<crate::events::AgentEvent>,
+    bus: broadcast::Sender<rsclaw_events::AgentEvent>,
     slot: Slot,
 ) {
     let agent_id = kind.as_str();
@@ -550,7 +550,7 @@ fn inject_followup(inbox: &InboxTarget, display: &str, summary: &str) {
 
 pub(crate) async fn run_turn(
     driver: &mut dyn Driver,
-    bus: &broadcast::Sender<crate::events::AgentEvent>,
+    bus: &broadcast::Sender<rsclaw_events::AgentEvent>,
     session_id: &str,
     agent_id: &str,
     notif: Option<&NotifTarget>,

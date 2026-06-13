@@ -76,11 +76,9 @@ pub mod config;
 pub mod cron;
 pub mod desktop;
 pub mod embed;
-pub mod events;
 pub mod gateway;
 pub mod heartbeat;
 pub mod hooks;
-pub mod i18n;
 pub mod kb;
 pub mod mcp;
 pub mod migrate;
@@ -89,11 +87,16 @@ pub mod provider;
 pub mod server;
 pub mod skill;
 pub mod store;
-pub mod sys;
-pub mod util;
 pub mod ws;
 
-pub use sys::MemoryTier;
+// Extracted base crates — re-exported under their historical module paths so
+// in-crate `crate::i18n::` / `crate::util::` etc. still resolve during the split.
+pub use rsclaw_events as events;
+pub use rsclaw_i18n as i18n;
+pub use rsclaw_platform as sys;
+pub use rsclaw_util as util;
+
+pub use rsclaw_platform::MemoryTier;
 
 /// Ensure the rustls TLS crypto provider is installed for all lib tests.
 /// This runs once before any test in the crate, preventing "No provider set"

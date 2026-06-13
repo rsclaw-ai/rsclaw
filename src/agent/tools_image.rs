@@ -106,7 +106,7 @@ impl super::runtime::AgentRuntime {
         // through the channel directly to the end user.
         if image_chain.is_empty() {
             return Ok(json!({
-                "error": crate::i18n::t("image_gen_no_model", crate::i18n::default_lang())
+                "error": rsclaw_i18n::t("image_gen_no_model", rsclaw_i18n::default_lang())
             }));
         }
 
@@ -145,7 +145,7 @@ impl super::runtime::AgentRuntime {
                 Err(e) => {
                     let kind = crate::provider::health::classify_error(&e);
                     let body = format!("{e:#}");
-                    let truncated = crate::util::truncate_str(&body, 200).to_owned();
+                    let truncated = rsclaw_util::truncate_str(&body, 200).to_owned();
                     self.model_health.record_failure(chain_model, kind.clone(), truncated);
                     // Cost gate: provider already charged for this
                     // attempt. Surface the failure to the user instead
@@ -539,8 +539,8 @@ impl super::runtime::AgentRuntime {
                 // Non-JSON bodies are preserved as Value::String by
                 // parse_response_body; fall back to a raw preview so
                 // 401/429/400 are distinguishable.
-                .or_else(|| resp_body.as_str().map(|s| crate::util::truncate_str(s, 200)))
-                .unwrap_or_else(|| crate::util::truncate_str(&raw, 200));
+                .or_else(|| resp_body.as_str().map(|s| rsclaw_util::truncate_str(s, 200)))
+                .unwrap_or_else(|| rsclaw_util::truncate_str(&raw, 200));
             return Err(anyhow!("image: API error (HTTP {resp_status}): {err_msg}"));
         }
 
@@ -593,7 +593,7 @@ impl super::runtime::AgentRuntime {
                 .unwrap_or("");
             return Err(post_billing(format!(
                 "no image data in Gemini response (finishReason: {finish_reason}, text: {}) — likely safety-filtered; rephrase the prompt to avoid policy-sensitive content",
-                crate::util::truncate_str(refusal_text, 200)
+                rsclaw_util::truncate_str(refusal_text, 200)
             )));
         }
 
@@ -630,7 +630,7 @@ impl super::runtime::AgentRuntime {
         let Some(img_ref) = img_ref else {
             return Err(post_billing(format!(
                 "no image data in response (no url/base64 image field; body preview: {})",
-                crate::util::truncate_str(&resp_body.to_string(), 200)
+                rsclaw_util::truncate_str(&resp_body.to_string(), 200)
             )));
         };
 

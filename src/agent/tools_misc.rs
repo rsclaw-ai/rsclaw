@@ -783,7 +783,7 @@ $synth.Speak('{}')
                 );
             };
             clean.push(TodoItem {
-                text: crate::util::truncate_str(text, MAX_TEXT_BYTES).to_owned(),
+                text: rsclaw_util::truncate_str(text, MAX_TEXT_BYTES).to_owned(),
                 status: status.to_owned(),
             });
         }
@@ -979,7 +979,7 @@ $synth.Speak('{}')
         // Build structured options once, used for both the WS prompt payload
         // (L2: capable channels render natively) and the formatted text
         // fallback (L1: every channel works).
-        let mut options: Vec<crate::events::AskUserOption> = Vec::with_capacity(raw_options.len());
+        let mut options: Vec<rsclaw_events::AskUserOption> = Vec::with_capacity(raw_options.len());
         for (idx, opt) in raw_options.iter().enumerate() {
             // Accept either a {"label","description"} object (the schema's
             // canonical shape) OR a bare string. Qwen-style local models emit a
@@ -1007,7 +1007,7 @@ $synth.Speak('{}')
             if label.is_empty() {
                 bail!("ask_user: option[{idx}].label must be non-empty");
             }
-            options.push(crate::events::AskUserOption { label, description });
+            options.push(rsclaw_events::AskUserOption { label, description });
         }
 
         // Render the L1 text fallback. Numbered list with optional
@@ -1042,14 +1042,14 @@ $synth.Speak('{}')
         // native UI; uncapable subscribers ignore the `question` field and
         // fall back to the agent's plain-text reply.
         if let Some(ref bus) = self.event_bus {
-            let prompt = crate::events::AskUserPrompt {
+            let prompt = rsclaw_events::AskUserPrompt {
                 question: question.clone(),
                 options,
                 multi_select,
                 recommended_index,
                 header,
             };
-            let _ = bus.send(crate::events::AgentEvent {
+            let _ = bus.send(rsclaw_events::AgentEvent {
                 session_id: ctx.session_key.clone(),
                 agent_id: ctx.agent_id.clone(),
                 delta: String::new(),

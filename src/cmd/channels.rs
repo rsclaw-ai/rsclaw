@@ -385,7 +385,7 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
                     let data_dir = crate::config::loader::base_dir().join("var/data");
                     if let Ok(store) = crate::store::redb_store::RedbStore::open(
                         &data_dir.join("redb/data.redb"),
-                        crate::sys::detect_memory_tier(),
+                        rsclaw_platform::detect_memory_tier(),
                     ) {
                         if store.delete_pairing(&channel, &peer).is_ok() {
                             changed = true;
@@ -526,7 +526,7 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
             let data_dir = crate::config::loader::base_dir().join("var/data");
             let redb_store = crate::store::redb_store::RedbStore::open(
                 &data_dir.join("redb/data.redb"),
-                crate::sys::detect_memory_tier(),
+                rsclaw_platform::detect_memory_tier(),
             )
             .ok();
 

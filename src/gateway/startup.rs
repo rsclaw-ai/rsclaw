@@ -292,8 +292,8 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // so UI clients see banners. Allocated early so the BGE downloader (next
     // step) and the file-watcher bridge (later) can both publish.
     let (restart_request_tx, _restart_request_rx) =
-        tokio::sync::broadcast::channel::<crate::events::RestartRequest>(16);
-    let pending_restart: Arc<std::sync::RwLock<Option<crate::events::RestartRequest>>> =
+        tokio::sync::broadcast::channel::<rsclaw_events::RestartRequest>(16);
+    let pending_restart: Arc<std::sync::RwLock<Option<rsclaw_events::RestartRequest>>> =
         Arc::new(std::sync::RwLock::new(None));
 
     // Graceful-shutdown coordinator — wired to task queue worker, axum graceful
@@ -454,7 +454,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 
     // Create the SSE broadcast channel once so agents and the HTTP server
     // share the same sender.
-    let (event_tx, _) = broadcast::channel::<crate::events::AgentEvent>(1024);
+    let (event_tx, _) = broadcast::channel::<rsclaw_events::AgentEvent>(1024);
 
     // Construct the cap manager once — shared by every AgentRuntime so
     // `tool_cap` works in production (not just unit tests).
@@ -570,9 +570,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
         .and_then(|g| g.language.as_deref());
     info!(lang = ?lang, "i18n: gateway language config");
     if let Some(lang) = lang {
-        crate::i18n::set_default_lang(lang);
+        rsclaw_i18n::set_default_lang(lang);
         info!(
-            resolved = crate::i18n::default_lang(),
+            resolved = rsclaw_i18n::default_lang(),
             "i18n: default language set"
         );
     }
@@ -772,7 +772,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             .and_then(|g| g.language.as_deref())
             .map(str::to_owned);
         tokio::spawn(async move {
-            let lang = crate::i18n::resolve_lang(cfg_lang.as_deref().unwrap_or("en")).to_owned();
+            let lang = rsclaw_i18n::resolve_lang(cfg_lang.as_deref().unwrap_or("en")).to_owned();
             loop {
                 match reload_rx.recv().await {
                     Ok(ConfigChange::FullReload(new_cfg)) => {
@@ -794,12 +794,12 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                                 &bridge_tx,
                                 &bridge_pending,
                                 &bridge_shutdown,
-                                crate::events::RestartRequest::new(
-                                    crate::events::RestartReason::ConfigChanged {
+                                rsclaw_events::RestartRequest::new(
+                                    rsclaw_events::RestartReason::ConfigChanged {
                                         sections: needs_restart,
                                     },
-                                    crate::events::RestartUrgency::Recommended,
-                                    crate::i18n::t("restart_required_config_changed", &lang),
+                                    rsclaw_events::RestartUrgency::Recommended,
+                                    rsclaw_i18n::t("restart_required_config_changed", &lang),
                                 ),
                             );
                         }
@@ -810,10 +810,10 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                             &bridge_tx,
                             &bridge_pending,
                             &bridge_shutdown,
-                            crate::events::RestartRequest::new(
-                                crate::events::RestartReason::ConfigChanged { sections: fields },
-                                crate::events::RestartUrgency::Required,
-                                crate::i18n::t("restart_required_config_changed", &lang),
+                            rsclaw_events::RestartRequest::new(
+                                rsclaw_events::RestartReason::ConfigChanged { sections: fields },
+                                rsclaw_events::RestartUrgency::Required,
+                                rsclaw_i18n::t("restart_required_config_changed", &lang),
                             ),
                         );
                     }
@@ -1740,7 +1740,7 @@ fn spawn_agent_tasks(
     skills: Arc<SkillRegistry>,
     providers: Arc<ProviderRegistry>,
     memory: Option<Arc<tokio::sync::Mutex<MemoryStore>>>,
-    event_tx: broadcast::Sender<crate::events::AgentEvent>,
+    event_tx: broadcast::Sender<rsclaw_events::AgentEvent>,
     spawner: Option<Arc<AgentSpawner>>,
     plugins: Option<Arc<crate::plugin::PluginRegistry>>,
     mcp: Option<Arc<crate::mcp::McpRegistry>>,
@@ -1969,11 +1969,11 @@ fn spawn_agent_tasks(
                         .gateway
                         .as_ref()
                         .and_then(|g| g.language.as_deref())
-                        .map(crate::i18n::resolve_lang)
+                        .map(rsclaw_i18n::resolve_lang)
                         .unwrap_or("en");
                     let user_text = match outcome {
                         crate::agent::registry::ReplyOutcome::Canceled => "[canceled]".to_owned(),
-                        _ => crate::i18n::t("backend_unavailable", i18n_lang),
+                        _ => rsclaw_i18n::t("backend_unavailable", i18n_lang),
                     };
                     AgentReply {
                         text: user_text,
@@ -1997,7 +1997,7 @@ fn spawn_agent_tasks(
                 if reply.needs_outer_done_emit || turn_errored {
                     if !reply.text.is_empty() {
                         // receiver may have been dropped
-                        let _ = event_tx_task.send(crate::events::AgentEvent {
+                        let _ = event_tx_task.send(rsclaw_events::AgentEvent {
                             session_id: session_key.clone(),
                             agent_id: handle.id.clone(),
                             delta: reply.text.clone(),
@@ -2010,7 +2010,7 @@ fn spawn_agent_tasks(
                         });
                     }
                     // receiver may have been dropped
-                    let _ = event_tx_task.send(crate::events::AgentEvent {
+                    let _ = event_tx_task.send(rsclaw_events::AgentEvent {
                         session_id: session_key.clone(),
                         agent_id: handle.id.clone(),
                         delta: String::new(),
@@ -2239,7 +2239,7 @@ pub(crate) async fn handle_pending_analysis(
         .gateway
         .as_ref()
         .and_then(|g| g.language.as_deref())
-        .map(crate::i18n::resolve_lang)
+        .map(rsclaw_i18n::resolve_lang)
         .unwrap_or("en");
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -2266,7 +2266,7 @@ pub(crate) async fn handle_pending_analysis(
             .send(crate::channel::OutboundMessage {
                 target_id,
                 is_group,
-                text: crate::i18n::t("analysis_failed", i18n_lang),
+                text: rsclaw_i18n::t("analysis_failed", i18n_lang),
                 reply_to: None,
                 images: vec![],
                 channel: None,
@@ -2300,7 +2300,7 @@ pub(crate) async fn handle_pending_analysis(
                 .send(crate::channel::OutboundMessage {
                     target_id,
                     is_group,
-                    text: crate::i18n::t("analysis_failed", i18n_lang),
+                    text: rsclaw_i18n::t("analysis_failed", i18n_lang),
                     reply_to: None,
                     images: vec![],
                     channel: None,
@@ -2316,7 +2316,7 @@ pub(crate) async fn handle_pending_analysis(
                 .send(crate::channel::OutboundMessage {
                     target_id,
                     is_group,
-                    text: crate::i18n::t("analysis_timeout", i18n_lang),
+                    text: rsclaw_i18n::t("analysis_timeout", i18n_lang),
                     reply_to: None,
                     images: vec![],
                     channel: None,
@@ -2792,10 +2792,10 @@ pub(crate) async fn ensure_bge_model_present(
 /// gateway drains, capped at 60s. The frontend treats `inflight = 0` as
 /// "ready to restart now" and short-circuits its countdown.
 pub(crate) fn publish_restart(
-    tx: &tokio::sync::broadcast::Sender<crate::events::RestartRequest>,
-    latch: &Arc<std::sync::RwLock<Option<crate::events::RestartRequest>>>,
+    tx: &tokio::sync::broadcast::Sender<rsclaw_events::RestartRequest>,
+    latch: &Arc<std::sync::RwLock<Option<rsclaw_events::RestartRequest>>>,
     shutdown: &crate::gateway::ShutdownCoordinator,
-    mut req: crate::events::RestartRequest,
+    mut req: rsclaw_events::RestartRequest,
 ) {
     let initial = shutdown.inflight() as u64;
     req.inflight = initial;

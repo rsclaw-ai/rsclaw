@@ -833,7 +833,7 @@ impl Channel for QQBotChannel {
                     continue;
                 }
                 info!(
-                    response = crate::util::truncate_str(&upload_text, 500),
+                    response = rsclaw_util::truncate_str(&upload_text, 500),
                     "qq: image upload response"
                 );
                 let file_info: serde_json::Value = match serde_json::from_str(&upload_text) {

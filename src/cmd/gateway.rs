@@ -342,7 +342,7 @@ fn gateway_read_pid() -> Option<u32> {
 }
 
 fn process_alive(pid: u32) -> bool {
-    crate::sys::process_alive(pid)
+    rsclaw_platform::process_alive(pid)
 }
 
 /// Scan for a running gateway process when PID file is missing.
@@ -689,7 +689,7 @@ pub fn gateway_signal_stop() -> Result<()> {
         let _ = std::fs::remove_file(gateway_pid_file());
         anyhow::bail!("gateway process {pid} is not running");
     }
-    crate::sys::process_terminate(pid)?;
+    rsclaw_platform::process_terminate(pid)?;
     let outcome = wait_for_process_exit(pid);
     if should_remove_pid_after_stop(&outcome) {
         let _ = std::fs::remove_file(gateway_pid_file());

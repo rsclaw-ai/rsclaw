@@ -92,7 +92,7 @@ impl LlmProvider for AnthropicProvider {
                 let req_body_preview = if req_body_str.len() > 4000 {
                     format!(
                         "{}...[truncated, total {} bytes]",
-                        crate::util::truncate_str(&req_body_str, 4000),
+                        rsclaw_util::truncate_str(&req_body_str, 4000),
                         req_body_str.len()
                     )
                 } else {

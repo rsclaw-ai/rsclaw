@@ -409,7 +409,7 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
             }
             if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
                 if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                    let _ = crate::sys::process_terminate(pid as u32);
+                    let _ = rsclaw_platform::process_terminate(pid as u32);
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     #[allow(unused_mut)]
                     let mut upd = std::process::Command::new(&current_exe);

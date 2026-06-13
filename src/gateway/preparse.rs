@@ -317,7 +317,7 @@ pub(crate) async fn try_preparse_locally_with_account(
     // the reply. Make it a local fast response listing all preparse
     // slash commands, so it lands within milliseconds on every channel.
     if lower == "/help" || lower == "/?" {
-        return Some(txt(help_text(crate::i18n::default_lang())));
+        return Some(txt(help_text(rsclaw_i18n::default_lang())));
     }
     // /version
     if lower == "/version" {
@@ -400,9 +400,9 @@ pub(crate) async fn try_preparse_locally_with_account(
         drop(flags);
         // 2. Signal runtime to clear sessions at next opportunity
         handle.clear_signal.store(true, Ordering::SeqCst);
-        return Some(txt(crate::i18n::t(
+        return Some(txt(rsclaw_i18n::t(
             "session_cleared",
-            crate::i18n::default_lang(),
+            rsclaw_i18n::default_lang(),
         )
         .to_owned()));
     }
@@ -417,9 +417,9 @@ pub(crate) async fn try_preparse_locally_with_account(
         }
         drop(flags);
         handle.new_session_signal.store(true, Ordering::SeqCst);
-        return Some(txt(crate::i18n::t(
+        return Some(txt(rsclaw_i18n::t(
             "session_new",
-            crate::i18n::default_lang(),
+            rsclaw_i18n::default_lang(),
         )
         .to_owned()));
     }
@@ -433,7 +433,7 @@ pub(crate) async fn try_preparse_locally_with_account(
     // Sticky direct mode is for "I want to talk to claudecode directly
     // for the next several turns" without the LLM in the middle.
     if lower == "/cap" || lower == "/cap -h" || lower == "/cap --help" || lower == "/cap help" {
-        return Some(txt(crate::i18n::t("cap_help", crate::i18n::default_lang())));
+        return Some(txt(rsclaw_i18n::t("cap_help", rsclaw_i18n::default_lang())));
     }
     if lower.starts_with("/cap ") {
         // Parse from `t` (case-preserved) so path arguments like
@@ -444,21 +444,21 @@ pub(crate) async fn try_preparse_locally_with_account(
         let mut parts = rest.splitn(2, char::is_whitespace);
         let agent_str = parts.next().unwrap_or("").trim();
         let path_arg = parts.next().unwrap_or("").trim();
-        let lang = crate::i18n::default_lang();
+        let lang = rsclaw_i18n::default_lang();
         let Some(kind) = crate::cap::AgentKind::from_str(&agent_str.to_lowercase()) else {
-            return Some(txt(crate::i18n::t_fmt(
+            return Some(txt(rsclaw_i18n::t_fmt(
                 "cap_unknown_agent",
                 lang,
                 &[("agent", agent_str)],
             )));
         };
         let Some(manager) = crate::cap::GLOBAL_CAP_LIVE.get() else {
-            return Some(txt(crate::i18n::t("cap_not_initialised", lang)));
+            return Some(txt(rsclaw_i18n::t("cap_not_initialised", lang)));
         };
         let cwd = match resolve_cap_workspace(path_arg, workspace()) {
             Ok(p) => p,
             Err(reason) => {
-                return Some(txt(crate::i18n::t_fmt(
+                return Some(txt(rsclaw_i18n::t_fmt(
                     "cap_bad_workspace",
                     lang,
                     &[("path", path_arg), ("reason", &reason)],
@@ -502,7 +502,7 @@ pub(crate) async fn try_preparse_locally_with_account(
                     account.map(|s| s.to_owned()),
                     lang,
                 );
-                let reply = crate::i18n::t_fmt(
+                let reply = rsclaw_i18n::t_fmt(
                     "cap_bound",
                     lang,
                     &[
@@ -517,7 +517,7 @@ pub(crate) async fn try_preparse_locally_with_account(
                 let is_binary_missing = err.contains("binary not found on PATH");
                 let hint = if is_binary_missing {
                     match kind {
-                        crate::cap::AgentKind::Opencode => crate::i18n::t_fmt(
+                        crate::cap::AgentKind::Opencode => rsclaw_i18n::t_fmt(
                             "cap_install_hint_go",
                             lang,
                             &[
@@ -525,7 +525,7 @@ pub(crate) async fn try_preparse_locally_with_account(
                                 ("cmd", kind.as_str()),
                             ],
                         ),
-                        _ => crate::i18n::t_fmt(
+                        _ => rsclaw_i18n::t_fmt(
                             "cap_install_hint_npm",
                             lang,
                             &[
@@ -535,7 +535,7 @@ pub(crate) async fn try_preparse_locally_with_account(
                         ),
                     }
                 } else {
-                    crate::i18n::t_fmt("cap_open_failed", lang, &[("err", &err)])
+                    rsclaw_i18n::t_fmt("cap_open_failed", lang, &[("err", &err)])
                 };
                 return Some(txt(hint));
             }
@@ -554,7 +554,7 @@ pub(crate) async fn try_preparse_locally_with_account(
     // CLI errors at spawn — we surface that as a cap_open_failed
     // reply.
     if lower.starts_with("/cap-resume ") || lower == "/cap-resume" {
-        let lang = crate::i18n::default_lang();
+        let lang = rsclaw_i18n::default_lang();
         // Parse "<agent> [session_id]" from the original (non-lowered)
         // text because session ids are case-sensitive on opencode.
         // Empty session_id → "continue last" mode (CLI-native flag).
@@ -563,17 +563,17 @@ pub(crate) async fn try_preparse_locally_with_account(
         let agent_str = parts.next().unwrap_or("").trim();
         let session_id = parts.next().unwrap_or("").trim();
         if agent_str.is_empty() {
-            return Some(txt(crate::i18n::t("cap_resume_help", lang)));
+            return Some(txt(rsclaw_i18n::t("cap_resume_help", lang)));
         }
         let Some(kind) = crate::cap::AgentKind::from_str(&agent_str.to_lowercase()) else {
-            return Some(txt(crate::i18n::t_fmt(
+            return Some(txt(rsclaw_i18n::t_fmt(
                 "cap_unknown_agent",
                 lang,
                 &[("agent", agent_str)],
             )));
         };
         let Some(manager) = crate::cap::GLOBAL_CAP_LIVE.get() else {
-            return Some(txt(crate::i18n::t("cap_not_initialised", lang)));
+            return Some(txt(rsclaw_i18n::t("cap_not_initialised", lang)));
         };
         let cwd = workspace();
         let spawn_result = if session_id.is_empty() {
@@ -600,7 +600,7 @@ pub(crate) async fn try_preparse_locally_with_account(
                 } else {
                     session_id
                 };
-                return Some(txt(crate::i18n::t_fmt(
+                return Some(txt(rsclaw_i18n::t_fmt(
                     "cap_resumed",
                     lang,
                     &[("agent", kind.display_name()), ("session_id", label)],
@@ -611,7 +611,7 @@ pub(crate) async fn try_preparse_locally_with_account(
                 let is_binary_missing = err.contains("binary not found on PATH");
                 let hint = if is_binary_missing {
                     match kind {
-                        crate::cap::AgentKind::Opencode => crate::i18n::t_fmt(
+                        crate::cap::AgentKind::Opencode => rsclaw_i18n::t_fmt(
                             "cap_install_hint_go",
                             lang,
                             &[
@@ -619,7 +619,7 @@ pub(crate) async fn try_preparse_locally_with_account(
                                 ("cmd", kind.as_str()),
                             ],
                         ),
-                        _ => crate::i18n::t_fmt(
+                        _ => rsclaw_i18n::t_fmt(
                             "cap_install_hint_npm",
                             lang,
                             &[
@@ -629,7 +629,7 @@ pub(crate) async fn try_preparse_locally_with_account(
                         ),
                     }
                 } else {
-                    crate::i18n::t_fmt("cap_open_failed", lang, &[("err", &err)])
+                    rsclaw_i18n::t_fmt("cap_open_failed", lang, &[("err", &err)])
                 };
                 return Some(txt(hint));
             }
@@ -637,12 +637,12 @@ pub(crate) async fn try_preparse_locally_with_account(
     }
     // /cap-exit — release any sticky binding on this IM session.
     if lower == "/cap-exit" {
-        let lang = crate::i18n::default_lang();
+        let lang = rsclaw_i18n::default_lang();
         let Some(manager) = crate::cap::GLOBAL_CAP_LIVE.get() else {
-            return Some(txt(crate::i18n::t("cap_not_initialised", lang)));
+            return Some(txt(rsclaw_i18n::t("cap_not_initialised", lang)));
         };
         let Some((sid, kind)) = manager.unbind_sticky(&this_session_key).await else {
-            return Some(txt(crate::i18n::t("cap_no_active", lang)));
+            return Some(txt(rsclaw_i18n::t("cap_no_active", lang)));
         };
         // Capture the native session_id BEFORE tearing the actor down
         // — once `end_session` drops the LiveSessionHandle, that
@@ -662,13 +662,13 @@ pub(crate) async fn try_preparse_locally_with_account(
         // Build the close reply, append the resume hint if we have
         // the native id so the user has the `/cap-resume` command
         // ready to copy without having to run `/status`.
-        let closed = crate::i18n::t_fmt(
+        let closed = rsclaw_i18n::t_fmt(
             "cap_session_closed",
             lang,
             &[("agent", kind.display_name())],
         );
         let body = if let Some(nsid) = native_sid {
-            let hint = crate::i18n::t_fmt(
+            let hint = rsclaw_i18n::t_fmt(
                 "cap_resume_hint_after_exit",
                 lang,
                 &[("agent", kind.as_str()), ("session_id", &nsid)],
@@ -786,9 +786,9 @@ $g.Dispose();$b.Dispose()"#
                 });
             }
         }
-        return Some(txt(crate::i18n::t(
+        return Some(txt(rsclaw_i18n::t(
             "screenshot_failed",
-            crate::i18n::default_lang(),
+            rsclaw_i18n::default_lang(),
         )
         .to_owned()));
     }
@@ -870,9 +870,9 @@ $g.Dispose();$b.Dispose()"#
                 });
             }
         }
-        return Some(txt(crate::i18n::t_fmt(
+        return Some(txt(rsclaw_i18n::t_fmt(
             "webshot_failed",
-            crate::i18n::default_lang(),
+            rsclaw_i18n::default_lang(),
             &[("url", &url)],
         )));
     }
@@ -946,7 +946,7 @@ $g.Dispose();$b.Dispose()"#
         let cron_path = crate::cron::resolve_cron_store_path();
         let _guard = crate::cron::CRON_FILE_LOCK.lock().await;
         let mut jobs = crate::agent::tools_cron::read_cron_jobs(&cron_path).await;
-        let zh = crate::i18n::default_lang() == "zh";
+        let zh = rsclaw_i18n::default_lang() == "zh";
         // Match by 1-based index when the arg is a positive integer,
         // otherwise treat as job id (loop-xxxx / cron-xxxx).
         let removed = if let Ok(idx) = key.parse::<usize>()
@@ -1002,7 +1002,7 @@ $g.Dispose();$b.Dispose()"#
     // back to the originating channel/peer. Persists to cron.json5 and
     // signals the cron runner to reload.
     if lower == "/loop" || lower == "/loop -h" || lower == "/loop --help" || lower == "/loop help" {
-        return Some(txt(loop_help_text(crate::i18n::default_lang())));
+        return Some(txt(loop_help_text(rsclaw_i18n::default_lang())));
     }
     if lower.starts_with("/loop ") {
         let rest = t.get(6..).unwrap_or("").trim();
@@ -1011,7 +1011,7 @@ $g.Dispose();$b.Dispose()"#
             None => (rest, ""),
         };
         if interval_s.is_empty() || prompt.is_empty() {
-            return Some(txt(loop_help_text(crate::i18n::default_lang())));
+            return Some(txt(loop_help_text(rsclaw_i18n::default_lang())));
         }
         let every_ms = match parse_interval_ms(interval_s) {
             Some(v) if v >= 2_000 => v,
@@ -1049,7 +1049,7 @@ $g.Dispose();$b.Dispose()"#
         }
         drop(_guard);
         crate::cron::trigger_reload();
-        let zh = crate::i18n::default_lang() == "zh";
+        let zh = rsclaw_i18n::default_lang() == "zh";
         let human = format_interval_ms(every_ms);
         return Some(txt(if zh {
             format!(
@@ -1068,7 +1068,7 @@ $g.Dispose();$b.Dispose()"#
         || lower == "/watch --help"
         || lower == "/watch help"
     {
-        return Some(txt(watch_help_text(crate::i18n::default_lang())));
+        return Some(txt(watch_help_text(rsclaw_i18n::default_lang())));
     }
     if let Some(body) = t.strip_prefix("/watch ") {
         let body = body.trim();
@@ -1101,7 +1101,7 @@ $g.Dispose();$b.Dispose()"#
     // /task with no args or -h/--help → print task help (short-circuit;
     // otherwise it would route into the task queue with an empty message).
     if lower == "/task" || lower == "/task -h" || lower == "/task --help" || lower == "/task help" {
-        return Some(txt(task_help_text(crate::i18n::default_lang())));
+        return Some(txt(task_help_text(rsclaw_i18n::default_lang())));
     }
     // /model — show current model; /models — list providers; /model <name> — switch
     if lower == "/model" || lower == "/models" {
@@ -1915,8 +1915,8 @@ fn format_screen_reply(filter: &str, v: &serde_json::Value) -> String {
                         if s.len() > 60 {
                             // CJK-safe truncate — `&s[..60]` can
                             // panic mid-codepoint. See
-                            // crate::util::truncate_str.
-                            format!("{}…", crate::util::truncate_str(&s, 60))
+                            // rsclaw_util::truncate_str.
+                            format!("{}…", rsclaw_util::truncate_str(&s, 60))
                         } else {
                             s
                         }
@@ -2171,7 +2171,7 @@ fn spawn_resume_hint_followup(
             );
             return;
         };
-        let text = crate::i18n::t_fmt(
+        let text = rsclaw_i18n::t_fmt(
             "cap_resume_hint",
             lang,
             &[("agent", kind.as_str()), ("session_id", &nsid)],

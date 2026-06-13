@@ -1267,9 +1267,9 @@ impl CronRunner {
                             // Success but no output - send summary
                             let job_name = job.name.as_deref().unwrap_or(&job.id);
                             let seconds = (duration_ms / 1000).to_string();
-                            Some(crate::i18n::t_fmt(
+                            Some(rsclaw_i18n::t_fmt(
                                 "cron_run_success",
-                                crate::i18n::default_lang(),
+                                rsclaw_i18n::default_lang(),
                                 &[("name", job_name), ("seconds", &seconds)],
                             ))
                         }
@@ -1297,9 +1297,9 @@ impl CronRunner {
                             let consecutive_str = consecutive.to_string();
                             let error_str = e.to_string();
                             Some(if will_disable {
-                                crate::i18n::t_fmt(
+                                rsclaw_i18n::t_fmt(
                                     "cron_run_failed_disabled",
-                                    crate::i18n::default_lang(),
+                                    rsclaw_i18n::default_lang(),
                                     &[
                                         ("name", job_name),
                                         ("consecutive", &consecutive_str),
@@ -1307,9 +1307,9 @@ impl CronRunner {
                                     ],
                                 )
                             } else {
-                                crate::i18n::t_fmt(
+                                rsclaw_i18n::t_fmt(
                                     "cron_run_failed_retry",
-                                    crate::i18n::default_lang(),
+                                    rsclaw_i18n::default_lang(),
                                     &[
                                         ("name", job_name),
                                         ("consecutive", &consecutive_str),
@@ -1454,9 +1454,9 @@ impl CronRunner {
             Ok(output) if !output.trim().is_empty() => output.clone(),
             Ok(_) => {
                 let job_name = job.name.as_deref().unwrap_or(&job.id);
-                crate::i18n::t_fmt(
+                rsclaw_i18n::t_fmt(
                     "cron_run_success_no_duration",
-                    crate::i18n::default_lang(),
+                    rsclaw_i18n::default_lang(),
                     &[("name", job_name)],
                 )
             }
@@ -1467,9 +1467,9 @@ impl CronRunner {
                 // (manual triggers don't count toward auto-disable threshold)
                 let consecutive_str = consecutive.to_string();
                 let error_str = e.to_string();
-                crate::i18n::t_fmt(
+                rsclaw_i18n::t_fmt(
                     "cron_run_failed_manual",
-                    crate::i18n::default_lang(),
+                    rsclaw_i18n::default_lang(),
                     &[
                         ("name", job_name),
                         ("consecutive", &consecutive_str),

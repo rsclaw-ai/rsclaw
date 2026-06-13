@@ -208,7 +208,7 @@ impl McpClient {
                 if val.get("id").is_some() {
                     return Ok::<Value, anyhow::Error>(val);
                 }
-                debug!(name = %self.name, "MCP notification (skipped): {}", crate::util::truncate_str(&line, 200));
+                debug!(name = %self.name, "MCP notification (skipped): {}", rsclaw_util::truncate_str(&line, 200));
             }
         })
         .await

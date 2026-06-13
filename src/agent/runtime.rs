@@ -1399,13 +1399,13 @@ pub fn is_known_vision_model(model: &str) -> bool {
 
 /// User-facing error message emitted when vision-model resolution lands
 /// on a configuration that can't drive `computer_use`. Localised — the
-/// gateway language is read from `crate::i18n::default_lang()` so the
+/// gateway language is read from `rsclaw_i18n::default_lang()` so the
 /// message reaches the user in the channel they configured (Feishu /
 /// WeChat / Telegram / etc.). Falls back to English when the language
 /// is unset.
 pub fn vision_unavailable_message(reason: &str) -> String {
-    let lang = crate::i18n::default_lang();
-    crate::i18n::t_fmt("vision_unavailable", lang, &[("reason", reason)])
+    let lang = rsclaw_i18n::default_lang();
+    rsclaw_i18n::t_fmt("vision_unavailable", lang, &[("reason", reason)])
 }
 
 impl AgentRuntime {
@@ -1662,7 +1662,7 @@ impl AgentRuntime {
             for f in &files {
                 let _ = std::fs::remove_file(&f.path);
             }
-            return Ok(direct(crate::i18n::t_fmt(
+            return Ok(direct(rsclaw_i18n::t_fmt(
                 "video_deleted",
                 i18n_lang,
                 &[("names", &names.join(", "))],
@@ -1672,7 +1672,7 @@ impl AgentRuntime {
         let ffmpeg = match crate::agent::platform::ensure_ffmpeg().await {
             Ok(p) => p,
             Err(e) => {
-                return Ok(direct(crate::i18n::t_fmt(
+                return Ok(direct(rsclaw_i18n::t_fmt(
                     "video_no_ffmpeg",
                     i18n_lang,
                     &[("err", &format!("{e:#}"))],
@@ -1757,7 +1757,7 @@ impl AgentRuntime {
             sections.join("\n\n")
         );
         Ok(AgentReply {
-            text: crate::i18n::t("analyzing", i18n_lang),
+            text: rsclaw_i18n::t("analyzing", i18n_lang),
             is_empty: false,
             tool_calls: None,
             images: vec![],
@@ -2380,7 +2380,7 @@ impl AgentRuntime {
                     _ => "image/png",
                 };
                 let orig_len = bytes.len();
-                let (final_bytes, final_mime) = crate::util::downscale_image_for_vision(
+                let (final_bytes, final_mime) = rsclaw_util::downscale_image_for_vision(
                     &bytes,
                     orig_mime,
                     1 * 1024 * 1024,
@@ -2486,7 +2486,7 @@ impl AgentRuntime {
                     .gateway
                     .as_ref()
                     .and_then(|g| g.language.as_deref())
-                    .map(crate::i18n::resolve_lang)
+                    .map(rsclaw_i18n::resolve_lang)
                     .unwrap_or("en");
 
                 // -----------------------------------------------------
@@ -2639,7 +2639,7 @@ impl AgentRuntime {
                         let is_empty = reply_text.trim().is_empty();
                         return Ok(AgentReply {
                             text: if is_empty {
-                                crate::i18n::t_fmt(
+                                rsclaw_i18n::t_fmt(
                                     "cap_no_output",
                                     lang,
                                     &[("agent", kind.display_name())],
@@ -2663,7 +2663,7 @@ impl AgentRuntime {
                         // since chunker hasn't streamed an error).
                         let _ = manager.unbind_sticky(session_key).await;
                         let err = e.to_string();
-                        let msg = crate::i18n::t_fmt(
+                        let msg = rsclaw_i18n::t_fmt(
                             "cap_driver_error",
                             lang,
                             &[("agent", kind.as_str()), ("err", &err)],
@@ -2817,7 +2817,7 @@ impl AgentRuntime {
             .gateway
             .as_ref()
             .and_then(|g| g.language.as_deref())
-            .map(crate::i18n::resolve_lang)
+            .map(rsclaw_i18n::resolve_lang)
             .unwrap_or("en");
 
         // ---------------------------------------------------------------
@@ -2896,7 +2896,7 @@ impl AgentRuntime {
                         let msg = binary_kept
                             .iter()
                             .map(|(name, subdir)| {
-                                let suffix = crate::i18n::t_fmt(
+                                let suffix = rsclaw_i18n::t_fmt(
                                     "file_kept_in_uploads",
                                     &i18n_lang,
                                     &[("subdir", subdir.as_str())],
@@ -2920,7 +2920,7 @@ impl AgentRuntime {
                     // Has extractable text: return "analyzing..." immediately,
                     // attach pending analysis for the per-user worker to process.
                     return Ok(AgentReply {
-                        text: crate::i18n::t("analyzing", i18n_lang),
+                        text: rsclaw_i18n::t("analyzing", i18n_lang),
                         is_empty: false,
                         tool_calls: None,
                         images: vec![],
@@ -2972,7 +2972,7 @@ impl AgentRuntime {
                     // Binary files: direct reply, no LLM needed.
                     if analysis_text.is_empty() {
                         let msg = if binary_deleted.is_empty() {
-                            crate::i18n::t("no_extractable_deleted", i18n_lang)
+                            rsclaw_i18n::t("no_extractable_deleted", i18n_lang)
                         } else {
                             format!(
                                 "{}\n{}",
@@ -2981,7 +2981,7 @@ impl AgentRuntime {
                                     .map(|f| format!("- {f}"))
                                     .collect::<Vec<_>>()
                                     .join("\n"),
-                                crate::i18n::t("no_extractable_deleted", i18n_lang)
+                                rsclaw_i18n::t("no_extractable_deleted", i18n_lang)
                             )
                         };
                         return Ok(AgentReply {
@@ -3005,7 +3005,7 @@ impl AgentRuntime {
                         ));
                     }
                     return Ok(AgentReply {
-                        text: crate::i18n::t("analyzing", i18n_lang),
+                        text: rsclaw_i18n::t("analyzing", i18n_lang),
                         is_empty: false,
                         tool_calls: None,
                         images: vec![],
@@ -3028,7 +3028,7 @@ impl AgentRuntime {
                         let _ = std::fs::remove_file(uploads.join(&pf.filename));
                     }
                     return Ok(AgentReply {
-                        text: crate::i18n::t("files_deleted", i18n_lang),
+                        text: rsclaw_i18n::t("files_deleted", i18n_lang),
                         is_empty: false,
                         tool_calls: None,
                         images: vec![],
@@ -3089,7 +3089,7 @@ impl AgentRuntime {
                             .gateway
                             .as_ref()
                             .and_then(|g| g.language.as_deref())
-                            .map(crate::i18n::resolve_lang)
+                            .map(rsclaw_i18n::resolve_lang)
                             .unwrap_or("en");
                         build_help_text_filtered(allowed, lang)
                     }
@@ -3183,7 +3183,7 @@ impl AgentRuntime {
                             };
                             self.sessions.insert(session_key.to_owned(), vec![msg]);
                         }
-                        crate::i18n::t("session_cleared", crate::i18n::default_lang()).to_owned()
+                        rsclaw_i18n::t("session_cleared", rsclaw_i18n::default_lang()).to_owned()
                     }
                     "__COMPACT__" => {
                         // Manual compaction: force compress + save summary to memory.
@@ -3249,17 +3249,17 @@ impl AgentRuntime {
                                         Err(e) => warn!("compact: failed to save to memory: {e}"),
                                     }
                                 }
-                                crate::i18n::t("compact_done", crate::i18n::default_lang())
+                                rsclaw_i18n::t("compact_done", rsclaw_i18n::default_lang())
                                     .to_owned()
                             } else {
-                                crate::i18n::t(
+                                rsclaw_i18n::t(
                                     "compact_done_no_summary",
-                                    crate::i18n::default_lang(),
+                                    rsclaw_i18n::default_lang(),
                                 )
                                 .to_owned()
                             }
                         } else {
-                            crate::i18n::t("compact_nothing", crate::i18n::default_lang())
+                            rsclaw_i18n::t("compact_nothing", rsclaw_i18n::default_lang())
                                 .to_owned()
                         }
                     }
@@ -3280,7 +3280,7 @@ impl AgentRuntime {
                     }
                     "__TEXT_MODE__" => {
                         self.voice_mode_sessions.remove(session_key);
-                        let zh = crate::i18n::default_lang() == "zh";
+                        let zh = rsclaw_i18n::default_lang() == "zh";
                         if zh {
                             "已切换到文字回复模式。".to_owned()
                         } else {
@@ -3289,7 +3289,7 @@ impl AgentRuntime {
                     }
                     "__VOICE_MODE__" => {
                         self.voice_mode_sessions.insert(session_key.to_owned());
-                        let zh = crate::i18n::default_lang() == "zh";
+                        let zh = rsclaw_i18n::default_lang() == "zh";
                         if zh {
                             "已切换到语音回复模式。".to_owned()
                         } else {
@@ -3854,8 +3854,8 @@ impl AgentRuntime {
             if !rejected.is_empty() && accepted.is_empty() {
                 let limit_str = format!("{:.0}", max_file_size as f64 / 1e6);
                 let msg =
-                    crate::i18n::t_fmt("file_size_exceeded", i18n_lang, &[("limit", &limit_str)]);
-                let adjust = crate::i18n::t("file_size_adjust", i18n_lang);
+                    rsclaw_i18n::t_fmt("file_size_exceeded", i18n_lang, &[("limit", &limit_str)]);
+                let adjust = rsclaw_i18n::t("file_size_adjust", i18n_lang);
                 return Ok(AgentReply {
                     text: format!("{msg}\n{}\n\n{adjust}", rejected.join("\n")),
                     is_empty: false,
@@ -3878,7 +3878,7 @@ impl AgentRuntime {
                 let avail_mb = available / 1_000_000;
                 let need_mb = total_size / 1_000_000;
                 return Ok(AgentReply {
-                    text: crate::i18n::t_fmt(
+                    text: rsclaw_i18n::t_fmt(
                         "disk_space_low",
                         i18n_lang,
                         &[
@@ -3969,13 +3969,13 @@ impl AgentRuntime {
                         format!("{:.1} KB", *size as f64 / 1_000.0)
                     };
                     let analysis = if *has_text {
-                        crate::i18n::t_fmt(
+                        rsclaw_i18n::t_fmt(
                             "file_analyzable",
                             i18n_lang,
                             &[("tokens", &tokens.to_string())],
                         )
                     } else {
-                        crate::i18n::t("file_binary", i18n_lang)
+                        rsclaw_i18n::t("file_binary", i18n_lang)
                     };
                     format!("- {name} ({size_str}, {analysis})")
                 })
@@ -3995,9 +3995,9 @@ impl AgentRuntime {
                     !fs.is_empty() && fs.iter().all(|f| matches!(f.stage, PendingStage::VideoMenu))
                 });
             let menu_msg = if all_videos {
-                crate::i18n::t("video_menu", i18n_lang)
+                rsclaw_i18n::t("video_menu", i18n_lang)
             } else if any_analyzable {
-                crate::i18n::t("file_menu", i18n_lang)
+                rsclaw_i18n::t("file_menu", i18n_lang)
             } else {
                 // Binary only -- simplified menu.
                 if i18n_lang == "zh" {
@@ -5208,10 +5208,10 @@ impl AgentRuntime {
                 .unwrap_or(false);
             let sherpa_tts_ready = sherpa_tts_bin.exists() && has_vits_dir;
             if !sherpa_tts_ready && super::install_hints::claim_first_hint("tts-sherpa") {
-                let lang = crate::i18n::default_lang();
+                let lang = rsclaw_i18n::default_lang();
                 reply
                     .text
-                    .push_str(&crate::i18n::t("install_hint_tts_sherpa", lang));
+                    .push_str(&rsclaw_i18n::t("install_hint_tts_sherpa", lang));
             }
 
             match self.generate_tts_audio(&reply.text).await {
@@ -5851,8 +5851,8 @@ impl AgentRuntime {
                     iterations = iteration,
                     "agent_loop: stagnation budget exhausted after wrap-up, breaking out"
                 );
-                let lang = crate::i18n::default_lang();
-                let terminal_text = crate::i18n::t_fmt(
+                let lang = rsclaw_i18n::default_lang();
+                let terminal_text = rsclaw_i18n::t_fmt(
                     "agent_max_iterations",
                     lang,
                     &[
@@ -5895,15 +5895,15 @@ impl AgentRuntime {
                 );
                 // Return last error info to user with details
                 let error_text = if let Some(ref info) = last_error_info {
-                    let lang = crate::i18n::default_lang();
+                    let lang = rsclaw_i18n::default_lang();
                     let truncated: String = info.chars().take(500).collect();
-                    crate::i18n::t_fmt(
+                    rsclaw_i18n::t_fmt(
                         "agent_tool_errors",
                         lang,
                         &[("error", &truncated)],
                     )
                 } else {
-                    crate::i18n::t("agent_tool_errors", crate::i18n::default_lang())
+                    rsclaw_i18n::t("agent_tool_errors", rsclaw_i18n::default_lang())
                         .replace("{error}", "(unknown)")
                 };
                 // Emit done=true so WS subscribers (desktop chat) see the
@@ -7329,7 +7329,7 @@ impl AgentRuntime {
                             same_call_streak
                         );
                         let terminal_text =
-                            crate::i18n::t("agent_loop_detected", crate::i18n::default_lang())
+                            rsclaw_i18n::t("agent_loop_detected", rsclaw_i18n::default_lang())
                                 .to_owned();
                         // Emit done=true so WS subscribers (desktop chat) see
                         // the terminal text and the terminator frame together.
@@ -8510,7 +8510,7 @@ impl AgentRuntime {
                 if let Some(desc) = raw.get("description").and_then(|d| d.as_str()) {
                     compact.insert(
                         "description".to_owned(),
-                        json!(crate::util::truncate_str(desc, 180)),
+                        json!(rsclaw_util::truncate_str(desc, 180)),
                     );
                 }
                 props.insert(name.clone(), Value::Object(compact));
@@ -8528,7 +8528,7 @@ impl AgentRuntime {
             "tool": tool.tool,
             "name": format!("{}.{}", tool.plugin, tool.tool),
             "runtime": tool.runtime,
-            "description": crate::util::truncate_str(&tool.description, 280),
+            "description": rsclaw_util::truncate_str(&tool.description, 280),
             "input_schema_compact": Self::compact_input_schema(&tool.input_schema),
         })
     }
@@ -9152,7 +9152,7 @@ impl AgentRuntime {
                         json!({
                             "tool": tool.tool,
                             "name": format!("{}.{}", plugin, tool.tool),
-                            "description": crate::util::truncate_str(&tool.description, 180),
+                            "description": rsclaw_util::truncate_str(&tool.description, 180),
                         })
                     })
                     .collect::<Vec<_>>();
@@ -11998,7 +11998,7 @@ fn intermediate_notification_text(text: &str) -> Option<&str> {
 ///     The chunker doesn't try to be smarter — outbound dispatch
 ///     already handles per-channel rate limiting.
 async fn stream_cap_chunks_to_im(
-    mut bus_rx: tokio::sync::broadcast::Receiver<crate::events::AgentEvent>,
+    mut bus_rx: tokio::sync::broadcast::Receiver<rsclaw_events::AgentEvent>,
     pseudo_session_id: String,
     notif_tx: tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>,
     target_id: String,
@@ -12089,7 +12089,7 @@ async fn stream_cap_chunks_to_im(
 
             // 5-second silent-start heartbeat.
             _ = heartbeat_fut => {
-                let text = crate::i18n::t_fmt(
+                let text = rsclaw_i18n::t_fmt(
                     "cap_thinking",
                     lang,
                     &[("agent", &agent_label)],
@@ -12122,7 +12122,7 @@ async fn stream_cap_chunks_to_im(
                     if !e.delta.is_empty() {
                         let ev_is_thought = matches!(
                             e.channel,
-                            Some(crate::events::TextChannel::Thought)
+                            Some(rsclaw_events::TextChannel::Thought)
                         );
                         // Skip thought/reasoning tokens in IM stream.
                         // Coding agents emit verbose English thinking

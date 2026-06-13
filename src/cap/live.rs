@@ -84,7 +84,7 @@ pub struct CapLiveManager {
     /// active sessions; the pool only holds live_sids, never owns
     /// the driver subprocess directly (the actor in `sessions` does).
     suspended: Arc<RwLock<HashMap<(String, AgentKind), String>>>,
-    bus: broadcast::Sender<crate::events::AgentEvent>,
+    bus: broadcast::Sender<rsclaw_events::AgentEvent>,
     /// Outbound notification channel — when set, preparse can post
     /// asynchronous follow-up messages to IM after `/cap` returns its
     /// initial bind reply (e.g. surface the agent's native session_id
@@ -150,7 +150,7 @@ pub(crate) struct LiveDispatchResult {
 }
 
 impl CapLiveManager {
-    pub(crate) fn new(bus: broadcast::Sender<crate::events::AgentEvent>) -> Self {
+    pub(crate) fn new(bus: broadcast::Sender<rsclaw_events::AgentEvent>) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             sticky: Arc::new(RwLock::new(HashMap::new())),
@@ -741,7 +741,7 @@ async fn actor_loop(
     kind: AgentKind,
     mut driver: Box<dyn Driver>,
     mut rx: mpsc::Receiver<LiveRequest>,
-    bus: broadcast::Sender<crate::events::AgentEvent>,
+    bus: broadcast::Sender<rsclaw_events::AgentEvent>,
     sessions: Arc<RwLock<HashMap<String, LiveSessionHandle>>>,
     sticky: Arc<RwLock<HashMap<String, (String, AgentKind)>>>,
     suspended: Arc<RwLock<HashMap<(String, AgentKind), String>>>,

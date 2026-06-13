@@ -112,7 +112,7 @@ impl WatchRegistry {
     #[doc(hidden)]
     pub fn init_for_test() -> Arc<Self> {
         let channels = Arc::new(crate::channel::ChannelManager::new(
-            crate::sys::MemoryTier::Standard,
+            rsclaw_platform::MemoryTier::Standard,
         ));
         Arc::new(WatchRegistry {
             inner: Mutex::new(HashMap::new()),

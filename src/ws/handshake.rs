@@ -580,7 +580,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     Err(e) => {
                         warn!(
                             "ws parse error: {e} — raw: {}",
-                            crate::util::truncate_str(&raw, 200)
+                            rsclaw_util::truncate_str(&raw, 200)
                         );
                         let err = ResFrame::err("0", ErrorShape::bad_request(e.to_string()));
                         let _ = send_serialized(&outbound_tx, &err).await; // best-effort error reply

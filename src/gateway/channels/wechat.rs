@@ -281,9 +281,9 @@ pub(crate) fn start_wechat_personal_if_configured(
                                     .send(OutboundMessage {
                                         target_id: from_user.clone(),
                                         is_group: false,
-                                        text: crate::i18n::t_fmt(
+                                        text: rsclaw_i18n::t_fmt(
                                             "pairing_required",
-                                            crate::i18n::default_lang(),
+                                            rsclaw_i18n::default_lang(),
                                             &[("code", &code)],
                                         ),
                                         reply_to: None,
@@ -304,9 +304,9 @@ pub(crate) fn start_wechat_personal_if_configured(
                                     .send(OutboundMessage {
                                         target_id: from_user.clone(),
                                         is_group: false,
-                                        text: crate::i18n::t(
+                                        text: rsclaw_i18n::t(
                                             "pairing_queue_full",
-                                            crate::i18n::default_lang(),
+                                            rsclaw_i18n::default_lang(),
                                         )
                                         .to_owned(),
                                         reply_to: None,

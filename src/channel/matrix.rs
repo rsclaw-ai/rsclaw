@@ -339,7 +339,7 @@ impl Channel for MatrixChannel {
                                         .to_owned();
                                     let orig_len = bytes.len();
                                     let (final_bytes, final_mime) =
-                                        crate::util::downscale_image_for_vision(
+                                        rsclaw_util::downscale_image_for_vision(
                                             &bytes,
                                             &orig_mime,
                                             1 * 1024 * 1024,
@@ -354,7 +354,7 @@ impl Channel for MatrixChannel {
                                     let data_url = format!("data:{final_mime};base64,{b64}");
                                     info!(from = %sender, room = %room_id, from_bytes = orig_len, to_bytes = final_bytes.len(), "Matrix: image downloaded (SDK)");
                                     on_msg(
-                                        sender, crate::i18n::t("describe_image", crate::i18n::default_lang()), room_id, is_group,
+                                        sender, rsclaw_i18n::t("describe_image", rsclaw_i18n::default_lang()), room_id, is_group,
                                         vec![crate::agent::registry::ImageAttachment {
                                             data: data_url,
                                             mime_type: final_mime,
@@ -365,7 +365,7 @@ impl Channel for MatrixChannel {
                                 }
                                 Err(e) => {
                                     warn!("Matrix: image download failed (SDK): {e}");
-                                    on_msg(sender, crate::i18n::t("image_download_failed", crate::i18n::default_lang()), room_id, is_group, vec![], vec![]);
+                                    on_msg(sender, rsclaw_i18n::t("image_download_failed", rsclaw_i18n::default_lang()), room_id, is_group, vec![], vec![]);
                                 }
                             }
                         }
@@ -417,13 +417,13 @@ impl Channel for MatrixChannel {
                                             on_msg(sender, text, room_id, is_group, vec![], vec![]);
                                         }
                                         Err(_) => {
-                                            on_msg(sender, crate::i18n::t("video_message_received", crate::i18n::default_lang()), room_id, is_group, vec![], vec![]);
+                                            on_msg(sender, rsclaw_i18n::t("video_message_received", rsclaw_i18n::default_lang()), room_id, is_group, vec![], vec![]);
                                         }
                                     }
                                 }
                                 Err(e) => {
                                     warn!("Matrix: video download failed (SDK): {e}");
-                                    on_msg(sender, crate::i18n::t("video_message_received", crate::i18n::default_lang()), room_id, is_group, vec![], vec![]);
+                                    on_msg(sender, rsclaw_i18n::t("video_message_received", rsclaw_i18n::default_lang()), room_id, is_group, vec![], vec![]);
                                 }
                             }
                         }
@@ -789,7 +789,7 @@ impl Channel for MatrixChannel {
                 }
 
                 debug!(
-                    url = crate::util::truncate_str(&url, 120),
+                    url = rsclaw_util::truncate_str(&url, 120),
                     "Matrix: sync request"
                 );
 
@@ -939,7 +939,7 @@ impl Channel for MatrixChannel {
                                                                     let bytes_vec = bytes.to_vec();
                                                                     let orig_len = bytes_vec.len();
                                                                     let (final_bytes, final_mime) =
-                                                                        crate::util::downscale_image_for_vision(
+                                                                        rsclaw_util::downscale_image_for_vision(
                                                                             &bytes_vec,
                                                                             "image/png",
                                                                             1 * 1024 * 1024,
@@ -957,7 +957,7 @@ impl Channel for MatrixChannel {
                                                                     info!(from = %sender, room = %room_id, from_bytes = orig_len, to_bytes = final_bytes.len(), "Matrix: image received");
                                                                     (self.on_message)(
                                                                         sender.to_owned(),
-                                                                        crate::i18n::t("describe_image", crate::i18n::default_lang()),
+                                                                        rsclaw_i18n::t("describe_image", rsclaw_i18n::default_lang()),
                                                                         room_id.clone(),
                                                                         true,
                                                                         vec![crate::agent::registry::ImageAttachment {
@@ -1070,7 +1070,7 @@ impl Channel for MatrixChannel {
                         warn!(
                             "Matrix: sync error {} -- {}",
                             status,
-                            crate::util::truncate_str(&body, 200)
+                            rsclaw_util::truncate_str(&body, 200)
                         );
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     }

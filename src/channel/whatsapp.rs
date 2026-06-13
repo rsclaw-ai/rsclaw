@@ -174,9 +174,9 @@ impl WhatsAppChannel {
                                                 mime_type: mime.to_owned(),
                                                 source_path: None,
                                             });
-                                            text = crate::i18n::t(
+                                            text = rsclaw_i18n::t(
                                                 "describe_image",
-                                                crate::i18n::default_lang(),
+                                                rsclaw_i18n::default_lang(),
                                             );
                                             info!(size = bytes.len(), "WhatsApp image downloaded");
                                         }

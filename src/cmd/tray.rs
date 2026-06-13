@@ -145,7 +145,7 @@ fn update_status(
         && std::fs::read_to_string(&pid_file)
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok())
-            .is_some_and(|pid| crate::sys::process_alive(pid));
+            .is_some_and(|pid| rsclaw_platform::process_alive(pid));
 
     if running {
         status_item.set_text("Status: Running");

@@ -465,7 +465,7 @@ impl TelegramChannel {
             Err(e) => {
                 warn!(
                     file_id = file_id,
-                    response = crate::util::truncate_str(&raw_text, 300),
+                    response = rsclaw_util::truncate_str(&raw_text, 300),
                     "Telegram getFile parse error: {e}"
                 );
                 anyhow::bail!("Telegram getFile parse error");
@@ -474,7 +474,7 @@ impl TelegramChannel {
         if !resp.ok {
             warn!(
                 file_id = file_id,
-                response = crate::util::truncate_str(&raw_text, 300),
+                response = rsclaw_util::truncate_str(&raw_text, 300),
                 "Telegram getFile failed"
             );
         }
@@ -878,7 +878,7 @@ impl Channel for TelegramChannel {
                                                 use base64::Engine;
                                                 let orig_len = bytes.len();
                                                 let (final_bytes, final_mime) =
-                                                    crate::util::downscale_image_for_vision(
+                                                    rsclaw_util::downscale_image_for_vision(
                                                         &bytes,
                                                         "image/jpeg",
                                                         1 * 1024 * 1024,

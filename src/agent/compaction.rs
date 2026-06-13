@@ -753,7 +753,7 @@ impl AgentRuntime {
         // If compaction barely helped (still >80% of threshold), inject a
         // system hint so the agent will relay the /new suggestion to the user.
         if new_tokens > token_threshold * 4 / 5 {
-            let zh = crate::i18n::default_lang() == "zh";
+            let zh = rsclaw_i18n::default_lang() == "zh";
             let hint = if zh {
                 "[system] 上下文压缩后仍然较大，响应可能变慢。请告知用户发送 /new 开启新会话以恢复正常速度。"
             } else {

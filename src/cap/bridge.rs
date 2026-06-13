@@ -20,7 +20,7 @@ use super::runtime::NotifTarget;
 #[allow(dead_code)]
 pub(crate) struct Sinks<'a> {
     pub notif: Option<&'a NotifTarget>,
-    pub agent_event: Option<&'a broadcast::Sender<crate::events::AgentEvent>>,
+    pub agent_event: Option<&'a broadcast::Sender<rsclaw_events::AgentEvent>>,
     pub reply: Option<&'a mut String>,
     pub session_id: &'a str,
     pub agent_id: &'a str,
@@ -50,13 +50,13 @@ pub(crate) fn dispatch(event: &AgentEvent, sinks: &mut Sinks<'_>) -> bool {
         AgentEvent::TextChunk { text, channel, .. } => {
             // cap-rs TextChannel has Assistant, Thought, System.
             let (delta_channel, write_to_reply) = match channel {
-                TextChannel::Assistant => (crate::events::TextChannel::Assistant, true),
-                TextChannel::Thought => (crate::events::TextChannel::Thought, false),
-                TextChannel::System => (crate::events::TextChannel::System, false),
+                TextChannel::Assistant => (rsclaw_events::TextChannel::Assistant, true),
+                TextChannel::Thought => (rsclaw_events::TextChannel::Thought, false),
+                TextChannel::System => (rsclaw_events::TextChannel::System, false),
                 // cap_rs::core::TextChannel is `#[non_exhaustive]` —
                 // a future variant we don't recognise falls through
                 // as System (debug-only, won't pollute reply text).
-                _ => (crate::events::TextChannel::System, false),
+                _ => (rsclaw_events::TextChannel::System, false),
             };
             if write_to_reply {
                 if let Some(buf) = sinks.reply.as_deref_mut() {
@@ -64,7 +64,7 @@ pub(crate) fn dispatch(event: &AgentEvent, sinks: &mut Sinks<'_>) -> bool {
                 }
             }
             if let Some(bus) = sinks.agent_event {
-                let _ = bus.send(crate::events::AgentEvent {
+                let _ = bus.send(rsclaw_events::AgentEvent {
                     session_id: sinks.session_id.to_owned(),
                     agent_id: sinks.agent_id.to_owned(),
                     delta: text.clone(),
@@ -91,7 +91,7 @@ pub(crate) fn dispatch(event: &AgentEvent, sinks: &mut Sinks<'_>) -> bool {
                 "cap thought event"
             );
             if let Some(bus) = sinks.agent_event {
-                let _ = bus.send(crate::events::AgentEvent {
+                let _ = bus.send(rsclaw_events::AgentEvent {
                     session_id: sinks.session_id.to_owned(),
                     agent_id: sinks.agent_id.to_owned(),
                     delta: text.clone(),
@@ -100,7 +100,7 @@ pub(crate) fn dispatch(event: &AgentEvent, sinks: &mut Sinks<'_>) -> bool {
                     images: Vec::new(),
                     tool_log: Vec::new(),
                     question: None,
-                    channel: Some(crate::events::TextChannel::Thought),
+                    channel: Some(rsclaw_events::TextChannel::Thought),
                 });
             }
             false

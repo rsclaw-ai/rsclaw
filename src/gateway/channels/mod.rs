@@ -337,7 +337,7 @@ pub(crate) fn start_channels(
                                         .send(OutboundMessage {
                                             target_id: chat_id.to_string(),
                                             is_group: false,
-                                            text: crate::i18n::t_fmt("pairing_required", crate::i18n::default_lang(), &[("code", &code)]),
+                                            text: rsclaw_i18n::t_fmt("pairing_required", rsclaw_i18n::default_lang(), &[("code", &code)]),
                                             reply_to: None,
                                             images: vec![],
                                             channel: None,
@@ -355,7 +355,7 @@ pub(crate) fn start_channels(
                                         .send(OutboundMessage {
                                             target_id: chat_id.to_string(),
                                             is_group: false,
-                                            text: crate::i18n::t("pairing_queue_full", crate::i18n::default_lang()).to_owned(),
+                                            text: rsclaw_i18n::t("pairing_queue_full", rsclaw_i18n::default_lang()).to_owned(),
                                             reply_to: None,
                                             images: vec![],
                                             channel: None,

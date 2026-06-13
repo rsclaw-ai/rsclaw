@@ -84,10 +84,10 @@ where
         } else {
             current.clone()
         };
-        let lang = crate::i18n::default_lang();
-        let keep_label = crate::i18n::t_fmt("cli_keep", lang, &[("value", &display_val)]);
-        let edit_label = crate::i18n::t("cli_edit", lang);
-        let back_label = crate::i18n::t("cli_back", lang);
+        let lang = rsclaw_i18n::default_lang();
+        let keep_label = rsclaw_i18n::t_fmt("cli_keep", lang, &[("value", &display_val)]);
+        let edit_label = rsclaw_i18n::t("cli_edit", lang);
+        let back_label = rsclaw_i18n::t("cli_back", lang);
         let items = &[
             keep_label.as_str(),
             edit_label.as_str(),
@@ -303,7 +303,7 @@ fn select_language() -> Result<&'static str> {
         }
     };
     let lang = codes[idx];
-    crate::i18n::set_default_lang(lang);
+    rsclaw_i18n::set_default_lang(lang);
     Ok(lang)
 }
 
@@ -769,9 +769,9 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
 
     // Language selection as the very first step.
     let lang = select_language()?;
-    crate::i18n::set_default_lang(lang);
+    rsclaw_i18n::set_default_lang(lang);
 
-    header(&crate::i18n::t("cli_setup_title", lang));
+    header(&rsclaw_i18n::t("cli_setup_title", lang));
 
     // Check for existing OpenClaw installation
     let home = dirs_next::home_dir().unwrap_or_default();
@@ -789,19 +789,19 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
 
         step(
             "*",
-            &crate::i18n::t_fmt(
+            &rsclaw_i18n::t_fmt(
                 "cli_detected_openclaw",
-                crate::i18n::default_lang(),
+                rsclaw_i18n::default_lang(),
                 &[("path", &openclaw_dir.display().to_string())],
             ),
         );
         if session_count > 0 {
-            let lang = crate::i18n::default_lang();
+            let lang = rsclaw_i18n::default_lang();
             step(
                 " ",
                 &format!(
                     "  {}",
-                    crate::i18n::t_fmt(
+                    rsclaw_i18n::t_fmt(
                         "cli_data_summary",
                         lang,
                         &[
@@ -815,18 +815,18 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         }
         println!();
 
-        let lang = crate::i18n::default_lang();
-        let import_desc = crate::i18n::t("cli_import_desc", lang);
-        let fresh_desc = crate::i18n::t("cli_fresh_desc", lang);
+        let lang = rsclaw_i18n::default_lang();
+        let import_desc = rsclaw_i18n::t("cli_import_desc", lang);
+        let fresh_desc = rsclaw_i18n::t("cli_fresh_desc", lang);
         let options: Vec<&str> = vec![import_desc.as_str(), fresh_desc.as_str()];
-        let migration_prompt = crate::i18n::t("cli_migration_mode", lang);
+        let migration_prompt = rsclaw_i18n::t("cli_migration_mode", lang);
         match select_step(&migration_prompt, &options, 0) {
             StepResult::Next(0) => Some(crate::migrate::MigrateMode::Import),
             StepResult::Next(_) => Some(crate::migrate::MigrateMode::New),
             StepResult::Back | StepResult::Cancel => {
                 println!(
                     "  {}",
-                    crate::i18n::t("cli_setup_cancelled", crate::i18n::default_lang())
+                    rsclaw_i18n::t("cli_setup_cancelled", rsclaw_i18n::default_lang())
                 );
                 return Ok(());
             }
@@ -837,11 +837,11 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
 
     let base = {
         let b = crate::config::loader::base_dir();
-        let lang = crate::i18n::default_lang();
+        let lang = rsclaw_i18n::default_lang();
         if migrate_mode == Some(crate::migrate::MigrateMode::Import) {
             step(
                 "+",
-                &crate::i18n::t_fmt(
+                &rsclaw_i18n::t_fmt(
                     "cli_import_data_to",
                     lang,
                     &[("path", &b.display().to_string())],
@@ -850,7 +850,7 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         } else {
             step(
                 "*",
-                &crate::i18n::t_fmt("cli_using_dir", lang, &[("path", &b.display().to_string())]),
+                &rsclaw_i18n::t_fmt("cli_using_dir", lang, &[("path", &b.display().to_string())]),
             );
         }
         b
@@ -878,9 +878,9 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
     if migrate_mode == Some(crate::migrate::MigrateMode::Import) {
         step(
             "*",
-            &crate::i18n::t_fmt(
+            &rsclaw_i18n::t_fmt(
                 "cli_importing_sessions",
-                crate::i18n::default_lang(),
+                rsclaw_i18n::default_lang(),
                 &[("count", &session_count.to_string())],
             ),
         );
@@ -888,15 +888,15 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
             Ok(()) => {
                 step(
                     "+",
-                    &crate::i18n::t("cli_converted_config", crate::i18n::default_lang()),
+                    &rsclaw_i18n::t("cli_converted_config", rsclaw_i18n::default_lang()),
                 );
             }
             Err(e) => {
                 step(
                     "!",
-                    &crate::i18n::t_fmt(
+                    &rsclaw_i18n::t_fmt(
                         "cli_import_failed",
-                        crate::i18n::default_lang(),
+                        rsclaw_i18n::default_lang(),
                         &[("err", &e.to_string())],
                     ),
                 );
@@ -936,7 +936,7 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
     if seeded > 0 {
         step(
             "+",
-            &crate::i18n::t_fmt(
+            &rsclaw_i18n::t_fmt(
                 "cli_workspace_seeded",
                 lang,
                 &[
@@ -961,22 +961,22 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
     // default_config(lang).
     step(
         "+",
-        &crate::i18n::t_fmt(
+        &rsclaw_i18n::t_fmt(
             "cli_gateway_language_set",
             lang,
             &[("lang", lang_code_to_name(lang))],
         ),
     );
 
-    let lang_final = crate::i18n::default_lang();
-    done(&crate::i18n::t("cli_setup_complete", lang_final));
+    let lang_final = rsclaw_i18n::default_lang();
+    done(&rsclaw_i18n::t("cli_setup_complete", lang_final));
     println!();
     if migrate_mode == Some(crate::migrate::MigrateMode::Import) {
         // Migration done: config already exists, just start gateway
-        hint(&crate::i18n::t("cli_then_start", lang_final));
+        hint(&rsclaw_i18n::t("cli_then_start", lang_final));
     } else {
         // Fresh install: run onboard wizard to configure providers/channels
-        hint(&crate::i18n::t_fmt(
+        hint(&rsclaw_i18n::t_fmt(
             "cli_edit_config",
             lang_final,
             &[("path", &config_path.display().to_string())],
@@ -1004,8 +1004,8 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
             .ok()
             .and_then(|c| c.raw.gateway.as_ref().and_then(|g| g.language.clone()));
         if let Some(ref l) = configured_lang {
-            let resolved = crate::i18n::resolve_lang(l);
-            crate::i18n::set_default_lang(resolved);
+            let resolved = rsclaw_i18n::resolve_lang(l);
+            rsclaw_i18n::set_default_lang(resolved);
             resolved
         } else {
             select_language()?
@@ -1013,11 +1013,11 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
     };
 
     println!();
-    let wiz_title = crate::i18n::t("cli_setup_wizard_title", lang);
+    let wiz_title = rsclaw_i18n::t("cli_setup_wizard_title", lang);
     println!("  {wiz_title}");
     println!("  {}", "=".repeat(wiz_title.len()));
     println!();
-    hint(&crate::i18n::t("cli_press_esc_back", lang));
+    hint(&rsclaw_i18n::t("cli_press_esc_back", lang));
 
     let defs = load_defaults_for_lang(lang);
     let ec = load_existing_defaults(&defs);
@@ -1053,22 +1053,22 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
     'outer: loop {
         match wiz_step {
             STEP_AGENT => {
-                header(&crate::i18n::t("cli_step_agent", lang));
-                let agent_prompt = crate::i18n::t("cli_agent_name", lang);
+                header(&rsclaw_i18n::t("cli_step_agent", lang));
+                let agent_prompt = rsclaw_i18n::t("cli_agent_name", lang);
                 match input_step(&format!("  {agent_prompt}"), agent_name.clone()) {
                     StepResult::Next(val) => {
                         agent_name = val;
                         wiz_step = STEP_PROVIDER;
                     }
                     StepResult::Back | StepResult::Cancel => {
-                        println!("  {}", crate::i18n::t("cli_setup_cancelled", lang));
+                        println!("  {}", rsclaw_i18n::t("cli_setup_cancelled", lang));
                         return Ok(());
                     }
                 }
             }
             STEP_PROVIDER => {
-                header(&crate::i18n::t("cli_step_model_provider", lang));
-                let choose_prov = crate::i18n::t("cli_choose_provider", lang);
+                header(&rsclaw_i18n::t("cli_step_model_provider", lang));
+                let choose_prov = rsclaw_i18n::t("cli_choose_provider", lang);
                 match select_step(&format!("  {choose_prov}"), &provider_labels, provider_idx) {
                     StepResult::Next(idx) => {
                         provider_idx = idx;
@@ -1091,7 +1091,7 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                         wiz_step = STEP_AGENT;
                     }
                     StepResult::Cancel => {
-                        println!("  {}", crate::i18n::t("cli_setup_cancelled", lang));
+                        println!("  {}", rsclaw_i18n::t("cli_setup_cancelled", lang));
                         return Ok(());
                     }
                 }
@@ -1134,7 +1134,7 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                         wiz_step = STEP_PROVIDER;
                     }
                     StepResult::Cancel => {
-                        println!("  {}", crate::i18n::t("cli_setup_cancelled", lang));
+                        println!("  {}", rsclaw_i18n::t("cli_setup_cancelled", lang));
                         return Ok(());
                     }
                 }
@@ -1160,7 +1160,7 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                         wiz_step = STEP_BASE_URL;
                     }
                     StepResult::Cancel => {
-                        println!("  {}", crate::i18n::t("cli_setup_cancelled", lang));
+                        println!("  {}", rsclaw_i18n::t("cli_setup_cancelled", lang));
                         return Ok(());
                     }
                 }
@@ -1177,7 +1177,7 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                             wiz_step = STEP_PROVIDER;
                         }
                         StepResult::Cancel => {
-                            println!("  {}", crate::i18n::t("cli_setup_cancelled", lang));
+                            println!("  {}", rsclaw_i18n::t("cli_setup_cancelled", lang));
                             return Ok(());
                         }
                     }
@@ -1191,7 +1191,7 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                             wiz_step = STEP_API_TYPE;
                         }
                         StepResult::Cancel => {
-                            println!("  {}", crate::i18n::t("cli_setup_cancelled", lang));
+                            println!("  {}", rsclaw_i18n::t("cli_setup_cancelled", lang));
                             return Ok(());
                         }
                     }
@@ -1210,7 +1210,7 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                             wiz_step = STEP_PROVIDER;
                         }
                         StepResult::Cancel => {
-                            println!("  {}", crate::i18n::t("cli_setup_cancelled", lang));
+                            println!("  {}", rsclaw_i18n::t("cli_setup_cancelled", lang));
                             return Ok(());
                         }
                     }
@@ -1229,7 +1229,7 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                             wiz_step = STEP_PROVIDER;
                         }
                         StepResult::Cancel => {
-                            println!("  {}", crate::i18n::t("cli_setup_cancelled", lang));
+                            println!("  {}", rsclaw_i18n::t("cli_setup_cancelled", lang));
                             return Ok(());
                         }
                     }
@@ -1244,7 +1244,7 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                     let prompt = if provider.name == "custom" {
                         "  API key (blank if none required)".to_string()
                     } else {
-                        let enter_key = crate::i18n::t("cli_enter_api_key", lang);
+                        let enter_key = rsclaw_i18n::t("cli_enter_api_key", lang);
                         format!(
                             "  {} ({} - blank = env ${})",
                             provider.label, enter_key, provider.env_var
@@ -1263,7 +1263,7 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                             }
                         }
                         StepResult::Cancel => {
-                            println!("  {}", crate::i18n::t("cli_setup_cancelled", lang));
+                            println!("  {}", rsclaw_i18n::t("cli_setup_cancelled", lang));
                             return Ok(());
                         }
                     }
@@ -1283,7 +1283,7 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                 } else {
                     default_model.clone()
                 };
-                let model_prompt = crate::i18n::t("cli_default_model", lang);
+                let model_prompt = rsclaw_i18n::t("cli_default_model", lang);
                 match input_step(&format!("  {model_prompt}"), model_default) {
                     StepResult::Next(val) => {
                         default_model = val;
@@ -1302,14 +1302,14 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                         }
                     }
                     StepResult::Cancel => {
-                        println!("  {}", crate::i18n::t("cli_setup_cancelled", lang));
+                        println!("  {}", rsclaw_i18n::t("cli_setup_cancelled", lang));
                         return Ok(());
                     }
                 }
             }
             STEP_PORT => {
-                header(&crate::i18n::t("cli_step_gateway", lang));
-                let port_prompt = crate::i18n::t("cli_port", lang);
+                header(&rsclaw_i18n::t("cli_step_gateway", lang));
+                let port_prompt = rsclaw_i18n::t("cli_port", lang);
                 match input_step(&format!("  {port_prompt}"), port) {
                     StepResult::Next(val) => {
                         port = val;
@@ -1319,7 +1319,7 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                         wiz_step = STEP_MODEL;
                     }
                     StepResult::Cancel => {
-                        println!("  {}", crate::i18n::t("cli_setup_cancelled", lang));
+                        println!("  {}", rsclaw_i18n::t("cli_setup_cancelled", lang));
                         return Ok(());
                     }
                 }
@@ -1327,7 +1327,7 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
             STEP_BIND => {
                 let (bind_labels, bind_values_vec) = build_bind_options();
                 let bind_refs: Vec<&str> = bind_labels.iter().map(|s| s.as_str()).collect();
-                let bind_prompt = crate::i18n::t("cli_bind_mode", lang);
+                let bind_prompt = rsclaw_i18n::t("cli_bind_mode", lang);
                 match select_step(&format!("  {bind_prompt}"), &bind_refs, bind_mode) {
                     StepResult::Next(idx) => {
                         custom_bind = Some(bind_values_vec[idx].clone());
@@ -1338,15 +1338,15 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                         wiz_step = STEP_PORT;
                     }
                     StepResult::Cancel => {
-                        println!("  {}", crate::i18n::t("cli_setup_cancelled", lang));
+                        println!("  {}", rsclaw_i18n::t("cli_setup_cancelled", lang));
                         return Ok(());
                     }
                 }
             }
             STEP_CHANNELS => {
                 // One-at-a-time channel configuration loop
-                let ch_header = crate::i18n::t("cli_choose_channels", lang);
-                header(&crate::i18n::t_fmt(
+                let ch_header = rsclaw_i18n::t("cli_choose_channels", lang);
+                header(&rsclaw_i18n::t_fmt(
                     "cli_step_channels",
                     lang,
                     &[("label", &ch_header)],
@@ -1362,19 +1362,19 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                         .collect();
 
                     if available.is_empty() {
-                        println!("  {}", crate::i18n::t("cli_all_channels_configured", lang));
+                        println!("  {}", rsclaw_i18n::t("cli_all_channels_configured", lang));
                         break;
                     }
 
                     // Add "Skip / Done" as the first option
-                    let skip_done = crate::i18n::t("cli_skip_done", lang);
+                    let skip_done = rsclaw_i18n::t("cli_skip_done", lang);
                     let mut labels: Vec<&str> = vec![&skip_done];
                     labels.extend(available.iter().map(|(_, l)| *l));
 
                     let add_prompt = if channel_configs.is_empty() {
-                        crate::i18n::t("cli_add_channel", lang)
+                        rsclaw_i18n::t("cli_add_channel", lang)
                     } else {
-                        crate::i18n::t("cli_add_another_channel", lang)
+                        rsclaw_i18n::t("cli_add_another_channel", lang)
                     };
                     match select_step(&format!("  {add_prompt}"), &labels, 0) {
                         StepResult::Next(0) => break, // Skip / Done
@@ -1391,7 +1391,7 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                                     // selection again
                                 }
                                 ChannelResult::Cancel => {
-                                    println!("  {}", crate::i18n::t("cli_setup_cancelled", lang));
+                                    println!("  {}", rsclaw_i18n::t("cli_setup_cancelled", lang));
                                     return Ok(());
                                 }
                             }
@@ -1405,7 +1405,7 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
                             }
                         }
                         StepResult::Cancel => {
-                            println!("  {}", crate::i18n::t("cli_setup_cancelled", lang));
+                            println!("  {}", rsclaw_i18n::t("cli_setup_cancelled", lang));
                             return Ok(());
                         }
                     }
@@ -1668,10 +1668,10 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
     let _ = agent::seed_workspace(&workspace);
 
     // Summary
-    header(&crate::i18n::t("cli_onboard_complete", lang));
+    header(&rsclaw_i18n::t("cli_onboard_complete", lang));
     step(
         "*",
-        &crate::i18n::t_fmt(
+        &rsclaw_i18n::t_fmt(
             "cli_summary_config",
             lang,
             &[("path", &config_path.display().to_string())],
@@ -1679,7 +1679,7 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
     );
     step(
         "*",
-        &crate::i18n::t_fmt(
+        &rsclaw_i18n::t_fmt(
             "cli_summary_provider",
             lang,
             &[("label", &provider.label), ("name", &provider.name)],
@@ -1687,21 +1687,21 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
     );
     step(
         "*",
-        &crate::i18n::t_fmt("cli_summary_model", lang, &[("model", &default_model)]),
+        &rsclaw_i18n::t_fmt("cli_summary_model", lang, &[("model", &default_model)]),
     );
     step(
         "*",
-        &crate::i18n::t_fmt("cli_summary_agent", lang, &[("name", &agent_name)]),
+        &rsclaw_i18n::t_fmt("cli_summary_agent", lang, &[("name", &agent_name)]),
     );
     step(
         "*",
-        &crate::i18n::t_fmt("cli_summary_port", lang, &[("port", &port.to_string())]),
+        &rsclaw_i18n::t_fmt("cli_summary_port", lang, &[("port", &port.to_string())]),
     );
     if !channel_configs.is_empty() {
         let names: Vec<&str> = channel_configs.iter().map(|(n, _)| n.as_str()).collect();
         step(
             "*",
-            &crate::i18n::t_fmt(
+            &rsclaw_i18n::t_fmt(
                 "cli_summary_channels",
                 lang,
                 &[("names", &names.join(", "))],
@@ -1709,7 +1709,7 @@ pub async fn cmd_onboard(_args: OnboardArgs) -> Result<()> {
         );
     }
     println!();
-    hint(&crate::i18n::t("cli_next_start", lang));
+    hint(&rsclaw_i18n::t("cli_next_start", lang));
     println!();
 
     Ok(())
@@ -1727,7 +1727,7 @@ enum ChannelResult {
 
 /// Configure a single channel interactively.
 async fn configure_one_channel(ch: &ChannelDef) -> ChannelResult {
-    let lang = crate::i18n::default_lang();
+    let lang = rsclaw_i18n::default_lang();
     println!();
     println!("  -- {} --", ch.label);
 
@@ -1735,17 +1735,17 @@ async fn configure_one_channel(ch: &ChannelDef) -> ChannelResult {
     if ch.login {
         if ch.fields.is_empty() {
             // Login-only channel (e.g. Weixin)
-            println!("  {}", crate::i18n::t("cli_starting_login", lang));
+            println!("  {}", rsclaw_i18n::t("cli_starting_login", lang));
             match run_channel_login(&ch.name).await {
                 Ok(fields) => return ChannelResult::Done(fields),
                 Err(e) => {
                     println!(
                         "  [!] {}",
-                        crate::i18n::t_fmt("cli_login_failed", lang, &[("err", &e.to_string())])
+                        rsclaw_i18n::t_fmt("cli_login_failed", lang, &[("err", &e.to_string())])
                     );
                     println!(
                         "      {}",
-                        crate::i18n::t_fmt("cli_login_later", lang, &[("channel", &ch.name)])
+                        rsclaw_i18n::t_fmt("cli_login_later", lang, &[("channel", &ch.name)])
                     );
                     return ChannelResult::Done(vec![]);
                 }
@@ -1753,19 +1753,19 @@ async fn configure_one_channel(ch: &ChannelDef) -> ChannelResult {
         }
 
         // Channel supports both login and manual (e.g. Feishu)
-        let opt_scan = crate::i18n::t("cli_scan_oauth", lang);
-        let opt_manual = crate::i18n::t("cli_manual_input", lang);
+        let opt_scan = rsclaw_i18n::t("cli_scan_oauth", lang);
+        let opt_manual = rsclaw_i18n::t("cli_manual_input", lang);
         let options: Vec<&str> = vec![&opt_scan, &opt_manual];
-        let auth_prompt = crate::i18n::t_fmt("cli_auth_method", lang, &[("label", &ch.label)]);
+        let auth_prompt = rsclaw_i18n::t_fmt("cli_auth_method", lang, &[("label", &ch.label)]);
         match select_step(&format!("  {auth_prompt}"), &options, 0) {
             StepResult::Next(0) => match run_channel_login(&ch.name).await {
                 Ok(fields) => return ChannelResult::Done(fields),
                 Err(e) => {
                     println!(
                         "  [!] {}",
-                        crate::i18n::t_fmt("cli_login_failed", lang, &[("err", &e.to_string())])
+                        rsclaw_i18n::t_fmt("cli_login_failed", lang, &[("err", &e.to_string())])
                     );
-                    println!("      {}", crate::i18n::t("cli_fallback_manual", lang));
+                    println!("      {}", rsclaw_i18n::t("cli_fallback_manual", lang));
                 }
             },
             StepResult::Next(_) => { /* manual -- fall through */ }
@@ -1821,13 +1821,13 @@ async fn configure_one_channel(ch: &ChannelDef) -> ChannelResult {
 pub async fn cmd_configure(args: ConfigureArgs) -> Result<()> {
     let (path, mut val) = load_config_json().map_err(|e| {
         let err_str = format!("{e:#}");
-        let lang0 = crate::i18n::default_lang();
+        let lang0 = rsclaw_i18n::default_lang();
         if err_str.contains("no config file found") {
-            anyhow::anyhow!("{}", crate::i18n::t("cli_no_config_found", lang0))
+            anyhow::anyhow!("{}", rsclaw_i18n::t("cli_no_config_found", lang0))
         } else {
             anyhow::anyhow!(
                 "{}",
-                crate::i18n::t_fmt("cli_config_parse_failed", lang0, &[("err", &err_str)])
+                rsclaw_i18n::t_fmt("cli_config_parse_failed", lang0, &[("err", &err_str)])
             )
         }
     })?;
@@ -1840,21 +1840,21 @@ pub async fn cmd_configure(args: ConfigureArgs) -> Result<()> {
             .as_ref()
             .and_then(|g| g.language.as_deref())
         {
-            crate::i18n::set_default_lang(lang);
+            rsclaw_i18n::set_default_lang(lang);
         }
     }
-    let lang = crate::i18n::default_lang();
+    let lang = rsclaw_i18n::default_lang();
 
-    header(&crate::i18n::t("cli_configure_title", lang));
+    header(&rsclaw_i18n::t("cli_configure_title", lang));
     step(
         "*",
-        &crate::i18n::t_fmt(
+        &rsclaw_i18n::t_fmt(
             "cli_editing",
             lang,
             &[("path", &path.display().to_string())],
         ),
     );
-    hint(&crate::i18n::t("cli_press_esc", lang));
+    hint(&rsclaw_i18n::t("cli_press_esc", lang));
 
     let defs = load_defaults_for_lang(lang);
     let mut ec = load_existing_defaults(&defs);
@@ -1872,7 +1872,7 @@ pub async fn cmd_configure(args: ConfigureArgs) -> Result<()> {
                 "safety" | "exec" => configure_exec_safety(&mut val).await?,
                 other => println!(
                     "  {}",
-                    crate::i18n::t_fmt("cli_unknown_section", lang, &[("name", other)])
+                    rsclaw_i18n::t_fmt("cli_unknown_section", lang, &[("name", other)])
                 ),
             }
         }
@@ -1881,16 +1881,16 @@ pub async fn cmd_configure(args: ConfigureArgs) -> Result<()> {
         let mut last_idx: usize = 1; // Start at Gateway, not Save & Exit
         let mut at_save_exit = false; // true when cursor is on Save & Exit
         loop {
-            let s_save = crate::i18n::t("cli_save_exit", lang);
-            let s_gw = crate::i18n::t("cli_gateway", lang);
-            let s_mp = crate::i18n::t("cli_model_provider", lang);
-            let s_ch = crate::i18n::t("cli_channels", lang);
-            let s_ws = crate::i18n::t("cli_web_search", lang);
-            let s_ul = crate::i18n::t("cli_upload_limits", lang);
-            let s_es = crate::i18n::t("cli_exec_safety", lang);
+            let s_save = rsclaw_i18n::t("cli_save_exit", lang);
+            let s_gw = rsclaw_i18n::t("cli_gateway", lang);
+            let s_mp = rsclaw_i18n::t("cli_model_provider", lang);
+            let s_ch = rsclaw_i18n::t("cli_channels", lang);
+            let s_ws = rsclaw_i18n::t("cli_web_search", lang);
+            let s_ul = rsclaw_i18n::t("cli_upload_limits", lang);
+            let s_es = rsclaw_i18n::t("cli_exec_safety", lang);
             let sections: Vec<&str> = vec![&s_save, &s_gw, &s_mp, &s_ch, &s_ws, &s_ul, &s_es];
 
-            let section_prompt = crate::i18n::t("cli_configure_section", lang);
+            let section_prompt = rsclaw_i18n::t("cli_configure_section", lang);
             match select_step(&format!("  {section_prompt}"), &sections, last_idx) {
                 StepResult::Next(0) => break, // Save & Exit
                 StepResult::Next(idx) => {
@@ -1910,7 +1910,7 @@ pub async fn cmd_configure(args: ConfigureArgs) -> Result<()> {
                     if at_save_exit {
                         // Already at Save & Exit, ESC again -> discard and quit.
                         println!();
-                        println!("  {}", crate::i18n::t("cli_cancelled", lang));
+                        println!("  {}", rsclaw_i18n::t("cli_cancelled", lang));
                         println!();
                         return Ok(());
                     }
@@ -1926,12 +1926,12 @@ pub async fn cmd_configure(args: ConfigureArgs) -> Result<()> {
     // Save only if changes were made
     if val == original {
         println!();
-        println!("  {}", crate::i18n::t("cli_no_changes", lang));
+        println!("  {}", rsclaw_i18n::t("cli_no_changes", lang));
         println!();
     } else {
         rotate_backups(&path);
         std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
-        done(&crate::i18n::t_fmt(
+        done(&rsclaw_i18n::t_fmt(
             "cli_saved_to",
             lang,
             &[("path", &path.display().to_string())],
@@ -1943,19 +1943,19 @@ pub async fn cmd_configure(args: ConfigureArgs) -> Result<()> {
             && std::fs::read_to_string(&pid_file)
                 .ok()
                 .and_then(|s| s.trim().parse::<u32>().ok())
-                .is_some_and(|pid| crate::sys::process_alive(pid));
+                .is_some_and(|pid| rsclaw_platform::process_alive(pid));
 
         if gateway_running {
-            hint(&crate::i18n::t("cli_restarting_gateway", lang));
+            hint(&rsclaw_i18n::t("cli_restarting_gateway", lang));
             if let Ok(pid_str) = std::fs::read_to_string(&pid_file)
                 && let Ok(pid) = pid_str.trim().parse::<u32>()
             {
-                let _ = crate::sys::process_terminate(pid);
+                let _ = rsclaw_platform::process_terminate(pid);
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
             match crate::cmd::gateway::spawn_gateway_bg_pub() {
-                Ok(_) => done(&crate::i18n::t("cli_gateway_restarted", lang)),
-                Err(e) => hint(&crate::i18n::t_fmt(
+                Ok(_) => done(&rsclaw_i18n::t("cli_gateway_restarted", lang)),
+                Err(e) => hint(&rsclaw_i18n::t_fmt(
                     "cli_restart_failed",
                     lang,
                     &[("err", &e.to_string())],
@@ -1973,8 +1973,8 @@ pub async fn cmd_configure(args: ConfigureArgs) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 async fn configure_gateway(val: &mut serde_json::Value, ec: &ExistingConfig) -> Result<()> {
-    let lang = crate::i18n::default_lang();
-    header(&crate::i18n::t("cli_section_gateway", lang));
+    let lang = rsclaw_i18n::default_lang();
+    header(&rsclaw_i18n::t("cli_section_gateway", lang));
 
     let current_port = get_nested_value(val, "gateway.port")
         .and_then(|v| v.as_u64())
@@ -1990,7 +1990,7 @@ async fn configure_gateway(val: &mut serde_json::Value, ec: &ExistingConfig) -> 
         .unwrap_or(0);
 
     // Port
-    let port_prompt = crate::i18n::t("cli_port", lang);
+    let port_prompt = rsclaw_i18n::t("cli_port", lang);
     let new_port = match input_step(&format!("  {port_prompt}"), current_port) {
         StepResult::Next(v) => v,
         StepResult::Back | StepResult::Cancel => return Ok(()),
@@ -1999,7 +1999,7 @@ async fn configure_gateway(val: &mut serde_json::Value, ec: &ExistingConfig) -> 
     // Bind mode with auto-detected LAN IPs
     let (bind_labels, bind_values) = build_bind_options();
     let bind_refs: Vec<&str> = bind_labels.iter().map(|s| s.as_str()).collect();
-    let bind_prompt = crate::i18n::t("cli_bind_mode", lang);
+    let bind_prompt = rsclaw_i18n::t("cli_bind_mode", lang);
     let new_bind_value =
         match select_step(&format!("  {bind_prompt}"), &bind_refs, current_bind_idx) {
             StepResult::Next(idx) => bind_values[idx].clone(),
@@ -2041,8 +2041,8 @@ async fn configure_model(
     defs: &Defaults,
     ec: &mut ExistingConfig,
 ) -> Result<()> {
-    let lang = crate::i18n::default_lang();
-    header(&crate::i18n::t("cli_section_model_provider", lang));
+    let lang = rsclaw_i18n::default_lang();
+    header(&rsclaw_i18n::t("cli_section_model_provider", lang));
 
     let provider_labels: Vec<&str> = defs.providers.iter().map(|p| p.label.as_str()).collect();
     let mut provider_idx = ec.provider_idx;
@@ -2055,7 +2055,7 @@ async fn configure_model(
     };
 
     // Provider select
-    let prov_prompt = crate::i18n::t("cli_provider", lang);
+    let prov_prompt = rsclaw_i18n::t("cli_provider", lang);
     match select_step(&format!("  {prov_prompt}"), &provider_labels, provider_idx) {
         StepResult::Next(idx) => {
             if idx != provider_idx {
@@ -2204,13 +2204,13 @@ async fn configure_model(
                     "*".repeat(s.len().min(20))
                 }
             })
-            .unwrap_or_else(|| crate::i18n::t("cli_not_set", lang));
+            .unwrap_or_else(|| rsclaw_i18n::t("cli_not_set", lang));
         step(
             "*",
-            &crate::i18n::t_fmt("cli_current_key", lang, &[("key", &current_key_display)]),
+            &rsclaw_i18n::t_fmt("cli_current_key", lang, &[("key", &current_key_display)]),
         );
 
-        let change_prompt = crate::i18n::t("cli_change_api_key", lang);
+        let change_prompt = rsclaw_i18n::t("cli_change_api_key", lang);
         match confirm_step(&format!("  {change_prompt}"), false) {
             StepResult::Next(true) => {
                 change_key = true;
@@ -2235,7 +2235,7 @@ async fn configure_model(
     } else {
         format!("{}/your-model-id", provider.name)
     };
-    let model_prompt = crate::i18n::t("cli_default_model", lang);
+    let model_prompt = rsclaw_i18n::t("cli_default_model", lang);
     match input_step(&format!("  {model_prompt}"), model_default) {
         StepResult::Next(m) => new_model = m,
         StepResult::Back | StepResult::Cancel => return Ok(()),
@@ -2267,7 +2267,7 @@ async fn configure_model(
         || provider.name == "openai"
         || provider.name == "gemini"
     {
-        step("*", &crate::i18n::t("cli_testing_connectivity", lang));
+        step("*", &rsclaw_i18n::t("cli_testing_connectivity", lang));
         // Resolve effective api_type: user's pick this turn > existing
         // config value > provider default. Without this, doubao probes
         // would always hit `/v1/models` (404 on ARK CodingPlan) even when
@@ -2302,7 +2302,7 @@ async fn configure_model(
             {
                 Ok(()) => {
                     if probe_models.len() == 1 {
-                        step("*", &crate::i18n::t("cli_connection_ok", lang));
+                        step("*", &rsclaw_i18n::t("cli_connection_ok", lang));
                     } else {
                         println!("  [ok] {probe_model}");
                     }
@@ -2312,7 +2312,7 @@ async fn configure_model(
                     if probe_models.len() == 1 {
                         println!(
                             "  [!] {}",
-                            crate::i18n::t_fmt(
+                            rsclaw_i18n::t_fmt(
                                 "cli_connection_failed",
                                 lang,
                                 &[("err", &e.to_string())],
@@ -2325,7 +2325,7 @@ async fn configure_model(
             }
         }
         if any_failed {
-            println!("      {}", crate::i18n::t("cli_fix_later", lang));
+            println!("      {}", rsclaw_i18n::t("cli_fix_later", lang));
         }
     }
 
@@ -2621,9 +2621,9 @@ fn edit_fields_at_prefix(
 
         let result = if field.secret && !current.is_empty() {
             let masked = mask_secret(&current);
-            let keep_label = crate::i18n::t_fmt("cli_keep", lang, &[("value", &masked)]);
-            let edit_label = crate::i18n::t("cli_edit", lang);
-            let back_label = crate::i18n::t("cli_back", lang);
+            let keep_label = rsclaw_i18n::t_fmt("cli_keep", lang, &[("value", &masked)]);
+            let edit_label = rsclaw_i18n::t("cli_edit", lang);
+            let back_label = rsclaw_i18n::t("cli_back", lang);
             let items = &[
                 keep_label.as_str(),
                 edit_label.as_str(),
@@ -2669,12 +2669,12 @@ async fn edit_channel_config(val: &mut serde_json::Value, ch: &ChannelDef) -> bo
             .is_some_and(|s| !s.is_empty())
     });
 
-    let lang = crate::i18n::default_lang();
+    let lang = rsclaw_i18n::default_lang();
 
     if ch.login {
         if ch.fields.is_empty() && !already_configured {
             // Login-only channel with no manual fields
-            println!("  {}", crate::i18n::t("cli_starting_login", lang));
+            println!("  {}", rsclaw_i18n::t("cli_starting_login", lang));
             match run_channel_login(&ch.name).await {
                 Ok(_fields) => {
                     toggle_channel_enabled(val, &ch.name, true);
@@ -2683,11 +2683,11 @@ async fn edit_channel_config(val: &mut serde_json::Value, ch: &ChannelDef) -> bo
                 Err(e) => {
                     println!(
                         "  [!] {}",
-                        crate::i18n::t_fmt("cli_login_failed", lang, &[("err", &e.to_string())])
+                        rsclaw_i18n::t_fmt("cli_login_failed", lang, &[("err", &e.to_string())])
                     );
                     println!(
                         "      {}",
-                        crate::i18n::t_fmt("cli_login_later", lang, &[("channel", &ch.name)])
+                        rsclaw_i18n::t_fmt("cli_login_later", lang, &[("channel", &ch.name)])
                     );
                     return false;
                 }
@@ -2696,11 +2696,11 @@ async fn edit_channel_config(val: &mut serde_json::Value, ch: &ChannelDef) -> bo
 
         // Show scan/manual/back -- default to manual if already configured
         let default_idx = if already_configured { 1 } else { 0 };
-        let opt_scan = crate::i18n::t("cli_scan_rescan", lang);
-        let opt_manual = crate::i18n::t("cli_manual_edit", lang);
-        let opt_back = crate::i18n::t("cli_back", lang);
+        let opt_scan = rsclaw_i18n::t("cli_scan_rescan", lang);
+        let opt_manual = rsclaw_i18n::t("cli_manual_edit", lang);
+        let opt_back = rsclaw_i18n::t("cli_back", lang);
         let options_vec = [opt_scan.as_str(), opt_manual.as_str(), opt_back.as_str()];
-        let auth_prompt = crate::i18n::t_fmt("cli_auth_method", lang, &[("label", &ch.label)]);
+        let auth_prompt = rsclaw_i18n::t_fmt("cli_auth_method", lang, &[("label", &ch.label)]);
         match select_step(&format!("  {auth_prompt}"), &options_vec, default_idx) {
             StepResult::Next(0) => match run_channel_login(&ch.name).await {
                 Ok(fields) => {
@@ -2716,9 +2716,9 @@ async fn edit_channel_config(val: &mut serde_json::Value, ch: &ChannelDef) -> bo
                 Err(e) => {
                     println!(
                         "  [!] {}",
-                        crate::i18n::t_fmt("cli_login_failed", lang, &[("err", &e.to_string())])
+                        rsclaw_i18n::t_fmt("cli_login_failed", lang, &[("err", &e.to_string())])
                     );
-                    println!("      {}", crate::i18n::t("cli_fallback_manual", lang));
+                    println!("      {}", rsclaw_i18n::t("cli_fallback_manual", lang));
                 }
             },
             StepResult::Next(1) => { /* manual -- fall through to field editor */ }
@@ -2729,7 +2729,7 @@ async fn edit_channel_config(val: &mut serde_json::Value, ch: &ChannelDef) -> bo
     if ch.fields.is_empty() {
         println!(
             "  {}",
-            crate::i18n::t_fmt("cli_no_fields", lang, &[("label", &ch.label)])
+            rsclaw_i18n::t_fmt("cli_no_fields", lang, &[("label", &ch.label)])
         );
         return false;
     }
@@ -2781,12 +2781,12 @@ async fn edit_channel_config(val: &mut serde_json::Value, ch: &ChannelDef) -> bo
     if is_configured {
         println!(
             "  {}",
-            crate::i18n::t_fmt("cli_config_enter_keep", lang, &[("label", &ch.label)])
+            rsclaw_i18n::t_fmt("cli_config_enter_keep", lang, &[("label", &ch.label)])
         );
     } else {
         println!(
             "  {}",
-            crate::i18n::t_fmt("cli_config_label", lang, &[("label", &ch.label)])
+            rsclaw_i18n::t_fmt("cli_config_label", lang, &[("label", &ch.label)])
         );
     }
 
@@ -2815,7 +2815,7 @@ fn edit_channel_policies(val: &mut serde_json::Value, ch_name: &str, lang: &str)
         .iter()
         .position(|&p| p == current_dm)
         .unwrap_or(0);
-    let dm_prompt = crate::i18n::t_fmt("cli_dm_policy", lang, &[("policy", &current_dm)]);
+    let dm_prompt = rsclaw_i18n::t_fmt("cli_dm_policy", lang, &[("policy", &current_dm)]);
     if let StepResult::Next(idx) = select_step(&format!("  {dm_prompt}"), dm_policies, dm_idx) {
         let new_policy = dm_policies[idx];
         if new_policy != current_dm {
@@ -2836,7 +2836,7 @@ fn edit_channel_policies(val: &mut serde_json::Value, ch_name: &str, lang: &str)
         .iter()
         .position(|&p| p == current_gp)
         .unwrap_or(0);
-    let gp_prompt = crate::i18n::t_fmt("cli_group_policy", lang, &[("policy", &current_gp)]);
+    let gp_prompt = rsclaw_i18n::t_fmt("cli_group_policy", lang, &[("policy", &current_gp)]);
     if let StepResult::Next(idx) = select_step(&format!("  {gp_prompt}"), gp_policies, gp_idx) {
         let new_policy = gp_policies[idx];
         if new_policy != current_gp {
@@ -2853,9 +2853,9 @@ fn edit_channel_policies(val: &mut serde_json::Value, ch_name: &str, lang: &str)
 /// Asks the user whether to migrate a single-account config to multi-account
 /// layout. Returns true when the user picks "Add another account".
 fn prompt_add_another_account(label: &str, lang: &str) -> bool {
-    let keep = crate::i18n::t("cli_account_keep_single", lang);
-    let add = crate::i18n::t("cli_account_add_another", lang);
-    let prompt = crate::i18n::t_fmt("cli_account_choose_mode", lang, &[("label", label)]);
+    let keep = rsclaw_i18n::t("cli_account_keep_single", lang);
+    let add = rsclaw_i18n::t("cli_account_add_another", lang);
+    let prompt = rsclaw_i18n::t_fmt("cli_account_choose_mode", lang, &[("label", label)]);
     matches!(
         select_step(&format!("  {prompt}"), &[keep.as_str(), add.as_str()], 0),
         StepResult::Next(1)
@@ -2868,14 +2868,14 @@ fn edit_channel_multi_account(val: &mut serde_json::Value, ch: &ChannelDef, lang
     let mut changed = false;
     loop {
         let names = account_names(val, &ch.name);
-        let add_label = crate::i18n::t("cli_account_add_new", lang);
-        let back_label = crate::i18n::t("cli_back", lang);
+        let add_label = rsclaw_i18n::t("cli_account_add_new", lang);
+        let back_label = rsclaw_i18n::t("cli_back", lang);
 
         let mut items: Vec<String> = names.clone();
         items.push(add_label);
         items.push(back_label);
         let items_ref: Vec<&str> = items.iter().map(|s| s.as_str()).collect();
-        let title = crate::i18n::t_fmt("cli_account_list_title", lang, &[("label", &ch.label)]);
+        let title = rsclaw_i18n::t_fmt("cli_account_list_title", lang, &[("label", &ch.label)]);
 
         let sel = match select_step(&format!("  {title}"), &items_ref, 0) {
             StepResult::Next(i) => i,
@@ -2884,7 +2884,7 @@ fn edit_channel_multi_account(val: &mut serde_json::Value, ch: &ChannelDef, lang
 
         if sel == names.len() {
             // [+ Add account]
-            let name_prompt = crate::i18n::t("cli_account_name_prompt", lang);
+            let name_prompt = rsclaw_i18n::t("cli_account_name_prompt", lang);
             let new_name = match input_step(&format!("  {name_prompt}"), String::new()) {
                 StepResult::Next(s) => s.trim().to_owned(),
                 _ => continue,
@@ -2893,13 +2893,13 @@ fn edit_channel_multi_account(val: &mut serde_json::Value, ch: &ChannelDef, lang
                 continue;
             }
             if new_name.contains('.') || new_name.contains(' ') {
-                println!("  [!] {}", crate::i18n::t("cli_account_name_invalid", lang));
+                println!("  [!] {}", rsclaw_i18n::t("cli_account_name_invalid", lang));
                 continue;
             }
             if names.iter().any(|n| n == &new_name) {
                 println!(
                     "  [!] {}",
-                    crate::i18n::t_fmt("cli_account_exists", lang, &[("name", &new_name)])
+                    rsclaw_i18n::t_fmt("cli_account_exists", lang, &[("name", &new_name)])
                 );
                 continue;
             }
@@ -2912,15 +2912,15 @@ fn edit_channel_multi_account(val: &mut serde_json::Value, ch: &ChannelDef, lang
             break;
         } else {
             let acct = names[sel].clone();
-            let edit_label = crate::i18n::t("cli_edit", lang);
-            let remove_label = crate::i18n::t("cli_account_remove", lang);
-            let back_label2 = crate::i18n::t("cli_back", lang);
+            let edit_label = rsclaw_i18n::t("cli_edit", lang);
+            let remove_label = rsclaw_i18n::t("cli_account_remove", lang);
+            let back_label2 = rsclaw_i18n::t("cli_back", lang);
             let inner = [
                 edit_label.as_str(),
                 remove_label.as_str(),
                 back_label2.as_str(),
             ];
-            let inner_prompt = crate::i18n::t_fmt("cli_account_action", lang, &[("name", &acct)]);
+            let inner_prompt = rsclaw_i18n::t_fmt("cli_account_action", lang, &[("name", &acct)]);
             match select_step(&format!("  {inner_prompt}"), &inner, 0) {
                 StepResult::Next(0) => {
                     let prefix = format!("channels.{}.accounts.{}", ch.name, acct);
@@ -2940,17 +2940,17 @@ fn edit_channel_multi_account(val: &mut serde_json::Value, ch: &ChannelDef, lang
 }
 
 async fn configure_channels(val: &mut serde_json::Value, defs: &Defaults) -> Result<()> {
-    let lang = crate::i18n::default_lang();
-    header(&crate::i18n::t("cli_section_channels", lang));
-    hint(&crate::i18n::t("cli_channels_hint", lang));
+    let lang = rsclaw_i18n::default_lang();
+    header(&rsclaw_i18n::t("cli_section_channels", lang));
+    hint(&rsclaw_i18n::t("cli_channels_hint", lang));
 
     let term = console::Term::stderr();
     let mut cursor: usize = 0;
 
     loop {
         // Build items -- add [Finished] at top
-        let finished_label = crate::i18n::t("cli_finished", lang);
-        let configured_label = crate::i18n::t("cli_configured", lang);
+        let finished_label = rsclaw_i18n::t("cli_finished", lang);
+        let configured_label = rsclaw_i18n::t("cli_configured", lang);
         let mut items: Vec<String> = vec![finished_label];
         items.extend(defs.channels.iter().map(|ch| {
             let enabled = get_channel_enabled(val, &ch.name);
@@ -2966,7 +2966,7 @@ async fn configure_channels(val: &mut serde_json::Value, defs: &Defaults) -> Res
                 0
             };
             let tag: String = if accts > 0 {
-                crate::i18n::t_fmt("cli_accounts_count", lang, &[("n", &accts.to_string())])
+                rsclaw_i18n::t_fmt("cli_accounts_count", lang, &[("n", &accts.to_string())])
             } else if configured {
                 configured_label.clone()
             } else {
@@ -2986,9 +2986,9 @@ async fn configure_channels(val: &mut serde_json::Value, defs: &Defaults) -> Res
 
         // Render list
         let _ = term.clear_screen();
-        println!("  {}", crate::i18n::t("cli_section_channels", lang));
+        println!("  {}", rsclaw_i18n::t("cli_section_channels", lang));
         println!("  {}", "\u{2500}".repeat(20));
-        println!("  {}", crate::i18n::t("cli_channels_hint_short", lang));
+        println!("  {}", rsclaw_i18n::t("cli_channels_hint_short", lang));
         println!();
         for (i, item) in items.iter().enumerate() {
             if i == cursor {
@@ -3043,10 +3043,10 @@ async fn configure_channels(val: &mut serde_json::Value, defs: &Defaults) -> Res
 // ---------------------------------------------------------------------------
 
 async fn configure_web_search(val: &mut serde_json::Value) -> Result<()> {
-    let lang = crate::i18n::default_lang();
-    header(&crate::i18n::t("cli_section_web_search", lang));
+    let lang = rsclaw_i18n::default_lang();
+    header(&rsclaw_i18n::t("cli_section_web_search", lang));
 
-    let lang = crate::i18n::default_lang();
+    let lang = rsclaw_i18n::default_lang();
     let providers: Vec<String> = if lang == "zh" {
         vec![
             "Bing (免费)".into(),
@@ -3088,7 +3088,7 @@ async fn configure_web_search(val: &mut serde_json::Value) -> Result<()> {
         _ => 0,
     };
 
-    let search_prompt = crate::i18n::t("cli_search_provider", lang);
+    let search_prompt = rsclaw_i18n::t("cli_search_provider", lang);
     match select_step(&format!("  {search_prompt}"), &provider_refs, default_idx) {
         StepResult::Next(0) => {
             // Bing Free
@@ -3195,8 +3195,8 @@ async fn configure_web_search(val: &mut serde_json::Value) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 async fn configure_upload_limits(val: &mut serde_json::Value) -> Result<()> {
-    let lang = crate::i18n::default_lang();
-    header(&crate::i18n::t("cli_section_upload_limits", lang));
+    let lang = rsclaw_i18n::default_lang();
+    header(&rsclaw_i18n::t("cli_section_upload_limits", lang));
 
     let current_size = get_nested_value(val, "tools.upload.maxFileSize")
         .and_then(|v| v.as_u64())
@@ -3206,7 +3206,7 @@ async fn configure_upload_limits(val: &mut serde_json::Value) -> Result<()> {
         .and_then(|v| v.as_u64())
         .unwrap_or(50_000);
 
-    let size_prompt = crate::i18n::t("cli_max_file_size", lang);
+    let size_prompt = rsclaw_i18n::t("cli_max_file_size", lang);
     match input_step(&format!("  {size_prompt}"), current_size as u32) {
         StepResult::Next(mb) => {
             ensure_json_path(val, &["tools"]);
@@ -3220,7 +3220,7 @@ async fn configure_upload_limits(val: &mut serde_json::Value) -> Result<()> {
         _ => return Ok(()),
     }
 
-    let chars_prompt = crate::i18n::t("cli_max_text_chars", lang);
+    let chars_prompt = rsclaw_i18n::t("cli_max_text_chars", lang);
     match input_step(&format!("  {chars_prompt}"), current_chars as u32) {
         StepResult::Next(chars) => {
             ensure_json_path(val, &["tools"]);
@@ -3239,7 +3239,7 @@ async fn configure_upload_limits(val: &mut serde_json::Value) -> Result<()> {
         Some(false) => 2,
         None => 0,
     };
-    let vision_prompt = crate::i18n::t("cli_vision_support", lang);
+    let vision_prompt = rsclaw_i18n::t("cli_vision_support", lang);
     match select_step(&format!("  {vision_prompt}"), vision_options, default_v) {
         StepResult::Next(0) => {
             // Remove override, use auto-detect
@@ -3271,33 +3271,33 @@ async fn configure_upload_limits(val: &mut serde_json::Value) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 async fn configure_exec_safety(val: &mut serde_json::Value) -> Result<()> {
-    let lang = crate::i18n::default_lang();
-    header(&crate::i18n::t("cli_section_exec_safety", lang));
+    let lang = rsclaw_i18n::default_lang();
+    header(&rsclaw_i18n::t("cli_section_exec_safety", lang));
 
     let current = get_nested_value(val, "tools.exec.safety")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
     let status = if current {
-        crate::i18n::t("cli_exec_enabled", lang)
+        rsclaw_i18n::t("cli_exec_enabled", lang)
     } else {
-        crate::i18n::t("cli_exec_disabled", lang)
+        rsclaw_i18n::t("cli_exec_disabled", lang)
     };
     step(
         "*",
-        &crate::i18n::t_fmt("cli_exec_current", lang, &[("status", &status)]),
+        &rsclaw_i18n::t_fmt("cli_exec_current", lang, &[("status", &status)]),
     );
 
-    let enable_prompt = crate::i18n::t("cli_enable_exec_safety", lang);
+    let enable_prompt = rsclaw_i18n::t("cli_enable_exec_safety", lang);
     match confirm_step(&format!("  {enable_prompt}"), current) {
         StepResult::Next(enabled) => {
             ensure_json_path(val, &["tools"]);
             ensure_json_path(val, &["tools", "exec"]);
             set_nested_value(val, "tools.exec.safety", serde_json::json!(enabled))?;
             if enabled {
-                step("*", &crate::i18n::t("cli_exec_safety_on", lang));
+                step("*", &rsclaw_i18n::t("cli_exec_safety_on", lang));
             } else {
-                step("*", &crate::i18n::t("cli_exec_safety_off", lang));
+                step("*", &rsclaw_i18n::t("cli_exec_safety_off", lang));
             }
         }
         _ => {}
@@ -3315,8 +3315,8 @@ async fn run_channel_login(channel: &str) -> anyhow::Result<Vec<(String, String)
     let client = reqwest::Client::new();
     match channel {
         "wechat" | "weixin" => {
-            let lang = crate::i18n::default_lang();
-            println!("  {}", crate::i18n::t("cli_scanning_qr", lang));
+            let lang = rsclaw_i18n::default_lang();
+            println!("  {}", rsclaw_i18n::t("cli_scanning_qr", lang));
             let (_url, qrcode) =
                 crate::channel::wechat::WeChatPersonalChannel::start_qr_login(&client).await?;
             let (token, bot_id) =
@@ -3324,7 +3324,7 @@ async fn run_channel_login(channel: &str) -> anyhow::Result<Vec<(String, String)
                     .await?;
             println!(
                 "  {}",
-                crate::i18n::t_fmt("cli_login_success_bot", lang, &[("id", &bot_id)])
+                rsclaw_i18n::t_fmt("cli_login_success_bot", lang, &[("id", &bot_id)])
             );
             // token from ilink API is already in "botId:secret" format
             Ok(vec![
@@ -3338,9 +3338,9 @@ async fn run_channel_login(channel: &str) -> anyhow::Result<Vec<(String, String)
                 crate::channel::auth::feishu_auth::onboard(&client, brand).await?;
             println!(
                 "  {}",
-                crate::i18n::t_fmt(
+                rsclaw_i18n::t_fmt(
                     "cli_login_success_brand",
-                    crate::i18n::default_lang(),
+                    rsclaw_i18n::default_lang(),
                     &[("brand", &actual_brand)]
                 )
             );
@@ -3469,7 +3469,7 @@ async fn test_provider_connectivity(
                 Ok(())
             } else {
                 let body = resp.text().await.unwrap_or_default();
-                anyhow::bail!("{status}: {}", crate::util::truncate_str(&body, 200))
+                anyhow::bail!("{status}: {}", rsclaw_util::truncate_str(&body, 200))
             };
         }
         _ => {
@@ -3528,7 +3528,7 @@ async fn test_provider_connectivity(
         return Ok(());
     }
     let body = resp.text().await.unwrap_or_default();
-    let snippet = crate::util::truncate_str(&body, 200);
+    let snippet = rsclaw_util::truncate_str(&body, 200);
     if code == 401 || code == 403 {
         anyhow::bail!("{status} (auth): {snippet}");
     }
@@ -3601,7 +3601,7 @@ async fn probe_rsclaw_connectivity(
             )),
             _ => Err(anyhow::anyhow!(
                 "{status}: {}",
-                crate::util::truncate_str(&body, 200)
+                rsclaw_util::truncate_str(&body, 200)
             )),
         };
     }

@@ -698,7 +698,7 @@ impl FeishuChannel {
                     info!(
                         len = text.len(),
                         "feishu: WS frame received: {}",
-                        crate::util::truncate_str(&text, 300)
+                        rsclaw_util::truncate_str(&text, 300)
                     );
                     self.handle_ws_event(&text).await;
                 }
@@ -998,7 +998,7 @@ impl FeishuChannel {
                             // limit. Falls back to original bytes on decode
                             // failure (best-effort).
                             let (final_bytes, final_mime) =
-                                crate::util::downscale_image_for_vision(
+                                rsclaw_util::downscale_image_for_vision(
                                     &bytes,
                                     "image/png",
                                     1 * 1024 * 1024, // 1 MB byte trigger
@@ -1125,7 +1125,7 @@ impl FeishuChannel {
                                 "image/jpeg"
                             };
                             let orig_len = bytes.len();
-                            match crate::util::downscale_image_for_vision(
+                            match rsclaw_util::downscale_image_for_vision(
                                 &bytes,
                                 orig_mime,
                                 1 * 1024 * 1024,

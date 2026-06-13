@@ -1424,7 +1424,7 @@ fn parse_sse_chunk(chunk: Result<bytes::Bytes>) -> Vec<Result<StreamEvent>> {
     }
     if !has_data_line && !text.trim().is_empty() {
         tracing::warn!(
-            raw = crate::util::truncate_str(&text, 500),
+            raw = rsclaw_util::truncate_str(&text, 500),
             "openai: non-SSE chunk received"
         );
     }

@@ -531,7 +531,7 @@ impl super::runtime::AgentRuntime {
                     .file_name()
                     .map(|n| {
                         let s = n.to_string_lossy().into_owned();
-                        crate::util::truncate_str(&s, 200).to_owned()
+                        rsclaw_util::truncate_str(&s, 200).to_owned()
                     })
                     .unwrap_or_default();
                 json!({

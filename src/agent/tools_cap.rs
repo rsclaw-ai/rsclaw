@@ -56,7 +56,7 @@ impl super::runtime::AgentRuntime {
             .gateway
             .as_ref()
             .and_then(|g| g.language.as_deref())
-            .map(crate::i18n::resolve_lang)
+            .map(rsclaw_i18n::resolve_lang)
             .unwrap_or("en");
 
         // Build NotifTarget only when we have both the broadcast sender
@@ -107,7 +107,7 @@ impl super::runtime::AgentRuntime {
             "agent": agent_str,
             "status": "submitted",
             "session_id": submitted.session_id,
-            "output": crate::i18n::t_fmt(
+            "output": rsclaw_i18n::t_fmt(
                 "acp_queued",
                 lang,
                 &[("name", kind.display_name())],
@@ -163,7 +163,7 @@ impl super::runtime::AgentRuntime {
             .gateway
             .as_ref()
             .and_then(|g| g.language.as_deref())
-            .map(crate::i18n::resolve_lang)
+            .map(rsclaw_i18n::resolve_lang)
             .unwrap_or("en");
 
         // Optional IM notification (same shape as cap task mode — surfaces
@@ -294,13 +294,13 @@ impl super::runtime::AgentRuntime {
             .gateway
             .as_ref()
             .and_then(|g| g.language.as_deref())
-            .map(crate::i18n::resolve_lang)
+            .map(rsclaw_i18n::resolve_lang)
             .unwrap_or("en");
         Ok(json!({
             "agent": kind.as_str(),
             "session_id": session_id,
             "status": "bound",
-            "output": crate::i18n::t_fmt(
+            "output": rsclaw_i18n::t_fmt(
                 "cap_bound",
                 lang,
                 &[
@@ -337,12 +337,12 @@ impl super::runtime::AgentRuntime {
             .gateway
             .as_ref()
             .and_then(|g| g.language.as_deref())
-            .map(crate::i18n::resolve_lang)
+            .map(rsclaw_i18n::resolve_lang)
             .unwrap_or("en");
         let Some((sid, kind)) = manager.unbind_sticky(&ctx.session_key).await else {
             return Ok(json!({
                 "status": "not_bound",
-                "output": crate::i18n::t("cap_no_active", lang),
+                "output": rsclaw_i18n::t("cap_no_active", lang),
             }));
         };
         let _ = manager.end_session(&sid).await;
@@ -357,7 +357,7 @@ impl super::runtime::AgentRuntime {
             "agent": kind.as_str(),
             "session_id": sid,
             "status": "released",
-            "output": crate::i18n::t_fmt(
+            "output": rsclaw_i18n::t_fmt(
                 "cap_session_closed",
                 lang,
                 &[("agent", kind.display_name())],

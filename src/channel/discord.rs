@@ -520,7 +520,7 @@ impl DiscordChannel {
                                                 content_type
                                             };
                                             let (final_bytes, final_mime) =
-                                                crate::util::downscale_image_for_vision(
+                                                rsclaw_util::downscale_image_for_vision(
                                                     &bytes,
                                                     orig_mime,
                                                     1 * 1024 * 1024,
@@ -812,7 +812,7 @@ fn discord_process_file(filename: &str, bytes: &[u8]) -> String {
         if let Ok(text) = crate::agent::doc::safe_extract_pdf_from_mem(bytes) {
             return format!(
                 "[PDF: {filename}]\n{}",
-                crate::util::truncate_str(&text, 20000)
+                rsclaw_util::truncate_str(&text, 20000)
             );
         }
         // Fallback to pdftotext CLI
@@ -827,7 +827,7 @@ fn discord_process_file(filename: &str, bytes: &[u8]) -> String {
                     let text = String::from_utf8_lossy(&o.stdout);
                     return format!(
                         "[PDF: {filename}]\n{}",
-                        crate::util::truncate_str(&text, 20000)
+                        rsclaw_util::truncate_str(&text, 20000)
                     );
                 }
             }
@@ -846,7 +846,7 @@ fn discord_process_file(filename: &str, bytes: &[u8]) -> String {
             };
             format!(
                 "[{label}: {filename}]\n{}",
-                crate::util::truncate_str(&text, 20000)
+                rsclaw_util::truncate_str(&text, 20000)
             )
         } else {
             let label = if lower.ends_with(".docx") {
@@ -862,7 +862,7 @@ fn discord_process_file(filename: &str, bytes: &[u8]) -> String {
         let text = String::from_utf8_lossy(bytes);
         format!(
             "[File: {filename}]\n```\n{}\n```",
-            crate::util::truncate_str(&text, 20000)
+            rsclaw_util::truncate_str(&text, 20000)
         )
     } else {
         let ws = crate::config::loader::base_dir().join("workspace/uploads");

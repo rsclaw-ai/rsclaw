@@ -150,7 +150,7 @@ impl LineChannel {
                         use base64::Engine;
                         let orig_len = bytes.len();
                         let (final_bytes, final_mime) =
-                            crate::util::downscale_image_for_vision(
+                            rsclaw_util::downscale_image_for_vision(
                                 &bytes,
                                 "image/jpeg",
                                 1 * 1024 * 1024,

@@ -314,7 +314,7 @@ fn gateway_status_str() -> String {
         Ok(p) => p,
         Err(_) => return "stopped (bad PID file)".to_string(),
     };
-    let alive = crate::sys::process_alive(pid);
+    let alive = rsclaw_platform::process_alive(pid);
 
     if alive {
         format!("running (pid {pid})")

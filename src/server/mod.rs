@@ -152,10 +152,10 @@ pub struct AppState {
     pub plugins: Arc<crate::plugin::PluginRegistry>,
     /// Broadcast channel for restart-required events
     /// (config changed, model downloaded, etc.). Multi-source, single sink.
-    pub restart_request_tx: broadcast::Sender<crate::events::RestartRequest>,
+    pub restart_request_tx: broadcast::Sender<rsclaw_events::RestartRequest>,
     /// Latch holding the current pending restart request, if any.
     /// Read on WS handshake so late-connecting UIs see prior events.
-    pub pending_restart: Arc<std::sync::RwLock<Option<crate::events::RestartRequest>>>,
+    pub pending_restart: Arc<std::sync::RwLock<Option<rsclaw_events::RestartRequest>>>,
     /// Graceful shutdown coordinator — used by /api/v1/restart to drain
     /// in-flight HTTP requests, task queue tasks, and channel handlers
     /// before re-exec.
@@ -194,8 +194,8 @@ pub struct AppState {
     pub model_health: crate::provider::health::ProviderHealthRegistry,
 }
 
-// AgentEvent is defined in crate::events to avoid circular deps with agent.
-pub use crate::events::AgentEvent;
+// AgentEvent is defined in rsclaw_events to avoid circular deps with agent.
+pub use rsclaw_events::AgentEvent;
 
 // ---------------------------------------------------------------------------
 // Request / response shapes

@@ -499,7 +499,7 @@ fn truncate(s: &str, n: usize) -> String {
     if s.len() <= n {
         s.to_owned()
     } else {
-        format!("{}…", crate::util::truncate_str(s, n))
+        format!("{}…", rsclaw_util::truncate_str(s, n))
     }
 }
 

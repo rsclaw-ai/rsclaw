@@ -584,5 +584,5 @@ fn fix_types_recursive(val: &mut serde_json::Value) -> usize {
 
 /// Check if a process with the given PID is running.
 fn process_exists(pid: u32) -> bool {
-    crate::sys::process_alive(pid)
+    rsclaw_platform::process_alive(pid)
 }

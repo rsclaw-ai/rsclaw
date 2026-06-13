@@ -164,7 +164,7 @@ impl FailoverManager {
                         );
                     } else {
                         let body = format!("{e:#}");
-                        let truncated = crate::util::truncate_str(&body, 200).to_owned();
+                        let truncated = rsclaw_util::truncate_str(&body, 200).to_owned();
                         self.model_health
                             .record_failure(model_str, kind.clone(), truncated);
                         info!(

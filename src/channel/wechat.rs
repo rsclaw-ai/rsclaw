@@ -694,7 +694,7 @@ impl WeChatPersonalChannel {
                                         Ok(bytes) => {
                                             let orig_len = bytes.len();
                                             let (final_bytes, final_mime) =
-                                                crate::util::downscale_image_for_vision(
+                                                rsclaw_util::downscale_image_for_vision(
                                                     &bytes,
                                                     "image/jpeg",
                                                     1 * 1024 * 1024,
@@ -723,9 +723,9 @@ impl WeChatPersonalChannel {
                                             if !from.is_empty() {
                                                 (self.on_message)(
                                                     from.clone(),
-                                                    crate::i18n::t(
+                                                    rsclaw_i18n::t(
                                                         "describe_image",
-                                                        crate::i18n::default_lang(),
+                                                        rsclaw_i18n::default_lang(),
                                                     ),
                                                     images,
                                                     vec![],
@@ -806,9 +806,9 @@ impl WeChatPersonalChannel {
                                                 if !from.is_empty() {
                                                     (self.on_message)(
                                                         from.clone(),
-                                                        crate::i18n::t(
+                                                        rsclaw_i18n::t(
                                                             "describe_video",
-                                                            crate::i18n::default_lang(),
+                                                            rsclaw_i18n::default_lang(),
                                                         ),
                                                         vec![img],
                                                         vec![fa],
@@ -872,14 +872,14 @@ impl WeChatPersonalChannel {
         let text = resp.text().await.unwrap_or_default();
 
         if !status.is_success() {
-            info!(status = %status, body = crate::util::truncate_str(&text, 200), "wechat: getupdates error");
+            info!(status = %status, body = rsclaw_util::truncate_str(&text, 200), "wechat: getupdates error");
             bail!("getupdates failed: {status} {text}");
         }
 
         let parsed: GetUpdatesResponse = serde_json::from_str(&text).with_context(|| {
             format!(
                 "wechat: parse getupdates response: {}",
-                crate::util::truncate_str(&text, 300)
+                rsclaw_util::truncate_str(&text, 300)
             )
         })?;
 
@@ -926,14 +926,14 @@ impl WeChatPersonalChannel {
             let text = resp.text().await.unwrap_or_default();
             warn!(
                 status = %status,
-                body = crate::util::truncate_str(&text, 500),
+                body = rsclaw_util::truncate_str(&text, 500),
                 param_len = encrypt_query_param.len(),
                 has_aes_key = !aes_key_b64.is_empty(),
                 "wechat: CDN download failed"
             );
             bail!(
                 "CDN download failed: {status} {}",
-                crate::util::truncate_str(&text, 200)
+                rsclaw_util::truncate_str(&text, 200)
             );
         }
 
@@ -1077,23 +1077,23 @@ impl WeChatPersonalChannel {
         if !status.is_success() {
             bail!(
                 "getuploadurl failed: {status} {}",
-                crate::util::truncate_str(&text, 300)
+                rsclaw_util::truncate_str(&text, 300)
             );
         }
 
         debug!(
-            response = crate::util::truncate_str(&text, 500),
+            response = rsclaw_util::truncate_str(&text, 500),
             "wechat: getuploadurl response"
         );
         let parsed: GetUploadUrlResponse = serde_json::from_str(&text).with_context(|| {
             format!(
                 "parse getuploadurl response: {}",
-                crate::util::truncate_str(&text, 300)
+                rsclaw_util::truncate_str(&text, 300)
             )
         })?;
         if parsed.upload_param.is_none() {
             warn!(
-                response = crate::util::truncate_str(&text, 500),
+                response = rsclaw_util::truncate_str(&text, 500),
                 "wechat: getuploadurl returned no upload_param"
             );
         }
@@ -1889,9 +1889,9 @@ impl Channel for WeChatPersonalChannel {
                     // somewhere else (e.g. publish to douyin) without re-running.
                     if !sent {
                         let mb_str = format!("{:.1}", bytes.len() as f64 / 1_048_576.0);
-                        let fallback_text = crate::i18n::t_fmt(
+                        let fallback_text = rsclaw_i18n::t_fmt(
                             "wechat_video_notify_failed",
-                            crate::i18n::default_lang(),
+                            rsclaw_i18n::default_lang(),
                             &[
                                 ("filename", filename.as_str()),
                                 ("mb", &mb_str),

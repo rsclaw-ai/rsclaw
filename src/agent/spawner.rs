@@ -215,11 +215,11 @@ impl AgentSpawner {
                         .gateway
                         .as_ref()
                         .and_then(|g| g.language.as_deref())
-                        .map(crate::i18n::resolve_lang)
+                        .map(rsclaw_i18n::resolve_lang)
                         .unwrap_or("en");
                     let user_text = match outcome {
                         crate::agent::registry::ReplyOutcome::Canceled => "[canceled]".to_owned(),
-                        _ => crate::i18n::t("backend_unavailable", i18n_lang),
+                        _ => rsclaw_i18n::t("backend_unavailable", i18n_lang),
                     };
                     AgentReply {
                         text: user_text,

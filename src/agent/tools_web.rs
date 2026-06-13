@@ -651,11 +651,11 @@ impl AgentRuntime {
 
         // If still empty after all attempts, add a hint about API keys.
         if results.is_empty() && is_free_mode {
-            let i18n_lang = crate::i18n::default_lang();
+            let i18n_lang = rsclaw_i18n::default_lang();
             return Ok(json!({
                 "results": [],
                 "provider": chosen,
-                "error": crate::i18n::t("search_captcha_blocked", i18n_lang)
+                "error": rsclaw_i18n::t("search_captcha_blocked", i18n_lang)
             }));
         }
 
@@ -1983,8 +1983,8 @@ impl AgentRuntime {
                 {
                     Some(p) => p,
                     None => {
-                        let lang = crate::i18n::default_lang();
-                        let msg = crate::i18n::t_fmt("tool_missing", lang, &[("tool", "chrome")]);
+                        let lang = rsclaw_i18n::default_lang();
+                        let msg = rsclaw_i18n::t_fmt("tool_missing", lang, &[("tool", "chrome")]);
                         warn!("{}", msg);
                         if let Some(ref tx) = self.notification_tx {
                             let _ = tx.send(crate::channel::OutboundMessage {
@@ -2041,9 +2041,9 @@ impl AgentRuntime {
                                 let _ = tx.send(crate::channel::OutboundMessage {
                                     target_id: ctx.peer_id.clone(),
                                     is_group: false,
-                                    text: crate::i18n::t(
+                                    text: rsclaw_i18n::t(
                                         "browser_quit_for_cdp",
-                                        crate::i18n::default_lang(),
+                                        rsclaw_i18n::default_lang(),
                                     ),
                                     reply_to: None,
                                     images: vec![],
@@ -2083,9 +2083,9 @@ impl AgentRuntime {
                                 let _ = tx.send(crate::channel::OutboundMessage {
                                     target_id: ctx.peer_id.clone(),
                                     is_group: false,
-                                    text: crate::i18n::t(
+                                    text: rsclaw_i18n::t(
                                         "browser_using_temp_profile",
-                                        crate::i18n::default_lang(),
+                                        rsclaw_i18n::default_lang(),
                                     ),
                                     reply_to: None,
                                     images: vec![],
@@ -2443,7 +2443,7 @@ async fn fetch_weather_cn(
         None => {
             tracing::warn!(
                 expected_var = %cfg.js_var_name,
-                head = %crate::util::truncate_str(&body, 80),
+                head = %rsclaw_util::truncate_str(&body, 80),
                 "weather.com.cn: body doesn't start with expected JS var assignment"
             );
             return None;

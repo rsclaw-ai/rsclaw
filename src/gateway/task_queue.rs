@@ -652,7 +652,7 @@ fn send_task_ack(task: &QueuedTask, max_turns: u32, ttl_secs: u64) {
         warn!(channel = %msg.channel, task_id = %task.id, "task_queue: channel sender not registered, ack dropped");
         return;
     };
-    let lang = crate::i18n::default_lang();
+    let lang = rsclaw_i18n::default_lang();
     let ack = OutboundMessage {
         target_id: msg.chat_id.clone(),
         is_group: msg.is_group,
@@ -1166,9 +1166,9 @@ impl TaskQueueWorker {
         };
         // TODO: lookup per-peer language once channels expose a per-target
         // language hint (currently they don't — falls back to gateway-wide).
-        let text = crate::i18n::t_fmt(
+        let text = rsclaw_i18n::t_fmt(
             "task_notify_failure",
-            crate::i18n::default_lang(),
+            rsclaw_i18n::default_lang(),
             &[("reason", reason)],
         );
         let out = OutboundMessage {

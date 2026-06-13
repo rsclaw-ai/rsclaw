@@ -155,9 +155,9 @@ pub(crate) fn start_wecom_if_configured(
                                     .gateway
                                     .as_ref()
                                     .and_then(|g| g.language.as_deref())
-                                    .map(crate::i18n::resolve_lang)
+                                    .map(rsclaw_i18n::resolve_lang)
                                     .unwrap_or("en");
-                                let msg = crate::i18n::t_fmt(
+                                let msg = rsclaw_i18n::t_fmt(
                                     "pairing_required",
                                     lang,
                                     &[("code", &code)],
