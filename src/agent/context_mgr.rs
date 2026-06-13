@@ -14,30 +14,10 @@ use crate::{
     },
 };
 
-/// Estimate token count for mixed-language text.
-/// - ASCII/Latin: ~4 chars per token
-/// - CJK (Chinese/Japanese/Korean): ~1.5 chars per token
-/// - Other Unicode: ~2 chars per token
-pub fn estimate_tokens(text: &str) -> usize {
-    let mut ascii_chars = 0usize;
-    let mut cjk_chars = 0usize;
-    let mut other_chars = 0usize;
-    for ch in text.chars() {
-        if ch.is_ascii() {
-            ascii_chars += 1;
-        } else if ('\u{4E00}'..='\u{9FFF}').contains(&ch)
-            || ('\u{3400}'..='\u{4DBF}').contains(&ch)
-            || ('\u{3000}'..='\u{303F}').contains(&ch)
-            || ('\u{FF00}'..='\u{FFEF}').contains(&ch)
-            || ('\u{AC00}'..='\u{D7AF}').contains(&ch)
-        {
-            cjk_chars += 1;
-        } else {
-            other_chars += 1;
-        }
-    }
-    ascii_chars / 4 + (cjk_chars * 2 + 1) / 3 + other_chars / 2 + 1
-}
+// `estimate_tokens` lifted to rsclaw-util (crate-split); re-exported so
+// `crate::agent::context_mgr::estimate_tokens` (and runtime's `pub use
+// super::context_mgr::estimate_tokens`) keep resolving.
+pub use rsclaw_util::estimate_tokens;
 
 /// Prune the session message history in-place according to config.
 ///

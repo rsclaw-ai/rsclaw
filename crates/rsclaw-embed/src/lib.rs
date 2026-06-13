@@ -12,7 +12,7 @@
 //!   - `OllamaEmbedder`  — Ollama local REST API.
 //!
 //! `agent::memory` re-exports these names for backward compatibility,
-//! so existing `crate::agent::memory::EmbedderBackend` paths keep
+//! so existing `EmbedderBackend (agent crate)` paths keep
 //! working.
 
 use std::path::Path;
@@ -92,7 +92,7 @@ pub trait Embedder: Send + Sync {
     /// Count tokens precisely (when tokenizer is available) or estimate.
     fn count_tokens(&self, text: &str) -> usize {
         // Default: heuristic estimation (ASCII/4 + CJK*1.5)
-        crate::agent::runtime::estimate_tokens(text)
+        rsclaw_util::estimate_tokens(text)
     }
 }
 
@@ -305,7 +305,7 @@ impl Embedder for LocalBgeEmbedder {
         self.tokenizer
             .encode(text, false)
             .map(|e| e.get_ids().len())
-            .unwrap_or_else(|_| crate::agent::runtime::estimate_tokens(text))
+            .unwrap_or_else(|_| rsclaw_util::estimate_tokens(text))
     }
 }
 

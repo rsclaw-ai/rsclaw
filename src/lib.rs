@@ -74,7 +74,6 @@ pub mod cmd;
 pub mod computer;
 pub mod cron;
 pub mod desktop;
-pub mod embed;
 pub mod gateway;
 pub mod heartbeat;
 pub mod hooks;
@@ -91,6 +90,7 @@ pub mod ws;
 // Extracted base crates — re-exported under their historical module paths so
 // in-crate `crate::i18n::` / `crate::util::` etc. still resolve during the split.
 pub use rsclaw_config as config;
+pub use rsclaw_embed as embed;
 pub use rsclaw_events as events;
 pub use rsclaw_i18n as i18n;
 pub use rsclaw_platform as sys;
