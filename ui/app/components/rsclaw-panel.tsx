@@ -2858,7 +2858,7 @@ function TauriConfigPageInner() {
     (async () => {
       try {
         const { listen } = await import("@tauri-apps/api/event");
-        const fn = await listen("rsclaw:console-install-key", async () => {
+        const reload = async () => {
           if (cancelled || dirty) return;
           try {
             const content = (await tauriInvokeV2("read_config_file")) as string;
@@ -2869,9 +2869,19 @@ function TauriConfigPageInner() {
           } catch {
             /* swallow */
           }
-        });
-        if (cancelled) fn();
-        else unlisten = fn;
+        };
+        // Two triggers reload the panel's config snapshot:
+        //   - console-install-key: the webview one-tap key install (Rust-emitted).
+        //   - config-changed: any rsclaw-card mutation that writes the config
+        //     directly (Set-as-default / manual key paste / disconnect). Without
+        //     the latter, switching primary to rsclaw via the card updated the
+        //     file but left the Primary chain input showing the stale value.
+        const fns = await Promise.all([
+          listen("rsclaw:console-install-key", reload),
+          listen("rsclaw:config-changed", reload),
+        ]);
+        if (cancelled) { fns.forEach((f) => f()); }
+        else unlisten = () => fns.forEach((f) => f());
       } catch {
         /* event subscription unavailable */
       }

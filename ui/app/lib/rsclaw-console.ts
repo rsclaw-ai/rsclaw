@@ -117,6 +117,25 @@ export async function onKeyInstalled(
  * Returns the merged config object so the caller can refresh derived
  * state (default model dropdown, agents list, …) without re-reading.
  */
+/**
+ * Tell any open config panel its on-disk config just changed under it, so it
+ * re-reads rsclaw.json5. The rsclaw provider card writes the config directly
+ * (Set-as-default / manual key paste / disconnect) instead of going through
+ * the panel's own updateConfig, so without this signal the panel's cached
+ * snapshot — and the Primary/Flash/Vision chain inputs derived from it — go
+ * stale even though the file is correct. The webview one-tap path already
+ * emits `rsclaw:console-install-key` from Rust; this covers the in-app paths.
+ */
+async function notifyConfigChanged(): Promise<void> {
+  if (!isTauri) return;
+  try {
+    const { emit } = await import("@tauri-apps/api/event");
+    await emit("rsclaw:config-changed", {});
+  } catch {
+    /* event bus unavailable — panel falls back to its raw-tab re-read */
+  }
+}
+
 export async function applyInstalledKey(
   data: InstalledKeyData,
 ): Promise<{ ok: boolean; error?: string }> {
@@ -216,6 +235,7 @@ export async function applyInstalledKey(
         /* gateway not running yet — fine */
       }
 
+      await notifyConfigChanged();
       return { ok: true };
     }
 
@@ -233,6 +253,7 @@ export async function applyInstalledKey(
     }
     seedDefaultModel(merged);
     await saveConfig({ raw: JSON.stringify(merged, null, 2) });
+    await notifyConfigChanged();
     return { ok: true };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -335,6 +356,7 @@ export async function setRsclawAsPrimary(): Promise<{
     } else {
       await saveConfig({ raw: next });
     }
+    await notifyConfigChanged();
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
@@ -372,6 +394,7 @@ export async function disconnectAccount(): Promise<{
     } else {
       await saveConfig({ raw: next });
     }
+    await notifyConfigChanged();
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
