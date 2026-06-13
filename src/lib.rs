@@ -64,12 +64,10 @@
 
 pub mod a2a;
 pub mod agent;
-pub mod cli;
 pub mod cmd;
 pub mod cron;
 pub mod gateway;
 pub mod hooks;
-pub mod migrate;
 pub mod server;
 pub mod ws;
 
@@ -78,6 +76,8 @@ pub mod ws;
 pub use rsclaw_config as config;
 pub use rsclaw_artifact as artifact;
 pub use rsclaw_astock as astock;
+pub use rsclaw_cli as cli;
+pub use rsclaw_migrate as migrate;
 pub use rsclaw_heartbeat as heartbeat;
 pub(crate) use rsclaw_cap as cap;
 pub use rsclaw_desktop as desktop;

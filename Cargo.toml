@@ -23,6 +23,8 @@ rsclaw-mcp = { path = "crates/rsclaw-mcp" }
 rsclaw-astock = { path = "crates/rsclaw-astock" }
 rsclaw-cap = { path = "crates/rsclaw-cap" }
 rsclaw-heartbeat = { path = "crates/rsclaw-heartbeat" }
+rsclaw-cli = { path = "crates/rsclaw-cli" }
+rsclaw-migrate = { path = "crates/rsclaw-migrate" }
 rsclaw-desktop = { path = "crates/rsclaw-desktop" }
 rsclaw-evolution = { path = "crates/rsclaw-evolution" }
 rsclaw-memory = { path = "crates/rsclaw-memory" }
@@ -162,7 +164,6 @@ mime = "0.3"
 mime_guess = "2"
 matrix-sdk = { version = "0.9", optional = true, default-features = false, features = ["e2e-encryption", "rustls-tls", "sqlite"] }
 fs2 = "0.4.3"
-rusqlite = { version = "0.32", optional = true, features = ["bundled"] }
 htmd    = "0.5"
 lol_html = "1.2"
 # Embed `tools/` site-rules + app-rules into the binary at compile time
@@ -209,7 +210,7 @@ cap-rs = { version = "0.1.0", default-features = false, features = ["stream-json
 [features]
 default = ["openclaw-migrate"]
 channel-matrix = ["dep:matrix-sdk"]
-openclaw-migrate = ["rusqlite"]
+openclaw-migrate = ["rsclaw-migrate/openclaw-migrate"]
 tray = ["dep:tray-icon", "dep:muda"]
 
 [profile.release]

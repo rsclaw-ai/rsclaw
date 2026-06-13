@@ -115,7 +115,7 @@ pub fn openclaw_dir_exists() -> bool {
 
 /// Check whether the rsclaw data directory already exists.
 pub fn rsclaw_dir_exists() -> bool {
-    crate::config::loader::base_dir().is_dir()
+    rsclaw_config::loader::base_dir().is_dir()
 }
 
 /// Print a one-line notice when OpenClaw is detected but rsclaw is not yet set
@@ -140,7 +140,7 @@ pub fn maybe_print_openclaw_notice() -> bool {
 /// can exit early.
 pub fn check_needs_setup() -> bool {
     // Resolve base_dir (respects RSCLAW_BASE_DIR from --profile/--dev/--base-dir).
-    let base = crate::config::loader::base_dir();
+    let base = rsclaw_config::loader::base_dir();
     let config_path = base.join("rsclaw.json5");
 
     if config_path.is_file() {

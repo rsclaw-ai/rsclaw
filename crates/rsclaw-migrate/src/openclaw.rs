@@ -721,7 +721,7 @@ pub fn read_agent_memories(agent_dir: &Path, agent_id: &str) -> Result<Vec<Conve
 /// Memory entries are collected but require async MemoryStore for full import.
 pub fn import_sessions_to_redb(
     openclaw_dir: &Path,
-    store: &crate::store::redb_store::RedbStore,
+    store: &rsclaw_store::redb_store::RedbStore,
 ) -> Result<ImportStats> {
     let mut stats = ImportStats::default();
     let mut all_sessions: Vec<ConvertedSession> = Vec::new();
@@ -838,11 +838,11 @@ pub struct MemoryImportStats {
 /// gateway boots).
 pub async fn import_memories_to_store(
     openclaw_dir: &Path,
-    mem_arc: &std::sync::Arc<tokio::sync::Mutex<crate::agent::MemoryStore>>,
+    mem_arc: &std::sync::Arc<tokio::sync::Mutex<rsclaw_memory::MemoryStore>>,
 ) -> Result<MemoryImportStats> {
     use rayon::prelude::*;
 
-    use crate::agent::memory::MemoryDoc;
+    use rsclaw_memory::MemoryDoc;
 
     let agents_dir = openclaw_dir.join("agents");
     if !agents_dir.is_dir() {
@@ -975,11 +975,11 @@ pub async fn import_memories_to_store(
 pub async fn import_workspace_memory(
     openclaw_dir: &Path,
     rsclaw_dir: &Path,
-    mem_arc: &std::sync::Arc<tokio::sync::Mutex<crate::agent::MemoryStore>>,
+    mem_arc: &std::sync::Arc<tokio::sync::Mutex<rsclaw_memory::MemoryStore>>,
 ) -> Result<MemoryImportStats> {
     use rayon::prelude::*;
 
-    use crate::agent::memory::MemoryDoc;
+    use rsclaw_memory::MemoryDoc;
 
     let mut sources: Vec<(String, String, String)> = Vec::new(); // (scope, kind, text)
     let mut copy_jobs: Vec<(PathBuf, PathBuf)> = Vec::new();
@@ -1717,7 +1717,7 @@ pub fn read_sqlite_memories(db_path: &Path, agent_id: &str) -> Result<Vec<Memory
                     agent_id: agent_id.to_owned(),
                     source_file: format!(
                         "sqlite:chunks:{}",
-                        crate::config::loader::path_to_forward_slash(db_path)
+                        rsclaw_config::loader::path_to_forward_slash(db_path)
                     ),
                 })
             })?
@@ -1746,7 +1746,7 @@ pub fn read_sqlite_memories(db_path: &Path, agent_id: &str) -> Result<Vec<Memory
                         agent_id: agent_id.to_owned(),
                         source_file: format!(
                             "sqlite:memories:{}",
-                            crate::config::loader::path_to_forward_slash(db_path)
+                            rsclaw_config::loader::path_to_forward_slash(db_path)
                         ),
                     })
                 })?
