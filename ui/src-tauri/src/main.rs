@@ -1377,16 +1377,27 @@ fn search_skills(query: String) -> Result<serde_json::Value, String> {
 
         let stats_mode = has_stats.unwrap_or(false);
         let need = if stats_mode { 5 } else { 3 };
-        let parts: Vec<&str> = trimmed.splitn(need, |c: char| c.is_whitespace()).filter(|s| !s.is_empty()).collect();
-        if parts.len() < need { continue; }
+        // Split on runs of whitespace, NOT every single whitespace char.
+        // The table aligns columns with multiple spaces — using
+        // `splitn(need, char::is_whitespace)` produced empty segments for
+        // each extra space and burned the segment budget before reaching
+        // the real columns, so genuine result rows came back with too few
+        // parts and got skipped entirely (= "search finds nothing"), while
+        // the single-spaced footer "Install with: rsclaw skills install
+        // <name>" split cleanly into 5 and was scraped as a fake result
+        // named "Install". split_whitespace() collapses runs so columns
+        // land where they should; the description (last column, may itself
+        // contain spaces) is rejoined from the remainder.
+        let cols: Vec<&str> = trimmed.split_whitespace().collect();
+        if cols.len() < need { continue; }
 
-        let name = parts[0].trim();
+        let name = cols[0].trim();
         if name.is_empty() || name == "NAME" { continue; }
 
         let (installs, stars, registry, desc) = if stats_mode {
-            (parts[1].trim(), parts[2].trim(), parts[3].trim(), parts[4].trim())
+            (cols[1], cols[2], cols[3], cols[4..].join(" "))
         } else {
-            ("", "", parts[1].trim(), parts[2].trim())
+            ("", "", cols[1], cols[2..].join(" "))
         };
 
         seen_any_result = true;
