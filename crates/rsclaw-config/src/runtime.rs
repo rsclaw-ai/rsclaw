@@ -189,7 +189,7 @@ pub struct ExtRuntime {
     pub tools: Option<ToolsConfig>,
     pub skills: Option<SkillsConfig>,
     pub plugins: Option<PluginsConfig>,
-    pub evolution: Option<crate::config::schema::EvolutionConfig>,
+    pub evolution: Option<crate::schema::EvolutionConfig>,
 }
 
 /// Operational: cron, hooks, sandbox, logging, secrets.  Rarely change.
@@ -217,7 +217,7 @@ pub struct RuntimeConfig {
     pub ops: OpsRuntime,
     /// Original parsed config — retained for sections not yet mapped to runtime
     /// types.
-    pub raw: crate::config::schema::Config,
+    pub raw: crate::schema::Config,
 }
 
 impl RuntimeConfig {

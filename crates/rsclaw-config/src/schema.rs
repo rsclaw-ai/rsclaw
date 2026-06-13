@@ -2025,7 +2025,7 @@ pub struct SkillRegistryEntry {
 // ---------------------------------------------------------------------------
 
 /// Top-level evolution config block. All fields optional; missing values fall
-/// back to [`crate::agent::evolution::EvolutionConfig::default`].
+/// back to `EvolutionConfig::default` (agent crate).
 ///
 /// `preset = "test"` swaps the base to looser test-mode thresholds before
 /// individual field overrides apply.
@@ -2269,7 +2269,7 @@ impl SecretOrString {
         match self {
             SecretOrString::Plain(s) => {
                 // Support ${VAR} syntax in plain strings.
-                let expanded = crate::config::loader::expand_env_vars(s);
+                let expanded = crate::loader::expand_env_vars(s);
                 Some(expanded)
             }
             SecretOrString::Ref(r) if r.source == SecretSource::Env => std::env::var(&r.id).ok(),
