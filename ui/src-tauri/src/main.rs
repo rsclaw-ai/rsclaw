@@ -1618,7 +1618,35 @@ fn local_tool_binary_path(name: &str) -> Option<std::path::PathBuf> {
         ]);
     }
 
-    probes.into_iter().find(|p| p.is_file())
+    if let Some(hit) = probes.into_iter().find(|p| p.is_file()) {
+        return Some(hit);
+    }
+
+    // npm-package fallback: tools installed via `npm install --prefix`
+    // (claude-code, opencode, codex, qoder, …) expose their binary under
+    // `node_modules/.bin/<bin>` — but the bin name is the *package's*
+    // declared bin, which often differs from the tool name we probe by
+    // (e.g. qoder → qodercli, @qoder-ai/qodercli). The fixed-name probes
+    // above all miss in that case, leaving the install stuck on
+    // "Installing…" forever even though the binary is on disk. Treat a
+    // non-empty `node_modules/.bin/` as proof of a successful npm install
+    // and return its first real entry.
+    let npm_bin_dir = dir.join("node_modules").join(".bin");
+    if npm_bin_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&npm_bin_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                // .bin holds symlinks to the actual JS shims; is_file()
+                // follows the link, so a live shim counts and a dangling
+                // one doesn't.
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Expand `${VAR}` placeholders in a string by reading from the process
