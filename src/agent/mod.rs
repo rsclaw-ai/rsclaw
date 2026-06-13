@@ -20,6 +20,7 @@ pub mod install_hints;
 pub mod loop_detection;
 pub mod memory;
 pub mod args_sanitizer;
+pub mod tools_ocr;
 pub mod video;
 pub mod memory_extractor;
 pub mod platform;

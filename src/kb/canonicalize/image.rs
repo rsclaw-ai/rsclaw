@@ -34,7 +34,7 @@ impl Canonicalizer for ImageCanonicalizer {
     }
 
     fn canonicalize(&self, input: CanonicalizeInput<'_>) -> Result<Option<CanonicalizedSource>> {
-        let Some(client) = crate::ocr::OcrClient::from_config() else {
+        let Some(client) = crate::agent::tools_ocr::OcrClient::from_config() else {
             // No OCR endpoint → image ingest is a no-op, not a failure.
             tracing::info!(
                 mime = input.mime,
