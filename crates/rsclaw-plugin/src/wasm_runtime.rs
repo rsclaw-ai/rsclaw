@@ -55,7 +55,7 @@ use rsclaw_browser::BrowserSession;
 // ---------------------------------------------------------------------------
 
 bindgen!({
-    path: "src/plugin/wit/world.wit",
+    path: "src/wit/world.wit",
     world: "jimeng-plugin",
     imports: { default: async | trappable },
     exports: { default: async },
@@ -235,7 +235,7 @@ impl wasmtime_wasi::WasiView for HostState {
 /// under the workspace dir — otherwise the call is rejected.
 fn canonicalize_plugin_path(input: &str) -> Result<PathBuf, String> {
     let workspace = rsclaw_config::loader::base_dir().join("workspace");
-    let canonical = crate::agent::runtime::canonicalize_external_path(input, &workspace);
+    let canonical = rsclaw_util::canonicalize_external_path(input, &workspace);
     if !canonical.starts_with(&workspace) {
         return Err(format!(
             "plugin path '{}' resolves outside workspace ({})",
@@ -252,7 +252,7 @@ fn canonicalize_writable_path(input: &str) -> Result<PathBuf, String> {
     let base = rsclaw_config::loader::base_dir();
     let workspace = base.join("workspace");
     let plugins_var = base.join("var").join("plugins");
-    let canonical = crate::agent::runtime::canonicalize_external_path(input, &workspace);
+    let canonical = rsclaw_util::canonicalize_external_path(input, &workspace);
     if canonical.starts_with(&workspace) || canonical.starts_with(&plugins_var) {
         return Ok(canonical);
     }
@@ -276,7 +276,7 @@ fn canonicalize_plugin_artifact_path(input: &str) -> Result<PathBuf, String> {
                 .join("Downloads")
         })
         .join("rsclaw");
-    let canonical = crate::agent::runtime::canonicalize_external_path(input, &workspace);
+    let canonical = rsclaw_util::canonicalize_external_path(input, &workspace);
     if canonical.starts_with(&workspace)
         || canonical.starts_with(&plugins_var)
         || canonical.starts_with(&downloads_rsclaw)
@@ -299,7 +299,7 @@ pub(crate) async fn extract_text_from_plugin_file(path: &str) -> Result<String, 
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| canonical.to_string_lossy().into_owned());
-    match crate::agent::runtime::extract_file_text(&filename, &bytes).await {
+    match rsclaw_channel::extract_file_text(&filename, &bytes).await {
         Some(text) if !text.trim().is_empty() => Ok(text),
         Some(_) => Err(format!(
             "no readable text extracted from {}",
@@ -549,7 +549,7 @@ impl rsclaw::plugin::host_browser::Host for HostState {
         // the LLM ("upload ~/Downloads/cat.png") so we tolerate any path
         // the user has access to. Just expand `~` and normalize.
         let workspace = rsclaw_config::loader::base_dir().join("workspace");
-        let canonical = crate::agent::runtime::canonicalize_external_path(&filepath, &workspace);
+        let canonical = rsclaw_util::canonicalize_external_path(&filepath, &workspace);
         // Note: cmd_upload expects `files: [path]` (array), not `filepath: path`.
         Ok(self
             .browser_action(

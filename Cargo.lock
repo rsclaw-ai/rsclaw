@@ -7535,7 +7535,6 @@ dependencies = [
  "rsclaw-embed",
  "rsclaw-events",
  "rsclaw-evolution",
- "rsclaw-hooks",
  "rsclaw-i18n",
  "rsclaw-kb",
  "rsclaw-mcp",
@@ -7810,24 +7809,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rsclaw-hooks"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "rsclaw-config",
- "rsclaw-events",
- "rsclaw-i18n",
- "rsclaw-platform",
- "rsclaw-provider",
- "rsclaw-types",
- "rsclaw-util",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "rsclaw-i18n"
 version = "0.1.0"
 
@@ -7933,9 +7914,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "chrono",
  "dirs-next",
  "futures",
  "json5",
+ "rand 0.9.2",
  "reqwest",
  "rsclaw-browser",
  "rsclaw-channel",
@@ -7958,6 +7941,7 @@ dependencies = [
  "uuid",
  "wasmtime",
  "wasmtime-wasi",
+ "which 7.0.3",
 ]
 
 [[package]]

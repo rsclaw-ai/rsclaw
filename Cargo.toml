@@ -27,7 +27,6 @@ rsclaw-doc = { path = "crates/rsclaw-doc" }
 rsclaw-browser = { path = "crates/rsclaw-browser" }
 rsclaw-channel = { path = "crates/rsclaw-channel" }
 rsclaw-computer = { path = "crates/rsclaw-computer" }
-rsclaw-hooks = { path = "crates/rsclaw-hooks" }
 rsclaw-kb = { path = "crates/rsclaw-kb" }
 rsclaw-plugin = { path = "crates/rsclaw-plugin" }
 rsclaw-skill = { path = "crates/rsclaw-skill" }

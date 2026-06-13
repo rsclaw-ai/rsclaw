@@ -33,3 +33,6 @@ dirs-next = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 wasmtime = { version = "36.0.10", features = ["async"] }
 wasmtime-wasi = "36.0.10"
+chrono = { version = "0.4", features = ["serde"] }
+which = "7"
+rand = "0.9"
