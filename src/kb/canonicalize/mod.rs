@@ -7,6 +7,7 @@
 
 pub mod email;
 pub mod html;
+pub mod image;
 pub mod legacy;
 pub mod md;
 pub mod mime;

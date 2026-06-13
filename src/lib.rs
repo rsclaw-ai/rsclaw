@@ -84,6 +84,7 @@ pub mod i18n;
 pub mod kb;
 pub mod mcp;
 pub mod migrate;
+pub mod ocr;
 pub mod plugin;
 pub mod provider;
 pub mod server;

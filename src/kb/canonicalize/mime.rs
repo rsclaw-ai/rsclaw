@@ -4,6 +4,7 @@ use super::*;
 use crate::kb::canonicalize::{
     email::{EML_MIME, EmlCanonicalizer, MBOX_MIME, MboxCanonicalizer},
     html::HtmlCanonicalizer,
+    image::ImageCanonicalizer,
     legacy::{DOC_MIME, LegacyOfficeCanonicalizer, PPT_MIME},
     md::MdCanonicalizer,
     ooxml::{DOCX_MIME, DocxCanonicalizer, PPTX_MIME, PptxCanonicalizer},
@@ -18,6 +19,19 @@ use crate::kb::canonicalize::{
 pub fn detect_mime(bytes: &[u8], filename_hint: Option<&str>) -> String {
     if bytes.starts_with(b"%PDF-") {
         return "application/pdf".into();
+    }
+    // Image magic bytes (OCR canonicalizer handles these).
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return "image/png".into();
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return "image/jpeg".into();
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return "image/webp".into();
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return "image/gif".into();
     }
     if let Some(name) = filename_hint {
         let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
@@ -41,6 +55,12 @@ pub fn detect_mime(bytes: &[u8], filename_hint: Option<&str>) -> String {
             "ppt" => return PPT_MIME.into(),
             "eml" => return EML_MIME.into(),
             "mbox" => return MBOX_MIME.into(),
+            "png" => return "image/png".into(),
+            "jpg" | "jpeg" => return "image/jpeg".into(),
+            "webp" => return "image/webp".into(),
+            "gif" => return "image/gif".into(),
+            "bmp" => return "image/bmp".into(),
+            "tif" | "tiff" => return "image/tiff".into(),
             _ => {}
         }
     }
@@ -59,6 +79,7 @@ pub fn canonicalize_by_mime(input: CanonicalizeInput<'_>) -> Result<Option<Canon
     let registered: &[&dyn Canonicalizer] = &[
         &MdCanonicalizer,
         &HtmlCanonicalizer,
+        &ImageCanonicalizer,
         &PdfCanonicalizer,
         &TextCanonicalizer,
         &DocxCanonicalizer,

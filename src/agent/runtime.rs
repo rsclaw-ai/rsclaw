@@ -9746,6 +9746,7 @@ impl AgentRuntime {
             "web_browser" | "browser" => return self.tool_web_browser(ctx, args).await,
             "computer_use" => return self.tool_computer_use(ctx, args).await,
             "image_gen" | "image" => return self.tool_image(args).await,
+            "ocr" => return self.tool_ocr(args).await,
             "video_gen" | "video" => return self.tool_video(args, ctx).await,
             "pdf" => return self.tool_pdf(args).await,
             "text_to_voice" | "text_to_speech" | "tts" => return self.tool_tts(args).await,

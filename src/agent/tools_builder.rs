@@ -396,6 +396,7 @@ pub(crate) fn toolset_allowed_names(
         "todo",
         "web_browser",
         "image_gen",
+        "ocr",
         "video_gen",
         "channel",
         "cron",
@@ -1668,6 +1669,22 @@ pub fn build_tool_list(
                 "size":   {"type": "string", "description": "Image size, e.g. 2048x2048", "default": "2048x2048"}
             },
             "required": ["prompt"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "ocr".to_owned(),
+        description: "Extract text from an image via OCR (rsclaw-ocr-v1). Use when the user \
+            sends a screenshot/photo/scan and wants the TEXT read out verbatim (receipts, \
+            documents, slides, chat screenshots) — distinct from describing what an image \
+            shows. Pass a file reference path, an http(s) URL, or a data URI. Requires an \
+            `kb.ocr` endpoint configured; if absent the call returns an error.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "image": {"type": "string", "description": "Image to OCR: a workspace/uploads file path, an http(s):// URL, or a data:image/...;base64,... URI."},
+                "lang":  {"type": "string", "description": "Optional language hint (zh/en/...). Omit to auto-detect."}
+            },
+            "required": ["image"]
         }),
     });
     tools.push(ToolDef {

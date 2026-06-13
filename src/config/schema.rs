@@ -2366,6 +2366,13 @@ pub struct KbConfig {
     /// fused order, never fail the search. Query-time only — no reindex.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rerank: Option<KbRerankConfig>,
+    /// Optional OCR stage for image / scanned-PDF ingestion. When set, an
+    /// image source (png/jpeg/webp/…) is sent to an OCR endpoint
+    /// (`/v1/ocr`) and the extracted text becomes the doc body. Without it,
+    /// images aren't ingestable. base_url may be empty when `model` is a
+    /// `rsclaw-*` name (defaults to the fleet API).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ocr: Option<KbOcrConfig>,
     /// DEPRECATED (unused): superseded by `embed`. Kept only so existing
     /// configs that still set it continue to parse (deny_unknown_fields). No
     /// code reads it — embedder selection goes through `embed` /
@@ -2411,6 +2418,31 @@ pub struct KbRerankConfig {
     /// everything below the window is dropped). Default 20.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_n: Option<usize>,
+    /// Kill-switch without deleting the block. Default true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+/// OCR endpoint config (`kb.ocr`). Speaks the rsclaw-native `/v1/ocr`
+/// shape (`{model, image, stream:false}` → `{content, …}`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct KbOcrConfig {
+    /// API root, e.g. `https://api.rsclaw.ai/v1`. May be empty when
+    /// `model` is a `rsclaw-*` name (then defaults to the fleet API).
+    /// `/ocr` is appended at request time.
+    #[serde(default)]
+    pub base_url: String,
+    /// Model name (e.g. `rsclaw-ocr-v1`). Drives both the request body
+    /// and the empty-base_url → fleet-API convention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// API key; falls back to the rsclaw provider key / env when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<SecretOrString>,
+    /// Optional language hint ("zh"/"en"/…); omitted → endpoint auto-detects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
     /// Kill-switch without deleting the block. Default true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
