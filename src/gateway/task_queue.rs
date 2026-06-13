@@ -54,103 +54,12 @@ pub enum TaskOutcome {
     NeedsInput(String),
 }
 
-/// Self-reported outcome an agent fills in via the `task_finish` tool when
-/// it believes its task is finished (or deliberately abandoned).
-///
-/// Provides structured signal that replaces the fragile string-matching path
-/// in `classify_outcome`. Also serialised into `A2aTask.metadata.outcome`
-/// for protocol-compliant A2A v1.0 reporting.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct StructuredOutcome {
-    /// How complete the work is. Drives the orchestrator's continue/stop call.
-    pub completion: Completion,
+// StructuredOutcome/Completion/Recommend lifted to rsclaw-types (crate-split).
+pub use rsclaw_types::{StructuredOutcome, Completion, Recommend};
 
-    /// The agent's own recommendation for what to do next. Orchestrator
-    /// treats this as a strong hint but applies its own decision matrix.
-    pub recommend: Recommend,
 
-    /// Did the agent actually run tests/build/lint/curl that confirmed the
-    /// claimed work? `false` is honest; `true` without `verification_log`
-    /// is downgraded to `false` by the orchestrator.
-    #[serde(default)]
-    pub verified: bool,
 
-    /// Evidence backing `verified=true`. Short excerpt of command + output.
-    /// Required when `verified=true`; absence downgrades to `verified=false`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verification_log: Option<String>,
-
-    /// Concrete things the agent did. Each entry should map to an observable
-    /// artifact (file changed, command run, message sent). Empty list with
-    /// `completion=Full` is suspicious — orchestrator may downgrade.
-    #[serde(default)]
-    pub accomplished: Vec<String>,
-
-    /// Things the agent deliberately skipped, paired with the reason.
-    /// Distinct from `blocked_on` — these are choices, not obstacles.
-    #[serde(default)]
-    pub skipped: Vec<SkipEntry>,
-
-    /// Unresolved blockers. Non-empty implies `completion != Full`.
-    /// When `recommend = NeedsHuman`, these are surfaced to the user verbatim.
-    #[serde(default)]
-    pub blocked_on: Vec<String>,
-
-    /// Assumptions the agent made when the spec was ambiguous. Non-empty
-    /// with `completion < Full` triggers orchestrator to confirm with user.
-    #[serde(default)]
-    pub assumptions: Vec<String>,
-
-    /// Suggested next tasks. Each entry is a self-contained task description,
-    /// not a TODO note. Auto-spawned when `recommend = Continue`.
-    #[serde(default)]
-    pub follow_up_tasks: Vec<String>,
-
-    /// Optional one-paragraph prose summary for the channel reply.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary: Option<String>,
-}
-
-/// How complete the agent's work is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Completion {
-    /// Everything the user asked for, done and (ideally) verified.
-    Full,
-    /// Meaningful subset done. Coverage implied by `accomplished` length.
-    Partial,
-    /// Almost nothing achieved. Agent should explain in `blocked_on`.
-    Minimal,
-    /// Agent attempted, work was wrong/rolled back, nothing landed.
-    Failed,
-}
-
-/// Recommended next action for the orchestrator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Recommend {
-    /// Done, deliver to user, close the task.
-    Ship,
-    /// Spawn the next task automatically using `follow_up_tasks`.
-    Continue,
-    /// Stop the auto-continue loop; surface `blocked_on` to the user.
-    NeedsHuman,
-    /// Same task, fresh attempt. Agent thinks a retry with the same prompt
-    /// might succeed (transient failure, flaky env).
-    Retry,
-    /// Agent gave up; orchestrator should not retry without changed inputs.
-    Abandon,
-}
-
-/// A deliberate skip, paired with its reason.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkipEntry {
-    /// What was skipped.
-    pub what: String,
-    /// Why it was skipped.
-    pub why: String,
-}
+pub use rsclaw_types::SkipEntry;
 
 /// What the worker should do after grading a turn's outcome.
 ///
@@ -248,26 +157,8 @@ pub fn decide_action(outcome: &TaskOutcome, turn: u32, max_turns: u32) -> Dispat
 // `OnceLock<Mutex<HashMap>>` is intentional — no DashMap dependency, and the
 // contention profile (one writer per turn per session) doesn't warrant it.
 
-static PENDING_OUTCOMES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, StructuredOutcome>>> =
-    std::sync::OnceLock::new();
-
-fn pending_outcomes_map() -> &'static std::sync::Mutex<HashMap<String, StructuredOutcome>> {
-    PENDING_OUTCOMES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-}
-
-/// Stage a structured outcome produced by the `task_finish` tool. The next
-/// call to [`drain_pending_outcome`] for the same `session_key` consumes it.
-pub fn stage_pending_outcome(session_key: &str, outcome: StructuredOutcome) {
-    if let Ok(mut map) = pending_outcomes_map().lock() {
-        map.insert(session_key.to_owned(), outcome);
-    }
-}
-
-/// Remove and return the staged outcome for `session_key`, if any. Called
-/// by [`TaskQueueWorker`] once per turn before string-classifying the reply.
-pub fn drain_pending_outcome(session_key: &str) -> Option<StructuredOutcome> {
-    pending_outcomes_map().lock().ok()?.remove(session_key)
-}
+// pending-outcome staging map lifted to rsclaw-types (crate-split); re-exported.
+pub use rsclaw_types::{stage_pending_outcome, drain_pending_outcome};
 
 
 

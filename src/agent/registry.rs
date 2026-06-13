@@ -612,20 +612,8 @@ pub struct AgentReply {
     pub outcome: ReplyOutcome,
 }
 
-/// How a turn finished, surfaced from the gateway worker so A2A consumers
-/// can emit the right terminal state. Non-A2A channels (WebSocket, channels/*)
-/// ignore this — they show `reply.text` to the user regardless.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum ReplyOutcome {
-    #[default]
-    Ok,
-    /// Turn errored — `text` is the rendered error message.
-    Error,
-    /// Turn was cancelled via the A2A cancel_token. The cancel handler has
-    /// already published the terminal `Canceled` status event; A2A consumers
-    /// must not emit another terminal event.
-    Canceled,
-}
+// ReplyOutcome lifted to rsclaw-types (crate-split); re-exported.
+pub use rsclaw_types::ReplyOutcome;
 
 // ---------------------------------------------------------------------------
 // AgentRegistry
