@@ -39,6 +39,7 @@ Validate each with `cargo metadata --no-deps` (manifest parse only, NOT a build)
 | rsclaw-config | src/config/ | 2fb0e213 | clean root, no first-party deps |
 | rsclaw-retry | src/channel/retry.rs | 30e875fc | SendRetry; channel re-exports `as retry` |
 | rsclaw-embed | src/embed/ | db956f06 | also sank estimate_tokens -> rsclaw-util |
+| rsclaw-provider | src/provider/ | a8ade182 | wire DTOs stay in-crate; lifted BUILTIN_TOOL_NAMES -> types |
 
 Namespace sweep already applied across whole `src/`:
 `crate::{util,sys,i18n,events}::` → `rsclaw_{util,platform,i18n,events}::`.
@@ -62,11 +63,52 @@ Root `src/lib.rs` re-exports: events, i18n, sys(=platform), util, config.
   store. To extract store cleanly, lift those records to rsclaw-types FIRST
   (same re-export pattern), which breaks store→gateway.
 
-## REMAINING ORDER (bottom-up)  — resume at rsclaw-provider
+## REMAINING ORDER (bottom-up)  — resume at gateway-records lift + store
 
 1. ~~rsclaw-retry~~ DONE (30e875fc)
 2. ~~rsclaw-embed~~ DONE (db956f06)
-3. **rsclaw-provider** ← src/provider/ (13K). deps: config, util, types, events.
+3. ~~rsclaw-provider~~ DONE (a8ade182)
+
+### NEXT: gateway-records lift (enables store + kb) — PRECISE SPEC
+Store depends ENTIRELY on gateway records (QueuedTask 17, TaskStatus 8,
+ExternalJob 5, QueuedMessage 1, ExternalJobStatus 2). These records live
+INSIDE 1892-line task_queue.rs alongside TaskQueueManager/Worker machinery.
+Lift ONLY the record cluster to rsclaw-types, leave the managers in gateway,
+re-export from task_queue.rs / external_jobs.rs.
+
+Lift set — all verified self-contained (records' impls have ZERO crate:: refs):
+- task_queue.rs: `Priority` (L32-42), `TaskStatus` (L43-59), `QueuedFile`,
+  `QueuedMessage`, `QueuedTask` + its impl (L293-525), AND the serde helper
+  `default_max_turns` (used by `#[serde(default="default_max_turns")]`).
+  NOTE: Priority/TaskStatus are clean — do NOT pull in TaskOutcome/
+  StructuredOutcome/Completion/Recommend/DispatchAction (they stay in gateway).
+- external_jobs.rs: `ExternalJobKind`, `ExternalJobOrigin`, `ExternalJobStatus`,
+  `ExternalJobDelivery`, `ExternalJob` + impl (L80-216, incl MAX_DELIVERY_ATTEMPTS).
+  Leave `PollOutcome` (L50) in gateway (not referenced by the records).
+Records derive Serialize/Deserialize (+ serde default fns) and use std + the
+attachment types already in rsclaw-types. types Cargo.toml may need nothing new
+(serde already there); verify chrono not needed (timestamps are i64, so no).
+After lift: re-export `pub use rsclaw_types::{...}` at both original sites.
+
+### THEN
+4. **rsclaw-store** ← src/store/ (mod/redb_store/search). Repoint
+   crate::gateway::{task_queue,external_jobs}::X -> rsclaw_types::X (or rely on
+   the re-export — but store becomes its own crate so it CANNOT reach
+   crate::gateway::; must point at rsclaw_types:: directly). root: `pub use
+   rsclaw_store as store;`. 25 consumers keep working via that re-export.
+5. **rsclaw-kb** ← src/kb/ (deps embed, config, store, +2 agent refs to break).
+6. **rsclaw-channel** ← src/channel/ (deps types, config, util, retry, cap(2)).
+   ~119 old agent refs were attachment types now in rsclaw-types -> repoint to
+   rsclaw_types::. Keep transcription + attachments in-crate.
+7. **leaves**: artifact, mcp, browser, computer, skill, hooks, plugin, cmd(17K,
+   top-of-graph), cli. Each: move dir, root re-export shim, repoint refs to
+   already-extracted crates (config/provider/embed/store/kb/channel/types ->
+   rsclaw_*::).
+8. runtime knot stays in root: agent, gateway, server, ws, a2a, acp, heartbeat,
+   cap, cron, astock, desktop, migrate.
+
+### OLD step 3 detail (kept for reference)
+- **rsclaw-provider** ← src/provider/ (13K). deps: config, util, types, events.
    Repoint provider's refs to agent attachment types → rsclaw_types::. Keep wire
    DTOs in-crate. root lib.rs: `pub use rsclaw_provider as provider;`.
 4. **lift gateway records to rsclaw-types** (QueuedTask/ExternalJob/statuses) via
