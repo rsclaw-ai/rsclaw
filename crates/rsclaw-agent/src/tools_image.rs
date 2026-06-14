@@ -77,6 +77,26 @@ pub(crate) fn default_image_model(provider: &str) -> Option<&'static str> {
     }
 }
 
+/// Snap a requested image size to one Agnes Image 2.0/2.1 actually
+/// supports (1024x1024 / 1024x768 / 768x1024). Anything larger (e.g. the
+/// model loves to ask for 2048x2048) hangs the upstream until the client
+/// times out, so we always clamp by aspect ratio rather than trust the
+/// caller's `size`.
+pub(crate) fn agnes_image_size(requested: &str) -> &'static str {
+    let (w, h) = requested
+        .split_once('x')
+        .and_then(|(a, b)| Some((a.trim().parse::<f32>().ok()?, b.trim().parse::<f32>().ok()?)))
+        .unwrap_or((1024.0, 1024.0));
+    let ratio = w / h.max(1.0);
+    if ratio > 1.15 {
+        "1024x768"
+    } else if ratio < 0.87 {
+        "768x1024"
+    } else {
+        "1024x1024"
+    }
+}
+
 /// Default video-gen model for a primary LLM provider — same opt-in-by-
 /// primary-provider rule as [`default_image_model`].
 pub(crate) fn default_video_model(provider: &str) -> Option<&'static str> {
@@ -265,6 +285,10 @@ impl super::runtime::AgentRuntime {
         let (base_url, _auth_style) = rsclaw_provider::defaults::resolve_base_url(prov_name);
 
         let default_size = match prov_name {
+            // Agnes Image 2.0/2.1 only support up to 1024-tier sizes
+            // (1024x1024 / 1024x768 / 768x1024); a 2048x2048 request hangs
+            // server-side until the client times out.
+            "agnes" => "1024x1024",
             _ => "2048x2048",
         };
         let size = args["size"].as_str().unwrap_or(default_size);
@@ -537,7 +561,9 @@ impl super::runtime::AgentRuntime {
             let body = json!({
                 "model": image_model,
                 "prompt": prompt,
-                "size": size,
+                // Clamp to a supported tier — the model often asks for
+                // 2048x2048, which Agnes can't serve and hangs on.
+                "size": agnes_image_size(size),
                 "extra_body": extra,
             });
             let resp = client
