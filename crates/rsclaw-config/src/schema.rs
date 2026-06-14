@@ -439,6 +439,17 @@ pub struct AgentDefaults {
     /// is bounded by the worker's max-session-ctx; this only bounds the
     /// per-turn delta. Default: 5000.
     pub max_per_turn_input_tokens: Option<u32>,
+    /// Max tokens a SINGLE `read_artifact` call may return in one page.
+    /// `read_artifact` is the explicit "give me this content" path, so it
+    /// gets a much wider budget than the generic per-turn floor
+    /// (`max_per_turn_input_tokens`) — most SKILL.md / web pages then come
+    /// back whole in one read and never need paging. Still BOUNDED: a
+    /// deliberate read can't blow the session context in one shot. Content
+    /// beyond this size is served via the server-side read cursor (each
+    /// `read_artifact` returns the next chunk ≤ this budget). The per-turn
+    /// aggregate guard is raised to at least this value so the page actually
+    /// reaches the model instead of being re-trimmed. Default: 16000.
+    pub max_artifact_read_tokens: Option<u32>,
     pub timezone: Option<String>,
     pub timestamp: Option<Value>,
     pub thinking: Option<ThinkingConfig>,

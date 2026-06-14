@@ -819,29 +819,38 @@ pub fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "read_artifact".to_owned(),
-        description: "Read the full content of a tool_result artifact written by the runtime backstop.\n\
+        description: "Read the content of a tool_result artifact written by the runtime backstop.\n\
             \n\
             When any tool produces output larger than ~4 KB, the runtime writes the full \
             payload to disk and shows you only a head+tail preview in the tool_result. The \
-            preview ends with `... N lines omitted — call read_artifact(tool_result_id=\"tr_xxxxxxxx\") ...`. \
+            preview ends with `... call read_artifact(tool_result_id=\"tr_xxxxxxxx\") ...`. \
             That id is your handle.\n\
             \n\
-            Modes:\n\
-              - mode=\"stat\"        size + line count only, no content (CHEAP — check first if you don't know how big it is)\n\
-              - mode=\"full\"        (default) entire artifact text\n\
-              - mode=\"head:N\"      first N lines\n\
-              - mode=\"tail:N\"      last N lines\n\
+            DEFAULT (no mode): returns the NEXT unread chunk and advances a server-side \
+            cursor. To read a long artifact, just call read_artifact again (no mode) until \
+            you see `at_end` — you do NOT compute line ranges, and you cannot accidentally \
+            re-read the same page. Content that fits in one page comes back whole on the \
+            first call. If the artifact is large, the first chunk is prefixed with an AI \
+            summary so you can decide whether to keep paging or jump straight to specifics.\n\
+            \n\
+            Modes (optional):\n\
+              - (none)             next unread chunk (cursor advances) — the normal way to read\n\
+              - mode=\"reset\"       restart paging from the top\n\
+              - mode=\"query:Q\"     SEMANTIC search — returns the sections most relevant to \
+            question Q. BEST way to find a fact in a big artifact; prefer over paging when \
+            you know what you're looking for.\n\
+              - mode=\"grep:PAT\"    case-insensitive regex over lines (exact-string match; alternation `a|b|c` works)\n\
               - mode=\"lines:A-B\"   inclusive 1-indexed line range\n\
-              - mode=\"grep:PAT\"    case-insensitive regex over lines (substring works; alternation `a|b|c` works)\n\
+              - mode=\"head:N\" / \"tail:N\"   first / last N lines\n\
+              - mode=\"stat\"        size + line count only, no content (CHEAP)\n\
             \n\
             Artifacts are session-scoped — an id from another session won't resolve. They \
-            also expire after 7 days. If you only need to scan for a known substring, \
-            `mode=\"grep:...\"` is much cheaper than `full`.".to_owned(),
+            also expire after 7 days.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "tool_result_id": {"type": "string", "description": "Artifact id of the form `tr_xxxxxxxx` returned in a prior compacted tool_result."},
-                "mode": {"type": "string", "description": "full | head:N | tail:N | lines:A-B | grep:PATTERN. Default `full`."}
+                "mode": {"type": "string", "description": "Omit to read the next chunk (cursor advances — the normal way). Or: query:QUESTION (semantic search) | grep:PATTERN | lines:A-B | head:N | tail:N | reset | stat."}
             },
             "required": ["tool_result_id"]
         }),
@@ -1471,7 +1480,8 @@ pub fn build_tool_list(
             "properties": {
                 "query":    {"type": "string", "description": "Search query — specific keywords + dates."},
                 "provider": {"type": "string", "description": "duckduckgo | google | bing | brave. Empty = default."},
-                "limit":    {"type": "integer", "default": 5, "description": "Max results."}
+                "limit":    {"type": "integer", "default": 5, "description": "Max results."},
+                "deep":     {"type": "boolean", "default": false, "description": "When true, don't return snippets — fetch the top pages' full text, rerank the most relevant passages against the query, and return those text chunks with their source URLs. Use for precision questions where snippets are too thin (analysis, comparisons, 'what does X actually say'). Slower (a few seconds); skip for quick lookups."}
             },
             "required": ["query"]
         }),

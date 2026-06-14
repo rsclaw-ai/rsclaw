@@ -44,7 +44,8 @@ fn attach_raw_artifact(result: &mut Value, artifact: Option<String>, raw_chars: 
         Value::String(
             "`text` above is a flash-model summary of this page. The full \
              markdown is preserved in the artifact — call read_artifact \
-             with `mode=full|grep:…|lines:A-B` for the raw content."
+             (no mode) to read the next chunk, or mode=\"query:QUESTION\" / \
+             grep:PATTERN to jump to the raw content you need."
                 .to_owned(),
         ),
     );
@@ -153,6 +154,22 @@ impl AgentRuntime {
         let query = args["query"]
             .as_str()
             .ok_or_else(|| anyhow!("web_search: `query` required"))?;
+
+        // ---- Deep mode: fetch top-page bodies + rerank into chunks ----------
+        // `deep=true` upgrades snippet-search into a read-the-page pipeline
+        // (fetch top-N full text → chunk → embed/cosine recall → optional
+        // cross-encoder rerank → return the most relevant chunks). It calls
+        // back into plain search (with `_planned`, and no `deep`) for URLs, so
+        // this branch does not recurse.
+        if args
+            .get("deep")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            let q = query.trim().to_owned();
+            let limit = args.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
+            return self.deep_web_search(&q, limit).await;
+        }
 
         // ---- Query planner: split & route via the flash model ---------------
         // For a multi-entity or structured query the planner decomposes it
@@ -658,6 +675,164 @@ impl AgentRuntime {
         }
 
         Ok(json!({ "results": results, "provider": chosen }))
+    }
+
+    /// `web_search` deep mode (DeepSeek/Yuanbao-style "read the page"):
+    /// search → concurrently fetch top-N page bodies (strict per-fetch
+    /// timeout) → chunk → embed + cosine recall → optional cross-encoder
+    /// rerank → return the most relevant *text chunks* with their source
+    /// URL, instead of thin snippets. Purely in-memory — does NOT touch the
+    /// KB store. Degrades to plain snippet search whenever a stage yields
+    /// nothing usable, so it never fails harder than the base search.
+    pub(crate) async fn deep_web_search(&self, query: &str, limit: Option<usize>) -> Result<Value> {
+        let fetch_n = limit.unwrap_or(DEEP_FETCH_TOP_N).clamp(1, 10);
+
+        // 1. Plain search for URLs. `_planned` bypasses the query planner;
+        //    `deep` is absent so this does not recurse.
+        // Box::pin breaks the async-fn recursion cycle (tool_web_search →
+        // deep_web_search → tool_web_search); the `_planned`/no-`deep` args
+        // ensure it runs the plain snippet path exactly once.
+        let raw = Box::pin(
+            self.tool_web_search(json!({ "query": query, "limit": fetch_n, "_planned": true })),
+        )
+        .await?;
+        let hits: Vec<(String, String)> = raw
+            .get("results")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|r| {
+                        let url = r.get("url").and_then(|v| v.as_str())?.to_owned();
+                        let title = r
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_owned();
+                        Some((title, url))
+                    })
+                    .take(fetch_n)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if hits.is_empty() {
+            return Ok(raw);
+        }
+
+        // 2. Fetch page bodies concurrently with a strict per-fetch timeout
+        //    (reqwest's own timeout); reuse the HTML→text dehydrator.
+        let client = match reqwest::Client::builder()
+            .user_agent(DEEP_FETCH_UA)
+            .timeout(Duration::from_millis(DEEP_PER_FETCH_TIMEOUT_MS))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "deep_web_search: client build failed; returning snippets");
+                return Ok(raw);
+            }
+        };
+        let pages: Vec<(String, String, String)> = futures::stream::iter(hits.into_iter().map(
+            |(title, url)| {
+                let client = client.clone();
+                async move {
+                    let body = client.get(&url).send().await.ok()?.text().await.ok()?;
+                    let text = crate::web_parsers::html_dehydrate_to_text(&body);
+                    if text.trim().chars().count() < 200 {
+                        return None; // SPA / blocked / empty — skip (no browser fallback in deep mode for latency)
+                    }
+                    Some((title, url, text))
+                }
+            },
+        ))
+        .buffer_unordered(DEEP_FETCH_CONCURRENCY)
+        .filter_map(|x| async move { x })
+        .collect()
+        .await;
+        if pages.is_empty() {
+            return Ok(raw);
+        }
+
+        // 3. Chunk every page (~500-token, paragraph-aware, CJK-calibrated).
+        let mut chunk_text: Vec<String> = Vec::new();
+        let mut chunk_src: Vec<(String, String)> = Vec::new(); // (title, url)
+        for (title, url, text) in &pages {
+            for c in deep_chunk(text) {
+                chunk_text.push(c);
+                chunk_src.push((title.clone(), url.clone()));
+            }
+        }
+        if chunk_text.is_empty() {
+            return Ok(raw);
+        }
+
+        // 4. Embed query + chunks, cosine recall to top-K.
+        let embedder = deep_embedder();
+        let mut batch: Vec<String> = Vec::with_capacity(chunk_text.len() + 1);
+        batch.push(query.to_owned());
+        batch.extend(chunk_text.iter().cloned());
+        let mut order: Vec<usize> = (0..chunk_text.len()).collect();
+        match embedder.embed_batch(&batch) {
+            Ok(vecs) if vecs.len() == chunk_text.len() + 1 => {
+                let qv = &vecs[0];
+                let mut scored: Vec<(usize, f32)> = (0..chunk_text.len())
+                    .map(|i| (i, rsclaw_kb::search::cosine_sim(qv, &vecs[i + 1])))
+                    .collect();
+                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                order = scored.into_iter().map(|(i, _)| i).collect();
+            }
+            Ok(_) => warn!("deep_web_search: embed batch size mismatch; using fetch order"),
+            Err(e) => warn!(error = %e, "deep_web_search: embed failed; using fetch order"),
+        }
+        order.truncate(DEEP_COSINE_TOPK.min(chunk_text.len()));
+
+        // 5. Optional cross-encoder rerank over the cosine top-K.
+        let mut final_order = order.clone();
+        if let Some(reranker) = self.resolve_web_reranker() {
+            let docs: Vec<&str> = order.iter().map(|&i| chunk_text[i].as_str()).collect();
+            match reranker.rerank(query, &docs) {
+                Ok(scores) => {
+                    let mut z: Vec<(usize, f32)> =
+                        order.iter().copied().zip(scores).collect();
+                    z.sort_by(|a, b| {
+                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    final_order = z.into_iter().map(|(i, _)| i).collect();
+                }
+                Err(e) => warn!(error = %e, "deep_web_search: rerank failed; using cosine order"),
+            }
+        }
+        final_order.truncate(DEEP_RETURN_CHUNKS);
+
+        let results: Vec<Value> = final_order
+            .iter()
+            .map(|&i| {
+                json!({
+                    "title": chunk_src[i].0,
+                    "url": chunk_src[i].1,
+                    "text": chunk_text[i],
+                })
+            })
+            .collect();
+        info!(
+            chunks = chunk_text.len(),
+            returned = results.len(),
+            "deep_web_search: returned reranked chunks"
+        );
+        Ok(json!({ "mode": "deep", "query": query, "results": results }))
+    }
+
+    /// Resolve the reranker for deep web search, per the rsclaw-protocol
+    /// default policy: explicit `kb.rerank` wins; else if the primary model
+    /// is `rsclaw/` default to the fleet `rsclaw-reranker-v1`; else `None`
+    /// (caller keeps the local cosine order from `bge-small-zh`).
+    fn resolve_web_reranker(&self) -> Option<std::sync::Arc<rsclaw_kb::rerank::KbReranker>> {
+        if let Some(r) = rsclaw_kb::rerank::KbReranker::from_config() {
+            return Some(r);
+        }
+        if self.primary_is_rsclaw() {
+            return Some(rsclaw_kb::rerank::KbReranker::rsclaw_default());
+        }
+        None
     }
 
     /// Helper: run a free scraping search provider and return results.
@@ -2901,4 +3076,125 @@ async fn fetch_stock_sina(client: &reqwest::Client, query: &str) -> (&'static st
             "time": fields[31],
         }),
     )
+}
+
+// ---------------------------------------------------------------------------
+// web_search deep mode — tuning + chunking + embedder
+// ---------------------------------------------------------------------------
+
+/// Top search results whose full page we fetch in deep mode.
+const DEEP_FETCH_TOP_N: usize = 5;
+/// Concurrent page fetches (buffer_unordered window).
+const DEEP_FETCH_CONCURRENCY: usize = 5;
+/// Strict per-page fetch deadline — past this we drop the page so one slow
+/// site can't stall the whole answer.
+const DEEP_PER_FETCH_TIMEOUT_MS: u64 = 3000;
+/// Cosine-recall window handed to the reranker.
+const DEEP_COSINE_TOPK: usize = 12;
+/// Chunks returned to the model after rerank.
+const DEEP_RETURN_CHUNKS: usize = 5;
+const DEEP_FETCH_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+/// Process-wide cached embedder for deep web search. Reuses the KB's
+/// configured embedder (local `bge-small-zh` by default, or the remote
+/// fleet embedder if `kb.embed` points there) so we never reload a local
+/// model per query.
+fn deep_embedder() -> std::sync::Arc<dyn rsclaw_kb::embedder::KbEmbedder> {
+    static EMB: std::sync::OnceLock<std::sync::Arc<dyn rsclaw_kb::embedder::KbEmbedder>> =
+        std::sync::OnceLock::new();
+    EMB.get_or_init(|| {
+        let kb_root = rsclaw_config::loader::base_dir().join("kb");
+        rsclaw_kb::embedder::resolve_embedder(&kb_root)
+    })
+    .clone()
+}
+
+/// Split dehydrated page text into ~500-token, paragraph-aligned chunks.
+/// CJK-calibrated token estimate (CJK ≈ 1 token/char, ASCII ≈ 1 token/4
+/// chars). Transient web text, so no dedup / version IDs (unlike the KB
+/// chunker). Capped at 40 chunks/page to bound a pathological page.
+fn deep_chunk(text: &str) -> Vec<String> {
+    const TARGET: usize = 500;
+    let mut out: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    let mut buf_tok = 0usize;
+    for para in text.split("\n\n").map(str::trim).filter(|p| !p.is_empty()) {
+        let t = deep_approx_tokens(para);
+        if buf_tok + t > TARGET && !buf.is_empty() {
+            out.push(std::mem::take(&mut buf));
+            buf_tok = 0;
+        }
+        if !buf.is_empty() {
+            buf.push_str("\n\n");
+        }
+        buf.push_str(para);
+        buf_tok += t;
+        if buf_tok >= TARGET * 2 {
+            out.push(std::mem::take(&mut buf));
+            buf_tok = 0;
+        }
+        if out.len() >= 40 {
+            break;
+        }
+    }
+    if !buf.trim().is_empty() && out.len() < 40 {
+        out.push(buf);
+    }
+    out
+}
+
+/// CJK-aware token estimate matching the KB chunker's calibration.
+fn deep_approx_tokens(s: &str) -> usize {
+    let mut cjk = 0usize;
+    let mut other = 0usize;
+    for c in s.chars() {
+        if matches!(c as u32, 0x2E80..=0x9FFF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF) {
+            cjk += 1;
+        } else {
+            other += 1;
+        }
+    }
+    cjk + other / 4
+}
+
+#[cfg(test)]
+mod deep_search_tests {
+    use super::{deep_approx_tokens, deep_chunk};
+
+    #[test]
+    fn approx_tokens_cjk_vs_ascii() {
+        assert_eq!(deep_approx_tokens("贵州茅台"), 4); // 4 CJK = 4 tokens
+        assert_eq!(deep_approx_tokens("abcdefgh"), 2); // 8 ascii / 4 = 2
+        // mixed: 2 CJK + 4 ascii/4 = 2 + 1
+        assert_eq!(deep_approx_tokens("茅台abcd"), 3);
+    }
+
+    #[test]
+    fn chunk_splits_paragraphs_to_target() {
+        // Each paragraph ~250 CJK tokens; two should fit one ~500 chunk,
+        // the third spills to a second chunk.
+        let para = "茅".repeat(250);
+        let text = format!("{para}\n\n{para}\n\n{para}");
+        let chunks = deep_chunk(&text);
+        assert_eq!(chunks.len(), 2, "got {} chunks", chunks.len());
+        // First chunk holds two paragraphs joined by a blank line.
+        assert!(chunks[0].contains("\n\n"));
+    }
+
+    #[test]
+    fn chunk_empty_and_blank_yield_nothing() {
+        assert!(deep_chunk("").is_empty());
+        assert!(deep_chunk("\n\n   \n\n").is_empty());
+    }
+
+    #[test]
+    fn chunk_caps_at_40() {
+        // 100 short paragraphs, each its own chunk would exceed the cap.
+        let text = (0..100)
+            .map(|i| format!("paragraph number {i} with some filler words here"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let chunks = deep_chunk(&text);
+        assert!(chunks.len() <= 40, "cap breached: {}", chunks.len());
+    }
 }

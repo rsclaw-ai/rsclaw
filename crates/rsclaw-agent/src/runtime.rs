@@ -732,6 +732,16 @@ pub struct AgentRuntime {
     /// command. Shares the same driver primitives as `cap_manager` but
     /// keeps long-lived drivers keyed by session_id.
     pub(crate) cap_live_manager: Option<std::sync::Arc<rsclaw_cap::CapLiveManager>>,
+    /// Server-side read cursors for `read_artifact` sequential paging.
+    /// Key: `"{session_key}\u{0}{artifact_id}"` → next 1-indexed line to
+    /// return. A bare `read_artifact` (no explicit mode) returns the next
+    /// unread chunk and advances this cursor, so the model never has to
+    /// compute `lines:A-B` ranges — calling again always makes progress and
+    /// re-reading the same page is impossible. Interior-mutable because tool
+    /// dispatch borrows `&self`. Entries are best-effort (lost on restart,
+    /// which just resets paging to the top — harmless).
+    pub(crate) artifact_cursors:
+        std::sync::Mutex<std::collections::HashMap<String, usize>>,
 }
 
 impl AgentRuntime {
@@ -817,6 +827,7 @@ impl AgentRuntime {
             exec_pool,
             cap_manager,
             cap_live_manager,
+            artifact_cursors: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
 
         // Purge any internal-session history left over in redb from older
@@ -1355,6 +1366,30 @@ impl AgentRuntime {
     /// If both are empty, falls back to primary chain (matches the
     /// legacy `FallbackToPrimary` semantics — drivers want SOMETHING
     /// vision-capable, and the agent's primary is the best guess).
+    /// True when the agent's primary model chain (per-agent or defaults)
+    /// uses the `rsclaw/` protocol. Drives rsclaw-protocol defaults (e.g.
+    /// defaulting rerank to the fleet `rsclaw-reranker-v1`), mirroring the
+    /// detection inside [`resolve_vision_chain`].
+    pub(crate) fn primary_is_rsclaw(&self) -> bool {
+        let per_agent = &self.handle.config;
+        let defaults = &self.config.agents.defaults;
+        per_agent
+            .model
+            .as_ref()
+            .map(|m| m.primary_chain())
+            .into_iter()
+            .flatten()
+            .chain(
+                defaults
+                    .model
+                    .as_ref()
+                    .map(|m| m.primary_chain())
+                    .into_iter()
+                    .flatten(),
+            )
+            .any(|m| m.trim().starts_with("rsclaw/"))
+    }
+
     pub(crate) fn resolve_vision_chain(&self) -> Vec<String> {
         let per_agent = &self.handle.config;
         let defaults = &self.config.agents.defaults;
@@ -2001,8 +2036,10 @@ impl AgentRuntime {
         match rsclaw_artifact::default_store().write(session_key, body) {
             Ok(id) => format!(
                 "{page}\n\n[truncated to fit the per-turn input budget — full output preserved; \
-                 call read_artifact(tool_result_id=\"{}\", mode=\"lines:A-B\" | \"grep:PATTERN\") \
-                 to page through the rest]",
+                 call read_artifact(tool_result_id=\"{}\") to read the next chunk (repeat to \
+                 page through it), or read_artifact(tool_result_id=\"{}\", mode=\"query:QUESTION\") \
+                 to jump to the relevant part]",
+                id.as_str(),
                 id.as_str()
             ),
             // Artifact write failed: bounded but lossy. Mark it honestly.
@@ -5640,6 +5677,21 @@ impl AgentRuntime {
         let mut last_tool_key = String::new();
         let mut same_call_streak: usize = 0;
         const MAX_SAME_CALL_STREAK: usize = 5;
+        // Track consecutive calls to the same tool NAME (args may differ). This
+        // catches loops that bypass `same_call_streak` by varying args every
+        // call — e.g. read_artifact paging forever (mode/lines change each turn,
+        // each page is "new" so the stagnation budget never depletes). Legit
+        // paging rarely exceeds a handful; past the threshold we deplete the
+        // budget hard so the wrap-up prompt fires and the model must answer.
+        let mut last_tool_name_only = String::new();
+        let mut same_name_streak: usize = 0;
+        const MAX_SAME_NAME_STREAK: usize = 10;
+        // Absolute hard ceiling on loop iterations, independent of the
+        // progress-aware stagnation budget. The budget treats every call that
+        // returns new output as "free", so a productive-looking loop (paging,
+        // re-routing search) can spin unbounded — this is the universal
+        // backstop. Set well above any legitimate multi-tool turn.
+        const HARD_MAX_ITERATIONS: usize = 80;
         // Track consecutive tool errors — stop early when tools keep failing.
         let mut error_streak: usize = 0;
         // Identical-failing-call ledger: hash(tool_name + canonical args) →
@@ -5672,6 +5724,50 @@ impl AgentRuntime {
 
         loop {
             iteration += 1;
+            // Absolute hard ceiling — universal backstop against loops that the
+            // progress-aware stagnation budget can't catch (productive-looking
+            // paging / re-routing). A turn that legitimately needs >80 tool
+            // iterations is itself pathological; stop and hand back what we have.
+            if iteration > HARD_MAX_ITERATIONS {
+                warn!(
+                    session = %ctx.session_key,
+                    iterations = iteration,
+                    tool = %last_tool_name,
+                    "agent_loop: hard iteration ceiling reached, breaking out"
+                );
+                let lang = rsclaw_i18n::default_lang();
+                let terminal_text = rsclaw_i18n::t_fmt(
+                    "agent_max_iterations",
+                    lang,
+                    &[
+                        ("iterations", &iteration.to_string()),
+                        ("tool", &last_tool_name),
+                    ],
+                );
+                if let Some(ref bus) = self.event_bus {
+                    let _ = bus.send(AgentEvent {
+                        session_id: ctx.session_key.clone(),
+                        agent_id: ctx.agent_id.clone(),
+                        delta: terminal_text.clone(),
+                        done: true,
+                        files: vec![],
+                        images: vec![],
+                        tool_log: vec![],
+                        question: None,
+                        channel: None,
+                    });
+                }
+                return Ok(AgentReply {
+                    text: terminal_text,
+                    is_empty: false,
+                    tool_calls: None,
+                    images: vec![],
+                    files: vec![],
+                    pending_analysis: None,
+                    needs_outer_done_emit: false,
+                    outcome: crate::registry::ReplyOutcome::Ok,
+                });
+            }
             // Check clear_signal mid-loop: clear sessions and abort.
             if self.handle.clear_signal.load(Ordering::SeqCst) {
                 self.handle.clear_signal.store(false, Ordering::SeqCst);
@@ -5897,14 +5993,19 @@ impl AgentRuntime {
             // (413) when a big tool result / SKILL.md landed in one turn.
             // Lossless: oversized results are paged (read_artifact handle
             // preserved), not dropped.
-            let per_turn_budget = self
-                .live
-                .agents
-                .read()
-                .await
-                .defaults
-                .max_per_turn_input_tokens
-                .unwrap_or(5_000) as usize;
+            let per_turn_budget = {
+                let defaults = &self.live.agents.read().await.defaults;
+                let base = defaults.max_per_turn_input_tokens.unwrap_or(5_000) as usize;
+                // A deliberate `read_artifact` self-paginates to ≤
+                // max_artifact_read_tokens; the aggregate guard must allow at
+                // least that much through, or it would re-trim the page the
+                // model explicitly asked for back down to `base` and defeat the
+                // wider single-read budget. So the per-turn ceiling is the max
+                // of the two — still bounded (capped at the read budget), so
+                // context can't blow unbounded.
+                let artifact_read = defaults.max_artifact_read_tokens.unwrap_or(16_000) as usize;
+                base.max(artifact_read)
+            };
             self.cap_turn_input_to_budget(&ctx.session_key, &mut turn_scratchpad, per_turn_budget)
                 .await;
 
@@ -7281,6 +7382,28 @@ impl AgentRuntime {
                     same_call_streak = 1;
                 }
 
+                // Detect the same tool NAME called repeatedly with varying args
+                // (read_artifact paging, search re-routing). These bypass
+                // same_call_streak (args differ) and the stagnation budget (each
+                // result is "new"), so deplete the budget hard past the
+                // threshold to force the wrap-up prompt instead of spinning.
+                if tool_name == last_tool_name_only {
+                    same_name_streak += 1;
+                    if same_name_streak > MAX_SAME_NAME_STREAK {
+                        budget -= 4;
+                        ctx.turn_metrics.stagnation_budget = budget;
+                        warn!(
+                            tool = %tool_name,
+                            streak = same_name_streak,
+                            budget,
+                            "agent_loop: same tool name repeated past threshold, depleting budget"
+                        );
+                    }
+                } else {
+                    last_tool_name_only = tool_name.clone();
+                    same_name_streak = 1;
+                }
+
                 // Upgrade stagnation budget when complex or multi-step tools are used.
                 if matches!(
                     tool_name.as_str(),
@@ -7835,9 +7958,17 @@ impl AgentRuntime {
                             // bypass the backstop — re-compacting their full-read
                             // response would write a new artifact and force the LLM
                             // into a nested re-fetch loop.
+                            //
+                            // `skill_use` is also exempt: SKILL.md is INSTRUCTIONS the
+                            // model must execute faithfully (exact CLI flags / steps).
+                            // Offloading it to a head+tail preview would force the model
+                            // to act on a partial spec — a correctness bug, not just a
+                            // token-saving tradeoff. The per-turn aggregate guard
+                            // (cap_turn_input_to_budget) still bounds a pathologically
+                            // huge SKILL.md, so this can't blow the context unbounded.
                             let v = if matches!(
                                 tool_name.as_str(),
-                                "read_artifact" | "read_session_archive"
+                                "read_artifact" | "read_session_archive" | "skill_use"
                             ) {
                                 v
                             } else {

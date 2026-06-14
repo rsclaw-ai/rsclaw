@@ -182,7 +182,88 @@ fn selected_start_line(mode: &str, total_lines: usize) -> Option<usize> {
     None
 }
 
+/// A line-windowed slice of an artifact, used by ad-hoc semantic search.
+struct SearchChunk {
+    text: String,
+    /// 0-indexed first line of the chunk.
+    start_line: usize,
+    /// 0-indexed line one past the chunk's last line.
+    end_line: usize,
+}
+
+/// Split text into ~line-windowed chunks for transient semantic search.
+/// Deliberately simpler than the KB markdown chunker — no LogicalSourceId /
+/// locator machinery, just fixed windows with line tracking, which is all a
+/// one-blob top-k retrieval needs.
+fn chunk_for_search(full: &str) -> Vec<SearchChunk> {
+    const WINDOW: usize = 40;
+    let lines: Vec<&str> = full.lines().collect();
+    let mut chunks = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let end = (i + WINDOW).min(lines.len());
+        let text = lines[i..end].join("\n");
+        if !text.trim().is_empty() {
+            chunks.push(SearchChunk {
+                text,
+                start_line: i,
+                end_line: end,
+            });
+        }
+        i = end;
+    }
+    chunks
+}
+
+/// Cosine similarity of two equal-length embedding vectors.
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() {
+        return 0.0;
+    }
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if na < 1e-12 || nb < 1e-12 {
+        0.0
+    } else {
+        dot / (na * nb)
+    }
+}
+
+/// Fallback chunk scorer when no embedder is available: term-overlap count.
+fn substring_score(chunks: &[SearchChunk], query: &str) -> Vec<(usize, f32)> {
+    let ql = query.to_lowercase();
+    let terms: Vec<&str> = ql.split_whitespace().collect();
+    let mut scored: Vec<(usize, f32)> = chunks
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let cl = c.text.to_lowercase();
+            let hits = terms.iter().filter(|t| cl.contains(*t)).count();
+            (i, hits as f32)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored
+}
+
 impl AgentRuntime {
+    /// Per-call read budget for `read_artifact` — much wider than the generic
+    /// per-turn floor (`max_per_turn_input_tokens`), so a deliberate read of a
+    /// SKILL.md / web page comes back whole in one shot. Still BOUNDED
+    /// (`max_artifact_read_tokens`, default 16000): content beyond this is
+    /// served chunk-by-chunk via the server-side cursor, so a single read can
+    /// never blow the session context.
+    async fn artifact_read_budget(&self) -> usize {
+        self.live
+            .agents
+            .read()
+            .await
+            .defaults
+            .max_artifact_read_tokens
+            .unwrap_or(16_000) as usize
+    }
+
     pub(crate) async fn tool_read_artifact(&self, ctx: &RunContext, args: Value) -> Result<Value> {
         // Trim string args: the rsclaw v1 tool-call protocol leaks a trailing
         // newline into them (same root cause as read_session_archive `mode`
@@ -201,7 +282,9 @@ impl AgentRuntime {
             })?;
         let id = ArtifactId::parse(id_str)?;
 
-        let mode = args["mode"].as_str().unwrap_or("full").trim();
+        // No mode = cursor mode (return the next unread chunk). The model
+        // never has to compute line ranges; calling again always advances.
+        let mode = args["mode"].as_str().unwrap_or("").trim();
         let store = default_store();
         let full = store.read(&ctx.session_key, &id).map_err(|e| {
             anyhow!(
@@ -213,14 +296,13 @@ impl AgentRuntime {
         })?;
 
         let total_lines = full.lines().count();
-        let selected = apply_mode(&full, mode)?;
+        let budget = self.artifact_read_budget().await;
 
-        // stat returns no content — emit the size summary and return early
-        // so pagination never touches it.
+        // stat — size summary only, no content.
         if mode == "stat" {
             return Ok(json!({
                 "tool_result_id": id.as_str(),
-                "mode": mode,
+                "mode": "stat",
                 "total_lines": total_lines,
                 "returned_chars": 0,
                 "content": "",
@@ -229,52 +311,316 @@ impl AgentRuntime {
             }));
         }
 
-        // Per-turn input floor: a mode=full (or any) result that would blow
-        // `max_per_turn_input_tokens` is paged instead of dumped whole.
-        // Lossless (full artifact stays on disk) + bounded (page ≤ budget);
-        // the model pages on via lines:A-B / grep:.
-        let budget = self
-            .live
-            .agents
-            .read()
-            .await
-            .defaults
-            .max_per_turn_input_tokens
-            .unwrap_or(5_000) as usize;
-        let (page, page_lines, selected_lines) = paginate_to_budget(&selected, budget);
-        let truncated = page_lines < selected_lines;
+        // query:QUESTION — semantic search over the artifact (no cursor/paging).
+        if let Some(q) = mode.strip_prefix("query:") {
+            return self
+                .artifact_semantic_search(&id, &full, q.trim(), budget)
+                .await;
+        }
+
+        // Random-access modes (head/tail/lines/grep): explicit, bypass the
+        // cursor, bounded to the (now wider) budget.
+        let is_random_access = mode.starts_with("head:")
+            || mode.starts_with("tail:")
+            || mode.starts_with("lines:")
+            || mode.starts_with("grep:");
+        if is_random_access {
+            let selected = apply_mode(&full, mode)?;
+            let (page, page_lines, selected_lines) = paginate_to_budget(&selected, budget);
+            let truncated = page_lines < selected_lines;
+            let mut out = json!({
+                "tool_result_id": id.as_str(),
+                "mode": mode,
+                "total_lines": total_lines,
+                "returned_chars": page.chars().count(),
+                "content": page,
+            });
+            if truncated {
+                out["truncated"] = json!(true);
+                out["returned_lines"] = json!(page_lines);
+                out["selected_lines"] = json!(selected_lines);
+                let next = match selected_start_line(mode, total_lines) {
+                    Some(start) => {
+                        let next_start = start + page_lines;
+                        format!(
+                            "Returned lines {start}-{} of this slice. Call read_artifact with \
+                             mode=\"lines:{next_start}-{total_lines}\" for the next page, or \
+                             grep:PATTERN / query:QUESTION to jump straight to what you need.",
+                            start + page_lines - 1
+                        )
+                    }
+                    None => format!(
+                        "Returned {page_lines} of {selected_lines} matching lines. Narrow the \
+                         grep:PATTERN or use query:QUESTION."
+                    ),
+                };
+                out["next"] = json!(next);
+            }
+            return Ok(out);
+        }
+
+        // Cursor modes: "" / "next" advance from the saved cursor; "full" /
+        // "reset" start over from the top. Re-reading the same page is
+        // impossible — each call moves the cursor forward — which is the whole
+        // point: it removes the stateful "compute the next lines:A-B" burden
+        // that even strong models fail at on long content.
+        let from_top = mode == "full" || mode == "reset";
+        let cursor_key = format!("{}\u{0}{}", ctx.session_key, id.as_str());
+        let lines: Vec<&str> = full.lines().collect();
+
+        let start_line = if from_top {
+            0
+        } else {
+            self.artifact_cursors
+                .lock()
+                .map(|m| m.get(&cursor_key).copied().unwrap_or(0))
+                .unwrap_or(0)
+        };
+
+        // Already past the end (a bare "next" after everything was read):
+        // say so clearly instead of returning an empty page the model loops on.
+        if start_line >= total_lines && !from_top {
+            return Ok(json!({
+                "tool_result_id": id.as_str(),
+                "mode": "next",
+                "total_lines": total_lines,
+                "at_end": true,
+                "content": "[END of artifact — all content has already been read]",
+                "next": "Nothing left to read. Use mode=\"reset\" to start over, or \
+                         grep:PATTERN / query:QUESTION to search specific content.",
+            }));
+        }
+
+        // On the first chunk of content that won't fit in one page, prepend a
+        // best-effort flash summary so the model can orient (and choose to
+        // grep/query) instead of blindly paging.
+        let summary = if start_line == 0
+            && crate::context_mgr::estimate_tokens(&full) > budget
+        {
+            self.artifact_summary(&ctx.session_key, &id, &full).await
+        } else {
+            None
+        };
+        let reserve = if summary.is_some() { 700 } else { 0 };
+        let page_budget = budget.saturating_sub(reserve).max(256);
+
+        let remaining_text = lines[start_line.min(lines.len())..].join("\n");
+        let (page, page_lines, _sel) = paginate_to_budget(&remaining_text, page_budget);
+        let next_line = start_line + page_lines;
+        let at_end = next_line >= total_lines;
+
+        if let Ok(mut m) = self.artifact_cursors.lock() {
+            m.insert(cursor_key, if at_end { total_lines } else { next_line });
+        }
+
+        let content = if let Some(ref s) = summary {
+            format!(
+                "[AI summary of the full {total_lines}-line artifact — use it to decide whether \
+                 to keep reading, grep:PATTERN, or query:QUESTION]\n{s}\n\n\
+                 [--- full content, lines {}-{} ---]\n{page}",
+                start_line + 1,
+                next_line
+            )
+        } else {
+            page
+        };
 
         let mut out = json!({
             "tool_result_id": id.as_str(),
-            "mode": mode,
+            "mode": "next",
             "total_lines": total_lines,
-            "returned_chars": page.chars().count(),
-            "content": page,
+            "returned_lines": page_lines,
+            "from_line": start_line + 1,
+            "to_line": next_line,
+            "content": content,
         });
-        if truncated {
-            out["truncated"] = json!(true);
-            out["returned_lines"] = json!(page_lines);
-            out["selected_lines"] = json!(selected_lines);
-            // Precise lines:A-B next-page hint when the slice is contiguous;
-            // generic guidance for grep (non-contiguous).
-            let next = match selected_start_line(mode, total_lines) {
-                Some(start) => {
-                    let next_start = start + page_lines;
-                    format!(
-                        "Returned lines {start}-{} of this slice (~{budget}-token page cap). \
-                         Call read_artifact with mode=\"lines:{next_start}-{total_lines}\" for the \
-                         next page, or grep:PATTERN to jump straight to the content you need.",
-                        start + page_lines - 1
-                    )
-                }
-                None => format!(
-                    "Returned {page_lines} of {selected_lines} matching lines (~{budget}-token \
-                     page cap). Narrow the grep:PATTERN or request a specific lines:A-B range."
-                ),
-            };
-            out["next"] = json!(next);
+        if at_end {
+            out["at_end"] = json!(true);
+        } else {
+            out["next"] = json!(format!(
+                "Showed lines {}-{} of {total_lines}. Call read_artifact again (no mode) to \
+                 continue from line {}; or grep:PATTERN / query:QUESTION to jump to specifics.",
+                start_line + 1,
+                next_line,
+                next_line + 1
+            ));
         }
         Ok(out)
+    }
+
+    /// Best-effort flash summary of an artifact, cached in a `<id>.summary.txt`
+    /// sidecar so it is generated at most once. Returns `None` on any failure —
+    /// the summary is a nicety, never required for correctness.
+    async fn artifact_summary(
+        &self,
+        session_key: &str,
+        id: &ArtifactId,
+        full: &str,
+    ) -> Option<String> {
+        let store = default_store();
+        if let Some(cached) = store.read_summary(session_key, id) {
+            return Some(cached);
+        }
+        // Cap the input fed to flash so a giant artifact doesn't bust its own
+        // context — a gist of the head is enough to orient the reader.
+        let input: String = full.chars().take(48_000).collect();
+        let summary = self.flash_summarize(&input).await?;
+        if let Err(e) = store.write_summary(session_key, id, &summary) {
+            tracing::warn!(error = %e, "artifact: failed to cache summary sidecar");
+        }
+        Some(summary)
+    }
+
+    /// One-shot, stateless flash completion that condenses `text` into a short
+    /// gist + section outline. Calls the provider registry directly (like
+    /// `query_planner`) so it works behind `&self` — the FailoverManager path
+    /// needs `&mut`, which the tool dispatch can't give.
+    async fn flash_summarize(&self, text: &str) -> Option<String> {
+        use futures::StreamExt;
+        use rsclaw_provider::{AgentEndpoint, LlmRequest, Message, MessageContent, Role, StreamEvent};
+
+        let flash_model = self.resolve_flash_model_name();
+        let (provider_name, model_id) = self.providers.resolve_model(&flash_model);
+        let provider = match self.providers.get(provider_name) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("artifact summary: flash provider unavailable: {e:#}");
+                return None;
+            }
+        };
+
+        let req = LlmRequest {
+            fallback_models: Vec::new(),
+            model: model_id.to_owned(),
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text(format!(
+                    "Summarize the following document for another AI that will then read \
+                     specific parts of it. Give a 2-4 sentence gist, then a short bullet \
+                     outline of the main sections/topics. Be faithful and concise; do not \
+                     invent.\n\n{text}"
+                )),
+                rsclaw_hidden: None,
+            }],
+            tools: vec![],
+            system: Some(
+                "You are a precise document summarizer. Output only the gist and outline."
+                    .to_owned(),
+            ),
+            max_tokens: Some(400),
+            temperature: Some(0.0),
+            frequency_penalty: None,
+            thinking_budget: None,
+            endpoint: AgentEndpoint::Flash,
+            kv_cache_mode: 0,
+            session_key: None,
+            system_shared: None,
+            user_system: None,
+            recall: None,
+        };
+
+        let mut stream = match provider.stream(req).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("artifact summary flash call failed: {e:#}");
+                return None;
+            }
+        };
+        let mut buf = String::new();
+        while let Some(ev) = stream.next().await {
+            match ev {
+                Ok(StreamEvent::TextDelta(d)) => buf.push_str(&d),
+                Ok(StreamEvent::Done { .. }) | Ok(StreamEvent::Error(_)) => break,
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("artifact summary stream error: {e:#}");
+                    break;
+                }
+            }
+        }
+        let buf = buf.trim().to_owned();
+        if buf.is_empty() { None } else { Some(buf) }
+    }
+
+    /// Semantic search over a single artifact, reusing the hot KB embedder
+    /// (no persistent index): chunk → embed chunks + query → cosine top-k.
+    /// Degrades to term-overlap scoring when the embedder is unavailable.
+    async fn artifact_semantic_search(
+        &self,
+        id: &ArtifactId,
+        full: &str,
+        query: &str,
+        budget: usize,
+    ) -> Result<Value> {
+        if query.is_empty() {
+            return Err(anyhow!("read_artifact: query:QUESTION must be non-empty"));
+        }
+        let chunks = chunk_for_search(full);
+        if chunks.is_empty() {
+            return Ok(json!({
+                "tool_result_id": id.as_str(),
+                "mode": format!("query:{query}"),
+                "matches": [],
+                "note": "Artifact is empty.",
+            }));
+        }
+
+        let ranked: Vec<(usize, f32)> = if let Some(kb) = rsclaw_kb::global_service() {
+            let embedder = kb.embedder();
+            let mut inputs: Vec<String> = Vec::with_capacity(chunks.len() + 1);
+            inputs.push(query.to_owned());
+            inputs.extend(chunks.iter().map(|c| c.text.clone()));
+            let n = chunks.len();
+            match tokio::task::spawn_blocking(move || embedder.embed_batch(&inputs)).await {
+                Ok(Ok(vecs)) if vecs.len() == n + 1 => {
+                    let q = vecs[0].clone();
+                    let mut scored: Vec<(usize, f32)> = vecs[1..]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| (i, cosine(&q, v)))
+                        .collect();
+                    scored.sort_by(|a, b| {
+                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    scored
+                }
+                _ => substring_score(&chunks, query),
+            }
+        } else {
+            substring_score(&chunks, query)
+        };
+
+        let mut used = 0usize;
+        let mut matches = Vec::new();
+        for (i, score) in ranked.into_iter().take(12) {
+            if score <= 0.0 && !matches.is_empty() {
+                break;
+            }
+            let c = &chunks[i];
+            let t = crate::context_mgr::estimate_tokens(&c.text);
+            if used + t > budget && !matches.is_empty() {
+                break;
+            }
+            used += t;
+            matches.push(json!({
+                "from_line": c.start_line + 1,
+                "to_line": c.end_line,
+                "score": (score * 1000.0).round() / 1000.0,
+                "text": c.text,
+            }));
+            if used >= budget {
+                break;
+            }
+        }
+
+        Ok(json!({
+            "tool_result_id": id.as_str(),
+            "mode": format!("query:{query}"),
+            "total_lines": full.lines().count(),
+            "matches": matches,
+            "note": "Top semantically-relevant sections. Read surrounding context with \
+                     lines:A-B, or refine with another query:QUESTION.",
+        }))
     }
 }
 
@@ -439,5 +785,65 @@ mod tests {
         // grep / stat are non-contiguous → no precise next-range.
         assert_eq!(selected_start_line("grep:foo", 100), None);
         assert_eq!(selected_start_line("stat", 100), None);
+    }
+
+    #[test]
+    fn chunk_for_search_windows_with_line_tracking() {
+        // 95 lines → windows of 40 → [0..40, 40..80, 80..95].
+        let text = (1..=95)
+            .map(|i| format!("L{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let chunks = chunk_for_search(&text);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!((chunks[0].start_line, chunks[0].end_line), (0, 40));
+        assert_eq!((chunks[1].start_line, chunks[1].end_line), (40, 80));
+        assert_eq!((chunks[2].start_line, chunks[2].end_line), (80, 95));
+        assert!(chunks[0].text.starts_with("L1\n"));
+        assert!(chunks[2].text.ends_with("L95"));
+    }
+
+    #[test]
+    fn chunk_for_search_empty_input() {
+        assert!(chunk_for_search("").is_empty());
+    }
+
+    #[test]
+    fn cosine_identical_orthogonal_and_mismatch() {
+        let a = [1.0_f32, 0.0, 0.0];
+        let b = [1.0_f32, 0.0, 0.0];
+        let c = [0.0_f32, 1.0, 0.0];
+        assert!((cosine(&a, &b) - 1.0).abs() < 1e-6);
+        assert!(cosine(&a, &c).abs() < 1e-6);
+        // Length mismatch → 0.0, never a panic.
+        assert_eq!(cosine(&a, &[1.0_f32, 0.0]), 0.0);
+        // Zero vector → 0.0 (no NaN).
+        assert_eq!(cosine(&a, &[0.0_f32, 0.0, 0.0]), 0.0);
+    }
+
+    #[test]
+    fn substring_score_ranks_by_term_overlap() {
+        let chunks = vec![
+            SearchChunk {
+                text: "the quick brown fox".to_owned(),
+                start_line: 0,
+                end_line: 1,
+            },
+            SearchChunk {
+                text: "lazy dog sleeps".to_owned(),
+                start_line: 1,
+                end_line: 2,
+            },
+            SearchChunk {
+                text: "quick lazy fox jumps".to_owned(),
+                start_line: 2,
+                end_line: 3,
+            },
+        ];
+        let ranked = substring_score(&chunks, "quick fox");
+        // Chunk 0 and 2 both contain both terms; chunk 1 contains neither.
+        assert_eq!(ranked[0].1, 2.0);
+        assert_eq!(ranked.last().unwrap().1, 0.0);
+        assert_eq!(ranked.last().unwrap().0, 1);
     }
 }
