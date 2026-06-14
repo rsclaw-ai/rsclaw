@@ -2,8 +2,107 @@ use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Result, bail};
 
-use super::style::*;
-use crate::cli::ToolsCommand;
+use rsclaw_cli::ToolsCommand;
+
+// ---------------------------------------------------------------------------
+// CLI styling helpers (formerly crate::cmd::style; inlined here so this crate
+// stays free of a back-dependency on the root binary). Only the subset used by
+// the tools install/manifest layer is reproduced.
+// ---------------------------------------------------------------------------
+
+fn use_color() -> bool {
+    std::env::var("NO_COLOR").is_err()
+}
+
+fn green(s: &str) -> String {
+    if use_color() {
+        format!("\x1b[32m{s}\x1b[0m")
+    } else {
+        s.to_owned()
+    }
+}
+
+fn yellow(s: &str) -> String {
+    if use_color() {
+        format!("\x1b[33m{s}\x1b[0m")
+    } else {
+        s.to_owned()
+    }
+}
+
+fn red(s: &str) -> String {
+    if use_color() {
+        format!("\x1b[31m{s}\x1b[0m")
+    } else {
+        s.to_owned()
+    }
+}
+
+fn bold(s: &str) -> String {
+    if use_color() {
+        format!("\x1b[1m{s}\x1b[0m")
+    } else {
+        s.to_owned()
+    }
+}
+
+fn dim(s: &str) -> String {
+    if use_color() {
+        format!("\x1b[2m{s}\x1b[0m")
+    } else {
+        s.to_owned()
+    }
+}
+
+fn cyan(s: &str) -> String {
+    if use_color() {
+        format!("\x1b[36m{s}\x1b[0m")
+    } else {
+        s.to_owned()
+    }
+}
+
+fn banner(title: &str) {
+    let arch = std::env::consts::ARCH;
+    let os = std::env::consts::OS;
+    let c = use_color();
+    let r = if c { "\x1b[31m" } else { "" }; // red
+    let b = if c { "\x1b[1m" } else { "" }; // bold
+    let d = if c { "\x1b[2m" } else { "" }; // dim
+    let n = if c { "\x1b[0m" } else { "" }; // reset
+
+    println!(
+        r#"
+    {r}.       .{n}
+    {r} \     /{n}        {b} ____  ____   ____ _        _  __        __{n}
+    {r}( )---( ){n}       {b}|  _ \/ ___| / ___| |      / \ \ \      / /{n}
+    {r} / . . \{n}        {b}| |_) \___ \| |   | |     / _ \ \ \ /\ / /{n}
+    {r}| \___/ |{n}       {b}|  _ < ___) | |___| |___ / ___ \ \ V  V /{n}
+    {r} \_____/{n}        {b}|_| \_\____/ \____|_____/_/   \_\ \_/\_/{n}
+    {r}/       \{n}
+    {r}(       ){n}       {d}-- {title} --{n}
+"#
+    );
+    println!("    {d}[{n} {b}core{n} {d}]{n}");
+    println!("    {d}>{n} engine:   {title} {d}(Rust 2024 Edition){n}");
+    println!("    {d}>{n} platform: {arch} on {os}");
+    println!("    {d}>{n} compat:   OpenClaw drop-in replacement");
+    println!();
+    println!("    {d}{}{n}", "-".repeat(56));
+    println!();
+}
+
+fn ok(msg: &str) {
+    println!("  {} {msg}", green("[ok]"));
+}
+
+fn warn_msg(msg: &str) {
+    println!("  {} {msg}", yellow("[warn]"));
+}
+
+fn err_msg(msg: &str) {
+    println!("  {} {msg}", red("[error]"));
+}
 
 // ---------------------------------------------------------------------------
 // Hub endpoints
@@ -129,7 +228,7 @@ const TOOLS: &[ToolDef] = &[
 // ---------------------------------------------------------------------------
 
 fn tools_dir() -> PathBuf {
-    crate::config::loader::base_dir().join("tools")
+    rsclaw_config::loader::base_dir().join("tools")
 }
 
 // ---------------------------------------------------------------------------
@@ -190,7 +289,7 @@ fn manifest_tool_version(manifest: &serde_json::Value, tool: &str) -> Option<Str
 /// All installable tool names: cached-manifest keys ∪ compiled-in baseline.
 /// Sorted + de-duped for byte-stable downstream rendering. `None` cache →
 /// baseline only (offline / fetch failed).
-pub(crate) fn available_tools(cache: Option<&serde_json::Value>) -> Vec<String> {
+pub fn available_tools(cache: Option<&serde_json::Value>) -> Vec<String> {
     let mut names: Vec<String> = TOOLS.iter().map(|d| d.name.to_owned()).collect();
     // schema 2: installable tools live under `.tools` (keyed by name).
     if let Some(obj) = cache
@@ -207,7 +306,7 @@ pub(crate) fn available_tools(cache: Option<&serde_json::Value>) -> Vec<String> 
 /// Installed tools (those whose local_bin exists) paired with their marker
 /// version (None when the marker is missing — e.g. installed by an older
 /// build).
-pub(crate) fn installed_tools(tools_dir: &std::path::Path) -> Vec<(String, Option<String>)> {
+pub fn installed_tools(tools_dir: &std::path::Path) -> Vec<(String, Option<String>)> {
     // Marker + presence both key off `local_bin` (the install subdir) so the
     // marker sits alongside the binary. We only count a tool as installed when
     // a runnable binary exists; an empty staging dir from a failed install must
@@ -754,7 +853,7 @@ pub async fn cmd_install(name: &str, force: bool) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("fetch signed meta.json: {e}"))?
             .text()
             .await?;
-        let (_, _, tools_sha) = crate::skill::sig::verify_signed_meta(&meta_txt)?;
+        let (_, _, tools_sha) = rsclaw_skill::sig::verify_signed_meta(&meta_txt)?;
         use sha2::{Digest, Sha256};
         let got = format!("{:x}", Sha256::digest(manifest_txt.as_bytes()));
         if tools_sha.is_empty() || got != tools_sha {

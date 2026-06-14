@@ -177,3 +177,15 @@ pub fn canonicalize_external_path(
     }
     out
 }
+/// Read a dotted-path nested value from a JSON object (crate-split: lifted from
+/// cmd/config_json.rs so non-cmd crates can resolve config paths).
+pub fn get_nested_value<'a>(
+    val: &'a serde_json::Value,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    let mut cur = val;
+    for part in key.split('.') {
+        cur = cur.get(part)?;
+    }
+    Some(cur)
+}

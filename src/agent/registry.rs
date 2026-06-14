@@ -219,7 +219,7 @@ impl AgentHandle {
         // a process-wide OnceLock so this stays sync and free of
         // tokio::runtime::Handle::current() dependencies.
         let mut sticky_lines = String::new();
-        if let Some(mgr) = crate::cap::GLOBAL_CAP_LIVE.get() {
+        if let Some(mgr) = rsclaw_cap::GLOBAL_CAP_LIVE.get() {
             let snapshot = mgr.snapshot_sticky_blocking();
             if !snapshot.is_empty() {
                 sticky_lines.push_str("Sticky cap:\n");

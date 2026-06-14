@@ -1363,8 +1363,8 @@ pub fn build_tool_list(
     // enum/description derive from the available-tools list (cached manifest ∪
     // compiled-in baseline) so a new tool needs no edit here.
     {
-        let cache = crate::cmd::tools::load_manifest_cache_pub(&crate::cmd::tools::tools_dir_pub());
-        let available = crate::cmd::tools::available_tools(cache.as_ref());
+        let cache = rsclaw_tools::load_manifest_cache_pub(&rsclaw_tools::tools_dir_pub());
+        let available = rsclaw_tools::available_tools(cache.as_ref());
         tools.push(ToolDef {
             name: "install_tool".to_owned(),
             description: format!("Install a tool/runtime. Available: {}.", available.join(", ")),

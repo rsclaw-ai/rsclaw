@@ -1,5 +1,5 @@
 //! `tool_cap` — single LLM-facing tool that dispatches to one of four
-//! coding agents via `crate::cap::CapAgentManager`.
+//! coding agents via `rsclaw_cap::CapAgentManager`.
 //!
 //! The call returns IMMEDIATELY with `status: submitted` once the prompt
 //! is queued. Live progress reaches the user's IM channel via
@@ -12,7 +12,7 @@ use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
 use super::runtime::RunContext;
-use crate::cap::{
+use rsclaw_cap::{
     AgentKind, CapAgentManager, CapLiveManager,
     runtime::{InboxTarget, NotifTarget},
 };

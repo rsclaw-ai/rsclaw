@@ -7,7 +7,7 @@ use reqwest::Client;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::{JsonRpcRequest, JsonRpcResponse};
+use crate::types::{JsonRpcRequest, JsonRpcResponse};
 
 pub struct A2aClient {
     client: Client,

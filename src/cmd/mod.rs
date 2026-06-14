@@ -39,7 +39,9 @@ pub mod skills;
 pub mod stock;
 pub mod style;
 pub mod system;
-pub mod tools;
+// tools/ extracted to the rsclaw-tools crate (crate-split). Re-export under the
+// same path so `crate::cmd::tools::X` keeps resolving across the codebase.
+pub use rsclaw_tools as tools;
 pub mod tray;
 pub mod uninstall;
 pub mod update;

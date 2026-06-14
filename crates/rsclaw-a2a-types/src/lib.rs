@@ -6,3 +6,5 @@
 //! a2a runtime module, so agent core can later extract independently.
 pub mod types;
 pub mod event;
+
+pub mod client;

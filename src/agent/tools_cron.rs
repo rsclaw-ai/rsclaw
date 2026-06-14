@@ -142,7 +142,7 @@ impl super::runtime::AgentRuntime {
                         return Err(anyhow!("cron add: `every_seconds`/`every_ms` must be > 0"));
                     }
                     // Floor: 2s. Below this the scheduler busy-loops (matches
-                    // crate::cron::MIN_REFIRE_GAP_MS).
+                    // rsclaw_cron::MIN_REFIRE_GAP_MS).
                     const MIN_INTERVAL_MS: u64 = 2_000;
                     // Ceiling: 10 years. Beyond this `anchor_ms + n * every_ms`
                     // can overflow u64 inside compute_next_run.
@@ -175,7 +175,7 @@ impl super::runtime::AgentRuntime {
                     // validator's message teaches the 5-field format (incl. the
                     // "017 * * *" missing-space hint), so the model can fix the
                     // expression on its next try.
-                    if let Err(msg) = crate::cron::validate_cron_expr(sched) {
+                    if let Err(msg) = rsclaw_cron::validate_cron_expr(sched) {
                         return Err(anyhow!("cron add: invalid schedule: {msg}"));
                     }
                     // Standard cron expression or interval.
@@ -433,7 +433,7 @@ impl super::runtime::AgentRuntime {
                 let id = jobs[idx]["id"].as_str().unwrap_or("?").to_string();
                 if let Some(schedule) = args["schedule"].as_str() {
                     // Same teaching validation as the add path.
-                    if let Err(msg) = crate::cron::validate_cron_expr(schedule) {
+                    if let Err(msg) = rsclaw_cron::validate_cron_expr(schedule) {
                         return Err(anyhow!("cron edit: invalid schedule: {msg}"));
                     }
                     let tz = args["tz"].as_str();
@@ -596,7 +596,7 @@ pub(crate) fn format_cron_jobs(jobs: &[Value]) -> String {
 /// Read cron jobs.
 ///
 /// Authoritative source is redb once the gateway has initialised the cron store
-/// (mirrors `crate::cron::load_cron_jobs`). Without this, the agent tool read
+/// (mirrors `rsclaw_cron::load_cron_jobs`). Without this, the agent tool read
 /// from `cron.json5` while the rest of the system used redb — so a job added
 /// here was invisible to the runner and got clobbered when the runner
 /// re-exported redb→file on the next reload (add succeeded, list came back
@@ -604,7 +604,7 @@ pub(crate) fn format_cron_jobs(jobs: &[Value]) -> String {
 /// isn't wired up. Handles both bare array `[...]` and wrapped
 /// `{"version":1,"jobs":[...]}` formats; parses with json5 for comment support.
 pub(crate) async fn read_cron_jobs(path: &std::path::Path) -> Vec<Value> {
-    if let Some(store) = crate::cron::cron_store() {
+    if let Some(store) = rsclaw_cron::cron_store() {
         match store.cron_list() {
             Ok(entries) => {
                 return entries
@@ -636,12 +636,12 @@ pub(crate) async fn read_cron_jobs(path: &std::path::Path) -> Vec<Value> {
 /// Write cron jobs.
 ///
 /// Authoritative target is redb once initialised (mirrors
-/// `crate::cron::save_cron_jobs`): the agent tool must write the same store the
+/// `rsclaw_cron::save_cron_jobs`): the agent tool must write the same store the
 /// runner reads, or the runner's redb→file re-export on reload wipes the
 /// agent's write. The `cron.json5` file is still (re)written as a best-effort
 /// export so `cat` / git-diff / hand-edit / the pre-redb fallback keep working.
 pub(crate) async fn write_cron_jobs(path: &std::path::Path, jobs: &[Value]) -> Result<()> {
-    if let Some(store) = crate::cron::cron_store() {
+    if let Some(store) = rsclaw_cron::cron_store() {
         let entries: Vec<(String, String)> = jobs
             .iter()
             .filter_map(|j| {

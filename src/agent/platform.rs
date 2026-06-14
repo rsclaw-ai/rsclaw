@@ -105,7 +105,7 @@ pub(crate) async fn ensure_chrome() -> Result<String> {
         return Ok(p);
     }
     tracing::info!("Chrome not found locally, auto-installing Chrome for Testing");
-    crate::cmd::tools::cmd_install("chrome", false).await?;
+    rsclaw_tools::cmd_install("chrome", false).await?;
     detect_chrome().ok_or_else(|| {
         anyhow::anyhow!("Chrome auto-install completed but binary still not detected")
     })
@@ -118,7 +118,7 @@ pub(crate) async fn ensure_ffmpeg() -> Result<String> {
         return Ok(p);
     }
     tracing::info!("ffmpeg not found locally, auto-installing");
-    crate::cmd::tools::cmd_install("ffmpeg", false).await?;
+    rsclaw_tools::cmd_install("ffmpeg", false).await?;
     detect_ffmpeg().ok_or_else(|| {
         anyhow::anyhow!("ffmpeg auto-install completed but binary still not detected")
     })

@@ -728,12 +728,12 @@ pub struct AgentRuntime {
     pub(crate) exec_pool: Arc<super::exec_pool::ExecPool>,
     /// Coding-agent proxy (Claude Code, Opencode, Codex, Amp). `None` until
     /// Task 9 wires up construction; `None` outside the gateway.
-    pub(crate) cap_manager: Option<std::sync::Arc<crate::cap::CapAgentManager>>,
+    pub(crate) cap_manager: Option<std::sync::Arc<rsclaw_cap::CapAgentManager>>,
     /// Interactive multi-instance cap session manager — backs the
     /// `cap_live` / `cap_live_end` tools and the IM `/cap` direct-mode
     /// command. Shares the same driver primitives as `cap_manager` but
     /// keeps long-lived drivers keyed by session_id.
-    pub(crate) cap_live_manager: Option<std::sync::Arc<crate::cap::CapLiveManager>>,
+    pub(crate) cap_live_manager: Option<std::sync::Arc<rsclaw_cap::CapLiveManager>>,
 }
 
 impl AgentRuntime {
@@ -753,8 +753,8 @@ impl AgentRuntime {
         mcp: Option<Arc<crate::mcp::McpRegistry>>,
         notification_tx: Option<tokio::sync::broadcast::Sender<crate::channel::OutboundMessage>>,
         model_health: crate::provider::health::ProviderHealthRegistry,
-        cap_manager: Option<std::sync::Arc<crate::cap::CapAgentManager>>,
-        cap_live_manager: Option<std::sync::Arc<crate::cap::CapLiveManager>>,
+        cap_manager: Option<std::sync::Arc<rsclaw_cap::CapAgentManager>>,
+        cap_live_manager: Option<std::sync::Arc<rsclaw_cap::CapLiveManager>>,
     ) -> Self {
         // Populate auth.order so FailoverManager uses the configured profile
         // priority per provider (AGENTS.md §12).
@@ -8949,7 +8949,7 @@ impl AgentRuntime {
             .iter()
             .find(|e| e.id == agent_id || e.id == normalized_id)
         {
-            use crate::a2a::client::A2aClient;
+            use rsclaw_a2a_types::client::A2aClient;
             let client = A2aClient::new();
             // Use remote agent ID if configured, otherwise omit (uses remote default).
             let remote_id = ext.remote_agent_id.as_deref().unwrap_or("");
@@ -9546,7 +9546,7 @@ fn write_config_value(dot_path: &str, value: serde_json::Value) -> anyhow::Resul
         // Recurse for nested paths
         if i > 0 {
             let prefix = parts[..=i].join(".");
-            if crate::cmd::config_json::get_nested_value(&val, &prefix).is_none() {
+            if rsclaw_util::get_nested_value(&val, &prefix).is_none() {
                 set_nested_value(&mut val, &prefix, serde_json::json!({}))?;
             }
         }

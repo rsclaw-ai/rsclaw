@@ -39,9 +39,9 @@ pub struct AgentSpawner {
     pub model_health: crate::provider::health::ProviderHealthRegistry,
     /// Coding-agent cap manager — shared from gateway startup so dynamically
     /// spawned agents also have `tool_cap` available.
-    pub cap_manager: Option<std::sync::Arc<crate::cap::CapAgentManager>>,
+    pub cap_manager: Option<std::sync::Arc<rsclaw_cap::CapAgentManager>>,
     /// Interactive multi-instance cap session manager, shared identically.
-    pub cap_live_manager: Option<std::sync::Arc<crate::cap::CapLiveManager>>,
+    pub cap_live_manager: Option<std::sync::Arc<rsclaw_cap::CapLiveManager>>,
     me: OnceLock<Weak<AgentSpawner>>,
 }
 
@@ -60,8 +60,8 @@ impl AgentSpawner {
         event_tx: broadcast::Sender<AgentEvent>,
         plugins: Option<Arc<PluginRegistry>>,
         model_health: crate::provider::health::ProviderHealthRegistry,
-        cap_manager: Option<std::sync::Arc<crate::cap::CapAgentManager>>,
-        cap_live_manager: Option<std::sync::Arc<crate::cap::CapLiveManager>>,
+        cap_manager: Option<std::sync::Arc<rsclaw_cap::CapAgentManager>>,
+        cap_live_manager: Option<std::sync::Arc<rsclaw_cap::CapLiveManager>>,
     ) -> Arc<Self> {
         let s = Arc::new(Self {
             registry,

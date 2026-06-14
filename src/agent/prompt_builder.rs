@@ -906,7 +906,7 @@ pub fn build_user_system(
     // ## Installed Tools — per-machine binary runtimes (node/bun/ffmpeg/…) and
     // their versions. Volatile (changes on install), so it lives here in
     // user_system, not the cached prefix. So the agent knows what it can run.
-    let installed_tools = crate::cmd::tools::installed_tools(&crate::cmd::tools::tools_dir_pub());
+    let installed_tools = rsclaw_tools::installed_tools(&rsclaw_tools::tools_dir_pub());
     if !installed_tools.is_empty() {
         let lines: Vec<String> = installed_tools
             .iter()

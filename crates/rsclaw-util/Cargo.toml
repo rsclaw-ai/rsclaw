@@ -7,5 +7,6 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 anyhow = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 dirs-next = "2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
