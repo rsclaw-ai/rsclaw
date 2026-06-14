@@ -249,6 +249,7 @@ mod tests {
     fn agent(id: &str, default: bool, channels: Option<Vec<&str>>) -> AgentEntry {
         AgentEntry {
             id: id.to_owned(),
+            description: None,
             default: if default { Some(true) } else { None },
             workspace: None,
             model: None,

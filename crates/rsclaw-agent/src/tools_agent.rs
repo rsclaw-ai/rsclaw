@@ -87,6 +87,7 @@ impl AgentRuntime {
 
         let entry = AgentEntry {
             id: id.clone(),
+            description: None,
             default: Some(false),
             workspace: Some(rsclaw_config::loader::path_to_forward_slash(
                 &rsclaw_config::loader::base_dir().join(format!("workspace-{id}")),
@@ -213,6 +214,7 @@ impl AgentRuntime {
         use rsclaw_config::schema::{AgentEntry, ModelConfig};
         let entry = AgentEntry {
             id: id.clone(),
+            description: None,
             default: Some(false),
             workspace: Some(rsclaw_config::loader::path_to_forward_slash(&ws_path)),
             model: Some(ModelConfig {

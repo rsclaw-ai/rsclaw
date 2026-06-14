@@ -2160,10 +2160,17 @@ pub fn build_tool_list(
             }
             tools.push(ToolDef {
                 name: format!("agent_{}", handle.id),
-                description: format!(
-                    "Send a task to agent '{}'. Returns the agent's reply.",
-                    handle.id
-                ),
+                // Honor a per-agent `description` (capabilities + trigger
+                // keywords) so a routing agent knows WHEN to delegate here.
+                // Without it the generic blurb is opaque and the model just
+                // does the work itself instead of dispatching. Mirrors the
+                // external a2a-peer path below.
+                description: handle.config.description.clone().unwrap_or_else(|| {
+                    format!(
+                        "Send a task to agent '{}'. Returns the agent's reply.",
+                        handle.id
+                    )
+                }),
                 parameters: json!({
                     "type": "object",
                     "properties": {

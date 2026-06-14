@@ -482,6 +482,13 @@ pub struct AgentEntry {
     pub default: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Capability blurb shown to OTHER agents as this agent's `agent_<id>`
+    /// tool description (what it's for + trigger keywords). Without it the
+    /// tool reads just "Send a task to agent '<id>'" — opaque, so a routing
+    /// agent can't tell WHEN to delegate here and falls back to doing the
+    /// work itself. Mirrors `A2aPeerConfig.description` for local agents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1057,7 +1064,7 @@ pub struct ProviderConfig {
     pub user_agent: Option<String>,
     /// Override the wire `prefix_id` for `rsclaw` providers (protocol
     /// §2.1.1 / §2.10.1, namespaced `<ns>/<ver>`). Defaults to
-    /// `provider::rsclaw::RSCLAW_DEFAULT_PREFIX_ID` (`rsclaw/2026.5.15`)
+    /// `provider::rsclaw::RSCLAW_DEFAULT_PREFIX_ID` (`rsclaw/2026.6.16`)
     /// when omitted. Ignored for non-rsclaw `api` formats.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_id: Option<String>,

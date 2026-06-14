@@ -673,6 +673,7 @@ impl AgentRegistry {
             let codex = cfg.agents.defaults.codex.clone();
             vec![rsclaw_config::schema::AgentEntry {
                 id: "main".to_owned(),
+                description: None,
                 default: Some(true),
                 name: Some("Main Agent".to_owned()),
                 workspace,
@@ -975,6 +976,7 @@ mod tests {
     fn entry(id: &str, default: bool, channels: Option<Vec<&str>>) -> AgentEntry {
         AgentEntry {
             id: id.to_owned(),
+            description: None,
             default: if default { Some(true) } else { None },
             workspace: None,
             model: None,
