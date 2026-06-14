@@ -18,6 +18,13 @@ import {
   setAuthToken,
 } from "../lib/rsclaw-api";
 import { markSetupComplete } from "../lib/first-launch";
+import {
+  useCatalog,
+  getProviderMap,
+  getProviderOrder,
+  getChannelMap,
+  getChannelOrder,
+} from "../lib/catalog";
 import { toast } from "../lib/toast";
 import {
   type ApiType,
@@ -784,36 +791,16 @@ export interface ProviderDef {
   defaultUserAgent?: string;
 }
 
-// All providers (unordered lookup table)
-export const ALL_PROVIDERS: Record<string, ProviderDef> = {
-  rsclaw:      { id: "rsclaw",      name: "RsClaw",             tag: "\u589E\u91CF\u534F\u8BAE \u00B7 \u4E1A\u5185\u9996\u53D1", tagEn: "Incremental \u00B7 Industry-first", keyLabel: "RsClaw API Key", keyPlaceholder: "sk-...", hasBaseUrl: true, defaultBaseUrl: "https://api.rsclaw.ai/v1/agent" },
-  agnes:       { id: "agnes",       name: "Agnes AI",           tag: "\u514D\u8D39 \u00B7 \u6587\u56FE\u89C6", tagEn: "Free \u00B7 text/image/video", keyLabel: "Agnes API Key", keyPlaceholder: "sk-...", hasBaseUrl: true, defaultBaseUrl: "https://apihub.agnes-ai.com/v1" },
-  qwen:        { id: "qwen",        name: "Qwen (\u5343\u95EE)", tag: "\u56FD\u5185\u76F4\u8FDE",      tagEn: "China direct",      keyLabel: "DashScope API Key",   keyPlaceholder: "sk-..." },
-  doubao:      { id: "doubao",      name: "Doubao (\u8C46\u5305)", tag: "\u5B57\u8282\u8DF3\u52A8",     tagEn: "ByteDance",         keyLabel: "ARK API Key",         keyPlaceholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", hasBaseUrl: true, defaultBaseUrl: "https://ark.cn-beijing.volces.com/api/v3" },
-  minimax:     { id: "minimax",     name: "MiniMax",            tag: "\u56FD\u5185",                  tagEn: "China",             keyLabel: "MiniMax API Key",     keyPlaceholder: "eyJ..." },
-  deepseek:    { id: "deepseek",    name: "DeepSeek",           tag: "\u4F4E\u6210\u672C",            tagEn: "Low cost",          keyLabel: "DeepSeek API Key",    keyPlaceholder: "sk-..." },
-  kimi:        { id: "kimi",        name: "Kimi",               tag: "\u56FD\u5185",                  tagEn: "China",             keyLabel: "Kimi API Key",        keyPlaceholder: "sk-...", hasBaseUrl: true, defaultBaseUrl: "https://api.moonshot.cn/v1", defaultUserAgent: "rsclaw/2026.5.5" },
-  codingplan:  { id: "codingplan",  name: "CodingPlan",         tag: "\u7F16\u7A0B\u8BA1\u5212",      tagEn: "Coding Plan",       keyLabel: "API URL",             keyPlaceholder: "https://api.example.com/v1", isUrl: true },
-  zhipu:       { id: "zhipu",       name: "Zhipu (GLM)",        tag: "\u56FD\u5185",                  tagEn: "China",             keyLabel: "Zhipu API Key",       keyPlaceholder: "sk-..." },
-  ollama:      { id: "ollama",      name: "Ollama (local)",     tag: "\u65E0\u9700 Key",              tagEn: "No Key",            keyLabel: "URL",                 keyPlaceholder: "http://localhost:11434/v1", isUrl: true },
-  custom:      { id: "custom",      name: "Custom Provider",    tag: "\u81EA\u5B9A\u4E49",            tagEn: "Custom",            keyLabel: "API URL",             keyPlaceholder: "https://api.example.com/v1", isUrl: true },
-  gaterouter:  { id: "gaterouter",  name: "GateRouter",         tag: "\u805A\u5408\u8DEF\u7531",      tagEn: "Aggregator",        keyLabel: "GateRouter Key",      keyPlaceholder: "sk-..." },
-  openrouter:  { id: "openrouter",  name: "OpenRouter",         tag: "\u805A\u5408\u8DEF\u7531",      tagEn: "Aggregator",        keyLabel: "OpenRouter Key",      keyPlaceholder: "sk-or-..." },
-  anthropic:   { id: "anthropic",   name: "Anthropic (Claude)", tag: "\u63A8\u8350",                  tagEn: "Recommended",       keyLabel: "Anthropic API Key",   keyPlaceholder: "sk-ant-..." },
-  openai:      { id: "openai",      name: "OpenAI (GPT)",       tag: "",                              tagEn: "",                  keyLabel: "OpenAI API Key",      keyPlaceholder: "sk-..." },
-  gemini:      { id: "gemini",      name: "Google Gemini",      tag: "",                              tagEn: "",                  keyLabel: "Gemini API Key",      keyPlaceholder: "AIza..." },
-  grok:        { id: "grok",        name: "xAI (Grok)",         tag: "",                              tagEn: "",                  keyLabel: "xAI API Key",         keyPlaceholder: "xai-..." },
-  groq:        { id: "groq",        name: "Groq",               tag: "\u5FEB\u901F\u63A8\u7406",      tagEn: "Fast",              keyLabel: "Groq API Key",        keyPlaceholder: "gsk_..." },
-  siliconflow: { id: "siliconflow", name: "SiliconFlow",        tag: "\u56FD\u5185\u52A0\u901F",      tagEn: "China accel",       keyLabel: "SiliconFlow Key",     keyPlaceholder: "sk-..." },
-};
-
-export const PROV_ORDER_ZH = ["rsclaw","agnes","qwen","deepseek","doubao","custom","codingplan","minimax","kimi","zhipu","ollama","gaterouter","openrouter","anthropic","openai","gemini","grok","groq","siliconflow"];
-export const PROV_ORDER_EN = ["rsclaw","agnes","anthropic","openai","gemini","grok","openrouter","ollama","custom","codingplan","groq","doubao","qwen","minimax","deepseek","kimi","zhipu","gaterouter","siliconflow"];
+// Provider list now lives in defaults.toml, surfaced via lib/catalog.ts
+// (FALLBACK_CATALOG holds the hardcoded copy for when the backend read fails).
 
 function getProviders(lang?: string): ProviderDef[] {
-  const isZhOrder = (lang || getLang()) === "cn";
-  const order = isZhOrder ? PROV_ORDER_ZH : PROV_ORDER_EN;
-  return order.map((id) => ALL_PROVIDERS[id]).filter(Boolean);
+  // Sourced from defaults.toml via the catalog (seeded synchronously from
+  // FALLBACK_CATALOG; reconciled when the async load settles).
+  const map = getProviderMap();
+  return getProviderOrder(lang || getLang())
+    .map((id) => map[id])
+    .filter(Boolean);
 }
 
 interface ModelDef {
@@ -880,64 +867,16 @@ export interface ChannelDef {
   credFields: { key: string; label: string; type: string; ph: string }[];
 }
 
-// All channels (lookup)
-export const ALL_CHANNELS: Record<string, ChannelDef> = {
-  feishu:   { id: "feishu",   icon: "\u98DE", name: "\u98DE\u4E66 / Lark", nameEn: "Feishu / Lark",  hasQr: true, qrLabel: "\u626B\u7801", qrLabelEn: "QR", credFields: [
-    { key: "appId", label: "App ID", type: "text", ph: "cli_xxx" },
-    { key: "appSecret", label: "App Secret", type: "password", ph: "" },
-  ] },
-  wechat:   { id: "wechat",   icon: "\u5FAE", name: "\u5FAE\u4FE1",        nameEn: "Weixin",         hasQr: true, qrLabel: "\u626B\u7801", qrLabelEn: "QR", credFields: [] },
-  wecom:    { id: "wecom",    icon: "WC",     name: "\u4F01\u4E1A\u5FAE\u4FE1", nameEn: "WeCom",     hasQr: false, credFields: [
-    { key: "botId", label: "Bot ID", type: "text", ph: "" },
-    { key: "secret", label: "Secret", type: "password", ph: "" },
-  ] },
-  qq:       { id: "qq",       icon: "QQ",     name: "QQ Bot",              nameEn: "QQ Bot",          hasQr: false, credFields: [
-    { key: "appId", label: "App ID", type: "text", ph: "" },
-    { key: "appSecret", label: "App Secret", type: "password", ph: "" },
-  ] },
-  dingtalk: { id: "dingtalk", icon: "DT",     name: "\u9489\u9489",        nameEn: "DingTalk",        hasQr: false, credFields: [
-    { key: "appKey", label: "App Key", type: "text", ph: "" },
-    { key: "appSecret", label: "App Secret", type: "password", ph: "" },
-  ] },
-  telegram: { id: "telegram", icon: "Tg",     name: "Telegram",            nameEn: "Telegram",        hasQr: false, credFields: [
-    { key: "botToken", label: "Bot Token", type: "password", ph: "123456:ABC-DEF..." },
-  ] },
-  matrix:   { id: "matrix",   icon: "Mx",     name: "Matrix",              nameEn: "Matrix",          hasQr: false, credFields: [
-    { key: "homeserver", label: "Homeserver", type: "text", ph: "https://matrix.org" },
-    { key: "userId", label: "User ID", type: "text", ph: "@bot:matrix.org" },
-    { key: "accessToken", label: "Access Token", type: "password", ph: "" },
-  ] },
-  discord:  { id: "discord",  icon: "Dc",     name: "Discord",             nameEn: "Discord",         hasQr: false, credFields: [
-    { key: "token", label: "Bot Token", type: "password", ph: "" },
-  ] },
-  slack:    { id: "slack",    icon: "Sl",     name: "Slack",               nameEn: "Slack",           hasQr: false, credFields: [
-    { key: "botToken", label: "Bot Token", type: "password", ph: "xoxb-..." },
-    { key: "appToken", label: "App Token", type: "password", ph: "xapp-..." },
-  ] },
-  whatsapp: { id: "whatsapp", icon: "WA",     name: "WhatsApp",            nameEn: "WhatsApp",        hasQr: false, credFields: [
-    { key: "phoneNumberId", label: "Phone Number ID", type: "text", ph: "" },
-    { key: "accessToken", label: "Access Token", type: "password", ph: "" },
-  ] },
-  signal:   { id: "signal",   icon: "Sg",     name: "Signal",              nameEn: "Signal",          hasQr: false, credFields: [
-    { key: "phone", label: "Phone Number", type: "text", ph: "+1234567890" },
-  ] },
-  line:     { id: "line",     icon: "Li",     name: "LINE",                nameEn: "LINE",            hasQr: false, credFields: [
-    { key: "channelSecret", label: "Channel Secret", type: "password", ph: "" },
-    { key: "channelAccessToken", label: "Access Token", type: "password", ph: "" },
-  ] },
-  zalo:     { id: "zalo",     icon: "Za",     name: "Zalo",                nameEn: "Zalo",            hasQr: false, credFields: [
-    { key: "accessToken", label: "Access Token", type: "password", ph: "" },
-    { key: "oaSecret", label: "OA Secret", type: "password", ph: "" },
-  ] },
-};
-
-export const CH_ORDER_ZH = ["feishu","wechat","wecom","qq","dingtalk","telegram","matrix","discord","slack","whatsapp","signal","line","zalo"];
-export const CH_ORDER_EN = ["telegram","matrix","discord","slack","whatsapp","signal","line","feishu","wechat","wecom","qq","dingtalk","zalo"];
+// Channel list now lives in defaults.toml, surfaced via lib/catalog.ts
+// (FALLBACK_CATALOG holds the hardcoded copy for when the backend read fails).
 
 function getChannels(lang?: string): ChannelDef[] {
-  const isZhOrder = (lang || getLang()) === "cn";
-  const order = isZhOrder ? CH_ORDER_ZH : CH_ORDER_EN;
-  return order.map((id) => ALL_CHANNELS[id]).filter(Boolean);
+  // Sourced from defaults.toml via the catalog (seeded synchronously from
+  // FALLBACK_CATALOG; reconciled when the async load settles).
+  const map = getChannelMap();
+  return getChannelOrder(lang || getLang())
+    .map((id) => map[id])
+    .filter(Boolean);
 }
 
 // (step labels are now in T[lang].stepLabels)
@@ -1576,8 +1515,45 @@ export function OnboardingPage() {
   const [step, setStep] = useState(0); // 0 = welcome screen
   const t = T[wizLang];
   const isZh = wizLang === "cn";
-  const PROVIDERS = useMemo(() => getProviders(wizLang), [wizLang]);
-  const CHANNELS = useMemo(() => getChannels(wizLang), [wizLang]);
+  // Drive re-renders when the defaults.toml catalog finishes loading; the
+  // accessors below read the latest resolved catalog (FALLBACK until then).
+  const { loaded: catalogLoaded } = useCatalog();
+  const PROVIDERS = useMemo(() => getProviders(wizLang), [wizLang, catalogLoaded]);
+  const CHANNELS = useMemo(() => getChannels(wizLang), [wizLang, catalogLoaded]);
+
+  // Reconcile provider/channel state with any entries the live catalog adds
+  // beyond the synchronous FALLBACK (e.g. a hot-added provider). Existing
+  // state is preserved; only missing keys are appended.
+  useEffect(() => {
+    const provMap = getProviderMap();
+    setProvs((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const id of getProviderOrder(wizLang)) {
+        const p = provMap[id];
+        if (!p || next[id]) continue;
+        const ps = makeProvState(false, p.isUrl, p.defaultUserAgent);
+        if (id === "custom") { ps.apiType = undefined; ps.baseUrl = ""; }
+        else if (p.hasBaseUrl && p.defaultBaseUrl) { ps.baseUrl = p.defaultBaseUrl; }
+        if (id === "doubao") ps.apiType = "openai-responses";
+        if (id === "kimi") ps.apiType = "openai";
+        next[id] = ps;
+        changed = true;
+      }
+      return changed ? next : prev;
+    });
+    setChs((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const id of Object.keys(getChannelMap())) {
+        if (next[id]) continue;
+        next[id] = makeChState();
+        changed = true;
+      }
+      return changed ? next : prev;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [catalogLoaded]);
 
   // Commit language selection and enter step 1
   const enterWizard = () => {
@@ -1600,7 +1576,10 @@ export function OnboardingPage() {
   // Step 2
   const [provs, setProvs] = useState<Record<string, ProvState>>(() => {
     const m: Record<string, ProvState> = {};
-    Object.values(ALL_PROVIDERS).forEach((p) => {
+    const provMap = getProviderMap();
+    // Iterate via the (alias-free) order so the grok→xai alias key doesn't
+    // double-init xai's state.
+    getProviderOrder(wizLang).map((id) => provMap[id]).filter(Boolean).forEach((p) => {
       const ps = makeProvState(false, p.isUrl, p.defaultUserAgent);
       if (p.id === "custom") {
         // Leave apiType and baseUrl empty - user picks them
@@ -1643,7 +1622,7 @@ export function OnboardingPage() {
   // Step 3
   const [chs, setChs] = useState<Record<string, ChState>>(() => {
     const m: Record<string, ChState> = {};
-    Object.values(ALL_CHANNELS).forEach((c) => {
+    Object.values(getChannelMap()).forEach((c) => {
       m[c.id] = makeChState();
     });
     return m;
@@ -1984,7 +1963,7 @@ export function OnboardingPage() {
     });
     // Auto-start QR login when selecting a channel that supports it
     if (!wasEnabled) {
-      const chDef = ALL_CHANNELS[id];
+      const chDef = getChannelMap()[id];
       if (chDef?.hasQr) {
         setTimeout(() => startChannelQr(id), 300);
       }
