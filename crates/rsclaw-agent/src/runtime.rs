@@ -1377,6 +1377,30 @@ impl AgentRuntime {
             push(m.vision_chain(), &mut out, &mut seen);
         }
         if out.is_empty() {
+            // rsclaw-protocol default: when the primary is a `rsclaw/` model and
+            // no explicit vision chain is configured, the fleet serves a
+            // dedicated vision head — default to it (mirrors the flash default
+            // rsclaw/rsclaw-flash-v1). Lets `vision: []` "just work" on rsclaw.
+            let primary_is_rsclaw = per_agent
+                .model
+                .as_ref()
+                .map(|m| m.primary_chain())
+                .into_iter()
+                .flatten()
+                .chain(
+                    defaults
+                        .model
+                        .as_ref()
+                        .map(|m| m.primary_chain())
+                        .into_iter()
+                        .flatten(),
+                )
+                .any(|m| m.trim().starts_with("rsclaw/"));
+            if primary_is_rsclaw {
+                out.push(rsclaw_provider::rsclaw::RSCLAW_DEFAULT_VISION.to_owned());
+            }
+        }
+        if out.is_empty() {
             // FallbackToPrimary: no explicit vision config, try primary
             // — but ONLY entries known to support vision. Without this
             // filter, the driver would silently route screenshots to a
