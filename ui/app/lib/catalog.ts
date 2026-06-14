@@ -6,7 +6,7 @@
 // The backend exposes the SAME catalog two ways, both snake_case:
 //   1. Tauri command  `read_defaults_catalog`  → returns a JSON STRING
 //      (works *before* the gateway starts — onboarding needs this).
-//   2. Gateway HTTP    GET /api/v1/catalog       → returns JSON.
+//   2. Gateway HTTP    GET /api/v1/defaults      → returns JSON.
 //
 // This module loads that catalog once (module-level cached promise), maps the
 // snake_case backend shape into the camelCase shapes the existing components
@@ -371,8 +371,8 @@ async function fetchRawCatalog(): Promise<RawCatalog> {
     // Defensive: some Tauri setups auto-parse — accept an object too.
     return json as RawCatalog;
   }
-  const r = await gatewayFetch("/api/v1/catalog");
-  if (!r.ok) throw new Error(`catalog fetch failed: ${r.status}`);
+  const r = await gatewayFetch("/api/v1/defaults");
+  if (!r.ok) throw new Error(`defaults fetch failed: ${r.status}`);
   return (await r.json()) as RawCatalog;
 }
 
