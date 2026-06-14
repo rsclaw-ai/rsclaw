@@ -1,11 +1,12 @@
 # rsclaw defaults — provider, channel, and search engine definitions
 #
 # Edit this file to customize providers, channels, search engines, etc.
-# Generated on first `rsclaw setup`; future releases only append missing
-# built-in entries and never overwrite user-customized entries.
+# Generated on first `rsclaw setup`. On a defaults_version bump, releases
+# refresh the built-in (shipped) entries to the latest definitions and keep
+# any entries you added yourself; the previous file is saved as defaults.toml.bak.*.
 
 [meta]
-defaults_version = "2026.6.16"
+defaults_version = "2026.6.17"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Providers
