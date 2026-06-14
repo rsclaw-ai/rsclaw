@@ -190,15 +190,19 @@ impl super::runtime::AgentRuntime {
         }
 
         // args["model"] override → exactly one attempt (no chain retry —
-        // explicit user intent).
-        let attempt_models: Vec<String> = if let Some(m) = args
+        // explicit user intent). An explicit model is also FORCED: it
+        // bypasses the health breaker (Cooling/Disabled), matching the
+        // "pass an explicit `model` argument to force one attempt" hint we
+        // surface when the whole chain is cooling.
+        let explicit_model = args
             .get("model")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-        {
-            vec![m.to_owned()]
-        } else {
-            image_chain.clone()
+            .map(str::to_owned);
+        let forced = explicit_model.is_some();
+        let attempt_models: Vec<String> = match explicit_model {
+            Some(m) => vec![m],
+            None => image_chain.clone(),
         };
 
         // ── Pre-submit chain retry ──────────────────────────────────────
@@ -209,10 +213,10 @@ impl super::runtime::AgentRuntime {
         self.model_health.ensure(&attempt_models);
         let mut last_error: Option<anyhow::Error> = None;
         for chain_model in &attempt_models {
-            if !self.model_health.is_callable(chain_model) {
+            if !forced && !self.model_health.is_callable(chain_model) {
                 tracing::info!(
                     model = %chain_model,
-                    "tool_image: skipping (model marked Disabled or Cooling)"
+                    "tool_image: skipping (model cooling; pass explicit `model` to force)"
                 );
                 continue;
             }
@@ -222,24 +226,28 @@ impl super::runtime::AgentRuntime {
                     return Ok(v);
                 }
                 Err(e) => {
-                    let kind = rsclaw_provider::health::classify_error(&e);
-                    let body = format!("{e:#}");
-                    let truncated = rsclaw_util::truncate_str(&body, 200).to_owned();
-                    self.model_health.record_failure(chain_model, kind.clone(), truncated);
-                    // Cost gate: provider already charged for this
-                    // attempt. Surface the failure to the user instead
-                    // of double-billing through the next chain entry.
+                    // Cost gate: the provider already charged for this
+                    // attempt (generation succeeded; the failure is in the
+                    // download / post-processing leg). The MODEL is healthy
+                    // — do NOT record a health failure (that would wrongly
+                    // cool a working model). Surface to the user instead of
+                    // double-billing through the next chain entry.
                     if e.downcast_ref::<PostBillingError>().is_some() {
                         tracing::warn!(
                             model = %chain_model,
-                            kind = ?kind,
                             error = %e,
-                            "tool_image: post-billing failure — NOT advancing chain"
+                            "tool_image: post-billing failure — NOT advancing chain, not recording health"
                         );
                         return Err(anyhow!(
                             "image_gen: provider {chain_model} was billed but did not return a usable image: {e:#}. Do NOT retry this tool automatically (each attempt is billed) — report the failure to the user and let them decide whether to retry"
                         ));
                     }
+                    // Pre-billing failure: classify + cool the model, then
+                    // advance the chain.
+                    let kind = rsclaw_provider::health::classify_error(&e);
+                    let body = format!("{e:#}");
+                    let truncated = rsclaw_util::truncate_str(&body, 200).to_owned();
+                    self.model_health.record_failure(chain_model, kind.clone(), truncated);
                     tracing::warn!(
                         model = %chain_model,
                         kind = ?kind,
@@ -261,7 +269,7 @@ impl super::runtime::AgentRuntime {
             // Disabled/Cooling — nothing was actually attempted, so
             // "all failed" would misdiagnose.
             None => anyhow!(
-                "image_gen: all {} configured image model(s) are currently Disabled or Cooling (recent failures) — none were attempted. Check /api/v1/models/health, wait for cooldown, or pass an explicit `model` argument to force one attempt",
+                "image_gen: all {} configured image model(s) are currently cooling down from recent failures — none were attempted. The cooldown is time-bounded and clears on its own; check /api/v1/models/health, wait for it to expire, or pass an explicit `model` argument to force one attempt now",
                 attempt_models.len()
             ),
         })
