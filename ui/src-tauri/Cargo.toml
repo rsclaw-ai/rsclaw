@@ -31,6 +31,7 @@ time = { version = "0.3", features = ["serde-well-known"] }
 tauri-plugin-notification = "2"
 tauri-plugin-single-instance = "2"
 json5 = "0.4"
+toml = "1"
 percent-encoding = "2.3.1"
 url = "2.5"
 reqwest = { version = "0.11.18", features = ["json", "stream"] }

@@ -706,6 +706,146 @@ fn read_config_file() -> Result<String, String> {
     std::fs::read_to_string(&config_path).map_err(|e| e.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Defaults catalog (providers / channels / search engines)
+//
+// The onboarding wizard runs BEFORE the gateway starts, so it can't hit the
+// gateway's `GET /api/v1/catalog` endpoint. This command parses defaults.toml
+// directly and returns the SAME JSON shape that endpoint returns: snake_case
+// field names throughout, top-level keys `providers` / `channels` /
+// `search_engines`. The structs below mirror `rsclaw_config::catalog::*`;
+// every field is `#[serde(default)]` so old/partial defaults.toml still parse.
+// ---------------------------------------------------------------------------
+
+/// Compiled-in fallback — the exact same defaults.toml the gateway embeds.
+const EMBEDDED_DEFAULTS_TOML: &str = include_str!("../../../defaults.toml");
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct CatalogProviderDef {
+    name: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    env_var: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    base_url: String,
+    #[serde(default)]
+    user_agent: String,
+    #[serde(default)]
+    needs_key: bool,
+    #[serde(default = "default_api_type")]
+    api_type: String,
+    #[serde(default)]
+    name_zh: String,
+    #[serde(default)]
+    name_en: String,
+    #[serde(default)]
+    tag_zh: String,
+    #[serde(default)]
+    tag_en: String,
+    #[serde(default)]
+    key_label: String,
+    #[serde(default)]
+    key_placeholder: String,
+    #[serde(default)]
+    is_url: bool,
+    #[serde(default)]
+    has_base_url: bool,
+    #[serde(default)]
+    order_zh: i32,
+    #[serde(default)]
+    order_en: i32,
+}
+
+fn default_api_type() -> String {
+    "openai".to_owned()
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct CatalogChannelFieldDef {
+    key: String,
+    #[serde(default)]
+    prompt: String,
+    #[serde(default)]
+    secret: bool,
+    #[serde(default)]
+    placeholder: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct CatalogChannelDef {
+    name: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    fields: Vec<CatalogChannelFieldDef>,
+    #[serde(default)]
+    login: bool,
+    #[serde(default)]
+    multi_account: bool,
+    #[serde(default)]
+    name_zh: String,
+    #[serde(default)]
+    icon: String,
+    #[serde(default)]
+    has_qr: bool,
+    #[serde(default)]
+    qr_label_zh: String,
+    #[serde(default)]
+    qr_label_en: String,
+    #[serde(default)]
+    order_zh: i32,
+    #[serde(default)]
+    order_en: i32,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct CatalogSearchEngineDef {
+    name: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    env_var: String,
+    #[serde(default)]
+    label_zh: String,
+    #[serde(default)]
+    label_en: String,
+    #[serde(default)]
+    needs_key: bool,
+    #[serde(default)]
+    order: i32,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Default)]
+struct DefaultsCatalog {
+    #[serde(default)]
+    providers: Vec<CatalogProviderDef>,
+    #[serde(default)]
+    channels: Vec<CatalogChannelDef>,
+    #[serde(default)]
+    search_engines: Vec<CatalogSearchEngineDef>,
+}
+
+/// Read & parse the defaults catalog without the gateway running, then return
+/// it as a JSON string matching `GET /api/v1/catalog`. Prefers the user's
+/// `~/.rsclaw/defaults.toml`; falls back to the embedded copy on a fresh
+/// install (or if the user file is unreadable).
+#[tauri::command]
+fn read_defaults_catalog() -> Result<String, String> {
+    let user_path = rsclaw_base_dir().join("defaults.toml");
+    let toml_src = std::fs::read_to_string(&user_path)
+        .unwrap_or_else(|_| EMBEDDED_DEFAULTS_TOML.to_owned());
+
+    let catalog: DefaultsCatalog =
+        toml::from_str(&toml_src).map_err(|e| format!("failed to parse defaults.toml: {e}"))?;
+
+    serde_json::to_string(&catalog).map_err(|e| e.to_string())
+}
+
 /// Check if rsclaw is already set up (config file exists).
 #[tauri::command]
 fn check_setup() -> Result<bool, String> {
@@ -2456,6 +2596,7 @@ fn main() {
             install_tool,
             get_tool_install_status,
             get_tool_install_result,
+            read_defaults_catalog,
             test_provider,
             write_workspace_file,
             read_workspace_file,

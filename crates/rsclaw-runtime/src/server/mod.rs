@@ -296,6 +296,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/logs", get(get_logs))
         .route("/providers/test", post(test_provider))
         .route("/providers/models", post(list_provider_models))
+        .route("/catalog", get(get_catalog))
         .route("/models/health", get(models_health))
         .route("/models/health/reset", post(models_health_reset))
         .route("/doctor", get(run_doctor))
@@ -3434,6 +3435,24 @@ async fn wechat_qr_status(Json(req): Json<QrStatusRequest>) -> Response {
 // ---------------------------------------------------------------------------
 
 /// Run `rsclaw doctor` and return structured output.
+/// GET /api/v1/catalog — return the provider / channel / search-engine
+/// catalog parsed from `defaults.toml` (user file with embedded fallback).
+///
+/// The JSON shape is the serialization of [`rsclaw_config::catalog::Catalog`]:
+/// `{ "providers": [...], "channels": [...], "search_engines": [...] }` with
+/// **snake_case** field names throughout (e.g. `name_zh`, `key_placeholder`,
+/// `has_base_url`). Channel field keys (`appId`, …) pass through as authored.
+async fn get_catalog() -> Response {
+    match rsclaw_config::catalog::load_catalog() {
+        Ok(catalog) => (StatusCode::OK, Json(serde_json::json!(catalog))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to parse defaults.toml: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
 async fn run_doctor() -> Response {
     run_doctor_cmd(false).await
 }

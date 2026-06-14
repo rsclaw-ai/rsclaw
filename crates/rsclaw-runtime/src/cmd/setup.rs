@@ -412,84 +412,15 @@ fn builtin_defaults() -> String {
     rsclaw_config::loader::embedded_defaults_toml().to_owned()
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
-struct ProviderDef {
-    name: String,
-    label: String,
-    #[serde(default)]
-    env_var: String,
-    #[serde(default)]
-    model: String,
-    #[serde(default)]
-    base_url: String,
-    #[serde(default)]
-    user_agent: String,
-    #[serde(default)]
-    needs_key: bool,
-    /// API protocol identifier. Mirrors `ApiFormat` serde names:
-    /// `openai` (alias for `openai-completions`), `openai-responses`,
-    /// `anthropic`, `gemini`, `ollama`, `rsclaw`. When omitted in
-    /// `defaults.toml`, falls back to `"openai"` via `default_api_type`
-    /// — matching the gateway's `_ => OpenAiCompletions` catch-all in
-    /// `providers.rs:113-128`. Providers whose runtime protocol differs
-    /// (rsclaw, anthropic, gemini, ollama, doubao) MUST set this
-    /// explicitly so the wizard's picker default lines up with what the
-    /// gateway will actually run.
-    #[serde(default = "default_api_type")]
-    api_type: String,
-}
-
-fn default_api_type() -> String {
-    "openai".to_owned()
-}
+// Provider / channel / search-engine catalog structs are now shared, public,
+// and decorative-field-aware in `rsclaw_config::catalog`. Re-exported here so
+// the rest of this module keeps using the short local names.
+use rsclaw_config::catalog::{
+    Catalog as Defaults, ChannelDef, ChannelFieldDef, ProviderDef, SearchEngineDef,
+};
 
 fn initial_onboard_api_type() -> String {
     String::new()
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct ChannelFieldDef {
-    key: String,
-    prompt: String,
-    #[serde(default)]
-    secret: bool,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct ChannelDef {
-    name: String,
-    label: String,
-    #[serde(default)]
-    fields: Vec<ChannelFieldDef>,
-    /// If true, run `channels login` flow (QR/OAuth) instead of prompting
-    /// fields.
-    #[serde(default)]
-    login: bool,
-    /// If true, gateway reads `channels.<name>.accounts.<acct>.<field>` and the
-    /// editor exposes add/edit/remove account UI on top of the single-account
-    /// flow.
-    #[serde(default)]
-    multi_account: bool,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-#[allow(dead_code)]
-struct SearchEngineDef {
-    name: String,
-    label: String,
-    url: String,
-    #[serde(default)]
-    env_var: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct Defaults {
-    #[serde(default)]
-    providers: Vec<ProviderDef>,
-    #[serde(default)]
-    channels: Vec<ChannelDef>,
-    #[serde(default)]
-    search_engines: Vec<SearchEngineDef>,
 }
 
 /// Load defaults: user's `~/.rsclaw/defaults.toml` with built-in fallback.
@@ -3660,11 +3591,13 @@ mod account_helper_tests {
                 key: "appId".into(),
                 prompt: "App ID".into(),
                 secret: false,
+                placeholder: String::new(),
             },
             ChannelFieldDef {
                 key: "appSecret".into(),
                 prompt: "App Secret".into(),
                 secret: true,
+                placeholder: String::new(),
             },
         ]
     }
