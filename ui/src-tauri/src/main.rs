@@ -2049,6 +2049,22 @@ fn expand_env_vars(s: &str) -> String {
     out
 }
 
+/// Look up a provider's default base URL from `defaults.toml` (user file with
+/// embedded fallback). Lets `test_provider` resolve any provider shipped in the
+/// catalog — including ones added after this file's hardcoded match was last
+/// updated — mirroring the gateway's `resolve_base_url`.
+fn provider_base_url_from_defaults(provider: &str) -> Option<String> {
+    let user_path = rsclaw_base_dir().join("defaults.toml");
+    let toml_src = std::fs::read_to_string(&user_path)
+        .unwrap_or_else(|_| EMBEDDED_DEFAULTS_TOML.to_owned());
+    let catalog: DefaultsCatalog = toml::from_str(&toml_src).ok()?;
+    catalog
+        .providers
+        .into_iter()
+        .find(|p| p.name == provider && !p.base_url.is_empty())
+        .map(|p| p.base_url)
+}
+
 /// Test provider API key by calling /v1/models directly (no gateway needed).
 #[tauri::command]
 async fn test_provider(provider: String, api_key: String, base_url: Option<String>, api_type: Option<String>) -> Result<serde_json::Value, String> {
@@ -2088,30 +2104,38 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
         provider.as_str()
     };
 
-    // Resolve base URL: explicit base_url param > provider default
-    let default_base = match provider.as_str() {
-        "anthropic"   => "https://api.anthropic.com/v1",
-        "openai"      => "https://api.openai.com/v1",
-        "deepseek"    => "https://api.deepseek.com/v1",
-        "qwen"        => "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "doubao"      => "https://ark.cn-beijing.volces.com/api/v3",
-        "minimax"     => "https://api.minimaxi.com/v1",
-        "kimi"        => "https://api.moonshot.cn/v1",
-        "zhipu"       => "https://open.bigmodel.cn/api/paas/v4",
-        "groq"        => "https://api.groq.com/openai/v1",
-        "grok"        => "https://api.x.ai/v1",
-        "gemini"      => "https://generativelanguage.googleapis.com/v1beta",
-        "siliconflow" => "https://api.siliconflow.cn/v1",
-        "openrouter"  => "https://openrouter.ai/api/v1",
-        "gaterouter"  => "https://api.gaterouter.ai/openai/v1",
-        "ollama"      => "http://localhost:11434",
-        "rsclaw"      => "https://api.rsclaw.ai/v1/agent",
-        "custom" | "codingplan" => "",
-        _ => return Ok(serde_json::json!({"ok": false, "error": "unknown provider"})),
+    // Resolve base URL: explicit base_url param > defaults.toml > hardcoded
+    // fallback. The defaults.toml lookup means newly-shipped providers (e.g.
+    // agnes) resolve here the same way the gateway resolves them — without
+    // having to re-add every provider to the match below (which previously
+    // 404'd new providers as "unknown provider").
+    let effective_base: String = if let Some(u) = base_url.filter(|u| !u.is_empty()) {
+        u
+    } else if let Some(u) = provider_base_url_from_defaults(&provider) {
+        u
+    } else {
+        match provider.as_str() {
+            "anthropic"   => "https://api.anthropic.com/v1",
+            "openai"      => "https://api.openai.com/v1",
+            "deepseek"    => "https://api.deepseek.com/v1",
+            "qwen"        => "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "doubao"      => "https://ark.cn-beijing.volces.com/api/v3",
+            "minimax"     => "https://api.minimaxi.com/v1",
+            "kimi"        => "https://api.moonshot.cn/v1",
+            "zhipu"       => "https://open.bigmodel.cn/api/paas/v4",
+            "groq"        => "https://api.groq.com/openai/v1",
+            "grok"        => "https://api.x.ai/v1",
+            "gemini"      => "https://generativelanguage.googleapis.com/v1beta",
+            "siliconflow" => "https://api.siliconflow.cn/v1",
+            "openrouter"  => "https://openrouter.ai/api/v1",
+            "gaterouter"  => "https://api.gaterouter.ai/openai/v1",
+            "ollama"      => "http://localhost:11434",
+            "rsclaw"      => "https://api.rsclaw.ai/v1/agent",
+            "custom" | "codingplan" => "",
+            _ => return Ok(serde_json::json!({"ok": false, "error": "unknown provider"})),
+        }
+        .to_owned()
     };
-    let effective_base = base_url
-        .filter(|u| !u.is_empty())
-        .unwrap_or_else(|| default_base.to_owned());
     let effective_base = effective_base.trim_end_matches('/');
 
     // Determine auth style based on provider or api_type
