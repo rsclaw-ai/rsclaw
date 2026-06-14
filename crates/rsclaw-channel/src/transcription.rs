@@ -5,6 +5,8 @@
 //!   - `local`    — Local whisper.cpp via command-line
 //!   - `tencent`  — Tencent Cloud ASR (腾讯语音识别)
 //!   - `aliyun`   — Alibaba Cloud ASR (阿里语音识别)
+//!   - `rsclaw`   — self-hosted rsclaw-server ASR (qwen3-asr); opt-in via
+//!     `TRANSCRIPTION_PROVIDER=rsclaw`, never auto-selected
 //!   - `builtin`  — Platform's built-in recognition (e.g., WeChat)
 //!
 //! Audio decoding uses symphonia (pure Rust) — no ffmpeg required.
@@ -72,6 +74,9 @@ pub async fn transcribe_audio(
         "local" => transcribe_local(&effective_bytes, &effective_name).await,
         "tencent" => transcribe_tencent(client, &effective_bytes, &effective_name).await,
         "aliyun" => transcribe_aliyun(client, &effective_bytes, &effective_name).await,
+        "rsclaw" => {
+            transcribe_rsclaw(client, &effective_bytes, &effective_name, &effective_mime).await
+        }
         _ => transcribe_openai(client, &effective_bytes, &effective_name, &effective_mime).await,
     };
 
@@ -354,6 +359,81 @@ print(resultText)
 // OpenAI Whisper
 // ---------------------------------------------------------------------------
 
+/// Transcribe via a self-hosted rsclaw-server `/v1/audio/transcriptions`
+/// (qwen3-asr). **Opt-in only** — reached solely when
+/// `TRANSCRIPTION_PROVIDER=rsclaw` is set; never auto-selected, so local /
+/// offline transcription stays the default. Reuses the
+/// `models.providers["rsclaw"]` block (`base_url` + `api_key`) that the
+/// chat/agent lanes already use, so no new config is needed.
+async fn transcribe_rsclaw(
+    client: &Client,
+    audio_bytes: &[u8],
+    file_name: &str,
+    mime_type: &str,
+) -> Result<String> {
+    let cfg = rsclaw_config::load().context("load config for rsclaw transcription")?;
+    let provider = cfg
+        .raw
+        .models
+        .as_ref()
+        .and_then(|m| m.providers.get("rsclaw"));
+    let base = provider
+        .and_then(|p| p.base_url.as_deref())
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .map(rsclaw_v1_root)
+        .unwrap_or_else(|| rsclaw_embed::RSCLAW_API_BASE_URL.to_owned());
+    let api_key = provider
+        .and_then(|p| p.api_key.as_ref())
+        .and_then(|s| s.resolve_early())
+        .context(
+            "rsclaw transcription needs models.providers.rsclaw.api_key \
+             (set it, and TRANSCRIPTION_PROVIDER=rsclaw)",
+        )?;
+
+    let part = reqwest::multipart::Part::bytes(audio_bytes.to_vec())
+        .file_name(file_name.to_owned())
+        .mime_str(mime_type)?;
+    // `model` is advisory — the server pins rsclaw-asr-v1 regardless — but
+    // send it for parity with the OpenAI shape.
+    let form = reqwest::multipart::Form::new()
+        .text("model", "rsclaw-asr-v1")
+        .part("file", part);
+
+    let url = format!("{base}/audio/transcriptions");
+    let resp = client
+        .post(&url)
+        .bearer_auth(&api_key)
+        .multipart(form)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("rsclaw ASR error {status}: {body}");
+    }
+
+    let result: serde_json::Value = resp.json().await?;
+    let text = result
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+
+    debug!(chars = text.len(), %url, "rsclaw ASR transcription complete");
+    Ok(text)
+}
+
+/// Reduce a provider `base_url` to the `/v1` root for the audio endpoints.
+/// The rsclaw provider block is commonly pointed at the agent sub-root
+/// (`…/v1/agent`) for chat/agent lanes, but transcriptions live at
+/// `…/v1/audio/…`, so peel a trailing `/agent` (and trailing slashes).
+fn rsclaw_v1_root(base: &str) -> String {
+    let b = base.trim_end_matches('/');
+    b.strip_suffix("/agent").unwrap_or(b).to_owned()
+}
+
 async fn transcribe_openai(
     client: &Client,
     audio_bytes: &[u8],
@@ -516,13 +596,12 @@ async fn transcribe_local(audio_bytes: &[u8], file_name: &str) -> Result<String>
     };
 
     // Determine model path
-    let model = find_whisper_model()
-        .context(
-            "no offline STT model installed. Self-install (agent may run these with user \
+    let model = find_whisper_model().context(
+        "no offline STT model installed. Self-install (agent may run these with user \
              approval): `rsclaw tools install sherpa-onnx` then `rsclaw models download \
              paraformer-zh` (Chinese, 70MB; or `whisper` for multilingual, 110MB). \
              Alternative: set WHISPER_MODEL=/path/to/ggml-model.bin for whisper-cli.",
-        )?;
+    )?;
 
     // Run whisper
     // Use WHISPER_LANGUAGE env (default: "zh" for Chinese).
