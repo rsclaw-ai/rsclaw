@@ -1,0 +1,1015 @@
+//! Channel subsystem.
+//!
+//! TODO: Channel instances are stored behind `OnceCell` (set once at startup).
+//! This prevents hot-adding or replacing channels at runtime. Migrate to
+//! `ArcSwap` to support the channel hot-add feature (see feature backlog).
+//!
+//! A *channel* is an integration point where messages arrive (Telegram,
+//! Discord, CLI, etc.). Each channel implementation:
+//!   1. Receives inbound messages and forwards them to the gateway router.
+//!   2. Sends outbound replies (with optional chunking / preview streaming).
+//!   3. Enforces `dmPolicy` (pairing / allowlist / open / disabled).
+//!
+//! Modules:
+//!   - `mod`      — `Channel` trait, `DmPolicyEnforcer`, `PairingStore`
+//!   - `chunker`  — text chunking with code-fence protection
+//!   - `telegram` — Telegram Bot API client
+//!   - `discord`  — Discord Bot WebSocket + REST
+//!   - `slack`    — Slack Socket Mode + Web API
+//!   - `whatsapp` — WhatsApp Cloud API (webhook)
+//!   - `signal`   — Signal via signal-cli JSON-RPC
+//!   - `dingtalk` — DingTalk Robot Stream Mode + REST
+//!   - `line`     — LINE Messaging API (webhook)
+//!   - `zalo`     — Zalo Official Account API (webhook)
+//!   - `matrix`   — Matrix Client-Server API (long-poll sync)
+//!   - `cli`      — CLI interactive channel
+
+// crate-split: root aliases so grouped `use crate::{config::.., provider::.., retry::..}`
+// imports resolve to the extracted crates.
+use rsclaw_config as config;
+use rsclaw_provider as provider;
+use rsclaw_store as store;
+use rsclaw_util as util;
+use rsclaw_i18n as i18n;
+use rsclaw_events as events;
+use rsclaw_platform as sys;
+use rsclaw_embed as embed;
+
+pub mod attachments;
+pub mod auth;
+pub mod chunker;
+pub mod cli;
+pub mod custom;
+pub mod dingtalk;
+pub mod discord;
+pub mod feishu;
+pub mod line;
+pub mod matrix;
+pub mod qq;
+// retry helpers extracted to rsclaw-retry (crate-split); re-exported so
+// crate::retry::{SendRetry, send_with_retry} keeps resolving.
+pub use rsclaw_retry as retry;
+pub mod signal;
+pub mod slack;
+pub mod telegram;
+pub mod transcription;
+pub mod tts;
+pub mod wechat;
+pub mod wecom;
+pub mod whatsapp;
+pub mod zalo;
+
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use anyhow::Result;
+use futures::future::BoxFuture;
+use rand::Rng;
+use tokio::sync::Mutex;
+use tracing::{debug, info, warn};
+
+use crate::{
+    config::schema::DmPolicy,
+    provider::{RetryConfig, backoff_delay},
+};
+
+// ---------------------------------------------------------------------------
+// OutboundMessage
+// ---------------------------------------------------------------------------
+
+/// Build a desktop-only notification text annotated with a kind tag.
+///
+/// The desktop channel detects the prefix and lifts `kind` into the
+/// notification payload so the UI can render the bubble with a badge
+/// (e.g. `[任务完成]`). Other channel impls never see the prefix because
+/// routing only sends desktop-targeted messages to `DesktopChannel`.
+///
+/// Use the kind constants in [`outbound_kind`] for known values.
+pub fn outbound_with_kind(kind: &str, text: impl Into<String>) -> String {
+    format!("\u{e000}rsclaw:kind={kind}\u{e001}{}", text.into())
+}
+
+/// Known kind tags for [`outbound_with_kind`]. Keep in sync with the desktop
+/// UI's notification renderer.
+pub mod outbound_kind {
+    pub const TASK_COMPLETE: &str = "task_complete";
+    pub const ASYNC_SEND: &str = "async_send";
+}
+
+// `OutboundMessage` lifted to `rsclaw-types` (crate-split); re-exported here so
+// existing `crate::OutboundMessage` paths keep resolving.
+pub use rsclaw_types::OutboundMessage;
+
+// ---------------------------------------------------------------------------
+// Channel trait
+// ---------------------------------------------------------------------------
+
+// BoxFuture is required here because this trait is used as `dyn Channel`
+// (see ChannelManager, gateway/channels). Native async fn in traits
+// does not support dynamic dispatch.
+/// Every channel integration implements this trait.
+pub trait Channel: Send + Sync {
+    /// Human-readable name of this channel, e.g. "telegram", "discord".
+    fn name(&self) -> &str;
+
+    /// Send a message to the channel.
+    fn send(&self, msg: OutboundMessage) -> BoxFuture<'_, Result<()>>;
+
+    /// Start the inbound message loop (long-running task).
+    fn run(self: Arc<Self>) -> BoxFuture<'static, Result<()>>;
+}
+
+// ---------------------------------------------------------------------------
+// DmPolicy enforcer
+// ---------------------------------------------------------------------------
+
+/// Maximum number of pending pairing requests per channel.
+const MAX_PENDING_PAIRINGS: usize = 3;
+/// How long a pairing code is valid.
+const PAIRING_TTL: Duration = Duration::from_secs(3600);
+
+/// Pairing code entry.
+#[derive(Debug, Clone)]
+struct PairingEntry {
+    code: String,
+    peer_id: String,
+    created_at: Instant,
+}
+
+/// In-memory store for dmPolicy = "pairing" state.
+#[derive(Debug, Default)]
+pub struct PairingStore {
+    approved: HashSet<String>,
+    pending: Vec<PairingEntry>,
+}
+
+impl PairingStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_approved(&self, peer_id: &str) -> bool {
+        self.approved.contains(peer_id)
+    }
+
+    /// Create a pairing code for `peer_id`. Returns `None` when queue is full.
+    pub fn create_pairing(&mut self, peer_id: &str) -> Option<String> {
+        self.pending
+            .retain(|e| e.created_at.elapsed() < PAIRING_TTL);
+
+        // Reuse existing code for the same peer.
+        if let Some(existing) = self.pending.iter().find(|e| e.peer_id == peer_id) {
+            return Some(existing.code.clone());
+        }
+
+        if self.pending.len() >= MAX_PENDING_PAIRINGS {
+            return None;
+        }
+
+        let code = generate_pairing_code();
+        self.pending.push(PairingEntry {
+            code: code.clone(),
+            peer_id: peer_id.to_owned(),
+            created_at: Instant::now(),
+        });
+        Some(code)
+    }
+
+    /// Approve a pairing code. Returns the peer ID on success.
+    pub fn approve(&mut self, code: &str) -> Option<String> {
+        self.pending
+            .retain(|e| e.created_at.elapsed() < PAIRING_TTL);
+        let code_upper = code.to_uppercase();
+        let pos = self
+            .pending
+            .iter()
+            .position(|e| e.code.to_uppercase() == code_upper)?;
+        let entry = self.pending.remove(pos);
+        self.approved.insert(entry.peer_id.clone());
+        Some(entry.peer_id)
+    }
+
+    pub fn revoke(&mut self, peer_id: &str) {
+        self.approved.remove(peer_id);
+    }
+
+    /// List pending pairing requests (not yet approved). Returns (code,
+    /// peer_id, seconds_remaining).
+    pub fn list_pending(&mut self) -> Vec<(String, String, u64)> {
+        self.pending
+            .retain(|e| e.created_at.elapsed() < PAIRING_TTL);
+        self.pending
+            .iter()
+            .map(|e| {
+                let remaining = PAIRING_TTL
+                    .as_secs()
+                    .saturating_sub(e.created_at.elapsed().as_secs());
+                (e.code.clone(), e.peer_id.clone(), remaining)
+            })
+            .collect()
+    }
+
+    /// List approved peer IDs.
+    pub fn list_approved(&self) -> Vec<String> {
+        self.approved.iter().cloned().collect()
+    }
+}
+
+fn generate_pairing_code() -> String {
+    const CHARS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I to avoid confusion
+    let mut rng = rand::rng();
+    let part = |rng: &mut rand::rngs::ThreadRng| -> String {
+        (0..4)
+            .map(|_| CHARS[rng.random_range(0..CHARS.len())] as char)
+            .collect()
+    };
+    format!("{}-{}", part(&mut rng), part(&mut rng))
+}
+
+// ---------------------------------------------------------------------------
+// DmPolicyEnforcer
+// ---------------------------------------------------------------------------
+
+/// Evaluates the configured `dmPolicy` for an inbound DM.
+/// Approved peers are persisted to redb so they survive restarts.
+#[derive(Debug)]
+pub struct DmPolicyEnforcer {
+    policy: DmPolicy,
+    allow_from: HashSet<String>,
+    pairing: Mutex<PairingStore>,
+    channel_name: String,
+    store: Option<Arc<rsclaw_store::redb_store::RedbStore>>,
+}
+
+/// Outcome of a dmPolicy check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyResult {
+    Allow,
+    Deny,
+    SendPairingCode(String),
+    PairingQueueFull,
+}
+
+impl DmPolicyEnforcer {
+    pub fn new(policy: DmPolicy, allow_from: Vec<String>) -> Self {
+        Self {
+            policy,
+            allow_from: allow_from.into_iter().collect(),
+            pairing: Mutex::new(PairingStore::new()),
+            channel_name: String::new(),
+            store: None,
+        }
+    }
+
+    /// Enable persistence: load approved peers from redb on init, write-through
+    /// on approve/revoke.
+    pub fn with_persistence(
+        mut self,
+        channel: &str,
+        store: Arc<rsclaw_store::redb_store::RedbStore>,
+    ) -> Self {
+        self.channel_name = channel.to_owned();
+        // Load previously approved peers from redb.
+        if let Ok(pairs) = store.list_pairings(channel) {
+            let mut ps = self.pairing.try_lock().expect("lock during init");
+            for peer_id in pairs {
+                ps.approved.insert(peer_id);
+            }
+            if !ps.approved.is_empty() {
+                info!(
+                    channel,
+                    count = ps.approved.len(),
+                    "loaded persisted pairing approvals"
+                );
+            }
+        }
+        self.store = Some(store);
+        self
+    }
+
+    pub async fn check(&self, peer_id: &str) -> PolicyResult {
+        match &self.policy {
+            DmPolicy::Disabled => {
+                debug!(peer_id, "DM rejected: policy=disabled");
+                PolicyResult::Deny
+            }
+            DmPolicy::Open => PolicyResult::Allow,
+            DmPolicy::Allowlist => {
+                if self.allow_from.contains(peer_id) || self.allow_from.contains("*") {
+                    PolicyResult::Allow
+                } else {
+                    debug!(peer_id, "DM rejected: not in allowlist");
+                    PolicyResult::Deny
+                }
+            }
+            DmPolicy::Pairing => {
+                let mut store = self.pairing.lock().await;
+                if store.is_approved(peer_id) {
+                    PolicyResult::Allow
+                } else {
+                    match store.create_pairing(peer_id) {
+                        Some(code) => {
+                            info!(peer_id, code, "pairing code generated");
+                            PolicyResult::SendPairingCode(code)
+                        }
+                        None => {
+                            warn!(peer_id, "pairing queue full");
+                            PolicyResult::PairingQueueFull
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn approve_pairing(&self, code: &str) -> Option<String> {
+        let peer = self.pairing.lock().await.approve(code);
+        // Persist to redb.
+        if let (Some(peer_id), Some(db)) = (&peer, &self.store) {
+            let state = rsclaw_store::redb_store::PairingState::Approved;
+            if let Err(e) = db.put_pairing(&self.channel_name, peer_id, &state) {
+                warn!(channel = %self.channel_name, peer_id, error = %e, "failed to persist pairing approval");
+            }
+        }
+        peer
+    }
+
+    pub async fn revoke(&self, peer_id: &str) {
+        self.pairing.lock().await.revoke(peer_id);
+        // Remove from redb.
+        if let Some(ref db) = self.store {
+            if let Err(e) = db.delete_pairing(&self.channel_name, peer_id) {
+                warn!(channel = %self.channel_name, peer_id, error = %e, "failed to delete pairing from store");
+            }
+        }
+    }
+
+    /// List pending pairing requests for this channel.
+    pub async fn list_pending(&self) -> Vec<(String, String, u64)> {
+        self.pairing.lock().await.list_pending()
+    }
+
+    /// List approved peers for this channel.
+    pub async fn list_approved(&self) -> Vec<String> {
+        self.pairing.lock().await.list_approved()
+    }
+
+    /// Get the channel name.
+    pub fn channel_name(&self) -> &str {
+        &self.channel_name
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Media type detection — shared by all channels
+// ---------------------------------------------------------------------------
+
+/// Detect if an attachment is an image based on content_type and filename.
+pub fn is_image_attachment(content_type: &str, filename: &str) -> bool {
+    if content_type.starts_with("image/") {
+        return true;
+    }
+    let lower = filename.to_lowercase();
+    lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".png")
+        || lower.ends_with(".gif")
+        || lower.ends_with(".webp")
+        || lower.ends_with(".bmp")
+        || lower.ends_with(".svg")
+        || lower.ends_with(".tiff")
+        || lower.ends_with(".ico")
+        || lower.ends_with(".heic")
+        || lower.ends_with(".heif")
+        || lower.ends_with(".avif")
+}
+
+/// Detect if an attachment is audio/voice based on content_type and filename.
+pub fn is_audio_attachment(content_type: &str, filename: &str) -> bool {
+    if content_type.starts_with("audio/") || content_type == "voice" {
+        return true;
+    }
+    let lower = filename.to_lowercase();
+    lower.ends_with(".amr")
+        || lower.ends_with(".ogg")
+        || lower.ends_with(".opus")
+        || lower.ends_with(".silk")
+        || lower.ends_with(".wav")
+        || lower.ends_with(".mp3")
+        || lower.ends_with(".m4a")
+        || lower.ends_with(".aac")
+        || lower.ends_with(".flac")
+        || lower.ends_with(".wma")
+}
+
+/// Detect if an attachment is video based on content_type and filename.
+pub fn is_video_attachment(content_type: &str, filename: &str) -> bool {
+    if content_type.starts_with("video/") {
+        return true;
+    }
+    let lower = filename.to_lowercase();
+    lower.ends_with(".mp4")
+        || lower.ends_with(".mov")
+        || lower.ends_with(".avi")
+        || lower.ends_with(".mkv")
+        || lower.ends_with(".webm")
+        || lower.ends_with(".wmv")
+        || lower.ends_with(".flv")
+        || lower.ends_with(".3gp")
+}
+
+/// Detect if an attachment is a document based on content_type and filename.
+pub fn is_document_attachment(content_type: &str, filename: &str) -> bool {
+    if content_type.starts_with("application/pdf")
+        || content_type.starts_with("application/msword")
+        || content_type.contains("officedocument")
+        || content_type.contains("spreadsheet")
+        || content_type.contains("presentation")
+        || content_type == "text/plain"
+        || content_type == "text/csv"
+        || content_type == "text/markdown"
+        || content_type == "application/json"
+    {
+        return true;
+    }
+    let lower = filename.to_lowercase();
+    lower.ends_with(".pdf")
+        || lower.ends_with(".doc")
+        || lower.ends_with(".docx")
+        || lower.ends_with(".xls")
+        || lower.ends_with(".xlsx")
+        || lower.ends_with(".ppt")
+        || lower.ends_with(".pptx")
+        || lower.ends_with(".txt")
+        || lower.ends_with(".md")
+        || lower.ends_with(".csv")
+        || lower.ends_with(".json")
+        || lower.ends_with(".xml")
+        || lower.ends_with(".rtf")
+}
+
+/// Return the upload subdirectory for a file based on its type.
+///
+/// - video → "videos"
+/// - audio → "audios"
+/// - document → "docs"
+/// - image → "images"
+/// - other → "files"
+pub fn upload_subdir(mime_type: &str, filename: &str) -> &'static str {
+    if is_video_attachment(mime_type, filename) {
+        "videos"
+    } else if is_audio_attachment(mime_type, filename) {
+        "audios"
+    } else if is_image_attachment(mime_type, filename) {
+        "images"
+    } else if is_document_attachment(mime_type, filename) {
+        "docs"
+    } else {
+        "files"
+    }
+}
+
+/// Single-letter kind for a (mime, filename) pair: `i`/`v`/`a`/`d`/`f`.
+/// Shared by `upload_filename` (user uploads, `up_` prefix), the
+/// `a2a` ingest path (`a2a_` prefix), and the plugin/agent download
+/// path (`dl_` prefix) so all three naming schemes agree on category.
+pub fn kind_for_mime(mime_type: &str, filename: &str) -> char {
+    if is_video_attachment(mime_type, filename) {
+        'v'
+    } else if is_audio_attachment(mime_type, filename) {
+        'a'
+    } else if is_document_attachment(mime_type, filename) {
+        'd'
+    } else if mime_type.starts_with("image/") {
+        'i'
+    } else {
+        'f'
+    }
+}
+
+/// Generic canonical filename factory used by every provenance bucket.
+///
+/// Format: `{prefix}_{kind}_{YYYYMMDDHHmm}{abc}.{ext}`
+/// where `prefix` is one of:
+///   `up`  — user upload via a messaging channel
+///   `dl`  — generated/downloaded by a plugin or agent tool
+///   `a2a` — received from an A2A peer over the protocol
+///
+/// `kind` is `i`/`v`/`a`/`d`/`f` per `kind_for_mime`. `abc` is 3 random
+/// lowercase letters (~17 576 combinations — well under the
+/// birthday-collision threshold for any realistic per-minute rate).
+pub fn canonical_filename(prefix: &str, mime_type: &str, original_filename: &str) -> String {
+    let kind = kind_for_mime(mime_type, original_filename);
+    let ts = canonical_timestamp();
+    let abc = random_suffix3();
+    let ext = std::path::Path::new(original_filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or(match kind {
+            'i' => "png",
+            'v' => "mp4",
+            'a' => "mp3",
+            'd' => "pdf",
+            _ => "bin",
+        });
+    format!("{prefix}_{kind}_{ts}{abc}.{ext}")
+}
+
+/// User-upload filename (prefix `up_`). Thin wrapper kept for back-compat
+/// with the existing channel-side call sites; new code should call
+/// `canonical_filename` directly with an explicit prefix.
+pub fn upload_filename(mime_type: &str, original_filename: &str) -> String {
+    canonical_filename("up", mime_type, original_filename)
+}
+
+/// Map a file extension to the single-letter kind used in canonical
+/// `up_/dl_` filenames. Mirrors `upload_prefix` but starts from the
+/// extension (which is what the host has when allocating artifacts on
+/// behalf of a plugin — there's no mime type at that point).
+pub fn kind_from_extension(ext: &str) -> char {
+    let e = ext.to_ascii_lowercase();
+    match e.as_str() {
+        "mp4" | "mov" | "webm" | "mkv" | "avi" | "m4v" => 'v',
+        "mp3" | "wav" | "m4a" | "ogg" | "opus" | "aac" | "flac" => 'a',
+        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "md" | "csv" => 'd',
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "svg" | "heic" | "heif" => 'i',
+        _ => 'f',
+    }
+}
+
+/// Subdirectory under `~/Downloads/rsclaw/` (or `<workspace>/uploads/`)
+/// for a given canonical kind letter.
+pub fn category_for_kind(kind: char) -> &'static str {
+    match kind {
+        'i' => "images",
+        'v' => "videos",
+        'a' => "audios",
+        'd' => "docs",
+        _ => "files",
+    }
+}
+
+fn canonical_timestamp() -> String {
+    chrono::Local::now().format("%Y%m%d%H%M").to_string()
+}
+
+fn random_suffix3() -> String {
+    let mut s = String::with_capacity(3);
+    for _ in 0..3 {
+        s.push((rand::random::<u8>() % 26 + b'a') as char);
+    }
+    s
+}
+
+// ---------------------------------------------------------------------------
+// @-reference resolver
+// ---------------------------------------------------------------------------
+
+/// Result of resolving `@` file references in a message.
+pub struct ResolvedRefs {
+    /// Text with `[file references]` block appended.
+    pub text: String,
+    /// Image file paths that should be loaded for vision analysis.
+    pub image_paths: Vec<std::path::PathBuf>,
+}
+
+/// Scan text for `@<filename>` file references and resolve them to full
+/// paths. Supported shapes:
+///
+/// * `@up_<kind>_<suffix>.<ext>` — uploaded by the user; lives under
+///   `<workspace>/uploads/<category>/`
+/// * `@dl_<kind>_<suffix>.<ext>` — generated/downloaded by a plugin; lives
+///   under `~/Downloads/rsclaw/<category>/`
+///
+/// Image references are collected in `image_paths` so the caller can
+/// load them as vision attachments.
+pub fn resolve_file_refs(text: &str, workspace: &std::path::Path) -> ResolvedRefs {
+    let uploads = workspace.join("uploads");
+    let a2a_root = workspace.join("a2a");
+    let downloads_root = dirs_next::download_dir()
+        .unwrap_or_else(|| {
+            dirs_next::home_dir()
+                .map(|h| h.join("Downloads"))
+                .unwrap_or_else(|| workspace.to_path_buf())
+        })
+        .join("rsclaw");
+
+    // Three provenance buckets: up/ (channel uploads), dl/ (plugin or agent
+    // downloads), a2a/ (received from A2A peers). Filenames share the
+    // `<prefix>_<kind>_<ts><suffix>.<ext>` shape; the prefix decides which
+    // bucket the file lives under.
+    let re = regex::Regex::new(r"@(up|dl|a2a)_([ivdaf])_([a-z0-9_]+)\.(\w+)").expect("valid regex");
+
+    let mut resolved = Vec::new();
+    let mut image_paths = Vec::new();
+    for cap in re.captures_iter(text) {
+        let source = &cap[1];
+        let kind = cap[2].chars().next().unwrap_or('f');
+        let full_name = &cap[0][1..]; // strip the leading '@'
+        let subdir = category_for_kind(kind);
+        let path = match source {
+            "dl" => downloads_root.join(subdir).join(full_name),
+            "a2a" => a2a_root.join(subdir).join(full_name),
+            _ => uploads.join(subdir).join(full_name),
+        };
+        if path.exists() {
+            resolved.push((full_name.to_string(), path.to_string_lossy().to_string()));
+            if kind == 'i' {
+                image_paths.push(path);
+            }
+        }
+    }
+
+    if resolved.is_empty() {
+        return ResolvedRefs {
+            text: text.to_string(),
+            image_paths,
+        };
+    }
+
+    let mut result = text.to_string();
+    result.push_str("\n\n[file references]\n");
+    for (name, path) in &resolved {
+        result.push_str(&format!("@{name} = {path}\n"));
+    }
+    ResolvedRefs {
+        text: result,
+        image_paths,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ChannelManager — concurrent channel limit (AGENTS.md §18)
+// ---------------------------------------------------------------------------
+
+use rsclaw_platform::MemoryTier;
+
+pub struct ChannelManager {
+    channels: HashMap<String, Arc<dyn Channel>>,
+    tier: MemoryTier,
+}
+
+impl ChannelManager {
+    pub fn new(tier: MemoryTier) -> Self {
+        Self {
+            channels: HashMap::new(),
+            tier,
+        }
+    }
+
+    pub fn max_concurrent(&self) -> usize {
+        match self.tier {
+            MemoryTier::Low => 3,
+            MemoryTier::Standard => 8,
+            MemoryTier::High => usize::MAX,
+        }
+    }
+
+    pub fn register(&mut self, ch: Arc<dyn Channel>) -> Result<()> {
+        let name = ch.name().to_owned();
+        self.register_with_name(name, ch)
+    }
+
+    /// Register a channel under a specific name (defaults to `ch.name()`).
+    /// Used for multi-account channels that need both an account-keyed
+    /// alias (e.g. `"feishu/main"`) and a bare-name fallback so callers
+    /// can route by account when they know it.
+    ///
+    /// Aliases — registrations whose `ch` is already present in the map
+    /// (detected via `Arc::ptr_eq`) — do not consume `max_concurrent` quota.
+    /// This lets a real multi-account channel register multiple lookup keys
+    /// (e.g. `"feishu"` and `"feishu/main"`) without burning extra slots.
+    pub fn register_with_name(&mut self, name: String, ch: Arc<dyn Channel>) -> Result<()> {
+        let is_alias = self
+            .channels
+            .values()
+            .any(|existing| Arc::ptr_eq(existing, &ch));
+        if !is_alias && self.distinct_channel_count() >= self.max_concurrent() {
+            anyhow::bail!(
+                "channel limit reached ({}) for memory tier {:?}",
+                self.max_concurrent(),
+                self.tier
+            );
+        }
+        self.channels.insert(name, ch);
+        Ok(())
+    }
+
+    /// Count distinct underlying channels (collapses alias entries that point
+    /// at the same `Arc<dyn Channel>`).
+    fn distinct_channel_count(&self) -> usize {
+        let mut seen: Vec<*const ()> = Vec::with_capacity(self.channels.len());
+        for ch in self.channels.values() {
+            let ptr = Arc::as_ptr(ch) as *const ();
+            if !seen.iter().any(|p| *p == ptr) {
+                seen.push(ptr);
+            }
+        }
+        seen.len()
+    }
+
+    pub fn get(&self, name: &str) -> Option<Arc<dyn Channel>> {
+        self.channels.get(name).cloned()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// send_with_retry — agents.md §22
+// ---------------------------------------------------------------------------
+
+/// Send `msg` via `channel`, retrying up to `config.attempts` times with
+/// exponential back-off on transient failures.
+pub async fn send_with_retry(
+    channel: &dyn Channel,
+    msg: OutboundMessage,
+    config: &RetryConfig,
+) -> Result<()> {
+    let mut last_err = anyhow::anyhow!("no attempts made");
+    for attempt in 0..config.attempts {
+        match channel.send(msg.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = e;
+                if attempt + 1 < config.attempts {
+                    let delay = backoff_delay(attempt, config);
+                    warn!(
+                        channel = channel.name(),
+                        attempt,
+                        ?delay,
+                        "channel send failed, retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
+// ---------------------------------------------------------------------------
+// Office document text extraction (docx/xlsx/pptx)
+// ---------------------------------------------------------------------------
+
+/// Extract text from an Office document (docx/xlsx/pptx) based on filename.
+/// Returns None if the file is not a recognized Office format or extraction
+/// fails.
+pub fn extract_office_text(filename: &str, bytes: &[u8]) -> Option<String> {
+    let lower = filename.to_lowercase();
+    if lower.ends_with(".docx") {
+        return extract_docx_text(bytes);
+    }
+    if lower.ends_with(".xlsx") {
+        return extract_xlsx_text(bytes);
+    }
+    if lower.ends_with(".pptx") {
+        return extract_pptx_text(bytes);
+    }
+    None
+}
+
+/// Extract text from a .docx file (ZIP containing word/document.xml).
+fn extract_docx_text(bytes: &[u8]) -> Option<String> {
+    use std::io::Cursor;
+    let cursor = Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(cursor).ok()?;
+    let mut doc = archive.by_name("word/document.xml").ok()?;
+    let mut xml = String::new();
+    std::io::Read::read_to_string(&mut doc, &mut xml).ok()?;
+    // Strip XML tags to get plain text
+    let text = regex::Regex::new(r"<[^>]+>")
+        .ok()?
+        .replace_all(&xml, " ")
+        .to_string();
+    // Clean up whitespace
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(text)
+}
+
+/// Extract text from a .xlsx file (ZIP containing xl/sharedStrings.xml).
+fn extract_xlsx_text(bytes: &[u8]) -> Option<String> {
+    use std::io::Cursor;
+    let cursor = Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(cursor).ok()?;
+    let mut text = String::new();
+
+    // Try shared strings first (contains all text values)
+    if let Ok(mut ss) = archive.by_name("xl/sharedStrings.xml") {
+        let mut xml = String::new();
+        std::io::Read::read_to_string(&mut ss, &mut xml).ok()?;
+        let clean = regex::Regex::new(r"<[^>]+>").ok()?.replace_all(&xml, " ");
+        text.push_str(&clean);
+    }
+
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(text)
+}
+
+/// Extract text from a .pptx file (ZIP containing ppt/slides/slide*.xml).
+fn extract_pptx_text(bytes: &[u8]) -> Option<String> {
+    use std::io::Cursor;
+    let cursor = Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(cursor).ok()?;
+    let mut text = String::new();
+
+    for i in 0..archive.len() {
+        if let Ok(mut file) = archive.by_index(i) {
+            let name = file.name().to_owned();
+            if name.starts_with("ppt/slides/slide") && name.ends_with(".xml") {
+                let mut xml = String::new();
+                let _ = std::io::Read::read_to_string(&mut file, &mut xml);
+                if let Ok(re) = regex::Regex::new(r"<[^>]+>") {
+                    let clean = re.replace_all(&xml, " ").to_string();
+                    text.push_str(&clean);
+                    text.push('\n');
+                }
+            }
+        }
+    }
+
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(text)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pairing_policy_generates_code() {
+        let enforcer = DmPolicyEnforcer::new(DmPolicy::Pairing, vec![]);
+        let result = enforcer.check("user_1").await;
+        assert!(
+            matches!(result, PolicyResult::SendPairingCode(_)),
+            "expected pairing code, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pairing_approved_allows_subsequent() {
+        let enforcer = DmPolicyEnforcer::new(DmPolicy::Pairing, vec![]);
+        let code = match enforcer.check("user_1").await {
+            PolicyResult::SendPairingCode(c) => c,
+            other => panic!("expected code, got {other:?}"),
+        };
+        let approved = enforcer.approve_pairing(&code).await;
+        assert_eq!(approved.as_deref(), Some("user_1"));
+        assert_eq!(enforcer.check("user_1").await, PolicyResult::Allow);
+    }
+
+    #[tokio::test]
+    async fn allowlist_policy() {
+        let enforcer = DmPolicyEnforcer::new(DmPolicy::Allowlist, vec!["alice".to_owned()]);
+        assert_eq!(enforcer.check("alice").await, PolicyResult::Allow);
+        assert_eq!(enforcer.check("bob").await, PolicyResult::Deny);
+    }
+
+    #[tokio::test]
+    async fn disabled_policy_always_denies() {
+        let enforcer = DmPolicyEnforcer::new(DmPolicy::Disabled, vec![]);
+        assert_eq!(enforcer.check("anyone").await, PolicyResult::Deny);
+    }
+
+    #[tokio::test]
+    async fn pairing_queue_full() {
+        let enforcer = DmPolicyEnforcer::new(DmPolicy::Pairing, vec![]);
+        for i in 0..MAX_PENDING_PAIRINGS {
+            let r = enforcer.check(&format!("user_{i}")).await;
+            assert!(matches!(r, PolicyResult::SendPairingCode(_)));
+        }
+        assert_eq!(
+            enforcer.check("overflow_user").await,
+            PolicyResult::PairingQueueFull
+        );
+    }
+
+    #[test]
+    fn pairing_code_format() {
+        let code = generate_pairing_code();
+        let parts: Vec<&str> = code.split('-').collect();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].len(), 4);
+        assert_eq!(parts[1].len(), 4);
+    }
+
+    #[test]
+    fn channel_manager_low_tier_limit() {
+        let mut mgr = ChannelManager::new(MemoryTier::Low);
+        assert_eq!(mgr.max_concurrent(), 3);
+
+        struct Dummy(String);
+        impl Channel for Dummy {
+            fn name(&self) -> &str {
+                &self.0
+            }
+            fn send(&self, _: OutboundMessage) -> BoxFuture<'_, Result<()>> {
+                Box::pin(async move { Ok(()) })
+            }
+            fn run(self: Arc<Self>) -> BoxFuture<'static, Result<()>> {
+                Box::pin(async move { Ok(()) })
+            }
+        }
+
+        for i in 0..3 {
+            mgr.register(Arc::new(Dummy(format!("ch{i}")))).expect("ok");
+        }
+        assert!(mgr.register(Arc::new(Dummy("ch4".into()))).is_err());
+    }
+}
+
+// File-text extraction (crate-split): lifted from agent/runtime.rs. Belongs in
+// channel — PDF via rsclaw_doc, office via self, audio via self transcription.
+/// Attempt to extract readable text from a file based on extension.
+/// Returns `None` for binary/unrecognized formats.
+pub async fn extract_file_text(filename: &str, bytes: &[u8]) -> Option<String> {
+    let lower = filename.to_lowercase();
+    if lower.ends_with(".pdf") {
+        match rsclaw_doc::safe_extract_pdf_from_mem(bytes) {
+            Ok(text) => return Some(text),
+            Err(_) => {}
+        }
+        // Fallback to pdftotext CLI
+        let tmp = std::env::temp_dir().join(format!("rsclaw_extract_{}", uuid::Uuid::new_v4()));
+        std::fs::write(&tmp, bytes).ok()?;
+        #[allow(unused_mut)]
+        let mut pdf_cmd = std::process::Command::new("pdftotext");
+        pdf_cmd.args([tmp.to_str().unwrap_or(""), "-"]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            pdf_cmd.creation_flags(0x08000000);
+        }
+        let output = pdf_cmd.output();
+        let _ = std::fs::remove_file(&tmp);
+        output
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+    } else if lower.ends_with(".docx") || lower.ends_with(".xlsx") || lower.ends_with(".pptx") {
+        crate::extract_office_text(filename, bytes)
+    } else if is_likely_text_file(&lower) {
+        Some(String::from_utf8_lossy(bytes).to_string())
+    } else if is_audio_or_video(&lower) {
+        extract_audio_text(bytes, &lower).await
+    } else {
+        None
+    }
+}
+
+fn is_audio_or_video(lower: &str) -> bool {
+    [
+        ".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv", ".mp3", ".wav", ".ogg", ".m4a",
+        ".aac", ".flac", ".wma", ".opus",
+    ]
+    .iter()
+    .any(|e| lower.ends_with(e))
+}
+
+/// Extract text from audio/video by running ffmpeg -> whisper.
+pub async fn extract_audio_text(bytes: &[u8], lower_filename: &str) -> Option<String> {
+    let ext = lower_filename.rsplit('.').next().unwrap_or("mp4");
+    let mime = match ext {
+        "mp4" | "m4a" | "m4v" => "video/mp4",
+        "ogg" | "oga" | "opus" => "audio/ogg",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "amr" => "audio/amr",
+        "webm" => "video/webm",
+        _ => "application/octet-stream",
+    };
+
+    tracing::info!(file = %lower_filename, bytes = bytes.len(), "extract_audio_text: starting");
+
+    let client = reqwest::Client::new();
+    let result =
+        crate::transcription::transcribe_audio(&client, bytes, lower_filename, mime).await;
+
+    match result {
+        Ok(text) if !text.trim().is_empty() => Some(format!(
+            "[Audio transcription from {ext} file]\n{}",
+            text.trim()
+        )),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!("extract_audio_text: transcription failed: {e:#}");
+            None
+        }
+    }
+}
+
+fn is_likely_text_file(lower: &str) -> bool {
+    [
+        ".txt", ".md", ".csv", ".json", ".toml", ".yaml", ".yml", ".xml", ".html", ".rs", ".py",
+        ".js", ".ts", ".go", ".sh", ".log", ".conf", ".cfg", ".c", ".h", ".java", ".css", ".sql",
+        ".rb", ".php", ".swift", ".kt", ".lua",
+    ]
+    .iter()
+    .any(|e| lower.ends_with(e))
+}

@@ -1,0 +1,18 @@
+[package]
+name = "rsclaw-doc"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+calamine = "0.26"
+docx-rs = "0.4"
+krilla = "0.7"
+lopdf = "0.34"
+rust_xlsxwriter = "0.83"
+zip = "2"
+pdf-extract = "0.10"

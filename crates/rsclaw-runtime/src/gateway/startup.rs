@@ -1,0 +1,2902 @@
+//! Gateway startup orchestration.
+//!
+//! Wires together: config, store, providers, agent runtimes, channels,
+//! cron scheduler, and HTTP server into a running gateway.
+
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+
+use anyhow::{Context, Result};
+use tokio::sync::{broadcast, mpsc};
+use tracing::{error, info, warn};
+
+use super::channels::{start_channels, start_custom_channels};
+use rsclaw_provider::build::build_providers;
+use crate::{
+    MemoryTier,
+    cron::CronRunner,
+    gateway::{
+        LiveConfig,
+        hot_reload::{ConfigChange, FileWatcher},
+    },
+    server::{AppState, serve},
+};
+use rsclaw_agent::{
+        AgentMessage, AgentRegistry, AgentReply, AgentRuntime, AgentSpawner, MemoryStore,
+        PendingAnalysis,
+    };
+use rsclaw_channel::OutboundMessage;
+use rsclaw_config::{self as config, runtime::RuntimeConfig, schema::BindMode};
+use rsclaw_plugin::{MemoryStoreSlot, PluginRegistry, load_all_plugins};
+use rsclaw_provider::registry::ProviderRegistry;
+use rsclaw_skill::{SkillRegistry, load_skills};
+use rsclaw_store::Store;
+
+// ---------------------------------------------------------------------------
+// Sync-only channel allow-list
+// ---------------------------------------------------------------------------
+
+/// Channels whose responses arrive back at the caller through a non-
+/// notification transport — currently the HTTP `/api/v1/message`
+/// endpoint, which uses a `oneshot::reply_tx` on the `AgentMessage`
+/// plus an optional SSE byte stream.
+///
+/// The agent runtime still fans the assistant reply out onto the
+/// notification bus for observers (UI, telemetry), so this list
+/// suppresses the otherwise-misleading `WARN: no channel sender
+/// registered` log for those known-by-design absences. Future
+/// sync-only entry points (stdio MCP, in-process embeds, etc.)
+/// should be added here.
+const SYNC_ONLY_CHANNELS: &[&str] = &["api"];
+
+fn is_sync_only_channel(name: &str) -> bool {
+    SYNC_ONLY_CHANNELS.contains(&name)
+}
+
+// ---------------------------------------------------------------------------
+// Gateway entry point
+// ---------------------------------------------------------------------------
+
+/// Start the full gateway. Blocks until shutdown (Ctrl-C).
+/// Prepend common tool directories to the process `PATH`, in priority order,
+/// so subprocesses (cap-rs coding agents, shell exec, MCP servers) can find
+/// user-installed binaries even when the gateway was launched from a desktop
+/// app / launchd (which inherit a stripped PATH without the shell profile).
+///
+/// Priority (earlier wins): system package dirs first, then user-local dirs,
+/// then per-tool dirs, finally the inherited PATH. Only existing dirs and
+/// not-already-present entries are added, so this is idempotent and never
+/// shadows a dir the user already ordered ahead.
+fn enrich_process_path() {
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    let current = std::env::var("PATH").unwrap_or_default();
+    let existing: std::collections::HashSet<&str> = current.split(sep).collect();
+
+    let mut prefix: Vec<String> = Vec::new();
+    let mut push_if = |p: String| {
+        if std::path::Path::new(&p).is_dir() && !existing.contains(p.as_str()) {
+            prefix.push(p);
+        }
+    };
+
+    // HIGHEST priority: rsclaw-managed tools under {base_dir}/tools, winning
+    // over any system-wide install; respects --profile / --base-dir.
+    let tools = rsclaw_config::loader::base_dir().join("tools");
+    #[cfg(unix)]
+    {
+        // One clean shim dir of symlinks (sync_tool_shims) to each
+        // install_tool-managed binary under its canonical command name.
+        push_if(tools.join("bin").to_string_lossy().to_string());
+    }
+    #[cfg(windows)]
+    {
+        // No shim dir on Windows (symlinks need privilege; an .exe must stay
+        // beside its sibling DLLs). Add each tool's own dir + bin/ +
+        // node_modules/.bin so `<tool>.exe`/`.cmd` resolves by name in place.
+        if let Ok(entries) = std::fs::read_dir(&tools) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    push_if(p.join("node_modules").join(".bin").to_string_lossy().to_string());
+                    push_if(p.join("bin").to_string_lossy().to_string());
+                    push_if(p.to_string_lossy().to_string());
+                }
+            }
+        }
+        // claude-code's Windows binary lives deep under the npm package tree:
+        // tools/claude-code/node_modules/@anthropic-ai/claude-code/bin/claude.exe
+        push_if(
+            tools
+                .join("claude-code")
+                .join("node_modules")
+                .join("@anthropic-ai")
+                .join("claude-code")
+                .join("bin")
+                .to_string_lossy()
+                .to_string(),
+        );
+    }
+
+    // System / package-manager dirs next.
+    #[cfg(target_os = "macos")]
+    {
+        for p in ["/usr/local/bin", "/opt/homebrew/bin", "/opt/homebrew/sbin"] {
+            push_if(p.to_owned());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        for p in ["/usr/local/bin"] {
+            push_if(p.to_owned());
+        }
+    }
+    // User-local dirs next.
+    if let Some(home) = dirs_next::home_dir() {
+        for rel in [
+            ".local/bin",
+            ".cargo/bin",
+            "bin",
+            "go/bin",
+            ".bun/bin",
+            ".opencode/bin",
+        ] {
+            push_if(home.join(rel).to_string_lossy().to_string());
+        }
+    }
+
+    if prefix.is_empty() {
+        return;
+    }
+    prefix.push(current);
+    let joined = prefix.join(&sep.to_string());
+    // SAFETY: called once at startup before any worker thread spawns a child.
+    unsafe {
+        std::env::set_var("PATH", &joined);
+    }
+    tracing::info!(path = %joined, "enriched process PATH for subprocess tool resolution");
+}
+
+pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Result<()> {
+    // 0. (Restart safety net.) When this process was spawned as a
+    //    replacement during a `gateway restart`, the parent sets
+    //    `RSCLAW_PARENT_PID=<self>` on the child's env before spawn.
+    //    On macOS the native-respawn path uses `execv` so the parent's
+    //    fds (including redb's exclusive file lock) close atomically
+    //    when the new image takes over — no race. But on platforms
+    //    where exec isn't available, OR when the user starts a fresh
+    //    `rsclaw gateway start` while a previous gateway is still
+    //    holding the lock during graceful drain, opening redb here
+    //    would fail with "Database locked by another gateway
+    //    instance". Wait up to 5s for the parent to actually exit
+    //    before letting MemoryStore / KB / a2a tasks open their redbs.
+    wait_for_parent_release();
+    // 0. Refresh the tools/bin shim dir, then enrich the process PATH before
+    //    anything spawns a subprocess. Desktop/launchd-started gateways inherit
+    //    a stripped PATH; the shim dir + PATH prepend let cap-rs coding-agent
+    //    drivers and shell tools resolve every binary by bare name from one
+    //    place. Sync first so the shims exist before PATH points at them.
+    crate::cmd::tools::sync_tool_shims();
+    enrich_process_path();
+
+    // 0. Apply global proxy env vars before any HTTP clients are created.
+    rsclaw_config::apply_proxy_env(&config);
+
+    // 0a. Initialize the self-evolution config singleton from
+    //     `[ext.evolution]` (or built-in defaults if absent). Read by memory
+    //     tier transition, crystallizer, and meditation phases.
+    rsclaw_agent::evolution::init_evolution_config(
+        rsclaw_agent::evolution::EvolutionConfig::from_raw(config.ext.evolution.as_ref()),
+    );
+
+    // 0b. Propagate skill-registry credentials from rsclaw.json5 into
+    //     process env. Spawned skill subprocesses (python CLIs etc.)
+    //     inherit env, so this is the bridge that lets users keep keys
+    //     in the config file instead of shell rc / launchctl. Done here,
+    //     pre-runtime, while the process is still single-threaded.
+    propagate_skill_registry_env(&config);
+
+    // 0c. Propagate the root-level `env: { … }` map into process env.
+    //     Same purpose as 0b but generic: lets users define arbitrary
+    //     KV pairs (e.g. ASTOCK, LOG_DIR) used by /watch slash command
+    //     and gateway-spawned subprocesses. Shell-provided env wins so
+    //     `ASTOCK=... cargo run -- gateway restart` still overrides.
+    propagate_user_env(&config);
+
+    // 1. Resolve data directory — respects RSCLAW_BASE_DIR for --dev/--profile.
+    let base_dir = rsclaw_config::loader::base_dir();
+    let data_dir = base_dir.join("var/data");
+    std::fs::create_dir_all(&data_dir).context("create data dir")?;
+
+    // 1b. Seed tool prompts if not present.
+    {
+        let lang = config
+            .raw
+            .gateway
+            .as_ref()
+            .and_then(|g| g.language.as_deref());
+        if let Err(e) = rsclaw_agent::bootstrap::seed_tools(&base_dir, lang) {
+            warn!("failed to seed tool prompts: {e:#}");
+        }
+    }
+
+    // 2. Open store. If the database is locked by another instance, exit cleanly so
+    //    systemd won't keep restarting.
+    let store = match Store::open(&data_dir, tier) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            if msg.contains("already open") || msg.contains("Cannot acquire lock") {
+                eprintln!("  [!] Database locked by another gateway instance. Exiting cleanly.");
+                std::process::exit(0);
+            }
+            return Err(e).context("open store");
+        }
+    };
+    info!("store opened at {}", data_dir.display());
+
+    // 2b. Bind cron storage to redb. From this point on
+    // `crate::cron::load_cron_jobs` / `save_cron_jobs` and the
+    // CronRunner's `save_store` operate on redb instead of cron.json5.
+    // The file is still maintained as a best-effort export for
+    // `cat` / `git diff`.
+    crate::cron::init_cron_store(Arc::clone(&store.db));
+
+    // 3. Build provider registry.
+    let providers = Arc::new(build_providers(&config));
+    info!("{} provider(s) registered", providers.names().len());
+
+    // 4. Load skills.
+    let global_skills = base_dir.join("skills");
+    let skills = Arc::new(
+        load_skills(&global_skills, None, config.ext.skills.as_ref()).unwrap_or_else(|e| {
+            warn!("failed to load skills: {e:#}");
+            SkillRegistry::new()
+        }),
+    );
+    info!("{} skill(s) loaded", skills.len());
+
+    // Auto-install allowlist (security gate for the skill_install tool): load
+    // the local cache now so the gate has data immediately, then refresh from
+    // the hub in the background. Fail-closed — no cache + failed fetch = empty.
+    let (al_s, al_p) = rsclaw_skill::allowlist::load_cached();
+    info!(
+        skills = al_s,
+        plugins = al_p,
+        "allowlist: loaded from cache"
+    );
+    tokio::spawn(async {
+        if let Err(e) = rsclaw_skill::allowlist::refresh().await {
+            warn!("allowlist refresh failed (keeping cache; fail-closed): {e:#}");
+        }
+    });
+    // First-startup-only fetch of the tools manifest (fail-open to the
+    // compiled-in baseline). NOT an auto-update poll — later startups skip.
+    tokio::spawn(async {
+        crate::cmd::tools::fetch_manifest_if_missing().await;
+    });
+
+    // 5. Build agent registry with live receivers.
+    let (registry, receivers) =
+        AgentRegistry::from_config_with_receivers(&config, Arc::clone(&providers));
+    let registry = Arc::new(registry);
+    info!("{} agent(s) registered", registry.len());
+
+    // Create notification broadcast channel early so background model downloads
+    // can also send notifications to users via channels.
+    let (notification_tx, notification_rx) =
+        broadcast::channel::<rsclaw_channel::OutboundMessage>(64);
+
+    // Restart-required event channel + latch. Published into by the file
+    // watcher bridge and the BGE auto-downloader; subscribed to by WS dispatch
+    // so UI clients see banners. Allocated early so the BGE downloader (next
+    // step) and the file-watcher bridge (later) can both publish.
+    let (restart_request_tx, _restart_request_rx) =
+        tokio::sync::broadcast::channel::<rsclaw_events::RestartRequest>(16);
+    let pending_restart: Arc<std::sync::RwLock<Option<rsclaw_events::RestartRequest>>> =
+        Arc::new(std::sync::RwLock::new(None));
+
+    // Graceful-shutdown coordinator — wired to task queue worker, axum graceful
+    // shutdown, and the /api/v1/restart drain handler. Created here (before the
+    // BGE block) so `publish_restart` can stamp the live inflight count on
+    // every event, including the BGE auto-download notifications.
+    let shutdown = crate::gateway::ShutdownCoordinator::new();
+
+    // 6. Resolve and validate the BGE embedding model BEFORE opening the
+    // memory store. Production must run with semantic search; failures here
+    // abort startup so users notice immediately rather than silently
+    // degrading to keyword-only retrieval.
+    //
+    // Priority: bge-base-zh > bge-small-zh > bge-small-en. If none of these
+    // dirs already contains a usable model, sync-download bge-small-zh.
+    let search_cfg = config.raw.memory_search.as_ref();
+    let model_dir = {
+        let base_zh = base_dir.join("models/bge-base-zh");
+        let zh = base_dir.join("models/bge-small-zh");
+        let en = base_dir.join("models/bge-small-en");
+        if base_zh.join("model.safetensors").exists() {
+            base_zh
+        } else if zh.join("model.safetensors").exists() {
+            zh
+        } else if en.join("model.safetensors").exists() {
+            en
+        } else {
+            zh // default download target
+        }
+    };
+    ensure_bge_model_present(&model_dir, search_cfg).await?;
+
+    // `memory` is an `Option<Arc<…>>`: clone it freely at every sink below
+    // (agent tasks, heartbeat, AppState ~795) — clones are cheap refcount bumps
+    // and order-independent. Never move it; the final owner is `AppState.memory`.
+    let memory = match MemoryStore::open(&data_dir, Some(&model_dir), tier, search_cfg).await {
+        Ok(mut m) => {
+            // Wire the shared BM25 index so every extractor / WS / CLI write
+            // dual-writes into tantivy and `search_hybrid` can fuse keyword
+            // hits with vector hits. Then reindex existing docs so memories
+            // written before this code shipped are also keyword-searchable.
+            m.set_search_index(Arc::clone(&store.search));
+            match m.reindex_bm25() {
+                Ok(n) if n > 0 => info!(indexed = n, "memory: BM25 backfill complete"),
+                Ok(_) => {}
+                Err(e) => warn!("memory: BM25 reindex failed (vector still works): {e:#}"),
+            }
+            info!("memory store opened");
+            let arc = Arc::new(tokio::sync::Mutex::new(m));
+            rsclaw_agent::memory::set_global_store(Arc::clone(&arc));
+            // astock: build the client once if config.astock.enabled is set,
+            // and register it on the process-global slot. Failures here are
+            // surfaced at info level (not warn) — "astock not configured" is
+            // the normal state for non-A股 users and shouldn't look like an
+            // error in startup logs.
+            match rsclaw_astock::AstockClient::from_config(config.raw.astock.as_ref()) {
+                Ok(c) => {
+                    rsclaw_astock::set_global_client(Arc::new(c));
+                    rsclaw_astock::set_global_briefing_sink(Arc::new(crate::gateway::task_queue::GatewayBriefingSink));
+                    info!("astock client initialized");
+                    // Spin up the daily-briefing scheduler — it's
+                    // cheap (one tokio task) and silently no-ops if
+                    // no peer has a watchlist. Only meaningful when
+                    // astock itself is live, so gate on the client
+                    // being installed.
+                    rsclaw_astock::briefing::spawn_scheduler();
+                    info!("astock briefing scheduler started");
+                    // SSE listeners: one tokio task per configured
+                    // filter, push notifications on `hit` events for
+                    // codes any peer is watching. Gated on the same
+                    // astock-client-present check so non-A股 users
+                    // carry zero background cost.
+                    if let Some(astock_cfg) = config.raw.astock.as_ref() {
+                        rsclaw_astock::sse::spawn_listeners(astock_cfg);
+                    }
+                }
+                Err(e) => {
+                    info!(reason = %e, "astock client not initialised (subsystem dormant)");
+                }
+            }
+            Some(arc)
+        }
+        Err(e) => {
+            // Memory store opening should not fail once the model is
+            // validated by ensure_bge_model_present — propagate so startup
+            // surfaces the underlying issue (disk full, redb corruption…).
+            return Err(anyhow::anyhow!("failed to open memory store: {e:#}"));
+        }
+    };
+
+    // Embedder upgrade detection: if the active model produces a different
+    // vector dimension than what's stored in redb (e.g. user dropped a
+    // bge-base-zh dir and restarted), kick off a background re-embed via the
+    // two-index hot-swap API. The gateway keeps serving — search returns
+    // empty for the migrating docs until the swap commits, then catches up.
+    if let Some(mem_arc) = memory.as_ref() {
+        let pending = {
+            let mem = mem_arc.lock().await;
+            mem.pending_migration_count()
+        };
+        if pending > 0 {
+            info!(
+                pending,
+                "embedder dimension changed since last run; spawning background re-embed"
+            );
+            let bg_mem = Arc::clone(mem_arc);
+            tokio::spawn(async move {
+                if let Err(e) = run_embedder_reembed(&bg_mem).await {
+                    warn!(
+                        "background re-embed failed ({e:#}); search will be partial until next restart"
+                    );
+                }
+            });
+        }
+    }
+
+    // 7. Load all plugins (JS + WASM) and register built-in memory slot.
+    let plugins_dir = base_dir.join("plugins");
+    let wasm_browser: Arc<tokio::sync::Mutex<Option<rsclaw_browser::BrowserSession>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    // Resolve default vision model for host-vlm interface.
+    let vision_model = config
+        .raw
+        .agents
+        .as_ref()
+        .and_then(|a| a.defaults.as_ref())
+        .and_then(|d| d.model.as_ref())
+        .and_then(|m| m.vision_head().map(String::from));
+
+    let mut plugin_registry = load_all_plugins(
+        &plugins_dir,
+        config.ext.plugins.as_ref(),
+        Arc::clone(&wasm_browser),
+        Some(notification_tx.clone()),
+        Some(Arc::clone(&providers)),
+        vision_model,
+    )
+    .await
+    .unwrap_or_else(|e| {
+        warn!("plugin load error: {e:#}");
+        PluginRegistry::new()
+    });
+    if let Some(ref mem_arc) = memory
+        && !plugin_registry.slots.has_memory()
+    {
+        let slot = MemoryStoreSlot::new(Arc::clone(mem_arc));
+        let _ = plugin_registry.slots.set_memory(Arc::new(slot), "built-in");
+    }
+    info!(
+        "{} plugin(s) loaded (js={}, wasm={}), memory slot: {}",
+        plugin_registry.len(),
+        plugin_registry.js_count(),
+        plugin_registry.wasm_count(),
+        plugin_registry.slots.has_memory()
+    );
+
+    let wasm_plugins = Arc::new(plugin_registry.take_wasm_plugins());
+    let plugins = Arc::new(plugin_registry);
+
+    // Create the SSE broadcast channel once so agents and the HTTP server
+    // share the same sender.
+    let (event_tx, _) = broadcast::channel::<rsclaw_events::AgentEvent>(1024);
+
+    // Construct the cap manager once — shared by every AgentRuntime so
+    // `tool_cap` works in production (not just unit tests).
+    let cap_manager = std::sync::Arc::new(rsclaw_cap::CapAgentManager::new(event_tx.clone()));
+
+    // Interactive cap session manager (Phase 1 of cap multi-instance
+    // sessions). Shared the same way as `cap_manager` so every
+    // AgentRuntime can offer the `cap_live` tool to its LLM.
+    //
+    // Wire the outbound notification channel BEFORE wrapping in Arc so
+    // preparse-side `/cap` follow-up tasks (resume-id hint after Ready
+    // fires) can push to IM without per-channel plumbing.
+    let cap_live_manager = {
+        let mut m = rsclaw_cap::CapLiveManager::new(event_tx.clone());
+        m.set_notification_tx(notification_tx.clone());
+        std::sync::Arc::new(m)
+    };
+    // Publish a process-wide handle so preparse (`/cap`, `/cap-exit`)
+    // can register sticky IM bindings without per-channel plumbing.
+    // Set BEFORE any channel inbound task is spawned; runtime code
+    // accesses the manager via `self.cap_live_manager` directly.
+    rsclaw_cap::set_global_cap_live(std::sync::Arc::clone(&cap_live_manager));
+
+    // Build LiveConfig BEFORE the spawner: hot-reloadable per-domain locks
+    // that AgentRuntime reads for live-mutable fields (temperature, etc.).
+    let live = Arc::new(LiveConfig::new((*config).clone()));
+
+    // Shared per-model health table — one Arc cloned into AppState (for
+    // the /api/v1/models/health endpoint) AND into every FailoverManager
+    // via the spawner, so writes from the runtime are visible to the
+    // HTTP layer in real time.
+    let model_health = rsclaw_provider::health::ProviderHealthRegistry::new();
+
+    // Create AgentSpawner — enables agent-to-agent dynamic spawning.
+    let spawner = AgentSpawner::new_arc(
+        Arc::clone(&registry),
+        Arc::clone(&config),
+        Arc::clone(&live),
+        Arc::clone(&providers),
+        Arc::clone(&skills),
+        Arc::clone(&store),
+        memory.clone(),
+        event_tx.clone(),
+        Some(Arc::clone(&plugins)),
+        model_health.clone(),
+        Some(Arc::clone(&cap_manager)),
+        Some(Arc::clone(&cap_live_manager)),
+    );
+
+    // Spawn MCP servers and discover tools (before agent tasks so tools are
+    // available).
+    let mcp_registry = Arc::new(rsclaw_mcp::McpRegistry::new());
+    spawn_mcp_servers(&config, Arc::clone(&mcp_registry)).await;
+
+    // Clone memory before passing to agent tasks so heartbeat can also use it.
+    let heartbeat_memory = memory.clone();
+
+    // Shared computer_use permission store + broadcast channel.
+    // `bypass_all` is read from `tools.computerUse.bypassAll` (default
+    // false). The settings UI exposes a runtime toggle that mutates the
+    // store's AtomicBool without touching the config file.
+    let bypass_all_default = config
+        .raw
+        .tools
+        .as_ref()
+        .and_then(|t| t.computer_use.as_ref())
+        .and_then(|cu| cu.bypass_all)
+        .unwrap_or(false);
+    let computer_permission = Arc::new(rsclaw_computer::permission::RedbPermissionStore::new(
+        Arc::clone(&store.db),
+        bypass_all_default,
+    ));
+    let (computer_permission_tx, _) =
+        broadcast::channel::<rsclaw_computer::permission::PermissionRequest>(64);
+    // Status events are higher-frequency than permission requests (one
+    // per VLM step), so give a larger buffer. Subscribers that lag
+    // simply drop events — status is best-effort UX, not load-bearing.
+    let (computer_status_tx, _) =
+        broadcast::channel::<rsclaw_computer::status::ComputerUseStatus>(256);
+    let computer_runs: Arc<
+        tokio::sync::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    > = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+
+    spawn_agent_tasks(
+        receivers,
+        Arc::clone(&registry),
+        Arc::clone(&config),
+        Arc::clone(&live),
+        Arc::clone(&store),
+        Arc::clone(&skills),
+        Arc::clone(&providers),
+        memory.clone(),
+        event_tx.clone(),
+        Some(Arc::clone(&spawner)),
+        Some(Arc::clone(&plugins)),
+        Some(Arc::clone(&mcp_registry)),
+        Some(notification_tx.clone()),
+        Arc::clone(&wasm_plugins),
+        Arc::clone(&computer_permission),
+        computer_permission_tx.clone(),
+        computer_status_tx.clone(),
+        Arc::clone(&computer_runs),
+        model_health.clone(),
+        Arc::clone(&cap_manager),
+        Arc::clone(&cap_live_manager),
+    );
+
+    // Set i18n default language from gateway config.
+    let lang = config
+        .raw
+        .gateway
+        .as_ref()
+        .and_then(|g| g.language.as_deref());
+    info!(lang = ?lang, "i18n: gateway language config");
+    if let Some(lang) = lang {
+        rsclaw_i18n::set_default_lang(lang);
+        info!(
+            resolved = rsclaw_i18n::default_lang(),
+            "i18n: default language set"
+        );
+    }
+
+    // 8. Build channel manager and start channels.
+    let mut channel_manager = rsclaw_channel::ChannelManager::new(tier);
+    let feishu_slot: Arc<tokio::sync::OnceCell<Arc<rsclaw_channel::feishu::FeishuChannel>>> =
+        Arc::new(tokio::sync::OnceCell::new());
+    let wecom_slot: Arc<tokio::sync::OnceCell<Arc<rsclaw_channel::wecom::WeComChannel>>> =
+        Arc::new(tokio::sync::OnceCell::new());
+    let whatsapp_slot: Arc<tokio::sync::OnceCell<Arc<rsclaw_channel::whatsapp::WhatsAppChannel>>> =
+        Arc::new(tokio::sync::OnceCell::new());
+    let line_slot: Arc<tokio::sync::OnceCell<Arc<rsclaw_channel::line::LineChannel>>> =
+        Arc::new(tokio::sync::OnceCell::new());
+    let zalo_slot: Arc<tokio::sync::OnceCell<Arc<rsclaw_channel::zalo::ZaloChannel>>> =
+        Arc::new(tokio::sync::OnceCell::new());
+    let dm_enforcers: Arc<
+        std::sync::RwLock<std::collections::HashMap<String, Arc<rsclaw_channel::DmPolicyEnforcer>>>,
+    > = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+
+    // Channel sender registry for notification routing.
+    let channel_senders: Arc<
+        std::sync::RwLock<std::collections::HashMap<String, mpsc::Sender<OutboundMessage>>>,
+    > = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+    // Make the senders reachable from inside TaskQueueManager::submit so the
+    // user-facing "task received" ack can fire without threading the map
+    // through every submit call site.
+    super::task_queue::install_channel_senders(Arc::clone(&channel_senders));
+
+    // Create task queue manager before channels so channels can submit to it.
+    let task_queue_mgr = Arc::new(super::task_queue::TaskQueueManager::new(Arc::clone(
+        &store.db,
+    )));
+    // Publish a global handle so the agent's `task` function-call tool can
+    // submit follow-up tasks without threading the manager through every
+    // tool-dispatch surface.
+    super::task_queue::install_task_queue(Arc::clone(&task_queue_mgr));
+    // crate-split P3: inject the task-queue host so rsclaw-agent's `task` tool
+    // can enqueue without depending on the gateway crate.
+    rsclaw_types::set_task_queue_host(Arc::new(super::task_queue::GatewayTaskQueueHost));
+
+    start_channels(
+        &config,
+        Arc::clone(&registry),
+        &mut channel_manager,
+        Arc::clone(&feishu_slot),
+        Arc::clone(&wecom_slot),
+        Arc::clone(&whatsapp_slot),
+        Arc::clone(&line_slot),
+        Arc::clone(&zalo_slot),
+        Arc::clone(&dm_enforcers),
+        Arc::clone(&store.db),
+        Arc::clone(&channel_senders),
+        Arc::clone(&task_queue_mgr),
+        shutdown.clone(),
+    );
+
+    // Spawn task queue worker — processes queued tasks in priority order.
+    {
+        let worker = Arc::new(super::task_queue::TaskQueueWorker::new(
+            Arc::clone(&task_queue_mgr),
+            Arc::clone(&registry),
+            Arc::clone(&channel_senders),
+            shutdown.clone(),
+            (*config).clone(),
+        ));
+        tokio::spawn(async move { worker.run().await });
+        info!("task queue worker started");
+    }
+
+    // Spawn external-jobs worker — drives long-running provider tasks
+    // (video / image generation) to completion across gateway restarts.
+    {
+        let worker = Arc::new(super::external_jobs_worker::ExternalJobsWorker::new(
+            Arc::clone(&store.db),
+            notification_tx.clone(),
+            shutdown.clone(),
+            Arc::clone(&config),
+        ));
+        tokio::spawn(async move { worker.run().await });
+        info!("external jobs worker started");
+    }
+
+    // Spawn notification router task — routes OutboundMessages from ACP tools
+    // (OpenCode, ClaudeCode) to the correct channel based on msg.channel.
+    {
+        let senders = Arc::clone(&channel_senders);
+        let mut rx = notification_rx;
+        tokio::spawn(async move {
+            info!("notification router started");
+            while let Ok(msg) = rx.recv().await {
+                if let Some(ref ch_name) = msg.channel {
+                    // Try per-account sender first (wechat/acct → wechat),
+                    // same pattern as task_queue::channel_tx_for.
+                    let tx = {
+                        let senders_guard =
+                            senders.read().expect("channel_senders RwLock poisoned");
+                        msg.account
+                            .as_ref()
+                            .filter(|a| !a.is_empty())
+                            .and_then(|acct| {
+                                let key = format!("{ch_name}/{acct}");
+                                senders_guard.get(&key).cloned()
+                            })
+                            .or_else(|| senders_guard.get(ch_name).cloned())
+                    };
+                    if let Some(tx) = tx {
+                        info!(channel = %ch_name, target_id = %msg.target_id, "routing notification");
+                        if let Err(e) = tx.send(msg.clone()).await {
+                            tracing::warn!(error = %e, "notification send failed");
+                        }
+                    } else if is_sync_only_channel(ch_name) {
+                        // sync-only channels (HTTP /api/v1/message, future stdio
+                        // MCP, etc.) carry their reply back through their own
+                        // transport — the oneshot reply_tx on the AgentMessage,
+                        // an SSE byte stream, etc. The notification fan-out
+                        // here is a fire-and-forget event-bus emit for
+                        // observers (UI, telemetry) and the absence of a
+                        // registered sender is by design, not a misconfig.
+                        // Surface at debug so operators can still see the
+                        // dispatch path without flooding logs on every API
+                        // call.
+                        tracing::debug!(
+                            channel = %ch_name,
+                            "notification: sync-only channel, no sender expected"
+                        );
+                    } else {
+                        warn!(channel = %ch_name, "no channel sender registered for notification");
+                    }
+                } else {
+                    // No channel specified — send to first registered channel (default)
+                    let first = {
+                        let guard = senders.read().expect("channel_senders RwLock poisoned");
+                        guard.iter().next().map(|(k, v)| (k.clone(), v.clone()))
+                    };
+                    if let Some((ch_name, tx)) = first {
+                        info!(channel = %ch_name, "routing notification to default channel");
+                        if let Err(e) = tx.send(msg.clone()).await {
+                            tracing::warn!(error = %e, "notification send failed");
+                        }
+                    } else {
+                        warn!("notification: no channels registered");
+                    }
+                }
+            }
+            info!("notification router ended");
+        });
+    }
+
+    // 9. Start heartbeat runner — scans agent workspaces for HEARTBEAT.md.
+    let hb_enabled = config
+        .agents
+        .defaults
+        .heartbeat
+        .as_ref()
+        .and_then(|h| h.enabled)
+        .unwrap_or(true);
+    if hb_enabled {
+        let hb_host: std::sync::Arc<dyn rsclaw_heartbeat::HeartbeatHost> =
+            std::sync::Arc::new(crate::gateway::heartbeat_host::RuntimeHeartbeatHost {
+                registry: Arc::clone(&registry),
+                shutdown: Some(shutdown.clone()),
+                defaults: config.agents.defaults.clone(),
+            });
+        let runner = rsclaw_heartbeat::HeartbeatRunner::new(
+            hb_host,
+            &data_dir,
+            heartbeat_memory,
+        )
+        .with_meditation_deps(rsclaw_heartbeat::MeditationDeps {
+            config: Arc::clone(&config),
+            db: Arc::clone(&store.db),
+        });
+        let runner = std::sync::Arc::new(runner);
+        runner.run();
+        info!("heartbeat runner started");
+    }
+
+    // 11. Write PID file early so the hot-reload task can clean it on restart.
+    let pid_file = rsclaw_config::loader::pid_file();
+    if let Some(parent) = pid_file.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            warn!("could not create PID file directory: {e}");
+        }
+    }
+    let pid = std::process::id();
+    if let Err(e) = std::fs::write(&pid_file, pid.to_string()) {
+        warn!("could not write PID file: {e}");
+    }
+    info!(pid, "gateway PID written to {}", pid_file.display());
+
+    // 12. Start config hot-reload watcher (if config file is detectable).
+    if let Some(config_path) = config::loader::detect_config_path() {
+        let (mut watcher, mut reload_rx) = FileWatcher::new(config_path);
+        tokio::spawn(async move { watcher.run().await });
+        let live_reload = Arc::clone(&live);
+        let (restart_tx, _) = broadcast::channel::<Vec<String>>(8);
+        let bridge_tx = restart_request_tx.clone();
+        let bridge_pending = Arc::clone(&pending_restart);
+        let bridge_shutdown = shutdown.clone();
+        let cfg_lang = config
+            .raw
+            .gateway
+            .as_ref()
+            .and_then(|g| g.language.as_deref())
+            .map(str::to_owned);
+        tokio::spawn(async move {
+            let lang = rsclaw_i18n::resolve_lang(cfg_lang.as_deref().unwrap_or("en")).to_owned();
+            loop {
+                match reload_rx.recv().await {
+                    Ok(ConfigChange::FullReload(new_cfg)) => {
+                        // `apply` now uses `diff_restart_sections` as the
+                        // single source of truth: empty = hot-safe (already
+                        // written into live locks); non-empty = a restart is
+                        // recommended for the listed sections.
+                        let new_owned = (*new_cfg).clone();
+                        let needs_restart = live_reload.apply(new_owned, &restart_tx).await;
+                        if needs_restart.is_empty() {
+                            info!("config hot-reload applied (hot-safe fields only)");
+                        } else {
+                            warn!(?needs_restart, "config change requires gateway restart");
+                            // FullReload doesn't fully propagate to running
+                            // agents/channels (providers/prompts/credentials
+                            // are snapshotted at spawn). Surface a Recommended
+                            // banner so the user can apply changes cleanly.
+                            publish_restart(
+                                &bridge_tx,
+                                &bridge_pending,
+                                &bridge_shutdown,
+                                rsclaw_events::RestartRequest::new(
+                                    rsclaw_events::RestartReason::ConfigChanged {
+                                        sections: needs_restart,
+                                    },
+                                    rsclaw_events::RestartUrgency::Recommended,
+                                    rsclaw_i18n::t("restart_required_config_changed", &lang),
+                                ),
+                            );
+                        }
+                    }
+                    Ok(ConfigChange::RequiresRestart(fields)) => {
+                        warn!(?fields, "config change requires restart — surfacing banner");
+                        publish_restart(
+                            &bridge_tx,
+                            &bridge_pending,
+                            &bridge_shutdown,
+                            rsclaw_events::RestartRequest::new(
+                                rsclaw_events::RestartReason::ConfigChanged { sections: fields },
+                                rsclaw_events::RestartUrgency::Required,
+                                rsclaw_i18n::t("restart_required_config_changed", &lang),
+                            ),
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    // 13. Start HTTP server.
+    let devices_path = rsclaw_config::loader::base_dir().join("var/data/devices.json");
+    let devices = Arc::new(crate::ws::DeviceStore::new(devices_path));
+    let ws_conns = Arc::new(crate::ws::ConnRegistry::new());
+
+    // Start custom channels (webhook + websocket).
+    let custom_webhooks: Arc<
+        std::sync::RwLock<
+            std::collections::HashMap<String, Arc<rsclaw_channel::custom::CustomWebhookChannel>>,
+        >,
+    > = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+    start_custom_channels(
+        &config,
+        Arc::clone(&registry),
+        &mut channel_manager,
+        Arc::clone(&custom_webhooks),
+        Arc::clone(&channel_senders),
+        Arc::clone(&store.db),
+        shutdown.clone(),
+    );
+
+    // Register desktop channel — routes cron delivery to connected WS clients.
+    {
+        let desktop_ch = Arc::new(crate::gateway::desktop_channel::DesktopChannel::new(Arc::clone(
+            &ws_conns,
+        )));
+        // Bridge the notification_tx → DesktopChannel path so AgentRuntime
+        // (which only has notification_tx, not ChannelManager) can route
+        // short-delay reminders through the same broadcast path cron uses.
+        let (desktop_out_tx, mut desktop_out_rx) = mpsc::channel::<OutboundMessage>(64);
+        {
+            let mut senders = channel_senders
+                .write()
+                .expect("channel_senders lock poisoned");
+            senders.insert("desktop".to_string(), desktop_out_tx.clone());
+            // "ws" is the channel name used by WS-originated agent runs (see
+            // ws/methods/chat.rs where AgentMessage.channel = "ws"). Without
+            // this alias, OutboundMessages tagged channel="ws" — e.g. WASM
+            // plugin progress notify(), async task completion messages — hit
+            // the notification router's "no channel sender registered" warn
+            // and get dropped, leaving the desktop UI without progress pings.
+            senders.insert("ws".to_string(), desktop_out_tx);
+        }
+        let desktop_for_bridge = Arc::clone(&desktop_ch);
+        tokio::spawn(async move {
+            use rsclaw_channel::Channel;
+            while let Some(msg) = desktop_out_rx.recv().await {
+                if let Err(e) = desktop_for_bridge.send(msg).await {
+                    warn!(error = %e, "desktop notification bridge: send failed");
+                }
+            }
+        });
+        if let Err(e) = channel_manager.register(desktop_ch as Arc<dyn rsclaw_channel::Channel>) {
+            warn!("failed to register desktop channel: {e}");
+        }
+    }
+
+    // All channels registered - now wrap for sharing with cron runner
+    let channel_manager = Arc::new(channel_manager);
+
+    // /watch registry — events fly directly from sources to chat without going
+    // through the agent. Must be initialized after channels are registered so
+    // delivery can resolve any channel name (esp. for /loop /watch composition).
+    crate::gateway::watch::WatchRegistry::init(Arc::clone(&channel_manager));
+    tracing::info!("watch registry initialized");
+
+    // Create cron reload broadcast channel (used to notify CronRunner of new jobs)
+    let (cron_reload_tx, _cron_reload_rx) = tokio::sync::broadcast::channel::<()>(16);
+    // Make the sender reachable from non-server paths (fast preparse `/loop`).
+    crate::cron::install_reload_sender(cron_reload_tx.clone());
+
+    // Start cron runner — jobs loaded from base_dir/cron.json5
+    {
+        let cron_cfg =
+            config
+                .ops
+                .cron
+                .clone()
+                .unwrap_or_else(|| rsclaw_config::schema::CronConfig {
+                    enabled: Some(true),
+                    max_concurrent_runs: None,
+                    session_retention: None,
+                    run_log: None,
+                    jobs: None,
+                    default_delivery: None,
+                });
+        let cron_enabled = cron_cfg.enabled.unwrap_or(true);
+
+        // Load jobs from openclaw-compatible path
+        let cron_file = crate::cron::resolve_cron_store_path();
+        let (jobs, parse_ok) = crate::cron::load_cron_jobs();
+        if !parse_ok {
+            error!(file = %cron_file.display(), "cron.json5 has syntax errors - jobs will NOT run until file is fixed");
+        } else if !jobs.is_empty() {
+            info!(file = %cron_file.display(), count = jobs.len(), "loaded cron jobs");
+        }
+
+        if cron_enabled {
+            let cron_data_dir = base_dir.join("var").join("data");
+            let runner = CronRunner::new_with_shutdown(
+                &cron_cfg,
+                jobs,
+                !parse_ok, // skip_initial_save if parse failed
+                Arc::clone(&registry),
+                Arc::clone(&channel_manager),
+                cron_data_dir,
+                cron_reload_tx.clone(),
+                Arc::clone(&ws_conns),
+                Some(shutdown.clone()),
+            );
+            tokio::spawn(async move {
+                if let Err(e) = runner.run().await {
+                    error!("cron runner error: {e:#}");
+                }
+            });
+            info!("cron runner started");
+        }
+    }
+
+    // A2A v1.0 plumbing — task event bus, persistent store, push dispatcher
+    // all share the same instances so events flow end-to-end.
+    let a2a_bus = crate::a2a::event::TaskEventBus::new();
+    let a2a_task_store = {
+        let path = rsclaw_config::loader::base_dir().join("var/data/a2a/tasks.redb");
+        Arc::new(crate::a2a::store::TaskStore::open(&path).expect("open A2A task store"))
+    };
+    let a2a_push_dispatcher = Arc::new(crate::a2a::push::PushDispatcher::new(
+        Arc::clone(&a2a_task_store),
+        a2a_bus.clone(),
+    ));
+    let a2a_relay_hub = Arc::new(crate::a2a::relay::RelayHub::new());
+
+    // Production safety net: a relay hub with no inbound A2A auth is a
+    // pass-through that lets any HTTP caller invoke any spoke agent.
+    // That's the "dev pass-through" by design, but it's easy to deploy
+    // by accident. Surface a single loud warning so an operator can fix
+    // it before the box is reachable from anywhere it shouldn't be.
+    if config.gateway.a2a_relay.mode == rsclaw_config::runtime::A2aRelayModeRuntime::Hub
+        && config.gateway.auth_token.is_none()
+        && config.gateway.a2a_principals.is_empty()
+    {
+        warn!(
+            relay_id = %config.gateway.a2a_relay.relay_id,
+            "a2a relay is running in Hub mode without inbound auth — any HTTP client \
+             can invoke any connected spoke agent. Set `gateway.auth.token` or define \
+             `gateway.a2a.clients` before exposing this gateway to a network."
+        );
+    }
+
+    // User-managed RAG knowledge base. Open once; spawn the async indexing
+    // worker that drains embed jobs in the background. A failure here (corrupt
+    // store, bad permissions, full disk) disables KB but must not abort the
+    // gateway — every other channel and provider stays up.
+    let knowledge_svc = match rsclaw_kb::KnowledgeService::open(base_dir.join("kb")) {
+        Ok(svc) => {
+            let svc = Arc::new(svc);
+            svc.spawn_worker();
+            // Register the single live instance so agent tools (knowledge_base)
+            // reach it without re-opening redb (which is exclusively locked).
+            rsclaw_kb::set_global_service(Arc::clone(&svc));
+            Some(svc)
+        }
+        Err(e) => {
+            tracing::error!("knowledge base disabled: failed to open store: {e:#}");
+            None
+        }
+    };
+
+    let state = AppState {
+        config: Arc::clone(&config),
+        live: Arc::clone(&live),
+        agents: Arc::clone(&registry),
+        store: Arc::clone(&store),
+        event_bus: event_tx,
+        computer_permission: Arc::clone(&computer_permission),
+        computer_permission_tx: computer_permission_tx.clone(),
+        computer_status_tx: computer_status_tx.clone(),
+        computer_runs: Arc::clone(&computer_runs),
+        devices,
+        ws_conns,
+        feishu: Arc::clone(&feishu_slot),
+        wecom: Arc::clone(&wecom_slot),
+        whatsapp: Arc::clone(&whatsapp_slot),
+        line: Arc::clone(&line_slot),
+        zalo: Arc::clone(&zalo_slot),
+        started_at: std::time::Instant::now(),
+        dm_enforcers: Arc::clone(&dm_enforcers),
+        custom_webhooks: Arc::clone(&custom_webhooks),
+        cron_reload: cron_reload_tx,
+        notification_tx: notification_tx.clone(),
+        wasm_plugins: Arc::clone(&wasm_plugins),
+        plugins: Arc::clone(&plugins),
+        restart_request_tx: restart_request_tx.clone(),
+        pending_restart: Arc::clone(&pending_restart),
+        shutdown: shutdown.clone(),
+        task_event_bus: a2a_bus,
+        task_cancels: Arc::new(dashmap::DashMap::new()),
+        suspended_tasks: Arc::new(dashmap::DashMap::new()),
+        task_store: a2a_task_store,
+        push_dispatcher: a2a_push_dispatcher,
+        relay_hub: a2a_relay_hub,
+        knowledge: knowledge_svc,
+        memory: memory.clone(),
+        model_health: model_health.clone(),
+    };
+    crate::a2a::relay::start_spoke_if_configured(state.clone());
+    crate::ws::tick::start_tick_loop(Arc::clone(&state.ws_conns));
+
+    // Relay stream deadline sweeper. The hub-side `stream_pending`
+    // map has no end-to-end timeout (reqwest's was removed in b94c40f
+    // to support long video-gen flows). Without this loop a stuck
+    // spoke + healthy WS + slow consumer could pin entries forever.
+    {
+        let relay_hub = Arc::clone(&state.relay_hub);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let swept = relay_hub.sweep_expired_streams();
+                if swept > 0 {
+                    tracing::info!(swept, "relay stream deadline sweeper");
+                }
+            }
+        });
+    }
+
+    // Start browser pool idle reaper (checks every 60s).
+    tokio::spawn(async {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            rsclaw_browser::pool::BrowserPool::global()
+                .reap_if_idle()
+                .await;
+        }
+    });
+
+    let bind_addr = resolve_bind_addr(&config);
+    info!("starting HTTP server on {bind_addr}");
+
+    // Background update check (non-blocking)
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+        let client = reqwest::Client::builder()
+            .user_agent("rsclaw/dev")
+            .timeout(std::time::Duration::from_secs(10))
+            .build();
+
+        let Ok(client) = client else { return };
+
+        let resp = client
+            .get("https://api.github.com/repos/rsclaw-ai/rsclaw/releases/latest")
+            .send()
+            .await;
+
+        if let Ok(resp) = resp {
+            if let Ok(release) = resp.json::<serde_json::Value>().await {
+                let latest_raw = release["tag_name"].as_str().unwrap_or("");
+                let current_raw = option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev");
+                // Extract bare version: "2026.4.1 (abc123)" -> "2026.4.1",
+                // "2026.4.1-beta" -> "2026.4.1".
+                fn strip_ver(s: &str) -> &str {
+                    let s = s.trim_start_matches('v');
+                    let s = s.split_once(' ').map(|(v, _)| v).unwrap_or(s);
+                    s.split_once('-').map(|(v, _)| v).unwrap_or(s)
+                }
+                fn ver_newer(latest: &str, current: &str) -> bool {
+                    let parse = |s: &str| -> Vec<u32> {
+                        s.split('.').filter_map(|p| p.parse().ok()).collect()
+                    };
+                    let l = parse(latest);
+                    let c = parse(current);
+                    for i in 0..l.len().max(c.len()) {
+                        let lv = l.get(i).copied().unwrap_or(0);
+                        let cv = c.get(i).copied().unwrap_or(0);
+                        if lv > cv {
+                            return true;
+                        }
+                        if lv < cv {
+                            return false;
+                        }
+                    }
+                    false
+                }
+                let latest = strip_ver(latest_raw);
+                let current = strip_ver(current_raw);
+                if !latest.is_empty() && ver_newer(latest, current) {
+                    info!(
+                        current = current_raw,
+                        latest = latest_raw,
+                        "new rsclaw version available -- run `rsclaw update` to upgrade"
+                    );
+                }
+            }
+        }
+    });
+
+    // Global signal handler: a single SIGINT or SIGTERM triggers the
+    // shared graceful drain (same path as POST /api/v1/shutdown). Without
+    // this, no component listens for OS signals — Ctrl-C would be silently
+    // absorbed by tokio's signal subsystem and the gateway would only
+    // exit via HTTP or kill -9.
+    {
+        let sd = shutdown.clone();
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{SignalKind, signal};
+                let mut sigterm = match signal(SignalKind::terminate()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("failed to install SIGTERM handler: {e:#}");
+                        return;
+                    }
+                };
+                tokio::select! {
+                    res = tokio::signal::ctrl_c() => {
+                        if let Err(e) = res {
+                            warn!("ctrl_c handler error: {e:#}");
+                            return;
+                        }
+                        info!("SIGINT received, beginning graceful shutdown");
+                    }
+                    _ = sigterm.recv() => {
+                        info!("SIGTERM received, beginning graceful shutdown");
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                if let Err(e) = tokio::signal::ctrl_c().await {
+                    warn!("ctrl_c handler error: {e:#}");
+                    return;
+                }
+                info!("Ctrl-C received, beginning graceful shutdown");
+            }
+            // Stop /watch source/processor tasks before draining HTTP so SSE
+            // and subprocesses get a clean exit instead of dangling.
+            if let Some(reg) = crate::gateway::watch::WatchRegistry::global() {
+                reg.shutdown_all().await;
+            }
+            sd.begin_drain();
+        });
+    }
+
+    // Run serve with a hard-timeout safety net. Axum's
+    // `with_graceful_shutdown` waits for ALL existing connections to
+    // close after the drain signal — but long-lived WS connections
+    // (the Tauri UI keeps one open indefinitely) never close on
+    // their own, so without an outer timeout the process can hang
+    // forever after SIGTERM. We give the drain 60s (mirrors the
+    // existing inflight-drain timeout in the restart branch below);
+    // after that we log a warning and bail so the process actually
+    // exits and the restart path (or systemd / CI) can proceed.
+    const SHUTDOWN_HARD_TIMEOUT_SECS: u64 = 60;
+    let shutdown_for_timeout = shutdown.clone();
+    let result = tokio::select! {
+        r = serve(state, bind_addr) => r,
+        _ = async {
+            // Wait for the drain to begin first — the timeout only
+            // makes sense once shutdown is requested. Before drain we
+            // never hit the sleep branch.
+            shutdown_for_timeout.notified().await;
+            tokio::time::sleep(Duration::from_secs(SHUTDOWN_HARD_TIMEOUT_SECS)).await;
+            warn!(
+                timeout_secs = SHUTDOWN_HARD_TIMEOUT_SECS,
+                "graceful shutdown hard timeout reached — connections still open, forcing serve to return"
+            );
+        } => Ok(()),
+    };
+
+    // At this point `axum::serve` has returned, which means the listener has
+    // been dropped — so the port is free for whatever runs next. Two paths:
+    //   - clean shutdown (Ctrl-C, SIGTERM, /api/v1/shutdown): just clean up the PID
+    //     file and return.
+    //   - restart requested (/api/v1/restart, system.restart): wait for non-HTTP
+    //     inflight to drain, spawn the replacement, then exit. We spawn HERE rather
+    //     than in the restart handler to avoid the race where the child's `bind()`
+    //     runs before the parent's listener drops; that race could cause
+    //     `cmd_gateway` to see "port in use" and exit cleanly, leaving the gateway
+    //     dead.
+    if shutdown.is_restart_requested() {
+        // Channel-origin turns cannot deliver their result anymore — the
+        // outbound channel senders stopped when drain began — so waiting
+        // for them only delays the restart (observed: 81/108 historical
+        // restarts burned the full 60s on exactly this). Cancel their
+        // turns now; HTTP/API turns still hold an open connection that CAN
+        // answer, so they keep the full drain window. Explicit allowlist:
+        // only origins whose delivery path is provably dead.
+        const UNDELIVERABLE_ORIGINS: &[&str] = &[
+            "wechat", "feishu", "telegram", "discord", "qq", "dingtalk",
+            "wecom", "slack", "whatsapp", "line", "matrix", "signal", "cron",
+        ];
+        let mut cancelled = 0usize;
+        for handle in registry.all() {
+            if let Ok(map) = handle.cancel_tokens.read() {
+                for (sk, tok) in map.iter() {
+                    // Channel session keys: "agent:<id>:<channel>:..."
+                    let channel = sk.split(':').nth(2).unwrap_or("");
+                    if UNDELIVERABLE_ORIGINS.contains(&channel) {
+                        tok.cancel();
+                        cancelled += 1;
+                    }
+                }
+            }
+        }
+        if cancelled > 0 {
+            info!(
+                cancelled,
+                "drain: cancelled channel-origin turns whose delivery path already stopped"
+            );
+        }
+
+        info!("restart requested - waiting for inflight drain (max 60s)");
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let n = shutdown.inflight();
+            if n == 0 {
+                info!("graceful drain: inflight cleared");
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                warn!(
+                    inflight = n,
+                    "graceful drain: 60s timeout reached, restarting anyway"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // If a service manager (launchd/systemd) is supervising this process,
+        // ask it to restart us so the new instance picks up the supervisor's
+        // env, ulimits, log routing — instead of doing a naked re-exec that
+        // bypasses the manager. `try_service_self_restart` returns true only
+        // when it has confirmed delivery to the supervisor; on success it
+        // does NOT return (the supervisor SIGTERMs us as part of the kickstart).
+        if try_service_self_restart() {
+            info!("service-manager restart dispatched; exiting for supervisor takeover");
+            std::process::exit(0);
+        }
+
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                error!("current_exe failed; cannot respawn replacement: {e:#}");
+                // Don't remove the PID file - we'd rather leave a stale PID
+                // than wipe it and bail with no replacement running.
+                return result;
+            }
+        };
+        let mut cmd = std::process::Command::new(&exe);
+        // Forward --dev, --profile, --base-dir flags so the replacement
+        // process uses the same isolation mode as the original.
+        let original_args: Vec<String> = std::env::args().collect();
+        let mut extra_args: Vec<String> = Vec::new();
+        let mut i = 1; // skip argv[0]
+        while i < original_args.len() {
+            match original_args[i].as_str() {
+                "--dev" => {
+                    extra_args.push("--dev".to_owned());
+                }
+                "--profile" => {
+                    extra_args.push("--profile".to_owned());
+                    if let Some(val) = original_args.get(i + 1) {
+                        extra_args.push(val.clone());
+                        i += 1;
+                    }
+                }
+                "--base-dir" => {
+                    extra_args.push("--base-dir".to_owned());
+                    if let Some(val) = original_args.get(i + 1) {
+                        extra_args.push(val.clone());
+                        i += 1;
+                    }
+                }
+                s if s.starts_with("--profile=") => {
+                    extra_args.push(s.to_owned());
+                }
+                s if s.starts_with("--base-dir=") => {
+                    extra_args.push(s.to_owned());
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        extra_args.extend(["gateway".to_owned(), "run".to_owned()]);
+        cmd.args(&extra_args);
+        // Pass our PID so the replacement's `wait_for_parent_release`
+        // safety net knows whose exit to wait for before opening
+        // redb. Even on the Unix exec path (where the fd / lock
+        // release is atomic) we set this so a re-exec from a SIGTERM
+        // path that didn't quite finish drain still has a fallback
+        // signal to wait on. Cheap to set, narrows the window of any
+        // future race introduction.
+        cmd.env("RSCLAW_PARENT_PID", std::process::id().to_string());
+        // Re-attach stdio to the canonical gateway log. fd inheritance
+        // usually carries this through exec(), but the spawn() fallback —
+        // and an exec that failed mid-rebuild (ETXTBSY) — leaves the
+        // replacement logging into whatever pipe the restart requester
+        // happened to hold. Observed 2026-06-12: a post-restart instance
+        // logged nowhere for 85 minutes (wechat outage invisible).
+        // Explicit re-attach makes both paths deterministic; Rust's
+        // CommandExt::exec applies configured stdio before the exec.
+        {
+            let log_path = rsclaw_config::loader::log_file();
+            if let Some(parent) = log_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                && let Ok(f2) = f.try_clone()
+            {
+                cmd.stdout(std::process::Stdio::from(f));
+                cmd.stderr(std::process::Stdio::from(f2));
+            }
+        }
+        // Windows: suppress the console flash when re-execing from a GUI app.
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        // Unix: use `exec()` instead of `spawn() + exit(0)`. The race
+        // we kept hitting on every `gateway restart`:
+        //   1. parent spawns child (clone semantics: child inherits
+        //      our open fds, but the redb file LOCK is process-scoped
+        //      and NOT inherited — both processes are now contending)
+        //   2. parent calls exit(0), eventually closes redb and
+        //      releases the lock — but not before
+        //   3. child reaches MemoryStore::open and fails with
+        //      "Database locked by another gateway instance"
+        // `exec` replaces the current process image in place: all
+        // file descriptors (and therefore the redb lock) close
+        // atomically before the new image runs `main`. Zero overlap
+        // window, no spawn+exit race. Doesn't return on success.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let err = cmd.exec();
+            // exec() only returns on failure (e.g. EACCES, ENOENT on
+            // the binary itself). Fall through to the legacy
+            // spawn+exit path so the user at least gets SOMETHING
+            // running — even if it does hit the lock race.
+            error!(
+                "exec for replacement gateway failed: {err:#}; \
+                 falling back to spawn+exit (may hit lock race)"
+            );
+        }
+        match cmd.spawn() {
+            Ok(_) => info!("replacement gateway spawned"),
+            Err(e) => error!("failed to spawn replacement gateway: {e:#}"),
+        }
+        // Do NOT remove the PID file - the new gateway process overwrites it
+        // with its own PID on startup. Removing here races and can leave us
+        // with no PID file after a successful restart.
+        std::process::exit(0);
+    }
+
+    // Clean shutdown path - remove the PID file before returning.
+    if let Err(e) = std::fs::remove_file(&pid_file) {
+        warn!("could not remove PID file on exit: {e}");
+    }
+    result
+}
+
+/// Best-effort: if this process is currently supervised by launchd (macOS)
+/// or systemd (Linux), dispatch the restart through the service manager
+/// rather than via naked `cmd.spawn()` from `current_exe`.
+///
+/// Why: a supervisor-managed restart respects the supervisor's env, ulimits,
+/// log routing, and respawn policy. A naked exec orphans the new process to
+/// PID 1 and loses anything the supervisor would have re-applied.
+///
+/// Detection is **runtime-only** (env vars set by the supervisor on the
+/// Safety net for the replacement gateway during a `gateway restart`.
+///
+/// The parent sets `RSCLAW_PARENT_PID=<pid>` on the child's env right
+/// before respawn. On the macOS / Linux exec path this is mostly
+/// belt-and-suspenders (exec replaces the process image in place, so
+/// fds + the redb file lock close atomically before `main` runs).
+/// But it also covers the cases exec doesn't:
+///   * Windows native respawn — still uses spawn+exit, so a window
+///     where parent + child both contend the redb lock is real.
+///   * `rsclaw gateway start` invoked by a human while a previous
+///     gateway is still in the middle of graceful drain (60s
+///     window): the new process inherits no env from the old one,
+///     `RSCLAW_PARENT_PID` is unset, and we just proceed; if it
+///     genuinely conflicts the existing PID-file check + redb's
+///     own error surface that condition cleanly.
+///   * Future codepaths that bypass exec for whatever reason.
+///
+/// Polls `kill(pid, 0)` every 50ms for up to 5s. Returns immediately
+/// when the env var is unset (clean cold start) or the parent has
+/// already exited. Logs at info on actual wait so the next
+/// "why did startup take 3 seconds" question is answerable from the
+/// log alone.
+fn wait_for_parent_release() {
+    let Ok(pid_str) = std::env::var("RSCLAW_PARENT_PID") else {
+        return;
+    };
+    let Ok(pid) = pid_str.trim().parse::<i32>() else {
+        // Malformed env — degrade silently rather than blocking
+        // startup forever. The PID file / redb error path takes
+        // over if there's actually a conflict.
+        return;
+    };
+    // Don't wait on ourselves. Can happen on weird launchd / shell
+    // setups that re-export the env across a re-exec.
+    if pid == std::process::id() as i32 {
+        return;
+    }
+    let start = std::time::Instant::now();
+    let deadline = start + std::time::Duration::from_secs(5);
+    let mut waited = false;
+    while std::time::Instant::now() < deadline {
+        if !parent_alive(pid) {
+            if waited {
+                info!(
+                    parent_pid = pid,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "parent gateway exited; lock released"
+                );
+            }
+            return;
+        }
+        waited = true;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    warn!(
+        parent_pid = pid,
+        "parent gateway still alive after 5s; opening anyway (may hit lock race)"
+    );
+    // Best-effort clean of the env so any further re-execs from THIS
+    // process don't replay the wait.
+    unsafe {
+        std::env::remove_var("RSCLAW_PARENT_PID");
+    }
+}
+
+/// Cross-platform "is this PID still running" probe.
+///
+/// Unix uses `kill(pid, 0)` — the kernel rejects it with `ESRCH` when
+/// no process is running with that pid (or `EPERM` if it IS running
+/// but we lack permission; either way the process exists). Windows
+/// is handled by shelling out to `tasklist` — adds a few-ms cost,
+/// but the Windows native-respawn path is rare enough that the
+/// extra spawn isn't worth a `windows-sys` dependency in Cargo.toml.
+fn parent_alive(pid: i32) -> bool {
+    #[cfg(unix)]
+    {
+        // libc::kill returns 0 on success, -1 on failure with errno
+        // set; ESRCH (3) = "no such process".
+        // SAFETY: kill is async-signal-safe; signal 0 is the
+        // "existence check" syscall that doesn't actually deliver.
+        let rc = unsafe { libc::kill(pid, 0) };
+        if rc == 0 {
+            return true;
+        }
+        // Any errno OTHER than ESRCH means the process exists but we
+        // can't signal it — treat as alive.
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows fallback: `tasklist /FI "PID eq <n>" /NH` prints a
+        // single matching row when the pid is alive, or "INFO: No
+        // tasks ..." when it's gone. Cheap and dependency-free.
+        //
+        // CREATE_NO_WINDOW = 0x08000000 — without it the tasklist
+        // process briefly flashes a console window. Every gateway
+        // restart's parent-PID wait would otherwise pop a momentary
+        // window each iteration.
+        use std::os::windows::process::CommandExt;
+        match std::process::Command::new("tasklist")
+            .args([
+                "/FI",
+                &format!("PID eq {pid}"),
+                "/NH",
+                "/FO",
+                "CSV",
+            ])
+            .creation_flags(0x08000000)
+            .output()
+        {
+            Ok(out) => {
+                let s = String::from_utf8_lossy(&out.stdout);
+                s.lines().any(|l| l.contains(&pid.to_string()))
+            }
+            // tasklist unavailable (very old Windows / WSL edge) —
+            // treat as dead so we don't deadlock startup; the redb
+            // lock surface will error cleanly on actual conflict.
+            Err(_) => false,
+        }
+    }
+}
+
+/// running process), distinct from `cmd::gateway::try_service_start` /
+/// `try_service_stop` which probe install-file presence.
+///
+/// Returns true when the supervisor command was dispatched successfully —
+/// caller should then `exit(0)` to let the supervisor finish the lifecycle.
+/// Returns false in all other cases (not supervised, supervisor command
+/// failed, or unsupported OS); caller falls back to native respawn.
+fn try_service_self_restart() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // launchd sets XPC_SERVICE_NAME (= job label) for managed processes.
+        // BUT macOS sets it to the literal string "0" for processes that are
+        // NOT launched as a managed service (shells, `cargo run`, Terminal
+        // children). Treating "0" (or empty) as "supervised" sends us to
+        // `launchctl kickstart gui/<uid>/0`, which fails with "Could not find
+        // service 0" on every restart before falling back. Only a real job
+        // label means we're actually supervised.
+        let label = match std::env::var("XPC_SERVICE_NAME") {
+            Ok(l) if !l.is_empty() && l != "0" => l,
+            _ => return false,
+        };
+        info!(label = %label, "detected launchd supervision; kickstarting via launchctl");
+        // Try the user agent domain first (gui/<uid>/<label>), then the
+        // system daemon domain. `-k` kills the existing job before starting.
+        let uid = unsafe { libc::getuid() };
+        for target in [
+            format!("gui/{}/{}", uid, label),
+            format!("system/{}", label),
+        ] {
+            let status = std::process::Command::new("launchctl")
+                .args(["kickstart", "-k", &target])
+                .status();
+            if matches!(status, Ok(s) if s.success()) {
+                info!(target = %target, "launchctl kickstart dispatched");
+                return true;
+            }
+        }
+        // Routine on every non-launchd dev gateway (nohup/CLI starts) —
+        // info, not warn: the native respawn below is the expected path.
+        info!("launchctl kickstart unavailable for label {label}; using native respawn");
+        false
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // systemd sets INVOCATION_ID for service units. Without it, no
+        // service supervision is in play.
+        if std::env::var("INVOCATION_ID").is_err() {
+            return false;
+        }
+        // Derive the unit name from /proc/self/cgroup — systemd encodes it
+        // in the cgroup path (e.g. `/system.slice/rsclaw.service`).
+        let unit = std::fs::read_to_string("/proc/self/cgroup")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find_map(|l| l.rsplit('/').next().filter(|t| t.ends_with(".service")))
+                    .map(str::to_owned)
+            });
+        let Some(unit) = unit else {
+            warn!("INVOCATION_ID set but unit name not found in /proc/self/cgroup; falling back");
+            return false;
+        };
+        info!(unit = %unit, "detected systemd supervision; restarting via systemctl");
+        // Try --user first; if it fails (not a user unit), retry system-wide.
+        for args in [
+            vec!["--user", "restart", unit.as_str()],
+            vec!["restart", unit.as_str()],
+        ] {
+            let status = std::process::Command::new("systemctl").args(&args).status();
+            if matches!(status, Ok(s) if s.success()) {
+                info!(unit = %unit, "systemctl restart dispatched");
+                return true;
+            }
+        }
+        warn!("systemctl restart failed for unit {unit}; falling back to native respawn");
+        false
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // The Service Control Manager runs services in session 0 with
+        // SESSIONNAME=Services. Absent or different means we're interactive.
+        let in_services_session = std::env::var("SESSIONNAME")
+            .map(|s| s.eq_ignore_ascii_case("Services"))
+            .unwrap_or(false);
+        if !in_services_session {
+            return false;
+        }
+        info!("detected Windows service supervision; signaling SCM via sc stop");
+        // Note: a service can't `sc restart` itself — stop is one-way and
+        // start runs in a detached SCM context. The actual restart is gated
+        // by the service's FailureActions policy. The installer should set
+        //   sc failure rsclaw reset=86400 actions=restart/5000
+        // so SCM auto-respawns us. If FailureActions isn't configured, this
+        // path stops us and leaves it to a human / monitoring system.
+        use std::os::windows::process::CommandExt;
+        let status = std::process::Command::new("sc")
+            .args(["stop", "rsclaw"])
+            .creation_flags(0x08000000)
+            .status();
+        if matches!(status, Ok(s) if s.success()) {
+            info!("sc stop dispatched; SCM FailureActions will respawn if configured");
+            return true;
+        }
+        warn!("sc stop failed; falling back to native respawn");
+        false
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        // No supported service manager on this OS — caller will native-respawn.
+        false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Agent task spawning
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+/// Map a registry name to the env vars it cares about: `(api_key_var,
+/// base_url_var)`. Hard-coded here because the env name is part of each
+/// registry's published contract — we don't want users renaming their
+/// existing env vars by editing defaults.toml.
+fn registry_env_names(name: &str) -> Option<(&'static str, &'static str)> {
+    match name {
+        "iwencai" => Some(("IWENCAI_API_KEY", "IWENCAI_BASE_URL")),
+        // Future registries with paid keys go here.
+        _ => None,
+    }
+}
+
+/// Read the root-level `env: { K: V, ... }` map and export each entry to
+/// the gateway process env. Values may reference other env vars via
+/// `${VAR}` — those are expanded against the current process env at the
+/// time this function runs (so `${HOME}` etc work out of the box).
+///
+/// **Precedence:** shell-provided env wins. If a key already exists in
+/// the process env (e.g. inherited from the launching shell), the config
+/// value is skipped. This lets users override per-launch without editing
+/// rsclaw.json5.
+///
+/// SAFETY: called once during single-threaded gateway startup, before
+/// any async runtime tasks spawn — matches the existing precedent in
+/// `apply_proxy_env` and `propagate_skill_registry_env`.
+fn propagate_user_env(config: &RuntimeConfig) {
+    let Some(env_map) = config.raw.env.as_ref() else {
+        return;
+    };
+    apply_user_env_map(&env_map.0);
+}
+
+/// Inner helper, separated from `propagate_user_env` so it can be unit-tested
+/// without constructing a full `RuntimeConfig`.
+fn apply_user_env_map(env_map: &std::collections::HashMap<String, String>) {
+    for (key, raw_val) in env_map {
+        if key.is_empty() {
+            continue;
+        }
+        if std::env::var(key).is_ok() {
+            // Already set by shell / launchd / systemd — don't clobber.
+            continue;
+        }
+        let expanded = rsclaw_config::loader::expand_env_vars(raw_val);
+        // SAFETY: pre-async-runtime, single-threaded.
+        unsafe { std::env::set_var(key, &expanded) };
+        info!(key = %key, "exported user env var from rsclaw.json5");
+    }
+}
+
+/// Read `skill_registries.<name>.{apiKey,baseUrl}` from the resolved
+/// config and export each non-empty value to the corresponding env var.
+/// SAFETY: called once during single-threaded gateway startup, before any
+/// async runtime tasks spawn — matches the existing precedent in
+/// `apply_proxy_env`.
+fn propagate_skill_registry_env(config: &RuntimeConfig) {
+    let Some(map) = config.raw.skill_registries.as_ref() else {
+        return;
+    };
+    for (name, entry) in map {
+        let Some((api_key_var, base_url_var)) = registry_env_names(name) else {
+            continue;
+        };
+        if let Some(key_field) = entry.api_key.as_ref() {
+            if let Some(val) = key_field.resolve_early().filter(|s| !s.is_empty()) {
+                if std::env::var(api_key_var).is_err() {
+                    // SAFETY: pre-async-runtime, single-threaded.
+                    unsafe { std::env::set_var(api_key_var, &val) };
+                    info!(registry = %name, env = api_key_var, "exported registry api key to env");
+                }
+            }
+        }
+        if let Some(url_field) = entry.base_url.as_ref() {
+            if let Some(val) = url_field.resolve_early().filter(|s| !s.is_empty()) {
+                if std::env::var(base_url_var).is_err() {
+                    unsafe { std::env::set_var(base_url_var, &val) };
+                    info!(registry = %name, env = base_url_var, "exported registry base url to env");
+                }
+            }
+        }
+    }
+}
+
+fn spawn_agent_tasks(
+    receivers: HashMap<String, mpsc::Receiver<AgentMessage>>,
+    registry: Arc<AgentRegistry>,
+    config: Arc<RuntimeConfig>,
+    live: Arc<LiveConfig>,
+    store: Arc<Store>,
+    skills: Arc<SkillRegistry>,
+    providers: Arc<ProviderRegistry>,
+    memory: Option<Arc<tokio::sync::Mutex<MemoryStore>>>,
+    event_tx: broadcast::Sender<rsclaw_events::AgentEvent>,
+    spawner: Option<Arc<AgentSpawner>>,
+    plugins: Option<Arc<rsclaw_plugin::PluginRegistry>>,
+    mcp: Option<Arc<rsclaw_mcp::McpRegistry>>,
+    notification_tx: Option<broadcast::Sender<rsclaw_channel::OutboundMessage>>,
+    wasm_plugins: Arc<Vec<rsclaw_plugin::WasmPlugin>>,
+    computer_permission: Arc<rsclaw_computer::permission::RedbPermissionStore>,
+    computer_permission_tx: broadcast::Sender<rsclaw_computer::permission::PermissionRequest>,
+    computer_status_tx: broadcast::Sender<rsclaw_computer::status::ComputerUseStatus>,
+    computer_runs: Arc<
+        tokio::sync::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    >,
+    model_health: rsclaw_provider::health::ProviderHealthRegistry,
+    cap_manager: std::sync::Arc<rsclaw_cap::CapAgentManager>,
+    cap_live_manager: std::sync::Arc<rsclaw_cap::CapLiveManager>,
+) {
+    for (agent_id, mut rx) in receivers {
+        let handle = match registry.get(&agent_id) {
+            Ok(h) => h,
+            Err(e) => {
+                error!(agent_id, "agent handle not found: {e:#}");
+                continue;
+            }
+        };
+
+        // Collect fallback models from agent config → global defaults.
+        let fallback_models = handle
+            .config
+            .model
+            .as_ref()
+            .and_then(|m| m.fallbacks.clone())
+            .or_else(|| {
+                config
+                    .agents
+                    .defaults
+                    .model
+                    .as_ref()
+                    .and_then(|m| m.fallbacks.clone())
+            })
+            .unwrap_or_default();
+
+        let mut runtime = AgentRuntime::new(
+            Arc::clone(&handle),
+            Arc::clone(&config),
+            Arc::clone(&live),
+            Arc::clone(&providers),
+            fallback_models,
+            Arc::clone(&skills),
+            Arc::clone(&store),
+            memory.clone(),
+            Some(Arc::clone(&registry)),
+            Some(event_tx.clone()),
+            spawner.clone(),
+            plugins.clone(),
+            mcp.clone(),
+            notification_tx.clone(),
+            model_health.clone(),
+            Some(Arc::clone(&cap_manager)),
+            Some(Arc::clone(&cap_live_manager)),
+        );
+
+        // Inject WASM plugins into the agent runtime.
+        runtime.wasm_plugins = Arc::clone(&wasm_plugins);
+
+        // Share the computer_use permission store + broadcast channel
+        // so `tool_vlm_drive` can register pending requests that the WS
+        // handler can resolve.
+        runtime.computer_permission = Some(Arc::clone(&computer_permission));
+        runtime.computer_permission_tx = Some(computer_permission_tx.clone());
+        runtime.computer_status_tx = Some(computer_status_tx.clone());
+        runtime.computer_runs = Some(Arc::clone(&computer_runs));
+
+        let event_tx_task = event_tx.clone();
+        let config_for_task = Arc::clone(&config);
+        tokio::spawn(async move {
+            info!(agent_id = %handle.id, "agent runtime task started");
+            while let Some(msg) = rx.recv().await {
+                info!(
+                    agent_id = %handle.id,
+                    session_key = %msg.session_key,
+                    channel = %msg.channel,
+                    "agent runtime: received msg from queue"
+                );
+                let AgentMessage {
+                    session_key,
+                    text,
+                    channel,
+                    peer_id,
+                    chat_id,
+                    reply_tx,
+                    extra_tools,
+                    images,
+                    files,
+                    account,
+                    task_id,
+                    context_id,
+                    cancel_token,
+                    event_tx,
+                    input_request_tx,
+                } = msg;
+                // Hard-cancel token for this turn. A2A callers supply their own
+                // (CancelTask). For everyone else (WS chat.abort, channels) we
+                // mint one and register it under the session key so chat.abort
+                // can fire `.cancel()` — the `tokio::select!` below then drops
+                // the in-flight `run_turn` future immediately, even if it's
+                // parked on a stalled LLM stream. `registered` tracks whether
+                // we own the map entry so we clean it up afterwards.
+                let (turn_token, registered) = match cancel_token {
+                    Some(t) => (t, false),
+                    None => {
+                        let t = tokio_util::sync::CancellationToken::new();
+                        if let Ok(mut toks) = handle.cancel_tokens.write() {
+                            toks.insert(session_key.clone(), t.clone());
+                        }
+                        (t, true)
+                    }
+                };
+
+                // Build a TurnContext from the A2A wires on AgentMessage.
+                // `cancel_token` is now always set, so the runtime's
+                // cooperative `is_cancelled()` checks (between iterations and
+                // at tool-dispatch boundaries) also observe WS aborts.
+                let turn_ctx = rsclaw_agent::registry::TurnContext {
+                    task_id,
+                    context_id,
+                    event_tx,
+                    cancel_token: Some(turn_token.clone()),
+                    input_request_tx,
+                };
+                // Per-turn stuck-turn watchdog (P2c). If a single user turn
+                // runs longer than this without completing, assume something
+                // is wedged (LLM provider hang, runaway tool-call loop, a
+                // tool that ignored its own internal deadline) and force-
+                // abort the turn via the cancel_token. Generous because
+                // long legitimate cap_live + multi-tool turns can take a
+                // while, but tight enough to keep the single-threaded
+                // agent queue from going dark for an hour.
+                const TURN_WALL_CLOCK_LIMIT: std::time::Duration =
+                    std::time::Duration::from_secs(20 * 60);
+                let watchdog_token = turn_token.clone();
+                let watchdog_agent = handle.id.clone();
+                let watchdog_session = session_key.clone();
+                let watchdog = tokio::spawn(async move {
+                    tokio::time::sleep(TURN_WALL_CLOCK_LIMIT).await;
+                    if !watchdog_token.is_cancelled() {
+                        tracing::error!(
+                            agent = %watchdog_agent,
+                            session = %watchdog_session,
+                            limit_s = TURN_WALL_CLOCK_LIMIT.as_secs(),
+                            "stuck-turn watchdog: firing cancel_token — turn exceeded \
+                             wall-clock limit; the agent queue must not stay dark"
+                        );
+                        watchdog_token.cancel();
+                    }
+                });
+                let result = tokio::select! {
+                    biased;
+                    // Hard cancel: drops the run_turn future (and every await
+                    // it holds — LLM stream, tool calls) the moment the token
+                    // fires. This is what frees the single-threaded queue when
+                    // a turn is wedged on a non-yielding await.
+                    _ = turn_token.cancelled() => Err(anyhow::anyhow!("turn aborted")),
+                    r = runtime.run_turn(
+                        &session_key,
+                        &text,
+                        &channel,
+                        &peer_id,
+                        &chat_id,
+                        account.as_deref(),
+                        extra_tools,
+                        images,
+                        files,
+                        turn_ctx,
+                    ) => r,
+                };
+                // Turn completed (success/error/cancel) — stop the watchdog.
+                // If the watchdog already fired the cancel, the select! above
+                // already exited via the cancellation branch; this abort is
+                // just hygiene to release the spawned task.
+                watchdog.abort();
+                // Drop our registered token so a later abort for this session
+                // can't cancel a future turn, and the map doesn't leak.
+                if registered {
+                    if let Ok(mut toks) = handle.cancel_tokens.write() {
+                        toks.remove(&session_key);
+                    }
+                }
+                let turn_errored = result.is_err();
+                let reply = result.unwrap_or_else(|e| {
+                    // A2A consumers key off `outcome` to publish the right
+                    // terminal status (Failed vs Canceled). Without this
+                    // distinction the A2A reply-watcher saw `Ok(reply)` and
+                    // always published Completed — so cancellations and
+                    // LLM/tool errors were silently reported as success.
+                    //
+                    // Both A2A CancelTask and WS chat.abort produce
+                    // cancellations from the user; only genuine LLM/tool
+                    // failures should map to Error and show
+                    // "backend_unavailable" to the user. "turn aborted" is
+                    // the WS abort path (agent/runtime.rs:5457), "canceled
+                    // by A2A CancelTask" is the A2A path.
+                    let err_str = e.to_string();
+                    let is_user_cancel = err_str.contains("canceled by A2A CancelTask")
+                        || err_str.contains("turn aborted");
+                    // A user-initiated cancel is not an error — log at INFO so
+                    // it doesn't pollute error dashboards / alerting.
+                    if is_user_cancel {
+                        info!(agent = %handle.id, "turn canceled by user: {e:#}");
+                    } else {
+                        error!(agent = %handle.id, "turn error: {e:#}");
+                    }
+                    let outcome = if is_user_cancel {
+                        rsclaw_agent::registry::ReplyOutcome::Canceled
+                    } else {
+                        rsclaw_agent::registry::ReplyOutcome::Error
+                    };
+                    // User-facing text: don't leak the raw anyhow Error
+                    // (HTTP status codes, internal IDs, JSON error bodies)
+                    // to the chat channel — that material is operator-
+                    // debug-only and lives in the ERROR log above. The
+                    // end user sees an i18n'd "service unavailable" line
+                    // for real LLM / transport errors; the original
+                    // outcome tag (Error / Canceled) survives so A2A
+                    // consumers still key off the terminal status.
+                    let i18n_lang = config_for_task
+                        .raw
+                        .gateway
+                        .as_ref()
+                        .and_then(|g| g.language.as_deref())
+                        .map(rsclaw_i18n::resolve_lang)
+                        .unwrap_or("en");
+                    let user_text = match outcome {
+                        rsclaw_agent::registry::ReplyOutcome::Canceled => "[canceled]".to_owned(),
+                        _ => rsclaw_i18n::t("backend_unavailable", i18n_lang),
+                    };
+                    AgentReply {
+                        text: user_text,
+                        is_empty: false,
+                        tool_calls: None,
+                        images: vec![],
+                        files: vec![],
+                        pending_analysis: None,
+                        needs_outer_done_emit: false,
+                        outcome,
+                    }
+                });
+                // Emit to event_bus for any reply path that bypassed
+                // agent_loop (preparse, file-attach short-circuits, /btw,
+                // disk-low, __DIRECT_REPLY__, etc.) *and* for turns that
+                // failed with Err (agent_loop returns early via `?` on LLM
+                // errors and never gets to emit done — WS clients would hang
+                // waiting for the terminator forever). Normal LLM turns
+                // already emit deltas + done from inside agent_loop, so a
+                // second emit would duplicate the done frame.
+                if reply.needs_outer_done_emit || turn_errored {
+                    if !reply.text.is_empty() {
+                        // receiver may have been dropped
+                        let _ = event_tx_task.send(rsclaw_events::AgentEvent {
+                            session_id: session_key.clone(),
+                            agent_id: handle.id.clone(),
+                            delta: reply.text.clone(),
+                            done: false,
+                            files: vec![],
+                            images: vec![],
+                            tool_log: vec![],
+                            question: None,
+                            channel: None,
+                        });
+                    }
+                    // receiver may have been dropped
+                    let _ = event_tx_task.send(rsclaw_events::AgentEvent {
+                        session_id: session_key.clone(),
+                        agent_id: handle.id.clone(),
+                        delta: String::new(),
+                        done: true,
+                        files: vec![],
+                        images: vec![],
+                        tool_log: vec![],
+                        question: None,
+                        channel: None,
+                    });
+                }
+                // /goal — completion-driven turn loop. See
+                // `src/agent/goal.rs`. After every turn, if the
+                // session has an active goal we either:
+                //   * append a terminal status (✅/❌/⚠) to the reply
+                //     text so the user sees it in the same chat
+                //     bubble, AND clear the goal state, OR
+                //   * schedule the next iteration via the task queue.
+                //
+                // Mutating `reply.text` is safe because nothing on the
+                // path from here to the channel send re-evaluates the
+                // text against goal markers — the hook ran, the
+                // decision is made. Submitting the next turn happens
+                // INSIDE this match arm (not via reply_tx) because the
+                // channel reply path delivers `reply` to the user; the
+                // next /goal turn is a separate enqueued message that
+                // arrives through the normal worker loop.
+                let mut reply = reply;
+                if !turn_errored
+                    && let Some(reaction) =
+                        rsclaw_agent::goal::check_after_turn(&session_key, &reply.text).await
+                {
+                    use rsclaw_agent::goal::Reaction;
+                    match reaction {
+                        Reaction::Done(status_line) => {
+                            // Strip the GOAL_ marker line itself so it
+                            // doesn't read as machine output in the
+                            // user's chat — the human-friendly status
+                            // line we append takes its place.
+                            reply.text = strip_trailing_goal_marker(&reply.text);
+                            if !reply.text.is_empty() {
+                                reply.text.push_str("\n\n");
+                            }
+                            reply.text.push_str(&status_line);
+                            reply.is_empty = reply.text.is_empty()
+                                && reply.images.is_empty()
+                                && reply.files.is_empty();
+                        }
+                        Reaction::Continue(next_prompt) => {
+                            // Strip the user-visible reply of any
+                            // accidentally-leaked GOAL_* marker
+                            // (parse_terminal said Continue, so there
+                            // can't be one — but defensive).
+                            if let Some(tq) =
+                                crate::gateway::task_queue::get_task_queue()
+                            {
+                                let delivery_channel: &str =
+                                    if channel == "ws" { "desktop" } else { &channel };
+                                if let Err(e) =
+                                    crate::gateway::task_queue::submit_to_queue(
+                                        &tq,
+                                        &session_key,
+                                        &next_prompt,
+                                        delivery_channel,
+                                        &peer_id,
+                                        &peer_id,
+                                        false,
+                                        crate::gateway::task_queue::Priority::Cron,
+                                    )
+                                {
+                                    warn!(
+                                        session = %session_key,
+                                        error = %e,
+                                        "/goal: failed to enqueue continuation turn"
+                                    );
+                                }
+                            } else {
+                                warn!(
+                                    "/goal: task_queue not installed; cannot enqueue continuation"
+                                );
+                            }
+                        }
+                    }
+                }
+                // receiver may have been dropped (e.g. channel timeout)
+                let _ = reply_tx.send(reply);
+            }
+            info!(agent_id = %handle.id, "agent runtime task ended (channel closed)");
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bind address helper
+// ---------------------------------------------------------------------------
+
+/// Drop the trailing `GOAL_ACHIEVED` / `GOAL_FAILED ...` line from a
+/// reply when it terminated a `/goal` loop. Anything after the marker
+/// on the same line is also dropped (per spec the marker must be the
+/// last non-blank line). We then trim any leftover trailing blank
+/// lines so the appended "✅ Goal achieved" status reads as a clean
+/// continuation, not as a margin-floating block.
+fn strip_trailing_goal_marker(text: &str) -> String {
+    let mut lines: Vec<&str> = text.lines().collect();
+    // Find the last non-blank line. If it carries a marker, remove it
+    // plus any blank lines that immediately precede it.
+    while let Some(last) = lines.last() {
+        if last.trim().is_empty() {
+            lines.pop();
+            continue;
+        }
+        break;
+    }
+    if let Some(last) = lines.last() {
+        let t = last.trim();
+        if t == "GOAL_ACHIEVED" || t.starts_with("GOAL_FAILED") {
+            lines.pop();
+            // Strip any blank lines now trailing.
+            while let Some(last) = lines.last() {
+                if last.trim().is_empty() {
+                    lines.pop();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+fn resolve_bind_addr(config: &RuntimeConfig) -> SocketAddr {
+    let port = config.gateway.port;
+    // If a custom bind_address is set, parse and use it.
+    if let Some(ref addr) = config.gateway.bind_address {
+        if let Ok(ip) = addr.parse::<std::net::IpAddr>() {
+            return SocketAddr::new(ip, port);
+        }
+        tracing::warn!(
+            addr = addr.as_str(),
+            "invalid bind_address, falling back to bind mode"
+        );
+    }
+    match config.gateway.bind {
+        BindMode::Auto | BindMode::Lan => SocketAddr::from(([0, 0, 0, 0], port)),
+        BindMode::Loopback => SocketAddr::from(([127, 0, 0, 1], port)),
+        BindMode::All => SocketAddr::from(([0, 0, 0, 0], port)),
+        BindMode::Custom => SocketAddr::from(([0, 0, 0, 0], port)),
+        BindMode::Tailnet => SocketAddr::from(([127, 0, 0, 1], port)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MCP server process management
+// ---------------------------------------------------------------------------
+
+async fn spawn_mcp_servers(config: &RuntimeConfig, registry: Arc<rsclaw_mcp::McpRegistry>) {
+    let mcp = match config.raw.mcp.as_ref() {
+        Some(m) => m,
+        None => return,
+    };
+
+    if mcp.enabled == Some(false) {
+        return;
+    }
+
+    let servers = match mcp.servers.as_ref() {
+        Some(s) => s,
+        None => return,
+    };
+
+    for server_cfg in servers {
+        match rsclaw_mcp::McpClient::spawn(server_cfg).await {
+            Ok(mut client) => {
+                // Initialize + discover tools.
+                if let Err(e) = client.initialize().await {
+                    error!(name = %server_cfg.name, error = %e, "MCP initialize failed");
+                    continue;
+                }
+                match client.list_tools().await {
+                    Ok(tools) => {
+                        info!(
+                            name = %server_cfg.name,
+                            tools = tools.len(),
+                            "MCP server ready"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(name = %server_cfg.name, error = %e, "MCP tools/list failed");
+                    }
+                }
+                registry.register(Arc::new(client)).await;
+            }
+            Err(e) => {
+                error!(name = %server_cfg.name, error = %e, "failed to start MCP server");
+            }
+        }
+    }
+
+    let total = registry.clients.lock().await.len();
+    if total > 0 {
+        info!(count = total, "MCP server(s) registered");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// QQ Official Bot (QQ机器人)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Pending file analysis helper
+// ---------------------------------------------------------------------------
+
+/// Process a pending file analysis: send the analysis text to the agent for
+/// LLM processing and deliver the result (or timeout/error message) as a
+/// follow-up outbound message.
+pub(crate) async fn handle_pending_analysis(
+    analysis: PendingAnalysis,
+    handle: Arc<rsclaw_agent::AgentHandle>,
+    out_tx: &mpsc::Sender<rsclaw_channel::OutboundMessage>,
+    target_id: String,
+    is_group: bool,
+    config: &RuntimeConfig,
+) {
+    let i18n_lang = config
+        .raw
+        .gateway
+        .as_ref()
+        .and_then(|g| g.language.as_deref())
+        .map(rsclaw_i18n::resolve_lang)
+        .unwrap_or("en");
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let msg = AgentMessage {
+        session_key: analysis.session_key,
+        text: analysis.text,
+        channel: analysis.channel,
+        peer_id: analysis.peer_id.clone(),
+        chat_id: String::new(),
+        reply_tx,
+        task_id: None,
+        context_id: None,
+        event_tx: None,
+        cancel_token: None,
+        input_request_tx: None,
+        extra_tools: vec![],
+        images: vec![],
+        files: vec![],
+        account: None,
+    };
+    if handle.tx.send(msg).await.is_err() {
+        // receiver may have been dropped
+        let _ = out_tx
+            .send(rsclaw_channel::OutboundMessage {
+                target_id,
+                is_group,
+                text: rsclaw_i18n::t("analysis_failed", i18n_lang),
+                reply_to: None,
+                images: vec![],
+                channel: None,
+
+                account: None,
+                files: vec![],
+            })
+            .await;
+        return;
+    }
+    match tokio::time::timeout(Duration::from_secs(600), reply_rx).await {
+        Ok(Ok(r)) if !r.text.is_empty() || !r.images.is_empty() || !r.files.is_empty() => {
+            // receiver may have been dropped
+            let _ = out_tx
+                .send(rsclaw_channel::OutboundMessage {
+                    target_id,
+                    is_group,
+                    text: r.text,
+                    reply_to: None,
+                    images: r.images,
+                    files: r.files,
+                    account: None,
+                    channel: None,
+                })
+                .await;
+        }
+        Ok(Ok(_)) => {} // empty reply, nothing to send
+        Ok(Err(_)) => {
+            // receiver may have been dropped
+            let _ = out_tx
+                .send(rsclaw_channel::OutboundMessage {
+                    target_id,
+                    is_group,
+                    text: rsclaw_i18n::t("analysis_failed", i18n_lang),
+                    reply_to: None,
+                    images: vec![],
+                    channel: None,
+
+                    account: None,
+                    files: vec![],
+                })
+                .await;
+        }
+        Err(_) => {
+            // receiver may have been dropped
+            let _ = out_tx
+                .send(rsclaw_channel::OutboundMessage {
+                    target_id,
+                    is_group,
+                    text: rsclaw_i18n::t("analysis_timeout", i18n_lang),
+                    reply_to: None,
+                    images: vec![],
+                    channel: None,
+
+                    account: None,
+                    files: vec![],
+                })
+                .await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Embedder migration driver — backs the dim-mismatch background re-embed
+// kicked off in start_gateway after MemoryStore::open.
+// ---------------------------------------------------------------------------
+
+/// Drive a re-embed pass over all docs in `mem_arc` whose stored vector
+/// dimension doesn't match the active embedder. Uses the standard two-index
+/// `begin_swap` / `swap_apply_batch` / `commit_swap` machinery so reads stay
+/// served from primary (empty for the affected docs) and writes dual-write
+/// to both indexes throughout. Heavy embedding work happens off-lock; each
+/// lock window is bounded to a single batch.
+async fn run_embedder_reembed(
+    mem_arc: &std::sync::Arc<tokio::sync::Mutex<rsclaw_agent::MemoryStore>>,
+) -> anyhow::Result<()> {
+    /// Docs embedded per batch. Keeps each lock window to a few hundred ms
+    /// even with the slowest CPU-only BGE inference.
+    const BATCH: usize = 50;
+
+    let (embedder, expected_total) = {
+        let mut mem = mem_arc.lock().await;
+        let e = mem.embedder_arc();
+        let pending_count = mem.pending_migration_count();
+        mem.begin_swap(std::sync::Arc::clone(&e))?;
+        (e, pending_count)
+    };
+    let started = std::time::Instant::now();
+
+    let mut total = 0usize;
+    let mut batch_no = 0usize;
+    loop {
+        let pending = {
+            let mem = mem_arc.lock().await;
+            mem.swap_pending(BATCH)
+        };
+        if pending.is_empty() {
+            break;
+        }
+        batch_no += 1;
+        // Heavy work off-lock — parallel across the rayon pool so a 100-doc
+        // batch finishes in batch_size/num_cores * inference time instead of
+        // sequential. BertModel::forward takes `&self`, so concurrent embed
+        // calls are safe.
+        let batch_started = std::time::Instant::now();
+        use rayon::prelude::*;
+        let batch: Vec<(usize, Vec<f32>)> = pending
+            .into_par_iter()
+            .map(|(idx, text)| (idx, embedder.embed(&text)))
+            .collect();
+        let applied = {
+            let mut mem = mem_arc.lock().await;
+            match mem.swap_apply_batch(batch) {
+                Ok(n) => n,
+                Err(e) => {
+                    mem.abort_swap();
+                    return Err(e);
+                }
+            }
+        };
+        // applied == 0 used to abort, but with the swap_apply_batch
+        // idempotency guard a concurrent `add` dual-write can legitimately
+        // cover the entire batch before we land. Trust `swap_pending` to
+        // exclude the now-covered docs on the next iteration; the loop
+        // terminates naturally when nothing remains. Cap at 2x expected
+        // to make pathological cases (embedder always returning wrong
+        // dim) surface as a bounded failure instead of an infinite spin.
+        total += applied;
+        if batch_no > expected_total.saturating_mul(2).max(64) {
+            let mut mem = mem_arc.lock().await;
+            mem.abort_swap();
+            anyhow::bail!(
+                "embedder re-embed: ran {batch_no} batches against {expected_total} expected docs without converging — aborting"
+            );
+        }
+        info!(
+            batch = batch_no,
+            applied,
+            total,
+            expected = expected_total,
+            batch_ms = batch_started.elapsed().as_millis() as u64,
+            "embedder re-embed: batch complete"
+        );
+    }
+
+    let migrated = {
+        let mut mem = mem_arc.lock().await;
+        mem.commit_swap()?
+    };
+    info!(
+        total,
+        migrated,
+        elapsed_secs = started.elapsed().as_secs(),
+        "embedder re-embed complete; semantic search now full-coverage"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// BGE model: validate-or-download with atomic install
+// ---------------------------------------------------------------------------
+
+/// Conservative liveness check: does a process with `pid` exist? Used by
+/// the staging-dir sweep to clean up after crashed previous runs without
+/// disturbing concurrent processes that are mid-download. Errs on the
+/// side of "alive" so we never wipe an active stage dir.
+fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // kill(pid, 0) returns 0 if the process exists (any state, incl
+        // zombie); ESRCH means no such process. EPERM means it exists but
+        // we can't signal it — still alive. Use std's portable errno read
+        // (libc::__error is macOS, __errno_location is Linux — std hides
+        // the difference).
+        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if rc == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(windows)]
+    {
+        // Open a handle with PROCESS_QUERY_LIMITED_INFORMATION — sufficient
+        // to test existence. NULL handle == doesn't exist.
+        use winapi::um::{
+            handleapi::CloseHandle, processthreadsapi::OpenProcess,
+            winnt::PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                false
+            } else {
+                CloseHandle(h);
+                true
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // Unknown platform: assume alive so we never wrongly delete.
+        let _ = pid;
+        true
+    }
+}
+
+/// Make sure the BGE model at `model_dir` is present AND loadable. The
+/// gateway must not start without semantic search — if validation fails
+/// here, the error propagates and the process exits with a clear message.
+///
+/// Algorithm:
+///   1. If `model_dir/model.safetensors` exists → try `LocalBgeEmbedder::load`.
+///      Pass: return Ok. Fail: bail (don't auto-delete; might be a user-placed
+///      model or upgrade in flight).
+///   2. Otherwise, sync-download into
+///      `model_dir.with_extension("downloading")/`, validate by attempting to
+///      load it, then atomically rename into place.
+///   3. Any failure cleans up the tmp dir and bails.
+/// Sentinel filename + content schema for "rsclaw owns this model dir".
+/// Presence = managed (we may freely wipe / re-download on failure).
+/// Absence = user-placed (preserve files; fail loudly, never auto-delete).
+/// Body is one `key=value` per line, intentionally readable + grep-able.
+const SENTINEL_FILE: &str = ".rsclaw-managed";
+
+fn write_managed_sentinel(model_dir: &std::path::Path, url: &str, bytes: u64) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let body = format!(
+        "version={ver}\nurl={url}\nbytes={bytes}\ninstalled_at_ms={now_ms}\n",
+        ver = env!("CARGO_PKG_VERSION"),
+    );
+    if let Err(e) = std::fs::write(model_dir.join(SENTINEL_FILE), body) {
+        tracing::warn!(
+            error = %e,
+            "failed to write {SENTINEL_FILE} — re-download recovery on next start will be disabled"
+        );
+    }
+}
+
+/// Read the `bytes=` field of the sentinel, if present and parseable.
+/// Used to detect silent corruption (file size shifted since install).
+fn read_sentinel_bytes(model_dir: &std::path::Path) -> Option<u64> {
+    let body = std::fs::read_to_string(model_dir.join(SENTINEL_FILE)).ok()?;
+    body.lines()
+        .find_map(|line| line.strip_prefix("bytes="))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+pub(crate) async fn ensure_bge_model_present(
+    model_dir: &std::path::Path,
+    search_cfg: Option<&rsclaw_config::schema::MemorySearchConfig>,
+) -> anyhow::Result<()> {
+    use rsclaw_agent::memory::LocalBgeEmbedder;
+
+    // Wait for an in-progress Tauri seed to finish before deciding whether
+    // to download. The Tauri app writes `<model_dir>.seeding.tauri` with its
+    // PID while copying the bundled model into place; if that PID is still
+    // alive we hold off up to 30s rather than redundantly hitting the CDN.
+    // Stale lock files (PID gone) are ignored.
+    let seeding_lock = model_dir.with_extension("seeding.tauri");
+    if seeding_lock.exists() {
+        let lock_pid = std::fs::read_to_string(&seeding_lock)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        if let Some(pid) = lock_pid {
+            if pid_alive(pid) {
+                tracing::info!(
+                    pid,
+                    lock = %seeding_lock.display(),
+                    "BGE model seed in progress (Tauri); waiting up to 30s"
+                );
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                while seeding_lock.exists() && std::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    // Re-check liveness — Tauri might have crashed mid-copy.
+                    let still_alive = std::fs::read_to_string(&seeding_lock)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u32>().ok())
+                        .map(pid_alive)
+                        .unwrap_or(false);
+                    if !still_alive {
+                        let _ = std::fs::remove_file(&seeding_lock);
+                        break;
+                    }
+                }
+            } else {
+                tracing::debug!(stale_pid = pid, "stale seed lock from dead PID, removing");
+                let _ = std::fs::remove_file(&seeding_lock);
+            }
+        } else {
+            // Unparseable PID — treat as stale.
+            let _ = std::fs::remove_file(&seeding_lock);
+        }
+    }
+
+    let weights_path = model_dir.join("model.safetensors");
+    if weights_path.exists() {
+        let weights_bytes = std::fs::metadata(&weights_path).map(|m| m.len()).ok();
+        let dir_is_managed = model_dir.join(SENTINEL_FILE).exists();
+
+        // Sentinel + size-mismatch = silent corruption (truncated file from a
+        // crash mid-extract, partial write to a full disk, etc.). For OUR
+        // installs we can safely auto-recover by deleting and re-downloading.
+        if dir_is_managed {
+            if let (Some(actual), Some(expected)) = (weights_bytes, read_sentinel_bytes(model_dir))
+            {
+                if actual != expected {
+                    tracing::warn!(
+                        actual,
+                        expected,
+                        "BGE model.safetensors size differs from sentinel; re-downloading"
+                    );
+                    let _ = std::fs::remove_dir_all(model_dir);
+                    // Fall through to download path below.
+                }
+            }
+        }
+
+        // If we still have files (size matched OR not managed), try loading.
+        if model_dir.join("model.safetensors").exists() {
+            match LocalBgeEmbedder::load(model_dir) {
+                Ok(_) => return Ok(()),
+                Err(e) if dir_is_managed => {
+                    tracing::warn!(
+                        error = %format!("{e:#}"),
+                        dir = %model_dir.display(),
+                        "managed BGE model failed to load; auto-recovering"
+                    );
+                    let _ = std::fs::remove_dir_all(model_dir);
+                    // Fall through to download path.
+                }
+                Err(e) => {
+                    anyhow::bail!(
+                        "BGE model at {} failed to load: {e:#}\n\
+                         This is a user-placed directory (no {SENTINEL_FILE} sentinel) — \
+                         fix the files or remove the directory to trigger a fresh \
+                         download, then restart.",
+                        model_dir.display()
+                    );
+                }
+            }
+        }
+    }
+
+    let local_cfg = search_cfg.and_then(|c| c.local.as_ref());
+    let url = local_cfg
+        .and_then(|c| c.model_download_url.as_deref())
+        .unwrap_or("https://gitfast.org/tools/models/bge-small-zh-v1.5.zip")
+        .to_owned();
+
+    // Per-PID staging directory. Two concurrent gateway processes hitting the
+    // same model_dir (e.g. a fast `gateway restart` overlap or two CLIs) must
+    // not write into the same staging dir — one would overwrite the other's
+    // half-extracted state and the load-test would see Frankenstein files.
+    // Each process gets its own stage; whichever finishes first atomic-renames
+    // into model_dir, the other's load-test passes against the now-existing
+    // files (same model URL → same content) or its rename overwrites cleanly.
+    //
+    // Resume semantics: download_resumable's sidecar `.meta` lives next to the
+    // archive in the per-PID dir, so resume only kicks in if the SAME process
+    // restarts. Across-process resume isn't worth the file-locking complexity
+    // for a one-shot bootstrap.
+    let pid = std::process::id();
+    let tmp_dir = model_dir.with_extension(format!("downloading.pid{pid}"));
+    // Sweep stale per-PID staging dirs from crashed previous runs (any dir
+    // matching `<basename>.downloading.pid*` whose pid is no longer alive).
+    if let Some(parent) = model_dir.parent() {
+        let prefix = model_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| format!("{n}.downloading.pid"))
+            .unwrap_or_default();
+        if !prefix.is_empty()
+            && let Ok(entries) = std::fs::read_dir(parent)
+        {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if let Some(name) = p.file_name().and_then(|n| n.to_str())
+                    && let Some(other_pid_str) = name.strip_prefix(&prefix)
+                    && let Ok(other_pid) = other_pid_str.parse::<u32>()
+                    && other_pid != pid
+                    && !pid_alive(other_pid)
+                {
+                    tracing::info!(stale = %p.display(), "sweeping stale staging dir");
+                    let _ = std::fs::remove_dir_all(&p);
+                }
+            }
+        }
+    }
+    std::fs::create_dir_all(&tmp_dir)
+        .with_context(|| format!("failed to create download dir {}", tmp_dir.display()))?;
+
+    let archive_name = url.rsplit('/').next().unwrap_or("bge-model.zip");
+    let archive_path = tmp_dir.join(archive_name);
+
+    info!(
+        "BGE model not present; downloading from {url} -> {}",
+        archive_path.display()
+    );
+    let client = reqwest::Client::new();
+    let download_result =
+        crate::cmd::tools::download_resumable(&client, &url, &archive_path, "BGE model").await;
+    if let Err(e) = download_result {
+        // Leave the partial archive in place so the next run resumes from
+        // the same byte. No clean-up here.
+        anyhow::bail!(
+            "BGE model download failed: {e:#}\n\
+             URL: {url}\n\
+             Partial download retained at {} for resume on next start.\n\
+             Or manually place model files at {} and restart.",
+            archive_path.display(),
+            model_dir.display()
+        );
+    }
+
+    // Wipe any stale extracted files from a prior failed run before extracting
+    // fresh.
+    for entry in std::fs::read_dir(&tmp_dir)?.flatten() {
+        let p = entry.path();
+        if p == archive_path {
+            continue;
+        }
+        if p.is_dir() {
+            let _ = std::fs::remove_dir_all(&p);
+        } else {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+    if let Err(e) = crate::cmd::tools::extract_zip_public(&archive_path, &tmp_dir) {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        anyhow::bail!(
+            "BGE model archive extraction failed: {e:#}\n\
+             The downloaded file at {} may be corrupted. Re-run after deleting it.",
+            archive_path.display()
+        );
+    }
+
+    // Load-test before commit — this is our only completeness guarantee.
+    if let Err(e) = LocalBgeEmbedder::load(&tmp_dir) {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        anyhow::bail!(
+            "downloaded BGE model failed validation: {e:#}\n\
+             The download may have been corrupted. Retry by restarting; if this\n\
+             persists, the upstream model URL may be broken: {url}"
+        );
+    }
+
+    // Drop the archive — only the extracted files matter from here on.
+    let _ = std::fs::remove_file(&archive_path);
+
+    // Install. The presence of `SENTINEL_FILE` in the existing model_dir
+    // tells us "rsclaw owns this dir" (managed) — we may freely wipe and
+    // rename. Without the sentinel we treat the dir as user-managed and
+    // copy-merge to preserve hand-placed files (different config.json,
+    // partial transfer in progress, etc.). model.safetensors is always
+    // overwritten when it's our turn to install — its mismatch is what
+    // brought us into this branch in the first place.
+    let dir_is_managed = model_dir.exists() && model_dir.join(SENTINEL_FILE).exists();
+    if !model_dir.exists() || dir_is_managed {
+        if model_dir.exists() {
+            std::fs::remove_dir_all(model_dir)
+                .with_context(|| format!("failed to clear managed dir {}", model_dir.display()))?;
+        }
+        std::fs::rename(&tmp_dir, model_dir).with_context(|| {
+            format!(
+                "failed to install model: rename {} -> {}",
+                tmp_dir.display(),
+                model_dir.display()
+            )
+        })?;
+    } else {
+        std::fs::create_dir_all(model_dir)
+            .with_context(|| format!("failed to ensure install dir {}", model_dir.display()))?;
+        for entry in std::fs::read_dir(&tmp_dir)?.flatten() {
+            let src = entry.path();
+            let Some(name) = src.file_name() else {
+                continue;
+            };
+            let dst = model_dir.join(name);
+            if dst.exists() && name != "model.safetensors" {
+                tracing::debug!(file = %dst.display(), "preserving user-placed file");
+                continue;
+            }
+            if let Err(e) = std::fs::rename(&src, &dst) {
+                // Cross-device rename can fail on overlay filesystems; fall
+                // back to copy + remove.
+                std::fs::copy(&src, &dst).with_context(|| {
+                    format!(
+                        "failed to install {} -> {}: rename {e}",
+                        src.display(),
+                        dst.display()
+                    )
+                })?;
+                let _ = std::fs::remove_file(&src);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    // Stamp the sentinel so a future restart can size-check the install and
+    // safely auto-recover from corruption / truncation.
+    let installed_bytes = std::fs::metadata(model_dir.join("model.safetensors"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    write_managed_sentinel(model_dir, &url, installed_bytes);
+
+    info!("BGE model installed at {}", model_dir.display());
+    Ok(())
+}
+
+/// Publish a `RestartRequest` into the broadcast channel and store it in the
+/// `pending_restart` latch so late-connecting UI clients see it on handshake.
+///
+/// `send` failure (no live subscribers) is normal and ignored — the latch
+/// guarantees the next subscriber will pick it up.
+///
+/// Stamps the request with the current `shutdown.inflight()` count so the UI
+/// can decide whether to restart immediately (idle) or show the countdown
+/// banner (busy). When the initial count is non-zero, spawns a watcher that
+/// re-publishes (latch + broadcast) with `inflight = 0` as soon as the
+/// gateway drains, capped at 60s. The frontend treats `inflight = 0` as
+/// "ready to restart now" and short-circuits its countdown.
+pub(crate) fn publish_restart(
+    tx: &tokio::sync::broadcast::Sender<rsclaw_events::RestartRequest>,
+    latch: &Arc<std::sync::RwLock<Option<rsclaw_events::RestartRequest>>>,
+    shutdown: &crate::gateway::ShutdownCoordinator,
+    mut req: rsclaw_events::RestartRequest,
+) {
+    let initial = shutdown.inflight() as u64;
+    req.inflight = initial;
+
+    if let Ok(mut guard) = latch.write() {
+        *guard = Some(req.clone());
+    } else {
+        warn!("pending_restart lock poisoned; restart event still broadcast");
+    }
+    let _ = tx.send(req.clone());
+
+    if initial == 0 {
+        return;
+    }
+
+    // Busy at publish time: poll until idle (or 60s deadline) and re-publish
+    // with inflight = 0 so the UI restarts immediately.
+    let tx = tx.clone();
+    let latch = Arc::clone(latch);
+    let shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if shutdown.inflight() == 0 {
+                let mut updated = req;
+                updated.inflight = 0;
+                if let Ok(mut guard) = latch.write() {
+                    *guard = Some(updated.clone());
+                }
+                let _ = tx.send(updated);
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                return;
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod user_env_tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    #[test]
+    fn sets_unset_variables() {
+        unsafe { std::env::remove_var("RSCLAW_TEST_USER_ENV_NEW") };
+        let mut map = HashMap::new();
+        map.insert(
+            "RSCLAW_TEST_USER_ENV_NEW".to_owned(),
+            "from-config".to_owned(),
+        );
+        apply_user_env_map(&map);
+        assert_eq!(
+            std::env::var("RSCLAW_TEST_USER_ENV_NEW").as_deref(),
+            Ok("from-config")
+        );
+        unsafe { std::env::remove_var("RSCLAW_TEST_USER_ENV_NEW") };
+    }
+
+    #[test]
+    fn preexisting_shell_value_wins() {
+        unsafe { std::env::set_var("RSCLAW_TEST_USER_ENV_KEEP", "from-shell") };
+        let mut map = HashMap::new();
+        map.insert(
+            "RSCLAW_TEST_USER_ENV_KEEP".to_owned(),
+            "from-config".to_owned(),
+        );
+        apply_user_env_map(&map);
+        assert_eq!(
+            std::env::var("RSCLAW_TEST_USER_ENV_KEEP").as_deref(),
+            Ok("from-shell"),
+            "shell-provided value must not be overwritten"
+        );
+        unsafe { std::env::remove_var("RSCLAW_TEST_USER_ENV_KEEP") };
+    }
+
+    #[test]
+    fn expands_nested_var_refs() {
+        unsafe { std::env::set_var("RSCLAW_TEST_USER_ENV_REF", "/var/log/foo") };
+        unsafe { std::env::remove_var("RSCLAW_TEST_USER_ENV_TARGET") };
+        let mut map = HashMap::new();
+        map.insert(
+            "RSCLAW_TEST_USER_ENV_TARGET".to_owned(),
+            "${RSCLAW_TEST_USER_ENV_REF}/app.log".to_owned(),
+        );
+        apply_user_env_map(&map);
+        assert_eq!(
+            std::env::var("RSCLAW_TEST_USER_ENV_TARGET").as_deref(),
+            Ok("/var/log/foo/app.log")
+        );
+        unsafe { std::env::remove_var("RSCLAW_TEST_USER_ENV_REF") };
+        unsafe { std::env::remove_var("RSCLAW_TEST_USER_ENV_TARGET") };
+    }
+}

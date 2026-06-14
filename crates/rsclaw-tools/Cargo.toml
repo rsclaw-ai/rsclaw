@@ -1,0 +1,32 @@
+[package]
+name = "rsclaw-tools"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+reqwest = { version = "0.12", features = ["json", "stream", "multipart", "blocking", "rustls-tls-webpki-roots-no-provider", "socks"], default-features = false }
+futures = "0.3"
+indicatif = "0.17"
+sha2 = "0.10"
+zip = "2"
+tar = "0.4"
+flate2 = "1"
+xz2 = "0.1"
+bzip2 = "0.6.1"
+which = "7"
+tempfile = "3"
+dirs-next = "2"
+
+rsclaw-skill = { path = "../rsclaw-skill" }
+rsclaw-config = { path = "../rsclaw-config" }
+rsclaw-cli = { path = "../rsclaw-cli" }
+
+[dev-dependencies]
+tempfile = "3"

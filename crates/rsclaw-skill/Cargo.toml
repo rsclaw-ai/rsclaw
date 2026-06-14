@@ -1,0 +1,38 @@
+[package]
+name = "rsclaw-skill"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+rsclaw-types = { path = "../rsclaw-types" }
+rsclaw-config = { path = "../rsclaw-config" }
+rsclaw-util = { path = "../rsclaw-util" }
+rsclaw-i18n = { path = "../rsclaw-i18n" }
+rsclaw-events = { path = "../rsclaw-events" }
+rsclaw-platform = { path = "../rsclaw-platform" }
+rsclaw-provider = { path = "../rsclaw-provider" }
+rsclaw-store = { path = "../rsclaw-store" }
+rsclaw-evolution = { path = "../rsclaw-evolution" }
+rsclaw-memory = { path = "../rsclaw-memory" }
+reqwest = { version = "0.12", features = ["json", "stream", "multipart", "blocking", "rustls-tls-webpki-roots-no-provider", "socks"], default-features = false }
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+toml = "1"
+serde_yaml_ng = "0.10"
+sha2 = "0.10"
+base64 = "0.22"
+ed25519-dalek = "2"
+zip = "2"
+tar = "0.4"
+flate2 = "1"
+
+[dev-dependencies]
+tempfile = "3"
+which = "7"

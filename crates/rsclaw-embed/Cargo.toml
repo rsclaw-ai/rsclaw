@@ -1,0 +1,19 @@
+[package]
+name = "rsclaw-embed"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tracing = "0.1"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream", "multipart", "blocking", "rustls-tls-webpki-roots-no-provider", "socks"], default-features = false }
+candle-core = "0.9"
+candle-nn = "0.9"
+candle-transformers = "0.9"
+tokenizers = "0.21"
+rsclaw-util = { path = "../rsclaw-util" }

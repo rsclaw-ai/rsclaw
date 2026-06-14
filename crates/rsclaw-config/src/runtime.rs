@@ -1,0 +1,490 @@
+//! RuntimeConfig — the unified config consumed by all modules after loading.
+//!
+//! `Config` (schema layer, lots of Option<T>) is converted into this
+//! representation via `IntoRuntime`, which also applies defaults and validates
+//! cross-field constraints.
+//!
+//! Sub-structs are grouped by hot-reload domain so each can be independently
+//! swapped via `Arc<RwLock<T>>` without touching the rest:
+//!
+//!   GatewayRuntime  — network / auth / channel-health knobs
+//!   AgentsRuntime   — agent list, per-agent defaults, bindings
+//!   ChannelRuntime  — channel drivers + session routing
+//!   ModelRuntime    — provider registry + auth
+//!   ExtRuntime      — skills, plugins, tools
+//!   OpsRuntime      — cron, hooks, sandbox, logging, secrets
+
+use anyhow::Result;
+
+use super::schema::{
+    A2aPeerConfig, A2aRelayMode, A2aRelayStrategy, AgentDefaults, AgentEntry, AuthConfig, BindMode,
+    BindingConfig, ChannelsConfig, Config, CronConfig, DmScope, GatewayMode, HooksConfig,
+    LoggingConfig, ModelsConfig, PluginsConfig, ReloadMode, SandboxConfig, SecretOrString,
+    SecretsConfig, SessionConfig, SkillsConfig, ToolsConfig,
+};
+
+// ---------------------------------------------------------------------------
+// Sub-structs
+// ---------------------------------------------------------------------------
+
+/// A resolved, accepted A2A inbound credential: the `secret` that authenticates
+/// as principal `id`, carrying optional `scopes` for future per-method
+/// authorization (A2A §7.5). Anonymous (legacy / env) credentials get a
+/// synthetic id like `legacy:bearer:0`.
+#[derive(Debug, Clone)]
+pub struct A2aPrincipal {
+    pub id: String,
+    pub secret: String,
+    pub scopes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum A2aRelayModeRuntime {
+    Disabled,
+    Hub,
+    Spoke,
+}
+
+impl Default for A2aRelayModeRuntime {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
+impl From<A2aRelayMode> for A2aRelayModeRuntime {
+    fn from(value: A2aRelayMode) -> Self {
+        match value {
+            A2aRelayMode::Disabled => Self::Disabled,
+            A2aRelayMode::Hub => Self::Hub,
+            A2aRelayMode::Spoke => Self::Spoke,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum A2aRelayStrategyRuntime {
+    PrimaryStandby,
+    MultiHome,
+}
+
+impl Default for A2aRelayStrategyRuntime {
+    fn default() -> Self {
+        Self::PrimaryStandby
+    }
+}
+
+impl From<A2aRelayStrategy> for A2aRelayStrategyRuntime {
+    fn from(value: A2aRelayStrategy) -> Self {
+        match value {
+            A2aRelayStrategy::PrimaryStandby => Self::PrimaryStandby,
+            A2aRelayStrategy::MultiHome => Self::MultiHome,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct A2aRelayNodeRuntime {
+    pub node_id: String,
+    /// Bearer token. Empty string means "token auth disabled" — the node
+    /// MUST authenticate via Ed25519 challenge-response (`public_key` set).
+    pub token: String,
+    /// Base64 Ed25519 public key (raw 32 bytes). When set, the hub
+    /// requires a successful challenge-response signature from this node.
+    pub public_key: Option<String>,
+    pub roles: Vec<String>,
+    pub scopes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct A2aRelayRuntime {
+    pub mode: A2aRelayModeRuntime,
+    pub relay_id: String,
+    pub public_url: Option<String>,
+    pub node_id: Option<String>,
+    pub hub_urls: Vec<String>,
+    pub strategy: A2aRelayStrategyRuntime,
+    pub token: Option<String>,
+    /// Spoke-side Ed25519 private key (raw base64, 32 bytes). Resolved at
+    /// startup from `relay.privateKey` or read from `relay.privateKeyFile`.
+    /// When present, spoke uses keypair handshake.
+    pub private_key: Option<String>,
+    /// Hub-side revocation list — node_ids whose connections are refused.
+    pub revoked_nodes: Vec<String>,
+    pub nodes: Vec<A2aRelayNodeRuntime>,
+}
+
+/// Network / auth / channel-health knobs.  Swappable without restart.
+#[derive(Debug, Clone)]
+pub struct GatewayRuntime {
+    pub port: u16,
+    pub mode: GatewayMode,
+    pub bind: BindMode,
+    /// Custom IP address to bind to (when bind mode is Custom or an IP string).
+    pub bind_address: Option<String>,
+    pub reload: ReloadMode,
+    pub auth_token: Option<String>,
+    /// Accepted A2A inbound credentials for `/api/v1/a2a`, each carrying the
+    /// principal `id` it authenticates as. Resolved from `gateway.a2a.clients`
+    /// plus the deprecated `authTokens`/`apiKeys` (as anonymous principals) and
+    /// the env lists `RSCLAW_A2A_BEARER_TOKENS` / `RSCLAW_A2A_API_KEYS`. A
+    /// secret matches on either the Bearer or X-API-Key header. Empty Vec =
+    /// the middleware passes through (dev mode).
+    pub a2a_principals: Vec<A2aPrincipal>,
+    /// Private rsclaw A2A relay overlay configuration. Standard `/api/v1/a2a`
+    /// auth remains in `a2a_principals`; relay credentials are separate.
+    pub a2a_relay: A2aRelayRuntime,
+    /// Max body size in bytes for `/api/v1/a2a`. Resolved from
+    /// `gateway.a2a.maxBodyMb` × 1 MiB. Default 100 MiB. Wired as
+    /// `DefaultBodyLimit::max(...)` on the route — axum's stock 2 MiB
+    /// is too small for realistic file attachments.
+    pub a2a_max_body_bytes: u64,
+    /// True when `gateway.auth.token` is present in config (Plain or
+    /// SecretRef). Used by the validator to avoid a false "no auth token"
+    /// warning when the token is a SecretRef that couldn't be resolved at
+    /// startup (e.g. file/exec).
+    pub auth_token_configured: bool,
+    /// True when `gateway.auth.token` was specified as a plain string rather
+    /// than a SecretRef.  Used by the validator to emit a security warning
+    /// (agents.md §24).
+    pub auth_token_is_plaintext: bool,
+    pub allow_tailscale: bool,
+    pub channel_health_check_minutes: u32,
+    pub channel_stale_event_threshold_minutes: u32,
+    pub channel_max_restarts_per_hour: u32,
+    /// Global default User-Agent for LLM provider requests. Provider-level
+    /// overrides this.
+    pub user_agent: Option<String>,
+    /// Default response language (e.g. "Chinese", "English"). Affects registry
+    /// selection.
+    pub language: Option<String>,
+}
+
+/// Agent list, per-agent defaults, bindings.  Registry rebuild required on
+/// change.
+#[derive(Debug, Clone)]
+pub struct AgentsRuntime {
+    pub defaults: AgentDefaults,
+    pub list: Vec<AgentEntry>,
+    pub bindings: Vec<BindingConfig>,
+    pub a2a: Vec<A2aPeerConfig>,
+}
+
+/// Channel drivers + session routing.  Swappable per-channel.
+#[derive(Debug, Clone)]
+pub struct ChannelRuntime {
+    pub channels: ChannelsConfig,
+    pub session: SessionConfig,
+}
+
+/// LLM provider registry + auth config.  ProviderRegistry rebuild is cheap.
+#[derive(Debug, Clone)]
+pub struct ModelRuntime {
+    pub models: Option<ModelsConfig>,
+    pub auth: Option<AuthConfig>,
+}
+
+/// Skills, plugins, tools.  Reload triggers skill/plugin re-scan only.
+#[derive(Debug, Clone)]
+pub struct ExtRuntime {
+    pub tools: Option<ToolsConfig>,
+    pub skills: Option<SkillsConfig>,
+    pub plugins: Option<PluginsConfig>,
+    pub evolution: Option<crate::schema::EvolutionConfig>,
+}
+
+/// Operational: cron, hooks, sandbox, logging, secrets.  Rarely change.
+#[derive(Debug, Clone)]
+pub struct OpsRuntime {
+    pub cron: Option<CronConfig>,
+    pub hooks: Option<HooksConfig>,
+    pub sandbox: Option<SandboxConfig>,
+    pub logging: Option<LoggingConfig>,
+    pub secrets: Option<SecretsConfig>,
+}
+
+// ---------------------------------------------------------------------------
+// RuntimeConfig
+// ---------------------------------------------------------------------------
+
+/// Top-level runtime config — composed of domain sub-structs.
+#[derive(Debug, Clone)]
+pub struct RuntimeConfig {
+    pub gateway: GatewayRuntime,
+    pub agents: AgentsRuntime,
+    pub channel: ChannelRuntime,
+    pub model: ModelRuntime,
+    pub ext: ExtRuntime,
+    pub ops: OpsRuntime,
+    /// Original parsed config — retained for sections not yet mapped to runtime
+    /// types.
+    pub raw: crate::schema::Config,
+}
+
+impl RuntimeConfig {
+    /// Resolve the default agent (the one with `default: true`, or the first).
+    pub fn default_agent(&self) -> Option<&AgentEntry> {
+        self.agents
+            .list
+            .iter()
+            .find(|a| a.default == Some(true))
+            .or_else(|| self.agents.list.first())
+    }
+
+    /// Resolve a specific agent by ID.
+    pub fn agent_by_id(&self, id: &str) -> Option<&AgentEntry> {
+        self.agents.list.iter().find(|a| a.id == id)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Conversion from Config
+// ---------------------------------------------------------------------------
+
+pub trait IntoRuntime {
+    fn into_runtime(self) -> Result<RuntimeConfig>;
+}
+
+impl IntoRuntime for Config {
+    fn into_runtime(self) -> Result<RuntimeConfig> {
+        let raw = self.clone();
+        let gw = self.gateway.unwrap_or_default();
+        let agents_cfg = self.agents.unwrap_or_default();
+
+        // Resolve auth token before consuming `gw`.
+        let token_ref = gw.auth.as_ref().and_then(|a| a.token.as_ref());
+        let auth_token_configured = token_ref.is_some()
+            || std::env::var("RSCLAW_AUTH_TOKEN").is_ok()
+            || std::env::var("OPENCLAW_GATEWAY_TOKEN").is_ok();
+        let auth_token_is_plaintext = token_ref
+            .map(|t| matches!(t, SecretOrString::Plain(_)))
+            .unwrap_or(false);
+        // Use resolve_early() so SecretRef::Env tokens are resolved inline;
+        // File/Exec refs return None here and must be resolved later via
+        // SecretsManager.
+        // Fallback: RSCLAW_AUTH_TOKEN or OPENCLAW_GATEWAY_TOKEN env vars.
+        let auth_token = token_ref
+            .and_then(|t| t.resolve_early())
+            .or_else(|| std::env::var("RSCLAW_AUTH_TOKEN").ok())
+            .or_else(|| std::env::var("OPENCLAW_GATEWAY_TOKEN").ok());
+
+        // A2A inbound auth — resolve config-listed tokens/keys, then merge
+        // env-set lists for back-compat with the original env-only design.
+        // Empty in both => middleware passes through (dev mode).
+        let resolve_list = |list: Option<&Vec<SecretOrString>>| -> Vec<String> {
+            list.map(|v| v.iter().filter_map(|s| s.resolve_early()).collect())
+                .unwrap_or_default()
+        };
+        let env_split = |name: &str| -> Vec<String> {
+            std::env::var(name)
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+        // Unified A2A credential pool. Named `clients` resolve to their own id;
+        // the deprecated authTokens/apiKeys and env lists become anonymous
+        // principals. A secret is accepted on either header at request time —
+        // transport is the caller's choice, not a config axis.
+        let mut a2a_principals: Vec<A2aPrincipal> = Vec::new();
+        if let Some(clients) = gw.a2a.as_ref().and_then(|a| a.clients.as_ref()) {
+            for c in clients {
+                if let Some(secret) = c.secret.resolve_early() {
+                    a2a_principals.push(A2aPrincipal {
+                        id: c.id.clone(),
+                        secret,
+                        scopes: c.scopes.clone().unwrap_or_default(),
+                    });
+                }
+            }
+        }
+        let anon = |secret: String, kind: &str, n: usize| A2aPrincipal {
+            id: format!("legacy:{kind}:{n}"),
+            secret,
+            scopes: Vec::new(),
+        };
+        for (n, s) in resolve_list(gw.a2a.as_ref().and_then(|a| a.auth_tokens.as_ref()))
+            .into_iter()
+            .chain(env_split("RSCLAW_A2A_BEARER_TOKENS"))
+            .enumerate()
+        {
+            a2a_principals.push(anon(s, "bearer", n));
+        }
+        for (n, s) in resolve_list(gw.a2a.as_ref().and_then(|a| a.api_keys.as_ref()))
+            .into_iter()
+            .chain(env_split("RSCLAW_A2A_API_KEYS"))
+            .enumerate()
+        {
+            a2a_principals.push(anon(s, "apikey", n));
+        }
+        let a2a_max_body_bytes: u64 =
+            gw.a2a.as_ref().and_then(|a| a.max_body_mb).unwrap_or(100) as u64 * 1024 * 1024;
+        let a2a_relay = gw
+            .a2a
+            .as_ref()
+            .and_then(|a| a.relay.as_ref())
+            .map(|relay| {
+                let mode = relay
+                    .mode
+                    .clone()
+                    .map(A2aRelayModeRuntime::from)
+                    .unwrap_or_default();
+                let relay_id = relay
+                    .relay_id
+                    .clone()
+                    .or_else(|| relay.node_id.clone())
+                    .unwrap_or_else(|| "main".to_owned());
+                let mut hub_urls = Vec::new();
+                if let Some(url) = relay.hub_url.clone() {
+                    hub_urls.push(url);
+                }
+                if let Some(urls) = relay.relays.clone() {
+                    hub_urls.extend(urls);
+                }
+                let nodes = relay
+                    .nodes
+                    .as_ref()
+                    .map(|nodes| {
+                        nodes
+                            .iter()
+                            .filter_map(|node| {
+                                // A node is valid if it has either a token OR
+                                // a public_key. Both is also fine (defense in
+                                // depth). Neither = drop, with a warning so
+                                // operators see the typo early.
+                                let token = node
+                                    .token
+                                    .as_ref()
+                                    .and_then(|t| t.resolve_early())
+                                    .unwrap_or_default();
+                                let public_key = node.public_key.clone();
+                                if token.is_empty() && public_key.is_none() {
+                                    tracing::warn!(
+                                        node = %node.node_id,
+                                        "a2a relay node has neither token nor publicKey; skipping"
+                                    );
+                                    return None;
+                                }
+                                Some(A2aRelayNodeRuntime {
+                                    node_id: node.node_id.clone(),
+                                    token,
+                                    public_key,
+                                    roles: node.roles.clone().unwrap_or_default(),
+                                    scopes: node.scopes.clone().unwrap_or_default(),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // Spoke private key: prefer inline `privateKey`, else read
+                // `privateKeyFile`. File read errors are warned, not fatal —
+                // gateway still starts so the operator can fix and reload.
+                let private_key = relay
+                    .private_key
+                    .as_ref()
+                    .and_then(|k| k.resolve_early())
+                    .or_else(|| {
+                        relay.private_key_file.as_ref().and_then(|path| {
+                            match std::fs::read_to_string(path) {
+                                Ok(content) => Some(content.trim().to_owned()),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        path = %path,
+                                        error = %e,
+                                        "a2a relay privateKeyFile read failed"
+                                    );
+                                    None
+                                }
+                            }
+                        })
+                    });
+                A2aRelayRuntime {
+                    mode,
+                    relay_id,
+                    public_url: relay.public_url.clone(),
+                    node_id: relay.node_id.clone(),
+                    hub_urls,
+                    strategy: relay
+                        .strategy
+                        .clone()
+                        .map(A2aRelayStrategyRuntime::from)
+                        .unwrap_or_default(),
+                    token: relay.token.as_ref().and_then(|token| token.resolve_early()),
+                    private_key,
+                    revoked_nodes: relay.revoked_nodes.clone().unwrap_or_default(),
+                    nodes,
+                }
+            })
+            .unwrap_or_default();
+
+        Ok(RuntimeConfig {
+            gateway: GatewayRuntime {
+                port: gw.port.unwrap_or(18888),
+                mode: gw.mode.unwrap_or(GatewayMode::Local),
+                bind: gw.bind.unwrap_or(BindMode::Loopback),
+                bind_address: gw.bind_address.clone(),
+                reload: gw.reload.unwrap_or(ReloadMode::Hybrid),
+                auth_token,
+                a2a_principals,
+                a2a_relay,
+                a2a_max_body_bytes,
+                auth_token_configured,
+                auth_token_is_plaintext,
+                allow_tailscale: gw
+                    .auth
+                    .as_ref()
+                    .and_then(|a| a.allow_tailscale)
+                    .unwrap_or(false),
+                channel_health_check_minutes: gw.channel_health_check_minutes.unwrap_or(5),
+                channel_stale_event_threshold_minutes: gw
+                    .channel_stale_event_threshold_minutes
+                    .unwrap_or(30),
+                channel_max_restarts_per_hour: gw.channel_max_restarts_per_hour.unwrap_or(10),
+                user_agent: gw.user_agent.clone(),
+                language: gw.language.clone(),
+            },
+            agents: AgentsRuntime {
+                defaults: agents_cfg.defaults.unwrap_or_default(),
+                list: agents_cfg.list.unwrap_or_default(),
+                bindings: self.bindings.unwrap_or_default(),
+                a2a: agents_cfg.a2a.unwrap_or_default(),
+            },
+            channel: ChannelRuntime {
+                channels: self.channels.unwrap_or_default(),
+                session: self.session.unwrap_or_else(default_session),
+            },
+            model: ModelRuntime {
+                models: self.models,
+                auth: self.auth,
+            },
+            ext: ExtRuntime {
+                tools: self.tools,
+                skills: self.skills,
+                plugins: self.plugins,
+                evolution: self.evolution,
+            },
+            ops: OpsRuntime {
+                cron: self.cron,
+                hooks: self.hooks,
+                sandbox: self.sandbox,
+                logging: self.logging,
+                secrets: self.secrets,
+            },
+            raw,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn default_session() -> SessionConfig {
+    SessionConfig {
+        dm_scope: Some(DmScope::PerChannelPeer),
+        thread_bindings: None,
+        reset: None,
+        identity_links: None,
+        maintenance: None,
+    }
+}

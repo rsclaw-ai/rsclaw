@@ -7525,7 +7525,40 @@ dependencies = [
  "redb 4.1.0",
  "regex",
  "reqwest",
- "rusqlite",
+ "rsclaw-a2a-types",
+ "rsclaw-agent",
+ "rsclaw-artifact",
+ "rsclaw-astock",
+ "rsclaw-browser",
+ "rsclaw-cap",
+ "rsclaw-channel",
+ "rsclaw-cli",
+ "rsclaw-computer",
+ "rsclaw-config",
+ "rsclaw-cron",
+ "rsclaw-desktop",
+ "rsclaw-doc",
+ "rsclaw-embed",
+ "rsclaw-events",
+ "rsclaw-evolution",
+ "rsclaw-heartbeat",
+ "rsclaw-i18n",
+ "rsclaw-jobs",
+ "rsclaw-kb",
+ "rsclaw-mcp",
+ "rsclaw-memory",
+ "rsclaw-migrate",
+ "rsclaw-platform",
+ "rsclaw-plugin",
+ "rsclaw-provider",
+ "rsclaw-retry",
+ "rsclaw-runtime",
+ "rsclaw-skill",
+ "rsclaw-store",
+ "rsclaw-tools",
+ "rsclaw-types",
+ "rsclaw-util",
+ "rsclaw-watch",
  "rust_xlsxwriter",
  "rustls",
  "serde",
@@ -7564,6 +7597,892 @@ dependencies = [
  "xcap",
  "xz2",
  "zip 2.4.2",
+]
+
+[[package]]
+name = "rsclaw-a2a-types"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dashmap",
+ "eventsource-stream",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "rsclaw-agent"
+version = "0.1.0"
+dependencies = [
+ "anycli",
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "dirs-next",
+ "encoding_rs",
+ "fs2",
+ "futures",
+ "glob",
+ "globset",
+ "ignore",
+ "image 0.25.10",
+ "include_dir",
+ "json5",
+ "lol_html",
+ "moka",
+ "rand 0.9.2",
+ "regex",
+ "reqwest",
+ "rsclaw-a2a-types",
+ "rsclaw-artifact",
+ "rsclaw-astock",
+ "rsclaw-browser",
+ "rsclaw-cap",
+ "rsclaw-channel",
+ "rsclaw-computer",
+ "rsclaw-config",
+ "rsclaw-cron",
+ "rsclaw-doc",
+ "rsclaw-events",
+ "rsclaw-evolution",
+ "rsclaw-i18n",
+ "rsclaw-jobs",
+ "rsclaw-kb",
+ "rsclaw-mcp",
+ "rsclaw-memory",
+ "rsclaw-platform",
+ "rsclaw-plugin",
+ "rsclaw-provider",
+ "rsclaw-skill",
+ "rsclaw-store",
+ "rsclaw-tools",
+ "rsclaw-types",
+ "rsclaw-util",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "toml 1.1.0+spec-1.1.0",
+ "tracing",
+ "urlencoding",
+ "uuid",
+ "which 7.0.3",
+]
+
+[[package]]
+name = "rsclaw-artifact"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "regex",
+ "rsclaw-config",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rsclaw-astock"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "chrono-tz",
+ "futures",
+ "plotters",
+ "reqwest",
+ "rsclaw-config",
+ "rsclaw-i18n",
+ "rsclaw-memory",
+ "rsclaw-types",
+ "rsclaw-util",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rsclaw-browser"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "dirs-next",
+ "futures",
+ "libc",
+ "reqwest",
+ "rsclaw-config",
+ "rsclaw-events",
+ "rsclaw-i18n",
+ "rsclaw-platform",
+ "rsclaw-types",
+ "rsclaw-util",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite 0.29.0",
+ "tracing",
+ "url",
+ "wiremock",
+]
+
+[[package]]
+name = "rsclaw-cap"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cap-rs",
+ "futures",
+ "rsclaw-config",
+ "rsclaw-events",
+ "rsclaw-i18n",
+ "rsclaw-memory",
+ "rsclaw-types",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rsclaw-channel"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "dirs-next",
+ "encoding_rs",
+ "flate2",
+ "futures",
+ "hex",
+ "hmac",
+ "htmd",
+ "json5",
+ "lark-websocket-protobuf",
+ "lol_html",
+ "mailparse",
+ "matrix-sdk",
+ "md-5",
+ "mime",
+ "mime_guess",
+ "ogg",
+ "opus-decoder",
+ "prost 0.13.5",
+ "qrcode",
+ "rand 0.9.2",
+ "regex",
+ "reqwest",
+ "rsclaw-config",
+ "rsclaw-doc",
+ "rsclaw-embed",
+ "rsclaw-events",
+ "rsclaw-i18n",
+ "rsclaw-platform",
+ "rsclaw-provider",
+ "rsclaw-retry",
+ "rsclaw-store",
+ "rsclaw-types",
+ "rsclaw-util",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "silk-rs",
+ "symphonia",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite 0.29.0",
+ "tracing",
+ "url",
+ "urlencoding",
+ "uuid",
+ "which 7.0.3",
+ "zip 2.4.2",
+]
+
+[[package]]
+name = "rsclaw-cli"
+version = "0.1.0"
+dependencies = [
+ "clap 4.6.0",
+]
+
+[[package]]
+name = "rsclaw-computer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "display-info",
+ "enigo",
+ "futures",
+ "image 0.25.10",
+ "rsclaw-config",
+ "rsclaw-events",
+ "rsclaw-i18n",
+ "rsclaw-platform",
+ "rsclaw-provider",
+ "rsclaw-store",
+ "rsclaw-types",
+ "rsclaw-util",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "xcap",
+]
+
+[[package]]
+name = "rsclaw-config"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "chrono-tz",
+ "dirs-next",
+ "json5",
+ "libc",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 1.1.0+spec-1.1.0",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "rsclaw-cron"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "chrono-tz",
+ "json5",
+ "regex",
+ "rsclaw-config",
+ "rsclaw-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rsclaw-desktop"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "enigo",
+ "image 0.25.10",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "xcap",
+]
+
+[[package]]
+name = "rsclaw-doc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "calamine",
+ "docx-rs",
+ "krilla",
+ "lopdf 0.34.0",
+ "pdf-extract",
+ "rust_xlsxwriter",
+ "serde_json",
+ "tokio",
+ "zip 2.4.2",
+]
+
+[[package]]
+name = "rsclaw-embed"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "candle-nn",
+ "candle-transformers",
+ "reqwest",
+ "rsclaw-util",
+ "serde",
+ "serde_json",
+ "tokenizers",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rsclaw-events"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rsclaw-evolution"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rsclaw-config",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "rsclaw-heartbeat"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "chrono-tz",
+ "rsclaw-config",
+ "rsclaw-evolution",
+ "rsclaw-memory",
+ "rsclaw-provider",
+ "rsclaw-skill",
+ "rsclaw-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rsclaw-i18n"
+version = "0.1.0"
+
+[[package]]
+name = "rsclaw-jobs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "dirs-next",
+ "hmac",
+ "rand 0.9.2",
+ "reqwest",
+ "rsclaw-channel",
+ "rsclaw-config",
+ "rsclaw-provider",
+ "rsclaw-types",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rsclaw-kb"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "calamine",
+ "chrono",
+ "dirs-next",
+ "hnsw_rs",
+ "jieba-rs",
+ "lol_html",
+ "mailparse",
+ "once_cell",
+ "pdf-extract",
+ "redb 4.1.0",
+ "regex",
+ "reqwest",
+ "rsclaw-config",
+ "rsclaw-embed",
+ "rsclaw-events",
+ "rsclaw-i18n",
+ "rsclaw-platform",
+ "rsclaw-provider",
+ "rsclaw-store",
+ "rsclaw-types",
+ "rsclaw-util",
+ "rust_xlsxwriter",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2",
+ "tantivy",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "ulid",
+ "url",
+ "zip 2.4.2",
+]
+
+[[package]]
+name = "rsclaw-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rsclaw-config",
+ "rsclaw-provider",
+ "rsclaw-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rsclaw-memory"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "hnsw_rs",
+ "redb 4.1.0",
+ "rsclaw-config",
+ "rsclaw-embed",
+ "rsclaw-events",
+ "rsclaw-evolution",
+ "rsclaw-i18n",
+ "rsclaw-platform",
+ "rsclaw-store",
+ "rsclaw-types",
+ "rsclaw-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rsclaw-migrate"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs-next",
+ "hex",
+ "json5",
+ "rayon",
+ "redb 4.1.0",
+ "regex",
+ "rsclaw-config",
+ "rsclaw-memory",
+ "rsclaw-store",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rsclaw-platform"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs-next",
+ "libc",
+ "rsclaw-config",
+ "serde",
+ "serde_json",
+ "sys-info",
+ "tokio",
+ "tracing",
+ "which 7.0.3",
+]
+
+[[package]]
+name = "rsclaw-plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "dirs-next",
+ "futures",
+ "json5",
+ "rand 0.9.2",
+ "reqwest",
+ "rsclaw-browser",
+ "rsclaw-channel",
+ "rsclaw-config",
+ "rsclaw-desktop",
+ "rsclaw-events",
+ "rsclaw-i18n",
+ "rsclaw-kb",
+ "rsclaw-memory",
+ "rsclaw-platform",
+ "rsclaw-provider",
+ "rsclaw-store",
+ "rsclaw-types",
+ "rsclaw-util",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+ "wasmtime",
+ "wasmtime-wasi",
+ "which 7.0.3",
+]
+
+[[package]]
+name = "rsclaw-provider"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "eventsource-stream",
+ "futures",
+ "reqwest",
+ "rsclaw-config",
+ "rsclaw-i18n",
+ "rsclaw-types",
+ "rsclaw-util",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "toml 1.1.0+spec-1.1.0",
+ "tracing",
+ "url",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
+name = "rsclaw-retry"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rand 0.9.2",
+ "reqwest",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rsclaw-runtime"
+version = "2026.6.12"
+dependencies = [
+ "aes",
+ "anycli",
+ "anyhow",
+ "arc-swap",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "bzip2 0.6.1",
+ "calamine",
+ "candle-core",
+ "candle-nn",
+ "candle-transformers",
+ "cap-rs",
+ "chrono",
+ "chrono-tz",
+ "clap 4.6.0",
+ "console 0.16.3",
+ "crossterm",
+ "ctor",
+ "dashmap",
+ "dialoguer",
+ "dirs-next",
+ "display-info",
+ "docx-rs",
+ "ed25519-dalek",
+ "encoding_rs",
+ "enigo",
+ "eventsource-stream",
+ "flate2",
+ "fs2",
+ "futures",
+ "glob",
+ "globset",
+ "hex",
+ "hmac",
+ "hnsw_rs",
+ "htmd",
+ "ignore",
+ "image 0.25.10",
+ "include_dir",
+ "indicatif",
+ "jaq-core",
+ "jaq-json",
+ "jaq-std",
+ "jieba-rs",
+ "json5",
+ "krilla",
+ "lark-websocket-protobuf",
+ "libc",
+ "lol_html",
+ "lopdf 0.34.0",
+ "mailparse",
+ "matrix-sdk",
+ "md-5",
+ "mime",
+ "mime_guess",
+ "moka",
+ "muda 0.16.1",
+ "ogg",
+ "once_cell",
+ "opus-decoder",
+ "pdf-extract",
+ "plotters",
+ "prost 0.13.5",
+ "qrcode",
+ "rand 0.9.2",
+ "ratatui",
+ "rayon",
+ "redb 2.6.3",
+ "redb 4.1.0",
+ "regex",
+ "reqwest",
+ "rsclaw-a2a-types",
+ "rsclaw-agent",
+ "rsclaw-artifact",
+ "rsclaw-astock",
+ "rsclaw-browser",
+ "rsclaw-cap",
+ "rsclaw-channel",
+ "rsclaw-cli",
+ "rsclaw-computer",
+ "rsclaw-config",
+ "rsclaw-cron",
+ "rsclaw-desktop",
+ "rsclaw-doc",
+ "rsclaw-embed",
+ "rsclaw-events",
+ "rsclaw-evolution",
+ "rsclaw-heartbeat",
+ "rsclaw-i18n",
+ "rsclaw-jobs",
+ "rsclaw-kb",
+ "rsclaw-mcp",
+ "rsclaw-memory",
+ "rsclaw-migrate",
+ "rsclaw-platform",
+ "rsclaw-plugin",
+ "rsclaw-provider",
+ "rsclaw-retry",
+ "rsclaw-skill",
+ "rsclaw-store",
+ "rsclaw-tools",
+ "rsclaw-types",
+ "rsclaw-util",
+ "rsclaw-watch",
+ "rust_xlsxwriter",
+ "rustls",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha1",
+ "sha2",
+ "silk-rs",
+ "symphonia",
+ "sys-info",
+ "tantivy",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokenizers",
+ "tokio",
+ "tokio-stream",
+ "tokio-test",
+ "tokio-tungstenite 0.29.0",
+ "tokio-util",
+ "toml 1.1.0+spec-1.1.0",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "tray-icon",
+ "ulid",
+ "url",
+ "urlencoding",
+ "uuid",
+ "wasmtime",
+ "wasmtime-wasi",
+ "which 7.0.3",
+ "winapi",
+ "wiremock",
+ "xcap",
+ "xz2",
+ "zip 2.4.2",
+]
+
+[[package]]
+name = "rsclaw-skill"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "ed25519-dalek",
+ "flate2",
+ "futures",
+ "reqwest",
+ "rsclaw-config",
+ "rsclaw-events",
+ "rsclaw-evolution",
+ "rsclaw-i18n",
+ "rsclaw-memory",
+ "rsclaw-platform",
+ "rsclaw-provider",
+ "rsclaw-store",
+ "rsclaw-types",
+ "rsclaw-util",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2",
+ "tar",
+ "tempfile",
+ "tokio",
+ "toml 1.1.0+spec-1.1.0",
+ "tracing",
+ "which 7.0.3",
+ "zip 2.4.2",
+]
+
+[[package]]
+name = "rsclaw-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "md-5",
+ "redb 2.6.3",
+ "redb 4.1.0",
+ "rsclaw-config",
+ "rsclaw-events",
+ "rsclaw-i18n",
+ "rsclaw-platform",
+ "rsclaw-types",
+ "rsclaw-util",
+ "serde",
+ "serde_json",
+ "tantivy",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rsclaw-tools"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bzip2 0.6.1",
+ "dirs-next",
+ "flate2",
+ "futures",
+ "indicatif",
+ "reqwest",
+ "rsclaw-cli",
+ "rsclaw-config",
+ "rsclaw-skill",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "which 7.0.3",
+ "xz2",
+ "zip 2.4.2",
+]
+
+[[package]]
+name = "rsclaw-types"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "futures",
+ "hex",
+ "md-5",
+ "serde",
+ "uuid",
+]
+
+[[package]]
+name = "rsclaw-util"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs-next",
+ "image 0.25.10",
+ "serde_json",
+]
+
+[[package]]
+name = "rsclaw-watch"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "eventsource-stream",
+ "futures",
+ "jaq-core",
+ "jaq-json",
+ "jaq-std",
+ "regex",
+ "reqwest",
+ "rsclaw-channel",
+ "rsclaw-config",
+ "rsclaw-i18n",
+ "rsclaw-platform",
+ "rsclaw-util",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
