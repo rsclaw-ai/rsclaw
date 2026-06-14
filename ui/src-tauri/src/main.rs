@@ -1643,6 +1643,60 @@ fn uninstall_plugin(name: String) -> Result<String, String> {
 /// don't `.output()` here — the CLI downloads can take 10s–10min and a
 /// blocking Tauri command leaves the UI with no progress feedback and looks
 /// hung (which is the regression this commit fixes).
+/// Outcome of a background tool install, queryable from the frontend.
+#[derive(Clone, Default)]
+struct ToolInstallOutcome {
+    done: bool,
+    success: bool,
+    /// Combined stdout+stderr from the sidecar — carries the real reason on
+    /// failure ("no download for platform win-x64", "download failed", extract
+    /// errors, "no runnable binary", …).
+    output: String,
+}
+
+/// Per-tool install outcomes. Written by the background thread in
+/// `install_tool`, read by `get_tool_install_result`. Keyed by tool name.
+fn tool_install_outcomes()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, ToolInstallOutcome>> {
+    static R: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, ToolInstallOutcome>>,
+    > = std::sync::OnceLock::new();
+    R.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Append a tool-install run's captured output to ~/.rsclaw/var/tools-install.log
+/// with a timestamped header, so failures stay diagnosable after the fact.
+fn append_install_log(name: &str, force: bool, body: &str) {
+    use std::io::Write;
+    let path = rsclaw_base_dir().join("var").join("tools-install.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(f, "\n===== install '{name}' (force={force}) epoch={ts} =====");
+        let _ = f.write_all(body.as_bytes());
+        let _ = f.flush();
+    }
+}
+
+/// Install an external tool binary (chrome/ffmpeg/node/python/opencode/
+/// claude-code/...) via sidecar. There is no uninstall — tools are host
+/// binaries; removal is manual. `force` reinstalls even if present.
+///
+/// Returns immediately (UI never blocks), but unlike a pure fire-and-forget
+/// it spawns a background THREAD that runs the sidecar to completion, captures
+/// its full stdout+stderr, mirrors it to the install log, and records the
+/// outcome (success + output) in `tool_install_outcomes()`. The frontend polls
+/// `get_tool_install_result` to surface the real failure reason instead of a
+/// generic "timed out". This is the fix for "no specific error shown".
 #[tauri::command]
 fn install_tool(name: String, force: Option<bool>) -> Result<String, String> {
     let exe_dir = std::env::current_exe()
@@ -1657,31 +1711,72 @@ fn install_tool(name: String, force: Option<bool>) -> Result<String, String> {
         })
     });
 
-    let mut args: Vec<&str> = vec!["tools", "install", &name];
-    if force.unwrap_or(false) {
-        args.push("--force");
-    }
-
-    let spawn_result = match sidecar.as_ref().filter(|p| p.exists()) {
-        Some(path) => hide_window(
-            std::process::Command::new(path)
-                .args(&args)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null()),
-        )
-        .spawn(),
-        None => hide_window(
-            std::process::Command::new("rsclaw")
-                .args(&args)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null()),
-        )
-        .spawn(),
+    // Use the bundled sidecar if present, else fall back to `rsclaw` on PATH.
+    let program: std::ffi::OsString = match sidecar.as_ref().filter(|p| p.exists()) {
+        Some(path) => path.as_os_str().to_owned(),
+        None => std::ffi::OsString::from("rsclaw"),
     };
 
-    spawn_result
-        .map(|_| format!("install of {name} started in background"))
-        .map_err(|e| format!("failed to spawn rsclaw tools install: {e}"))
+    let forced = force.unwrap_or(false);
+
+    // Mark in-progress so a poll racing the thread start sees done=false.
+    tool_install_outcomes()
+        .lock()
+        .map(|mut m| m.insert(name.clone(), ToolInstallOutcome::default()))
+        .ok();
+
+    let name_for_msg = name.clone();
+    std::thread::spawn(move || {
+        let mut args: Vec<String> = vec!["tools".into(), "install".into(), name.clone()];
+        if forced {
+            args.push("--force".into());
+        }
+
+        let result = hide_window(std::process::Command::new(&program).args(&args)).output();
+
+        let (success, body) = match result {
+            Ok(o) => {
+                let body = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                (o.status.success(), body)
+            }
+            Err(e) => (false, format!("failed to spawn rsclaw tools install: {e}\n")),
+        };
+
+        append_install_log(&name, forced, &body);
+
+        if let Ok(mut m) = tool_install_outcomes().lock() {
+            m.insert(
+                name,
+                ToolInstallOutcome {
+                    done: true,
+                    success,
+                    output: body,
+                },
+            );
+        }
+    });
+
+    Ok(format!("install of {name_for_msg} started in background"))
+}
+
+/// Poll the outcome of a background install started by `install_tool`. Returns
+/// `{done, success, output}`. `done=false` while the sidecar is still running;
+/// on `done=true`, `output` carries the sidecar's combined stdout+stderr — the
+/// real error text on failure.
+#[tauri::command]
+fn get_tool_install_result(name: String) -> serde_json::Value {
+    match tool_install_outcomes().lock().ok().and_then(|m| m.get(&name).cloned()) {
+        Some(o) => serde_json::json!({
+            "done": o.done,
+            "success": o.success,
+            "output": o.output,
+        }),
+        None => serde_json::json!({ "done": false, "success": false, "output": "" }),
+    }
 }
 
 #[tauri::command]
@@ -2360,6 +2455,7 @@ fn main() {
             uninstall_plugin,
             install_tool,
             get_tool_install_status,
+            get_tool_install_result,
             test_provider,
             write_workspace_file,
             read_workspace_file,
