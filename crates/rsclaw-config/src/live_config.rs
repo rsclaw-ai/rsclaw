@@ -14,7 +14,7 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
 use tracing::{info, warn};
 
-use crate::config::{
+use crate::{
     runtime::{
         AgentsRuntime, ChannelRuntime, ExtRuntime, GatewayRuntime, ModelRuntime, OpsRuntime,
         RuntimeConfig,
@@ -127,7 +127,7 @@ impl LiveConfig {
 // ---------------------------------------------------------------------------
 
 /// Fields that cannot be changed without restarting the gateway.
-pub(crate) fn detect_restart_fields(old: &GatewayRuntime, new: &GatewayRuntime) -> Vec<String> {
+pub fn detect_restart_fields(old: &GatewayRuntime, new: &GatewayRuntime) -> Vec<String> {
     let mut fields = Vec::new();
     if old.port != new.port {
         fields.push("gateway.port".to_owned());
@@ -332,7 +332,7 @@ fn normalise_empties(v: &mut serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::{BindMode, GatewayMode, ReloadMode};
+    use crate::schema::{BindMode, GatewayMode, ReloadMode};
 
     fn base_gw() -> GatewayRuntime {
         GatewayRuntime {
@@ -384,7 +384,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_updates_auth_token() {
-        use crate::config::{
+        use crate::{
             runtime::{AgentsRuntime, ChannelRuntime, ExtRuntime, ModelRuntime, OpsRuntime},
             schema::SessionConfig,
         };
@@ -442,7 +442,7 @@ mod tests {
     }
 
     fn empty_runtime_config() -> RuntimeConfig {
-        use crate::config::{
+        use crate::{
             runtime::{AgentsRuntime, ChannelRuntime, ExtRuntime, ModelRuntime, OpsRuntime},
             schema::SessionConfig,
         };
@@ -489,15 +489,15 @@ mod tests {
     fn hot_safe_when_only_default_temperature_changes() {
         let mut old = empty_runtime_config();
         let mut new = empty_runtime_config();
-        old.raw.agents = Some(crate::config::schema::AgentsConfig {
-            defaults: Some(crate::config::schema::AgentDefaults {
+        old.raw.agents = Some(crate::schema::AgentsConfig {
+            defaults: Some(crate::schema::AgentDefaults {
                 temperature: Some(0.5),
                 ..Default::default()
             }),
             ..Default::default()
         });
-        new.raw.agents = Some(crate::config::schema::AgentsConfig {
-            defaults: Some(crate::config::schema::AgentDefaults {
+        new.raw.agents = Some(crate::schema::AgentsConfig {
+            defaults: Some(crate::schema::AgentDefaults {
                 temperature: Some(0.3),
                 ..Default::default()
             }),
@@ -512,7 +512,7 @@ mod tests {
         let mut new = empty_runtime_config();
         // Production loader updates both runtime + raw; mirror that.
         new.gateway.port = 19000;
-        new.raw.gateway = Some(crate::config::schema::GatewayConfig {
+        new.raw.gateway = Some(crate::schema::GatewayConfig {
             port: Some(19000),
             ..Default::default()
         });
@@ -526,7 +526,7 @@ mod tests {
         // Regression: previously `channels_changed` only checked is_some()
         // flips per channel, so adding feishu-b to an existing feishu config
         // (still Some) silently passed and no banner fired.
-        use crate::config::schema::{ChannelsConfig, FeishuConfig};
+        use crate::schema::{ChannelsConfig, FeishuConfig};
 
         let mut old = empty_runtime_config();
         let mut new = empty_runtime_config();
@@ -571,7 +571,7 @@ mod tests {
 
     #[test]
     fn not_hot_safe_when_channel_block_removed() {
-        use crate::config::schema::{ChannelsConfig, FeishuConfig};
+        use crate::schema::{ChannelsConfig, FeishuConfig};
 
         let mut old = empty_runtime_config();
         let new = empty_runtime_config();
@@ -606,7 +606,7 @@ mod tests {
         // a second account. `apply` must return non-empty sections so the
         // caller surfaces a restart banner; the previous coarse
         // `channels_changed` (is_some flips only) silently passed.
-        use crate::config::schema::{ChannelsConfig, FeishuConfig};
+        use crate::schema::{ChannelsConfig, FeishuConfig};
 
         let mut cfg = empty_runtime_config();
         let mut feishu = FeishuConfig {
@@ -657,23 +657,23 @@ mod tests {
         // a restart banner.
         let mut old = empty_runtime_config();
         let mut new = empty_runtime_config();
-        old.raw.gateway = Some(crate::config::schema::GatewayConfig {
-            auth: Some(crate::config::schema::GatewayAuth {
+        old.raw.gateway = Some(crate::schema::GatewayConfig {
+            auth: Some(crate::schema::GatewayAuth {
                 mode: None,
                 password: None,
                 allow_tailscale: None,
                 allow_local: None,
-                token: Some(crate::config::schema::SecretOrString::Plain("old".into())),
+                token: Some(crate::schema::SecretOrString::Plain("old".into())),
             }),
             ..Default::default()
         });
-        new.raw.gateway = Some(crate::config::schema::GatewayConfig {
-            auth: Some(crate::config::schema::GatewayAuth {
+        new.raw.gateway = Some(crate::schema::GatewayConfig {
+            auth: Some(crate::schema::GatewayAuth {
                 mode: None,
                 password: None,
                 allow_tailscale: None,
                 allow_local: None,
-                token: Some(crate::config::schema::SecretOrString::Plain(
+                token: Some(crate::schema::SecretOrString::Plain(
                     "rotated".into(),
                 )),
             }),
@@ -694,11 +694,11 @@ mod tests {
         // silently passed even though they're cold (read at startup only).
         let mut old = empty_runtime_config();
         let mut new = empty_runtime_config();
-        old.raw.gateway = Some(crate::config::schema::GatewayConfig {
+        old.raw.gateway = Some(crate::schema::GatewayConfig {
             language: Some("en".into()),
             ..Default::default()
         });
-        new.raw.gateway = Some(crate::config::schema::GatewayConfig {
+        new.raw.gateway = Some(crate::schema::GatewayConfig {
             language: Some("zh".into()),
             ..Default::default()
         });
@@ -716,7 +716,7 @@ mod tests {
         let old = empty_runtime_config();
         let mut new = empty_runtime_config();
         new.gateway.port = 19000;
-        new.raw.gateway = Some(crate::config::schema::GatewayConfig {
+        new.raw.gateway = Some(crate::schema::GatewayConfig {
             port: Some(19000),
             ..Default::default()
         });
@@ -731,8 +731,8 @@ mod tests {
     #[tokio::test]
     async fn snapshot_preserves_raw() {
         let mut cfg = empty_runtime_config();
-        cfg.raw.agents = Some(crate::config::schema::AgentsConfig {
-            defaults: Some(crate::config::schema::AgentDefaults {
+        cfg.raw.agents = Some(crate::schema::AgentsConfig {
+            defaults: Some(crate::schema::AgentDefaults {
                 temperature: Some(0.42),
                 ..Default::default()
             }),
@@ -752,8 +752,8 @@ mod tests {
         // compaction.rs), so changing them must not fire the restart banner.
         let mut old = empty_runtime_config();
         let mut new = empty_runtime_config();
-        old.raw.agents = Some(crate::config::schema::AgentsConfig {
-            defaults: Some(crate::config::schema::AgentDefaults {
+        old.raw.agents = Some(crate::schema::AgentsConfig {
+            defaults: Some(crate::schema::AgentDefaults {
                 temperature: Some(0.5),
                 btw_tokens: Some(8_000),
                 context_tokens: Some(128_000),
@@ -766,8 +766,8 @@ mod tests {
             }),
             ..Default::default()
         });
-        new.raw.agents = Some(crate::config::schema::AgentsConfig {
-            defaults: Some(crate::config::schema::AgentDefaults {
+        new.raw.agents = Some(crate::schema::AgentsConfig {
+            defaults: Some(crate::schema::AgentDefaults {
                 temperature: Some(0.7),
                 btw_tokens: Some(12_000),
                 context_tokens: Some(96_000),
@@ -792,15 +792,15 @@ mod tests {
         // surface a restart banner until those reads are migrated too.
         let mut old = empty_runtime_config();
         let mut new = empty_runtime_config();
-        old.raw.agents = Some(crate::config::schema::AgentsConfig {
-            defaults: Some(crate::config::schema::AgentDefaults {
+        old.raw.agents = Some(crate::schema::AgentsConfig {
+            defaults: Some(crate::schema::AgentDefaults {
                 workspace: Some("/tmp/old-ws".into()),
                 ..Default::default()
             }),
             ..Default::default()
         });
-        new.raw.agents = Some(crate::config::schema::AgentsConfig {
-            defaults: Some(crate::config::schema::AgentDefaults {
+        new.raw.agents = Some(crate::schema::AgentsConfig {
+            defaults: Some(crate::schema::AgentDefaults {
                 workspace: Some("/tmp/new-ws".into()),
                 ..Default::default()
             }),
@@ -820,14 +820,14 @@ mod tests {
         // not fire the restart banner.
         let mut old = empty_runtime_config();
         let mut new = empty_runtime_config();
-        old.raw.tools = Some(crate::config::schema::ToolsConfig {
+        old.raw.tools = Some(crate::schema::ToolsConfig {
             loop_detection: None,
             deny: None,
             allow: None,
             exec: None,
             web_search: None,
             web_fetch: None,
-            web_browser: Some(crate::config::schema::WebBrowserConfig {
+            web_browser: Some(crate::schema::WebBrowserConfig {
                 enabled: None,
                 chrome_path: None,
                 headed: Some(false),
@@ -838,14 +838,14 @@ mod tests {
             upload: None,
             session_result_limits: None,
         });
-        new.raw.tools = Some(crate::config::schema::ToolsConfig {
+        new.raw.tools = Some(crate::schema::ToolsConfig {
             loop_detection: None,
             deny: None,
             allow: None,
             exec: None,
             web_search: None,
             web_fetch: None,
-            web_browser: Some(crate::config::schema::WebBrowserConfig {
+            web_browser: Some(crate::schema::WebBrowserConfig {
                 enabled: None,
                 chrome_path: None,
                 headed: Some(true),
@@ -870,13 +870,13 @@ mod tests {
         // in tools_web.rs.
         let mut old = empty_runtime_config();
         let mut new = empty_runtime_config();
-        old.raw.tools = Some(crate::config::schema::ToolsConfig {
+        old.raw.tools = Some(crate::schema::ToolsConfig {
             loop_detection: None,
             deny: None,
             allow: None,
             exec: None,
             web_search: None,
-            web_fetch: Some(crate::config::schema::WebFetchConfig {
+            web_fetch: Some(crate::schema::WebFetchConfig {
                 enabled: None,
                 max_length: Some(50_000),
                 user_agent: None,
@@ -887,13 +887,13 @@ mod tests {
             upload: None,
             session_result_limits: None,
         });
-        new.raw.tools = Some(crate::config::schema::ToolsConfig {
+        new.raw.tools = Some(crate::schema::ToolsConfig {
             loop_detection: None,
             deny: None,
             allow: None,
             exec: None,
             web_search: None,
-            web_fetch: Some(crate::config::schema::WebFetchConfig {
+            web_fetch: Some(crate::schema::WebFetchConfig {
                 enabled: None,
                 max_length: Some(200_000),
                 user_agent: None,
@@ -913,8 +913,8 @@ mod tests {
         // the per-turn LoopDetector.
         let mut old = empty_runtime_config();
         let mut new = empty_runtime_config();
-        old.raw.tools = Some(crate::config::schema::ToolsConfig {
-            loop_detection: Some(crate::config::schema::LoopDetectionConfig {
+        old.raw.tools = Some(crate::schema::ToolsConfig {
+            loop_detection: Some(crate::schema::LoopDetectionConfig {
                 enabled: Some(true),
                 window: Some(10),
                 threshold: Some(20),
@@ -930,8 +930,8 @@ mod tests {
             upload: None,
             session_result_limits: None,
         });
-        new.raw.tools = Some(crate::config::schema::ToolsConfig {
-            loop_detection: Some(crate::config::schema::LoopDetectionConfig {
+        new.raw.tools = Some(crate::schema::ToolsConfig {
+            loop_detection: Some(crate::schema::LoopDetectionConfig {
                 enabled: Some(true),
                 window: Some(30),
                 threshold: Some(40),
@@ -957,7 +957,7 @@ mod tests {
         // restart banner until the channel migrates its read site.
         let mut old = empty_runtime_config();
         let mut new = empty_runtime_config();
-        old.raw.tools = Some(crate::config::schema::ToolsConfig {
+        old.raw.tools = Some(crate::schema::ToolsConfig {
             loop_detection: None,
             deny: None,
             allow: None,
@@ -966,7 +966,7 @@ mod tests {
             web_fetch: None,
             web_browser: None,
             computer_use: None,
-            upload: Some(crate::config::schema::UploadConfig {
+            upload: Some(crate::schema::UploadConfig {
                 max_file_size: Some(50 * 1024 * 1024),
                 max_text_chars: Some(20_000),
                 supports_vision: Some(false),
@@ -974,7 +974,7 @@ mod tests {
             }),
             session_result_limits: None,
         });
-        new.raw.tools = Some(crate::config::schema::ToolsConfig {
+        new.raw.tools = Some(crate::schema::ToolsConfig {
             loop_detection: None,
             deny: None,
             allow: None,
@@ -983,7 +983,7 @@ mod tests {
             web_fetch: None,
             web_browser: None,
             computer_use: None,
-            upload: Some(crate::config::schema::UploadConfig {
+            upload: Some(crate::schema::UploadConfig {
                 max_file_size: Some(100 * 1024 * 1024),
                 max_text_chars: Some(50_000),
                 supports_vision: Some(true),
@@ -1003,11 +1003,11 @@ mod tests {
         // tools.exec migration was deferred — its read sites still go
         // through `self.config.ext.tools.exec` cold, so changing it must
         // trigger a restart banner.
-        use crate::config::schema::ExecToolConfig;
+        use crate::schema::ExecToolConfig;
 
         let mut old = empty_runtime_config();
         let mut new = empty_runtime_config();
-        old.raw.tools = Some(crate::config::schema::ToolsConfig {
+        old.raw.tools = Some(crate::schema::ToolsConfig {
             loop_detection: None,
             deny: None,
             allow: None,
@@ -1022,7 +1022,7 @@ mod tests {
             upload: None,
             session_result_limits: None,
         });
-        new.raw.tools = Some(crate::config::schema::ToolsConfig {
+        new.raw.tools = Some(crate::schema::ToolsConfig {
             loop_detection: None,
             deny: None,
             allow: None,

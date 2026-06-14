@@ -7,13 +7,13 @@ use anyhow::{Result, anyhow};
 use tokio::sync::{broadcast, mpsc};
 use tracing::info;
 
+use rsclaw_config::live_config::LiveConfig;
 use crate::{
     agent::{
         AgentHandle, AgentKind, AgentMessage, AgentRegistry, AgentReply, AgentRuntime, MemoryStore,
     },
     config::{runtime::RuntimeConfig, schema::AgentEntry},
     events::AgentEvent,
-    gateway::live_config::LiveConfig,
     plugin::PluginRegistry,
     provider::registry::ProviderRegistry,
     skill::SkillRegistry,

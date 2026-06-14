@@ -76,10 +76,10 @@ use super::{
     tools_builder::{build_tool_list, toolset_allowed_names},
     workspace::{DEFAULT_MAX_CHARS_PER_FILE, DEFAULT_TOTAL_MAX_CHARS, SessionType},
 };
+use rsclaw_config::live_config::LiveConfig;
 use crate::{
     config::runtime::RuntimeConfig,
     events::AgentEvent,
-    gateway::live_config::LiveConfig,
     plugin::PluginRegistry,
     provider::{
         AgentEndpoint, ContentPart, LlmRequest, Message, MessageContent, RecallBundle, Role,
