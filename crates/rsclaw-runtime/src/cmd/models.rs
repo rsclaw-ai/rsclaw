@@ -75,13 +75,28 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
         }
         ModelsCommand::SetImage { model } => {
             let (path, mut val) = load_config_json()?;
+            // Must match the key `image_gen` reads: `ModelConfig.image`
+            // (`image_chain()`). The old `imageModel` key was dead — written
+            // here but never read, so set-image silently no-op'd.
             set_nested_value(
                 &mut val,
-                "agents.defaults.model.imageModel",
+                "agents.defaults.model.image",
                 model.clone().into(),
             )?;
             std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
             ok(&format!("image model set to '{}'", cyan(&model)));
+        }
+        ModelsCommand::SetVideo { model } => {
+            let (path, mut val) = load_config_json()?;
+            // Matches the key `video_gen` reads: `ModelConfig.video`
+            // (`video_chain()`).
+            set_nested_value(
+                &mut val,
+                "agents.defaults.model.video",
+                model.clone().into(),
+            )?;
+            std::fs::write(&path, serde_json::to_string_pretty(&val)?)?;
+            ok(&format!("video model set to '{}'", cyan(&model)));
         }
         ModelsCommand::Scan => {
             banner(&format!(

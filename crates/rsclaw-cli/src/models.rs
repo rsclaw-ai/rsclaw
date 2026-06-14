@@ -7,7 +7,14 @@ pub enum ModelsCommand {
     Set {
         model: String,
     },
+    /// Set the text-to-image model chain (`agents.defaults.model.image`),
+    /// e.g. `rsclaw/rsclaw-image-v1` or `doubao/doubao-seedream-5-0-260128`.
     SetImage {
+        model: String,
+    },
+    /// Set the text-to-video model chain (`agents.defaults.model.video`),
+    /// e.g. `rsclaw/rsclaw-video-v1` or `doubao/doubao-seedance-2-0-260128`.
+    SetVideo {
         model: String,
     },
     #[command(subcommand)]
