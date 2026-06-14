@@ -13,6 +13,13 @@ rust-version = "1.91"
 # that bubble up from `objc 0.2.x`'s `msg_send!` macro expansion. The macro
 # lives in a third-party crate and isn't fixable here; declaring the cfg
 # value as known is the recommended workaround per rustc's diagnostic.
+# Root this crate as its own workspace. The repo root Cargo.toml declares a
+# `[workspace]` (members = crates/*) for the CLI crate-split; without this empty
+# table cargo treats `ui/src-tauri` as an accidental workspace member and
+# `cargo metadata` (run by `tauri build`) errors. The desktop app builds
+# standalone via the bundled CLI sidecar, so it has no path deps into the root.
+[workspace]
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
 
