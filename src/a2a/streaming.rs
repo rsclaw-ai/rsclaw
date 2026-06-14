@@ -152,7 +152,7 @@ pub async fn handle_streaming_rpc(
                     task_id: tid.clone(),
                     context_id: String::new(),
                     state: TaskState::Failed,
-                    message: Some(crate::a2a::event::text_message(if tid.is_empty() {
+                    message: Some(rsclaw_a2a_types::event::text_message(if tid.is_empty() {
                         "SubscribeToTask: missing task id"
                     } else {
                         "SubscribeToTask: task not found"
@@ -175,7 +175,7 @@ pub async fn handle_streaming_rpc(
                 task_id: tid.clone(),
                 context_id: String::new(),
                 state: TaskState::Failed,
-                message: Some(crate::a2a::event::text_message(&format!(
+                message: Some(rsclaw_a2a_types::event::text_message(&format!(
                     "unsupported streaming method: {other}"
                 ))),
                 final_: true,
@@ -250,7 +250,7 @@ pub(crate) async fn spawn_streaming_task(
                 task_id: tid.clone(),
                 context_id: String::new(),
                 state: TaskState::Failed,
-                message: Some(crate::a2a::event::text_message(&format!(
+                message: Some(rsclaw_a2a_types::event::text_message(&format!(
                     "invalid params: {e}"
                 ))),
                 final_: true,
@@ -310,7 +310,7 @@ pub(crate) async fn spawn_streaming_task(
             task_id: task_id.clone(),
             context_id: session_key.clone(),
             state: TaskState::Failed,
-            message: Some(crate::a2a::event::text_message(
+            message: Some(rsclaw_a2a_types::event::text_message(
                 "no agent available for this task",
             )),
             final_: true,
@@ -466,7 +466,7 @@ pub(crate) async fn spawn_streaming_task(
                         task_id: task_id_for_reply.clone(),
                         context_id: ctx_id_for_reply,
                         state: TaskState::Failed,
-                        message: Some(crate::a2a::event::text_message(&reply.text)),
+                        message: Some(rsclaw_a2a_types::event::text_message(&reply.text)),
                         final_: true,
                     });
                 }

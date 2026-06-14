@@ -316,7 +316,7 @@ pub use rsclaw_types::{FileAttachment, ImageAttachment};
 pub struct TurnContext {
     pub task_id: Option<String>,
     pub context_id: Option<String>,
-    pub event_tx: Option<tokio::sync::mpsc::Sender<crate::a2a::event::AgentEvent>>,
+    pub event_tx: Option<tokio::sync::mpsc::Sender<rsclaw_a2a_types::event::AgentEvent>>,
     pub cancel_token: Option<tokio_util::sync::CancellationToken>,
     pub input_request_tx: Option<tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<String>>>,
 }
@@ -339,11 +339,11 @@ impl TurnContext {
         else {
             return;
         };
-        let _ = tx.try_send(crate::a2a::event::AgentEvent::Status {
+        let _ = tx.try_send(rsclaw_a2a_types::event::AgentEvent::Status {
             task_id: task_id.clone(),
             context_id: context_id.clone(),
-            state: crate::a2a::types::TaskState::Working,
-            message: Some(crate::a2a::event::text_message(message)),
+            state: rsclaw_a2a_types::types::TaskState::Working,
+            message: Some(rsclaw_a2a_types::event::text_message(message)),
             final_: false,
         });
     }
@@ -362,15 +362,15 @@ impl TurnContext {
         if let (Some(tx), Some(task_id), Some(context_id)) =
             (&self.event_tx, &self.task_id, &self.context_id)
         {
-            let prompt_msg = crate::a2a::event::text_message(prompt);
+            let prompt_msg = rsclaw_a2a_types::event::text_message(prompt);
             let ev = if auth {
-                crate::a2a::event::AgentEvent::AuthRequired {
+                rsclaw_a2a_types::event::AgentEvent::AuthRequired {
                     task_id: task_id.clone(),
                     context_id: context_id.clone(),
                     prompt: prompt_msg,
                 }
             } else {
-                crate::a2a::event::AgentEvent::InputRequired {
+                rsclaw_a2a_types::event::AgentEvent::InputRequired {
                     task_id: task_id.clone(),
                     context_id: context_id.clone(),
                     prompt: prompt_msg,
@@ -411,7 +411,7 @@ pub struct AgentMessage {
     /// `AgentEvent`s (status changes, artifact chunks) here when the caller
     /// (e.g. A2A SendStreamingMessage) wants to observe progress. Legacy
     /// channels pass `None`.
-    pub event_tx: Option<tokio::sync::mpsc::Sender<crate::a2a::event::AgentEvent>>,
+    pub event_tx: Option<tokio::sync::mpsc::Sender<rsclaw_a2a_types::event::AgentEvent>>,
     /// Optional cancellation token. Runtime checks this between LLM/tool
     /// turns; if cancelled, emits TASK_STATE_CANCELED and exits. Legacy
     /// channels pass `None`.

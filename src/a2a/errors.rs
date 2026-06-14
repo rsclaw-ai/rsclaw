@@ -2,7 +2,7 @@
 
 use serde_json::json;
 
-use super::types::JsonRpcError;
+use rsclaw_a2a_types::types::JsonRpcError;
 
 pub fn invalid_argument(msg: impl Into<String>, field: impl Into<String>) -> JsonRpcError {
     JsonRpcError {

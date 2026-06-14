@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
-use super::types::{A2aArtifact, A2aMessage, A2aTask, PushNotificationConfig, TaskState};
+use rsclaw_a2a_types::types::{A2aArtifact, A2aMessage, A2aTask, PushNotificationConfig, TaskState};
 
 const TASKS: TableDefinition<&str, &str> = TableDefinition::new("a2a_tasks");
 /// Push configs keyed by "{task_id}:{config_id}".

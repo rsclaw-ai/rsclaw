@@ -301,19 +301,19 @@ async fn handle_send_message(
         let wait = async {
             loop {
                 match bus_rx.recv().await {
-                    Ok(crate::a2a::event::AgentEvent::Status {
+                    Ok(rsclaw_a2a_types::event::AgentEvent::Status {
                         state: s,
                         final_: true,
                         ..
                     }) => {
                         return Some(s);
                     }
-                    Ok(crate::a2a::event::AgentEvent::InputRequired { .. }) => {
+                    Ok(rsclaw_a2a_types::event::AgentEvent::InputRequired { .. }) => {
                         // Re-suspended — return the new pause state so the
                         // client knows to send another resume.
                         return Some(TaskState::InputRequired);
                     }
-                    Ok(crate::a2a::event::AgentEvent::AuthRequired { .. }) => {
+                    Ok(rsclaw_a2a_types::event::AgentEvent::AuthRequired { .. }) => {
                         return Some(TaskState::AuthRequired);
                     }
                     Ok(_) => continue,     // intermediate Working / Artifact
@@ -396,7 +396,7 @@ async fn handle_send_message(
     // subscriber (or push webhook listener) can observe progress.
     state
         .task_event_bus
-        .publish(crate::a2a::event::AgentEvent::Status {
+        .publish(rsclaw_a2a_types::event::AgentEvent::Status {
             task_id: task_id.clone(),
             context_id: session_key.clone(),
             state: TaskState::Submitted,
@@ -405,7 +405,7 @@ async fn handle_send_message(
         });
     state
         .task_event_bus
-        .publish(crate::a2a::event::AgentEvent::Status {
+        .publish(rsclaw_a2a_types::event::AgentEvent::Status {
             task_id: task_id.clone(),
             context_id: session_key.clone(),
             state: TaskState::Working,
@@ -426,7 +426,7 @@ async fn handle_send_message(
     // tool names, InputRequired/AuthRequired, etc.). Streaming has the same
     // bridge; without it the sync path's bus only sees Submitted/Working/
     // Completed/Failed and push webhooks miss the per-tool progress.
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<crate::a2a::event::AgentEvent>(64);
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<rsclaw_a2a_types::event::AgentEvent>(64);
     {
         let bus = state.task_event_bus.clone();
         tokio::spawn(async move {
@@ -527,7 +527,7 @@ async fn handle_send_message(
 
             state
                 .task_event_bus
-                .publish(crate::a2a::event::AgentEvent::Artifact {
+                .publish(rsclaw_a2a_types::event::AgentEvent::Artifact {
                     task_id: task_id.clone(),
                     context_id: session_key.clone(),
                     artifact_id: artifact.artifact_id.clone(),
@@ -537,7 +537,7 @@ async fn handle_send_message(
                 });
             state
                 .task_event_bus
-                .publish(crate::a2a::event::AgentEvent::Status {
+                .publish(rsclaw_a2a_types::event::AgentEvent::Status {
                     task_id: task_id.clone(),
                     context_id: session_key.clone(),
                     state: TaskState::Completed,
@@ -565,11 +565,11 @@ async fn handle_send_message(
             state.task_cancels.remove(&task_id);
             state
                 .task_event_bus
-                .publish(crate::a2a::event::AgentEvent::Status {
+                .publish(rsclaw_a2a_types::event::AgentEvent::Status {
                     task_id: task_id.clone(),
                     context_id: session_key.clone(),
                     state: TaskState::Failed,
-                    message: Some(crate::a2a::event::text_message(&reply.text)),
+                    message: Some(rsclaw_a2a_types::event::text_message(&reply.text)),
                     final_: true,
                 });
             state.task_event_bus.close(&task_id);
@@ -578,7 +578,7 @@ async fn handle_send_message(
                 "contextId": session_key,
                 "status": {
                     "state": "TASK_STATE_FAILED",
-                    "message": crate::a2a::event::text_message(&reply.text),
+                    "message": rsclaw_a2a_types::event::text_message(&reply.text),
                 },
                 "history": [history_msg],
             });
@@ -750,7 +750,7 @@ async fn handle_cancel_task(
                 .unwrap_or_default();
             state
                 .task_event_bus
-                .publish(crate::a2a::event::AgentEvent::Status {
+                .publish(rsclaw_a2a_types::event::AgentEvent::Status {
                     task_id: params.id.clone(),
                     context_id: ctx,
                     state: TaskState::Canceled,
@@ -1026,7 +1026,7 @@ pub(crate) fn spawn_input_request_listener(
         while let Some(resume_tx) = ireq_rx.recv().await {
             state.suspended_tasks.insert(
                 task_id.clone(),
-                crate::a2a::event::SuspendedTask {
+                rsclaw_a2a_types::event::SuspendedTask {
                     task_id: task_id.clone(),
                     context_id: context_id.clone(),
                     resume_tx,
@@ -1048,11 +1048,11 @@ pub(crate) fn spawn_input_request_listener(
                     let _ = state_t.task_store.delete_push_configs_for_task(&task_id_t);
                     state_t.task_cancels.remove(&task_id_t);
                     state_t.task_event_bus.publish(
-                        crate::a2a::event::AgentEvent::Status {
+                        rsclaw_a2a_types::event::AgentEvent::Status {
                             task_id: task_id_t.clone(),
                             context_id: context_id_t,
                             state: TaskState::Failed,
-                            message: Some(crate::a2a::event::text_message(&format!(
+                            message: Some(rsclaw_a2a_types::event::text_message(&format!(
                                 "wait_input timed out after {timeout_secs}s without a resume SendMessage on the same taskId"
                             ))),
                             final_: true,
@@ -1102,7 +1102,7 @@ fn finalize_failed_task(state: &AppState, task_id: &str, context_id: &str) {
     state.task_cancels.remove(task_id);
     state
         .task_event_bus
-        .publish(crate::a2a::event::AgentEvent::Status {
+        .publish(rsclaw_a2a_types::event::AgentEvent::Status {
             task_id: task_id.to_owned(),
             context_id: context_id.to_owned(),
             state: TaskState::Failed,

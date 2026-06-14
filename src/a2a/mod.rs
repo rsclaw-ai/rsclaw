@@ -5,7 +5,6 @@
 pub mod auth;
 pub mod client;
 pub mod errors;
-pub mod event;
 pub mod files;
 pub mod push;
 pub mod relay;
@@ -13,7 +12,9 @@ pub mod relay_identity;
 pub mod server;
 pub mod store;
 pub mod streaming;
-pub mod types;
 pub mod version;
 
-pub use types::*;
+// event + types lifted to rsclaw-a2a-types (crate-split step-12 P1); re-exported
+// so crate::a2a::{event,types}:: paths (server/gateway/a2a-internal) keep resolving.
+pub use rsclaw_a2a_types::{event, types};
+pub use rsclaw_a2a_types::types::*;

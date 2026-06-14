@@ -30,7 +30,7 @@ use anyhow::{Context, Result};
 use base64::Engine as _;
 use tracing::warn;
 
-use super::types::A2aPart;
+use rsclaw_a2a_types::types::A2aPart;
 use crate::channel::{canonical_filename, category_for_kind, kind_for_mime};
 
 /// `<workspace>/a2a/<category>/` — created if it doesn't exist.
