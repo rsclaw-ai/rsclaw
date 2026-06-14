@@ -314,9 +314,7 @@ async fn read_sse_terminal_event(resp: reqwest::Response) -> Result<(String, Str
     loop {
         let chunk = tokio::time::timeout(Duration::from_secs(45), stream.next())
             .await
-            .map_err(|_| {
-                anyhow::anyhow!("rsclaw replay: SSE idle for 45s (heartbeats stopped)")
-            })?;
+            .map_err(|_| anyhow::anyhow!("rsclaw replay: SSE idle for 45s (heartbeats stopped)"))?;
         let Some(chunk) = chunk else {
             anyhow::bail!("rsclaw replay: SSE stream ended without a terminal event");
         };
@@ -425,13 +423,13 @@ impl RsclawProvider {
         // that helper was tuned for.
         // Tuned for rsclaw native protocol (NOT OpenAI-compat):
         // - connect_timeout 30s: localhost loopback connects fast (<1ms) but a
-        //   saturated rsclaw-server under heavy session churn can accept-stall.
-        //   30s tolerates a brief bind() backlog without surfacing as timeout.
-        // - pool_idle_timeout 30s: rsclaw-server (axum) keeps idle keepalive
-        //   for 60s by default, so a 30s client-side idle is safely inside that
-        //   window. Old 10s caused stale-pool refetches under bursty load.
-        // - tcp_keepalive 30s: keeps long-prefill streaming connections alive
-        //   through any intermediate timeouts during a 20+ second prefill.
+        //   saturated rsclaw-server under heavy session churn can accept-stall. 30s
+        //   tolerates a brief bind() backlog without surfacing as timeout.
+        // - pool_idle_timeout 30s: rsclaw-server (axum) keeps idle keepalive for 60s by
+        //   default, so a 30s client-side idle is safely inside that window. Old 10s
+        //   caused stale-pool refetches under bursty load.
+        // - tcp_keepalive 30s: keeps long-prefill streaming connections alive through
+        //   any intermediate timeouts during a 20+ second prefill.
         let client = reqwest::Client::builder()
             .user_agent(user_agent.as_deref().unwrap_or(super::DEFAULT_USER_AGENT))
             .redirect(reqwest::redirect::Policy::none())
@@ -1292,7 +1290,13 @@ impl RsclawProvider {
         // so a redirected open still gets the full budget against the
         // ultimate target rather than splitting it.
         let resp = self
-            .send_following_redirects("/sessions", &body, Some(Duration::from_secs(180)), None, false)
+            .send_following_redirects(
+                "/sessions",
+                &body,
+                Some(Duration::from_secs(180)),
+                None,
+                false,
+            )
             .await?;
         let status = resp.status();
         if !status.is_success() {
@@ -1378,13 +1382,7 @@ impl RsclawProvider {
         let idem_key = uuid::Uuid::new_v4().to_string();
         let resp = tokio::time::timeout(
             Duration::from_secs(60),
-            self.send_following_redirects(
-                "/sessions/replay",
-                &body,
-                None,
-                Some(&idem_key),
-                true,
-            ),
+            self.send_following_redirects("/sessions/replay", &body, None, Some(&idem_key), true),
         )
         .await
         .map_err(|_| anyhow::anyhow!("rsclaw replay: no response headers within 60s"))??;
@@ -1403,18 +1401,21 @@ impl RsclawProvider {
                 let body = resp.text().await.unwrap_or_default();
                 anyhow::bail!("rsclaw replay failed {status}: {body}");
             }
-            return tokio::time::timeout(Duration::from_secs(300), resp.json::<CreateSessionResp>())
-                .await
-                .map_err(|_| anyhow::anyhow!("rsclaw replay: body read timed out after 300s"))?
-                .context("rsclaw replay: parse response");
+            return tokio::time::timeout(
+                Duration::from_secs(300),
+                resp.json::<CreateSessionResp>(),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("rsclaw replay: body read timed out after 300s"))?
+            .context("rsclaw replay: parse response");
         }
 
-        let (event, data) = tokio::time::timeout(
-            Duration::from_secs(30 * 60),
-            read_sse_terminal_event(resp),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("rsclaw replay: SSE total deadline (30min) exceeded"))??;
+        let (event, data) =
+            tokio::time::timeout(Duration::from_secs(30 * 60), read_sse_terminal_event(resp))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("rsclaw replay: SSE total deadline (30min) exceeded")
+                })??;
 
         if event == "result" {
             return serde_json::from_str::<CreateSessionResp>(&data)
@@ -1425,10 +1426,7 @@ impl RsclawProvider {
         // path so failover classification treats both identically.
         let parsed: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
         let code = parsed.get("status").and_then(Value::as_u64).unwrap_or(0);
-        let detail = parsed
-            .get("body")
-            .map(Value::to_string)
-            .unwrap_or(data);
+        let detail = parsed.get("body").map(Value::to_string).unwrap_or(data);
         anyhow::bail!("rsclaw replay failed {code}: {detail}");
     }
 
@@ -1603,9 +1601,26 @@ impl RsclawProvider {
         // session traffic uses, so a fastshot worker pinned under the
         // LB benefits from the same per-origin caching as the primary
         // pool.
-        let resp = self
-            .send_following_redirects(path, &body, Some(Duration::from_secs(60)), None, false)
-            .await?;
+        // No per-request builder timeout: reqwest's `.timeout()` is a
+        // TOTAL deadline that includes the streamed SSE body, so the old
+        // 60s cap killed long vision/oneshot generations mid-stream —
+        // surfacing as a misleading "error decoding response body" and
+        // getting amplified 3× by the failover retry layer. Mirror
+        // `turn()`: bound only time-to-headers with `tokio::time::timeout`;
+        // once headers arrive the body streams as long as the generation
+        // needs (TCP liveness is covered by the client-level
+        // `tcp_keepalive(30s)`). Without this, /vision /oneshot /fastshot
+        // /ocr all 503-by-timeout on any response that runs past 60s.
+        let send_fut = self.send_following_redirects(path, &body, None, None, false);
+        let resp = match tokio::time::timeout(TURN_HEADERS_TIMEOUT, send_fut).await {
+            Ok(r) => r?,
+            Err(_) => anyhow::bail!(
+                "rsclaw {path}: timed out waiting for response headers after {}s ({}{})",
+                TURN_HEADERS_TIMEOUT.as_secs(),
+                self.base_url,
+                path,
+            ),
+        };
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -1855,12 +1870,13 @@ struct ReplayReq<'a> {
 
 /// Split the `(prefix_id, dynamic_prefix, dynamic_user_tools)` triple into
 /// the protocol's mutually-exclusive wire shape:
-/// - **Registry path** (`prefix_id` non-empty, §2.1.1): emit `prefix_id`,
-///   omit `dynamic_prefix`, surface `user_tools` at the TOP level so the
-///   worker pairs them with the registered base.
+/// - **Registry path** (`prefix_id` non-empty, §2.1.1): emit `prefix_id`, omit
+///   `dynamic_prefix`, surface `user_tools` at the TOP level so the worker
+///   pairs them with the registered base.
 /// - **Dynamic path** (`prefix_id` empty, §2.1.2): omit `prefix_id`, emit
 ///   `dynamic_prefix` carrying the full base+user payload. Top-level
-///   `user_tools` is empty (its values live inside `dynamic_prefix.user_tools`).
+///   `user_tools` is empty (its values live inside
+///   `dynamic_prefix.user_tools`).
 ///
 /// In both cases the same `dynamic.user_tools` slice is the source of
 /// truth; this helper just routes it to the correct wire position so the
@@ -1868,11 +1884,7 @@ struct ReplayReq<'a> {
 fn prefix_fields<'a>(
     prefix_id: &'a str,
     dynamic: DynamicPrefixWire<'a>,
-) -> (
-    Option<&'a str>,
-    Option<DynamicPrefixWire<'a>>,
-    &'a [Value],
-) {
+) -> (Option<&'a str>, Option<DynamicPrefixWire<'a>>, &'a [Value]) {
     if prefix_id.is_empty() {
         // Dynamic path: dynamic_prefix.user_tools already carries the
         // per-session private tools; the top-level slot stays empty
@@ -2145,8 +2157,7 @@ impl TurnOptions {
             enable_thinking: req.thinking_budget.map(|b| b > 0),
             stop: None,
             idle_ttl_secs: None,
-            constrain_tool_calls: (constrain_tool_calls && !req.tools.is_empty())
-                .then_some(true),
+            constrain_tool_calls: (constrain_tool_calls && !req.tools.is_empty()).then_some(true),
         }
     }
 }
@@ -2167,13 +2178,13 @@ impl TurnOptions {
 ///   `dynamic_prefix.user_system` (worker layer-2 cache key intentionally
 ///   EXCLUDES this, so it can vary per session without collapsing the hit rate)
 /// - `dynamic_tools`         ← shared/base tools — names from
-///   [`BUILTIN_TOOL_NAMES`]. Participates in `base_hash16`, so this set
-///   MUST be byte-identical across clients of the same RsClaw version
-///   or the base prefix cache fragments per-client.
-/// - `dynamic_user_tools`    ← per-session/per-client private tools:
-///   plugins, MCP, workspace-specific. Not in `base_hash16`; folded
-///   into the user-segment key so two sessions differing only here
-///   share the base cache but get separate segment slots.
+///   [`BUILTIN_TOOL_NAMES`]. Participates in `base_hash16`, so this set MUST be
+///   byte-identical across clients of the same RsClaw version or the base
+///   prefix cache fragments per-client.
+/// - `dynamic_user_tools`    ← per-session/per-client private tools: plugins,
+///   MCP, workspace-specific. Not in `base_hash16`; folded into the
+///   user-segment key so two sessions differing only here share the base cache
+///   but get separate segment slots.
 ///
 /// When the split fields are missing (internal sessions / non-runtime
 /// callers) we degrade gracefully: stuff `req.system` into
@@ -3437,7 +3448,8 @@ mod tests {
     #[test]
     fn sse_parser_returns_error_event_with_status() {
         let mut p = SseTerminalParser::default();
-        let raw = ": hb\n\nevent: error\ndata: {\"status\":503,\"body\":{\"error\":\"no capacity\"}}\n\n";
+        let raw =
+            ": hb\n\nevent: error\ndata: {\"status\":503,\"body\":{\"error\":\"no capacity\"}}\n\n";
         let (ev, data) = feed_sse(&mut p, raw).expect("terminal event");
         assert_eq!(ev, "error");
         let v: Value = serde_json::from_str(&data).unwrap();
@@ -4958,7 +4970,8 @@ data: {"type":"block_stop","index":0}
         let mut req = req_with(vec![], 2, Some("k"));
         req.system_shared = Some("<sys>".into());
         req.tools.push(ToolDef {
-            name: "memory".into(), // builtin → drops into base, which the registered prefix already owns
+            name: "memory".into(), /* builtin → drops into base, which the registered prefix
+                                    * already owns */
             description: "memory".into(),
             parameters: json!({"type":"object"}),
         });
@@ -6428,8 +6441,7 @@ data: {"type":"block_stop","index":0}
             fn stream(
                 &self,
                 _req: crate::LlmRequest,
-            ) -> futures::future::BoxFuture<'_, anyhow::Result<crate::LlmStream>>
-            {
+            ) -> futures::future::BoxFuture<'_, anyhow::Result<crate::LlmStream>> {
                 Box::pin(async { anyhow::bail!("stub provider has no streaming") })
             }
         }
