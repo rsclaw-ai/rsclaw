@@ -46,7 +46,7 @@ pub mod prompt;
 pub mod status;
 
 pub use action::{Action, ActionSpec, ExecCtx, MouseButton, ParsedAction, Screenshot, ScrollDir};
-pub use driver::{DriverOutcome, VlmDriver};
+pub use driver::{CoordSpace, DriverOutcome, VlmDriver};
 pub use operator::Operator;
 pub use parser::{CoordFormat, parse_vlm_response};
 

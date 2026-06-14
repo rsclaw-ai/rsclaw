@@ -61,7 +61,7 @@ use super::platform::{display_logical_scale, jpeg_dimensions, powershell_hidden}
 use rsclaw_computer::{
     Action, ExecCtx, MouseButton, ScrollDir,
     app_rules::AppRuleSet,
-    driver::{DriverOutcome, VlmDriver},
+    driver::{CoordSpace, DriverOutcome, VlmDriver},
     operator::Operator as _,
     operators::native::NativeOperator,
     parser::CoordFormat,
@@ -575,6 +575,7 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
                 let driver = VlmDriver {
                     operator: &operator,
                     provider: provider_clone,
+                    coord_space: CoordSpace::for_model(&model_name_clone),
                     model_name: model_name_clone,
                     coord_format: CoordFormat::Auto,
                     max_loop: max_steps,
@@ -816,6 +817,7 @@ $g.Dispose(); $dst.Dispose(); $src.Dispose()
             let attempt_driver = VlmDriver {
                 operator: &operator,
                 provider: attempt_provider,
+                coord_space: CoordSpace::for_model(&attempt_model),
                 model_name: attempt_model.clone(),
                 coord_format: CoordFormat::Auto,
                 max_loop: max_steps,

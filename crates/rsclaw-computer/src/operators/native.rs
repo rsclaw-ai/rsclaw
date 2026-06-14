@@ -728,6 +728,8 @@ fn macos_app_candidates(app: &str) -> Vec<String> {
             candidates.push("微信".to_owned());
         }
         "douyin" | "tiktok" => candidates.push("抖音".to_owned()),
+        "yuanbao" | "tencent yuanbao" | "腾讯元宝" => candidates.push("元宝".to_owned()),
+        "doubao" => candidates.push("豆包".to_owned()),
         _ => {}
     }
     candidates.dedup();

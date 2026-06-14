@@ -209,23 +209,57 @@ fn parse_block(block: &Block, hint: CoordFormat) -> Option<ParsedAction> {
     })
 }
 
-/// Split `name(args)` into `(name, args)`. The args section is
-/// everything between the first `(` and the LAST `)` so nested parens
-/// inside string literals survive. Returns `None` if the string is not
-/// shaped like a function call.
+/// Split `name(args)` into `(name, args)`. The args section runs from the
+/// first `(` to its **matching** `)`, tracking quote state and bracket
+/// depth so a `)` inside a string literal (e.g. `type(content='a)b')`) or
+/// a nested tuple (e.g. `drag(start_box=(1,2), end_box=(3,4))`) does not
+/// close early. Returns `None` if the string is not shaped like a
+/// function call.
+///
+/// Stopping at the FIRST balanced `)` (rather than `rfind`'s LAST `)`) is
+/// what makes the parser robust to a model that runs away repeating
+/// `click(...)Action: click(...)Action: ...` on a single line until it
+/// hits `max_tokens` — observed with rsclaw-vision-v1. With `rfind` the
+/// args swallowed the entire repeated tail, the coordinate extractor then
+/// failed, and the action came back with `start=None` (an unusable
+/// click). First-balanced-paren yields only the first call's args and
+/// silently drops the repeated garbage.
 fn split_call(s: &str) -> Option<(&str, &str)> {
     let s = s.trim();
     let lparen = s.find('(')?;
-    let rparen = s.rfind(')')?;
-    if rparen <= lparen {
-        return None;
-    }
     let name = s[..lparen].trim();
     if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
         return None;
     }
-    let args = &s[lparen + 1..rparen];
-    Some((name, args))
+
+    let body = &s[lparen + 1..];
+    let mut depth: i32 = 1;
+    let mut in_quote: Option<char> = None;
+    let mut chars = body.char_indices();
+    while let Some((off, c)) = chars.next() {
+        if let Some(q) = in_quote {
+            // Inside a string literal: a backslash escapes the next char,
+            // and only the matching quote closes it — brackets are inert.
+            if c == '\\' {
+                chars.next();
+            } else if c == q {
+                in_quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => in_quote = Some(c),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((name, &body[..off]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Map alias keys to their canonical name. Older outputs use `point` /
@@ -634,6 +668,31 @@ Action: type(content='hello\n')";
         assert_eq!(actions[0].start, Some((10.0, 20.0)));
         assert_eq!(actions[1].action_type, "type");
         assert_eq!(actions[1].raw_args.get("content"), Some(&"hi".to_owned()));
+    }
+
+    #[test]
+    fn runaway_repetition_yields_first_action_only() {
+        // Real rsclaw-vision-v1 failure: a correct first Thought+Action,
+        // then the `Action: click(...)` repeats inline (no newlines) until
+        // max_tokens. Before the first-balanced-paren fix, `split_call`'s
+        // rfind(')') swallowed the entire repeated tail into start_box,
+        // coordinate extraction failed, and the click came back with
+        // start=None (unusable). Now we must recover the first action's
+        // coordinate and ignore the runaway garbage.
+        let mut text = String::from(
+            "Thought: 我看到屏幕底部的任务栏上有个元宝的图标。\nAction: click(start_box='(1204,1357)')",
+        );
+        for _ in 0..200 {
+            text.push_str("Action: click(start_box='(1204,1357)')");
+        }
+        let actions = parse_vlm_response(&text, CoordFormat::Auto);
+        assert_eq!(actions[0].action_type, "click");
+        assert_eq!(actions[0].start, Some((1204.0, 1357.0)));
+        assert_eq!(
+            actions[0].raw_args.get("start_box"),
+            Some(&"(1204,1357)".to_owned()),
+            "start_box must hold only the first call's coord, not the repeated tail"
+        );
     }
 
     #[test]

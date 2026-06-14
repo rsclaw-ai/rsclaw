@@ -90,11 +90,49 @@ pub struct Step {
     pub result_message: Option<String>,
 }
 
+/// How to interpret the bare coordinate numbers a model emits inside
+/// `start_box` / `end_box`.
+///
+/// `Normalized` is the target convention (ui-tars-desktop's 0-1000 grid)
+/// and the correct long-term state. `Pixels` is the pragmatic client-side
+/// adaptation for rsclaw-vision-v1, which — despite the prompt explicitly
+/// asking for a 0-1000 grid — emits raw absolute pixels of the screenshot
+/// it was sent (like Doubao UI-TARS). That is a worker/model-side issue
+/// tracked separately; when the model is fixed to emit normalized coords,
+/// flip `CoordSpace::for_model` back so rsclaw-vision uses `Normalized`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoordSpace {
+    /// 0-1000 normalized grid → rescale by `coord / 1000 * screen_dim`.
+    Normalized,
+    /// Raw pixels of the screenshot the model was sent. The driver sends
+    /// the full-resolution screenshot, so model coords are already in
+    /// physical-pixel space → identity (no rescale).
+    Pixels,
+}
+
+impl CoordSpace {
+    /// Pick the coordinate space for a given model id. rsclaw-vision-v1
+    /// currently emits raw pixels; everything else follows the 0-1000
+    /// prompt convention. Single source of truth — flip the rsclaw branch
+    /// to `Normalized` once the model is fixed worker-side.
+    pub fn for_model(model: &str) -> Self {
+        let m = model.to_ascii_lowercase();
+        if m.contains("rsclaw-vision") {
+            CoordSpace::Pixels
+        } else {
+            CoordSpace::Normalized
+        }
+    }
+}
+
 pub struct VlmDriver<'a> {
     pub operator: &'a dyn Operator,
     pub provider: Arc<dyn LlmProvider>,
     pub model_name: String,
     pub coord_format: CoordFormat,
+    /// How to interpret model-emitted coordinates (0-1000 grid vs raw
+    /// screenshot pixels). Derive with [`CoordSpace::for_model`].
+    pub coord_space: CoordSpace,
     pub max_loop: usize,
     pub abort: Arc<AtomicBool>,
     pub app_rules: &'a AppRuleSet,
@@ -221,10 +259,31 @@ impl VlmDriver<'_> {
                     }
                 }
             };
-            let snap_b64 = BASE64.encode(&snap.png_bytes);
             let screen_w = snap.physical_size.0;
             let screen_h = snap.physical_size.1;
             let scale = snap.scale_factor;
+            // Pre-downscale the screenshot to a size under the vision
+            // encoder's pixel budget. Otherwise the encoder downscales it
+            // server-side and the model reports coordinates in that
+            // unknown smaller space (measured ~0.76x on a 2880x1800
+            // screen), so every click lands high. Sending a known-size
+            // image makes the model's pixel coords invertible: physical =
+            // model / vision_scale (see parsed_to_action). No-op for
+            // screens already under budget.
+            let (vision_png, vision_scale) =
+                downscale_for_vision(&snap.png_bytes, screen_w, screen_h);
+            let snap_b64 = BASE64.encode(vision_png.as_ref());
+            if vision_scale < 1.0 {
+                debug!(
+                    vision_scale,
+                    sent = format!(
+                        "{}x{}",
+                        (screen_w as f32 * vision_scale).round() as u32,
+                        (screen_h as f32 * vision_scale).round() as u32
+                    ),
+                    "downscaled screenshot for vision model"
+                );
+            }
 
             // Signal "model call starting" BEFORE the VLM round-trip
             // (typically 5–30 s on heavy VLMs). Without this, the UI
@@ -252,7 +311,11 @@ impl VlmDriver<'_> {
                 messages,
                 tools: Vec::new(),
                 system: Some(system_prompt.clone()),
-                max_tokens: Some(2048),
+                // One Thought + one Action line is well under 512 tokens.
+                // Capping low bounds the cost/latency of rsclaw-vision-v1's
+                // known runaway-repetition (it re-emits `Action:` until the
+                // limit); the parser already takes only the first action.
+                max_tokens: Some(512),
                 temperature: Some(0.0),
                 frequency_penalty: None,
                 thinking_budget: None,
@@ -416,7 +479,9 @@ impl VlmDriver<'_> {
                 }
 
                 // Map ParsedAction → executable Action.
-                let Some(action) = parsed_to_action(&pa, screen_w, screen_h) else {
+                let Some(action) =
+                    parsed_to_action(&pa, screen_w, screen_h, self.coord_space, vision_scale)
+                else {
                     warn!(
                         action_type = %pa.action_type,
                         "could not map parsed action; skipping"
@@ -835,6 +900,50 @@ async fn stream_prediction(
     })
 }
 
+/// Max pixels we send to the vision model. Larger screenshots get
+/// downscaled by the model's encoder server-side, after which the model
+/// reports coordinates in that unknown smaller space (measured ~0.76x on
+/// a 2880x1800 screen) and every click lands high. Pre-downscaling to a
+/// size safely under that budget ourselves means the model receives our
+/// exact dimensions and emits coords in them, so `parsed_to_action` can
+/// invert by the known `vision_scale`. 1.44 MP keeps small UI text
+/// legible (validated against rsclaw-vision-v1) while staying well under
+/// the observed ~3 MP encoder budget.
+const MAX_VISION_PIXELS: u64 = 1_440_000;
+
+/// Downscale a screenshot PNG (aspect preserved) to at most
+/// [`MAX_VISION_PIXELS`]. Returns the PNG bytes to send and the linear
+/// scale factor applied (`sent_dim / original_dim`, `<= 1.0`). A no-op
+/// (borrowed bytes, scale `1.0`) when the screen is already under budget.
+/// On any decode/encode error it degrades to the original bytes + `1.0`
+/// — at worst that single frame reverts to the pre-fix behaviour rather
+/// than failing the run.
+fn downscale_for_vision(png_bytes: &[u8], w: u32, h: u32) -> (std::borrow::Cow<'_, [u8]>, f32) {
+    let pixels = w as u64 * h as u64;
+    if pixels == 0 || pixels <= MAX_VISION_PIXELS {
+        return (std::borrow::Cow::Borrowed(png_bytes), 1.0);
+    }
+    let factor = (MAX_VISION_PIXELS as f64 / pixels as f64).sqrt() as f32;
+    // Floor (truncate) so the result is guaranteed `<= MAX_VISION_PIXELS`
+    // — rounding up could nudge it back over the budget.
+    let nw = ((w as f32 * factor) as u32).max(1);
+    let nh = ((h as f32 * factor) as u32).max(1);
+    match image::load_from_memory(png_bytes) {
+        Ok(img) => {
+            let small = img.resize_exact(nw, nh, image::imageops::FilterType::Triangle);
+            let mut buf = std::io::Cursor::new(Vec::new());
+            if small.write_to(&mut buf, image::ImageFormat::Png).is_ok() {
+                // Use the actual emitted width for the scale so integer
+                // rounding stays exact; aspect is preserved so the height
+                // factor is within a pixel of this.
+                return (std::borrow::Cow::Owned(buf.into_inner()), nw as f32 / w as f32);
+            }
+            (std::borrow::Cow::Borrowed(png_bytes), 1.0)
+        }
+        Err(_) => (std::borrow::Cow::Borrowed(png_bytes), 1.0),
+    }
+}
+
 /// Translate a parser-emitted [`ParsedAction`] into an executable
 /// [`Action`]. Returns `None` for action types this layer can't map
 /// (caller will skip + log).
@@ -855,21 +964,36 @@ async fn stream_prediction(
 /// To support UI-TARS 1.5 (which emits 0-1000 internally), add an
 /// explicit `coord_space="normalized"` config flag and a separate
 /// codepath; do NOT bring back a magnitude heuristic.
-fn parsed_to_action(p: &ParsedAction, screen_w: u32, screen_h: u32) -> Option<Action> {
-    // Coord pipeline: model emits in a 0-1000 normalized grid (see
-    // the prompt's "Coordinate Space" section + UITARS_1_5-style
-    // examples), so we rescale `x/1000 * screen_w` to physical
-    // pixels. This matches ui-tars-desktop's defaultNormalizeCoords
-    // pipeline and works across UI-TARS, Doubao-vision, Claude,
-    // GPT-4o, kimi etc. — the in-context examples anchor any
-    // vision-capable LLM into the 0-1000 range, and the same rescale
-    // takes them home.
+fn parsed_to_action(
+    p: &ParsedAction,
+    screen_w: u32,
+    screen_h: u32,
+    coord_space: CoordSpace,
+    vision_scale: f32,
+) -> Option<Action> {
+    // Coord pipeline depends on what the model emits:
+    //   - Normalized (0-1000 grid, the prompt's documented convention and
+    //     ui-tars-desktop's defaultNormalizeCoords): rescale
+    //     `x/1000 * screen_w` to physical pixels. Resize-invariant, so
+    //     `vision_scale` does not apply.
+    //   - Pixels (rsclaw-vision-v1's actual behaviour): the model emits
+    //     absolute pixels of the image it was sent. We pre-downscale that
+    //     image by `vision_scale` (<=1.0) to stay under the encoder's
+    //     budget, so the model's pixels are in the downscaled space →
+    //     physical = model / vision_scale. With no downscale
+    //     (vision_scale == 1.0) this is identity.
+    // In both cases the result is physical pixels; the native operator
+    // divides by scale_factor for macOS Retina before driving enigo.
+    let inv = if vision_scale > 0.0 { 1.0 / vision_scale } else { 1.0 };
     let scale = |c: (f32, f32)| -> (i32, i32) {
         let (x, y) = c;
-        (
-            (x * screen_w as f32 / 1000.0).round() as i32,
-            (y * screen_h as f32 / 1000.0).round() as i32,
-        )
+        match coord_space {
+            CoordSpace::Normalized => (
+                (x * screen_w as f32 / 1000.0).round() as i32,
+                (y * screen_h as f32 / 1000.0).round() as i32,
+            ),
+            CoordSpace::Pixels => ((x * inv).round() as i32, (y * inv).round() as i32),
+        }
     };
 
     let start_xy = p.start.map(scale);
@@ -1028,7 +1152,7 @@ mod tests {
         // (0, 0) on the grid → (0, 0) on the screen.
         let mut p = pa("click", &[]);
         p.start = Some((0.0, 0.0));
-        let a = parsed_to_action(&p, 2880, 1800).unwrap();
+        let a = parsed_to_action(&p, 2880, 1800, CoordSpace::Normalized, 1.0).unwrap();
         match a {
             Action::Click { x, y, .. } => {
                 assert_eq!(x, 0);
@@ -1043,7 +1167,7 @@ mod tests {
         // (500, 500) on the grid → midpoint of the screen.
         let mut p = pa("click", &[]);
         p.start = Some((500.0, 500.0));
-        let a = parsed_to_action(&p, 2880, 1800).unwrap();
+        let a = parsed_to_action(&p, 2880, 1800, CoordSpace::Normalized, 1.0).unwrap();
         match a {
             Action::Click { x, y, .. } => {
                 assert_eq!(x, 1440);
@@ -1058,7 +1182,7 @@ mod tests {
         // (1000, 1000) on the grid → bottom-right of the screen.
         let mut p = pa("click", &[]);
         p.start = Some((1000.0, 1000.0));
-        let a = parsed_to_action(&p, 1920, 1080).unwrap();
+        let a = parsed_to_action(&p, 1920, 1080, CoordSpace::Normalized, 1.0).unwrap();
         match a {
             Action::Click { x, y, .. } => {
                 assert_eq!(x, 1920);
@@ -1074,7 +1198,7 @@ mod tests {
         // left). Must NOT be passed through as raw pixels.
         let mut p = pa("click", &[]);
         p.start = Some((40.0, 50.0));
-        let a = parsed_to_action(&p, 2880, 1800).unwrap();
+        let a = parsed_to_action(&p, 2880, 1800, CoordSpace::Normalized, 1.0).unwrap();
         match a {
             Action::Click { x, y, .. } => {
                 assert_eq!(x, 115); // 40/1000*2880 = 115.2
@@ -1085,11 +1209,89 @@ mod tests {
     }
 
     #[test]
+    fn pixels_mode_passes_coords_through_unscaled() {
+        // rsclaw-vision-v1 real output: `click(start_box='(1204,1357)')`
+        // on a 2880x1800 screen. In Pixels mode the coord IS already a
+        // physical pixel → identity. (The Normalized path would rescale it
+        // to 1204/1000*2880 = 3468 — off-screen — which was the bug.)
+        let mut p = pa("click", &[]);
+        p.start = Some((1204.0, 1357.0));
+        let a = parsed_to_action(&p, 2880, 1800, CoordSpace::Pixels, 1.0).unwrap();
+        match a {
+            Action::Click { x, y, .. } => {
+                assert_eq!(x, 1204);
+                assert_eq!(y, 1357);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn pixels_mode_upscales_by_inverse_vision_scale() {
+        // When the screenshot was downscaled by 0.5 before sending, the
+        // model emits coords in that half-size space; physical = model /
+        // 0.5 = model * 2. Matches the live validation: model (688,672)
+        // on a 1440x900 image -> (1376,1344) on the 2880x1800 screen.
+        let mut p = pa("click", &[]);
+        p.start = Some((688.0, 672.0));
+        let a = parsed_to_action(&p, 2880, 1800, CoordSpace::Pixels, 0.5).unwrap();
+        match a {
+            Action::Click { x, y, .. } => {
+                assert_eq!(x, 1376);
+                assert_eq!(y, 1344);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn downscale_for_vision_noop_under_budget() {
+        // A small image (under MAX_VISION_PIXELS) is returned untouched
+        // with scale 1.0 — no decode/re-encode.
+        let (bytes, scale) = downscale_for_vision(b"not-a-real-png", 1280, 800);
+        assert_eq!(scale, 1.0);
+        assert_eq!(bytes.as_ref(), b"not-a-real-png");
+    }
+
+    #[test]
+    fn downscale_for_vision_scales_large_image() {
+        // 2880x1800 (5.18 MP) is over budget → factor = sqrt(1.44M/5.18M)
+        // ≈ 0.527. Build a real PNG so decode/encode succeed.
+        let img = image::RgbImage::from_pixel(2880, 1800, image::Rgb([10, 20, 30]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        let png = buf.into_inner();
+        let (bytes, scale) = downscale_for_vision(&png, 2880, 1800);
+        assert!(scale > 0.5 && scale < 0.55, "scale was {scale}");
+        // Sent image must be a valid, smaller PNG under the pixel budget.
+        let sent = image::load_from_memory(bytes.as_ref()).unwrap();
+        assert!((sent.width() as u64 * sent.height() as u64) <= MAX_VISION_PIXELS);
+    }
+
+    #[test]
+    fn coord_space_for_model_picks_pixels_for_rsclaw_vision() {
+        assert_eq!(
+            CoordSpace::for_model("rsclaw-vision-v1"),
+            CoordSpace::Pixels
+        );
+        assert_eq!(
+            CoordSpace::for_model("rsclaw/rsclaw-vision-v1"),
+            CoordSpace::Pixels
+        );
+        // Everything else stays on the 0-1000 prompt convention.
+        assert_eq!(CoordSpace::for_model("ui-tars-1.5"), CoordSpace::Normalized);
+        assert_eq!(CoordSpace::for_model("doubao-vision"), CoordSpace::Normalized);
+        assert_eq!(CoordSpace::for_model(""), CoordSpace::Normalized);
+    }
+
+    #[test]
     fn maps_drag_with_both_endpoints() {
         let mut p = pa("drag", &[]);
         p.start = Some((100.0, 100.0));
         p.end = Some((200.0, 200.0));
-        let a = parsed_to_action(&p, 1920, 1080).unwrap();
+        let a = parsed_to_action(&p, 1920, 1080, CoordSpace::Normalized, 1.0).unwrap();
         match a {
             Action::Drag {
                 from_x,
@@ -1109,7 +1311,7 @@ mod tests {
     #[test]
     fn maps_type_action() {
         let p = pa("type", &[("content", "hello world")]);
-        let a = parsed_to_action(&p, 1920, 1080).unwrap();
+        let a = parsed_to_action(&p, 1920, 1080, CoordSpace::Normalized, 1.0).unwrap();
         match a {
             Action::Type { text } => assert_eq!(text, "hello world"),
             _ => panic!("wrong variant"),
@@ -1140,7 +1342,7 @@ mod tests {
     fn maps_scroll_with_direction() {
         let mut p = pa("scroll", &[("direction", "up"), ("clicks", "5")]);
         p.start = Some((1000.0, 500.0));
-        let a = parsed_to_action(&p, 1920, 1080).unwrap();
+        let a = parsed_to_action(&p, 1920, 1080, CoordSpace::Normalized, 1.0).unwrap();
         match a {
             Action::Scroll {
                 direction, clicks, ..
@@ -1155,7 +1357,7 @@ mod tests {
     #[test]
     fn unmapped_action_returns_none() {
         let p = pa("teleport", &[]);
-        assert!(parsed_to_action(&p, 1920, 1080).is_none());
+        assert!(parsed_to_action(&p, 1920, 1080, CoordSpace::Normalized, 1.0).is_none());
     }
 
     #[test]
