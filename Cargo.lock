@@ -7556,6 +7556,7 @@ dependencies = [
  "rsclaw-tools",
  "rsclaw-types",
  "rsclaw-util",
+ "rsclaw-watch",
  "rust_xlsxwriter",
  "rustls",
  "serde",
@@ -8243,6 +8244,32 @@ dependencies = [
  "dirs-next",
  "image 0.25.10",
  "serde_json",
+]
+
+[[package]]
+name = "rsclaw-watch"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "eventsource-stream",
+ "futures",
+ "jaq-core",
+ "jaq-json",
+ "jaq-std",
+ "regex",
+ "reqwest",
+ "rsclaw-channel",
+ "rsclaw-config",
+ "rsclaw-i18n",
+ "rsclaw-platform",
+ "rsclaw-util",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

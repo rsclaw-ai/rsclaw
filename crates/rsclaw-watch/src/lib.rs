@@ -20,15 +20,13 @@ use anyhow::Result;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{info, warn};
 
+use rsclaw_channel::ChannelManager;
 use crate::{
-    channel::ChannelManager,
-    gateway::watch::{
-        dedup::{DedupKey, dedup_key},
-        filter::Filter,
-        parser::{ParsedCommand, SourceKind, StopTarget, WatchSpec},
-        rate_limit::{DeliveryMsg, RateLimiter},
-        source::{EventRecord, FileSource, ShellSource, SourceImpl, SseSource, WatchStartError},
-    },
+    dedup::{DedupKey, dedup_key},
+    filter::Filter,
+    parser::{ParsedCommand, SourceKind, StopTarget, WatchSpec},
+    rate_limit::{DeliveryMsg, RateLimiter},
+    source::{EventRecord, FileSource, ShellSource, SourceImpl, SseSource, WatchStartError},
 };
 
 /// Per (channel, peer) concurrent watch cap. Spec §"并发上限". Prevents a
@@ -111,7 +109,7 @@ impl WatchRegistry {
     /// (any test that lands first would freeze the state for the rest).
     #[doc(hidden)]
     pub fn init_for_test() -> Arc<Self> {
-        let channels = Arc::new(crate::channel::ChannelManager::new(
+        let channels = Arc::new(rsclaw_channel::ChannelManager::new(
             rsclaw_platform::MemoryTier::Standard,
         ));
         Arc::new(WatchRegistry {
@@ -583,7 +581,7 @@ fn resolve_template_defaults(
     (spec.grep.clone(), jq, event_filter)
 }
 
-pub(crate) fn build_source_impl(spec: &WatchSpec) -> Result<SourceImpl, WatchStartError> {
+pub fn build_source_impl(spec: &WatchSpec) -> Result<SourceImpl, WatchStartError> {
     // Resolve `${VAR}` references in raw_source up-front so every source kind
     // gets consistent env-var support. Without this, file paths would be
     // taken literally and shell commands would depend on the platform's
@@ -591,14 +589,14 @@ pub(crate) fn build_source_impl(spec: &WatchSpec) -> Result<SourceImpl, WatchSta
     // `powershell -Command` which uses `$env:VAR` syntax instead).
     // SSE headers are still substituted inside SseSource::build because
     // they live outside raw_source.
-    let resolved_source = crate::gateway::watch::sse::substitute_env_vars(&spec.raw_source)
+    let resolved_source = crate::sse::substitute_env_vars(&spec.raw_source)
         .map_err(|e| WatchStartError::UnresolvedEnv(e.to_string()))?;
 
     match spec.kind {
         SourceKind::File => {
             // Also expand a leading `~` / `~/` / `~\` so users can write paths
             // the way they'd type them in a shell.
-            let path = crate::config::loader::expand_tilde_path_pub(&resolved_source);
+            let path = rsclaw_config::loader::expand_tilde_path_pub(&resolved_source);
             if !path.exists() {
                 return Err(WatchStartError::InvalidPath(resolved_source));
             }
@@ -651,7 +649,7 @@ pub enum Origin {
 #[cfg(test)]
 mod build_tests {
     use super::*;
-    use crate::gateway::watch::parser::SourceKind;
+    use crate::parser::SourceKind;
 
     fn spec_file(raw: &str) -> WatchSpec {
         WatchSpec {

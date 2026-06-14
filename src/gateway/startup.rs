@@ -9,10 +9,8 @@ use anyhow::{Context, Result};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
 
-use super::{
-    channels::{start_channels, start_custom_channels},
-    providers::build_providers,
-};
+use super::channels::{start_channels, start_custom_channels};
+use rsclaw_provider::build::build_providers;
 use crate::{
     MemoryTier,
     agent::{

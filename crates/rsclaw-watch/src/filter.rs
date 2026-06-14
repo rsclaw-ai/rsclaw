@@ -9,7 +9,7 @@
 use anyhow::Result;
 use regex::Regex;
 
-use crate::gateway::watch::{jq::CompiledJq, parser::EventFilter, source::EventRecord};
+use crate::{jq::CompiledJq, parser::EventFilter, source::EventRecord};
 
 pub struct Filter {
     event_filter: Option<EventFilter>,

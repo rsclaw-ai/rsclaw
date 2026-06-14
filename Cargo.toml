@@ -47,6 +47,7 @@ rsclaw-platform = { path = "crates/rsclaw-platform" }
 rsclaw-i18n = { path = "crates/rsclaw-i18n" }
 rsclaw-events = { path = "crates/rsclaw-events" }
 rsclaw-cron = { path = "crates/rsclaw-cron" }
+rsclaw-watch = { path = "crates/rsclaw-watch" }
 
 # Async runtime
 tokio        = { version = "1", features = ["full"] }

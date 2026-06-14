@@ -6,19 +6,17 @@ use std::{collections::HashMap, sync::Arc};
 
 use tracing::info;
 
+use rsclaw_config::runtime::RuntimeConfig;
 use crate::{
-    config::runtime::RuntimeConfig,
-    provider::{
-        LlmProvider,
-        anthropic::{self as anthropic, AnthropicProvider},
-        gemini::{self as gemini, GeminiProvider},
-        openai::OpenAiProvider,
-        registry::ProviderRegistry,
-        rsclaw::RsclawProvider,
-    },
+    LlmProvider,
+    anthropic::{self as anthropic, AnthropicProvider},
+    gemini::{self as gemini, GeminiProvider},
+    openai::OpenAiProvider,
+    registry::ProviderRegistry,
+    rsclaw::RsclawProvider,
 };
 
-pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
+pub fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
     let mut registry = ProviderRegistry::new();
 
     if let Some(models_cfg) = &config.model.models {
@@ -111,7 +109,7 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
 
             // Determine API format: explicit `api` field > name-based inference.
             let api_format = provider_cfg.api.clone().unwrap_or_else(|| {
-                use crate::config::schema::ApiFormat;
+                use rsclaw_config::schema::ApiFormat;
                 match name.as_str() {
                     "anthropic" => ApiFormat::Anthropic,
                     "gemini" => ApiFormat::Gemini,
@@ -129,8 +127,8 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
 
             let provider: Arc<dyn LlmProvider> = match (name.as_str(), &api_format) {
                 ("anthropic", _)
-                | (_, &crate::config::schema::ApiFormat::Anthropic)
-                | (_, &crate::config::schema::ApiFormat::AnthropicMessages) => {
+                | (_, &rsclaw_config::schema::ApiFormat::Anthropic)
+                | (_, &rsclaw_config::schema::ApiFormat::AnthropicMessages) => {
                     let key = api_key
                         .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
                         .unwrap_or_default();
@@ -144,19 +142,19 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                     let url = base_url.unwrap_or_else(|| gemini::GEMINI_API_BASE.to_owned());
                     Arc::new(GeminiProvider::with_user_agent(key, url, user_agent))
                 }
-                (_, &crate::config::schema::ApiFormat::Ollama) => {
+                (_, &rsclaw_config::schema::ApiFormat::Ollama) => {
                     // Ollama backend: reasoning models use native /api/chat
                     let key = api_key.or_else(|| std::env::var("OPENAI_API_KEY").ok());
                     let url = base_url.unwrap_or_else(|| "http://localhost:11434".to_owned());
                     Arc::new(OpenAiProvider::ollama_with_ua(url, key, user_agent))
                 }
-                (_, &crate::config::schema::ApiFormat::OpenAiResponses) => {
+                (_, &rsclaw_config::schema::ApiFormat::OpenAiResponses) => {
                     let key = api_key.or_else(|| std::env::var("OPENAI_API_KEY").ok());
                     let url = base_url
-                        .unwrap_or_else(|| crate::provider::openai::OPENAI_API_BASE.to_owned());
+                        .unwrap_or_else(|| crate::openai::OPENAI_API_BASE.to_owned());
                     Arc::new(OpenAiProvider::responses_with_ua(url, key, user_agent))
                 }
-                (_, &crate::config::schema::ApiFormat::Rsclaw) => {
+                (_, &rsclaw_config::schema::ApiFormat::Rsclaw) => {
                     // rsclaw stateful session protocol (kvCacheMode=2).
                     // `baseUrl` should point at either rsclaw-server
                     // (e.g. `https://api.rsclaw.ai/v1/agent`) or a
@@ -170,8 +168,8 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                         .or_else(|| std::env::var("RSCLAW_SERVER_KEY").ok())
                         .filter(|s| !s.is_empty());
                     let url = base_url
-                        .unwrap_or_else(|| crate::provider::rsclaw::RSCLAW_DEFAULT_BASE.to_owned());
-                    let provider = crate::provider::rsclaw::RsclawProvider::new(url, key);
+                        .unwrap_or_else(|| crate::rsclaw::RSCLAW_DEFAULT_BASE.to_owned());
+                    let provider = crate::rsclaw::RsclawProvider::new(url, key);
                     let provider = match provider_cfg.prefix_id.clone() {
                         Some(pid) => provider.with_prefix_id(pid),
                         None => provider,
@@ -194,7 +192,7 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
                         Arc::new(OpenAiProvider::with_user_agent(url, key, user_agent))
                     } else {
                         Arc::new(OpenAiProvider::with_user_agent(
-                            crate::provider::openai::OPENAI_API_BASE,
+                            crate::openai::OPENAI_API_BASE,
                             key,
                             user_agent,
                         ))
@@ -397,7 +395,7 @@ pub(crate) fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
         // the chain composes correctly.
         let key = nonempty_env("RSCLAW_KEY").or_else(|| nonempty_env("RSCLAW_SERVER_KEY"));
         let url = nonempty_env("RSCLAW_URL")
-            .unwrap_or_else(|| crate::provider::rsclaw::RSCLAW_DEFAULT_BASE.to_string());
+            .unwrap_or_else(|| crate::rsclaw::RSCLAW_DEFAULT_BASE.to_string());
         registry.register("rsclaw", Arc::new(RsclawProvider::new(url, key)));
     }
 

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 
-use crate::channel::{ChannelManager, OutboundMessage};
+use rsclaw_channel::{ChannelManager, OutboundMessage};
 
 /// Push `body` to (channel, account, peer) using the same ChannelManager
 /// that /loop / cron use.

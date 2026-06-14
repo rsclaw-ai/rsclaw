@@ -107,7 +107,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::gateway::watch::jq::CompiledJq;
+    use crate::jq::CompiledJq;
 
     fn run_astock(input: serde_json::Value) -> Vec<String> {
         let f = CompiledJq::compile(ASTOCK_JQ).expect("astock jq compiles");

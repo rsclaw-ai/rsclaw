@@ -12,7 +12,6 @@ pub mod external_jobs_worker;
 pub mod hot_reload;
 pub mod live_config;
 pub mod preparse;
-pub mod providers;
 pub mod router;
 pub mod session;
 pub mod shutdown;
@@ -20,7 +19,7 @@ pub mod startup;
 pub mod desktop_channel;
 pub mod heartbeat_host;
 pub mod task_queue;
-pub mod watch;
+pub use rsclaw_watch as watch;
 
 pub use hot_reload::{ConfigChange, FileWatcher};
 pub use live_config::LiveConfig;

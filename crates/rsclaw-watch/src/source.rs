@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use tracing::warn;
 
-use crate::gateway::watch::parser::SourceKind;
+use crate::parser::SourceKind;
 
 /// Unified event record emitted by every EventSource.
 #[derive(Debug, Clone, Serialize)]
@@ -98,11 +98,11 @@ impl SseSource {
     /// Returns `WatchStartError::UnresolvedEnv(name)` on the first unset /
     /// empty var.
     pub fn build(url: &str, headers: &[(String, String)]) -> Result<Self, WatchStartError> {
-        let url = crate::gateway::watch::sse::substitute_env_vars(url)
+        let url = crate::sse::substitute_env_vars(url)
             .map_err(|e| WatchStartError::UnresolvedEnv(e.to_string()))?;
         let mut subst_headers = Vec::with_capacity(headers.len());
         for (k, v) in headers {
-            let v2 = crate::gateway::watch::sse::substitute_env_vars(v)
+            let v2 = crate::sse::substitute_env_vars(v)
                 .map_err(|e| WatchStartError::UnresolvedEnv(e.to_string()))?;
             subst_headers.push((k.clone(), v2));
         }
@@ -120,7 +120,7 @@ impl SourceImpl {
         match self {
             SourceImpl::File(s) => run_file(s, tx, stop).await,
             SourceImpl::Shell(s) => run_shell(s, tx, stop).await,
-            SourceImpl::Sse(s) => crate::gateway::watch::sse::run_sse(s, tx, stop).await,
+            SourceImpl::Sse(s) => crate::sse::run_sse(s, tx, stop).await,
         }
     }
 
