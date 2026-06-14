@@ -37,6 +37,7 @@ rsclaw-kb = { path = "crates/rsclaw-kb" }
 rsclaw-plugin = { path = "crates/rsclaw-plugin" }
 rsclaw-skill = { path = "crates/rsclaw-skill" }
 rsclaw-store = { path = "crates/rsclaw-store" }
+rsclaw-jobs = { path = "crates/rsclaw-jobs" }
 rsclaw-embed = { path = "crates/rsclaw-embed" }
 rsclaw-provider = { path = "crates/rsclaw-provider" }
 rsclaw-retry = { path = "crates/rsclaw-retry" }

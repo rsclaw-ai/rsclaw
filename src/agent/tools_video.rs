@@ -2,9 +2,9 @@
 //! Kling.
 //!
 //! All providers are async HTTP APIs: this file only resolves config and
-//! credentials, calls the matching `submit_*` in
-//! `gateway::external_jobs_worker`, and persists an `ExternalJob`. The
-//! worker handles polling, download, and channel delivery.
+//! credentials, calls the matching `submit_*` in `rsclaw_jobs`, and
+//! persists an `ExternalJob`. The gateway worker handles polling, download,
+//! and channel delivery.
 //!
 //! Split from `tools_misc.rs` for maintainability. Methods live in
 //! `impl AgentRuntime` via the split-impl pattern.
@@ -168,7 +168,7 @@ impl super::runtime::AgentRuntime {
 
             let submit_result: Result<(&'static str, String)> = match provider {
                 "doubao" => match resolve_key("doubao", "ARK_API_KEY") {
-                    Some(key) => crate::gateway::external_jobs_worker::submit_seedance(
+                    Some(key) => rsclaw_jobs::submit_seedance(
                         &client,
                         &key,
                         prompt,
@@ -183,7 +183,7 @@ impl super::runtime::AgentRuntime {
                     )),
                 },
                 "minimax" => match resolve_key("minimax", "MINIMAX_API_KEY") {
-                    Some(key) => crate::gateway::external_jobs_worker::submit_minimax(
+                    Some(key) => rsclaw_jobs::submit_minimax(
                         &client,
                         &key,
                         prompt,
@@ -213,7 +213,7 @@ impl super::runtime::AgentRuntime {
                         .or_else(|| std::env::var("KLING_SECRET_KEY").ok());
                     match (ak, sk) {
                         (Some(access), Some(secret)) => {
-                            crate::gateway::external_jobs_worker::submit_kling(
+                            rsclaw_jobs::submit_kling(
                                 &client,
                                 &access,
                                 &secret,
@@ -336,8 +336,8 @@ impl super::runtime::AgentRuntime {
 ///
 /// Hits `POST https://api.rsclaw.ai/v1/videos` with the OAI Sora-2 +
 /// Seedance superset body. Polling is handled by
-/// `gateway::external_jobs_worker::poll_rsclaw` after the caller
-/// enqueues the corresponding `ExternalJob{ provider: "rsclaw" }`.
+/// `rsclaw_jobs::poll_rsclaw` after the caller enqueues the corresponding
+/// `ExternalJob{ provider: "rsclaw" }`.
 ///
 /// 307/308 redirects from the LB are followed by
 /// `crate::provider::rsclaw_http::post_json` — same protocol as the

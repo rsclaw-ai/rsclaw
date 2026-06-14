@@ -7542,6 +7542,7 @@ dependencies = [
  "rsclaw-evolution",
  "rsclaw-heartbeat",
  "rsclaw-i18n",
+ "rsclaw-jobs",
  "rsclaw-kb",
  "rsclaw-mcp",
  "rsclaw-memory",
@@ -7917,6 +7918,27 @@ dependencies = [
 [[package]]
 name = "rsclaw-i18n"
 version = "0.1.0"
+
+[[package]]
+name = "rsclaw-jobs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "dirs-next",
+ "hmac",
+ "rand 0.9.2",
+ "reqwest",
+ "rsclaw-channel",
+ "rsclaw-config",
+ "rsclaw-provider",
+ "rsclaw-types",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "rsclaw-kb"

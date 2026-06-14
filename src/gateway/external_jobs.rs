@@ -21,23 +21,9 @@
 //! Terminal rows are kept around briefly so the delivery side can
 //! idempotently handle restart races, then GC'd by `cleanup_finished`.
 
-use serde::{Deserialize, Serialize};
-
 // Records lifted to rsclaw-types (crate-split); re-exported.
-pub use rsclaw_types::{ExternalJobKind, ExternalJobOrigin, ExternalJobStatus, ExternalJobDelivery, ExternalJob, DEFAULT_TIMEOUT_SECS};
-
-
-/// What a single provider poll returned. Worker uses this to decide
-/// whether to keep polling, deliver the artifact, or surface a failure.
-#[derive(Debug, Clone)]
-pub enum PollOutcome {
-    /// Provider says the job is still in progress — schedule another poll.
-    Pending,
-    /// Provider returned the artifact URL.
-    Done(String),
-    /// Provider reported a non-recoverable failure.
-    Failed(String),
-}
+// PollOutcome also lifted to rsclaw-types so rsclaw-jobs can return it.
+pub use rsclaw_types::{ExternalJobKind, ExternalJobOrigin, ExternalJobStatus, ExternalJobDelivery, ExternalJob, DEFAULT_TIMEOUT_SECS, PollOutcome};
 
 
 

@@ -415,6 +415,22 @@ pub struct ExternalJob {
     pub delivery_attempts: u32,
 }
 
+/// What a single provider poll returned. Worker uses this to decide
+/// whether to keep polling, deliver the artifact, or surface a failure.
+///
+/// Lifted from `gateway/external_jobs.rs` (crate-split) so `rsclaw-jobs`
+/// can return it without depending on the gateway runtime. Re-exported at
+/// `crate::gateway::external_jobs::PollOutcome`.
+#[derive(Debug, Clone)]
+pub enum PollOutcome {
+    /// Provider says the job is still in progress — schedule another poll.
+    Pending,
+    /// Provider returned the artifact URL.
+    Done(String),
+    /// Provider reported a non-recoverable failure.
+    Failed(String),
+}
+
 /// Default per-job timeout — 30 minutes covers Seedance / MiniMax / Kling
 /// in the worst case while still bounding redb row lifetime.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30 * 60;
