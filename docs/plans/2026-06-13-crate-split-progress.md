@@ -72,3 +72,28 @@ Prior classification was too coarse. Verdicts:
 - **ws**: TRUE_CYCLE_LEAVE_ROOT (effort L)
   - traits: ['No trait inversions possible for full extraction: AppState aggregates 30+ runtime subsystems (agents, store, event_bus, computer_permission, shutdown, memory, knowledge, task_store, etc.) and every ws handler method depends on multiple fields. Defining a trait would require 15-20+ accessors and is artificial since AppState IS fundamentally the handler context.']
   - VERDICT: ws is NOT EXTRACTABLE to a standalone crate without creating artificial trait seams. The core blocker is that EVERY ws method handler (50+ functions across 10 modules) has signature `async fn
+
+## FINAL (2026-06-14): 28 crates extracted, knot proven splittable
+
+After the re-analysis, 6 of the "runtime knot" modules WERE extractable —
+prior classification was too coarse (it equated "depends on agent/gateway"
+with "unsplittable", but the real test is the NATURE of the edge):
+
+| module | how | 
+|---|---|
+| astock | BriefingSink trait inversion (gateway queue API) |
+| cap | dead-code removal (inject_followup) broke the AgentMessage edge |
+| heartbeat | HeartbeatHost trait inversion (registry/shutdown/send) |
+| cli | clean leaf (zero deps) |
+| migrate | repoint to rsclaw_memory/config/store |
+| cron | file-internal split: data/persistence -> rsclaw-cron, CronRunner stays root |
+
+GENUINE knot (stays root — AppState-bound RPC / core orchestration, would
+cycle without the event-bus inversion of plan step 12):
+agent, gateway, server, ws, a2a, cmd, hooks, cron-runner.
+- a2a was assessed extractable but streaming.rs/relay.rs are AppState-bound A2A
+  RPC handlers (crate::server::{caller_owns,build_agent_card,a2a_rpc_handler_inner})
+  — same class as ws. Kept its useful type sinks (ReplyOutcome/StructuredOutcome).
+
+RESULT: 28 crates + root. Full `cargo check` GREEN. `cargo build` ->
+target/debug/rsclaw (323MB). computer_e2e 3/3 (real-display screenshot).
