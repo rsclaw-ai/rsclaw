@@ -15,6 +15,10 @@ name = "rsclaw"
 path = "src/main.rs"
 
 [dependencies]
+# Composition root + RPC handlers (a2a, cmd, cron, gateway, hooks, server, ws)
+# plus the process entry point `rsclaw_runtime::run`.
+rsclaw-runtime = { path = "crates/rsclaw-runtime" }
+
 # Extracted workspace crates (crate-split, feat/crate-split)
 rsclaw-agent = { path = "crates/rsclaw-agent" }
 rsclaw-types = { path = "crates/rsclaw-types" }
@@ -215,9 +219,9 @@ cap-rs = { version = "0.1.0", default-features = false, features = ["stream-json
 
 [features]
 default = ["openclaw-migrate"]
-channel-matrix = ["dep:matrix-sdk"]
-openclaw-migrate = ["rsclaw-migrate/openclaw-migrate"]
-tray = ["dep:tray-icon", "dep:muda"]
+channel-matrix = ["rsclaw-runtime/channel-matrix"]
+openclaw-migrate = ["rsclaw-migrate/openclaw-migrate", "rsclaw-runtime/openclaw-migrate"]
+tray = ["rsclaw-runtime/tray"]
 
 [profile.release]
 # Size-optimized (`"s"` is a good balance: much smaller than default 3 with
