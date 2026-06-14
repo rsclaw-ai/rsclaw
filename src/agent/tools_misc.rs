@@ -1080,7 +1080,7 @@ $synth.Speak('{}')
     /// drains before classifying the turn — once drained, it becomes
     /// `TaskOutcome::Structured`, taking precedence over the string classifier.
     pub(crate) async fn tool_task_finish(&self, ctx: &RunContext, args: Value) -> Result<Value> {
-        let outcome: crate::gateway::task_queue::StructuredOutcome =
+        let outcome: rsclaw_types::StructuredOutcome =
             serde_json::from_value(args.clone()).map_err(|e| {
                 anyhow!(
                     "task_finish: invalid outcome payload: {e}. Required fields: \
@@ -1098,7 +1098,7 @@ $synth.Speak('{}')
 
         if matches!(
             outcome.completion,
-            crate::gateway::task_queue::Completion::Full
+            rsclaw_types::Completion::Full
         ) && outcome.accomplished.is_empty()
         {
             bail!(
@@ -1119,7 +1119,7 @@ $synth.Speak('{}')
             "task_finish: agent declared outcome"
         );
 
-        crate::gateway::task_queue::stage_pending_outcome(&ctx.session_key, outcome);
+        rsclaw_types::stage_pending_outcome(&ctx.session_key, outcome);
 
         Ok(json!({
             "ok": true,

@@ -298,9 +298,9 @@ impl super::runtime::AgentRuntime {
             }
         };
 
-        let job = crate::gateway::external_jobs::ExternalJob::new_submitted(
+        let job = rsclaw_types::ExternalJob::new_submitted(
             ctx.session_key.clone(),
-            crate::gateway::external_jobs::ExternalJobDelivery {
+            rsclaw_types::ExternalJobDelivery {
                 channel: ctx.channel.clone(),
                 target_id: if ctx.chat_id.is_empty() {
                     ctx.peer_id.clone()
@@ -310,10 +310,10 @@ impl super::runtime::AgentRuntime {
                 is_group: !ctx.chat_id.is_empty() && ctx.chat_id != ctx.peer_id,
                 reply_to: None,
             },
-            crate::gateway::external_jobs::ExternalJobOrigin::Agent,
+            rsclaw_types::ExternalJobOrigin::Agent,
             provider_key,
             &task_id,
-            crate::gateway::external_jobs::ExternalJobKind::VideoGen,
+            rsclaw_types::ExternalJobKind::VideoGen,
             prompt,
         );
         let job_id = job.id.clone();

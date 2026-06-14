@@ -166,9 +166,7 @@ pub use rsclaw_types::{stage_pending_outcome, drain_pending_outcome};
 
 
 /// Default max turns for /task mode.
-pub const TASK_DEFAULT_MAX_TURNS: u32 = 10;
-/// Default TTL for /task mode (1 hour).
-pub const TASK_DEFAULT_TTL_SECS: u64 = 3600;
+pub use rsclaw_types::{TASK_DEFAULT_MAX_TURNS, TASK_DEFAULT_TTL_SECS};
 
 /// Parse `/task` prefix and extract turn/timeout flags.
 ///
@@ -1669,5 +1667,25 @@ impl rsclaw_types::BriefingSink for GatewayBriefingSink {
         msg: OutboundMessage,
     ) -> Result<(), String> {
         push_outbound(channel, account, msg)
+    }
+}
+
+/// Root-side `rsclaw_types::TaskQueueHost` impl (crate-split P3 trait inversion).
+/// Lets rsclaw-agent's `task` tool enqueue background tasks via the gateway
+/// queue without depending on the gateway crate. Injected at startup.
+pub struct GatewayTaskQueueHost;
+
+impl rsclaw_types::TaskQueueHost for GatewayTaskQueueHost {
+    fn submit_task(
+        &self,
+        session_key: &str,
+        message: QueuedMessage,
+        priority: Priority,
+        max_turns: u32,
+        ttl_secs: u64,
+    ) -> anyhow::Result<(String, bool)> {
+        let manager = get_task_queue()
+            .ok_or_else(|| anyhow::anyhow!("task queue not available (gateway not started?)"))?;
+        manager.submit_task(session_key, message, priority, max_turns, ttl_secs)
     }
 }

@@ -611,6 +611,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // submit follow-up tasks without threading the manager through every
     // tool-dispatch surface.
     super::task_queue::install_task_queue(Arc::clone(&task_queue_mgr));
+    // crate-split P3: inject the task-queue host so rsclaw-agent's `task` tool
+    // can enqueue without depending on the gateway crate.
+    rsclaw_types::set_task_queue_host(Arc::new(super::task_queue::GatewayTaskQueueHost));
 
     start_channels(
         &config,

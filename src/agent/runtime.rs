@@ -9166,8 +9166,8 @@ impl AgentRuntime {
     /// keyword heuristic regularly mis-classified short Chinese
     /// questions like "你可以帮我做啥？", so the decision moved here.
     pub(crate) async fn tool_task(&self, ctx: &RunContext, args: Value) -> Result<Value> {
-        use crate::gateway::task_queue::{
-            self, Priority, QueuedMessage, TASK_DEFAULT_MAX_TURNS, TASK_DEFAULT_TTL_SECS,
+        use rsclaw_types::{
+            Priority, QueuedMessage, TASK_DEFAULT_MAX_TURNS, TASK_DEFAULT_TTL_SECS,
         };
         let task_text = args
             .get("task_text")
@@ -9190,7 +9190,7 @@ impl AgentRuntime {
             .and_then(|v| v.as_u64())
             .unwrap_or(TASK_DEFAULT_TTL_SECS);
 
-        let Some(manager) = task_queue::get_task_queue() else {
+        let Some(host) = rsclaw_types::task_queue_host() else {
             return Ok(json!({
                 "error": "task queue not available (gateway not fully started?)"
             }));
@@ -9209,7 +9209,7 @@ impl AgentRuntime {
             account: None,
         };
 
-        let (task_id, merged) = manager
+        let (task_id, merged) = host
             .submit_task(
                 &ctx.session_key,
                 message,

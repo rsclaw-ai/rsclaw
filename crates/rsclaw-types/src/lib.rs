@@ -705,3 +705,35 @@ pub struct SkipEntry {
     /// Why it was skipped.
     pub why: String,
 }
+/// Default max turns for /task mode (crate-split: lifted from gateway/task_queue.rs).
+pub const TASK_DEFAULT_MAX_TURNS: u32 = 10;
+/// Default TTL for /task mode (1 hour).
+pub const TASK_DEFAULT_TTL_SECS: u64 = 3600;
+
+// ============================================================================
+// TaskQueueHost (crate-split step-12 P3): trait inversion so rsclaw-agent can
+// submit background tasks WITHOUT depending on the gateway task-queue runtime.
+// Root's gateway implements this and injects it at startup.
+// ============================================================================
+pub trait TaskQueueHost: Send + Sync {
+    /// Submit a background task to the queue. Returns (task_id, merged_into_existing).
+    fn submit_task(
+        &self,
+        session_key: &str,
+        message: QueuedMessage,
+        priority: Priority,
+        max_turns: u32,
+        ttl_secs: u64,
+    ) -> anyhow::Result<(String, bool)>;
+}
+
+static TASK_QUEUE_HOST: std::sync::OnceLock<std::sync::Arc<dyn TaskQueueHost>> =
+    std::sync::OnceLock::new();
+
+pub fn set_task_queue_host(host: std::sync::Arc<dyn TaskQueueHost>) {
+    let _ = TASK_QUEUE_HOST.set(host);
+}
+
+pub fn task_queue_host() -> Option<std::sync::Arc<dyn TaskQueueHost>> {
+    TASK_QUEUE_HOST.get().cloned()
+}
