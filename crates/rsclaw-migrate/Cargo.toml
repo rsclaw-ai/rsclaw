@@ -16,7 +16,7 @@ rayon = "1"
 sha2 = "0.10"
 regex = "1"
 hex = "0.4"
-json5 = "0.4"
+json5 = "1"
 dirs-next = "2"
 uuid = { version = "1", features = ["v4"] }
 rusqlite = { version = "0.32", optional = true, features = ["bundled"] }

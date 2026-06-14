@@ -24,7 +24,7 @@ rsclaw-kb = { path = "../rsclaw-kb" }
 rsclaw-browser = { path = "../rsclaw-browser" }
 rsclaw-memory = { path = "../rsclaw-memory" }
 rsclaw-desktop = { path = "../rsclaw-desktop" }
-json5 = "0.4"
+json5 = "1"
 base64 = "0.22"
 futures = "0.3"
 uuid = { version = "1", features = ["v4"] }
