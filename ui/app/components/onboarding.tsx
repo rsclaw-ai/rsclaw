@@ -787,6 +787,7 @@ export interface ProviderDef {
 // All providers (unordered lookup table)
 export const ALL_PROVIDERS: Record<string, ProviderDef> = {
   rsclaw:      { id: "rsclaw",      name: "RsClaw",             tag: "\u589E\u91CF\u534F\u8BAE \u00B7 \u4E1A\u5185\u9996\u53D1", tagEn: "Incremental \u00B7 Industry-first", keyLabel: "RsClaw API Key", keyPlaceholder: "sk-...", hasBaseUrl: true, defaultBaseUrl: "https://api.rsclaw.ai/v1/agent" },
+  agnes:       { id: "agnes",       name: "Agnes AI",           tag: "\u514D\u8D39 \u00B7 \u6587\u56FE\u89C6", tagEn: "Free \u00B7 text/image/video", keyLabel: "Agnes API Key", keyPlaceholder: "sk-...", hasBaseUrl: true, defaultBaseUrl: "https://apihub.agnes-ai.com/v1" },
   qwen:        { id: "qwen",        name: "Qwen (\u5343\u95EE)", tag: "\u56FD\u5185\u76F4\u8FDE",      tagEn: "China direct",      keyLabel: "DashScope API Key",   keyPlaceholder: "sk-..." },
   doubao:      { id: "doubao",      name: "Doubao (\u8C46\u5305)", tag: "\u5B57\u8282\u8DF3\u52A8",     tagEn: "ByteDance",         keyLabel: "ARK API Key",         keyPlaceholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", hasBaseUrl: true, defaultBaseUrl: "https://ark.cn-beijing.volces.com/api/v3" },
   minimax:     { id: "minimax",     name: "MiniMax",            tag: "\u56FD\u5185",                  tagEn: "China",             keyLabel: "MiniMax API Key",     keyPlaceholder: "eyJ..." },
@@ -806,8 +807,8 @@ export const ALL_PROVIDERS: Record<string, ProviderDef> = {
   siliconflow: { id: "siliconflow", name: "SiliconFlow",        tag: "\u56FD\u5185\u52A0\u901F",      tagEn: "China accel",       keyLabel: "SiliconFlow Key",     keyPlaceholder: "sk-..." },
 };
 
-export const PROV_ORDER_ZH = ["rsclaw","qwen","deepseek","doubao","custom","codingplan","minimax","kimi","zhipu","ollama","gaterouter","openrouter","anthropic","openai","gemini","grok","groq","siliconflow"];
-export const PROV_ORDER_EN = ["rsclaw","anthropic","openai","gemini","grok","openrouter","ollama","custom","codingplan","groq","doubao","qwen","minimax","deepseek","kimi","zhipu","gaterouter","siliconflow"];
+export const PROV_ORDER_ZH = ["rsclaw","agnes","qwen","deepseek","doubao","custom","codingplan","minimax","kimi","zhipu","ollama","gaterouter","openrouter","anthropic","openai","gemini","grok","groq","siliconflow"];
+export const PROV_ORDER_EN = ["rsclaw","agnes","anthropic","openai","gemini","grok","openrouter","ollama","custom","codingplan","groq","doubao","qwen","minimax","deepseek","kimi","zhipu","gaterouter","siliconflow"];
 
 function getProviders(lang?: string): ProviderDef[] {
   const isZhOrder = (lang || getLang()) === "cn";
@@ -825,6 +826,10 @@ interface ModelDef {
 export const MODELS: Record<string, ModelDef[]> = {
   rsclaw: [
     { id: "rsclaw-agent-v1", tag: "推荐", tagEn: "Recommended", rec: true },
+  ],
+  agnes: [
+    { id: "agnes-2.0-flash", tag: "免费", tagEn: "Free", rec: true },
+    { id: "agnes-1.5-flash", tag: "", tagEn: "", rec: false },
   ],
   qwen: [
     { id: "qwen3.6-plus", tag: "\u6700\u65B0", tagEn: "Latest", rec: true },

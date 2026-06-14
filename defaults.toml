@@ -23,6 +23,18 @@ base_url   = "https://api.rsclaw.ai/v1/agent"
 api_type   = "rsclaw"
 needs_key  = true
 
+# Agnes AI (Sapiens AI) — OpenAI-compatible chat/completions, plus
+# /v1/images/generations and an async /v1/videos surface. Free tier as of
+# 2026-06. Text speaks standard OpenAI Chat Completions, so api_type is the
+# default openai-completions. See: https://agnes-ai.com/doc
+[[providers]]
+name       = "agnes"
+label      = "Agnes AI"
+env_var    = "AGNES_API_KEY"
+model      = "agnes/agnes-2.0-flash"
+base_url   = "https://apihub.agnes-ai.com/v1"
+needs_key  = true
+
 [[providers]]
 name       = "doubao"
 label      = "Doubao (ByteDance)"
@@ -333,6 +345,12 @@ label       = "Kling (Kuaishou)"
 env_var     = "KLING_ACCESS_KEY"
 model       = "kling-v2-master"
 base_url    = "https://api.klingai.com"
+
+[video_providers.agnes]
+label       = "Agnes Video V2.0 (Sapiens AI)"
+env_var     = "AGNES_API_KEY"
+model       = "agnes-video-v2.0"
+base_url    = "https://apihub.agnes-ai.com"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Skill Registries (used by rsclaw skills install/search)

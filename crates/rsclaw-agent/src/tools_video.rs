@@ -35,7 +35,7 @@ impl super::runtime::AgentRuntime {
         // from `agents.defaults.model.video` or the per-agent handle
         // override. StringOrVec collapses single string + array into the
         // same chain shape.
-        let video_chain: Vec<String> = self
+        let mut video_chain: Vec<String> = self
             .handle
             .config
             .model
@@ -54,6 +54,19 @@ impl super::runtime::AgentRuntime {
             .into_iter()
             .map(|s| s.to_owned())
             .collect();
+
+        // No explicit video model configured? Default to the primary LLM
+        // provider's first-party video model when it has one (agnes →
+        // agnes-video-v2.0, rsclaw → rsclaw-video-v1). Same opt-in-by-
+        // primary-provider rule as the image tool.
+        if video_chain.is_empty()
+            && let Some(def) = self
+                .primary_provider()
+                .as_deref()
+                .and_then(super::tools_image::default_video_model)
+        {
+            video_chain.push(def.to_owned());
+        }
 
         // Cost gate: a single Seedance / MiniMax Hailuo / Kling clip costs
         // 0.1–1+ USD and runs minutes long. Force explicit opt-in via
@@ -92,6 +105,8 @@ impl super::runtime::AgentRuntime {
             let m = model.to_lowercase();
             if m.contains("kling") {
                 "kling"
+            } else if m.contains("agnes") {
+                "agnes"
             } else if m.contains("minimax") || m.contains("hailuo") {
                 "minimax"
             } else if m.starts_with("rsclaw/") || m.contains("rsclaw-video") || m == "rsclaw" {
@@ -230,6 +245,21 @@ impl super::runtime::AgentRuntime {
                         )),
                     }
                 }
+                "agnes" => match resolve_key("agnes", "AGNES_API_KEY") {
+                    Some(key) => rsclaw_jobs::submit_agnes(
+                        &client,
+                        &key,
+                        prompt,
+                        duration,
+                        aspect_ratio,
+                        Some(model_id.as_str()),
+                    )
+                    .await
+                    .map(|id| ("agnes", id)),
+                    None => Err(anyhow!(
+                        "video_gen: no API key for Agnes. Set `model.models.providers.agnes.apiKey` in rsclaw.json5 or export AGNES_API_KEY, then retry — or tell the user the Agnes key is missing."
+                    )),
+                },
                 "rsclaw" => match resolve_key("rsclaw", "RSCLAW_API_KEY") {
                     Some(key) => submit_rsclaw_video(
                         &client,
@@ -351,7 +381,12 @@ async fn submit_rsclaw_video(
     aspect_ratio: &str,
     model_hint: Option<&str>,
 ) -> Result<String> {
-    let model = model_hint.unwrap_or("rsclaw-video-v1");
+    // Chain entries may arrive prefixed (`rsclaw/rsclaw-video-v1`); strip
+    // the `provider/` segment so the upstream `model` field is the bare id.
+    let model = model_hint
+        .map(|m| m.rsplit('/').next().unwrap_or(m))
+        .filter(|m| !m.is_empty() && *m != "rsclaw")
+        .unwrap_or("rsclaw-video-v1");
     let body = json!({
         "model": model,
         "prompt": prompt,

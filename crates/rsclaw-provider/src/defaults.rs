@@ -27,6 +27,7 @@ fn builtin_base_url(provider: &str) -> (&'static str, &'static str) {
             "bearer",
         ),
         "doubao" => ("https://ark.cn-beijing.volces.com/api/v3", "bearer"),
+        "agnes" => ("https://apihub.agnes-ai.com/v1", "bearer"),
         "minimax" => ("https://api.minimaxi.com/v1", "bearer"),
         "kimi" | "moonshot" => ("https://api.moonshot.cn/v1", "bearer"),
         "zhipu" => ("https://open.bigmodel.cn/api/paas/v4", "bearer"),

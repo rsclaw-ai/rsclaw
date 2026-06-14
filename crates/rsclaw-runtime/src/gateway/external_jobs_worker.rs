@@ -334,6 +334,12 @@ impl ExternalJobsWorker {
                     .ok_or_else(|| anyhow!("rsclaw: no API key configured"))?;
                 rsclaw_jobs::poll_rsclaw(&key, &job.external_task_id).await
             }
+            "agnes" => {
+                let key = self
+                    .resolve_provider_key("agnes", "AGNES_API_KEY")
+                    .ok_or_else(|| anyhow!("agnes: no API key configured"))?;
+                rsclaw_jobs::poll_agnes(&self.client, &key, &job.external_task_id).await
+            }
             other => Err(anyhow!("no async polling adapter for provider: {other}")),
         }
     }

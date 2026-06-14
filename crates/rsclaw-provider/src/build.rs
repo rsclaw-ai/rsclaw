@@ -225,6 +225,7 @@ pub fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
     // Auto-register OpenAI-compatible providers from env vars.
     let compat_providers = [
         // --- International ---
+        ("agnes", "https://apihub.agnes-ai.com/v1", "AGNES_API_KEY"),
         ("groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY"),
         (
             "deepseek",

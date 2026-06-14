@@ -365,6 +365,122 @@ pub async fn download_artifact(
 }
 
 // ---------------------------------------------------------------------------
+// Agnes Video V2.0 (Sapiens AI) — async submit + poll
+// ---------------------------------------------------------------------------
+//
+// Submit: POST https://apihub.agnes-ai.com/v1/videos → {video_id, task_id,
+//   status:"queued", ...}. We key off `video_id` (the doc's recommended
+//   retrieval id).
+// Poll:   GET https://apihub.agnes-ai.com/agnesapi?video_id=<VIDEO_ID>.
+//   status ∈ {queued, in_progress, completed, failed}; the finished URL is
+//   surfaced under one of a few field names depending on upstream shape.
+
+const AGNES_BASE: &str = "https://apihub.agnes-ai.com";
+const AGNES_DEFAULT_VIDEO_MODEL: &str = "agnes-video-v2.0";
+
+/// Map an `aspect_ratio` string to a 720p-tier `(width, height)`. Agnes
+/// standardizes off-spec sizes to the nearest tier anyway, so this only
+/// needs to be close.
+fn agnes_video_dims(aspect_ratio: &str) -> (u32, u32) {
+    match aspect_ratio {
+        "9:16" => (720, 1280),
+        "1:1" => (960, 960),
+        "4:3" => (1024, 768),
+        "3:4" => (768, 1024),
+        _ => (1280, 720), // 16:9 default
+    }
+}
+
+/// Submit an Agnes text→video task and return the provider's `video_id`.
+pub async fn submit_agnes(
+    client: &reqwest::Client,
+    api_key: &str,
+    prompt: &str,
+    duration: u64,
+    aspect_ratio: &str,
+    model_override: Option<&str>,
+) -> Result<String> {
+    // Chain entries arrive as `agnes/agnes-video-v2.0`; strip the
+    // `provider/` prefix so the upstream `model` field is the bare id.
+    let model = model_override
+        .map(|m| m.rsplit('/').next().unwrap_or(m))
+        .filter(|m| !m.is_empty() && *m != "agnes")
+        .unwrap_or(AGNES_DEFAULT_VIDEO_MODEL);
+    let (width, height) = agnes_video_dims(aspect_ratio);
+    let frame_rate = 24u64;
+    // num_frames must satisfy 8n+1 and be ≤ 441.
+    let raw_frames = duration.saturating_mul(frame_rate).max(8);
+    let num_frames = (((raw_frames - 1) / 8) * 8 + 1).min(441);
+    let body = json!({
+        "model": model,
+        "prompt": prompt,
+        "width": width,
+        "height": height,
+        "frame_rate": frame_rate,
+        "num_frames": num_frames,
+    });
+    let resp: serde_json::Value = client
+        .post(format!("{AGNES_BASE}/v1/videos"))
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| anyhow!("agnes: submit failed: {e}"))?
+        .json()
+        .await
+        .map_err(|e| anyhow!("agnes: submit parse failed: {e}"))?;
+    // Prefer video_id (recommended retrieval id); fall back to id/task_id.
+    let id = resp["video_id"]
+        .as_str()
+        .or_else(|| resp["id"].as_str())
+        .or_else(|| resp["task_id"].as_str())
+        .ok_or_else(|| anyhow!("agnes: no video_id/task_id in response: {resp}"))?
+        .to_owned();
+    Ok(id)
+}
+
+pub async fn poll_agnes(
+    client: &reqwest::Client,
+    api_key: &str,
+    video_id: &str,
+) -> Result<PollOutcome> {
+    let resp: serde_json::Value = client
+        .get(format!("{AGNES_BASE}/agnesapi"))
+        .query(&[("video_id", video_id)])
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .map_err(|e| anyhow!("agnes: poll failed: {e}"))?
+        .json()
+        .await
+        .map_err(|e| anyhow!("agnes: poll parse failed: {e}"))?;
+    let status = resp["status"].as_str().unwrap_or("unknown");
+    match status {
+        "completed" | "succeeded" => {
+            let url = resp["video_url"]
+                .as_str()
+                .or_else(|| resp["url"].as_str())
+                .or_else(|| resp.pointer("/data/0/url").and_then(|v| v.as_str()))
+                .or_else(|| resp["remixed_from_video_id"].as_str())
+                .filter(|s| s.starts_with("http"))
+                .ok_or_else(|| anyhow!("agnes: no video URL in completed result: {resp}"))?
+                .to_owned();
+            Ok(PollOutcome::Done(url))
+        }
+        "failed" | "cancelled" | "error" => {
+            let msg = resp
+                .pointer("/error/message")
+                .and_then(|v| v.as_str())
+                .or_else(|| resp["error"].as_str())
+                .or_else(|| resp["message"].as_str())
+                .unwrap_or("task failed");
+            Ok(PollOutcome::Failed(format!("{status}: {msg}")))
+        }
+        _ => Ok(PollOutcome::Pending),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // rsclaw (in-fleet `RsclawGenBackend`) — async submit (via
 // `agent::tools_video::submit_rsclaw_video`) + poll here.
 // ---------------------------------------------------------------------------

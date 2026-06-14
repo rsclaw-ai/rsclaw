@@ -65,7 +65,55 @@ async fn save_generated_image_bytes(bytes: &[u8], mime: &str) -> Result<String> 
     Ok(save_path.to_string_lossy().into_owned())
 }
 
+/// Default image-gen model for a primary LLM provider, used only when the
+/// user hasn't configured `agents.defaults.model.image` explicitly. Keeps
+/// the "pick a sane gen model that matches my chat provider" behaviour
+/// scoped to providers that actually ship a first-party image model.
+pub(crate) fn default_image_model(provider: &str) -> Option<&'static str> {
+    match provider {
+        "agnes" => Some("agnes/agnes-image-2.1-flash"),
+        "rsclaw" => Some("rsclaw/rsclaw-image-v1"),
+        _ => None,
+    }
+}
+
+/// Default video-gen model for a primary LLM provider — same opt-in-by-
+/// primary-provider rule as [`default_image_model`].
+pub(crate) fn default_video_model(provider: &str) -> Option<&'static str> {
+    match provider {
+        "agnes" => Some("agnes/agnes-video-v2.0"),
+        "rsclaw" => Some("rsclaw/rsclaw-video-v1"),
+        _ => None,
+    }
+}
+
 impl super::runtime::AgentRuntime {
+    /// Resolve the primary LLM provider name (e.g. `"agnes"`, `"rsclaw"`)
+    /// from the per-agent handle override, falling back to
+    /// `agents.defaults.model.primary`. Used to pick a default image/video
+    /// gen model when the user left those chains empty.
+    pub(crate) fn primary_provider(&self) -> Option<String> {
+        let head = self
+            .handle
+            .config
+            .model
+            .as_ref()
+            .and_then(|m| m.primary_head())
+            .or_else(|| {
+                self.config
+                    .agents
+                    .defaults
+                    .model
+                    .as_ref()
+                    .and_then(|m| m.primary_head())
+            })?;
+        Some(
+            rsclaw_provider::registry::ProviderRegistry::parse_model(head)
+                .0
+                .to_owned(),
+        )
+    }
+
     pub(crate) async fn tool_image(&self, args: Value) -> Result<Value> {
         let prompt = args["prompt"]
             .as_str()
@@ -79,7 +127,7 @@ impl super::runtime::AgentRuntime {
         // means the provider charged but didn't deliver — surface the
         // error rather than double-bill (matches video's submit-only
         // rule for the same reason).
-        let image_chain: Vec<String> = self
+        let mut image_chain: Vec<String> = self
             .handle
             .config
             .model
@@ -98,6 +146,17 @@ impl super::runtime::AgentRuntime {
             .into_iter()
             .map(|s| s.to_owned())
             .collect();
+
+        // No explicit image model configured? If the primary LLM provider
+        // ships a first-party image model (agnes → agnes-image-2.1-flash,
+        // rsclaw → rsclaw-image-v1), default to it instead of erroring.
+        // The primary provider's key is already configured, so this stays
+        // within the user's chosen vendor — no surprise cross-billing.
+        if image_chain.is_empty()
+            && let Some(def) = self.primary_provider().as_deref().and_then(default_image_model)
+        {
+            image_chain.push(def.to_owned());
+        }
 
         // Cost gate: image generation hits a paid third-party API on every
         // call (doubao seedream / dall-e / qwen / minimax / gemini imagen).
@@ -230,7 +289,7 @@ impl super::runtime::AgentRuntime {
         // Providers with image generation support. The explicit image model is
         // the cost gate: do not silently fall back to another paid provider
         // just because an API key happens to be configured.
-        let image_providers = ["doubao", "bytedance", "openai", "qwen", "minimax", "gemini", "rsclaw"];
+        let image_providers = ["doubao", "bytedance", "openai", "qwen", "minimax", "gemini", "rsclaw", "agnes"];
         let (img_url, img_key, img_prov, img_env_var) = if image_providers.contains(&prov_name) {
             // rsclaw's LLM default in defaults.toml ends in `/v1/agent`;
             // the gen surface lives off the host root. `gen_host_base`
@@ -251,6 +310,7 @@ impl super::runtime::AgentRuntime {
                 "gemini" => Some("GEMINI_API_KEY"),
                 "openai" => Some("OPENAI_API_KEY"),
                 "rsclaw" => Some("RSCLAW_API_KEY"),
+                "agnes" => Some("AGNES_API_KEY"),
                 _ => None,
             };
             let env_key = env_var.and_then(|v| std::env::var(v).ok());
@@ -292,6 +352,7 @@ impl super::runtime::AgentRuntime {
                 "minimax" => "image-01",
                 "gemini" => "gemini-3-pro-image-preview",
                 "rsclaw" => "rsclaw-image-v1",
+                "agnes" => "agnes-image-2.1-flash",
                 _ => "gpt-image-2",
             });
 
@@ -323,6 +384,7 @@ impl super::runtime::AgentRuntime {
         let is_qwen = img_prov == "qwen";
         let is_minimax = img_prov == "minimax";
         let is_gemini = img_prov == "gemini";
+        let is_agnes = img_prov == "agnes";
         // Read response as raw bytes first, then parse — splitting the
         // two lets us tell "provider rejected before billing" (non-2xx,
         // parse-can-be-anything) from "provider charged but didn't
@@ -454,6 +516,42 @@ impl super::runtime::AgentRuntime {
                 .bytes()
                 .await
                 .map_err(|e| anyhow!("image: gemini read body: {e}"))?;
+            let body = parse_response_body(st, &body_bytes)?;
+            (st, body)
+        } else if is_agnes {
+            // Agnes Image 2.0/2.1 Flash: OAI-shaped /v1/images/generations,
+            // but with two quirks from the official docs:
+            //   1. `response_format` MUST live under `extra_body` — placing
+            //      it at the top level returns a 400.
+            //   2. image-to-image input goes in `extra_body.image` (array of
+            //      public URLs or `data:image/...;base64,...` Data URIs); no
+            //      `tags: ["img2img"]` needed.
+            // Output URL is at data[0].url (same parser as the OAI block).
+            let url = format!("{}/images/generations", img_url.trim_end_matches('/'));
+            let mut extra = json!({ "response_format": "url" });
+            // Pass through optional input images for image-to-image / multi-image
+            // composition when the caller supplies them.
+            if let Some(imgs) = args.get("image").and_then(|v| v.as_array()) {
+                extra["image"] = json!(imgs);
+            }
+            let body = json!({
+                "model": image_model,
+                "prompt": prompt,
+                "size": size,
+                "extra_body": extra,
+            });
+            let resp = client
+                .post(&url)
+                .header("Authorization", format!("Bearer {api_key}"))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| anyhow!("image: agnes request failed: {e}"))?;
+            let st = resp.status();
+            let body_bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| anyhow!("image: agnes read body: {e}"))?;
             let body = parse_response_body(st, &body_bytes)?;
             (st, body)
         } else {
