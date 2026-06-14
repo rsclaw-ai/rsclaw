@@ -1,13 +1,13 @@
 use anyhow::Result;
 
-use crate::config;
+
 
 /// Detect the active config file and parse it as a JSON value.
 /// Note: write-back via `serde_json::to_string_pretty` converts JSON5 to
 /// standard JSON (losing comments and trailing commas). Users should use
 /// env-var references instead of comments for important annotations.
 pub fn load_config_json() -> Result<(std::path::PathBuf, serde_json::Value)> {
-    let path = config::loader::detect_config_path()
+    let path = crate::loader::detect_config_path()
         .ok_or_else(|| anyhow::anyhow!("no config file found"))?;
     let raw = std::fs::read_to_string(&path)?;
     let val: serde_json::Value = json5::from_str(&raw)?;

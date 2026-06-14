@@ -9531,7 +9531,7 @@ fn format_tool_result(val: &serde_json::Value) -> String {
 /// Write a dot-path value to the config file (e.g.
 /// "tools.upload.max_file_size").
 fn write_config_value(dot_path: &str, value: serde_json::Value) -> anyhow::Result<()> {
-    use crate::cmd::config_json::{load_config_json, set_nested_value};
+    use rsclaw_config::config_json::{load_config_json, set_nested_value};
 
     let (path, mut val) = load_config_json()?;
 

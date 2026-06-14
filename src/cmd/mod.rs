@@ -7,7 +7,7 @@ pub mod browser;
 pub mod channels;
 pub mod completion;
 pub mod config;
-pub mod config_json;
+pub use rsclaw_config::config_json;
 pub mod cron;
 pub mod daemon;
 pub mod dashboard;
