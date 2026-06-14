@@ -63,7 +63,6 @@
 )]
 
 pub mod a2a;
-pub mod agent;
 pub mod cmd;
 pub mod cron;
 pub mod gateway;
@@ -73,6 +72,7 @@ pub mod ws;
 
 // Extracted base crates — re-exported under their historical module paths so
 // in-crate `crate::i18n::` / `crate::util::` etc. still resolve during the split.
+pub use rsclaw_agent as agent;
 pub use rsclaw_config as config;
 pub use rsclaw_artifact as artifact;
 pub use rsclaw_astock as astock;

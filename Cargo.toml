@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Extracted workspace crates (crate-split, feat/crate-split)
+rsclaw-agent = { path = "crates/rsclaw-agent" }
 rsclaw-types = { path = "crates/rsclaw-types" }
 rsclaw-a2a-types = { path = "crates/rsclaw-a2a-types" }
 rsclaw-config = { path = "crates/rsclaw-config" }

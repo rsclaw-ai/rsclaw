@@ -1,0 +1,70 @@
+[package]
+name = "rsclaw-agent"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "rsclaw_agent"
+path = "src/lib.rs"
+
+[dependencies]
+# Externals (versions mirrored from the root workspace Cargo.toml)
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+futures = "0.3"
+regex = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
+reqwest = { version = "0.12", features = ["json", "stream", "multipart", "blocking", "rustls-tls-webpki-roots-no-provider", "socks"], default-features = false }
+urlencoding = "2"
+tempfile = "3"
+moka = { version = "0.12", features = ["future"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+sha2 = "0.10"
+ignore = "0.4"
+glob = "0.3.3"
+globset = "0.4"
+toml = "1"
+rand = "0.9"
+json5 = "0.4"
+include_dir = "0.7"
+lol_html = "1.2"
+encoding_rs = "0.8.35"
+anycli = "0.2"
+fs2 = "0.4.3"
+dirs-next = "2"
+which = "7"
+
+# Extracted workspace crates
+rsclaw-types = { path = "../rsclaw-types" }
+rsclaw-a2a-types = { path = "../rsclaw-a2a-types" }
+rsclaw-config = { path = "../rsclaw-config" }
+rsclaw-provider = { path = "../rsclaw-provider" }
+rsclaw-channel = { path = "../rsclaw-channel" }
+rsclaw-skill = { path = "../rsclaw-skill" }
+rsclaw-astock = { path = "../rsclaw-astock" }
+rsclaw-browser = { path = "../rsclaw-browser" }
+rsclaw-kb = { path = "../rsclaw-kb" }
+rsclaw-plugin = { path = "../rsclaw-plugin" }
+rsclaw-artifact = { path = "../rsclaw-artifact" }
+rsclaw-computer = { path = "../rsclaw-computer" }
+rsclaw-mcp = { path = "../rsclaw-mcp" }
+rsclaw-memory = { path = "../rsclaw-memory" }
+rsclaw-evolution = { path = "../rsclaw-evolution" }
+rsclaw-cap = { path = "../rsclaw-cap" }
+rsclaw-cron = { path = "../rsclaw-cron" }
+rsclaw-tools = { path = "../rsclaw-tools" }
+rsclaw-util = { path = "../rsclaw-util" }
+rsclaw-i18n = { path = "../rsclaw-i18n" }
+rsclaw-events = { path = "../rsclaw-events" }
+rsclaw-platform = { path = "../rsclaw-platform" }
+rsclaw-store = { path = "../rsclaw-store" }
+rsclaw-doc = { path = "../rsclaw-doc" }
+rsclaw-jobs = { path = "../rsclaw-jobs" }
