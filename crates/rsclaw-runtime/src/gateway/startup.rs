@@ -146,7 +146,19 @@ fn enrich_process_path() {
     if prefix.is_empty() {
         return;
     }
-    prefix.push(current);
+    // Append the inherited PATH entry-by-entry, then dedup the whole list
+    // preserving first occurrence (which preserves priority order). The
+    // inherited PATH can already contain duplicates — e.g. a launcher that
+    // double-adds a plugin bin dir, as Claude Code does with
+    // rust-analyzer-lsp — and pushing `current` verbatim would propagate
+    // those dupes into every subprocess's PATH.
+    for entry in current.split(sep) {
+        if !entry.is_empty() {
+            prefix.push(entry.to_string());
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    prefix.retain(|p| seen.insert(p.clone()));
     let joined = prefix.join(&sep.to_string());
     // SAFETY: called once at startup before any worker thread spawns a child.
     unsafe {
