@@ -8353,6 +8353,43 @@ impl AgentRuntime {
                             result_text = cleaned.to_string();
                         }
                     }
+
+                    // Audio artifacts: any tool returning an `audio_file` /
+                    // `audio_path` (audio_gen music/voice, tts) → auto-attach
+                    // as an audio file. Mirrors the image auto-forward but for
+                    // sound, so synchronous audio bytes reach every channel.
+                    if let Some(audio_path) = v
+                        .get("audio_file")
+                        .and_then(|p| p.as_str())
+                        .or_else(|| v.get("audio_path").and_then(|p| p.as_str()))
+                    {
+                        let pb = std::path::PathBuf::from(expand_tilde(audio_path));
+                        if pb.exists() {
+                            let pb_str = pb.to_string_lossy().to_string();
+                            if !tool_files.iter().any(|(_, _, p)| p == &pb_str) {
+                                let lower = pb_str.to_lowercase();
+                                let mime = if lower.ends_with(".mp3") {
+                                    "audio/mpeg"
+                                } else if lower.ends_with(".wav") {
+                                    "audio/wav"
+                                } else if lower.ends_with(".flac") {
+                                    "audio/flac"
+                                } else if lower.ends_with(".ogg") || lower.ends_with(".opus") {
+                                    "audio/ogg"
+                                } else if lower.ends_with(".m4a") || lower.ends_with(".aac") {
+                                    "audio/mp4"
+                                } else {
+                                    "audio/mpeg"
+                                };
+                                let filename = pb
+                                    .file_name()
+                                    .map(|f| f.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "audio".to_string());
+                                tool_files.push((filename, mime.to_owned(), pb_str.clone()));
+                                tracing::info!(path = %pb_str, "auto-sending audio file as attachment");
+                            }
+                        }
+                    }
                 }
 
                 // Cap or compress tool result for session storage.
@@ -8852,6 +8889,9 @@ impl AgentRuntime {
             "image_gen" | "image" => return self.tool_image(args).await,
             "ocr" => return self.tool_ocr(args).await,
             "video_gen" | "video" => return self.tool_video(args, ctx).await,
+            "avatar_gen" | "avatar" => return self.tool_avatar_gen(args, ctx).await,
+            "mv_gen" | "mv" => return self.tool_mv_gen(args, ctx).await,
+            "audio_gen" => return self.tool_audio_gen(args).await,
             "pdf" => return self.tool_pdf(args).await,
             "text_to_voice" | "text_to_speech" | "tts" => return self.tool_tts(args).await,
             "send_message" | "message" => return self.tool_message(args).await,

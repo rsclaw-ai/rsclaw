@@ -340,8 +340,28 @@ impl ExternalJobsWorker {
                     .ok_or_else(|| anyhow!("agnes: no API key configured"))?;
                 rsclaw_jobs::poll_agnes(&self.client, &key, &job.external_task_id).await
             }
+            "openai" => {
+                let key = self
+                    .resolve_provider_key("openai", "OPENAI_API_KEY")
+                    .ok_or_else(|| anyhow!("openai: no API key configured"))?;
+                let base = self.resolve_provider_base_url("openai");
+                rsclaw_jobs::poll_openai_video(&self.client, &base, &key, &job.external_task_id)
+                    .await
+            }
             other => Err(anyhow!("no async polling adapter for provider: {other}")),
         }
+    }
+
+    /// Resolve a provider's configured `base_url`, falling back to the builtin
+    /// default for that provider (e.g. openai → https://api.openai.com/v1).
+    fn resolve_provider_base_url(&self, provider: &str) -> String {
+        self.config
+            .model
+            .models
+            .as_ref()
+            .and_then(|m| m.providers.get(provider))
+            .and_then(|p| p.base_url.clone())
+            .unwrap_or_else(|| rsclaw_provider::defaults::resolve_base_url(provider).0)
     }
 
     /// Resolve a single-bearer-token provider key from rsclaw.json5

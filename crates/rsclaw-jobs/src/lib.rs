@@ -582,6 +582,116 @@ pub async fn poll_agnes(
 }
 
 // ---------------------------------------------------------------------------
+// OpenAI-compatible video (Sora-2 shape) — async submit + poll, configurable
+// base_url. Defaults to https://api.openai.com/v1 but any OAI-compatible
+// video gateway works by setting `models.providers.openai.base_url`. Mirrors
+// the image side's `custom_oai` baseUrl passthrough.
+// ---------------------------------------------------------------------------
+
+const OPENAI_DEFAULT_VIDEO_MODEL: &str = "sora-2";
+
+fn openai_video_size(aspect_ratio: &str) -> &'static str {
+    match aspect_ratio {
+        "9:16" => "720x1280",
+        "1:1" => "1024x1024",
+        _ => "1280x720",
+    }
+}
+
+/// Submit an OpenAI-compatible (Sora-2 shape) text→video / image→video task
+/// and return the provider's `id`. `base_url` is the provider's configured
+/// endpoint (already including the `/v1` suffix for stock OpenAI); we post to
+/// `{base}/videos`. Each `images` entry is a public URL or a
+/// `data:image/...;base64,...` Data URI; the first frame is forwarded as
+/// `input_reference` (OAI) — gateways that don't recognise it ignore it.
+pub async fn submit_openai_video(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    prompt: &str,
+    duration: u64,
+    aspect_ratio: &str,
+    model_override: Option<&str>,
+    images: &[String],
+) -> Result<String> {
+    let model = model_override
+        .map(|m| m.rsplit('/').next().unwrap_or(m))
+        .filter(|m| !m.is_empty() && *m != "openai")
+        .unwrap_or(OPENAI_DEFAULT_VIDEO_MODEL);
+    let mut body = json!({
+        "model": model,
+        "prompt": prompt,
+        "seconds": duration,
+        "size": openai_video_size(aspect_ratio),
+    });
+    if let Some(first) = images.first() {
+        body["input_reference"] = json!(first);
+    }
+    let url = format!("{}/videos", base_url.trim_end_matches('/'));
+    let resp: serde_json::Value = client
+        .post(url)
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| anyhow!("openai-video: submit failed: {e}"))?
+        .json()
+        .await
+        .map_err(|e| anyhow!("openai-video: submit parse failed: {e}"))?;
+    let id = resp["id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("openai-video: no id in response: {resp}"))?
+        .to_owned();
+    Ok(id)
+}
+
+pub async fn poll_openai_video(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    id: &str,
+) -> Result<PollOutcome> {
+    let base = base_url.trim_end_matches('/');
+    let resp: serde_json::Value = client
+        .get(format!("{base}/videos/{id}"))
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .map_err(|e| anyhow!("openai-video: poll failed: {e}"))?
+        .json()
+        .await
+        .map_err(|e| anyhow!("openai-video: poll parse failed: {e}"))?;
+    let status = resp["status"].as_str().unwrap_or("unknown");
+    match status {
+        "completed" | "succeeded" => {
+            // Prefer an explicit URL in the status body (what OAI-compatible
+            // gateways return). Stock OpenAI serves bytes at `/videos/{id}/content`
+            // behind auth instead — fall back to that URL last so at least the
+            // gateway case delivers.
+            let url = resp["video_url"]
+                .as_str()
+                .or_else(|| resp.pointer("/data/0/url").and_then(|v| v.as_str()))
+                .or_else(|| resp["url"].as_str())
+                .or_else(|| resp.pointer("/output/url").and_then(|v| v.as_str()))
+                .filter(|s| s.starts_with("http"))
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{base}/videos/{id}/content"));
+            Ok(PollOutcome::Done(url))
+        }
+        "failed" | "cancelled" | "error" => {
+            let msg = resp
+                .pointer("/error/message")
+                .and_then(|v| v.as_str())
+                .or_else(|| resp["error"].as_str())
+                .or_else(|| resp["message"].as_str())
+                .unwrap_or("task failed");
+            Ok(PollOutcome::Failed(format!("{status}: {msg}")))
+        }
+        _ => Ok(PollOutcome::Pending),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // rsclaw (in-fleet `RsclawGenBackend`) — async submit (via
 // `agent::tools_video::submit_rsclaw_video`) + poll here.
 // ---------------------------------------------------------------------------

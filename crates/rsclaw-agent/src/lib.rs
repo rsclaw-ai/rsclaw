@@ -37,6 +37,7 @@ pub mod tools_artifact;
 pub mod tools_builder;
 pub(crate) mod tools_cap;
 pub mod tools_computer;
+pub mod tools_audio;
 pub mod tools_cron;
 pub mod tools_file;
 pub mod tools_image;

@@ -370,7 +370,10 @@ impl super::runtime::AgentRuntime {
         // Providers with image generation support. The explicit image model is
         // the cost gate: do not silently fall back to another paid provider
         // just because an API key happens to be configured.
-        let image_providers = ["doubao", "bytedance", "openai", "qwen", "minimax", "gemini", "rsclaw", "agnes"];
+        // Narrow external set: doubao (强), openai/gpt-image (强, custom baseUrl),
+        // rsclaw (自家 gen), agnes (免费). qwen/minimax/gemini are no longer
+        // routed from core — the dead inline branches below stay unreachable.
+        let image_providers = ["doubao", "openai", "rsclaw", "agnes"];
         // A provider configured with an explicit base_url is treated as an
         // OpenAI-compatible image endpoint even if it's not a known name —
         // this is how e.g. gpt-image-2 (or any /images/generations gateway)
@@ -407,7 +410,7 @@ impl super::runtime::AgentRuntime {
         } else {
             return Ok(json!({
                 "error": format!(
-                    "Configured image model provider `{prov_name}` does not support image generation. Configure agents.defaults.model.image with one of: doubao, qwen, minimax, gemini, openai, rsclaw."
+                    "Configured image model provider `{prov_name}` does not support image generation. Configure agents.defaults.model.image with one of: doubao, openai, rsclaw, agnes."
                 )
             }));
         };

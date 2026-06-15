@@ -247,6 +247,9 @@ pub(crate) const COLD_TOOLS: &[&str] = &[
     "cap_bind_sticky",
     "cap_unbind_sticky",
     "video_gen",
+    "avatar_gen",
+    "mv_gen",
+    "audio_gen",
     "create_docx",
     "create_pdf",
     "create_pptx",
@@ -396,6 +399,9 @@ pub fn toolset_allowed_names(
         "image_gen",
         "ocr",
         "video_gen",
+        "avatar_gen",
+        "mv_gen",
+        "audio_gen",
         "channel",
         "cron",
         "computer_use",
@@ -1713,10 +1719,68 @@ pub fn build_tool_list(
                 "prompt":       {"type": "string", "description": "Video description. Use the user's original language and wording."},
                 "duration":     {"type": "integer", "description": "Duration in seconds (default: 5)", "default": 5},
                 "aspect_ratio": {"type": "string", "description": "Aspect ratio: 16:9, 9:16, 1:1 (default: 16:9)", "default": "16:9"},
-                "image":        {"type": ["string", "array"], "items": {"type": "string"}, "description": "Optional reference image(s) for image-to-video (agnes, doubao, minimax, kling). Each entry: a LOCAL FILE PATH (e.g. the path returned by image_gen — auto-encoded to base64), a public https URL, or a data:image/...;base64,... URI. ONE image = first frame (animate this image). TWO images = first + last frame (interpolate). THREE+ = reference images (doubao multimodal). minimax uses the first frame only."},
-                "model":        {"type": "string", "description": "Video model to use, e.g. seedance, minimax, kling (optional, uses configured default)"}
+                "image":        {"type": ["string", "array"], "items": {"type": "string"}, "description": "Optional reference image(s) for image-to-video (agnes, doubao, rsclaw). Each entry: a LOCAL FILE PATH (e.g. the path returned by image_gen — auto-encoded to base64), a public https URL, or a data:image/...;base64,... URI. ONE image = first frame (animate this image). TWO images = first + last frame (interpolate). THREE+ = reference images (doubao multimodal)."},
+                "model":        {"type": "string", "description": "Video model to use, e.g. doubao seedance, agnes, rsclaw, sora-2 (optional, uses configured default)"}
             },
             "required": ["prompt"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "avatar_gen".to_owned(),
+        description: "Generate a talking-avatar / 数字人 video via the rsclaw gen service: a face \
+            portrait + a speech audio clip → a lip-synced video. Use when the user wants a digital \
+            human / virtual presenter / 数字人口播 from a photo and a voice clip. There is NO text \
+            prompt — supply the speech as AUDIO. The finished video is delivered automatically.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "image": {"type": "string", "description": "REQUIRED: face portrait — a LOCAL FILE PATH (auto-encoded to base64), a public https URL, or a data:image/...;base64,... URI."},
+                "audio": {"type": "string", "description": "REQUIRED: speech audio to lip-sync — a LOCAL FILE PATH (wav/mp3/flac/m4a, auto-encoded to base64), a public https URL, or a data:audio/...;base64,... URI."},
+                "model": {"type": "string", "description": "Optional rsclaw gen avatar model id (uses configured default when empty)."}
+            },
+            "required": ["image", "audio"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "mv_gen".to_owned(),
+        description: "Generate a music-video (MV) via the rsclaw gen service (lyrics + reference \
+            image → music video). Use when the user wants an MV / music-driven clip. The finished \
+            video is delivered automatically. Pass the user's original wording as-is.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "Style / theme description for the MV. Use the user's original language."},
+                "lyrics": {"type": "string", "description": "Optional song lyrics to drive the MV / vocals."},
+                "image":  {"type": "string", "description": "Optional reference image: a LOCAL FILE PATH (auto-encoded to base64), a public https URL, or a data:image/...;base64,... URI."},
+                "model":  {"type": "string", "description": "Optional rsclaw gen mv model id (uses configured default when empty)."}
+            },
+            "required": ["prompt"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "audio_gen".to_owned(),
+        description: "Generate AUDIO via the rsclaw gen service. Two modes via `kind`: \
+            `music` (style/lyrics → a song) and `voice` (text → speech, with optional one-shot \
+            voice cloning from a reference clip). Returns the finished audio as an attachment. \
+            Use for: 生成歌曲/音乐/BGM (kind=music), or 文字转语音/配音/语音克隆 (kind=voice). \
+            Pass the user's original wording as-is.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "kind":   {"type": "string", "enum": ["music", "voice"], "description": "music = song from a style/lyrics; voice = text-to-speech / voice clone.", "default": "music"},
+                "prompt": {"type": "string", "description": "music ONLY: style description (e.g. 'upbeat lo-fi hip hop'). Required for kind=music."},
+                "lyrics": {"type": "string", "description": "music ONLY: optional song lyrics (with vocals)."},
+                "duration": {"type": "integer", "description": "music ONLY: target length in seconds."},
+                "text":   {"type": "string", "description": "voice ONLY: the words to speak. Required for kind=voice."},
+                "voice":  {"type": "string", "description": "voice ONLY: a preset voice name or a natural-language voice description (e.g. '温柔女声')."},
+                "instructions": {"type": "string", "description": "voice ONLY: optional delivery/style direction (e.g. '低沉磁性, 语速偏慢')."},
+                "speed":  {"type": "number", "description": "voice ONLY: speaking speed 0.25-4.0 (default 1.0)."},
+                "reference_audio": {"type": "string", "description": "voice ONLY: optional clone reference — a LOCAL FILE PATH (auto-encoded), an https URL, or a data:audio/...;base64,... URI."},
+                "reference_text":  {"type": "string", "description": "voice ONLY: transcript of reference_audio, improves clone fidelity."},
+                "response_format": {"type": "string", "description": "Output container: mp3 (default) | wav | flac.", "default": "mp3"},
+                "model":  {"type": "string", "description": "Optional rsclaw gen model id (uses configured default per kind when empty)."}
+            },
+            "required": []
         }),
     });
     tools.push(ToolDef {
