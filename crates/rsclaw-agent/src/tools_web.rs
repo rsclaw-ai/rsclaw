@@ -761,44 +761,95 @@ impl AgentRuntime {
                 chunk_src.push((title.clone(), url.clone()));
             }
         }
+        // Bound total chunks handed to the embedder (the remote path embeds
+        // serially; the local path is CPU-bound). Keep earlier, higher-ranked
+        // pages' chunks.
+        if chunk_text.len() > DEEP_MAX_CHUNKS {
+            chunk_text.truncate(DEEP_MAX_CHUNKS);
+            chunk_src.truncate(DEEP_MAX_CHUNKS);
+        }
         if chunk_text.is_empty() {
             return Ok(raw);
         }
 
-        // 4. Embed query + chunks, cosine recall to top-K.
-        let embedder = deep_embedder();
-        let mut batch: Vec<String> = Vec::with_capacity(chunk_text.len() + 1);
+        // 4. Embed query + chunks OFF the async worker. The local candle
+        //    embedder is synchronous + CPU-bound and the remote one drives
+        //    blocking reqwest; on the single-worker runtime an inline call
+        //    head-of-line-blocks every other session, so wrap it in
+        //    spawn_blocking (mirrors tools_artifact.rs). Resolve the embedder
+        //    inside the closure so a first-time local-model load also stays
+        //    off the worker.
+        let n = chunk_text.len();
+        let mut batch: Vec<String> = Vec::with_capacity(n + 1);
         batch.push(query.to_owned());
         batch.extend(chunk_text.iter().cloned());
-        let mut order: Vec<usize> = (0..chunk_text.len()).collect();
-        match embedder.embed_batch(&batch) {
-            Ok(vecs) if vecs.len() == chunk_text.len() + 1 => {
-                let qv = &vecs[0];
-                let mut scored: Vec<(usize, f32)> = (0..chunk_text.len())
-                    .map(|i| (i, rsclaw_kb::search::cosine_sim(qv, &vecs[i + 1])))
-                    .collect();
-                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                order = scored.into_iter().map(|(i, _)| i).collect();
-            }
-            Ok(_) => warn!("deep_web_search: embed batch size mismatch; using fetch order"),
-            Err(e) => warn!(error = %e, "deep_web_search: embed failed; using fetch order"),
-        }
-        order.truncate(DEEP_COSINE_TOPK.min(chunk_text.len()));
+        let embed_res =
+            tokio::task::spawn_blocking(move || deep_embedder().embed_batch(&batch)).await;
 
-        // 5. Optional cross-encoder rerank over the cosine top-K.
+        let mut order: Vec<usize> = (0..n).collect();
+        let mut embed_ok = false;
+        match embed_res {
+            Ok(Ok(vecs)) if vecs.len() == n + 1 => {
+                let qv = &vecs[0];
+                let qnorm: f32 = qv.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if qnorm > 1e-6 {
+                    let mut scored: Vec<(usize, f32)> = (0..n)
+                        .map(|i| (i, rsclaw_kb::search::cosine_sim(qv, &vecs[i + 1])))
+                        .collect();
+                    // Degenerate guard: a backend that returns zero vectors on
+                    // failure makes every score collapse to one value — the
+                    // embeddings are useless, so don't trust the cosine order.
+                    let max = scored.iter().map(|s| s.1).fold(f32::MIN, f32::max);
+                    let min = scored.iter().map(|s| s.1).fold(f32::MAX, f32::min);
+                    if max - min > 1e-4 {
+                        scored.sort_by(|a, b| {
+                            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        order = scored.into_iter().map(|(i, _)| i).collect();
+                        embed_ok = true;
+                    }
+                }
+            }
+            Ok(Ok(_)) => warn!("deep_web_search: embed batch size mismatch"),
+            Ok(Err(e)) => warn!(error = %e, "deep_web_search: embed failed"),
+            Err(e) => warn!(error = %e, "deep_web_search: embed task join failed"),
+        }
+        if !embed_ok {
+            warn!("deep_web_search: embeddings unusable; leaning on rerank or snippets");
+        }
+        order.truncate(DEEP_COSINE_TOPK.min(n));
+
+        // 5. Optional cross-encoder rerank (also off-worker). The reranker
+        //    ranks independently of the embeddings, so it still works when
+        //    they failed. But with neither usable embeddings NOR a reranker,
+        //    a random chunk order is worse than snippets — fall back.
+        let reranker = self.resolve_web_reranker();
+        if !embed_ok && reranker.is_none() {
+            return Ok(raw);
+        }
         let mut final_order = order.clone();
-        if let Some(reranker) = self.resolve_web_reranker() {
-            let docs: Vec<&str> = order.iter().map(|&i| chunk_text[i].as_str()).collect();
-            match reranker.rerank(query, &docs) {
-                Ok(scores) => {
+        if let Some(reranker) = reranker {
+            let q = query.to_owned();
+            let docs: Vec<String> = order.iter().map(|&i| chunk_text[i].clone()).collect();
+            let order_for_rerank = order.clone();
+            let rr = tokio::task::spawn_blocking(move || {
+                let refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
+                reranker.rerank(&q, &refs)
+            })
+            .await;
+            match rr {
+                Ok(Ok(scores)) => {
                     let mut z: Vec<(usize, f32)> =
-                        order.iter().copied().zip(scores).collect();
-                    z.sort_by(|a, b| {
-                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                    });
+                        order_for_rerank.into_iter().zip(scores).collect();
+                    z.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                     final_order = z.into_iter().map(|(i, _)| i).collect();
                 }
-                Err(e) => warn!(error = %e, "deep_web_search: rerank failed; using cosine order"),
+                Ok(Err(e)) => {
+                    warn!(error = %e, "deep_web_search: rerank failed; using cosine order")
+                }
+                Err(e) => {
+                    warn!(error = %e, "deep_web_search: rerank task join failed; using cosine order")
+                }
             }
         }
         final_order.truncate(DEEP_RETURN_CHUNKS);
@@ -821,13 +872,22 @@ impl AgentRuntime {
         Ok(json!({ "mode": "deep", "query": query, "results": results }))
     }
 
-    /// Resolve the reranker for deep web search, per the rsclaw-protocol
-    /// default policy: explicit `kb.rerank` wins; else if the primary model
-    /// is `rsclaw/` default to the fleet `rsclaw-reranker-v1`; else `None`
-    /// (caller keeps the local cosine order from `bge-small-zh`).
+    /// Resolve the reranker for deep web search.
+    ///
+    /// Policy: if a `kb.rerank` block is configured at all, honor it exactly —
+    /// `from_config()` Some → use it; None (disabled via `enabled:false`, or
+    /// empty base_url + non-rsclaw model) → the user opted out, so no remote
+    /// rerank (caller keeps the local cosine order). ONLY when no `kb.rerank`
+    /// block exists do we apply the rsclaw-protocol default: a `rsclaw/`
+    /// primary defaults to the fleet `rsclaw-reranker-v1`; otherwise `None`.
     fn resolve_web_reranker(&self) -> Option<std::sync::Arc<rsclaw_kb::rerank::KbReranker>> {
-        if let Some(r) = rsclaw_kb::rerank::KbReranker::from_config() {
-            return Some(r);
+        let has_rerank_block = rsclaw_config::load()
+            .ok()
+            .and_then(|c| c.raw.kb.as_ref().and_then(|kb| kb.rerank.clone()))
+            .is_some();
+        if has_rerank_block {
+            // Respect the explicit config (Some = use it, None = opted out).
+            return rsclaw_kb::rerank::KbReranker::from_config();
         }
         if self.primary_is_rsclaw() {
             return Some(rsclaw_kb::rerank::KbReranker::rsclaw_default());
@@ -3093,13 +3153,20 @@ const DEEP_PER_FETCH_TIMEOUT_MS: u64 = 3000;
 const DEEP_COSINE_TOPK: usize = 12;
 /// Chunks returned to the model after rerank.
 const DEEP_RETURN_CHUNKS: usize = 5;
+/// Hard cap on total chunks embedded per deep search (across all pages) —
+/// bounds embed cost on the serial remote path and the CPU-bound local one.
+const DEEP_MAX_CHUNKS: usize = 60;
 const DEEP_FETCH_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-/// Process-wide cached embedder for deep web search. Reuses the KB's
-/// configured embedder (local `bge-small-zh` by default, or the remote
-/// fleet embedder if `kb.embed` points there) so we never reload a local
-/// model per query.
+/// Embedder for deep web search. Reuses the KB service's already-loaded
+/// embedder when the service is up (so we never load a *second* copy of the
+/// local `bge-small-zh` model); otherwise resolves once and caches it
+/// process-wide. Call from inside `spawn_blocking` — a first-time local
+/// model load is CPU/IO-bound.
 fn deep_embedder() -> std::sync::Arc<dyn rsclaw_kb::embedder::KbEmbedder> {
+    if let Some(svc) = rsclaw_kb::global_service() {
+        return svc.embedder();
+    }
     static EMB: std::sync::OnceLock<std::sync::Arc<dyn rsclaw_kb::embedder::KbEmbedder>> =
         std::sync::OnceLock::new();
     EMB.get_or_init(|| {
