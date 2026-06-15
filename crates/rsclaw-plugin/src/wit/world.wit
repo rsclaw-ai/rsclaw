@@ -127,6 +127,8 @@ interface host-background {
     /// Subscribe to an SSE stream.
     sse-subscribe: func(name: string, url: string, headers-json: string, resume-key: string)
         -> result<string, string>;
+    /// Inspect a plugin SSE subscription scoped to the current invocation context.
+    sse-status: func(name: string) -> result<string, string>;
     /// Push an outbound message to a concrete channel/peer.
     push-outbound: func(channel: string, peer-id: string, message-json: string) -> result<string, string>;
     /// Submit a synthetic user turn to the agent queue.

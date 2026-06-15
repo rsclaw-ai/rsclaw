@@ -1071,6 +1071,15 @@ impl rsclaw::plugin::host_background::Host for HostState {
         .await)
     }
 
+    async fn sse_status(&mut self, name: String) -> HostTrapResult<Result<String, String>> {
+        Ok(crate::sse_status(
+            self.plugin_name.clone(),
+            name,
+            self.invocation_context(),
+        )
+        .await)
+    }
+
     async fn push_outbound(
         &mut self,
         channel: String,

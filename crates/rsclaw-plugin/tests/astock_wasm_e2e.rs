@@ -16,6 +16,7 @@ use tokio::sync::{Mutex, broadcast};
 struct FakeBackgroundHost {
     cron_calls: AtomicUsize,
     sse_calls: AtomicUsize,
+    sse_status_calls: AtomicUsize,
     submit_calls: AtomicUsize,
 }
 
@@ -55,6 +56,27 @@ impl rsclaw_plugin::PluginBackgroundHost for FakeBackgroundHost {
             assert!(resume_key.contains("quick_rally"));
             assert_eq!(ctx.map(|c| c.channel), Some("test".to_owned()));
             Ok("fake_sse_registered".to_owned())
+        })
+    }
+
+    fn sse_status(
+        &self,
+        plugin: String,
+        name: String,
+        ctx: Option<rsclaw_plugin::PluginInvocationContext>,
+    ) -> futures::future::BoxFuture<'static, Result<String, String>> {
+        self.sse_status_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            assert_eq!(plugin, "astock");
+            assert_eq!(name, "astock.quick_rally");
+            assert_eq!(ctx.map(|c| c.channel), Some("test".to_owned()));
+            Ok(json!({
+                "ok": true,
+                "name": name,
+                "active": true,
+                "count": 1
+            })
+            .to_string())
         })
     }
 
@@ -241,6 +263,21 @@ async fn astock_wasm_quote_slash_chart_and_device_headers() {
     assert_eq!(alerts_register["data"]["ok"].as_bool(), Some(true));
     assert_eq!(background.sse_calls.load(Ordering::SeqCst), 1);
 
+    let alerts_status = plugin
+        .call_tool_with_ctx(
+            "slash",
+            json!({ "text": "/astock alerts status" }),
+            Some(notify_ctx()),
+        )
+        .await
+        .expect("alerts status");
+    assert_eq!(alerts_status["data"]["ok"].as_bool(), Some(true));
+    assert_eq!(background.sse_status_calls.load(Ordering::SeqCst), 1);
+    let alert_status_body: Value =
+        serde_json::from_str(alerts_status["data"]["status"].as_str().unwrap_or_default())
+            .expect("alerts status body");
+    assert_eq!(alert_status_body["active"].as_bool(), Some(true));
+
     let chart = plugin
         .call_tool_with_ctx(
             "chart",
@@ -250,16 +287,13 @@ async fn astock_wasm_quote_slash_chart_and_device_headers() {
         .await
         .expect("chart");
     assert_eq!(chart["ok"].as_bool(), Some(true));
-    let chart_path = chart["path"].as_str().expect("chart path");
-    let svg = std::fs::read_to_string(chart_path).expect("read chart svg");
-    assert!(svg.contains("<svg"));
-    assert!(svg.contains("<polyline"));
-    assert!(svg.contains("600519"));
+    assert_eq!(chart["mime"].as_str(), Some("image/png"));
 
     let outbound = rx.recv().await.expect("chart notification");
     assert_eq!(outbound.channel.as_deref(), Some("test"));
-    assert_eq!(outbound.files.len(), 1);
-    assert_eq!(outbound.files[0].1, "image/svg+xml");
+    assert_eq!(outbound.images.len(), 1);
+    assert!(outbound.images[0].starts_with("data:image/png;base64,"));
+    assert!(outbound.files.is_empty());
 
     assert!(
         saw_device_headers.load(Ordering::SeqCst),

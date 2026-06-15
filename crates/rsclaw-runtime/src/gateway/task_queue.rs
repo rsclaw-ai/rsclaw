@@ -1768,6 +1768,15 @@ impl rsclaw_plugin::PluginBackgroundHost for GatewayPluginBackgroundHost {
         })
     }
 
+    fn sse_status(
+        &self,
+        plugin: String,
+        name: String,
+        ctx: Option<rsclaw_plugin::PluginInvocationContext>,
+    ) -> futures::future::BoxFuture<'static, std::result::Result<String, String>> {
+        Box::pin(async move { Ok(plugin_sse_status_json(&plugin, &name, ctx.as_ref())) })
+    }
+
     fn push_outbound(
         &self,
         channel: String,
@@ -1806,6 +1815,18 @@ fn claim_plugin_background_key(key: &str) -> bool {
     guard.insert(key.to_owned())
 }
 
+fn plugin_background_key_prefix(
+    kind: &str,
+    plugin: &str,
+    name: &str,
+    ctx: Option<&rsclaw_plugin::PluginInvocationContext>,
+) -> String {
+    let ctx = ctx
+        .map(plugin_invocation_context_key)
+        .unwrap_or_else(|| "global".to_owned());
+    format!("{kind}:{plugin}:{name}:{ctx}")
+}
+
 fn plugin_background_key(
     kind: &str,
     plugin: &str,
@@ -1827,6 +1848,29 @@ fn plugin_invocation_context_key(ctx: &rsclaw_plugin::PluginInvocationContext) -
         "agent={}:channel={}:peer={}:chat={}:session={}",
         ctx.agent_id, ctx.channel, ctx.peer_id, ctx.chat_id, ctx.session_key
     )
+}
+
+fn plugin_sse_status_json(
+    plugin: &str,
+    name: &str,
+    ctx: Option<&rsclaw_plugin::PluginInvocationContext>,
+) -> String {
+    let prefix = plugin_background_key_prefix("sse", plugin, name, ctx);
+    let count = plugin_background_keys()
+        .read()
+        .map(|keys| {
+            keys.iter()
+                .filter(|key| *key == &prefix || key.starts_with(&format!("{prefix}:")))
+                .count()
+        })
+        .unwrap_or(0);
+    serde_json::json!({
+        "ok": true,
+        "name": name,
+        "active": count > 0,
+        "count": count,
+    })
+    .to_string()
 }
 
 fn parse_hhmm(raw: &str) -> Option<(u32, u32)> {
@@ -2183,6 +2227,35 @@ mod plugin_background_tests {
 
         assert_ne!(key_a, key_b);
         assert_ne!(key_a, key_other_url);
+    }
+
+    #[test]
+    fn plugin_sse_status_is_context_scoped() {
+        let a = ctx("peer-status-a");
+        let b = ctx("peer-status-b");
+        let url = "https://astock.rsclaw.ai/v1/stream/quick?filter=quick_rally";
+        let status_name = "astock.quick_rally.status_test";
+
+        let before: Value =
+            serde_json::from_str(&plugin_sse_status_json("astock", status_name, Some(&a)))
+                .expect("status JSON before");
+        assert_eq!(before["active"].as_bool(), Some(false));
+        assert_eq!(before["count"].as_u64(), Some(0));
+
+        let key = plugin_background_key("sse", "astock", status_name, Some(url), Some(&a));
+        assert!(claim_plugin_background_key(&key));
+
+        let active: Value =
+            serde_json::from_str(&plugin_sse_status_json("astock", status_name, Some(&a)))
+                .expect("status JSON active");
+        assert_eq!(active["active"].as_bool(), Some(true));
+        assert_eq!(active["count"].as_u64(), Some(1));
+
+        let other_peer: Value =
+            serde_json::from_str(&plugin_sse_status_json("astock", status_name, Some(&b)))
+                .expect("status JSON other peer");
+        assert_eq!(other_peer["active"].as_bool(), Some(false));
+        assert_eq!(other_peer["count"].as_u64(), Some(0));
     }
 
     #[tokio::test]

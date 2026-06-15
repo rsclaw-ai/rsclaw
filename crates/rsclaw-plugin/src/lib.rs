@@ -64,6 +64,13 @@ pub trait PluginBackgroundHost: Send + Sync {
         ctx: Option<PluginInvocationContext>,
     ) -> BoxFuture<'static, std::result::Result<String, String>>;
 
+    fn sse_status(
+        &self,
+        plugin: String,
+        name: String,
+        ctx: Option<PluginInvocationContext>,
+    ) -> BoxFuture<'static, std::result::Result<String, String>>;
+
     fn push_outbound(
         &self,
         channel: String,
@@ -114,6 +121,17 @@ pub(crate) async fn sse_subscribe(
         return Err("plugin background host is not installed".to_owned());
     };
     host.sse_subscribe(plugin, name, url, headers_json, resume_key, ctx).await
+}
+
+pub(crate) async fn sse_status(
+    plugin: String,
+    name: String,
+    ctx: Option<PluginInvocationContext>,
+) -> std::result::Result<String, String> {
+    let Some(host) = PLUGIN_BACKGROUND_HOST.get().cloned() else {
+        return Err("plugin background host is not installed".to_owned());
+    };
+    host.sse_status(plugin, name, ctx).await
 }
 
 pub(crate) async fn push_outbound(
