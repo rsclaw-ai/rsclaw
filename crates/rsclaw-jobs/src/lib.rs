@@ -691,6 +691,38 @@ pub async fn poll_openai_video(
     }
 }
 
+/// Poll a rsclaw async image job (image-edit / t2i-v2, gen-api.md §1). The
+/// job's `external_task_id` is the signed `data[].url` returned at submit
+/// time. That URL is authless and self-describes status by HTTP code:
+///   409 → still processing (Pending)
+///   200 → ready; the body is the image bytes (Done — hand the URL back to
+///         `download_artifact`, which GETs it without auth)
+///   502 → generation failed
+/// We don't read the 200 body here; the status is in the response head, so a
+/// poll stays cheap.
+pub async fn poll_rsclaw_image(
+    client: &reqwest::Client,
+    signed_url: &str,
+) -> Result<PollOutcome> {
+    let resp = client
+        .get(signed_url)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| anyhow!("rsclaw-image: poll failed: {e}"))?;
+    match resp.status().as_u16() {
+        200 => Ok(PollOutcome::Done(signed_url.to_owned())),
+        409 | 202 | 425 => Ok(PollOutcome::Pending),
+        502 => Ok(PollOutcome::Failed(
+            "rsclaw-image: generation failed (502)".to_owned(),
+        )),
+        other if (400..600).contains(&other) => Ok(PollOutcome::Failed(format!(
+            "rsclaw-image: poll status {other}"
+        ))),
+        _ => Ok(PollOutcome::Pending),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // rsclaw (in-fleet `RsclawGenBackend`) — async submit (via
 // `agent::tools_video::submit_rsclaw_video`) + poll here.

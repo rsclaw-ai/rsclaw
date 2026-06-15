@@ -301,6 +301,7 @@ impl super::runtime::AgentRuntime {
                         aspect_ratio,
                         Some(model_id.as_str()),
                         &images,
+                        args["video"].as_str().filter(|s| s.starts_with("http")),
                     )
                     .await
                     .map(|id| ("rsclaw", id)),
@@ -394,11 +395,12 @@ impl super::runtime::AgentRuntime {
         }))
     }
 
-    /// Avatar (数字人) generation — `POST /v1/videos/avatar` on the rsclaw gen
-    /// surface (gen-api.md §3). Face image + speech audio → lip-synced video.
-    /// NO prompt. Body: `input_reference.image_url` + `audio` (URL/data-URI;
-    /// local paths are base64-encoded here). `model` optional (default
-    /// `rsclaw-avatar-v1`, server fills when omitted).
+    /// Avatar (数字人) generation — `POST /v1/videos/avatar` (gen-api.md §3).
+    /// Character image required; driven EITHER by speech `audio` (lip-sync →
+    /// `talk`) OR by a driving `video` (motion/expression transfer, character
+    /// swap → `animate`). The server auto-selects the lane from the inputs —
+    /// no `model` needed. Body: `input_reference.image_url` + (`audio` and/or
+    /// driving video as `input_references[{type:video}]`).
     pub(crate) async fn tool_avatar_gen(
         &self,
         args: Value,
@@ -407,43 +409,65 @@ impl super::runtime::AgentRuntime {
         let images = normalize_gen_assets(&args["image"]).await;
         let audio = normalize_gen_assets(&args["audio"]).await;
         let Some(image_url) = images.first() else {
-            return Ok(json!({ "error": "avatar_gen: a face `image` is required (local path, https URL, or data URI)" }));
+            return Ok(json!({ "error": "avatar_gen: a character `image` is required (local path, https URL, or data URI)" }));
         };
-        let Some(audio_url) = audio.first() else {
-            return Ok(json!({ "error": "avatar_gen: a speech `audio` is required (local path, https URL, or data URI)" }));
-        };
+        // Driving video (animate lane). Large files → http(s) URL only per
+        // the doc (data-URI not accepted), so pass it through verbatim.
+        let drive_video = args["video"].as_str().filter(|s| s.starts_with("http"));
+        if audio.first().is_none() && drive_video.is_none() {
+            return Ok(json!({ "error": "avatar_gen: provide a driving signal — either `audio` (speech → lip-sync) or `video` (a driving video URL → motion transfer)" }));
+        }
         let mut body = json!({
             "input_reference": { "image_url": image_url },
-            "audio": audio_url,
         });
+        if let Some(audio_url) = audio.first() {
+            body["audio"] = json!(audio_url);
+        }
+        if let Some(v) = drive_video {
+            body["input_references"] = json!([{ "type": "video", "video_url": v }]);
+        }
+        // Optional passthroughs: explicit lane override + animate mode.
         if let Some(m) = args["model"].as_str().filter(|s| !s.is_empty()) {
             body["model"] = json!(m.rsplit('/').next().unwrap_or(m));
+        }
+        if let Some(mode) = args["mode"].as_str().filter(|s| !s.is_empty()) {
+            body["mode"] = json!(mode);
         }
         self.submit_rsclaw_gen_video("avatar", body, "avatar", ctx)
             .await
     }
 
-    /// Music-video (MV) generation — `POST /v1/videos/mv` (gen-api.md §6,
-    /// 预留/reserved: 歌词 + 图 → music-mv). Body: `prompt` (style) + optional
-    /// `lyrics` + optional `input_reference.image_url`.
+    /// Music-video (MV) generation — `POST /v1/videos/mv` (gen-api.md §3b).
+    /// Character image + lyrics → singing MV (worker chain: lyrics → music →
+    /// image + audio-drive → mp4). `image` + `lyrics` REQUIRED; `prompt`
+    /// (style/timbre) and `duration` optional. `model` default rsclaw-mv-v1.
     pub(crate) async fn tool_mv_gen(
         &self,
         args: Value,
         ctx: &super::runtime::RunContext,
     ) -> Result<Value> {
-        let prompt = args["prompt"].as_str().unwrap_or("").to_owned();
         let images = normalize_gen_assets(&args["image"]).await;
-        let mut body = json!({ "prompt": prompt });
+        let Some(image_url) = images.first() else {
+            return Ok(json!({ "error": "mv_gen: a character `image` is required (local path, https URL, or data URI)" }));
+        };
+        let Some(lyrics) = args["lyrics"].as_str().filter(|s| !s.is_empty()) else {
+            return Ok(json!({ "error": "mv_gen: `lyrics` is required (the song words to sing)" }));
+        };
+        let mut body = json!({
+            "input_reference": { "image_url": image_url },
+            "lyrics": lyrics,
+        });
+        if let Some(prompt) = args["prompt"].as_str().filter(|s| !s.is_empty()) {
+            body["prompt"] = json!(prompt);
+        }
+        if let Some(dur) = args["duration"].as_u64() {
+            body["duration"] = json!(dur);
+        }
         if let Some(m) = args["model"].as_str().filter(|s| !s.is_empty()) {
             body["model"] = json!(m.rsplit('/').next().unwrap_or(m));
         }
-        if let Some(lyrics) = args["lyrics"].as_str().filter(|s| !s.is_empty()) {
-            body["lyrics"] = json!(lyrics);
-        }
-        if let Some(first) = images.first() {
-            body["input_reference"] = json!({ "image_url": first });
-        }
-        self.submit_rsclaw_gen_video("mv", body, &prompt, ctx).await
+        let label = args["prompt"].as_str().unwrap_or("mv");
+        self.submit_rsclaw_gen_video("mv", body, label, ctx).await
     }
 
     /// Shared submit path for the rsclaw-gen video families (avatar / mv).
@@ -630,6 +654,7 @@ async fn submit_rsclaw_video(
     aspect_ratio: &str,
     model_hint: Option<&str>,
     images: &[String],
+    video_ref: Option<&str>,
 ) -> Result<String> {
     // Chain entries may arrive prefixed (`rsclaw/rsclaw-video-v1`); strip
     // the `provider/` segment so the upstream `model` field is the bare id.
@@ -640,17 +665,37 @@ async fn submit_rsclaw_video(
     // gen-api.md §2: `seconds` is a STRING, `size` is WxH, and image-to-video
     // uses `input_reference.image_url` (first frame) + optional
     // `last_frame_reference.image_url` (last frame → first-last-frame).
+    let size = rsclaw_video_size(aspect_ratio);
+    // The t2v/i2v worker needs explicit `width`/`height` (the `size` string
+    // alone isn't enough), so send both forms.
+    let (w, h) = size
+        .split_once('x')
+        .and_then(|(a, b)| Some((a.parse::<u32>().ok()?, b.parse::<u32>().ok()?)))
+        .unwrap_or((1280, 720));
     let mut body = json!({
         "model": model,
         "prompt": prompt,
         "seconds": duration.to_string(),
-        "size": rsclaw_video_size(aspect_ratio),
+        "size": size,
+        "width": w,
+        "height": h,
     });
-    if let Some(first) = images.first() {
-        body["input_reference"] = json!({ "image_url": first });
-    }
-    if let Some(last) = images.get(1) {
-        body["last_frame_reference"] = json!({ "image_url": last });
+    // v2v structure transfer (model rsclaw-video-ref-v1): the driving video
+    // goes in `input_references` as a `video` item; an optional first image
+    // sets the opening frame's look.
+    if let Some(v) = video_ref {
+        let mut refs = vec![json!({ "type": "video", "video_url": v })];
+        if let Some(first) = images.first() {
+            refs.push(json!({ "type": "image", "image_url": first }));
+        }
+        body["input_references"] = json!(refs);
+    } else {
+        if let Some(first) = images.first() {
+            body["input_reference"] = json!({ "image_url": first });
+        }
+        if let Some(last) = images.get(1) {
+            body["last_frame_reference"] = json!({ "image_url": last });
+        }
     }
 
     let url = format!(

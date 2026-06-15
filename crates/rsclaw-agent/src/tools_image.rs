@@ -176,7 +176,11 @@ impl super::runtime::AgentRuntime {
         )
     }
 
-    pub(crate) async fn tool_image(&self, mut args: Value) -> Result<Value> {
+    pub(crate) async fn tool_image(
+        &self,
+        mut args: Value,
+        ctx: &super::runtime::RunContext,
+    ) -> Result<Value> {
         // Image-to-image: normalize any input image(s) up front (local paths →
         // base64 data URIs) so every provider branch sees ready-to-send
         // strings in args["image"].
@@ -272,6 +276,16 @@ impl super::runtime::AgentRuntime {
             match self.try_image_for_model(prompt, chain_model, &args).await {
                 Ok(v) => {
                     self.model_health.record_success(chain_model);
+                    // rsclaw image-edit / t2i-v2 are async (gen-api.md §1): the
+                    // provider returned status:"processing" + a signed poll
+                    // URL. Hand it to the ExternalJob worker (kind ImageGen,
+                    // provider "rsclaw_image") for delivery instead of blocking
+                    // the turn ~280s.
+                    if v.get("_async_image_job").and_then(|b| b.as_bool()) == Some(true) {
+                        let poll_url =
+                            v.get("poll_url").and_then(|u| u.as_str()).unwrap_or_default();
+                        return self.enqueue_rsclaw_image_job(poll_url, prompt, ctx).await;
+                    }
                     return Ok(v);
                 }
                 Err(e) => {
@@ -322,6 +336,53 @@ impl super::runtime::AgentRuntime {
                 attempt_models.len()
             ),
         })
+    }
+
+    /// Enqueue a rsclaw async image job (image-edit / t2i-v2). The signed
+    /// `poll_url` is the ExternalJob's task id; the worker polls it
+    /// (409→pending / 200→download / 502→fail) via `poll_rsclaw_image` and
+    /// delivers the image like any other ImageGen artifact.
+    async fn enqueue_rsclaw_image_job(
+        &self,
+        poll_url: &str,
+        prompt: &str,
+        ctx: &super::runtime::RunContext,
+    ) -> Result<Value> {
+        if poll_url.is_empty() {
+            return Err(anyhow!(
+                "image_gen: rsclaw returned status=processing without a poll URL"
+            ));
+        }
+        let job = rsclaw_types::ExternalJob::new_submitted(
+            ctx.session_key.clone(),
+            rsclaw_types::ExternalJobDelivery {
+                channel: ctx.channel.clone(),
+                target_id: if ctx.chat_id.is_empty() {
+                    ctx.peer_id.clone()
+                } else {
+                    ctx.chat_id.clone()
+                },
+                is_group: !ctx.chat_id.is_empty() && ctx.chat_id != ctx.peer_id,
+                reply_to: None,
+            },
+            rsclaw_types::ExternalJobOrigin::Agent,
+            "rsclaw_image",
+            poll_url,
+            rsclaw_types::ExternalJobKind::ImageGen,
+            prompt,
+        );
+        let job_id = job.id.clone();
+        self.store
+            .db
+            .enqueue_external_job(&job)
+            .map_err(|e| anyhow!("image_gen: enqueue external job: {e}"))?;
+        Ok(json!({
+            "status": "submitted",
+            "provider": "rsclaw",
+            "kind": "image",
+            "job_id": job_id,
+            "message": "Image edit submitted to the rsclaw gen service (async, ~1–5min). The finished image will be delivered automatically when ready. The user has been informed; do NOT poll or wait — your turn is complete."
+        }))
     }
 
     /// One attempt for a single configured image model id. Called per
@@ -446,6 +507,20 @@ impl super::runtime::AgentRuntime {
                 "agnes" => "agnes-image-2.1-flash",
                 _ => "gpt-image-2",
             });
+
+        // rsclaw: a reference image means image-edit, but the t2i model
+        // produces garbage on edit requests (gen-api.md note #4). When the
+        // caller didn't name an explicit model and supplied a ref image, swap
+        // the default t2i model for the edit model.
+        let image_model = if img_prov == "rsclaw"
+            && args.get("model").and_then(|m| m.as_str()).is_none()
+            && !args["image"].is_null()
+            && image_model == "rsclaw-image-v1"
+        {
+            "rsclaw-image-edit-v1"
+        } else {
+            image_model
+        };
 
         // Resolve User-Agent: provider config -> gateway config -> default
         let img_ua = self
@@ -744,6 +819,28 @@ impl super::runtime::AgentRuntime {
                 .or_else(|| resp_body.as_str().map(|s| rsclaw_util::truncate_str(s, 200)))
                 .unwrap_or_else(|| rsclaw_util::truncate_str(&raw, 200));
             return Err(anyhow!("image: API error (HTTP {resp_status}): {err_msg}"));
+        }
+
+        // rsclaw async image (image-edit / t2i-v2): a 2xx carrying
+        // status:"processing" means the artifact isn't ready — the response
+        // already includes the signed poll URL at data[0].url. Surface a
+        // marker so `tool_image` enqueues an ExternalJob instead of trying to
+        // download a not-yet-ready URL. Plain t2i has no `status` field and
+        // falls through to synchronous extraction below.
+        if img_prov == "rsclaw"
+            && resp_body.get("status").and_then(|s| s.as_str()) == Some("processing")
+        {
+            let poll_url = resp_body
+                .pointer("/data/0/url")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    post_billing("rsclaw image: status=processing but no data[0].url to poll")
+                })?;
+            return Ok(json!({
+                "_async_image_job": true,
+                "poll_url": poll_url,
+                "model": image_model,
+            }));
         }
 
         // Extract image URL/base64 — different response formats per provider

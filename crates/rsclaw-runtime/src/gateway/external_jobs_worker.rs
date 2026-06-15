@@ -348,6 +348,11 @@ impl ExternalJobsWorker {
                 rsclaw_jobs::poll_openai_video(&self.client, &base, &key, &job.external_task_id)
                     .await
             }
+            // Async rsclaw image (image-edit / t2i-v2). external_task_id is the
+            // signed, authless poll URL; no provider key needed.
+            "rsclaw_image" => {
+                rsclaw_jobs::poll_rsclaw_image(&self.client, &job.external_task_id).await
+            }
             other => Err(anyhow!("no async polling adapter for provider: {other}")),
         }
     }
