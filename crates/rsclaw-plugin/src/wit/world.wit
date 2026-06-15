@@ -87,6 +87,53 @@ interface host-runtime {
         -> result<string, string>;
 }
 
+interface host-config {
+    /// Return this plugin's resolved config JSON. Simple `{source:"env",id:"VAR"}`
+    /// secret references are replaced with the environment value before the
+    /// guest sees the object.
+    plugin-config: func() -> result<string, string>;
+}
+
+interface host-context {
+    /// Return the current invocation context as JSON. Empty fields mean the
+    /// plugin was invoked outside an agent/channel turn.
+    current-context: func() -> result<string, string>;
+}
+
+interface host-http {
+    /// Perform an HTTP request. `headers-json` is an object, `body` is raw
+    /// UTF-8 text, and the return value is JSON `{status, headers, body}`.
+    request: func(method: string, url: string, headers-json: string, body: string, timeout-ms: u32)
+        -> result<string, string>;
+}
+
+interface host-kv {
+    /// Plugin-scoped key/value store backed by the host.
+    kv-get: func(key: string) -> result<string, string>;
+    kv-set: func(key: string, value: string) -> result<string, string>;
+    kv-delete: func(key: string) -> result<string, string>;
+}
+
+interface host-device {
+    /// Stable host-generated public key for this machine/profile.
+    device-public-key: func() -> result<string, string>;
+    /// Sign an arbitrary payload with the host-held private key.
+    device-sign: func(payload: string) -> result<string, string>;
+}
+
+interface host-background {
+    /// Register/update a cron-style task for this plugin.
+    cron-register: func(name: string, schedule-json: string) -> result<string, string>;
+    /// Subscribe to an SSE stream.
+    sse-subscribe: func(name: string, url: string, headers-json: string, resume-key: string)
+        -> result<string, string>;
+    /// Push an outbound message to a concrete channel/peer.
+    push-outbound: func(channel: string, peer-id: string, message-json: string) -> result<string, string>;
+    /// Submit a synthetic user turn to the agent queue.
+    submit-agent-turn: func(session-key: string, prompt: string, route-json: string)
+        -> result<string, string>;
+}
+
 interface host-storage {
     /// Request a writable absolute path for a new artifact file. The host
     /// picks the location (typically under its base-dir), creates the parent
@@ -255,6 +302,12 @@ interface plugin-api {
 world jimeng-plugin {
     import host-browser;
     import host-runtime;
+    import host-config;
+    import host-context;
+    import host-http;
+    import host-kv;
+    import host-device;
+    import host-background;
     import host-storage;
     import host-media;
     import host-android;

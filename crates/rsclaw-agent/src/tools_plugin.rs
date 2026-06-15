@@ -946,6 +946,11 @@ impl AgentRuntime {
                         ctx.peer_id.clone()
                     },
                     channel: ctx.channel.clone(),
+                    agent_id: ctx.agent_id.clone(),
+                    peer_id: ctx.peer_id.clone(),
+                    chat_id: ctx.chat_id.clone(),
+                    session_key: ctx.session_key.clone(),
+                    is_group: false,
                 }
             });
             return wp

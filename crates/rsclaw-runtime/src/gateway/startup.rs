@@ -462,6 +462,10 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 
     let wasm_plugins = Arc::new(plugin_registry.take_wasm_plugins());
     let plugins = Arc::new(plugin_registry);
+    for handle in registry.all() {
+        handle.set_wasm_plugins(Arc::clone(&wasm_plugins));
+        handle.set_notification_tx(notification_tx.clone());
+    }
 
     // Create the SSE broadcast channel once so agents and the HTTP server
     // share the same sender.
@@ -624,6 +628,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // crate-split P3: inject the task-queue host so rsclaw-agent's `task` tool
     // can enqueue without depending on the gateway crate.
     rsclaw_types::set_task_queue_host(Arc::new(super::task_queue::GatewayTaskQueueHost));
+    rsclaw_plugin::set_plugin_background_host(Arc::new(
+        super::task_queue::GatewayPluginBackgroundHost,
+    ));
 
     start_channels(
         &config,

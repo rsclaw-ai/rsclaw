@@ -370,6 +370,20 @@ pub(crate) async fn try_preparse_locally_with_account(
         dm_scope: DmScope::PerChannelPeer,
     });
 
+    if let Some(reply) = try_plugin_slash(
+        t,
+        handle,
+        channel,
+        peer_id,
+        account,
+        &this_session_key,
+        origin,
+    )
+    .await
+    {
+        return Some(reply);
+    }
+
     // /abort — set abort flag for THIS session only.
     if lower == "/abort" {
         let flags = handle
@@ -2078,6 +2092,161 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
     || lower == "/task help"
     || t.starts_with("! ")
     || t.starts_with("$ ")
+}
+
+async fn try_plugin_slash(
+    text: &str,
+    handle: &rsclaw_agent::AgentHandle,
+    channel: &str,
+    peer_id: &str,
+    account: Option<&str>,
+    session_key: &str,
+    origin: PreparseOrigin,
+) -> Option<OutboundMessage> {
+    let plugins = handle.wasm_plugins_snapshot();
+    if plugins.is_empty() {
+        return None;
+    }
+    let lower = text.trim().to_lowercase();
+    for plugin in plugins.iter() {
+        for command in &plugin.slash_commands {
+            let prefix = command.prefix.trim();
+            if prefix.is_empty() {
+                continue;
+            }
+            let prefix_lower = prefix.to_lowercase();
+            let matches =
+                lower == prefix_lower || lower.starts_with(&format!("{prefix_lower} "));
+            if !matches {
+                continue;
+            }
+            let Some(tx) = handle.notification_tx() else {
+                return Some(plugin_slash_error(format!(
+                    "plugin slash `{prefix}` cannot run: notification host is unavailable"
+                )));
+            };
+            let args = serde_json::json!({
+                "text": text,
+                "prefix": prefix,
+                "args": slash_args_after_prefix(text, prefix),
+                "channel": channel,
+                "peer_id": peer_id,
+                "account": account,
+                "session_key": session_key,
+                "origin": match origin {
+                    PreparseOrigin::User => "user",
+                    PreparseOrigin::Cron => "cron",
+                },
+            });
+            let notify_ctx = Some(rsclaw_plugin::wasm_runtime::WasmNotifyCtx {
+                tx,
+                target_id: peer_id.to_owned(),
+                channel: channel.to_owned(),
+                agent_id: handle.id.clone(),
+                peer_id: peer_id.to_owned(),
+                chat_id: peer_id.to_owned(),
+                session_key: session_key.to_owned(),
+                is_group: false,
+            });
+            return Some(match plugin.call_tool_with_ctx(&command.handler, args, notify_ctx).await {
+                Ok(value) => plugin_slash_outbound(value),
+                Err(e) => plugin_slash_error(format!("plugin slash `{prefix}` failed: {e:#}")),
+            });
+        }
+    }
+    None
+}
+
+fn slash_args_after_prefix(text: &str, prefix: &str) -> String {
+    text.trim()
+        .chars()
+        .skip(prefix.chars().count())
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+fn plugin_slash_error(text: String) -> OutboundMessage {
+    OutboundMessage {
+        target_id: String::new(),
+        is_group: false,
+        text,
+        reply_to: None,
+        images: vec![],
+        files: vec![],
+        channel: None,
+        account: None,
+    }
+}
+
+fn plugin_slash_outbound(value: serde_json::Value) -> OutboundMessage {
+    let text = value
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()));
+    let values_to_strings = |key: &str| -> Vec<String> {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let values_to_files = || -> Vec<(String, String, String)> {
+        value
+            .get("files")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| arr.iter().filter_map(plugin_file_tuple).collect())
+            .unwrap_or_default()
+    };
+    OutboundMessage {
+        target_id: String::new(),
+        is_group: false,
+        text,
+        reply_to: None,
+        images: values_to_strings("images"),
+        files: values_to_files(),
+        channel: None,
+        account: None,
+    }
+}
+
+fn plugin_file_tuple(value: &serde_json::Value) -> Option<(String, String, String)> {
+    let (path, filename, mime) = if let Some(path) = value.as_str() {
+        let filename = std::path::Path::new(path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("plugin-file")
+            .to_owned();
+        (path.to_owned(), filename, "application/octet-stream".to_owned())
+    } else {
+        let obj = value.as_object()?;
+        let path = obj.get("path").and_then(serde_json::Value::as_str)?.to_owned();
+        let filename = obj
+            .get("filename")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                std::path::Path::new(&path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("plugin-file")
+                    .to_owned()
+            });
+        let mime = obj
+            .get("mime")
+            .or_else(|| obj.get("mimeType"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("application/octet-stream")
+            .to_owned();
+        (path, filename, mime)
+    };
+    Some((filename, mime, path))
 }
 
 // ---------------------------------------------------------------------------

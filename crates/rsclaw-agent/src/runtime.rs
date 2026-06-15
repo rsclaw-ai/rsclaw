@@ -177,6 +177,19 @@ pub(crate) const DEFAULT_USER_TOOLS_CAP: usize = 30;
 /// so old transcripts replay.
 pub(crate) const PLUGIN_TOOL_SEP: &str = "__";
 
+fn is_stock_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "stock_quote"
+            | "stock_kline"
+            | "stock_snapshot"
+            | "stock_ask"
+            | "stock_query"
+            | "stock_chart"
+            | "stock_watchlist"
+    )
+}
+
 /// A plugin tool that's been selected for inclusion in
 /// `dynamic_prefix.user_tools`. Owns its data so the caller doesn't
 /// need to hold a borrow on the plugin registry while building the
@@ -4261,6 +4274,9 @@ impl AgentRuntime {
             // doesn't dirty the base prefix.
             if let Some(ref mcp) = self.mcp {
                 all.extend(mcp.all_tool_defs().await);
+            }
+            if !self.has_stock_tool_provider() {
+                all.retain(|t| !is_stock_tool_name(&t.name));
             }
             // user_tools_cap default — 30 fits ~10 headlines × 3 plugins
             // without overflowing a 64k-context small model.
@@ -8554,6 +8570,14 @@ impl AgentRuntime {
         )
     }
 
+    fn has_stock_tool_provider(&self) -> bool {
+        rsclaw_astock::global_client().is_some()
+            || self.wasm_plugins.iter().any(|wp| {
+                wp.capabilities.iter().any(|c| c == "trustedToolAlias")
+                    && wp.tool_aliases.values().any(|alias| is_stock_tool_name(alias))
+            })
+    }
+
     async fn dispatch_tool(
         &self,
         ctx: &RunContext,
@@ -8629,6 +8653,40 @@ impl AgentRuntime {
                      just summarise the completed cap results in plain text."
                 ));
             }
+        }
+
+        if is_stock_tool_name(name) && !self.has_stock_tool_provider() {
+            return Err(anyhow!(
+                "tool '{name}' is unavailable: no astock WASM plugin or built-in astock client is configured"
+            ));
+        }
+
+        if let Some((wp, plugin_tool)) = self.wasm_plugins.iter().find_map(|wp| {
+            if !wp.capabilities.iter().any(|c| c == "trustedToolAlias") {
+                return None;
+            }
+            wp.tool_aliases
+                .iter()
+                .find(|(_, alias)| alias.as_str() == name)
+                .map(|(plugin_tool, _)| (wp, plugin_tool.as_str()))
+        }) {
+            let notify_ctx = self.notification_tx.as_ref().map(|tx| {
+                rsclaw_plugin::wasm_runtime::WasmNotifyCtx {
+                    tx: tx.clone(),
+                    target_id: if !ctx.chat_id.is_empty() {
+                        ctx.chat_id.clone()
+                    } else {
+                        ctx.peer_id.clone()
+                    },
+                    channel: ctx.channel.clone(),
+                    agent_id: ctx.agent_id.clone(),
+                    peer_id: ctx.peer_id.clone(),
+                    chat_id: ctx.chat_id.clone(),
+                    session_key: ctx.session_key.clone(),
+                    is_group: false,
+                }
+            });
+            return wp.call_tool_with_ctx(plugin_tool, args, notify_ctx).await;
         }
 
         // 2. Built-in tools (checked before A2A prefix so reserved names are not
@@ -9032,6 +9090,11 @@ impl AgentRuntime {
                             ctx.peer_id.clone()
                         },
                         channel: ctx.channel.clone(),
+                        agent_id: ctx.agent_id.clone(),
+                        peer_id: ctx.peer_id.clone(),
+                        chat_id: ctx.chat_id.clone(),
+                        session_key: ctx.session_key.clone(),
+                        is_group: false,
                     }
                 });
                 return wp.call_tool_with_ctx(tool_name, args, notify_ctx).await;

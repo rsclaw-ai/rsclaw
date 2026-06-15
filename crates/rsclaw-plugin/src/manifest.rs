@@ -113,6 +113,23 @@ pub struct PluginManifest {
     /// Arbitrary extra fields for future compatibility.
     #[serde(default, flatten)]
     pub extra: HashMap<String, Value>,
+    /// Plugin-specific configuration block. The host resolves simple
+    /// secret references before exposing it to trusted WASM plugins via
+    /// `host-config`.
+    #[serde(default)]
+    pub config: Value,
+    /// Capability names requested by this plugin. Dangerous capabilities
+    /// such as background workers, outbound push, and tool aliases are
+    /// honored only for trusted plugins.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// Slash command prefixes this plugin wants to handle locally.
+    #[serde(default, rename = "slashCommands")]
+    pub slash_commands: Vec<PluginSlashCommand>,
+    /// Optional trusted aliases from plugin tool names to first-class
+    /// tool names. Example: `{ quote: "stock_quote" }`.
+    #[serde(default, rename = "toolAliases")]
+    pub tool_aliases: HashMap<String, String>,
 
     // --- runtime fields (not in JSON) ---
     /// Absolute path to the plugin directory.
@@ -184,6 +201,15 @@ pub struct PluginToolDef {
     /// real ToolDefs in. Ungrouped tools keep headline/search behavior.
     #[serde(default)]
     pub group: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginSlashCommand {
+    /// Command prefix, for example `/astock`.
+    pub prefix: String,
+    /// Tool name inside this plugin that handles the slash payload.
+    pub handler: String,
 }
 
 fn default_runtime() -> String {

@@ -13,13 +13,15 @@
 //!   - `log`, `sleep`, `read-file`
 
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
-use base64::Engine as _;
+use base64::{Engine as _, engine::general_purpose};
+use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -97,6 +99,14 @@ pub struct WasmPlugin {
     /// invokes `host::browser_download(url, ...)` so the host doesn't need
     /// to hardcode per-platform auth quirks.
     browser_cdn_rules: Vec<crate::manifest::CdnDownloadRule>,
+    /// Resolved plugin config exposed through `host-config`.
+    plugin_config: serde_json::Value,
+    /// Requested host capabilities from the manifest.
+    pub capabilities: Vec<String>,
+    /// Slash command metadata from the manifest.
+    pub slash_commands: Vec<crate::manifest::PluginSlashCommand>,
+    /// Trusted tool aliases from plugin tool name to first-class host tool name.
+    pub tool_aliases: HashMap<String, String>,
     /// Minimum gap between successive `call_tool` invocations on this plugin
     /// (host-enforced rate limit). 0 disables throttling.
     min_call_interval: Duration,
@@ -137,6 +147,11 @@ pub struct WasmNotifyCtx {
     pub tx: tokio::sync::broadcast::Sender<rsclaw_channel::OutboundMessage>,
     pub target_id: String,
     pub channel: String,
+    pub agent_id: String,
+    pub peer_id: String,
+    pub chat_id: String,
+    pub session_key: String,
+    pub is_group: bool,
 }
 
 /// State passed into the wasmtime `Store`, available to host functions.
@@ -151,6 +166,8 @@ struct HostState {
     cdn_rules: Vec<crate::manifest::CdnDownloadRule>,
     /// Plugin name — used to scope per-plugin resources (SQLite DB path, etc.).
     plugin_name: String,
+    /// Resolved plugin config visible to this invocation.
+    plugin_config: serde_json::Value,
     /// Desktop session for host-desktop interface (input synthesis,
     /// screenshots).
     desktop: Box<dyn rsclaw_desktop::DesktopSession>,
@@ -169,6 +186,7 @@ fn new_host_state(
     notify_ctx: Option<WasmNotifyCtx>,
     cdn_rules: Vec<crate::manifest::CdnDownloadRule>,
     plugin_name: String,
+    plugin_config: serde_json::Value,
     providers: Option<Arc<rsclaw_provider::registry::ProviderRegistry>>,
     vision_model: Option<String>,
 ) -> HostState {
@@ -182,6 +200,7 @@ fn new_host_state(
         notify_ctx,
         cdn_rules,
         plugin_name,
+        plugin_config,
         desktop: rsclaw_desktop::create_session(),
         providers,
         vision_model,
@@ -197,6 +216,7 @@ fn new_sandboxed_store(
     notify_ctx: Option<WasmNotifyCtx>,
     cdn_rules: Vec<crate::manifest::CdnDownloadRule>,
     plugin_name: String,
+    plugin_config: serde_json::Value,
     providers: Option<Arc<rsclaw_provider::registry::ProviderRegistry>>,
     vision_model: Option<String>,
 ) -> Store<HostState> {
@@ -207,6 +227,7 @@ fn new_sandboxed_store(
             notify_ctx,
             cdn_rules,
             plugin_name,
+            plugin_config,
             providers,
             vision_model,
         ),
@@ -247,17 +268,28 @@ fn canonicalize_plugin_path(input: &str) -> Result<PathBuf, String> {
 }
 
 /// Same as `canonicalize_plugin_path` but also permits paths under
-/// `~/.rsclaw/var/plugins/` so plugins can persist databases and config.
+/// `~/.rsclaw/var/plugins/` and host-allocated artifact paths so plugins can
+/// persist databases/config and write files returned by `allocate-artifact`.
 fn canonicalize_writable_path(input: &str) -> Result<PathBuf, String> {
     let base = rsclaw_config::loader::base_dir();
     let workspace = base.join("workspace");
     let plugins_var = base.join("var").join("plugins");
+    let downloads_rsclaw = dirs_next::download_dir()
+        .unwrap_or_else(|| {
+            dirs_next::home_dir()
+                .unwrap_or_else(rsclaw_config::loader::base_dir)
+                .join("Downloads")
+        })
+        .join("rsclaw");
     let canonical = rsclaw_util::canonicalize_external_path(input, &workspace);
-    if canonical.starts_with(&workspace) || canonical.starts_with(&plugins_var) {
+    if canonical.starts_with(&workspace)
+        || canonical.starts_with(&plugins_var)
+        || canonical.starts_with(&downloads_rsclaw)
+    {
         return Ok(canonical);
     }
     Err(format!(
-        "writable path '{}' resolves outside allowed dirs (workspace or var/plugins)",
+        "writable path '{}' resolves outside allowed dirs (workspace, var/plugins, or Downloads/rsclaw)",
         input
     ))
 }
@@ -642,7 +674,7 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
             // Enforce workspace allowlist on the supplied path. Plugins
             // can only attach files that already live under the workspace
             // dir — same containment rule used by `read_file`.
-            let canonical = match canonicalize_plugin_path(&file_path) {
+            let canonical = match canonicalize_plugin_artifact_path(&file_path) {
                 Ok(p) => p,
                 Err(e) => return Ok(Err(e)),
             };
@@ -836,6 +868,209 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
     }
 }
 
+impl rsclaw::plugin::host_config::Host for HostState {
+    async fn plugin_config(&mut self) -> HostTrapResult<Result<String, String>> {
+        serde_json::to_string(&self.plugin_config)
+            .map(Ok)
+            .map_err(wasmtime::Error::from)
+    }
+}
+
+impl rsclaw::plugin::host_context::Host for HostState {
+    async fn current_context(&mut self) -> HostTrapResult<Result<String, String>> {
+        let ctx = match &self.notify_ctx {
+            Some(ctx) => json!({
+                "plugin": self.plugin_name,
+                "target_id": ctx.target_id,
+                "channel": ctx.channel,
+                "agent_id": ctx.agent_id,
+                "peer_id": ctx.peer_id,
+                "chat_id": ctx.chat_id,
+                "session_key": ctx.session_key,
+                "is_group": ctx.is_group,
+            }),
+            None => json!({
+                "plugin": self.plugin_name,
+                "target_id": "",
+                "channel": "",
+                "agent_id": "",
+                "peer_id": "",
+                "chat_id": "",
+                "session_key": "",
+                "is_group": false,
+            }),
+        };
+        Ok(Ok(ctx.to_string()))
+    }
+}
+
+impl rsclaw::plugin::host_http::Host for HostState {
+    async fn request(
+        &mut self,
+        method: String,
+        url: String,
+        headers_json: String,
+        body: String,
+        timeout_ms: u32,
+    ) -> HostTrapResult<Result<String, String>> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let headers: serde_json::Map<String, serde_json::Value> = if headers_json.trim().is_empty() {
+            serde_json::Map::new()
+        } else {
+            match serde_json::from_str::<serde_json::Value>(&headers_json) {
+                Ok(serde_json::Value::Object(map)) => map,
+                Ok(_) => return Ok(Err("host_http.request: headers_json must be an object".to_owned())),
+                Err(e) => return Ok(Err(format!("host_http.request: invalid headers_json: {e}"))),
+            }
+        };
+        let timeout = if timeout_ms == 0 {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_millis(u64::from(timeout_ms))
+        };
+        let client = match reqwest::Client::builder().timeout(timeout).build() {
+            Ok(c) => c,
+            Err(e) => return Ok(Err(format!("host_http.request: client build failed: {e}"))),
+        };
+        let method = match reqwest::Method::from_bytes(method.as_bytes()) {
+            Ok(m) => m,
+            Err(e) => return Ok(Err(format!("host_http.request: invalid method: {e}"))),
+        };
+        let mut rb = client.request(method, &url);
+        for (k, v) in headers {
+            let Some(s) = v.as_str() else {
+                return Ok(Err(format!("host_http.request: header `{k}` must be a string")));
+            };
+            rb = rb.header(&k, s);
+        }
+        if !body.is_empty() {
+            rb = rb.body(body);
+        }
+        let resp = match rb.send().await {
+            Ok(r) => r,
+            Err(e) => return Ok(Err(format!("host_http.request: transport error: {e}"))),
+        };
+        let status = resp.status().as_u16();
+        let mut out_headers = serde_json::Map::new();
+        for (k, v) in resp.headers() {
+            if let Ok(s) = v.to_str() {
+                out_headers.insert(k.as_str().to_owned(), json!(s));
+            }
+        }
+        let body = match resp.text().await {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(format!("host_http.request: body read failed: {e}"))),
+        };
+        Ok(Ok(json!({
+            "status": status,
+            "headers": out_headers,
+            "body": body,
+        }).to_string()))
+    }
+}
+
+impl rsclaw::plugin::host_kv::Host for HostState {
+    async fn kv_get(&mut self, key: String) -> HostTrapResult<Result<String, String>> {
+        plugin_kv_get(&self.plugin_name, key).await
+    }
+
+    async fn kv_set(&mut self, key: String, value: String) -> HostTrapResult<Result<String, String>> {
+        plugin_kv_set(&self.plugin_name, key, value).await
+    }
+
+    async fn kv_delete(&mut self, key: String) -> HostTrapResult<Result<String, String>> {
+        plugin_kv_delete(&self.plugin_name, key).await
+    }
+}
+
+impl rsclaw::plugin::host_device::Host for HostState {
+    async fn device_public_key(&mut self) -> HostTrapResult<Result<String, String>> {
+        match load_device_signing_key().await {
+            Ok(key) => Ok(Ok(device_public_key_json(&key))),
+            Err(e) => Ok(Err(e)),
+        }
+    }
+
+    async fn device_sign(&mut self, payload: String) -> HostTrapResult<Result<String, String>> {
+        match load_device_signing_key().await {
+            Ok(key) => {
+                let sig = key.sign(payload.as_bytes());
+                Ok(Ok(json!({
+                    "alg": "ed25519",
+                    "publicKey": general_purpose::STANDARD.encode(key.verifying_key().as_bytes()),
+                    "signature": general_purpose::STANDARD.encode(sig.to_bytes()),
+                })
+                .to_string()))
+            }
+            Err(e) => Ok(Err(e)),
+        }
+    }
+}
+
+impl rsclaw::plugin::host_background::Host for HostState {
+    async fn cron_register(
+        &mut self,
+        name: String,
+        schedule_json: String,
+    ) -> HostTrapResult<Result<String, String>> {
+        Ok(crate::cron_register(
+            self.plugin_name.clone(),
+            name,
+            schedule_json,
+            self.invocation_context(),
+        )
+        .await)
+    }
+
+    async fn sse_subscribe(
+        &mut self,
+        name: String,
+        url: String,
+        headers_json: String,
+        resume_key: String,
+    ) -> HostTrapResult<Result<String, String>> {
+        Ok(crate::sse_subscribe(
+            self.plugin_name.clone(),
+            name,
+            url,
+            headers_json,
+            resume_key,
+            self.invocation_context(),
+        )
+        .await)
+    }
+
+    async fn push_outbound(
+        &mut self,
+        channel: String,
+        peer_id: String,
+        message_json: String,
+    ) -> HostTrapResult<Result<String, String>> {
+        Ok(crate::push_outbound(
+            channel,
+            peer_id,
+            message_json,
+            self.invocation_context(),
+        )
+        .await)
+    }
+
+    async fn submit_agent_turn(
+        &mut self,
+        session_key: String,
+        prompt: String,
+        route_json: String,
+    ) -> HostTrapResult<Result<String, String>> {
+        Ok(crate::submit_agent_turn(
+            session_key,
+            prompt,
+            route_json,
+            self.invocation_context(),
+        )
+        .await)
+    }
+}
+
 /// Return the SQLite database path for a given plugin name.
 fn plugin_db_path(plugin_name: &str) -> PathBuf {
     rsclaw_config::loader::base_dir()
@@ -843,6 +1078,153 @@ fn plugin_db_path(plugin_name: &str) -> PathBuf {
         .join("plugins")
         .join(plugin_name)
         .join("plugin.db")
+}
+
+fn device_key_path() -> PathBuf {
+    rsclaw_config::loader::base_dir()
+        .join("device")
+        .join("host-ed25519.key")
+}
+
+async fn load_device_signing_key() -> Result<SigningKey, String> {
+    tokio::task::spawn_blocking(|| {
+        let path = device_key_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("host_device: create key dir failed: {e}"))?;
+        }
+        if path.exists() {
+            let raw = std::fs::read_to_string(&path)
+                .map_err(|e| format!("host_device: read key failed: {e}"))?;
+            let bytes = general_purpose::STANDARD
+                .decode(raw.trim())
+                .map_err(|e| format!("host_device: key base64 decode failed: {e}"))?;
+            let key_bytes: [u8; 32] = bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| "host_device: key must be 32 bytes".to_owned())?;
+            return Ok(SigningKey::from_bytes(&key_bytes));
+        }
+        let key_bytes: [u8; 32] = rand::random();
+        let encoded = general_purpose::STANDARD.encode(key_bytes);
+        std::fs::write(&path, encoded)
+            .map_err(|e| format!("host_device: write key failed: {e}"))?;
+        Ok(SigningKey::from_bytes(&key_bytes))
+    })
+    .await
+    .map_err(|e| format!("host_device: key task failed: {e}"))?
+}
+
+fn device_public_key_json(key: &SigningKey) -> String {
+    json!({
+        "alg": "ed25519",
+        "publicKey": general_purpose::STANDARD.encode(key.verifying_key().as_bytes()),
+    })
+    .to_string()
+}
+
+async fn plugin_kv_get(plugin_name: &str, key: String) -> HostTrapResult<Result<String, String>> {
+    let db_path = plugin_db_path(plugin_name);
+    let result = tokio::task::spawn_blocking(move || {
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        }
+        let conn = rusqlite::Connection::open(db_path)?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            [],
+        )?;
+        let mut stmt = conn.prepare("SELECT value FROM kv WHERE key = ?1")?;
+        let value: Option<String> = stmt.query_row([key], |row| row.get(0)).ok();
+        Ok::<_, rusqlite::Error>(value.unwrap_or_default())
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => Ok(Ok(value)),
+        Ok(Err(e)) => Ok(Err(format!("host_kv.get: {e}"))),
+        Err(e) => Ok(Err(format!("host_kv.get panic: {e}"))),
+    }
+}
+
+async fn plugin_kv_set(
+    plugin_name: &str,
+    key: String,
+    value: String,
+) -> HostTrapResult<Result<String, String>> {
+    let db_path = plugin_db_path(plugin_name);
+    let result = tokio::task::spawn_blocking(move || {
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        }
+        let conn = rusqlite::Connection::open(db_path)?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO kv (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )?;
+        Ok::<_, rusqlite::Error>(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => Ok(Ok("ok".to_owned())),
+        Ok(Err(e)) => Ok(Err(format!("host_kv.set: {e}"))),
+        Err(e) => Ok(Err(format!("host_kv.set panic: {e}"))),
+    }
+}
+
+async fn plugin_kv_delete(plugin_name: &str, key: String) -> HostTrapResult<Result<String, String>> {
+    let db_path = plugin_db_path(plugin_name);
+    let result = tokio::task::spawn_blocking(move || {
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        }
+        let conn = rusqlite::Connection::open(db_path)?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            [],
+        )?;
+        let changed = conn.execute("DELETE FROM kv WHERE key = ?1", [key])?;
+        Ok::<_, rusqlite::Error>(changed)
+    })
+    .await;
+    match result {
+        Ok(Ok(changed)) => Ok(Ok(json!({ "deleted": changed }).to_string())),
+        Ok(Err(e)) => Ok(Err(format!("host_kv.delete: {e}"))),
+        Err(e) => Ok(Err(format!("host_kv.delete panic: {e}"))),
+    }
+}
+
+fn resolve_plugin_config(raw: &serde_json::Value) -> serde_json::Value {
+    fn walk(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(map) => {
+                let source = map.get("source").and_then(|v| v.as_str());
+                let id = map.get("id").and_then(|v| v.as_str());
+                if source == Some("env") && let Some(id) = id {
+                    return std::env::var(id)
+                        .map(serde_json::Value::String)
+                        .unwrap_or(serde_json::Value::Null);
+                }
+                serde_json::Value::Object(
+                    map.iter()
+                        .map(|(k, v)| (k.clone(), walk(v)))
+                        .collect(),
+                )
+            }
+            serde_json::Value::Array(arr) => {
+                serde_json::Value::Array(arr.iter().map(walk).collect())
+            }
+            other => other.clone(),
+        }
+    }
+    walk(raw)
 }
 
 impl rsclaw::plugin::host_storage::Host for HostState {
@@ -1252,6 +1634,18 @@ fn adb_match_elements(xml: &str, sel_type: &str, sel_val: &str) -> Vec<serde_jso
 }
 
 impl HostState {
+    fn invocation_context(&self) -> Option<crate::PluginInvocationContext> {
+        self.notify_ctx.as_ref().map(|ctx| crate::PluginInvocationContext {
+            target_id: ctx.target_id.clone(),
+            channel: ctx.channel.clone(),
+            agent_id: ctx.agent_id.clone(),
+            peer_id: ctx.peer_id.clone(),
+            chat_id: ctx.chat_id.clone(),
+            session_key: ctx.session_key.clone(),
+            is_group: ctx.is_group,
+        })
+    }
+
     /// Execute a browser action by locking the shared browser session.
     /// Auto-starts Chrome if no session exists.
     async fn browser_action(&mut self, action: &str, args: Value) -> Result<String, String> {
@@ -1953,6 +2347,36 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostState>> {
         wasmtime::component::HasSelf<HostState>,
     >(&mut linker, |state: &mut HostState| state)
     .map_err(|e| anyhow::anyhow!("failed to add host-runtime linker interfaces: {e}"))?;
+    rsclaw::plugin::host_config::add_to_linker::<
+        HostState,
+        wasmtime::component::HasSelf<HostState>,
+    >(&mut linker, |state: &mut HostState| state)
+    .map_err(|e| anyhow::anyhow!("failed to add host-config linker interfaces: {e}"))?;
+    rsclaw::plugin::host_context::add_to_linker::<
+        HostState,
+        wasmtime::component::HasSelf<HostState>,
+    >(&mut linker, |state: &mut HostState| state)
+    .map_err(|e| anyhow::anyhow!("failed to add host-context linker interfaces: {e}"))?;
+    rsclaw::plugin::host_http::add_to_linker::<
+        HostState,
+        wasmtime::component::HasSelf<HostState>,
+    >(&mut linker, |state: &mut HostState| state)
+    .map_err(|e| anyhow::anyhow!("failed to add host-http linker interfaces: {e}"))?;
+    rsclaw::plugin::host_kv::add_to_linker::<
+        HostState,
+        wasmtime::component::HasSelf<HostState>,
+    >(&mut linker, |state: &mut HostState| state)
+    .map_err(|e| anyhow::anyhow!("failed to add host-kv linker interfaces: {e}"))?;
+    rsclaw::plugin::host_device::add_to_linker::<
+        HostState,
+        wasmtime::component::HasSelf<HostState>,
+    >(&mut linker, |state: &mut HostState| state)
+    .map_err(|e| anyhow::anyhow!("failed to add host-device linker interfaces: {e}"))?;
+    rsclaw::plugin::host_background::add_to_linker::<
+        HostState,
+        wasmtime::component::HasSelf<HostState>,
+    >(&mut linker, |state: &mut HostState| state)
+    .map_err(|e| anyhow::anyhow!("failed to add host-background linker interfaces: {e}"))?;
     rsclaw::plugin::host_storage::add_to_linker::<
         HostState,
         wasmtime::component::HasSelf<HostState>,
@@ -2030,6 +2454,10 @@ pub async fn load_wasm_plugin(
         linker,
         browser,
         browser_cdn_rules: manifest.browser_cdn.download_rules.clone(),
+        plugin_config: resolve_plugin_config(&manifest.config),
+        capabilities: manifest.capabilities.clone(),
+        slash_commands: manifest.slash_commands.clone(),
+        tool_aliases: manifest.tool_aliases.clone(),
         min_call_interval: Duration::from_millis(u64::from(manifest.min_call_interval_ms)),
         last_call: Mutex::new(None),
         providers,
@@ -2099,6 +2527,7 @@ impl WasmPlugin {
             notify_ctx,
             self.browser_cdn_rules.clone(),
             self.name.clone(),
+            self.plugin_config.clone(),
             self.providers.clone(),
             self.vision_model.clone(),
         );
