@@ -568,6 +568,12 @@ fn build_shared_system_prefix_uncached() -> String {
          - Have enough info to answer? STOP and reply immediately.\n\
          - Do NOT repeat a tool call that already returned useful results.\n\
          - Don't repeat a call that already returned what you need. But for multi-source tasks, fetch EVERY distinct source the answer requires — the \"stop at one\" rule does NOT cap genuine multi-source work (e.g. fixtures + odds + head-to-head, or research across several pages).\n\
+         ### Before you declare done (verify, then reply)\n\
+         - A claim of success (\"fixed/working/done/created\") needs EVIDENCE from a tool result THIS turn. Never assert it otherwise.\n\
+         - Changed code? Run the build/tests (or the smallest check that proves it) before saying it works. If you cannot run it, say so explicitly.\n\
+         - Wrote/edited a file or produced an artifact? Confirm it exists with the expected content.\n\
+         - A todo plan is active? Do NOT give the final answer while any item is still pending/in_progress — finish them, or explicitly state what is blocked.\n\
+         - Verification is BOUNDED: ONE decisive check, not re-searching. \"Have enough info? STOP\" still holds — this adds a single proof step, it does NOT license loops.\n\
          ### Plan Tracking (todo)\n\
          For any task needing 3+ steps or multiple tool calls: call `todo` FIRST with the \
          full step list, keep exactly ONE item in_progress, mark it done IMMEDIATELY after \
