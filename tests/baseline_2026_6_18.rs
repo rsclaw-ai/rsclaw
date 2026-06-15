@@ -253,8 +253,8 @@ fn baseline_builtin_tools_byte_stable() {
 
     assert_eq!(
         builtin.len(),
-        58,
-        "Expected 58 builtin tools in the 2026.6.18 baseline; got {}. \
+        59,
+        "Expected 59 builtin tools in the 2026.6.18 baseline; got {}. \
          If a builtin tool was added or removed intentionally, regenerate the fixture \
          and bump this count.",
         builtin.len()
