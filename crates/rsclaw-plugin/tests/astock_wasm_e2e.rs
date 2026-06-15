@@ -50,10 +50,10 @@ impl rsclaw_plugin::PluginBackgroundHost for FakeBackgroundHost {
         self.sse_calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             assert_eq!(plugin, "astock");
-            assert_eq!(name, "astock.quick_rally");
-            assert!(url.contains("/v1/stream/quick?filter=quick_rally"));
+            assert!(name.starts_with("astock.quick_"));
+            assert!(url.contains("/v1/stream/quick?filter=quick_"));
             assert!(headers_json.contains("Bearer test-key"));
-            assert!(resume_key.contains("quick_rally"));
+            assert!(resume_key.contains("quick_"));
             assert_eq!(ctx.map(|c| c.channel), Some("test".to_owned()));
             Ok("fake_sse_registered".to_owned())
         })
@@ -68,7 +68,7 @@ impl rsclaw_plugin::PluginBackgroundHost for FakeBackgroundHost {
         self.sse_status_calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             assert_eq!(plugin, "astock");
-            assert_eq!(name, "astock.quick_rally");
+            assert!(name.starts_with("astock.quick_"));
             assert_eq!(ctx.map(|c| c.channel), Some("test".to_owned()));
             Ok(json!({
                 "ok": true,
@@ -195,7 +195,35 @@ async fn astock_wasm_quote_slash_chart_and_device_headers() {
         .expect("snapshot from watchlist");
     assert_eq!(snapshot["ok"].as_bool(), Some(true));
     assert_eq!(snapshot["used_watchlist"].as_bool(), Some(true));
+    assert_eq!(snapshot["sort_by"].as_str(), Some("amount"));
+    assert_eq!(snapshot["shown"].as_u64(), Some(1));
+    assert_eq!(snapshot["rows"].as_array().map(Vec::len), Some(1));
     assert!(snapshot["markdown"].as_str().unwrap_or_default().contains("600519"));
+
+    let kline = plugin
+        .call_tool_with_ctx(
+            "kline",
+            json!({ "code": "600519", "period": "1d", "count": 30, "offset": 2, "adjust": "qfq" }),
+            Some(notify_ctx()),
+        )
+        .await
+        .expect("kline");
+    assert_eq!(kline["ok"].as_bool(), Some(true));
+    assert_eq!(kline["bars"].as_array().map(Vec::len), Some(30));
+    assert!(kline["markdown"].as_str().unwrap_or_default().contains("600519"));
+    assert!(kline.get("data_quality").is_some());
+
+    let ask = plugin
+        .call_tool_with_ctx(
+            "ask",
+            json!({ "query": "今天贵州茅台怎么样", "page": 2, "limit": 5, "call_type": "text" }),
+            Some(notify_ctx()),
+        )
+        .await
+        .expect("ask");
+    assert_eq!(ask["ok"].as_bool(), Some(true));
+    assert_eq!(ask["query"].as_str(), Some("今天贵州茅台怎么样"));
+    assert!(ask["response"]["answer"].as_str().unwrap_or_default().contains("贵州茅台"));
 
     let screen = plugin
         .call_tool_with_ctx(
@@ -261,7 +289,7 @@ async fn astock_wasm_quote_slash_chart_and_device_headers() {
         .await
         .expect("alerts register");
     assert_eq!(alerts_register["data"]["ok"].as_bool(), Some(true));
-    assert_eq!(background.sse_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(background.sse_calls.load(Ordering::SeqCst), 3);
 
     let alerts_status = plugin
         .call_tool_with_ctx(
@@ -272,11 +300,15 @@ async fn astock_wasm_quote_slash_chart_and_device_headers() {
         .await
         .expect("alerts status");
     assert_eq!(alerts_status["data"]["ok"].as_bool(), Some(true));
-    assert_eq!(background.sse_status_calls.load(Ordering::SeqCst), 1);
-    let alert_status_body: Value =
-        serde_json::from_str(alerts_status["data"]["status"].as_str().unwrap_or_default())
+    assert_eq!(background.sse_status_calls.load(Ordering::SeqCst), 3);
+    let alert_statuses = alerts_status["data"]["status"]
+        .as_array()
+        .expect("alerts status array");
+    assert_eq!(alert_statuses.len(), 3);
+    let first_status: Value =
+        serde_json::from_str(alert_statuses[0]["status"].as_str().unwrap_or_default())
             .expect("alerts status body");
-    assert_eq!(alert_status_body["active"].as_bool(), Some(true));
+    assert_eq!(first_status["active"].as_bool(), Some(true));
 
     let chart = plugin
         .call_tool_with_ctx(
@@ -385,6 +417,7 @@ fn handle_mock_conn(mut stream: TcpStream, saw_device_headers: Arc<AtomicBool>) 
             "code": "600519",
             "period": "1d",
             "adjust": "qfq",
+            "data_quality": { "2026": "high" },
             "klines": (0..30).map(|i| json!({
                 "timestamp": 1718000000 + i * 86400,
                 "open": 100.0 + i as f64,
@@ -394,6 +427,13 @@ fn handle_mock_conn(mut stream: TcpStream, saw_device_headers: Arc<AtomicBool>) 
                 "volume": 1000 + i,
                 "amount": 100000.0 + i as f64
             })).collect::<Vec<_>>()
+        })
+    } else if path.starts_with("/v1/ask") {
+        json!({
+            "answer": "贵州茅台 当前走势稳定",
+            "items": [
+                { "code": "600519", "name": "贵州茅台" }
+            ]
         })
     } else {
         json!({ "ok": true })
