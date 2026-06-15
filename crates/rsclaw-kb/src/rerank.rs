@@ -81,7 +81,7 @@ impl KbReranker {
     pub fn remote(base_url: &str, model: impl Into<String>, top_n: usize) -> std::sync::Arc<Self> {
         let base = base_url.trim().trim_end_matches('/');
         std::sync::Arc::new(Self {
-            client: rsclaw_embed::build_remote_client(RERANK_TIMEOUT_SECS),
+            client: rsclaw_embed::FleetHttp::new(None),
             url: format!("{base}/rerank"),
             model: Some(model.into()),
             top_n: top_n.clamp(2, 100),
