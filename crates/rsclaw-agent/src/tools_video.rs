@@ -447,7 +447,6 @@ impl super::runtime::AgentRuntime {
     }
 
     /// Shared submit path for the rsclaw-gen video families (avatar / mv).
-    /// Motion control is NOT a separate tool — it falls under `video_gen`.
     /// POSTs the pre-built `body` to `/v1/videos/{endpoint}`,
     /// then enqueues an `ExternalJob{ provider: "rsclaw", kind: VideoGen }` so
     /// the same `poll_rsclaw` loop (GET /v1/videos/{id} → /content) delivers

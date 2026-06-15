@@ -628,7 +628,7 @@ model       = "doubao-seedance-2-0-260128"
 base_url    = "https://ark.cn-beijing.volces.com/api/v3"
 
 [video_providers.rsclaw]
-label       = "RsClaw Gen (avatar / mv / motion 聚合)"
+label       = "RsClaw Gen (avatar / mv 聚合)"
 env_var     = "RSCLAW_API_KEY"
 model       = "rsclaw-video-v1"
 base_url    = "https://api.rsclaw.ai"
