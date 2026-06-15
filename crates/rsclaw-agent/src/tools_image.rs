@@ -821,21 +821,16 @@ impl super::runtime::AgentRuntime {
             return Err(anyhow!("image: API error (HTTP {resp_status}): {err_msg}"));
         }
 
-        // rsclaw async image (image-edit / t2i-v2): a 2xx carrying
-        // status:"processing" means the artifact isn't ready — the response
-        // already includes the signed poll URL at data[0].url. Surface a
-        // marker so `tool_image` enqueues an ExternalJob instead of trying to
-        // download a not-yet-ready URL. Plain t2i has no `status` field and
-        // falls through to synchronous extraction below.
+        // rsclaw image generation is async end-to-end (t2i / t2i-v2 /
+        // image-edit). The POST returns a signed content URL — sometimes with
+        // status:"processing", sometimes not — that may 409 until the artifact
+        // is ready. Always hand that URL to the ExternalJob worker instead of
+        // downloading inline: `poll_rsclaw_image` resolves 200 immediately for
+        // an already-ready t2i and keeps polling on 409 for the slow lanes.
+        // (If no url is present we fall through to synchronous extraction.)
         if img_prov == "rsclaw"
-            && resp_body.get("status").and_then(|s| s.as_str()) == Some("processing")
+            && let Some(poll_url) = resp_body.pointer("/data/0/url").and_then(|v| v.as_str())
         {
-            let poll_url = resp_body
-                .pointer("/data/0/url")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    post_billing("rsclaw image: status=processing but no data[0].url to poll")
-                })?;
             return Ok(json!({
                 "_async_image_job": true,
                 "poll_url": poll_url,
