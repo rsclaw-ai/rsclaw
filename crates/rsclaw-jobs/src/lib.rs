@@ -39,11 +39,37 @@ pub async fn submit_seedance(
     duration: u64,
     aspect_ratio: &str,
     model_override: Option<&str>,
+    images: &[String],
 ) -> Result<String> {
     let model = model_override.unwrap_or(SEEDANCE_DEFAULT_MODEL);
+    // Build the `content` array: a text item plus, for image-to-video, one
+    // `image_url` item per reference frame with a `role`. Per the Ark spec
+    // the three image scenes are mutually exclusive, so map by count:
+    //   1 image  → first_frame  (图生视频-首帧)
+    //   2 images → first_frame + last_frame  (图生视频-首尾帧)
+    //   3+ images→ reference_image each  (多模态参考生视频, Seedance 2.0, 1~9)
+    // `url` accepts a public URL or a `data:image/<fmt>;base64,...` Data URI.
+    let mut content = vec![json!({"type": "text", "text": prompt})];
+    let roles: &[&str] = match images.len() {
+        0 | 1 => &["first_frame"],
+        2 => &["first_frame", "last_frame"],
+        _ => &[],
+    };
+    for (i, img) in images.iter().enumerate() {
+        let role = if images.len() >= 3 {
+            "reference_image"
+        } else {
+            roles[i]
+        };
+        content.push(json!({
+            "type": "image_url",
+            "image_url": {"url": img},
+            "role": role,
+        }));
+    }
     let body = json!({
         "model": model,
-        "content": [{"type": "text", "text": prompt}],
+        "content": content,
         "ratio": aspect_ratio,
         "duration": duration,
         "watermark": false,
@@ -423,11 +449,23 @@ pub async fn submit_agnes(
         "frame_rate": frame_rate,
         "num_frames": num_frames,
     });
-    // Image-to-video: top-level `image` array + `mode: ti2vid` per the Agnes
-    // Video V2.0 spec. Text-to-video sends neither.
-    if !images.is_empty() {
-        body["image"] = json!(images);
-        body["mode"] = json!("ti2vid");
+    // Image-to-video. Per the Agnes Video V2.0 spec the shapes differ by
+    // count: a single reference frame goes in the TOP-LEVEL `image` as a
+    // STRING (`mode: ti2vid`) — passing an array there 400s
+    // ("cannot unmarshal array ... type string"). Multiple frames
+    // (first+last / keyframes) go in `extra_body.image` as an array with
+    // `mode: keyframes`. Each entry is a public URL or
+    // `data:image/...;base64,...` Data URI. Text-to-video sends neither.
+    match images.len() {
+        0 => {}
+        1 => {
+            body["image"] = json!(images[0]);
+            body["mode"] = json!("ti2vid");
+        }
+        _ => {
+            body["mode"] = json!("keyframes");
+            body["extra_body"] = json!({ "image": images, "mode": "keyframes" });
+        }
     }
     let resp: serde_json::Value = client
         .post(format!("{AGNES_BASE}/v1/videos"))

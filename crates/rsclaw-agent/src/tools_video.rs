@@ -239,6 +239,7 @@ impl super::runtime::AgentRuntime {
                         duration,
                         aspect_ratio,
                         Some(model_id.as_str()),
+                        &images,
                     )
                     .await
                     .map(|id| ("seedance", id)),
