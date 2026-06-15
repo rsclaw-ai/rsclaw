@@ -98,3 +98,4 @@ pub fn create_session() -> Box<dyn DesktopSession> {
 }
 
 mod native;
+pub mod macos_perm;

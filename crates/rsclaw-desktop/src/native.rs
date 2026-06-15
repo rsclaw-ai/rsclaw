@@ -154,6 +154,24 @@ fn capture_app_window(app_name: &str) -> Result<String, String> {
                 && w.height().unwrap_or(0) >= 200
         })
         .ok_or_else(|| format!("no on-screen window for app '{app_name}'"))?;
+    // macOS: prefer Apple's `screencapture -l<windowID>` for the pixel grab.
+    // xcap's in-process window capture (deprecated CGWindowListCreateImage /
+    // SCScreenshotManager) hangs ~30s then fails with "Failed to copy data" on
+    // hardware-accelerated / opaque windows — notably WeChat 4.x — silently
+    // degrading callers to a wrong-region fallback. screencapture uses Apple's
+    // current path, is occlusion-proof, and captures those windows correctly
+    // (verified on WeChat). xcap stays as the fallback for the rare case
+    // screencapture is unavailable / fails.
+    #[cfg(target_os = "macos")]
+    if let Ok(window_id) = win.id() {
+        match screencapture_window_by_id(window_id) {
+            Ok(uri) => return Ok(uri),
+            Err(se) => warn!(
+                "screencapture -l{window_id} failed ({se}); falling back to xcap capture_image"
+            ),
+        }
+    }
+
     let img: RgbaImage = win
         .capture_image()
         .map_err(|e| format!("xcap window capture_image failed: {e}"))?;
@@ -164,6 +182,41 @@ fn capture_app_window(app_name: &str) -> Result<String, String> {
             .map_err(|e| format!("PNG encode failed: {e}"))?;
     }
     let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+    Ok(format!("data:image/png;base64,{b64}"))
+}
+
+/// Capture a single window by its CGWindowID via Apple's `screencapture -l`
+/// CLI. Occlusion-proof and handles hardware-accelerated / opaque windows
+/// (e.g. WeChat 4.x) that xcap's in-process capture cannot. Returns a PNG
+/// data URI. The temp file is keyed by pid+window-id so concurrent captures
+/// of different windows don't collide.
+#[cfg(target_os = "macos")]
+fn screencapture_window_by_id(window_id: u32) -> Result<String, String> {
+    let tmp = std::env::temp_dir().join(format!(
+        "rsclaw_wincap_{}_{window_id}.png",
+        std::process::id()
+    ));
+    let out = Command::new("/usr/sbin/screencapture")
+        .arg("-x") // silent — no shutter sound
+        .arg("-o") // omit the window's drop shadow
+        .arg(format!("-l{window_id}")) // capture the window with this id
+        .arg(&tmp)
+        .output()
+        .map_err(|e| format!("screencapture spawn failed: {e}"))?;
+    if !out.status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "screencapture exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let bytes = std::fs::read(&tmp).map_err(|e| format!("read screencapture output: {e}"))?;
+    let _ = std::fs::remove_file(&tmp);
+    if bytes.is_empty() {
+        return Err("screencapture produced an empty file (window off-screen?)".to_string());
+    }
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(format!("data:image/png;base64,{b64}"))
 }
 
