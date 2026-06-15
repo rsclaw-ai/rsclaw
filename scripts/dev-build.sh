@@ -5,17 +5,26 @@
 # Why this script exists
 # ----------------------
 # `cargo build` produces a binary signed with cargo's default
-# `linker-signed adhoc` signature. The codesign Identifier is derived
-# from the binary hash, so every rebuild changes the identifier and
-# macOS TCC (Privacy & Security) treats it as a fresh, untrusted
-# binary. Even when "Accessibility" / "Input Monitoring" toggles still
-# look enabled in System Settings, TCC silently denies because the
-# identifier in its database no longer matches the on-disk binary.
+# `linker-signed adhoc` signature, whose codesign Identifier is derived
+# from the binary hash. macOS TCC (Privacy & Security) keys its grants
+# on the binary's code-signing *designated requirement*.
 #
-# This wrapper runs `cargo build` and then re-signs the binary with a
-# stable ad-hoc identifier (`rsclaw.dev`). After authorising the binary
-# once in System Settings, subsequent rebuilds keep the same identifier
-# and the grant survives.
+# IMPORTANT: for an AD-HOC signature (`codesign --sign -`) that
+# requirement is a pinned **cdhash** — and a stable `--identifier` does
+# NOT change that. So every rebuild produces a new cdhash and the grant
+# silently stops applying (Screen Recording / Accessibility look enabled
+# in System Settings but capture fails with `Failed to copy data` and
+# input no-ops). A stable identifier alone is NOT enough; the binary must
+# be signed with a real (even self-signed) IDENTITY so the requirement
+# becomes identity-based and survives rebuilds.
+#
+# This wrapper therefore signs with a real code-signing identity when one
+# is available (auto-detected, or `RSCLAW_CODESIGN_IDENTITY`), and falls
+# back to ad-hoc only with a loud warning. After authorising the binary
+# once in System Settings, subsequent rebuilds keep the same identity and
+# the grant survives. (Import a stable identity once via:
+#   security import id.p12 -k ~/Library/Keychains/login.keychain-db \
+#     -P <pw> -T /usr/bin/codesign -A )
 #
 # Usage
 # -----
@@ -73,14 +82,32 @@ if [ ! -f "$binary" ]; then
     exit 1
 fi
 
-# Re-sign with a stable identifier. Only meaningful on macOS — on Linux
-# / Windows codesign is a no-op so we just skip.
+# Re-sign with a stable identity + identifier so macOS TCC grants survive
+# rebuilds. Only meaningful on macOS — on Linux / Windows codesign is a
+# no-op so we just skip.
 if [ "$(uname)" = "Darwin" ]; then
     if ! command -v codesign >/dev/null 2>&1; then
         echo "[dev-build] WARNING: codesign not found; binary will use cargo's hash-based ad-hoc signature, TCC permissions will not survive rebuilds" >&2
     else
-        codesign --force --sign - --identifier "$IDENTIFIER" "$binary" 2>&1 |
-            grep -v "replacing existing signature" || true
-        echo "[dev-build] $binary signed with identifier=$IDENTIFIER"
+        # Pick a stable signing identity: explicit override wins, else the
+        # first valid code-signing identity in the keychain (by SHA-1, which
+        # is unambiguous), else none.
+        identity="${RSCLAW_CODESIGN_IDENTITY:-}"
+        if [ -z "$identity" ]; then
+            identity="$(security find-identity -v -p codesigning 2>/dev/null \
+                | awk '/^[[:space:]]*[0-9]+\)/ {print $2; exit}')"
+        fi
+        if [ -n "$identity" ]; then
+            codesign --force --sign "$identity" --identifier "$IDENTIFIER" "$binary" 2>&1 |
+                grep -v "replacing existing signature" || true
+            echo "[dev-build] $binary signed with stable identity=$identity identifier=$IDENTIFIER (TCC grants survive rebuilds)"
+        else
+            codesign --force --sign - --identifier "$IDENTIFIER" "$binary" 2>&1 |
+                grep -v "replacing existing signature" || true
+            echo "[dev-build] WARNING: no code-signing identity in keychain — signed AD-HOC (identifier=$IDENTIFIER)." >&2
+            echo "[dev-build]          macOS TCC grants (Screen Recording / Accessibility) will NOT survive rebuilds — the" >&2
+            echo "[dev-build]          designated requirement is a cdhash that changes every build. Import a stable identity" >&2
+            echo "[dev-build]          (security import id.p12 -T /usr/bin/codesign -A) or set RSCLAW_CODESIGN_IDENTITY." >&2
+        fi
     fi
 fi

@@ -194,6 +194,11 @@ interface host-desktop {
     /// Screenshot a screen region. Returns data URI.
     desktop-screenshot-region: func(x: u32, y: u32, w: u32, h: u32) -> result<string, string>;
 
+    /// OCR the app's main window (macOS Vision). Returns JSON
+    /// `[{"text":"...","x":143,"y":699}, ...]` with 0-1000 relative centre
+    /// coords -- precise enough to click a named row.
+    desktop-ocr-window: func(bundle-id: string) -> result<string, string>;
+
     /// Move the mouse cursor to absolute screen coordinates (x, y) without clicking.
     desktop-mouse-move: func(x: u32, y: u32) -> result<string, string>;
 

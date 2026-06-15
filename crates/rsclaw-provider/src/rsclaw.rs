@@ -18,7 +18,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use futures::{StreamExt, TryStreamExt, future::BoxFuture};
-use reqwest::{Client, StatusCode};
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -114,38 +114,19 @@ const TURN_HEADERS_TIMEOUT: Duration = Duration::from_secs(60);
 /// replaced.
 const MAX_SESSIONS: usize = 10_000;
 
-/// Maximum redirect hops we'll follow before bailing. 5 is generous —
-/// a healthy rsclaw-server topology should be at most ONE 308 hop
-/// (LB / API gateway → real worker), but multi-region or canary fleet
-/// setups can stack two. Above five we're almost certainly in a loop
-/// or fighting a misconfigured DNS round-robin returning 308 forever.
-const MAX_REDIRECT_HOPS: usize = 5;
-
-/// Fallback redirect-cache TTL when the 308 response omits a
-/// `Cache-Control: max-age=N` directive. We deliberately set this
-/// SHORT (5 min) rather than long: a server that forgets to declare
-/// its TTL probably has buggy 308 emission too, so we should
-/// re-validate often enough that we don't get pinned to a stale
-/// target. Servers that want longer caching MUST set `max-age=3600`
-/// (or whatever they prefer) explicitly. rsclaw-server's documented
-/// default is `max-age=3600` (1h).
-const DEFAULT_REDIRECT_TTL: Duration = Duration::from_secs(300);
-
 // ---------------------------------------------------------------------------
 // Provider
 // ---------------------------------------------------------------------------
 
 pub struct RsclawProvider {
-    /// Reqwest client with redirects DISABLED — we manage 307/308
-    /// ourselves so we can capture the `Cache-Control` directive on
-    /// 308 responses (reqwest's auto-redirect strips the response
-    /// headers before we can read them). Other providers in this
-    /// crate still use the default redirect policy via
-    /// `http_client_with_ua` — this is rsclaw-specific because only
-    /// rsclaw-server is part of OUR infrastructure (other providers
-    /// are arbitrary upstreams where redirect-caching would let an
-    /// attacker pin us to a malicious host).
-    client: Client,
+    /// Shared fleet HTTP client: a connection-reusing reqwest client
+    /// (redirects DISABLED so the 308 `Cache-Control` survives) wrapped
+    /// in the crate-wide [`rsclaw_embed::FleetHttp`] 307/308 redirect
+    /// cache, so the LB hop is amortised across this provider AND the
+    /// OCR / embed / rerank lanes. Redirect-caching is rsclaw-specific
+    /// (only rsclaw-server is OUR infra); arbitrary upstreams keep the
+    /// default redirect policy via `http_client_with_ua`.
+    fleet: rsclaw_embed::FleetHttp,
     base_url: String,
     bearer: Option<String>,
     /// Namespaced `<ns>/<ver>` string sent verbatim as the wire
@@ -172,129 +153,6 @@ pub struct RsclawProvider {
     /// option, so a stale mix is safe but pointless).
     constrain_tool_calls: bool,
     sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
-    /// Cache of 308 redirects, keyed by *origin* (scheme + host + port)
-    /// of the requested URL. Lets a single LB call amortise across the
-    /// whole session (and across sessions, since this is per-provider-
-    /// instance and providers are global). See [`RedirectCache`].
-    redirect_cache: Arc<Mutex<RedirectCache>>,
-}
-
-/// Entry in [`RedirectCache`] — where to actually send requests that
-/// target this origin, and until when this rerouting is valid.
-#[derive(Debug, Clone)]
-struct RedirectEntry {
-    /// Scheme + host + port to send to. The path portion of any
-    /// request is appended verbatim; e.g. `(api.rsclaw.ai/v1/agent/...
-    /// → server.rsclaw.ai:8443/v1/agent/...)`.
-    target_origin: String,
-    /// Instant after which this entry is ignored. Computed from
-    /// `Cache-Control: max-age=N` on the 308 response, or
-    /// [`DEFAULT_REDIRECT_TTL`] if the directive was absent.
-    expires_at: std::time::Instant,
-}
-
-#[derive(Debug, Default)]
-struct RedirectCache {
-    entries: HashMap<String, RedirectEntry>,
-}
-
-impl RedirectCache {
-    /// Look up `origin`. Returns the target origin only when the entry
-    /// is fresh; expired entries are removed lazily.
-    fn lookup(&mut self, origin: &str) -> Option<String> {
-        let now = std::time::Instant::now();
-        match self.entries.get(origin) {
-            Some(e) if e.expires_at > now => Some(e.target_origin.clone()),
-            Some(_) => {
-                // Lazy eviction — drop the stale entry so subsequent
-                // lookups don't keep re-checking the same dead row.
-                self.entries.remove(origin);
-                None
-            }
-            None => None,
-        }
-    }
-
-    fn store(&mut self, origin: String, target_origin: String, ttl: Duration) {
-        let expires_at = std::time::Instant::now() + ttl;
-        self.entries.insert(
-            origin,
-            RedirectEntry {
-                target_origin,
-                expires_at,
-            },
-        );
-    }
-
-    fn invalidate(&mut self, origin: &str) {
-        self.entries.remove(origin);
-    }
-}
-
-/// Extract the origin (`scheme://host[:port]`) prefix from a URL.
-/// Returns `None` for inputs that don't look like absolute URLs.
-fn origin_of(url: &str) -> Option<&str> {
-    let scheme_end = url.find("://")? + 3;
-    let path_start = url[scheme_end..]
-        .find('/')
-        .map(|i| scheme_end + i)
-        .unwrap_or(url.len());
-    Some(&url[..path_start])
-}
-
-/// Rewrite the origin portion of `url` to `new_origin`, preserving the
-/// path / query / fragment.
-fn rewrite_origin(url: &str, new_origin: &str) -> String {
-    match origin_of(url) {
-        Some(orig) => format!("{}{}", new_origin, &url[orig.len()..]),
-        None => url.to_owned(),
-    }
-}
-
-/// Resolve a possibly-relative `Location` header value against `base`
-/// per RFC 3986 §5.3 (minimal — only handles the cases real
-/// rsclaw-server emits: absolute URL, absolute path, or empty).
-fn resolve_location(base: &str, location: &str) -> Option<String> {
-    if location.is_empty() {
-        return None;
-    }
-    if location.contains("://") {
-        return Some(location.to_owned());
-    }
-    let base_origin = origin_of(base)?;
-    if location.starts_with('/') {
-        Some(format!("{base_origin}{location}"))
-    } else {
-        // Relative-to-current-path is intentionally not supported.
-        // rsclaw-server doesn't emit such Location headers and
-        // supporting them would invite path-confusion bugs. Treat as
-        // unrecognised and let the caller fall through to error.
-        None
-    }
-}
-
-/// Parse `Cache-Control: ..., max-age=N, ...` returning the number
-/// of seconds, or `None` if missing / malformed. Also returns `None`
-/// when `no-store` or `no-cache` is present — those directives
-/// explicitly forbid caching and override any `max-age` in the same
-/// header. Multiple `Cache-Control` headers (rare) are caller's
-/// responsibility to concat before calling.
-fn parse_max_age(cache_control: Option<&str>) -> Option<Duration> {
-    let header = cache_control?;
-    let mut max_age: Option<u64> = None;
-    for directive in header.split(',') {
-        let d = directive.trim();
-        let d_lower = d.to_ascii_lowercase();
-        if d_lower == "no-store" || d_lower == "no-cache" {
-            return None;
-        }
-        if let Some(value) = d_lower.strip_prefix("max-age=") {
-            if let Ok(n) = value.trim().parse::<u64>() {
-                max_age = Some(n);
-            }
-        }
-    }
-    max_age.map(Duration::from_secs)
 }
 
 /// Consume an SSE response until the first terminal event and return
@@ -439,14 +297,16 @@ impl RsclawProvider {
             .build()
             .expect("failed to build rsclaw HTTP client");
         Self {
-            client,
+            // Wrap the provider's connection-reusing, redirect-disabled client
+            // in the shared 307/308 cache so the LB hop amortises across this
+            // provider and the OCR / embed / rerank lanes alike.
+            fleet: rsclaw_embed::FleetHttp::from_client(client),
             base_url,
             bearer,
             prefix_id: RSCLAW_DEFAULT_PREFIX_ID.to_owned(),
             compact_timeout: Duration::from_secs(RSCLAW_DEFAULT_COMPACT_TIMEOUT_SECS),
             constrain_tool_calls: false,
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            redirect_cache: Arc::new(Mutex::new(RedirectCache::default())),
         }
     }
 
@@ -500,19 +360,6 @@ impl RsclawProvider {
         }
         self.prefix_id = s;
         self
-    }
-
-    fn auth_header(&self) -> Option<(String, String)> {
-        // `Some("")` slips in when `RSCLAW_KEY` is set but blank (env
-        // var present, value empty) — `std::env::var` returns `Ok("")`,
-        // gateway/providers.rs `.ok()`s that into `Some("")`. Sending
-        // `Authorization: Bearer ` with an empty token gets rejected
-        // by stricter proxies and obscures the real "no auth
-        // configured" error, so treat empty as absent here.
-        self.bearer
-            .as_ref()
-            .filter(|k| !k.is_empty())
-            .map(|k| ("authorization".to_string(), format!("Bearer {k}")))
     }
 
     /// Acquire the sessions lock, recovering from poison rather than
@@ -1090,73 +937,27 @@ fn invalidate_on_error(
 // ---------------------------------------------------------------------------
 
 impl RsclawProvider {
-    /// Resolve a request URL via the redirect cache.
-    ///
-    /// Strips the configured `base_url`'s origin off the front, looks
-    /// the origin up in [`RedirectCache`], and if there's a fresh 308
-    /// cached, rewrites the URL to point at the cached target instead.
-    /// This is what lets the very first request through the LB pay
-    /// the redirect cost ONCE, then route directly for the cache TTL
-    /// (1h by rsclaw-server's default).
-    fn resolve_url(&self, path: &str) -> String {
-        let full = format!("{}{}", self.base_url, path);
-        let Some(origin) = origin_of(&full) else {
-            return full;
-        };
-        if let Ok(mut cache) = self.redirect_cache.lock() {
-            if let Some(target) = cache.lookup(origin) {
-                return rewrite_origin(&full, &target);
-            }
-        }
-        full
-    }
-
-    /// Invalidate any cached redirect entry whose origin matches `url`.
-    /// Called by request paths that observe target-host failure
-    /// (connection refused, 5xx, timeout) so a dead target doesn't
-    /// keep getting hammered for the rest of the cache window.
-    fn invalidate_redirect_for(&self, url: &str) {
-        let Some(origin) = origin_of(url) else { return };
-        if let Ok(mut cache) = self.redirect_cache.lock() {
-            cache.invalidate(origin);
-        }
-    }
-
     /// POST `body` to `path` (e.g. `/sessions`) under `base_url`,
-    /// transparently capturing 307/308 redirects.
+    /// delegating 307/308 capture + caching to the shared
+    /// [`rsclaw_embed::FleetHttp`] — the SAME redirect cache the OCR /
+    /// embed / rerank lanes use, so the LB hop amortises fleet-wide.
     ///
-    /// - 308 responses: extract `Location` + `Cache-Control: max-age`, record
-    ///   the target origin in [`RedirectCache`] with that TTL (or
-    ///   [`DEFAULT_REDIRECT_TTL`] if absent), then follow once. Subsequent
-    ///   calls through [`resolve_url`] go DIRECT to the target until the TTL
-    ///   expires — amortising the LB cost across the whole cache window instead
-    ///   of paying it per request.
-    /// - 307 responses: follow without caching (temporary by spec).
-    /// - All other statuses: returned as-is to the caller, even error statuses.
-    ///   Callers decide how to interpret them (e.g. turn() recognises
-    ///   404/409/503 as session-evicted and triggers replay).
+    /// - 308: the target origin is cached (per `Cache-Control: max-age`,
+    ///   or a short default) so subsequent calls route DIRECT until the
+    ///   TTL expires, instead of re-paying the LB redirect per request.
+    /// - 307: followed without caching (temporary by spec).
+    /// - All other statuses (incl. errors): returned as-is for the
+    ///   caller to interpret (e.g. turn() reads 404/409/503 as
+    ///   session-evicted and triggers replay).
     ///
-    /// `body_max_age_fallback` is the per-request override for the
-    /// "no Cache-Control on 308" fallback TTL. Passing `None` uses
-    /// [`DEFAULT_REDIRECT_TTL`]. Currently always `None`, but the
-    /// hook exists for callers that want a different policy.
-    ///
-    /// `builder_timeout` controls reqwest's total request deadline
-    /// per individual hop (NOT cumulative across redirects). `None`
-    /// = no builder timeout, used by streaming `turn()` which wraps
-    /// the headers phase externally with `tokio::time::timeout`.
-    ///
-    /// `idempotency_key` adds an `Idempotency-Key: <key>` header on
-    /// every hop. Pass `Some(uuid)` on requests that are safe to
-    /// dedupe at the server (e.g. `/sessions/replay`) so a transport
-    /// retry that crossed the wire twice doesn't create two sessions.
-    /// The server is expected to cache the response by key within a
-    /// short TTL (5 min) and return the cached result on duplicate.
-    /// `accept_sse` adds `Accept: text/event-stream` on every hop,
-    /// opting in to the server's keep-alive variant of long-running
-    /// endpoints (currently `/sessions/replay`). Servers that predate
-    /// the SSE path ignore the header and answer plain JSON — callers
-    /// must dispatch on the response Content-Type.
+    /// `builder_timeout` is reqwest's per-hop deadline (NOT cumulative);
+    /// `None` is used by streaming `turn()`, which bounds the headers
+    /// phase externally with `tokio::time::timeout`. `idempotency_key`
+    /// adds `Idempotency-Key` on every hop (safe-to-dedupe requests like
+    /// `/sessions/replay`). `accept_sse` adds `Accept: text/event-stream`
+    /// to opt into the server's keep-alive long-poll variant. The bearer
+    /// is taken from `self.bearer`; FleetHttp drops it when empty, so an
+    /// `RSCLAW_KEY=""` never emits a bare `Authorization: Bearer `.
     async fn send_following_redirects<B: Serialize>(
         &self,
         path: &str,
@@ -1165,105 +966,17 @@ impl RsclawProvider {
         idempotency_key: Option<&str>,
         accept_sse: bool,
     ) -> Result<reqwest::Response> {
-        let mut current_url = self.resolve_url(path);
-        let mut hops = 0;
-
-        loop {
-            let mut builder = self.client.post(&current_url).json(body);
-            if let Some(t) = builder_timeout {
-                builder = builder.timeout(t);
-            }
-            if let Some(key) = idempotency_key {
-                builder = builder.header("Idempotency-Key", key);
-            }
-            if accept_sse {
-                builder = builder.header("Accept", "text/event-stream");
-            }
-            if let Some((k, v)) = self.auth_header() {
-                builder = builder.header(k, v);
-            }
-            let resp = match super::send_with_transport_retry(builder).await {
-                Ok(r) => r,
-                Err(e) => {
-                    // Transport-level failure against a redirected
-                    // target → invalidate so the next attempt goes
-                    // back through the LB. Connection refused / DNS
-                    // failure on the cached target is the canonical
-                    // "target host is dead, LB should reroute" signal.
-                    self.invalidate_redirect_for(&current_url);
-                    return Err(
-                        anyhow::Error::from(e).context(format!("rsclaw POST {current_url}"))
-                    );
-                }
-            };
-
-            let status = resp.status();
-            if status != StatusCode::TEMPORARY_REDIRECT && status != StatusCode::PERMANENT_REDIRECT
-            {
-                return Ok(resp);
-            }
-
-            // Redirect path. Pull Location + Cache-Control before
-            // consuming the response.
-            let location = resp
-                .headers()
-                .get("location")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned);
-            let cache_control = resp
-                .headers()
-                .get("cache-control")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned);
-
-            let Some(loc) = location else {
-                anyhow::bail!(
-                    "rsclaw: {status} redirect from {current_url} omitted Location header"
-                );
-            };
-            let Some(next_url) = resolve_location(&current_url, &loc) else {
-                anyhow::bail!(
-                    "rsclaw: {status} redirect from {current_url} had unsupported Location {loc:?}"
-                );
-            };
-
-            // 308 only: cache the target origin so future requests
-            // skip the LB. 307 is temporary by spec and explicitly
-            // must NOT be cached (otherwise we'd defeat the whole
-            // point of the LB using 307 for ephemeral moves).
-            if status == StatusCode::PERMANENT_REDIRECT {
-                if let (Some(current_origin), Some(next_origin)) =
-                    (origin_of(&current_url), origin_of(&next_url))
-                {
-                    // Only cache when the origin actually changed —
-                    // a 308 that points back at the same origin is a
-                    // server misconfiguration (would cause an infinite
-                    // loop), surface it via the hop counter below
-                    // rather than caching the self-loop.
-                    if current_origin != next_origin {
-                        let ttl =
-                            parse_max_age(cache_control.as_deref()).unwrap_or(DEFAULT_REDIRECT_TTL);
-                        if let Ok(mut cache) = self.redirect_cache.lock() {
-                            cache.store(current_origin.to_owned(), next_origin.to_owned(), ttl);
-                        }
-                        tracing::info!(
-                            from = %current_origin,
-                            to = %next_origin,
-                            ttl_secs = ttl.as_secs(),
-                            "rsclaw: cached 308 redirect"
-                        );
-                    }
-                }
-            }
-
-            hops += 1;
-            if hops > MAX_REDIRECT_HOPS {
-                anyhow::bail!(
-                    "rsclaw: too many redirects ({MAX_REDIRECT_HOPS} hops) starting from {path}"
-                );
-            }
-            current_url = next_url;
-        }
+        let url = format!("{}{}", self.base_url, path);
+        self.fleet
+            .post_following_redirects(
+                &url,
+                body,
+                self.bearer.as_deref(),
+                accept_sse,
+                idempotency_key,
+                builder_timeout,
+            )
+            .await
     }
 
     async fn open(&self, split: &SplitRequest<'_>) -> Result<CreateSessionResp> {
@@ -1542,7 +1255,15 @@ impl RsclawProvider {
 
         let mut body = serde_json::Map::new();
         body.insert("prompt".to_owned(), Value::String(prompt));
-        body.insert("stream".to_owned(), Value::Bool(true));
+        // /vision wants a single complete result — the caller (e.g. vlm_parse)
+        // accumulates ALL deltas before using the text, so streaming buys
+        // nothing and pays the cluster's per-SSE-chunk forwarding latency
+        // (~250ms/chunk through the relay ⇒ tens of seconds per call, and long
+        // replies time out → "error decoding response body"). Request a single
+        // non-streamed JSON body for vision; keep SSE for /fastshot and
+        // /oneshot where token-by-token delivery still matters.
+        let use_stream = path != "/vision";
+        body.insert("stream".to_owned(), Value::Bool(use_stream));
         if let Some(mt) = req.max_tokens {
             body.insert("max_tokens".to_owned(), Value::from(mt));
         }
@@ -1625,6 +1346,37 @@ impl RsclawProvider {
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("rsclaw {path} failed {status}: {body}");
+        }
+
+        // Non-streaming lane (vision): a single JSON {content, finish_reason,
+        // usage} reply (same shape as the OCR lane — `content`, not `text`).
+        // Wrap it as a one-delta stream so the LlmStream interface is
+        // unchanged for callers, while skipping the slow per-chunk SSE relay.
+        if !use_stream {
+            let json: Value = resp
+                .json()
+                .await
+                .map_err(|e| anyhow::anyhow!("rsclaw {path}: decode non-stream body: {e}"))?;
+            if let Some(err) = json.get("error").and_then(|v| v.as_str()) {
+                return Ok(Box::pin(futures::stream::iter(vec![Ok(StreamEvent::Error(
+                    err.to_owned(),
+                ))])) as LlmStream);
+            }
+            let content = json
+                .get("content")
+                .and_then(|v| v.as_str())
+                .or_else(|| json.get("text").and_then(|v| v.as_str()))
+                .or_else(|| {
+                    json.pointer("/choices/0/message/content")
+                        .and_then(|v| v.as_str())
+                })
+                .unwrap_or_default()
+                .to_owned();
+            let events = vec![
+                Ok(StreamEvent::TextDelta(content)),
+                Ok(StreamEvent::Done { usage: None }),
+            ];
+            return Ok(Box::pin(futures::stream::iter(events)) as LlmStream);
         }
 
         // Native rsclaw fastshot/vision SSE — distinct from the
@@ -3473,163 +3225,6 @@ mod tests {
         assert_eq!(ev, "result");
     }
 
-    #[test]
-    fn origin_of_extracts_origin() {
-        assert_eq!(
-            origin_of("https://api.rsclaw.ai/v1/agent/sessions"),
-            Some("https://api.rsclaw.ai")
-        );
-        assert_eq!(
-            origin_of("http://localhost:8443/path"),
-            Some("http://localhost:8443")
-        );
-        assert_eq!(origin_of("https://host"), Some("https://host"));
-        assert_eq!(origin_of("not-a-url"), None);
-    }
-
-    #[test]
-    fn rewrite_origin_preserves_path_and_query() {
-        let url = "https://api.rsclaw.ai/v1/agent/sessions/rs_w7_abc/turn";
-        let new = rewrite_origin(url, "https://server.rsclaw.ai:8443");
-        assert_eq!(
-            new,
-            "https://server.rsclaw.ai:8443/v1/agent/sessions/rs_w7_abc/turn"
-        );
-    }
-
-    #[test]
-    fn resolve_location_handles_absolute_and_relative() {
-        // Absolute URL: returned as-is.
-        assert_eq!(
-            resolve_location(
-                "https://api.rsclaw.ai/v1/agent/sessions",
-                "https://server.rsclaw.ai:8443/v1/agent/sessions",
-            ),
-            Some("https://server.rsclaw.ai:8443/v1/agent/sessions".into()),
-        );
-        // Absolute path: rebased on caller origin.
-        assert_eq!(
-            resolve_location("https://api.rsclaw.ai/v1/agent/sessions", "/other/path"),
-            Some("https://api.rsclaw.ai/other/path".into()),
-        );
-        // Empty / relative-to-current-path explicitly unsupported —
-        // rsclaw-server doesn't emit those and supporting them invites
-        // path-confusion bugs.
-        assert_eq!(
-            resolve_location("https://api.rsclaw.ai/v1/agent/sessions", ""),
-            None,
-        );
-        assert_eq!(
-            resolve_location("https://api.rsclaw.ai/v1/agent/sessions", "other"),
-            None,
-        );
-    }
-
-    #[test]
-    fn parse_max_age_extracts_seconds() {
-        assert_eq!(
-            parse_max_age(Some("max-age=3600")),
-            Some(Duration::from_secs(3600))
-        );
-        assert_eq!(
-            parse_max_age(Some("public, max-age=300, must-revalidate")),
-            Some(Duration::from_secs(300))
-        );
-        assert_eq!(
-            parse_max_age(Some("MAX-AGE=120")),
-            Some(Duration::from_secs(120))
-        ); // case-insensitive
-    }
-
-    #[test]
-    fn parse_max_age_returns_none_when_missing() {
-        assert_eq!(parse_max_age(None), None);
-        assert_eq!(parse_max_age(Some("public")), None);
-        assert_eq!(parse_max_age(Some("private, must-revalidate")), None);
-    }
-
-    #[test]
-    fn parse_max_age_returns_none_on_no_store_or_no_cache() {
-        // RFC 7234 says no-store / no-cache forbid the response from
-        // being stored regardless of max-age. Honour that override so
-        // a server that wants to forcibly disable our redirect cache
-        // can do so by adding `no-store` to the 308's Cache-Control.
-        assert_eq!(parse_max_age(Some("no-store")), None);
-        assert_eq!(parse_max_age(Some("max-age=3600, no-store")), None);
-        assert_eq!(parse_max_age(Some("no-cache, max-age=300")), None);
-    }
-
-    #[test]
-    fn redirect_cache_lookup_returns_target_when_fresh() {
-        let mut cache = RedirectCache::default();
-        cache.store(
-            "https://api.rsclaw.ai".into(),
-            "https://server.rsclaw.ai:8443".into(),
-            Duration::from_secs(60),
-        );
-        assert_eq!(
-            cache.lookup("https://api.rsclaw.ai"),
-            Some("https://server.rsclaw.ai:8443".into()),
-        );
-        // Miss key → None.
-        assert_eq!(cache.lookup("https://other.example.com"), None);
-    }
-
-    #[test]
-    fn redirect_cache_expires_stale_entries_lazily() {
-        let mut cache = RedirectCache::default();
-        // Negative TTL → immediately expired. (`Instant::now()` already
-        // past the computed `expires_at`.)
-        cache.entries.insert(
-            "https://api.rsclaw.ai".into(),
-            RedirectEntry {
-                target_origin: "https://server.rsclaw.ai:8443".into(),
-                expires_at: std::time::Instant::now() - Duration::from_secs(1),
-            },
-        );
-        assert!(cache.lookup("https://api.rsclaw.ai").is_none());
-        // Entry should be evicted as a side-effect — subsequent
-        // lookups don't keep re-walking a dead row.
-        assert!(!cache.entries.contains_key("https://api.rsclaw.ai"));
-    }
-
-    #[test]
-    fn redirect_cache_invalidate_removes_entry() {
-        let mut cache = RedirectCache::default();
-        cache.store(
-            "https://api.rsclaw.ai".into(),
-            "https://server.rsclaw.ai:8443".into(),
-            Duration::from_secs(3600),
-        );
-        cache.invalidate("https://api.rsclaw.ai");
-        assert!(cache.lookup("https://api.rsclaw.ai").is_none());
-    }
-
-    #[test]
-    fn provider_resolve_url_returns_origin_when_cache_empty() {
-        let provider = RsclawProvider::new("https://api.rsclaw.ai/v1/agent", None);
-        assert_eq!(
-            provider.resolve_url("/sessions"),
-            "https://api.rsclaw.ai/v1/agent/sessions",
-        );
-    }
-
-    #[test]
-    fn provider_resolve_url_rewrites_when_cache_fresh() {
-        let provider = RsclawProvider::new("https://api.rsclaw.ai/v1/agent", None);
-        if let Ok(mut cache) = provider.redirect_cache.lock() {
-            cache.store(
-                "https://api.rsclaw.ai".into(),
-                "https://server.rsclaw.ai:8443".into(),
-                Duration::from_secs(3600),
-            );
-        }
-        assert_eq!(
-            provider.resolve_url("/sessions/rs_w7_abc/turn"),
-            "https://server.rsclaw.ai:8443/v1/agent/sessions/rs_w7_abc/turn",
-        );
-    }
-
     /// Thin shim mirroring `parse_sse_chunk`'s signature so tests don't
     /// have to repeat the lock-wrap boilerplate.
     async fn parse_sse_test(
@@ -4527,27 +4122,6 @@ data: {"type":"block_stop","index":0}
     }
 
     #[test]
-    fn auth_header_omits_when_bearer_is_none_or_empty() {
-        // `RSCLAW_KEY=""` (env var set but blank) flows in as
-        // `Some("")` from `std::env::var(...).ok()` — sending
-        // `Authorization: Bearer ` would be rejected by stricter
-        // proxies. Treat None and Some("") as the same "no auth"
-        // signal at the wire boundary.
-        let p = RsclawProvider::new("http://x", None);
-        assert!(p.auth_header().is_none());
-        let p = RsclawProvider::new("http://x", Some(String::new()));
-        assert!(p.auth_header().is_none());
-    }
-
-    #[test]
-    fn auth_header_emits_bearer_when_populated() {
-        let p = RsclawProvider::new("http://x", Some("sk-abc".into()));
-        let (k, v) = p.auth_header().expect("bearer set");
-        assert_eq!(k, "authorization");
-        assert_eq!(v, "Bearer sk-abc");
-    }
-
-    #[test]
     fn ctor_trims_whitespace_from_base_url_and_bearer() {
         // dotenv-loaded env vars routinely carry a trailing newline —
         // `RSCLAW_KEY=sk-abc\n` round-trips into the provider as
@@ -4555,22 +4129,32 @@ data: {"type":"block_stop","index":0}
         // containing `\n` (RFC 7230), so without trimming every signed
         // request fails before leaving the process. Same hazard for
         // base_url where leading/trailing whitespace breaks URL parse.
+        // (The wire-side "drop empty bearer so we never emit a bare
+        // `Authorization: Bearer `" guard now lives in `FleetHttp`.)
         let p = RsclawProvider::new("  http://x:8090/v1/agent/  ", Some("  sk-abc\n  ".into()));
         assert_eq!(p.base_url, "http://x:8090/v1/agent");
-        let (k, v) = p.auth_header().expect("bearer survived trim");
-        assert_eq!(k, "authorization");
-        assert_eq!(v, "Bearer sk-abc");
+        assert_eq!(p.bearer.as_deref(), Some("sk-abc"));
     }
 
     #[test]
-    fn ctor_blank_after_trim_bearer_becomes_none() {
-        // `RSCLAW_KEY="   "` (whitespace-only) MUST NOT survive as
-        // `Some("   ")` — that would emit `Authorization: Bearer    `
-        // which stricter proxies reject the same way they reject the
-        // empty-string form covered by `auth_header_omits_when_*`.
-        let p = RsclawProvider::new("http://x", Some("   \n\t".into()));
-        assert!(p.bearer.is_none());
-        assert!(p.auth_header().is_none());
+    fn ctor_blank_or_empty_bearer_becomes_none() {
+        // `RSCLAW_KEY=""` (env var set but blank) flows in as `Some("")`
+        // from `std::env::var(...).ok()`; `RSCLAW_KEY="   "` as
+        // `Some("   ")`. Neither MUST survive — emitting `Authorization:
+        // Bearer ` (or `Bearer    `) gets rejected by stricter proxies
+        // and obscures the real "no auth configured" error. None / empty
+        // / whitespace-only all collapse to `bearer == None`.
+        assert!(RsclawProvider::new("http://x", None).bearer.is_none());
+        assert!(
+            RsclawProvider::new("http://x", Some(String::new()))
+                .bearer
+                .is_none()
+        );
+        assert!(
+            RsclawProvider::new("http://x", Some("   \n\t".into()))
+                .bearer
+                .is_none()
+        );
     }
 
     #[test]

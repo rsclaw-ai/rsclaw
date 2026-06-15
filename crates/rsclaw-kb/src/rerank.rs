@@ -29,7 +29,7 @@ pub const DEFAULT_RERANK_TOP_N: usize = 20;
 const RERANK_TIMEOUT_SECS: u64 = 30;
 
 pub struct KbReranker {
-    client: reqwest::Client,
+    client: rsclaw_embed::FleetHttp,
     url: String,
     model: Option<String>,
     pub top_n: usize,
@@ -64,7 +64,9 @@ impl KbReranker {
         // Disable idle-pool reuse for the same reason as the embedder: a
         // slow rerank endpoint's keep-alive connection gets reaped between
         // calls and reqwest would otherwise hand back the dead socket.
-        let client = rsclaw_embed::build_remote_client(RERANK_TIMEOUT_SECS);
+        // Shared redirect-cached fleet client (308 baseUrl caching), same as
+        // the OCR / embed / provider lanes — amortises the LB redirect.
+        let client = rsclaw_embed::FleetHttp::new(None);
         Some(std::sync::Arc::new(Self {
             client,
             url: format!("{base}/rerank"),
@@ -116,14 +118,19 @@ impl KbReranker {
         }
 
         let send = || async {
-            self.client
-                .post(self.url.as_str())
-                .json(&body)
-                .send()
+            let resp = self
+                .client
+                .post_following_redirects(
+                    self.url.as_str(),
+                    &body,
+                    None,
+                    false,
+                    None,
+                    Some(std::time::Duration::from_secs(RERANK_TIMEOUT_SECS)),
+                )
                 .await?
-                .error_for_status()?
-                .json::<serde_json::Value>()
-                .await
+                .error_for_status()?;
+            anyhow::Ok(resp.json::<serde_json::Value>().await?)
         };
         let resp: serde_json::Value = match tokio::runtime::Handle::try_current() {
             Ok(handle) => tokio::task::block_in_place(|| handle.block_on(send()))

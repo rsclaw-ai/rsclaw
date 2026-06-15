@@ -21,6 +21,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tracing::warn;
 
+pub mod fleet;
+pub use fleet::FleetHttp;
+
 /// Shared HTTP client for remote embedding/rerank endpoints.
 ///
 /// `pool_max_idle_per_host(0)` is load-bearing, not a tweak: a slow
@@ -314,7 +317,7 @@ impl Embedder for LocalBgeEmbedder {
 // ---------------------------------------------------------------------------
 
 pub struct OpenAiEmbedder {
-    client: reqwest::Client,
+    client: FleetHttp,
     api_key: String,
     model: String,
     dim: i32,
@@ -338,7 +341,10 @@ impl OpenAiEmbedder {
         let dim = dim_override.unwrap_or_else(|| openai_model_dim(&model));
         let base_url = base_url.unwrap_or_else(|| OPENAI_DEFAULT_BASE_URL.to_owned());
         Self {
-            client: build_remote_client(120),
+            // Shared redirect-cached fleet client (308 baseUrl caching). When
+            // base_url points at the rsclaw fleet (e.g. Qwen3-Embedding) this
+            // amortises the LB redirect; against plain OpenAI it's a no-op.
+            client: FleetHttp::new(None),
             api_key,
             model,
             dim,
@@ -354,15 +360,19 @@ impl OpenAiEmbedder {
         });
 
         let send = || async {
-            self.client
-                .post(url.as_str())
-                .header("Authorization", format!("Bearer {}", self.api_key))
-                .json(&body)
-                .send()
+            let resp = self
+                .client
+                .post_following_redirects(
+                    url.as_str(),
+                    &body,
+                    Some(self.api_key.as_str()),
+                    false,
+                    None,
+                    Some(Duration::from_secs(120)),
+                )
                 .await?
-                .error_for_status()?
-                .text()
-                .await
+                .error_for_status()?;
+            anyhow::Ok(resp.text().await?)
         };
         // Retry transient transport errors (idempotent for embeddings).
         let mut last_err: Option<anyhow::Error> = None;
@@ -383,7 +393,7 @@ impl OpenAiEmbedder {
                     if attempt + 1 < EMBED_ATTEMPTS {
                         std::thread::sleep(Duration::from_millis(200 * (attempt as u64 + 1)));
                     }
-                    last_err = Some(anyhow::Error::new(e));
+                    last_err = Some(e);
                 }
             }
         }

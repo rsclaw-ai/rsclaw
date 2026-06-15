@@ -22,6 +22,21 @@ use anyhow::Result;
 /// Default User-Agent for all LLM provider HTTP requests.
 pub const DEFAULT_USER_AGENT: &str = concat!("rsclaw/", env!("CARGO_PKG_VERSION"));
 
+/// Install the rustls aws-lc-rs crypto provider once before any test runs.
+///
+/// reqwest is built with `rustls-tls-webpki-roots-no-provider`, so the
+/// process must install a `CryptoProvider` before the first client is
+/// constructed — the app does this at startup (see `rsclaw-runtime`), but
+/// the unit-test binary has no startup, so any test that builds a provider
+/// client would otherwise panic `No provider set` at `Client::build()`.
+/// `#[ctor]` runs this at test-binary load, before the first `#[test]`.
+/// Mirrors rsclaw-runtime's `init_test_crypto`.
+#[cfg(test)]
+#[ctor::ctor]
+fn init_test_crypto() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
 /// Warn (at most once per `(provider, session_key)` pair across the
 /// process lifetime) when a non-`rsclaw` provider receives a request
 /// with `kv_cache_mode=2`. Mode 2 is the rsclaw-server stateful
