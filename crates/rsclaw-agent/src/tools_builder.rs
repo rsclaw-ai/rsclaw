@@ -1712,6 +1712,7 @@ pub fn build_tool_list(
                 "prompt":       {"type": "string", "description": "Video description. Use the user's original language and wording."},
                 "duration":     {"type": "integer", "description": "Duration in seconds (default: 5)", "default": 5},
                 "aspect_ratio": {"type": "string", "description": "Aspect ratio: 16:9, 9:16, 1:1 (default: 16:9)", "default": "16:9"},
+                "image":        {"type": "string", "description": "Optional first-frame / reference image for image-to-video. Pass a LOCAL FILE PATH (e.g. the path returned by image_gen) — it is auto-encoded to base64; or a public https URL, or a data:image/...;base64,... URI. For multiple keyframes pass an array of such strings."},
                 "model":        {"type": "string", "description": "Video model to use, e.g. seedance, minimax, kling (optional, uses configured default)"}
             },
             "required": ["prompt"]

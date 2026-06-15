@@ -31,6 +31,55 @@ impl super::runtime::AgentRuntime {
         let duration = args["duration"].as_u64().unwrap_or(5);
         let aspect_ratio = args["aspect_ratio"].as_str().unwrap_or("16:9");
 
+        // Optional first-frame / reference image(s) for image-to-video.
+        // Accept a single string or an array. Each entry may be a public
+        // http(s) URL, an existing `data:image/...;base64,...` Data URI, or a
+        // LOCAL FILE PATH — the common case, since a freshly generated image
+        // has no public URL to point at. Local paths are read and encoded to
+        // a base64 Data URI here so the provider gets self-contained input.
+        // Only providers whose submit adapter supports it (currently agnes)
+        // consume these; others ignore.
+        let raw_images: Vec<String> = match &args["image"] {
+            Value::String(s) if !s.is_empty() => vec![s.clone()],
+            Value::Array(a) => a
+                .iter()
+                .filter_map(|v| v.as_str().filter(|s| !s.is_empty()).map(str::to_owned))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let mut images: Vec<String> = Vec::with_capacity(raw_images.len());
+        for img in raw_images {
+            if img.starts_with("http://")
+                || img.starts_with("https://")
+                || img.starts_with("data:")
+            {
+                images.push(img);
+                continue;
+            }
+            // Treat as a local file path → base64 Data URI.
+            match tokio::fs::read(&img).await {
+                Ok(bytes) => {
+                    use base64::Engine;
+                    let mime = match std::path::Path::new(&img)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.to_ascii_lowercase())
+                        .as_deref()
+                    {
+                        Some("jpg") | Some("jpeg") => "image/jpeg",
+                        Some("webp") => "image/webp",
+                        Some("gif") => "image/gif",
+                        _ => "image/png",
+                    };
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    images.push(format!("data:{mime};base64,{b64}"));
+                }
+                Err(e) => {
+                    tracing::warn!(path = %img, error = %e, "video_gen: image not readable, skipping");
+                }
+            }
+        }
+
         // Resolve the configured video chain (head + optional fallbacks)
         // from `agents.defaults.model.video` or the per-agent handle
         // override. StringOrVec collapses single string + array into the
@@ -253,6 +302,7 @@ impl super::runtime::AgentRuntime {
                         duration,
                         aspect_ratio,
                         Some(model_id.as_str()),
+                        &images,
                     )
                     .await
                     .map(|id| ("agnes", id)),

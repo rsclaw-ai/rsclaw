@@ -391,7 +391,10 @@ fn agnes_video_dims(aspect_ratio: &str) -> (u32, u32) {
     }
 }
 
-/// Submit an Agnes text→video task and return the provider's `video_id`.
+/// Submit an Agnes text→video OR image→video task and return the provider's
+/// `video_id`. When `images` is non-empty the request becomes image-to-video
+/// (`image` array + `mode: ti2vid`); each entry is a public URL or a
+/// `data:image/...;base64,...` Data URI.
 pub async fn submit_agnes(
     client: &reqwest::Client,
     api_key: &str,
@@ -399,6 +402,7 @@ pub async fn submit_agnes(
     duration: u64,
     aspect_ratio: &str,
     model_override: Option<&str>,
+    images: &[String],
 ) -> Result<String> {
     // Chain entries arrive as `agnes/agnes-video-v2.0`; strip the
     // `provider/` prefix so the upstream `model` field is the bare id.
@@ -411,7 +415,7 @@ pub async fn submit_agnes(
     // num_frames must satisfy 8n+1 and be ≤ 441.
     let raw_frames = duration.saturating_mul(frame_rate).max(8);
     let num_frames = (((raw_frames - 1) / 8) * 8 + 1).min(441);
-    let body = json!({
+    let mut body = json!({
         "model": model,
         "prompt": prompt,
         "width": width,
@@ -419,6 +423,12 @@ pub async fn submit_agnes(
         "frame_rate": frame_rate,
         "num_frames": num_frames,
     });
+    // Image-to-video: top-level `image` array + `mode: ti2vid` per the Agnes
+    // Video V2.0 spec. Text-to-video sends neither.
+    if !images.is_empty() {
+        body["image"] = json!(images);
+        body["mode"] = json!("ti2vid");
+    }
     let resp: serde_json::Value = client
         .post(format!("{AGNES_BASE}/v1/videos"))
         .bearer_auth(api_key)
