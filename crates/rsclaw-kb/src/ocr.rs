@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 const OCR_TIMEOUT_SECS: u64 = 120;
 
 pub struct OcrClient {
-    client: reqwest::Client,
+    client: rsclaw_embed::FleetHttp,
     url: String,
     model: Option<String>,
     api_key: Option<String>,
@@ -62,7 +62,10 @@ impl OcrClient {
         // `/agent/ocr`. (Verified live: /v1/agent/ocr → 503 no_worker,
         // /v1/ocr → 404 no route.)
         Some(std::sync::Arc::new(Self {
-            client: rsclaw_embed::build_remote_client(OCR_TIMEOUT_SECS),
+            // FleetHttp = redirect-cached fleet client (308 baseUrl caching +
+            // idle-pool disabled), shared with the rsclaw provider and the
+            // embed/rerank lanes so they all amortise the LB redirect.
+            client: rsclaw_embed::FleetHttp::new(None),
             url: format!("{base}/agent/ocr"),
             model: oc.model,
             api_key,
@@ -95,16 +98,19 @@ impl OcrClient {
         }
 
         let send = || async {
-            let mut req = self.client.post(self.url.as_str());
-            if let Some(k) = &self.api_key {
-                req = req.header("Authorization", format!("Bearer {k}"));
-            }
-            req.json(&body)
-                .send()
+            let resp = self
+                .client
+                .post_following_redirects(
+                    self.url.as_str(),
+                    &body,
+                    self.api_key.as_deref(),
+                    false,
+                    None,
+                    Some(std::time::Duration::from_secs(OCR_TIMEOUT_SECS)),
+                )
                 .await?
-                .error_for_status()?
-                .json::<serde_json::Value>()
-                .await
+                .error_for_status()?;
+            anyhow::Ok(resp.json::<serde_json::Value>().await?)
         };
         let resp: serde_json::Value = match tokio::runtime::Handle::try_current() {
             Ok(handle) => {

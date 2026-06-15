@@ -26,6 +26,13 @@ rsclaw-types = { path = "../rsclaw-types" }
 rsclaw-config = { path = "../rsclaw-config" }
 rsclaw-util = { path = "../rsclaw-util" }
 rsclaw-i18n = { path = "../rsclaw-i18n" }
+rsclaw-embed = { path = "../rsclaw-embed" }
 
 [dev-dependencies]
 wiremock = "0.6"
+# Test-only: install the rustls aws-lc-rs crypto provider once before any
+# test builds a reqwest client (reqwest uses `*-no-provider`, so the app
+# normally installs it at startup — tests have no startup). Mirrors
+# rsclaw-runtime's `init_test_crypto` ctor.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+ctor = "0.4"
