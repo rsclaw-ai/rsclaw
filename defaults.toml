@@ -621,6 +621,9 @@ order    = 8
 [video_providers.seedance]
 label       = "Seedance 2.0 (ByteDance)"
 env_var     = "ARK_API_KEY"
+# Variants (use the exact ARK model id): pro = doubao-seedance-2-0-260128,
+# fast = doubao-seedance-2-0-fast-260128. Override per-call via the video_gen
+# `model` arg or agents.defaults.model.video (e.g. doubao/<id>).
 model       = "doubao-seedance-2-0-260128"
 base_url    = "https://ark.cn-beijing.volces.com/api/v3"
 

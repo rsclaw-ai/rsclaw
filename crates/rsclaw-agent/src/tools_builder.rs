@@ -1673,12 +1673,13 @@ pub fn build_tool_list(
 
     tools.push(ToolDef {
         name: "image_gen".to_owned(),
-        description: "Generate an image from a text description using an AI image model. Pass the user's original description as-is (preserve their language, do not translate).".to_owned(),
+        description: "Generate or EDIT an image with an AI image model. Text-to-image (prompt only) or image-to-image (pass `image` to transform/edit an existing picture). Pass the user's original description as-is (preserve their language, do not translate).".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "prompt": {"type": "string", "description": "Image description. IMPORTANT: use the user's original language and wording, do not translate to English."},
-                "size":   {"type": "string", "description": "Image size, e.g. 2048x2048", "default": "2048x2048"}
+                "prompt": {"type": "string", "description": "Image description, or for image-to-image the edit instruction (what to change/keep). Use the user's original language and wording, do not translate."},
+                "size":   {"type": "string", "description": "Image size, e.g. 2048x2048", "default": "2048x2048"},
+                "image":  {"type": ["string", "array"], "items": {"type": "string"}, "description": "Optional input image(s) for image-to-image / editing (agnes, doubao seedream, and OAI-compatible gateways). Each entry: a LOCAL FILE PATH (e.g. a prior image_gen result — auto-encoded to base64), a public https URL, or a data:image/...;base64,... URI. One image = edit/transform it; multiple = multi-image composition (agnes)."}
             },
             "required": ["prompt"]
         }),

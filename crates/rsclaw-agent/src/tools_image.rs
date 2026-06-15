@@ -97,6 +97,48 @@ pub(crate) fn agnes_image_size(requested: &str) -> &'static str {
     }
 }
 
+/// Normalize image-to-image input(s): accept a single string or an array of
+/// strings. http(s)/data: entries pass through; a LOCAL FILE PATH (e.g. an
+/// earlier image_gen result) is read and base64-encoded into a `data:` URI so
+/// providers get self-contained input. Unreadable paths are dropped.
+pub(crate) async fn normalize_image_inputs(v: &Value) -> Vec<String> {
+    let raw: Vec<String> = match v {
+        Value::String(s) if !s.is_empty() => vec![s.clone()],
+        Value::Array(a) => a
+            .iter()
+            .filter_map(|x| x.as_str().filter(|s| !s.is_empty()).map(str::to_owned))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let mut out = Vec::with_capacity(raw.len());
+    for img in raw {
+        if img.starts_with("http://") || img.starts_with("https://") || img.starts_with("data:") {
+            out.push(img);
+            continue;
+        }
+        match tokio::fs::read(&img).await {
+            Ok(bytes) => {
+                use base64::Engine;
+                let mime = match std::path::Path::new(&img)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_ascii_lowercase())
+                    .as_deref()
+                {
+                    Some("jpg") | Some("jpeg") => "image/jpeg",
+                    Some("webp") => "image/webp",
+                    Some("gif") => "image/gif",
+                    _ => "image/png",
+                };
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                out.push(format!("data:{mime};base64,{b64}"));
+            }
+            Err(e) => tracing::warn!(path = %img, error = %e, "image_gen: input image not readable, skipping"),
+        }
+    }
+    out
+}
+
 /// Default video-gen model for a primary LLM provider — same opt-in-by-
 /// primary-provider rule as [`default_image_model`].
 pub(crate) fn default_video_model(provider: &str) -> Option<&'static str> {
@@ -134,7 +176,14 @@ impl super::runtime::AgentRuntime {
         )
     }
 
-    pub(crate) async fn tool_image(&self, args: Value) -> Result<Value> {
+    pub(crate) async fn tool_image(&self, mut args: Value) -> Result<Value> {
+        // Image-to-image: normalize any input image(s) up front (local paths →
+        // base64 data URIs) so every provider branch sees ready-to-send
+        // strings in args["image"].
+        if !args["image"].is_null() {
+            let imgs = normalize_image_inputs(&args["image"]).await;
+            args["image"] = if imgs.is_empty() { Value::Null } else { json!(imgs) };
+        }
         let prompt = args["prompt"]
             .as_str()
             .ok_or_else(|| anyhow!("image: `prompt` required"))?;
@@ -322,7 +371,14 @@ impl super::runtime::AgentRuntime {
         // the cost gate: do not silently fall back to another paid provider
         // just because an API key happens to be configured.
         let image_providers = ["doubao", "bytedance", "openai", "qwen", "minimax", "gemini", "rsclaw", "agnes"];
-        let (img_url, img_key, img_prov, img_env_var) = if image_providers.contains(&prov_name) {
+        // A provider configured with an explicit base_url is treated as an
+        // OpenAI-compatible image endpoint even if it's not a known name —
+        // this is how e.g. gpt-image-2 (or any /images/generations gateway)
+        // runs against a custom baseUrl without hardcoding the provider here.
+        let custom_oai = !image_providers.contains(&prov_name) && cfg_url.is_some();
+        let (img_url, img_key, img_prov, img_env_var) = if image_providers.contains(&prov_name)
+            || custom_oai
+        {
             // rsclaw's LLM default in defaults.toml ends in `/v1/agent`;
             // the gen surface lives off the host root. `gen_host_base`
             // normalises both shapes; we append `/v1` for the OAI mount.
@@ -624,6 +680,17 @@ impl super::runtime::AgentRuntime {
             }
             if let Some(c) = args.get("output_compression").and_then(|v| v.as_u64()) {
                 body["output_compression"] = json!(c);
+            }
+            // Image-to-image: forward normalized input image(s). gpt-image
+            // editing uses a separate multipart `/images/edits` endpoint, so
+            // it's skipped here; doubao seedream and OAI-compatible gateways
+            // accept an `image` field on `/images/generations` (string for a
+            // single image, array for multi-reference).
+            if !is_gpt_image && !args["image"].is_null() {
+                body["image"] = match &args["image"] {
+                    Value::Array(a) if a.len() == 1 => a[0].clone(),
+                    other => other.clone(),
+                };
             }
 
             if img_prov == "rsclaw" {
