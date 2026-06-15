@@ -1712,7 +1712,7 @@ pub fn build_tool_list(
                 "prompt":       {"type": "string", "description": "Video description. Use the user's original language and wording."},
                 "duration":     {"type": "integer", "description": "Duration in seconds (default: 5)", "default": 5},
                 "aspect_ratio": {"type": "string", "description": "Aspect ratio: 16:9, 9:16, 1:1 (default: 16:9)", "default": "16:9"},
-                "image":        {"type": ["string", "array"], "items": {"type": "string"}, "description": "Optional reference image(s) for image-to-video (agnes, doubao). Each entry: a LOCAL FILE PATH (e.g. the path returned by image_gen — auto-encoded to base64), a public https URL, or a data:image/...;base64,... URI. ONE image = first frame (animate this image). TWO images = first + last frame (interpolate between them). THREE+ = reference images (doubao multimodal)."},
+                "image":        {"type": ["string", "array"], "items": {"type": "string"}, "description": "Optional reference image(s) for image-to-video (agnes, doubao, minimax, kling). Each entry: a LOCAL FILE PATH (e.g. the path returned by image_gen — auto-encoded to base64), a public https URL, or a data:image/...;base64,... URI. ONE image = first frame (animate this image). TWO images = first + last frame (interpolate). THREE+ = reference images (doubao multimodal). minimax uses the first frame only."},
                 "model":        {"type": "string", "description": "Video model to use, e.g. seedance, minimax, kling (optional, uses configured default)"}
             },
             "required": ["prompt"]

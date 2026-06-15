@@ -157,17 +157,24 @@ pub async fn submit_minimax(
     duration: u64,
     aspect_ratio: &str,
     model_override: Option<&str>,
+    images: &[String],
 ) -> Result<String> {
     let model = model_override.unwrap_or(MINIMAX_DEFAULT_MODEL);
+    let mut body = json!({
+        "prompt": prompt,
+        "model": model,
+        "duration": duration,
+        "resolution": minimax_resolution(aspect_ratio),
+    });
+    // Image-to-video: MiniMax (Hailuo) takes a single `first_frame_image`,
+    // a public URL or a `data:image/...;base64,...` Data URI.
+    if let Some(first) = images.first() {
+        body["first_frame_image"] = json!(first);
+    }
     let resp: serde_json::Value = client
         .post(format!("{MINIMAX_BASE}/video_generation"))
         .bearer_auth(api_key)
-        .json(&json!({
-            "prompt": prompt,
-            "model": model,
-            "duration": duration,
-            "resolution": minimax_resolution(aspect_ratio),
-        }))
+        .json(&body)
         .send()
         .await
         .map_err(|e| anyhow!("minimax: submit failed: {e}"))?
@@ -249,18 +256,47 @@ pub async fn submit_kling(
     duration: u64,
     aspect_ratio: &str,
     model_override: Option<&str>,
+    images: &[String],
 ) -> Result<String> {
     let model = model_override.unwrap_or(KLING_DEFAULT_MODEL);
     let jwt = kling_jwt(access_key, secret_key)?;
-    let resp: serde_json::Value = client
-        .post(format!("{KLING_BASE}/v1/videos/text2video"))
-        .bearer_auth(&jwt)
-        .json(&json!({
+    // Kling wants RAW base64 for image inputs — strip the `data:<mime>;base64,`
+    // prefix that the tool layer adds. Public URLs pass through untouched.
+    let kling_img = |s: &String| -> String {
+        match s.split_once(";base64,") {
+            Some((_, b64)) => b64.to_owned(),
+            None => s.clone(),
+        }
+    };
+    // Image-to-video uses a different endpoint + body: `image` (start frame)
+    // and optional `image_tail` (end frame). aspect_ratio is derived from the
+    // image, so it's omitted there.
+    let (url, body) = if images.is_empty() {
+        (
+            format!("{KLING_BASE}/v1/videos/text2video"),
+            json!({
+                "model_name": model,
+                "prompt": prompt,
+                "duration": duration.to_string(),
+                "aspect_ratio": aspect_ratio,
+            }),
+        )
+    } else {
+        let mut b = json!({
             "model_name": model,
             "prompt": prompt,
             "duration": duration.to_string(),
-            "aspect_ratio": aspect_ratio,
-        }))
+            "image": kling_img(&images[0]),
+        });
+        if let Some(tail) = images.get(1) {
+            b["image_tail"] = json!(kling_img(tail));
+        }
+        (format!("{KLING_BASE}/v1/videos/image2video"), b)
+    };
+    let resp: serde_json::Value = client
+        .post(url)
+        .bearer_auth(&jwt)
+        .json(&body)
         .send()
         .await
         .map_err(|e| anyhow!("kling: submit failed: {e}"))?
