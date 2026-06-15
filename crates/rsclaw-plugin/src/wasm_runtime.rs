@@ -1944,7 +1944,8 @@ fn adb_match_elements(xml: &str, sel_type: &str, sel_val: &str) -> Vec<serde_jso
     let mut pos = 0;
     while let Some(rel) = xml[pos..].find("<node ") {
         let start = pos + rel;
-        // Opening tag ends at the first `>` (attribute values use &gt; for literal `>`).
+        // Opening tag ends at the first `>` (attribute values use &gt; for literal
+        // `>`).
         let tag_end = xml[start..]
             .find('>')
             .map(|r| start + r + 1)
@@ -2012,7 +2013,10 @@ impl HostState {
         // Auto-start browser if not initialized.
         if guard.is_none() {
             tracing::info!("WASM plugin: auto-starting browser session");
-            let chrome_path = rsclaw_platform::detect_chrome().ok_or_else(|| anyhow::anyhow!("Chrome not found; run: rsclaw tools install chrome"))
+            let chrome_path = rsclaw_platform::detect_chrome()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Chrome not found; run: rsclaw tools install chrome")
+                })
                 .map_err(|e| format!("failed to obtain Chrome: {e:#}"))?;
             // All plugins share one Chrome profile so that auth state
             // (cookies, localStorage) is reused across the session — e.g.
@@ -2309,19 +2313,27 @@ impl rsclaw::plugin::host_android::Host for HostState {
     async fn android_tap(&mut self, x: u32, y: u32) -> HostTrapResult<Result<String, String>> {
         let serial = self.android_serial.clone();
         let (xs, ys) = (x.to_string(), y.to_string());
-        Ok(adb_run_str(serial.as_deref(), &["shell", "input", "tap", &xs, &ys])
-            .await
-            .map(|_| "tapped".to_string()))
+        Ok(
+            adb_run_str(serial.as_deref(), &["shell", "input", "tap", &xs, &ys])
+                .await
+                .map(|_| "tapped".to_string()),
+        )
     }
 
     async fn android_swipe(
         &mut self,
-        x1: u32, y1: u32, x2: u32, y2: u32, duration_ms: u32,
+        x1: u32,
+        y1: u32,
+        x2: u32,
+        y2: u32,
+        duration_ms: u32,
     ) -> HostTrapResult<Result<String, String>> {
         let serial = self.android_serial.clone();
         let (s1, s2, s3, s4, s5) = (
-            x1.to_string(), y1.to_string(),
-            x2.to_string(), y2.to_string(),
+            x1.to_string(),
+            y1.to_string(),
+            x2.to_string(),
+            y2.to_string(),
             duration_ms.to_string(),
         );
         Ok(adb_run_str(
@@ -2345,9 +2357,65 @@ impl rsclaw::plugin::host_android::Host for HostState {
         }
         let serial = self.android_serial.clone();
         let escaped = text.replace(' ', "%s");
-        Ok(adb_run_str(serial.as_deref(), &["shell", "input", "text", &escaped])
+        Ok(
+            adb_run_str(serial.as_deref(), &["shell", "input", "text", &escaped])
+                .await
+                .map(|_| "typed".to_string()),
+        )
+    }
+
+    async fn android_clipboard_set(
+        &mut self,
+        text: String,
+    ) -> HostTrapResult<Result<String, String>> {
+        if text.contains('\0') {
+            return Ok(Err(
+                "android_clipboard_set: refusing text containing NUL".to_string()
+            ));
+        }
+        const MAX_CLIPBOARD_TEXT_BYTES: usize = 256 * 1024;
+        if text.len() > MAX_CLIPBOARD_TEXT_BYTES {
+            return Ok(Err(format!(
+                "android_clipboard_set: text too large ({} bytes, max {})",
+                text.len(),
+                MAX_CLIPBOARD_TEXT_BYTES
+            )));
+        }
+        let serial = self.android_serial.clone();
+        let output = match adb_run_str(
+            serial.as_deref(),
+            &["shell", "cmd", "clipboard", "set", "text", "rsclaw", &text],
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(err) => return Ok(Err(err)),
+        };
+        if output.contains("No shell command implementation") {
+            return Ok(Err(
+                "android_clipboard_set: device does not implement `cmd clipboard`".to_string(),
+            ));
+        }
+        Ok(Ok("clipboard_set".to_string()))
+    }
+
+    async fn android_paste(&mut self) -> HostTrapResult<Result<String, String>> {
+        let serial = self.android_serial.clone();
+        match adb_run_str(
+            serial.as_deref(),
+            &["shell", "input", "keyevent", "KEYCODE_PASTE"],
+        )
+        .await
+        {
+            Ok(_) => Ok(Ok("pasted".to_string())),
+            Err(first) => Ok(adb_run_str(
+                serial.as_deref(),
+                &["shell", "input", "keyevent", "279"],
+            )
             .await
-            .map(|_| "typed".to_string()))
+            .map(|_| "pasted".to_string())
+            .map_err(|second| format!("android_paste failed: {first}; fallback failed: {second}"))),
+        }
     }
 
     async fn android_press(&mut self, key: String) -> HostTrapResult<Result<String, String>> {
@@ -2383,9 +2451,11 @@ impl rsclaw::plugin::host_android::Host for HostState {
             }
         };
         let serial = self.android_serial.clone();
-        Ok(adb_run_str(serial.as_deref(), &["shell", "input", "keyevent", kc])
-            .await
-            .map(|_| format!("pressed {key}")))
+        Ok(
+            adb_run_str(serial.as_deref(), &["shell", "input", "keyevent", kc])
+                .await
+                .map(|_| format!("pressed {key}")),
+        )
     }
 
     async fn android_get_ui_xml(
@@ -2403,13 +2473,20 @@ impl rsclaw::plugin::host_android::Host for HostState {
         // resumed activity from `dumpsys activity activities` when the
         // window service doesn't expose mCurrentFocus in the expected
         // shape — happens on some single-user images and during ANR.
-        if let Ok(out) =
-            adb_run_str(serial.as_deref(), &["shell", "dumpsys", "window", "windows"]).await
+        if let Ok(out) = adb_run_str(
+            serial.as_deref(),
+            &["shell", "dumpsys", "window", "windows"],
+        )
+        .await
             && let Some(activity) = parse_current_focus_activity(&out)
         {
             return Ok(Ok(activity));
         }
-        match adb_run_str(serial.as_deref(), &["shell", "dumpsys", "activity", "activities"]).await
+        match adb_run_str(
+            serial.as_deref(),
+            &["shell", "dumpsys", "activity", "activities"],
+        )
+        .await
         {
             Ok(out) => match parse_resumed_activity(&out) {
                 Some(activity) => Ok(Ok(activity)),
@@ -2419,9 +2496,7 @@ impl rsclaw::plugin::host_android::Host for HostState {
                         .to_string(),
                 )),
             },
-            Err(e) => Ok(Err(format!(
-                "dumpsys activity activities failed: {e}"
-            ))),
+            Err(e) => Ok(Err(format!("dumpsys activity activities failed: {e}"))),
         }
     }
 
@@ -2430,8 +2505,13 @@ impl rsclaw::plugin::host_android::Host for HostState {
         Ok(adb_run_str(
             serial.as_deref(),
             &[
-                "shell", "monkey", "-p", &pkg,
-                "-c", "android.intent.category.LAUNCHER", "1",
+                "shell",
+                "monkey",
+                "-p",
+                &pkg,
+                "-c",
+                "android.intent.category.LAUNCHER",
+                "1",
             ],
         )
         .await
@@ -2474,7 +2554,9 @@ impl rsclaw::plugin::host_android::Host for HostState {
             Err(e) => return Ok(Err(e)),
         };
         let elements = adb_match_elements(&xml, &selector_type, &selector_value);
-        Ok(Ok(serde_json::to_string(&elements).unwrap_or_else(|_| "[]".to_string())))
+        Ok(Ok(
+            serde_json::to_string(&elements).unwrap_or_else(|_| "[]".to_string())
+        ))
     }
 
     async fn android_tap_element(
@@ -2499,9 +2581,11 @@ impl rsclaw::plugin::host_android::Host for HostState {
         let cx = el["bounds"]["centerX"].as_i64().unwrap_or(0) as u32;
         let cy = el["bounds"]["centerY"].as_i64().unwrap_or(0) as u32;
         let (xs, ys) = (cx.to_string(), cy.to_string());
-        Ok(adb_run_str(serial.as_deref(), &["shell", "input", "tap", &xs, &ys])
-            .await
-            .map(|_| "tapped".to_string()))
+        Ok(
+            adb_run_str(serial.as_deref(), &["shell", "input", "tap", &xs, &ys])
+                .await
+                .map(|_| "tapped".to_string()),
+        )
     }
 
     async fn android_get_element_text(
@@ -2566,9 +2650,11 @@ impl rsclaw::plugin::host_android::Host for HostState {
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
         let escaped = text.replace(' ', "%s");
-        Ok(adb_run_str(serial.as_deref(), &["shell", "input", "text", &escaped])
-            .await
-            .map(|_| "set".to_string()))
+        Ok(
+            adb_run_str(serial.as_deref(), &["shell", "input", "text", &escaped])
+                .await
+                .map(|_| "set".to_string()),
+        )
     }
 
     async fn android_element_exists(
@@ -2591,8 +2677,8 @@ impl rsclaw::plugin::host_android::Host for HostState {
         selector_value: String,
         timeout_ms: u32,
     ) -> HostTrapResult<Result<String, String>> {
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_millis(u64::from(timeout_ms));
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(u64::from(timeout_ms));
         let serial = self.android_serial.clone();
         // Surface ADB failure after a small streak — otherwise a
         // disconnected device or a wedged uiautomator service silently
@@ -3177,14 +3263,18 @@ mod android_helper_tests {
         assert_eq!(adb_xml_unescape("plain"), "plain");
         assert_eq!(adb_xml_unescape("Don&apos;t"), "Don't");
         assert_eq!(adb_xml_unescape("a&amp;b"), "a&b");
-        assert_eq!(adb_xml_unescape("quote &quot; lt &lt; gt &gt;"), "quote \" lt < gt >");
+        assert_eq!(
+            adb_xml_unescape("quote &quot; lt &lt; gt &gt;"),
+            "quote \" lt < gt >"
+        );
         assert_eq!(adb_xml_unescape("line1&#10;line2"), "line1\nline2");
         assert_eq!(adb_xml_unescape("line1&#xA;line2"), "line1\nline2");
     }
 
     #[test]
     fn xml_attr_extracts_quoted_value() {
-        let node = r#"<node text="hello world" resource-id="com.x:id/foo" bounds="[0,0][100,200]">"#;
+        let node =
+            r#"<node text="hello world" resource-id="com.x:id/foo" bounds="[0,0][100,200]">"#;
         assert_eq!(adb_xml_attr(node, "text"), "hello world");
         assert_eq!(adb_xml_attr(node, "resource-id"), "com.x:id/foo");
         assert_eq!(adb_xml_attr(node, "bounds"), "[0,0][100,200]");

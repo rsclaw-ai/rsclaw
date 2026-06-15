@@ -184,6 +184,12 @@ interface host-android {
     /// Type text into the currently focused element (equivalent to send_keys).
     android-type: func(text: string) -> result<string, string>;
 
+    /// Set Android primary clipboard text.
+    android-clipboard-set: func(text: string) -> result<string, string>;
+
+    /// Paste Android primary clipboard text into the currently focused input.
+    android-paste: func() -> result<string, string>;
+
     /// Press a hardware/nav key by name: back, home, enter.
     android-press: func(key: string) -> result<string, string>;
 
