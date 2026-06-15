@@ -19,7 +19,6 @@ rsclaw-a2a-types = { path = "../rsclaw-a2a-types" }
 rsclaw-config = { path = "../rsclaw-config" }
 rsclaw-artifact = { path = "../rsclaw-artifact" }
 rsclaw-mcp = { path = "../rsclaw-mcp" }
-rsclaw-astock = { path = "../rsclaw-astock" }
 rsclaw-cap = { path = "../rsclaw-cap" }
 rsclaw-heartbeat = { path = "../rsclaw-heartbeat" }
 rsclaw-cli = { path = "../rsclaw-cli" }
@@ -138,7 +137,6 @@ urlencoding = "2"
 silk-rs = "0.2"
 symphonia = { version = "0.5", features = ["mp3", "aac", "ogg", "flac", "wav", "pcm", "vorbis", "isomp4", "mkv"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
-plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "bitmap_encoder", "ab_glyph", "line_series", "histogram", "candlestick", "chrono"] }
 opus-decoder = "0.1"
 enigo = "0.6"
 display-info = "0.5"

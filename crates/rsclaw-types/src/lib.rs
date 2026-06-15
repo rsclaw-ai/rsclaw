@@ -546,9 +546,9 @@ pub trait NotificationSink: Send + Sync {
 pub mod turn_metrics;
 
 // ============================================================================
-// BriefingSink (crate-split): trait inversion so rsclaw-astock can submit to the
-// gateway task queue + push outbound WITHOUT depending on the gateway runtime.
-// Root's gateway implements this and injects it at startup.
+// BriefingSink (crate-split): trait inversion so trusted runtime integrations can
+// submit to the gateway task queue + push outbound WITHOUT depending on the
+// gateway runtime.
 // ============================================================================
 pub trait BriefingSink: Send + Sync {
     /// Submit a briefing prompt to the agent task queue.

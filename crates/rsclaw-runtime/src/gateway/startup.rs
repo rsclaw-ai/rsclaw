@@ -354,36 +354,6 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             info!("memory store opened");
             let arc = Arc::new(tokio::sync::Mutex::new(m));
             rsclaw_agent::memory::set_global_store(Arc::clone(&arc));
-            // astock: build the client once if config.astock.enabled is set,
-            // and register it on the process-global slot. Failures here are
-            // surfaced at info level (not warn) — "astock not configured" is
-            // the normal state for non-A股 users and shouldn't look like an
-            // error in startup logs.
-            match rsclaw_astock::AstockClient::from_config(config.raw.astock.as_ref()) {
-                Ok(c) => {
-                    rsclaw_astock::set_global_client(Arc::new(c));
-                    rsclaw_astock::set_global_briefing_sink(Arc::new(crate::gateway::task_queue::GatewayBriefingSink));
-                    info!("astock client initialized");
-                    // Spin up the daily-briefing scheduler — it's
-                    // cheap (one tokio task) and silently no-ops if
-                    // no peer has a watchlist. Only meaningful when
-                    // astock itself is live, so gate on the client
-                    // being installed.
-                    rsclaw_astock::briefing::spawn_scheduler();
-                    info!("astock briefing scheduler started");
-                    // SSE listeners: one tokio task per configured
-                    // filter, push notifications on `hit` events for
-                    // codes any peer is watching. Gated on the same
-                    // astock-client-present check so non-A股 users
-                    // carry zero background cost.
-                    if let Some(astock_cfg) = config.raw.astock.as_ref() {
-                        rsclaw_astock::sse::spawn_listeners(astock_cfg);
-                    }
-                }
-                Err(e) => {
-                    info!(reason = %e, "astock client not initialised (subsystem dormant)");
-                }
-            }
             Some(arc)
         }
         Err(e) => {

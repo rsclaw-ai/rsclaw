@@ -1645,10 +1645,9 @@ mod tests {
     }
 }
 
-/// Root-side implementation of `rsclaw_types::BriefingSink` (crate-split
-/// trait inversion). Lets `rsclaw-astock` submit briefings + push outbound
-/// through the gateway task queue without depending on the gateway crate.
-/// Injected into astock at startup via `astock::set_global_briefing_sink`.
+/// Root-side implementation of `rsclaw_types::BriefingSink` for trusted
+/// plugin background registrations that submit briefings + push outbound
+/// through the gateway task queue.
 pub struct GatewayBriefingSink;
 
 impl rsclaw_types::BriefingSink for GatewayBriefingSink {

@@ -49,7 +49,6 @@ rsclaw-config = { path = "../rsclaw-config" }
 rsclaw-provider = { path = "../rsclaw-provider" }
 rsclaw-channel = { path = "../rsclaw-channel" }
 rsclaw-skill = { path = "../rsclaw-skill" }
-rsclaw-astock = { path = "../rsclaw-astock" }
 rsclaw-browser = { path = "../rsclaw-browser" }
 rsclaw-kb = { path = "../rsclaw-kb" }
 rsclaw-plugin = { path = "../rsclaw-plugin" }

@@ -3,22 +3,6 @@
 version = 4
 
 [[package]]
-name = "ab_glyph"
-version = "0.2.32"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01c0457472c38ea5bd1c3b5ada5e368271cb550be7a4ca4a0b4634e9913f6cc2"
-dependencies = [
- "ab_glyph_rasterizer",
- "owned_ttf_parser",
-]
-
-[[package]]
-name = "ab_glyph_rasterizer"
-version = "0.1.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
-
-[[package]]
 name = "accessory"
 version = "1.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2269,7 +2253,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed73cbf5e1c37baa23f4132569ac1187829f03922c206bd68fe109e3001a343d"
 dependencies = [
  "base64 0.22.1",
- "image 0.25.10",
+ "image",
  "quick-xml 0.36.2",
  "serde",
  "serde_json",
@@ -4046,20 +4030,6 @@ dependencies = [
 
 [[package]]
 name = "image"
-version = "0.24.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5690139d2f55868e080017335e4b94cb7414274c74f1669c84fb5feba2c9f69d"
-dependencies = [
- "bytemuck",
- "byteorder",
- "color_quant",
- "jpeg-decoder",
- "num-traits",
- "png 0.17.16",
-]
-
-[[package]]
-name = "image"
 version = "0.25.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
@@ -4483,12 +4453,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jpeg-decoder"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00810f1d8b74be64b13dbf3db89ac67740615d6c891f0e7b6179326533011a07"
-
-[[package]]
 name = "js-sys"
 version = "0.3.91"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4800,7 +4764,7 @@ dependencies = [
  "drm",
  "gbm",
  "gl",
- "image 0.25.10",
+ "image",
  "khronos-egl",
  "memmap2",
  "rustix 1.1.4",
@@ -6090,15 +6054,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "owned_ttf_parser"
-version = "0.25.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36820e9051aca1014ddc75770aab4d68bc1e9e632f0f5627c4086bc216fb583b"
-dependencies = [
- "ttf-parser",
-]
-
-[[package]]
 name = "ownedbytes"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6465,38 +6420,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
-name = "plotters"
-version = "0.3.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5aeb6f403d7a4911efb1e33402027fc44f29b5bf6def3effcc22d7bb75f2b747"
-dependencies = [
- "ab_glyph",
- "chrono",
- "num-traits",
- "once_cell",
- "plotters-backend",
- "plotters-bitmap",
- "wasm-bindgen",
- "web-sys",
-]
-
-[[package]]
-name = "plotters-backend"
-version = "0.3.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df42e13c12958a16b3f7f4386b9ab1f3e7933914ecea48da7139435263a4172a"
-
-[[package]]
-name = "plotters-bitmap"
-version = "0.3.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72ce181e3f6bf82d6c1dc569103ca7b1bd964c60ba03d7e6cdfbb3e3eb7f7405"
-dependencies = [
- "image 0.24.9",
- "plotters-backend",
-]
-
-[[package]]
 name = "png"
 version = "0.17.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6849,7 +6772,7 @@ version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 dependencies = [
- "image 0.25.10",
+ "image",
 ]
 
 [[package]]
@@ -7447,7 +7370,7 @@ dependencies = [
  "hnsw_rs",
  "htmd",
  "ignore",
- "image 0.25.10",
+ "image",
  "include_dir",
  "indicatif",
  "jaq-core",
@@ -7471,7 +7394,6 @@ dependencies = [
  "once_cell",
  "opus-decoder",
  "pdf-extract",
- "plotters",
  "prost 0.13.5",
  "qrcode",
  "rand 0.9.2",
@@ -7484,7 +7406,6 @@ dependencies = [
  "rsclaw-a2a-types",
  "rsclaw-agent",
  "rsclaw-artifact",
- "rsclaw-astock",
  "rsclaw-browser",
  "rsclaw-cap",
  "rsclaw-channel",
@@ -7585,7 +7506,7 @@ dependencies = [
  "glob",
  "globset",
  "ignore",
- "image 0.25.10",
+ "image",
  "include_dir",
  "json5",
  "lol_html",
@@ -7595,7 +7516,6 @@ dependencies = [
  "reqwest",
  "rsclaw-a2a-types",
  "rsclaw-artifact",
- "rsclaw-astock",
  "rsclaw-browser",
  "rsclaw-cap",
  "rsclaw-channel",
@@ -7645,28 +7565,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "rsclaw-astock"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "chrono-tz",
- "futures",
- "plotters",
- "reqwest",
- "rsclaw-config",
- "rsclaw-i18n",
- "rsclaw-memory",
- "rsclaw-types",
- "rsclaw-util",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -7793,7 +7691,7 @@ dependencies = [
  "display-info",
  "enigo",
  "futures",
- "image 0.25.10",
+ "image",
  "rsclaw-config",
  "rsclaw-events",
  "rsclaw-i18n",
@@ -7860,7 +7758,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "enigo",
- "image 0.25.10",
+ "image",
  "serde_json",
  "tokio",
  "tracing",
@@ -8115,6 +8013,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",
@@ -8207,7 +8106,7 @@ dependencies = [
  "hnsw_rs",
  "htmd",
  "ignore",
- "image 0.25.10",
+ "image",
  "include_dir",
  "indicatif",
  "jaq-core",
@@ -8231,7 +8130,6 @@ dependencies = [
  "once_cell",
  "opus-decoder",
  "pdf-extract",
- "plotters",
  "prost 0.13.5",
  "qrcode",
  "rand 0.9.2",
@@ -8244,7 +8142,6 @@ dependencies = [
  "rsclaw-a2a-types",
  "rsclaw-agent",
  "rsclaw-artifact",
- "rsclaw-astock",
  "rsclaw-browser",
  "rsclaw-cap",
  "rsclaw-channel",
@@ -8417,7 +8314,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dirs-next",
- "image 0.25.10",
+ "image",
  "serde_json",
 ]
 
@@ -12248,7 +12145,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03d20dc4057d755e2b78da287f9057065a89c507af69e1a5eac19e868c21cd8a"
 dependencies = [
  "dispatch2",
- "image 0.25.10",
+ "image",
  "libwayshot-xcap",
  "log",
  "objc2",

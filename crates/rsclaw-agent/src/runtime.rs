@@ -8571,11 +8571,10 @@ impl AgentRuntime {
     }
 
     fn has_stock_tool_provider(&self) -> bool {
-        rsclaw_astock::global_client().is_some()
-            || self.wasm_plugins.iter().any(|wp| {
-                wp.capabilities.iter().any(|c| c == "trustedToolAlias")
-                    && wp.tool_aliases.values().any(|alias| is_stock_tool_name(alias))
-            })
+        self.wasm_plugins.iter().any(|wp| {
+            wp.capabilities.iter().any(|c| c == "trustedToolAlias")
+                && wp.tool_aliases.values().any(|alias| is_stock_tool_name(alias))
+        })
     }
 
     async fn dispatch_tool(
@@ -8657,7 +8656,7 @@ impl AgentRuntime {
 
         if is_stock_tool_name(name) && !self.has_stock_tool_provider() {
             return Err(anyhow!(
-                "tool '{name}' is unavailable: no astock WASM plugin or built-in astock client is configured"
+                "tool '{name}' is unavailable: astock is provided by the commercial astock WASM plugin, but no trusted stock tool alias is loaded"
             ));
         }
 
@@ -8881,13 +8880,12 @@ impl AgentRuntime {
             "read_artifact" => return self.tool_read_artifact(ctx, args).await,
             "read_session_archive" => return self.tool_read_session_archive(ctx, args).await,
             "knowledge_base" | "kb_search" => return self.tool_knowledge_base(args).await,
-            "stock_quote" => return self.tool_stock_quote(args).await,
-            "stock_kline" => return self.tool_stock_kline(args).await,
-            "stock_snapshot" => return self.tool_stock_snapshot(ctx, args).await,
-            "stock_ask" => return self.tool_stock_ask(args).await,
-            "stock_query" => return self.tool_stock_query(args).await,
-            "stock_chart" => return self.tool_stock_chart(args).await,
-            "stock_watchlist" => return self.tool_stock_watchlist(ctx, args).await,
+            "stock_quote" | "stock_kline" | "stock_snapshot" | "stock_ask" | "stock_query"
+            | "stock_chart" | "stock_watchlist" => {
+                return Err(anyhow!(
+                    "tool '{name}' is provided by the astock WASM plugin alias layer, but no loaded plugin claimed this exact alias"
+                ));
+            }
             "research_ingest_wechat" => return self.tool_research_ingest_wechat(args).await,
             "research_analyze_charts" => return self.tool_research_analyze_charts(args).await,
             "write_file" | "write" => return self.tool_write(args).await,

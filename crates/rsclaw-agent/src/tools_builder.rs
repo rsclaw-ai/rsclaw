@@ -917,10 +917,8 @@ pub fn build_tool_list(
     });
 
     // -----------------------------------------------------------------
-    // A-share market data (astock). Tools no-op with a structured
-    // "astock_not_configured" reply when the gateway hasn't been wired
-    // to an astock instance — so they're always safe to advertise; the
-    // LLM learns at first call that it can't use them and stops trying.
+    // A-share market data (astock). These first-class tool names are exposed
+    // only when a trusted astock WASM plugin claims the matching aliases.
     // -----------------------------------------------------------------
     tools.push(ToolDef {
         name: "stock_quote".to_owned(),

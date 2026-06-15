@@ -15,7 +15,7 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -49,6 +49,8 @@ const MEMORY_CAP_BYTES: usize = 256 * 1024 * 1024;
 const SHARED_BROWSER_PROFILE: &str = "rsclaw";
 
 type HostTrapResult<T> = std::result::Result<T, wasmtime::Error>;
+
+static HOST_HTTP_TLS_PROVIDER: OnceLock<()> = OnceLock::new();
 
 use rsclaw_browser::BrowserSession;
 
@@ -913,7 +915,6 @@ impl rsclaw::plugin::host_http::Host for HostState {
         body: String,
         timeout_ms: u32,
     ) -> HostTrapResult<Result<String, String>> {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let headers: serde_json::Map<String, serde_json::Value> = if headers_json.trim().is_empty() {
             serde_json::Map::new()
         } else {
@@ -928,7 +929,7 @@ impl rsclaw::plugin::host_http::Host for HostState {
         } else {
             Duration::from_millis(u64::from(timeout_ms))
         };
-        let client = match reqwest::Client::builder().timeout(timeout).build() {
+        let client = match host_http_client(timeout) {
             Ok(c) => c,
             Err(e) => return Ok(Err(format!("host_http.request: client build failed: {e}"))),
         };
@@ -967,6 +968,36 @@ impl rsclaw::plugin::host_http::Host for HostState {
             "body": body,
         }).to_string()))
     }
+}
+
+fn ensure_host_http_tls_provider() -> std::result::Result<(), String> {
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return Ok(());
+    }
+    if HOST_HTTP_TLS_PROVIDER.get().is_some() {
+        return Ok(());
+    }
+    match rustls::crypto::aws_lc_rs::default_provider().install_default() {
+        Ok(()) => {
+            let _ = HOST_HTTP_TLS_PROVIDER.set(());
+            Ok(())
+        }
+        Err(_) if rustls::crypto::CryptoProvider::get_default().is_some() => {
+            let _ = HOST_HTTP_TLS_PROVIDER.set(());
+            Ok(())
+        }
+        Err(_) => Err("failed to install rustls crypto provider".to_owned()),
+    }
+}
+
+fn host_http_client(timeout: Duration) -> std::result::Result<reqwest::Client, String> {
+    ensure_host_http_tls_provider()?;
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .use_rustls_tls()
+        .tls_built_in_root_certs(true)
+        .build()
+        .map_err(|e| e.to_string())
 }
 
 impl rsclaw::plugin::host_kv::Host for HostState {
@@ -2622,6 +2653,19 @@ impl WasmPlugin {
 #[cfg(test)]
 mod android_helper_tests {
     use super::*;
+
+    #[test]
+    fn host_http_tls_provider_init_is_idempotent() {
+        ensure_host_http_tls_provider().expect("first TLS provider init");
+        ensure_host_http_tls_provider().expect("second TLS provider init");
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+
+    #[test]
+    fn host_http_client_builds_with_rustls_roots() {
+        let client = host_http_client(Duration::from_secs(1)).expect("host HTTP client");
+        drop(client);
+    }
 
     #[test]
     fn xml_unescape_handles_common_entities() {
