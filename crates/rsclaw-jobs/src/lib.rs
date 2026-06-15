@@ -41,7 +41,14 @@ pub async fn submit_seedance(
     model_override: Option<&str>,
     images: &[String],
 ) -> Result<String> {
-    let model = model_override.unwrap_or(SEEDANCE_DEFAULT_MODEL);
+    // Chain entries / `model` args arrive provider-prefixed
+    // (`doubao/doubao-seedance-2-0-fast-…`); strip it so the bare ARK model
+    // id goes on the wire. This is what lets the caller pick any seedance
+    // variant (pro / fast / lite) via the model field.
+    let model = model_override
+        .map(|m| m.rsplit('/').next().unwrap_or(m))
+        .filter(|m| !m.is_empty() && *m != "doubao" && *m != "bytedance")
+        .unwrap_or(SEEDANCE_DEFAULT_MODEL);
     // Build the `content` array: a text item plus, for image-to-video, one
     // `image_url` item per reference frame with a `role`. Per the Ark spec
     // the three image scenes are mutually exclusive, so map by count:
@@ -159,7 +166,12 @@ pub async fn submit_minimax(
     model_override: Option<&str>,
     images: &[String],
 ) -> Result<String> {
-    let model = model_override.unwrap_or(MINIMAX_DEFAULT_MODEL);
+    // Strip provider prefix so a `minimax/<id>` chain entry sends the bare
+    // model id (lets the caller pick Hailuo-2.3 / 2.3-Fast etc).
+    let model = model_override
+        .map(|m| m.rsplit('/').next().unwrap_or(m))
+        .filter(|m| !m.is_empty() && *m != "minimax")
+        .unwrap_or(MINIMAX_DEFAULT_MODEL);
     let mut body = json!({
         "prompt": prompt,
         "model": model,
@@ -258,7 +270,12 @@ pub async fn submit_kling(
     model_override: Option<&str>,
     images: &[String],
 ) -> Result<String> {
-    let model = model_override.unwrap_or(KLING_DEFAULT_MODEL);
+    // Strip provider prefix so a `kling/<id>` chain entry sends the bare
+    // model_name (lets the caller pick kling-v1 / v2-master etc).
+    let model = model_override
+        .map(|m| m.rsplit('/').next().unwrap_or(m))
+        .filter(|m| !m.is_empty() && *m != "kling")
+        .unwrap_or(KLING_DEFAULT_MODEL);
     let jwt = kling_jwt(access_key, secret_key)?;
     // Kling wants RAW base64 for image inputs — strip the `data:<mime>;base64,`
     // prefix that the tool layer adds. Public URLs pass through untouched.
