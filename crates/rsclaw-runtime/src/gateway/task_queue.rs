@@ -1689,7 +1689,7 @@ impl rsclaw_plugin::PluginBackgroundHost for GatewayPluginBackgroundHost {
         ctx: Option<rsclaw_plugin::PluginInvocationContext>,
     ) -> futures::future::BoxFuture<'static, std::result::Result<String, String>> {
         Box::pin(async move {
-            let key = format!("cron:{plugin}:{name}");
+            let key = plugin_background_key("cron", &plugin, &name, None, ctx.as_ref());
             if !claim_plugin_background_key(&key) {
                 return Ok("already_registered".to_owned());
             }
@@ -1755,7 +1755,7 @@ impl rsclaw_plugin::PluginBackgroundHost for GatewayPluginBackgroundHost {
         ctx: Option<rsclaw_plugin::PluginInvocationContext>,
     ) -> futures::future::BoxFuture<'static, std::result::Result<String, String>> {
         Box::pin(async move {
-            let key = format!("sse:{plugin}:{name}:{url}");
+            let key = plugin_background_key("sse", &plugin, &name, Some(&url), ctx.as_ref());
             if !claim_plugin_background_key(&key) {
                 return Ok("already_registered".to_owned());
             }
@@ -1805,6 +1805,29 @@ fn claim_plugin_background_key(key: &str) -> bool {
         return false;
     };
     guard.insert(key.to_owned())
+}
+
+fn plugin_background_key(
+    kind: &str,
+    plugin: &str,
+    name: &str,
+    extra: Option<&str>,
+    ctx: Option<&rsclaw_plugin::PluginInvocationContext>,
+) -> String {
+    let ctx = ctx
+        .map(plugin_invocation_context_key)
+        .unwrap_or_else(|| "global".to_owned());
+    match extra {
+        Some(extra) if !extra.is_empty() => format!("{kind}:{plugin}:{name}:{ctx}:{extra}"),
+        _ => format!("{kind}:{plugin}:{name}:{ctx}"),
+    }
+}
+
+fn plugin_invocation_context_key(ctx: &rsclaw_plugin::PluginInvocationContext) -> String {
+    format!(
+        "agent={}:channel={}:peer={}:chat={}:session={}",
+        ctx.agent_id, ctx.channel, ctx.peer_id, ctx.chat_id, ctx.session_key
+    )
 }
 
 fn parse_hhmm(raw: &str) -> Option<(u32, u32)> {
@@ -2025,13 +2048,15 @@ async fn run_plugin_sse(
                                     if line.is_empty() {
                                         if !data_lines.is_empty() {
                                             let data = data_lines.join("\n");
-                                            let text = format_plugin_sse_text(&plugin, &name, &event_name, &data);
-                                            let _ = push_plugin_outbound(
-                                                &ctx.channel,
-                                                &ctx.peer_id,
-                                                &serde_json::json!({ "text": text }).to_string(),
-                                                Some(&ctx),
-                                            );
+                                            if plugin_sse_should_push(&plugin, &data, &ctx).await {
+                                                let text = format_plugin_sse_text(&plugin, &name, &event_name, &data);
+                                                let _ = push_plugin_outbound(
+                                                    &ctx.channel,
+                                                    &ctx.peer_id,
+                                                    &serde_json::json!({ "text": text }).to_string(),
+                                                    Some(&ctx),
+                                                );
+                                            }
                                         }
                                         event_name.clear();
                                         data_lines.clear();
@@ -2056,6 +2081,30 @@ async fn run_plugin_sse(
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(60));
     }
+}
+
+async fn plugin_sse_should_push(
+    plugin: &str,
+    data: &str,
+    ctx: &rsclaw_plugin::PluginInvocationContext,
+) -> bool {
+    if plugin != "astock" {
+        return true;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        return false;
+    };
+    let Some(code) = value.get("code").and_then(Value::as_str) else {
+        return false;
+    };
+    let key = format!("watchlist:{}:{}:{}", ctx.agent_id, ctx.channel, ctx.peer_id);
+    let Ok(Some(raw)) = rsclaw_plugin::wasm_runtime::plugin_kv_get_value(plugin, &key).await else {
+        return false;
+    };
+    let Ok(codes) = serde_json::from_str::<Vec<String>>(&raw) else {
+        return false;
+    };
+    codes.iter().any(|c| c == code)
 }
 
 fn format_plugin_sse_text(plugin: &str, name: &str, event_name: &str, data: &str) -> String {
@@ -2087,5 +2136,80 @@ impl rsclaw_types::TaskQueueHost for GatewayTaskQueueHost {
         let manager = get_task_queue()
             .ok_or_else(|| anyhow::anyhow!("task queue not available (gateway not started?)"))?;
         manager.submit_task(session_key, message, priority, max_turns, ttl_secs)
+    }
+}
+
+#[cfg(test)]
+mod plugin_background_tests {
+    use super::*;
+
+    fn ctx(peer: &str) -> rsclaw_plugin::PluginInvocationContext {
+        rsclaw_plugin::PluginInvocationContext {
+            target_id: peer.to_owned(),
+            channel: "test".to_owned(),
+            agent_id: "main".to_owned(),
+            peer_id: peer.to_owned(),
+            chat_id: peer.to_owned(),
+            session_key: format!("agent:main:test:direct:{peer}"),
+            is_group: false,
+        }
+    }
+
+    #[test]
+    fn plugin_background_keys_are_peer_scoped() {
+        let a = ctx("peer-a");
+        let b = ctx("peer-b");
+        let key_a = plugin_background_key("cron", "astock", "astock.briefing", None, Some(&a));
+        let key_a_again = plugin_background_key("cron", "astock", "astock.briefing", None, Some(&a));
+        let key_b = plugin_background_key("cron", "astock", "astock.briefing", None, Some(&b));
+
+        assert_eq!(key_a, key_a_again);
+        assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn plugin_background_sse_keys_include_url_and_peer() {
+        let a = ctx("peer-a");
+        let b = ctx("peer-b");
+        let url = "https://astock.rsclaw.ai/v1/stream/quick?filter=quick_rally";
+        let key_a = plugin_background_key("sse", "astock", "astock.quick_rally", Some(url), Some(&a));
+        let key_b = plugin_background_key("sse", "astock", "astock.quick_rally", Some(url), Some(&b));
+        let key_other_url = plugin_background_key(
+            "sse",
+            "astock",
+            "astock.quick_rally",
+            Some("https://astock.rsclaw.ai/v1/stream/quick?filter=quick_goldcross"),
+            Some(&a),
+        );
+
+        assert_ne!(key_a, key_b);
+        assert_ne!(key_a, key_other_url);
+    }
+
+    #[tokio::test]
+    async fn astock_sse_pushes_only_watched_codes() {
+        let ctx = ctx("peer-filtered");
+        let key = format!("watchlist:{}:{}:{}", ctx.agent_id, ctx.channel, ctx.peer_id);
+        rsclaw_plugin::wasm_runtime::plugin_kv_set_value(
+            "astock",
+            &key,
+            &serde_json::json!(["600519"]).to_string(),
+        )
+        .await
+        .expect("set watchlist");
+
+        assert!(
+            plugin_sse_should_push("astock", r#"{"code":"600519","name":"贵州茅台"}"#, &ctx).await
+        );
+        assert!(
+            !plugin_sse_should_push("astock", r#"{"code":"000001","name":"平安银行"}"#, &ctx).await
+        );
+        assert!(!plugin_sse_should_push("astock", r#"{"event":"snapshot"}"#, &ctx).await);
+    }
+
+    #[tokio::test]
+    async fn non_astock_sse_pushes_without_watchlist_filter() {
+        let ctx = ctx("peer-any");
+        assert!(plugin_sse_should_push("other", r#"{"event":"anything"}"#, &ctx).await);
     }
 }

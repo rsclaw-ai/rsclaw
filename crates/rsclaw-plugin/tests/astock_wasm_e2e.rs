@@ -265,6 +265,21 @@ async fn astock_wasm_quote_slash_chart_and_device_headers() {
         saw_device_headers.load(Ordering::SeqCst),
         "mock astock server did not observe device signature headers"
     );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let key_path = rsclaw_config::loader::base_dir()
+            .join("device")
+            .join("host-ed25519.key");
+        let mode = std::fs::metadata(&key_path)
+            .expect("device key metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "device key should be owner-only");
+    }
 }
 
 fn spawn_mock_astock(saw_device_headers: Arc<AtomicBool>) -> String {

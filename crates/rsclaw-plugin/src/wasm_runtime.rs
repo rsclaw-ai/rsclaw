@@ -1094,6 +1094,7 @@ async fn load_device_signing_key() -> Result<SigningKey, String> {
                 .map_err(|e| format!("host_device: create key dir failed: {e}"))?;
         }
         if path.exists() {
+            restrict_device_key_permissions(&path)?;
             let raw = std::fs::read_to_string(&path)
                 .map_err(|e| format!("host_device: read key failed: {e}"))?;
             let bytes = general_purpose::STANDARD
@@ -1109,10 +1110,25 @@ async fn load_device_signing_key() -> Result<SigningKey, String> {
         let encoded = general_purpose::STANDARD.encode(key_bytes);
         std::fs::write(&path, encoded)
             .map_err(|e| format!("host_device: write key failed: {e}"))?;
+        restrict_device_key_permissions(&path)?;
         Ok(SigningKey::from_bytes(&key_bytes))
     })
     .await
     .map_err(|e| format!("host_device: key task failed: {e}"))?
+}
+
+fn restrict_device_key_permissions(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("host_device: set key permissions failed: {e}"))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 fn device_public_key_json(key: &SigningKey) -> String {
@@ -1124,7 +1140,17 @@ fn device_public_key_json(key: &SigningKey) -> String {
 }
 
 async fn plugin_kv_get(plugin_name: &str, key: String) -> HostTrapResult<Result<String, String>> {
+    match plugin_kv_get_value(plugin_name, &key).await {
+        Ok(Some(value)) => Ok(Ok(value)),
+        Ok(None) => Ok(Ok(String::new())),
+        Err(e) => Ok(Err(format!("host_kv.get: {e}"))),
+    }
+}
+
+/// Read a plugin-scoped key/value entry for trusted host-side integrations.
+pub async fn plugin_kv_get_value(plugin_name: &str, key: &str) -> Result<Option<String>, String> {
     let db_path = plugin_db_path(plugin_name);
+    let key = key.to_owned();
     let result = tokio::task::spawn_blocking(move || {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)
@@ -1137,13 +1163,13 @@ async fn plugin_kv_get(plugin_name: &str, key: String) -> HostTrapResult<Result<
         )?;
         let mut stmt = conn.prepare("SELECT value FROM kv WHERE key = ?1")?;
         let value: Option<String> = stmt.query_row([key], |row| row.get(0)).ok();
-        Ok::<_, rusqlite::Error>(value.unwrap_or_default())
+        Ok::<_, rusqlite::Error>(value)
     })
     .await;
     match result {
-        Ok(Ok(value)) => Ok(Ok(value)),
-        Ok(Err(e)) => Ok(Err(format!("host_kv.get: {e}"))),
-        Err(e) => Ok(Err(format!("host_kv.get panic: {e}"))),
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(e) => Err(format!("host_kv.get panic: {e}")),
     }
 }
 
@@ -1152,7 +1178,17 @@ async fn plugin_kv_set(
     key: String,
     value: String,
 ) -> HostTrapResult<Result<String, String>> {
+    match plugin_kv_set_value(plugin_name, &key, &value).await {
+        Ok(()) => Ok(Ok("ok".to_owned())),
+        Err(e) => Ok(Err(format!("host_kv.set: {e}"))),
+    }
+}
+
+/// Write a plugin-scoped key/value entry for trusted host-side integrations.
+pub async fn plugin_kv_set_value(plugin_name: &str, key: &str, value: &str) -> Result<(), String> {
     let db_path = plugin_db_path(plugin_name);
+    let key = key.to_owned();
+    let value = value.to_owned();
     let result = tokio::task::spawn_blocking(move || {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)
@@ -1172,9 +1208,9 @@ async fn plugin_kv_set(
     })
     .await;
     match result {
-        Ok(Ok(())) => Ok(Ok("ok".to_owned())),
-        Ok(Err(e)) => Ok(Err(format!("host_kv.set: {e}"))),
-        Err(e) => Ok(Err(format!("host_kv.set panic: {e}"))),
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(e) => Err(format!("host_kv.set panic: {e}")),
     }
 }
 
