@@ -34,6 +34,12 @@ pub trait DesktopSession: Send + Sync {
     /// Screenshot a screen region. Returns data URI.
     async fn screenshot_region(&self, x: u32, y: u32, w: u32, h: u32) -> Result<String, String>;
 
+    /// OCR the app's main window with on-device text recognition (macOS
+    /// Vision). Returns a JSON array of recognised lines with 0-1000
+    /// relative centre coordinates: `[{"text":"...","x":143,"y":699}, ...]`.
+    /// Precise enough to click a named row, unlike VLM grounding.
+    async fn ocr_window(&self, bundle_id: &str) -> Result<String, String>;
+
     /// Move the mouse cursor to absolute screen coordinates without clicking.
     async fn mouse_move(&self, x: u32, y: u32) -> Result<String, String>;
 

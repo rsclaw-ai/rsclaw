@@ -1332,6 +1332,13 @@ impl rsclaw::plugin::host_desktop::Host for HostState {
         Ok(self.desktop.screenshot_window(&bundle_id).await)
     }
 
+    async fn desktop_ocr_window(
+        &mut self,
+        bundle_id: String,
+    ) -> wasmtime::Result<Result<String, String>> {
+        Ok(self.desktop.ocr_window(&bundle_id).await)
+    }
+
     async fn desktop_screenshot_region(
         &mut self,
         x: u32,
