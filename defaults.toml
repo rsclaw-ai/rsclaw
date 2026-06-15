@@ -5,7 +5,7 @@
 # built-in entries and never overwrite user-customized entries.
 
 [meta]
-defaults_version = "2026.5.20"
+defaults_version = "2026.6.16"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Providers
@@ -22,6 +22,36 @@ model      = "rsclaw/rsclaw-agent-v1"
 base_url   = "https://api.rsclaw.ai/v1/agent"
 api_type   = "rsclaw"
 needs_key  = true
+name_zh         = "RsClaw"
+name_en         = "RsClaw"
+tag_zh          = "增量协议 · 业内首发"
+tag_en          = "Incremental · Industry-first"
+key_label       = "RsClaw API Key"
+key_placeholder = "sk-..."
+has_base_url     = true
+order_zh        = 0
+order_en        = 0
+
+# Agnes AI (Sapiens AI) — OpenAI-compatible chat/completions, plus
+# /v1/images/generations and an async /v1/videos surface. Free tier as of
+# 2026-06. Text speaks standard OpenAI Chat Completions, so api_type is the
+# default openai-completions. See: https://agnes-ai.com/doc
+[[providers]]
+name       = "agnes"
+label      = "Agnes AI"
+env_var    = "AGNES_API_KEY"
+model      = "agnes/agnes-2.0-flash"
+base_url   = "https://apihub.agnes-ai.com/v1"
+needs_key  = true
+name_zh         = "Agnes AI"
+name_en         = "Agnes AI"
+tag_zh          = "免费 · 文图视"
+tag_en          = "Free · text/image/video"
+key_label       = "Agnes API Key"
+key_placeholder = "sk-..."
+has_base_url     = true
+order_zh        = 1
+order_en        = 1
 
 [[providers]]
 name       = "doubao"
@@ -31,6 +61,15 @@ model      = "doubao/doubao-seed-2.0-pro"
 base_url   = "https://ark.cn-beijing.volces.com/api/v3"
 api_type   = "openai-responses"
 needs_key  = true
+name_zh         = "Doubao (豆包)"
+name_en         = "Doubao (豆包)"
+tag_zh          = "字节跳动"
+tag_en          = "ByteDance"
+key_label       = "ARK API Key"
+key_placeholder = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+has_base_url     = true
+order_zh        = 4
+order_en        = 11
 
 [[providers]]
 name       = "qwen"
@@ -39,6 +78,14 @@ env_var    = "DASHSCOPE_API_KEY"
 model      = "qwen/qwen-plus"
 base_url   = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 needs_key  = true
+name_zh         = "Qwen (千问)"
+name_en         = "Qwen (千问)"
+tag_zh          = "国内直连"
+tag_en          = "China direct"
+key_label       = "DashScope API Key"
+key_placeholder = "sk-..."
+order_zh        = 2
+order_en        = 12
 
 [[providers]]
 name       = "minimax"
@@ -47,6 +94,14 @@ env_var    = "MINIMAX_API_KEY"
 model      = "minimax/MiniMax-M2.5"
 base_url   = "https://api.minimaxi.com/v1"
 needs_key  = true
+name_zh         = "MiniMax"
+name_en         = "MiniMax"
+tag_zh          = "国内"
+tag_en          = "China"
+key_label       = "MiniMax API Key"
+key_placeholder = "eyJ..."
+order_zh        = 7
+order_en        = 13
 
 [[providers]]
 name       = "deepseek"
@@ -55,6 +110,14 @@ env_var    = "DEEPSEEK_API_KEY"
 model      = "deepseek/deepseek-v4-flash"
 base_url   = "https://api.deepseek.com/v1"
 needs_key  = true
+name_zh         = "DeepSeek"
+name_en         = "DeepSeek"
+tag_zh          = "低成本"
+tag_en          = "Low cost"
+key_label       = "DeepSeek API Key"
+key_placeholder = "sk-..."
+order_zh        = 3
+order_en        = 14
 
 [[providers]]
 name       = "kimi"
@@ -62,8 +125,17 @@ label      = "Kimi"
 env_var    = "MOONSHOT_API_KEY"
 model      = "kimi/kimi-k2.6"
 base_url   = "https://api.moonshot.cn/v1"
-user_agent = "rsclaw/2026.5.20"
+user_agent = "rsclaw/2026.6.16"
 needs_key  = true
+name_zh         = "Kimi"
+name_en         = "Kimi"
+tag_zh          = "国内"
+tag_en          = "China"
+key_label       = "Kimi API Key"
+key_placeholder = "sk-..."
+has_base_url     = true
+order_zh        = 8
+order_en        = 15
 
 [[providers]]
 name       = "zhipu"
@@ -72,6 +144,14 @@ env_var    = "ZHIPU_API_KEY"
 model      = "zhipu/glm-4-plus"
 base_url   = "https://open.bigmodel.cn/api/paas/v4"
 needs_key  = true
+name_zh         = "Zhipu (GLM)"
+name_en         = "Zhipu (GLM)"
+tag_zh          = "国内"
+tag_en          = "China"
+key_label       = "Zhipu API Key"
+key_placeholder = "sk-..."
+order_zh        = 9
+order_en        = 16
 
 [[providers]]
 name       = "gaterouter"
@@ -80,6 +160,14 @@ env_var    = "GATEROUTER_API_KEY"
 model      = "gaterouter/auto"
 base_url   = "https://api.gaterouter.ai/openai/v1"
 needs_key  = true
+name_zh         = "GateRouter"
+name_en         = "GateRouter"
+tag_zh          = "聚合路由"
+tag_en          = "Aggregator"
+key_label       = "GateRouter Key"
+key_placeholder = "sk-..."
+order_zh        = 11
+order_en        = 17
 
 [[providers]]
 name       = "openrouter"
@@ -88,6 +176,14 @@ env_var    = "OPENROUTER_API_KEY"
 model      = "openrouter/anthropic/claude-sonnet-4.6"
 base_url   = "https://openrouter.ai/api/v1"
 needs_key  = true
+name_zh         = "OpenRouter"
+name_en         = "OpenRouter"
+tag_zh          = "聚合路由"
+tag_en          = "Aggregator"
+key_label       = "OpenRouter Key"
+key_placeholder = "sk-or-..."
+order_zh        = 12
+order_en        = 6
 
 [[providers]]
 name       = "anthropic"
@@ -97,6 +193,14 @@ model      = "anthropic/claude-sonnet-4-6"
 base_url   = "https://api.anthropic.com/v1"
 api_type   = "anthropic"
 needs_key  = true
+name_zh         = "Anthropic (Claude)"
+name_en         = "Anthropic (Claude)"
+tag_zh          = "推荐"
+tag_en          = "Recommended"
+key_label       = "Anthropic API Key"
+key_placeholder = "sk-ant-..."
+order_zh        = 13
+order_en        = 2
 
 [[providers]]
 name       = "openai"
@@ -105,6 +209,12 @@ env_var    = "OPENAI_API_KEY"
 model      = "openai/gpt-4o"
 base_url   = "https://api.openai.com/v1"
 needs_key  = true
+name_zh         = "OpenAI (GPT)"
+name_en         = "OpenAI (GPT)"
+key_label       = "OpenAI API Key"
+key_placeholder = "sk-..."
+order_zh        = 14
+order_en        = 3
 
 [[providers]]
 name       = "gemini"
@@ -114,6 +224,12 @@ model      = "gemini/gemini-2.5-flash"
 base_url   = "https://generativelanguage.googleapis.com/v1beta"
 api_type   = "gemini"
 needs_key  = true
+name_zh         = "Google Gemini"
+name_en         = "Google Gemini"
+key_label       = "Gemini API Key"
+key_placeholder = "AIza..."
+order_zh        = 15
+order_en        = 4
 
 [[providers]]
 name       = "xai"
@@ -122,6 +238,12 @@ env_var    = "XAI_API_KEY"
 model      = "xai/grok-3"
 base_url   = "https://api.x.ai/v1"
 needs_key  = true
+name_zh         = "xAI (Grok)"
+name_en         = "xAI (Grok)"
+key_label       = "xAI API Key"
+key_placeholder = "xai-..."
+order_zh        = 16
+order_en        = 5
 
 [[providers]]
 name       = "groq"
@@ -130,6 +252,14 @@ env_var    = "GROQ_API_KEY"
 model      = "groq/llama-3.3-70b-versatile"
 base_url   = "https://api.groq.com/openai/v1"
 needs_key  = true
+name_zh         = "Groq"
+name_en         = "Groq"
+tag_zh          = "快速推理"
+tag_en          = "Fast"
+key_label       = "Groq API Key"
+key_placeholder = "gsk_..."
+order_zh        = 17
+order_en        = 10
 
 [[providers]]
 name       = "siliconflow"
@@ -138,6 +268,14 @@ env_var    = "SILICONFLOW_API_KEY"
 model      = "siliconflow/deepseek-ai/DeepSeek-V3"
 base_url   = "https://api.siliconflow.cn/v1"
 needs_key  = true
+name_zh         = "SiliconFlow"
+name_en         = "SiliconFlow"
+tag_zh          = "国内加速"
+tag_en          = "China accel"
+key_label       = "SiliconFlow Key"
+key_placeholder = "sk-..."
+order_zh        = 18
+order_en        = 18
 
 [[providers]]
 name       = "ollama"
@@ -147,6 +285,15 @@ model      = "ollama/llama3.3"
 base_url   = "http://127.0.0.1:11434"
 api_type   = "ollama"
 needs_key  = false
+name_zh         = "Ollama (local)"
+name_en         = "Ollama (local)"
+tag_zh          = "无需 Key"
+tag_en          = "No Key"
+key_label       = "URL"
+key_placeholder = "http://localhost:11434/v1"
+is_url           = true
+order_zh        = 10
+order_en        = 7
 
 [[providers]]
 name       = "codingplan"
@@ -157,6 +304,15 @@ base_url   = ""
 api_type   = "openai"
 user_agent = "claude-code/0.1.0"
 needs_key  = false
+name_zh         = "CodingPlan"
+name_en         = "CodingPlan"
+tag_zh          = "编程计划"
+tag_en          = "Coding Plan"
+key_label       = "API URL"
+key_placeholder = "https://api.example.com/v1"
+is_url           = true
+order_zh        = 6
+order_en        = 9
 
 [[providers]]
 name       = "custom"
@@ -166,6 +322,15 @@ model      = ""
 base_url   = ""
 api_type   = "openai"
 needs_key  = false
+name_zh         = "Custom Provider"
+name_en         = "Custom Provider"
+tag_zh          = "自定义"
+tag_en          = "Custom"
+key_label       = "API URL"
+key_placeholder = "https://api.example.com/v1"
+is_url           = true
+order_zh        = 5
+order_en        = 8
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Channels
@@ -176,9 +341,16 @@ name  = "feishu"
 label = "Feishu / Lark"
 login = true
 multi_account = true
+name_zh     = "飞书 / Lark"
+icon        = "飞"
+has_qr      = true
+qr_label_zh = "扫码"
+qr_label_en = "QR"
+order_zh    = 0
+order_en    = 7
 fields = [
-  { key = "appId",     prompt = "App ID",     secret = false },
-  { key = "appSecret", prompt = "App Secret", secret = true  },
+  { key = "appId",     prompt = "App ID",     secret = false, placeholder = "cli_xxx" },
+  { key = "appSecret", prompt = "App Secret", secret = true,  placeholder = "" },
 ]
 
 [[channels]]
@@ -186,131 +358,260 @@ name  = "wechat"
 label = "Weixin"
 login = true
 multi_account = true
+name_zh     = "微信"
+icon        = "微"
+has_qr      = true
+qr_label_zh = "扫码"
+qr_label_en = "QR"
+order_zh    = 1
+order_en    = 8
 fields = [
-  { key = "botToken", prompt = "Bot Token (from QR login)", secret = true  },
-  { key = "botId",    prompt = "Bot ID",                     secret = false },
+  { key = "botToken", prompt = "Bot Token (from QR login)", secret = true,  placeholder = "" },
+  { key = "botId",    prompt = "Bot ID",                     secret = false, placeholder = "" },
 ]
 
 [[channels]]
 name  = "wecom"
 label = "WeCom"
 multi_account = true
+name_zh  = "企业微信"
+icon     = "WC"
+has_qr   = false
+order_zh = 2
+order_en = 9
 fields = [
-  { key = "botId",  prompt = "Bot ID",  secret = false },
-  { key = "secret",  prompt = "Secret",  secret = true  },
+  { key = "botId",  prompt = "Bot ID",  secret = false, placeholder = "" },
+  { key = "secret",  prompt = "Secret",  secret = true,  placeholder = "" },
 ]
 
 [[channels]]
 name  = "qq"
 label = "QQ Bot"
+name_zh  = "QQ Bot"
+icon     = "QQ"
+has_qr   = false
+order_zh = 3
+order_en = 10
 fields = [
-  { key = "appId",     prompt = "App ID",     secret = false },
-  { key = "appSecret", prompt = "App Secret", secret = true  },
+  { key = "appId",     prompt = "App ID",     secret = false, placeholder = "" },
+  { key = "appSecret", prompt = "App Secret", secret = true,  placeholder = "" },
 ]
 
 [[channels]]
 name  = "dingtalk"
 label = "DingTalk"
+name_zh  = "钉钉"
+icon     = "DT"
+has_qr   = false
+order_zh = 4
+order_en = 11
 fields = [
-  { key = "appKey",    prompt = "App Key",    secret = false },
-  { key = "appSecret", prompt = "App Secret", secret = true  },
+  { key = "appKey",    prompt = "App Key",    secret = false, placeholder = "" },
+  { key = "appSecret", prompt = "App Secret", secret = true,  placeholder = "" },
 ]
 
 [[channels]]
 name  = "telegram"
 label = "Telegram"
 multi_account = true
+name_zh  = "Telegram"
+icon     = "Tg"
+has_qr   = false
+order_zh = 5
+order_en = 0
 fields = [
-  { key = "botToken", prompt = "Bot Token", secret = true },
+  { key = "botToken", prompt = "Bot Token", secret = true, placeholder = "123456:ABC-DEF..." },
 ]
 
 [[channels]]
 name  = "matrix"
 label = "Matrix"
 multi_account = true
+name_zh  = "Matrix"
+icon     = "Mx"
+has_qr   = false
+order_zh = 6
+order_en = 1
 fields = [
-  { key = "homeserver",  prompt = "Homeserver URL (e.g. https://matrix.org)", secret = false },
-  { key = "accessToken", prompt = "Access Token", secret = true },
-  { key = "userId",      prompt = "Bot User ID (e.g. @bot:matrix.org)", secret = false },
-  { key = "deviceId",    prompt = "Device ID (optional, auto-generated)", secret = false },
-  { key = "recoveryKey", prompt = "E2EE Recovery Key (optional)", secret = true },
+  { key = "homeserver",  prompt = "Homeserver URL (e.g. https://matrix.org)", secret = false, placeholder = "https://matrix.org" },
+  { key = "accessToken", prompt = "Access Token", secret = true, placeholder = "" },
+  { key = "userId",      prompt = "Bot User ID (e.g. @bot:matrix.org)", secret = false, placeholder = "@bot:matrix.org" },
+  { key = "deviceId",    prompt = "Device ID (optional, auto-generated)", secret = false, placeholder = "" },
+  { key = "recoveryKey", prompt = "E2EE Recovery Key (optional)", secret = true, placeholder = "" },
 ]
 
 [[channels]]
 name  = "discord"
 label = "Discord"
+name_zh  = "Discord"
+icon     = "Dc"
+has_qr   = false
+order_zh = 7
+order_en = 2
 fields = [
-  { key = "token", prompt = "Bot Token", secret = true },
+  { key = "token", prompt = "Bot Token", secret = true, placeholder = "" },
 ]
 
 [[channels]]
 name  = "slack"
 label = "Slack"
 multi_account = true
+name_zh  = "Slack"
+icon     = "Sl"
+has_qr   = false
+order_zh = 8
+order_en = 3
 fields = [
-  { key = "botToken", prompt = "Bot Token", secret = true },
-  { key = "appToken", prompt = "App Token", secret = true },
+  { key = "botToken", prompt = "Bot Token", secret = true, placeholder = "xoxb-..." },
+  { key = "appToken", prompt = "App Token", secret = true, placeholder = "xapp-..." },
 ]
 
 [[channels]]
 name  = "whatsapp"
 label = "WhatsApp"
 multi_account = true
+name_zh  = "WhatsApp"
+icon     = "WA"
+has_qr   = false
+order_zh = 9
+order_en = 4
 fields = [
-  { key = "phoneNumberId", prompt = "Phone Number ID", secret = false },
-  { key = "accessToken",   prompt = "Access Token",    secret = true  },
+  { key = "phoneNumberId", prompt = "Phone Number ID", secret = false, placeholder = "" },
+  { key = "accessToken",   prompt = "Access Token",    secret = true,  placeholder = "" },
 ]
 
 [[channels]]
 name  = "signal"
 label = "Signal"
+name_zh  = "Signal"
+icon     = "Sg"
+has_qr   = false
+order_zh = 10
+order_en = 5
 fields = [
-  { key = "phoneNumber", prompt = "Phone Number (E.164)", secret = false },
+  { key = "phoneNumber", prompt = "Phone Number (E.164)", secret = false, placeholder = "+1234567890" },
 ]
 
 [[channels]]
 name  = "line"
 label = "LINE"
+name_zh  = "LINE"
+icon     = "Li"
+has_qr   = false
+order_zh = 11
+order_en = 6
 fields = [
-  { key = "channelAccessToken", prompt = "Channel Access Token", secret = true },
-  { key = "channelSecret",      prompt = "Channel Secret",       secret = true },
+  { key = "channelAccessToken", prompt = "Channel Access Token", secret = true, placeholder = "" },
+  { key = "channelSecret",      prompt = "Channel Secret",       secret = true, placeholder = "" },
 ]
 
 [[channels]]
 name  = "zalo"
 label = "Zalo"
+name_zh  = "Zalo"
+icon     = "Za"
+has_qr   = false
+order_zh = 12
+order_en = 12
 fields = [
-  { key = "accessToken", prompt = "Access Token", secret = true },
-  { key = "oaSecret",    prompt = "OA Secret",    secret = true },
+  { key = "accessToken", prompt = "Access Token", secret = true, placeholder = "" },
+  { key = "oaSecret",    prompt = "OA Secret",    secret = true, placeholder = "" },
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Search Engines (used by web_search tool)
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Free scraper-based engines (no API key required).
+[[search_engines]]
+name     = "bing-free"
+label    = "Bing (free)"
+label_zh = "Bing (免费)"
+label_en = "Bing (free)"
+url      = ""
+env_var  = ""
+needs_key = false
+order    = 0
+
+[[search_engines]]
+name     = "baidu-free"
+label    = "Baidu (free)"
+label_zh = "百度 (免费)"
+label_en = "Baidu (free)"
+url      = ""
+env_var  = ""
+needs_key = false
+order    = 1
+
+[[search_engines]]
+name     = "sogou"
+label    = "Sogou (free)"
+label_zh = "搜狗 (免费)"
+label_en = "Sogou (free)"
+url      = ""
+env_var  = ""
+needs_key = false
+order    = 2
+
+[[search_engines]]
+name     = "360"
+label    = "360 Search (free)"
+label_zh = "360搜索 (免费)"
+label_en = "360 Search (free)"
+url      = ""
+env_var  = ""
+needs_key = false
+order    = 3
+
 [[search_engines]]
 name     = "duckduckgo"
 label    = "DuckDuckGo"
+label_zh = "DuckDuckGo (免费)"
+label_en = "DuckDuckGo (free)"
 url      = "https://html.duckduckgo.com/html/"
 env_var  = ""
-
-[[search_engines]]
-name     = "brave"
-label    = "Brave Search"
-url      = "https://api.search.brave.com/res/v1/web/search"
-env_var  = "BRAVE_API_KEY"
+needs_key = false
+order    = 4
 
 [[search_engines]]
 name     = "google"
 label    = "Google"
+label_zh = "Google (需 API Key)"
+label_en = "Google (API key)"
 url      = "https://www.googleapis.com/customsearch/v1"
 env_var  = "GOOGLE_SEARCH_API_KEY"
+needs_key = true
+order    = 5
 
 [[search_engines]]
 name     = "bing"
 label    = "Bing"
+label_zh = "Bing (需 API Key)"
+label_en = "Bing (API key)"
 url      = "https://api.bing.microsoft.com/v7.0/search"
 env_var  = "BING_API_KEY"
+needs_key = true
+order    = 6
+
+[[search_engines]]
+name     = "brave"
+label    = "Brave Search"
+label_zh = "Brave (需 API Key)"
+label_en = "Brave (API key)"
+url      = "https://api.search.brave.com/res/v1/web/search"
+env_var  = "BRAVE_API_KEY"
+needs_key = true
+order    = 7
+
+[[search_engines]]
+name     = "serper"
+label    = "Serper"
+label_zh = "Serper (需 API Key)"
+label_en = "Serper (API key)"
+url      = "https://google.serper.dev/search"
+env_var  = "SERPER_API_KEY"
+needs_key = true
+order    = 8
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Video Generation Providers (used by video_gen tool)
@@ -333,6 +634,12 @@ label       = "Kling (Kuaishou)"
 env_var     = "KLING_ACCESS_KEY"
 model       = "kling-v2-master"
 base_url    = "https://api.klingai.com"
+
+[video_providers.agnes]
+label       = "Agnes Video V2.0 (Sapiens AI)"
+env_var     = "AGNES_API_KEY"
+model       = "agnes-video-v2.0"
+base_url    = "https://apihub.agnes-ai.com"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Skill Registries (used by rsclaw skills install/search)

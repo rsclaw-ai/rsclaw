@@ -71,36 +71,57 @@ export async function startToolInstall(
   try {
     await tauriInvoke("install_tool", { name, force: true });
     const startedAt = Date.now();
-    let installed = false;
+    // Poll the background install OUTCOME (not just the file probe). The
+    // outcome carries the sidecar's real stdout+stderr, so on failure we can
+    // show the actual reason (no download for platform / download failed /
+    // extract error / no runnable binary) instead of a generic timeout.
     while (Date.now() - startedAt < TIMEOUT_MS) {
       await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-      // External cancel — abandon the poll without surfacing an error
-      // (no toast). Whoever called cancelToolInstall owns the UX.
+      // External cancel — abandon the poll without surfacing an error.
       if (!installing.has(name)) return;
-      const status = (await tauriInvoke("get_tool_install_status", {
+
+      const res = (await tauriInvoke("get_tool_install_result", {
         name,
-      })) as { installed?: boolean };
-      if (status?.installed) {
-        installed = true;
-        break;
+      })) as { done?: boolean; success?: boolean; output?: string };
+
+      if (res?.done) {
+        if (res.success) {
+          // Sidecar reported success — double-check the binary actually landed.
+          const status = (await tauriInvoke("get_tool_install_status", {
+            name,
+          })) as { installed?: boolean };
+          if (!status?.installed) {
+            throw new Error(
+              (zh
+                ? "安装命令成功但未检测到二进制：\n"
+                : "Install reported success but no binary was found:\n") +
+                (res.output || "").trim(),
+            );
+          }
+          try {
+            await onComplete?.();
+          } catch {
+            /* tolerate — refresh failure shouldn't error the install path */
+          }
+          toast.success(zh ? `${name} 安装完成` : `${name} installed`);
+          return;
+        }
+        // Failed — surface the sidecar's real error text.
+        throw new Error((res.output || "").trim() || (zh ? "安装失败（无输出）" : "Install failed (no output)"));
       }
     }
-    if (!installed) {
-      throw new Error(
-        zh
-          ? "安装超时（10 分钟未检测到本地文件，请检查网络或日志）"
-          : "Install timed out (10min with no local binary detected — check network / logs)",
-      );
-    }
-    try {
-      await onComplete?.();
-    } catch {
-      /* tolerate — refresh failure shouldn't error the install path */
-    }
-    toast.success(zh ? `${name} 安装完成` : `${name} installed`);
+    // Hit the wall-clock ceiling without the sidecar finishing.
+    throw new Error(
+      zh
+        ? "安装超时（10 分钟）。详细日志见 ~/.rsclaw/var/tools-install.log"
+        : "Install timed out (10min). See ~/.rsclaw/var/tools-install.log",
+    );
   } catch (e: unknown) {
     const msg = typeof e === "string" ? e : (e as Error)?.message || "";
-    toast.fromError(zh ? "安装失败" : "Install failed", msg);
+    const hint = zh
+      ? "\n详见 ~/.rsclaw/var/tools-install.log"
+      : "\nSee ~/.rsclaw/var/tools-install.log";
+    toast.fromError(zh ? "安装失败" : "Install failed", `${msg}${hint}`);
   } finally {
     installing.delete(name);
     notify();

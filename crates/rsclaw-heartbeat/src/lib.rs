@@ -1,0 +1,598 @@
+pub mod meditation;
+pub mod schedule;
+pub mod state;
+
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+
+use anyhow::{Result, anyhow, bail};
+use chrono::NaiveTime;
+use chrono_tz::Tz;
+use state::{HeartbeatState, HeartbeatStore};
+use tracing::{info, warn};
+
+use rsclaw_config::loader::base_dir;
+
+/// Host abstraction (crate-split trait inversion): lets heartbeat reach the
+/// agent registry + graceful-shutdown coordinator WITHOUT depending on the
+/// agent/gateway runtime crates. Root implements this over AgentRegistry +
+/// ShutdownCoordinator and injects it at startup. Keeps AgentMessage
+/// construction + resolve_flash_model_for on the root side.
+#[async_trait::async_trait]
+pub trait HeartbeatHost: Send + Sync {
+    /// Flash model name for an agent (registry.get + resolve_flash_model_for,
+    /// with the configured default fallback applied root-side).
+    fn agent_flash_model(&self, agent_id: &str) -> Option<String>;
+    /// Provider registry for an agent (crystallize-phase LLM calls).
+    fn agent_providers(&self, agent_id: &str) -> Option<std::sync::Arc<rsclaw_provider::registry::ProviderRegistry>>;
+    /// Agent workspace dir (lessons-phase target).
+    fn agent_workspace(&self, agent_id: &str) -> Option<String>;
+    /// Send a heartbeat message to the agent and await its reply (or timeout).
+    async fn send_heartbeat(&self, agent_id: &str, session_key: &str, text: &str) -> anyhow::Result<()>;
+    /// Whether the runtime is draining (graceful shutdown in progress).
+    fn is_draining(&self) -> bool;
+    /// Register an in-flight unit of work; the returned opaque guard
+    /// decrements the count on drop so a graceful restart waits for the
+    /// tick. Returns `None` when no shutdown coordinator is wired.
+    fn begin_work(&self) -> Option<Box<dyn std::any::Any + Send>>;
+}
+
+/// Type of heartbeat action.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum HeartbeatType {
+    /// Send the content as a message to the agent.
+    #[default]
+    Message,
+    /// Run a meditation cycle on the agent's memory store.
+    Meditate,
+}
+
+/// Parsed representation of a HEARTBEAT.md file.
+#[derive(Debug, Clone)]
+pub struct HeartbeatSpec {
+    pub every: Duration,
+    pub active_hours: Option<(NaiveTime, NaiveTime)>,
+    pub timezone: Tz,
+    pub content: String,
+    /// The type of heartbeat action (message or meditate).
+    pub spec_type: HeartbeatType,
+}
+
+/// Parse a HEARTBEAT.md string (frontmatter + body) into a [`HeartbeatSpec`].
+pub fn parse_heartbeat_md(raw: &str) -> Result<HeartbeatSpec> {
+    // Must start with "---"
+    let rest = raw
+        .strip_prefix("---")
+        .ok_or_else(|| anyhow!("HEARTBEAT.md must begin with a '---' frontmatter block"))?;
+
+    // The first character after "---" must be a newline (or the line ends
+    // immediately)
+    let rest = if rest.starts_with('\n') {
+        &rest[1..]
+    } else if rest.starts_with("\r\n") {
+        &rest[2..]
+    } else {
+        bail!("HEARTBEAT.md must begin with a '---' frontmatter block");
+    };
+
+    // Find the closing "---"
+    let closing = rest
+        .find("\n---")
+        .ok_or_else(|| anyhow!("HEARTBEAT.md frontmatter is not closed with '---'"))?;
+
+    let fm_text = &rest[..closing];
+    let after_closing = &rest[closing + 4..]; // skip "\n---"
+    let content = if after_closing.starts_with('\n') {
+        after_closing[1..].to_string()
+    } else if after_closing.starts_with("\r\n") {
+        after_closing[2..].to_string()
+    } else {
+        after_closing.to_string()
+    };
+
+    // Parse frontmatter key-value pairs (simple "key: value" lines)
+    let mut every_raw: Option<String> = None;
+    let mut active_hours_raw: Option<String> = None;
+    let mut timezone_raw: Option<String> = None;
+    let mut type_raw: Option<String> = None;
+
+    for line in fm_text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, val)) = line.split_once(':') {
+            let key = key.trim();
+            let val = val.trim().to_string();
+            match key {
+                "every" => every_raw = Some(val),
+                "active_hours" => active_hours_raw = Some(val),
+                "timezone" | "tz" => timezone_raw = Some(val),
+                "type" | "kind" => type_raw = Some(val),
+                _ => {} // ignore unknown keys
+            }
+        }
+    }
+
+    let every_str = every_raw
+        .ok_or_else(|| anyhow!("HEARTBEAT.md frontmatter is missing required field 'every'"))?;
+    let every = parse_duration(&every_str);
+
+    let active_hours = active_hours_raw
+        .as_deref()
+        .map(parse_time_range)
+        .transpose()?;
+
+    let timezone: Tz = match timezone_raw.as_deref() {
+        Some("auto") | None => rsclaw_config::system_tz(),
+        Some(tz_str) => tz_str
+            .parse()
+            .map_err(|_| anyhow!("Unknown timezone: '{}'", tz_str))?,
+    };
+
+    let spec_type = match type_raw.as_deref() {
+        Some("meditate" | "meditation") => HeartbeatType::Meditate,
+        _ => HeartbeatType::Message,
+    };
+
+    Ok(HeartbeatSpec {
+        every,
+        active_hours,
+        timezone,
+        content,
+        spec_type,
+    })
+}
+
+/// Parse a human-readable duration string into [`std::time::Duration`].
+///
+/// Supported forms: `"5m"`, `"30m"`, `"1h"`, `"30s"`, bare integer (treated as
+/// minutes).
+fn parse_duration(s: &str) -> Duration {
+    let s = s.trim();
+    if let Some(mins) = s.strip_suffix('m') {
+        if let Ok(n) = mins.parse::<u64>() {
+            return Duration::from_secs(n * 60);
+        }
+    }
+    if let Some(hours) = s.strip_suffix('h') {
+        if let Ok(n) = hours.parse::<u64>() {
+            return Duration::from_secs(n * 3600);
+        }
+    }
+    if let Some(secs) = s.strip_suffix('s') {
+        if let Ok(n) = secs.parse::<u64>() {
+            return Duration::from_secs(n);
+        }
+    }
+    // Bare number → minutes
+    if let Ok(n) = s.parse::<u64>() {
+        return Duration::from_secs(n * 60);
+    }
+    // Fallback: 60 seconds minimum to prevent infinite loop if parsing fails.
+    tracing::warn!(input = %s, "parse_duration: unrecognized format, falling back to 60s");
+    Duration::from_secs(60)
+}
+
+/// Parse a time range string of the form `"HH:MM-HH:MM"`.
+fn parse_time_range(s: &str) -> Result<(NaiveTime, NaiveTime)> {
+    let (start_str, end_str) = s
+        .split_once('-')
+        .ok_or_else(|| anyhow!("active_hours must be in 'HH:MM-HH:MM' format, got '{}'", s))?;
+
+    let start = NaiveTime::parse_from_str(start_str.trim(), "%H:%M")
+        .map_err(|e| anyhow!("Invalid start time '{}': {}", start_str.trim(), e))?;
+    let end = NaiveTime::parse_from_str(end_str.trim(), "%H:%M")
+        .map_err(|e| anyhow!("Invalid end time '{}': {}", end_str.trim(), e))?;
+
+    Ok((start, end))
+}
+
+/// Optional dependencies required by the meditation crystallization phase.
+/// When present, meditation extends from "dedup + cleanup" to also scan
+/// Core un-crystallized memories and distill them into SKILL.md files.
+#[derive(Clone)]
+pub struct MeditationDeps {
+    /// Runtime config — used to resolve per-agent flash model with fallback
+    /// to global defaults.
+    pub config: Arc<rsclaw_config::runtime::RuntimeConfig>,
+    /// redb handle for skill usage stats — drives the disuse-retirement
+    /// pass over auto-crystallized skills.
+    pub db: Arc<rsclaw_store::redb_store::RedbStore>,
+}
+
+/// Heartbeat runner — scans agent workspaces and spawns per-agent heartbeat
+/// loops. Periodically rescans to discover new HEARTBEAT.md files from
+/// dynamically created agents.
+pub struct HeartbeatRunner {
+    host: Arc<dyn HeartbeatHost>,
+    store: Arc<HeartbeatStore>,
+    /// Tracks which agents already have a running heartbeat loop.
+    active: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Shared memory store (used by meditation heartbeat type).
+    memory: Option<Arc<tokio::sync::Mutex<rsclaw_memory::MemoryStore>>>,
+    /// Optional deps for the meditation crystallization phase. When `None`,
+    /// meditation runs with dedup + cleanup only (back-compat).
+    meditation_deps: Option<MeditationDeps>,
+}
+
+impl HeartbeatRunner {
+    /// Create a new heartbeat runner. The host abstracts the agent registry
+    /// and (optional) graceful-shutdown coordinator (crate-split inversion).
+    pub fn new(
+        host: Arc<dyn HeartbeatHost>,
+        data_dir: &Path,
+        memory: Option<Arc<tokio::sync::Mutex<rsclaw_memory::MemoryStore>>>,
+    ) -> Self {
+        let state_path = data_dir.join("heartbeat").join("state.json");
+        Self {
+            host,
+            store: Arc::new(HeartbeatStore::new(state_path)),
+            active: std::sync::Mutex::new(std::collections::HashSet::new()),
+            memory,
+            meditation_deps: None,
+        }
+    }
+
+    /// Attach optional meditation dependencies. When set, meditation cycles
+    /// also run the crystallization phase (scan Core un-crystallized
+    /// memories, distill into SKILL.md). Returns `self` for chaining.
+    pub fn with_meditation_deps(mut self, deps: MeditationDeps) -> Self {
+        self.meditation_deps = Some(deps);
+        self
+    }
+
+    /// Start heartbeat loops for existing agents and spawn a rescan task
+    /// to discover new HEARTBEAT.md files from dynamically created agents.
+    pub fn run(self: Arc<Self>) {
+        self.scan_and_spawn();
+
+        // Rescan every 60 seconds for new HEARTBEAT.md files.
+        let runner = Arc::clone(&self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                if runner.host.is_draining() {
+                        info!("heartbeat rescan: drain signaled, stopping");
+                        break;
+                }
+                runner.scan_and_spawn();
+            }
+        });
+    }
+
+    /// Scan all workspace directories for HEARTBEAT*.md and spawn loops for new
+    /// ones.
+    fn scan_and_spawn(self: &Arc<Self>) {
+        let base = base_dir();
+        // Collect workspace dirs: "workspace" + "workspace-*"
+        let mut dirs: Vec<(String, PathBuf)> = vec![("main".to_string(), base.join("workspace"))];
+        if let Ok(entries) = std::fs::read_dir(&base) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if let Some(agent_id) = name.strip_prefix("workspace-") {
+                    dirs.push((agent_id.to_string(), entry.path()));
+                }
+            }
+        }
+
+        let mut active = self.active.lock().unwrap();
+        for (agent_id, workspace) in &dirs {
+            // Find all HEARTBEAT*.md files in the workspace.
+            let heartbeat_files = Self::find_heartbeat_files(workspace);
+            for hb_path in heartbeat_files {
+                let filename = hb_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                let key = format!("{agent_id}:{filename}");
+                if active.contains(&key) {
+                    continue;
+                }
+
+                active.insert(key);
+                let runner = Arc::clone(self);
+                let agent_id = agent_id.clone();
+
+                info!(agent_id = %agent_id, file = %filename, "heartbeat loop started");
+
+                tokio::spawn(async move {
+                    runner.agent_loop(&agent_id, &hb_path).await;
+                });
+            }
+        }
+    }
+
+    /// Find all HEARTBEAT*.md files in a workspace directory.
+    fn find_heartbeat_files(workspace: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(workspace) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("HEARTBEAT") && name.ends_with(".md") {
+                    files.push(entry.path());
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    /// Per-agent heartbeat loop.
+    async fn agent_loop(&self, agent_id: &str, heartbeat_path: &Path) {
+        let filename = heartbeat_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        let state_key = format!("{agent_id}:{filename}");
+
+        // Load persisted state for startup delay.
+        let mut hb_state = self.store.load(&state_key).unwrap_or_else(|e| {
+            warn!(agent_id, "failed to load heartbeat state: {e:#}");
+            HeartbeatState::new(&state_key)
+        });
+
+        // Initial spec read for startup delay calculation.
+        let spec = match self.read_spec(&heartbeat_path) {
+            Some(s) => s,
+            None => return,
+        };
+        let delay = schedule::startup_delay(spec.every, hb_state.last_run_at);
+        info!(agent_id, ?delay, "heartbeat waiting for first tick");
+        tokio::time::sleep(delay).await;
+
+        loop {
+            if self.host.is_draining() {
+                info!(agent_id, "heartbeat: drain signaled, stopping");
+                return;
+            }
+
+            // Re-read HEARTBEAT.md each tick (auto hot-reload).
+            let spec = match self.read_spec(&heartbeat_path) {
+                Some(s) => s,
+                None => {
+                    info!(agent_id, "HEARTBEAT.md removed, stopping heartbeat");
+                    return;
+                }
+            };
+
+            // Check active hours — sleep until window if outside.
+            if let Some(sleep_dur) = schedule::check_active_hours(spec.active_hours, spec.timezone)
+            {
+                info!(
+                    agent_id,
+                    secs = sleep_dur.as_secs(),
+                    "outside active_hours, sleeping"
+                );
+                tokio::time::sleep(sleep_dur).await;
+                continue;
+            }
+
+            // Track this tick in the gateway's inflight count so a graceful
+            // restart waits for it before exiting.
+            let _inflight_guard = self.host.begin_work();
+
+            // Execute heartbeat action based on type.
+            let result = match spec.spec_type {
+                HeartbeatType::Message => {
+                    self.send_heartbeat(agent_id, &state_key, &spec.content)
+                        .await
+                }
+                HeartbeatType::Meditate => self.run_meditation(agent_id).await,
+            };
+            match result {
+                Ok(()) => {
+                    hb_state.record_success();
+                }
+                Err(e) => {
+                    warn!(agent_id, "heartbeat failed: {e:#}");
+                    hb_state.record_failure(&e.to_string());
+                }
+            }
+
+            // Persist state (best-effort).
+            if let Err(e) = self.store.save(hb_state.clone()) {
+                warn!(agent_id, "failed to save heartbeat state: {e:#}");
+            }
+
+            // Sleep with backoff.
+            let interval = schedule::backoff_interval(spec.every, hb_state.consecutive_failures);
+            tokio::time::sleep(interval).await;
+        }
+    }
+
+    /// Read and parse HEARTBEAT.md. Returns None if file missing or
+    /// unparseable.
+    fn read_spec(&self, path: &Path) -> Option<HeartbeatSpec> {
+        let raw = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
+        match parse_heartbeat_md(&raw) {
+            Ok(spec) => Some(spec),
+            Err(e) => {
+                warn!(path = %path.display(), "failed to parse HEARTBEAT.md: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// Run a meditation cycle for the given agent.
+    ///
+    /// Delegates to [`meditation::meditate`] for dedup + cleanup. If the
+    /// runner was constructed with [`MeditationDeps`], also runs the
+    /// crystallize phase (Core un-crystallized → SKILL.md), bounded to a
+    /// few clusters per cycle.
+    async fn run_meditation(&self, agent_id: &str) -> Result<()> {
+        let mem = match self.memory.as_ref() {
+            Some(m) => m,
+            None => {
+                info!(agent_id, "meditation: no memory store available, skipping");
+                return Ok(());
+            }
+        };
+
+        let scope = format!("agent:{agent_id}");
+        let config = meditation::MeditationConfig::default();
+
+        // Phase 1+3: dedup + cleanup (always run, holds &mut lock).
+        let mut report = {
+            let mut store = mem.lock().await;
+            meditation::meditate(&mut store, &scope, &config).await?
+        };
+
+        // Phase 2: crystallize (only if deps were provided). Runs after
+        // dedup so duplicate Core docs don't waste LLM calls on overlapping
+        // clusters.
+        if let Some(deps) = &self.meditation_deps {
+            let Some(providers) = self.host.agent_providers(agent_id) else {
+                warn!(agent_id, "crystallize phase: agent handle missing");
+                return Ok(());
+            };
+            let primary_model = self
+                .host
+                .agent_flash_model(agent_id)
+                .unwrap_or_else(|| "rsclaw/rsclaw-agent-v1".to_owned());
+            let skills_dir = rsclaw_skill::default_global_skills_dir()
+                .unwrap_or_else(|| rsclaw_config::loader::base_dir().join("skills"));
+
+            match meditation::crystallize_phase(
+                mem,
+                &scope,
+                &providers,
+                &primary_model,
+                &skills_dir,
+            )
+            .await
+            {
+                Ok(n) => {
+                    report.skills_crystallized = n;
+                    report.total_processed += n;
+                }
+                Err(e) => {
+                    warn!(agent_id, "crystallize phase failed: {e:#}");
+                }
+            }
+
+            // Retirement pass: auto-crystallized skills with no activation
+            // inside the disuse window move to skills/.retired/ — closes
+            // the generate→use→retire loop so bad or obsolete auto-skills
+            // stop occupying the prompt's skill list forever.
+            match rsclaw_skill::retire_unused_auto_skills(&deps.db, &skills_dir) {
+                Ok(retired) if !retired.is_empty() => {
+                    info!(agent_id, ?retired, "retired unused auto-skills");
+                }
+                Ok(_) => {}
+                Err(e) => warn!(agent_id, "skill retirement failed: {e:#}"),
+            }
+        }
+
+        // Lessons phase: publish standing behavioural rules (kind=lesson,
+        // importance >= 0.6) into the workspace's memory/lessons.md so the
+        // system prompt's "Learned Rules" section carries them every turn —
+        // corrections must not depend on vector-recall luck.
+        match self.host.agent_workspace(agent_id) {
+            Some(ws) => {
+                let ws = rsclaw_config::loader::expand_tilde_path_pub(&ws);
+                let store = mem.lock().await;
+                match meditation::lessons_phase(&store, &scope, &ws, 8) {
+                    Ok(n) => report.lessons_published = n,
+                    Err(e) => warn!(agent_id, "lessons phase failed: {e:#}"),
+                }
+            }
+            None => warn!(agent_id, "lessons phase: agent workspace unavailable"),
+        }
+
+        info!(
+            agent_id,
+            merged = report.duplicates_merged,
+            cleaned = report.crystallized_cleaned,
+            crystallized = report.skills_crystallized,
+            lessons = report.lessons_published,
+            processed = report.total_processed,
+            "meditation cycle complete"
+        );
+        Ok(())
+    }
+
+    /// Send a heartbeat message to the agent and wait for reply.
+    ///
+    /// Delegates to the host (crate-split): AgentMessage construction, the
+    /// agent mpsc send, and the 300s reply-wait timeout all live root-side in
+    /// the `HeartbeatHost` impl. The `heartbeat:` session-key prefix is
+    /// preserved (first-segment match for is_internal_session routing).
+    async fn send_heartbeat(&self, agent_id: &str, state_key: &str, content: &str) -> Result<()> {
+        let session_key = format!("heartbeat:{state_key}");
+        self.host.send_heartbeat(agent_id, &session_key, content).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn parse_basic_frontmatter() {
+        let input = "---\nevery: 30m\ntimezone: Asia/Shanghai\n---\nHello world\n";
+        let spec = parse_heartbeat_md(input).unwrap();
+        assert_eq!(spec.every, Duration::from_secs(30 * 60));
+        assert!(spec.active_hours.is_none());
+        assert_eq!(spec.timezone, chrono_tz::Asia::Shanghai);
+        assert_eq!(spec.content.trim(), "Hello world");
+    }
+
+    #[test]
+    fn parse_with_active_hours() {
+        let input =
+            "---\nevery: 1h\nactive_hours: 09:15-15:05\ntimezone: Asia/Tokyo\n---\nBody text\n";
+        let spec = parse_heartbeat_md(input).unwrap();
+        assert_eq!(spec.every, Duration::from_secs(3600));
+        let (s, e) = spec.active_hours.unwrap();
+        assert_eq!(s, NaiveTime::from_hms_opt(9, 15, 0).unwrap());
+        assert_eq!(e, NaiveTime::from_hms_opt(15, 5, 0).unwrap());
+        assert_eq!(spec.timezone, chrono_tz::Asia::Tokyo);
+        assert_eq!(spec.content.trim(), "Body text");
+    }
+
+    #[test]
+    fn parse_missing_every_fails() {
+        let input = "---\nactive_hours: 09:00-17:00\n---\ncontent\n";
+        let err = parse_heartbeat_md(input).unwrap_err();
+        assert!(err.to_string().contains("every"));
+    }
+
+    #[test]
+    fn parse_missing_frontmatter_fails() {
+        let input = "No frontmatter here\n";
+        let err = parse_heartbeat_md(input).unwrap_err();
+        assert!(err.to_string().contains("---"));
+    }
+
+    #[test]
+    fn parse_duration_variants() {
+        assert_eq!(parse_duration("5m"), Duration::from_secs(5 * 60));
+        assert_eq!(parse_duration("1h"), Duration::from_secs(3600));
+        assert_eq!(parse_duration("30s"), Duration::from_secs(30));
+        assert_eq!(parse_duration("30"), Duration::from_secs(30 * 60));
+    }
+
+    #[test]
+    fn parse_time_range_valid() {
+        let (s, e) = parse_time_range("09:00-17:30").unwrap();
+        assert_eq!(s, NaiveTime::from_hms_opt(9, 0, 0).unwrap());
+        assert_eq!(e, NaiveTime::from_hms_opt(17, 30, 0).unwrap());
+    }
+
+    #[test]
+    fn parse_time_range_invalid() {
+        assert!(parse_time_range("not-a-time").is_err());
+        assert!(parse_time_range("25:00-26:00").is_err());
+        assert!(parse_time_range("09:00").is_err());
+    }
+}

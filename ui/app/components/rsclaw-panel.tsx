@@ -53,15 +53,15 @@ import {
   testProviderKey,
   listProviderModels,
 } from "../lib/rsclaw-api";
+import { MODELS } from "./onboarding";
 import {
-  ALL_PROVIDERS,
-  ALL_CHANNELS,
-  PROV_ORDER_ZH,
-  PROV_ORDER_EN,
-  CH_ORDER_ZH,
-  CH_ORDER_EN,
-  MODELS,
-} from "./onboarding";
+  useCatalog,
+  getProviderMap,
+  getProviderOrder,
+  getChannelMap,
+  getChannelOrder,
+  getSearchEngines,
+} from "../lib/catalog";
 import {
   type ApiType,
   API_TYPE_LABELS,
@@ -2781,6 +2781,11 @@ function QrPane({
 
 function TauriConfigPageInner() {
   const zh = getLang() === "cn";
+  // Catalog of providers/channels/search-engines from defaults.toml. Seeded
+  // synchronously from FALLBACK (mirrors the old hardcoded lists), reconciled
+  // when the async load settles — `catalogLoaded` re-renders this page so the
+  // ordered lists below pick up the live data.
+  const { loaded: catalogLoaded } = useCatalog();
   const [raw, setRaw] = useState("");
   const [config, setConfig] = useState<any>({});
   const [cfgPath, setCfgPath] = useState("");
@@ -2858,7 +2863,7 @@ function TauriConfigPageInner() {
     (async () => {
       try {
         const { listen } = await import("@tauri-apps/api/event");
-        const fn = await listen("rsclaw:console-install-key", async () => {
+        const reload = async () => {
           if (cancelled || dirty) return;
           try {
             const content = (await tauriInvokeV2("read_config_file")) as string;
@@ -2869,9 +2874,19 @@ function TauriConfigPageInner() {
           } catch {
             /* swallow */
           }
-        });
-        if (cancelled) fn();
-        else unlisten = fn;
+        };
+        // Two triggers reload the panel's config snapshot:
+        //   - console-install-key: the webview one-tap key install (Rust-emitted).
+        //   - config-changed: any rsclaw-card mutation that writes the config
+        //     directly (Set-as-default / manual key paste / disconnect). Without
+        //     the latter, switching primary to rsclaw via the card updated the
+        //     file but left the Primary chain input showing the stale value.
+        const fns = await Promise.all([
+          listen("rsclaw:console-install-key", reload),
+          listen("rsclaw:config-changed", reload),
+        ]);
+        if (cancelled) { fns.forEach((f) => f()); }
+        else unlisten = () => fns.forEach((f) => f());
       } catch {
         /* event subscription unavailable */
       }
@@ -2913,7 +2928,7 @@ function TauriConfigPageInner() {
     for (const [provId, provConf] of Object.entries(provs) as [string, any][]) {
       const apiKey = provConf?.apiKey || "";
       const baseUrl = provConf?.baseUrl || "";
-      const provDef = ALL_PROVIDERS[provId];
+      const provDef = getProviderMap()[provId];
       const hasKey = !!apiKey || provDef?.isUrl;
       if (!hasKey) continue;
       // Check if provider has a selected default model in config
@@ -3084,17 +3099,22 @@ function TauriConfigPageInner() {
 
   if (loading) return <div style={{ padding: 40, textAlign: "center", color: V.t1 }}>...</div>;
 
-  // ── Ordered providers / channels ──
-  const provOrder = zh ? PROV_ORDER_ZH : PROV_ORDER_EN;
+  // ── Ordered providers / channels (from defaults.toml catalog) ──
+  // `catalogLoaded` is read so this render is re-run when the async catalog
+  // load settles; the accessors read the latest resolved catalog.
+  void catalogLoaded;
+  const provMap = getProviderMap();
+  const provOrder = getProviderOrder(zh ? "cn" : "en");
   // rsclaw lives in its own card above this list (account-managed,
   // not BYOK). Drop it from the regular grid so the user doesn't see
   // it twice.
   const provList = provOrder
     .filter((id) => id !== "rsclaw")
-    .map((id) => ALL_PROVIDERS[id])
+    .map((id) => provMap[id])
     .filter(Boolean);
-  const chOrder = zh ? CH_ORDER_ZH : CH_ORDER_EN;
-  const chList = chOrder.map((id) => ALL_CHANNELS[id]).filter(Boolean);
+  const chMap = getChannelMap();
+  const chOrder = getChannelOrder(zh ? "cn" : "en");
+  const chList = chOrder.map((id) => chMap[id]).filter(Boolean);
 
   const CRED_FIELDS: Record<string, { key: string; label: string; type: string; ph: string }[]> = {
     wechat:   [{ key: "botId", label: "Bot ID", type: "text", ph: "xxx@im.bot" }, { key: "botToken", label: "Bot Token", type: "password", ph: "${WECHAT_BOT_TOKEN}" }],
@@ -3142,7 +3162,7 @@ function TauriConfigPageInner() {
         // Auto-test when opening a provider card that has a key but hasn't been tested
         const apiKey = getVal(`models.providers.${id}.apiKey`, "");
         const baseUrl = getVal(`models.providers.${id}.baseUrl`, "");
-        const hasKey = !!apiKey || ALL_PROVIDERS[id]?.isUrl;
+        const hasKey = !!apiKey || getProviderMap()[id]?.isUrl;
         const notTested = !provTest[id] || provTest[id] === "idle";
         if (hasKey && notTested) {
           setTimeout(() => handleTestProvider(id), 100);
@@ -4433,15 +4453,9 @@ function TauriConfigPageInner() {
                 <div style={{ fontSize: 12, color: V.t1, fontWeight: 500 }}>{zh ? "\u641C\u7D22\u63D0\u4F9B\u5546" : "Search Provider"}</div>
               </div>
               <select style={{ ...fSelect, minWidth: 260 }} value={getVal("tools.webSearch.provider", "bing-free")} onChange={(e) => updateConfig("tools.webSearch.provider", e.target.value)}>
-                <option value="bing-free">Bing {zh ? "(\u514D\u8D39)" : "(free)"}</option>
-                <option value="baidu-free">{zh ? "\u767E\u5EA6 (\u514D\u8D39)" : "Baidu (free)"}</option>
-                <option value="sogou">{zh ? "\u641C\u72D7 (\u514D\u8D39)" : "Sogou (free)"}</option>
-                <option value="360">{zh ? "360\u641C\u7D22 (\u514D\u8D39)" : "360 Search (free)"}</option>
-                <option value="duckduckgo">DuckDuckGo {zh ? "(\u514D\u8D39)" : "(free)"}</option>
-                <option value="google">Google {zh ? "(\u9700 API Key)" : "(API key)"}</option>
-                <option value="bing">Bing {zh ? "(\u9700 API Key)" : "(API key)"}</option>
-                <option value="brave">Brave {zh ? "(\u9700 API Key)" : "(API key)"}</option>
-                <option value="serper">Serper {zh ? "(\u9700 API Key)" : "(API key)"}</option>
+                {getSearchEngines(zh ? "cn" : "en").map((se) => (
+                  <option key={se.value} value={se.value}>{se.label}</option>
+                ))}
               </select>
             </div>
             {/* API Key fields for providers that need them */}

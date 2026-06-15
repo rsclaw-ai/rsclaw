@@ -5,7 +5,7 @@ import styles from "./setup-wizard.module.scss";
 import ReturnIcon from "../icons/return.svg";
 import ConfirmIcon from "../icons/confirm.svg";
 import { useNavigate } from "react-router-dom";
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import { Path } from "../constant";
 import { isTauri, invoke as tauriInvokeV2 } from "../utils/tauri";
 import { showToast } from "./ui-lib";
@@ -15,6 +15,7 @@ import {
   API_TYPE_DEFAULT_URLS,
   API_TYPE_NEEDS_KEY,
 } from "../lib/provider-defaults";
+import { useCatalog, getProviderMap } from "../lib/catalog";
 
 const GATEWAY_BASE = "http://localhost:18888/api/v1";
 
@@ -45,50 +46,30 @@ const CONFIG_LANG_TO_CODE: Record<string, string> = {
   Russian: "ru",
 };
 
-const PROVIDERS = [
-  {
-    id: "rsclaw",
-    name: "RsClaw",
-    desc: "Stateful kvCache=2 fleet (recommended)",
-    placeholder: "sk-...",
-  },
-  {
-    id: "anthropic",
-    name: "Anthropic",
-    desc: "Claude models",
-    placeholder: "sk-ant-...",
-  },
-  {
-    id: "openai",
-    name: "OpenAI",
-    desc: "GPT-4, GPT-3.5 models",
-    placeholder: "sk-...",
-  },
-  {
-    id: "doubao",
-    name: "Doubao (\u8C46\u5305)",
-    desc: "ByteDance, API URL editable",
-    placeholder: "xxxxxxxx-xxxx-...",
-  },
-  {
-    id: "qwen",
-    name: "Qwen (\u5343\u95EE)",
-    desc: "Alibaba Cloud DashScope",
-    placeholder: "sk-...",
-  },
-  {
-    id: "ollama",
-    name: "Ollama",
-    desc: "Local models, no API key needed",
-    placeholder: "",
-  },
-  {
-    id: "custom",
-    name: "Custom",
-    desc: "OpenAI-compatible endpoint",
-    placeholder: "your-api-key",
-  },
+// Curated provider subset shown in the wizard. `id` + wizard-specific
+// English `desc` stay local; each provider's input `placeholder` is sourced
+// from the defaults.toml catalog (keyPlaceholder), falling back to the value
+// here when the catalog has no entry. The list/order is intentionally a small
+// curated subset, distinct from the full catalog list rendered elsewhere.
+const WIZARD_PROVIDERS: { id: string; name: string; desc: string; placeholder: string }[] = [
+  { id: "rsclaw", name: "RsClaw", desc: "Stateful kvCache=2 fleet (recommended)", placeholder: "sk-..." },
+  { id: "anthropic", name: "Anthropic", desc: "Claude models", placeholder: "sk-ant-..." },
+  { id: "openai", name: "OpenAI", desc: "GPT-4, GPT-3.5 models", placeholder: "sk-..." },
+  { id: "doubao", name: "Doubao (\u8C46\u5305)", desc: "ByteDance, API URL editable", placeholder: "xxxxxxxx-xxxx-..." },
+  { id: "qwen", name: "Qwen (\u5343\u95EE)", desc: "Alibaba Cloud DashScope", placeholder: "sk-..." },
+  { id: "ollama", name: "Ollama", desc: "Local models, no API key needed", placeholder: "" },
+  { id: "custom", name: "Custom", desc: "OpenAI-compatible endpoint", placeholder: "your-api-key" },
 ];
+
+/** Resolve the curated wizard list, sourcing each placeholder from the
+ *  defaults.toml catalog (with the local string as fallback). */
+function buildWizardProviders(): { id: string; name: string; desc: string; placeholder: string }[] {
+  const map = getProviderMap();
+  return WIZARD_PROVIDERS.map((p) => ({
+    ...p,
+    placeholder: map[p.id]?.keyPlaceholder || p.placeholder,
+  }));
+}
 
 interface WizardConfig {
   language: string;
@@ -102,6 +83,10 @@ interface WizardConfig {
 
 export function SetupWizardPage() {
   const navigate = useNavigate();
+  // Catalog drives provider placeholders (from defaults.toml); seeded
+  // synchronously from FALLBACK, reconciled on load.
+  const { loaded: catalogLoaded } = useCatalog();
+  const PROVIDERS = useMemo(() => buildWizardProviders(), [catalogLoaded]);
   const [step, setStep] = useState(0);
   const [config, setConfig] = useState<WizardConfig>({
     language: "zh-CN",

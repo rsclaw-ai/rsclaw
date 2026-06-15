@@ -1,0 +1,2684 @@
+//! Lightweight i18n for user-facing channel messages.
+//!
+//! CLI output and log messages stay in English.  Only strings sent back to
+//! users through channels (WeChat, QQ, Telegram, etc.) are translated.
+//!
+//! Supported languages: en, zh, th, vi, ja, es, ko, ru, fr, de, json.
+
+use std::{
+    collections::HashMap,
+    sync::{LazyLock, OnceLock},
+};
+
+// ---------------------------------------------------------------------------
+// Global default language (set once at gateway startup)
+// ---------------------------------------------------------------------------
+
+static DEFAULT_LANG: OnceLock<String> = OnceLock::new();
+
+/// Set the default language for channel messages.  Call once at startup.
+pub fn set_default_lang(lang: &str) {
+    let _ = DEFAULT_LANG.set(resolve_lang(lang).to_owned());
+}
+
+/// Return the current default language code (falls back to "en").
+pub fn default_lang() -> &'static str {
+    DEFAULT_LANG.get().map(|s| s.as_str()).unwrap_or("en")
+}
+
+// ---------------------------------------------------------------------------
+// Translation table
+// ---------------------------------------------------------------------------
+
+type LangMap = HashMap<&'static str, &'static str>;
+type MsgMap = HashMap<&'static str, LangMap>;
+
+static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
+    let mut m: MsgMap = HashMap::new();
+
+    macro_rules! msg {
+        ($key:expr, $( $lang:expr => $val:expr ),+ $(,)?) => {{
+            let mut lang_map: LangMap = HashMap::new();
+            $( lang_map.insert($lang, $val); )+
+            m.insert($key, lang_map);
+        }};
+    }
+
+    msg!("pairing_required",
+        "en" => "[\u{1F980}RsClaw] Pairing required. Your code: {code}\nApprove via: rsclaw channels pair {code}",
+        "zh" => "[\u{1F980}RsClaw \u{63D0}\u{793A}] \u{9700}\u{8981}\u{914D}\u{5BF9}\u{9A8C}\u{8BC1}\u{3002}\u{4F60}\u{7684}\u{914D}\u{5BF9}\u{7801}: {code}\n\u{6279}\u{51C6}\u{547D}\u{4EE4}: rsclaw channels pair {code}",
+        "th" => "[\u{1F980}RsClaw] \u{0E15}\u{0E49}\u{0E2D}\u{0E07}\u{0E01}\u{0E32}\u{0E23}\u{0E01}\u{0E32}\u{0E23}\u{0E08}\u{0E31}\u{0E1A}\u{0E04}\u{0E39}\u{0E48} \u{0E23}\u{0E2B}\u{0E31}\u{0E2A}\u{0E02}\u{0E2D}\u{0E07}\u{0E04}\u{0E38}\u{0E13}: {code}\n\u{0E2D}\u{0E19}\u{0E38}\u{0E21}\u{0E31}\u{0E15}\u{0E34}: rsclaw channels pair {code}",
+        "vi" => "[\u{1F980}RsClaw] Can xac thuc ghep doi. Ma cua ban: {code}\nPhe duyet: rsclaw channels pair {code}",
+        "ja" => "[\u{1F980}RsClaw] \u{30DA}\u{30A2}\u{30EA}\u{30F3}\u{30B0}\u{304C}\u{5FC5}\u{8981}\u{3067}\u{3059}\u{3002}\u{30B3}\u{30FC}\u{30C9}: {code}\n\u{627F}\u{8A8D}: rsclaw channels pair {code}",
+        "es" => "[\u{1F980}RsClaw] Emparejamiento requerido. Tu codigo: {code}\nAprobar: rsclaw channels pair {code}",
+        "ko" => "[\u{1F980}RsClaw] \u{D398}\u{C5B4}\u{B9C1}\u{C774} \u{D544}\u{C694}\u{D569}\u{B2C8}\u{B2E4}. \u{CF54}\u{B4DC}: {code}\n\u{C2B9}\u{C778}: rsclaw channels pair {code}",
+        "ru" => "[\u{1F980}RsClaw] \u{0422}\u{0440}\u{0435}\u{0431}\u{0443}\u{0435}\u{0442}\u{0441}\u{044F} \u{0441}\u{043E}\u{043F}\u{0440}\u{044F}\u{0436}\u{0435}\u{043D}\u{0438}\u{0435}. \u{0412}\u{0430}\u{0448} \u{043A}\u{043E}\u{0434}: {code}\n\u{041E}\u{0434}\u{043E}\u{0431}\u{0440}\u{0438}\u{0442}\u{044C}: rsclaw channels pair {code}",
+        "fr" => "[\u{1F980}RsClaw] Appairage requis. Votre code : {code}\nApprouver : rsclaw channels pair {code}",
+        "de" => "[\u{1F980}RsClaw] Kopplung erforderlich. Ihr Code: {code}\nGenehmigen: rsclaw channels pair {code}",
+    );
+
+    msg!("pairing_queue_full",
+        "en" => "Pairing queue full. Try again later.",
+        "zh" => "配对队列已满，请稍后再试。",
+        "fr" => "File d'appairage pleine. Réessayez plus tard.",
+        "de" => "Kopplungswarteschlange voll. Versuchen Sie es später erneut.",
+        "th" => "คิวการจับคู่เต็ม โปรดลองใหม่ภายหลัง",
+        "vi" => "Hang doi ghep doi day. Vui long thu lai sau.",
+        "ja" => "ペアリングキューが満杯です。後でもう一度お試しください。",
+        "es" => "Cola de emparejamiento llena. Intente de nuevo mas tarde.",
+        "ko" => "페어링 대기열이 가득 찼습니다. 나중에 다시 시도하세요.",
+        "ru" => "Очередь сопряжения заполнена. Повторите попытку позже.",
+    );
+
+    // Surfaced when reply.outcome == ReplyOutcome::Error. Channels swap
+    // the raw `[error: ...]` reply text with this friendly message
+    // before sending to the end user. The original error stays in the
+    // gateway log at ERROR level for operator debugging.
+    msg!("backend_unavailable",
+        "en" => "\u{26A0}\u{FE0F} Service temporarily unavailable. Please retry shortly.",
+        "zh" => "\u{26A0}\u{FE0F} 服务暂时不可用，请稍后重试。",
+        "fr" => "\u{26A0}\u{FE0F} Service temporairement indisponible. R\u{00E9}essayez sous peu.",
+        "de" => "\u{26A0}\u{FE0F} Dienst vor\u{00FC}bergehend nicht verf\u{00FC}gbar. Bitte sp\u{00E4}ter erneut versuchen.",
+        "th" => "\u{26A0}\u{FE0F} \u{0E1A}\u{0E23}\u{0E34}\u{0E01}\u{0E32}\u{0E23}\u{0E44}\u{0E21}\u{0E48}\u{0E1E}\u{0E23}\u{0E49}\u{0E2D}\u{0E21}\u{0E43}\u{0E0A}\u{0E49}\u{0E07}\u{0E32}\u{0E19}\u{0E0A}\u{0E31}\u{0E48}\u{0E27}\u{0E04}\u{0E23}\u{0E32}\u{0E27} \u{0E42}\u{0E1B}\u{0E23}\u{0E14}\u{0E25}\u{0E2D}\u{0E07}\u{0E43}\u{0E2B}\u{0E21}\u{0E48}",
+        "vi" => "\u{26A0}\u{FE0F} Dich vu tam thoi khong kha dung. Vui long thu lai sau.",
+        "ja" => "\u{26A0}\u{FE0F} \u{30B5}\u{30FC}\u{30D3}\u{30B9}\u{306F}\u{4E00}\u{6642}\u{7684}\u{306B}\u{5229}\u{7528}\u{3067}\u{304D}\u{307E}\u{305B}\u{3093}\u{3002}\u{3057}\u{3070}\u{3089}\u{304F}\u{3057}\u{3066}\u{304B}\u{3089}\u{518D}\u{8A66}\u{884C}\u{3057}\u{3066}\u{304F}\u{3060}\u{3055}\u{3044}\u{3002}",
+        "es" => "\u{26A0}\u{FE0F} Servicio temporalmente no disponible. Vuelve a intentarlo en breve.",
+        "ko" => "\u{26A0}\u{FE0F} \u{C11C}\u{BE44}\u{C2A4}\u{B97C} \u{C77C}\u{C2DC}\u{C801}\u{C73C}\u{B85C} \u{C0AC}\u{C6A9}\u{D560} \u{C218} \u{C5C6}\u{C2B5}\u{B2C8}\u{B2E4}. \u{C7A0}\u{C2DC} \u{D6C4} \u{B2E4}\u{C2DC} \u{C2DC}\u{B3C4}\u{D574} \u{C8FC}\u{C138}\u{C694}.",
+        "ru" => "\u{26A0}\u{FE0F} \u{0421}\u{0435}\u{0440}\u{0432}\u{0438}\u{0441} \u{0432}\u{0440}\u{0435}\u{043C}\u{0435}\u{043D}\u{043D}\u{043E} \u{043D}\u{0435}\u{0434}\u{043E}\u{0441}\u{0442}\u{0443}\u{043F}\u{0435}\u{043D}. \u{041F}\u{043E}\u{0432}\u{0442}\u{043E}\u{0440}\u{0438}\u{0442}\u{0435} \u{043F}\u{043E}\u{043F}\u{044B}\u{0442}\u{043A}\u{0443} \u{043F}\u{043E}\u{0437}\u{0436}\u{0435}.",
+    );
+
+    // web_browser headed mode: a non-CDP Chrome holds the singleton lock on
+    // the user's default profile, so we ask them to quit and wait up to 60s
+    // before relaunching it with remote debugging + their profile.
+    msg!("browser_quit_for_cdp",
+        "en" => "Chrome is running without remote debugging. To browse with your login state (cookies/session), please quit Chrome — I'll reopen it with your profile automatically (valid for 60s). If you don't quit within 60s, I'll continue with a temporary browser (no login state).",
+        "zh" => "检测到 Chrome 正在运行但未开启远程调试。为了用你的登录态(cookie/会话)操作浏览器，请退出 Chrome——我会自动用你的默认配置重新打开它(60 秒内有效)。若 60 秒内未退出，我将使用临时浏览器(无登录态)继续。",
+    );
+
+    // web_browser headed mode: the 60s quit window elapsed and Chrome is still
+    // running, so we fall back to an isolated temp profile (no user cookies).
+    msg!("browser_using_temp_profile",
+        "en" => "You didn't quit Chrome, so I'll continue with a temporary browser (without your login state / cookies).",
+        "zh" => "未检测到你退出 Chrome，本次将使用临时浏览器(无你的登录态/cookie)继续。",
+    );
+
+    msg!("file_saved",
+        "en" => "Saved {count} file(s) to uploads/",
+        "zh" => "已保存 {count} 个文件到 uploads/",
+        "th" => "บันทึก {count} ไฟล์ไปยัง uploads/ แล้ว",
+        "vi" => "Da luu {count} tep vao uploads/",
+        "ja" => "{count}件のファイルをuploads/に保存しました",
+        "es" => "{count} archivo(s) guardado(s) en uploads/",
+        "ko" => "{count}개 파일을 uploads/에 저장했습니다",
+        "ru" => "Сохранено {count} файл(ов) в uploads/",
+        "fr" => "{count} fichier(s) enregistré(s) dans uploads/",
+        "de" => "{count} Datei(en) in uploads/ gespeichert",
+    );
+
+    // Suffix appended to a binary-only file delivery message; rendered as
+    // `- {filename} {suffix}` after the agent skips text extraction.
+    msg!("file_kept_in_uploads",
+        "en" => "(kept in uploads/{subdir}/)",
+        "zh" => "(已保留在 uploads/{subdir}/)",
+        "th" => "(เก็บไว้ใน uploads/{subdir}/)",
+        "vi" => "(giu trong uploads/{subdir}/)",
+        "ja" => "(uploads/{subdir}/ に保存)",
+        "es" => "(conservado en uploads/{subdir}/)",
+        "ko" => "(uploads/{subdir}/에 보관됨)",
+        "ru" => "(сохранено в uploads/{subdir}/)",
+        "fr" => "(conservé dans uploads/{subdir}/)",
+        "de" => "(in uploads/{subdir}/ aufbewahrt)",
+    );
+
+    msg!("file_menu",
+        "en" => "Choose:\n1. Analyze & keep\n2. Analyze & delete\n3. Delete",
+        "zh" => "请选择:\n1. 分析并保留\n2. 分析后删除\n3. 直接删除",
+        "th" => "เลือก:\n1. วิเคราะห์และเก็บไว้\n2. วิเคราะห์แล้วลบ\n3. ลบ",
+        "vi" => "Chon:\n1. Phan tich va giu\n2. Phan tich roi xoa\n3. Xoa",
+        "ja" => "選択:\n1. 分析して保持\n2. 分析して削除\n3. 削除",
+        "es" => "Elige:\n1. Analizar y conservar\n2. Analizar y eliminar\n3. Eliminar",
+        "ko" => "선택:\n1. 분석 후 보관\n2. 분석 후 삭제\n3. 삭제",
+        "ru" => "Выберите:\n1. Анализ и сохранить\n2. Анализ и удалить\n3. Удалить",
+        "fr" => "Choisissez :\n1. Analyser et conserver\n2. Analyser et supprimer\n3. Supprimer",
+        "de" => "Auswahl:\n1. Analysieren und behalten\n2. Analysieren und löschen\n3. Löschen",
+    );
+
+    msg!("video_menu",
+        "en" => "Choose:\n1. Extract audio & transcribe\n2. Analyze frames (vision)\n3. Transcribe + analyze frames\n4. Delete",
+        "zh" => "请选择:\n1. 提取音频并转写\n2. 分析画面 (vision)\n3. 转写+画面分析\n4. 删除",
+        "ja" => "選択:\n1. 音声抽出して文字起こし\n2. フレーム分析 (vision)\n3. 文字起こし+フレーム分析\n4. 削除",
+        "ko" => "선택:\n1. 오디오 추출 및 전사\n2. 프레임 분석 (vision)\n3. 전사+프레임 분석\n4. 삭제",
+        "es" => "Elige:\n1. Extraer audio y transcribir\n2. Analizar fotogramas (vision)\n3. Transcribir + fotogramas\n4. Eliminar",
+        "ru" => "Выберите:\n1. Извлечь аудио и расшифровать\n2. Анализ кадров (vision)\n3. Расшифровка + кадры\n4. Удалить",
+        "fr" => "Choisissez :\n1. Extraire l'audio et transcrire\n2. Analyser les images (vision)\n3. Transcrire + images\n4. Supprimer",
+        "de" => "Auswahl:\n1. Audio extrahieren & transkribieren\n2. Frames analysieren (vision)\n3. Transkribieren + Frames\n4. Löschen",
+    );
+
+    msg!("video_deleted",
+        "en" => "Deleted: {names}",
+        "zh" => "已删除: {names}",
+        "ja" => "削除しました: {names}",
+        "ko" => "삭제됨: {names}",
+        "es" => "Eliminado: {names}",
+        "ru" => "Удалено: {names}",
+        "fr" => "Supprimé : {names}",
+        "de" => "Gelöscht: {names}",
+    );
+
+    msg!("video_no_ffmpeg",
+        "en" => "ffmpeg is required for video processing but could not be set up: {err}",
+        "zh" => "视频处理需要 ffmpeg，但安装失败: {err}",
+        "ja" => "動画処理には ffmpeg が必要ですが、セットアップに失敗しました: {err}",
+        "ko" => "비디오 처리에 ffmpeg가 필요하지만 설치에 실패했습니다: {err}",
+        "es" => "Se requiere ffmpeg para procesar video, pero falló la instalación: {err}",
+        "ru" => "Для обработки видео нужен ffmpeg, но установка не удалась: {err}",
+        "fr" => "ffmpeg est requis pour la vidéo mais l'installation a échoué : {err}",
+        "de" => "ffmpeg wird benötigt, konnte aber nicht eingerichtet werden: {err}",
+    );
+
+    msg!("file_size_exceeded",
+        "en" => "File size exceeds limit ({limit} MB). Rejected:",
+        "zh" => "文件超出大小限制 ({limit} MB)。已拒绝:",
+        "th" => "ไฟล์เกินขนาดจำกัด ({limit} MB) ปฏิเสธ:",
+        "vi" => "Tep vuot qua gioi han ({limit} MB). Tu choi:",
+        "ja" => "ファイルサイズ制限超過 ({limit} MB)。拒否:",
+        "es" => "Archivo excede el limite ({limit} MB). Rechazado:",
+        "ko" => "파일 크기 제한 초과 ({limit} MB). 거부:",
+        "ru" => "Файл превышает лимит ({limit} MB). Отклонено:",
+        "fr" => "Le fichier dépasse la limite ({limit} Mo). Rejeté :",
+        "de" => "Datei überschreitet das Limit ({limit} MB). Abgelehnt:",
+    );
+
+    msg!("file_size_adjust",
+        "en" => "Adjust via /config_upload_size <MB>",
+        "zh" => "可通过 /config_upload_size <MB> 调整",
+        "th" => "ปรับได้ผ่าน /config_upload_size <MB>",
+        "vi" => "Dieu chinh qua /config_upload_size <MB>",
+        "ja" => "/config_upload_size <MB> で調整可能",
+        "es" => "Ajustar con /config_upload_size <MB>",
+        "ko" => "/config_upload_size <MB>로 조정 가능",
+        "ru" => "Настроить через /config_upload_size <MB>",
+        "fr" => "Ajuster via /config_upload_size <MB>",
+        "de" => "Anpassen über /config_upload_size <MB>",
+    );
+
+    msg!("disk_space_low",
+        "en" => "Insufficient disk space.\nRequired: {need} MB\nAvailable: {avail} MB",
+        "zh" => "磁盘空间不足。\n需要: {need} MB\n可用: {avail} MB",
+        "th" => "พื้นที่ดิสก์ไม่เพียงพอ\nต้องการ: {need} MB\nมี: {avail} MB",
+        "vi" => "Khong du dung luong dia.\nCan: {need} MB\nCon: {avail} MB",
+        "ja" => "ディスク容量不足。\n必要: {need} MB\n空き: {avail} MB",
+        "es" => "Espacio en disco insuficiente.\nNecesario: {need} MB\nDisponible: {avail} MB",
+        "ko" => "디스크 공간 부족.\n필요: {need} MB\n사용 가능: {avail} MB",
+        "ru" => "Недостаточно места на диске.\nТребуется: {need} MB\nДоступно: {avail} MB",
+        "fr" => "Espace disque insuffisant.\nRequis : {need} Mo\nDisponible : {avail} Mo",
+        "de" => "Unzureichender Speicherplatz.\nBenötigt: {need} MB\nVerfügbar: {avail} MB",
+    );
+
+    msg!("no_extractable_content",
+        "en" => "No extractable content.",
+        "zh" => "无法提取内容。",
+        "th" => "ไม่สามารถดึงเนื้อหาได้",
+        "vi" => "Khong the trich xuat noi dung.",
+        "ja" => "抽出可能なコンテンツがありません。",
+        "es" => "Sin contenido extraible.",
+        "ko" => "추출 가능한 콘텐츠가 없습니다.",
+        "ru" => "Нет извлекаемого содержимого.",
+        "fr" => "Aucun contenu extractible.",
+        "de" => "Kein extrahierbarer Inhalt.",
+    );
+
+    msg!("no_extractable_deleted",
+        "en" => "No extractable content. Files deleted.",
+        "zh" => "无法提取内容。文件已删除。",
+        "th" => "ไม่สามารถดึงเนื้อหาได้ ไฟล์ถูกลบแล้ว",
+        "vi" => "Khong the trich xuat noi dung. Tep da bi xoa.",
+        "ja" => "抽出可能なコンテンツがありません。ファイルを削除しました。",
+        "es" => "Sin contenido extraible. Archivos eliminados.",
+        "ko" => "추출 가능한 콘텐츠가 없습니다. 파일이 삭제되었습니다.",
+        "ru" => "Нет извлекаемого содержимого. Файлы удалены.",
+        "fr" => "Aucun contenu extractible. Fichiers supprimés.",
+        "de" => "Kein extrahierbarer Inhalt. Dateien gelöscht.",
+    );
+
+    msg!("video_not_supported",
+        "en" => "[Video message received. Video analysis is not yet supported.]",
+        "zh" => "[收到视频消息。暂不支持视频分析。]",
+        "th" => "[ได้รับวิดีโอ ยังไม่รองรับการวิเคราะห์วิดีโอ]",
+        "vi" => "[Da nhan video. Chua ho tro phan tich video.]",
+        "ja" => "[動画を受信。動画分析は未対応です。]",
+        "es" => "[Video recibido. Analisis de video no soportado.]",
+        "ko" => "[동영상 수신. 동영상 분석은 아직 지원되지 않습니다.]",
+        "ru" => "[Получено видео. Анализ видео пока не поддерживается.]",
+        "fr" => "[Vidéo reçue. L'analyse vidéo n'est pas encore prise en charge.]",
+        "de" => "[Video empfangen. Videoanalyse wird noch nicht unterstützt.]",
+    );
+
+    msg!("describe_image",
+        "en" => "Describe this image.",
+        "zh" => "描述这张图片。",
+        "th" => "อธิบายภาพนี้",
+        "vi" => "Mo ta hinh anh nay.",
+        "ja" => "この画像を説明してください。",
+        "es" => "Describe esta imagen.",
+        "ko" => "이 이미지를 설명해 주세요.",
+        "ru" => "Опишите это изображение.",
+        "fr" => "Décrivez cette image.",
+        "de" => "Beschreiben Sie dieses Bild.",
+    );
+    msg!("describe_video",
+        "en" => "Analyze this video.",
+        "zh" => "分析一下这个视频。",
+        "th" => "วิเคราะห์วิดีโอนี้",
+        "vi" => "Phan tich video nay.",
+        "ja" => "この動画を分析してください。",
+        "es" => "Analiza este video.",
+        "ko" => "이 동영상을 분석해 주세요.",
+        "ru" => "Проанализируйте это видео.",
+        "fr" => "Analysez cette vidéo.",
+        "de" => "Analysieren Sie dieses Video.",
+    );
+
+    msg!("image_received",
+        "en" => "[image received]",
+        "zh" => "[已收到图片]",
+        "th" => "[ได้รับภาพแล้ว]",
+        "vi" => "[Da nhan hinh anh]",
+        "ja" => "[画像を受信]",
+        "es" => "[imagen recibida]",
+        "ko" => "[이미지 수신]",
+        "ru" => "[изображение получено]",
+        "fr" => "[image reçue]",
+        "de" => "[Bild empfangen]",
+    );
+
+    msg!("image_download_failed",
+        "en" => "[image received but download failed]",
+        "zh" => "[收到图片但下载失败]",
+        "th" => "[ได้รับภาพแต่ดาวน์โหลดล้มเหลว]",
+        "vi" => "[Da nhan hinh anh nhung tai xuong that bai]",
+        "ja" => "[画像を受信しましたがダウンロードに失敗しました]",
+        "es" => "[imagen recibida pero la descarga fallo]",
+        "ko" => "[이미지를 수신했지만 다운로드에 실패했습니다]",
+        "ru" => "[изображение получено, но загрузка не удалась]",
+        "fr" => "[image reçue mais le téléchargement a échoué]",
+        "de" => "[Bild empfangen, aber Download fehlgeschlagen]",
+    );
+
+    msg!("file_analyzable",
+        "en" => "analyzable, ~{tokens} tokens",
+        "zh" => "可分析, 约{tokens} tokens",
+        "th" => "วิเคราะห์ได้, ~{tokens} tokens",
+        "vi" => "co the phan tich, ~{tokens} tokens",
+        "ja" => "分析可能, 約{tokens} tokens",
+        "es" => "analizable, ~{tokens} tokens",
+        "ko" => "분석 가능, ~{tokens} tokens",
+        "ru" => "можно проанализировать, ~{tokens} tokens",
+        "fr" => "analysable, ~{tokens} tokens",
+        "de" => "analysierbar, ~{tokens} Tokens",
+    );
+
+    msg!("file_binary",
+        "en" => "binary",
+        "zh" => "二进制文件",
+        "th" => "ไฟล์ไบนารี",
+        "vi" => "tep nhi phan",
+        "ja" => "バイナリ",
+        "es" => "binario",
+        "ko" => "바이너리",
+        "ru" => "бинарный",
+        "fr" => "binaire",
+        "de" => "Binärdatei",
+    );
+
+    msg!("session_cleared",
+        "en" => "Session cleared.",
+        "zh" => "会话已清除。",
+        "th" => "ล้างเซสชันแล้ว",
+        "vi" => "Phien lam viec da xoa.",
+        "ja" => "セッションをクリアしました。",
+        "es" => "Sesion borrada.",
+        "ko" => "세션이 삭제되었습니다.",
+        "ru" => "Сессия очищена.",
+        "fr" => "Session effacée.",
+        "de" => "Sitzung gelöscht.",
+    );
+
+    msg!("session_new",
+        "en" => "New session started.",
+        "zh" => "已开启新会话。",
+        "th" => "เริ่มเซสชันใหม่แล้ว",
+        "vi" => "Da bat dau phien moi.",
+        "ja" => "新しいセッションを開始しました。",
+        "es" => "Nueva sesion iniciada.",
+        "ko" => "새 세션이 시작되었습니다.",
+        "ru" => "Начата новая сессия.",
+        "fr" => "Nouvelle session démarrée.",
+        "de" => "Neue Sitzung gestartet.",
+    );
+
+    msg!("compact_done",
+        "en" => "✓ Session compacted and saved to memory.",
+        "zh" => "✓ 会话已压缩并保存到记忆。",
+        "th" => "✓ บีบอัดเซสชันและบันทึกลงหน่วยความจำแล้ว",
+        "vi" => "✓ Da nen phien va luu vao bo nho.",
+        "ja" => "✓ セッションを圧縮して記憶に保存しました。",
+        "es" => "✓ Sesion compactada y guardada en memoria.",
+        "ko" => "✓ 세션이 압축되어 메모리에 저장되었습니다.",
+        "ru" => "✓ Сессия сжата и сохранена в память.",
+        "fr" => "✓ Session compactée et sauvegardée en mémoire.",
+        "de" => "✓ Sitzung komprimiert und im Speicher gespeichert.",
+    );
+
+    msg!("compact_done_no_summary",
+        "en" => "✓ Session compacted (no summary to save).",
+        "zh" => "✓ 会话已压缩（无摘要可保存）。",
+        "th" => "✓ บีบอัดเซสชันแล้ว (ไม่มีสรุปให้บันทึก)",
+        "vi" => "✓ Da nen phien (khong co tom tat de luu).",
+        "ja" => "✓ セッションを圧縮しました（保存する要約なし）。",
+        "es" => "✓ Sesion compactada (sin resumen que guardar).",
+        "ko" => "✓ 세션이 압축되었습니다 (저장할 요약 없음).",
+        "ru" => "✓ Сессия сжата (нет резюме для сохранения).",
+        "fr" => "✓ Session compactée (aucun résumé à sauvegarder).",
+        "de" => "✓ Sitzung komprimiert (keine Zusammenfassung zu speichern).",
+    );
+
+    msg!("compact_nothing",
+        "en" => "Nothing to compact.",
+        "zh" => "无需压缩。",
+        "th" => "ไม่มีสิ่งที่ต้องบีบอัด",
+        "vi" => "Khong co gi de nen.",
+        "ja" => "圧縮するものはありません。",
+        "es" => "Nada que compactar.",
+        "ko" => "압축할 항목이 없습니다.",
+        "ru" => "Нечего сжимать.",
+        "fr" => "Rien à compacter.",
+        "de" => "Nichts zu komprimieren.",
+    );
+
+    msg!("screenshot_failed",
+        "en" => "screenshot failed",
+        "zh" => "截图失败",
+        "th" => "จับภาพหน้าจอล้มเหลว",
+        "vi" => "Chup man hinh that bai",
+        "ja" => "スクリーンショットに失敗しました",
+        "es" => "captura de pantalla fallida",
+        "ko" => "스크린샷 실패",
+        "ru" => "не удалось сделать снимок экрана",
+        "fr" => "échec de la capture d'écran",
+        "de" => "Bildschirmfoto fehlgeschlagen",
+    );
+
+    msg!("webshot_failed",
+        "en" => "webshot failed for {url}",
+        "zh" => "网页截图失败：{url}",
+        "th" => "เว็บช็อตล้มเหลวสำหรับ {url}",
+        "vi" => "Chup web that bai cho {url}",
+        "ja" => "{url} のウェブショットに失敗しました",
+        "es" => "captura web fallida para {url}",
+        "ko" => "{url}의 웹샷 실패",
+        "ru" => "не удалось сделать веб-снимок для {url}",
+        "fr" => "échec de la capture web pour {url}",
+        "de" => "Webshot fehlgeschlagen für {url}",
+    );
+
+    msg!("analyzing",
+        "en" => "Analyzing file content...",
+        "zh" => "正在分析文件内容...",
+        "th" => "กำลังวิเคราะห์เนื้อหาไฟล์...",
+        "vi" => "Dang phan tich noi dung tep...",
+        "ja" => "ファイル内容を分析中...",
+        "es" => "Analizando contenido del archivo...",
+        "ko" => "파일 내용 분석 중...",
+        "ru" => "Анализ содержимого файла...",
+        "fr" => "Analyse du contenu du fichier...",
+        "de" => "Dateiinhalt wird analysiert...",
+    );
+
+    msg!("analysis_timeout",
+        "en" => "Analysis timed out.",
+        "zh" => "分析超时。",
+        "th" => "การวิเคราะห์หมดเวลา",
+        "vi" => "Phan tich het thoi gian.",
+        "ja" => "分析がタイムアウトしました。",
+        "es" => "El analisis expiro.",
+        "ko" => "분석 시간이 초과되었습니다.",
+        "ru" => "Время анализа истекло.",
+        "fr" => "L'analyse a expiré.",
+        "de" => "Analyse-Zeitüberschreitung.",
+    );
+
+    msg!("analysis_failed",
+        "en" => "Analysis failed.",
+        "zh" => "分析失败。",
+        "th" => "การวิเคราะห์ล้มเหลว",
+        "vi" => "Phan tich that bai.",
+        "ja" => "分析に失敗しました。",
+        "es" => "El analisis fallo.",
+        "ko" => "분석에 실패했습니다.",
+        "ru" => "Анализ не удался.",
+        "fr" => "L'analyse a échoué.",
+        "de" => "Analyse fehlgeschlagen.",
+    );
+
+    msg!("task_notify_failure",
+        "en" => "\u{26A0}\u{FE0F} Task delivery failed ({reason}). Please try again or rephrase.",
+        "zh" => "\u{26A0}\u{FE0F} 任务执行失败（{reason}），请稍后重试或换一种说法。",
+        "th" => "\u{26A0}\u{FE0F} \u{0E07}\u{0E32}\u{0E19}\u{0E25}\u{0E49}\u{0E21}\u{0E40}\u{0E2B}\u{0E25}\u{0E27} ({reason}) \u{0E42}\u{0E1B}\u{0E23}\u{0E14}\u{0E25}\u{0E2D}\u{0E07}\u{0E43}\u{0E2B}\u{0E21}\u{0E48}",
+        "vi" => "\u{26A0}\u{FE0F} Tac vu khong giao duoc ({reason}). Vui long thu lai.",
+        "ja" => "\u{26A0}\u{FE0F} タスクの実行に失敗しました（{reason}）。後でもう一度お試しください。",
+        "es" => "\u{26A0}\u{FE0F} Tarea fallida ({reason}). Vuelva a intentarlo.",
+        "ko" => "\u{26A0}\u{FE0F} 작업 실행 실패 ({reason}). 다시 시도하세요.",
+        "ru" => "\u{26A0}\u{FE0F} Сбой задачи ({reason}). Повторите попытку.",
+        "fr" => "\u{26A0}\u{FE0F} Échec de la tâche ({reason}). Réessayez.",
+        "de" => "\u{26A0}\u{FE0F} Aufgabe fehlgeschlagen ({reason}). Bitte erneut versuchen.",
+    );
+
+    msg!("wechat_video_notify_failed",
+        "en" => "\u{1F4E6} Video generated ({filename}, {mb}MB) but WeChat delivery was rejected.\n\nFile saved at: {path}\n\nYou can ask me to publish to Douyin / other platforms — no need to regenerate.",
+        "zh" => "\u{1F4E6} 视频已生成（{filename}, {mb}MB），但微信通知投递异常。\n\n文件保存在：{path}\n\n你可以让我直接发到抖音 / 其他平台，无需重新生成视频。",
+        "th" => "\u{1F4E6} \u{0E27}\u{0E34}\u{0E14}\u{0E35}\u{0E42}\u{0E2D}\u{0E40}\u{0E2A}\u{0E23}\u{0E47}\u{0E08}\u{0E41}\u{0E25}\u{0E49}\u{0E27} ({filename}, {mb}MB) \u{0E41}\u{0E15}\u{0E48}\u{0E2A}\u{0E48}\u{0E07}\u{0E1C}\u{0E48}\u{0E32}\u{0E19} WeChat \u{0E44}\u{0E21}\u{0E48}\u{0E2A}\u{0E33}\u{0E40}\u{0E23}\u{0E47}\u{0E08}\n\u{0E44}\u{0E1F}\u{0E25}\u{0E4C}: {path}",
+        "vi" => "\u{1F4E6} Video da xong ({filename}, {mb}MB) nhung WeChat tu choi giao. File: {path}",
+        "ja" => "\u{1F4E6} 動画は生成されました（{filename}, {mb}MB）が、WeChatでの送信に失敗しました。\nファイル: {path}",
+        "es" => "\u{1F4E6} Video generado ({filename}, {mb}MB) pero WeChat rechazó la entrega.\nArchivo: {path}",
+        "ko" => "\u{1F4E6} 동영상은 생성되었지만 ({filename}, {mb}MB) WeChat 전송이 거부되었습니다.\n파일: {path}",
+        "ru" => "\u{1F4E6} Видео готово ({filename}, {mb}MB), но WeChat отклонил доставку.\nФайл: {path}",
+        "fr" => "\u{1F4E6} Vidéo générée ({filename}, {mb}MB) mais WeChat a refusé la livraison.\nFichier : {path}",
+        "de" => "\u{1F4E6} Video erstellt ({filename}, {mb}MB), aber WeChat-Zustellung abgelehnt.\nDatei: {path}",
+    );
+
+    msg!("files_deleted",
+        "en" => "Files deleted.",
+        "zh" => "文件已删除。",
+        "th" => "ลบไฟล์แล้ว",
+        "vi" => "Tep da bi xoa.",
+        "ja" => "ファイルを削除しました。",
+        "es" => "Archivos eliminados.",
+        "ko" => "파일이 삭제되었습니다.",
+        "ru" => "Файлы удалены.",
+        "fr" => "Fichiers supprimés.",
+        "de" => "Dateien gelöscht.",
+    );
+
+    msg!("image_attachment_received",
+        "en" => "[image attachment received]",
+        "zh" => "[收到图片附件]",
+        "th" => "[ได้รับไฟล์แนบภาพ]",
+        "vi" => "[Da nhan tep dinh kem hinh anh]",
+        "ja" => "[画像添付ファイルを受信]",
+        "es" => "[imagen adjunta recibida]",
+        "ko" => "[이미지 첨부 수신]",
+        "ru" => "[получено вложение с изображением]",
+        "fr" => "[pièce jointe image reçue]",
+        "de" => "[Bildanhang empfangen]",
+    );
+
+    msg!("image_file_received",
+        "en" => "[image file received]",
+        "zh" => "[收到图片文件]",
+        "th" => "[ได้รับไฟล์ภาพ]",
+        "vi" => "[Da nhan tep hinh anh]",
+        "ja" => "[画像ファイルを受信]",
+        "es" => "[archivo de imagen recibido]",
+        "ko" => "[이미지 파일 수신]",
+        "ru" => "[получен файл изображения]",
+        "fr" => "[fichier image reçu]",
+        "de" => "[Bilddatei empfangen]",
+    );
+
+    msg!("video_message_received",
+        "en" => "[video message received]",
+        "zh" => "[收到视频消息]",
+        "th" => "[ได้รับวิดีโอ]",
+        "vi" => "[Da nhan video]",
+        "ja" => "[動画メッセージを受信]",
+        "es" => "[mensaje de video recibido]",
+        "ko" => "[동영상 메시지 수신]",
+        "ru" => "[получено видео сообщение]",
+        "fr" => "[message vidéo reçu]",
+        "de" => "[Videonachricht empfangen]",
+    );
+
+    // -----------------------------------------------------------------------
+    // CLI interactive prompts (en + zh only — developer-facing)
+    // -----------------------------------------------------------------------
+
+    // Setup
+    msg!("cli_setup_title",
+        "en" => "rsclaw setup",
+        "zh" => "rsclaw 初始化",
+        "fr" => "rsclaw configuration initiale",
+        "de" => "rsclaw Einrichtung",
+        "th" => "rsclaw ตั้งค่า",
+        "vi" => "rsclaw thiet lap",
+        "ja" => "rsclaw セットアップ",
+        "es" => "rsclaw configuracion",
+        "ko" => "rsclaw 설정",
+        "ru" => "rsclaw настройка",
+    );
+    msg!("cli_migration_mode",
+        "en" => "Migration mode",
+        "zh" => "迁移模式",
+        "fr" => "Mode de migration",
+        "de" => "Migrationsmodus",
+        "th" => "โหมดการย้ายข้อมูล",
+        "vi" => "Che do di cu",
+        "ja" => "マイグレーションモード",
+        "es" => "Modo de migracion",
+        "ko" => "마이그레이션 모드",
+        "ru" => "Режим миграции",
+    );
+    msg!("cli_import_desc",
+        "en" => "Import  -- copy data into ~/.rsclaw (recommended)",
+        "zh" => "导入  -- 将数据复制到 ~/.rsclaw（推荐）",
+        "fr" => "Importer  -- copier les données dans ~/.rsclaw (recommandé)",
+        "de" => "Importieren  -- Daten nach ~/.rsclaw kopieren (empfohlen)",
+        "th" => "นำเข้า  -- คัดลอกข้อมูลไปยัง ~/.rsclaw (แนะนำ)",
+        "vi" => "Nhap  -- sao chep du lieu vao ~/.rsclaw (khuyen nghi)",
+        "ja" => "インポート  -- データを ~/.rsclaw にコピー（推奨）",
+        "es" => "Importar  -- copiar datos a ~/.rsclaw (recomendado)",
+        "ko" => "가져오기  -- 데이터를 ~/.rsclaw에 복사 (권장)",
+        "ru" => "Импорт  -- скопировать данные в ~/.rsclaw (рекомендуется)",
+    );
+    msg!("cli_fresh_desc",
+        "en" => "New     -- ignore OpenClaw data, start new",
+        "zh" => "全新  -- 忽略 OpenClaw 数据，从零开始",
+        "fr" => "Nouveau  -- ignorer les données OpenClaw, recommencer",
+        "de" => "Neu     -- OpenClaw-Daten ignorieren, neu starten",
+        "th" => "ใหม่     -- ละเว้นข้อมูล OpenClaw เริ่มต้นใหม่",
+        "vi" => "Moi     -- bo qua du lieu OpenClaw, bat dau moi",
+        "ja" => "新規     -- OpenClawデータを無視して新しく開始",
+        "es" => "Nuevo     -- ignorar datos OpenClaw, comenzar de nuevo",
+        "ko" => "새로 시작     -- OpenClaw 데이터 무시, 새로 시작",
+        "ru" => "Новый     -- игнорировать данные OpenClaw, начать заново",
+    );
+    msg!("cli_default_language",
+        "en" => "Default language",
+        "zh" => "默认语言",
+        "fr" => "Langue par défaut",
+        "de" => "Standardsprache",
+        "th" => "ภาษาเริ่มต้น",
+        "vi" => "Ngon ngu mac dinh",
+        "ja" => "デフォルト言語",
+        "es" => "Idioma predeterminado",
+        "ko" => "기본 언어",
+        "ru" => "Язык по умолчанию",
+    );
+    msg!("cli_setup_complete",
+        "en" => "Setup complete",
+        "zh" => "初始化完成",
+        "fr" => "Configuration terminée",
+        "de" => "Einrichtung abgeschlossen",
+        "th" => "การตั้งค่าเสร็จสมบูรณ์",
+        "vi" => "Thiet lap hoan tat",
+        "ja" => "セットアップ完了",
+        "es" => "Configuracion completa",
+        "ko" => "설정 완료",
+        "ru" => "Настройка завершена",
+    );
+    msg!("cli_detected_openclaw",
+        "en" => "Detected OpenClaw at {path}",
+        "zh" => "检测到 OpenClaw 位于 {path}",
+        "fr" => "OpenClaw détecté à {path}",
+        "de" => "OpenClaw erkannt unter {path}",
+        "th" => "พบ OpenClaw ที่ {path}",
+        "vi" => "Phat hien OpenClaw tai {path}",
+        "ja" => "OpenClawを {path} で検出しました",
+        "es" => "OpenClaw detectado en {path}",
+        "ko" => "OpenClaw 감지됨: {path}",
+        "ru" => "OpenClaw обнаружен по пути {path}",
+    );
+
+    // Configure
+    msg!("cli_configure_section",
+        "en" => "Configure section",
+        "zh" => "配置项",
+        "fr" => "Section de configuration",
+        "de" => "Konfigurationsabschnitt",
+        "th" => "ส่วนการตั้งค่า",
+        "vi" => "Muc cau hinh",
+        "ja" => "設定セクション",
+        "es" => "Seccion de configuracion",
+        "ko" => "설정 섹션",
+        "ru" => "Раздел конфигурации",
+    );
+    msg!("cli_save_exit",
+        "en" => "[Save & Exit]",
+        "zh" => "[保存并退出]",
+        "fr" => "[Enregistrer et quitter]",
+        "de" => "[Speichern und beenden]",
+        "th" => "[บันทึกและออก]",
+        "vi" => "[Luu va Thoat]",
+        "ja" => "[保存して終了]",
+        "es" => "[Guardar y salir]",
+        "ko" => "[저장 및 종료]",
+        "ru" => "[Сохранить и выйти]",
+    );
+    msg!("cli_gateway",
+        "en" => "Gateway (port, bind)",
+        "zh" => "网关（端口、绑定）",
+        "fr" => "Passerelle (port, liaison)",
+        "de" => "Gateway (Port, Bindung)",
+        "th" => "เกตเวย์ (พอร์ต, การผูก)",
+        "vi" => "Gateway (cong, lien ket)",
+        "ja" => "ゲートウェイ（ポート、バインド）",
+        "es" => "Pasarela (puerto, enlace)",
+        "ko" => "게이트웨이 (포트, 바인드)",
+        "ru" => "Шлюз (порт, привязка)",
+    );
+    msg!("cli_model_provider",
+        "en" => "Model Provider (provider, API key, model)",
+        "zh" => "模型提供商（提供商、API 密钥、模型）",
+        "fr" => "Fournisseur de modèle (fournisseur, clé API, modèle)",
+        "de" => "Modellanbieter (Anbieter, API-Schlüssel, Modell)",
+        "th" => "ผู้ให้บริการโมเดล (ผู้ให้บริการ, คีย์ API, โมเดล)",
+        "vi" => "Nha cung cap mo hinh (nha cung cap, khoa API, mo hinh)",
+        "ja" => "モデルプロバイダー（プロバイダー、APIキー、モデル）",
+        "es" => "Proveedor de modelo (proveedor, clave API, modelo)",
+        "ko" => "모델 제공업체 (제공업체, API 키, 모델)",
+        "ru" => "Поставщик модели (провайдер, API-ключ, модель)",
+    );
+    msg!("cli_channels",
+        "en" => "Channels (add/remove)",
+        "zh" => "消息通道（添加/删除）",
+        "fr" => "Canaux (ajouter/supprimer)",
+        "de" => "Kanäle (hinzufügen/entfernen)",
+        "th" => "ช่องทาง (เพิ่ม/ลบ)",
+        "vi" => "Kenh (them/xoa)",
+        "ja" => "チャンネル（追加/削除）",
+        "es" => "Canales (agregar/eliminar)",
+        "ko" => "채널 (추가/제거)",
+        "ru" => "Каналы (добавить/удалить)",
+    );
+    msg!("cli_web_search",
+        "en" => "Web Search (provider, API keys)",
+        "zh" => "网络搜索（提供商、API 密钥）",
+        "fr" => "Recherche web (fournisseur, clés API)",
+        "de" => "Websuche (Anbieter, API-Schlüssel)",
+        "th" => "การค้นหาเว็บ (ผู้ให้บริการ, คีย์ API)",
+        "vi" => "Tim kiem web (nha cung cap, khoa API)",
+        "ja" => "ウェブ検索（プロバイダー、APIキー）",
+        "es" => "Busqueda web (proveedor, claves API)",
+        "ko" => "웹 검색 (제공업체, API 키)",
+        "ru" => "Веб-поиск (провайдер, API-ключи)",
+    );
+    msg!("cli_upload_limits",
+        "en" => "Upload Limits (file size, text chars)",
+        "zh" => "上传限制（文件大小、文本字符数）",
+        "fr" => "Limites de téléversement (taille fichier, caractères texte)",
+        "de" => "Upload-Limits (Dateigröße, Textzeichen)",
+        "th" => "ขีดจำกัดการอัปโหลด (ขนาดไฟล์, ตัวอักษรข้อความ)",
+        "vi" => "Gioi han tai len (kich thuoc tep, ky tu van ban)",
+        "ja" => "アップロード制限（ファイルサイズ、テキスト文字数）",
+        "es" => "Limites de carga (tamano de archivo, caracteres de texto)",
+        "ko" => "업로드 제한 (파일 크기, 텍스트 문자)",
+        "ru" => "Ограничения загрузки (размер файла, символы текста)",
+    );
+    msg!("cli_exec_safety",
+        "en" => "Exec Safety (on/off)",
+        "zh" => "执行安全（开/关）",
+        "fr" => "Sécurité d'exécution (on/off)",
+        "de" => "Ausführungssicherheit (ein/aus)",
+        "th" => "ความปลอดภัยการรัน (เปิด/ปิด)",
+        "vi" => "Bao mat thuc thi (bat/tat)",
+        "ja" => "実行セーフティ（オン/オフ）",
+        "es" => "Seguridad de ejecucion (on/off)",
+        "ko" => "실행 보안 (켜기/끄기)",
+        "ru" => "Безопасность выполнения (вкл/выкл)",
+    );
+    msg!("cli_no_changes",
+        "en" => "No changes made.",
+        "zh" => "未做任何更改。",
+        "fr" => "Aucune modification effectuée.",
+        "de" => "Keine Änderungen vorgenommen.",
+        "th" => "ไม่มีการเปลี่ยนแปลง",
+        "vi" => "Khong co thay doi nao.",
+        "ja" => "変更はありません。",
+        "es" => "Sin cambios realizados.",
+        "ko" => "변경 사항 없음.",
+        "ru" => "Изменений не внесено.",
+    );
+    msg!("cli_cancelled",
+        "en" => "Cancelled -- no changes saved.",
+        "zh" => "已取消 -- 未保存任何更改。",
+        "fr" => "Annulé -- aucune modification enregistrée.",
+        "de" => "Abgebrochen -- keine Änderungen gespeichert.",
+        "th" => "ยกเลิก -- ไม่มีการบันทึกการเปลี่ยนแปลง",
+        "vi" => "Da huy -- khong luu thay doi nao.",
+        "ja" => "キャンセル -- 変更は保存されていません。",
+        "es" => "Cancelado -- ningun cambio guardado.",
+        "ko" => "취소됨 -- 변경 사항이 저장되지 않았습니다.",
+        "ru" => "Отменено -- изменения не сохранены.",
+    );
+    msg!("cli_saved_to",
+        "en" => "Saved to {path}",
+        "zh" => "已保存到 {path}",
+        "fr" => "Enregistré dans {path}",
+        "de" => "Gespeichert unter {path}",
+        "th" => "บันทึกไปยัง {path}",
+        "vi" => "Da luu vao {path}",
+        "ja" => "{path} に保存しました",
+        "es" => "Guardado en {path}",
+        "ko" => "{path}에 저장됨",
+        "ru" => "Сохранено в {path}",
+    );
+
+    // Onboard
+    msg!("cli_choose_provider",
+        "en" => "Choose a provider",
+        "zh" => "选择提供商",
+        "fr" => "Choisir un fournisseur",
+        "de" => "Anbieter auswählen",
+        "th" => "เลือกผู้ให้บริการ",
+        "vi" => "Chon nha cung cap",
+        "ja" => "プロバイダーを選択",
+        "es" => "Elegir un proveedor",
+        "ko" => "제공업체 선택",
+        "ru" => "Выберите провайдера",
+    );
+    msg!("cli_enter_api_key",
+        "en" => "Enter API key",
+        "zh" => "输入 API 密钥",
+        "fr" => "Entrez la clé API",
+        "de" => "API-Schlüssel eingeben",
+        "th" => "ป้อนคีย์ API",
+        "vi" => "Nhap khoa API",
+        "ja" => "APIキーを入力",
+        "es" => "Ingresar clave API",
+        "ko" => "API 키 입력",
+        "ru" => "Введите API-ключ",
+    );
+    msg!("cli_choose_channels",
+        "en" => "Choose channels to enable",
+        "zh" => "选择要启用的消息通道",
+        "fr" => "Choisir les canaux à activer",
+        "de" => "Zu aktivierende Kanäle auswählen",
+        "th" => "เลือกช่องทางที่จะเปิดใช้งาน",
+        "vi" => "Chon cac kenh de kich hoat",
+        "ja" => "有効にするチャンネルを選択",
+        "es" => "Elegir canales a habilitar",
+        "ko" => "활성화할 채널 선택",
+        "ru" => "Выберите каналы для включения",
+    );
+    msg!("cli_onboard_complete",
+        "en" => "Onboard complete",
+        "zh" => "向导完成",
+        "fr" => "Assistant terminé",
+        "de" => "Einrichtungsassistent abgeschlossen",
+        "th" => "ตัวช่วยตั้งค่าเสร็จสมบูรณ์",
+        "vi" => "Huong dan hoan tat",
+        "ja" => "オンボード完了",
+        "es" => "Asistente completado",
+        "ko" => "온보딩 완료",
+        "ru" => "Подключение завершено",
+    );
+
+    // Setup wizard (onboard)
+    msg!("cli_setup_wizard_title",
+        "en" => "rsclaw -- setup wizard",
+        "zh" => "rsclaw -- 设置向导",
+        "fr" => "rsclaw -- assistant de configuration",
+        "de" => "rsclaw -- Einrichtungsassistent",
+        "th" => "rsclaw -- ตัวช่วยตั้งค่า",
+        "vi" => "rsclaw -- huong dan thiet lap",
+        "ja" => "rsclaw -- セットアップウィザード",
+        "es" => "rsclaw -- asistente de configuracion",
+        "ko" => "rsclaw -- 설정 마법사",
+        "ru" => "rsclaw -- мастер настройки",
+    );
+    msg!("cli_press_esc_back",
+        "en" => "Press ESC to go back to the previous step",
+        "zh" => "按 ESC 返回上一步",
+        "fr" => "Appuyez sur ÉCHAP pour revenir à l'étape précédente",
+        "de" => "ESC drücken, um zum vorherigen Schritt zurückzukehren",
+        "th" => "กด ESC เพื่อกลับไปขั้นตอนก่อนหน้า",
+        "vi" => "Nhan ESC de quay lai buoc truoc",
+        "ja" => "前のステップに戻るにはESCを押してください",
+        "es" => "Presione ESC para volver al paso anterior",
+        "ko" => "이전 단계로 돌아가려면 ESC를 누르세요",
+        "ru" => "Нажмите ESC, чтобы вернуться на предыдущий шаг",
+    );
+    msg!("cli_setup_cancelled",
+        "en" => "Setup cancelled.",
+        "zh" => "设置已取消。",
+        "fr" => "Configuration annulée.",
+        "de" => "Einrichtung abgebrochen.",
+        "th" => "ยกเลิกการตั้งค่า",
+        "vi" => "Da huy thiet lap.",
+        "ja" => "セットアップをキャンセルしました。",
+        "es" => "Configuracion cancelada.",
+        "ko" => "설정이 취소되었습니다.",
+        "ru" => "Настройка отменена.",
+    );
+    msg!("cli_confirm_setup",
+        "en" => "Proceed with setup?",
+        "zh" => "继续执行初始化？",
+        "fr" => "Continuer la configuration ?",
+        "de" => "Mit der Einrichtung fortfahren?",
+        "th" => "ดำเนินการตั้งค่าต่อหรือไม่?",
+        "vi" => "Tiep tuc thiet lap?",
+        "ja" => "セットアップを続行しますか？",
+        "es" => "¿Continuar con la configuracion?",
+        "ko" => "설정을 계속하시겠습니까?",
+        "ru" => "Продолжить настройку?",
+    );
+    msg!("cli_step_agent",
+        "en" => "1. Agent",
+        "zh" => "1. 智能体",
+        "fr" => "1. Agent",
+        "de" => "1. Agent",
+        "th" => "1. เอเจนต์",
+        "vi" => "1. Agent",
+        "ja" => "1. エージェント",
+        "es" => "1. Agente",
+        "ko" => "1. 에이전트",
+        "ru" => "1. Агент",
+    );
+    msg!("cli_agent_name",
+        "en" => "Agent name",
+        "zh" => "智能体名称",
+        "fr" => "Nom de l'agent",
+        "de" => "Agent-Name",
+        "th" => "ชื่อเอเจนต์",
+        "vi" => "Ten agent",
+        "ja" => "エージェント名",
+        "es" => "Nombre del agente",
+        "ko" => "에이전트 이름",
+        "ru" => "Имя агента",
+    );
+    msg!("cli_step_model_provider",
+        "en" => "2. Model Provider",
+        "zh" => "2. 模型提供商",
+        "fr" => "2. Fournisseur de modèle",
+        "de" => "2. Modellanbieter",
+        "th" => "2. ผู้ให้บริการโมเดล",
+        "vi" => "2. Nha cung cap mo hinh",
+        "ja" => "2. モデルプロバイダー",
+        "es" => "2. Proveedor de modelo",
+        "ko" => "2. 모델 제공업체",
+        "ru" => "2. Поставщик модели",
+    );
+    msg!("cli_step_gateway",
+        "en" => "3. Gateway",
+        "zh" => "3. 网关",
+        "fr" => "3. Passerelle",
+        "de" => "3. Gateway",
+        "th" => "3. เกตเวย์",
+        "vi" => "3. Gateway",
+        "ja" => "3. ゲートウェイ",
+        "es" => "3. Pasarela",
+        "ko" => "3. 게이트웨이",
+        "ru" => "3. Шлюз",
+    );
+    msg!("cli_step_channels",
+        "en" => "4. {label}",
+        "zh" => "4. {label}",
+        "fr" => "4. {label}",
+        "de" => "4. {label}",
+        "th" => "4. {label}",
+        "vi" => "4. {label}",
+        "ja" => "4. {label}",
+        "es" => "4. {label}",
+        "ko" => "4. {label}",
+        "ru" => "4. {label}",
+    );
+    msg!("cli_add_channel",
+        "en" => "Add a channel",
+        "zh" => "添加消息通道",
+        "fr" => "Ajouter un canal",
+        "de" => "Kanal hinzufügen",
+        "th" => "เพิ่มช่องทาง",
+        "vi" => "Them kenh",
+        "ja" => "チャンネルを追加",
+        "es" => "Agregar un canal",
+        "ko" => "채널 추가",
+        "ru" => "Добавить канал",
+    );
+    msg!("cli_add_another_channel",
+        "en" => "Add another channel",
+        "zh" => "添加其他消息通道",
+        "fr" => "Ajouter un autre canal",
+        "de" => "Weiteren Kanal hinzufügen",
+        "th" => "เพิ่มช่องทางอื่น",
+        "vi" => "Them kenh khac",
+        "ja" => "別のチャンネルを追加",
+        "es" => "Agregar otro canal",
+        "ko" => "다른 채널 추가",
+        "ru" => "Добавить ещё один канал",
+    );
+    msg!("cli_all_channels_configured",
+        "en" => "All channels configured.",
+        "zh" => "所有消息通道已配置。",
+        "fr" => "Tous les canaux sont configurés.",
+        "de" => "Alle Kanäle konfiguriert.",
+        "th" => "ตั้งค่าช่องทางทั้งหมดแล้ว",
+        "vi" => "Tat ca cac kenh da duoc cau hinh.",
+        "ja" => "すべてのチャンネルが設定されました。",
+        "es" => "Todos los canales configurados.",
+        "ko" => "모든 채널이 구성되었습니다.",
+        "ru" => "Все каналы настроены.",
+    );
+    msg!("cli_skip_done",
+        "en" => "[Skip / Done]",
+        "zh" => "[跳过 / 完成]",
+        "fr" => "[Passer / Terminé]",
+        "de" => "[Überspringen / Fertig]",
+        "th" => "[ข้าม / เสร็จสิ้น]",
+        "vi" => "[Bo qua / Xong]",
+        "ja" => "[スキップ / 完了]",
+        "es" => "[Omitir / Listo]",
+        "ko" => "[건너뛰기 / 완료]",
+        "ru" => "[Пропустить / Готово]",
+    );
+    msg!("cli_default_model",
+        "en" => "Default model",
+        "zh" => "默认模型",
+        "fr" => "Modèle par défaut",
+        "de" => "Standardmodell",
+        "th" => "โมเดลเริ่มต้น",
+        "vi" => "Mo hinh mac dinh",
+        "ja" => "デフォルトモデル",
+        "es" => "Modelo predeterminado",
+        "ko" => "기본 모델",
+        "ru" => "Модель по умолчанию",
+    );
+    msg!("cli_port",
+        "en" => "Port",
+        "zh" => "端口",
+        "fr" => "Port",
+        "de" => "Port",
+        "th" => "พอร์ต",
+        "vi" => "Cong",
+        "ja" => "ポート",
+        "es" => "Puerto",
+        "ko" => "포트",
+        "ru" => "Порт",
+    );
+    msg!("cli_bind_mode",
+        "en" => "Bind mode",
+        "zh" => "绑定模式",
+        "fr" => "Mode de liaison",
+        "de" => "Bindungsmodus",
+        "th" => "โหมดการผูก",
+        "vi" => "Che do lien ket",
+        "ja" => "バインドモード",
+        "es" => "Modo de enlace",
+        "ko" => "바인드 모드",
+        "ru" => "Режим привязки",
+    );
+    msg!("cli_next_start",
+        "en" => "Next: rsclaw gateway start",
+        "zh" => "下一步: rsclaw gateway start",
+        "fr" => "Suivant : rsclaw gateway start",
+        "de" => "Nächster Schritt: rsclaw gateway start",
+        "th" => "ถัดไป: rsclaw gateway start",
+        "vi" => "Tiep theo: rsclaw gateway start",
+        "ja" => "次へ: rsclaw gateway start",
+        "es" => "Siguiente: rsclaw gateway start",
+        "ko" => "다음: rsclaw gateway start",
+        "ru" => "Следующий шаг: rsclaw gateway start",
+    );
+    msg!("cli_summary_config",
+        "en" => "Config: {path}",
+        "zh" => "配置文件: {path}",
+        "fr" => "Config : {path}",
+        "de" => "Konfiguration: {path}",
+        "th" => "การตั้งค่า: {path}",
+        "vi" => "Cau hinh: {path}",
+        "ja" => "設定: {path}",
+        "es" => "Config: {path}",
+        "ko" => "설정: {path}",
+        "ru" => "Конфигурация: {path}",
+    );
+    msg!("cli_summary_provider",
+        "en" => "Provider: {label} ({name})",
+        "zh" => "提供商: {label} ({name})",
+        "fr" => "Fournisseur : {label} ({name})",
+        "de" => "Anbieter: {label} ({name})",
+        "th" => "ผู้ให้บริการ: {label} ({name})",
+        "vi" => "Nha cung cap: {label} ({name})",
+        "ja" => "プロバイダー: {label} ({name})",
+        "es" => "Proveedor: {label} ({name})",
+        "ko" => "제공업체: {label} ({name})",
+        "ru" => "Провайдер: {label} ({name})",
+    );
+    msg!("cli_summary_model",
+        "en" => "Model: {model}",
+        "zh" => "模型: {model}",
+        "fr" => "Modèle : {model}",
+        "de" => "Modell: {model}",
+        "th" => "โมเดล: {model}",
+        "vi" => "Mo hinh: {model}",
+        "ja" => "モデル: {model}",
+        "es" => "Modelo: {model}",
+        "ko" => "모델: {model}",
+        "ru" => "Модель: {model}",
+    );
+    msg!("cli_summary_agent",
+        "en" => "Agent: {name}",
+        "zh" => "智能体: {name}",
+        "fr" => "Agent : {name}",
+        "de" => "Agent: {name}",
+        "th" => "เอเจนต์: {name}",
+        "vi" => "Agent: {name}",
+        "ja" => "エージェント: {name}",
+        "es" => "Agente: {name}",
+        "ko" => "에이전트: {name}",
+        "ru" => "Агент: {name}",
+    );
+    msg!("cli_summary_port",
+        "en" => "Port: {port}",
+        "zh" => "端口: {port}",
+        "fr" => "Port : {port}",
+        "de" => "Port: {port}",
+        "th" => "พอร์ต: {port}",
+        "vi" => "Cong: {port}",
+        "ja" => "ポート: {port}",
+        "es" => "Puerto: {port}",
+        "ko" => "포트: {port}",
+        "ru" => "Порт: {port}",
+    );
+    msg!("cli_summary_channels",
+        "en" => "Channels: {names}",
+        "zh" => "消息通道: {names}",
+        "fr" => "Canaux : {names}",
+        "de" => "Kanäle: {names}",
+        "th" => "ช่องทาง: {names}",
+        "vi" => "Cac kenh: {names}",
+        "ja" => "チャンネル: {names}",
+        "es" => "Canales: {names}",
+        "ko" => "채널: {names}",
+        "ru" => "Каналы: {names}",
+    );
+
+    // Configure
+    msg!("cli_configure_title",
+        "en" => "rsclaw configure",
+        "zh" => "rsclaw 配置",
+        "fr" => "rsclaw configuration",
+        "de" => "rsclaw Konfiguration",
+        "th" => "rsclaw การตั้งค่า",
+        "vi" => "rsclaw cau hinh",
+        "ja" => "rsclaw 設定",
+        "es" => "rsclaw configurar",
+        "ko" => "rsclaw 구성",
+        "ru" => "rsclaw конфигурация",
+    );
+    msg!("cli_editing",
+        "en" => "Editing: {path}",
+        "zh" => "编辑: {path}",
+        "fr" => "Édition : {path}",
+        "de" => "Bearbeiten: {path}",
+        "th" => "กำลังแก้ไข: {path}",
+        "vi" => "Dang chinh sua: {path}",
+        "ja" => "編集中: {path}",
+        "es" => "Editando: {path}",
+        "ko" => "편집 중: {path}",
+        "ru" => "Редактирование: {path}",
+    );
+    msg!("cli_press_esc",
+        "en" => "Press ESC to go back",
+        "zh" => "按 ESC 返回",
+        "fr" => "Appuyez sur ÉCHAP pour revenir",
+        "de" => "ESC drücken zum Zurückkehren",
+        "th" => "กด ESC เพื่อกลับ",
+        "vi" => "Nhan ESC de quay lai",
+        "ja" => "ESCを押して戻る",
+        "es" => "Presione ESC para volver",
+        "ko" => "돌아가려면 ESC를 누르세요",
+        "ru" => "Нажмите ESC для возврата",
+    );
+    msg!("cli_unknown_section",
+        "en" => "Unknown section: {name}",
+        "zh" => "未知配置项: {name}",
+        "fr" => "Section inconnue : {name}",
+        "de" => "Unbekannter Abschnitt: {name}",
+        "th" => "ส่วนที่ไม่รู้จัก: {name}",
+        "vi" => "Muc khong xac dinh: {name}",
+        "ja" => "不明なセクション: {name}",
+        "es" => "Seccion desconocida: {name}",
+        "ko" => "알 수 없는 섹션: {name}",
+        "ru" => "Неизвестный раздел: {name}",
+    );
+    msg!("cli_no_config_found",
+        "en" => "No config file found. Run `rsclaw onboard` first.",
+        "zh" => "未找到配置文件。请先运行 `rsclaw onboard`。",
+        "fr" => "Aucun fichier de configuration trouvé. Exécutez d'abord `rsclaw onboard`.",
+        "de" => "Keine Konfigurationsdatei gefunden. Führen Sie zuerst `rsclaw onboard` aus.",
+        "th" => "ไม่พบไฟล์การตั้งค่า กรุณาเรียกใช้ `rsclaw onboard` ก่อน",
+        "vi" => "Khong tim thay file cau hinh. Chay `rsclaw onboard` truoc.",
+        "ja" => "設定ファイルが見つかりません。先に `rsclaw onboard` を実行してください。",
+        "es" => "No se encontro archivo de config. Ejecute `rsclaw onboard` primero.",
+        "ko" => "설정 파일을 찾을 수 없습니다. 먼저 `rsclaw onboard`를 실행하세요.",
+        "ru" => "Файл конфигурации не найден. Сначала запустите `rsclaw onboard`.",
+    );
+    msg!("cli_config_parse_failed",
+        "en" => "Config parse failed: {err}\n\nTry `rsclaw doctor --fix` to auto-repair.",
+        "zh" => "配置解析失败: {err}\n\n请尝试 `rsclaw doctor --fix` 自动修复。",
+        "fr" => "Échec de l'analyse de la configuration : {err}\n\nEssayez `rsclaw doctor --fix` pour réparer automatiquement.",
+        "de" => "Konfigurationsanalyse fehlgeschlagen: {err}\n\nVersuchen Sie `rsclaw doctor --fix` zur automatischen Reparatur.",
+        "th" => "แยกวิเคราะห์การตั้งค่าล้มเหลว: {err}\n\nลองใช้ `rsclaw doctor --fix` เพื่อแก้ไขอัตโนมัติ",
+        "vi" => "Phan tich cau hinh that bai: {err}\n\nThu `rsclaw doctor --fix` de tu sua.",
+        "ja" => "設定の解析に失敗しました: {err}\n\n自動修復には `rsclaw doctor --fix` を試してください。",
+        "es" => "Analisis de config fallido: {err}\n\nIntente `rsclaw doctor --fix` para reparar automaticamente.",
+        "ko" => "설정 파싱 실패: {err}\n\n자동 복구를 위해 `rsclaw doctor --fix`를 시도해 보세요.",
+        "ru" => "Ошибка разбора конфигурации: {err}\n\nПопробуйте `rsclaw doctor --fix` для автоматического исправления.",
+    );
+    msg!("cli_restarting_gateway",
+        "en" => "Restarting gateway...",
+        "zh" => "正在重启网关...",
+        "fr" => "Redémarrage de la passerelle...",
+        "de" => "Gateway wird neu gestartet...",
+        "th" => "กำลังรีสตาร์ทเกตเวย์...",
+        "vi" => "Dang khoi dong lai gateway...",
+        "ja" => "ゲートウェイを再起動中...",
+        "es" => "Reiniciando pasarela...",
+        "ko" => "게이트웨이를 다시 시작하는 중...",
+        "ru" => "Перезапуск шлюза...",
+    );
+    msg!("cli_gateway_restarted",
+        "en" => "Gateway restarted",
+        "zh" => "网关已重启",
+        "fr" => "Passerelle redémarrée",
+        "de" => "Gateway neu gestartet",
+        "th" => "เกตเวย์รีสตาร์ทแล้ว",
+        "vi" => "Gateway da khoi dong lai",
+        "ja" => "ゲートウェイが再起動しました",
+        "es" => "Pasarela reiniciada",
+        "ko" => "게이트웨이가 다시 시작되었습니다",
+        "ru" => "Шлюз перезапущен",
+    );
+    msg!("cli_restart_failed",
+        "en" => "Failed to restart: {err}. Start manually: rsclaw gateway start",
+        "zh" => "重启失败: {err}。请手动启动: rsclaw gateway start",
+        "fr" => "Échec du redémarrage : {err}. Démarrez manuellement : rsclaw gateway start",
+        "de" => "Neustart fehlgeschlagen: {err}. Manuell starten: rsclaw gateway start",
+        "th" => "รีสตาร์ทล้มเหลว: {err} กรุณาเริ่มต้นด้วยตนเอง: rsclaw gateway start",
+        "vi" => "Khoi dong lai that bai: {err}. Khoi dong thu cong: rsclaw gateway start",
+        "ja" => "再起動に失敗しました: {err}。手動で起動: rsclaw gateway start",
+        "es" => "Error al reiniciar: {err}. Iniciar manualmente: rsclaw gateway start",
+        "ko" => "재시작 실패: {err}. 수동으로 시작: rsclaw gateway start",
+        "ru" => "Ошибка перезапуска: {err}. Запустите вручную: rsclaw gateway start",
+    );
+
+    // Section headers
+    msg!("cli_section_gateway",
+        "en" => "Gateway",
+        "zh" => "网关",
+        "fr" => "Passerelle",
+        "de" => "Gateway",
+        "th" => "เกตเวย์",
+        "vi" => "Gateway",
+        "ja" => "ゲートウェイ",
+        "es" => "Pasarela",
+        "ko" => "게이트웨이",
+        "ru" => "Шлюз",
+    );
+    msg!("cli_section_model_provider",
+        "en" => "Model Provider",
+        "zh" => "模型提供商",
+        "fr" => "Fournisseur de modèle",
+        "de" => "Modellanbieter",
+        "th" => "ผู้ให้บริการโมเดล",
+        "vi" => "Nha cung cap mo hinh",
+        "ja" => "モデルプロバイダー",
+        "es" => "Proveedor de modelo",
+        "ko" => "모델 제공업체",
+        "ru" => "Поставщик модели",
+    );
+    msg!("cli_section_channels",
+        "en" => "Channels",
+        "zh" => "消息通道",
+        "fr" => "Canaux",
+        "de" => "Kanäle",
+        "th" => "ช่องทาง",
+        "vi" => "Cac kenh",
+        "ja" => "チャンネル",
+        "es" => "Canales",
+        "ko" => "채널",
+        "ru" => "Каналы",
+    );
+    msg!("cli_section_web_search",
+        "en" => "Web Search",
+        "zh" => "网络搜索",
+        "fr" => "Recherche web",
+        "de" => "Websuche",
+        "th" => "การค้นหาเว็บ",
+        "vi" => "Tim kiem web",
+        "ja" => "ウェブ検索",
+        "es" => "Busqueda web",
+        "ko" => "웹 검색",
+        "ru" => "Веб-поиск",
+    );
+    msg!("cli_section_upload_limits",
+        "en" => "Upload Limits",
+        "zh" => "上传限制",
+        "fr" => "Limites de téléversement",
+        "de" => "Upload-Limits",
+        "th" => "ขีดจำกัดการอัปโหลด",
+        "vi" => "Gioi han tai len",
+        "ja" => "アップロード制限",
+        "es" => "Limites de carga",
+        "ko" => "업로드 제한",
+        "ru" => "Ограничения загрузки",
+    );
+    msg!("cli_section_exec_safety",
+        "en" => "Exec Safety",
+        "zh" => "执行安全",
+        "fr" => "Sécurité d'exécution",
+        "de" => "Ausführungssicherheit",
+        "th" => "ความปลอดภัยการรัน",
+        "vi" => "Bao mat thuc thi",
+        "ja" => "実行セーフティ",
+        "es" => "Seguridad de ejecucion",
+        "ko" => "실행 보안",
+        "ru" => "Безопасность выполнения",
+    );
+
+    // Channel config
+    msg!("cli_channels_hint",
+        "en" => "Space = toggle on/off, Enter = edit config, ESC = done",
+        "zh" => "空格 = 开关切换, 回车 = 编辑配置, ESC = 完成",
+        "fr" => "Espace = activer/désactiver, Entrée = modifier la config, ÉCHAP = terminé",
+        "de" => "Leertaste = ein/aus, Enter = Konfig bearbeiten, ESC = fertig",
+        "th" => "Space = เปิด/ปิด, Enter = แก้ไขการตั้งค่า, ESC = เสร็จสิ้น",
+        "vi" => "Space = bat/tat, Enter = sua cau hinh, ESC = xong",
+        "ja" => "スペース = オン/オフ切替, Enter = 設定編集, ESC = 完了",
+        "es" => "Espacio = activar/desactivar, Enter = editar config, ESC = listo",
+        "ko" => "스페이스 = 켜기/끄기, Enter = 설정 편집, ESC = 완료",
+        "ru" => "Пробел = вкл/выкл, Enter = редактировать, ESC = готово",
+    );
+    msg!("cli_channels_hint_short",
+        "en" => "Space = toggle on/off | Enter = edit | ESC = done",
+        "zh" => "空格 = 开关 | 回车 = 编辑 | ESC = 完成",
+        "fr" => "Espace = activer/désactiver | Entrée = modifier | ÉCHAP = terminé",
+        "de" => "Leertaste = ein/aus | Enter = bearbeiten | ESC = fertig",
+        "th" => "Space = เปิด/ปิด | Enter = แก้ไข | ESC = เสร็จ",
+        "vi" => "Space = bat/tat | Enter = sua | ESC = xong",
+        "ja" => "スペース = オン/オフ | Enter = 編集 | ESC = 完了",
+        "es" => "Espacio = activar/desactivar | Enter = editar | ESC = listo",
+        "ko" => "스페이스 = 켜기/끄기 | Enter = 편집 | ESC = 완료",
+        "ru" => "Пробел = вкл/выкл | Enter = редактировать | ESC = готово",
+    );
+    msg!("cli_finished",
+        "en" => "[Finished]",
+        "zh" => "[完成]",
+        "fr" => "[Terminé]",
+        "de" => "[Fertig]",
+        "th" => "[เสร็จสิ้น]",
+        "vi" => "[Hoan thanh]",
+        "ja" => "[完了]",
+        "es" => "[Terminado]",
+        "ko" => "[완료]",
+        "ru" => "[Завершено]",
+    );
+    msg!("cli_configured",
+        "en" => "configured",
+        "zh" => "已配置",
+        "fr" => "configuré",
+        "de" => "konfiguriert",
+        "th" => "ตั้งค่าแล้ว",
+        "vi" => "da cau hinh",
+        "ja" => "設定済み",
+        "es" => "configurado",
+        "ko" => "구성됨",
+        "ru" => "настроено",
+    );
+    // Setup: multi-account editor
+    msg!("cli_accounts_count",
+        "en" => "{n} accounts",
+        "zh" => "{n} 个账号",
+    );
+    msg!("cli_account_choose_mode",
+        "en" => "{label}: already configured. Keep single account or add another?",
+        "zh" => "{label}: 已配置。保持单账号，还是再加一个？",
+    );
+    msg!("cli_account_keep_single",
+        "en" => "Keep single account (edit fields)",
+        "zh" => "保持单账号（编辑字段）",
+    );
+    msg!("cli_account_add_another",
+        "en" => "Add another account",
+        "zh" => "添加另一个账号",
+    );
+    msg!("cli_account_list_title",
+        "en" => "{label} accounts",
+        "zh" => "{label} 账号列表",
+    );
+    msg!("cli_account_add_new",
+        "en" => "[+ Add account]",
+        "zh" => "[+ 添加账号]",
+    );
+    msg!("cli_account_name_prompt",
+        "en" => "Account name (e.g. work, personal)",
+        "zh" => "账号名（例如 work、personal）",
+    );
+    msg!("cli_account_name_invalid",
+        "en" => "Invalid name. Avoid dots and spaces.",
+        "zh" => "账号名非法，不能含点号或空格。",
+    );
+    msg!("cli_account_exists",
+        "en" => "Account '{name}' already exists.",
+        "zh" => "账号 '{name}' 已存在。",
+    );
+    msg!("cli_account_action",
+        "en" => "Account '{name}': edit / remove?",
+        "zh" => "账号 '{name}'：编辑还是删除？",
+    );
+    msg!("cli_account_remove",
+        "en" => "Remove account",
+        "zh" => "删除账号",
+    );
+    msg!("cli_starting_login",
+        "en" => "Starting login flow...",
+        "zh" => "正在启动登录流程...",
+        "fr" => "Démarrage du processus de connexion...",
+        "de" => "Anmeldevorgang wird gestartet...",
+        "th" => "กำลังเริ่มกระบวนการเข้าสู่ระบบ...",
+        "vi" => "Dang bat dau qua trinh dang nhap...",
+        "ja" => "ログインフローを開始しています...",
+        "es" => "Iniciando flujo de inicio de sesion...",
+        "ko" => "로그인 흐름을 시작하는 중...",
+        "ru" => "Запуск процесса входа...",
+    );
+    msg!("cli_login_failed",
+        "en" => "Login failed: {err}",
+        "zh" => "登录失败: {err}",
+        "fr" => "Échec de la connexion : {err}",
+        "de" => "Anmeldung fehlgeschlagen: {err}",
+        "th" => "เข้าสู่ระบบล้มเหลว: {err}",
+        "vi" => "Dang nhap that bai: {err}",
+        "ja" => "ログイン失敗: {err}",
+        "es" => "Inicio de sesion fallido: {err}",
+        "ko" => "로그인 실패: {err}",
+        "ru" => "Ошибка входа: {err}",
+    );
+    msg!("cli_login_later",
+        "en" => "Run `rsclaw channels login {channel}` later.",
+        "zh" => "稍后运行 `rsclaw channels login {channel}`。",
+        "fr" => "Exécutez `rsclaw channels login {channel}` plus tard.",
+        "de" => "Führen Sie später `rsclaw channels login {channel}` aus.",
+        "th" => "เรียกใช้ `rsclaw channels login {channel}` ในภายหลัง",
+        "vi" => "Chay `rsclaw channels login {channel}` sau.",
+        "ja" => "後で `rsclaw channels login {channel}` を実行してください。",
+        "es" => "Ejecute `rsclaw channels login {channel}` mas tarde.",
+        "ko" => "나중에 `rsclaw channels login {channel}`을 실행하세요.",
+        "ru" => "Запустите `rsclaw channels login {channel}` позже.",
+    );
+    msg!("cli_fallback_manual",
+        "en" => "Falling back to manual input.",
+        "zh" => "回退到手动输入。",
+        "fr" => "Retour à la saisie manuelle.",
+        "de" => "Zurück zur manuellen Eingabe.",
+        "th" => "กลับไปใช้การป้อนข้อมูลด้วยตนเอง",
+        "vi" => "Chuyen sang nhap thu cong.",
+        "ja" => "手動入力にフォールバックします。",
+        "es" => "Volviendo a entrada manual.",
+        "ko" => "수동 입력으로 전환합니다.",
+        "ru" => "Переход к ручному вводу.",
+    );
+    msg!("cli_scan_oauth",
+        "en" => "Scan / OAuth login",
+        "zh" => "扫码 / OAuth 登录",
+        "fr" => "Scan / Connexion OAuth",
+        "de" => "Scan / OAuth-Anmeldung",
+        "th" => "สแกน / OAuth เข้าสู่ระบบ",
+        "vi" => "Quet / Dang nhap OAuth",
+        "ja" => "スキャン / OAuthログイン",
+        "es" => "Escanear / Inicio de sesion OAuth",
+        "ko" => "스캔 / OAuth 로그인",
+        "ru" => "Сканирование / Вход через OAuth",
+    );
+    msg!("cli_manual_input",
+        "en" => "Manual input (appId + appSecret)",
+        "zh" => "手动输入 (appId + appSecret)",
+        "fr" => "Saisie manuelle (appId + appSecret)",
+        "de" => "Manuelle Eingabe (appId + appSecret)",
+        "th" => "ป้อนด้วยตนเอง (appId + appSecret)",
+        "vi" => "Nhap thu cong (appId + appSecret)",
+        "ja" => "手動入力 (appId + appSecret)",
+        "es" => "Entrada manual (appId + appSecret)",
+        "ko" => "수동 입력 (appId + appSecret)",
+        "ru" => "Ручной ввод (appId + appSecret)",
+    );
+    msg!("cli_auth_method",
+        "en" => "{label} auth method",
+        "zh" => "{label} 认证方式",
+        "fr" => "Méthode d'authentification {label}",
+        "de" => "{label} Authentifizierungsmethode",
+        "th" => "วิธีการยืนยันตัวตน {label}",
+        "vi" => "Phuong thuc xac thuc {label}",
+        "ja" => "{label} 認証方法",
+        "es" => "Metodo de autenticacion {label}",
+        "ko" => "{label} 인증 방법",
+        "ru" => "Метод аутентификации {label}",
+    );
+    msg!("cli_no_fields",
+        "en" => "No configurable fields for {label}.",
+        "zh" => "{label} 没有可配置的字段。",
+        "fr" => "Aucun champ configurable pour {label}.",
+        "de" => "Keine konfigurierbaren Felder für {label}.",
+        "th" => "ไม่มีฟิลด์ที่ตั้งค่าได้สำหรับ {label}",
+        "vi" => "Khong co truong co the cau hinh cho {label}.",
+        "ja" => "{label} に設定可能なフィールドはありません。",
+        "es" => "Sin campos configurables para {label}.",
+        "ko" => "{label}에 설정 가능한 필드가 없습니다.",
+        "ru" => "Нет настраиваемых полей для {label}.",
+    );
+    msg!("cli_config_enter_keep",
+        "en" => "{label} config (Enter = keep, select Edit to change):",
+        "zh" => "{label} 配置 (回车 = 保留, 选择编辑以更改):",
+        "fr" => "Config {label} (Entrée = conserver, sélectionner Modifier pour changer) :",
+        "de" => "{label}-Konfiguration (Enter = beibehalten, Bearbeiten wählen zum Ändern):",
+        "th" => "การตั้งค่า {label} (Enter = เก็บไว้, เลือกแก้ไขเพื่อเปลี่ยน):",
+        "vi" => "Cau hinh {label} (Enter = giu nguyen, chon Sua de thay doi):",
+        "ja" => "{label} 設定 (Enter = 保持, 変更するには編集を選択):",
+        "es" => "Config {label} (Enter = mantener, seleccionar Editar para cambiar):",
+        "ko" => "{label} 설정 (Enter = 유지, 변경하려면 편집 선택):",
+        "ru" => "Конфигурация {label} (Enter = сохранить, выберите Редактировать для изменения):",
+    );
+    msg!("cli_config_label",
+        "en" => "{label} config:",
+        "zh" => "{label} 配置:",
+        "fr" => "Config {label} :",
+        "de" => "{label}-Konfiguration:",
+        "th" => "การตั้งค่า {label}:",
+        "vi" => "Cau hinh {label}:",
+        "ja" => "{label} 設定:",
+        "es" => "Config {label}:",
+        "ko" => "{label} 설정:",
+        "ru" => "Конфигурация {label}:",
+    );
+    msg!("cli_scan_rescan",
+        "en" => "Scan / OAuth login (re-scan)",
+        "zh" => "扫码 / OAuth 登录 (重新扫描)",
+        "fr" => "Scan / Connexion OAuth (re-scan)",
+        "de" => "Scan / OAuth-Anmeldung (erneut scannen)",
+        "th" => "สแกน / OAuth เข้าสู่ระบบ (สแกนใหม่)",
+        "vi" => "Quet / Dang nhap OAuth (quet lai)",
+        "ja" => "スキャン / OAuthログイン（再スキャン）",
+        "es" => "Escanear / OAuth (volver a escanear)",
+        "ko" => "스캔 / OAuth 로그인 (재스캔)",
+        "ru" => "Сканирование / OAuth (повторное сканирование)",
+    );
+    msg!("cli_manual_edit",
+        "en" => "Manual edit",
+        "zh" => "手动编辑",
+        "fr" => "Modification manuelle",
+        "de" => "Manuell bearbeiten",
+        "th" => "แก้ไขด้วยตนเอง",
+        "vi" => "Chinh sua thu cong",
+        "ja" => "手動編集",
+        "es" => "Edicion manual",
+        "ko" => "수동 편집",
+        "ru" => "Ручное редактирование",
+    );
+    msg!("cli_dm_policy",
+        "en" => "DM Policy (current: {policy})",
+        "zh" => "私聊策略 (当前: {policy})",
+        "fr" => "Politique DM (actuel : {policy})",
+        "de" => "DM-Richtlinie (aktuell: {policy})",
+        "th" => "นโยบาย DM (ปัจจุบัน: {policy})",
+        "vi" => "Chinh sach DM (hien tai: {policy})",
+        "ja" => "DMポリシー (現在: {policy})",
+        "es" => "Politica DM (actual: {policy})",
+        "ko" => "DM 정책 (현재: {policy})",
+        "ru" => "Политика ЛС (текущая: {policy})",
+    );
+    msg!("cli_group_policy",
+        "en" => "Group Policy (current: {policy})",
+        "zh" => "群聊策略 (当前: {policy})",
+        "fr" => "Politique de groupe (actuel : {policy})",
+        "de" => "Gruppenrichtlinie (aktuell: {policy})",
+        "th" => "นโยบายกลุ่ม (ปัจจุบัน: {policy})",
+        "vi" => "Chinh sach nhom (hien tai: {policy})",
+        "ja" => "グループポリシー (現在: {policy})",
+        "es" => "Politica de grupo (actual: {policy})",
+        "ko" => "그룹 정책 (현재: {policy})",
+        "ru" => "Политика группы (текущая: {policy})",
+    );
+
+    // Provider / model
+    msg!("cli_provider",
+        "en" => "Provider",
+        "zh" => "提供商",
+        "fr" => "Fournisseur",
+        "de" => "Anbieter",
+        "th" => "ผู้ให้บริการ",
+        "vi" => "Nha cung cap",
+        "ja" => "プロバイダー",
+        "es" => "Proveedor",
+        "ko" => "제공업체",
+        "ru" => "Провайдер",
+    );
+    msg!("cli_current_key",
+        "en" => "Current key: {key}",
+        "zh" => "当前密钥: {key}",
+        "fr" => "Clé actuelle : {key}",
+        "de" => "Aktueller Schlüssel: {key}",
+        "th" => "คีย์ปัจจุบัน: {key}",
+        "vi" => "Khoa hien tai: {key}",
+        "ja" => "現在のキー: {key}",
+        "es" => "Clave actual: {key}",
+        "ko" => "현재 키: {key}",
+        "ru" => "Текущий ключ: {key}",
+    );
+    msg!("cli_change_api_key",
+        "en" => "Change API key?",
+        "zh" => "更改 API 密钥？",
+        "fr" => "Changer la clé API ?",
+        "de" => "API-Schlüssel ändern?",
+        "th" => "เปลี่ยนคีย์ API?",
+        "vi" => "Thay doi khoa API?",
+        "ja" => "APIキーを変更しますか？",
+        "es" => "¿Cambiar clave API?",
+        "ko" => "API 키를 변경하시겠습니까?",
+        "ru" => "Изменить API-ключ?",
+    );
+    msg!("cli_testing_connectivity",
+        "en" => "Testing provider connectivity...",
+        "zh" => "正在测试提供商连通性...",
+        "fr" => "Test de la connectivité du fournisseur...",
+        "de" => "Anbieter-Konnektivität wird getestet...",
+        "th" => "กำลังทดสอบการเชื่อมต่อผู้ให้บริการ...",
+        "vi" => "Dang kiem tra ket noi nha cung cap...",
+        "ja" => "プロバイダーの接続テスト中...",
+        "es" => "Probando conectividad del proveedor...",
+        "ko" => "제공업체 연결을 테스트하는 중...",
+        "ru" => "Проверка подключения к провайдеру...",
+    );
+    msg!("cli_connection_ok",
+        "en" => "Connection OK",
+        "zh" => "连接正常",
+        "fr" => "Connexion OK",
+        "de" => "Verbindung OK",
+        "th" => "เชื่อมต่อได้",
+        "vi" => "Ket noi OK",
+        "ja" => "接続OK",
+        "es" => "Conexion OK",
+        "ko" => "연결 정상",
+        "ru" => "Соединение установлено",
+    );
+    msg!("cli_connection_failed",
+        "en" => "Connection failed: {err}",
+        "zh" => "连接失败: {err}",
+        "fr" => "Échec de la connexion : {err}",
+        "de" => "Verbindung fehlgeschlagen: {err}",
+        "th" => "การเชื่อมต่อล้มเหลว: {err}",
+        "vi" => "Ket noi that bai: {err}",
+        "ja" => "接続に失敗しました: {err}",
+        "es" => "Conexion fallida: {err}",
+        "ko" => "연결 실패: {err}",
+        "ru" => "Ошибка подключения: {err}",
+    );
+    msg!("cli_fix_later",
+        "en" => "You can still save and fix later.",
+        "zh" => "你仍可以保存，稍后再修复。",
+        "fr" => "Vous pouvez toujours enregistrer et corriger plus tard.",
+        "de" => "Sie können trotzdem speichern und später beheben.",
+        "th" => "คุณยังสามารถบันทึกและแก้ไขในภายหลัง",
+        "vi" => "Ban van co the luu va sua sau.",
+        "ja" => "保存して後で修正することができます。",
+        "es" => "Aun puedes guardar y arreglar despues.",
+        "ko" => "저장하고 나중에 수정할 수 있습니다.",
+        "ru" => "Вы всё равно можете сохранить и исправить позже.",
+    );
+    msg!("cli_not_set",
+        "en" => "(not set)",
+        "zh" => "(未设置)",
+        "fr" => "(non défini)",
+        "de" => "(nicht gesetzt)",
+        "th" => "(ยังไม่ได้ตั้งค่า)",
+        "vi" => "(chua dat)",
+        "ja" => "（未設定）",
+        "es" => "(no establecido)",
+        "ko" => "(설정되지 않음)",
+        "ru" => "(не задано)",
+    );
+
+    // Search providers
+    msg!("cli_search_provider",
+        "en" => "Search provider",
+        "zh" => "搜索提供商",
+        "fr" => "Fournisseur de recherche",
+        "de" => "Suchanbieter",
+        "th" => "ผู้ให้บริการค้นหา",
+        "vi" => "Nha cung cap tim kiem",
+        "ja" => "検索プロバイダー",
+        "es" => "Proveedor de busqueda",
+        "ko" => "검색 제공업체",
+        "ru" => "Поставщик поиска",
+    );
+    msg!("cli_ddg_selected",
+        "en" => "DuckDuckGo selected (no API key needed)",
+        "zh" => "已选择 DuckDuckGo（无需 API 密钥）",
+        "fr" => "DuckDuckGo sélectionné (pas de clé API nécessaire)",
+        "de" => "DuckDuckGo ausgewählt (kein API-Schlüssel erforderlich)",
+        "th" => "เลือก DuckDuckGo แล้ว (ไม่ต้องใช้คีย์ API)",
+        "vi" => "Da chon DuckDuckGo (khong can khoa API)",
+        "ja" => "DuckDuckGoを選択しました（APIキー不要）",
+        "es" => "DuckDuckGo seleccionado (no se necesita clave API)",
+        "ko" => "DuckDuckGo 선택됨 (API 키 불필요)",
+        "ru" => "Выбран DuckDuckGo (API-ключ не нужен)",
+    );
+
+    // Upload limits
+    msg!("cli_max_file_size",
+        "en" => "Max file size (MB)",
+        "zh" => "最大文件大小 (MB)",
+        "fr" => "Taille max. du fichier (Mo)",
+        "de" => "Max. Dateigröße (MB)",
+        "th" => "ขนาดไฟล์สูงสุด (MB)",
+        "vi" => "Kich thuoc file toi da (MB)",
+        "ja" => "最大ファイルサイズ (MB)",
+        "es" => "Tamano maximo de archivo (MB)",
+        "ko" => "최대 파일 크기 (MB)",
+        "ru" => "Максимальный размер файла (МБ)",
+    );
+    msg!("cli_max_text_chars",
+        "en" => "Max text chars",
+        "zh" => "最大文本字符数",
+        "fr" => "Caractères texte max.",
+        "de" => "Max. Textzeichen",
+        "th" => "จำนวนตัวอักษรข้อความสูงสุด",
+        "vi" => "So ky tu van ban toi da",
+        "ja" => "最大テキスト文字数",
+        "es" => "Maximo de caracteres de texto",
+        "ko" => "최대 텍스트 문자 수",
+        "ru" => "Максимальное количество символов текста",
+    );
+    msg!("cli_vision_support",
+        "en" => "Model supports images (vision)",
+        "zh" => "模型支持图片（视觉）",
+        "fr" => "Le modèle prend en charge les images (vision)",
+        "de" => "Modell unterstützt Bilder (Vision)",
+        "th" => "โมเดลรองรับรูปภาพ (วิสัยทัศน์)",
+        "vi" => "Mo hinh ho tro hinh anh (vision)",
+        "ja" => "モデルが画像をサポート（ビジョン）",
+        "es" => "El modelo admite imagenes (vision)",
+        "ko" => "모델이 이미지 지원 (비전)",
+        "ru" => "Модель поддерживает изображения (vision)",
+    );
+
+    // Exec safety
+    msg!("cli_exec_current",
+        "en" => "Current: {status}",
+        "zh" => "当前: {status}",
+        "fr" => "Actuel : {status}",
+        "de" => "Aktuell: {status}",
+        "th" => "ปัจจุบัน: {status}",
+        "vi" => "Hien tai: {status}",
+        "ja" => "現在: {status}",
+        "es" => "Actual: {status}",
+        "ko" => "현재: {status}",
+        "ru" => "Текущий: {status}",
+    );
+    msg!("cli_exec_enabled",
+        "en" => "enabled",
+        "zh" => "已启用",
+        "fr" => "activé",
+        "de" => "aktiviert",
+        "th" => "เปิดใช้งาน",
+        "vi" => "da kich hoat",
+        "ja" => "有効",
+        "es" => "habilitado",
+        "ko" => "활성화됨",
+        "ru" => "включено",
+    );
+    msg!("cli_exec_disabled",
+        "en" => "disabled",
+        "zh" => "已禁用",
+        "fr" => "désactivé",
+        "de" => "deaktiviert",
+        "th" => "ปิดใช้งาน",
+        "vi" => "da tat",
+        "ja" => "無効",
+        "es" => "deshabilitado",
+        "ko" => "비활성화됨",
+        "ru" => "отключено",
+    );
+    msg!("cli_enable_exec_safety",
+        "en" => "Enable exec safety rules?",
+        "zh" => "启用执行安全规则？",
+        "fr" => "Activer les règles de sécurité d'exécution ?",
+        "de" => "Ausführungssicherheitsregeln aktivieren?",
+        "th" => "เปิดใช้งานกฎความปลอดภัยการรัน?",
+        "vi" => "Kich hoat quy tac bao mat thuc thi?",
+        "ja" => "実行セーフティルールを有効にしますか？",
+        "es" => "¿Habilitar reglas de seguridad de ejecucion?",
+        "ko" => "실행 보안 규칙을 활성화하시겠습니까?",
+        "ru" => "Включить правила безопасности выполнения?",
+    );
+    msg!("cli_exec_safety_on",
+        "en" => "Exec safety enabled (deny/confirm rules active)",
+        "zh" => "执行安全已启用（拒绝/确认规则生效）",
+        "fr" => "Sécurité d'exécution activée (règles refus/confirmation actives)",
+        "de" => "Ausführungssicherheit aktiviert (Ablehnungs-/Bestätigungsregeln aktiv)",
+        "th" => "เปิดใช้งานความปลอดภัยการรัน (กฎปฏิเสธ/ยืนยันทำงานอยู่)",
+        "vi" => "Bao mat thuc thi da bat (quy tac tu choi/xac nhan hoat dong)",
+        "ja" => "実行セーフティ有効（拒否/確認ルール有効）",
+        "es" => "Seguridad de ejecucion habilitada (reglas de denegacion/confirmacion activas)",
+        "ko" => "실행 보안 활성화됨 (거부/확인 규칙 활성)",
+        "ru" => "Безопасность выполнения включена (правила запрета/подтверждения активны)",
+    );
+    msg!("cli_exec_safety_off",
+        "en" => "Exec safety disabled (all commands allowed)",
+        "zh" => "执行安全已禁用（允许所有命令）",
+        "fr" => "Sécurité d'exécution désactivée (toutes les commandes autorisées)",
+        "de" => "Ausführungssicherheit deaktiviert (alle Befehle erlaubt)",
+        "th" => "ปิดใช้งานความปลอดภัยการรัน (อนุญาตคำสั่งทั้งหมด)",
+        "vi" => "Bao mat thuc thi da tat (cho phep tat ca lenh)",
+        "ja" => "実行セーフティ無効（すべてのコマンドが許可）",
+        "es" => "Seguridad de ejecucion deshabilitada (todos los comandos permitidos)",
+        "ko" => "실행 보안 비활성화됨 (모든 명령 허용)",
+        "ru" => "Безопасность выполнения отключена (все команды разрешены)",
+    );
+
+    // Setup: input_step helpers
+    msg!("cli_keep",
+        "en" => "Keep: {value}",
+        "zh" => "保留: {value}",
+        "fr" => "Conserver : {value}",
+        "de" => "Beibehalten: {value}",
+        "th" => "เก็บไว้: {value}",
+        "vi" => "Giu nguyen: {value}",
+        "ja" => "保持: {value}",
+        "es" => "Mantener: {value}",
+        "ko" => "유지: {value}",
+        "ru" => "Сохранить: {value}",
+    );
+    msg!("cli_edit",
+        "en" => "Edit",
+        "zh" => "编辑",
+        "fr" => "Modifier",
+        "de" => "Bearbeiten",
+        "th" => "แก้ไข",
+        "vi" => "Chinh sua",
+        "ja" => "編集",
+        "es" => "Editar",
+        "ko" => "편집",
+        "ru" => "Редактировать",
+    );
+    msg!("cli_back",
+        "en" => "Back",
+        "zh" => "返回",
+        "fr" => "Retour",
+        "de" => "Zurück",
+        "th" => "กลับ",
+        "vi" => "Quay lai",
+        "ja" => "戻る",
+        "es" => "Atras",
+        "ko" => "뒤로",
+        "ru" => "Назад",
+    );
+
+    // Setup: workspace copy / migration
+    msg!("cli_copy_workspace_failed",
+        "en" => "Failed to copy workspace {path}: {err}",
+        "zh" => "工作区复制失败 {path}: {err}",
+        "fr" => "Échec de la copie de l'espace de travail {path} : {err}",
+        "de" => "Workspace-Kopie fehlgeschlagen {path}: {err}",
+        "th" => "คัดลอกพื้นที่ทำงาน {path} ล้มเหลว: {err}",
+        "vi" => "Sao chep workspace that bai {path}: {err}",
+        "ja" => "ワークスペース {path} のコピーに失敗しました: {err}",
+        "es" => "Error al copiar workspace {path}: {err}",
+        "ko" => "작업 공간 {path} 복사 실패: {err}",
+        "ru" => "Ошибка копирования рабочего пространства {path}: {err}",
+    );
+    msg!("cli_copied_workspace",
+        "en" => "Copied {src} -> {dest} ({count} items)",
+        "zh" => "已复制 {src} -> {dest} ({count} 项)",
+        "fr" => "Copié {src} -> {dest} ({count} éléments)",
+        "de" => "Kopiert {src} -> {dest} ({count} Elemente)",
+        "th" => "คัดลอก {src} -> {dest} ({count} รายการ)",
+        "vi" => "Da sao chep {src} -> {dest} ({count} muc)",
+        "ja" => "{src} -> {dest} をコピーしました（{count}項目）",
+        "es" => "Copiado {src} -> {dest} ({count} elementos)",
+        "ko" => "{src} -> {dest} 복사됨 ({count}개 항목)",
+        "ru" => "Скопировано {src} -> {dest} ({count} элементов)",
+    );
+    msg!("cli_converted_config",
+        "en" => "Converted openclaw.json -> rsclaw.json5 (workspace paths updated)",
+        "zh" => "已转换 openclaw.json -> rsclaw.json5（工作区路径已更新）",
+        "fr" => "Converti openclaw.json -> rsclaw.json5 (chemins d'espace de travail mis à jour)",
+        "de" => "Konvertiert openclaw.json -> rsclaw.json5 (Workspace-Pfade aktualisiert)",
+        "th" => "แปลง openclaw.json -> rsclaw.json5 (อัปเดตพาธพื้นที่ทำงาน)",
+        "vi" => "Da chuyen doi openclaw.json -> rsclaw.json5 (cap nhat duong dan workspace)",
+        "ja" => "openclaw.json -> rsclaw.json5 を変換しました（ワークスペースパス更新）",
+        "es" => "Convertido openclaw.json -> rsclaw.json5 (rutas de workspace actualizadas)",
+        "ko" => "openclaw.json -> rsclaw.json5 변환됨 (작업 공간 경로 업데이트)",
+        "ru" => "Конвертировано openclaw.json -> rsclaw.json5 (пути рабочего пространства обновлены)",
+    );
+    msg!("cli_importing_sessions",
+        "en" => "Importing {count} session(s)...",
+        "zh" => "正在导入 {count} 个会话...",
+        "fr" => "Importation de {count} session(s)...",
+        "de" => "{count} Sitzung(en) werden importiert...",
+        "th" => "กำลังนำเข้า {count} เซสชัน...",
+        "vi" => "Dang nhap {count} phien...",
+        "ja" => "{count}件のセッションをインポート中...",
+        "es" => "Importando {count} sesion(es)...",
+        "ko" => "{count}개 세션을 가져오는 중...",
+        "ru" => "Импорт {count} сессий...",
+    );
+    msg!("cli_imported_sessions",
+        "en" => "Imported {sessions} session(s), {messages} message(s)",
+        "zh" => "已导入 {sessions} 个会话，{messages} 条消息",
+        "fr" => "{sessions} session(s) importée(s), {messages} message(s)",
+        "de" => "{sessions} Sitzung(en) importiert, {messages} Nachricht(en)",
+        "th" => "นำเข้า {sessions} เซสชัน, {messages} ข้อความ",
+        "vi" => "Da nhap {sessions} phien, {messages} tin nhan",
+        "ja" => "{sessions}件のセッション、{messages}件のメッセージをインポートしました",
+        "es" => "Importadas {sessions} sesion(es), {messages} mensaje(s)",
+        "ko" => "{sessions}개 세션, {messages}개 메시지 가져옴",
+        "ru" => "Импортировано {sessions} сессий, {messages} сообщений",
+    );
+    msg!("cli_import_errors",
+        "en" => "{count} error(s) during import",
+        "zh" => "导入过程中出现 {count} 个错误",
+        "fr" => "{count} erreur(s) lors de l'importation",
+        "de" => "{count} Fehler beim Import",
+        "th" => "{count} ข้อผิดพลาดระหว่างการนำเข้า",
+        "vi" => "{count} loi trong qua trinh nhap",
+        "ja" => "インポート中に{count}件のエラーが発生しました",
+        "es" => "{count} error(es) durante la importacion",
+        "ko" => "가져오기 중 {count}개 오류",
+        "ru" => "{count} ошибок при импорте",
+    );
+    msg!("cli_import_failed",
+        "en" => "Import failed: {err}",
+        "zh" => "导入失败: {err}",
+        "fr" => "Échec de l'importation : {err}",
+        "de" => "Import fehlgeschlagen: {err}",
+        "th" => "การนำเข้าล้มเหลว: {err}",
+        "vi" => "Nhap that bai: {err}",
+        "ja" => "インポートに失敗しました: {err}",
+        "es" => "Importacion fallida: {err}",
+        "ko" => "가져오기 실패: {err}",
+        "ru" => "Ошибка импорта: {err}",
+    );
+    msg!("cli_store_open_failed",
+        "en" => "Could not open store: {err}",
+        "zh" => "无法打开存储: {err}",
+        "fr" => "Impossible d'ouvrir le stockage : {err}",
+        "de" => "Speicher konnte nicht geöffnet werden: {err}",
+        "th" => "ไม่สามารถเปิดที่จัดเก็บ: {err}",
+        "vi" => "Khong the mo kho luu tru: {err}",
+        "ja" => "ストアを開けませんでした: {err}",
+        "es" => "No se pudo abrir el almacen: {err}",
+        "ko" => "저장소를 열 수 없습니다: {err}",
+        "ru" => "Не удалось открыть хранилище: {err}",
+    );
+    msg!("cli_gateway_language_set",
+        "en" => "gateway.language = {lang}",
+        "zh" => "gateway.language = {lang}",
+        "fr" => "gateway.language = {lang}",
+        "de" => "gateway.language = {lang}",
+        "th" => "gateway.language = {lang}",
+        "vi" => "gateway.language = {lang}",
+        "ja" => "gateway.language = {lang}",
+        "es" => "gateway.language = {lang}",
+        "ko" => "gateway.language = {lang}",
+        "ru" => "gateway.language = {lang}",
+    );
+
+    // Channel login
+    msg!("cli_scanning_qr",
+        "en" => "Scanning QR code for Weixin login...",
+        "zh" => "正在扫描微信登录二维码...",
+        "fr" => "Scan du code QR pour la connexion Weixin...",
+        "de" => "QR-Code für Weixin-Anmeldung wird gescannt...",
+        "th" => "กำลังสแกน QR code สำหรับการเข้าสู่ระบบ Weixin...",
+        "vi" => "Dang quet ma QR de dang nhap Weixin...",
+        "ja" => "Weixinログイン用QRコードをスキャン中...",
+        "es" => "Escaneando codigo QR para inicio de sesion Weixin...",
+        "ko" => "Weixin 로그인을 위한 QR 코드 스캔 중...",
+        "ru" => "Сканирование QR-кода для входа в Weixin...",
+    );
+    msg!("cli_login_success_bot",
+        "en" => "Login successful! bot_id={id}",
+        "zh" => "登录成功！bot_id={id}",
+        "fr" => "Connexion réussie ! bot_id={id}",
+        "de" => "Anmeldung erfolgreich! bot_id={id}",
+        "th" => "เข้าสู่ระบบสำเร็จ! bot_id={id}",
+        "vi" => "Dang nhap thanh cong! bot_id={id}",
+        "ja" => "ログイン成功！bot_id={id}",
+        "es" => "Inicio de sesion exitoso! bot_id={id}",
+        "ko" => "로그인 성공! bot_id={id}",
+        "ru" => "Вход выполнен успешно! bot_id={id}",
+    );
+    msg!("cli_login_success_brand",
+        "en" => "Login successful! brand={brand}",
+        "zh" => "登录成功！brand={brand}",
+        "fr" => "Connexion réussie ! brand={brand}",
+        "de" => "Anmeldung erfolgreich! brand={brand}",
+        "th" => "เข้าสู่ระบบสำเร็จ! brand={brand}",
+        "vi" => "Dang nhap thanh cong! brand={brand}",
+        "ja" => "ログイン成功！brand={brand}",
+        "es" => "Inicio de sesion exitoso! brand={brand}",
+        "ko" => "로그인 성공! brand={brand}",
+        "ru" => "Вход выполнен успешно! brand={brand}",
+    );
+
+    // Setup: import / migration
+    msg!("cli_import_data_to",
+        "en" => "Import: data will be copied to {path}",
+        "zh" => "导入: 数据将复制到 {path}",
+        "fr" => "Importer : les données seront copiées dans {path}",
+        "de" => "Import: Daten werden nach {path} kopiert",
+        "th" => "นำเข้า: ข้อมูลจะถูกคัดลอกไปยัง {path}",
+        "vi" => "Nhap: du lieu se duoc sao chep vao {path}",
+        "ja" => "インポート: データは {path} にコピーされます",
+        "es" => "Importar: los datos se copiaran a {path}",
+        "ko" => "가져오기: 데이터가 {path}에 복사됩니다",
+        "ru" => "Импорт: данные будут скопированы в {path}",
+    );
+    msg!("cli_using_dir",
+        "en" => "Using {path}",
+        "zh" => "使用 {path}",
+        "fr" => "Utilisation de {path}",
+        "de" => "Verwende {path}",
+        "th" => "ใช้งาน {path}",
+        "vi" => "Dang su dung {path}",
+        "ja" => "{path} を使用しています",
+        "es" => "Usando {path}",
+        "ko" => "{path} 사용 중",
+        "ru" => "Используется {path}",
+    );
+    msg!("cli_edit_config",
+        "en" => "Edit {path}",
+        "zh" => "编辑 {path}",
+        "fr" => "Modifier {path}",
+        "de" => "Bearbeiten {path}",
+        "th" => "แก้ไข {path}",
+        "vi" => "Sua {path}",
+        "ja" => "{path} を編集",
+        "es" => "Editar {path}",
+        "ko" => "{path} 편집",
+        "ru" => "Редактировать {path}",
+    );
+    msg!("cli_then_start",
+        "en" => "Then run: rsclaw gateway start",
+        "zh" => "然后运行: rsclaw gateway start",
+        "fr" => "Puis exécutez : rsclaw gateway start",
+        "de" => "Dann ausführen: rsclaw gateway start",
+        "th" => "จากนั้นรัน: rsclaw gateway start",
+        "vi" => "Sau do chay: rsclaw gateway start",
+        "ja" => "次に実行: rsclaw gateway start",
+        "es" => "Luego ejecutar: rsclaw gateway start",
+        "ko" => "그런 다음 실행: rsclaw gateway start",
+        "ru" => "Затем запустите: rsclaw gateway start",
+    );
+    msg!("cli_data_summary",
+        "en" => "{agents} agent(s), {sessions} session(s), {jsonl} JSONL file(s)",
+        "zh" => "{agents} 个智能体, {sessions} 个会话, {jsonl} 个 JSONL 文件",
+        "fr" => "{agents} agent(s), {sessions} session(s), {jsonl} fichier(s) JSONL",
+        "de" => "{agents} Agent(en), {sessions} Sitzung(en), {jsonl} JSONL-Datei(en)",
+        "th" => "{agents} เอเจนต์, {sessions} เซสชัน, {jsonl} ไฟล์ JSONL",
+        "vi" => "{agents} agent, {sessions} phien, {jsonl} file JSONL",
+        "ja" => "{agents}エージェント、{sessions}セッション、{jsonl}JSONLファイル",
+        "es" => "{agents} agente(s), {sessions} sesion(es), {jsonl} archivo(s) JSONL",
+        "ko" => "에이전트 {agents}개, 세션 {sessions}개, JSONL 파일 {jsonl}개",
+        "ru" => "{agents} агентов, {sessions} сессий, {jsonl} JSONL-файлов",
+    );
+    msg!("cli_workspace_seeded",
+        "en" => "{count} workspace file(s) in {path}",
+        "zh" => "{count} 个工作空间文件位于 {path}",
+        "fr" => "{count} fichier(s) d'espace de travail dans {path}",
+        "de" => "{count} Workspace-Datei(en) in {path}",
+        "th" => "{count} ไฟล์พื้นที่ทำงานใน {path}",
+        "vi" => "{count} file workspace trong {path}",
+        "ja" => "{path} に {count} 個のワークスペースファイル",
+        "es" => "{count} archivo(s) de workspace en {path}",
+        "ko" => "{path}에 작업 공간 파일 {count}개",
+        "ru" => "{count} файлов рабочего пространства в {path}",
+    );
+
+    // --- Processing indicator (timeout-triggered) ---
+    msg!("processing",
+        "en" => "Processing, please wait...",
+        "zh" => "正在处理中，请稍候...",
+        "th" => "กำลังประมวลผล กรุณารอสักครู่...",
+        "vi" => "Dang xu ly, vui long cho...",
+        "ja" => "処理中です。しばらくお待ちください...",
+        "es" => "Procesando, por favor espere...",
+        "ko" => "처리 중입니다. 잠시만 기다려 주세요...",
+        "ru" => "Обработка, пожалуйста подождите...",
+        "fr" => "Traitement en cours, veuillez patienter...",
+        "de" => "Verarbeitung läuft, bitte warten...",
+    );
+
+    msg!("search_captcha_blocked",
+        "en" => "All free search providers were blocked (CAPTCHA). Consider configuring an API key (serper, brave, or bing) in settings for reliable search.",
+        "zh" => "所有免费搜索引擎被人机验证拦截。建议在设置中配置搜索 API 密钥（serper、brave 或 bing）以获得稳定的搜索服务。",
+        "ja" => "全ての無料検索エンジンがCAPTCHAでブロックされました。安定した検索のため、設定でAPIキー（serper、brave、bing）の設定をお勧めします。",
+        "ko" => "모든 무료 검색 엔진이 CAPTCHA에 의해 차단되었습니다. 안정적인 검색을 위해 설정에서 API 키(serper, brave, bing)를 구성하세요.",
+        "fr" => "Tous les moteurs de recherche gratuits sont bloqués (CAPTCHA). Configurez une clé API (serper, brave ou bing) pour une recherche fiable.",
+        "de" => "Alle kostenlosen Suchmaschinen wurden durch CAPTCHA blockiert. Konfigurieren Sie einen API-Schlüssel (serper, brave oder bing) für zuverlässige Suche.",
+        "th" => "เครื่องมือค้นหาฟรีทั้งหมดถูกบล็อก (CAPTCHA) ลองกำหนดค่าคีย์ API (serper, brave หรือ bing) ในการตั้งค่าเพื่อการค้นหาที่เชื่อถือได้",
+        "vi" => "Tat ca cac cong cu tim kiem mien phi bi chan (CAPTCHA). Hay cau hinh khoa API (serper, brave, hoac bing) trong cai dat de tim kiem on dinh.",
+        "es" => "Todos los motores de busqueda gratuitos fueron bloqueados (CAPTCHA). Considera configurar una clave API (serper, brave o bing) para busqueda confiable.",
+        "ru" => "Все бесплатные поисковые системы заблокированы (CAPTCHA). Рассмотрите настройку API-ключа (serper, brave или bing) для надёжного поиска.",
+    );
+
+    // -----------------------------------------------------------------------
+    // cap-protocol tool messages (coding agents: claudecode / openclaude / opencode / codex)
+    // -----------------------------------------------------------------------
+
+    msg!("acp_start_failed",
+        "en" => "❌ {name} startup failed\n\n{error}",
+        "zh" => "❌ {name} 启动失败\n\n{error}",
+        "ja" => "❌ {name} の起動に失敗しました\n\n{error}",
+        "ko" => "❌ {name} 시작 실패\n\n{error}",
+        "fr" => "❌ Échec du démarrage de {name}\n\n{error}",
+        "de" => "❌ {name} Start fehlgeschlagen\n\n{error}",
+        "th" => "❌ {name} เริ่มต้นล้มเหลว\n\n{error}",
+        "vi" => "❌ {name} khởi động thất bại\n\n{error}",
+        "es" => "❌ Error al iniciar {name}\n\n{error}",
+        "ru" => "❌ Ошибка запуска {name}\n\n{error}",
+    );
+
+    msg!("acp_submitted",
+        "en" => "🚀 {name} task submitted, processing...",
+        "zh" => "🚀 {name} 任务已提交，执行中...",
+        "ja" => "🚀 {name} タスク送信済み、処理中...",
+        "ko" => "🚀 {name} 작업 제출됨, 처리 중...",
+        "fr" => "🚀 Tâche {name} soumise, en cours...",
+        "de" => "🚀 {name}-Aufgabe eingereicht, wird verarbeitet...",
+        "th" => "🚀 ส่งงาน {name} แล้ว กำลังประมวลผล...",
+        "vi" => "🚀 Đã gửi tác vụ {name}, đang xử lý...",
+        "es" => "🚀 Tarea {name} enviada, procesando...",
+        "ru" => "🚀 Задача {name} отправлена, обрабатывается...",
+    );
+
+    msg!("acp_queued",
+        "en" => "{name} task submitted. Result will be pushed when complete.",
+        "zh" => "{name} 任务已提交，完成后将推送结果。",
+        "ja" => "{name} タスク送信済み。完了後に結果を送信します。",
+        "ko" => "{name} 작업 제출됨. 완료 후 결과가 전송됩니다.",
+        "fr" => "Tâche {name} soumise. Le résultat sera envoyé à la fin.",
+        "de" => "{name}-Aufgabe eingereicht. Ergebnis wird nach Abschluss gesendet.",
+        "th" => "ส่งงาน {name} แล้ว ผลลัพธ์จะถูกส่งเมื่อเสร็จสิ้น",
+        "vi" => "Đã gửi tác vụ {name}. Kết quả sẽ được gửi khi hoàn thành.",
+        "es" => "Tarea {name} enviada. El resultado se enviará al completarse.",
+        "ru" => "Задача {name} отправлена. Результат будет отправлен по завершении.",
+    );
+
+    msg!("acp_done_result",
+        "en" => "{status} {name} done\n\n**Tools called**: {count}\n\n**Result**:\n{result}",
+        "zh" => "{status} {name} 完成\n\n**调用工具**: {count} 个\n\n**结果**:\n{result}",
+        "ja" => "{status} {name} 完了\n\n**ツール呼び出し**: {count} 回\n\n**結果**:\n{result}",
+        "ko" => "{status} {name} 완료\n\n**도구 호출**: {count}회\n\n**결과**:\n{result}",
+        "fr" => "{status} {name} terminé\n\n**Outils appelés**: {count}\n\n**Résultat**:\n{result}",
+        "de" => "{status} {name} abgeschlossen\n\n**Aufgerufene Tools**: {count}\n\n**Ergebnis**:\n{result}",
+        "th" => "{status} {name} เสร็จแล้ว\n\n**เรียกใช้เครื่องมือ**: {count} ครั้ง\n\n**ผลลัพธ์**:\n{result}",
+        "vi" => "{status} {name} hoàn tất\n\n**Công cụ đã gọi**: {count}\n\n**Kết quả**:\n{result}",
+        "es" => "{status} {name} completado\n\n**Herramientas usadas**: {count}\n\n**Resultado**:\n{result}",
+        "ru" => "{status} {name} завершён\n\n**Вызвано инструментов**: {count}\n\n**Результат**:\n{result}",
+    );
+
+    msg!("acp_done_summary",
+        "en" => "{status} {name} done\n\n**Tools called**: {count}\n\n**Summary**:\n{summary}",
+        "zh" => "{status} {name} 完成\n\n**调用工具**: {count} 个\n\n**执行摘要**:\n{summary}",
+        "ja" => "{status} {name} 完了\n\n**ツール呼び出し**: {count} 回\n\n**実行概要**:\n{summary}",
+        "ko" => "{status} {name} 완료\n\n**도구 호출**: {count}회\n\n**실행 요약**:\n{summary}",
+        "fr" => "{status} {name} terminé\n\n**Outils appelés**: {count}\n\n**Résumé**:\n{summary}",
+        "de" => "{status} {name} abgeschlossen\n\n**Aufgerufene Tools**: {count}\n\n**Zusammenfassung**:\n{summary}",
+        "th" => "{status} {name} เสร็จแล้ว\n\n**เรียกใช้เครื่องมือ**: {count} ครั้ง\n\n**สรุป**:\n{summary}",
+        "vi" => "{status} {name} hoàn tất\n\n**Công cụ đã gọi**: {count}\n\n**Tóm tắt**:\n{summary}",
+        "es" => "{status} {name} completado\n\n**Herramientas usadas**: {count}\n\n**Resumen**:\n{summary}",
+        "ru" => "{status} {name} завершён\n\n**Вызвано инструментов**: {count}\n\n**Сводка**:\n{summary}",
+    );
+
+    msg!("acp_done_empty",
+        "en" => "{status} {name} done\n\n**Tools called**: 0\n\n(no output)",
+        "zh" => "{status} {name} 完成\n\n**调用工具**: 0 个\n\n(无输出)",
+        "ja" => "{status} {name} 完了\n\n**ツール呼び出し**: 0 回\n\n(出力なし)",
+        "ko" => "{status} {name} 완료\n\n**도구 호출**: 0회\n\n(출력 없음)",
+        "fr" => "{status} {name} terminé\n\n**Outils appelés**: 0\n\n(aucune sortie)",
+        "de" => "{status} {name} abgeschlossen\n\n**Aufgerufene Tools**: 0\n\n(keine Ausgabe)",
+        "th" => "{status} {name} เสร็จแล้ว\n\n**เรียกใช้เครื่องมือ**: 0 ครั้ง\n\n(ไม่มีผลลัพธ์)",
+        "vi" => "{status} {name} hoàn tất\n\n**Công cụ đã gọi**: 0\n\n(không có đầu ra)",
+        "es" => "{status} {name} completado\n\n**Herramientas usadas**: 0\n\n(sin salida)",
+        "ru" => "{status} {name} завершён\n\n**Вызвано инструментов**: 0\n\n(нет вывода)",
+    );
+
+    msg!("acp_error",
+        "en" => "❌ {name} error\n\n{error}",
+        "zh" => "❌ {name} 错误\n\n{error}",
+        "ja" => "❌ {name} エラー\n\n{error}",
+        "ko" => "❌ {name} 오류\n\n{error}",
+        "fr" => "❌ Erreur {name}\n\n{error}",
+        "de" => "❌ {name}-Fehler\n\n{error}",
+        "th" => "❌ {name} ข้อผิดพลาด\n\n{error}",
+        "vi" => "❌ {name} lỗi\n\n{error}",
+        "es" => "❌ Error de {name}\n\n{error}",
+        "ru" => "❌ Ошибка {name}\n\n{error}",
+    );
+
+    msg!("acp_timeout",
+        "en" => "{name} execution timed out or process exited abnormally. Check that {name} is running and retry.",
+        "zh" => "{name} 执行超时或进程异常退出。请检查 {name} 是否正常运行后重试。",
+        "ja" => "{name} の実行がタイムアウトまたはプロセスが異常終了しました。{name} が正常に動作しているか確認して再試行してください。",
+        "ko" => "{name} 실행 시간 초과 또는 프로세스가 비정상 종료되었습니다. {name}이 정상 실행 중인지 확인 후 재시도하세요.",
+        "fr" => "Délai d'exécution de {name} dépassé ou processus arrêté anormalement. Vérifiez que {name} fonctionne et réessayez.",
+        "de" => "{name}-Ausführung hat das Zeitlimit überschritten oder Prozess wurde abnormal beendet. Prüfen Sie ob {name} läuft und versuchen Sie es erneut.",
+        "th" => "{name} การดำเนินการหมดเวลาหรือโปรเซสออกผิดปกติ โปรดตรวจสอบว่า {name} ทำงานอยู่และลองอีกครั้ง",
+        "vi" => "{name} thực thi hết thời gian chờ hoặc tiến trình thoát bất thường. Hãy kiểm tra {name} đang chạy và thử lại.",
+        "es" => "Tiempo de ejecución de {name} agotado o proceso terminado anormalmente. Verifique que {name} esté en ejecución y reintente.",
+        "ru" => "Время выполнения {name} истекло или процесс завершился аварийно. Убедитесь, что {name} запущен, и повторите попытку.",
+    );
+
+    msg!("acp_truncated",
+        "en" => "{content}...\n\n[truncated]",
+        "zh" => "{content}...\n\n[已截断]",
+        "ja" => "{content}...\n\n[切り詰め]",
+        "ko" => "{content}...\n\n[잘림]",
+        "fr" => "{content}...\n\n[tronqué]",
+        "de" => "{content}...\n\n[gekürzt]",
+        "th" => "{content}...\n\n[ตัดทอนแล้ว]",
+        "vi" => "{content}...\n\n[đã cắt bớt]",
+        "es" => "{content}...\n\n[truncado]",
+        "ru" => "{content}...\n\n[усечено]",
+    );
+
+    msg!("acp_tool_start",
+        "en" => "Tool started",
+        "zh" => "工具开始",
+        "ja" => "ツール開始",
+        "ko" => "도구 시작",
+        "fr" => "Outil démarré",
+        "de" => "Tool gestartet",
+        "th" => "เครื่องมือเริ่มทำงาน",
+        "vi" => "Công cụ đã bắt đầu",
+        "es" => "Herramienta iniciada",
+        "ru" => "Инструмент запущен",
+    );
+
+    msg!("acp_tool_executing",
+        "en" => "Executing: {title}",
+        "zh" => "执行工具: {title}",
+        "ja" => "実行中: {title}",
+        "ko" => "실행 중: {title}",
+        "fr" => "Exécution: {title}",
+        "de" => "Ausführung: {title}",
+        "th" => "กำลังดำเนินการ: {title}",
+        "vi" => "Đang thực thi: {title}",
+        "es" => "Ejecutando: {title}",
+        "ru" => "Выполняется: {title}",
+    );
+
+    msg!("acp_tool_done",
+        "en" => "Tool completed",
+        "zh" => "工具完成",
+        "ja" => "ツール完了",
+        "ko" => "도구 완료",
+        "fr" => "Outil terminé",
+        "de" => "Tool abgeschlossen",
+        "th" => "เครื่องมือเสร็จสิ้น",
+        "vi" => "Công cụ hoàn thành",
+        "es" => "Herramienta completada",
+        "ru" => "Инструмент завершён",
+    );
+
+    msg!("acp_tool_completed",
+        "en" => "Completed: {title}",
+        "zh" => "工具执行完成: {title}",
+        "ja" => "完了: {title}",
+        "ko" => "완료: {title}",
+        "fr" => "Terminé: {title}",
+        "de" => "Abgeschlossen: {title}",
+        "th" => "เสร็จสิ้น: {title}",
+        "vi" => "Đã hoàn thành: {title}",
+        "es" => "Completado: {title}",
+        "ru" => "Завершено: {title}",
+    );
+
+    msg!("acp_tool_failed",
+        "en" => "Tool failed",
+        "zh" => "工具失败",
+        "ja" => "ツール失敗",
+        "ko" => "도구 실패",
+        "fr" => "Outil échoué",
+        "de" => "Tool fehlgeschlagen",
+        "th" => "เครื่องมือล้มเหลว",
+        "vi" => "Công cụ thất bại",
+        "es" => "Herramienta fallida",
+        "ru" => "Инструмент завершился с ошибкой",
+    );
+
+    msg!("acp_tool_error",
+        "en" => "Failed: {title} - {error}",
+        "zh" => "工具执行失败: {title} - {error}",
+        "ja" => "失敗: {title} - {error}",
+        "ko" => "실패: {title} - {error}",
+        "fr" => "Échec: {title} - {error}",
+        "de" => "Fehlgeschlagen: {title} - {error}",
+        "th" => "ล้มเหลว: {title} - {error}",
+        "vi" => "Thất bại: {title} - {error}",
+        "es" => "Fallido: {title} - {error}",
+        "ru" => "Ошибка: {title} - {error}",
+    );
+
+    msg!("acp_session_created",
+        "en" => "Session created",
+        "zh" => "会话已创建",
+        "ja" => "セッション作成済み",
+        "ko" => "세션 생성됨",
+        "fr" => "Session créée",
+        "de" => "Sitzung erstellt",
+        "th" => "สร้างเซสชันแล้ว",
+        "vi" => "Phiên đã được tạo",
+        "es" => "Sesión creada",
+        "ru" => "Сессия создана",
+    );
+
+    msg!("acp_session_info",
+        "en" => "Session ID: {id}\nTitle: {title}",
+        "zh" => "Session ID: {id}\n标题: {title}",
+        "ja" => "セッション ID: {id}\nタイトル: {title}",
+        "ko" => "세션 ID: {id}\n제목: {title}",
+        "fr" => "ID de session: {id}\nTitre: {title}",
+        "de" => "Sitzungs-ID: {id}\nTitel: {title}",
+        "th" => "Session ID: {id}\nชื่อ: {title}",
+        "vi" => "ID phiên: {id}\nTiêu đề: {title}",
+        "es" => "ID de sesión: {id}\nTítulo: {title}",
+        "ru" => "ID сессии: {id}\nЗаголовок: {title}",
+    );
+
+    // -- Restart-required banner messages (shown to UI as RestartRequest) --
+    msg!("restart_required_config_changed",
+        "en" => "Configuration changed. Restart gateway to apply.",
+        "zh" => "配置已更改，请重启 gateway 以生效。",
+        "ja" => "設定が変更されました。ゲートウェイを再起動して適用してください。",
+    );
+    msg!("tool_missing",
+        "en" => "[system] {tool} not found. Run `rsclaw tools install {tool}`, or download from https://gitfast.io",
+        "zh" => "[系统] 未找到 {tool}，请运行 `rsclaw tools install {tool}` 或从 https://gitfast.io 下载安装",
+        "ja" => "[システム] {tool} が見つかりません。`rsclaw tools install {tool}` を実行するか https://gitfast.io からダウンロードしてください",
+    );
+
+    msg!("agent_max_iterations",
+        "en" => "No new progress after {iterations} steps (last: {tool}). You can continue the conversation and I'll try a different approach.",
+        "zh" => "已执行 {iterations} 步但连续没有新进展（最后操作：{tool}）。你可以继续对话，我会尝试换种方式处理。",
+        "ja" => "{iterations}ステップ実行したが進捗なし（最後: {tool}）。会話を続けると別の方法を試します。",
+    );
+
+    msg!("agent_loop_detected",
+        "en" => "Detected repeated identical operation without progress. Trying a different approach.",
+        "zh" => "检测到重复执行相同操作但没有进展，尝试换一种方式处理。",
+        "cn" => "检测到重复执行相同操作但没有进展，尝试换一种方式处理。",
+        "ja" => "同じ操作の繰り返しを検出しました。別のアプローチを試みます。",
+        "ko" => "동일한 작업이 반복 감지되었습니다. 다른 접근 방식을 시도합니다.",
+        "de" => "Wiederholte identische Operation ohne Fortschritt erkannt. Versuche einen anderen Ansatz.",
+        "fr" => "Operation identique repetee sans progres detectee. Essai d'une autre approche.",
+        "es" => "Se detecto una operacion identica repetida sin progreso. Intentando un enfoque diferente.",
+        "ru" => "Обнаружено повторение одинаковой операции без прогресса. Пробую другой подход.",
+        "th" => "ตรวจพบการทำงานซ้ำโดยไม่มีความคืบหน้า กำลังลองวิธีอื่น",
+        "vi" => "Phat hien thao tac lap lai khong tien trien. Thu cach tiep can khac.",
+    );
+
+    msg!("agent_tool_errors",
+        "en" => "Tools failed consecutively. Last error: {error}",
+        "zh" => "工具连续执行失败。最后错误：{error}",
+        "ja" => "ツールが連続して失敗しました。最後のエラー: {error}",
+    );
+
+    msg!("cron_run_success",
+        "en" => "[ok] Scheduled task completed\n\n**Task**: {name}\n**Duration**: {seconds}s",
+        "zh" => "[ok] 定时任务执行完成\n\n**任务**: {name}\n**耗时**: {seconds}秒",
+        "ja" => "[ok] スケジュールタスク完了\n\n**タスク**: {name}\n**所要時間**: {seconds}秒",
+        "vi" => "[ok] Tac vu da chay xong\n\n**Tac vu**: {name}\n**Thoi gian**: {seconds}s",
+    );
+
+    msg!("cron_run_success_no_duration",
+        "en" => "[ok] Scheduled task completed\n\n**Task**: {name}",
+        "zh" => "[ok] 定时任务执行完成\n\n**任务**: {name}",
+        "ja" => "[ok] スケジュールタスク完了\n\n**タスク**: {name}",
+        "vi" => "[ok] Tac vu da chay xong\n\n**Tac vu**: {name}",
+    );
+
+    msg!("cron_run_failed_disabled",
+        "en" => "[fail] Scheduled task failed\n\n**Task**: {name}\n**Consecutive failures**: {consecutive}\n**Error**: {error}\n\n[warn] Task auto-disabled. Please check the configuration and re-enable manually.",
+        "zh" => "[fail] 定时任务执行失败\n\n**任务**: {name}\n**连续失败**: {consecutive} 次\n**错误**: {error}\n\n[warn] 任务已被自动禁用，请检查配置后手动启用。",
+        "ja" => "[fail] スケジュールタスク失敗\n\n**タスク**: {name}\n**連続失敗**: {consecutive} 回\n**エラー**: {error}\n\n[warn] タスクは自動的に無効化されました。設定を確認してから手動で有効化してください。",
+        "vi" => "[fail] Tac vu loi\n\n**Tac vu**: {name}\n**That bai lien tiep**: {consecutive} lan\n**Loi**: {error}\n\n[warn] Tac vu da bi tu dong tat. Vui long kiem tra cau hinh va bat lai thu cong.",
+    );
+
+    msg!("cron_run_failed_retry",
+        "en" => "[fail] Scheduled task failed\n\n**Task**: {name}\n**Consecutive failures**: {consecutive}\n**Next retry**: in {backoff}\n**Error**: {error}",
+        "zh" => "[fail] 定时任务执行失败\n\n**任务**: {name}\n**连续失败**: {consecutive} 次\n**下次重试**: {backoff}后\n**错误**: {error}",
+        "ja" => "[fail] スケジュールタスク失敗\n\n**タスク**: {name}\n**連続失敗**: {consecutive} 回\n**次回再試行**: {backoff}後\n**エラー**: {error}",
+        "vi" => "[fail] Tac vu loi\n\n**Tac vu**: {name}\n**That bai lien tiep**: {consecutive} lan\n**Thu lai sau**: {backoff}\n**Loi**: {error}",
+    );
+
+    msg!("cron_run_failed_manual",
+        "en" => "[fail] Scheduled task failed\n\n**Task**: {name}\n**Consecutive failures**: {consecutive}\n**Error**: {error}",
+        "zh" => "[fail] 定时任务执行失败\n\n**任务**: {name}\n**连续失败**: {consecutive} 次\n**错误**: {error}",
+        "ja" => "[fail] スケジュールタスク失敗\n\n**タスク**: {name}\n**連続失敗**: {consecutive} 回\n**エラー**: {error}",
+        "vi" => "[fail] Tac vu loi\n\n**Tac vu**: {name}\n**That bai lien tiep**: {consecutive} lan\n**Loi**: {error}",
+    );
+
+    msg!("install_hint_stt_sherpa",
+        "en" => "\n\n[System hint] This transcription used a fallback path (provider={provider}). For better Chinese accuracy, install:\n  rsclaw tools install sherpa-onnx\n  rsclaw models download paraformer-zh\nThis hint is shown only once.",
+        "zh" => "\n\n[\u{7CFB}\u{7EDF}\u{63D0}\u{793A}] \u{672C}\u{6B21}\u{8BED}\u{97F3}\u{8BC6}\u{522B}\u{8D70}\u{7684}\u{662F}\u{5907}\u{4EFD}\u{8DEF}\u{5F84}\u{FF08}provider={provider}\u{FF09}\u{3002}\u{8981}\u{83B7}\u{5F97}\u{66F4}\u{597D}\u{7684}\u{4E2D}\u{6587}\u{8BC6}\u{522B}\u{6548}\u{679C}\u{FF0C}\u{8BF7}\u{8FD0}\u{884C}\u{FF1A}\n  rsclaw tools install sherpa-onnx\n  rsclaw models download paraformer-zh\n\u{6B64}\u{63D0}\u{793A}\u{53EA}\u{663E}\u{793A}\u{4E00}\u{6B21}\u{3002}",
+        "ja" => "\n\n[\u{30B7}\u{30B9}\u{30C6}\u{30E0}\u{306E}\u{304A}\u{77E5}\u{3089}\u{305B}] \u{4ECA}\u{56DE}\u{306E}\u{97F3}\u{58F0}\u{8A8D}\u{8B58}\u{306F}\u{30D5}\u{30A9}\u{30FC}\u{30EB}\u{30D0}\u{30C3}\u{30AF}\u{7D4C}\u{8DEF}\u{3092}\u{4F7F}\u{7528}\u{3057}\u{307E}\u{3057}\u{305F}\u{FF08}provider={provider}\u{FF09}\u{3002}\u{8A8D}\u{8B58}\u{7CBE}\u{5EA6}\u{3092}\u{4E0A}\u{3052}\u{308B}\u{306B}\u{306F}\u{FF1A}\n  rsclaw tools install sherpa-onnx\n  rsclaw models download paraformer-zh\n\u{3053}\u{306E}\u{30D2}\u{30F3}\u{30C8}\u{306F}1\u{56DE}\u{306E}\u{307F}\u{8868}\u{793A}\u{3055}\u{308C}\u{307E}\u{3059}\u{3002}",
+    );
+
+    msg!("vision_unavailable",
+        "en" => "computer_use requires a vision-capable model, but {reason}\n\nHow to fix:\n• Set `agents.defaults.model.vision` to a vision model in your config, OR\n• Replace `agents.defaults.model.primary` with a vision-capable model.\n\nKnown vision-capable model identifiers include:\n• qwen-3.x-x\n• kimi-k2.5/kimi-k2.6/kimi-k2.x/kimi-for-coding\n• doubao-seed-2.0-pro/doubao-seed-2.0-lite/doubao-seed-2.x\n• gpt-4o / gpt-4o-mini\n• claude-3-5-sonnet / claude-sonnet-4-x\n• gemini-1.5-x/gemini-2-x/gemini-3-x\n• gemma-3-x/gemma-4-x",
+        "zh" => "computer_use 需要支持视觉的模型，但{reason}\n\n如何修复:\n• 在配置中将 `agents.defaults.model.vision` 设为视觉模型，或\n• 将 `agents.defaults.model.primary` 替换为支持视觉的模型。\n\n已知支持视觉的模型标识包括:\n• qwen-3.x-x\n• kimi-k2.5/kimi-k2.6/kimi-k2.x/kimi-for-coding\n• doubao-seed-2.0-pro/doubao-seed-2.0-lite/doubao-seed-2.x\n• gpt-4o / gpt-4o-mini\n• claude-3-5-sonnet / claude-sonnet-4-x\n• gemini-1.5-x/gemini-2-x/gemini-3-x\n• gemma-3-x/gemma-4-x",
+        "ja" => "computer_use には視覚対応モデルが必要ですが、{reason}\n\n対処方法:\n• 設定で `agents.defaults.model.vision` に視覚モデルを設定するか、\n• `agents.defaults.model.primary` を視覚対応モデルに置き換えてください。\n\n既知の視覚対応モデル ID:\n• qwen-3.x-x\n• kimi-k2.5/kimi-k2.6/kimi-k2.x/kimi-for-coding\n• doubao-seed-2.0-pro/doubao-seed-2.0-lite/doubao-seed-2.x\n• gpt-4o / gpt-4o-mini\n• claude-3-5-sonnet / claude-sonnet-4-x\n• gemini-1.5-x/gemini-2-x/gemini-3-x\n• gemma-3-x/gemma-4-x",
+        "ko" => "computer_use 에는 비전 지원 모델이 필요하지만, {reason}\n\n해결 방법:\n• 구성에서 `agents.defaults.model.vision` 를 비전 모델로 설정하거나,\n• `agents.defaults.model.primary` 를 비전 지원 모델로 교체하세요.\n\n알려진 비전 지원 모델 ID:\n• qwen-3.x-x\n• kimi-k2.5/kimi-k2.6/kimi-k2.x/kimi-for-coding\n• doubao-seed-2.0-pro/doubao-seed-2.0-lite/doubao-seed-2.x\n• gpt-4o / gpt-4o-mini\n• claude-3-5-sonnet / claude-sonnet-4-x\n• gemini-1.5-x/gemini-2-x/gemini-3-x\n• gemma-3-x/gemma-4-x",
+        "th" => "computer_use ต้องใช้โมเดลที่รองรับการมองเห็น แต่ {reason}\n\nวิธีแก้:\n• ตั้งค่า `agents.defaults.model.vision` เป็นโมเดลวิชั่นในการตั้งค่า หรือ\n• เปลี่ยน `agents.defaults.model.primary` เป็นโมเดลที่รองรับวิชั่น\n\nรายชื่อโมเดลที่รองรับวิชั่น:\n• qwen-3.x-x\n• kimi-k2.5/kimi-k2.6/kimi-k2.x/kimi-for-coding\n• doubao-seed-2.0-pro/doubao-seed-2.0-lite/doubao-seed-2.x\n• gpt-4o / gpt-4o-mini\n• claude-3-5-sonnet / claude-sonnet-4-x\n• gemini-1.5-x/gemini-2-x/gemini-3-x\n• gemma-3-x/gemma-4-x",
+        "vi" => "computer_use yeu cau mo hinh ho tro thi giac, nhung {reason}\n\nCach khac phuc:\n• Dat `agents.defaults.model.vision` thanh mo hinh vision trong config, HOAC\n• Thay `agents.defaults.model.primary` bang mo hinh ho tro vision.\n\nDanh sach mo hinh ho tro vision:\n• qwen-3.x-x\n• kimi-k2.5/kimi-k2.6/kimi-k2.x/kimi-for-coding\n• doubao-seed-2.0-pro/doubao-seed-2.0-lite/doubao-seed-2.x\n• gpt-4o / gpt-4o-mini\n• claude-3-5-sonnet / claude-sonnet-4-x\n• gemini-1.5-x/gemini-2-x/gemini-3-x\n• gemma-3-x/gemma-4-x",
+        "es" => "computer_use requiere un modelo con capacidad de vision, pero {reason}\n\nComo solucionarlo:\n• Configure `agents.defaults.model.vision` con un modelo de vision, O\n• Reemplace `agents.defaults.model.primary` con un modelo con vision.\n\nIdentificadores de modelos con vision conocidos:\n• qwen-3.x-x\n• kimi-k2.5/kimi-k2.6/kimi-k2.x/kimi-for-coding\n• doubao-seed-2.0-pro/doubao-seed-2.0-lite/doubao-seed-2.x\n• gpt-4o / gpt-4o-mini\n• claude-3-5-sonnet / claude-sonnet-4-x\n• gemini-1.5-x/gemini-2-x/gemini-3-x\n• gemma-3-x/gemma-4-x",
+        "fr" => "computer_use exige un modele compatible vision, mais {reason}\n\nComment corriger :\n• Definissez `agents.defaults.model.vision` sur un modele vision, OU\n• Remplacez `agents.defaults.model.primary` par un modele vision.\n\nIdentifiants de modeles vision connus :\n• qwen-3.x-x\n• kimi-k2.5/kimi-k2.6/kimi-k2.x/kimi-for-coding\n• doubao-seed-2.0-pro/doubao-seed-2.0-lite/doubao-seed-2.x\n• gpt-4o / gpt-4o-mini\n• claude-3-5-sonnet / claude-sonnet-4-x\n• gemini-1.5-x/gemini-2-x/gemini-3-x\n• gemma-3-x/gemma-4-x",
+        "de" => "computer_use erfordert ein vision-faehiges Modell, aber {reason}\n\nSo behebt man das:\n• Setzen Sie `agents.defaults.model.vision` auf ein Vision-Modell in der Konfiguration, ODER\n• Ersetzen Sie `agents.defaults.model.primary` durch ein vision-faehiges Modell.\n\nBekannte vision-faehige Modell-IDs:\n• qwen-3.x-x\n• kimi-k2.5/kimi-k2.6/kimi-k2.x/kimi-for-coding\n• doubao-seed-2.0-pro/doubao-seed-2.0-lite/doubao-seed-2.x\n• gpt-4o / gpt-4o-mini\n• claude-3-5-sonnet / claude-sonnet-4-x\n• gemini-1.5-x/gemini-2-x/gemini-3-x\n• gemma-3-x/gemma-4-x",
+        "ru" => "computer_use \u{0442}\u{0440}\u{0435}\u{0431}\u{0443}\u{0435}\u{0442} \u{043C}\u{043E}\u{0434}\u{0435}\u{043B}\u{044C} \u{0441} \u{043F}\u{043E}\u{0434}\u{0434}\u{0435}\u{0440}\u{0436}\u{043A}\u{043E}\u{0439} \u{0437}\u{0440}\u{0435}\u{043D}\u{0438}\u{044F}, \u{043D}\u{043E} {reason}\n\n\u{041A}\u{0430}\u{043A} \u{0438}\u{0441}\u{043F}\u{0440}\u{0430}\u{0432}\u{0438}\u{0442}\u{044C}:\n• \u{0423}\u{0441}\u{0442}\u{0430}\u{043D}\u{043E}\u{0432}\u{0438}\u{0442}\u{0435} `agents.defaults.model.vision` \u{043D}\u{0430} \u{0432}\u{0438}\u{0437}\u{0443}\u{0430}\u{043B}\u{044C}\u{043D}\u{0443}\u{044E} \u{043C}\u{043E}\u{0434}\u{0435}\u{043B}\u{044C} \u{0432} \u{043A}\u{043E}\u{043D}\u{0444}\u{0438}\u{0433}\u{0435}, \u{0418}\u{041B}\u{0418}\n• \u{0417}\u{0430}\u{043C}\u{0435}\u{043D}\u{0438}\u{0442}\u{0435} `agents.defaults.model.primary` \u{043D}\u{0430} \u{0432}\u{0438}\u{0437}\u{0443}\u{0430}\u{043B}\u{044C}\u{043D}\u{0443}\u{044E} \u{043C}\u{043E}\u{0434}\u{0435}\u{043B}\u{044C}.\n\n\u{0418}\u{0437}\u{0432}\u{0435}\u{0441}\u{0442}\u{043D}\u{044B}\u{0435} \u{0432}\u{0438}\u{0437}\u{0443}\u{0430}\u{043B}\u{044C}\u{043D}\u{044B}\u{0435} \u{043C}\u{043E}\u{0434}\u{0435}\u{043B}\u{0438}:\n• qwen-3.x-x\n• kimi-k2.5/kimi-k2.6/kimi-k2.x/kimi-for-coding\n• doubao-seed-2.0-pro/doubao-seed-2.0-lite/doubao-seed-2.x\n• gpt-4o / gpt-4o-mini\n• claude-3-5-sonnet / claude-sonnet-4-x\n• gemini-1.5-x/gemini-2-x/gemini-3-x\n• gemma-3-x/gemma-4-x",
+    );
+
+    msg!("install_hint_tts_sherpa",
+        "en" => "\n\n[System hint] Voice reply is using the fallback system TTS — Chinese sounds robotic. For natural Chinese speech, install:\n  rsclaw tools install sherpa-onnx\n  rsclaw models download melo\nThis hint is shown only once.",
+        "zh" => "\n\n[\u{7CFB}\u{7EDF}\u{63D0}\u{793A}] \u{5F53}\u{524D}\u{8BED}\u{97F3}\u{56DE}\u{590D}\u{8D70}\u{7684}\u{662F}\u{7CFB}\u{7EDF}\u{5907}\u{4EFD} TTS\u{FF0C}\u{4E2D}\u{6587}\u{97F3}\u{8D28}\u{4E00}\u{822C}\u{3002}\u{8981}\u{4F7F}\u{7528}\u{66F4}\u{81EA}\u{7136}\u{7684} MeloTTS\u{FF0C}\u{8BF7}\u{8FD0}\u{884C}\u{FF1A}\n  rsclaw tools install sherpa-onnx\n  rsclaw models download melo\n\u{6B64}\u{63D0}\u{793A}\u{53EA}\u{663E}\u{793A}\u{4E00}\u{6B21}\u{3002}",
+        "ja" => "\n\n[\u{30B7}\u{30B9}\u{30C6}\u{30E0}\u{306E}\u{304A}\u{77E5}\u{3089}\u{305B}] \u{97F3}\u{58F0}\u{5FDC}\u{7B54}\u{306F}\u{30B7}\u{30B9}\u{30C6}\u{30E0}\u{30D0}\u{30C3}\u{30AF}\u{30A2}\u{30C3}\u{30D7} TTS \u{3092}\u{4F7F}\u{7528}\u{3057}\u{3066}\u{3044}\u{307E}\u{3059}\u{3002}\u{3088}\u{308A}\u{81EA}\u{7136}\u{306A}\u{4E2D}\u{56FD}\u{8A9E}\u{306E}\u{305F}\u{3081}\u{306B}\u{FF1A}\n  rsclaw tools install sherpa-onnx\n  rsclaw models download melo\n\u{3053}\u{306E}\u{30D2}\u{30F3}\u{30C8}\u{306F}1\u{56DE}\u{306E}\u{307F}\u{8868}\u{793A}\u{3055}\u{308C}\u{307E}\u{3059}\u{3002}",
+    );
+
+    // Cost-gate messages delivered back through the channel when image_gen
+    // or video_gen is invoked without an explicit model in
+    // `agents.defaults.model.image` / `.video`. Phrased for end-users (not
+    // operators): name the config key but lead with WHY (paid API) and
+    // give a concrete model example so the user knows what to type.
+    msg!("image_gen_no_model",
+        "en" => "Image generation is a paid third-party API and is disabled until you pick a model. Set `agents.defaults.model.image` in rsclaw.json5 (e.g. \"doubao/doubao-seedream-5-0-260128\"), or pick one in the desktop app under 配置管理 → 模型 → 图像生成模型. Then retry.",
+        "zh" => "图像生成需要调用付费的第三方 API，未配置模型前已禁用。请在 rsclaw.json5 中设置 `agents.defaults.model.image`（例如 \"doubao/doubao-seedream-5-0-260128\"），或在桌面应用「配置管理 → 模型 → 图像生成模型」中选择一个模型，然后重试。",
+        "ja" => "画像生成は有料の外部 API のため、モデル未設定では無効化されています。rsclaw.json5 で `agents.defaults.model.image` を設定（例: \"doubao/doubao-seedream-5-0-260128\"）するか、デスクトップアプリの「配置管理 → 模型 → 图像生成模型」で選択してから再試行してください。",
+        "ko" => "이미지 생성은 유료 외부 API이므로 모델을 설정해야 사용할 수 있습니다. rsclaw.json5에서 `agents.defaults.model.image`를 설정(예: \"doubao/doubao-seedream-5-0-260128\")하거나 데스크톱 앱의 配置管理 → 模型 → 图像生成模型에서 선택한 뒤 다시 시도해 주세요.",
+        "th" => "การสร้างภาพเป็น API ภายนอกที่มีค่าใช้จ่าย ระบบจึงปิดไว้จนกว่าจะตั้งค่าโมเดล โปรดตั้งค่า `agents.defaults.model.image` ใน rsclaw.json5 (เช่น \"doubao/doubao-seedream-5-0-260128\") หรือเลือกในแอปเดสก์ท็อปที่ 配置管理 → 模型 → 图像生成模型 จากนั้นลองใหม่",
+        "vi" => "Tao hinh anh dung API ben thu ba co phi nen bi tat cho den khi ban chon mo hinh. Hay dat `agents.defaults.model.image` trong rsclaw.json5 (vi du \"doubao/doubao-seedream-5-0-260128\") hoac chon trong app desktop tai 配置管理 → 模型 → 图像生成模型, roi thu lai.",
+        "es" => "La generacion de imagenes usa una API externa de pago y esta deshabilitada hasta que elija un modelo. Configure `agents.defaults.model.image` en rsclaw.json5 (p. ej. \"doubao/doubao-seedream-5-0-260128\") o seleccione uno en la app de escritorio: 配置管理 → 模型 → 图像生成模型. Luego reintente.",
+        "fr" => "La generation d'images utilise une API tierce payante et reste desactivee tant qu'aucun modele n'est choisi. Definissez `agents.defaults.model.image` dans rsclaw.json5 (ex. \"doubao/doubao-seedream-5-0-260128\") ou selectionnez-en un dans l'app de bureau : 配置管理 → 模型 → 图像生成模型. Puis reessayez.",
+        "de" => "Bildgenerierung nutzt eine kostenpflichtige Drittanbieter-API und ist deaktiviert, bis ein Modell ausgewaehlt ist. Setzen Sie `agents.defaults.model.image` in rsclaw.json5 (z. B. \"doubao/doubao-seedream-5-0-260128\") oder waehlen Sie eines in der Desktop-App: 配置管理 → 模型 → 图像生成模型. Versuchen Sie es dann erneut.",
+        "ru" => "Генерация изображений использует платный сторонний API и отключена до выбора модели. Задайте `agents.defaults.model.image` в rsclaw.json5 (например, \"doubao/doubao-seedream-5-0-260128\") или выберите его в десктопном приложении: 配置管理 → 模型 → 图像生成模型. Затем повторите.",
+    );
+
+    msg!("video_gen_no_model",
+        "en" => "Video generation is a paid third-party API (Seedance / Hailuo / Kling — each clip costs real money and takes minutes) and is disabled until you pick a model. Set `agents.defaults.model.video` in rsclaw.json5 (e.g. \"doubao/doubao-seedance-2-0-260128\", \"minimax/video-01-director\", or \"kling/kling-v2-master\"), or pick one in the desktop app under 配置管理 → 模型 → 视频生成模型. Then retry.",
+        "zh" => "视频生成需要调用付费的第三方 API（Seedance / Hailuo / Kling，每条视频都要真金白银且耗时数分钟），未配置模型前已禁用。请在 rsclaw.json5 中设置 `agents.defaults.model.video`（例如 \"doubao/doubao-seedance-2-0-260128\"、\"minimax/video-01-director\" 或 \"kling/kling-v2-master\"），或在桌面应用「配置管理 → 模型 → 视频生成模型」中选择一个模型，然后重试。",
+        "ja" => "動画生成は有料の外部 API（Seedance / Hailuo / Kling、1 本ごとに費用が発生し数分かかります）のため、モデル未設定では無効化されています。rsclaw.json5 で `agents.defaults.model.video` を設定（例: \"doubao/doubao-seedance-2-0-260128\"、\"minimax/video-01-director\"、\"kling/kling-v2-master\"）するか、デスクトップアプリの「配置管理 → 模型 → 视频生成模型」で選択してから再試行してください。",
+        "ko" => "동영상 생성은 유료 외부 API(Seedance / Hailuo / Kling — 클립마다 비용이 발생하고 수 분이 걸립니다)이므로 모델을 설정해야 사용할 수 있습니다. rsclaw.json5에서 `agents.defaults.model.video`를 설정(예: \"doubao/doubao-seedance-2-0-260128\", \"minimax/video-01-director\", \"kling/kling-v2-master\")하거나 데스크톱 앱의 配置管理 → 模型 → 视频生成模型에서 선택한 뒤 다시 시도해 주세요.",
+        "th" => "การสร้างวิดีโอเป็น API ภายนอกที่มีค่าใช้จ่าย (Seedance / Hailuo / Kling — แต่ละคลิปมีค่าใช้จ่ายและใช้เวลาหลายนาที) จึงปิดไว้จนกว่าจะตั้งค่าโมเดล โปรดตั้งค่า `agents.defaults.model.video` ใน rsclaw.json5 (เช่น \"doubao/doubao-seedance-2-0-260128\", \"minimax/video-01-director\" หรือ \"kling/kling-v2-master\") หรือเลือกในแอปเดสก์ท็อปที่ 配置管理 → 模型 → 视频生成模型 จากนั้นลองใหม่",
+        "vi" => "Tao video dung API ben thu ba co phi (Seedance / Hailuo / Kling — moi clip ton tien va mat vai phut) nen bi tat cho den khi ban chon mo hinh. Hay dat `agents.defaults.model.video` trong rsclaw.json5 (vi du \"doubao/doubao-seedance-2-0-260128\", \"minimax/video-01-director\" hoac \"kling/kling-v2-master\") hoac chon trong app desktop tai 配置管理 → 模型 → 视频生成模型, roi thu lai.",
+        "es" => "La generacion de video usa una API externa de pago (Seedance / Hailuo / Kling — cada clip cuesta dinero real y tarda minutos) y esta deshabilitada hasta que elija un modelo. Configure `agents.defaults.model.video` en rsclaw.json5 (p. ej. \"doubao/doubao-seedance-2-0-260128\", \"minimax/video-01-director\" o \"kling/kling-v2-master\") o seleccione uno en la app de escritorio: 配置管理 → 模型 → 视频生成模型. Luego reintente.",
+        "fr" => "La generation video utilise une API tierce payante (Seedance / Hailuo / Kling — chaque clip a un cout reel et prend plusieurs minutes) et reste desactivee tant qu'aucun modele n'est choisi. Definissez `agents.defaults.model.video` dans rsclaw.json5 (ex. \"doubao/doubao-seedance-2-0-260128\", \"minimax/video-01-director\" ou \"kling/kling-v2-master\") ou selectionnez-en un dans l'app de bureau : 配置管理 → 模型 → 视频生成模型. Puis reessayez.",
+        "de" => "Videogenerierung nutzt eine kostenpflichtige Drittanbieter-API (Seedance / Hailuo / Kling — jeder Clip kostet echtes Geld und dauert Minuten) und ist deaktiviert, bis ein Modell ausgewaehlt ist. Setzen Sie `agents.defaults.model.video` in rsclaw.json5 (z. B. \"doubao/doubao-seedance-2-0-260128\", \"minimax/video-01-director\" oder \"kling/kling-v2-master\") oder waehlen Sie eines in der Desktop-App: 配置管理 → 模型 → 视频生成模型. Versuchen Sie es dann erneut.",
+        "ru" => "Генерация видео использует платный сторонний API (Seedance / Hailuo / Kling — каждый ролик стоит реальных денег и занимает минуты) и отключена до выбора модели. Задайте `agents.defaults.model.video` в rsclaw.json5 (например, \"doubao/doubao-seedance-2-0-260128\", \"minimax/video-01-director\" или \"kling/kling-v2-master\") или выберите его в десктопном приложении: 配置管理 → 模型 → 视频生成模型. Затем повторите.",
+    );
+
+    // -----------------------------------------------------------------
+    // cap_live sticky direct mode (Phase 2a, 2026-05-31)
+    // -----------------------------------------------------------------
+    msg!("cap_help",
+        "en" => "/cap <agent> [path] — bind this chat to a coding agent (claudecode | openclaude | opencode | codex | qoder), optionally rooting the session at <path> (must be under $HOME; default: rsclaw workspace)\n/cap-exit             — release the binding",
+        "zh" => "/cap <代理> [路径] — 把当前会话直连到一个编程代理（claudecode | openclaude | opencode | codex | qoder），可选指定工作目录 [路径]（必须在 $HOME 之下，默认使用 rsclaw 工作区）\n/cap-exit             — 释放绑定，恢复主 LLM",
+    );
+
+    msg!("cap_bound",
+        "en" => "Bound to {agent} (session {sid}). Next messages go directly to the driver. /cap-exit to release, /status to see the resume id.",
+        "zh" => "已绑定到 {agent}（会话 {sid}）。接下来的消息会直接发给子代理。/cap-exit 释放，/status 查看 resume id。",
+    );
+
+    msg!("cap_unknown_agent",
+        "en" => "/cap: unknown agent `{agent}` (try: claudecode, openclaude, opencode, codex, qoder)",
+        "zh" => "/cap：未知代理 `{agent}`（可选：claudecode、openclaude、opencode、codex、qoder）",
+    );
+
+    msg!("cap_not_initialised",
+        "en" => "/cap: cap_live not initialised",
+        "zh" => "/cap：cap_live 尚未初始化",
+    );
+
+    msg!("cap_open_failed",
+        "en" => "/cap: failed to open session: {err}",
+        "zh" => "/cap：打开会话失败：{err}",
+    );
+
+    msg!("cap_install_hint_npm",
+        "en" => "{agent} not found. Run `rsclaw tools install {cmd}` to install it.",
+        "zh" => "未找到 {agent}，请运行 `rsclaw tools install {cmd}` 安装。",
+    );
+
+    msg!("cap_install_hint_go",
+        "en" => "{agent} not found. Install it from https://github.com/opencode-ai/opencode then retry /cap {cmd}.",
+        "zh" => "未找到 {agent}，请从 https://github.com/opencode-ai/opencode 安装后重试 /cap {cmd}。",
+    );
+
+    msg!("cap_fallback_protocol",
+        "en" => "{agent} connected via {protocol} (stream-json not available)",
+        "zh" => "{agent} 通过 {protocol} 连接（stream-json 不可用）",
+    );
+
+    msg!("cap_bad_workspace",
+        "en" => "/cap: workspace path rejected — {path}: {reason}",
+        "zh" => "/cap：工作目录被拒绝 — {path}：{reason}",
+    );
+
+    msg!("cap_session_closed",
+        "en" => "{agent} session closed. Normal LLM behavior resumed.",
+        "zh" => "{agent} 会话已关闭，恢复正常对话。",
+    );
+
+    msg!("cap_no_active",
+        "en" => "/cap-exit: no active cap session here",
+        "zh" => "/cap-exit：当前会话没有绑定中的代理",
+    );
+
+    msg!("cap_driver_error",
+        "en" => "[cap {agent} driver error] {err}\n(sticky binding released; use /cap {agent} to reconnect or just keep chatting with the main LLM)",
+        "zh" => "[cap {agent} 驱动错误] {err}\n（已自动释放绑定；可用 /cap {agent} 重新连接，或直接继续跟主 LLM 对话）",
+    );
+
+    msg!("cap_no_output",
+        "en" => "[{agent}] (no output)",
+        "zh" => "[{agent}]（无输出）",
+    );
+
+    msg!("cap_thinking",
+        "en" => "💭 {agent} is responding…",
+        "zh" => "💭 {agent} 正在处理…",
+    );
+
+    msg!("cap_bound_with_resume",
+        "en" => "Bound to {agent} (session {sid}). Next messages go directly to the driver. /cap-exit to release.\nResume later: /cap-resume {agent_slug} {session_id}",
+        "zh" => "已绑定到 {agent}（会话 {sid}）。接下来的消息会直接发给子代理，使用 /cap-exit 释放绑定。\n下次恢复对话：/cap-resume {agent_slug} {session_id}",
+    );
+
+    msg!("cap_resumed",
+        "en" => "Resumed {agent} session {session_id}. Next messages continue the previous conversation. /cap-exit to release.",
+        "zh" => "已恢复 {agent} 会话 {session_id}。后续消息继续之前的对话。使用 /cap-exit 释放绑定。",
+    );
+
+    msg!("cap_resume_help",
+        "en" => "/cap-resume <agent> [session_id]\n  /cap-resume claudecode 00000000-…   resume by id\n  /cap-resume claudecode               resume the most recent saved session",
+        "zh" => "/cap-resume <代理> [会话ID]\n  /cap-resume claudecode 00000000-…   按 ID 恢复\n  /cap-resume claudecode               恢复最近一次会话",
+    );
+
+    msg!("cap_resume_hint",
+        "en" => "📌 Resume command:\n/cap-resume {agent} {session_id}",
+        "zh" => "📌 续聊命令:\n/cap-resume {agent} {session_id}",
+    );
+
+    msg!("cap_resume_hint_after_exit",
+        "en" => "📌 To resume this conversation:\n/cap-resume {agent} {session_id}",
+        "zh" => "📌 恢复本次对话:\n/cap-resume {agent} {session_id}",
+    );
+
+    m
+});
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Translate a message key to the given language.  Falls back to English.
+pub fn t(key: &str, lang: &str) -> String {
+    if lang == "json" {
+        return format!("{{\"key\":\"{key}\",\"status\":\"ok\"}}");
+    }
+    MESSAGES
+        .get(key)
+        .and_then(|lm| lm.get(lang).or_else(|| lm.get("en")))
+        .map(|s| (*s).to_owned())
+        .unwrap_or_else(|| key.to_owned())
+}
+
+/// Translate with format arguments.
+///
+/// Example: `t_fmt("file_saved", "zh", &[("count", "3")])`
+pub fn t_fmt(key: &str, lang: &str, args: &[(&str, &str)]) -> String {
+    if lang == "json" {
+        let pairs: Vec<String> = args
+            .iter()
+            .map(|(k, v)| format!("\"{}\":\"{}\"", k, v))
+            .collect();
+        let extra = if pairs.is_empty() {
+            String::new()
+        } else {
+            format!(",{}", pairs.join(","))
+        };
+        return format!("{{\"key\":\"{key}\"{extra},\"status\":\"ok\"}}");
+    }
+    let mut text = t(key, lang);
+    for (k, v) in args {
+        text = text.replace(&format!("{{{k}}}"), v);
+    }
+    text
+}
+
+/// Resolve a human-readable or config language value to a language code.
+///
+/// Examples: "Chinese" -> "zh", "Thai" -> "th", "ja" -> "ja"
+pub fn resolve_lang(config_lang: &str) -> &'static str {
+    let l = config_lang.to_lowercase();
+    if l.starts_with("zh") || l.starts_with("cn") || l.contains("chinese") || l.contains("中文") {
+        "zh"
+    } else if l.starts_with("th") || l.contains("thai") || l.contains("ไทย") {
+        "th"
+    } else if l.starts_with("vi") || l.contains("vietnam") || l.contains("tiếng việt") {
+        "vi"
+    } else if l.starts_with("ja") || l.contains("japan") || l.contains("日本") {
+        "ja"
+    } else if l.starts_with("es") || l.contains("spanish") || l.contains("español") {
+        "es"
+    } else if l.starts_with("ko") || l.contains("korean") || l.contains("한국") {
+        "ko"
+    } else if l.starts_with("ru") || l.contains("russian") || l.contains("русск") {
+        "ru"
+    } else if l.starts_with("fr") || l.contains("french") || l.contains("français") {
+        "fr"
+    } else if l.starts_with("de") || l.contains("german") || l.contains("deutsch") {
+        "de"
+    } else if l == "json" || l.contains("raw") {
+        "json"
+    } else {
+        "en"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translate_english_default() {
+        assert_eq!(t("no_extractable_content", "en"), "No extractable content.");
+    }
+
+    #[test]
+    fn translate_chinese() {
+        let msg = t("no_extractable_content", "zh");
+        assert!(msg.contains("无法提取"));
+    }
+
+    #[test]
+    fn translate_with_args() {
+        let msg = t_fmt("file_saved", "en", &[("count", "3")]);
+        assert_eq!(msg, "Saved 3 file(s) to uploads/");
+    }
+
+    #[test]
+    fn translate_json_mode() {
+        let msg = t_fmt("file_saved", "json", &[("count", "3")]);
+        assert!(msg.contains("\"key\":\"file_saved\""));
+        assert!(msg.contains("\"count\":\"3\""));
+    }
+
+    #[test]
+    fn resolve_lang_chinese() {
+        assert_eq!(resolve_lang("Chinese"), "zh");
+        assert_eq!(resolve_lang("zh-CN"), "zh");
+    }
+
+    #[test]
+    fn resolve_lang_thai() {
+        assert_eq!(resolve_lang("Thai"), "th");
+        assert_eq!(resolve_lang("th"), "th");
+    }
+
+    #[test]
+    fn resolve_lang_unknown() {
+        assert_eq!(resolve_lang("English"), "en");
+        assert_eq!(resolve_lang("unknown"), "en");
+    }
+
+    #[test]
+    fn fallback_to_english() {
+        // Unknown language falls back to English
+        assert_eq!(t("no_extractable_content", "xx"), "No extractable content.");
+    }
+
+    #[test]
+    fn default_lang_fallback() {
+        // Before set_default_lang is called, default is "en"
+        assert_eq!(default_lang(), "en");
+    }
+
+    #[test]
+    fn vision_unavailable_translates_per_language() {
+        // Each translation must (a) interpolate {reason} and (b) keep
+        // the model-name list intact so the user sees something
+        // actionable in their channel.
+        for (lang, expected_keyword) in [
+            ("en", "How to fix"),
+            ("zh", "如何修复"),
+            ("ja", "対処方法"),
+            ("ko", "해결 방법"),
+            ("fr", "Comment corriger"),
+            ("de", "So behebt"),
+            ("es", "Como solucionarlo"),
+        ] {
+            let msg = t_fmt(
+                "vision_unavailable",
+                lang,
+                &[("reason", "primary text-only")],
+            );
+            assert!(msg.contains("primary text-only"), "{lang}: missing reason");
+            assert!(msg.contains(expected_keyword), "{lang}: missing keyword");
+            // Every translation must list the canonical model groups.
+            assert!(msg.contains("kimi-for-coding"), "{lang}: missing kimi");
+            assert!(msg.contains("doubao-seed-2"), "{lang}: missing doubao");
+            assert!(msg.contains("gpt-4o"), "{lang}: missing gpt-4o");
+        }
+    }
+
+    #[test]
+    fn vision_unavailable_unknown_lang_falls_back_to_english() {
+        let msg = t_fmt(
+            "vision_unavailable",
+            "zz",
+            &[("reason", "no model configured")],
+        );
+        assert!(msg.contains("How to fix"));
+        assert!(msg.contains("no model configured"));
+    }
+}

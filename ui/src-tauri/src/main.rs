@@ -350,6 +350,119 @@ fn run_setup() -> Result<String, String> {
     run_rsclaw_command(&["setup", "--non-interactive"])
 }
 
+/// First-launch convenience: make the bundled `rsclaw` sidecar reachable as a
+/// plain `rsclaw` command in the user's terminal, so e.g.
+/// `rsclaw skills install <slug>` works without hunting down the app-bundled
+/// binary path. The desktop sidecar otherwise lives inside the .app /
+/// install dir, which isn't on PATH — users hit "command not found".
+///
+/// Runs once (guarded by a marker under the base dir) and is fully
+/// best-effort: every failure is logged and ignored, never blocks startup.
+/// It never overwrites an existing `rsclaw` — if the user already installed
+/// the CLI, we leave their copy alone.
+///
+/// - macOS/Linux: symlink the sidecar into /usr/local/bin (standard PATH);
+///   fall back to ~/.local/bin if that dir isn't writable.
+/// - Windows: append the sidecar's directory to the user PATH (HKCU) via
+///   PowerShell, only if it isn't already present.
+fn ensure_rsclaw_on_path() {
+    let marker = rsclaw_base_dir().join(".path-setup-done");
+    if marker.exists() {
+        return;
+    }
+
+    let sidecar = match std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    {
+        Some(dir) => dir.join(if cfg!(target_os = "windows") {
+            "rsclaw.exe"
+        } else {
+            "rsclaw"
+        }),
+        None => return,
+    };
+    if !sidecar.exists() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(rsclaw_base_dir());
+
+    #[cfg(unix)]
+    {
+        let usr_local = std::path::Path::new("/usr/local/bin/rsclaw");
+        if usr_local.exists() {
+            // Respect a user's own rsclaw — don't clobber it.
+            let _ = std::fs::write(&marker, "rsclaw already present in /usr/local/bin");
+            return;
+        }
+        if std::path::Path::new("/usr/local/bin").is_dir() {
+            match std::os::unix::fs::symlink(&sidecar, usr_local) {
+                Ok(()) => {
+                    let _ = std::fs::write(
+                        &marker,
+                        format!("symlinked {} -> {}", sidecar.display(), usr_local.display()),
+                    );
+                    eprintln!("[setup] linked rsclaw into /usr/local/bin");
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("[setup] /usr/local/bin symlink failed ({e}); trying ~/.local/bin");
+                }
+            }
+        }
+        if let Some(home) = dirs::home_dir() {
+            let local_bin = home.join(".local/bin");
+            let _ = std::fs::create_dir_all(&local_bin);
+            let target = local_bin.join("rsclaw");
+            if !target.exists() {
+                match std::os::unix::fs::symlink(&sidecar, &target) {
+                    Ok(()) => {
+                        let _ = std::fs::write(
+                            &marker,
+                            "symlinked to ~/.local/bin (add it to PATH if missing)",
+                        );
+                        eprintln!("[setup] linked rsclaw into ~/.local/bin");
+                    }
+                    Err(e) => eprintln!("[setup] ~/.local/bin symlink failed: {e}"),
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let Some(dir) = sidecar.parent().map(|d| d.to_string_lossy().to_string()) else {
+            return;
+        };
+        // Single-quote escape for the PS string literal (paths rarely contain
+        // one, but be safe). Append to the user PATH only when absent.
+        let dir_ps = dir.replace('\'', "''");
+        let ps = format!(
+            "$d='{dir_ps}'; $p=[Environment]::GetEnvironmentVariable('PATH','User'); \
+             if (-not $p) {{ $p='' }}; \
+             if (($p -split ';') -notcontains $d) {{ \
+               [Environment]::SetEnvironmentVariable('PATH', ($d + ';' + $p), 'User') }}"
+        );
+        let status = hide_window(
+            std::process::Command::new("powershell").args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                &ps,
+            ]),
+        )
+        .status();
+        match status {
+            Ok(s) if s.success() => {
+                let _ = std::fs::write(&marker, format!("added {dir} to user PATH"));
+                eprintln!("[setup] added rsclaw dir to user PATH");
+            }
+            other => eprintln!("[setup] user PATH update failed: {other:?}"),
+        }
+    }
+}
+
 /// Copy the bundled BGE-small-zh model (shipped via tauri.conf.json
 /// `bundle.resources`) into `~/.rsclaw/models/bge-small-zh/` so the gateway
 /// finds it on its standard search path.
@@ -591,6 +704,146 @@ fn read_config_file() -> Result<String, String> {
         return Ok(String::new());
     }
     std::fs::read_to_string(&config_path).map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Defaults catalog (providers / channels / search engines)
+//
+// The onboarding wizard runs BEFORE the gateway starts, so it can't hit the
+// gateway's `GET /api/v1/catalog` endpoint. This command parses defaults.toml
+// directly and returns the SAME JSON shape that endpoint returns: snake_case
+// field names throughout, top-level keys `providers` / `channels` /
+// `search_engines`. The structs below mirror `rsclaw_config::catalog::*`;
+// every field is `#[serde(default)]` so old/partial defaults.toml still parse.
+// ---------------------------------------------------------------------------
+
+/// Compiled-in fallback — the exact same defaults.toml the gateway embeds.
+const EMBEDDED_DEFAULTS_TOML: &str = include_str!("../../../defaults.toml");
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct CatalogProviderDef {
+    name: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    env_var: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    base_url: String,
+    #[serde(default)]
+    user_agent: String,
+    #[serde(default)]
+    needs_key: bool,
+    #[serde(default = "default_api_type")]
+    api_type: String,
+    #[serde(default)]
+    name_zh: String,
+    #[serde(default)]
+    name_en: String,
+    #[serde(default)]
+    tag_zh: String,
+    #[serde(default)]
+    tag_en: String,
+    #[serde(default)]
+    key_label: String,
+    #[serde(default)]
+    key_placeholder: String,
+    #[serde(default)]
+    is_url: bool,
+    #[serde(default)]
+    has_base_url: bool,
+    #[serde(default)]
+    order_zh: i32,
+    #[serde(default)]
+    order_en: i32,
+}
+
+fn default_api_type() -> String {
+    "openai".to_owned()
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct CatalogChannelFieldDef {
+    key: String,
+    #[serde(default)]
+    prompt: String,
+    #[serde(default)]
+    secret: bool,
+    #[serde(default)]
+    placeholder: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct CatalogChannelDef {
+    name: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    fields: Vec<CatalogChannelFieldDef>,
+    #[serde(default)]
+    login: bool,
+    #[serde(default)]
+    multi_account: bool,
+    #[serde(default)]
+    name_zh: String,
+    #[serde(default)]
+    icon: String,
+    #[serde(default)]
+    has_qr: bool,
+    #[serde(default)]
+    qr_label_zh: String,
+    #[serde(default)]
+    qr_label_en: String,
+    #[serde(default)]
+    order_zh: i32,
+    #[serde(default)]
+    order_en: i32,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct CatalogSearchEngineDef {
+    name: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    env_var: String,
+    #[serde(default)]
+    label_zh: String,
+    #[serde(default)]
+    label_en: String,
+    #[serde(default)]
+    needs_key: bool,
+    #[serde(default)]
+    order: i32,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Default)]
+struct DefaultsCatalog {
+    #[serde(default)]
+    providers: Vec<CatalogProviderDef>,
+    #[serde(default)]
+    channels: Vec<CatalogChannelDef>,
+    #[serde(default)]
+    search_engines: Vec<CatalogSearchEngineDef>,
+}
+
+/// Read & parse the defaults catalog without the gateway running, then return
+/// it as a JSON string matching `GET /api/v1/catalog`. Prefers the user's
+/// `~/.rsclaw/defaults.toml`; falls back to the embedded copy on a fresh
+/// install (or if the user file is unreadable).
+#[tauri::command]
+fn read_defaults_catalog() -> Result<String, String> {
+    let user_path = rsclaw_base_dir().join("defaults.toml");
+    let toml_src = std::fs::read_to_string(&user_path)
+        .unwrap_or_else(|_| EMBEDDED_DEFAULTS_TOML.to_owned());
+
+    let catalog: DefaultsCatalog =
+        toml::from_str(&toml_src).map_err(|e| format!("failed to parse defaults.toml: {e}"))?;
+
+    serde_json::to_string(&catalog).map_err(|e| e.to_string())
 }
 
 /// Check if rsclaw is already set up (config file exists).
@@ -1366,6 +1619,16 @@ fn search_skills(query: String) -> Result<serde_json::Value, String> {
             continue;
         }
 
+        // Explicit footer guard. The blank-line break above only fires
+        // after at least one result, and only if a blank line actually
+        // precedes the footer. For zero-result searches (no blank line,
+        // or footer directly under the header) the hint line would slip
+        // through and be scraped as a fake "Install" entry. Stop at it
+        // unconditionally — nothing useful follows the hint.
+        if trimmed.starts_with("Install with") {
+            break;
+        }
+
         // First non-empty line is the header. Use it to fix column count.
         if has_stats.is_none() {
             let cols: Vec<&str> = trimmed.split_whitespace().collect();
@@ -1377,16 +1640,27 @@ fn search_skills(query: String) -> Result<serde_json::Value, String> {
 
         let stats_mode = has_stats.unwrap_or(false);
         let need = if stats_mode { 5 } else { 3 };
-        let parts: Vec<&str> = trimmed.splitn(need, |c: char| c.is_whitespace()).filter(|s| !s.is_empty()).collect();
-        if parts.len() < need { continue; }
+        // Split on runs of whitespace, NOT every single whitespace char.
+        // The table aligns columns with multiple spaces — using
+        // `splitn(need, char::is_whitespace)` produced empty segments for
+        // each extra space and burned the segment budget before reaching
+        // the real columns, so genuine result rows came back with too few
+        // parts and got skipped entirely (= "search finds nothing"), while
+        // the single-spaced footer "Install with: rsclaw skills install
+        // <name>" split cleanly into 5 and was scraped as a fake result
+        // named "Install". split_whitespace() collapses runs so columns
+        // land where they should; the description (last column, may itself
+        // contain spaces) is rejoined from the remainder.
+        let cols: Vec<&str> = trimmed.split_whitespace().collect();
+        if cols.len() < need { continue; }
 
-        let name = parts[0].trim();
+        let name = cols[0].trim();
         if name.is_empty() || name == "NAME" { continue; }
 
         let (installs, stars, registry, desc) = if stats_mode {
-            (parts[1].trim(), parts[2].trim(), parts[3].trim(), parts[4].trim())
+            (cols[1], cols[2], cols[3], cols[4..].join(" "))
         } else {
-            ("", "", parts[1].trim(), parts[2].trim())
+            ("", "", cols[1], cols[2..].join(" "))
         };
 
         seen_any_result = true;
@@ -1509,6 +1783,60 @@ fn uninstall_plugin(name: String) -> Result<String, String> {
 /// don't `.output()` here — the CLI downloads can take 10s–10min and a
 /// blocking Tauri command leaves the UI with no progress feedback and looks
 /// hung (which is the regression this commit fixes).
+/// Outcome of a background tool install, queryable from the frontend.
+#[derive(Clone, Default)]
+struct ToolInstallOutcome {
+    done: bool,
+    success: bool,
+    /// Combined stdout+stderr from the sidecar — carries the real reason on
+    /// failure ("no download for platform win-x64", "download failed", extract
+    /// errors, "no runnable binary", …).
+    output: String,
+}
+
+/// Per-tool install outcomes. Written by the background thread in
+/// `install_tool`, read by `get_tool_install_result`. Keyed by tool name.
+fn tool_install_outcomes()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, ToolInstallOutcome>> {
+    static R: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, ToolInstallOutcome>>,
+    > = std::sync::OnceLock::new();
+    R.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Append a tool-install run's captured output to ~/.rsclaw/var/tools-install.log
+/// with a timestamped header, so failures stay diagnosable after the fact.
+fn append_install_log(name: &str, force: bool, body: &str) {
+    use std::io::Write;
+    let path = rsclaw_base_dir().join("var").join("tools-install.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(f, "\n===== install '{name}' (force={force}) epoch={ts} =====");
+        let _ = f.write_all(body.as_bytes());
+        let _ = f.flush();
+    }
+}
+
+/// Install an external tool binary (chrome/ffmpeg/node/python/opencode/
+/// claude-code/...) via sidecar. There is no uninstall — tools are host
+/// binaries; removal is manual. `force` reinstalls even if present.
+///
+/// Returns immediately (UI never blocks), but unlike a pure fire-and-forget
+/// it spawns a background THREAD that runs the sidecar to completion, captures
+/// its full stdout+stderr, mirrors it to the install log, and records the
+/// outcome (success + output) in `tool_install_outcomes()`. The frontend polls
+/// `get_tool_install_result` to surface the real failure reason instead of a
+/// generic "timed out". This is the fix for "no specific error shown".
 #[tauri::command]
 fn install_tool(name: String, force: Option<bool>) -> Result<String, String> {
     let exe_dir = std::env::current_exe()
@@ -1523,31 +1851,72 @@ fn install_tool(name: String, force: Option<bool>) -> Result<String, String> {
         })
     });
 
-    let mut args: Vec<&str> = vec!["tools", "install", &name];
-    if force.unwrap_or(false) {
-        args.push("--force");
-    }
-
-    let spawn_result = match sidecar.as_ref().filter(|p| p.exists()) {
-        Some(path) => hide_window(
-            std::process::Command::new(path)
-                .args(&args)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null()),
-        )
-        .spawn(),
-        None => hide_window(
-            std::process::Command::new("rsclaw")
-                .args(&args)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null()),
-        )
-        .spawn(),
+    // Use the bundled sidecar if present, else fall back to `rsclaw` on PATH.
+    let program: std::ffi::OsString = match sidecar.as_ref().filter(|p| p.exists()) {
+        Some(path) => path.as_os_str().to_owned(),
+        None => std::ffi::OsString::from("rsclaw"),
     };
 
-    spawn_result
-        .map(|_| format!("install of {name} started in background"))
-        .map_err(|e| format!("failed to spawn rsclaw tools install: {e}"))
+    let forced = force.unwrap_or(false);
+
+    // Mark in-progress so a poll racing the thread start sees done=false.
+    tool_install_outcomes()
+        .lock()
+        .map(|mut m| m.insert(name.clone(), ToolInstallOutcome::default()))
+        .ok();
+
+    let name_for_msg = name.clone();
+    std::thread::spawn(move || {
+        let mut args: Vec<String> = vec!["tools".into(), "install".into(), name.clone()];
+        if forced {
+            args.push("--force".into());
+        }
+
+        let result = hide_window(std::process::Command::new(&program).args(&args)).output();
+
+        let (success, body) = match result {
+            Ok(o) => {
+                let body = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                (o.status.success(), body)
+            }
+            Err(e) => (false, format!("failed to spawn rsclaw tools install: {e}\n")),
+        };
+
+        append_install_log(&name, forced, &body);
+
+        if let Ok(mut m) = tool_install_outcomes().lock() {
+            m.insert(
+                name,
+                ToolInstallOutcome {
+                    done: true,
+                    success,
+                    output: body,
+                },
+            );
+        }
+    });
+
+    Ok(format!("install of {name_for_msg} started in background"))
+}
+
+/// Poll the outcome of a background install started by `install_tool`. Returns
+/// `{done, success, output}`. `done=false` while the sidecar is still running;
+/// on `done=true`, `output` carries the sidecar's combined stdout+stderr — the
+/// real error text on failure.
+#[tauri::command]
+fn get_tool_install_result(name: String) -> serde_json::Value {
+    match tool_install_outcomes().lock().ok().and_then(|m| m.get(&name).cloned()) {
+        Some(o) => serde_json::json!({
+            "done": o.done,
+            "success": o.success,
+            "output": o.output,
+        }),
+        None => serde_json::json!({ "done": false, "success": false, "output": "" }),
+    }
 }
 
 #[tauri::command]
@@ -1618,7 +1987,35 @@ fn local_tool_binary_path(name: &str) -> Option<std::path::PathBuf> {
         ]);
     }
 
-    probes.into_iter().find(|p| p.is_file())
+    if let Some(hit) = probes.into_iter().find(|p| p.is_file()) {
+        return Some(hit);
+    }
+
+    // npm-package fallback: tools installed via `npm install --prefix`
+    // (claude-code, opencode, codex, qoder, …) expose their binary under
+    // `node_modules/.bin/<bin>` — but the bin name is the *package's*
+    // declared bin, which often differs from the tool name we probe by
+    // (e.g. qoder → qodercli, @qoder-ai/qodercli). The fixed-name probes
+    // above all miss in that case, leaving the install stuck on
+    // "Installing…" forever even though the binary is on disk. Treat a
+    // non-empty `node_modules/.bin/` as proof of a successful npm install
+    // and return its first real entry.
+    let npm_bin_dir = dir.join("node_modules").join(".bin");
+    if npm_bin_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&npm_bin_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                // .bin holds symlinks to the actual JS shims; is_file()
+                // follows the link, so a live shim counts and a dangling
+                // one doesn't.
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Expand `${VAR}` placeholders in a string by reading from the process
@@ -2198,6 +2595,8 @@ fn main() {
             uninstall_plugin,
             install_tool,
             get_tool_install_status,
+            get_tool_install_result,
+            read_defaults_catalog,
             test_provider,
             write_workspace_file,
             read_workspace_file,
@@ -2229,6 +2628,12 @@ fn main() {
                     eprintln!("[setup] BGE model seeding failed (gateway will fall back to download): {e:#}");
                 }
             });
+
+            // First-launch: link the bundled rsclaw sidecar onto PATH so the
+            // user can run `rsclaw ...` in a terminal. Best-effort, once-only,
+            // off the UI thread (symlink is instant; the Windows PowerShell
+            // path-edit can take a moment).
+            tauri::async_runtime::spawn_blocking(ensure_rsclaw_on_path);
 
             // Build system tray. Labels are localized off `gateway.language`
             // (rsclaw.json5) with system-locale + English fallbacks; IDs stay

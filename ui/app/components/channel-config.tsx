@@ -9,13 +9,20 @@ import CloseIcon from "../icons/close.svg";
 import ConfirmIcon from "../icons/confirm.svg";
 import ReloadIcon from "../icons/reload.svg";
 import { useNavigate } from "react-router-dom";
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import { Path } from "../constant";
 import { showConfirm, showToast } from "./ui-lib";
 import { gatewayFetch, wechatQrStart, wechatQrStatus } from "../lib/rsclaw-api";
 import { isTauri, invoke as tauriInvokeV2 } from "../utils/tauri";
+import { getLang } from "../locales";
+import {
+  useCatalog,
+  getChannelMap,
+  getChannelOrder,
+  type CatalogChannelDef,
+} from "../lib/catalog";
 
-// ── Channel type definitions (aligned with onboarding.tsx ALL_CHANNELS) ──
+// ── Channel type definitions (sourced from the defaults.toml catalog) ──
 
 interface CredField {
   key: string;
@@ -32,63 +39,42 @@ interface ChannelTypeDef {
   credFields: CredField[];
 }
 
-const CHANNEL_TYPES: ChannelTypeDef[] = [
-  { id: "feishu", icon: "\u98DE", name: "Feishu / Lark", hasQr: true, credFields: [
-    { key: "appId", label: "App ID", type: "text", placeholder: "cli_xxx" },
-    { key: "appSecret", label: "App Secret", type: "password", placeholder: "" },
-  ] },
-  { id: "wechat", icon: "\u5FAE", name: "WeChat", hasQr: true, credFields: [] },
-  { id: "wecom", icon: "WC", name: "WeCom", hasQr: false, credFields: [
-    { key: "botId", label: "Bot ID", type: "text", placeholder: "" },
-    { key: "secret", label: "Secret", type: "password", placeholder: "" },
-  ] },
-  { id: "qq", icon: "QQ", name: "QQ Bot", hasQr: false, credFields: [
-    { key: "appId", label: "App ID", type: "text", placeholder: "" },
-    { key: "appSecret", label: "App Secret", type: "password", placeholder: "" },
-  ] },
-  { id: "dingtalk", icon: "DT", name: "DingTalk", hasQr: false, credFields: [
-    { key: "appKey", label: "App Key", type: "text", placeholder: "" },
-    { key: "appSecret", label: "App Secret", type: "password", placeholder: "" },
-  ] },
-  { id: "telegram", icon: "Tg", name: "Telegram", hasQr: false, credFields: [
-    { key: "botToken", label: "Bot Token", type: "password", placeholder: "123456:ABC-DEF..." },
-  ] },
-  { id: "discord", icon: "Dc", name: "Discord", hasQr: false, credFields: [
-    { key: "token", label: "Bot Token", type: "password", placeholder: "" },
-  ] },
-  { id: "slack", icon: "Sl", name: "Slack", hasQr: false, credFields: [
-    { key: "botToken", label: "Bot Token", type: "password", placeholder: "xoxb-..." },
-    { key: "appToken", label: "App Token", type: "password", placeholder: "xapp-..." },
-  ] },
-  { id: "whatsapp", icon: "WA", name: "WhatsApp", hasQr: false, credFields: [
-    { key: "phoneNumberId", label: "Phone Number ID", type: "text", placeholder: "" },
-    { key: "accessToken", label: "Access Token", type: "password", placeholder: "" },
-  ] },
-  { id: "signal", icon: "Sg", name: "Signal", hasQr: false, credFields: [
-    { key: "phone", label: "Phone Number", type: "text", placeholder: "+1234567890" },
-  ] },
-  { id: "line", icon: "Li", name: "LINE", hasQr: false, credFields: [
-    { key: "channelSecret", label: "Channel Secret", type: "password", placeholder: "" },
-    { key: "channelAccessToken", label: "Access Token", type: "password", placeholder: "" },
-  ] },
-  { id: "zalo", icon: "Za", name: "Zalo", hasQr: false, credFields: [
-    { key: "accessToken", label: "Access Token", type: "password", placeholder: "" },
-    { key: "oaSecret", label: "OA Secret", type: "password", placeholder: "" },
-  ] },
-  { id: "matrix", icon: "Mx", name: "Matrix", hasQr: false, credFields: [
-    { key: "homeserver", label: "Homeserver", type: "text", placeholder: "https://matrix.org" },
-    { key: "userId", label: "User ID", type: "text", placeholder: "@bot:matrix.org" },
-    { key: "accessToken", label: "Access Token", type: "password", placeholder: "" },
-  ] },
-  { id: "custom", icon: "\u2699", name: "Custom", hasQr: false, credFields: [
+const CUSTOM_CHANNEL_TYPE: ChannelTypeDef = {
+  id: "custom", icon: "⚙", name: "Custom", hasQr: false, credFields: [
     { key: "webhookUrl", label: "Webhook URL", type: "text", placeholder: "https://..." },
     { key: "wsUrl", label: "WebSocket URL", type: "text", placeholder: "wss://..." },
-  ] },
-];
+  ],
+};
 
-const CHANNEL_TYPE_MAP: Record<string, ChannelTypeDef> = Object.fromEntries(
-  CHANNEL_TYPES.map((ct) => [ct.id, ct]),
-);
+function mapCatalogChannel(c: CatalogChannelDef, zh: boolean): ChannelTypeDef {
+  return {
+    id: c.id,
+    icon: c.icon,
+    name: zh ? c.name : c.nameEn,
+    hasQr: c.hasQr,
+    credFields: c.credFields.map((f) => ({
+      key: f.key,
+      label: f.label,
+      type: (f.type === "password" ? "password" : "text") as "text" | "password",
+      placeholder: f.ph,
+    })),
+  };
+}
+
+// Ordered channel-type list for the current language (+ the custom extra).
+function getChannelTypes(): ChannelTypeDef[] {
+  const zh = getLang() === "cn";
+  const map = getChannelMap();
+  const list = getChannelOrder(zh ? "cn" : "en")
+    .map((id) => map[id])
+    .filter(Boolean)
+    .map((c) => mapCatalogChannel(c, zh));
+  return [...list, CUSTOM_CHANNEL_TYPE];
+}
+
+function getChannelTypeMap(): Record<string, ChannelTypeDef> {
+  return Object.fromEntries(getChannelTypes().map((ct) => [ct.id, ct]));
+}
 
 // ── Types ──
 
@@ -105,6 +91,11 @@ interface Channel {
 
 export function ChannelConfigPage() {
   const navigate = useNavigate();
+  // Channel types from the defaults.toml catalog (seeded synchronously from
+  // FALLBACK, reconciled on load).
+  const { loaded: catalogLoaded } = useCatalog();
+  const channelTypes = useMemo(() => getChannelTypes(), [catalogLoaded]);
+  const channelTypeMap = useMemo(() => getChannelTypeMap(), [catalogLoaded]);
   const [channels, setChannels] = useState<Channel[]>([]);
   const [loading, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);
@@ -139,7 +130,7 @@ export function ChannelConfigPage() {
     };
   }, []);
 
-  const typeDef = CHANNEL_TYPE_MAP[formType] || CHANNEL_TYPES[0];
+  const typeDef = channelTypeMap[formType] || channelTypes[0];
 
   const resetForm = () => {
     setFormName("");
@@ -379,7 +370,7 @@ export function ChannelConfigPage() {
                     setQrUrl(null);
                   }}
                 >
-                  {CHANNEL_TYPES.map((ct) => (
+                  {channelTypes.map((ct) => (
                     <option key={ct.id} value={ct.id}>
                       {ct.icon} {ct.name}
                     </option>
@@ -456,7 +447,7 @@ export function ChannelConfigPage() {
           {channels.length > 0 ? (
             <div className={styles["channel-list"]}>
               {channels.map((channel) => {
-                const ct = CHANNEL_TYPE_MAP[channel.type];
+                const ct = channelTypeMap[channel.type];
                 return (
                   <div
                     key={channel.id}

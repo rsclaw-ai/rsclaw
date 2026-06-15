@@ -3512,7 +3512,7 @@ dependencies = [
 
 [[package]]
 name = "rsclaw-ui"
-version = "2026.5.20"
+version = "2026.6.12"
 dependencies = [
  "auto-launch",
  "bytes",
@@ -3532,6 +3532,7 @@ dependencies = [
  "tauri-plugin-shell",
  "tauri-plugin-single-instance",
  "time",
+ "toml 1.1.2+spec-1.1.0",
  "url",
 ]
 
@@ -4794,6 +4795,21 @@ dependencies = [
  "toml_parser",
  "toml_writer",
  "winnow 0.7.15",
+]
+
+[[package]]
+name = "toml"
+version = "1.1.2+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81f3d15e84cbcd896376e6730314d59fb5a87f31e4b038454184435cd57defee"
+dependencies = [
+ "indexmap 2.14.0",
+ "serde_core",
+ "serde_spanned 1.1.1",
+ "toml_datetime 1.1.1+spec-1.1.0",
+ "toml_parser",
+ "toml_writer",
+ "winnow 1.0.1",
 ]
 
 [[package]]

@@ -1,0 +1,25 @@
+[package]
+name = "rsclaw-heartbeat"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+rsclaw-config = { path = "../rsclaw-config" }
+rsclaw-provider = { path = "../rsclaw-provider" }
+rsclaw-memory = { path = "../rsclaw-memory" }
+rsclaw-evolution = { path = "../rsclaw-evolution" }
+rsclaw-skill = { path = "../rsclaw-skill" }
+rsclaw-store = { path = "../rsclaw-store" }
+
+[dev-dependencies]
+tempfile = "3"

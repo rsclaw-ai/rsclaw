@@ -1,0 +1,23 @@
+[package]
+name = "rsclaw-desktop"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+tracing = "0.1"
+tokio = { version = "1", features = ["full"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+async-trait = "0.1"
+enigo = "0.6"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+
+# xcap → pipewire → libspa breaks the Linux build (libspa 0.9 needs newer spa
+# headers than distros ship). Gate to non-Linux to match the root crate and
+# rsclaw-computer; native.rs already stubs screen capture on Linux. This was
+# the one xcap dep the crate-split left ungated.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+xcap = "0.9"
