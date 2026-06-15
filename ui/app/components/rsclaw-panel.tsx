@@ -3795,7 +3795,7 @@ function TauriConfigPageInner() {
               labelZh={"\u56FE\u7247\u751F\u6210\u6A21\u578B"}
               labelEn="Image Generation Model"
               hint={`agents.defaults.model.image (${zh ? "\u7A7A=\u7981\u7528" : "empty = disabled"})`}
-              placeholder="doubao/doubao-seedream-5-0-260128, minimax/image-01"
+              placeholder="doubao/doubao-seedream-5-0-260128, agnes/agnes-image-2.1-flash"
               readChain={readChain}
               writeChain={writeChain}
               healthMap={healthMap}
@@ -3809,7 +3809,7 @@ function TauriConfigPageInner() {
               labelZh={"\u89C6\u9891\u751F\u6210\u6A21\u578B"}
               labelEn="Video Generation Model"
               hint={`agents.defaults.model.video (${zh ? "\u7A7A=\u7981\u7528;\u6BCF\u6BB5\u4ED8\u8D39\u4E14\u8017\u65F6" : "empty = disabled; each clip is paid and slow"})`}
-              placeholder="doubao/doubao-seedance-2-0-260128, minimax/video-01-director"
+              placeholder="doubao/doubao-seedance-2-0-260128, agnes/agnes-video-v2.0"
               readChain={readChain}
               writeChain={writeChain}
               healthMap={healthMap}
