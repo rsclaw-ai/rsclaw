@@ -415,6 +415,41 @@ pub async fn download_artifact(
         .bytes()
         .await
         .map_err(|e| anyhow!("download read: {e}"))?;
+    save_artifact_bytes(&bytes, kind).await
+}
+
+/// Download an artifact that requires Bearer auth, following the fleet LB's
+/// 307/308 hops with the bearer re-attached on each hop. Used for the rsclaw
+/// `/v1/videos/{id}/content` endpoint, which serves the mp4 INLINE behind auth
+/// (it does NOT presign to an authless R2 URL like the image path), so the
+/// authless `download_artifact` would save a "missing Bearer" 401 body.
+pub async fn download_artifact_authed(
+    url: &str,
+    api_key: &str,
+    kind: ExternalJobKind,
+) -> Result<String> {
+    let client =
+        rsclaw_provider::rsclaw_http::build_client(rsclaw_provider::DEFAULT_USER_AGENT, 180)?;
+    let resp = rsclaw_provider::rsclaw_http::get(&client, url, api_key).await?;
+    let st = resp.status();
+    if !st.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "download(authed): {st}: {}",
+            body.chars().take(200).collect::<String>()
+        ));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| anyhow!("download(authed) read: {e}"))?;
+    save_artifact_bytes(&bytes, kind).await
+}
+
+/// Persist downloaded artifact bytes to
+/// `~/Downloads/rsclaw/<category>/dl_<X>_<ts><abc>.<ext>` with the canonical
+/// naming, returning the absolute local path.
+async fn save_artifact_bytes(bytes: &[u8], kind: ExternalJobKind) -> Result<String> {
     let ext = match kind {
         ExternalJobKind::VideoGen => "mp4",
         ExternalJobKind::ImageGen => "png",
@@ -437,7 +472,7 @@ pub async fn download_artifact(
         .map(|_| (rand::random::<u8>() % 26 + b'a') as char)
         .collect();
     let path = dir.join(format!("dl_{kind_letter}_{ts}{abc}.{ext}"));
-    tokio::fs::write(&path, &bytes)
+    tokio::fs::write(&path, bytes)
         .await
         .map_err(|e| anyhow!("download: write: {e}"))?;
     Ok(path.to_string_lossy().to_string())
@@ -780,26 +815,18 @@ pub async fn poll_rsclaw(api_key: &str, video_id: &str) -> Result<PollOutcome> {
 
     match status {
         "completed" => {
-            // 2. Resolve `/content` → R2 presigned URL via the 307. The
-            //    helper returns the Location target without following
-            //    so Bearer never reaches Cloudflare.
-            let content_url = format!("{host}/v1/videos/{video_id}/content");
-            match rsclaw_provider::rsclaw_http::get_content_url(&client, &content_url, api_key)
-                .await?
-            {
-                Some(presigned) => Ok(PollOutcome::Done(presigned)),
-                None => {
-                    // In-memory BlobStore (dev) — content endpoint
-                    // serves bytes inline. Surface the API URL itself;
-                    // `download_artifact` will hit it without auth and
-                    // get 401 — flag as failed so ops sees the
-                    // misconfiguration rather than a silent hang.
-                    Err(anyhow!(
-                        "rsclaw: /content returned bytes inline (in-memory BlobStore); \
-                         configure S3-shaped blob store to enable artifact delivery"
-                    ))
-                }
-            }
+            // The status response carries a SIGNED, authless content URL
+            // (`url`, with exp+sig) — prefer it; it downloads without auth like
+            // the image path. Fall back to the bare `/content` path for older
+            // backends that served the mp4 inline behind Bearer (the worker's
+            // authed download for provider "rsclaw" still re-attaches the bearer
+            // and follows the LB hop in that case).
+            let url = v["url"]
+                .as_str()
+                .filter(|s| s.starts_with("http"))
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{host}/v1/videos/{video_id}/content"));
+            Ok(PollOutcome::Done(url))
         }
         "failed" | "cancelled" => {
             let msg = v

@@ -183,7 +183,20 @@ impl ExternalJobsWorker {
             }
             Ok(PollOutcome::Done(url)) => {
                 job.result_url = Some(url.clone());
-                match rsclaw_jobs::download_artifact(&self.client, &url, job.kind).await {
+                // rsclaw VIDEO artifacts are served inline behind Bearer at
+                // `/v1/videos/{id}/content` (no authless R2 presign), so they
+                // must be downloaded WITH the rsclaw key (following the LB hop).
+                // Everything else (agnes / openai / seedance public URLs, and
+                // the rsclaw_image signed url) is fetched authless.
+                let dl = if job.provider == "rsclaw" {
+                    let key = self
+                        .resolve_provider_key("rsclaw", "RSCLAW_API_KEY")
+                        .unwrap_or_default();
+                    rsclaw_jobs::download_artifact_authed(&url, &key, job.kind).await
+                } else {
+                    rsclaw_jobs::download_artifact(&self.client, &url, job.kind).await
+                };
+                match dl {
                     Ok(local_path) => {
                         job.result_path = Some(local_path);
                         job.status = ExternalJobStatus::Done;
