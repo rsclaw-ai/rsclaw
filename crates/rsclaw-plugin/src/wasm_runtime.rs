@@ -1332,6 +1332,13 @@ impl rsclaw::plugin::host_desktop::Host for HostState {
         Ok(self.desktop.screenshot_window(&bundle_id).await)
     }
 
+    async fn desktop_ocr_window(
+        &mut self,
+        bundle_id: String,
+    ) -> wasmtime::Result<Result<String, String>> {
+        Ok(self.desktop.ocr_window(&bundle_id).await)
+    }
+
     async fn desktop_screenshot_region(
         &mut self,
         x: u32,
@@ -1456,6 +1463,28 @@ impl rsclaw::plugin::host_vlm::Host for HostState {
                     "vlm_parse: provider {provider_name} not found: {e}"
                 )));
             }
+        };
+
+        // Downscale the screenshot before sending. Full-res window captures
+        // (~1834px) encode to ~2744 vision tokens and ship a multi-MB PNG over
+        // the Mac→cloud→GPU hop, which dominates per-call latency (~71s observed).
+        // Cap the long edge at 1280 and re-encode JPEG q85 — cuts both wire bytes
+        // and image tokens. Safe for navigation: the plugin maps VLM boxes in
+        // 0-1000 normalized space, independent of pixel dimensions. Any
+        // parse/decode/resize failure falls back to the original URI.
+        let image_data_uri = {
+            let downscaled = image_data_uri.split_once(";base64,").and_then(|(header, b64)| {
+                let mime = header.strip_prefix("data:").unwrap_or("image/png").to_string();
+                let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+                let (new_bytes, new_mime) =
+                    rsclaw_util::downscale_image_for_vision(&bytes, &mime, 256 * 1024, 1280, 85)
+                        .ok()?;
+                Some(format!(
+                    "data:{new_mime};base64,{}",
+                    base64::engine::general_purpose::STANDARD.encode(&new_bytes)
+                ))
+            });
+            downscaled.unwrap_or(image_data_uri)
         };
 
         let messages = vec![rsclaw_provider::Message {

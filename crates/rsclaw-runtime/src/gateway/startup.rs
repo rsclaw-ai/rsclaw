@@ -1073,6 +1073,15 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     let bind_addr = resolve_bind_addr(&config);
     info!("starting HTTP server on {bind_addr}");
 
+    // macOS permission preflight — turn a SILENT TCC denial into a LOUD one.
+    // A rebuild re-signs the binary with a new cdhash; an ad-hoc-signed grant
+    // is cdhash-pinned, so Screen Recording / Accessibility silently stop
+    // applying (capture hangs ~30s → `Failed to copy data` → wrong-region
+    // fallback; input no-ops) even while System Settings shows them enabled.
+    for w in rsclaw_desktop::macos_perm::preflight_warnings() {
+        warn!("macOS permission preflight: {w}");
+    }
+
     // Background update check (non-blocking)
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;

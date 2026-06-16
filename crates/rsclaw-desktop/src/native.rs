@@ -154,6 +154,24 @@ fn capture_app_window(app_name: &str) -> Result<String, String> {
                 && w.height().unwrap_or(0) >= 200
         })
         .ok_or_else(|| format!("no on-screen window for app '{app_name}'"))?;
+    // macOS: prefer Apple's `screencapture -l<windowID>` for the pixel grab.
+    // xcap's in-process window capture (deprecated CGWindowListCreateImage /
+    // SCScreenshotManager) hangs ~30s then fails with "Failed to copy data" on
+    // hardware-accelerated / opaque windows — notably WeChat 4.x — silently
+    // degrading callers to a wrong-region fallback. screencapture uses Apple's
+    // current path, is occlusion-proof, and captures those windows correctly
+    // (verified on WeChat). xcap stays as the fallback for the rare case
+    // screencapture is unavailable / fails.
+    #[cfg(target_os = "macos")]
+    if let Ok(window_id) = win.id() {
+        match screencapture_window_by_id(window_id) {
+            Ok(uri) => return Ok(uri),
+            Err(se) => warn!(
+                "screencapture -l{window_id} failed ({se}); falling back to xcap capture_image"
+            ),
+        }
+    }
+
     let img: RgbaImage = win
         .capture_image()
         .map_err(|e| format!("xcap window capture_image failed: {e}"))?;
@@ -166,6 +184,126 @@ fn capture_app_window(app_name: &str) -> Result<String, String> {
     let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
     Ok(format!("data:image/png;base64,{b64}"))
 }
+
+/// Capture a single window by its CGWindowID via Apple's `screencapture -l`
+/// CLI. Occlusion-proof and handles hardware-accelerated / opaque windows
+/// (e.g. WeChat 4.x) that xcap's in-process capture cannot. Returns a PNG
+/// data URI. The temp file is keyed by pid+window-id so concurrent captures
+/// of different windows don't collide.
+#[cfg(target_os = "macos")]
+fn screencapture_window_by_id(window_id: u32) -> Result<String, String> {
+    let tmp = std::env::temp_dir().join(format!(
+        "rsclaw_wincap_{}_{window_id}.png",
+        std::process::id()
+    ));
+    let out = Command::new("/usr/sbin/screencapture")
+        .arg("-x") // silent — no shutter sound
+        .arg("-o") // omit the window's drop shadow
+        .arg(format!("-l{window_id}")) // capture the window with this id
+        .arg(&tmp)
+        .output()
+        .map_err(|e| format!("screencapture spawn failed: {e}"))?;
+    if !out.status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "screencapture exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let bytes = std::fs::read(&tmp).map_err(|e| format!("read screencapture output: {e}"))?;
+    let _ = std::fs::remove_file(&tmp);
+    if bytes.is_empty() {
+        return Err("screencapture produced an empty file (window off-screen?)".to_string());
+    }
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:image/png;base64,{b64}"))
+}
+
+/// On-device OCR of an app window via macOS Vision (through `python3` +
+/// pyobjc, same shell-out pattern as `cgwindow_fallback`). Captures the
+/// window by id (occlusion-proof) to a temp PNG, runs accurate text
+/// recognition, and returns a JSON array of recognised lines with 0-1000
+/// relative centre coords: `[{"text":"东升","x":143,"y":699}, ...]`.
+/// Far more precise than VLM grounding for clicking a named row.
+#[cfg(not(target_os = "macos"))]
+fn ocr_window(_app_name: &str) -> Result<String, String> {
+    Err("ocr_window only implemented on macOS".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn ocr_window(app_name: &str) -> Result<String, String> {
+    let windows = Window::all().map_err(|e| format!("xcap Window::all failed: {e}"))?;
+    let win = windows
+        .iter()
+        .find(|w| {
+            w.app_name().map(|n| n == app_name).unwrap_or(false)
+                && !w.is_minimized().unwrap_or(true)
+                && w.width().unwrap_or(0) >= 200
+                && w.height().unwrap_or(0) >= 200
+        })
+        .ok_or_else(|| format!("no on-screen window for app '{app_name}'"))?;
+    let window_id = win.id().map_err(|e| format!("xcap window id: {e}"))?;
+    let tmp = std::env::temp_dir().join(format!(
+        "rsclaw_ocr_{}_{window_id}.png",
+        std::process::id()
+    ));
+    let cap = Command::new("/usr/sbin/screencapture")
+        .arg("-x")
+        .arg("-o")
+        .arg(format!("-l{window_id}"))
+        .arg(&tmp)
+        .output()
+        .map_err(|e| format!("screencapture spawn failed: {e}"))?;
+    if !cap.status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "screencapture -l{window_id} exited {}",
+            cap.status
+        ));
+    }
+    let out = Command::new("python3")
+        .arg("-c")
+        .arg(OCR_VISION_PY)
+        .arg(&tmp)
+        .output()
+        .map_err(|e| format!("python3 OCR spawn failed (need pyobjc Vision): {e}"))?;
+    let _ = std::fs::remove_file(&tmp);
+    if !out.status.success() {
+        return Err(format!(
+            "Vision OCR failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// macOS Vision text-recognition driver (run via `python3 -c`). Reads an
+/// image path from argv[1], prints `[{"text","x","y"}]` (0-1000 top-left
+/// centre coords) as JSON. RecognitionLevel 0 = accurate (1 = fast misses
+/// small CJK).
+#[cfg(target_os = "macos")]
+const OCR_VISION_PY: &str = r#"import sys, json, Vision, Quartz
+from Foundation import NSURL
+url = NSURL.fileURLWithPath_(sys.argv[1])
+src = Quartz.CGImageSourceCreateWithURL(url, None)
+cg = Quartz.CGImageSourceCreateImageAtIndex(src, 0, None)
+req = Vision.VNRecognizeTextRequest.alloc().init()
+req.setRecognitionLevel_(0)
+req.setRecognitionLanguages_(['zh-Hans', 'zh-Hant', 'en'])
+h = Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(cg, {})
+h.performRequests_error_([req], None)
+out = []
+for o in (req.results() or []):
+    c = o.topCandidates_(1)
+    if not c:
+        continue
+    b = o.boundingBox()
+    out.append({'text': c[0].string(),
+                'x': int((b.origin.x + b.size.width / 2.0) * 1000),
+                'y': int((1.0 - (b.origin.y + b.size.height / 2.0)) * 1000)})
+print(json.dumps(out, ensure_ascii=False))
+"#;
 
 /// Convert a macOS bundle-id to the process name used by System Events.
 /// E.g. "com.tencent.xinWeChat" -> "WeChat", "com.apple.Safari" -> "Safari".
@@ -624,6 +762,13 @@ end tell"#,
         tokio::task::spawn_blocking(move || capture_region(x, y, w, h))
             .await
             .map_err(|e| format!("screenshot_region join failed: {e}"))?
+    }
+
+    async fn ocr_window(&self, bundle_id: &str) -> Result<String, String> {
+        let app_name = bundle_to_app_name(bundle_id);
+        tokio::task::spawn_blocking(move || ocr_window(&app_name))
+            .await
+            .map_err(|e| format!("ocr_window join failed: {e}"))?
     }
 
     async fn mouse_move(&self, x: u32, y: u32) -> Result<String, String> {

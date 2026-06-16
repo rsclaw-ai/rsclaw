@@ -7406,7 +7406,7 @@ dependencies = [
 
 [[package]]
 name = "rsclaw"
-version = "2026.6.12"
+version = "2026.6.14"
 dependencies = [
  "aes",
  "anycli",
@@ -8128,13 +8128,16 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bytes",
+ "ctor",
  "eventsource-stream",
  "futures",
  "reqwest",
  "rsclaw-config",
+ "rsclaw-embed",
  "rsclaw-i18n",
  "rsclaw-types",
  "rsclaw-util",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
