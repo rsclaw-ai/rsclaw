@@ -7858,6 +7858,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
+ "core-graphics",
  "enigo",
  "image 0.25.10",
  "serde_json",

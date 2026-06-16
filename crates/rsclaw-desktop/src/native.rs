@@ -279,9 +279,9 @@ fn ocr_window(app_name: &str) -> Result<String, String> {
 }
 
 /// macOS Vision text-recognition driver (run via `python3 -c`). Reads an
-/// image path from argv[1], prints `[{"text","x","y"}]` (0-1000 top-left
-/// centre coords) as JSON. RecognitionLevel 0 = accurate (1 = fast misses
-/// small CJK).
+/// image path from argv[1], prints `[{"text","conf","x","y"}]` (conf 0-100,
+/// 0-1000 top-left centre coords) as JSON. RecognitionLevel 0 = accurate
+/// (1 = fast misses small CJK).
 #[cfg(target_os = "macos")]
 const OCR_VISION_PY: &str = r#"import sys, json, Vision, Quartz
 from Foundation import NSURL
@@ -299,7 +299,11 @@ for o in (req.results() or []):
     if not c:
         continue
     b = o.boundingBox()
+    # `conf` is Vision's per-line confidence scaled to 0-100. Clean CJK reads
+    # score ~100; partial / edge-clipped glyphs (the source of garbled text when
+    # scrolling) score ~30. Callers can drop low-confidence lines.
     out.append({'text': c[0].string(),
+                'conf': int(c[0].confidence() * 100),
                 'x': int((b.origin.x + b.size.width / 2.0) * 1000),
                 'y': int((1.0 - (b.origin.y + b.size.height / 2.0)) * 1000)})
 print(json.dumps(out, ensure_ascii=False))
@@ -889,12 +893,33 @@ print('ok')
 
     async fn mouse_scroll(&self, clicks: i32) -> Result<String, String> {
         tokio::task::spawn_blocking(move || {
-            let mut enigo = new_enigo()?;
-            let axis = Axis::Vertical;
-            enigo
-                .scroll(clicks, axis)
-                .map_err(|e| format!("scroll: {e}"))?;
-            Ok("ok".to_string())
+            // macOS: WeChat 4.x's CEF/radium view IGNORES enigo's scroll event
+            // (decorated with an event source + flags) — the message list never
+            // moves (verified: screenshot hash identical before/after). A RAW
+            // CGScrollWheelEvent does move it. Match enigo's vertical sign
+            // convention (wheel1 = -clicks) so callers are unaffected: a
+            // negative `clicks` scrolls UP toward older content.
+            #[cfg(target_os = "macos")]
+            {
+                use core_graphics::event::{CGEvent, CGEventTapLocation, ScrollEventUnit};
+                use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+                let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+                    .map_err(|()| "scroll: CGEventSource::new failed".to_string())?;
+                let event =
+                    CGEvent::new_scroll_event(source, ScrollEventUnit::LINE, 1, -clicks, 0, 0)
+                        .map_err(|()| "scroll: new_scroll_event failed".to_string())?;
+                event.post(CGEventTapLocation::HID);
+                return Ok("ok".to_string());
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let mut enigo = new_enigo()?;
+                let axis = Axis::Vertical;
+                enigo
+                    .scroll(clicks, axis)
+                    .map_err(|e| format!("scroll: {e}"))?;
+                Ok("ok".to_string())
+            }
         })
         .await
         .map_err(|e| format!("mouse_scroll join failed: {e}"))?

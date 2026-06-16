@@ -21,3 +21,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 # the one xcap dep the crate-split left ungated.
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 xcap = "0.9"
+
+# macOS: post raw CGScrollWheelEvents. enigo's decorated scroll event is ignored
+# by WeChat 4.x's CEF/radium view (verified: screenshot hash unchanged), while a
+# raw CGEvent scroll moves it. Same core-graphics version enigo already pulls in.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = { version = "0.25", features = ["highsierra"] }
