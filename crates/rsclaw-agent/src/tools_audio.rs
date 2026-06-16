@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 impl super::runtime::AgentRuntime {
     /// Music generation — style/lyrics → a song. `prompt` (style) required;
     /// `lyrics` / `duration` optional.
-    pub(crate) async fn tool_music_gen(&self, args: Value) -> Result<Value> {
+    pub(crate) async fn tool_music(&self, args: Value) -> Result<Value> {
         let prompt = args["prompt"]
             .as_str()
             .filter(|s| !s.is_empty())
@@ -49,7 +49,7 @@ impl super::runtime::AgentRuntime {
     /// Voice generation — text → speech, with optional one-shot voice clone
     /// (`reference_audio`). High-quality / cloning path; for a quick local
     /// read-aloud use `text_to_voice` instead. `text` required.
-    pub(crate) async fn tool_voice_gen(&self, args: Value) -> Result<Value> {
+    pub(crate) async fn tool_voice(&self, args: Value) -> Result<Value> {
         let input = args["text"]
             .as_str()
             .or_else(|| args["input"].as_str())

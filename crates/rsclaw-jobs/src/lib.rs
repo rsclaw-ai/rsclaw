@@ -507,17 +507,29 @@ pub async fn submit_agnes(
     // STRING (`mode: ti2vid`) — passing an array there 400s
     // ("cannot unmarshal array ... type string"). Multiple frames
     // (first+last / keyframes) go in `extra_body.image` as an array with
-    // `mode: keyframes`. Each entry is a public URL or
-    // `data:image/...;base64,...` Data URI. Text-to-video sends neither.
+    // `mode: keyframes`. Text-to-video sends neither.
+    //
+    // IMPORTANT: the agnes /v1/videos endpoint wants RAW base64 for inline
+    // image input — it does NOT strip the `data:<mime>;base64,` prefix (unlike
+    // its /v1/images endpoint, which DOES want the full data URI). A data URI
+    // here fails server-side with "Invalid base64-encoded string". Strip the
+    // prefix to raw base64; public http(s) URLs pass through untouched.
+    let agnes_img = |s: &String| -> String {
+        match s.split_once(";base64,") {
+            Some((_, b64)) => b64.to_owned(),
+            None => s.clone(),
+        }
+    };
     match images.len() {
         0 => {}
         1 => {
-            body["image"] = json!(images[0]);
+            body["image"] = json!(agnes_img(&images[0]));
             body["mode"] = json!("ti2vid");
         }
         _ => {
+            let raw: Vec<String> = images.iter().map(agnes_img).collect();
             body["mode"] = json!("keyframes");
-            body["extra_body"] = json!({ "image": images, "mode": "keyframes" });
+            body["extra_body"] = json!({ "image": raw, "mode": "keyframes" });
         }
     }
     let resp: serde_json::Value = client
