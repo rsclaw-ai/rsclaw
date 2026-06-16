@@ -1,96 +1,21 @@
-//! Audio generation tools on the rsclaw gen surface (gen-api.md §4/§5):
-//! `music_gen` (`POST /v1/audio/music`) and `voice_gen`
-//! (`POST /v1/audio/speech`, TTS + one-shot voice clone).
+//! Shared audio-generation base for `music_gen` (`tools_music.rs`) and
+//! `voice_gen` (`tools_voice.rs`) on the rsclaw gen surface (gen-api.md §4/§5).
 //!
-//! Both are SYNCHRONOUS: the HTTP response body IS the audio bytes
+//! Both endpoints are SYNCHRONOUS: the HTTP response body IS the audio bytes
 //! (`Content-Type: audio/*`). So — unlike video / avatar / mv — there's no
 //! `ExternalJob` polling. We POST, save the returned bytes, and return an
 //! `audio_file` path that the agent reply boundary auto-attaches.
 //!
-//! `voice_gen` is the high-quality / cloning path; the simpler local-OS
-//! read-aloud tool is `text_to_voice` (kept separate by design — cloning is a
-//! distinct capability, not something to overload onto the local TTS).
-//!
-//! Slow music jobs may exceed the synchronous window and return `504` with a
-//! `poll GET /v1/jobs/{id}` hint; surfaced as a retryable error.
+//! This file holds the pieces music + voice share: the `audio_submit` POST/
+//! save path, the output-format helper, and the canonical on-disk naming.
 
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
 impl super::runtime::AgentRuntime {
-    /// Music generation — style/lyrics → a song. `prompt` (style) required;
-    /// `lyrics` / `duration` optional.
-    pub(crate) async fn tool_music(&self, args: Value) -> Result<Value> {
-        let prompt = args["prompt"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow!("music_gen: `prompt` (style description) is required"))?;
-        let model = args["model"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(|m| m.rsplit('/').next().unwrap_or(m))
-            .unwrap_or("rsclaw-music-v1");
-        let fmt = audio_format(&args);
-        let mut body = json!({
-            "model": model,
-            "prompt": prompt,
-            "response_format": fmt,
-        });
-        if let Some(lyrics) = args["lyrics"].as_str().filter(|s| !s.is_empty()) {
-            body["lyrics"] = json!(lyrics);
-        }
-        if let Some(dur) = args["duration"].as_u64() {
-            body["duration"] = json!(dur);
-        }
-        self.audio_submit("/v1/audio/music", &body, &fmt, "music")
-            .await
-    }
-
-    /// Voice generation — text → speech, with optional one-shot voice clone
-    /// (`reference_audio`). High-quality / cloning path; for a quick local
-    /// read-aloud use `text_to_voice` instead. `text` required.
-    pub(crate) async fn tool_voice(&self, args: Value) -> Result<Value> {
-        let input = args["text"]
-            .as_str()
-            .or_else(|| args["input"].as_str())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow!("voice_gen: `text` (the words to speak) is required"))?;
-        let model = args["model"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(|m| m.rsplit('/').next().unwrap_or(m))
-            .unwrap_or("rsclaw-voice-v1");
-        let fmt = audio_format(&args);
-        let mut body = json!({
-            "model": model,
-            "input": input,
-            "response_format": fmt,
-        });
-        if let Some(voice) = args["voice"].as_str().filter(|s| !s.is_empty()) {
-            body["voice"] = json!(voice);
-        }
-        if let Some(instr) = args["instructions"].as_str().filter(|s| !s.is_empty()) {
-            body["instructions"] = json!(instr);
-        }
-        if let Some(speed) = args["speed"].as_f64() {
-            body["speed"] = json!(speed);
-        }
-        // One-shot voice clone: reference_audio (URL / data-URI / local path →
-        // base64). reference_text optionally improves fidelity.
-        let refs = super::tools_video::normalize_gen_assets(&args["reference_audio"]).await;
-        if let Some(r) = refs.first() {
-            body["reference_audio"] = json!({ "audio_url": r });
-            if let Some(rt) = args["reference_text"].as_str().filter(|s| !s.is_empty()) {
-                body["reference_text"] = json!(rt);
-            }
-        }
-        self.audio_submit("/v1/audio/speech", &body, &fmt, "voice")
-            .await
-    }
-
     /// Shared sync submit for the audio endpoints: POST, handle the bytes /
     /// JSON-envelope / 504 cases, save to disk, return an `audio_file` path.
-    async fn audio_submit(
+    pub(crate) async fn audio_submit(
         &self,
         endpoint: &str,
         body: &Value,
@@ -213,7 +138,7 @@ impl super::runtime::AgentRuntime {
 
 /// Resolve the output container — default mp3 for IM-platform compatibility
 /// (feishu/weixin won't render ogg/opus inline), overridable.
-fn audio_format(args: &Value) -> String {
+pub(crate) fn audio_format(args: &Value) -> String {
     args["response_format"]
         .as_str()
         .filter(|s| !s.is_empty())
