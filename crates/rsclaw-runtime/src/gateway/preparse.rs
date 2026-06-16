@@ -1364,9 +1364,6 @@ $g.Dispose();$b.Dispose()"#
         };
         return Some(txt(reply));
     }
-    // /astock is owned by the commercial astock WASM plugin. The plugin slash
-    // hook above handles it when installed; this fallback keeps the command
-    // fast and explicit when the plugin is absent.
     // /goal — result-driven turn loop. See src/agent/goal.rs.
     //
     //   /goal <condition>             # set + start
@@ -1393,14 +1390,6 @@ $g.Dispose();$b.Dispose()"#
         return Some(txt(
             goal_set_handler(handle, channel, peer_id, account, rest).await,
         ));
-    }
-    if lower == "/astock"
-        || lower == "/astock help"
-        || lower == "/astock -h"
-        || lower == "/astock --help"
-        || lower.starts_with("/astock ")
-    {
-        return Some(txt(astock_plugin_missing_text()));
     }
     None
 }
@@ -1536,12 +1525,6 @@ fn parse_goal_args(rest: &str) -> (String, u32) {
     (cond_toks.join(" ").trim().to_owned(), max_iter)
 }
 
-fn astock_plugin_missing_text() -> String {
-    "/astock 现在由 astock WASM 插件提供。\n\
-     请安装并启用插件 `~/dev/rsclaw-plugins/astock`，并设置 `ASTOCK_API_KEY`。"
-        .to_owned()
-}
-
 /// Check if a message is a fast preparse command that should bypass the
 /// per-user queue. These are local slash commands that execute instantly and
 /// should not wait behind slow LLM requests in the queue.
@@ -1554,7 +1537,7 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
         "/ls" | "/status" | "/version" | "/help" | "/?" | "/health" | "/uptime"
             | "/model" | "/models" | "/cron" | "/clear" | "/new" | "/abort" | "/sessions"
             | "/loop" | "/task" | "/watch" | "/plugin" | "/cap" | "/cap-exit" | "/cap-resume"
-            | "/astock" | "/goal"
+            | "/goal"
     )
     // Commands with optional/required args
     || lower.starts_with("/ls ")
@@ -1574,8 +1557,8 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
     || lower.starts_with("/watch ")
     || lower.starts_with("/cap ")
     || lower.starts_with("/cap-resume ")
-    || lower.starts_with("/astock ")
     || lower.starts_with("/goal ")
+    || is_installed_plugin_slash_preparse(t)
     // /task only short-circuits on help variants; non-help forms must NOT
     // bypass the queue (the task queue worker owns the multi-turn flow).
     || lower == "/task -h"
@@ -1583,6 +1566,47 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
     || lower == "/task help"
     || t.starts_with("! ")
     || t.starts_with("$ ")
+}
+
+fn is_installed_plugin_slash_preparse(text: &str) -> bool {
+    let trimmed = text.trim();
+    if !trimmed.starts_with('/') {
+        return false;
+    }
+    let plugins_dir = rsclaw_config::loader::base_dir().join("plugins");
+    installed_plugin_slash_matches_in_dir(&plugins_dir, trimmed)
+}
+
+fn installed_plugin_slash_matches_in_dir(plugins_dir: &std::path::Path, text: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(plugins_dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            return false;
+        };
+        if !file_type.is_dir() {
+            return false;
+        }
+        let Ok(manifest) = rsclaw_plugin::manifest::load_manifest(&path) else {
+            return false;
+        };
+        manifest
+            .slash_commands
+            .iter()
+            .any(|command| slash_prefix_matches(text, &command.prefix))
+    })
+}
+
+fn slash_prefix_matches(text: &str, prefix: &str) -> bool {
+    let prefix = prefix.trim();
+    if prefix.is_empty() {
+        return false;
+    }
+    let text_lower = text.trim().to_lowercase();
+    let prefix_lower = prefix.to_lowercase();
+    text_lower == prefix_lower || text_lower.starts_with(&format!("{prefix_lower} "))
 }
 
 async fn try_plugin_slash(
@@ -1605,10 +1629,7 @@ async fn try_plugin_slash(
             if prefix.is_empty() {
                 continue;
             }
-            let prefix_lower = prefix.to_lowercase();
-            let matches =
-                lower == prefix_lower || lower.starts_with(&format!("{prefix_lower} "));
-            if !matches {
+            if !slash_prefix_matches(&lower, prefix) {
                 continue;
             }
             let Some(tx) = handle.notification_tx() else {
@@ -1940,8 +1961,6 @@ fn help_text(lang: &str) -> String {
          \u{0020}\u{0020}/loop -h         定时循环（详见 -h）\n\
          \u{0020}\u{0020}/goal <cond>     盯一个结果型目标，模型自评 GOAL_ACHIEVED/FAILED 终止\n\
          \u{0020}\u{0020}/cron list       查看定时任务\n\n\
-         A股 (astock)\n\
-         \u{0020}\u{0020}/astock          A股数据 & 早报调度（详见 /astock help）\n\n\
          文件/截图\n\
          \u{0020}\u{0020}/ls [path]       列出工作区目录\n\
          \u{0020}\u{0020}/cat <file>      查看文件内容\n\
@@ -1949,6 +1968,7 @@ fn help_text(lang: &str) -> String {
          \u{0020}\u{0020}/webshot <url>   网页截图\n\n\
          技能/插件\n\
          \u{0020}\u{0020}/skill list      已安装技能\n\n\
+         \u{0020}\u{0020}/plugin list     插件状态；插件声明的 slash 命令会自动接管\n\n\
          编程代理直连\n\
          \u{0020}\u{0020}/cap <agent>            绑定本会话直连 cap 子代理\n\
          \u{0020}\u{0020}/cap-resume <ag> <id>   按 ID 恢复磁盘保存的会话\n\
@@ -1976,8 +1996,6 @@ fn help_text(lang: &str) -> String {
          \u{0020}\u{0020}/loop -h         repeat on a schedule (see -h)\n\
          \u{0020}\u{0020}/goal <cond>     result-driven loop; model self-tags GOAL_ACHIEVED/FAILED to stop\n\
          \u{0020}\u{0020}/cron list       view cron jobs\n\n\
-         A-shares (astock)\n\
-         \u{0020}\u{0020}/astock          A-share data & briefing scheduler (see /astock help)\n\n\
          File / screenshot\n\
          \u{0020}\u{0020}/ls [path]       list workspace directory\n\
          \u{0020}\u{0020}/cat <file>      view file contents\n\
@@ -1985,6 +2003,7 @@ fn help_text(lang: &str) -> String {
          \u{0020}\u{0020}/webshot <url>   web-page screenshot\n\n\
          Skills / plugins\n\
          \u{0020}\u{0020}/skill list      installed skills\n\n\
+         \u{0020}\u{0020}/plugin list     plugin status; plugin-declared slash commands auto-hook\n\n\
          Coding-agent direct mode\n\
          \u{0020}\u{0020}/cap <agent>            route this chat directly to a cap subagent\n\
          \u{0020}\u{0020}/cap-resume <ag> <id>   resume a saved session by id\n\

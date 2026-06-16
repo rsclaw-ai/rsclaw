@@ -731,8 +731,8 @@ impl AgentRuntime {
                 return Ok(raw);
             }
         };
-        let pages: Vec<(String, String, String)> = futures::stream::iter(hits.into_iter().map(
-            |(title, url)| {
+        let mut pages: Vec<(usize, String, String, String)> = futures::stream::iter(
+            hits.into_iter().enumerate().map(|(idx, (title, url))| {
                 let client = client.clone();
                 async move {
                     let body = client.get(&url).send().await.ok()?.text().await.ok()?;
@@ -740,10 +740,10 @@ impl AgentRuntime {
                     if text.trim().chars().count() < 200 {
                         return None; // SPA / blocked / empty — skip (no browser fallback in deep mode for latency)
                     }
-                    Some((title, url, text))
+                    Some((idx, title, url, text))
                 }
-            },
-        ))
+            }),
+        )
         .buffer_unordered(DEEP_FETCH_CONCURRENCY)
         .filter_map(|x| async move { x })
         .collect()
@@ -751,11 +751,15 @@ impl AgentRuntime {
         if pages.is_empty() {
             return Ok(raw);
         }
+        // buffer_unordered yields COMPLETION order; restore the original
+        // search-rank order so the DEEP_MAX_CHUNKS cap below keeps the
+        // highest-ranked pages' chunks (not whichever fetched fastest).
+        pages.sort_by_key(|(idx, ..)| *idx);
 
         // 3. Chunk every page (~500-token, paragraph-aware, CJK-calibrated).
         let mut chunk_text: Vec<String> = Vec::new();
         let mut chunk_src: Vec<(String, String)> = Vec::new(); // (title, url)
-        for (title, url, text) in &pages {
+        for (_, title, url, text) in &pages {
             for c in deep_chunk(text) {
                 chunk_text.push(c);
                 chunk_src.push((title.clone(), url.clone()));
@@ -828,6 +832,7 @@ impl AgentRuntime {
             return Ok(raw);
         }
         let mut final_order = order.clone();
+        let mut rerank_ok = false;
         if let Some(reranker) = reranker {
             let q = query.to_owned();
             let docs: Vec<String> = order.iter().map(|&i| chunk_text[i].clone()).collect();
@@ -843,6 +848,7 @@ impl AgentRuntime {
                         order_for_rerank.into_iter().zip(scores).collect();
                     z.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                     final_order = z.into_iter().map(|(i, _)| i).collect();
+                    rerank_ok = true;
                 }
                 Ok(Err(e)) => {
                     warn!(error = %e, "deep_web_search: rerank failed; using cosine order")
@@ -851,6 +857,12 @@ impl AgentRuntime {
                     warn!(error = %e, "deep_web_search: rerank task join failed; using cosine order")
                 }
             }
+        }
+        // With NEITHER usable embeddings NOR a successful rerank, `order` is
+        // just fetch/document order — arbitrary. Snippets beat arbitrary
+        // chunks, so honour the degrade-to-snippets contract here too.
+        if !embed_ok && !rerank_ok {
+            return Ok(raw);
         }
         final_order.truncate(DEEP_RETURN_CHUNKS);
 
@@ -3185,29 +3197,46 @@ fn deep_chunk(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut buf = String::new();
     let mut buf_tok = 0usize;
-    for para in text.split("\n\n").map(str::trim).filter(|p| !p.is_empty()) {
-        let t = deep_approx_tokens(para);
-        if buf_tok + t > TARGET && !buf.is_empty() {
-            out.push(std::mem::take(&mut buf));
-            buf_tok = 0;
-        }
-        if !buf.is_empty() {
-            buf.push_str("\n\n");
-        }
-        buf.push_str(para);
-        buf_tok += t;
-        if buf_tok >= TARGET * 2 {
-            out.push(std::mem::take(&mut buf));
-            buf_tok = 0;
-        }
-        if out.len() >= 40 {
-            break;
+    'outer: for para in text.split("\n\n").map(str::trim).filter(|p| !p.is_empty()) {
+        // A single blank-line-free paragraph can blow past TARGET; split it
+        // into bounded pieces first so one wall-of-text doesn't become a chunk
+        // the embedder just truncates at its 512-token limit.
+        for piece in split_oversized(para, TARGET) {
+            let t = deep_approx_tokens(&piece);
+            if buf_tok + t > TARGET && !buf.is_empty() {
+                out.push(std::mem::take(&mut buf));
+                buf_tok = 0;
+                if out.len() >= 40 {
+                    break 'outer;
+                }
+            }
+            if !buf.is_empty() {
+                buf.push_str("\n\n");
+            }
+            buf.push_str(&piece);
+            buf_tok += t;
         }
     }
     if !buf.trim().is_empty() && out.len() < 40 {
         out.push(buf);
     }
+    out.truncate(40);
     out
+}
+
+/// Split a paragraph that exceeds `target` tokens into `<= target`-token
+/// pieces by char window. CJK is 1 token/char (the worst case), so a
+/// `target`-char window never exceeds `target` tokens; ASCII under-fills,
+/// which `deep_chunk` re-packs. Returns the paragraph unchanged when it fits.
+fn split_oversized(para: &str, target: usize) -> Vec<String> {
+    if deep_approx_tokens(para) <= target {
+        return vec![para.to_owned()];
+    }
+    para.chars()
+        .collect::<Vec<char>>()
+        .chunks(target.max(1))
+        .map(|c| c.iter().collect::<String>())
+        .collect()
 }
 
 /// CJK-aware token estimate matching the KB chunker's calibration.
@@ -3227,6 +3256,23 @@ fn deep_approx_tokens(s: &str) -> usize {
 #[cfg(test)]
 mod deep_search_tests {
     use super::{deep_approx_tokens, deep_chunk};
+
+    #[test]
+    fn chunk_splits_oversized_single_paragraph() {
+        // One 2000-CJK-char paragraph with NO blank lines. Pre-fix this became
+        // a single ~2000-token chunk (then truncated by the embedder); now it
+        // must split into multiple chunks each within the ~500-token target.
+        let para = "茅".repeat(2000);
+        let chunks = deep_chunk(&para);
+        assert!(chunks.len() >= 4, "expected a split, got {}", chunks.len());
+        for c in &chunks {
+            assert!(
+                deep_approx_tokens(c) <= 500,
+                "chunk exceeds target: {} tokens",
+                deep_approx_tokens(c)
+            );
+        }
+    }
 
     #[test]
     fn approx_tokens_cjk_vs_ascii() {

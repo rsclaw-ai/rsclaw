@@ -362,6 +362,7 @@ async fn install_wasm_file(src: &std::path::Path) -> Result<()> {
         tool_groups: Default::default(),
         runtime: "wasm".to_owned(),
         entry: src.to_string_lossy().to_string(),
+        integrity: None,
         channels: vec![],
         slots: vec![],
         hooks: vec![],

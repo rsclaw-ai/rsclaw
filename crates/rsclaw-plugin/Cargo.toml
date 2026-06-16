@@ -38,6 +38,7 @@ wasmtime-wasi = "36.0.10"
 chrono = { version = "0.4", features = ["serde"] }
 which = "7"
 rand = "0.9"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

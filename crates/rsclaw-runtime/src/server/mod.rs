@@ -30,7 +30,7 @@
 //!   GET    /ws                              WebSocket gateway protocol
 //! (OpenClaw WS)
 
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use std::{convert::Infallible, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use axum::{
@@ -60,6 +60,8 @@ use rsclaw_config::runtime::RuntimeConfig;
 use rsclaw_store::Store;
 
 mod knowledge;
+
+const MAX_LOCAL_MEDIA_BYTES: u64 = 10 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Timing-safe token comparison
@@ -718,6 +720,124 @@ async fn send_message(
     .into_response()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn media_path_is_limited_to_allowed_roots() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let workspace = root.path().join("workspace");
+        let var = root.path().join("var");
+        let downloads = root.path().join("Downloads").join("rsclaw");
+        let outside = root.path().join("outside");
+        tokio::fs::create_dir_all(&workspace).await.expect("workspace");
+        tokio::fs::create_dir_all(&var).await.expect("var");
+        tokio::fs::create_dir_all(&downloads).await.expect("downloads");
+        tokio::fs::create_dir_all(&outside).await.expect("outside");
+
+        let workspace_file = workspace.join("chart.png");
+        let var_file = var.join("chart.png");
+        let downloads_file = downloads.join("chart.png");
+        let outside_file = outside.join("chart.png");
+        tokio::fs::write(&workspace_file, b"png").await.expect("workspace file");
+        tokio::fs::write(&var_file, b"png").await.expect("var file");
+        tokio::fs::write(&downloads_file, b"png").await.expect("downloads file");
+        tokio::fs::write(&outside_file, b"png").await.expect("outside file");
+
+        let roots = vec![workspace.clone(), var, downloads];
+        assert!(
+            canonicalize_media_path_in_roots("chart.png", &workspace, roots.clone())
+                .await
+                .is_ok()
+        );
+        assert!(
+            canonicalize_media_path_in_roots(
+                var_file.to_string_lossy().as_ref(),
+                &workspace,
+                roots.clone()
+            )
+            .await
+            .is_ok()
+        );
+        assert!(
+            canonicalize_media_path_in_roots(
+                downloads_file.to_string_lossy().as_ref(),
+                &workspace,
+                roots.clone()
+            )
+            .await
+            .is_ok()
+        );
+        assert!(
+            canonicalize_media_path_in_roots(
+                outside_file.to_string_lossy().as_ref(),
+                &workspace,
+                roots
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn media_path_rejects_large_or_non_file_inputs() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let workspace = root.path().join("workspace");
+        tokio::fs::create_dir_all(&workspace).await.expect("workspace");
+        let large = workspace.join("large.png");
+        let file = std::fs::File::create(&large).expect("large file");
+        file.set_len(MAX_LOCAL_MEDIA_BYTES + 1).expect("set len");
+        drop(file);
+
+        assert!(
+            canonicalize_media_path_in_roots("large.png", &workspace, vec![workspace.clone()])
+                .await
+                .is_err()
+        );
+        assert!(
+            canonicalize_media_path_in_roots(".", &workspace, vec![workspace.clone()])
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn media_path_rejects_symlink_escape() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let workspace = root.path().join("workspace");
+        let outside = root.path().join("outside");
+        tokio::fs::create_dir_all(&workspace).await.expect("workspace");
+        tokio::fs::create_dir_all(&outside).await.expect("outside");
+        let outside_file = outside.join("secret.png");
+        let link = workspace.join("linked.png");
+        tokio::fs::write(&outside_file, b"secret")
+            .await
+            .expect("outside file");
+        std::os::unix::fs::symlink(&outside_file, &link).expect("symlink");
+
+        assert!(
+            canonicalize_media_path_in_roots("linked.png", &workspace, vec![workspace.clone()])
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn media_mime_only_allows_supported_images() {
+        assert_eq!(
+            media_mime_for_path(std::path::Path::new("x.png")).expect("png"),
+            "image/png"
+        );
+        assert_eq!(
+            media_mime_for_path(std::path::Path::new("x.jpeg")).expect("jpeg"),
+            "image/jpeg"
+        );
+        assert!(media_mime_for_path(std::path::Path::new("id_rsa")).is_err());
+    }
+}
+
 async fn list_sessions(State(state): State<AppState>) -> impl IntoResponse {
     match state.store.db.list_sessions() {
         Ok(sessions) => Json(serde_json::json!({"sessions": sessions})).into_response(),
@@ -861,35 +981,84 @@ async fn resolve_media_to_image_data(media: &str) -> anyhow::Result<String> {
         return Ok(media.to_string());
     }
 
-    // Local file path. Expand `~` for ergonomics so callers can pass
-    // `~/.rsclaw/var/charts/foo.png` from a shell.
-    let expanded = if let Some(stripped) = media.strip_prefix("~/") {
-        match dirs_next::home_dir() {
-            Some(home) => home.join(stripped),
-            None => std::path::PathBuf::from(media),
-        }
-    } else {
-        std::path::PathBuf::from(media)
-    };
+    let expanded = canonicalize_allowed_media_path(media).await?;
+    let mime = media_mime_for_path(&expanded)?;
 
     let bytes = tokio::fs::read(&expanded)
         .await
         .map_err(|e| anyhow::anyhow!("read {}: {e}", expanded.display()))?;
 
-    let mime = match expanded
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:{mime};base64,{b64}"))
+}
+
+async fn canonicalize_allowed_media_path(media: &str) -> anyhow::Result<PathBuf> {
+    let base = rsclaw_config::loader::base_dir();
+    let workspace = base.join("workspace");
+    let roots = allowed_media_roots(&base);
+    canonicalize_media_path_in_roots(media, &workspace, roots).await
+}
+
+async fn canonicalize_media_path_in_roots(
+    media: &str,
+    workspace: &std::path::Path,
+    roots: Vec<PathBuf>,
+) -> anyhow::Result<PathBuf> {
+    let lexical = rsclaw_util::canonicalize_external_path(media, &workspace);
+    let meta = tokio::fs::metadata(&lexical)
+        .await
+        .map_err(|e| anyhow::anyhow!("stat {}: {e}", lexical.display()))?;
+    if !meta.is_file() {
+        anyhow::bail!("media path is not a regular file: {}", lexical.display());
+    }
+    if meta.len() > MAX_LOCAL_MEDIA_BYTES {
+        anyhow::bail!(
+            "media file too large: {} bytes exceeds {} bytes",
+            meta.len(),
+            MAX_LOCAL_MEDIA_BYTES
+        );
+    }
+    let canonical = tokio::fs::canonicalize(&lexical)
+        .await
+        .map_err(|e| anyhow::anyhow!("canonicalize {}: {e}", lexical.display()))?;
+    for root in roots {
+        let root_canonical = tokio::fs::canonicalize(&root)
+            .await
+            .unwrap_or(root);
+        if canonical.starts_with(&root_canonical) {
+            return Ok(canonical);
+        }
+    }
+    anyhow::bail!(
+        "media path '{}' resolves outside allowed dirs (workspace, var, or Downloads/rsclaw)",
+        media
+    )
+}
+
+fn allowed_media_roots(base: &std::path::Path) -> Vec<PathBuf> {
+    let downloads_rsclaw = dirs_next::download_dir()
+        .unwrap_or_else(|| {
+            dirs_next::home_dir()
+                .unwrap_or_else(rsclaw_config::loader::base_dir)
+                .join("Downloads")
+        })
+        .join("rsclaw");
+    vec![base.join("workspace"), base.join("var"), downloads_rsclaw]
+}
+
+fn media_mime_for_path(path: &std::path::Path) -> anyhow::Result<&'static str> {
+    match path
         .extension()
         .and_then(|s| s.to_str())
         .map(str::to_ascii_lowercase)
         .as_deref()
     {
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("webp") => "image/webp",
-        _ => "image/png",
-    };
-
-    use base64::Engine;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    Ok(format!("data:{mime};base64,{b64}"))
+        Some("png") => Ok("image/png"),
+        Some("jpg") | Some("jpeg") => Ok("image/jpeg"),
+        Some("webp") => Ok("image/webp"),
+        _ => anyhow::bail!("unsupported local media extension: {}", path.display()),
+    }
 }
 
 /// GET /api/v1/message/read — read recent messages from a session.

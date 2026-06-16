@@ -419,7 +419,7 @@ pub fn toolset_allowed_names(
         "plugin_search",
         "plugin_describe",
         "plugin_invoke",
-        // astock — built-in tools, dormant when not configured.
+        // Stock plugin aliases — dormant when no trusted plugin claims them.
         "stock_quote",
         "stock_kline",
         "stock_snapshot",
@@ -917,8 +917,8 @@ pub fn build_tool_list(
     });
 
     // -----------------------------------------------------------------
-    // A-share market data (astock). These first-class tool names are exposed
-    // only when a trusted astock WASM plugin claims the matching aliases.
+    // A-share market data. These first-class tool names are exposed only when
+    // a trusted stock WASM plugin claims the matching aliases.
     // -----------------------------------------------------------------
     tools.push(ToolDef {
         name: "stock_quote".to_owned(),
@@ -999,8 +999,8 @@ pub fn build_tool_list(
     tools.push(ToolDef {
         name: "stock_ask".to_owned(),
         description: "PREFERRED A-share entry point — natural-language query \
-            routed through iwencai (同花顺's question-understanding service via \
-            astock). Use this whenever the user phrases a market question in \
+            routed through the configured upstream question-understanding service. \
+            Use this whenever the user phrases a market question in \
             human terms: \"今天涨停的科技股有哪些\", \"北向资金净流入前 20\", \
             \"最近一周创业板连板高度榜\", \"机构调研最多的票\". Don't try to \
             assemble snapshot filters or SQL by hand for this kind of question — \
@@ -1138,9 +1138,9 @@ pub fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "stock_query".to_owned(),
-        description: "Read-only SQL against astock's DuckDB. ESCAPE HATCH only — \
+        description: "Read-only SQL through the stock plugin. ESCAPE HATCH only — \
             use when `stock_ask` / `stock_snapshot` / `stock_kline` genuinely \
-            cannot express the query. astock validates the SQL server-side and \
+            cannot express the query. The upstream service validates SQL server-side and \
             rejects anything that isn't a single SELECT. Joining the live K-line \
             tables and the EOD aggregates here is fine; we trust the validator.".to_owned(),
         parameters: json!({

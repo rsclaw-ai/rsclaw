@@ -1379,28 +1379,23 @@ impl AgentRuntime {
     /// If both are empty, falls back to primary chain (matches the
     /// legacy `FallbackToPrimary` semantics — drivers want SOMETHING
     /// vision-capable, and the agent's primary is the best guess).
-    /// True when the agent's primary model chain (per-agent or defaults)
-    /// uses the `rsclaw/` protocol. Drives rsclaw-protocol defaults (e.g.
-    /// defaulting rerank to the fleet `rsclaw-reranker-v1`), mirroring the
-    /// detection inside [`resolve_vision_chain`].
+    /// True when the agent's EFFECTIVE primary model is a `rsclaw/` model —
+    /// the head of the per-agent primary chain when set, else the head of the
+    /// defaults primary chain. Deliberately NOT "any model in either chain":
+    /// a non-rsclaw per-agent primary must not inherit rsclaw just because a
+    /// fallback entry or the defaults happen to be rsclaw. Drives
+    /// rsclaw-protocol defaults (e.g. defaulting rerank to the fleet
+    /// `rsclaw-reranker-v1`).
     pub(crate) fn primary_is_rsclaw(&self) -> bool {
         let per_agent = &self.handle.config;
         let defaults = &self.config.agents.defaults;
         per_agent
             .model
             .as_ref()
-            .map(|m| m.primary_chain())
-            .into_iter()
-            .flatten()
-            .chain(
-                defaults
-                    .model
-                    .as_ref()
-                    .map(|m| m.primary_chain())
-                    .into_iter()
-                    .flatten(),
-            )
-            .any(|m| m.trim().starts_with("rsclaw/"))
+            .or(defaults.model.as_ref())
+            .and_then(|m| m.primary_chain().into_iter().next())
+            .map(|head| head.trim().starts_with("rsclaw/"))
+            .unwrap_or(false)
     }
 
     pub(crate) fn resolve_vision_chain(&self) -> Vec<String> {
@@ -8656,7 +8651,7 @@ impl AgentRuntime {
 
         if is_stock_tool_name(name) && !self.has_stock_tool_provider() {
             return Err(anyhow!(
-                "tool '{name}' is unavailable: astock is provided by the commercial astock WASM plugin, but no trusted stock tool alias is loaded"
+                "tool '{name}' is unavailable: no trusted stock WASM plugin has claimed this tool alias"
             ));
         }
 
@@ -8883,7 +8878,7 @@ impl AgentRuntime {
             "stock_quote" | "stock_kline" | "stock_snapshot" | "stock_ask" | "stock_query"
             | "stock_chart" | "stock_watchlist" => {
                 return Err(anyhow!(
-                    "tool '{name}' is provided by the astock WASM plugin alias layer, but no loaded plugin claimed this exact alias"
+                    "tool '{name}' is provided by the stock plugin alias layer, but no loaded plugin claimed this exact alias"
                 ));
             }
             "research_ingest_wechat" => return self.tool_research_ingest_wechat(args).await,

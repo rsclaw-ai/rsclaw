@@ -106,8 +106,8 @@ pub fn parse(body: &str) -> Result<ParsedCommand> {
     // Chat clients (Feishu, WeChat, iOS smart-keyboard, ...) auto-rewrite
     // typed `--` to a Unicode em-dash `—` (U+2014) and lone `-` to en-dash
     // `–` (U+2013). Without this normalization a user typing
-    // `/watch sse $URL --template astock` actually delivers
-    // `... —template astock` to preparse — the parser then treats the
+    // `/watch sse $URL --event message` actually delivers
+    // `... —event message` to preparse — the parser then treats the
     // em-dash blob as part of the source URL, the SSE server rejects it
     // with 400, and the user sees endless `_disconnect server returned 400`
     // notifications with no obvious cause.
@@ -596,34 +596,16 @@ mod tests {
     }
 
     #[test]
-    fn flag_parsing_template_valid() {
-        let p = parse("https://x --template astock").unwrap();
-        if let ParsedCommand::Start(spec) = p {
-            assert_eq!(spec.template, Some("astock".to_owned()));
-        }
-    }
-
-    #[test]
-    fn flag_parsing_template_short_alias() {
-        // `-tpl` is the short alias for `--template` — same target,
-        // less typing in chat where users hand-type the slash command.
-        let p = parse("https://x -tpl astock").unwrap();
-        if let ParsedCommand::Start(spec) = p {
-            assert_eq!(spec.template, Some("astock".to_owned()));
-            assert_eq!(spec.raw_source, "https://x");
-        } else {
-            panic!("expected Start");
-        }
-    }
-
-    #[test]
     fn unicode_em_dash_normalized_to_double_dash() {
         // Feishu / WeChat auto-rewrite `--` to em-dash. The parser
         // must transparently undo that or every chat-typed `--flag`
         // gets swallowed into the source URL.
-        let p = parse("https://x \u{2014}template astock").unwrap();
+        let p = parse("https://x \u{2014}event message").unwrap();
         if let ParsedCommand::Start(spec) = p {
-            assert_eq!(spec.template, Some("astock".to_owned()));
+            assert_eq!(
+                spec.event_filter,
+                Some(EventFilter::Allow(vec!["message".to_owned()]))
+            );
             assert_eq!(spec.raw_source, "https://x");
         } else {
             panic!("expected Start");
@@ -633,13 +615,10 @@ mod tests {
     #[test]
     fn unicode_en_dash_normalized_to_single_dash() {
         // Same autocorrect path, the single-dash variant. `-tpl` becomes
-        // `\u{2013}tpl` on some clients; recover that too.
-        let p = parse("https://x \u{2013}tpl astock").unwrap();
-        if let ParsedCommand::Start(spec) = p {
-            assert_eq!(spec.template, Some("astock".to_owned()));
-        } else {
-            panic!("expected Start");
-        }
+        // `\u{2013}tpl` on some clients; recover that too before template
+        // validation runs.
+        let err = parse("https://x \u{2013}tpl does-not-exist").unwrap_err();
+        assert!(err.to_string().contains("unknown template"), "got: {err}");
     }
 
     #[test]

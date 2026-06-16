@@ -74,6 +74,11 @@ pub struct PluginManifest {
     /// Optional for OpenClaw extensions (defaults to `"./dist/index.js"`).
     #[serde(default = "default_entry")]
     pub entry: String,
+    /// Optional integrity digest for the entry file. Currently supports
+    /// `sha256:<hex>`. WASM plugins that declare this must match before
+    /// the host compiles the component.
+    #[serde(default)]
+    pub integrity: Option<String>,
     /// Channels this plugin provides (OpenClaw extension field).
     #[serde(default)]
     pub channels: Vec<String>,
@@ -206,7 +211,7 @@ pub struct PluginToolDef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginSlashCommand {
-    /// Command prefix, for example `/astock`.
+    /// Command prefix, for example `/myplugin`.
     pub prefix: String,
     /// Tool name inside this plugin that handles the slash payload.
     pub handler: String,
@@ -381,6 +386,7 @@ mod tests {
   description: "A WASM plugin",
   runtime: "wasm",
   entry: "./plugin.wasm",
+  integrity: "sha256:0123456789abcdef",
   tools: [
     {
       name: "do_thing",
@@ -395,6 +401,7 @@ mod tests {
         assert_eq!(m.name, "test-wasm");
         assert_eq!(m.version.as_deref(), Some("2.0.0"));
         assert_eq!(m.runtime, "wasm");
+        assert_eq!(m.integrity.as_deref(), Some("sha256:0123456789abcdef"));
         assert!(m.is_wasm());
         assert_eq!(m.tools.len(), 1);
     }

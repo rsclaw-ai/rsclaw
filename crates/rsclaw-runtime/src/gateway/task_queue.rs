@@ -339,7 +339,7 @@ pub fn get_task_queue() -> Option<Arc<TaskQueueManager>> {
 /// the channel is not registered (or `install_channel_senders` was never
 /// called).
 /// Push an outbound message directly to a channel without going through
-/// the task queue. Used by background subsystems (cron briefings, astock
+/// the task queue. Used by background subsystems (cron briefings, plugin
 /// SSE bridge, etc.) that have a pre-formatted message and don't need
 /// an LLM turn to produce it. Falls back to bare `{name}` lookup when
 /// `account` is `None` or absent from the sender map.
@@ -2091,15 +2091,13 @@ async fn run_plugin_sse(
                                     if line.is_empty() {
                                         if !data_lines.is_empty() {
                                             let data = data_lines.join("\n");
-                                            if plugin_sse_should_push(&plugin, &data, &ctx).await {
-                                                let text = format_plugin_sse_text(&plugin, &name, &event_name, &data);
-                                                let _ = push_plugin_outbound(
-                                                    &ctx.channel,
-                                                    &ctx.peer_id,
-                                                    &serde_json::json!({ "text": text }).to_string(),
-                                                    Some(&ctx),
-                                                );
-                                            }
+                                            let text = format_plugin_sse_text(&plugin, &name, &event_name, &data);
+                                            let _ = push_plugin_outbound(
+                                                &ctx.channel,
+                                                &ctx.peer_id,
+                                                &serde_json::json!({ "text": text }).to_string(),
+                                                Some(&ctx),
+                                            );
                                         }
                                         event_name.clear();
                                         data_lines.clear();
@@ -2124,30 +2122,6 @@ async fn run_plugin_sse(
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(60));
     }
-}
-
-async fn plugin_sse_should_push(
-    plugin: &str,
-    data: &str,
-    ctx: &rsclaw_plugin::PluginInvocationContext,
-) -> bool {
-    if plugin != "astock" {
-        return true;
-    }
-    let Ok(value) = serde_json::from_str::<Value>(data) else {
-        return false;
-    };
-    let Some(code) = value.get("code").and_then(Value::as_str) else {
-        return false;
-    };
-    let key = format!("watchlist:{}:{}:{}", ctx.agent_id, ctx.channel, ctx.peer_id);
-    let Ok(Some(raw)) = rsclaw_plugin::wasm_runtime::plugin_kv_get_value(plugin, &key).await else {
-        return false;
-    };
-    let Ok(codes) = serde_json::from_str::<Vec<String>>(&raw) else {
-        return false;
-    };
-    codes.iter().any(|c| c == code)
 }
 
 fn format_plugin_sse_text(plugin: &str, name: &str, event_name: &str, data: &str) -> String {
@@ -2202,9 +2176,9 @@ mod plugin_background_tests {
     fn plugin_background_keys_are_peer_scoped() {
         let a = ctx("peer-a");
         let b = ctx("peer-b");
-        let key_a = plugin_background_key("cron", "astock", "astock.briefing", None, Some(&a));
-        let key_a_again = plugin_background_key("cron", "astock", "astock.briefing", None, Some(&a));
-        let key_b = plugin_background_key("cron", "astock", "astock.briefing", None, Some(&b));
+        let key_a = plugin_background_key("cron", "market", "market.briefing", None, Some(&a));
+        let key_a_again = plugin_background_key("cron", "market", "market.briefing", None, Some(&a));
+        let key_b = plugin_background_key("cron", "market", "market.briefing", None, Some(&b));
 
         assert_eq!(key_a, key_a_again);
         assert_ne!(key_a, key_b);
@@ -2214,14 +2188,14 @@ mod plugin_background_tests {
     fn plugin_background_sse_keys_include_url_and_peer() {
         let a = ctx("peer-a");
         let b = ctx("peer-b");
-        let url = "https://astock.rsclaw.ai/v1/stream/quick?filter=quick_rally";
-        let key_a = plugin_background_key("sse", "astock", "astock.quick_rally", Some(url), Some(&a));
-        let key_b = plugin_background_key("sse", "astock", "astock.quick_rally", Some(url), Some(&b));
+        let url = "https://plugin.example/v1/stream?filter=alpha";
+        let key_a = plugin_background_key("sse", "market", "market.alpha", Some(url), Some(&a));
+        let key_b = plugin_background_key("sse", "market", "market.alpha", Some(url), Some(&b));
         let key_other_url = plugin_background_key(
             "sse",
-            "astock",
-            "astock.quick_rally",
-            Some("https://astock.rsclaw.ai/v1/stream/quick?filter=quick_goldcross"),
+            "market",
+            "market.alpha",
+            Some("https://plugin.example/v1/stream?filter=beta"),
             Some(&a),
         );
 
@@ -2233,55 +2207,29 @@ mod plugin_background_tests {
     fn plugin_sse_status_is_context_scoped() {
         let a = ctx("peer-status-a");
         let b = ctx("peer-status-b");
-        let url = "https://astock.rsclaw.ai/v1/stream/quick?filter=quick_rally";
-        let status_name = "astock.quick_rally.status_test";
+        let url = "https://plugin.example/v1/stream?filter=alpha";
+        let status_name = "market.alpha.status_test";
 
         let before: Value =
-            serde_json::from_str(&plugin_sse_status_json("astock", status_name, Some(&a)))
+            serde_json::from_str(&plugin_sse_status_json("market", status_name, Some(&a)))
                 .expect("status JSON before");
         assert_eq!(before["active"].as_bool(), Some(false));
         assert_eq!(before["count"].as_u64(), Some(0));
 
-        let key = plugin_background_key("sse", "astock", status_name, Some(url), Some(&a));
+        let key = plugin_background_key("sse", "market", status_name, Some(url), Some(&a));
         assert!(claim_plugin_background_key(&key));
 
         let active: Value =
-            serde_json::from_str(&plugin_sse_status_json("astock", status_name, Some(&a)))
+            serde_json::from_str(&plugin_sse_status_json("market", status_name, Some(&a)))
                 .expect("status JSON active");
         assert_eq!(active["active"].as_bool(), Some(true));
         assert_eq!(active["count"].as_u64(), Some(1));
 
         let other_peer: Value =
-            serde_json::from_str(&plugin_sse_status_json("astock", status_name, Some(&b)))
+            serde_json::from_str(&plugin_sse_status_json("market", status_name, Some(&b)))
                 .expect("status JSON other peer");
         assert_eq!(other_peer["active"].as_bool(), Some(false));
         assert_eq!(other_peer["count"].as_u64(), Some(0));
     }
 
-    #[tokio::test]
-    async fn astock_sse_pushes_only_watched_codes() {
-        let ctx = ctx("peer-filtered");
-        let key = format!("watchlist:{}:{}:{}", ctx.agent_id, ctx.channel, ctx.peer_id);
-        rsclaw_plugin::wasm_runtime::plugin_kv_set_value(
-            "astock",
-            &key,
-            &serde_json::json!(["600519"]).to_string(),
-        )
-        .await
-        .expect("set watchlist");
-
-        assert!(
-            plugin_sse_should_push("astock", r#"{"code":"600519","name":"贵州茅台"}"#, &ctx).await
-        );
-        assert!(
-            !plugin_sse_should_push("astock", r#"{"code":"000001","name":"平安银行"}"#, &ctx).await
-        );
-        assert!(!plugin_sse_should_push("astock", r#"{"event":"snapshot"}"#, &ctx).await);
-    }
-
-    #[tokio::test]
-    async fn non_astock_sse_pushes_without_watchlist_filter() {
-        let ctx = ctx("peer-any");
-        assert!(plugin_sse_should_push("other", r#"{"event":"anything"}"#, &ctx).await);
-    }
 }

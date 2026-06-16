@@ -20,7 +20,10 @@ pub mod manifest;
 pub mod slots;
 pub mod wasm_runtime;
 
-use std::{collections::HashMap, sync::{Arc, OnceLock}};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 
 use anyhow::Result;
 use futures::future::BoxFuture;
@@ -120,7 +123,8 @@ pub(crate) async fn sse_subscribe(
     let Some(host) = PLUGIN_BACKGROUND_HOST.get().cloned() else {
         return Err("plugin background host is not installed".to_owned());
     };
-    host.sse_subscribe(plugin, name, url, headers_json, resume_key, ctx).await
+    host.sse_subscribe(plugin, name, url, headers_json, resume_key, ctx)
+        .await
 }
 
 pub(crate) async fn sse_status(
@@ -143,7 +147,8 @@ pub(crate) async fn push_outbound(
     let Some(host) = PLUGIN_BACKGROUND_HOST.get().cloned() else {
         return Err("plugin background host is not installed".to_owned());
     };
-    host.push_outbound(channel, peer_id, message_json, ctx).await
+    host.push_outbound(channel, peer_id, message_json, ctx)
+        .await
 }
 
 pub(crate) async fn submit_agent_turn(
@@ -155,11 +160,11 @@ pub(crate) async fn submit_agent_turn(
     let Some(host) = PLUGIN_BACKGROUND_HOST.get().cloned() else {
         return Err("plugin background host is not installed".to_owned());
     };
-    host.submit_agent_turn(session_key, prompt, route_json, ctx).await
+    host.submit_agent_turn(session_key, prompt, route_json, ctx)
+        .await
 }
-pub use wasm_runtime::{WasmPlugin, WasmToolDef, load_wasm_plugin};
-
 use rsclaw_config::schema::PluginsConfig;
+pub use wasm_runtime::{WasmPlugin, WasmToolDef, load_wasm_plugin};
 
 // ---------------------------------------------------------------------------
 // PluginRegistry

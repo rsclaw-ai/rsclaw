@@ -20,7 +20,7 @@ static SHARED_SYSTEM_PREFIX: LazyLock<String> = LazyLock::new(build_shared_syste
 /// allowedCommands).
 pub(crate) const READONLY_COMMANDS: &[&str] = &[
     "/help", "/version", "/status", "/health", "/uptime", "/models", "/btw", "/clear", "/compact",
-    "/history", "/cron", "/abort", "/loop", "/task", "/plugin", "/astock", "/goal",
+    "/history", "/cron", "/abort", "/loop", "/task", "/plugin", "/goal",
 ];
 
 /// Format a Duration as human-readable string.

@@ -14,6 +14,7 @@
 
 use std::{
     collections::HashMap,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::PathBuf,
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
@@ -24,6 +25,7 @@ use base64::{Engine as _, engine::general_purpose};
 use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tracing::debug;
 use wasmtime::{
@@ -51,6 +53,7 @@ const SHARED_BROWSER_PROFILE: &str = "rsclaw";
 type HostTrapResult<T> = std::result::Result<T, wasmtime::Error>;
 
 static HOST_HTTP_TLS_PROVIDER: OnceLock<()> = OnceLock::new();
+static HOST_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 use rsclaw_browser::BrowserSession;
 
@@ -323,6 +326,54 @@ fn canonicalize_plugin_artifact_path(input: &str) -> Result<PathBuf, String> {
     ))
 }
 
+fn canonicalize_browser_upload_path(plugin_name: &str, input: &str) -> Result<PathBuf, String> {
+    let base = rsclaw_config::loader::base_dir();
+    let workspace = base.join("workspace");
+    let plugin_var = base.join("var").join("plugins").join(plugin_name);
+    let downloads_rsclaw = dirs_next::download_dir()
+        .unwrap_or_else(|| {
+            dirs_next::home_dir()
+                .unwrap_or_else(rsclaw_config::loader::base_dir)
+                .join("Downloads")
+        })
+        .join("rsclaw");
+    canonicalize_existing_file_in_roots(
+        input,
+        &workspace,
+        &[workspace.clone(), plugin_var, downloads_rsclaw],
+        "browser_upload",
+    )
+}
+
+fn canonicalize_existing_file_in_roots(
+    input: &str,
+    workspace: &std::path::Path,
+    allowed_roots: &[PathBuf],
+    context: &str,
+) -> Result<PathBuf, String> {
+    let lexical = rsclaw_util::canonicalize_external_path(input, workspace);
+    let meta = std::fs::metadata(&lexical)
+        .map_err(|e| format!("{context}: stat {}: {e}", lexical.display()))?;
+    if !meta.is_file() {
+        return Err(format!(
+            "{context}: path is not a regular file: {}",
+            lexical.display()
+        ));
+    }
+    let canonical = std::fs::canonicalize(&lexical)
+        .map_err(|e| format!("{context}: canonicalize {}: {e}", lexical.display()))?;
+    for root in allowed_roots {
+        let root_canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        if canonical.starts_with(&root_canonical) {
+            return Ok(canonical);
+        }
+    }
+    Err(format!(
+        "{context}: path '{}' resolves outside allowed dirs (workspace, plugin artifacts, or Downloads/rsclaw)",
+        input
+    ))
+}
+
 /// Extract readable text from a plugin-saved artifact.
 pub(crate) async fn extract_text_from_plugin_file(path: &str) -> Result<String, String> {
     let canonical = canonicalize_plugin_artifact_path(path)?;
@@ -577,13 +628,10 @@ impl rsclaw::plugin::host_browser::Host for HostState {
         ref_str: String,
         filepath: String,
     ) -> HostTrapResult<Result<String, String>> {
-        // Uploads send a file *out* of the host to a remote site. Unlike
-        // read_file (which enforces workspace containment to prevent reading
-        // /etc/passwd etc.), upload paths are typically user-supplied via
-        // the LLM ("upload ~/Downloads/cat.png") so we tolerate any path
-        // the user has access to. Just expand `~` and normalize.
-        let workspace = rsclaw_config::loader::base_dir().join("workspace");
-        let canonical = rsclaw_util::canonicalize_external_path(&filepath, &workspace);
+        let canonical = match canonicalize_browser_upload_path(&self.plugin_name, &filepath) {
+            Ok(path) => path,
+            Err(e) => return Ok(Err(e)),
+        };
         // Note: cmd_upload expects `files: [path]` (array), not `filepath: path`.
         Ok(self
             .browser_action(
@@ -788,6 +836,9 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
         sql: String,
         params: Vec<String>,
     ) -> HostTrapResult<Result<String, String>> {
+        if let Err(e) = validate_plugin_sql(&sql, PluginSqlKind::Execute) {
+            return Ok(Err(format!("sql_execute blocked: {e}")));
+        }
         let db_path = plugin_db_path(&self.plugin_name);
         if let Some(parent) = db_path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
@@ -822,6 +873,9 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
         sql: String,
         params: Vec<String>,
     ) -> HostTrapResult<Result<String, String>> {
+        if let Err(e) = validate_plugin_sql(&sql, PluginSqlKind::Query) {
+            return Ok(Err(format!("sql_query blocked: {e}")));
+        }
         let db_path = plugin_db_path(&self.plugin_name);
         if let Some(parent) = db_path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
@@ -868,6 +922,126 @@ impl rsclaw::plugin::host_runtime::Host for HostState {
             Err(e) => Ok(Err(format!("sql_query panic: {e}"))),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum PluginSqlKind {
+    Execute,
+    Query,
+}
+
+fn validate_plugin_sql(sql: &str, kind: PluginSqlKind) -> std::result::Result<(), String> {
+    let policy = sql_policy_text(sql);
+    let trimmed = policy.trim();
+    if trimmed.is_empty() {
+        return Err("empty SQL".to_owned());
+    }
+    let statement = trimmed.strip_suffix(';').unwrap_or(trimmed).trim();
+    if statement.contains(';') {
+        return Err("multiple SQL statements are not allowed".to_owned());
+    }
+    let tokens: Vec<&str> = statement
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|s| !s.is_empty())
+        .collect();
+    let Some(first) = tokens.first().copied() else {
+        return Err("empty SQL".to_owned());
+    };
+
+    const BLOCKED_TOKENS: &[&str] = &[
+        "alter",
+        "analyze",
+        "attach",
+        "detach",
+        "drop",
+        "load_extension",
+        "pragma",
+        "reindex",
+        "vacuum",
+    ];
+    for token in &tokens {
+        if BLOCKED_TOKENS.contains(token) {
+            return Err(format!("token `{token}` is not allowed"));
+        }
+        if *token == "kv" {
+            return Err("reserved table `kv` is not available through host SQL".to_owned());
+        }
+    }
+
+    match kind {
+        PluginSqlKind::Query => {
+            if first != "select" && first != "with" {
+                return Err("sql_query only allows SELECT statements".to_owned());
+            }
+            for token in &tokens {
+                if matches!(*token, "insert" | "update" | "delete" | "create" | "replace") {
+                    return Err(format!("sql_query cannot contain `{token}`"));
+                }
+            }
+        }
+        PluginSqlKind::Execute => match first {
+            "insert" | "update" | "delete" => {}
+            "create" => {
+                let second = tokens.get(1).copied();
+                let third = tokens.get(2).copied();
+                if second != Some("table")
+                    && !(matches!(second, Some("temp" | "temporary")) && third == Some("table"))
+                {
+                    return Err("sql_execute only allows CREATE TABLE".to_owned());
+                }
+            }
+            _ => {
+                return Err(
+                    "sql_execute only allows INSERT, UPDATE, DELETE, or CREATE TABLE".to_owned(),
+                );
+            }
+        },
+    }
+    Ok(())
+}
+
+fn sql_policy_text(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' | '"' | '`' => {
+                let quote = ch;
+                out.push(' ');
+                while let Some(inner) = chars.next() {
+                    if inner == quote {
+                        if chars.peek() == Some(&quote) {
+                            let _ = chars.next();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+            '-' if chars.peek() == Some(&'-') => {
+                let _ = chars.next();
+                for inner in chars.by_ref() {
+                    if inner == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                let _ = chars.next();
+                let mut prev = '\0';
+                for inner in chars.by_ref() {
+                    if prev == '*' && inner == '/' {
+                        break;
+                    }
+                    prev = inner;
+                }
+                out.push(' ');
+            }
+            other => out.push(other.to_ascii_lowercase()),
+        }
+    }
+    out
 }
 
 impl rsclaw::plugin::host_config::Host for HostState {
@@ -929,7 +1103,7 @@ impl rsclaw::plugin::host_http::Host for HostState {
         } else {
             Duration::from_millis(u64::from(timeout_ms))
         };
-        let client = match host_http_client(timeout) {
+        let client = match host_http_client() {
             Ok(c) => c,
             Err(e) => return Ok(Err(format!("host_http.request: client build failed: {e}"))),
         };
@@ -937,7 +1111,11 @@ impl rsclaw::plugin::host_http::Host for HostState {
             Ok(m) => m,
             Err(e) => return Ok(Err(format!("host_http.request: invalid method: {e}"))),
         };
-        let mut rb = client.request(method, &url);
+        let url = match validate_host_http_url(&url).await {
+            Ok(u) => u,
+            Err(e) => return Ok(Err(format!("host_http.request: blocked URL: {e}"))),
+        };
+        let mut rb = client.request(method, url).timeout(timeout);
         for (k, v) in headers {
             let Some(s) = v.as_str() else {
                 return Ok(Err(format!("host_http.request: header `{k}` must be a string")));
@@ -990,14 +1168,118 @@ fn ensure_host_http_tls_provider() -> std::result::Result<(), String> {
     }
 }
 
-fn host_http_client(timeout: Duration) -> std::result::Result<reqwest::Client, String> {
+fn host_http_client() -> std::result::Result<reqwest::Client, String> {
     ensure_host_http_tls_provider()?;
-    reqwest::Client::builder()
-        .timeout(timeout)
-        .use_rustls_tls()
-        .tls_built_in_root_certs(true)
-        .build()
-        .map_err(|e| e.to_string())
+    if let Some(client) = HOST_HTTP_CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .use_rustls_tls()
+            .tls_built_in_root_certs(true)
+            .build()
+            .map_err(|e| e.to_string())?;
+    let _ = HOST_HTTP_CLIENT.set(client);
+    HOST_HTTP_CLIENT
+        .get()
+        .cloned()
+        .ok_or_else(|| "host HTTP client init failed".to_owned())
+}
+
+async fn validate_host_http_url(raw: &str) -> std::result::Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(raw).map_err(|e| format!("invalid URL: {e}"))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        scheme => return Err(format!("scheme `{scheme}` is not allowed")),
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("URL credentials are not allowed".to_owned());
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| "URL host is required".to_owned())?;
+    if host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".localhost")
+    {
+        return Err("localhost is not allowed".to_owned());
+    }
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "URL port could not be resolved".to_owned())?;
+    validate_host_http_endpoint(host, port).await?;
+    Ok(url)
+}
+
+async fn validate_host_http_endpoint(host: &str, port: u16) -> std::result::Result<(), String> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return validate_host_http_ip(ip);
+    }
+
+    let mut addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| format!("DNS lookup failed for `{host}`: {e}"))?;
+    let mut resolved = false;
+    for addr in addrs.by_ref() {
+        resolved = true;
+        validate_host_http_ip(addr.ip())?;
+    }
+    if !resolved {
+        return Err(format!("DNS lookup returned no addresses for `{host}`"));
+    }
+    Ok(())
+}
+
+fn validate_host_http_ip(ip: IpAddr) -> std::result::Result<(), String> {
+    if is_forbidden_host_http_ip(ip) && !unsafe_allow_private_host_http_for_debug() {
+        return Err(format!("IP `{ip}` is not allowed"));
+    }
+    Ok(())
+}
+
+fn unsafe_allow_private_host_http_for_debug() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var("RSCLAW_UNSAFE_PLUGIN_HTTP_ALLOW_PRIVATE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
+}
+
+fn is_forbidden_host_http_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => is_forbidden_host_http_ipv4(ip),
+        IpAddr::V6(ip) => is_forbidden_host_http_ipv6(ip),
+    }
+}
+
+fn is_forbidden_host_http_ipv4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 0
+        || o[0] == 10
+        || o[0] == 127
+        || (o[0] == 100 && (64..=127).contains(&o[1]))
+        || (o[0] == 169 && o[1] == 254)
+        || (o[0] == 172 && (16..=31).contains(&o[1]))
+        || (o[0] == 192 && o[1] == 168)
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+        || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+        || o[0] >= 224
+}
+
+fn is_forbidden_host_http_ipv6(ip: Ipv6Addr) -> bool {
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return is_forbidden_host_http_ipv4(v4);
+    }
+    let segments = ip.segments();
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || (segments[0] & 0xfe00) == 0xfc00
+        || (segments[0] & 0xffc0) == 0xfe80
 }
 
 impl rsclaw::plugin::host_kv::Host for HostState {
@@ -2497,6 +2779,8 @@ pub async fn load_wasm_plugin(
     let path = manifest.entry_path();
     let wasm_bytes = std::fs::read(&path)
         .with_context(|| format!("failed to read WASM file: {}", path.display()))?;
+    verify_wasm_integrity(manifest.integrity.as_deref(), &wasm_bytes)
+        .with_context(|| format!("WASM integrity check failed: {}", path.display()))?;
 
     let component = Component::new(engine, &wasm_bytes).map_err(|e| {
         anyhow::anyhow!("failed to compile WASM component: {}: {e}", path.display())
@@ -2539,6 +2823,30 @@ pub async fn load_wasm_plugin(
         providers,
         vision_model,
     })
+}
+
+fn verify_wasm_integrity(integrity: Option<&str>, bytes: &[u8]) -> Result<()> {
+    let Some(raw) = integrity.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    let expected = raw
+        .strip_prefix("sha256:")
+        .ok_or_else(|| anyhow::anyhow!("unsupported integrity format `{raw}`"))?;
+    let actual = sha256_hex(bytes);
+    if !expected.eq_ignore_ascii_case(&actual) {
+        anyhow::bail!("sha256 mismatch: expected {expected}, got {actual}");
+    }
+    Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -2672,8 +2980,196 @@ mod android_helper_tests {
 
     #[test]
     fn host_http_client_builds_with_rustls_roots() {
-        let client = host_http_client(Duration::from_secs(1)).expect("host HTTP client");
+        let client = host_http_client().expect("host HTTP client");
         drop(client);
+    }
+
+    #[test]
+    fn wasm_integrity_accepts_matching_sha256() {
+        let bytes = b"rsclaw plugin";
+        let integrity = format!("sha256:{}", sha256_hex(bytes));
+        verify_wasm_integrity(Some(&integrity), bytes).expect("matching integrity");
+        verify_wasm_integrity(None, bytes).expect("missing integrity stays optional");
+    }
+
+    #[test]
+    fn wasm_integrity_rejects_mismatch_and_unknown_format() {
+        let bytes = b"rsclaw plugin";
+        assert!(verify_wasm_integrity(Some("sha256:deadbeef"), bytes).is_err());
+        assert!(verify_wasm_integrity(Some("sha512:deadbeef"), bytes).is_err());
+    }
+
+    #[test]
+    fn plugin_sql_policy_allows_basic_safe_shapes() {
+        assert!(validate_plugin_sql("select code, price from quotes where code = ?1", PluginSqlKind::Query).is_ok());
+        assert!(validate_plugin_sql("with ranked as (select code from quotes) select * from ranked", PluginSqlKind::Query).is_ok());
+        assert!(validate_plugin_sql("create table if not exists quotes (code text primary key, price real)", PluginSqlKind::Execute).is_ok());
+        assert!(validate_plugin_sql("insert into quotes (code, price) values (?1, ?2)", PluginSqlKind::Execute).is_ok());
+        assert!(validate_plugin_sql("update quotes set price = ?2 where code = ?1", PluginSqlKind::Execute).is_ok());
+        assert!(validate_plugin_sql("delete from quotes where code = ?1", PluginSqlKind::Execute).is_ok());
+    }
+
+    #[test]
+    fn plugin_sql_policy_ignores_blocked_words_inside_literals() {
+        assert!(validate_plugin_sql("select 'drop table kv; attach database x' as text", PluginSqlKind::Query).is_ok());
+        assert!(validate_plugin_sql("insert into notes (body) values ('pragma kv attach')", PluginSqlKind::Execute).is_ok());
+    }
+
+    #[test]
+    fn plugin_sql_policy_blocks_dangerous_shapes() {
+        for sql in [
+            "select * from kv",
+            "drop table quotes",
+            "attach database '/tmp/x.db' as x",
+            "pragma writable_schema = on",
+            "select * from quotes; drop table quotes",
+            "with x as (select 1) delete from quotes",
+        ] {
+            assert!(validate_plugin_sql(sql, PluginSqlKind::Query).is_err(), "{sql}");
+        }
+        for sql in [
+            "delete from kv where key = ?1",
+            "create index idx_quotes_code on quotes(code)",
+            "alter table quotes add column x text",
+            "vacuum",
+        ] {
+            assert!(validate_plugin_sql(sql, PluginSqlKind::Execute).is_err(), "{sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn host_http_url_allows_public_http_ip_literals() {
+        assert!(validate_host_http_url("https://8.8.8.8/path").await.is_ok());
+        assert!(validate_host_http_url("http://1.1.1.1:8080/path").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn host_http_url_rejects_ssrf_ip_literals() {
+        for url in [
+            "http://127.0.0.1:18888/api/v1/health",
+            "http://10.0.0.1/",
+            "http://172.16.0.1/",
+            "http://192.168.1.1/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]/",
+            "http://[fc00::1]/",
+            "http://[fe80::1]/",
+            "http://[::ffff:127.0.0.1]/",
+        ] {
+            assert!(validate_host_http_url(url).await.is_err(), "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn host_http_url_rejects_unsafe_shapes_before_request() {
+        for url in [
+            "file:///etc/passwd",
+            "ftp://example.com/file",
+            "https://user:pass@example.com/",
+            "http://localhost/",
+            "http://api.localhost/",
+        ] {
+            assert!(validate_host_http_url(url).await.is_err(), "{url}");
+        }
+    }
+
+    #[test]
+    fn browser_upload_path_is_limited_to_allowed_roots() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "rsclaw-browser-upload-path-test-{}-{unique}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        let plugin_var = root.join("var").join("plugins").join("sample");
+        let downloads_rsclaw = root.join("Downloads").join("rsclaw");
+        let outside = root.join(".ssh");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        std::fs::create_dir_all(&plugin_var).expect("plugin var dir");
+        std::fs::create_dir_all(&downloads_rsclaw).expect("downloads dir");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+
+        let workspace_file = workspace.join("upload.txt");
+        let plugin_file = plugin_var.join("upload.txt");
+        let downloads_file = downloads_rsclaw.join("upload.txt");
+        let outside_file = outside.join("id_rsa");
+        std::fs::write(&workspace_file, "workspace").expect("workspace file");
+        std::fs::write(&plugin_file, "plugin").expect("plugin file");
+        std::fs::write(&downloads_file, "download").expect("download file");
+        std::fs::write(&outside_file, "secret").expect("outside file");
+
+        let roots = [workspace.clone(), plugin_var, downloads_rsclaw];
+        assert_eq!(
+            canonicalize_existing_file_in_roots("upload.txt", &workspace, &roots, "browser_upload")
+                .expect("workspace upload"),
+            std::fs::canonicalize(&workspace_file).expect("workspace canonical")
+        );
+        assert!(
+            canonicalize_existing_file_in_roots(
+                plugin_file.to_string_lossy().as_ref(),
+                &workspace,
+                &roots,
+                "browser_upload"
+            )
+            .is_ok()
+        );
+        assert!(
+            canonicalize_existing_file_in_roots(
+                downloads_file.to_string_lossy().as_ref(),
+                &workspace,
+                &roots,
+                "browser_upload"
+            )
+            .is_ok()
+        );
+        assert!(
+            canonicalize_existing_file_in_roots(
+                outside_file.to_string_lossy().as_ref(),
+                &workspace,
+                &roots,
+                "browser_upload"
+            )
+            .is_err()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_upload_path_rejects_symlink_escape() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "rsclaw-browser-upload-symlink-test-{}-{unique}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        let outside_file = outside.join("secret.txt");
+        let link_path = workspace.join("linked-secret.txt");
+        std::fs::write(&outside_file, "secret").expect("outside file");
+        std::os::unix::fs::symlink(&outside_file, &link_path).expect("symlink");
+
+        let roots = [workspace.clone()];
+        assert!(
+            canonicalize_existing_file_in_roots(
+                "linked-secret.txt",
+                &workspace,
+                &roots,
+                "browser_upload"
+            )
+            .is_err()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
