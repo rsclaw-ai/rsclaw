@@ -244,6 +244,16 @@ fn ocr_window(app_name: &str) -> Result<String, String> {
         })
         .ok_or_else(|| format!("no on-screen window for app '{app_name}'"))?;
     let window_id = win.id().map_err(|e| format!("xcap window id: {e}"))?;
+    // Bounds of the EXACT window we OCR (frontmost match — may be a CEF popover
+    // that AppleScript/get_main_window can't see). Passing them to the OCR driver
+    // lets it emit screen-absolute click points, so callers never have to re-resolve
+    // the window (and never mis-scale a popover's coords by the main window).
+    let (wx, wy, ww, wh) = (
+        win.x().unwrap_or(0),
+        win.y().unwrap_or(0),
+        win.width().unwrap_or(0),
+        win.height().unwrap_or(0),
+    );
     let tmp = std::env::temp_dir().join(format!(
         "rsclaw_ocr_{}_{window_id}.png",
         std::process::id()
@@ -266,6 +276,10 @@ fn ocr_window(app_name: &str) -> Result<String, String> {
         .arg("-c")
         .arg(OCR_VISION_PY)
         .arg(&tmp)
+        .arg(wx.to_string())
+        .arg(wy.to_string())
+        .arg(ww.to_string())
+        .arg(wh.to_string())
         .output()
         .map_err(|e| format!("python3 OCR spawn failed (need pyobjc Vision): {e}"))?;
     let _ = std::fs::remove_file(&tmp);
@@ -278,14 +292,17 @@ fn ocr_window(app_name: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// macOS Vision text-recognition driver (run via `python3 -c`). Reads an
-/// image path from argv[1], prints `[{"text","conf","x","y"}]` (conf 0-100,
-/// 0-1000 top-left centre coords) as JSON. RecognitionLevel 0 = accurate
-/// (1 = fast misses small CJK).
+/// macOS Vision text-recognition driver (run via `python3 -c`). Reads an image
+/// path from argv[1] and the OCR'd window's screen bounds from argv[2..6]
+/// (x,y,w,h in logical points). Prints `[{"text","conf","x","y","sx","sy"}]`:
+/// `x`/`y` are 0-1000 top-left window-relative; `sx`/`sy` are screen-absolute
+/// click points (window origin + relative offset) so callers click without
+/// re-resolving the window. RecognitionLevel 0 = accurate (1 misses small CJK).
 #[cfg(target_os = "macos")]
 const OCR_VISION_PY: &str = r#"import sys, json, Vision, Quartz
 from Foundation import NSURL
 url = NSURL.fileURLWithPath_(sys.argv[1])
+wx, wy, ww, wh = (int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])) if len(sys.argv) >= 6 else (0, 0, 0, 0)
 src = Quartz.CGImageSourceCreateWithURL(url, None)
 cg = Quartz.CGImageSourceCreateImageAtIndex(src, 0, None)
 req = Vision.VNRecognizeTextRequest.alloc().init()
@@ -299,13 +316,17 @@ for o in (req.results() or []):
     if not c:
         continue
     b = o.boundingBox()
+    fx = b.origin.x + b.size.width / 2.0            # 0-1 left-origin
+    fy = 1.0 - (b.origin.y + b.size.height / 2.0)   # 0-1 top-origin (Vision is bottom-left)
     # `conf` is Vision's per-line confidence scaled to 0-100. Clean CJK reads
     # score ~100; partial / edge-clipped glyphs (the source of garbled text when
     # scrolling) score ~30. Callers can drop low-confidence lines.
     out.append({'text': c[0].string(),
                 'conf': int(c[0].confidence() * 100),
-                'x': int((b.origin.x + b.size.width / 2.0) * 1000),
-                'y': int((1.0 - (b.origin.y + b.size.height / 2.0)) * 1000)})
+                'x': int(fx * 1000),
+                'y': int(fy * 1000),
+                'sx': int(wx + fx * ww),
+                'sy': int(wy + fy * wh)})
 print(json.dumps(out, ensure_ascii=False))
 "#;
 
