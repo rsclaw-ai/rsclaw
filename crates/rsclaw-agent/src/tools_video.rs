@@ -80,6 +80,12 @@ impl super::runtime::AgentRuntime {
             }
         }
 
+        // Optional driving video for v2v (rsclaw-video-ref-v1 structure
+        // transfer) — local path / data-URI / http URL all accepted (local
+        // files normalised to a data-URI, same as the reference images).
+        let video_assets = normalize_gen_assets(&args["video"]).await;
+        let video_ref = video_assets.first().map(|s| s.as_str());
+
         // Resolve the configured video chain (head + optional fallbacks)
         // from `agents.defaults.model.video` or the per-agent handle
         // override. StringOrVec collapses single string + array into the
@@ -301,7 +307,7 @@ impl super::runtime::AgentRuntime {
                         aspect_ratio,
                         Some(model_id.as_str()),
                         &images,
-                        args["video"].as_str().filter(|s| s.starts_with("http")),
+                        video_ref,
                     )
                     .await
                     .map(|id| ("rsclaw", id)),
@@ -411,11 +417,13 @@ impl super::runtime::AgentRuntime {
         let Some(image_url) = images.first() else {
             return Ok(json!({ "error": "avatar_gen: a character `image` is required (local path, https URL, or data URI)" }));
         };
-        // Driving video (animate lane). Large files → http(s) URL only per
-        // the doc (data-URI not accepted), so pass it through verbatim.
-        let drive_video = args["video"].as_str().filter(|s| s.starts_with("http"));
+        // Driving video (animate lane) — local path / data-URI / http URL all
+        // accepted (normalised to a data-URI for local files, same as image/
+        // audio).
+        let drive = normalize_gen_assets(&args["video"]).await;
+        let drive_video = drive.first();
         if audio.first().is_none() && drive_video.is_none() {
-            return Ok(json!({ "error": "avatar_gen: provide a driving signal — either `audio` (speech → lip-sync) or `video` (a driving video URL → motion transfer)" }));
+            return Ok(json!({ "error": "avatar_gen: provide a driving signal — either `audio` (speech → lip-sync) or `video` (a driving video → motion transfer)" }));
         }
         let mut body = json!({
             "input_reference": { "image_url": image_url },

@@ -1720,7 +1720,8 @@ pub fn build_tool_list(
                 "duration":     {"type": "integer", "description": "Duration in seconds (default: 5)", "default": 5},
                 "aspect_ratio": {"type": "string", "description": "Aspect ratio: 16:9, 9:16, 1:1 (default: 16:9)", "default": "16:9"},
                 "image":        {"type": ["string", "array"], "items": {"type": "string"}, "description": "Optional reference image(s) for image-to-video (agnes, doubao, rsclaw). Each entry: a LOCAL FILE PATH (e.g. the path returned by image_gen — auto-encoded to base64), a public https URL, or a data:image/...;base64,... URI. ONE image = first frame (animate this image). TWO images = first + last frame (interpolate). THREE+ = reference images (doubao multimodal)."},
-                "model":        {"type": "string", "description": "Video model to use, e.g. doubao seedance, agnes, rsclaw, sora-2 (optional, uses configured default)"}
+                "video":        {"type": "string", "description": "Optional DRIVING video for video-to-video structure/motion transfer (rsclaw-video-ref-v1). A LOCAL FILE PATH (auto-encoded to base64), an https URL, or a data:video/...;base64,... URI."},
+                "model":        {"type": "string", "description": "Video model to use, e.g. doubao seedance, agnes, rsclaw, rsclaw-video-ref-v1 (v2v), sora-2 (optional, uses configured default)"}
             },
             "required": ["prompt"]
         }),
@@ -1736,7 +1737,7 @@ pub fn build_tool_list(
             "properties": {
                 "image": {"type": "string", "description": "REQUIRED: character portrait — a LOCAL FILE PATH (auto-encoded to base64), a public https URL, or a data:image/...;base64,... URI."},
                 "audio": {"type": "string", "description": "Speech audio for lip-sync (talk mode) — local path (wav/mp3/flac/m4a, auto-encoded), https URL, or data:audio/... URI. Provide this OR `video`."},
-                "video": {"type": "string", "description": "Driving video for motion/expression transfer (animate mode) — an https URL (large files; data-URI not accepted). Provide this OR `audio`."},
+                "video": {"type": "string", "description": "Driving video for motion/expression transfer (animate mode) — a LOCAL FILE PATH (auto-encoded to base64), an https URL, or a data:video/...;base64,... URI. Provide this OR `audio`."},
                 "mode":  {"type": "string", "description": "Optional animate sub-mode passthrough (e.g. character-animation vs character-swap)."},
                 "model": {"type": "string", "description": "Optional model override; normally leave empty so the server auto-selects talk/animate."}
             },
