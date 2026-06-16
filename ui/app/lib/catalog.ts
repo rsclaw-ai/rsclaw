@@ -36,6 +36,7 @@ export interface CatalogProviderDef {
   tagEn: string;
   keyLabel: string;
   keyPlaceholder: string;
+  defaultModel: string;
   isUrl?: boolean;
   hasBaseUrl?: boolean;
   defaultBaseUrl?: string;
@@ -150,6 +151,7 @@ export function canonicalProviderId(id: string): string {
 // ── Mapping snake_case → camelCase ───────────────────────────────────────
 
 function mapProvider(p: RawProvider): CatalogProviderDef {
+  const m = p.model || "";
   const def: CatalogProviderDef = {
     id: p.name,
     name: p.name_zh || p.label || p.name,
@@ -157,6 +159,7 @@ function mapProvider(p: RawProvider): CatalogProviderDef {
     tagEn: p.tag_en || "",
     keyLabel: p.key_label || "",
     keyPlaceholder: p.key_placeholder || "",
+    defaultModel: m.includes("/") ? m.split("/").slice(1).join("/") : m,
   };
   if (p.is_url) def.isUrl = true;
   if (p.has_base_url) def.hasBaseUrl = true;
@@ -240,26 +243,26 @@ function mapCatalog(raw: RawCatalog): Catalog {
 // is used directly (no mapping) whenever the backend read fails.
 
 const FALLBACK_PROVIDERS: Record<string, CatalogProviderDef> = {
-  rsclaw:      { id: "rsclaw",      name: "RsClaw",             tag: "增量协议 · 业内首发", tagEn: "Incremental · Industry-first", keyLabel: "RsClaw API Key", keyPlaceholder: "sk-...", hasBaseUrl: true, defaultBaseUrl: "https://api.rsclaw.ai/v1/agent" },
-  agnes:       { id: "agnes",       name: "Agnes AI",           tag: "免费 · 文图视", tagEn: "Free · text/image/video", keyLabel: "Agnes API Key", keyPlaceholder: "sk-...", hasBaseUrl: true, defaultBaseUrl: "https://apihub.agnes-ai.com/v1" },
-  qwen:        { id: "qwen",        name: "Qwen (千问)", tag: "国内直连",      tagEn: "China direct",      keyLabel: "DashScope API Key",   keyPlaceholder: "sk-..." },
-  doubao:      { id: "doubao",      name: "Doubao (豆包)", tag: "字节跳动",     tagEn: "ByteDance",         keyLabel: "ARK API Key",         keyPlaceholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", hasBaseUrl: true, defaultBaseUrl: "https://ark.cn-beijing.volces.com/api/v3" },
-  minimax:     { id: "minimax",     name: "MiniMax",            tag: "国内",                  tagEn: "China",             keyLabel: "MiniMax API Key",     keyPlaceholder: "eyJ..." },
-  deepseek:    { id: "deepseek",    name: "DeepSeek",           tag: "低成本",            tagEn: "Low cost",          keyLabel: "DeepSeek API Key",    keyPlaceholder: "sk-..." },
-  kimi:        { id: "kimi",        name: "Kimi",               tag: "国内",                  tagEn: "China",             keyLabel: "Kimi API Key",        keyPlaceholder: "sk-...", hasBaseUrl: true, defaultBaseUrl: "https://api.moonshot.cn/v1", defaultUserAgent: "rsclaw/2026.5.5" },
-  codingplan:  { id: "codingplan",  name: "CodingPlan",         tag: "编程计划",      tagEn: "Coding Plan",       keyLabel: "API URL",             keyPlaceholder: "https://api.example.com/v1", isUrl: true },
-  zhipu:       { id: "zhipu",       name: "Zhipu (GLM)",        tag: "国内",                  tagEn: "China",             keyLabel: "Zhipu API Key",       keyPlaceholder: "sk-..." },
-  ollama:      { id: "ollama",      name: "Ollama (local)",     tag: "无需 Key",              tagEn: "No Key",            keyLabel: "URL",                 keyPlaceholder: "http://localhost:11434/v1", isUrl: true },
-  custom:      { id: "custom",      name: "Custom Provider",    tag: "自定义",            tagEn: "Custom",            keyLabel: "API URL",             keyPlaceholder: "https://api.example.com/v1", isUrl: true },
-  gaterouter:  { id: "gaterouter",  name: "GateRouter",         tag: "聚合路由",      tagEn: "Aggregator",        keyLabel: "GateRouter Key",      keyPlaceholder: "sk-..." },
-  openrouter:  { id: "openrouter",  name: "OpenRouter",         tag: "聚合路由",      tagEn: "Aggregator",        keyLabel: "OpenRouter Key",      keyPlaceholder: "sk-or-..." },
-  anthropic:   { id: "anthropic",   name: "Anthropic (Claude)", tag: "推荐",                  tagEn: "Recommended",       keyLabel: "Anthropic API Key",   keyPlaceholder: "sk-ant-..." },
-  openai:      { id: "openai",      name: "OpenAI (GPT)",       tag: "",                              tagEn: "",                  keyLabel: "OpenAI API Key",      keyPlaceholder: "sk-..." },
-  gemini:      { id: "gemini",      name: "Google Gemini",      tag: "",                              tagEn: "",                  keyLabel: "Gemini API Key",      keyPlaceholder: "AIza..." },
+  rsclaw:      { id: "rsclaw",      name: "RsClaw",             tag: "增量协议 · 业内首发", tagEn: "Incremental · Industry-first", keyLabel: "RsClaw API Key", keyPlaceholder: "sk-...", defaultModel: "rsclaw-agent-v1", hasBaseUrl: true, defaultBaseUrl: "https://api.rsclaw.ai/v1/agent" },
+  agnes:       { id: "agnes",       name: "Agnes AI",           tag: "免费 · 文图视", tagEn: "Free · text/image/video", keyLabel: "Agnes API Key", keyPlaceholder: "sk-...", defaultModel: "agnes-2.0-flash", hasBaseUrl: true, defaultBaseUrl: "https://apihub.agnes-ai.com/v1" },
+  qwen:        { id: "qwen",        name: "Qwen (千问)", tag: "国内直连",      tagEn: "China direct",      keyLabel: "DashScope API Key",   keyPlaceholder: "sk-...", defaultModel: "qwen-max" },
+  doubao:      { id: "doubao",      name: "Doubao (豆包)", tag: "字节跳动",     tagEn: "ByteDance",         keyLabel: "ARK API Key",         keyPlaceholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", defaultModel: "doubao-seed-2.0-pro", hasBaseUrl: true, defaultBaseUrl: "https://ark.cn-beijing.volces.com/api/v3" },
+  minimax:     { id: "minimax",     name: "MiniMax",            tag: "国内",                  tagEn: "China",             keyLabel: "MiniMax API Key",     keyPlaceholder: "eyJ...", defaultModel: "MiniMax-M2.7" },
+  deepseek:    { id: "deepseek",    name: "DeepSeek",           tag: "低成本",            tagEn: "Low cost",          keyLabel: "DeepSeek API Key",    keyPlaceholder: "sk-...", defaultModel: "deepseek-chat" },
+  kimi:        { id: "kimi",        name: "Kimi",               tag: "国内",                  tagEn: "China",             keyLabel: "Kimi API Key",        keyPlaceholder: "sk-...", defaultModel: "", hasBaseUrl: true, defaultBaseUrl: "https://api.moonshot.cn/v1", defaultUserAgent: "rsclaw/2026.5.5" },
+  codingplan:  { id: "codingplan",  name: "CodingPlan",         tag: "编程计划",      tagEn: "Coding Plan",       keyLabel: "API URL",             keyPlaceholder: "https://api.example.com/v1", defaultModel: "", isUrl: true },
+  zhipu:       { id: "zhipu",       name: "Zhipu (GLM)",        tag: "国内",                  tagEn: "China",             keyLabel: "Zhipu API Key",       keyPlaceholder: "sk-...", defaultModel: "" },
+  ollama:      { id: "ollama",      name: "Ollama (local)",     tag: "无需 Key",              tagEn: "No Key",            keyLabel: "URL",                 keyPlaceholder: "http://localhost:11434/v1", defaultModel: "", isUrl: true },
+  custom:      { id: "custom",      name: "Custom Provider",    tag: "自定义",            tagEn: "Custom",            keyLabel: "API URL",             keyPlaceholder: "https://api.example.com/v1", defaultModel: "", isUrl: true },
+  gaterouter:  { id: "gaterouter",  name: "GateRouter",         tag: "聚合路由",      tagEn: "Aggregator",        keyLabel: "GateRouter Key",      keyPlaceholder: "sk-...", defaultModel: "" },
+  openrouter:  { id: "openrouter",  name: "OpenRouter",         tag: "聚合路由",      tagEn: "Aggregator",        keyLabel: "OpenRouter Key",      keyPlaceholder: "sk-or-...", defaultModel: "" },
+  anthropic:   { id: "anthropic",   name: "Anthropic (Claude)", tag: "推荐",                  tagEn: "Recommended",       keyLabel: "Anthropic API Key",   keyPlaceholder: "sk-ant-...", defaultModel: "" },
+  openai:      { id: "openai",      name: "OpenAI (GPT)",       tag: "",                              tagEn: "",                  keyLabel: "OpenAI API Key",      keyPlaceholder: "sk-...", defaultModel: "" },
+  gemini:      { id: "gemini",      name: "Google Gemini",      tag: "",                              tagEn: "",                  keyLabel: "Gemini API Key",      keyPlaceholder: "AIza...", defaultModel: "" },
   // Backend id is `xai`; we standardize on it. `grok` alias added below.
-  xai:         { id: "xai",         name: "xAI (Grok)",         tag: "",                              tagEn: "",                  keyLabel: "xAI API Key",         keyPlaceholder: "xai-..." },
-  groq:        { id: "groq",        name: "Groq",               tag: "快速推理",      tagEn: "Fast",              keyLabel: "Groq API Key",        keyPlaceholder: "gsk_..." },
-  siliconflow: { id: "siliconflow", name: "SiliconFlow",        tag: "国内加速",      tagEn: "China accel",       keyLabel: "SiliconFlow Key",     keyPlaceholder: "sk-..." },
+  xai:         { id: "xai",         name: "xAI (Grok)",         tag: "",                              tagEn: "",                  keyLabel: "xAI API Key",         keyPlaceholder: "xai-...", defaultModel: "" },
+  groq:        { id: "groq",        name: "Groq",               tag: "快速推理",      tagEn: "Fast",              keyLabel: "Groq API Key",        keyPlaceholder: "gsk_...", defaultModel: "" },
+  siliconflow: { id: "siliconflow", name: "SiliconFlow",        tag: "国内加速",      tagEn: "China accel",       keyLabel: "SiliconFlow Key",     keyPlaceholder: "sk-...", defaultModel: "" },
 };
 // grok → xai alias (back-compat).
 FALLBACK_PROVIDERS.grok = FALLBACK_PROVIDERS.xai;
@@ -417,6 +420,11 @@ function isZh(lang?: string): boolean {
 /** Provider lookup table (camelCase), keyed by id. Includes the grok alias. */
 export function getProviderMap(): Record<string, CatalogProviderDef> {
   return resolvedCatalog.providers;
+}
+
+/** Provider's default chat model id (no provider prefix), from defaults.toml. */
+export function getProviderDefaultModel(id: string): string {
+  return resolvedCatalog.providers[id]?.defaultModel || "";
 }
 
 /** Provider ids in display order for the given language ("cn" → ZH order). */

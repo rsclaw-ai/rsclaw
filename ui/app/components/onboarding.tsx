@@ -24,6 +24,7 @@ import {
   getProviderOrder,
   getChannelMap,
   getChannelOrder,
+  getProviderDefaultModel,
 } from "../lib/catalog";
 import { toast } from "../lib/toast";
 import {
@@ -803,58 +804,15 @@ function getProviders(lang?: string): ProviderDef[] {
     .filter(Boolean);
 }
 
+// ModelDef is the per-provider model shape used by ProvState.models and by
+// the live-fetch mapping. The hardcoded MODELS preset table was removed in
+// favor of live `/models` fetches + the catalog default-model fallback.
 interface ModelDef {
   id: string;
   tag: string;
   tagEn: string;
   rec: boolean;
 }
-
-export const MODELS: Record<string, ModelDef[]> = {
-  rsclaw: [
-    { id: "rsclaw-agent-v1", tag: "推荐", tagEn: "Recommended", rec: true },
-  ],
-  agnes: [
-    { id: "agnes-2.0-flash", tag: "免费", tagEn: "Free", rec: true },
-    { id: "agnes-1.5-flash", tag: "", tagEn: "", rec: false },
-  ],
-  qwen: [
-    { id: "qwen3.6-plus", tag: "\u6700\u65B0", tagEn: "Latest", rec: true },
-    { id: "qwen-max", tag: "\u63A8\u8350", tagEn: "Recommended", rec: false },
-    { id: "qwen-plus", tag: "\u5747\u8861", tagEn: "Balanced", rec: false },
-    { id: "qwen-turbo", tag: "\u5FEB\u901F", tagEn: "Fast", rec: false },
-  ],
-  doubao: [
-    { id: "doubao-seed-2.0-pro", tag: "\u63A8\u8350", tagEn: "Recommended", rec: true },
-    { id: "doubao-seed-2.0-lite", tag: "\u8F7B\u91CF", tagEn: "Lite", rec: false },
-  ],
-  deepseek: [
-    { id: "deepseek-v4-flash", tag: "\u901A\u7528", tagEn: "General", rec: true },
-    { id: "deepseek-v4-pro", tag: "\u63A8\u7406", tagEn: "Reasoning", rec: false },
-  ],
-  anthropic: [
-    { id: "claude-sonnet-4-20250514", tag: "\u63A8\u8350", tagEn: "Recommended", rec: true },
-    { id: "claude-opus-4-5", tag: "\u6700\u5F3A", tagEn: "Strongest", rec: false },
-    { id: "claude-haiku-4-5-20251001", tag: "\u6700\u5FEB", tagEn: "Fastest", rec: false },
-  ],
-  openai: [
-    { id: "gpt-4o", tag: "\u63A8\u8350", tagEn: "Recommended", rec: true },
-    { id: "gpt-4o-mini", tag: "\u5FEB\u901F", tagEn: "Fast", rec: false },
-    { id: "o3", tag: "\u63A8\u7406", tagEn: "Reasoning", rec: false },
-  ],
-  groq: [
-    { id: "llama-3.3-70b-versatile", tag: "\u63A8\u8350", tagEn: "Recommended", rec: true },
-    { id: "mixtral-8x7b-32768", tag: "", tagEn: "", rec: false },
-  ],
-  ollama: [
-    { id: "llama3.2:3b", tag: "\u5DF2\u5B89\u88C5", tagEn: "Installed", rec: true },
-    { id: "qwen2.5:7b", tag: "\u5DF2\u5B89\u88C5", tagEn: "Installed", rec: false },
-  ],
-  minimax: [
-    { id: "MiniMax-M2.7", tag: "\u6700\u65B0", tagEn: "Latest", rec: true },
-    { id: "MiniMax-M2.5", tag: "\u63A8\u8350", tagEn: "Recommended", rec: false },
-  ],
-};
 
 export interface ChannelDef {
   id: string;
@@ -1854,9 +1812,9 @@ export function OnboardingPage() {
     // list — if it's actually invalid the user finds out at the
     // gateway-start step's health check.
     if (id === "rsclaw") {
-      const fallback = MODELS["rsclaw"] || [];
-      const defaultModel =
-        fallback.find((m) => m.rec)?.id || fallback[0]?.id || "rsclaw-agent-v1";
+      const rdef = getProviderDefaultModel("rsclaw") || "rsclaw-agent-v1";
+      const fallback = [{ id: rdef, tag: "推荐", tagEn: "Recommended", rec: true }];
+      const defaultModel = rdef;
       setProvs((prev) => {
         const p = { ...prev };
         p[id] = {
@@ -1908,16 +1866,16 @@ export function OnboardingPage() {
         tagEn: "",
         rec: false,
       }));
-      // If no models returned, use fallback defaults
-      const fallback = MODELS[id] || [];
-      const finalModels = realModels.length > 0 ? realModels : fallback;
+      // Live fetch is the source of truth. If empty, fall back to the
+      // catalog default model for the picker's preselection.
+      const finalModels = realModels;
       setProvs((prev) => {
         const p = { ...prev };
         p[id] = {
           ...p[id],
           modelsLoading: false,
           models: finalModels,
-          selectedModel: finalModels[0]?.id || null,
+          selectedModel: finalModels[0]?.id || getProviderDefaultModel(id) || null,
         };
         return p;
       });
@@ -2542,11 +2500,10 @@ export function OnboardingPage() {
                   // a "tested successfully" state so `canNextStep2`
                   // flips immediately — no need for the user to click
                   // 获取模型 (which would fail anyway, see below).
-                  const rsclawModels = MODELS["rsclaw"] || [];
-                  const defaultModel =
-                    rsclawModels.find((m) => m.rec)?.id ||
-                    rsclawModels[0]?.id ||
-                    "rsclaw-agent-v1";
+                  const defaultModel = getProviderDefaultModel("rsclaw") || "rsclaw-agent-v1";
+                  const rsclawModels = [
+                    { id: defaultModel, tag: "推荐", tagEn: "Recommended", rec: true },
+                  ];
                   setProvs((prev) => {
                     const next: Record<string, ProvState> = {};
                     for (const [k, v] of Object.entries(prev)) {

@@ -2191,8 +2191,6 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
                 "doubao-seed-2.0-flash",
                 "doubao-seed-1.6-vision-thinking",
                 "doubao-seed-1.5-vision-pro",
-                "doubao-seedream-5-0-260128",
-                "doubao-seedance-2-0-260128",
             ]
         }));
     }

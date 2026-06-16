@@ -53,7 +53,6 @@ import {
   testProviderKey,
   listProviderModels,
 } from "../lib/rsclaw-api";
-import { MODELS } from "./onboarding";
 import {
   useCatalog,
   getProviderMap,
@@ -61,6 +60,7 @@ import {
   getChannelMap,
   getChannelOrder,
   getSearchEngines,
+  getProviderDefaultModel,
 } from "../lib/catalog";
 import {
   type ApiType,
@@ -2953,10 +2953,10 @@ function TauriConfigPageInner() {
       // If provider has key configured, mark as connected
       testState[provId] = "ok";
       if (selModel) selModels[provId] = selModel;
-      // Add fallback models from MODELS constant
-      if (MODELS[provId]) {
-        modelLists[provId] = MODELS[provId].map((m) => ({ id: m.id, tag: zh ? m.tag : m.tagEn }));
-      }
+      // Seed a single default-model entry so the dropdown has the
+      // preselected default before any live `/models` fetch.
+      const dm = getProviderDefaultModel(provId);
+      if (dm) modelLists[provId] = [{ id: dm, tag: "" }];
     }
     if (Object.keys(testState).length > 0) {
       setProvTest((prev) => ({ ...prev, ...testState }));
@@ -3191,26 +3191,9 @@ function TauriConfigPageInner() {
     setProvTest((prev) => ({ ...prev, [provId]: "testing" }));
     setProvErr((prev) => ({ ...prev, [provId]: "" }));
 
-    // rsclaw short-circuit — same rationale as the onboarding flow:
-    // the cloud agent endpoint doesn't expose an OpenAI-compatible
-    // `/models` listing, so the Tauri `test_provider` command bails
-    // out with "unknown provider". Trust the key, use the hardcoded
-    // MODELS["rsclaw"] preset list. Real validation happens at the
-    // gateway-start health check.
-    if (provId === "rsclaw") {
-      const presets = (MODELS["rsclaw"] || []).map((m) => ({
-        id: m.id,
-        tag: zh ? m.tag : m.tagEn,
-      }));
-      setProvTest((prev) => ({ ...prev, [provId]: "ok" }));
-      setProvModels((prev) => ({ ...prev, [provId]: presets }));
-      toast.success(
-        zh
-          ? `rsclaw 已就绪 (${presets.length} 个模型)`
-          : `rsclaw ready (${presets.length} models)`,
-      );
-      return;
-    }
+    // rsclaw flows through the normal `test_provider` path below — the
+    // Tauri command returns rsclaw's backend fallback models (agent-v1 /
+    // flash-v1 / vision-v1) since the cloud agent has no `/models` route.
 
     try {
       const tauriInvoke = isTauri ? tauriInvokeV2 : null;
@@ -3257,37 +3240,11 @@ function TauriConfigPageInner() {
           apiModels = Array.from(families.values()).sort();
         }
         if (apiModels.length > 0) {
-          // Always surface MODELS[provId] presets at the top of the list,
-          // even when they aren't returned by the upstream /v1/models call
-          // (e.g. doubao's "rolling alias" ids like `doubao-seed-2.0-pro`
-          // never appear in the API \u2014 only dated snapshots do). Dedup by
-          // id so a preset that DOES appear upstream isn't duplicated, and
-          // cap the API tail at 30 so the picker stays manageable.
-          const presets = (MODELS[provId] || []).map((m) => ({ id: m.id, tag: zh ? m.tag : m.tagEn }));
-          const presetIds = new Set(presets.map((m) => m.id));
-          const apiEntries = apiModels
-            .filter((id) => !presetIds.has(id))
-            .slice(0, 30)
-            .map((id) => {
-              const fallback = (MODELS[provId] || []).find((fm) => fm.id === id);
-              return { id, tag: fallback ? (zh ? fallback.tag : fallback.tagEn) : "" };
-            });
+          const entries = apiModels.slice(0, 30).map((id) => ({ id, tag: "" }));
           setProvTest((prev) => ({ ...prev, [provId]: "ok" }));
-          setProvModels((prev) => ({ ...prev, [provId]: [...presets, ...apiEntries] }));
+          setProvModels((prev) => ({ ...prev, [provId]: entries }));
           toast.success(zh ? `${provId} \u8FDE\u63A5\u6210\u529F (${apiModels.length} \u4E2A\u6A21\u578B)` : `${provId} connected (${apiModels.length} models)`);
-        } else if ((MODELS[provId] || []).length > 0) {
-          // Upstream is reachable (ok=true) but returned no listing \u2014 happens
-          // when the backend has no `/models` route (Volcengine ARK CodingPlan
-          // at `/api/coding/v3`, the Tauri/HTTP probe-fallback path returns
-          // ok+empty). Fall back to the local MODELS preset so the user can
-          // still pick a model. Same surface as the listed path: tag-decorated
-          // entries from the preset table.
-          const presets = (MODELS[provId] || []).map((m) => ({ id: m.id, tag: zh ? m.tag : m.tagEn }));
-          setProvTest((prev) => ({ ...prev, [provId]: "ok" }));
-          setProvModels((prev) => ({ ...prev, [provId]: presets }));
-          toast.success(zh ? `${provId} \u5DF2\u8FDE\u63A5 (${presets.length} \u4E2A\u9884\u8BBE\u6A21\u578B)` : `${provId} connected (${presets.length} preset models)`);
         } else {
-          // API key works but no models returned and no presets to fall back on
           setProvTest((prev) => ({ ...prev, [provId]: "err" }));
           setProvErr((prev) => ({ ...prev, [provId]: zh ? "API Key \u6709\u6548\u4F46\u672A\u83B7\u53D6\u5230\u6A21\u578B\u5217\u8868" : "API Key valid but no models returned" }));
         }
@@ -4117,9 +4074,8 @@ function TauriConfigPageInner() {
                             <div style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 200, overflowY: "auto" }}>
                               {models.map((m) => {
                                 const isSel = selModel === m.id || (!selModel && models[0]?.id === m.id);
-                                const fallbackModel = (MODELS[p.id] || []).find((fm) => fm.id === m.id);
-                                const tag = m.tag || (fallbackModel ? (zh ? fallbackModel.tag : fallbackModel.tagEn) : "");
-                                const isRec = fallbackModel?.rec;
+                                const tag = m.tag || "";
+                                const isRec = false;
                                 return (
                                   <div key={m.id} onClick={() => handleSelectModel(p.id, m.id)}
                                     style={{ display: "flex", alignItems: "center", gap: 9, padding: "7px 10px", borderRadius: 7, cursor: "pointer", border: `1px solid ${isSel ? V.obrd : "transparent"}`, background: isSel ? V.olo : "transparent", transition: "all .12s" }}>
@@ -4132,6 +4088,12 @@ function TauriConfigPageInner() {
                                 );
                               })}
                             </div>
+                          </div>
+                        )}
+                        {/* Empty-state hint: no models loaded yet (option A) */}
+                        {models.length === 0 && (
+                          <div style={{ fontSize: 11, color: V.t3, marginTop: 4 }}>
+                            {zh ? "填好 Key 后点「获取模型」加载可用模型" : "Enter your key, then click Fetch Models to load the list"}
                           </div>
                         )}
                       </div>
