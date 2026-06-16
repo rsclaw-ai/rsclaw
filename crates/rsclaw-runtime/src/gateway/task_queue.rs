@@ -5,14 +5,16 @@
 //! the same priority level).
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, OnceLock, RwLock},
     time::Duration,
 };
 
 use anyhow::Result;
+use futures::StreamExt as _;
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::{Notify, mpsc};
 use tracing::{error, info, warn};
 
@@ -298,6 +300,13 @@ pub struct TaskQueueManager {
 type ChannelSendersMap = Arc<RwLock<HashMap<String, mpsc::Sender<OutboundMessage>>>>;
 static CHANNEL_SENDERS: OnceLock<ChannelSendersMap> = OnceLock::new();
 static TASK_QUEUE: OnceLock<Arc<TaskQueueManager>> = OnceLock::new();
+static PLUGIN_BACKGROUND_KEYS: OnceLock<Arc<RwLock<HashSet<String>>>> = OnceLock::new();
+
+fn plugin_background_keys() -> Arc<RwLock<HashSet<String>>> {
+    PLUGIN_BACKGROUND_KEYS
+        .get_or_init(|| Arc::new(RwLock::new(HashSet::new())))
+        .clone()
+}
 
 /// Install the channel senders map. Called once at gateway startup.
 /// Subsequent installs are silently ignored (idempotent).
@@ -330,7 +339,7 @@ pub fn get_task_queue() -> Option<Arc<TaskQueueManager>> {
 /// the channel is not registered (or `install_channel_senders` was never
 /// called).
 /// Push an outbound message directly to a channel without going through
-/// the task queue. Used by background subsystems (cron briefings, astock
+/// the task queue. Used by background subsystems (cron briefings, plugin
 /// SSE bridge, etc.) that have a pre-formatted message and don't need
 /// an LLM turn to produce it. Falls back to bare `{name}` lookup when
 /// `account` is `None` or absent from the sender map.
@@ -1636,10 +1645,9 @@ mod tests {
     }
 }
 
-/// Root-side implementation of `rsclaw_types::BriefingSink` (crate-split
-/// trait inversion). Lets `rsclaw-astock` submit briefings + push outbound
-/// through the gateway task queue without depending on the gateway crate.
-/// Injected into astock at startup via `astock::set_global_briefing_sink`.
+/// Root-side implementation of `rsclaw_types::BriefingSink` for trusted
+/// plugin background registrations that submit briefings + push outbound
+/// through the gateway task queue.
 pub struct GatewayBriefingSink;
 
 impl rsclaw_types::BriefingSink for GatewayBriefingSink {
@@ -1668,6 +1676,466 @@ impl rsclaw_types::BriefingSink for GatewayBriefingSink {
     }
 }
 
+/// Root-side implementation of trusted WASM plugin background host methods.
+pub struct GatewayPluginBackgroundHost;
+
+impl rsclaw_plugin::PluginBackgroundHost for GatewayPluginBackgroundHost {
+    fn cron_register(
+        &self,
+        plugin: String,
+        name: String,
+        schedule_json: String,
+        ctx: Option<rsclaw_plugin::PluginInvocationContext>,
+    ) -> futures::future::BoxFuture<'static, std::result::Result<String, String>> {
+        Box::pin(async move {
+            let key = plugin_background_key("cron", &plugin, &name, None, ctx.as_ref());
+            if !claim_plugin_background_key(&key) {
+                return Ok("already_registered".to_owned());
+            }
+            let schedule: Value = serde_json::from_str(&schedule_json)
+                .map_err(|e| format!("plugin cron schedule JSON invalid: {e}"))?;
+            let slots = schedule
+                .get("slots")
+                .and_then(Value::as_object)
+                .ok_or_else(|| "plugin cron schedule requires object field `slots`".to_owned())?;
+            let prompt_template = schedule
+                .get("promptTemplate")
+                .and_then(Value::as_str)
+                .unwrap_or("Run plugin cron job {plugin}.{name} slot {slot}.")
+                .to_owned();
+            let session_key = schedule
+                .get("sessionKey")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let mut count = 0usize;
+            for (slot, hhmm) in slots {
+                let Some(hhmm) = hhmm.as_str() else {
+                    continue;
+                };
+                let Some((hour, minute)) = parse_hhmm(hhmm) else {
+                    continue;
+                };
+                let ctx_for_task = ctx.clone();
+                let prompt_template = prompt_template.clone();
+                let plugin = plugin.clone();
+                let name = name.clone();
+                let slot = slot.clone();
+                let session_key = session_key.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let wait = duration_until_shanghai(hour, minute);
+                        tokio::time::sleep(wait).await;
+                        let prompt = prompt_template
+                            .replace("{plugin}", &plugin)
+                            .replace("{name}", &name)
+                            .replace("{slot}", &slot);
+                        let session = session_key
+                            .clone()
+                            .or_else(|| ctx_for_task.as_ref().map(|c| c.session_key.clone()))
+                            .unwrap_or_else(|| format!("plugin:{plugin}:{name}:{slot}"));
+                        if let Err(e) = submit_plugin_agent_turn(&session, &prompt, "{}", ctx_for_task.as_ref()) {
+                            warn!(plugin, name, slot, error = %e, "plugin cron submit failed");
+                        }
+                    }
+                });
+                count += 1;
+            }
+            Ok(format!("registered {count} cron slot(s)"))
+        })
+    }
+
+    fn sse_subscribe(
+        &self,
+        plugin: String,
+        name: String,
+        url: String,
+        headers_json: String,
+        resume_key: String,
+        ctx: Option<rsclaw_plugin::PluginInvocationContext>,
+    ) -> futures::future::BoxFuture<'static, std::result::Result<String, String>> {
+        Box::pin(async move {
+            let key = plugin_background_key("sse", &plugin, &name, Some(&url), ctx.as_ref());
+            if !claim_plugin_background_key(&key) {
+                return Ok("already_registered".to_owned());
+            }
+            let Some(ctx) = ctx else {
+                return Err("plugin SSE subscribe requires invocation context".to_owned());
+            };
+            tokio::spawn(async move {
+                run_plugin_sse(plugin, name, url, headers_json, resume_key, ctx).await;
+            });
+            Ok("registered".to_owned())
+        })
+    }
+
+    fn sse_status(
+        &self,
+        plugin: String,
+        name: String,
+        ctx: Option<rsclaw_plugin::PluginInvocationContext>,
+    ) -> futures::future::BoxFuture<'static, std::result::Result<String, String>> {
+        Box::pin(async move { Ok(plugin_sse_status_json(&plugin, &name, ctx.as_ref())) })
+    }
+
+    fn push_outbound(
+        &self,
+        channel: String,
+        peer_id: String,
+        message_json: String,
+        ctx: Option<rsclaw_plugin::PluginInvocationContext>,
+    ) -> futures::future::BoxFuture<'static, std::result::Result<String, String>> {
+        Box::pin(async move { push_plugin_outbound(&channel, &peer_id, &message_json, ctx.as_ref()) })
+    }
+
+    fn submit_agent_turn(
+        &self,
+        session_key: String,
+        prompt: String,
+        route_json: String,
+        ctx: Option<rsclaw_plugin::PluginInvocationContext>,
+    ) -> futures::future::BoxFuture<'static, std::result::Result<String, String>> {
+        Box::pin(async move {
+            let session = if session_key.trim().is_empty() {
+                ctx.as_ref()
+                    .map(|c| c.session_key.as_str())
+                    .unwrap_or("plugin:agent-turn")
+            } else {
+                session_key.as_str()
+            };
+            submit_plugin_agent_turn(session, &prompt, &route_json, ctx.as_ref())
+        })
+    }
+}
+
+fn claim_plugin_background_key(key: &str) -> bool {
+    let keys = plugin_background_keys();
+    let Ok(mut guard) = keys.write() else {
+        return false;
+    };
+    guard.insert(key.to_owned())
+}
+
+fn plugin_background_key_prefix(
+    kind: &str,
+    plugin: &str,
+    name: &str,
+    ctx: Option<&rsclaw_plugin::PluginInvocationContext>,
+) -> String {
+    let ctx = ctx
+        .map(plugin_invocation_context_key)
+        .unwrap_or_else(|| "global".to_owned());
+    format!("{kind}:{plugin}:{name}:{ctx}")
+}
+
+fn plugin_background_key(
+    kind: &str,
+    plugin: &str,
+    name: &str,
+    extra: Option<&str>,
+    ctx: Option<&rsclaw_plugin::PluginInvocationContext>,
+) -> String {
+    let ctx = ctx
+        .map(plugin_invocation_context_key)
+        .unwrap_or_else(|| "global".to_owned());
+    match extra {
+        Some(extra) if !extra.is_empty() => format!("{kind}:{plugin}:{name}:{ctx}:{extra}"),
+        _ => format!("{kind}:{plugin}:{name}:{ctx}"),
+    }
+}
+
+fn plugin_invocation_context_key(ctx: &rsclaw_plugin::PluginInvocationContext) -> String {
+    format!(
+        "agent={}:channel={}:peer={}:chat={}:session={}",
+        ctx.agent_id, ctx.channel, ctx.peer_id, ctx.chat_id, ctx.session_key
+    )
+}
+
+fn plugin_sse_status_json(
+    plugin: &str,
+    name: &str,
+    ctx: Option<&rsclaw_plugin::PluginInvocationContext>,
+) -> String {
+    let prefix = plugin_background_key_prefix("sse", plugin, name, ctx);
+    let count = plugin_background_keys()
+        .read()
+        .map(|keys| {
+            keys.iter()
+                .filter(|key| *key == &prefix || key.starts_with(&format!("{prefix}:")))
+                .count()
+        })
+        .unwrap_or(0);
+    serde_json::json!({
+        "ok": true,
+        "name": name,
+        "active": count > 0,
+        "count": count,
+    })
+    .to_string()
+}
+
+fn parse_hhmm(raw: &str) -> Option<(u32, u32)> {
+    let (h, m) = raw.split_once(':')?;
+    let hour = h.parse::<u32>().ok()?;
+    let minute = m.parse::<u32>().ok()?;
+    if hour < 24 && minute < 60 {
+        Some((hour, minute))
+    } else {
+        None
+    }
+}
+
+fn duration_until_shanghai(hour: u32, minute: u32) -> Duration {
+    use chrono::{Datelike, TimeZone};
+    let tz = chrono_tz::Asia::Shanghai;
+    let now = chrono::Utc::now().with_timezone(&tz);
+    let today = tz
+        .with_ymd_and_hms(now.year(), now.month(), now.day(), hour, minute, 0)
+        .single()
+        .unwrap_or(now);
+    let next = if today > now {
+        today
+    } else {
+        today + chrono::Duration::days(1)
+    };
+    (next - now).to_std().unwrap_or(Duration::from_secs(60))
+}
+
+fn submit_plugin_agent_turn(
+    session_key: &str,
+    prompt: &str,
+    route_json: &str,
+    ctx: Option<&rsclaw_plugin::PluginInvocationContext>,
+) -> Result<String, String> {
+    let route: Value = serde_json::from_str(route_json).unwrap_or(Value::Null);
+    let route_ctx = route.get("context").unwrap_or(&Value::Null);
+    let channel = route
+        .get("channel")
+        .and_then(Value::as_str)
+        .or_else(|| route_ctx.get("channel").and_then(Value::as_str))
+        .or_else(|| ctx.map(|c| c.channel.as_str()))
+        .unwrap_or("plugin");
+    let peer_id = route
+        .get("peer_id")
+        .and_then(Value::as_str)
+        .or_else(|| route_ctx.get("peer_id").and_then(Value::as_str))
+        .or_else(|| ctx.map(|c| c.peer_id.as_str()))
+        .unwrap_or("plugin");
+    let chat_id = route
+        .get("chat_id")
+        .and_then(Value::as_str)
+        .or_else(|| route_ctx.get("chat_id").and_then(Value::as_str))
+        .or_else(|| ctx.map(|c| c.chat_id.as_str()))
+        .unwrap_or(peer_id);
+    let is_group = route
+        .get("is_group")
+        .and_then(Value::as_bool)
+        .or_else(|| route_ctx.get("is_group").and_then(Value::as_bool))
+        .or_else(|| ctx.map(|c| c.is_group))
+        .unwrap_or(false);
+    let tq = get_task_queue().ok_or_else(|| "task queue not installed".to_owned())?;
+    let (task_id, merged) = submit_to_queue(
+        &tq,
+        session_key,
+        prompt,
+        channel,
+        peer_id,
+        chat_id,
+        is_group,
+        Priority::Cron,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "taskId": task_id, "merged": merged }).to_string())
+}
+
+fn push_plugin_outbound(
+    channel: &str,
+    peer_id: &str,
+    message_json: &str,
+    ctx: Option<&rsclaw_plugin::PluginInvocationContext>,
+) -> Result<String, String> {
+    let message: Value = serde_json::from_str(message_json)
+        .map_err(|e| format!("plugin outbound message JSON invalid: {e}"))?;
+    let text = message
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let images = json_array_strings(&message, "images");
+    let files = json_array_files(&message, "files");
+    let account = message
+        .get("account")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let target_id = if peer_id.is_empty() {
+        ctx.map(|c| c.peer_id.clone()).unwrap_or_default()
+    } else {
+        peer_id.to_owned()
+    };
+    let msg = OutboundMessage {
+        target_id,
+        is_group: message
+            .get("is_group")
+            .and_then(Value::as_bool)
+            .or_else(|| ctx.map(|c| c.is_group))
+            .unwrap_or(false),
+        text,
+        reply_to: None,
+        images,
+        files,
+        channel: Some(channel.to_owned()),
+        account,
+    };
+    let account = msg.account.clone();
+    push_outbound(channel, account.as_deref(), msg)?;
+    Ok("dispatched".to_owned())
+}
+
+fn json_array_strings(value: &Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn json_array_files(value: &Value, key: &str) -> Vec<(String, String, String)> {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(json_file_tuple).collect())
+        .unwrap_or_default()
+}
+
+fn json_file_tuple(value: &Value) -> Option<(String, String, String)> {
+    let (path, filename, mime) = if let Some(path) = value.as_str() {
+        let filename = std::path::Path::new(path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("plugin-file")
+            .to_owned();
+        (path.to_owned(), filename, "application/octet-stream".to_owned())
+    } else {
+        let obj = value.as_object()?;
+        let path = obj.get("path").and_then(Value::as_str)?.to_owned();
+        let filename = obj
+            .get("filename")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                std::path::Path::new(&path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("plugin-file")
+                    .to_owned()
+            });
+        let mime = obj
+            .get("mime")
+            .or_else(|| obj.get("mimeType"))
+            .and_then(Value::as_str)
+            .unwrap_or("application/octet-stream")
+            .to_owned();
+        (path, filename, mime)
+    };
+    Some((filename, mime, path))
+}
+
+async fn run_plugin_sse(
+    plugin: String,
+    name: String,
+    url: String,
+    headers_json: String,
+    resume_key: String,
+    ctx: rsclaw_plugin::PluginInvocationContext,
+) {
+    let client = match reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            warn!(plugin, name, error = %e, "plugin SSE client build failed");
+            return;
+        }
+    };
+    let headers: Value = serde_json::from_str(&headers_json).unwrap_or_else(|_| Value::Null);
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        let mut req = client.get(&url).header("Accept", "text/event-stream");
+        if let Some(obj) = headers.as_object() {
+            for (k, v) in obj {
+                if let Some(s) = v.as_str() {
+                    req = req.header(k, s);
+                }
+            }
+        }
+        match req.send().await {
+            Ok(resp) => match resp.error_for_status() {
+                Ok(resp) => {
+                    backoff = Duration::from_secs(1);
+                    let mut buf = String::new();
+                    let mut event_name = String::new();
+                    let mut data_lines: Vec<String> = Vec::new();
+                    let mut stream = resp.bytes_stream();
+                    while let Some(chunk) = stream.next().await {
+                        match chunk {
+                            Ok(bytes) => {
+                                buf.push_str(&String::from_utf8_lossy(&bytes));
+                                while let Some(nl) = buf.find('\n') {
+                                    let line = buf[..nl].trim_end_matches('\r').to_owned();
+                                    buf.drain(..=nl);
+                                    if line.is_empty() {
+                                        if !data_lines.is_empty() {
+                                            let data = data_lines.join("\n");
+                                            let text = format_plugin_sse_text(&plugin, &name, &event_name, &data);
+                                            let _ = push_plugin_outbound(
+                                                &ctx.channel,
+                                                &ctx.peer_id,
+                                                &serde_json::json!({ "text": text }).to_string(),
+                                                Some(&ctx),
+                                            );
+                                        }
+                                        event_name.clear();
+                                        data_lines.clear();
+                                    } else if let Some(rest) = line.strip_prefix("event: ") {
+                                        event_name = rest.trim().to_owned();
+                                    } else if let Some(rest) = line.strip_prefix("data: ") {
+                                        data_lines.push(rest.to_owned());
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(plugin, name, resume_key, error = %e, "plugin SSE read failed");
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => warn!(plugin, name, error = %e, "plugin SSE HTTP status error"),
+            },
+            Err(e) => warn!(plugin, name, error = %e, "plugin SSE connect failed"),
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(60));
+    }
+}
+
+fn format_plugin_sse_text(plugin: &str, name: &str, event_name: &str, data: &str) -> String {
+    let label = if event_name.is_empty() { "event" } else { event_name };
+    if let Ok(v) = serde_json::from_str::<Value>(data) {
+        if let Some(code) = v.get("code").and_then(Value::as_str) {
+            let stock_name = v.get("name").and_then(Value::as_str).unwrap_or("");
+            let filter = v.get("filter").and_then(Value::as_str).unwrap_or(label);
+            return format!("[{plugin}/{name}] {filter}: {code} {stock_name}");
+        }
+    }
+    format!("[{plugin}/{name}] {label}: {data}")
+}
+
 /// Root-side `rsclaw_types::TaskQueueHost` impl (crate-split P3 trait inversion).
 /// Lets rsclaw-agent's `task` tool enqueue background tasks via the gateway
 /// queue without depending on the gateway crate. Injected at startup.
@@ -1686,4 +2154,82 @@ impl rsclaw_types::TaskQueueHost for GatewayTaskQueueHost {
             .ok_or_else(|| anyhow::anyhow!("task queue not available (gateway not started?)"))?;
         manager.submit_task(session_key, message, priority, max_turns, ttl_secs)
     }
+}
+
+#[cfg(test)]
+mod plugin_background_tests {
+    use super::*;
+
+    fn ctx(peer: &str) -> rsclaw_plugin::PluginInvocationContext {
+        rsclaw_plugin::PluginInvocationContext {
+            target_id: peer.to_owned(),
+            channel: "test".to_owned(),
+            agent_id: "main".to_owned(),
+            peer_id: peer.to_owned(),
+            chat_id: peer.to_owned(),
+            session_key: format!("agent:main:test:direct:{peer}"),
+            is_group: false,
+        }
+    }
+
+    #[test]
+    fn plugin_background_keys_are_peer_scoped() {
+        let a = ctx("peer-a");
+        let b = ctx("peer-b");
+        let key_a = plugin_background_key("cron", "market", "market.briefing", None, Some(&a));
+        let key_a_again = plugin_background_key("cron", "market", "market.briefing", None, Some(&a));
+        let key_b = plugin_background_key("cron", "market", "market.briefing", None, Some(&b));
+
+        assert_eq!(key_a, key_a_again);
+        assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn plugin_background_sse_keys_include_url_and_peer() {
+        let a = ctx("peer-a");
+        let b = ctx("peer-b");
+        let url = "https://plugin.example/v1/stream?filter=alpha";
+        let key_a = plugin_background_key("sse", "market", "market.alpha", Some(url), Some(&a));
+        let key_b = plugin_background_key("sse", "market", "market.alpha", Some(url), Some(&b));
+        let key_other_url = plugin_background_key(
+            "sse",
+            "market",
+            "market.alpha",
+            Some("https://plugin.example/v1/stream?filter=beta"),
+            Some(&a),
+        );
+
+        assert_ne!(key_a, key_b);
+        assert_ne!(key_a, key_other_url);
+    }
+
+    #[test]
+    fn plugin_sse_status_is_context_scoped() {
+        let a = ctx("peer-status-a");
+        let b = ctx("peer-status-b");
+        let url = "https://plugin.example/v1/stream?filter=alpha";
+        let status_name = "market.alpha.status_test";
+
+        let before: Value =
+            serde_json::from_str(&plugin_sse_status_json("market", status_name, Some(&a)))
+                .expect("status JSON before");
+        assert_eq!(before["active"].as_bool(), Some(false));
+        assert_eq!(before["count"].as_u64(), Some(0));
+
+        let key = plugin_background_key("sse", "market", status_name, Some(url), Some(&a));
+        assert!(claim_plugin_background_key(&key));
+
+        let active: Value =
+            serde_json::from_str(&plugin_sse_status_json("market", status_name, Some(&a)))
+                .expect("status JSON active");
+        assert_eq!(active["active"].as_bool(), Some(true));
+        assert_eq!(active["count"].as_u64(), Some(1));
+
+        let other_peer: Value =
+            serde_json::from_str(&plugin_sse_status_json("market", status_name, Some(&b)))
+                .expect("status JSON other peer");
+        assert_eq!(other_peer["active"].as_bool(), Some(false));
+        assert_eq!(other_peer["count"].as_u64(), Some(0));
+    }
+
 }

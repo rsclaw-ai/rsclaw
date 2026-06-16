@@ -177,6 +177,19 @@ pub(crate) const DEFAULT_USER_TOOLS_CAP: usize = 30;
 /// so old transcripts replay.
 pub(crate) const PLUGIN_TOOL_SEP: &str = "__";
 
+fn is_stock_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "stock_quote"
+            | "stock_kline"
+            | "stock_snapshot"
+            | "stock_ask"
+            | "stock_query"
+            | "stock_chart"
+            | "stock_watchlist"
+    )
+}
+
 /// A plugin tool that's been selected for inclusion in
 /// `dynamic_prefix.user_tools`. Owns its data so the caller doesn't
 /// need to hold a borrow on the plugin registry while building the
@@ -732,6 +745,16 @@ pub struct AgentRuntime {
     /// command. Shares the same driver primitives as `cap_manager` but
     /// keeps long-lived drivers keyed by session_id.
     pub(crate) cap_live_manager: Option<std::sync::Arc<rsclaw_cap::CapLiveManager>>,
+    /// Server-side read cursors for `read_artifact` sequential paging.
+    /// Key: `"{session_key}\u{0}{artifact_id}"` → next 1-indexed line to
+    /// return. A bare `read_artifact` (no explicit mode) returns the next
+    /// unread chunk and advances this cursor, so the model never has to
+    /// compute `lines:A-B` ranges — calling again always makes progress and
+    /// re-reading the same page is impossible. Interior-mutable because tool
+    /// dispatch borrows `&self`. Entries are best-effort (lost on restart,
+    /// which just resets paging to the top — harmless).
+    pub(crate) artifact_cursors:
+        std::sync::Mutex<std::collections::HashMap<String, usize>>,
 }
 
 impl AgentRuntime {
@@ -817,6 +840,7 @@ impl AgentRuntime {
             exec_pool,
             cap_manager,
             cap_live_manager,
+            artifact_cursors: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
 
         // Purge any internal-session history left over in redb from older
@@ -1355,6 +1379,25 @@ impl AgentRuntime {
     /// If both are empty, falls back to primary chain (matches the
     /// legacy `FallbackToPrimary` semantics — drivers want SOMETHING
     /// vision-capable, and the agent's primary is the best guess).
+    /// True when the agent's EFFECTIVE primary model is a `rsclaw/` model —
+    /// the head of the per-agent primary chain when set, else the head of the
+    /// defaults primary chain. Deliberately NOT "any model in either chain":
+    /// a non-rsclaw per-agent primary must not inherit rsclaw just because a
+    /// fallback entry or the defaults happen to be rsclaw. Drives
+    /// rsclaw-protocol defaults (e.g. defaulting rerank to the fleet
+    /// `rsclaw-reranker-v1`).
+    pub(crate) fn primary_is_rsclaw(&self) -> bool {
+        let per_agent = &self.handle.config;
+        let defaults = &self.config.agents.defaults;
+        per_agent
+            .model
+            .as_ref()
+            .or(defaults.model.as_ref())
+            .and_then(|m| m.primary_chain().into_iter().next())
+            .map(|head| head.trim().starts_with("rsclaw/"))
+            .unwrap_or(false)
+    }
+
     pub(crate) fn resolve_vision_chain(&self) -> Vec<String> {
         let per_agent = &self.handle.config;
         let defaults = &self.config.agents.defaults;
@@ -2001,8 +2044,10 @@ impl AgentRuntime {
         match rsclaw_artifact::default_store().write(session_key, body) {
             Ok(id) => format!(
                 "{page}\n\n[truncated to fit the per-turn input budget — full output preserved; \
-                 call read_artifact(tool_result_id=\"{}\", mode=\"lines:A-B\" | \"grep:PATTERN\") \
-                 to page through the rest]",
+                 call read_artifact(tool_result_id=\"{}\") to read the next chunk (repeat to \
+                 page through it), or read_artifact(tool_result_id=\"{}\", mode=\"query:QUESTION\") \
+                 to jump to the relevant part]",
+                id.as_str(),
                 id.as_str()
             ),
             // Artifact write failed: bounded but lossy. Mark it honestly.
@@ -4225,6 +4270,9 @@ impl AgentRuntime {
             if let Some(ref mcp) = self.mcp {
                 all.extend(mcp.all_tool_defs().await);
             }
+            if !self.has_stock_tool_provider() {
+                all.retain(|t| !is_stock_tool_name(&t.name));
+            }
             // user_tools_cap default — 30 fits ~10 headlines × 3 plugins
             // without overflowing a 64k-context small model.
             let cap = model_cfg
@@ -5640,6 +5688,21 @@ impl AgentRuntime {
         let mut last_tool_key = String::new();
         let mut same_call_streak: usize = 0;
         const MAX_SAME_CALL_STREAK: usize = 5;
+        // Track consecutive calls to the same tool NAME (args may differ). This
+        // catches loops that bypass `same_call_streak` by varying args every
+        // call — e.g. read_artifact paging forever (mode/lines change each turn,
+        // each page is "new" so the stagnation budget never depletes). Legit
+        // paging rarely exceeds a handful; past the threshold we deplete the
+        // budget hard so the wrap-up prompt fires and the model must answer.
+        let mut last_tool_name_only = String::new();
+        let mut same_name_streak: usize = 0;
+        const MAX_SAME_NAME_STREAK: usize = 10;
+        // Absolute hard ceiling on loop iterations, independent of the
+        // progress-aware stagnation budget. The budget treats every call that
+        // returns new output as "free", so a productive-looking loop (paging,
+        // re-routing search) can spin unbounded — this is the universal
+        // backstop. Set well above any legitimate multi-tool turn.
+        const HARD_MAX_ITERATIONS: usize = 80;
         // Track consecutive tool errors — stop early when tools keep failing.
         let mut error_streak: usize = 0;
         // Identical-failing-call ledger: hash(tool_name + canonical args) →
@@ -5672,6 +5735,50 @@ impl AgentRuntime {
 
         loop {
             iteration += 1;
+            // Absolute hard ceiling — universal backstop against loops that the
+            // progress-aware stagnation budget can't catch (productive-looking
+            // paging / re-routing). A turn that legitimately needs >80 tool
+            // iterations is itself pathological; stop and hand back what we have.
+            if iteration > HARD_MAX_ITERATIONS {
+                warn!(
+                    session = %ctx.session_key,
+                    iterations = iteration,
+                    tool = %last_tool_name,
+                    "agent_loop: hard iteration ceiling reached, breaking out"
+                );
+                let lang = rsclaw_i18n::default_lang();
+                let terminal_text = rsclaw_i18n::t_fmt(
+                    "agent_max_iterations",
+                    lang,
+                    &[
+                        ("iterations", &iteration.to_string()),
+                        ("tool", &last_tool_name),
+                    ],
+                );
+                if let Some(ref bus) = self.event_bus {
+                    let _ = bus.send(AgentEvent {
+                        session_id: ctx.session_key.clone(),
+                        agent_id: ctx.agent_id.clone(),
+                        delta: terminal_text.clone(),
+                        done: true,
+                        files: vec![],
+                        images: vec![],
+                        tool_log: vec![],
+                        question: None,
+                        channel: None,
+                    });
+                }
+                return Ok(AgentReply {
+                    text: terminal_text,
+                    is_empty: false,
+                    tool_calls: None,
+                    images: vec![],
+                    files: vec![],
+                    pending_analysis: None,
+                    needs_outer_done_emit: false,
+                    outcome: crate::registry::ReplyOutcome::Ok,
+                });
+            }
             // Check clear_signal mid-loop: clear sessions and abort.
             if self.handle.clear_signal.load(Ordering::SeqCst) {
                 self.handle.clear_signal.store(false, Ordering::SeqCst);
@@ -5897,14 +6004,19 @@ impl AgentRuntime {
             // (413) when a big tool result / SKILL.md landed in one turn.
             // Lossless: oversized results are paged (read_artifact handle
             // preserved), not dropped.
-            let per_turn_budget = self
-                .live
-                .agents
-                .read()
-                .await
-                .defaults
-                .max_per_turn_input_tokens
-                .unwrap_or(5_000) as usize;
+            let per_turn_budget = {
+                let defaults = &self.live.agents.read().await.defaults;
+                let base = defaults.max_per_turn_input_tokens.unwrap_or(5_000) as usize;
+                // A deliberate `read_artifact` self-paginates to ≤
+                // max_artifact_read_tokens; the aggregate guard must allow at
+                // least that much through, or it would re-trim the page the
+                // model explicitly asked for back down to `base` and defeat the
+                // wider single-read budget. So the per-turn ceiling is the max
+                // of the two — still bounded (capped at the read budget), so
+                // context can't blow unbounded.
+                let artifact_read = defaults.max_artifact_read_tokens.unwrap_or(16_000) as usize;
+                base.max(artifact_read)
+            };
             self.cap_turn_input_to_budget(&ctx.session_key, &mut turn_scratchpad, per_turn_budget)
                 .await;
 
@@ -7281,6 +7393,28 @@ impl AgentRuntime {
                     same_call_streak = 1;
                 }
 
+                // Detect the same tool NAME called repeatedly with varying args
+                // (read_artifact paging, search re-routing). These bypass
+                // same_call_streak (args differ) and the stagnation budget (each
+                // result is "new"), so deplete the budget hard past the
+                // threshold to force the wrap-up prompt instead of spinning.
+                if tool_name == last_tool_name_only {
+                    same_name_streak += 1;
+                    if same_name_streak > MAX_SAME_NAME_STREAK {
+                        budget -= 4;
+                        ctx.turn_metrics.stagnation_budget = budget;
+                        warn!(
+                            tool = %tool_name,
+                            streak = same_name_streak,
+                            budget,
+                            "agent_loop: same tool name repeated past threshold, depleting budget"
+                        );
+                    }
+                } else {
+                    last_tool_name_only = tool_name.clone();
+                    same_name_streak = 1;
+                }
+
                 // Upgrade stagnation budget when complex or multi-step tools are used.
                 if matches!(
                     tool_name.as_str(),
@@ -7835,9 +7969,17 @@ impl AgentRuntime {
                             // bypass the backstop — re-compacting their full-read
                             // response would write a new artifact and force the LLM
                             // into a nested re-fetch loop.
+                            //
+                            // `skill_use` is also exempt: SKILL.md is INSTRUCTIONS the
+                            // model must execute faithfully (exact CLI flags / steps).
+                            // Offloading it to a head+tail preview would force the model
+                            // to act on a partial spec — a correctness bug, not just a
+                            // token-saving tradeoff. The per-turn aggregate guard
+                            // (cap_turn_input_to_budget) still bounds a pathologically
+                            // huge SKILL.md, so this can't blow the context unbounded.
                             let v = if matches!(
                                 tool_name.as_str(),
-                                "read_artifact" | "read_session_archive"
+                                "read_artifact" | "read_session_archive" | "skill_use"
                             ) {
                                 v
                             } else {
@@ -8222,6 +8364,43 @@ impl AgentRuntime {
                             result_text = cleaned.to_string();
                         }
                     }
+
+                    // Audio artifacts: any tool returning an `audio_file` /
+                    // `audio_path` (audio_gen music/voice, tts) → auto-attach
+                    // as an audio file. Mirrors the image auto-forward but for
+                    // sound, so synchronous audio bytes reach every channel.
+                    if let Some(audio_path) = v
+                        .get("audio_file")
+                        .and_then(|p| p.as_str())
+                        .or_else(|| v.get("audio_path").and_then(|p| p.as_str()))
+                    {
+                        let pb = std::path::PathBuf::from(expand_tilde(audio_path));
+                        if pb.exists() {
+                            let pb_str = pb.to_string_lossy().to_string();
+                            if !tool_files.iter().any(|(_, _, p)| p == &pb_str) {
+                                let lower = pb_str.to_lowercase();
+                                let mime = if lower.ends_with(".mp3") {
+                                    "audio/mpeg"
+                                } else if lower.ends_with(".wav") {
+                                    "audio/wav"
+                                } else if lower.ends_with(".flac") {
+                                    "audio/flac"
+                                } else if lower.ends_with(".ogg") || lower.ends_with(".opus") {
+                                    "audio/ogg"
+                                } else if lower.ends_with(".m4a") || lower.ends_with(".aac") {
+                                    "audio/mp4"
+                                } else {
+                                    "audio/mpeg"
+                                };
+                                let filename = pb
+                                    .file_name()
+                                    .map(|f| f.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "audio".to_string());
+                                tool_files.push((filename, mime.to_owned(), pb_str.clone()));
+                                tracing::info!(path = %pb_str, "auto-sending audio file as attachment");
+                            }
+                        }
+                    }
                 }
 
                 // Cap or compress tool result for session storage.
@@ -8386,6 +8565,13 @@ impl AgentRuntime {
         )
     }
 
+    fn has_stock_tool_provider(&self) -> bool {
+        self.wasm_plugins.iter().any(|wp| {
+            wp.capabilities.iter().any(|c| c == "trustedToolAlias")
+                && wp.tool_aliases.values().any(|alias| is_stock_tool_name(alias))
+        })
+    }
+
     async fn dispatch_tool(
         &self,
         ctx: &RunContext,
@@ -8461,6 +8647,40 @@ impl AgentRuntime {
                      just summarise the completed cap results in plain text."
                 ));
             }
+        }
+
+        if is_stock_tool_name(name) && !self.has_stock_tool_provider() {
+            return Err(anyhow!(
+                "tool '{name}' is unavailable: no trusted stock WASM plugin has claimed this tool alias"
+            ));
+        }
+
+        if let Some((wp, plugin_tool)) = self.wasm_plugins.iter().find_map(|wp| {
+            if !wp.capabilities.iter().any(|c| c == "trustedToolAlias") {
+                return None;
+            }
+            wp.tool_aliases
+                .iter()
+                .find(|(_, alias)| alias.as_str() == name)
+                .map(|(plugin_tool, _)| (wp, plugin_tool.as_str()))
+        }) {
+            let notify_ctx = self.notification_tx.as_ref().map(|tx| {
+                rsclaw_plugin::wasm_runtime::WasmNotifyCtx {
+                    tx: tx.clone(),
+                    target_id: if !ctx.chat_id.is_empty() {
+                        ctx.chat_id.clone()
+                    } else {
+                        ctx.peer_id.clone()
+                    },
+                    channel: ctx.channel.clone(),
+                    agent_id: ctx.agent_id.clone(),
+                    peer_id: ctx.peer_id.clone(),
+                    chat_id: ctx.chat_id.clone(),
+                    session_key: ctx.session_key.clone(),
+                    is_group: false,
+                }
+            });
+            return wp.call_tool_with_ctx(plugin_tool, args, notify_ctx).await;
         }
 
         // 2. Built-in tools (checked before A2A prefix so reserved names are not
@@ -8655,13 +8875,12 @@ impl AgentRuntime {
             "read_artifact" => return self.tool_read_artifact(ctx, args).await,
             "read_session_archive" => return self.tool_read_session_archive(ctx, args).await,
             "knowledge_base" | "kb_search" => return self.tool_knowledge_base(args).await,
-            "stock_quote" => return self.tool_stock_quote(args).await,
-            "stock_kline" => return self.tool_stock_kline(args).await,
-            "stock_snapshot" => return self.tool_stock_snapshot(ctx, args).await,
-            "stock_ask" => return self.tool_stock_ask(args).await,
-            "stock_query" => return self.tool_stock_query(args).await,
-            "stock_chart" => return self.tool_stock_chart(args).await,
-            "stock_watchlist" => return self.tool_stock_watchlist(ctx, args).await,
+            "stock_quote" | "stock_kline" | "stock_snapshot" | "stock_ask" | "stock_query"
+            | "stock_chart" | "stock_watchlist" => {
+                return Err(anyhow!(
+                    "tool '{name}' is provided by the stock plugin alias layer, but no loaded plugin claimed this exact alias"
+                ));
+            }
             "research_ingest_wechat" => return self.tool_research_ingest_wechat(args).await,
             "research_analyze_charts" => return self.tool_research_analyze_charts(args).await,
             "write_file" | "write" => return self.tool_write(args).await,
@@ -8718,9 +8937,13 @@ impl AgentRuntime {
             "web_download" => return self.tool_web_download(args).await,
             "web_browser" | "browser" => return self.tool_web_browser(ctx, args).await,
             "computer_use" => return self.tool_computer_use(ctx, args).await,
-            "image_gen" | "image" => return self.tool_image(args).await,
+            "image_gen" | "image" => return self.tool_image(args, ctx).await,
             "ocr" => return self.tool_ocr(args).await,
             "video_gen" | "video" => return self.tool_video(args, ctx).await,
+            "avatar_gen" | "avatar" => return self.tool_avatar_gen(args, ctx).await,
+            "mv_gen" | "mv" => return self.tool_mv_gen(args, ctx).await,
+            "music_gen" | "music" => return self.tool_music(args).await,
+            "voice_gen" | "voice" => return self.tool_voice(args).await,
             "pdf" => return self.tool_pdf(args).await,
             "text_to_voice" | "text_to_speech" | "tts" => return self.tool_tts(args).await,
             "send_message" | "message" => return self.tool_message(args).await,
@@ -8861,6 +9084,11 @@ impl AgentRuntime {
                             ctx.peer_id.clone()
                         },
                         channel: ctx.channel.clone(),
+                        agent_id: ctx.agent_id.clone(),
+                        peer_id: ctx.peer_id.clone(),
+                        chat_id: ctx.chat_id.clone(),
+                        session_key: ctx.session_key.clone(),
+                        is_group: false,
                     }
                 });
                 return wp.call_tool_with_ctx(tool_name, args, notify_ctx).await;

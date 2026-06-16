@@ -97,6 +97,48 @@ pub(crate) fn agnes_image_size(requested: &str) -> &'static str {
     }
 }
 
+/// Normalize image-to-image input(s): accept a single string or an array of
+/// strings. http(s)/data: entries pass through; a LOCAL FILE PATH (e.g. an
+/// earlier image_gen result) is read and base64-encoded into a `data:` URI so
+/// providers get self-contained input. Unreadable paths are dropped.
+pub(crate) async fn normalize_image_inputs(v: &Value) -> Vec<String> {
+    let raw: Vec<String> = match v {
+        Value::String(s) if !s.is_empty() => vec![s.clone()],
+        Value::Array(a) => a
+            .iter()
+            .filter_map(|x| x.as_str().filter(|s| !s.is_empty()).map(str::to_owned))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let mut out = Vec::with_capacity(raw.len());
+    for img in raw {
+        if img.starts_with("http://") || img.starts_with("https://") || img.starts_with("data:") {
+            out.push(img);
+            continue;
+        }
+        match tokio::fs::read(&img).await {
+            Ok(bytes) => {
+                use base64::Engine;
+                let mime = match std::path::Path::new(&img)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_ascii_lowercase())
+                    .as_deref()
+                {
+                    Some("jpg") | Some("jpeg") => "image/jpeg",
+                    Some("webp") => "image/webp",
+                    Some("gif") => "image/gif",
+                    _ => "image/png",
+                };
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                out.push(format!("data:{mime};base64,{b64}"));
+            }
+            Err(e) => tracing::warn!(path = %img, error = %e, "image_gen: input image not readable, skipping"),
+        }
+    }
+    out
+}
+
 /// Default video-gen model for a primary LLM provider — same opt-in-by-
 /// primary-provider rule as [`default_image_model`].
 pub(crate) fn default_video_model(provider: &str) -> Option<&'static str> {
@@ -134,7 +176,18 @@ impl super::runtime::AgentRuntime {
         )
     }
 
-    pub(crate) async fn tool_image(&self, args: Value) -> Result<Value> {
+    pub(crate) async fn tool_image(
+        &self,
+        mut args: Value,
+        ctx: &super::runtime::RunContext,
+    ) -> Result<Value> {
+        // Image-to-image: normalize any input image(s) up front (local paths →
+        // base64 data URIs) so every provider branch sees ready-to-send
+        // strings in args["image"].
+        if !args["image"].is_null() {
+            let imgs = normalize_image_inputs(&args["image"]).await;
+            args["image"] = if imgs.is_empty() { Value::Null } else { json!(imgs) };
+        }
         let prompt = args["prompt"]
             .as_str()
             .ok_or_else(|| anyhow!("image: `prompt` required"))?;
@@ -190,15 +243,19 @@ impl super::runtime::AgentRuntime {
         }
 
         // args["model"] override → exactly one attempt (no chain retry —
-        // explicit user intent).
-        let attempt_models: Vec<String> = if let Some(m) = args
+        // explicit user intent). An explicit model is also FORCED: it
+        // bypasses the health breaker (Cooling/Disabled), matching the
+        // "pass an explicit `model` argument to force one attempt" hint we
+        // surface when the whole chain is cooling.
+        let explicit_model = args
             .get("model")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-        {
-            vec![m.to_owned()]
-        } else {
-            image_chain.clone()
+            .map(str::to_owned);
+        let forced = explicit_model.is_some();
+        let attempt_models: Vec<String> = match explicit_model {
+            Some(m) => vec![m],
+            None => image_chain.clone(),
         };
 
         // ── Pre-submit chain retry ──────────────────────────────────────
@@ -209,37 +266,51 @@ impl super::runtime::AgentRuntime {
         self.model_health.ensure(&attempt_models);
         let mut last_error: Option<anyhow::Error> = None;
         for chain_model in &attempt_models {
-            if !self.model_health.is_callable(chain_model) {
+            if !forced && !self.model_health.is_callable(chain_model) {
                 tracing::info!(
                     model = %chain_model,
-                    "tool_image: skipping (model marked Disabled or Cooling)"
+                    "tool_image: skipping (model cooling; pass explicit `model` to force)"
                 );
                 continue;
             }
             match self.try_image_for_model(prompt, chain_model, &args).await {
                 Ok(v) => {
                     self.model_health.record_success(chain_model);
+                    // rsclaw image-edit / t2i-v2 are async (gen-api.md §1): the
+                    // provider returned status:"processing" + a signed poll
+                    // URL. Hand it to the ExternalJob worker (kind ImageGen,
+                    // provider "rsclaw_image") for delivery instead of blocking
+                    // the turn ~280s.
+                    if v.get("_async_image_job").and_then(|b| b.as_bool()) == Some(true) {
+                        let poll_url =
+                            v.get("poll_url").and_then(|u| u.as_str()).unwrap_or_default();
+                        return self.enqueue_rsclaw_image_job(poll_url, prompt, ctx).await;
+                    }
                     return Ok(v);
                 }
                 Err(e) => {
-                    let kind = rsclaw_provider::health::classify_error(&e);
-                    let body = format!("{e:#}");
-                    let truncated = rsclaw_util::truncate_str(&body, 200).to_owned();
-                    self.model_health.record_failure(chain_model, kind.clone(), truncated);
-                    // Cost gate: provider already charged for this
-                    // attempt. Surface the failure to the user instead
-                    // of double-billing through the next chain entry.
+                    // Cost gate: the provider already charged for this
+                    // attempt (generation succeeded; the failure is in the
+                    // download / post-processing leg). The MODEL is healthy
+                    // — do NOT record a health failure (that would wrongly
+                    // cool a working model). Surface to the user instead of
+                    // double-billing through the next chain entry.
                     if e.downcast_ref::<PostBillingError>().is_some() {
                         tracing::warn!(
                             model = %chain_model,
-                            kind = ?kind,
                             error = %e,
-                            "tool_image: post-billing failure — NOT advancing chain"
+                            "tool_image: post-billing failure — NOT advancing chain, not recording health"
                         );
                         return Err(anyhow!(
                             "image_gen: provider {chain_model} was billed but did not return a usable image: {e:#}. Do NOT retry this tool automatically (each attempt is billed) — report the failure to the user and let them decide whether to retry"
                         ));
                     }
+                    // Pre-billing failure: classify + cool the model, then
+                    // advance the chain.
+                    let kind = rsclaw_provider::health::classify_error(&e);
+                    let body = format!("{e:#}");
+                    let truncated = rsclaw_util::truncate_str(&body, 200).to_owned();
+                    self.model_health.record_failure(chain_model, kind.clone(), truncated);
                     tracing::warn!(
                         model = %chain_model,
                         kind = ?kind,
@@ -261,10 +332,57 @@ impl super::runtime::AgentRuntime {
             // Disabled/Cooling — nothing was actually attempted, so
             // "all failed" would misdiagnose.
             None => anyhow!(
-                "image_gen: all {} configured image model(s) are currently Disabled or Cooling (recent failures) — none were attempted. Check /api/v1/models/health, wait for cooldown, or pass an explicit `model` argument to force one attempt",
+                "image_gen: all {} configured image model(s) are currently cooling down from recent failures — none were attempted. The cooldown is time-bounded and clears on its own; check /api/v1/models/health, wait for it to expire, or pass an explicit `model` argument to force one attempt now",
                 attempt_models.len()
             ),
         })
+    }
+
+    /// Enqueue a rsclaw async image job (image-edit / t2i-v2). The signed
+    /// `poll_url` is the ExternalJob's task id; the worker polls it
+    /// (409→pending / 200→download / 502→fail) via `poll_rsclaw_image` and
+    /// delivers the image like any other ImageGen artifact.
+    async fn enqueue_rsclaw_image_job(
+        &self,
+        poll_url: &str,
+        prompt: &str,
+        ctx: &super::runtime::RunContext,
+    ) -> Result<Value> {
+        if poll_url.is_empty() {
+            return Err(anyhow!(
+                "image_gen: rsclaw returned status=processing without a poll URL"
+            ));
+        }
+        let job = rsclaw_types::ExternalJob::new_submitted(
+            ctx.session_key.clone(),
+            rsclaw_types::ExternalJobDelivery {
+                channel: ctx.channel.clone(),
+                target_id: if ctx.chat_id.is_empty() {
+                    ctx.peer_id.clone()
+                } else {
+                    ctx.chat_id.clone()
+                },
+                is_group: !ctx.chat_id.is_empty() && ctx.chat_id != ctx.peer_id,
+                reply_to: None,
+            },
+            rsclaw_types::ExternalJobOrigin::Agent,
+            "rsclaw_image",
+            poll_url,
+            rsclaw_types::ExternalJobKind::ImageGen,
+            prompt,
+        );
+        let job_id = job.id.clone();
+        self.store
+            .db
+            .enqueue_external_job(&job)
+            .map_err(|e| anyhow!("image_gen: enqueue external job: {e}"))?;
+        Ok(json!({
+            "status": "submitted",
+            "provider": "rsclaw",
+            "kind": "image",
+            "job_id": job_id,
+            "message": "Image edit submitted to the rsclaw gen service (async, ~1–5min). The finished image will be delivered automatically when ready. The user has been informed; do NOT poll or wait — your turn is complete."
+        }))
     }
 
     /// One attempt for a single configured image model id. Called per
@@ -313,8 +431,18 @@ impl super::runtime::AgentRuntime {
         // Providers with image generation support. The explicit image model is
         // the cost gate: do not silently fall back to another paid provider
         // just because an API key happens to be configured.
-        let image_providers = ["doubao", "bytedance", "openai", "qwen", "minimax", "gemini", "rsclaw", "agnes"];
-        let (img_url, img_key, img_prov, img_env_var) = if image_providers.contains(&prov_name) {
+        // Narrow external set: doubao (强), openai/gpt-image (强, custom baseUrl),
+        // rsclaw (自家 gen), agnes (免费). qwen/minimax/gemini are no longer
+        // routed from core — the dead inline branches below stay unreachable.
+        let image_providers = ["doubao", "openai", "rsclaw", "agnes"];
+        // A provider configured with an explicit base_url is treated as an
+        // OpenAI-compatible image endpoint even if it's not a known name —
+        // this is how e.g. gpt-image-2 (or any /images/generations gateway)
+        // runs against a custom baseUrl without hardcoding the provider here.
+        let custom_oai = !image_providers.contains(&prov_name) && cfg_url.is_some();
+        let (img_url, img_key, img_prov, img_env_var) = if image_providers.contains(&prov_name)
+            || custom_oai
+        {
             // rsclaw's LLM default in defaults.toml ends in `/v1/agent`;
             // the gen surface lives off the host root. `gen_host_base`
             // normalises both shapes; we append `/v1` for the OAI mount.
@@ -343,7 +471,7 @@ impl super::runtime::AgentRuntime {
         } else {
             return Ok(json!({
                 "error": format!(
-                    "Configured image model provider `{prov_name}` does not support image generation. Configure agents.defaults.model.image with one of: doubao, qwen, minimax, gemini, openai, rsclaw."
+                    "Configured image model provider `{prov_name}` does not support image generation. Configure agents.defaults.model.image with one of: doubao, openai, rsclaw, agnes."
                 )
             }));
         };
@@ -379,6 +507,20 @@ impl super::runtime::AgentRuntime {
                 "agnes" => "agnes-image-2.1-flash",
                 _ => "gpt-image-2",
             });
+
+        // rsclaw: a reference image means image-edit, but the t2i model
+        // produces garbage on edit requests (gen-api.md note #4). When the
+        // caller didn't name an explicit model and supplied a ref image, swap
+        // the default t2i model for the edit model.
+        let image_model = if img_prov == "rsclaw"
+            && args.get("model").and_then(|m| m.as_str()).is_none()
+            && !args["image"].is_null()
+            && image_model == "rsclaw-image-v1"
+        {
+            "rsclaw-image-edit-v1"
+        } else {
+            image_model
+        };
 
         // Resolve User-Agent: provider config -> gateway config -> default
         let img_ua = self
@@ -617,6 +759,17 @@ impl super::runtime::AgentRuntime {
             if let Some(c) = args.get("output_compression").and_then(|v| v.as_u64()) {
                 body["output_compression"] = json!(c);
             }
+            // Image-to-image: forward normalized input image(s). gpt-image
+            // editing uses a separate multipart `/images/edits` endpoint, so
+            // it's skipped here; doubao seedream and OAI-compatible gateways
+            // accept an `image` field on `/images/generations` (string for a
+            // single image, array for multi-reference).
+            if !is_gpt_image && !args["image"].is_null() {
+                body["image"] = match &args["image"] {
+                    Value::Array(a) if a.len() == 1 => a[0].clone(),
+                    other => other.clone(),
+                };
+            }
 
             if img_prov == "rsclaw" {
                 // rsclaw LB may emit 307/308 redirecting to a backend
@@ -666,6 +819,23 @@ impl super::runtime::AgentRuntime {
                 .or_else(|| resp_body.as_str().map(|s| rsclaw_util::truncate_str(s, 200)))
                 .unwrap_or_else(|| rsclaw_util::truncate_str(&raw, 200));
             return Err(anyhow!("image: API error (HTTP {resp_status}): {err_msg}"));
+        }
+
+        // rsclaw image generation is async end-to-end (t2i / t2i-v2 /
+        // image-edit). The POST returns a signed content URL — sometimes with
+        // status:"processing", sometimes not — that may 409 until the artifact
+        // is ready. Always hand that URL to the ExternalJob worker instead of
+        // downloading inline: `poll_rsclaw_image` resolves 200 immediately for
+        // an already-ready t2i and keeps polling on 409 for the slow lanes.
+        // (If no url is present we fall through to synchronous extraction.)
+        if img_prov == "rsclaw"
+            && let Some(poll_url) = resp_body.pointer("/data/0/url").and_then(|v| v.as_str())
+        {
+            return Ok(json!({
+                "_async_image_job": true,
+                "poll_url": poll_url,
+                "model": image_model,
+            }));
         }
 
         // Extract image URL/base64 — different response formats per provider

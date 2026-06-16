@@ -26,3 +26,6 @@ rsclaw-channel = { path = "../rsclaw-channel" }
 rsclaw-util = { path = "../rsclaw-util" }
 rsclaw-i18n = { path = "../rsclaw-i18n" }
 rsclaw-platform = { path = "../rsclaw-platform" }
+
+[dev-dependencies]
+tempfile = "3"

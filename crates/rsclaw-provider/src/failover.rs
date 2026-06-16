@@ -355,7 +355,8 @@ impl FailoverManager {
         }
     }
 
-    fn is_cooling_down(&self, provider_name: &str, profile_id: &str) -> bool {
+    fn is_cooling_down(&mut self, provider_name: &str, profile_id: &str) -> bool {
+        self.cleanup_expired_cooldowns();
         self.cooldowns
             .get(&cooldown_key(provider_name, profile_id))
             .is_some_and(|&until| Instant::now() < until)
@@ -373,6 +374,19 @@ impl FailoverManager {
             .get(&cooldown_key(provider_name, profile_id))
             .copied()
             .unwrap_or(0)
+    }
+
+    fn cleanup_expired_cooldowns(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<String> = self
+            .cooldowns
+            .iter()
+            .filter_map(|(key, until)| (*until <= now).then_some(key.clone()))
+            .collect();
+        for key in expired {
+            self.cooldowns.remove(&key);
+            self.failure_counts.remove(&key);
+        }
     }
 }
 
@@ -532,5 +546,23 @@ mod tests {
             0,
             "sibling provider's hit count must stay at zero"
         );
+    }
+
+    #[test]
+    fn expired_cooldowns_are_garbage_collected() {
+        let mut mgr = FailoverManager::new(
+            HashMap::new(),
+            HashMap::new(),
+            vec![],
+            crate::health::ProviderHealthRegistry::default(),
+        );
+        mgr.set_cooldown("kimi", "default", Duration::from_secs(60));
+        mgr.set_cooldown("deepseek", "default", Duration::ZERO);
+
+        assert!(!mgr.is_cooling_down("deepseek", "default"));
+        assert!(!mgr.cooldowns.contains_key(&cooldown_key("deepseek", "default")));
+        assert_eq!(mgr.hit_count("deepseek", "default"), 0);
+        assert!(mgr.cooldowns.contains_key(&cooldown_key("kimi", "default")));
+        assert_eq!(mgr.hit_count("kimi", "default"), 1);
     }
 }

@@ -39,11 +39,44 @@ pub async fn submit_seedance(
     duration: u64,
     aspect_ratio: &str,
     model_override: Option<&str>,
+    images: &[String],
 ) -> Result<String> {
-    let model = model_override.unwrap_or(SEEDANCE_DEFAULT_MODEL);
+    // Chain entries / `model` args arrive provider-prefixed
+    // (`doubao/doubao-seedance-2-0-fast-…`); strip it so the bare ARK model
+    // id goes on the wire. This is what lets the caller pick any seedance
+    // variant (pro / fast / lite) via the model field.
+    let model = model_override
+        .map(|m| m.rsplit('/').next().unwrap_or(m))
+        .filter(|m| !m.is_empty() && *m != "doubao" && *m != "bytedance")
+        .unwrap_or(SEEDANCE_DEFAULT_MODEL);
+    // Build the `content` array: a text item plus, for image-to-video, one
+    // `image_url` item per reference frame with a `role`. Per the Ark spec
+    // the three image scenes are mutually exclusive, so map by count:
+    //   1 image  → first_frame  (图生视频-首帧)
+    //   2 images → first_frame + last_frame  (图生视频-首尾帧)
+    //   3+ images→ reference_image each  (多模态参考生视频, Seedance 2.0, 1~9)
+    // `url` accepts a public URL or a `data:image/<fmt>;base64,...` Data URI.
+    let mut content = vec![json!({"type": "text", "text": prompt})];
+    let roles: &[&str] = match images.len() {
+        0 | 1 => &["first_frame"],
+        2 => &["first_frame", "last_frame"],
+        _ => &[],
+    };
+    for (i, img) in images.iter().enumerate() {
+        let role = if images.len() >= 3 {
+            "reference_image"
+        } else {
+            roles[i]
+        };
+        content.push(json!({
+            "type": "image_url",
+            "image_url": {"url": img},
+            "role": role,
+        }));
+    }
     let body = json!({
         "model": model,
-        "content": [{"type": "text", "text": prompt}],
+        "content": content,
         "ratio": aspect_ratio,
         "duration": duration,
         "watermark": false,
@@ -131,17 +164,29 @@ pub async fn submit_minimax(
     duration: u64,
     aspect_ratio: &str,
     model_override: Option<&str>,
+    images: &[String],
 ) -> Result<String> {
-    let model = model_override.unwrap_or(MINIMAX_DEFAULT_MODEL);
+    // Strip provider prefix so a `minimax/<id>` chain entry sends the bare
+    // model id (lets the caller pick Hailuo-2.3 / 2.3-Fast etc).
+    let model = model_override
+        .map(|m| m.rsplit('/').next().unwrap_or(m))
+        .filter(|m| !m.is_empty() && *m != "minimax")
+        .unwrap_or(MINIMAX_DEFAULT_MODEL);
+    let mut body = json!({
+        "prompt": prompt,
+        "model": model,
+        "duration": duration,
+        "resolution": minimax_resolution(aspect_ratio),
+    });
+    // Image-to-video: MiniMax (Hailuo) takes a single `first_frame_image`,
+    // a public URL or a `data:image/...;base64,...` Data URI.
+    if let Some(first) = images.first() {
+        body["first_frame_image"] = json!(first);
+    }
     let resp: serde_json::Value = client
         .post(format!("{MINIMAX_BASE}/video_generation"))
         .bearer_auth(api_key)
-        .json(&json!({
-            "prompt": prompt,
-            "model": model,
-            "duration": duration,
-            "resolution": minimax_resolution(aspect_ratio),
-        }))
+        .json(&body)
         .send()
         .await
         .map_err(|e| anyhow!("minimax: submit failed: {e}"))?
@@ -223,18 +268,52 @@ pub async fn submit_kling(
     duration: u64,
     aspect_ratio: &str,
     model_override: Option<&str>,
+    images: &[String],
 ) -> Result<String> {
-    let model = model_override.unwrap_or(KLING_DEFAULT_MODEL);
+    // Strip provider prefix so a `kling/<id>` chain entry sends the bare
+    // model_name (lets the caller pick kling-v1 / v2-master etc).
+    let model = model_override
+        .map(|m| m.rsplit('/').next().unwrap_or(m))
+        .filter(|m| !m.is_empty() && *m != "kling")
+        .unwrap_or(KLING_DEFAULT_MODEL);
     let jwt = kling_jwt(access_key, secret_key)?;
-    let resp: serde_json::Value = client
-        .post(format!("{KLING_BASE}/v1/videos/text2video"))
-        .bearer_auth(&jwt)
-        .json(&json!({
+    // Kling wants RAW base64 for image inputs — strip the `data:<mime>;base64,`
+    // prefix that the tool layer adds. Public URLs pass through untouched.
+    let kling_img = |s: &String| -> String {
+        match s.split_once(";base64,") {
+            Some((_, b64)) => b64.to_owned(),
+            None => s.clone(),
+        }
+    };
+    // Image-to-video uses a different endpoint + body: `image` (start frame)
+    // and optional `image_tail` (end frame). aspect_ratio is derived from the
+    // image, so it's omitted there.
+    let (url, body) = if images.is_empty() {
+        (
+            format!("{KLING_BASE}/v1/videos/text2video"),
+            json!({
+                "model_name": model,
+                "prompt": prompt,
+                "duration": duration.to_string(),
+                "aspect_ratio": aspect_ratio,
+            }),
+        )
+    } else {
+        let mut b = json!({
             "model_name": model,
             "prompt": prompt,
             "duration": duration.to_string(),
-            "aspect_ratio": aspect_ratio,
-        }))
+            "image": kling_img(&images[0]),
+        });
+        if let Some(tail) = images.get(1) {
+            b["image_tail"] = json!(kling_img(tail));
+        }
+        (format!("{KLING_BASE}/v1/videos/image2video"), b)
+    };
+    let resp: serde_json::Value = client
+        .post(url)
+        .bearer_auth(&jwt)
+        .json(&body)
         .send()
         .await
         .map_err(|e| anyhow!("kling: submit failed: {e}"))?
@@ -391,7 +470,10 @@ fn agnes_video_dims(aspect_ratio: &str) -> (u32, u32) {
     }
 }
 
-/// Submit an Agnes text→video task and return the provider's `video_id`.
+/// Submit an Agnes text→video OR image→video task and return the provider's
+/// `video_id`. When `images` is non-empty the request becomes image-to-video
+/// (`image` array + `mode: ti2vid`); each entry is a public URL or a
+/// `data:image/...;base64,...` Data URI.
 pub async fn submit_agnes(
     client: &reqwest::Client,
     api_key: &str,
@@ -399,6 +481,7 @@ pub async fn submit_agnes(
     duration: u64,
     aspect_ratio: &str,
     model_override: Option<&str>,
+    images: &[String],
 ) -> Result<String> {
     // Chain entries arrive as `agnes/agnes-video-v2.0`; strip the
     // `provider/` prefix so the upstream `model` field is the bare id.
@@ -411,7 +494,7 @@ pub async fn submit_agnes(
     // num_frames must satisfy 8n+1 and be ≤ 441.
     let raw_frames = duration.saturating_mul(frame_rate).max(8);
     let num_frames = (((raw_frames - 1) / 8) * 8 + 1).min(441);
-    let body = json!({
+    let mut body = json!({
         "model": model,
         "prompt": prompt,
         "width": width,
@@ -419,6 +502,36 @@ pub async fn submit_agnes(
         "frame_rate": frame_rate,
         "num_frames": num_frames,
     });
+    // Image-to-video. Per the Agnes Video V2.0 spec the shapes differ by
+    // count: a single reference frame goes in the TOP-LEVEL `image` as a
+    // STRING (`mode: ti2vid`) — passing an array there 400s
+    // ("cannot unmarshal array ... type string"). Multiple frames
+    // (first+last / keyframes) go in `extra_body.image` as an array with
+    // `mode: keyframes`. Text-to-video sends neither.
+    //
+    // IMPORTANT: the agnes /v1/videos endpoint wants RAW base64 for inline
+    // image input — it does NOT strip the `data:<mime>;base64,` prefix (unlike
+    // its /v1/images endpoint, which DOES want the full data URI). A data URI
+    // here fails server-side with "Invalid base64-encoded string". Strip the
+    // prefix to raw base64; public http(s) URLs pass through untouched.
+    let agnes_img = |s: &String| -> String {
+        match s.split_once(";base64,") {
+            Some((_, b64)) => b64.to_owned(),
+            None => s.clone(),
+        }
+    };
+    match images.len() {
+        0 => {}
+        1 => {
+            body["image"] = json!(agnes_img(&images[0]));
+            body["mode"] = json!("ti2vid");
+        }
+        _ => {
+            let raw: Vec<String> = images.iter().map(agnes_img).collect();
+            body["mode"] = json!("keyframes");
+            body["extra_body"] = json!({ "image": raw, "mode": "keyframes" });
+        }
+    }
     let resp: serde_json::Value = client
         .post(format!("{AGNES_BASE}/v1/videos"))
         .bearer_auth(api_key)
@@ -476,6 +589,148 @@ pub async fn poll_agnes(
                 .unwrap_or("task failed");
             Ok(PollOutcome::Failed(format!("{status}: {msg}")))
         }
+        _ => Ok(PollOutcome::Pending),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI-compatible video (Sora-2 shape) — async submit + poll, configurable
+// base_url. Defaults to https://api.openai.com/v1 but any OAI-compatible
+// video gateway works by setting `models.providers.openai.base_url`. Mirrors
+// the image side's `custom_oai` baseUrl passthrough.
+// ---------------------------------------------------------------------------
+
+const OPENAI_DEFAULT_VIDEO_MODEL: &str = "sora-2";
+
+fn openai_video_size(aspect_ratio: &str) -> &'static str {
+    match aspect_ratio {
+        "9:16" => "720x1280",
+        "1:1" => "1024x1024",
+        _ => "1280x720",
+    }
+}
+
+/// Submit an OpenAI-compatible (Sora-2 shape) text→video / image→video task
+/// and return the provider's `id`. `base_url` is the provider's configured
+/// endpoint (already including the `/v1` suffix for stock OpenAI); we post to
+/// `{base}/videos`. Each `images` entry is a public URL or a
+/// `data:image/...;base64,...` Data URI; the first frame is forwarded as
+/// `input_reference` (OAI) — gateways that don't recognise it ignore it.
+pub async fn submit_openai_video(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    prompt: &str,
+    duration: u64,
+    aspect_ratio: &str,
+    model_override: Option<&str>,
+    images: &[String],
+) -> Result<String> {
+    let model = model_override
+        .map(|m| m.rsplit('/').next().unwrap_or(m))
+        .filter(|m| !m.is_empty() && *m != "openai")
+        .unwrap_or(OPENAI_DEFAULT_VIDEO_MODEL);
+    let mut body = json!({
+        "model": model,
+        "prompt": prompt,
+        "seconds": duration,
+        "size": openai_video_size(aspect_ratio),
+    });
+    if let Some(first) = images.first() {
+        body["input_reference"] = json!(first);
+    }
+    let url = format!("{}/videos", base_url.trim_end_matches('/'));
+    let resp: serde_json::Value = client
+        .post(url)
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| anyhow!("openai-video: submit failed: {e}"))?
+        .json()
+        .await
+        .map_err(|e| anyhow!("openai-video: submit parse failed: {e}"))?;
+    let id = resp["id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("openai-video: no id in response: {resp}"))?
+        .to_owned();
+    Ok(id)
+}
+
+pub async fn poll_openai_video(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    id: &str,
+) -> Result<PollOutcome> {
+    let base = base_url.trim_end_matches('/');
+    let resp: serde_json::Value = client
+        .get(format!("{base}/videos/{id}"))
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .map_err(|e| anyhow!("openai-video: poll failed: {e}"))?
+        .json()
+        .await
+        .map_err(|e| anyhow!("openai-video: poll parse failed: {e}"))?;
+    let status = resp["status"].as_str().unwrap_or("unknown");
+    match status {
+        "completed" | "succeeded" => {
+            // Prefer an explicit URL in the status body (what OAI-compatible
+            // gateways return). Stock OpenAI serves bytes at `/videos/{id}/content`
+            // behind auth instead — fall back to that URL last so at least the
+            // gateway case delivers.
+            let url = resp["video_url"]
+                .as_str()
+                .or_else(|| resp.pointer("/data/0/url").and_then(|v| v.as_str()))
+                .or_else(|| resp["url"].as_str())
+                .or_else(|| resp.pointer("/output/url").and_then(|v| v.as_str()))
+                .filter(|s| s.starts_with("http"))
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{base}/videos/{id}/content"));
+            Ok(PollOutcome::Done(url))
+        }
+        "failed" | "cancelled" | "error" => {
+            let msg = resp
+                .pointer("/error/message")
+                .and_then(|v| v.as_str())
+                .or_else(|| resp["error"].as_str())
+                .or_else(|| resp["message"].as_str())
+                .unwrap_or("task failed");
+            Ok(PollOutcome::Failed(format!("{status}: {msg}")))
+        }
+        _ => Ok(PollOutcome::Pending),
+    }
+}
+
+/// Poll a rsclaw async image job (image-edit / t2i-v2, gen-api.md §1). The
+/// job's `external_task_id` is the signed `data[].url` returned at submit
+/// time. That URL is authless and self-describes status by HTTP code:
+///   409 → still processing (Pending)
+///   200 → ready; the body is the image bytes (Done — hand the URL back to
+///         `download_artifact`, which GETs it without auth)
+///   502 → generation failed
+/// We don't read the 200 body here; the status is in the response head, so a
+/// poll stays cheap.
+pub async fn poll_rsclaw_image(
+    client: &reqwest::Client,
+    signed_url: &str,
+) -> Result<PollOutcome> {
+    let resp = client
+        .get(signed_url)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| anyhow!("rsclaw-image: poll failed: {e}"))?;
+    match resp.status().as_u16() {
+        200 => Ok(PollOutcome::Done(signed_url.to_owned())),
+        409 | 202 | 425 => Ok(PollOutcome::Pending),
+        502 => Ok(PollOutcome::Failed(
+            "rsclaw-image: generation failed (502)".to_owned(),
+        )),
+        other if (400..600).contains(&other) => Ok(PollOutcome::Failed(format!(
+            "rsclaw-image: poll status {other}"
+        ))),
         _ => Ok(PollOutcome::Pending),
     }
 }

@@ -99,7 +99,6 @@ pub mod ws;
 // ---------------------------------------------------------------------------
 pub use rsclaw_agent as agent;
 pub use rsclaw_artifact as artifact;
-pub use rsclaw_astock as astock;
 pub use rsclaw_browser as browser;
 pub use rsclaw_cap as cap;
 pub use rsclaw_channel as channel;
@@ -138,8 +137,8 @@ use cmd::{
     cmd_devices, cmd_directory, cmd_dns, cmd_docs, cmd_doctor, cmd_env, cmd_gateway, cmd_health,
     cmd_hooks, cmd_kb, cmd_logs, cmd_memory, cmd_message, cmd_migrate, cmd_models, cmd_onboard,
     cmd_plugins, cmd_qr, cmd_reset, cmd_sandbox, cmd_secrets, cmd_security, cmd_sessions,
-    cmd_setup, cmd_skills, cmd_status, cmd_stock, cmd_system, cmd_tools, cmd_tray, cmd_tui,
-    cmd_uninstall, cmd_update, cmd_watch, cmd_webhooks,
+    cmd_setup, cmd_skills, cmd_status, cmd_system, cmd_tools, cmd_tray, cmd_tui, cmd_uninstall,
+    cmd_update, cmd_watch, cmd_webhooks,
 };
 
 /// Resolve the rsclaw base directory and port offset.
@@ -299,7 +298,6 @@ pub async fn run() -> Result<()> {
         Command::Message(sub) => cmd_message(sub).await,
         Command::Kb(sub) => cmd_kb(sub, base_dir.join("kb")).await,
         Command::Memory(sub) => cmd_memory(sub).await,
-        Command::Stock(sub) => cmd_stock(sub).await,
         Command::Migrate(args) => cmd_migrate(args).await,
         Command::Sessions(sub) => cmd_sessions(sub).await,
         Command::Cron(sub) => cmd_cron(sub).await,

@@ -85,20 +85,16 @@ pub fn build_providers(config: &RuntimeConfig) -> ProviderRegistry {
             }
 
             let base_url = provider_cfg.base_url.clone().or_else(|| {
-                // Fall back to well-known base URLs for named providers.
-                match name.as_str() {
-                    "qwen" => Some("https://dashscope.aliyuncs.com/compatible-mode/v1".to_owned()),
-                    "deepseek" => Some("https://api.deepseek.com/v1".to_owned()),
-                    "kimi" | "moonshot" => Some("https://api.moonshot.cn/v1".to_owned()),
-                    "zhipu" => Some("https://open.bigmodel.cn/api/paas/v4".to_owned()),
-                    "minimax" => Some("https://api.minimaxi.com/v1".to_owned()),
-                    "siliconflow" => Some("https://api.siliconflow.cn/v1".to_owned()),
-                    "groq" => Some("https://api.groq.com/openai/v1".to_owned()),
-                    "openrouter" => Some("https://openrouter.ai/api/v1".to_owned()),
-                    "gaterouter" => Some("https://api.gaterouter.ai/openai/v1".to_owned()),
-                    "grok" | "xai" => Some("https://api.x.ai/v1".to_owned()),
-                    _ => None,
-                }
+                // Fall back to the single source of truth — defaults.toml then
+                // the hardcoded builtin table — which covers EVERY known
+                // provider (agnes, doubao, …), not just a hand-maintained
+                // subset. Without this, a provider configured with only an
+                // `apiKey` (e.g. agnes via `rsclaw setup`) resolved to a
+                // `None` base_url and the openai-completions arm fell back to
+                // `api.openai.com`, sending that provider's key to OpenAI and
+                // surfacing a baffling 401.
+                let (url, _auth) = crate::defaults::resolve_base_url(name);
+                (!url.is_empty()).then_some(url)
             });
 
             // Resolve User-Agent: provider > gateway > built-in default.

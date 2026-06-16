@@ -3770,7 +3770,7 @@ function TauriConfigPageInner() {
               labelZh={"\u89C6\u89C9\u6A21\u578B"}
               labelEn="Vision Model"
               hint={`agents.defaults.model.vision (${zh ? "\u7559\u7A7A\u2192\u4E3B\u6A21\u578B\uFF1Bcomputer_use \u4F18\u5148" : "empty \u2192 primary; computer_use prefers this"})`}
-              placeholder="qwen/qwen-3-vl-plus, doubao/seed-2.0-pro"
+              placeholder="rsclaw/rsclaw-vision-v1, qwen/qwen-3-vl-plus"
               readChain={readChain}
               writeChain={writeChain}
               healthMap={healthMap}
@@ -3795,7 +3795,7 @@ function TauriConfigPageInner() {
               labelZh={"\u56FE\u7247\u751F\u6210\u6A21\u578B"}
               labelEn="Image Generation Model"
               hint={`agents.defaults.model.image (${zh ? "\u7A7A=\u7981\u7528" : "empty = disabled"})`}
-              placeholder="doubao/doubao-seedream-5-0-260128, minimax/image-01"
+              placeholder="rsclaw/rsclaw-image-v1, doubao/doubao-seedream-5-0-260128"
               readChain={readChain}
               writeChain={writeChain}
               healthMap={healthMap}
@@ -3809,7 +3809,7 @@ function TauriConfigPageInner() {
               labelZh={"\u89C6\u9891\u751F\u6210\u6A21\u578B"}
               labelEn="Video Generation Model"
               hint={`agents.defaults.model.video (${zh ? "\u7A7A=\u7981\u7528;\u6BCF\u6BB5\u4ED8\u8D39\u4E14\u8017\u65F6" : "empty = disabled; each clip is paid and slow"})`}
-              placeholder="doubao/doubao-seedance-2-0-260128, minimax/video-01-director"
+              placeholder="rsclaw/rsclaw-video-v1, doubao/doubao-seedance-2-0-260128"
               readChain={readChain}
               writeChain={writeChain}
               healthMap={healthMap}

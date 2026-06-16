@@ -370,6 +370,20 @@ pub(crate) async fn try_preparse_locally_with_account(
         dm_scope: DmScope::PerChannelPeer,
     });
 
+    if let Some(reply) = try_plugin_slash(
+        t,
+        handle,
+        channel,
+        peer_id,
+        account,
+        &this_session_key,
+        origin,
+    )
+    .await
+    {
+        return Some(reply);
+    }
+
     // /abort — set abort flag for THIS session only.
     if lower == "/abort" {
         let flags = handle
@@ -1350,13 +1364,6 @@ $g.Dispose();$b.Dispose()"#
         };
         return Some(txt(reply));
     }
-    // /astock — A股数据/调度快路径。子命令:
-    //   briefing list / next / run <slot>
-    //   watchlist list / add <code...> / remove <code...> / clear
-    //   quote <code>
-    //   snapshot [code...]
-    //   chart <code> [period] [count]
-    // 不进 LLM，直接调 astock 子模块。
     // /goal — result-driven turn loop. See src/agent/goal.rs.
     //
     //   /goal <condition>             # set + start
@@ -1384,43 +1391,8 @@ $g.Dispose();$b.Dispose()"#
             goal_set_handler(handle, channel, peer_id, account, rest).await,
         ));
     }
-    if lower == "/astock" || lower == "/astock help" || lower == "/astock -h" || lower == "/astock --help" {
-        return Some(txt(astock_help_text()));
-    }
-    if let Some(rest) = lower.strip_prefix("/astock ") {
-        let raw_rest = t.strip_prefix("/astock ").unwrap_or(rest).trim();
-        // chart needs to attach the rendered PNG, so it bypasses the
-        // text-only `txt` helper and builds its own OutboundMessage.
-        // All other sub-commands stay text-only.
-        let first_word = raw_rest
-            .split_whitespace()
-            .next()
-            .map(str::to_lowercase)
-            .unwrap_or_default();
-        if first_word == "chart" {
-            let chart_args: Vec<String> = raw_rest
-                .split_whitespace()
-                .skip(1)
-                .map(str::to_owned)
-                .collect();
-            return Some(astock_chart_outbound(chart_args).await);
-        }
-        return Some(txt(
-            handle_astock_command(handle, channel, peer_id, raw_rest).await,
-        ));
-    }
     None
 }
-
-// ---------------------------------------------------------------------------
-// /astock dispatcher
-// ---------------------------------------------------------------------------
-//
-// Routes the `/astock <sub> <args...>` form to the appropriate
-// astock helper. Returns a single plain-text reply (the only shape
-// the fast preparse path can use). Chart sub-command returns a
-// special marker token consumed by the higher-level wrapper —
-// see `dispatch_astock_chart` for the image-attachment path.
 
 // ---------------------------------------------------------------------------
 // /goal handlers — completion-driven turn loop.
@@ -1553,490 +1525,6 @@ fn parse_goal_args(rest: &str) -> (String, u32) {
     (cond_toks.join(" ").trim().to_owned(), max_iter)
 }
 
-fn astock_help_text() -> String {
-    "/astock — A股数据 & 调度 (本地快路径，不进 LLM)\n\n\
-     调度\n\
-       /astock briefing list                 三个时段 + 下次 fire\n\
-       /astock briefing next                 只看下次\n\
-       /astock briefing run <slot>           立即补发 (premarket|midday|postmarket)\n\n\
-     自选股\n\
-       /astock watchlist list                当前自选股\n\
-       /astock watchlist add <code> [...]    加入 (支持批量)\n\
-       /astock watchlist remove <code> [...] 删除\n\
-       /astock watchlist clear               清空\n\n\
-     即时数据\n\
-       /astock quote <code> [<code>...]      实时报价\n\
-       /astock snapshot [<code>...]          快照 (空参 = 自选股)\n\
-       /astock chart <code> [period] [count] K 线图 (会推送到当前会话)\n\
-       /astock screen <filter> [limit]       异动筛选 (quick_rally / quick_goldcross / ...)\n\n\
-     备注: astock 未启用时所有子命令静默回 '_astock 未启用_'。"
-        .to_owned()
-}
-
-async fn handle_astock_command(
-    handle: &rsclaw_agent::AgentHandle,
-    channel: &str,
-    peer_id: &str,
-    rest: &str,
-) -> String {
-    let mut parts = rest.split_whitespace();
-    let Some(sub) = parts.next() else {
-        return astock_help_text();
-    };
-    let args: Vec<String> = parts.map(str::to_owned).collect();
-    match sub.to_lowercase().as_str() {
-        "briefing" => astock_briefing(args).await,
-        "watchlist" => astock_watchlist(handle, channel, peer_id, args).await,
-        "quote" => astock_quote(args).await,
-        "snapshot" => astock_snapshot(handle, channel, peer_id, args).await,
-        "screen" => astock_screen(args).await,
-        // `chart` is handled directly at the slash callsite so the
-        // PNG can be attached as an image — it never reaches this
-        // dispatcher. Document the case for the reader.
-        "chart" => "internal error: chart should be handled at the slash callsite".to_owned(),
-        other => format!("/astock: 未知子命令 `{other}`。看 `/astock help`"),
-    }
-}
-
-async fn astock_briefing(args: Vec<String>) -> String {
-    let action = args
-        .first()
-        .map(|s| s.to_lowercase())
-        .unwrap_or_else(|| "list".to_owned());
-    match action.as_str() {
-        "list" | "" => {
-            let snapshot = rsclaw_astock::briefing::schedule_snapshot();
-            let mut lines = vec!["**早报调度**".to_owned()];
-            for (slot, when) in snapshot {
-                lines.push(format!(
-                    "  {}  ·  {}  →  {}",
-                    slot.slug(),
-                    slot.label(),
-                    when.format("%Y-%m-%d %H:%M %Z")
-                ));
-            }
-            lines.push(String::new());
-            lines.push(
-                "提示: 调度写在 src/astock/briefing.rs，时间表硬编码。\
-                 改时间需 rebuild + `cargo run -- gateway restart`。"
-                    .to_owned(),
-            );
-            lines.join("\n")
-        }
-        "next" => {
-            let snapshot = rsclaw_astock::briefing::schedule_snapshot();
-            // schedule_snapshot returns slots in wallclock order; find
-            // the earliest absolute time among them — that's "next".
-            match snapshot.into_iter().min_by_key(|(_, w)| *w) {
-                Some((slot, when)) => format!(
-                    "下次: {} ({}) @ {}",
-                    slot.slug(),
-                    slot.label(),
-                    when.format("%Y-%m-%d %H:%M %Z")
-                ),
-                None => "_无可用 slot_".to_owned(),
-            }
-        }
-        "run" => {
-            let Some(slug) = args.get(1) else {
-                return "用法: /astock briefing run <premarket|midday|postmarket>".to_owned();
-            };
-            let Some(slot) = rsclaw_astock::briefing::BriefingSlot::from_slug(slug) else {
-                return format!(
-                    "未知 slot `{slug}`，可选: premarket | midday | postmarket"
-                );
-            };
-            // Fire-and-forget — the dispatch path drops a synthetic
-            // user turn onto the task queue, which the agent runtime
-            // handles asynchronously. The reply we return below is
-            // immediate; the briefing itself arrives a few seconds
-            // later via the normal channel send path.
-            tokio::spawn(async move {
-                rsclaw_astock::briefing::dispatch_one(slot).await;
-            });
-            format!("已触发 {} ({})，几秒内到达。", slot.slug(), slot.label())
-        }
-        other => format!("briefing: 未知动作 `{other}`，可选: list | next | run"),
-    }
-}
-
-async fn astock_watchlist(
-    handle: &rsclaw_agent::AgentHandle,
-    channel: &str,
-    peer_id: &str,
-    args: Vec<String>,
-) -> String {
-    let action = args
-        .first()
-        .map(|s| s.to_lowercase())
-        .unwrap_or_else(|| "list".to_owned());
-    let Some(mem) = rsclaw_agent::memory::global_store() else {
-        return "_memory 未启用，自选股无法持久化_".to_owned();
-    };
-    let scope = rsclaw_agent::tools_stock::watchlist_scope(&handle.id, channel, peer_id);
-    let result = match action.as_str() {
-        "list" | "" => rsclaw_agent::tools_stock::watchlist_list(&mem, &scope).await,
-        "add" => {
-            let codes: Vec<String> = args.iter().skip(1).cloned().collect();
-            rsclaw_agent::tools_stock::watchlist_add(&mem, &scope, codes).await
-        }
-        "remove" | "rm" | "delete" | "del" => {
-            let codes: Vec<String> = args.iter().skip(1).cloned().collect();
-            rsclaw_agent::tools_stock::watchlist_remove(&mem, &scope, codes).await
-        }
-        "clear" => rsclaw_agent::tools_stock::watchlist_clear(&mem, &scope).await,
-        other => {
-            return format!(
-                "watchlist: 未知动作 `{other}`，可选: list | add | remove | clear"
-            );
-        }
-    };
-    let v = match result {
-        Ok(v) => v,
-        Err(e) => return format!("/astock watchlist 出错: {e:#}"),
-    };
-    // For `list`, enrich with display names so the reply reads as
-    // `600519 贵州茅台 / 000001 平安银行` instead of bare codes.
-    // The name resolver caches aggressively (1h) so this is a noop
-    // round trip after the first call.
-    if matches!(action.as_str(), "list" | "") {
-        if let Some(arc) = rsclaw_astock::global_client() {
-            let codes: Vec<String> = v
-                .get("codes")
-                .and_then(|x| x.as_array())
-                .map(|arr| arr.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect())
-                .unwrap_or_default();
-            if !codes.is_empty() {
-                let names = arc.resolve_names(&codes).await;
-                return format_watchlist_list_with_names(&codes, &names);
-            }
-        }
-    }
-    format_watchlist_reply(&action, &v)
-}
-
-fn format_watchlist_list_with_names(
-    codes: &[String],
-    names: &std::collections::HashMap<String, String>,
-) -> String {
-    if codes.is_empty() {
-        return "_自选股为空 — `/astock watchlist add <code>` 加一只_".to_owned();
-    }
-    let mut lines = vec![format!("自选股 ({})", codes.len())];
-    for c in codes {
-        let name = names.get(c).map(String::as_str).unwrap_or("");
-        if name.is_empty() {
-            lines.push(format!("- {c}"));
-        } else {
-            lines.push(format!("- {c} {name}"));
-        }
-    }
-    lines.join("\n")
-}
-
-fn format_watchlist_reply(action: &str, v: &serde_json::Value) -> String {
-    let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
-    if !ok {
-        return v
-            .get("error")
-            .and_then(|x| x.as_str())
-            .unwrap_or("_出错_")
-            .to_owned();
-    }
-    match action {
-        "list" | "" => {
-            let codes: Vec<&str> = v
-                .get("codes")
-                .and_then(|x| x.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-                .unwrap_or_default();
-            if codes.is_empty() {
-                "_自选股为空 — `/astock watchlist add <code>` 加一只_".to_owned()
-            } else {
-                format!(
-                    "自选股 ({}): {}",
-                    codes.len(),
-                    codes.join(", ")
-                )
-            }
-        }
-        "add" => {
-            let added: Vec<&str> = v
-                .get("added")
-                .and_then(|x| x.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-                .unwrap_or_default();
-            let total = v.get("total").and_then(|x| x.as_u64()).unwrap_or(0);
-            if added.is_empty() {
-                format!("已存在或无新代码 (当前 {total} 只)")
-            } else {
-                format!(
-                    "已加入 {}: {}  (当前 {} 只)",
-                    added.len(),
-                    added.join(", "),
-                    total
-                )
-            }
-        }
-        "remove" | "rm" | "delete" | "del" => {
-            let removed = v.get("removed").and_then(|x| x.as_u64()).unwrap_or(0);
-            let requested = v.get("requested").and_then(|x| x.as_u64()).unwrap_or(0);
-            format!("删除 {removed}/{requested}")
-        }
-        "clear" => {
-            let removed = v.get("removed").and_then(|x| x.as_u64()).unwrap_or(0);
-            format!("已清空 (删除 {removed} 只)")
-        }
-        _ => v.to_string(),
-    }
-}
-
-async fn astock_quote(args: Vec<String>) -> String {
-    let codes: Vec<String> = args
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect();
-    if codes.is_empty() {
-        return "用法: /astock quote <code> [<code>...]".to_owned();
-    }
-    let Some(arc) = rsclaw_astock::global_client() else {
-        return "_astock 未启用_".to_owned();
-    };
-    let quote_codes = codes.clone();
-    let names_codes = codes;
-    // Fetch quotes + names in parallel. Names are best-effort —
-    // we render code-only if resolution times out / fails.
-    let quotes_fut = async {
-        if quote_codes.len() == 1 {
-            arc.quote(&quote_codes[0]).await.map(|q| vec![q])
-        } else {
-            arc.quote_batch(&quote_codes).await
-        }
-    };
-    let names_fut = arc.resolve_names(&names_codes);
-    let (quotes_res, names) = tokio::join!(quotes_fut, names_fut);
-    let quotes = match quotes_res {
-        Ok(q) => q,
-        Err(e) => return format!("astock quote: {e}"),
-    };
-    rsclaw_agent::tools_stock::render_quotes_markdown_with_names(&quotes, Some(&names))
-}
-
-async fn astock_screen(args: Vec<String>) -> String {
-    let filter = match args.first() {
-        Some(f) if !f.is_empty() => f.clone(),
-        _ => {
-            return "用法: /astock screen <quick_filter> [limit]\n\
-                    可选 filter: quick_rally | quick_goldcross | \
-                    quick_cow_catch | quick_deadtogold"
-                .to_owned();
-        }
-    };
-    let limit = args.get(1).and_then(|s| s.parse::<u32>().ok()).or(Some(10));
-    let Some(arc) = rsclaw_astock::global_client() else {
-        return "_astock 未启用_".to_owned();
-    };
-    let resp = match arc.screen_quick(&filter, limit).await {
-        Ok(v) => v,
-        Err(e) => return format!("astock screen: {e}"),
-    };
-    format_screen_reply(&filter, &resp)
-}
-
-/// Render the screen-quick JSON tree as IM-friendly markdown.
-///
-/// Astock's response shape (verified live against quick_rally at
-/// 2026-06-11 13:39):
-///   {
-///     "as_of_ts": null,
-///     "computed_at": "2026-06-11T13:39:30+08:00",
-///     "cost_credits": 85,
-///     "count": 0,
-///     "filters_applied": [...],
-///     "limit": 50,
-///     "results": [...],
-///     "total_matched": 0
-///   }
-///
-/// Each entry in `results` is per-filter — we surface code/name when
-/// present and otherwise dump the row as compact JSON. Defensive on
-/// shape because astock's filters expose different telemetry per
-/// type (rally has pct_change, goldcross has ma cross series, ...).
-fn format_screen_reply(filter: &str, v: &serde_json::Value) -> String {
-    let total = v
-        .get("total_matched")
-        .and_then(|x| x.as_u64())
-        .or_else(|| v.get("count").and_then(|x| x.as_u64()))
-        .unwrap_or(0);
-    let cost = v
-        .get("cost_credits")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(0);
-    let computed = v
-        .get("computed_at")
-        .and_then(|x| x.as_str())
-        .unwrap_or("?");
-    let results = v
-        .get("results")
-        .and_then(|x| x.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let mut lines = vec![format!(
-        "**{}** · {} 命中 · {} 积分 · {}",
-        filter, total, cost, computed
-    )];
-    if results.is_empty() {
-        lines.push("_无命中_".to_owned());
-        return lines.join("\n");
-    }
-    for row in results.iter().take(20) {
-        let code = row
-            .get("code")
-            .and_then(|x| x.as_str())
-            .unwrap_or("?");
-        let name = row
-            .get("name")
-            .and_then(|x| x.as_str())
-            .unwrap_or("");
-        // Best-effort: surface whichever metric column the filter
-        // chose to highlight, falling back to a compact JSON dump.
-        let metric = row
-            .get("pct_change")
-            .or_else(|| row.get("change_pct"))
-            .or_else(|| row.get("score"))
-            .or_else(|| row.get("rally"))
-            .and_then(|x| x.as_f64())
-            .map(|p| format!("{:+.2}%", p))
-            .unwrap_or_else(|| {
-                serde_json::to_string(row)
-                    .map(|s| {
-                        if s.len() > 60 {
-                            // CJK-safe truncate — `&s[..60]` can
-                            // panic mid-codepoint. See
-                            // rsclaw_util::truncate_str.
-                            format!("{}…", rsclaw_util::truncate_str(&s, 60))
-                        } else {
-                            s
-                        }
-                    })
-                    .unwrap_or_default()
-            });
-        let head = if name.is_empty() {
-            code.to_owned()
-        } else {
-            format!("{} {}", code, name)
-        };
-        lines.push(format!("- {}  {}", head, metric));
-    }
-    if results.len() > 20 {
-        lines.push(format!("_…剩余 {} 行_", results.len() - 20));
-    }
-    lines.join("\n")
-}
-
-async fn astock_snapshot(
-    handle: &rsclaw_agent::AgentHandle,
-    channel: &str,
-    peer_id: &str,
-    args: Vec<String>,
-) -> String {
-    let mut codes: Vec<String> = args
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect();
-    let Some(arc) = rsclaw_astock::global_client() else {
-        return "_astock 未启用_".to_owned();
-    };
-    let mut used_watchlist = false;
-    if codes.is_empty() {
-        // No explicit args → fall back to the caller's watchlist
-        // (matches `tool_stock_snapshot`'s `use_watchlist` default).
-        if let Some(mem) = rsclaw_agent::memory::global_store() {
-            let scope = rsclaw_agent::tools_stock::watchlist_scope(&handle.id, channel, peer_id);
-            let store = mem.lock().await;
-            codes = store
-                .list_active()
-                .into_iter()
-                .filter(|d| d.scope == scope && d.kind == "watchlist")
-                .map(|d| d.text)
-                .collect();
-            drop(store);
-            used_watchlist = !codes.is_empty();
-        }
-    }
-    if codes.is_empty() {
-        return "_无代码且自选股为空 — `/astock watchlist add <code>` 先加一只_".to_owned();
-    }
-    let rows = match arc.snapshot(None, None, &codes, None).await {
-        Ok(r) => r,
-        Err(e) => return format!("astock snapshot: {e}"),
-    };
-    rsclaw_agent::tools_stock::render_snapshot_markdown(&rows, used_watchlist, "amount")
-}
-
-/// Render a chart and return an `OutboundMessage` with the PNG
-/// attached as a base64 data URI. The channel sender (feishu/wechat)
-/// already knows how to upload `data:image/png;base64,...` payloads
-/// from the `images` field — see `feishu.rs::send_text_with_images`.
-async fn astock_chart_outbound(args: Vec<String>) -> OutboundMessage {
-    let code = match args.first() {
-        Some(c) if !c.is_empty() => c.clone(),
-        _ => {
-            return OutboundMessage {
-                text: "用法: /astock chart <code> [period] [count]".to_owned(),
-                ..Default::default()
-            };
-        }
-    };
-    let period = args.get(1).cloned().unwrap_or_else(|| "1d".to_owned());
-    let count_n = args.get(2).and_then(|s| s.parse::<u32>().ok()).unwrap_or(60);
-    let input = rsclaw_agent::tools_stock::ChartRenderInput {
-        code: &code,
-        period: &period,
-        count: count_n,
-        adjust: "qfq",
-        ma_periods: vec![5, 10, 20, 60],
-        name_hint: None,
-    };
-    let out = match rsclaw_agent::tools_stock::render_chart_for_code(input).await {
-        Ok(o) => o,
-        Err(rsclaw_agent::tools_stock::ChartRenderError::Dormant) => {
-            return OutboundMessage {
-                text: "_astock 未启用_".to_owned(),
-                ..Default::default()
-            };
-        }
-        Err(rsclaw_agent::tools_stock::ChartRenderError::Soft(msg)) => {
-            return OutboundMessage {
-                text: msg,
-                ..Default::default()
-            };
-        }
-    };
-    // PNG → base64 data URI. Same shape as
-    // `server::resolve_media_to_image_data` and what the feishu
-    // sender expects from `OutboundMessage::images`.
-    use base64::Engine;
-    let bytes = match tokio::fs::read(&out.path).await {
-        Ok(b) => b,
-        Err(e) => {
-            return OutboundMessage {
-                text: format!("chart 渲染成功但读取失败: {e}"),
-                ..Default::default()
-            };
-        }
-    };
-    let data_uri = format!(
-        "data:image/png;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(&bytes)
-    );
-    OutboundMessage {
-        text: out.title,
-        images: vec![data_uri],
-        ..Default::default()
-    }
-}
-
 /// Check if a message is a fast preparse command that should bypass the
 /// per-user queue. These are local slash commands that execute instantly and
 /// should not wait behind slow LLM requests in the queue.
@@ -2049,7 +1537,7 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
         "/ls" | "/status" | "/version" | "/help" | "/?" | "/health" | "/uptime"
             | "/model" | "/models" | "/cron" | "/clear" | "/new" | "/abort" | "/sessions"
             | "/loop" | "/task" | "/watch" | "/plugin" | "/cap" | "/cap-exit" | "/cap-resume"
-            | "/astock" | "/goal"
+            | "/goal"
     )
     // Commands with optional/required args
     || lower.starts_with("/ls ")
@@ -2069,8 +1557,8 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
     || lower.starts_with("/watch ")
     || lower.starts_with("/cap ")
     || lower.starts_with("/cap-resume ")
-    || lower.starts_with("/astock ")
     || lower.starts_with("/goal ")
+    || is_installed_plugin_slash_preparse(t)
     // /task only short-circuits on help variants; non-help forms must NOT
     // bypass the queue (the task queue worker owns the multi-turn flow).
     || lower == "/task -h"
@@ -2078,6 +1566,199 @@ pub(crate) fn is_fast_preparse(text: &str) -> bool {
     || lower == "/task help"
     || t.starts_with("! ")
     || t.starts_with("$ ")
+}
+
+fn is_installed_plugin_slash_preparse(text: &str) -> bool {
+    let trimmed = text.trim();
+    if !trimmed.starts_with('/') {
+        return false;
+    }
+    let plugins_dir = rsclaw_config::loader::base_dir().join("plugins");
+    installed_plugin_slash_matches_in_dir(&plugins_dir, trimmed)
+}
+
+fn installed_plugin_slash_matches_in_dir(plugins_dir: &std::path::Path, text: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(plugins_dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            return false;
+        };
+        if !file_type.is_dir() {
+            return false;
+        }
+        let Ok(manifest) = rsclaw_plugin::manifest::load_manifest(&path) else {
+            return false;
+        };
+        manifest
+            .slash_commands
+            .iter()
+            .any(|command| slash_prefix_matches(text, &command.prefix))
+    })
+}
+
+fn slash_prefix_matches(text: &str, prefix: &str) -> bool {
+    let prefix = prefix.trim();
+    if prefix.is_empty() {
+        return false;
+    }
+    let text_lower = text.trim().to_lowercase();
+    let prefix_lower = prefix.to_lowercase();
+    text_lower == prefix_lower || text_lower.starts_with(&format!("{prefix_lower} "))
+}
+
+async fn try_plugin_slash(
+    text: &str,
+    handle: &rsclaw_agent::AgentHandle,
+    channel: &str,
+    peer_id: &str,
+    account: Option<&str>,
+    session_key: &str,
+    origin: PreparseOrigin,
+) -> Option<OutboundMessage> {
+    let plugins = handle.wasm_plugins_snapshot();
+    if plugins.is_empty() {
+        return None;
+    }
+    let lower = text.trim().to_lowercase();
+    for plugin in plugins.iter() {
+        for command in &plugin.slash_commands {
+            let prefix = command.prefix.trim();
+            if prefix.is_empty() {
+                continue;
+            }
+            if !slash_prefix_matches(&lower, prefix) {
+                continue;
+            }
+            let Some(tx) = handle.notification_tx() else {
+                return Some(plugin_slash_error(format!(
+                    "plugin slash `{prefix}` cannot run: notification host is unavailable"
+                )));
+            };
+            let args = serde_json::json!({
+                "text": text,
+                "prefix": prefix,
+                "args": slash_args_after_prefix(text, prefix),
+                "channel": channel,
+                "peer_id": peer_id,
+                "account": account,
+                "session_key": session_key,
+                "origin": match origin {
+                    PreparseOrigin::User => "user",
+                    PreparseOrigin::Cron => "cron",
+                },
+            });
+            let notify_ctx = Some(rsclaw_plugin::wasm_runtime::WasmNotifyCtx {
+                tx,
+                target_id: peer_id.to_owned(),
+                channel: channel.to_owned(),
+                agent_id: handle.id.clone(),
+                peer_id: peer_id.to_owned(),
+                chat_id: peer_id.to_owned(),
+                session_key: session_key.to_owned(),
+                is_group: false,
+            });
+            return Some(match plugin.call_tool_with_ctx(&command.handler, args, notify_ctx).await {
+                Ok(value) => plugin_slash_outbound(value),
+                Err(e) => plugin_slash_error(format!("plugin slash `{prefix}` failed: {e:#}")),
+            });
+        }
+    }
+    None
+}
+
+fn slash_args_after_prefix(text: &str, prefix: &str) -> String {
+    text.trim()
+        .chars()
+        .skip(prefix.chars().count())
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+fn plugin_slash_error(text: String) -> OutboundMessage {
+    OutboundMessage {
+        target_id: String::new(),
+        is_group: false,
+        text,
+        reply_to: None,
+        images: vec![],
+        files: vec![],
+        channel: None,
+        account: None,
+    }
+}
+
+fn plugin_slash_outbound(value: serde_json::Value) -> OutboundMessage {
+    let text = value
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()));
+    let values_to_strings = |key: &str| -> Vec<String> {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let values_to_files = || -> Vec<(String, String, String)> {
+        value
+            .get("files")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| arr.iter().filter_map(plugin_file_tuple).collect())
+            .unwrap_or_default()
+    };
+    OutboundMessage {
+        target_id: String::new(),
+        is_group: false,
+        text,
+        reply_to: None,
+        images: values_to_strings("images"),
+        files: values_to_files(),
+        channel: None,
+        account: None,
+    }
+}
+
+fn plugin_file_tuple(value: &serde_json::Value) -> Option<(String, String, String)> {
+    let (path, filename, mime) = if let Some(path) = value.as_str() {
+        let filename = std::path::Path::new(path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("plugin-file")
+            .to_owned();
+        (path.to_owned(), filename, "application/octet-stream".to_owned())
+    } else {
+        let obj = value.as_object()?;
+        let path = obj.get("path").and_then(serde_json::Value::as_str)?.to_owned();
+        let filename = obj
+            .get("filename")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                std::path::Path::new(&path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("plugin-file")
+                    .to_owned()
+            });
+        let mime = obj
+            .get("mime")
+            .or_else(|| obj.get("mimeType"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("application/octet-stream")
+            .to_owned();
+        (path, filename, mime)
+    };
+    Some((filename, mime, path))
 }
 
 // ---------------------------------------------------------------------------
@@ -2280,8 +1961,6 @@ fn help_text(lang: &str) -> String {
          \u{0020}\u{0020}/loop -h         定时循环（详见 -h）\n\
          \u{0020}\u{0020}/goal <cond>     盯一个结果型目标，模型自评 GOAL_ACHIEVED/FAILED 终止\n\
          \u{0020}\u{0020}/cron list       查看定时任务\n\n\
-         A股 (astock)\n\
-         \u{0020}\u{0020}/astock          A股数据 & 早报调度（详见 /astock help）\n\n\
          文件/截图\n\
          \u{0020}\u{0020}/ls [path]       列出工作区目录\n\
          \u{0020}\u{0020}/cat <file>      查看文件内容\n\
@@ -2289,6 +1968,7 @@ fn help_text(lang: &str) -> String {
          \u{0020}\u{0020}/webshot <url>   网页截图\n\n\
          技能/插件\n\
          \u{0020}\u{0020}/skill list      已安装技能\n\n\
+         \u{0020}\u{0020}/plugin list     插件状态；插件声明的 slash 命令会自动接管\n\n\
          编程代理直连\n\
          \u{0020}\u{0020}/cap <agent>            绑定本会话直连 cap 子代理\n\
          \u{0020}\u{0020}/cap-resume <ag> <id>   按 ID 恢复磁盘保存的会话\n\
@@ -2316,8 +1996,6 @@ fn help_text(lang: &str) -> String {
          \u{0020}\u{0020}/loop -h         repeat on a schedule (see -h)\n\
          \u{0020}\u{0020}/goal <cond>     result-driven loop; model self-tags GOAL_ACHIEVED/FAILED to stop\n\
          \u{0020}\u{0020}/cron list       view cron jobs\n\n\
-         A-shares (astock)\n\
-         \u{0020}\u{0020}/astock          A-share data & briefing scheduler (see /astock help)\n\n\
          File / screenshot\n\
          \u{0020}\u{0020}/ls [path]       list workspace directory\n\
          \u{0020}\u{0020}/cat <file>      view file contents\n\
@@ -2325,6 +2003,7 @@ fn help_text(lang: &str) -> String {
          \u{0020}\u{0020}/webshot <url>   web-page screenshot\n\n\
          Skills / plugins\n\
          \u{0020}\u{0020}/skill list      installed skills\n\n\
+         \u{0020}\u{0020}/plugin list     plugin status; plugin-declared slash commands auto-hook\n\n\
          Coding-agent direct mode\n\
          \u{0020}\u{0020}/cap <agent>            route this chat directly to a cap subagent\n\
          \u{0020}\u{0020}/cap-resume <ag> <id>   resume a saved session by id\n\

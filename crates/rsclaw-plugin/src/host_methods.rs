@@ -10,12 +10,11 @@
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
+use rsclaw_browser::BrowserSession;
+use rsclaw_channel::OutboundMessage;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast};
 use tracing::{debug, warn};
-
-use rsclaw_browser::BrowserSession;
-use rsclaw_channel::OutboundMessage;
 
 /// All dependencies a host method might need. Cloned cheaply (everything is
 /// behind Arc) and shared across plugin spawns.
@@ -183,7 +182,10 @@ impl HostMethodRegistry {
 
         if guard.is_none() {
             tracing::info!("JS plugin: auto-starting browser session");
-            let chrome_path = rsclaw_platform::detect_chrome().ok_or_else(|| anyhow::anyhow!("Chrome not found; run: rsclaw tools install chrome"))
+            let chrome_path = rsclaw_platform::detect_chrome()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Chrome not found; run: rsclaw tools install chrome")
+                })
                 .map_err(|e| anyhow::anyhow!("failed to obtain Chrome: {e:#}"))?;
             let session = BrowserSession::start(&chrome_path, true, Some(PROFILE))
                 .await
@@ -369,7 +371,8 @@ impl HostMethodRegistry {
     }
 
     /// Extract readable text from a saved plugin artifact.
-    /// Params: `{ "path": "<artifact path>" }`. Mirrors wasm `extract-file-text`.
+    /// Params: `{ "path": "<artifact path>" }`. Mirrors wasm
+    /// `extract-file-text`.
     async fn host_extract_file_text(&self, params: Value) -> Result<Value> {
         let path = params["path"]
             .as_str()
@@ -381,7 +384,8 @@ impl HostMethodRegistry {
     }
 
     /// Ingest a prepared document into the local knowledge base.
-    /// Params: `{ "collection": "...", "title": "...", "content": "...", "mime": "text/markdown" }`.
+    /// Params: `{ "collection": "...", "title": "...", "content": "...",
+    /// "mime": "text/markdown" }`.
     async fn host_kb_ingest_document(&self, params: Value) -> Result<Value> {
         let collection = params["collection"]
             .as_str()
@@ -393,10 +397,9 @@ impl HostMethodRegistry {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("kb_ingest_document: `content` required"))?;
         let mime = params["mime"].as_str().unwrap_or("text/markdown");
-        let out =
-            crate::wasm_runtime::kb_ingest_document(collection, title, content, mime)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let out = crate::wasm_runtime::kb_ingest_document(collection, title, content, mime)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         serde_json::from_str(&out).map_err(|e| anyhow::anyhow!("kb ingest result JSON: {e}"))
     }
 

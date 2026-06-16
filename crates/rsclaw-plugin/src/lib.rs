@@ -20,18 +20,151 @@ pub mod manifest;
 pub mod slots;
 pub mod wasm_runtime;
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 
 use anyhow::Result;
+use futures::future::BoxFuture;
 pub use js_runtime::Plugin;
 pub use manifest::{
-    LEGACY_MANIFEST_FILE, MANIFEST_FILE, PluginManifest, PluginToolDef, load_manifest, scan_plugins,
+    LEGACY_MANIFEST_FILE, MANIFEST_FILE, PluginManifest, PluginSlashCommand, PluginToolDef,
+    load_manifest, scan_plugins,
 };
 pub use slots::{ContextEngineSlot, MemoryItem, MemorySlot, MemoryStoreSlot, SlotRegistry};
 use tracing::{info, warn};
-pub use wasm_runtime::{WasmPlugin, WasmToolDef, load_wasm_plugin};
 
+/// Invocation routing context passed to long-lived plugin background tasks.
+#[derive(Debug, Clone, Default)]
+pub struct PluginInvocationContext {
+    pub target_id: String,
+    pub channel: String,
+    pub agent_id: String,
+    pub peer_id: String,
+    pub chat_id: String,
+    pub session_key: String,
+    pub is_group: bool,
+}
+
+/// Host-provided bridge for trusted WASM plugin background capabilities.
+pub trait PluginBackgroundHost: Send + Sync {
+    fn cron_register(
+        &self,
+        plugin: String,
+        name: String,
+        schedule_json: String,
+        ctx: Option<PluginInvocationContext>,
+    ) -> BoxFuture<'static, std::result::Result<String, String>>;
+
+    fn sse_subscribe(
+        &self,
+        plugin: String,
+        name: String,
+        url: String,
+        headers_json: String,
+        resume_key: String,
+        ctx: Option<PluginInvocationContext>,
+    ) -> BoxFuture<'static, std::result::Result<String, String>>;
+
+    fn sse_status(
+        &self,
+        plugin: String,
+        name: String,
+        ctx: Option<PluginInvocationContext>,
+    ) -> BoxFuture<'static, std::result::Result<String, String>>;
+
+    fn push_outbound(
+        &self,
+        channel: String,
+        peer_id: String,
+        message_json: String,
+        ctx: Option<PluginInvocationContext>,
+    ) -> BoxFuture<'static, std::result::Result<String, String>>;
+
+    fn submit_agent_turn(
+        &self,
+        session_key: String,
+        prompt: String,
+        route_json: String,
+        ctx: Option<PluginInvocationContext>,
+    ) -> BoxFuture<'static, std::result::Result<String, String>>;
+}
+
+static PLUGIN_BACKGROUND_HOST: OnceLock<Arc<dyn PluginBackgroundHost>> = OnceLock::new();
+
+/// Install the process-wide background host used by trusted WASM plugins.
+pub fn set_plugin_background_host(host: Arc<dyn PluginBackgroundHost>) {
+    if PLUGIN_BACKGROUND_HOST.set(host).is_err() {
+        warn!("plugin background host already installed, ignoring duplicate install");
+    }
+}
+
+pub(crate) async fn cron_register(
+    plugin: String,
+    name: String,
+    schedule_json: String,
+    ctx: Option<PluginInvocationContext>,
+) -> std::result::Result<String, String> {
+    let Some(host) = PLUGIN_BACKGROUND_HOST.get().cloned() else {
+        return Err("plugin background host is not installed".to_owned());
+    };
+    host.cron_register(plugin, name, schedule_json, ctx).await
+}
+
+pub(crate) async fn sse_subscribe(
+    plugin: String,
+    name: String,
+    url: String,
+    headers_json: String,
+    resume_key: String,
+    ctx: Option<PluginInvocationContext>,
+) -> std::result::Result<String, String> {
+    let Some(host) = PLUGIN_BACKGROUND_HOST.get().cloned() else {
+        return Err("plugin background host is not installed".to_owned());
+    };
+    host.sse_subscribe(plugin, name, url, headers_json, resume_key, ctx)
+        .await
+}
+
+pub(crate) async fn sse_status(
+    plugin: String,
+    name: String,
+    ctx: Option<PluginInvocationContext>,
+) -> std::result::Result<String, String> {
+    let Some(host) = PLUGIN_BACKGROUND_HOST.get().cloned() else {
+        return Err("plugin background host is not installed".to_owned());
+    };
+    host.sse_status(plugin, name, ctx).await
+}
+
+pub(crate) async fn push_outbound(
+    channel: String,
+    peer_id: String,
+    message_json: String,
+    ctx: Option<PluginInvocationContext>,
+) -> std::result::Result<String, String> {
+    let Some(host) = PLUGIN_BACKGROUND_HOST.get().cloned() else {
+        return Err("plugin background host is not installed".to_owned());
+    };
+    host.push_outbound(channel, peer_id, message_json, ctx)
+        .await
+}
+
+pub(crate) async fn submit_agent_turn(
+    session_key: String,
+    prompt: String,
+    route_json: String,
+    ctx: Option<PluginInvocationContext>,
+) -> std::result::Result<String, String> {
+    let Some(host) = PLUGIN_BACKGROUND_HOST.get().cloned() else {
+        return Err("plugin background host is not installed".to_owned());
+    };
+    host.submit_agent_turn(session_key, prompt, route_json, ctx)
+        .await
+}
 use rsclaw_config::schema::PluginsConfig;
+pub use wasm_runtime::{WasmPlugin, WasmToolDef, load_wasm_plugin};
 
 // ---------------------------------------------------------------------------
 // PluginRegistry

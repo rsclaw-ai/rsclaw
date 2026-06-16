@@ -48,3 +48,4 @@ ui/src-tauri/gen/
 # scripts/fetch-bundled-model.sh before `tauri build`. config.json and
 # tokenizer.json are tiny and stay in the repo.
 ui/src-tauri/resources/bge-small-zh/model.safetensors
+.gstack/

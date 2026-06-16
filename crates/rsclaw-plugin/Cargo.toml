@@ -26,9 +26,11 @@ rsclaw-memory = { path = "../rsclaw-memory" }
 rsclaw-desktop = { path = "../rsclaw-desktop" }
 json5 = "1"
 base64 = "0.22"
+ed25519-dalek = "2"
 futures = "0.3"
 uuid = { version = "1", features = ["v4"] }
 reqwest = { version = "0.12", features = ["json", "stream", "multipart", "blocking", "rustls-tls-webpki-roots-no-provider", "socks"], default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 dirs-next = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 wasmtime = { version = "36.0.10", features = ["async"] }
@@ -36,3 +38,7 @@ wasmtime-wasi = "36.0.10"
 chrono = { version = "0.4", features = ["serde"] }
 which = "7"
 rand = "0.9"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

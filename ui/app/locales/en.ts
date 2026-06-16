@@ -571,7 +571,7 @@ const en: LocaleType = {
     },
     VideoModel: {
       Title: "Video Model",
-      SubTitle: "Model used for text-to-video generation (Seedance / MiniMax / Kling)",
+      SubTitle: "Model used for text-to-video generation (Seedance / Kling)",
     },
     BtwTokens: {
       Title: "Side Query Budget",
