@@ -12,7 +12,7 @@ export const API_TYPE_LABELS: Record<ApiType, string> = {
 };
 
 export const API_TYPE_DEFAULT_URLS: Record<ApiType, string> = {
-  rsclaw: "https://api.rsclaw.ai/v1/agent",
+  rsclaw: "https://api.rsclaw.ai/v1",
   openai: "https://api.openai.com/v1",
   "openai-responses": "https://api.openai.com/v1",
   anthropic: "https://api.anthropic.com/v1",

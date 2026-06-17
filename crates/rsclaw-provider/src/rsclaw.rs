@@ -27,12 +27,13 @@ use super::{
     RecallMetadata, Role, StreamEvent, TokenUsage,
 };
 
-/// Default base for the rsclaw-server fleet. The `/v1/agent` suffix
-/// is the external API mount inside rsclaw-server — the rsclaw-llm
-/// `/sessions/...` protocol paths are exposed to clients under that
-/// prefix, distinct from `/v1/chat/completions` etc. Setting
-/// `RSCLAW_URL` overrides this; that variable should also include the
-/// `/v1/agent` segment.
+/// Default base for the rsclaw-server fleet: the OpenAI-compatible `/v1`
+/// root. The incremental-protocol `/sessions/...` paths live under the
+/// `/agent` mount (`/v1/agent/sessions`, …) which this provider prepends
+/// itself (see `send_following_redirects`), so the base stays at `/v1`
+/// where sibling resources like `/v1/models` resolve correctly. Legacy
+/// configs that set the base to `…/v1/agent` are normalized in the
+/// constructor (trailing `/agent` stripped). Setting `RSCLAW_URL` overrides.
 ///
 /// `api.rsclaw.ai` fronts the fleet behind a 308-emitting LB that
 /// pins clients (via the [`RedirectCache`] in this module) to their
@@ -40,7 +41,7 @@ use super::{
 /// window (1h by default). First request through any provider
 /// instance pays the redirect cost; everything within the TTL after
 /// goes direct, so steady-state latency matches a direct deployment.
-pub const RSCLAW_DEFAULT_BASE: &str = "https://api.rsclaw.ai/v1/agent";
+pub const RSCLAW_DEFAULT_BASE: &str = "https://api.rsclaw.ai/v1";
 
 /// Default `prefix_id` per protocol §2.1.1 / §2.10.1 — namespaced
 /// `<ns>/<ver>` string the gateway sends on `POST /sessions`. It's a
@@ -266,6 +267,14 @@ impl RsclawProvider {
         // base_url where stray whitespace flips reqwest into
         // url-parse-error territory.
         let base_url = base_url.into().trim().trim_end_matches('/').to_string();
+        // Back-compat: older configs set base_url to `…/v1/agent`. The provider
+        // now prepends the `/agent` protocol mount itself (so `/v1/models` and
+        // friends sit at the `/v1` root), so strip a trailing `/agent` to avoid
+        // doubling it into `/v1/agent/agent/sessions`.
+        let base_url = base_url
+            .strip_suffix("/agent")
+            .map(|s| s.trim_end_matches('/').to_string())
+            .unwrap_or(base_url);
         let bearer = bearer
             .map(|b| b.trim().to_string())
             .filter(|b| !b.is_empty());
@@ -966,7 +975,10 @@ impl RsclawProvider {
         idempotency_key: Option<&str>,
         accept_sse: bool,
     ) -> Result<reqwest::Response> {
-        let url = format!("{}{}", self.base_url, path);
+        // Protocol paths live under the `/agent` mount; `base_url` is the `/v1`
+        // root (see RSCLAW_DEFAULT_BASE), so prepend `/agent` here. `/models`
+        // and other OpenAI-compat resources go to the bare `/v1` root elsewhere.
+        let url = format!("{}/agent{}", self.base_url, path);
         self.fleet
             .post_following_redirects(
                 &url,
@@ -1336,7 +1348,7 @@ impl RsclawProvider {
         let resp = match tokio::time::timeout(TURN_HEADERS_TIMEOUT, send_fut).await {
             Ok(r) => r?,
             Err(_) => anyhow::bail!(
-                "rsclaw {path}: timed out waiting for response headers after {}s ({}{})",
+                "rsclaw {path}: timed out waiting for response headers after {}s ({}/agent{})",
                 TURN_HEADERS_TIMEOUT.as_secs(),
                 self.base_url,
                 path,
@@ -1457,7 +1469,7 @@ impl RsclawProvider {
             let resp = match tokio::time::timeout(TURN_HEADERS_TIMEOUT, send_fut).await {
                 Ok(r) => r?,
                 Err(_) => anyhow::bail!(
-                    "rsclaw turn: timed out waiting for response headers after {}s ({}{})",
+                    "rsclaw turn: timed out waiting for response headers after {}s ({}/agent{})",
                     TURN_HEADERS_TIMEOUT.as_secs(),
                     self.base_url,
                     path,

@@ -243,7 +243,7 @@ function mapCatalog(raw: RawCatalog): Catalog {
 // is used directly (no mapping) whenever the backend read fails.
 
 const FALLBACK_PROVIDERS: Record<string, CatalogProviderDef> = {
-  rsclaw:      { id: "rsclaw",      name: "RsClaw",             tag: "增量协议 · 业内首发", tagEn: "Incremental · Industry-first", keyLabel: "RsClaw API Key", keyPlaceholder: "sk-...", defaultModel: "rsclaw-agent-v1", hasBaseUrl: true, defaultBaseUrl: "https://api.rsclaw.ai/v1/agent" },
+  rsclaw:      { id: "rsclaw",      name: "RsClaw",             tag: "增量协议 · 业内首发", tagEn: "Incremental · Industry-first", keyLabel: "RsClaw API Key", keyPlaceholder: "sk-...", defaultModel: "rsclaw-agent-v1", hasBaseUrl: true, defaultBaseUrl: "https://api.rsclaw.ai/v1" },
   agnes:       { id: "agnes",       name: "Agnes AI",           tag: "免费 · 文图视", tagEn: "Free · text/image/video", keyLabel: "Agnes API Key", keyPlaceholder: "sk-...", defaultModel: "agnes-2.0-flash", hasBaseUrl: true, defaultBaseUrl: "https://apihub.agnes-ai.com/v1" },
   qwen:        { id: "qwen",        name: "Qwen (千问)", tag: "国内直连",      tagEn: "China direct",      keyLabel: "DashScope API Key",   keyPlaceholder: "sk-...", defaultModel: "qwen-max" },
   doubao:      { id: "doubao",      name: "Doubao (豆包)", tag: "字节跳动",     tagEn: "ByteDance",         keyLabel: "ARK API Key",         keyPlaceholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", defaultModel: "doubao-seed-2.0-pro", hasBaseUrl: true, defaultBaseUrl: "https://ark.cn-beijing.volces.com/api/v3" },
