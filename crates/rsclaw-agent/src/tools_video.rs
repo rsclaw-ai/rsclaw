@@ -80,8 +80,9 @@ impl super::runtime::AgentRuntime {
             }
         }
 
-        // Optional driving video for v2v (rsclaw-video-ref-v1 structure
-        // transfer) — local path / data-URI / http URL all accepted (local
+        // Optional driving video for v2v (model rsclaw-video-v1 — the server
+        // picks the v2v lane from the driving video; there is no separate
+        // "-ref" model) — local path / data-URI / http URL all accepted (local
         // files normalised to a data-URI, same as the reference images).
         let video_assets = normalize_gen_assets(&args["video"]).await;
         let video_ref = video_assets.first().map(|s| s.as_str());
@@ -669,6 +670,11 @@ async fn submit_rsclaw_video(
     let model = model_hint
         .map(|m| m.rsplit('/').next().unwrap_or(m))
         .filter(|m| !m.is_empty() && *m != "rsclaw")
+        // `rsclaw-video-ref-v1` is NOT a real server model id — v2v is the
+        // base `rsclaw-video-v1` model with a driving video in
+        // `input_references`. Older prompt baselines advertised the bogus id;
+        // remap it so requests work even before the prefix is re-ingested.
+        .map(|m| if m.contains("video-ref") { "rsclaw-video-v1" } else { m })
         .unwrap_or("rsclaw-video-v1");
     // gen-api.md §2: `seconds` is a STRING, `size` is WxH, and image-to-video
     // uses `input_reference.image_url` (first frame) + optional
@@ -688,7 +694,8 @@ async fn submit_rsclaw_video(
         "width": w,
         "height": h,
     });
-    // v2v structure transfer (model rsclaw-video-ref-v1): the driving video
+    // v2v structure transfer (model rsclaw-video-v1; the server selects the
+    // v2v lane from the driving video): the driving video
     // goes in `input_references` as a `video` item; an optional first image
     // sets the opening frame's look.
     if let Some(v) = video_ref {
