@@ -2104,9 +2104,20 @@ async fn u2_status_ok(base: &str) -> bool {
 /// `<node ...>` tag shape the rest of the host (and plugins) parse.
 async fn u2_ui_xml(serial: Option<&str>) -> Result<String, String> {
     let base = u2_ensure(serial).await?;
+    // The sessionless `GET /source` errors on this server build; the page
+    // source must be fetched under a live session (esp. for Flutter pages
+    // whose semantics tree only materializes within a session).
+    let sid = {
+        let map = u2_conns().lock().await;
+        map.get(serial.unwrap_or("")).and_then(|c| c.session.clone())
+    };
+    let path = match &sid {
+        Some(s) => format!("{base}/session/{s}/source"),
+        None => format!("{base}/source"),
+    };
     let client = host_http_client()?;
     let resp = client
-        .get(format!("{base}/source"))
+        .get(&path)
         .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
