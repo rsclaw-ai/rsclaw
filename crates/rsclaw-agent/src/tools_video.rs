@@ -695,9 +695,9 @@ async fn submit_rsclaw_video(
         "height": h,
     });
     // v2v structure transfer (model rsclaw-video-v1; the server selects the
-    // v2v lane from the driving video): the driving video
-    // goes in `input_references` as a `video` item; an optional first image
-    // sets the opening frame's look.
+    // v2v lane from the driving video): the driving video goes in
+    // `input_references` as a `video` item; an optional first image sets the
+    // opening frame's look.
     if let Some(v) = video_ref {
         let mut refs = vec![json!({ "type": "video", "video_url": v })];
         if let Some(first) = images.first() {
