@@ -59,29 +59,28 @@ pub(crate) fn start_feishu_if_configured(
         }
     }
 
-    // Collect (account_name, app_id, app_secret, brand) tuples.
+    // Collect (account_name, app_id, app_secret, brand) tuples from:
+    //   1. channels.feishu.accounts.<name>.{appId, appSecret, brand?}
+    //   2. saved auth token (onboard flow fallback, for backward compat)
     let mut fs_accounts: Vec<(String, String, String, String)> = Vec::new();
 
-    // Legacy: single appId/appSecret at top level.
-    if let Some(cfg) = fs_cfg {
-        let id = cfg
-            .app_id
-            .as_deref()
-            .filter(|s| !s.starts_with("YOUR_"))
-            .map(str::to_owned);
-        let secret = cfg
-            .app_secret
-            .as_ref()
-            .and_then(|s| s.as_plain())
-            .filter(|s| !s.starts_with("YOUR_"))
-            .map(str::to_owned);
-        let brand = cfg.brand.as_deref().unwrap_or("feishu").to_owned();
-        if let (Some(id), Some(secret)) = (id, secret) {
-            fs_accounts.push(("default".to_owned(), id, secret, brand));
+    // 1. Config file: accounts.<name>.{appId, appSecret, brand?}
+    if let Some(accts) = fs_cfg.and_then(|c| c.accounts.as_ref()) {
+        for (name, acct) in accts {
+            let id = acct.get("appId").and_then(|v| v.as_str()).unwrap_or("");
+            let secret = acct.get("appSecret").and_then(|v| v.as_str()).unwrap_or("");
+            if !id.is_empty() && !secret.is_empty() {
+                let brand = acct
+                    .get("brand")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("feishu")
+                    .to_owned();
+                fs_accounts.push((name.clone(), id.to_owned(), secret.to_owned(), brand));
+            }
         }
     }
 
-    // Saved auth token from onboard flow (fallback for legacy single-account).
+    // 2. Saved auth token from onboard flow (legacy fallback).
     if fs_accounts.is_empty() {
         if let Some(saved) = rsclaw_channel::auth::load_token("feishu") {
             let id = saved["app_id"].as_str().unwrap_or("").to_owned();
@@ -93,29 +92,9 @@ pub(crate) fn start_feishu_if_configured(
         }
     }
 
-    // Multi-account: channels.feishu.accounts.<name>.{appId, appSecret, brand?}
-    if let Some(accts) = fs_cfg.and_then(|c| c.accounts.as_ref()) {
-        for (name, acct) in accts {
-            let id = acct.get("appId").and_then(|v| v.as_str()).unwrap_or("");
-            let secret = acct.get("appSecret").and_then(|v| v.as_str()).unwrap_or("");
-            if !id.is_empty() && !secret.is_empty() {
-                // Avoid duplicate if top-level credentials == this account's.
-                if !fs_accounts.iter().any(|(_, eid, _, _)| eid == id) {
-                    let brand = acct
-                        .get("brand")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("feishu")
-                        .to_owned();
-                    fs_accounts.push((name.clone(), id.to_owned(), secret.to_owned(), brand));
-                }
-            }
-        }
-    }
-
     if fs_accounts.is_empty() {
-        // No config section and no saved token — silently skip.
         if fs_cfg.is_some() {
-            warn!("feishu credentials not set, channel disabled");
+            warn!("feishu.appId not set in accounts, channel disabled");
         }
         return;
     }

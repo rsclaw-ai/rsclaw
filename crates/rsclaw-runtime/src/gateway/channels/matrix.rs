@@ -56,34 +56,16 @@ pub(crate) fn start_matrix_if_configured(
         enforcers.insert("matrix".to_owned(), Arc::clone(&enforcer));
     }
 
-    // Collect (account_name, homeserver, access_token, user_id) tuples.
+    // Collect (account_name, homeserver, access_token, user_id) tuples from
+    // accounts.<name>.{homeserver?, accessToken, userId?}
     let mut mx_accounts: Vec<(String, String, String, String)> = Vec::new();
-
-    // Legacy: single credentials at top level.
-    if let Some(token) = matrix_cfg
-        .access_token
-        .as_ref()
-        .and_then(|s| s.resolve_early())
-        .filter(|s| !s.is_empty())
-    {
-        let hs = matrix_cfg
-            .homeserver
-            .as_deref()
-            .unwrap_or("https://matrix.org")
-            .to_owned();
-        let uid = matrix_cfg.user_id.as_deref().unwrap_or("").to_owned();
-        mx_accounts.push(("default".to_owned(), hs, token, uid));
-    }
-
-    // Multi-account: channels.matrix.accounts.<name>.{homeserver?, accessToken,
-    // userId?}
     if let Some(accts) = &matrix_cfg.accounts {
         for (name, acct) in accts {
             let token = acct
                 .get("accessToken")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if !token.is_empty() && !mx_accounts.iter().any(|(_, _, et, _)| et == token) {
+            if !token.is_empty() {
                 let hs = acct
                     .get("homeserver")
                     .and_then(|v| v.as_str())
@@ -100,7 +82,7 @@ pub(crate) fn start_matrix_if_configured(
     }
 
     if mx_accounts.is_empty() {
-        warn!("matrix accessToken not set, channel disabled");
+        warn!("matrix.accessToken not set in accounts, channel disabled");
         return;
     }
 

@@ -185,28 +185,20 @@ pub(crate) fn start_channels(
     if let Some(tg_cfg) = &config.channel.channels.telegram
         && tg_cfg.base.enabled.unwrap_or(true)
     {
-        // Collect (account_name, bot_token) pairs.
+        // Collect (account_name, bot_token) pairs from
+        // accounts.<name>.botToken.
         let mut tg_accounts: Vec<(String, String)> = Vec::new();
-
-        // Legacy: single bot_token at top level.
-        if let Some(token) = tg_cfg.bot_token.as_ref().and_then(|t| t.as_plain()) {
-            tg_accounts.push(("default".to_owned(), token.to_owned()));
-        }
-
-        // OpenClaw: channels.telegram.accounts.<name>.botToken
         if let Some(accts) = &tg_cfg.accounts {
             for (name, acct) in accts {
-                if let Some(t) = acct.get("botToken").and_then(|v| v.as_str()) {
-                    // Avoid duplicate if top-level token == this account's token.
-                    if !tg_accounts.iter().any(|(_, existing)| existing == t) {
-                        tg_accounts.push((name.clone(), t.to_owned()));
-                    }
+                let t = acct.get("botToken").and_then(|v| v.as_str()).unwrap_or("");
+                if !t.is_empty() {
+                    tg_accounts.push((name.clone(), t.to_owned()));
                 }
             }
         }
 
         if tg_accounts.is_empty() {
-            warn!("telegram bot_token not set, channel disabled");
+            warn!("telegram.botToken not set in accounts, channel disabled");
         }
 
         // Load dmPolicy and groupPolicy from config.

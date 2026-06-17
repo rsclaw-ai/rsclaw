@@ -52,18 +52,9 @@ pub(crate) fn start_whatsapp_if_configured(
         enforcers.insert("whatsapp".to_owned(), Arc::clone(&enforcer));
     }
 
-    // Collect (account_name, phone_number_id, access_token) tuples.
+    // Collect (account_name, phone_number_id, access_token) tuples from
+    // accounts.<name>.{phoneNumberId, accessToken}
     let mut wa_accounts: Vec<(String, String, String)> = Vec::new();
-
-    // Legacy: credentials from env vars.
-    if let (Ok(pid), Ok(token)) = (
-        std::env::var("WHATSAPP_PHONE_NUMBER_ID"),
-        std::env::var("WHATSAPP_ACCESS_TOKEN"),
-    ) {
-        wa_accounts.push(("default".to_owned(), pid, token));
-    }
-
-    // Multi-account: channels.whatsapp.accounts.<name>.{phoneNumberId, accessToken}
     if let Some(accts) = &wa_cfg.accounts {
         for (name, acct) in accts {
             let pid = acct
@@ -75,15 +66,13 @@ pub(crate) fn start_whatsapp_if_configured(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             if !pid.is_empty() && !token.is_empty() {
-                if !wa_accounts.iter().any(|(_, epid, _)| epid == pid) {
-                    wa_accounts.push((name.clone(), pid.to_owned(), token.to_owned()));
-                }
+                wa_accounts.push((name.clone(), pid.to_owned(), token.to_owned()));
             }
         }
     }
 
     if wa_accounts.is_empty() {
-        warn!("WHATSAPP_PHONE_NUMBER_ID not set, whatsapp disabled");
+        warn!("whatsapp.phoneNumberId not set in accounts, channel disabled");
         return;
     }
 

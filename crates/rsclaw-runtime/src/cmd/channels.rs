@@ -222,15 +222,20 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
                             "dingtalk not configured -- add channels.dingtalk section to config"
                         )
                     })?;
-                    let app_key = dt
-                        .app_key
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("channels.dingtalk.appKey not set"))?;
-                    let app_secret = dt
-                        .app_secret
-                        .as_ref()
-                        .and_then(|s| s.as_plain())
-                        .ok_or_else(|| anyhow::anyhow!("channels.dingtalk.appSecret not set"))?;
+                    let accts = dt.accounts.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("channels.dingtalk.accounts not set")
+                    })?;
+                    let default_acct = accts.get("default").ok_or_else(|| {
+                        anyhow::anyhow!("channels.dingtalk.accounts.default not set")
+                    })?;
+                    let app_key = default_acct
+                        .get("appKey")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("channels.dingtalk.accounts.default.appKey not set"))?;
+                    let app_secret = default_acct
+                        .get("appSecret")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("channels.dingtalk.accounts.default.appSecret not set"))?;
                     let client = reqwest::Client::new();
                     rsclaw_channel::auth::dingtalk_auth::login(&client, app_key, app_secret, None)
                         .await?;

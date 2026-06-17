@@ -98,52 +98,12 @@ pub(crate) fn start_wechat_personal_if_configured(
     task_queue: Arc<crate::gateway::task_queue::TaskQueueManager>,
     shutdown: crate::gateway::ShutdownCoordinator,
 ) {
-    // Check if wechat channel is enabled in config
-    let enabled = config
-        .channel
-        .channels
-        .wechat
-        .as_ref()
-        .map(|c| c.base.enabled.unwrap_or(true))
-        .unwrap_or(false);
-
-    // Also check for saved token even without explicit config
-    let token_data = rsclaw_channel::auth::load_token("wechat");
-    let bot_token = if enabled {
-        // Try config first, then saved token
-        config
-            .channel
-            .channels
-            .wechat
-            .as_ref()
-            .and_then(|c| c.bot_token.as_ref())
-            .and_then(|t| t.as_plain().map(str::to_owned))
-            .or_else(|| {
-                token_data
-                    .as_ref()
-                    .and_then(|d| d.get("bot_token"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned)
-            })
-    } else if token_data.is_some() {
-        // No config but has saved token — auto-enable
-        token_data
-            .as_ref()
-            .and_then(|d| d.get("bot_token"))
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-    } else {
-        None
-    };
-
-    // Collect (account_name, token) pairs.
+    // Collect (account_name, token) pairs from:
+    //   1. channels.wechat.accounts.<name>.botToken  (config file)
+    //   2. saved token file (QR login fallback, for backward compat)
     let mut wc_accounts: Vec<(String, String)> = Vec::new();
 
-    if let Some(token) = bot_token {
-        wc_accounts.push(("default".to_owned(), token));
-    }
-
-    // Multi-account: channels.wechat.accounts.<name>.botToken
+    // 1. Config file: accounts.<name>.botToken
     if let Some(accts) = config
         .channel
         .channels
@@ -153,14 +113,27 @@ pub(crate) fn start_wechat_personal_if_configured(
     {
         for (name, acct) in accts {
             if let Some(t) = acct.get("botToken").and_then(|v| v.as_str()) {
-                if !wc_accounts.iter().any(|(_, et)| et == t) {
+                if !t.is_empty() {
                     wc_accounts.push((name.clone(), t.to_owned()));
                 }
             }
         }
     }
 
+    // 2. Saved token from QR login (legacy fallback, only if no accounts)
     if wc_accounts.is_empty() {
+        if let Some(saved) = rsclaw_channel::auth::load_token("wechat") {
+            if let Some(token) = saved.get("bot_token").and_then(|v| v.as_str()) {
+                if !token.is_empty() {
+                    wc_accounts.push(("default".to_owned(), token.to_owned()));
+                    tracing::info!("wechat: using saved token from QR login");
+                }
+            }
+        }
+    }
+
+    if wc_accounts.is_empty() {
+        warn!("wechat.botToken not set in accounts, channel disabled");
         return;
     }
 

@@ -37,51 +37,26 @@ pub(crate) fn start_dingtalk_if_configured(
         return;
     }
 
-    // Collect (account_name, app_key, app_secret, robot_code) tuples.
+    // Collect (account_name, app_key, app_secret, robot_code) tuples from
+    // accounts.<name>.{appKey, appSecret, robotCode?}
     let mut dt_accounts: Vec<(String, String, String, String)> = Vec::new();
-
-    // Legacy: single appKey/appSecret at top level.
-    if let (Some(key), Some(secret)) = (
-        dt_cfg
-            .app_key
-            .as_deref()
-            .filter(|s| !s.starts_with("YOUR_")),
-        dt_cfg
-            .app_secret
-            .as_ref()
-            .and_then(|s| s.as_plain())
-            .filter(|s| !s.starts_with("YOUR_")),
-    ) {
-        let robot = dt_cfg.robot_code.clone().unwrap_or_else(|| key.to_owned());
-        dt_accounts.push((
-            "default".to_owned(),
-            key.to_owned(),
-            secret.to_owned(),
-            robot,
-        ));
-    }
-
-    // Multi-account: channels.dingtalk.accounts.<name>.{appKey, appSecret,
-    // robotCode?}
     if let Some(accts) = &dt_cfg.accounts {
         for (name, acct) in accts {
             let key = acct.get("appKey").and_then(|v| v.as_str()).unwrap_or("");
             let secret = acct.get("appSecret").and_then(|v| v.as_str()).unwrap_or("");
             if !key.is_empty() && !secret.is_empty() {
-                if !dt_accounts.iter().any(|(_, ek, _, _)| ek == key) {
-                    let robot = acct
-                        .get("robotCode")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(key)
-                        .to_owned();
-                    dt_accounts.push((name.clone(), key.to_owned(), secret.to_owned(), robot));
-                }
+                let robot = acct
+                    .get("robotCode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(key)
+                    .to_owned();
+                dt_accounts.push((name.clone(), key.to_owned(), secret.to_owned(), robot));
             }
         }
     }
 
     if dt_accounts.is_empty() {
-        warn!("dingtalk appKey not set, channel disabled");
+        warn!("dingtalk.appKey not set in accounts, channel disabled");
         return;
     }
 
