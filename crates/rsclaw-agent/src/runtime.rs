@@ -7415,22 +7415,29 @@ impl AgentRuntime {
                     same_name_streak = 1;
                 }
 
-                // Upgrade stagnation budget when complex or multi-step tools are used.
-                if matches!(
-                    tool_name.as_str(),
-                    "web_browser"
-                        | "cap"
-                        | "cap_live"
-                        | "cap_live_end"
-                        | "cap_bind_sticky"
-                        | "cap_unbind_sticky"
-                        | "agent"
-                        | "search_content"
-                        | "search_file"
-                        | "shell"
-                        | "execute_command"
-                        | "exec"
-                ) {
+                // Upgrade stagnation budget when complex or multi-step tools are
+                // used — UNLESS the same tool name has repeated past threshold.
+                // Without this guard, a repeated complex tool (shell, search_*,
+                // web_browser, agent…) re-raises the budget every iteration and
+                // the same-name depletion above never bites; only the hard
+                // iteration ceiling would stop the spin.
+                if same_name_streak <= MAX_SAME_NAME_STREAK
+                    && matches!(
+                        tool_name.as_str(),
+                        "web_browser"
+                            | "cap"
+                            | "cap_live"
+                            | "cap_live_end"
+                            | "cap_bind_sticky"
+                            | "cap_unbind_sticky"
+                            | "agent"
+                            | "search_content"
+                            | "search_file"
+                            | "shell"
+                            | "execute_command"
+                            | "exec"
+                    )
+                {
                     let complex_budget = if configured_max > 0 {
                         BASE_ITERATIONS_COMPLEX.min(configured_max) as i32
                     } else {

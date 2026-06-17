@@ -98,6 +98,13 @@ pub const RSCLAW_DEFAULT_VISION: &str = "rsclaw/rsclaw-vision-v1";
 /// SSE body is allowed to take as long as the model needs.
 const TURN_HEADERS_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Read-idle bound applied per chunk once the SSE body is streaming. The
+/// headers deadline above no longer applies after the body begins, so this
+/// is the only thing that catches a worker that goes silent mid-generation
+/// (TCP alive, no bytes). 45s ≈ 15 missed heartbeats; matches the replay
+/// path's guard.
+const STREAM_READ_IDLE_SECS: u64 = 45;
+
 /// Hard cap on the in-memory `sessions` cache. Each entry is a few
 /// dozen bytes (`session_id` + `prefix_id` + counter), so 10_000 caps
 /// the per-process footprint at ~1MB even under churn. When the cap is
@@ -171,9 +178,13 @@ async fn read_sse_terminal_event(resp: reqwest::Response) -> Result<(String, Str
     let mut parser = SseTerminalParser::default();
 
     loop {
-        let chunk = tokio::time::timeout(Duration::from_secs(45), stream.next())
+        let chunk = tokio::time::timeout(Duration::from_secs(STREAM_READ_IDLE_SECS), stream.next())
             .await
-            .map_err(|_| anyhow::anyhow!("rsclaw replay: SSE idle for 45s (heartbeats stopped)"))?;
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "rsclaw replay: SSE idle for {STREAM_READ_IDLE_SECS}s (heartbeats stopped)"
+                )
+            })?;
         let Some(chunk) = chunk else {
             anyhow::bail!("rsclaw replay: SSE stream ended without a terminal event");
         };
@@ -1404,11 +1415,27 @@ impl RsclawProvider {
         // openai.rs implementation (worker can split frames across
         // TCP segments) but the JSON shape is fastshot-native so we
         // parse it locally.
-        let byte_stream = resp.bytes_stream();
+        // Per-chunk read-idle guard. We deliberately dropped the total
+        // `.timeout()` above so long generations can stream past 60s, but
+        // that leaves no bound on a worker that goes silent mid-stream (TCP
+        // alive, no bytes) — the consumer would hang forever. Mirror the
+        // replay path's 45s read-idle timeout: a silent gap surfaces as an
+        // error event instead of an indefinite stall.
+        let path_owned = path.to_string();
+        let byte_stream = tokio_stream::StreamExt::timeout(
+            resp.bytes_stream(),
+            Duration::from_secs(STREAM_READ_IDLE_SECS),
+        )
+        .map(move |r| match r {
+            Ok(Ok(bytes)) => Ok(bytes),
+            Ok(Err(e)) => Err(anyhow::anyhow!("stream read error: {e}")),
+            Err(_) => Err(anyhow::anyhow!(
+                "rsclaw {path_owned}: SSE idle for {STREAM_READ_IDLE_SECS}s (worker stalled mid-generation)"
+            )),
+        });
         let line_buffer = Arc::new(tokio::sync::Mutex::new(String::new()));
         let utf8_remainder = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
         let event_stream = byte_stream
-            .map_err(|e| anyhow::anyhow!("stream read error: {e}"))
             .then(move |chunk| {
                 let line_buffer = line_buffer.clone();
                 let utf8_remainder = utf8_remainder.clone();
