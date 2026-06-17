@@ -1912,6 +1912,17 @@ static ADB_UI_DUMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// dumps over a long session — failure to remove is silent (the next
 /// call uses a fresh path anyway).
 async fn adb_ui_xml(serial: Option<&str>, compressed: bool) -> Result<String, String> {
+    // Prefer the UIAutomator2 server: the built-in `uiautomator dump` blocks
+    // waiting for the UI to go idle and is KILLED on apps with continuous
+    // animation/content (Xianyu, Douyin, …). u2's /source dumps immediately.
+    // Fall back to the legacy dump if u2 can't be brought up (e.g. server APK
+    // not installed on the device).
+    match u2_ui_xml(serial).await {
+        Ok(xml) => return Ok(xml),
+        Err(e) => {
+            tracing::warn!("u2 source unavailable ({e}); falling back to uiautomator dump");
+        }
+    }
     let seq = ADB_UI_DUMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dest = format!("/sdcard/rsclaw_ui_dump_{}_{}.xml", std::process::id(), seq);
     let dump_args: &[&str] = if compressed {
@@ -1925,6 +1936,217 @@ async fn adb_ui_xml(serial: Option<&str>, compressed: bool) -> Result<String, St
     let xml = adb_run_str(serial, &["exec-out", "cat", &dest]).await?;
     let _ = adb_run_str(serial, &["shell", "rm", "-f", &dest]).await;
     Ok(xml)
+}
+
+// ---------------------------------------------------------------------------
+// UIAutomator2 server backend (host-android UI reads)
+// ---------------------------------------------------------------------------
+
+/// Device-side port the appium-uiautomator2 server listens on.
+const U2_DEVICE_PORT: u16 = 6790;
+
+struct U2Conn {
+    base: String,
+    /// A live u2 WebDriver session id (needed for /element/active + setValue).
+    /// `/source` is served session-less so reads don't require this.
+    session: Option<String>,
+    /// Held so the `am instrument` adb child isn't reaped (it keeps the
+    /// on-device server alive). Never awaited.
+    _instr: Option<tokio::process::Child>,
+}
+
+/// Per-serial u2 connection cache (process-global; HostState is per-call).
+fn u2_conns() -> &'static Mutex<std::collections::HashMap<String, U2Conn>> {
+    static M: OnceLock<Mutex<std::collections::HashMap<String, U2Conn>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Local forwarded port for a serial — distinct per device so multiple
+/// devices don't collide. Derived deterministically from the serial.
+fn u2_local_port(serial: Option<&str>) -> u16 {
+    match serial {
+        None => 6790,
+        Some(s) => {
+            let mut h: u32 = 2166136261;
+            for b in s.bytes() { h = (h ^ b as u32).wrapping_mul(16777619); }
+            6800 + (h % 600) as u16 // 6800..7400
+        }
+    }
+}
+
+/// Ensure the u2 server is running and forwarded; return its base URL.
+async fn u2_ensure(serial: Option<&str>) -> Result<String, String> {
+    let key = serial.unwrap_or("").to_string();
+    let mut map = u2_conns().lock().await;
+    if let Some(c) = map.get(&key) {
+        if u2_status_ok(&c.base).await {
+            return Ok(c.base.clone());
+        }
+        map.remove(&key); // stale; rebuild
+    }
+
+    // Require the server APKs (cls/appium install these; we don't bundle them).
+    let pkgs = adb_run_str(serial, &["shell", "pm", "list", "packages"]).await?;
+    if !pkgs.contains("io.appium.uiautomator2.server.test") {
+        return Err(
+            "appium-uiautomator2-server not installed on device (run `cls android uiauto setup` \
+             or appium first)"
+                .into(),
+        );
+    }
+
+    let local = u2_local_port(serial);
+    let base = format!("http://127.0.0.1:{local}");
+    let fwd = format!("tcp:{local}");
+    let dev = format!("tcp:{U2_DEVICE_PORT}");
+    adb_run_str(serial, &["forward", &fwd, &dev])
+        .await
+        .map_err(|e| format!("adb forward: {e}"))?;
+
+    // Already up (started by a previous run / cls / appium)? Reuse it.
+    if u2_status_ok(&base).await {
+        let session = u2_open_session(&base).await;
+        map.insert(key.clone(), U2Conn { base: base.clone(), session, _instr: None });
+        return Ok(base);
+    }
+
+    // Spawn the instrumentation server (long-lived; held in the cache).
+    let mut cmd = tokio::process::Command::new("adb");
+    if let Some(s) = serial { cmd.arg("-s").arg(s); }
+    cmd.args([
+        "shell", "am", "instrument", "-w", "-e", "disableAnalytics", "true",
+        "io.appium.uiautomator2.server.test/androidx.test.runner.AndroidJUnitRunner",
+    ]);
+    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    let child = cmd.spawn().map_err(|e| format!("spawn u2 instrument: {e}"))?;
+
+    // Poll /status up to ~30s.
+    let mut ok = false;
+    for _ in 0..60 {
+        if u2_status_ok(&base).await { ok = true; break; }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    if !ok {
+        return Err("u2 server did not become ready within 30s".into());
+    }
+    let session = u2_open_session(&base).await;
+    map.insert(key, U2Conn { base: base.clone(), session, _instr: Some(child) });
+    Ok(base)
+}
+
+/// Reuse an existing u2 session or create one. Returns None on failure
+/// (reads via /source still work; only focused-input needs a session).
+async fn u2_open_session(base: &str) -> Option<String> {
+    let client = host_http_client().ok()?;
+    // Reuse.
+    if let Ok(resp) = client.get(format!("{base}/sessions"))
+        .timeout(std::time::Duration::from_secs(5)).send().await
+        && let Ok(v) = resp.json::<Value>().await
+        && let Some(id) = v.get("value").and_then(|a| a.as_array()).and_then(|a| a.first())
+            .and_then(|s| s.get("sessionId").or_else(|| s.get("id"))).and_then(|x| x.as_str())
+        && !id.is_empty()
+    {
+        return Some(id.to_string());
+    }
+    // Create.
+    let caps = json!({"capabilities":{"alwaysMatch":{
+        "platformName":"Android","appium:automationName":"UiAutomator2","appium:noReset":true}}});
+    let resp = client.post(format!("{base}/session")).json(&caps)
+        .timeout(std::time::Duration::from_secs(20)).send().await.ok()?;
+    let v: Value = resp.json().await.ok()?;
+    v.pointer("/value/sessionId").or_else(|| v.get("sessionId"))
+        .and_then(|x| x.as_str()).map(String::from)
+}
+
+/// Type `text` into the currently FOCUSED element via u2 (Unicode-capable —
+/// the device-side instrumentation handles CJK, unlike `adb shell input text`
+/// which is ASCII-only). Caller is expected to have already focused the field
+/// (e.g. by tapping it). Returns Err if u2 / a session isn't available.
+async fn u2_type_focused(serial: Option<&str>, text: &str) -> Result<(), String> {
+    let base = u2_ensure(serial).await?;
+    let sid = {
+        let map = u2_conns().lock().await;
+        map.get(serial.unwrap_or("")).and_then(|c| c.session.clone())
+            .ok_or("u2 session unavailable")?
+    };
+    let client = host_http_client()?;
+    // Focused element.
+    let resp = client.get(format!("{base}/session/{sid}/element/active"))
+        .timeout(std::time::Duration::from_secs(8)).send().await
+        .map_err(|e| format!("u2 active element: {e}"))?;
+    let v: Value = resp.json().await.map_err(|e| format!("u2 active body: {e}"))?;
+    let aid = v.get("value").and_then(|x| x.get("ELEMENT").or_else(|| x.get("element-6066-11e4-a52e-4f735466cecf")))
+        .and_then(|x| x.as_str())
+        .ok_or("no focused element (tap the field first)")?
+        .to_string();
+    let body = json!({ "text": text, "value": [text] });
+    let resp = client.post(format!("{base}/session/{sid}/element/{aid}/value"))
+        .json(&body).timeout(std::time::Duration::from_secs(10)).send().await
+        .map_err(|e| format!("u2 setValue: {e}"))?;
+    if resp.status().is_success() { Ok(()) }
+    else { Err(format!("u2 setValue http {}", resp.status())) }
+}
+
+async fn u2_status_ok(base: &str) -> bool {
+    let Ok(client) = host_http_client() else { return false };
+    match client
+        .get(format!("{base}/status"))
+        .timeout(std::time::Duration::from_secs(4))
+        .send()
+        .await
+    {
+        Ok(r) => r.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+/// Fetch the current UI hierarchy from u2 and normalize it to the legacy
+/// `<node ...>` tag shape the rest of the host (and plugins) parse.
+async fn u2_ui_xml(serial: Option<&str>) -> Result<String, String> {
+    let base = u2_ensure(serial).await?;
+    let client = host_http_client()?;
+    let resp = client
+        .get(format!("{base}/source"))
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("u2 /source: {e}"))?;
+    let body = resp.text().await.map_err(|e| format!("u2 /source body: {e}"))?;
+    // u2 returns {"value":"<xml>"} (or sometimes raw XML).
+    let xml = serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|v| v.get("value").and_then(|x| x.as_str()).map(String::from))
+        .unwrap_or(body);
+    Ok(u2_normalize_xml(&xml))
+}
+
+/// u2 emits one element per class-named tag (`<android.widget.TextView .../>`)
+/// whereas the built-in dump uses `<node class="…" …>`. The host/plugin
+/// parsers key on `<node `, so rewrite every element open-tag name to `node`
+/// (attributes — including the existing `class="…"` — are preserved).
+fn u2_normalize_xml(xml: &str) -> String {
+    let mut out = String::with_capacity(xml.len() + 64);
+    let mut chars = xml.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '<' {
+            if let Some(&(_, n)) = chars.peek() {
+                if n.is_ascii_alphabetic() {
+                    // Element open tag — consume the tag name, emit `node`.
+                    let mut name = String::new();
+                    while let Some(&(_, ch)) = chars.peek() {
+                        if ch.is_whitespace() || ch == '>' || ch == '/' { break; }
+                        name.push(ch);
+                        chars.next();
+                    }
+                    let _ = (i, name);
+                    out.push_str("<node");
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Decode XML character references (e.g. `&#10;` → newline) found in
@@ -2375,17 +2597,31 @@ impl rsclaw::plugin::host_android::Host for HostState {
     }
 
     async fn android_type(&mut self, text: String) -> HostTrapResult<Result<String, String>> {
-        // adb shell input text runs through the device shell. See
-        // `ADB_INPUT_REFUSED_CHARS` for the rejection list — includes
-        // `\n` / `\r` / `\0` so a malicious payload can't smuggle a
-        // second command past `input text`.
+        let serial = self.android_serial.clone();
+        // Prefer u2: it types into the focused element via on-device
+        // instrumentation and handles CJK / arbitrary Unicode (which
+        // `adb shell input text` cannot — it's ASCII-only and would mangle
+        // or reject Chinese). The caller focuses the field by tapping first.
+        match u2_type_focused(serial.as_deref(), &text).await {
+            Ok(()) => return Ok(Ok("typed".to_string())),
+            Err(e) => {
+                tracing::warn!("u2 type failed ({e}); falling back to adb input text (ASCII only)");
+            }
+        }
+        // Fallback: adb input text — runs through the device shell, so reject
+        // metacharacters (and it can't represent non-ASCII anyway).
         if let Some(bad) = text.chars().find(|c| ADB_INPUT_REFUSED_CHARS.contains(c)) {
             return Ok(Err(format!(
                 "android_type: refusing text with shell metachar '{}' (strip and retry)",
                 bad.escape_debug()
             )));
         }
-        let serial = self.android_serial.clone();
+        if !text.is_ascii() {
+            return Ok(Err(
+                "android_type: non-ASCII text needs the u2 server (install appium-uiautomator2-server)"
+                    .to_string(),
+            ));
+        }
         let escaped = text.replace(' ', "%s");
         Ok(
             adb_run_str(serial.as_deref(), &["shell", "input", "text", &escaped])
@@ -2643,12 +2879,9 @@ impl rsclaw::plugin::host_android::Host for HostState {
         selector_value: String,
         text: String,
     ) -> HostTrapResult<Result<String, String>> {
-        if let Some(bad) = text.chars().find(|c| ADB_INPUT_REFUSED_CHARS.contains(c)) {
-            return Ok(Err(format!(
-                "android_set_element_text: refusing text with shell metachar '{}'",
-                bad.escape_debug()
-            )));
-        }
+        // NB: no early metachar rejection here — the u2 path (below) sets text
+        // via instrumentation, not the shell, so CJK/punctuation are fine. The
+        // adb fallback re-checks metachars before it runs.
         let serial = self.android_serial.clone();
         // Find element and get center coords.
         let xml = match adb_ui_xml(serial.as_deref(), false).await {
@@ -2679,6 +2912,25 @@ impl rsclaw::plugin::host_android::Host for HostState {
         }
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
+        // The field is now focused. Prefer u2 (Unicode/CJK-capable) to set the
+        // text; fall back to `adb input text` for ASCII-only when u2 is absent.
+        match u2_type_focused(serial.as_deref(), &text).await {
+            Ok(()) => return Ok(Ok("set".to_string())),
+            Err(e) => {
+                tracing::warn!("u2 set-text failed ({e}); falling back to adb input text");
+            }
+        }
+        if let Some(bad) = text.chars().find(|c| ADB_INPUT_REFUSED_CHARS.contains(c)) {
+            return Ok(Err(format!(
+                "android_set_element_text: refusing text with shell metachar '{}'",
+                bad.escape_debug()
+            )));
+        }
+        if !text.is_ascii() {
+            return Ok(Err(
+                "android_set_element_text: non-ASCII text needs the u2 server".to_string(),
+            ));
+        }
         let escaped = text.replace(' ', "%s");
         Ok(
             adb_run_str(serial.as_deref(), &["shell", "input", "text", &escaped])
