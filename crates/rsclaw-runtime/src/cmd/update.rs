@@ -36,7 +36,7 @@ fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     parse(a).cmp(&parse(b))
 }
 
-const RSCLAW_VERSION_URL: &str = "https://app.rsclaw.ai/api/version";
+pub(crate) const RSCLAW_VERSION_URL: &str = "https://app.rsclaw.ai/api/version";
 
 /// Apply GITHUB_PROXY env to a URL: proxy + "/" + url
 fn proxy_url(url: &str) -> String {
@@ -448,7 +448,7 @@ async fn do_update(args: &UpdateArgs) -> Result<()> {
 
 /// Parse a release response body that may be an array or a single object.
 /// Returns the first CLI release (tag starts with 'v' but not 'app-v').
-fn parse_release_body(body: &[u8]) -> Option<serde_json::Value> {
+pub(crate) fn parse_release_body(body: &[u8]) -> Option<serde_json::Value> {
     // Try array first (GitHub /releases endpoint)
     if let Ok(arr) = serde_json::from_slice::<Vec<serde_json::Value>>(body) {
         return arr.into_iter().find(|r| {

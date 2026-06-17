@@ -428,6 +428,54 @@ fn ensure_defaults_toml_up_to_date(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Merge a remotely-fetched `defaults.toml` into the on-disk file.
+///
+/// Reuses the same version-gated merge as the embedded upgrade path:
+/// `remote_raw` is treated as the "shipped" source, so it only takes
+/// effect when its `defaults_version` is newer than the user's current
+/// file — shipped entries are refreshed, user-added entries preserved,
+/// and the old file backed up first. No HTTP here: the caller (gateway
+/// startup) fetches the bytes and hands them in, so a fetch failure never
+/// reaches this function — the on-disk/local file is simply left intact.
+///
+/// Returns `Ok(true)` when the file was updated, `Ok(false)` when the
+/// remote was not newer (no-op), and `Err` only when the remote payload
+/// is not valid `defaults.toml` (unparseable / missing `defaults_version`)
+/// or the write fails — callers should treat `Err` as "keep local".
+pub fn merge_remote_defaults(remote_raw: &str) -> Result<bool> {
+    // Validate the remote is a well-formed defaults.toml carrying a
+    // version BEFORE touching the local file, so a corrupt/HTML error
+    // page served at the URL can't clobber anything.
+    let remote: DefaultsIndex =
+        toml::from_str(remote_raw).context("remote defaults.toml is not valid TOML")?;
+    if remote
+        .meta
+        .as_ref()
+        .and_then(|m| m.defaults_version.as_deref())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .is_none()
+    {
+        anyhow::bail!("remote defaults.toml has no defaults_version");
+    }
+
+    let path = base_dir().join("defaults.toml");
+    let local = std::fs::read_to_string(&path)
+        .unwrap_or_else(|_| embedded_defaults_toml().to_owned());
+
+    let Some(merged) = merge_defaults_toml(&local, remote_raw) else {
+        return Ok(false);
+    };
+
+    if path.exists() {
+        backup_defaults_before_upgrade(&path);
+    }
+    std::fs::write(&path, merged)
+        .with_context(|| format!("failed to write remote defaults.toml: {}", path.display()))?;
+    tracing::info!(path = %path.display(), "applied remote defaults.toml update");
+    Ok(true)
+}
+
 fn backup_defaults_before_upgrade(path: &Path) {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -753,5 +801,19 @@ label = "OpenAI"
 "#;
         // Same version → not legacy → no rewrite.
         assert!(merge_defaults_toml(builtin, builtin).is_none());
+    }
+
+    #[test]
+    fn merge_remote_defaults_rejects_invalid_payload() {
+        // An HTML error page / garbage served at the URL must not be
+        // treated as defaults — bail BEFORE touching the local file.
+        let err = merge_remote_defaults("<html>404 Not Found</html>")
+            .expect_err("non-TOML remote must error");
+        assert!(err.to_string().contains("not valid TOML"));
+
+        // Valid TOML but no version → can't version-gate → reject.
+        let err = merge_remote_defaults("[[providers]]\nname = \"x\"\n")
+            .expect_err("versionless remote must error");
+        assert!(err.to_string().contains("no defaults_version"));
     }
 }
