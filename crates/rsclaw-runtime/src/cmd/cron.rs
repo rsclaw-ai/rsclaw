@@ -1,5 +1,4 @@
 use anyhow::Result;
-use tracing::warn;
 
 use super::style::*;
 use rsclaw_cli::CronCommand;
@@ -115,7 +114,13 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
             if !parse_ok {
                 anyhow::bail!("cron.json5 has syntax errors - fix the file before adding jobs");
             }
-            let id = format!("job-{}", jobs.len() + 1);
+            let max_id = jobs
+                .iter()
+                .filter_map(|j| j.id.strip_prefix("job-"))
+                .filter_map(|s| s.parse::<usize>().ok())
+                .max()
+                .unwrap_or(0);
+            let id = format!("job-{}", max_id + 1);
 
             let job = crate::cron::CronJob {
                 id: id.clone(),
@@ -138,19 +143,7 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
             jobs.push(job);
             crate::cron::save_cron_jobs(&jobs)?;
 
-            // Notify the running gateway to reload cron jobs
-            if let Ok(config) = config::load() {
-                let port = config.gateway.port;
-                let url = format!("http://127.0.0.1:{port}/api/v1/cron/reload");
-                if let Ok(client) = reqwest::blocking::Client::builder()
-                    .timeout(std::time::Duration::from_secs(3))
-                    .build()
-                {
-                    if let Err(e) = client.post(&url).send() {
-                        warn!("failed to notify gateway of cron reload: {e}");
-                    }
-                }
-            }
+            notify_gateway_cron_reload().await;
 
             ok(&format!(
                 "added cron job '{}' ({})",
@@ -181,8 +174,8 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
             }
             ok(&format!("edited cron jobs file"));
         }
-        CronCommand::Enable { id } => cron_set_enabled(&id, true)?,
-        CronCommand::Disable { id } => cron_set_enabled(&id, false)?,
+        CronCommand::Enable { id } => cron_set_enabled(&id, true).await?,
+        CronCommand::Disable { id } => cron_set_enabled(&id, false).await?,
         CronCommand::Rm { id } => {
             let (mut jobs, parse_ok) = crate::cron::load_cron_jobs();
             if !parse_ok {
@@ -195,19 +188,7 @@ pub async fn cmd_cron(sub: CronCommand) -> Result<()> {
             }
             crate::cron::save_cron_jobs(&jobs)?;
 
-            // Notify the running gateway to reload cron jobs
-            if let Ok(config) = config::load() {
-                let port = config.gateway.port;
-                let url = format!("http://127.0.0.1:{port}/api/v1/cron/reload");
-                if let Ok(client) = reqwest::blocking::Client::builder()
-                    .timeout(std::time::Duration::from_secs(3))
-                    .build()
-                {
-                    if let Err(e) = client.post(&url).send() {
-                        warn!("failed to notify gateway of cron reload: {e}");
-                    }
-                }
-            }
+            notify_gateway_cron_reload().await;
 
             ok(&format!("removed cron job '{}'", cyan(&id)));
         }
@@ -301,7 +282,7 @@ fn validate_cron_part(part: &str, min: u32, max: u32) -> Result<()> {
 
 // ---------------------------------------------------------------------------
 
-pub fn cron_set_enabled(id: &str, enabled: bool) -> Result<()> {
+pub async fn cron_set_enabled(id: &str, enabled: bool) -> Result<()> {
     let (mut jobs, parse_ok) = crate::cron::load_cron_jobs();
     if !parse_ok {
         anyhow::bail!("cron.json5 has syntax errors - fix the file before modifying jobs");
@@ -320,19 +301,7 @@ pub fn cron_set_enabled(id: &str, enabled: bool) -> Result<()> {
     }
     crate::cron::save_cron_jobs(&jobs)?;
 
-    // Notify the running gateway to reload cron jobs
-    if let Ok(config) = config::load() {
-        let port = config.gateway.port;
-        let url = format!("http://127.0.0.1:{port}/api/v1/cron/reload");
-        if let Ok(client) = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(3))
-            .build()
-        {
-            if let Err(e) = client.post(&url).send() {
-                warn!("failed to notify gateway of cron reload: {e}");
-            }
-        }
-    }
+    notify_gateway_cron_reload().await;
 
     if enabled {
         ok(&format!("cron job '{}' enabled", cyan(id)));
@@ -340,6 +309,35 @@ pub fn cron_set_enabled(id: &str, enabled: bool) -> Result<()> {
         ok(&format!("cron job '{}' disabled", cyan(id)));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Gateway notification helper
+// ---------------------------------------------------------------------------
+
+/// Best-effort POST to the running gateway's cron/reload endpoint so it
+/// picks up file-based cron changes without requiring a restart. Uses the
+/// async `reqwest::Client` (never `reqwest::blocking::Client`, which would
+/// panic inside a tokio runtime context).
+async fn notify_gateway_cron_reload() {
+    let cfg = match config::load() {
+        Ok(c) => c,
+        _ => return,
+    };
+    let url = format!(
+        "http://127.0.0.1:{}/api/v1/cron/reload",
+        cfg.gateway.port
+    );
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build();
+    let client = match client {
+        Ok(c) => c,
+        _ => return,
+    };
+    if let Err(e) = client.post(&url).send().await {
+        tracing::warn!("failed to notify gateway of cron reload: {e}");
+    }
 }
 
 // ---------------------------------------------------------------------------
