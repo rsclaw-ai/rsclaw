@@ -2058,6 +2058,52 @@ async fn u2_open_session(base: &str) -> Option<String> {
         .and_then(|x| x.as_str()).map(String::from)
 }
 
+/// ADBKeyboard (com.android.adbkeyboard) IME package — injects arbitrary
+/// Unicode into the focused field via broadcast, IME-level, so it works even on
+/// Flutter-rendered inputs that expose NO accessibility element (where u2's
+/// element/setValue has nothing to target). This is the only reliable CJK path
+/// for such pages.
+const ADBKB_IME: &str = "com.android.adbkeyboard/.AdbIME";
+const ADBKB_PKG: &str = "com.android.adbkeyboard";
+
+/// Tracks which serials already have ADBKeyboard selected as the active IME.
+fn adbkb_ready() -> &'static Mutex<std::collections::HashSet<String>> {
+    static M: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Ensure ADBKeyboard is installed and selected as the active IME for `serial`.
+async fn adbkb_ensure(serial: Option<&str>) -> Result<(), String> {
+    let key = serial.unwrap_or("").to_string();
+    {
+        let set = adbkb_ready().lock().await;
+        if set.contains(&key) { return Ok(()); }
+    }
+    let pkgs = adb_run_str(serial, &["shell", "pm", "list", "packages"]).await?;
+    if !pkgs.contains(ADBKB_PKG) {
+        return Err("ADBKeyboard not installed (needed for CJK on Flutter inputs); \
+                    sideload https://github.com/senzhk/ADBKeyBoard ADBKeyboard.apk".into());
+    }
+    let _ = adb_run_str(serial, &["shell", "ime", "enable", ADBKB_IME]).await;
+    adb_run_str(serial, &["shell", "ime", "set", ADBKB_IME]).await
+        .map_err(|e| format!("ime set ADBKeyboard: {e}"))?;
+    // Let the IME switch settle.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    adbkb_ready().lock().await.insert(key);
+    Ok(())
+}
+
+/// Type `text` into the focused field via ADBKeyboard's base64 broadcast.
+async fn adbkb_type(serial: Option<&str>, text: &str) -> Result<(), String> {
+    adbkb_ensure(serial).await?;
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    adb_run_str(serial, &["shell", "am", "broadcast", "-a", "ADB_INPUT_B64", "--es", "msg", &b64])
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("ADBKeyboard broadcast: {e}"))
+}
+
 /// Type `text` into the currently FOCUSED element via u2 (Unicode-capable —
 /// the device-side instrumentation handles CJK, unlike `adb shell input text`
 /// which is ASCII-only). Caller is expected to have already focused the field
@@ -2609,29 +2655,29 @@ impl rsclaw::plugin::host_android::Host for HostState {
 
     async fn android_type(&mut self, text: String) -> HostTrapResult<Result<String, String>> {
         let serial = self.android_serial.clone();
-        // Prefer u2: it types into the focused element via on-device
-        // instrumentation and handles CJK / arbitrary Unicode (which
-        // `adb shell input text` cannot — it's ASCII-only and would mangle
-        // or reject Chinese). The caller focuses the field by tapping first.
-        match u2_type_focused(serial.as_deref(), &text).await {
+        // Types into the currently FOCUSED field (caller taps to focus first).
+        // 1) u2 element/setValue — fast, only works on native a11y EditTexts.
+        if u2_type_focused(serial.as_deref(), &text).await.is_ok() {
+            return Ok(Ok("typed".to_string()));
+        }
+        // 2) ADBKeyboard broadcast — IME-level, works on Flutter inputs that
+        //    expose no a11y element (the common Xianyu case), for ANY text
+        //    incl. ASCII digits and CJK.
+        match adbkb_type(serial.as_deref(), &text).await {
             Ok(()) => return Ok(Ok("typed".to_string())),
             Err(e) => {
-                tracing::warn!("u2 type failed ({e}); falling back to adb input text (ASCII only)");
+                if !text.is_ascii() {
+                    return Ok(Err(format!("CJK input needs u2/ADBKeyboard: {e}")));
+                }
+                tracing::warn!("ADBKeyboard unavailable ({e}); falling back to adb input text");
             }
         }
-        // Fallback: adb input text — runs through the device shell, so reject
-        // metacharacters (and it can't represent non-ASCII anyway).
+        // 3) adb input text — ASCII only, last resort.
         if let Some(bad) = text.chars().find(|c| ADB_INPUT_REFUSED_CHARS.contains(c)) {
             return Ok(Err(format!(
                 "android_type: refusing text with shell metachar '{}' (strip and retry)",
                 bad.escape_debug()
             )));
-        }
-        if !text.is_ascii() {
-            return Ok(Err(
-                "android_type: non-ASCII text needs the u2 server (install appium-uiautomator2-server)"
-                    .to_string(),
-            ));
         }
         let escaped = text.replace(' ', "%s");
         Ok(
@@ -2703,6 +2749,9 @@ impl rsclaw::plugin::host_android::Host for HostState {
             "enter" | "return" => "KEYCODE_ENTER",
             "tab" => "KEYCODE_TAB",
             "delete" | "del" => "KEYCODE_DEL",
+            "forward-del" | "forward_del" => "KEYCODE_FORWARD_DEL",
+            "move-end" | "move_end" => "KEYCODE_MOVE_END",
+            "move-home" | "move_home" => "KEYCODE_MOVE_HOME",
             "space" => "KEYCODE_SPACE",
             "escape" | "esc" => "KEYCODE_ESCAPE",
             "search" => "KEYCODE_SEARCH",
@@ -2923,24 +2972,27 @@ impl rsclaw::plugin::host_android::Host for HostState {
         }
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
-        // The field is now focused. Prefer u2 (Unicode/CJK-capable) to set the
-        // text; fall back to `adb input text` for ASCII-only when u2 is absent.
-        match u2_type_focused(serial.as_deref(), &text).await {
-            Ok(()) => return Ok(Ok("set".to_string())),
-            Err(e) => {
-                tracing::warn!("u2 set-text failed ({e}); falling back to adb input text");
+        // The field is now focused. CJK → ADBKeyboard (works on Flutter too);
+        // else u2 element/setValue; else adb input text (ASCII).
+        if !text.is_ascii() {
+            match adbkb_type(serial.as_deref(), &text).await {
+                Ok(()) => return Ok(Ok("set".to_string())),
+                Err(e) => {
+                    if let Ok(()) = u2_type_focused(serial.as_deref(), &text).await {
+                        return Ok(Ok("set".to_string()));
+                    }
+                    return Ok(Err(format!("CJK input failed: {e}")));
+                }
             }
+        }
+        if u2_type_focused(serial.as_deref(), &text).await.is_ok() {
+            return Ok(Ok("set".to_string()));
         }
         if let Some(bad) = text.chars().find(|c| ADB_INPUT_REFUSED_CHARS.contains(c)) {
             return Ok(Err(format!(
                 "android_set_element_text: refusing text with shell metachar '{}'",
                 bad.escape_debug()
             )));
-        }
-        if !text.is_ascii() {
-            return Ok(Err(
-                "android_set_element_text: non-ASCII text needs the u2 server".to_string(),
-            ));
         }
         let escaped = text.replace(' ', "%s");
         Ok(
