@@ -9,7 +9,8 @@ pub async fn cmd_completion(args: CompletionArgs) -> Result<()> {
         "bash" => generate_bash(),
         "zsh" => generate_zsh(),
         "fish" => generate_fish(),
-        other => anyhow::bail!("unsupported shell: {other} (use bash, zsh, or fish)"),
+        "powershell" | "pwsh" => generate_powershell(),
+        other => anyhow::bail!("unsupported shell: {other} (use bash, zsh, fish, or powershell)"),
     };
 
     if args.install {
@@ -23,7 +24,7 @@ pub async fn cmd_completion(args: CompletionArgs) -> Result<()> {
 
 fn generate_bash() -> String {
     r#"# rsclaw bash completions
-# Add to ~/.bashrc:  eval "$(rsclaw completion --shell bash)"
+# Add to ~/.bashrc:  eval "$(rsclaw completion bash)"
 _rsclaw() {
     local cur prev commands
     COMPREPLY=()
@@ -42,7 +43,7 @@ complete -F _rsclaw rsclaw
 
 fn generate_zsh() -> String {
     r#"# rsclaw zsh completions
-# Add to ~/.zshrc:  eval "$(rsclaw completion --shell zsh)"
+# Add to ~/.zshrc:  eval "$(rsclaw completion zsh)"
 #compdef rsclaw
 
 _rsclaw() {
@@ -132,6 +133,29 @@ complete -c rsclaw -n __fish_use_subcommand -a webhooks -d 'Webhook helpers'
     .to_string()
 }
 
+fn generate_powershell() -> String {
+    r#"# rsclaw PowerShell completions
+# Add to your PowerShell profile:  rsclaw completion powershell | Out-String | Invoke-Expression
+# Profile path: $PROFILE
+Register-ArgumentCompleter -Native -CommandName rsclaw -ScriptBlock {
+    param($wordToComplete, $commandAst, $cursorPosition)
+    $commands = @(
+        'setup', 'onboard', 'configure', 'config', 'doctor', 'env',
+        'gateway', 'channels', 'agents', 'models', 'skills', 'plugins',
+        'kb', 'memory', 'sessions', 'cron', 'hooks', 'system', 'tools',
+        'secrets', 'security', 'sandbox', 'logs', 'status', 'health',
+        'message', 'tui', 'backup', 'reset', 'update', 'upgrade',
+        'pairing', 'approvals', 'devices', 'directory', 'anycli',
+        'browser', 'dns', 'agent-turn', 'completion', 'dashboard',
+        'daemon', 'docs', 'qr', 'migrate', 'uninstall', 'webhooks',
+        'watch', 'debug'
+    )
+    $commands | Where-Object { $_ -like "$wordToComplete*" }
+}
+"#
+    .to_string()
+}
+
 fn install_completion(shell: &str, script: &str) -> Result<()> {
     let home = dirs_next::home_dir().unwrap_or_default();
     let (path, msg) = match shell {
@@ -151,11 +175,38 @@ fn install_completion(shell: &str, script: &str) -> Result<()> {
             println!("installed completions to {}", p.display());
             return Ok(());
         }
+        "powershell" | "pwsh" => {
+            // Best-effort: try $PROFILE.CurrentUserAllHosts, fallback to Documents
+            let profile = std::env::var("PROFILE").ok()
+                .or_else(|| {
+                    home.join("Documents/PowerShell/Microsoft.PowerShell_profile.ps1").to_str().map(String::from)
+                })
+                .unwrap_or_else(|| {
+                    home.join(".config/powershell/Microsoft.PowerShell_profile.ps1").to_str().unwrap_or("").to_string()
+                });
+            if profile.is_empty() {
+                anyhow::bail!("could not determine PowerShell profile path");
+            }
+            if let Some(parent) = std::path::Path::new(&profile).parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let eval_line = format!("\n# rsclaw completions\n{script}\n");
+            let existing = std::fs::read_to_string(&profile).unwrap_or_default();
+            if existing.contains("rsclaw") {
+                println!("completions already installed in {profile}");
+            } else {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new().append(true).open(&profile)?;
+                f.write_all(eval_line.as_bytes())?;
+                println!("installed completions to {profile}");
+            }
+            return Ok(());
+        }
         _ => anyhow::bail!("unsupported shell for install: {shell}"),
     };
 
     // For bash/zsh, append an eval line.
-    let eval_line = format!("\neval \"$(rsclaw completion --shell {shell})\"\n");
+    let eval_line = format!("\neval \"$(rsclaw completion {shell})\"\n");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     if existing.contains("rsclaw completion") {
         println!("completions already installed in {}", path.display());
