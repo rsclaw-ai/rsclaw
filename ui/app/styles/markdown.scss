@@ -441,6 +441,18 @@
   list-style-type: lower-alpha;
 }
 
+/* GFM task lists (`- [ ]` / `- [x]`): drop the residual list bullet and pull
+   the checkbox into the gutter so it reads as a checklist, not a bulleted
+   list with a stray checkbox. */
+.markdown-body .task-list-item {
+  list-style-type: none;
+}
+
+.markdown-body .task-list-item input[type="checkbox"] {
+  margin: 0 0.35em 0.25em -1.4em;
+  vertical-align: middle;
+}
+
 .markdown-body dd {
   margin-left: 0;
 }
