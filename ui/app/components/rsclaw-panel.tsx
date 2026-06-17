@@ -5457,6 +5457,9 @@ function SkillsTab() {
   const [search, setSearch] = useState("");
   const [searchResults, setSearchResults] = useState<{ name: string; version?: string; description?: string; registry?: string; installs?: string; stars?: string }[]>([]);
   const [searching, setSearching] = useState(false);
+  // True once a clawhub search has run (until the query is changed/cleared).
+  // Drives "search mode": installed + hub lists hide, results / no-matches show.
+  const [searched, setSearched] = useState(false);
   // Hub recommended catalog (GET /api/v1/hub/skills). Shown below the
   // installed list when the user isn't actively searching clawhub.
   const [hubSkills, setHubSkills] = useState<HubSkillEntry[]>([]);
@@ -5519,8 +5522,9 @@ function SkillsTab() {
   };
 
   const doSearch = async () => {
-    if (!search.trim()) { setSearchResults([]); return; }
+    if (!search.trim()) { setSearchResults([]); setSearched(false); return; }
     setSearching(true);
+    setSearched(true);
     try {
       const tauriInvoke = isTauri ? tauriInvokeV2 : null;
       if (tauriInvoke) {
@@ -5541,13 +5545,16 @@ function SkillsTab() {
       <div style={{ padding: "12px 28px 28px", flex: 1, overflowY: "auto" }}>
         {/* Search */}
         <div style={{ marginBottom: 20 }}>
-          <input value={search} onChange={(e) => setSearch(e.target.value)}
+          <input value={search} onChange={(e) => { setSearch(e.target.value); setSearched(false); }}
             onKeyDown={(e) => { if (e.key === "Enter") doSearch(); }}
             placeholder={zh ? "\u641C\u7D22\u6280\u80FD\uFF08\u56DE\u8F66\u8054\u7F51\u641C\u7D22\uFF09..." : "Search skills (Enter to search online)..."}
             style={{ width: "100%", background: V2.bg2, border: `1px solid ${V2.bd}`, borderRadius: 9, padding: "9px 14px", color: V2.t0, fontSize: 12, outline: "none" }} />
         </div>
 
-        {/* Installed */}
+        {/* Installed \u2014 hidden while a clawhub search is active so the search
+            results below surface at the top of the panel (otherwise a long
+            installed list buries them and you can't tell if there are hits). */}
+        {!searched && (<>
         <div style={{ fontSize: 11, fontWeight: 600, color: V2.t2, letterSpacing: 0.5, textTransform: "uppercase", marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
           {zh ? "\u5DF2\u5B89\u88C5" : "Installed"} <span style={{ fontSize: 9, padding: "1px 7px", borderRadius: 3, background: V2.bg4, color: V2.t2 }}>{installed.length}</span>
         </div>
@@ -5580,8 +5587,10 @@ function SkillsTab() {
             ))}
           </div>
         )}
+        </>)}
 
-        {/* Search results */}
+        {/* Search results — surfaces at the top during a search because the
+            installed list above is hidden while searching. */}
         {searchResults.length > 0 && (
           <>
             <div style={{ fontSize: 11, fontWeight: 600, color: V2.t2, letterSpacing: 0.5, textTransform: "uppercase", marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
@@ -5614,18 +5623,27 @@ function SkillsTab() {
         )}
         {searching && <div style={{ textAlign: "center", color: V2.t3, padding: 20 }}>...</div>}
 
+        {/* No matches — make it explicit that the search ran and found nothing,
+            instead of silently falling back to the installed/hub lists. */}
+        {searched && !searching && searchResults.length === 0 && (
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8, padding: "30px 0", color: V2.t3 }}>
+            <div style={{ fontSize: 26, opacity: 0.4 }}>{"🔍"}</div>
+            <div style={{ fontSize: 12 }}>{zh ? `没有找到匹配「${search.trim()}」的技能` : `No skills matching "${search.trim()}"`}</div>
+          </div>
+        )}
+
         {/* Hub recommended \u2014 GET /api/v1/hub/skills. Hidden while the user
             is browsing clawhub search results to avoid a cluttered double
             list. Install resolves the slug via `rsclaw skills install`
             (clawhub fallback). */}
-        {searchResults.length === 0 && !searching && hubSkillsErrored && (
+        {!searched &&hubSkillsErrored && (
           <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 12, padding: "28px 0", color: V2.t3 }}>
             <div style={{ fontSize: 12 }}>{zh ? "无法加载推荐技能（hub 接口不可用）" : "Couldn't load recommended skills (hub endpoint unavailable)"}</div>
             <button onClick={() => void fetchHubSkills()} style={{ padding: "6px 14px", borderRadius: 7, border: `1px solid ${V2.gbrd}`, background: V2.glo, color: V2.green, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "重试" : "Retry"}</button>
           </div>
         )}
 
-        {searchResults.length === 0 && !searching && !hubSkillsErrored && hubSkills.length > 0 && (
+        {!searched &&!hubSkillsErrored && hubSkills.length > 0 && (
           <>
             <div style={{ fontSize: 11, fontWeight: 600, color: V2.t2, letterSpacing: 0.5, textTransform: "uppercase", marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
               {zh ? "\u63A8\u8350\u5B89\u88C5" : "Recommended"} <span style={{ fontSize: 9, padding: "1px 7px", borderRadius: 3, background: V2.bg4, color: V2.t2 }}>{hubSkills.length}</span>
