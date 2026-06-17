@@ -206,10 +206,17 @@ pub use rsclaw_events::AgentEvent;
 
 #[derive(Debug, Deserialize)]
 pub struct SendMessageRequest {
+    // Aliases let the `rsclaw agent-turn` CLI (which posts to /api/v1/agent/turn
+    // with camelCase field names) share this handler. Extra agent-turn fields
+    // (deliver/thinking/local/timeout/replyTo/…) are ignored.
+    #[serde(alias = "message")]
     pub text: String,
+    #[serde(alias = "sessionId")]
     pub session_key: Option<String>,
+    #[serde(alias = "agent")]
     pub agent_id: Option<String>,
     pub channel: Option<String>,
+    #[serde(alias = "to")]
     pub peer_id: Option<String>,
     #[serde(default)]
     pub stream: bool,
@@ -266,6 +273,8 @@ struct PatchAgentRequest {
 pub fn build_router(state: AppState) -> Router {
     let mut api = Router::new()
         .route("/message", post(send_message))
+        // `rsclaw agent-turn` CLI alias — same handler, camelCase field aliases.
+        .route("/agent/turn", post(send_message))
         .route("/sessions", get(list_sessions))
         .route("/sessions/{id}", get(get_session).delete(delete_session))
         .route("/sessions/{id}/messages", get(get_session_messages))
