@@ -366,7 +366,7 @@ pub(crate) fn start_feishu_if_configured(
                                     let handle = if let Some(ref agent_id) = bound {
                                         match w_reg.get(agent_id) {
                                             Ok(h) => h,
-                                            Err(_) => match w_reg.route_account("feishu", None) {
+                                            Err(_) => match w_reg.route_account("feishu", Some(&w_acct)) {
                                                 Ok(h) => h,
                                                 Err(e) => {
                                                     error!("feishu route error: {e:#}");
@@ -375,7 +375,7 @@ pub(crate) fn start_feishu_if_configured(
                                             },
                                         }
                                     } else {
-                                        match w_reg.route_account("feishu", None) {
+                                        match w_reg.route_account("feishu", Some(&w_acct)) {
                                             Ok(h) => h,
                                             Err(e) => {
                                                 error!("feishu route error: {e:#}");

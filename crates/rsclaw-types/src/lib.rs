@@ -363,6 +363,8 @@ pub struct ExternalJobDelivery {
     pub target_id: String,
     pub is_group: bool,
     pub reply_to: Option<String>,
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 /// A provider job sitting in the persistent queue.

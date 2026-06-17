@@ -253,7 +253,7 @@ pub(crate) fn start_dingtalk_if_configured(
                                     let handle = if let Some(ref agent_id) = bound {
                                         match w_reg.get(agent_id) {
                                             Ok(h) => h,
-                                            Err(_) => match w_reg.route_account("dingtalk", None) {
+                                            Err(_) => match w_reg.route_account("dingtalk", Some(&w_acct)) {
                                                 Ok(h) => h,
                                                 Err(e) => {
                                                     error!("dingtalk route error: {e:#}");
@@ -262,7 +262,7 @@ pub(crate) fn start_dingtalk_if_configured(
                                             },
                                         }
                                     } else {
-                                        match w_reg.route_account("dingtalk", None) {
+                                        match w_reg.route_account("dingtalk", Some(&w_acct)) {
                                             Ok(h) => h,
                                             Err(e) => {
                                                 error!("dingtalk route error: {e:#}");
