@@ -1430,13 +1430,43 @@ async fn load_device_signing_key() -> Result<SigningKey, String> {
         }
         let key_bytes: [u8; 32] = rand::random();
         let encoded = general_purpose::STANDARD.encode(key_bytes);
-        std::fs::write(&path, encoded)
-            .map_err(|e| format!("host_device: write key failed: {e}"))?;
-        restrict_device_key_permissions(&path)?;
+        write_device_key_restricted(&path, &encoded)?;
         Ok(SigningKey::from_bytes(&key_bytes))
     })
     .await
     .map_err(|e| format!("host_device: key task failed: {e}"))?
+}
+
+/// Write the device key creating the file with `0o600` from the start, so
+/// the secret is never on disk under the default (world/group-readable)
+/// umask even briefly. A plain `fs::write` + later `chmod` leaves a
+/// TOCTOU window where a same-host attacker can read the key. On non-unix
+/// (no mode bits) fall back to a plain write; Windows protection relies on
+/// the per-user profile ACL.
+fn write_device_key_restricted(path: &std::path::Path, encoded: &str) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| format!("host_device: open key for write failed: {e}"))?;
+        f.write_all(encoded.as_bytes())
+            .map_err(|e| format!("host_device: write key failed: {e}"))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, encoded)
+            .map_err(|e| format!("host_device: write key failed: {e}"))?;
+    }
+    // Belt-and-suspenders: if the file pre-existed (concurrent create) the
+    // mode above is a no-op, so re-assert restrictive perms.
+    restrict_device_key_permissions(path)?;
+    Ok(())
 }
 
 fn restrict_device_key_permissions(path: &std::path::Path) -> Result<(), String> {
