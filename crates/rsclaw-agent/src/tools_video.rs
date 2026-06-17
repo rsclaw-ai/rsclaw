@@ -665,11 +665,11 @@ async fn submit_rsclaw_video(
     images: &[String],
     video_ref: Option<&str>,
 ) -> Result<String> {
-    // Default model by input shape: a plain image-to-video (single first
-    // frame, no driving video) defaults to the faster 720p i2v lane;
-    // everything else (t2v, first-last-frame, v2v) uses the base model. An
-    // explicit model hint always wins.
-    let default_model = if video_ref.is_none() && images.len() == 1 {
+    // Default model by input shape: everything without a driving video
+    // (t2v, i2v, ti2v, first-last-frame) defaults to the faster 720p lane;
+    // only v2v (structure transfer from a driving video) needs the base
+    // model. An explicit model hint always wins.
+    let default_model = if video_ref.is_none() {
         "rsclaw-video-v1-fast"
     } else {
         "rsclaw-video-v1"
