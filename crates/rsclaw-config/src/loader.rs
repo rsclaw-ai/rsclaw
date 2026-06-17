@@ -763,11 +763,23 @@ fn migrate_channel_legacy_fields(root: &mut serde_json::Value) {
             let default_acct = ch_obj
                 .entry("accounts")
                 .or_insert_with(|| serde_json::json!({}));
-            let default_map = default_acct.as_object_mut().expect("accounts must be object");
+            let default_map = match default_acct.as_object_mut() {
+                Some(m) => m,
+                None => {
+                    tracing::warn!(channel = %ch_name, "accounts field is not an object, skipping migration");
+                    continue;
+                }
+            };
             let default_entry = default_map
                 .entry("default")
                 .or_insert_with(|| serde_json::json!({}));
-            let entry_map = default_entry.as_object_mut().expect("account entry must be object");
+            let entry_map = match default_entry.as_object_mut() {
+                Some(m) => m,
+                None => {
+                    tracing::warn!(channel = %ch_name, "account entry is not an object, skipping migration");
+                    continue;
+                }
+            };
             for (key, val) in migrated {
                 entry_map.insert(key, val);
             }

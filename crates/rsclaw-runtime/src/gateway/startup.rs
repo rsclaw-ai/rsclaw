@@ -1188,7 +1188,17 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 // Touch the throttle stamp on a successful fetch so a
                 // transient outage retries on the next boot instead of
                 // being suppressed for 2h.
-                let _ = std::fs::write(&stamp, b"");
+                if let Err(e) = std::fs::write(&stamp, b"") {
+                    tracing::debug!(error = %e, "failed to write defaults fetch throttle stamp");
+                }
+                // Guard against an unexpectedly large response before
+                // downloading the full body.
+                if let Some(len) = resp.content_length() {
+                    if len > 1_048_576 {
+                        tracing::warn!(size = len, "remote defaults.toml too large, skipping");
+                        return;
+                    }
+                }
                 match resp.text().await {
                     Ok(body) => match rsclaw_config::loader::merge_remote_defaults(&body) {
                         Ok(true) => info!(

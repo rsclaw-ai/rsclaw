@@ -748,11 +748,20 @@ async fn respawn_driver(
     driver: &mut Box<dyn Driver>,
     sid: &str,
     reason: &str,
+    agent_sid_slot: &Arc<StdMutex<Option<String>>>,
 ) -> bool {
     match spawn_driver(*kind, cwd).await {
         Ok(fresh) => {
-            let _ = driver.shutdown().await;
+            if let Err(e) = driver.shutdown().await {
+                tracing::debug!(target: "cap", error = %e, "best-effort shutdown of dead driver");
+            }
             *driver = fresh;
+            // Clear the stale agent session id from the dead driver.
+            // The respawned driver has a fresh session; the slot will be
+            // repopulated when it emits Ready.
+            if let Ok(mut g) = agent_sid_slot.lock() {
+                *g = None;
+            }
             tracing::info!(
                 target: "cap",
                 session_id = %sid,
@@ -884,7 +893,7 @@ async fn actor_loop(
                         .await;
                     if let Err(e) = send_res {
                         if attempt == 0 {
-                            if respawn_driver(&kind, &cwd, &mut driver, &sid, "send failed").await {
+                            if respawn_driver(&kind, &cwd, &mut driver, &sid, "send failed", &agent_sid_slot).await {
                                 attempt += 1;
                                 continue;
                             }
@@ -892,16 +901,26 @@ async fn actor_loop(
                         break Err(anyhow!("cap_live driver send: {e}"));
                     }
                     let mut reply_buf = String::new();
-                    match run_turn(
-                        driver.as_mut(),
-                        &bus,
-                        &pseudo_session_id,
-                        "cap-live",
-                        notif.as_ref(),
-                        &mut reply_buf,
+                    let turn = match tokio::time::timeout(
+                        super::runtime::TURN_TIMEOUT,
+                        run_turn(
+                            driver.as_mut(),
+                            &bus,
+                            &pseudo_session_id,
+                            "cap-live",
+                            notif.as_ref(),
+                            &mut reply_buf,
+                        ),
                     )
                     .await
                     {
+                        Ok(r) => r,
+                        Err(_) => Err(anyhow!(
+                            "cap_live: turn timed out after {}s (driver hang?)",
+                            super::runtime::TURN_TIMEOUT.as_secs()
+                        )),
+                    };
+                    match turn {
                         Ok(()) => break Ok(reply_buf),
                         Err(e) => {
                             if attempt == 0
@@ -911,6 +930,7 @@ async fn actor_loop(
                                     &mut driver,
                                     &sid,
                                     "exited mid-turn",
+                                    &agent_sid_slot,
                                 )
                                 .await
                             {
@@ -937,7 +957,9 @@ async fn actor_loop(
             LiveRequest::Shutdown => break,
         }
     }
-    let _ = driver.shutdown().await;
+    if let Err(e) = driver.shutdown().await {
+        tracing::debug!(target: "cap", error = %e, "best-effort shutdown of dead driver");
+    }
     {
         let mut g = sessions.write().await;
         g.remove(&sid);

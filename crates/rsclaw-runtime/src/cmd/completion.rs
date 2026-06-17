@@ -176,13 +176,17 @@ fn install_completion(shell: &str, script: &str) -> Result<()> {
             return Ok(());
         }
         "powershell" | "pwsh" => {
-            // Best-effort: try $PROFILE.CurrentUserAllHosts, fallback to Documents
-            let profile = std::env::var("PROFILE").ok()
-                .or_else(|| {
-                    home.join("Documents/PowerShell/Microsoft.PowerShell_profile.ps1").to_str().map(String::from)
-                })
+            // Best-effort: use standard PowerShell profile paths.
+            // ($PROFILE is a PowerShell automatic variable, not an env var.)
+            let profile = home
+                .join("Documents/PowerShell/Microsoft.PowerShell_profile.ps1")
+                .to_str()
+                .map(String::from)
                 .unwrap_or_else(|| {
-                    home.join(".config/powershell/Microsoft.PowerShell_profile.ps1").to_str().unwrap_or("").to_string()
+                    home.join(".config/powershell/Microsoft.PowerShell_profile.ps1")
+                        .to_str()
+                        .unwrap_or("")
+                        .to_string()
                 });
             if profile.is_empty() {
                 anyhow::bail!("could not determine PowerShell profile path");

@@ -3192,8 +3192,9 @@ function TauriConfigPageInner() {
     setProvErr((prev) => ({ ...prev, [provId]: "" }));
 
     // rsclaw flows through the normal `test_provider` path below — the
-    // Tauri command returns rsclaw's backend fallback models (agent-v1 /
-    // flash-v1 / vision-v1) since the cloud agent has no `/models` route.
+    // Tauri command does a live `/v1/models` probe (rsclaw now exposes
+    // an OpenAI-compatible models endpoint), returning whatever the
+    // fleet advertises at probe time.
 
     try {
       const tauriInvoke = isTauri ? tauriInvokeV2 : null;
@@ -5545,7 +5546,7 @@ function SkillsTab() {
       <div style={{ padding: "12px 28px 28px", flex: 1, overflowY: "auto" }}>
         {/* Search */}
         <div style={{ marginBottom: 20 }}>
-          <input value={search} onChange={(e) => { setSearch(e.target.value); setSearched(false); }}
+          <input value={search} onChange={(e) => { setSearch(e.target.value); setSearched(false); setSearchResults([]); }}
             onKeyDown={(e) => { if (e.key === "Enter") doSearch(); }}
             placeholder={zh ? "\u641C\u7D22\u6280\u80FD\uFF08\u56DE\u8F66\u8054\u7F51\u641C\u7D22\uFF09..." : "Search skills (Enter to search online)..."}
             style={{ width: "100%", background: V2.bg2, border: `1px solid ${V2.bd}`, borderRadius: 9, padding: "9px 14px", color: V2.t0, fontSize: 12, outline: "none" }} />
@@ -5636,14 +5637,14 @@ function SkillsTab() {
             is browsing clawhub search results to avoid a cluttered double
             list. Install resolves the slug via `rsclaw skills install`
             (clawhub fallback). */}
-        {!searched &&hubSkillsErrored && (
+        {!searched && hubSkillsErrored && (
           <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 12, padding: "28px 0", color: V2.t3 }}>
             <div style={{ fontSize: 12 }}>{zh ? "无法加载推荐技能（hub 接口不可用）" : "Couldn't load recommended skills (hub endpoint unavailable)"}</div>
             <button onClick={() => void fetchHubSkills()} style={{ padding: "6px 14px", borderRadius: 7, border: `1px solid ${V2.gbrd}`, background: V2.glo, color: V2.green, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "重试" : "Retry"}</button>
           </div>
         )}
 
-        {!searched &&!hubSkillsErrored && hubSkills.length > 0 && (
+        {!searched && !hubSkillsErrored && hubSkills.length > 0 && (
           <>
             <div style={{ fontSize: 11, fontWeight: 600, color: V2.t2, letterSpacing: 0.5, textTransform: "uppercase", marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
               {zh ? "\u63A8\u8350\u5B89\u88C5" : "Recommended"} <span style={{ fontSize: 9, padding: "1px 7px", borderRadius: 3, background: V2.bg4, color: V2.t2 }}>{hubSkills.length}</span>

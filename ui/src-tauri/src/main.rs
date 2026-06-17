@@ -2159,10 +2159,6 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
     // - Volcengine ARK (doubao) — `/v3/models` 404s; only the inference
     //   endpoint is public. Inference fallback below confirms the key
     //   but can't enumerate models.
-    // - rsclaw — cloud-managed via `api.rsclaw.ai/v1/agent`, custom path
-    //   shape (no `/models`). Fleet versioning ties the list to
-    //   `RSCLAW_DEFAULT_*` constants in `src/provider/rsclaw.rs` —
-    //   keep this list in sync when those bump.
     if provider == "minimax" {
         return Ok(serde_json::json!({
             "ok": true,

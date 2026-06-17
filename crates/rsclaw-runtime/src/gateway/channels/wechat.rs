@@ -344,13 +344,13 @@ pub(crate) fn start_wechat_personal_if_configured(
                             let handle = if let Some(ref agent_id) = bound {
                                 match reg.get(agent_id) {
                                     Ok(h) => h,
-                                    Err(_) => match reg.route_account("wechat", None) {
+                                    Err(_) => match reg.route_account("wechat", Some(&w_acct)) {
                                         Ok(h) => h,
                                         Err(_) => return,
                                     },
                                 }
                             } else {
-                                match reg.route_account("wechat", None) {
+                                match reg.route_account("wechat", Some(&w_acct)) {
                                     Ok(h) => h,
                                     Err(_) => return,
                                 }
@@ -395,13 +395,13 @@ pub(crate) fn start_wechat_personal_if_configured(
                             let handle = if let Some(ref agent_id) = bound {
                                 match reg.get(agent_id) {
                                     Ok(h) => h,
-                                    Err(_) => match reg.route_account("wechat", None) {
+                                    Err(_) => match reg.route_account("wechat", Some(&w_acct)) {
                                         Ok(h) => h,
                                         Err(_) => return,
                                     },
                                 }
                             } else {
-                                match reg.route_account("wechat", None) {
+                                match reg.route_account("wechat", Some(&w_acct)) {
                                     Ok(h) => h,
                                     Err(_) => return,
                                 }

@@ -685,7 +685,7 @@ async fn submit_rsclaw_video(
         // base `rsclaw-video-v1` model with a driving video in
         // `input_references`. Older prompt baselines advertised the bogus id;
         // remap it so requests work even before the prefix is re-ingested.
-        .map(|m| if m.contains("video-ref") { "rsclaw-video-v1" } else { m })
+        .map(|m| if m == "rsclaw-video-ref-v1" { "rsclaw-video-v1" } else { m })
         .unwrap_or(default_model);
     // gen-api.md §2: `seconds` is a STRING, `size` is WxH, and image-to-video
     // uses `input_reference.image_url` (first frame) + optional

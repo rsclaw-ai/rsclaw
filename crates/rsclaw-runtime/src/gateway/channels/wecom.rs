@@ -48,7 +48,7 @@ pub(crate) fn start_wecom_if_configured(
                     .get("wsUrl")
                     .and_then(|v| v.as_str())
                     .map(str::to_owned);
-                wc_accounts.push((name.clone(), bid.to_owned(), sec.to_owned(), ws));
+                wc_accounts.push((name.clone(), bid.to_owned(), sec.to_owned(), ws.or_else(|| wc_cfg.ws_url.clone())));
             }
         }
     }

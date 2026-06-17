@@ -282,6 +282,7 @@ fn validate_cron_part(part: &str, min: u32, max: u32) -> Result<()> {
 
 // ---------------------------------------------------------------------------
 
+/// Enable or disable a cron job by id and notify the gateway to reload.
 pub async fn cron_set_enabled(id: &str, enabled: bool) -> Result<()> {
     let (mut jobs, parse_ok) = crate::cron::load_cron_jobs();
     if !parse_ok {

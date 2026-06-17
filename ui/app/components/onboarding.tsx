@@ -1805,11 +1805,12 @@ export function OnboardingPage() {
       return p;
     });
 
-    // rsclaw short-circuit: the cloud agent endpoint doesn't expose an
-    // OpenAI-compatible `/models` listing, and we're often clicking
-    // this button before the local gateway has started (onboarding
-    // step 2 runs pre-launch). Trust the key, use the hardcoded model
-    // list — if it's actually invalid the user finds out at the
+    // rsclaw short-circuit: onboarding step 2 runs before the local
+    // gateway has started, and the browser path has no Tauri
+    // `test_provider` command available. rsclaw *does* expose an
+    // OpenAI-compatible `/v1/models` endpoint, but we can't reliably
+    // reach it here. Trust the key and use the catalog default model —
+    // if it's actually invalid the user finds out at the
     // gateway-start step's health check.
     if (id === "rsclaw") {
       const rdef = getProviderDefaultModel("rsclaw") || "rsclaw-agent-v1";
@@ -2719,6 +2720,20 @@ export function OnboardingPage() {
                             </div>
                           ))}
                         </div>
+                      </>
+                    )}
+                    {ps.testStatus === "success" && (ps.models?.length || 0) === 0 && (
+                      <>
+                        <div style={{ fontSize: 11, color: "#d95f5f", marginBottom: 8 }}>
+                          {isZh ? "API 未返回模型列表，请手动输入模型 ID：" : "No models returned from the API. Please enter a model ID manually:"}
+                        </div>
+                        <input
+                          type="text"
+                          style={plainInputStyle}
+                          value={ps.selectedModel || ""}
+                          onChange={(e) => selectModel(activeId, e.target.value)}
+                          placeholder={isZh ? "输入模型 ID，如 gpt-4o" : "Enter model ID, e.g. gpt-4o"}
+                        />
                       </>
                     )}
                   </div>

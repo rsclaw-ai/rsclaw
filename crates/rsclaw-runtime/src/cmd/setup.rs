@@ -2645,14 +2645,9 @@ async fn edit_channel_config(val: &mut serde_json::Value, ch: &ChannelDef) -> bo
                             let _ = set_nested_value(val, &path, serde_json::json!(v));
                         }
                         toggle_channel_enabled(val, &ch.name, true);
-                        let mut changed = false;
-                        if edit_channel_multi_account(val, ch, lang) {
-                            changed = true;
-                        }
-                        if edit_channel_policies(val, &ch.name, lang) {
-                            changed = true;
-                        }
-                        return changed || true;
+                        edit_channel_multi_account(val, ch, lang);
+                        edit_channel_policies(val, &ch.name, lang);
+                        return true;
                     } else {
                         ensure_json_path(val, &["channels"]);
                         ensure_json_path(val, &["channels", &ch.name]);

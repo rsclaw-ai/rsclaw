@@ -22,6 +22,11 @@ use super::{bridge, permission};
 use rsclaw_types::OutboundMessage;
 use rsclaw_i18n as i18n;
 
+/// Per-turn timeout for a coding-agent driver run. A hung CLI can't tie
+/// up the actor indefinitely. Used by both task-mode (`actor_loop`) and
+/// live-mode (`live::actor_loop`) retry loops.
+pub(crate) const TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Which coding agent a `tool_cap` call dispatches to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AgentKind {
@@ -245,12 +250,14 @@ enum ResumeMode<'a> {
 /// arg-parse.
 async fn codex_supports_stream_json() -> bool {
     let bin = std::env::var("CODEX_BIN").unwrap_or_else(|_| "codex".to_string());
-    match tokio::process::Command::new(&bin)
-        .arg("exec")
-        .arg("--help")
-        .output()
-        .await
+    let mut cmd = tokio::process::Command::new(&bin);
+    cmd.arg("exec").arg("--help");
+    #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    match cmd.output().await {
         Ok(out) => {
             let help = String::from_utf8_lossy(&out.stdout);
             help.contains("--input-format")
@@ -421,7 +428,9 @@ async fn respawn_cap_driver(
 ) -> bool {
     match spawn_driver(kind, cwd).await {
         Ok(fresh) => {
-            let _ = driver.shutdown().await;
+            if let Err(e) = driver.shutdown().await {
+                tracing::debug!(target: "cap", error = %e, "best-effort shutdown of dead driver");
+            }
             *driver = fresh;
             tracing::info!(
                 target: "cap",
@@ -489,8 +498,6 @@ async fn actor_loop(
                 //    for a driver that already died. `run_turn` is wrapped
                 //    in a 5-minute timeout so a hung CLI can't tie up the
                 //    actor indefinitely.
-                const TURN_TIMEOUT: std::time::Duration =
-                    std::time::Duration::from_secs(300);
                 let mut reply_buf = String::new();
                 let mut attempt = 0u8;
                 let outcome = loop {
@@ -612,7 +619,9 @@ async fn actor_loop(
             }
         }
     }
-    let _ = driver.shutdown().await;
+    if let Err(e) = driver.shutdown().await {
+        tracing::debug!(target: "cap", error = %e, "best-effort shutdown of dead driver");
+    }
     let mut g = slot.write().await;
     *g = None;
 }
@@ -731,7 +740,9 @@ mod tests {
                 .await
             {
                 failures.push(format!("{name}: send: {e}"));
-                let _ = driver.shutdown().await;
+                if let Err(e) = driver.shutdown().await {
+                    tracing::debug!(target: "cap", error = %e, "best-effort shutdown of dead driver");
+                }
                 continue;
             }
             let mut reply = String::new();
@@ -740,7 +751,9 @@ mod tests {
                 run_turn(driver.as_mut(), &bus, "smoke", name, None, &mut reply),
             )
             .await;
-            let _ = driver.shutdown().await;
+            if let Err(e) = driver.shutdown().await {
+                tracing::debug!(target: "cap", error = %e, "best-effort shutdown of dead driver");
+            }
             match outcome {
                 Ok(Ok(())) if reply.trim().is_empty() => {
                     failures.push(format!("{name}: empty reply"));
@@ -793,7 +806,9 @@ mod tests {
             run_turn(driver.as_mut(), &bus, "smoke", "opencode", None, &mut reply),
         )
         .await;
-        let _ = driver.shutdown().await;
+        if let Err(e) = driver.shutdown().await {
+            tracing::debug!(target: "cap", error = %e, "best-effort shutdown of dead driver");
+        }
         match outcome {
             Ok(Ok(())) => {
                 assert!(!reply.trim().is_empty(), "opencode ACP: empty reply");
