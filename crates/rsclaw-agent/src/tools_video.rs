@@ -665,6 +665,15 @@ async fn submit_rsclaw_video(
     images: &[String],
     video_ref: Option<&str>,
 ) -> Result<String> {
+    // Default model by input shape: a plain image-to-video (single first
+    // frame, no driving video) defaults to the faster 720p i2v lane;
+    // everything else (t2v, first-last-frame, v2v) uses the base model. An
+    // explicit model hint always wins.
+    let default_model = if video_ref.is_none() && images.len() == 1 {
+        "rsclaw-video-v1-fast"
+    } else {
+        "rsclaw-video-v1"
+    };
     // Chain entries may arrive prefixed (`rsclaw/rsclaw-video-v1`); strip
     // the `provider/` segment so the upstream `model` field is the bare id.
     let model = model_hint
@@ -675,7 +684,7 @@ async fn submit_rsclaw_video(
         // `input_references`. Older prompt baselines advertised the bogus id;
         // remap it so requests work even before the prefix is re-ingested.
         .map(|m| if m.contains("video-ref") { "rsclaw-video-v1" } else { m })
-        .unwrap_or("rsclaw-video-v1");
+        .unwrap_or(default_model);
     // gen-api.md §2: `seconds` is a STRING, `size` is WxH, and image-to-video
     // uses `input_reference.image_url` (first frame) + optional
     // `last_frame_reference.image_url` (last frame → first-last-frame).
