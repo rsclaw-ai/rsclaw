@@ -1969,8 +1969,8 @@ fn help_text(lang: &str) -> String {
          技能/插件\n\
          \u{0020}\u{0020}/skill list      已安装技能\n\n\
          \u{0020}\u{0020}/plugin list     插件状态；插件声明的 slash 命令会自动接管\n\n\
-         编程代理直连\n\
-         \u{0020}\u{0020}/cap <agent>            绑定本会话直连 cap 子代理\n\
+         编程智能体直连\n\
+         \u{0020}\u{0020}/cap <agent>            绑定本会话直连 cap 子智能体\n\
          \u{0020}\u{0020}/cap-resume <ag> <id>   按 ID 恢复磁盘保存的会话\n\
          \u{0020}\u{0020}/cap-exit                释放绑定，恢复主 LLM\n\n\
          其他\n\

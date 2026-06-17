@@ -2419,18 +2419,18 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
     // cap_live sticky direct mode (Phase 2a, 2026-05-31)
     // -----------------------------------------------------------------
     msg!("cap_help",
-        "en" => "/cap <agent> [path] — bind this chat to a coding agent (claudecode | openclaude | opencode | codex | qoder), optionally rooting the session at <path> (must be under $HOME; default: rsclaw workspace)\n/cap-exit             — release the binding",
-        "zh" => "/cap <代理> [路径] — 把当前会话直连到一个编程代理（claudecode | openclaude | opencode | codex | qoder），可选指定工作目录 [路径]（必须在 $HOME 之下，默认使用 rsclaw 工作区）\n/cap-exit             — 释放绑定，恢复主 LLM",
+        "en" => "/cap <agent> [path] — bind this chat to a coding agent (claude/claudecode | openclaude | opencode | codex | qoder), optionally rooting the session at <path> (must be under $HOME; default: rsclaw workspace)\n/cap-exit             — release the binding",
+        "zh" => "/cap <智能体> [路径] — 把当前会话直连到一个编程智能体（claude/claudecode | openclaude | opencode | codex | qoder），可选指定工作目录 [路径]（必须在 $HOME 之下，默认使用 rsclaw 工作区）\n/cap-exit             — 释放绑定，恢复主 LLM",
     );
 
     msg!("cap_bound",
         "en" => "Bound to {agent} (session {sid}). Next messages go directly to the driver. /cap-exit to release, /status to see the resume id.",
-        "zh" => "已绑定到 {agent}（会话 {sid}）。接下来的消息会直接发给子代理。/cap-exit 释放，/status 查看 resume id。",
+        "zh" => "已绑定到 {agent}（会话 {sid}）。接下来的消息会直接发给子智能体。/cap-exit 释放，/status 查看 resume id。",
     );
 
     msg!("cap_unknown_agent",
-        "en" => "/cap: unknown agent `{agent}` (try: claudecode, openclaude, opencode, codex, qoder)",
-        "zh" => "/cap：未知代理 `{agent}`（可选：claudecode、openclaude、opencode、codex、qoder）",
+        "en" => "/cap: unknown agent `{agent}` (try: claude, openclaude, opencode, codex, qoder)",
+        "zh" => "/cap：未知智能体 `{agent}`（可选：claude、openclaude、opencode、codex、qoder）",
     );
 
     msg!("cap_not_initialised",
@@ -2470,7 +2470,7 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
 
     msg!("cap_no_active",
         "en" => "/cap-exit: no active cap session here",
-        "zh" => "/cap-exit：当前会话没有绑定中的代理",
+        "zh" => "/cap-exit：当前会话没有绑定中的智能体",
     );
 
     msg!("cap_driver_error",
@@ -2490,7 +2490,7 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
 
     msg!("cap_bound_with_resume",
         "en" => "Bound to {agent} (session {sid}). Next messages go directly to the driver. /cap-exit to release.\nResume later: /cap-resume {agent_slug} {session_id}",
-        "zh" => "已绑定到 {agent}（会话 {sid}）。接下来的消息会直接发给子代理，使用 /cap-exit 释放绑定。\n下次恢复对话：/cap-resume {agent_slug} {session_id}",
+        "zh" => "已绑定到 {agent}（会话 {sid}）。接下来的消息会直接发给子智能体，使用 /cap-exit 释放绑定。\n下次恢复对话：/cap-resume {agent_slug} {session_id}",
     );
 
     msg!("cap_resumed",
@@ -2500,7 +2500,7 @@ static MESSAGES: LazyLock<MsgMap> = LazyLock::new(|| {
 
     msg!("cap_resume_help",
         "en" => "/cap-resume <agent> [session_id]\n  /cap-resume claudecode 00000000-…   resume by id\n  /cap-resume claudecode               resume the most recent saved session",
-        "zh" => "/cap-resume <代理> [会话ID]\n  /cap-resume claudecode 00000000-…   按 ID 恢复\n  /cap-resume claudecode               恢复最近一次会话",
+        "zh" => "/cap-resume <智能体> [会话ID]\n  /cap-resume claudecode 00000000-…   按 ID 恢复\n  /cap-resume claudecode               恢复最近一次会话",
     );
 
     msg!("cap_resume_hint",
