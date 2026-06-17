@@ -3,17 +3,19 @@
 //! Each `ModelConfig` field that supports a chain (primary / flash / vision
 //! / image / video) is paired with a `ChainHealth` at runtime. The state
 //! machine routes each call through the chain in order, demoting failing
-//! models to `Cooling` (auto-recovers after backoff) or `Disabled`
-//! (permanent — needs operator intervention).
+//! models to `Cooling`, which always auto-recovers after a time-bounded
+//! backoff.
 //!
 //! Design choices, locked in with the user:
 //! - Status is **runtime-only**; never persisted to rsclaw.json5. The config
 //!   stays declarative (`primary: "doubao/x"` or `primary: [a, b]`) and the
 //!   user sees what they wrote.
-//! - **Disabled never self-heals** automatically. Auto-probing a model that
-//!   said "insufficient_quota" would just burn another tiny API charge per
-//!   probe — `Disabled` is the system's way of saying "stop calling this
-//!   thing until a human checks the balance / key / model id".
+//! - **A runtime failure never permanently disables a model.** Every failure
+//!   produces a time-bounded `Cooling`; disabling-class errors (auth /
+//!   balance / model-missing) escalate to the `MAX_COOLDOWN` ceiling so a
+//!   genuinely-broken config is re-probed at most hourly rather than being
+//!   locked out until manual reset. `Disabled` is reserved for explicit
+//!   operator/config disable, never reached from call results.
 //! - Restart resets all state (no on-disk persistence). Simple and avoids
 //!   the redb dance for what's essentially short-term volatile data.
 
@@ -71,8 +73,10 @@ pub enum ModelStatus {
     /// Temporarily skipped until `until` passes. After expiry the next
     /// call retries it; success → Healthy + consecutive_failures cleared.
     Cooling { until: Instant },
-    /// Permanently skipped. Only an explicit reset (CLI / API / config
-    /// reload that drops this id) clears it.
+    /// Skipped until an explicit reset (CLI / API / config reload that
+    /// drops this id) clears it. NOT produced by runtime failures anymore
+    /// — `record_failure` always uses a time-bounded `Cooling` so nothing
+    /// is permanently locked out. Reserved for explicit/operator disable.
     Disabled { reason: String },
 }
 
@@ -84,9 +88,9 @@ pub struct ModelHealth {
     /// Last observed error body / message. Used by `/models/health` and
     /// surfaced in CLI listings.
     pub last_error: Option<String>,
-    /// Counts consecutive transient/auth failures. Auth flips to
-    /// Disabled after `AUTH_DISABLE_AFTER` strikes — gives the user one
-    /// expired-key-cache-miss leeway before locking the model out.
+    /// Counts consecutive failures. Drives the exponential backoff and,
+    /// for disabling-class errors, the escalation to `MAX_COOLDOWN` after
+    /// `AUTH_DISABLE_AFTER` strikes. Cleared on success / reset.
     pub consecutive_failures: u32,
 }
 
@@ -118,28 +122,26 @@ impl ModelHealth {
 
     /// Apply a failure: classify + transition status + bump counters.
     /// `now` is injected so tests can pin time.
+    ///
+    /// A runtime failure NEVER lands in `Disabled` — it always produces a
+    /// time-bounded `Cooling` so the model recovers on its own after the
+    /// backoff. A transient blip (a flaky download, a brief gateway 5xx,
+    /// a key rotated mid-flight) must not lock a model out until a manual
+    /// reset. Disabling-class errors (auth / balance / model-missing) still
+    /// get the grace window, then escalate to the `MAX_COOLDOWN` ceiling so
+    /// a genuinely-broken config is re-probed at most hourly instead of
+    /// being hammered every call.
     pub fn record_failure(&mut self, kind: ErrorKind, body_snippet: String, now: Instant) {
         self.last_error = Some(body_snippet);
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
 
-        if kind.is_disabling() {
-            // Auth gets a short grace window (rotated keys etc.); Balance
-            // and ModelMissing flip immediately because a single hit
-            // strongly implies user-side config drift.
-            let lock_now = match kind {
-                ErrorKind::Auth => self.consecutive_failures >= AUTH_DISABLE_AFTER,
-                _ => true,
-            };
-            if lock_now {
-                self.status = ModelStatus::Disabled {
-                    reason: format!("{kind:?}"),
-                };
-                return;
-            }
-        }
-
+        let backoff = if kind.is_disabling() && self.consecutive_failures >= AUTH_DISABLE_AFTER {
+            MAX_COOLDOWN
+        } else {
+            cooling_backoff(self.consecutive_failures, kind)
+        };
         self.status = ModelStatus::Cooling {
-            until: now + cooling_backoff(self.consecutive_failures, kind),
+            until: now + backoff,
         };
     }
 
@@ -374,9 +376,11 @@ fn cooldown_seconds(s: &ModelStatus, now: Instant) -> Option<u64> {
 // Tunables
 // ---------------------------------------------------------------------------
 
-/// Auth failures absorbed before flipping to Disabled. 3 = one cached-key
-/// race + one operator rotation slip + one real failure. Beyond that, the
-/// signal is strong enough to lock.
+/// Disabling-class failures (auth / balance / model-missing) absorbed at
+/// the normal exponential backoff before escalating to the `MAX_COOLDOWN`
+/// ceiling. 3 = one cached-key race + one operator rotation slip + one real
+/// failure. Beyond that the signal is strong enough to back off to hourly
+/// re-probes (still bounded — never a permanent lock-out).
 pub const AUTH_DISABLE_AFTER: u32 = 3;
 
 /// Cap on cooldown duration so a long-running gateway doesn't end up with
@@ -652,23 +656,30 @@ mod tests {
     }
 
     #[test]
-    fn health_balance_disables_immediately() {
+    fn health_balance_cools_bounded_not_disabled() {
         let mut h = ModelHealth::new("doubao/x");
         h.record_failure(ErrorKind::Balance, "402".into(), Instant::now());
-        assert!(matches!(h.status, ModelStatus::Disabled { .. }));
+        // Bounded cooldown — never a permanent Disabled from a call result.
+        assert!(matches!(h.status, ModelStatus::Cooling { .. }));
+        assert!(!h.is_callable());
     }
 
     #[test]
-    fn health_auth_uses_grace_window() {
+    fn health_auth_escalates_to_bounded_cooldown_not_disabled() {
+        let now = Instant::now();
         let mut h = ModelHealth::new("doubao/x");
         for _ in 0..AUTH_DISABLE_AFTER - 1 {
-            h.record_failure(ErrorKind::Auth, "401".into(), Instant::now());
+            h.record_failure(ErrorKind::Auth, "401".into(), now);
         }
-        // Still Cooling (in grace) — not Disabled yet.
+        // Still Cooling on the normal backoff (in grace).
         assert!(matches!(h.status, ModelStatus::Cooling { .. }));
-        h.record_failure(ErrorKind::Auth, "401".into(), Instant::now());
-        // Now over the threshold.
-        assert!(matches!(h.status, ModelStatus::Disabled { .. }));
+        // Crossing the threshold escalates to the MAX_COOLDOWN ceiling, but
+        // it's still a (long) bounded Cooling — never Disabled.
+        h.record_failure(ErrorKind::Auth, "401".into(), now);
+        match h.status {
+            ModelStatus::Cooling { until } => assert_eq!(until, now + MAX_COOLDOWN),
+            other => panic!("expected bounded Cooling, got {other:?}"),
+        }
     }
 
     #[test]
@@ -681,10 +692,10 @@ mod tests {
     }
 
     #[test]
-    fn health_reset_clears_disabled() {
+    fn health_reset_clears_cooldown() {
         let mut h = ModelHealth::new("doubao/x");
         h.record_failure(ErrorKind::Balance, "402".into(), Instant::now());
-        assert!(matches!(h.status, ModelStatus::Disabled { .. }));
+        assert!(matches!(h.status, ModelStatus::Cooling { .. }));
         h.reset();
         assert!(matches!(h.status, ModelStatus::Healthy));
     }

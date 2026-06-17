@@ -546,14 +546,14 @@ const EN_TOOL_WEB_SEARCH: &str = r#"# web_search Usage Guide
 - SHORT keyword queries (2-5 words), `site:` filters for authority. Don't retry the same
   query after "No results"; don't open a browser for google.com/baidu.com.
 
-## Prefer direct APIs over scraping SEO results (via `web_fetch`, JSON returned as-is)
-| Intent | URL |
-|---|---|
-| Weather | `https://wttr.in/City?format=j1` |
-| IP geolocation | `https://ipinfo.io/8.8.8.8/json` |
-| Currency | `https://api.exchangerate.host/latest?base=USD&symbols=CNY` |
-| Wikipedia | `https://en.wikipedia.org/api/rest_v1/page/summary/TOPIC` |
-| GitHub | `https://api.github.com/repos/owner/name` |
+## web_search already routes common intents to authoritative APIs — TRUST its result
+`web_search` internally detects structured intents and queries the authoritative source
+directly, returning ready-to-use STRUCTURED data (not SEO scrapes). When the result already
+answers the question, ANSWER DIRECTLY from it — do NOT re-run the same search, and do NOT
+`web_fetch` the raw provider page (it's large, gets truncated to an artifact, and wastes steps).
+Auto-routed intents include: weather, currency, stock, crypto, flight/train/hotel, movie,
+express tracking, IP/DNS, Wikipedia, GitHub, translate, and more. Example: a weather question
+returns a parsed multi-day forecast — summarize it for the user, don't fetch weather.com.cn.
 "#;
 
 const EN_TOOL_WEB_FETCH: &str = r#"# web_fetch Usage Guide

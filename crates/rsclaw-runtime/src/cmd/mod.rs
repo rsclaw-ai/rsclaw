@@ -36,7 +36,6 @@ pub mod security;
 pub mod sessions;
 pub mod setup;
 pub mod skills;
-pub mod stock;
 pub mod style;
 pub mod system;
 // tools/ extracted to the rsclaw-tools crate (crate-split). Re-export under the
@@ -84,7 +83,6 @@ pub use security::cmd_security;
 pub use sessions::cmd_sessions;
 pub use setup::{cmd_configure, cmd_onboard, cmd_setup};
 pub use skills::cmd_skills;
-pub use stock::cmd_stock;
 pub use system::cmd_system;
 pub use tools::cmd_tools;
 pub use tray::cmd_tray;

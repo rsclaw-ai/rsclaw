@@ -247,6 +247,10 @@ pub(crate) const COLD_TOOLS: &[&str] = &[
     "cap_bind_sticky",
     "cap_unbind_sticky",
     "video_gen",
+    "avatar_gen",
+    "mv_gen",
+    "music_gen",
+    "voice_gen",
     "create_docx",
     "create_pdf",
     "create_pptx",
@@ -396,6 +400,10 @@ pub fn toolset_allowed_names(
         "image_gen",
         "ocr",
         "video_gen",
+        "avatar_gen",
+        "mv_gen",
+        "music_gen",
+        "voice_gen",
         "channel",
         "cron",
         "computer_use",
@@ -411,7 +419,7 @@ pub fn toolset_allowed_names(
         "plugin_search",
         "plugin_describe",
         "plugin_invoke",
-        // astock — built-in tools, dormant when not configured.
+        // Stock plugin aliases — dormant when no trusted plugin claims them.
         "stock_quote",
         "stock_kline",
         "stock_snapshot",
@@ -819,29 +827,38 @@ pub fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "read_artifact".to_owned(),
-        description: "Read the full content of a tool_result artifact written by the runtime backstop.\n\
+        description: "Read the content of a tool_result artifact written by the runtime backstop.\n\
             \n\
             When any tool produces output larger than ~4 KB, the runtime writes the full \
             payload to disk and shows you only a head+tail preview in the tool_result. The \
-            preview ends with `... N lines omitted — call read_artifact(tool_result_id=\"tr_xxxxxxxx\") ...`. \
+            preview ends with `... call read_artifact(tool_result_id=\"tr_xxxxxxxx\") ...`. \
             That id is your handle.\n\
             \n\
-            Modes:\n\
-              - mode=\"stat\"        size + line count only, no content (CHEAP — check first if you don't know how big it is)\n\
-              - mode=\"full\"        (default) entire artifact text\n\
-              - mode=\"head:N\"      first N lines\n\
-              - mode=\"tail:N\"      last N lines\n\
+            DEFAULT (no mode): returns the NEXT unread chunk and advances a server-side \
+            cursor. To read a long artifact, just call read_artifact again (no mode) until \
+            you see `at_end` — you do NOT compute line ranges, and you cannot accidentally \
+            re-read the same page. Content that fits in one page comes back whole on the \
+            first call. If the artifact is large, the first chunk is prefixed with an AI \
+            summary so you can decide whether to keep paging or jump straight to specifics.\n\
+            \n\
+            Modes (optional):\n\
+              - (none)             next unread chunk (cursor advances) — the normal way to read\n\
+              - mode=\"reset\"       restart paging from the top\n\
+              - mode=\"query:Q\"     SEMANTIC search — returns the sections most relevant to \
+            question Q. BEST way to find a fact in a big artifact; prefer over paging when \
+            you know what you're looking for.\n\
+              - mode=\"grep:PAT\"    case-insensitive regex over lines (exact-string match; alternation `a|b|c` works)\n\
               - mode=\"lines:A-B\"   inclusive 1-indexed line range\n\
-              - mode=\"grep:PAT\"    case-insensitive regex over lines (substring works; alternation `a|b|c` works)\n\
+              - mode=\"head:N\" / \"tail:N\"   first / last N lines\n\
+              - mode=\"stat\"        size + line count only, no content (CHEAP)\n\
             \n\
             Artifacts are session-scoped — an id from another session won't resolve. They \
-            also expire after 7 days. If you only need to scan for a known substring, \
-            `mode=\"grep:...\"` is much cheaper than `full`.".to_owned(),
+            also expire after 7 days.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "tool_result_id": {"type": "string", "description": "Artifact id of the form `tr_xxxxxxxx` returned in a prior compacted tool_result."},
-                "mode": {"type": "string", "description": "full | head:N | tail:N | lines:A-B | grep:PATTERN. Default `full`."}
+                "mode": {"type": "string", "description": "Omit to read the next chunk (cursor advances — the normal way). Or: query:QUESTION (semantic search) | grep:PATTERN | lines:A-B | head:N | tail:N | reset | stat."}
             },
             "required": ["tool_result_id"]
         }),
@@ -900,10 +917,8 @@ pub fn build_tool_list(
     });
 
     // -----------------------------------------------------------------
-    // A-share market data (astock). Tools no-op with a structured
-    // "astock_not_configured" reply when the gateway hasn't been wired
-    // to an astock instance — so they're always safe to advertise; the
-    // LLM learns at first call that it can't use them and stops trying.
+    // A-share market data. These first-class tool names are exposed only when
+    // a trusted stock WASM plugin claims the matching aliases.
     // -----------------------------------------------------------------
     tools.push(ToolDef {
         name: "stock_quote".to_owned(),
@@ -984,8 +999,8 @@ pub fn build_tool_list(
     tools.push(ToolDef {
         name: "stock_ask".to_owned(),
         description: "PREFERRED A-share entry point — natural-language query \
-            routed through iwencai (同花顺's question-understanding service via \
-            astock). Use this whenever the user phrases a market question in \
+            routed through the configured upstream question-understanding service. \
+            Use this whenever the user phrases a market question in \
             human terms: \"今天涨停的科技股有哪些\", \"北向资金净流入前 20\", \
             \"最近一周创业板连板高度榜\", \"机构调研最多的票\". Don't try to \
             assemble snapshot filters or SQL by hand for this kind of question — \
@@ -1123,9 +1138,9 @@ pub fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "stock_query".to_owned(),
-        description: "Read-only SQL against astock's DuckDB. ESCAPE HATCH only — \
+        description: "Read-only SQL through the stock plugin. ESCAPE HATCH only — \
             use when `stock_ask` / `stock_snapshot` / `stock_kline` genuinely \
-            cannot express the query. astock validates the SQL server-side and \
+            cannot express the query. The upstream service validates SQL server-side and \
             rejects anything that isn't a single SELECT. Joining the live K-line \
             tables and the EOD aggregates here is fine; we trust the validator.".to_owned(),
         parameters: json!({
@@ -1471,7 +1486,8 @@ pub fn build_tool_list(
             "properties": {
                 "query":    {"type": "string", "description": "Search query — specific keywords + dates."},
                 "provider": {"type": "string", "description": "duckduckgo | google | bing | brave. Empty = default."},
-                "limit":    {"type": "integer", "default": 5, "description": "Max results."}
+                "limit":    {"type": "integer", "default": 5, "description": "Max results."},
+                "deep":     {"type": "boolean", "default": false, "description": "When true, don't return snippets — fetch the top pages' full text, rerank the most relevant passages against the query, and return those text chunks with their source URLs. Use for precision questions where snippets are too thin (analysis, comparisons, 'what does X actually say'). Slower (a few seconds); skip for quick lookups."}
             },
             "required": ["query"]
         }),
@@ -1663,12 +1679,13 @@ pub fn build_tool_list(
 
     tools.push(ToolDef {
         name: "image_gen".to_owned(),
-        description: "Generate an image from a text description using an AI image model. Pass the user's original description as-is (preserve their language, do not translate).".to_owned(),
+        description: "Generate or EDIT an image with an AI image model. Text-to-image (prompt only) or image-to-image (pass `image` to transform/edit an existing picture). Pass the user's original description as-is (preserve their language, do not translate).".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "prompt": {"type": "string", "description": "Image description. IMPORTANT: use the user's original language and wording, do not translate to English."},
-                "size":   {"type": "string", "description": "Image size, e.g. 2048x2048", "default": "2048x2048"}
+                "prompt": {"type": "string", "description": "Image description, or for image-to-image the edit instruction (what to change/keep). Use the user's original language and wording, do not translate."},
+                "size":   {"type": "string", "description": "Image size, e.g. 2048x2048", "default": "2048x2048"},
+                "image":  {"type": ["string", "array"], "items": {"type": "string"}, "description": "Optional input image(s) for image-to-image / editing (agnes, doubao seedream, and OAI-compatible gateways). Each entry: a LOCAL FILE PATH (e.g. a prior image_gen result — auto-encoded to base64), a public https URL, or a data:image/...;base64,... URI. One image = edit/transform it; multiple = multi-image composition (agnes)."}
             },
             "required": ["prompt"]
         }),
@@ -1702,9 +1719,85 @@ pub fn build_tool_list(
                 "prompt":       {"type": "string", "description": "Video description. Use the user's original language and wording."},
                 "duration":     {"type": "integer", "description": "Duration in seconds (default: 5)", "default": 5},
                 "aspect_ratio": {"type": "string", "description": "Aspect ratio: 16:9, 9:16, 1:1 (default: 16:9)", "default": "16:9"},
-                "model":        {"type": "string", "description": "Video model to use, e.g. seedance, minimax, kling (optional, uses configured default)"}
+                "image":        {"type": ["string", "array"], "items": {"type": "string"}, "description": "Optional reference image(s) for image-to-video (agnes, doubao, rsclaw). Each entry: a LOCAL FILE PATH (e.g. the path returned by image_gen — auto-encoded to base64), a public https URL, or a data:image/...;base64,... URI. ONE image = first frame (animate this image). TWO images = first + last frame (interpolate). THREE+ = reference images (doubao multimodal)."},
+                "model":        {"type": "string", "description": "Video model to use, e.g. doubao seedance, agnes, rsclaw, sora-2 (optional, uses configured default)"}
             },
             "required": ["prompt"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "avatar_gen".to_owned(),
+        description: "Generate a 数字人 / digital-human video via the rsclaw gen service. A \
+            character image is REQUIRED, driven EITHER by speech `audio` (lip-sync / 口播) OR by a \
+            driving `video` (motion & expression transfer / character swap / 动作模仿). The server \
+            auto-selects the mode from the inputs. The finished video is delivered automatically.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "image": {"type": "string", "description": "REQUIRED: character portrait — a LOCAL FILE PATH (auto-encoded to base64), a public https URL, or a data:image/...;base64,... URI."},
+                "audio": {"type": "string", "description": "Speech audio for lip-sync (talk mode) — local path (wav/mp3/flac/m4a, auto-encoded), https URL, or data:audio/... URI. Provide this OR `video`."},
+                "video": {"type": "string", "description": "Driving video for motion/expression transfer (animate mode) — an https URL (large files; data-URI not accepted). Provide this OR `audio`."},
+                "mode":  {"type": "string", "description": "Optional animate sub-mode passthrough (e.g. character-animation vs character-swap)."},
+                "model": {"type": "string", "description": "Optional model override; normally leave empty so the server auto-selects talk/animate."}
+            },
+            "required": ["image"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "mv_gen".to_owned(),
+        description: "Generate a singing music-video (MV) via the rsclaw gen service: a character \
+            image + lyrics → the character singing the song (worker chain: lyrics → music → \
+            audio-driven avatar). Use for 唱歌MV / 让某人唱歌. Both `image` and `lyrics` are \
+            REQUIRED. The finished video is delivered automatically.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "image":  {"type": "string", "description": "REQUIRED: character image — a LOCAL FILE PATH (auto-encoded to base64), a public https URL, or a data:image/...;base64,... URI."},
+                "lyrics": {"type": "string", "description": "REQUIRED: the song lyrics to sing (line-separated). Use the user's original language."},
+                "prompt": {"type": "string", "description": "Optional style / timbre, e.g. 'upbeat city pop, 女声'."},
+                "duration": {"type": "integer", "description": "Optional target length in seconds."},
+                "model":  {"type": "string", "description": "Optional rsclaw gen mv model id (default rsclaw-mv-v1)."}
+            },
+            "required": ["image", "lyrics"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "music_gen".to_owned(),
+        description: "Generate MUSIC via the rsclaw gen service: a style description (and optional \
+            lyrics) → a song / BGM. Use for 生成歌曲/音乐/配乐/BGM. Returns the finished audio as \
+            an attachment. Pass the user's original wording as-is.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "prompt":   {"type": "string", "description": "Style description, e.g. 'upbeat lo-fi hip hop' / '舒缓的钢琴曲'. Required. Use the user's original language."},
+                "lyrics":   {"type": "string", "description": "Optional song lyrics (produces vocals)."},
+                "duration": {"type": "integer", "description": "Optional target length in seconds."},
+                "response_format": {"type": "string", "description": "Output container: mp3 (default) | wav | flac.", "default": "mp3"},
+                "model":    {"type": "string", "description": "Optional rsclaw gen music model id (default rsclaw-music-v1)."}
+            },
+            "required": ["prompt"]
+        }),
+    });
+    tools.push(ToolDef {
+        name: "voice_gen".to_owned(),
+        description: "High-quality text-to-speech and VOICE CLONING via the rsclaw gen service. \
+            Use when the user wants studio-quality narration/配音, a specific timbre/音色, or to \
+            CLONE a voice from a reference clip (pass `reference_audio`). For a quick, free, \
+            offline read-aloud, prefer `text_to_voice` instead. Returns the audio as an \
+            attachment.".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "text":   {"type": "string", "description": "The words to speak. Required. Use the user's original language."},
+                "voice":  {"type": "string", "description": "Optional preset voice name, or a natural-language voice description (e.g. '温柔女声')."},
+                "instructions": {"type": "string", "description": "Optional delivery/style direction (e.g. '低沉磁性, 语速偏慢')."},
+                "speed":  {"type": "number", "description": "Optional speaking speed 0.25-4.0 (default 1.0)."},
+                "reference_audio": {"type": "string", "description": "Optional CLONE reference — a LOCAL FILE PATH (auto-encoded), an https URL, or a data:audio/...;base64,... URI. Present → clone this voice."},
+                "reference_text":  {"type": "string", "description": "Optional transcript of reference_audio; improves clone fidelity."},
+                "response_format": {"type": "string", "description": "Output container: mp3 (default) | wav | flac.", "default": "mp3"},
+                "model":  {"type": "string", "description": "Optional rsclaw gen voice model id (default rsclaw-voice-v1)."}
+            },
+            "required": ["text"]
         }),
     });
     tools.push(ToolDef {

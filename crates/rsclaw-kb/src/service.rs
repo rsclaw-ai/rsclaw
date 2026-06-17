@@ -869,6 +869,14 @@ impl KnowledgeService {
         }))
     }
 
+    /// The active embedder handle (already loaded at gateway startup).
+    /// Exposed so callers outside the KB — e.g. ad-hoc semantic search over a
+    /// single artifact blob — can reuse the hot embedder without re-resolving
+    /// (which would re-load the model).
+    pub fn embedder(&self) -> std::sync::Arc<dyn KbEmbedder> {
+        self.embedder.clone()
+    }
+
     /// Embedders the UI can offer. The active one is marked default; local BGE
     /// models count as "downloaded" when present under `<base>/models/`.
     pub fn embedders(&self) -> Vec<EmbedderInfo> {

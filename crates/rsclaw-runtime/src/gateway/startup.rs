@@ -146,7 +146,19 @@ fn enrich_process_path() {
     if prefix.is_empty() {
         return;
     }
-    prefix.push(current);
+    // Append the inherited PATH entry-by-entry, then dedup the whole list
+    // preserving first occurrence (which preserves priority order). The
+    // inherited PATH can already contain duplicates — e.g. a launcher that
+    // double-adds a plugin bin dir, as Claude Code does with
+    // rust-analyzer-lsp — and pushing `current` verbatim would propagate
+    // those dupes into every subprocess's PATH.
+    for entry in current.split(sep) {
+        if !entry.is_empty() {
+            prefix.push(entry.to_string());
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    prefix.retain(|p| seen.insert(p.clone()));
     let joined = prefix.join(&sep.to_string());
     // SAFETY: called once at startup before any worker thread spawns a child.
     unsafe {
@@ -342,36 +354,6 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
             info!("memory store opened");
             let arc = Arc::new(tokio::sync::Mutex::new(m));
             rsclaw_agent::memory::set_global_store(Arc::clone(&arc));
-            // astock: build the client once if config.astock.enabled is set,
-            // and register it on the process-global slot. Failures here are
-            // surfaced at info level (not warn) — "astock not configured" is
-            // the normal state for non-A股 users and shouldn't look like an
-            // error in startup logs.
-            match rsclaw_astock::AstockClient::from_config(config.raw.astock.as_ref()) {
-                Ok(c) => {
-                    rsclaw_astock::set_global_client(Arc::new(c));
-                    rsclaw_astock::set_global_briefing_sink(Arc::new(crate::gateway::task_queue::GatewayBriefingSink));
-                    info!("astock client initialized");
-                    // Spin up the daily-briefing scheduler — it's
-                    // cheap (one tokio task) and silently no-ops if
-                    // no peer has a watchlist. Only meaningful when
-                    // astock itself is live, so gate on the client
-                    // being installed.
-                    rsclaw_astock::briefing::spawn_scheduler();
-                    info!("astock briefing scheduler started");
-                    // SSE listeners: one tokio task per configured
-                    // filter, push notifications on `hit` events for
-                    // codes any peer is watching. Gated on the same
-                    // astock-client-present check so non-A股 users
-                    // carry zero background cost.
-                    if let Some(astock_cfg) = config.raw.astock.as_ref() {
-                        rsclaw_astock::sse::spawn_listeners(astock_cfg);
-                    }
-                }
-                Err(e) => {
-                    info!(reason = %e, "astock client not initialised (subsystem dormant)");
-                }
-            }
             Some(arc)
         }
         Err(e) => {
@@ -450,6 +432,10 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 
     let wasm_plugins = Arc::new(plugin_registry.take_wasm_plugins());
     let plugins = Arc::new(plugin_registry);
+    for handle in registry.all() {
+        handle.set_wasm_plugins(Arc::clone(&wasm_plugins));
+        handle.set_notification_tx(notification_tx.clone());
+    }
 
     // Create the SSE broadcast channel once so agents and the HTTP server
     // share the same sender.
@@ -612,6 +598,9 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
     // crate-split P3: inject the task-queue host so rsclaw-agent's `task` tool
     // can enqueue without depending on the gateway crate.
     rsclaw_types::set_task_queue_host(Arc::new(super::task_queue::GatewayTaskQueueHost));
+    rsclaw_plugin::set_plugin_background_host(Arc::new(
+        super::task_queue::GatewayPluginBackgroundHost,
+    ));
 
     start_channels(
         &config,

@@ -213,7 +213,7 @@ impl WatchRegistry {
         };
         // Resolve `--template <name>` defaults into any flag slots the
         // user left empty. User flags always win — the template only
-        // fills holes — so `--template astock --grep ERR` keeps the
+        // fills holes — so `--template foo --grep ERR` keeps the
         // template's jq/event-filter while overriding nothing.
         let (effective_grep, effective_jq, effective_event_filter) =
             resolve_template_defaults(&spec);

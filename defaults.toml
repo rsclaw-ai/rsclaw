@@ -1,11 +1,12 @@
 # rsclaw defaults — provider, channel, and search engine definitions
 #
 # Edit this file to customize providers, channels, search engines, etc.
-# Generated on first `rsclaw setup`; future releases only append missing
-# built-in entries and never overwrite user-customized entries.
+# Generated on first `rsclaw setup`. On a defaults_version bump, releases
+# refresh the built-in (shipped) entries to the latest definitions and keep
+# any entries you added yourself; the previous file is saved as defaults.toml.bak.*.
 
 [meta]
-defaults_version = "2026.6.16"
+defaults_version = "2026.6.18"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Providers
@@ -620,26 +621,32 @@ order    = 8
 [video_providers.seedance]
 label       = "Seedance 2.0 (ByteDance)"
 env_var     = "ARK_API_KEY"
+# Variants (use the exact ARK model id): pro = doubao-seedance-2-0-260128,
+# fast = doubao-seedance-2-0-fast-260128. Override per-call via the video_gen
+# `model` arg or agents.defaults.model.video (e.g. doubao/<id>).
 model       = "doubao-seedance-2-0-260128"
 base_url    = "https://ark.cn-beijing.volces.com/api/v3"
 
-[video_providers.minimax]
-label       = "MiniMax Video (Hailuo)"
-env_var     = "MINIMAX_API_KEY"
-model       = "video-01-director"
-base_url    = "https://api.minimaxi.com/v1"
-
-[video_providers.kling]
-label       = "Kling (Kuaishou)"
-env_var     = "KLING_ACCESS_KEY"
-model       = "kling-v2-master"
-base_url    = "https://api.klingai.com"
+[video_providers.rsclaw]
+label       = "RsClaw Gen (avatar / mv 聚合)"
+env_var     = "RSCLAW_API_KEY"
+model       = "rsclaw-video-v1"
+base_url    = "https://api.rsclaw.ai"
 
 [video_providers.agnes]
 label       = "Agnes Video V2.0 (Sapiens AI)"
 env_var     = "AGNES_API_KEY"
 model       = "agnes-video-v2.0"
 base_url    = "https://apihub.agnes-ai.com"
+
+# OpenAI-compatible (Sora-2 shape). Defaults to api.openai.com; point
+# `models.providers.openai.base_url` at any OAI-compatible video gateway to
+# redirect. Same baseUrl passthrough as the gpt-image path on image_gen.
+[video_providers.openai]
+label       = "OpenAI / Sora-2 (OAI-compatible)"
+env_var     = "OPENAI_API_KEY"
+model       = "sora-2"
+base_url    = "https://api.openai.com/v1"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Skill Registries (used by rsclaw skills install/search)

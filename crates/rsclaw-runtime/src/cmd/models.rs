@@ -25,6 +25,18 @@ fn gateway_base() -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+/// Gateway bearer token from the resolved config, if one is set. The local
+/// gateway gates `/api/v1/*` on `Authorization: Bearer <token>` when
+/// configured; without sending it these `models health` calls 401 against
+/// our own daemon. Uses `rsclaw_config::load()` (resolved, flat
+/// `gateway.auth_token`) — same source as `gateway_http::GatewayEndpoint`.
+fn gateway_token() -> Option<String> {
+    rsclaw_config::load()
+        .ok()
+        .and_then(|c| c.gateway.auth_token.clone())
+        .filter(|t| !t.is_empty())
+}
+
 pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
     match sub {
         ModelsCommand::List | ModelsCommand::Status => {
@@ -226,11 +238,13 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
                     option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
                 ));
                 let url = format!("{}/api/v1/models/health", gateway_base());
-                let resp = reqwest::Client::new()
+                let mut rb = reqwest::Client::new()
                     .get(&url)
-                    .timeout(std::time::Duration::from_secs(5))
-                    .send()
-                    .await;
+                    .timeout(std::time::Duration::from_secs(5));
+                if let Some(t) = gateway_token() {
+                    rb = rb.bearer_auth(t);
+                }
+                let resp = rb.send().await;
                 match resp {
                     Ok(r) if r.status().is_success() => {
                         let body: serde_json::Value = r.json().await.unwrap_or_default();
@@ -285,12 +299,14 @@ pub async fn cmd_models(sub: ModelsCommand) -> Result<()> {
             }
             HealthCommand::Reset { model } => {
                 let url = format!("{}/api/v1/models/health/reset", gateway_base());
-                let resp = reqwest::Client::new()
+                let mut rb = reqwest::Client::new()
                     .post(&url)
                     .json(&serde_json::json!({ "model": &model }))
-                    .timeout(std::time::Duration::from_secs(5))
-                    .send()
-                    .await;
+                    .timeout(std::time::Duration::from_secs(5));
+                if let Some(t) = gateway_token() {
+                    rb = rb.bearer_auth(t);
+                }
+                let resp = rb.send().await;
                 match resp {
                     Ok(r) if r.status().is_success() => {
                         ok(&format!("reset '{}' — next chain iteration will retry it", cyan(&model)));

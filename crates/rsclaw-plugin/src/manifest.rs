@@ -74,6 +74,11 @@ pub struct PluginManifest {
     /// Optional for OpenClaw extensions (defaults to `"./dist/index.js"`).
     #[serde(default = "default_entry")]
     pub entry: String,
+    /// Optional integrity digest for the entry file. Currently supports
+    /// `sha256:<hex>`. WASM plugins that declare this must match before
+    /// the host compiles the component.
+    #[serde(default)]
+    pub integrity: Option<String>,
     /// Channels this plugin provides (OpenClaw extension field).
     #[serde(default)]
     pub channels: Vec<String>,
@@ -113,6 +118,23 @@ pub struct PluginManifest {
     /// Arbitrary extra fields for future compatibility.
     #[serde(default, flatten)]
     pub extra: HashMap<String, Value>,
+    /// Plugin-specific configuration block. The host resolves simple
+    /// secret references before exposing it to trusted WASM plugins via
+    /// `host-config`.
+    #[serde(default)]
+    pub config: Value,
+    /// Capability names requested by this plugin. Dangerous capabilities
+    /// such as background workers, outbound push, and tool aliases are
+    /// honored only for trusted plugins.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// Slash command prefixes this plugin wants to handle locally.
+    #[serde(default, rename = "slashCommands")]
+    pub slash_commands: Vec<PluginSlashCommand>,
+    /// Optional trusted aliases from plugin tool names to first-class
+    /// tool names. Example: `{ quote: "stock_quote" }`.
+    #[serde(default, rename = "toolAliases")]
+    pub tool_aliases: HashMap<String, String>,
 
     // --- runtime fields (not in JSON) ---
     /// Absolute path to the plugin directory.
@@ -184,6 +206,15 @@ pub struct PluginToolDef {
     /// real ToolDefs in. Ungrouped tools keep headline/search behavior.
     #[serde(default)]
     pub group: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginSlashCommand {
+    /// Command prefix, for example `/myplugin`.
+    pub prefix: String,
+    /// Tool name inside this plugin that handles the slash payload.
+    pub handler: String,
 }
 
 fn default_runtime() -> String {
@@ -355,6 +386,7 @@ mod tests {
   description: "A WASM plugin",
   runtime: "wasm",
   entry: "./plugin.wasm",
+  integrity: "sha256:0123456789abcdef",
   tools: [
     {
       name: "do_thing",
@@ -369,6 +401,7 @@ mod tests {
         assert_eq!(m.name, "test-wasm");
         assert_eq!(m.version.as_deref(), Some("2.0.0"));
         assert_eq!(m.runtime, "wasm");
+        assert_eq!(m.integrity.as_deref(), Some("sha256:0123456789abcdef"));
         assert!(m.is_wasm());
         assert_eq!(m.tools.len(), 1);
     }

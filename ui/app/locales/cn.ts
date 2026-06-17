@@ -566,7 +566,7 @@ const cn = {
     },
     VideoModel: {
       Title: "视频生成模型",
-      SubTitle: "用于文生视频的模型 (Seedance / MiniMax / Kling)",
+      SubTitle: "用于文生视频的模型 (Seedance / Kling)",
     },
     BtwTokens: {
       Title: "旁路上下文预算",

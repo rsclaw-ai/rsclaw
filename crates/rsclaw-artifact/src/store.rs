@@ -146,6 +146,31 @@ impl ArtifactStore {
         Ok(buf)
     }
 
+    /// Path of the summary sidecar for an artifact (`<id>.summary.txt`).
+    fn summary_path_for(&self, session_key: &str, id: &ArtifactId) -> PathBuf {
+        self.session_dir(session_key)
+            .join(format!("{}.summary.txt", id.as_str()))
+    }
+
+    /// Read a previously-cached flash summary for an artifact, if present.
+    /// Returns `None` when no sidecar exists (never an error — the summary is
+    /// an optional optimization).
+    pub fn read_summary(&self, session_key: &str, id: &ArtifactId) -> Option<String> {
+        let path = self.summary_path_for(session_key, id);
+        fs::read_to_string(path).ok().filter(|s| !s.trim().is_empty())
+    }
+
+    /// Cache a flash-generated summary next to its artifact. Best-effort:
+    /// failure is logged by the caller, never fatal (the summary is derived
+    /// data that can always be regenerated).
+    pub fn write_summary(&self, session_key: &str, id: &ArtifactId, summary: &str) -> Result<()> {
+        let dir = self.session_dir(session_key);
+        fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        let path = self.summary_path_for(session_key, id);
+        fs::write(&path, summary).with_context(|| format!("write summary {}", path.display()))?;
+        Ok(())
+    }
+
     /// Delete all artifacts for a session (called on session end).
     pub fn gc_session(&self, session_key: &str) -> io::Result<()> {
         let dir = self.session_dir(session_key);

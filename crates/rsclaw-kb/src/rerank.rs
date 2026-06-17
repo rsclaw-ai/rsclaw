@@ -75,6 +75,31 @@ impl KbReranker {
         }))
     }
 
+    /// Build a reranker against an explicit OpenAI/Jina-compatible endpoint
+    /// + model. For callers that resolve the endpoint themselves rather
+    /// than reading `kb.rerank` (e.g. the `web_search` deep pipeline).
+    pub fn remote(base_url: &str, model: impl Into<String>, top_n: usize) -> std::sync::Arc<Self> {
+        let base = base_url.trim().trim_end_matches('/');
+        std::sync::Arc::new(Self {
+            client: rsclaw_embed::FleetHttp::new(None),
+            url: format!("{base}/rerank"),
+            model: Some(model.into()),
+            top_n: top_n.clamp(2, 100),
+        })
+    }
+
+    /// The first-party fleet reranker (`rsclaw-reranker-v1` on the rsclaw
+    /// API). Default when the agent's primary model is the `rsclaw/`
+    /// protocol and no explicit `kb.rerank` endpoint is set — mirrors the
+    /// vision/flash rsclaw-protocol defaults.
+    pub fn rsclaw_default() -> std::sync::Arc<Self> {
+        Self::remote(
+            rsclaw_embed::RSCLAW_API_BASE_URL,
+            "rsclaw-reranker-v1",
+            DEFAULT_RERANK_TOP_N,
+        )
+    }
+
     /// Score `docs` against `query`. Returns one relevance score per input
     /// index (input order preserved); higher is more relevant. Errors
     /// bubble up so the caller can fall back to the fused order.

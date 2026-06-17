@@ -183,7 +183,20 @@ impl ExternalJobsWorker {
             }
             Ok(PollOutcome::Done(url)) => {
                 job.result_url = Some(url.clone());
-                match rsclaw_jobs::download_artifact(&self.client, &url, job.kind).await {
+                // rsclaw VIDEO artifacts are served inline behind Bearer at
+                // `/v1/videos/{id}/content` (no authless R2 presign), so they
+                // must be downloaded WITH the rsclaw key (following the LB hop).
+                // Everything else (agnes / openai / seedance public URLs, and
+                // the rsclaw_image signed url) is fetched authless.
+                let dl = if job.provider == "rsclaw" {
+                    let key = self
+                        .resolve_provider_key("rsclaw", "RSCLAW_API_KEY")
+                        .unwrap_or_default();
+                    rsclaw_jobs::download_artifact_authed(&url, &key, job.kind).await
+                } else {
+                    rsclaw_jobs::download_artifact(&self.client, &url, job.kind).await
+                };
+                match dl {
                     Ok(local_path) => {
                         job.result_path = Some(local_path);
                         job.status = ExternalJobStatus::Done;
@@ -340,8 +353,33 @@ impl ExternalJobsWorker {
                     .ok_or_else(|| anyhow!("agnes: no API key configured"))?;
                 rsclaw_jobs::poll_agnes(&self.client, &key, &job.external_task_id).await
             }
+            "openai" => {
+                let key = self
+                    .resolve_provider_key("openai", "OPENAI_API_KEY")
+                    .ok_or_else(|| anyhow!("openai: no API key configured"))?;
+                let base = self.resolve_provider_base_url("openai");
+                rsclaw_jobs::poll_openai_video(&self.client, &base, &key, &job.external_task_id)
+                    .await
+            }
+            // Async rsclaw image (image-edit / t2i-v2). external_task_id is the
+            // signed, authless poll URL; no provider key needed.
+            "rsclaw_image" => {
+                rsclaw_jobs::poll_rsclaw_image(&self.client, &job.external_task_id).await
+            }
             other => Err(anyhow!("no async polling adapter for provider: {other}")),
         }
+    }
+
+    /// Resolve a provider's configured `base_url`, falling back to the builtin
+    /// default for that provider (e.g. openai → https://api.openai.com/v1).
+    fn resolve_provider_base_url(&self, provider: &str) -> String {
+        self.config
+            .model
+            .models
+            .as_ref()
+            .and_then(|m| m.providers.get(provider))
+            .and_then(|p| p.base_url.clone())
+            .unwrap_or_else(|| rsclaw_provider::defaults::resolve_base_url(provider).0)
     }
 
     /// Resolve a single-bearer-token provider key from rsclaw.json5

@@ -77,6 +77,11 @@ pub struct AgentHandle {
     pub plugin_overrides: Arc<
         std::sync::RwLock<HashMap<String, HashMap<String, crate::runtime::PluginOverride>>>,
     >,
+    /// Loaded WASM plugins shared with queue-bypassing slash handlers.
+    pub wasm_plugins: Arc<std::sync::RwLock<Arc<Vec<rsclaw_plugin::WasmPlugin>>>>,
+    /// Outbound notification sender shared with queue-bypassing slash handlers.
+    pub notification_tx:
+        Arc<std::sync::RwLock<Option<tokio::sync::broadcast::Sender<rsclaw_channel::OutboundMessage>>>>,
     /// Per-session re-enabled cold tools: `session_key → {tool_name}`.
     /// Cold builtin tools (near-zero observed usage) are deferred behind the
     /// `request_tool` stub on non-rsclaw providers; calling the stub records
@@ -129,6 +134,38 @@ pub struct SessionTokens {
 }
 
 impl AgentHandle {
+    /// Replace the WASM plugin snapshot visible to slash handlers.
+    pub fn set_wasm_plugins(&self, plugins: Arc<Vec<rsclaw_plugin::WasmPlugin>>) {
+        if let Ok(mut g) = self.wasm_plugins.write() {
+            *g = plugins;
+        }
+    }
+
+    /// Return the current WASM plugin snapshot.
+    pub fn wasm_plugins_snapshot(&self) -> Arc<Vec<rsclaw_plugin::WasmPlugin>> {
+        self.wasm_plugins
+            .read()
+            .map(|g| Arc::clone(&g))
+            .unwrap_or_else(|_| Arc::new(Vec::new()))
+    }
+
+    /// Set the outbound notification sender visible to slash handlers.
+    pub fn set_notification_tx(
+        &self,
+        tx: tokio::sync::broadcast::Sender<rsclaw_channel::OutboundMessage>,
+    ) {
+        if let Ok(mut g) = self.notification_tx.write() {
+            *g = Some(tx);
+        }
+    }
+
+    /// Return the outbound notification sender, when the gateway has one.
+    pub fn notification_tx(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Sender<rsclaw_channel::OutboundMessage>> {
+        self.notification_tx.read().ok().and_then(|g| g.clone())
+    }
+
     /// Record context token stats for a conversation session.
     pub fn update_session_tokens(&self, session_key: &str, tokens: SessionTokens) {
         if let Ok(mut map) = self.session_tokens.write() {
@@ -741,6 +778,8 @@ impl AgentRegistry {
                     abort_flags: Arc::new(std::sync::RwLock::new(HashMap::new())),
                     cancel_tokens: Arc::new(std::sync::RwLock::new(HashMap::new())),
                     plugin_overrides: Arc::new(std::sync::RwLock::new(HashMap::new())),
+                    wasm_plugins: Arc::new(std::sync::RwLock::new(Arc::new(Vec::new()))),
+                    notification_tx: Arc::new(std::sync::RwLock::new(None)),
                     cold_enabled: Arc::new(std::sync::RwLock::new(HashMap::new())),
                     started_at: Instant::now(),
                     session_count: Arc::new(AtomicUsize::new(0)),

@@ -468,33 +468,41 @@ fn merge_defaults_toml(user_raw: &str, builtin_raw: &str) -> Option<String> {
         return None;
     }
 
-    let blocks = builtin_array_blocks(builtin_raw);
-    let mut merged = set_defaults_meta_version(user_raw, builtin_version);
-    let mut changed = merged != user_raw;
+    // Regenerate the file from the shipped catalog so every shipped entry
+    // carries the latest fields (decorative + functional), then preserve the
+    // user's *own* entries — those in their file but not shipped — by appending
+    // their original blocks verbatim. `builtin_raw` already carries the bumped
+    // `defaults_version`, so the rewritten file won't re-upgrade next launch.
+    // The caller backs the old file up first, so a user who hand-edited a
+    // shipped entry can recover from the `.bak.*` copy.
+    let user_blocks = builtin_array_blocks(user_raw);
+    let mut merged = builtin_raw.trim_end().to_owned();
 
-    for (table, names) in [
-        ("providers", names_for(&user.providers)),
-        ("channels", names_for(&user.channels)),
-        ("search_engines", names_for(&user.search_engines)),
+    for (table, user_entries) in [
+        ("providers", &user.providers),
+        ("channels", &user.channels),
+        ("search_engines", &user.search_engines),
     ] {
-        for entry in builtin_entries_for(&builtin, table) {
-            if names.contains(&entry.name) {
+        let shipped = names_for(builtin_entries_for(&builtin, table));
+        for entry in user_entries {
+            if shipped.contains(&entry.name) {
                 continue;
             }
-            if let Some(block) = blocks.get(&(table.to_owned(), entry.name.clone())) {
-                if !merged.ends_with('\n') {
-                    merged.push('\n');
-                }
+            if let Some(block) = user_blocks.get(&(table.to_owned(), entry.name.clone())) {
                 merged.push('\n');
-                merged.push_str("# Added by rsclaw defaults upgrade.\n");
+                merged.push('\n');
+                merged.push_str("# Preserved user-defined entry (kept across defaults upgrade).\n");
                 merged.push_str(block.trim_end());
                 merged.push('\n');
-                changed = true;
             }
         }
     }
 
-    changed.then_some(merged)
+    if !merged.ends_with('\n') {
+        merged.push('\n');
+    }
+
+    (merged != user_raw).then_some(merged)
 }
 
 fn defaults_version_is_legacy(user: &DefaultsIndex, builtin_version: &str) -> bool {
@@ -611,57 +619,6 @@ fn defaults_block_name(block: &str) -> Option<String> {
     })
 }
 
-fn set_defaults_meta_version(raw: &str, version: &str) -> String {
-    let version_line = format!("defaults_version = \"{version}\"");
-    let mut out = String::new();
-    let mut saw_meta = false;
-    let mut in_meta = false;
-    let mut wrote_version = false;
-
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if in_meta && trimmed.starts_with('[') {
-            if !wrote_version {
-                out.push_str(&version_line);
-                out.push('\n');
-                wrote_version = true;
-            }
-            in_meta = false;
-        }
-
-        if trimmed == "[meta]" {
-            saw_meta = true;
-            in_meta = true;
-        }
-
-        if in_meta && trimmed.starts_with("defaults_version") {
-            out.push_str(&version_line);
-            out.push('\n');
-            wrote_version = true;
-            continue;
-        }
-
-        out.push_str(line);
-        out.push('\n');
-    }
-
-    if saw_meta {
-        if in_meta && !wrote_version {
-            out.push_str(&version_line);
-            out.push('\n');
-        }
-    } else {
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push_str("\n[meta]\n");
-        out.push_str(&version_line);
-        out.push('\n');
-    }
-
-    out
-}
-
 /// Expand a leading `~/` in a path string to the user's home directory.
 /// Public alias used by `main.rs` for `--base-dir` resolution.
 pub fn expand_tilde_path_pub(p: &str) -> PathBuf {
@@ -728,12 +685,20 @@ mod tests {
     }
 
     #[test]
-    fn merge_defaults_adds_missing_builtin_entries_without_overwriting_user_entries() {
+    fn merge_defaults_refreshes_shipped_entries_and_keeps_user_added() {
         let user = r#"
+[meta]
+defaults_version = "2026.5.10"
+
 [[providers]]
 name = "openai"
 label = "My OpenAI"
 base_url = "https://proxy.example/v1"
+
+[[providers]]
+name = "mycorp"
+label = "MyCorp Internal"
+base_url = "https://llm.mycorp.internal/v1"
 
 [[channels]]
 name = "feishu"
@@ -760,11 +725,33 @@ label = "Feishu / Lark"
 
         let merged = merge_defaults_toml(user, builtin).expect("legacy user defaults should merge");
 
+        // Version is bumped to the shipped one.
         assert!(merged.contains("defaults_version = \"2026.5.20\""));
+        // Shipped entries are refreshed to the latest built-in definitions.
         assert!(merged.contains("name = \"rsclaw\""));
         assert!(merged.contains("base_url = \"https://api.rsclaw.ai/v1/agent\""));
-        assert!(merged.contains("label = \"My OpenAI\""));
-        assert!(merged.contains("base_url = \"https://proxy.example/v1\""));
-        assert!(!merged.contains("base_url = \"https://api.openai.com/v1\""));
+        assert!(merged.contains("base_url = \"https://api.openai.com/v1\""));
+        assert!(merged.contains("label = \"Feishu / Lark\""));
+        // A hand-edit to a *shipped* entry is overwritten (recoverable via .bak.*).
+        assert!(!merged.contains("My OpenAI"));
+        assert!(!merged.contains("https://proxy.example/v1"));
+        // A user-*added* entry (not shipped) is preserved verbatim.
+        assert!(merged.contains("name = \"mycorp\""));
+        assert!(merged.contains("MyCorp Internal"));
+        assert!(merged.contains("https://llm.mycorp.internal/v1"));
+    }
+
+    #[test]
+    fn merge_defaults_noop_when_user_version_current() {
+        let builtin = r#"
+[meta]
+defaults_version = "2026.5.20"
+
+[[providers]]
+name = "openai"
+label = "OpenAI"
+"#;
+        // Same version → not legacy → no rewrite.
+        assert!(merge_defaults_toml(builtin, builtin).is_none());
     }
 }
