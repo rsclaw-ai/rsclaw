@@ -276,9 +276,3 @@ xcap = "0.9"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["handleapi", "processthreadsapi", "winnt"] }
-
-# Local cap-rs override: carries the stream-json duplicate-assistant-snapshot
-# fix (OpenCode "OoposOopos" double reply). Drop this once the fix ships as a
-# published cap-rs release and the cap-rs dep is bumped to it.
-[patch.crates-io]
-cap-rs = { path = "../cap-protocol/crates/cap-rs" }
