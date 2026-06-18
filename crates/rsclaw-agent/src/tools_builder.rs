@@ -69,18 +69,35 @@ pub(crate) fn build_plugin_meta_tool_defs() -> Vec<ToolDef> {
 /// sorted by name. Output is capped at `cap`; the remainder is summarised with
 /// a pointer to plugin_search. Byte-stable for a given input (KV-cache
 /// hygiene in the per-machine layer). `tools` is (name, description) pairs.
-fn plugin_tool_list(tools: &[(&str, &str)], common: &[String], cap: usize) -> String {
+fn plugin_tool_list(
+    tools: &[(&str, &str)],
+    common: &[String],
+    headlines: &[&str],
+    cap: usize,
+) -> String {
     if tools.is_empty() {
         return "  (no declared tools)".to_owned();
+    }
+    // Headline tools are promoted to real `<plugin>__<tool>` ToolDefs
+    // (per-session `user_tools`) and are callable DIRECTLY. Listing them in the
+    // catalog would duplicate their description AND wrongly tell the model to
+    // reach them via plugin_invoke. The catalog is the discovery surface for
+    // the long tail that has NO ToolDef — so drop the headlines here.
+    let is_headline = |n: &str| headlines.contains(&n);
+    let visible: Vec<(&str, &str)> = tools.iter().copied().filter(|(n, _)| !is_headline(n)).collect();
+    if visible.is_empty() {
+        return "  (all common tools are exposed as direct `<plugin>__<tool>` calls; \
+                plugin_search for more)"
+            .to_owned();
     }
     let is_common = |n: &str| common.iter().any(|c| c == n);
     // Common first, in declared order (only those that actually exist).
     let mut ordered: Vec<(&str, &str)> = common
         .iter()
-        .filter_map(|c| tools.iter().find(|(n, _)| n == c).copied())
+        .filter_map(|c| visible.iter().find(|(n, _)| n == c).copied())
         .collect();
     // Then the rest, sorted by name.
-    let mut rest: Vec<(&str, &str)> = tools
+    let mut rest: Vec<(&str, &str)> = visible
         .iter()
         .filter(|(n, _)| !is_common(n))
         .copied()
@@ -121,9 +138,10 @@ fn render_plugin_catalog_block(
     summary_or_desc: &str,
     tools: &[(&str, &str)],
     common: &[String],
+    headlines: &[&str],
     cap: usize,
 ) -> String {
-    let list = plugin_tool_list(tools, common, cap);
+    let list = plugin_tool_list(tools, common, headlines, cap);
     // Omit the " — <blurb>" when neither summary nor description is set, so the
     // heading doesn't render a dangling em-dash.
     let heading = if summary_or_desc.is_empty() {
@@ -161,6 +179,14 @@ pub(crate) fn build_plugins_system(
                 .iter()
                 .map(|t| (t.name.as_str(), t.description.as_str()))
                 .collect();
+            // Headline tools are already exposed as direct ToolDefs — exclude
+            // them from the catalog so their description isn't loaded twice.
+            let headlines: Vec<&str> = p
+                .tools
+                .iter()
+                .filter(|t| t.headline)
+                .map(|t| t.name.as_str())
+                .collect();
             let blurb = p
                 .summary
                 .as_deref()
@@ -174,6 +200,7 @@ pub(crate) fn build_plugins_system(
                     blurb,
                     &tools,
                     &p.common_tools,
+                    &headlines,
                     8,
                 ),
             )
@@ -188,6 +215,12 @@ pub(crate) fn build_plugins_system(
                 .iter()
                 .map(|t| (t.name.as_str(), t.description.as_str()))
                 .collect();
+            let headlines: Vec<&str> = m
+                .tools
+                .iter()
+                .filter(|t| t.headline)
+                .map(|t| t.name.as_str())
+                .collect();
             let blurb = m
                 .summary
                 .as_deref()
@@ -201,6 +234,7 @@ pub(crate) fn build_plugins_system(
                     blurb,
                     &tools,
                     &m.common_tools,
+                    &headlines,
                     8,
                 ),
             ));
@@ -2378,7 +2412,7 @@ mod plugin_catalog_tests {
             ("alpha", "a"),
         ];
         let common = vec!["publish".to_string(), "list".to_string()];
-        let out = plugin_tool_list(&tools, &common, 3);
+        let out = plugin_tool_list(&tools, &common, &[], 3);
         // Common first, in commonTools order; then others by name; capped at 3.
         assert_eq!(
             out,
@@ -2387,26 +2421,26 @@ mod plugin_catalog_tests {
 
         // No common declared → first N by name + overflow.
         let none: Vec<String> = vec![];
-        let out2 = plugin_tool_list(&tools, &none, 2);
+        let out2 = plugin_tool_list(&tools, &none, &[], 2);
         assert_eq!(
             out2,
             "- alpha: a\n- list: List items\n- …2 more tools — plugin_search to find them"
         );
 
         // Empty.
-        assert_eq!(plugin_tool_list(&[], &none, 5), "  (no declared tools)");
+        assert_eq!(plugin_tool_list(&[], &none, &[], 5), "  (no declared tools)");
     }
 
     #[test]
     fn catalog_block_is_skill_md_shaped() {
         let tools = vec![("publish", "Publish a video")];
-        let block = render_plugin_catalog_block("douyin", "0.1.0", "Douyin ops", &tools, &[], 5);
+        let block = render_plugin_catalog_block("douyin", "0.1.0", "Douyin ops", &tools, &[], &[], 5);
         assert!(block.contains("### douyin — Douyin ops"));
         assert!(block.contains("- publish: Publish a video"));
         assert!(block.contains("plugin_search"));
 
         // Empty blurb → no dangling em-dash.
-        let bare = render_plugin_catalog_block("p", "1.0", "", &tools, &[], 5);
+        let bare = render_plugin_catalog_block("p", "1.0", "", &tools, &[], &[], 5);
         assert!(bare.contains("### p (v1.0)"));
         assert!(!bare.contains("—"));
     }
