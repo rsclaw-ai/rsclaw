@@ -93,6 +93,11 @@ pub fn load_json5(path: &Path) -> Result<Config> {
     //     so the startup code only reads `accounts` (no dual-path).
     migrate_channel_legacy_fields(&mut value);
 
+    // 3c. Migrate the few channels that historically read credentials from
+    //     env vars (whatsapp/line/zalo) into accounts.default.* too, so the
+    //     env-var-only configs keep working after the dual-path read removal.
+    migrate_channel_env_fallback(&mut value);
+
     // 4. Deserialize into the typed schema.
     let config: Config = serde_json::from_value(value)
         .with_context(|| format!("schema error in {}", path.display()))?;
@@ -786,6 +791,94 @@ fn migrate_channel_legacy_fields(root: &mut serde_json::Value) {
         }
 
         tracing::info!(channel = %ch_name, "migrated top-level fields to accounts.default");
+    }
+}
+
+/// Migrate env-var credentials into `accounts.default.<field>` for the three
+/// channels that historically read them directly (whatsapp/line/zalo).
+///
+/// `refactor: strip legacy dual-path credential reads` removed the per-channel
+/// `std::env::var(...)` fallbacks, so an install that supplied credentials ONLY
+/// via env vars would silently lose them after upgrade. This restores that path
+/// at config-load time, in the same shape the startup code now expects.
+///
+/// Semantics match the old `.or_else(env)` fallback:
+/// - config field always WINS — env only fills a field that `accounts` lacks;
+/// - only applies to a channel block that already EXISTS (i.e. the channel is
+///   configured/enabled), since a channel with no config was never started.
+fn migrate_channel_env_fallback(root: &mut serde_json::Value) {
+    /// (channel_name, [(env_var, account_field)])
+    const ENV_FIELDS: &[(&str, &[(&str, &str)])] = &[
+        (
+            "whatsapp",
+            &[
+                ("WHATSAPP_PHONE_NUMBER_ID", "phoneNumberId"),
+                ("WHATSAPP_ACCESS_TOKEN", "accessToken"),
+            ],
+        ),
+        ("line", &[("LINE_CHANNEL_ACCESS_TOKEN", "channelAccessToken")]),
+        ("zalo", &[("ZALO_ACCESS_TOKEN", "accessToken")]),
+    ];
+
+    let Some(channels_map) = root.get_mut("channels").and_then(|c| c.as_object_mut()) else {
+        return;
+    };
+
+    for &(ch_name, env_fields) in ENV_FIELDS {
+        // Only configured (present) channels — a channel with no block was
+        // never started, env vars or not.
+        let Some(ch_obj) = channels_map.get_mut(ch_name).and_then(|c| c.as_object_mut()) else {
+            continue;
+        };
+
+        // Already has a non-empty accounts value for any of these fields?
+        // Then config is authoritative; leave it alone.
+        let has_accounts_cred = ch_obj.get("accounts").and_then(|a| a.as_object()).is_some_and(|m| {
+            m.values().any(|v| {
+                v.as_object().is_some_and(|o| {
+                    env_fields
+                        .iter()
+                        .any(|(_, f)| o.get(*f).and_then(|s| s.as_str()).is_some_and(|s| !s.is_empty()))
+                })
+            })
+        });
+        if has_accounts_cred {
+            continue;
+        }
+
+        let from_env: Vec<(String, String)> = env_fields
+            .iter()
+            .filter_map(|(env, field)| {
+                std::env::var(env)
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| (field.to_string(), v))
+            })
+            .collect();
+        if from_env.is_empty() {
+            continue;
+        }
+
+        let accounts = ch_obj
+            .entry("accounts")
+            .or_insert_with(|| serde_json::json!({}));
+        let Some(accounts_map) = accounts.as_object_mut() else {
+            tracing::warn!(channel = %ch_name, "accounts field is not an object, skipping env migration");
+            continue;
+        };
+        let default_entry = accounts_map
+            .entry("default")
+            .or_insert_with(|| serde_json::json!({}));
+        let Some(entry_map) = default_entry.as_object_mut() else {
+            tracing::warn!(channel = %ch_name, "account entry is not an object, skipping env migration");
+            continue;
+        };
+        for (field, val) in from_env {
+            entry_map
+                .entry(field)
+                .or_insert_with(|| serde_json::Value::String(val));
+        }
+        tracing::info!(channel = %ch_name, "migrated env-var credentials to accounts.default");
     }
 }
 

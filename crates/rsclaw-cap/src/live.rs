@@ -756,11 +756,45 @@ async fn respawn_driver(
                 tracing::debug!(target: "cap", error = %e, "best-effort shutdown of dead driver");
             }
             *driver = fresh;
-            // Clear the stale agent session id from the dead driver.
-            // The respawned driver has a fresh session; the slot will be
-            // repopulated when it emits Ready.
-            if let Ok(mut g) = agent_sid_slot.lock() {
-                *g = None;
+            // Re-capture the fresh driver's native session id. The new driver
+            // emits a Ready (carrying its session id) during its init
+            // handshake, BEFORE it consumes the replayed prompt — so drain
+            // briefly for it here. The main loop's startup capture runs only
+            // once (before the loop) and never sees a respawn's Ready, so
+            // without this the slot would stay stale/None for the rest of the
+            // actor's life and get_agent_session_id / resume-by-id would break
+            // after any respawn. Bounded so a driver that never emits Ready
+            // can't stall the retry; on timeout the slot is left None.
+            {
+                use cap_rs::core::AgentEvent;
+                let mut captured: Option<String> = None;
+                let recapture_deadline =
+                    tokio::time::sleep(std::time::Duration::from_secs(8));
+                tokio::pin!(recapture_deadline);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut recapture_deadline => break,
+                        ev = driver.next_event() => match ev {
+                            Some(AgentEvent::Ready { session_id, .. }) => {
+                                captured = session_id;
+                                break;
+                            }
+                            Some(_) => continue,
+                            None => break,
+                        }
+                    }
+                }
+                if captured.is_none() {
+                    tracing::warn!(
+                        target: "cap",
+                        session_id = %sid,
+                        "no Ready captured after respawn; resume id unavailable until next bind"
+                    );
+                }
+                if let Ok(mut g) = agent_sid_slot.lock() {
+                    *g = captured;
+                }
             }
             tracing::info!(
                 target: "cap",
