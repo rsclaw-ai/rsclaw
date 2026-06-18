@@ -737,7 +737,7 @@ pub struct ModelConfig {
     /// tool names (the `toolset` preset becomes the fallback baseline,
     /// not an additive base). Use for hub-router agents and any setup
     /// where you want explicit control over what the model can call.
-    /// Examples: `["agent_spoke_aihub", "memory", "clarify"]`.
+    /// Examples: `["agent_spoke_aihub", "memory", "ask_user"]`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
     /// Per-agent always-on PIN list for plugin tools. Each entry is

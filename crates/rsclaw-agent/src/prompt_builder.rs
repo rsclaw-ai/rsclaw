@@ -436,7 +436,10 @@ fn build_shared_system_prefix_uncached() -> String {
          3. Execute: call the tool\n\
          4. Observe: check the result\n\
          5. Iterate: repeat until the task is complete, then reply to the user\n\
-         If a tool call fails, do NOT retry with the same arguments. Try a different approach or inform the user.\n\
+         If a tool call fails, do NOT retry with the same arguments — recover by error type: \
+         permission denied → check the Allowed list / pick another path; timeout → set wait=false or raise the timeout; \
+         rate limit → wait one turn; not found → re-read the source and retry with corrected params. \
+         If the last 2 tool calls returned no NEW information relevant to the question, STOP and reply with what you have.\n\
          \n\
          [ANTI-HALLUCINATION — HARD RULES]\n\
          1. DO NOT fabricate numbers, dates, temperatures, prices, names, URLs, or any concrete facts.\n\
@@ -647,10 +650,6 @@ independent subtasks yourself when they could run at once.\n\
 
     parts.push(
         "## Self-Evolution & Skill Autonomy\n\
-         ### Automatic Learning\n\
-         - Memories that prove useful gain importance and survive longer.\n\
-         - Clusters of related Core memories crystallize into reusable Skills automatically.\n\
-         - Periodic meditation deduplicates and cleans up stale memories.\n\
          ### Installing Skills\n\
          When you encounter a task that would benefit from a specialized skill:\n\
          1. Search: use shell to run `rsclaw skills search <query>`\n\
@@ -1037,7 +1036,7 @@ fn build_coding_mode_block() -> String {
         "",
         "**Discipline:**",
         "- Do not invent file paths, function names, or APIs. If unsure, \
-           `search_content` first or `clarify` with the user.",
+           `search_content` first or `ask_user` with the user.",
         "- When `edit_file` fails with \"not found\", re-read the file with \
            `read_file` — DO NOT retry the same `old_string`.",
         "- After a successful edit you do NOT need to re-read the file in the \

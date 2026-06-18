@@ -483,23 +483,6 @@ $synth.Speak('{}')
     // Clarify — ask the user a question before proceeding
     // -------------------------------------------------------------------
 
-    /// Present a clarifying question to the user.
-    pub(crate) async fn tool_clarify(&self, args: Value) -> Result<Value> {
-        let question = args["question"]
-            .as_str()
-            .ok_or_else(|| anyhow!("clarify: `question` required"))?;
-        let mut formatted = String::from(question);
-        if let Some(options) = args["options"].as_array() {
-            formatted.push('\n');
-            for (i, opt) in options.iter().enumerate() {
-                if let Some(s) = opt.as_str() {
-                    formatted.push_str(&format!("\n{}. {}", i + 1, s));
-                }
-            }
-        }
-        Ok(json!({"action": "clarify", "question": formatted, "waiting_for_user": true}))
-    }
-
     // -------------------------------------------------------------------
     // Gateway / pairing tools
     // -------------------------------------------------------------------

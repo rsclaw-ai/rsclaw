@@ -315,7 +315,7 @@ pub fn toolset_allowed_names(
         "web_search",
         "web_fetch",
         "memory",
-        "clarify",
+        "ask_user",
         "anycli",
         "skill_use",
         "plugin_list",
@@ -381,7 +381,7 @@ pub fn toolset_allowed_names(
         // Sub-agent dispatch — rsclaw-native task/spawn for non-coding sub-work
         "agent",
         // Disambiguation: ask the user when the task description is genuinely ambiguous
-        "clarify",
+        "ask_user",
         // Mark task done / send final report
         "task",
     ];
@@ -407,7 +407,7 @@ pub fn toolset_allowed_names(
         "channel",
         "cron",
         "computer_use",
-        "clarify",
+        "ask_user",
         "anycli",
         "skill_use",
         "skill_list",
@@ -419,14 +419,8 @@ pub fn toolset_allowed_names(
         "plugin_search",
         "plugin_describe",
         "plugin_invoke",
-        // Stock plugin aliases — dormant when no trusted plugin claims them.
-        "stock_quote",
-        "stock_kline",
-        "stock_snapshot",
-        "stock_ask",
-        "stock_query",
-        "stock_chart",
-        "stock_watchlist",
+        // Stock tools (stock_quote/kline/snapshot/ask/query/chart/watchlist) are
+        // provided entirely by the astock WASM plugin now — no core ToolDefs.
         "research_ingest_wechat",
         "research_analyze_charts",
     ];
@@ -917,162 +911,6 @@ pub fn build_tool_list(
     });
 
     // -----------------------------------------------------------------
-    // A-share market data. These first-class tool names are exposed only when
-    // a trusted stock WASM plugin claims the matching aliases.
-    // -----------------------------------------------------------------
-    tools.push(ToolDef {
-        name: "stock_quote".to_owned(),
-        description: "Real-time A-share quote(s). Pass `code` (string) for one \
-            quote, or `codes` (array) for a batch. Accepts codes in any common \
-            form (600519, sh600519, SH:600519, 600519.SH — normalized internally). \
-            Returns price, open/high/low, prior close, change %, volume, amount, \
-            and timestamp. Cached ~5s on the gateway side so the LLM can ask the \
-            same quote multiple times within a turn cheaply.".to_owned(),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "code": {"type": "string", "description": "Single stock code."},
-                "codes": {"type": "array", "items": {"type": "string"}, "description": "Multiple codes (batch)."},
-                "format": {"type": "string", "enum": ["summary", "raw"], "default": "summary",
-                           "description": "`summary` trims order-book levels (default); `raw` keeps bids/asks."}
-            },
-            "required": []
-        }),
-    });
-    tools.push(ToolDef {
-        name: "stock_kline".to_owned(),
-        description: "Historical K-line bars for one A-share code. Use for \
-            technical-analysis questions (\"近 60 日趋势\", \"创新高了吗\", \
-            \"突破均线没有\"). Defaults: 200 daily bars (`period=1d`), no \
-            adjustment. Set `adjust=qfq` for 前复权 / `hfq` for 后复权 when \
-            comparing across dividend events.".to_owned(),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "code": {"type": "string", "description": "Stock code (any common form)."},
-                "period": {"type": "string", "enum": ["1m","5m","15m","30m","1h","1d","1w","1mon"],
-                           "default": "1d", "description": "Bar granularity."},
-                "count": {"type": "integer", "default": 200, "minimum": 1, "maximum": 800,
-                          "description": "Number of bars to fetch."},
-                "offset": {"type": "integer", "default": 0,
-                           "description": "Skip N most-recent bars before counting."},
-                "adjust": {"type": "string", "enum": ["none","qfq","hfq"], "default": "none"}
-            },
-            "required": ["code"]
-        }),
-    });
-    tools.push(ToolDef {
-        name: "stock_snapshot".to_owned(),
-        description: "Full-market snapshot, sorted + capped. Use for broad market \
-            questions where you want a ranked list of A-shares: \"今天涨幅前 20\", \
-            \"沪市量比最高的票\", a watchlist refresh. The result is sorted by \
-            `sort_by` (default `amount`) and trimmed to `limit` rows (default \
-            50) so the LLM context stays bounded — the upstream service can \
-            return 5000+ rows on a busy day. Filter by `market` (SH/SZ/BJ) or an \
-            explicit `codes` list to narrow further. Set `ts=<date>` for a \
-            historical snapshot.\n\
-            \n\
-            Smart default: if you pass NO `codes`, NO `market`, and NO `ts`, \
-            the snapshot auto-filters to the caller's watchlist (see \
-            `stock_watchlist`). The result envelope's `used_watchlist: true` \
-            flag tells you whether that happened, so you can phrase the reply \
-            as \"你关注的 N 只...\" instead of \"全市场...\". Override with \
-            `use_watchlist=false` to force a market-wide snapshot.".to_owned(),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "ts": {"type": "string", "description": "Historical timestamp (YYYY-MM-DD or RFC3339); omit for live."},
-                "market": {"type": "string", "enum": ["SH","SZ","BJ"], "description": "Filter by exchange."},
-                "codes": {"type": "array", "items": {"type": "string"}, "description": "Explicit code allowlist."},
-                "adjust": {"type": "string", "enum": ["none","qfq","hfq"], "default": "none",
-                           "description": "Only valid with `ts`; live snapshots are always raw."},
-                "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 5000,
-                          "description": "Cap rows returned to the LLM."},
-                "sort_by": {"type": "string", "enum": ["amount","pct","price"], "default": "amount",
-                            "description": "Primary sort key."},
-                "order": {"type": "string", "enum": ["desc","asc"], "default": "desc"},
-                "use_watchlist": {"type": "boolean", "description": "When unset, defaults to the caller's watchlist if codes/market/ts are all empty. Pass false to force market-wide."}
-            },
-            "required": []
-        }),
-    });
-    tools.push(ToolDef {
-        name: "stock_ask".to_owned(),
-        description: "PREFERRED A-share entry point — natural-language query \
-            routed through the configured upstream question-understanding service. \
-            Use this whenever the user phrases a market question in \
-            human terms: \"今天涨停的科技股有哪些\", \"北向资金净流入前 20\", \
-            \"最近一周创业板连板高度榜\", \"机构调研最多的票\". Don't try to \
-            assemble snapshot filters or SQL by hand for this kind of question — \
-            iwencai handles the parsing and returns structured results that are \
-            usually richer than what we'd compute locally.\n\
-            \n\
-            Falls back gracefully on empty / unknown queries: returns \
-            `ok: false` with the upstream error so you can rephrase.".to_owned(),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Free-form A-share question in Chinese or English."},
-                "page": {"type": "integer", "description": "Result page (default 1)."},
-                "limit": {"type": "integer", "description": "Page size (upstream default applies if omitted)."},
-                "call_type": {"type": "string", "description": "Advanced iwencai hint; usually omit."}
-            },
-            "required": ["query"]
-        }),
-    });
-    tools.push(ToolDef {
-        name: "stock_chart".to_owned(),
-        description: "Render a K-line + volume chart PNG for the user and send \
-            it to the IM channel. DIFFERENT from `stock_kline` — that returns \
-            raw bars for YOU to analyse; this one delivers a picture to the \
-            USER's chat. Common pattern: call `stock_kline` first to read the \
-            recent trajectory, draft your written analysis, then call \
-            `stock_chart` so the user sees the picture beside your commentary.\n\
-            \n\
-            Defaults: 60 daily bars + MA5/10/20/60 overlays + volume subplot, \
-            红涨绿跌 color convention (NOT US green/red). Pass `name` if you \
-            know the Chinese stock name — it appears in the chart title.".to_owned(),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "code": {"type": "string", "description": "Stock code (any common form)."},
-                "name": {"type": "string", "description": "Chinese stock name to show in the title; optional."},
-                "period": {"type": "string", "enum": ["1m","5m","15m","30m","1h","1d","1w","1mon"], "default": "1d"},
-                "count": {"type": "integer", "default": 60, "minimum": 20, "maximum": 200},
-                "adjust": {"type": "string", "enum": ["none","qfq","hfq"], "default": "none"},
-                "ma": {"type": "array", "items": {"type": "integer"}, "default": [5,10,20,60],
-                       "description": "MA overlay periods; pass `[]` to disable."}
-            },
-            "required": ["code"]
-        }),
-    });
-    tools.push(ToolDef {
-        name: "stock_watchlist".to_owned(),
-        description: "Per-user persistent stock watchlist. Stored in rsclaw \
-            memory, scoped to (channel, peer) so each IM user has their own \
-            list across restarts. Use this when the user says \"加入关注\" / \
-            \"关注一下 600519\" / \"以后每天给我看茅台\" — adding to the \
-            watchlist lets downstream features (briefings, alerts, default \
-            snapshot filter) personalize automatically.\n\
-            \n\
-            Actions:\n\
-            - list — return all codes currently on the watchlist.\n\
-            - add — codes:[...] adds N codes; existing entries are skipped.\n\
-            - remove — codes:[...] removes by code.\n\
-            - clear — wipe the entire watchlist for this peer.\n\
-            \n\
-            Don't proactively add stocks the user merely asked about once — \
-            wait for explicit '关注/收藏/加入关注' intent.".to_owned(),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["list","add","remove","clear"], "default": "list"},
-                "code": {"type": "string", "description": "Single stock code (alternative to `codes`)."},
-                "codes": {"type": "array", "items": {"type": "string"}, "description": "Multiple stock codes."}
-            },
-            "required": []
-        }),
-    });
     tools.push(ToolDef {
         name: "research_analyze_charts".to_owned(),
         description: "Run a vision LLM over a batch of chart image URLs and \
@@ -1134,21 +972,6 @@ pub fn build_tool_list(
                                "description": "Optional extra tags (e.g. 板块名, 个股代码) to attach for later filtering."}
             },
             "required": ["url"]
-        }),
-    });
-    tools.push(ToolDef {
-        name: "stock_query".to_owned(),
-        description: "Read-only SQL through the stock plugin. ESCAPE HATCH only — \
-            use when `stock_ask` / `stock_snapshot` / `stock_kline` genuinely \
-            cannot express the query. The upstream service validates SQL server-side and \
-            rejects anything that isn't a single SELECT. Joining the live K-line \
-            tables and the EOD aggregates here is fine; we trust the validator.".to_owned(),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "sql": {"type": "string", "description": "A single read-only SELECT."}
-            },
-            "required": ["sql"]
         }),
     });
 
@@ -1400,8 +1223,7 @@ pub fn build_tool_list(
             - Returns file names, sizes, and types.\n\
             - Does not display hidden/dot files by default.\n\
             - Use 'pattern' to filter by glob (e.g. '*.json').\n\
-            - Use 'recursive' to list subdirectories.\n\
-            CRITICAL: 'path' must be returned before other parameters.".to_owned(),
+            - Use 'recursive' to list subdirectories.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -1417,8 +1239,7 @@ pub fn build_tool_list(
             - Supports wildcard patterns for flexible matching.\n\
             - Returns absolute file paths sorted by MOST-RECENTLY-MODIFIED first, so\n\
               recently-touched files (the usually-relevant ones) bubble to the top.\n\
-            - Prefer this over list_dir when you have a specific file pattern.\n\
-            CRITICAL: 'pattern' must be returned before other parameters.".to_owned(),
+            - Prefer this over list_dir when you have a specific file pattern.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -1442,8 +1263,7 @@ pub fn build_tool_list(
             - `output_mode`: 'content' (default; lines with matches), 'files_with_matches'\n\
               (file paths only — much cheaper for surveys), 'count' (per-file match count).\n\
             - `multiline: true` enables patterns that span lines (e.g. 'struct\\s+\\w+\\{[\\s\\S]*?field').\n\
-            - Use 'include' glob to filter by file type: '*.py', '*.rs', '*.{ts,tsx}'.\n\
-            CRITICAL: 'pattern' must be returned before other parameters.".to_owned(),
+            - Use 'include' glob to filter by file type: '*.py', '*.rs', '*.{ts,tsx}'.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -1543,7 +1363,13 @@ pub fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "web_browser".to_owned(),
-        description: format!("Control a web browser. Workflow: `open` URL → `snapshot` \
+        description: format!("Control a web browser. Every call needs `action`; quick \
+            reference of action → required params:\n\
+            open→url · snapshot→(interactive? annotate?) · click/hover/dblclick/focus/\
+            scrollintoview→ref · fill→ref+text · pick→ref+query · clickAt→x+y · \
+            drag→from+to · search→query · getbytext/getbyrole/getbylabel→text · \
+            scroll→(direction) · back/forward/reload/close→(none).\n\
+            Workflow: `open` URL → `snapshot` \
             (returns interactive element refs @e1, @e2…; `interactive: true` = actionable \
             elements only, saves tokens; add `annotate: true` for a labeled screenshot \
             alongside) → `click` ref=@e1 / `fill` ref=@e2 text='…' → re-snapshot after any \
@@ -1685,7 +1511,7 @@ pub fn build_tool_list(
             "properties": {
                 "prompt": {"type": "string", "description": "Image description, or for image-to-image the edit instruction (what to change/keep). Use the user's original language and wording, do not translate."},
                 "size":   {"type": "string", "description": "Image size, e.g. 2048x2048", "default": "2048x2048"},
-                "image":  {"type": ["string", "array"], "items": {"type": "string"}, "description": "Optional input image(s) for image-to-image / editing (agnes, doubao seedream, and OAI-compatible gateways). Each entry: a LOCAL FILE PATH (e.g. a prior image_gen result — auto-encoded to base64), a public https URL, or a data:image/...;base64,... URI. One image = edit/transform it; multiple = multi-image composition (agnes)."}
+                "image":  {"type": "string", "description": "Optional input image(s) for image-to-image / editing (agnes, doubao seedream, and OAI-compatible gateways). A single image as a string, OR a JSON array of strings for multi-image composition (agnes). Each entry: a LOCAL FILE PATH (e.g. a prior image_gen result — auto-encoded to base64), a public https URL, or a data:image/...;base64,... URI."}
             },
             "required": ["prompt"]
         }),
@@ -1719,7 +1545,7 @@ pub fn build_tool_list(
                 "prompt":       {"type": "string", "description": "Video description. Use the user's original language and wording."},
                 "duration":     {"type": "integer", "description": "Duration in seconds (default: 5)", "default": 5},
                 "aspect_ratio": {"type": "string", "description": "Aspect ratio: 16:9, 9:16, 1:1 (default: 16:9)", "default": "16:9"},
-                "image":        {"type": ["string", "array"], "items": {"type": "string"}, "description": "Optional reference image(s) for image-to-video (agnes, doubao, rsclaw). Each entry: a LOCAL FILE PATH (e.g. the path returned by image_gen — auto-encoded to base64), a public https URL, or a data:image/...;base64,... URI. ONE image = first frame (animate this image). TWO images = first + last frame (interpolate). THREE+ = reference images (doubao multimodal)."},
+                "image":        {"type": "string", "description": "Optional reference image(s) for image-to-video (agnes, doubao, rsclaw). A single image as a string, OR a JSON array: ONE image = first frame (animate this image), TWO = first + last frame (interpolate), THREE+ = reference images (doubao multimodal). Each entry: a LOCAL FILE PATH (e.g. the path returned by image_gen — auto-encoded to base64), a public https URL, or a data:image/...;base64,... URI."},
                 "video":        {"type": "string", "description": "Optional DRIVING video for video-to-video structure/motion transfer. A LOCAL FILE PATH (auto-encoded to base64), an https URL, or a data:video/...;base64,... URI. Passing this with model `rsclaw-video-v1` enables v2v — the server selects the v2v lane from the driving video; do NOT pass a separate model id for it."},
                 "model":        {"type": "string", "description": "Video model to use, e.g. doubao seedance, agnes, rsclaw / rsclaw-video-v1 (rsclaw also does v2v when a driving `video` is given), sora-2 (optional, uses configured default)"}
             },
@@ -1898,7 +1724,12 @@ pub fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "session".to_owned(),
-        description: "Manage sessions. Actions: send (message to another agent), list (all active sessions), history (retrieve conversation), status (session info).".to_owned(),
+        description: "Inspect and message agent-to-agent SESSIONS — the persistent \
+            conversation threads between agents (one per agent/peer pairing), NOT \
+            end-user IM delivery (that's `send_message`/`channel`). Use to talk to \
+            ANOTHER agent or review an existing thread. Actions: send (post a message \
+            into another agent's session), list (all active sessions), history \
+            (retrieve a session's conversation), status (one session's metadata).".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -2022,7 +1853,13 @@ pub fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "cap".to_owned(),
-        description: "Dispatch a coding task to a CLI coding agent. Pick one of five agents via `agent`.".to_owned(),
+        description: "Dispatch a coding task to a CLI coding agent (claude-code / \
+            openclaude / opencode / codex / cursor — pick via `agent`). \
+            FIRE-AND-FORGET: returns immediately with a task id; the agent runs in \
+            the background and its result is pushed to the user's IM channel when \
+            done. Do NOT wait for the result in this turn or re-call to poll — reply \
+            to the user that the task started, then stop. For an interactive \
+            multi-turn coding session instead, use `cap_live`.".to_owned(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -2104,23 +1941,6 @@ pub fn build_tool_list(
                 "format":  {"type": "string", "enum": ["json", "table", "csv", "markdown"], "description": "Output format (for run, default: json)"}
             },
             "required": ["action"]
-        }),
-    });
-    tools.push(ToolDef {
-        name: "clarify".to_owned(),
-        description: "Ask the user a clarifying question before proceeding. Use when:\n\
-            - The request is ambiguous and multiple valid interpretations exist\n\
-            - A choice is needed (e.g., which file, which format, which approach)\n\
-            - Destructive or irreversible action needs confirmation\n\
-            Provide options for quick selection or leave open-ended for free-form answers.\n\
-            IMPORTANT: Do NOT use this for simple confirmations. Only when genuine ambiguity exists.".to_owned(),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "question": {"type": "string", "description": "The question to ask the user"},
-                "options":  {"type": "array", "items": {"type": "string"}, "description": "Optional list of choices. Omit for open-ended questions."}
-            },
-            "required": ["question"]
         }),
     });
     tools.push(ToolDef {
