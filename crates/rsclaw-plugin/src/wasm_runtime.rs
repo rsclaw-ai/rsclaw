@@ -2746,19 +2746,28 @@ impl rsclaw::plugin::host_android::Host for HostState {
     async fn android_type(&mut self, text: String) -> HostTrapResult<Result<String, String>> {
         let serial = self.android_serial.clone();
         // Types into the currently FOCUSED field (caller taps to focus first).
-        // 1) u2 element/setValue — fast, only works on native a11y EditTexts.
+        // For non-ASCII (CJK), prefer ADBKeyboard: u2 element/setValue can
+        // "succeed" (HTTP 200) yet only commit a stray char on Flutter-backed
+        // EditTexts (e.g. the Xianyu chat input), so it must NOT run first for CJK.
+        if !text.is_ascii() {
+            match adbkb_type(serial.as_deref(), &text).await {
+                Ok(()) => return Ok(Ok("typed".to_string())),
+                Err(e) => {
+                    if u2_type_focused(serial.as_deref(), &text).await.is_ok() {
+                        return Ok(Ok("typed".to_string()));
+                    }
+                    return Ok(Err(format!("CJK input needs ADBKeyboard/u2: {e}")));
+                }
+            }
+        }
+        // ASCII: u2 element/setValue is fast on native EditTexts.
         if u2_type_focused(serial.as_deref(), &text).await.is_ok() {
             return Ok(Ok("typed".to_string()));
         }
-        // 2) ADBKeyboard broadcast — IME-level, works on Flutter inputs that
-        //    expose no a11y element (the common Xianyu case), for ANY text
-        //    incl. ASCII digits and CJK.
+        // ADBKeyboard broadcast — IME-level, works on Flutter inputs too.
         match adbkb_type(serial.as_deref(), &text).await {
             Ok(()) => return Ok(Ok("typed".to_string())),
             Err(e) => {
-                if !text.is_ascii() {
-                    return Ok(Err(format!("CJK input needs u2/ADBKeyboard: {e}")));
-                }
                 tracing::warn!("ADBKeyboard unavailable ({e}); falling back to adb input text");
             }
         }
