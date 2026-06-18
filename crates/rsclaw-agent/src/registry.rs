@@ -335,6 +335,21 @@ impl AgentHandle {
             option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev")
         )
     }
+
+    /// Render the `/model` (`/models`) reply: the effective model plus the
+    /// registered provider list. Single source of truth shared by the
+    /// gateway fast-preparse path and the agent-queue `__MODELS__` template,
+    /// so the two can never drift (they previously rendered "default" vs the
+    /// resolved name independently).
+    pub fn format_models(&self) -> String {
+        let mut lines = vec![format!("Current model: {}", self.effective_model)];
+        lines.push(String::new());
+        lines.push("Registered providers:".to_owned());
+        for name in self.providers.names() {
+            lines.push(format!("  {name}"));
+        }
+        lines.join("\n")
+    }
 }
 
 // `ImageAttachment` / `FileAttachment` lifted to `rsclaw-types` (crate-split);

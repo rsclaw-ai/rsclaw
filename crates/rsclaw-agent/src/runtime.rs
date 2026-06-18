@@ -3086,16 +3086,7 @@ impl AgentRuntime {
                         )
                     }
                     "__UPTIME__" => format_duration(self.started_at.elapsed()),
-                    "__MODELS__" => {
-                        let current = self.resolve_model_name();
-                        let mut lines = vec![format!("Current model: {current}")];
-                        lines.push(String::new());
-                        lines.push("Registered providers:".to_owned());
-                        for name in self.providers.names() {
-                            lines.push(format!("  {name}"));
-                        }
-                        lines.join("\n")
-                    }
+                    "__MODELS__" => self.handle.format_models(),
                     s if s.starts_with("__MODEL_SET__:") => {
                         let model = s.strip_prefix("__MODEL_SET__:").unwrap_or("");
                         // Runtime-only model switch (doesn't persist to config)
