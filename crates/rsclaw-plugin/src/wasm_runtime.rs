@@ -2121,11 +2121,19 @@ fn adbkb_ready() -> &'static Mutex<std::collections::HashSet<String>> {
 }
 
 /// Ensure ADBKeyboard is installed and selected as the active IME for `serial`.
+/// Self-healing: verifies the ACTUAL current IME rather than trusting the cache
+/// alone — the device IME can be changed out from under us (manual switch, another
+/// app), which previously left the cache stale and made CJK input silently no-op.
 async fn adbkb_ensure(serial: Option<&str>) -> Result<(), String> {
     let key = serial.unwrap_or("").to_string();
+    // Fast path: cached AND the device confirms ADBKeyboard is still active.
+    if adbkb_ready().lock().await.contains(&key)
+        && adb_run_str(serial, &["shell", "settings", "get", "secure", "default_input_method"])
+            .await
+            .map(|out| out.contains(ADBKB_IME))
+            .unwrap_or(false)
     {
-        let set = adbkb_ready().lock().await;
-        if set.contains(&key) { return Ok(()); }
+        return Ok(());
     }
     let pkgs = adb_run_str(serial, &["shell", "pm", "list", "packages"]).await?;
     if !pkgs.contains(ADBKB_PKG) {
