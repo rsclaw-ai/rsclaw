@@ -441,13 +441,11 @@
   list-style-type: lower-alpha;
 }
 
-/* GFM task lists (`- [ ]` / `- [x]`): drop the residual list bullet and pull
-   the checkbox into the gutter so it reads as a checklist, not a bulleted
-   list with a stray checkbox. */
-.markdown-body .task-list-item {
-  list-style-type: none;
-}
-
+/* GFM task lists: github-markdown-css already strips the bullet via
+   `.task-list-item { list-style: none }`, but its checkbox margin targets
+   `.task-list-item-checkbox` — a class react-markdown does NOT add to its
+   `<input type="checkbox">`. So keep this one rule to pull the actual rendered
+   checkbox into the gutter; everything else comes from github-markdown-css. */
 .markdown-body .task-list-item input[type="checkbox"] {
   margin: 0 0.35em 0.25em -1.4em;
   vertical-align: middle;
