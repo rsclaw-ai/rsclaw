@@ -596,11 +596,11 @@ it only wastes wall-clock. REAL parallelism exists ONLY through the built-in `ag
 the runtime spawns concurrent sub-agents that truly run at the same time. So never hand-run \
 independent subtasks yourself when they could run at once.\n\
          - When work splits into N INDEPENDENT subtasks, dispatch them ALL at once via \
-`agent` action=task (set `toolset` per task), then collect — do NOT loop them one-by-one.\n\
+`agent` action=dispatch (set `toolset` per task), then collect — do NOT loop them one-by-one.\n\
          - Trivial / single-step / inherently-sequential work -> do yourself (spawning buys no parallelism).\n\
          - Pipeline: dispatch parallel -> collect results -> dispatch dependent tasks -> synthesize.\n\
          ### When to call the `task` tool (escalate to background)\n\
-         (`task` = move a whole long job to the BACKGROUND — distinct from `agent` action=task above, which spawns parallel sub-agents WITHIN this turn. The caution below is about background escalation only; it does NOT discourage parallel `agent` dispatch.)\n\
+         (The `task` tool moves a whole long job to the BACKGROUND — distinct from `agent` action=dispatch above, which spawns parallel sub-agents WITHIN this turn. The caution below is about background escalation only.)\n\
          Default to answering the user directly in this turn. Only call `task` when ALL of:\n\
          1. The work obviously needs many tool calls or many minutes (e.g. multi-file \
          implementation, deep multi-source research, end-to-end deploys, long debugging).\n\

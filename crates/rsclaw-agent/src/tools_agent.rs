@@ -286,7 +286,7 @@ impl AgentRuntime {
             .send(msg)
             .await
             .map_err(|_| {
-                anyhow!("agent_task: task agent '{id}' exited before accepting the message (likely crashed on startup); retry agent action=task once — if it recurs, report to the user and check gateway logs")
+                anyhow!("agent_task: task agent '{id}' exited before accepting the message (likely crashed on startup); retry agent action=dispatch once — if it recurs, report to the user and check gateway logs")
             })?;
 
         // Spawn background worker to wait for reply, store result, then wake
@@ -313,7 +313,7 @@ impl AgentRuntime {
                 match tokio::time::timeout(Duration::from_secs(task_timeout), reply_rx).await {
                     Ok(Ok(reply)) => reply.text,
                     Ok(Err(_)) => format!(
-                        "[task {task_id} failed: sub-agent exited without replying (likely crashed mid-run); no result was produced. Retry with agent action=task, or do the work yourself and tell the user the sub-task failed.]"
+                        "[task {task_id} failed: sub-agent exited without replying (likely crashed mid-run); no result was produced. Retry with agent action=dispatch, or do the work yourself and tell the user the sub-task failed.]"
                     ),
                     Err(_) => format!(
                         "[task {task_id} timed out after {task_timeout}s — no result. Split it into smaller tasks, or ask the user to raise agents.defaults.timeout_seconds.]"
@@ -599,7 +599,10 @@ impl AgentRuntime {
         let action = args["action"].as_str().unwrap_or("list").trim();
         match action {
             "spawn" => self.tool_agent_spawn(args).await,
-            "task" => self.tool_agent_task(ctx, args).await,
+            // `dispatch` is the advertised action; `task` kept as a silent
+            // alias so sessions whose model still emits the old name (from a
+            // cached prefix) keep working.
+            "dispatch" | "task" => self.tool_agent_task(ctx, args).await,
             "send" => self.tool_agent_send(ctx, args).await,
             "list" => self.tool_agent_list().await,
             "update" => self.tool_agent_update(args).await,
@@ -613,7 +616,7 @@ impl AgentRuntime {
                     "note": "agent termination not yet implemented; agent will stop on next idle timeout"
                 }))
             }
-            _ => bail!("agent: unknown action '{action}' (spawn, task, send, list, update, kill)"),
+            _ => bail!("agent: unknown action '{action}' (spawn, dispatch, send, list, update, kill)"),
         }
     }
 }

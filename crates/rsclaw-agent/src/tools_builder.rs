@@ -1161,14 +1161,14 @@ pub fn build_tool_list(
     });
     tools.push(ToolDef {
         name: "agent".to_owned(),
-        description: "Manage internal sub-agents. Actions: task (one-shot job, returns \
+        description: "Manage internal sub-agents. Actions: dispatch (one-shot job, returns \
             task_id immediately, result delivered when done), spawn (persistent agent), \
             send (message an existing agent), list, update (model/name; model=\"\" resets), \
-            kill. Use task for independent parallelizable work; pick a `toolset` matching \
+            kill. Use dispatch for independent parallelizable work; pick a `toolset` matching \
             the job; after dispatching, tell the user and move on.\n\
             CRITICAL: when the user NAMES a CLI coding agent (claude/claudecode/openclaude/\
             opencode/codex), dispatch via `cap(agent=..., task=...)` — NOT this tool; \
-            action=task creates an internal sub-agent and will never spawn the external CLI. \
+            action=dispatch creates an internal sub-agent and will never spawn the external CLI. \
             Claiming \"已委托 X\" without an actual `cap` call in the same turn is deception.\n\
             Do NOT delegate GUI/desktop automation, `computer_use` work, or visual \
             verification — sub-agents start without the live screen state and loop on \
@@ -1183,12 +1183,12 @@ pub fn build_tool_list(
         parameters: json!({
             "type": "object",
             "properties": {
-                "action":  {"type": "string", "enum": ["spawn", "task", "send", "list", "update", "kill"], "description": "Action to perform"},
+                "action":  {"type": "string", "enum": ["spawn", "dispatch", "send", "list", "update", "kill"], "description": "Action to perform"},
                 "id":      {"type": "string", "description": "Agent ID (for spawn/send/update/kill)"},
-                "model":   {"type": "string", "description": "Model string (for spawn/task/update). Pass \"\" to remove per-agent model override."},
+                "model":   {"type": "string", "description": "Model string (for spawn/dispatch/update). Pass \"\" to remove per-agent model override."},
                 "name":    {"type": "string", "description": "Display name (for update)"},
-                "system":  {"type": "string", "description": "Role description (for spawn/task)"},
-                "message": {"type": "string", "description": "Message to send (for task/send)"},
+                "system":  {"type": "string", "description": "Role description (for spawn/dispatch)"},
+                "message": {"type": "string", "description": "Message to send (for dispatch/send)"},
                 "toolset": {"type": "string", "enum": ["minimal", "standard", "web", "code", "full"], "description": "Tool access level. Default: standard."}
             },
             "required": ["action"]
