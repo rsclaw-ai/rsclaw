@@ -2649,10 +2649,14 @@ async fn edit_channel_config(val: &mut serde_json::Value, ch: &ChannelDef) -> bo
                         edit_channel_policies(val, &ch.name, lang);
                         return true;
                     } else {
-                        ensure_json_path(val, &["channels"]);
-                        ensure_json_path(val, &["channels", &ch.name]);
+                        // Single account still lands under accounts.default —
+                        // the gateway listener reads only `accounts`, never the
+                        // legacy top-level shape. Writing top-level here would
+                        // rely on the load-time migration shim and leave the
+                        // file in the deprecated layout.
+                        ensure_json_path(val, &["channels", &ch.name, "accounts", "default"]);
                         for (k, v) in &fields {
-                            let path = format!("channels.{}.{}", ch.name, k);
+                            let path = format!("channels.{}.accounts.default.{}", ch.name, k);
                             let _ = set_nested_value(val, &path, serde_json::json!(v));
                         }
                         toggle_channel_enabled(val, &ch.name, true);
@@ -2721,7 +2725,7 @@ async fn edit_channel_config(val: &mut serde_json::Value, ch: &ChannelDef) -> bo
         }
     }
 
-    let is_configured = has_top;
+    let is_configured = has_top || has_accounts;
 
     println!();
     if is_configured {
@@ -2736,11 +2740,19 @@ async fn edit_channel_config(val: &mut serde_json::Value, ch: &ChannelDef) -> bo
         );
     }
 
-    let prefix = if ch.multi_account && !has_accounts && !has_top {
-        format!("channels.{}.accounts.default", ch.name)
-    } else {
-        format!("channels.{}", ch.name)
-    };
+    // Unified storage: a single account lives under accounts.default, matching
+    // what the gateway listener reads. Normalize any legacy top-level creds
+    // first so the edit form reads/writes the canonical location (and the file
+    // never keeps the deprecated top-level shape).
+    if has_top {
+        if has_accounts {
+            strip_top_fields(val, &ch.name, &ch.fields);
+        } else {
+            migrate_top_to_accounts(val, &ch.name, &ch.fields, "default");
+        }
+        changed = true;
+    }
+    let prefix = format!("channels.{}.accounts.default", ch.name);
     if edit_fields_at_prefix(val, &ch.fields, &prefix, lang) {
         changed = true;
     }

@@ -244,36 +244,46 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
                     "action",
                     &format!(
                         "set {} in your config",
-                        cyan("channels.telegram.botToken = \"${TELEGRAM_BOT_TOKEN}\"")
+                        cyan("channels.telegram.accounts.default.botToken = \"${TELEGRAM_BOT_TOKEN}\"")
                     ),
                 ),
                 "discord" => kv(
                     "action",
                     &format!(
                         "set {} in your config",
-                        cyan("channels.discord.token = \"${DISCORD_BOT_TOKEN}\"")
+                        cyan("channels.discord.accounts.default.token = \"${DISCORD_BOT_TOKEN}\"")
                     ),
                 ),
                 "slack" => kv(
                     "action",
                     &format!(
                         "set {} in your config",
-                        cyan("channels.slack.botToken and channels.slack.appToken")
+                        cyan("channels.slack.accounts.default.{botToken, appToken}")
                     ),
                 ),
                 "whatsapp" => kv(
                     "action",
-                    &format!("set {} in your config", cyan("channels.whatsapp.apiKey")),
+                    &format!(
+                        "set {} in your config",
+                        cyan("channels.whatsapp.accounts.default.{phoneNumberId, accessToken}")
+                    ),
                 ),
                 "signal" => kv(
                     "action",
-                    &format!("set {} in your config", cyan("channels.signal.phoneNumber")),
+                    &format!(
+                        "set {} in your config",
+                        cyan("channels.signal.accounts.default.phone")
+                    ),
                 ),
                 _ => kv("action", "set the required credentials in your config"),
             }
         }
         ChannelsCommand::Logout { channel } => {
             let (path, mut val) = load_config_json()?;
+            // Credentials now live under accounts.* — clear the whole subtree so
+            // the channel actually logs out. Also drop any legacy top-level keys
+            // for configs that predate the accounts migration.
+            remove_nested_value(&mut val, &format!("channels.{channel}.accounts"));
             for key in ["botToken", "token", "appToken", "apiKey"] {
                 let full = format!("channels.{channel}.{key}");
                 remove_nested_value(&mut val, &full);
