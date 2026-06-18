@@ -598,11 +598,8 @@ impl AgentRuntime {
         // tool_memory_consolidated for the diagnosis.
         let action = args["action"].as_str().unwrap_or("list").trim();
         match action {
-            "create" | "spawn" => self.tool_agent_spawn(args).await,
-            // `temp` is the advertised action (temp agent); `dispatch`
-            // and `task` kept as silent aliases so sessions whose model still
-            // emits the old name (from a cached prefix) keep working.
-            "temp" | "dispatch" | "task" => self.tool_agent_task(ctx, args).await,
+            "create" => self.tool_agent_spawn(args).await,
+            "temp" => self.tool_agent_task(ctx, args).await,
             "send" => self.tool_agent_send(ctx, args).await,
             "list" => self.tool_agent_list().await,
             "update" => self.tool_agent_update(args).await,
