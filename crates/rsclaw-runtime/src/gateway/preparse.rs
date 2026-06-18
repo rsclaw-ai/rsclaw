@@ -1117,12 +1117,10 @@ $g.Dispose();$b.Dispose()"#
     }
     // /model — show current model; /models — list providers; /model <name> — switch
     if lower == "/model" || lower == "/models" {
-        let model = handle
-            .config
-            .model
-            .as_ref()
-            .and_then(|m| m.primary_head())
-            .unwrap_or("default");
+        // Effective model resolved at handle construction (per-agent →
+        // agents.defaults → rsclaw fallback), so this shows the real model
+        // even when only agents.defaults.model is set.
+        let model = handle.effective_model.as_str();
         let mut lines = vec![format!("Current model: {model}")];
         lines.push(String::new());
         lines.push("Registered providers:".to_owned());
