@@ -645,6 +645,61 @@ impl rsclaw::plugin::host_browser::Host for HostState {
             .await)
     }
 
+    async fn browser_upload_multi(
+        &mut self,
+        ref_str: String,
+        filepaths: Vec<String>,
+    ) -> HostTrapResult<Result<String, String>> {
+        if filepaths.is_empty() {
+            return Ok(Err("browser_upload_multi: filepaths is empty".to_string()));
+        }
+        let mut canonical_files = Vec::with_capacity(filepaths.len());
+        for fp in &filepaths {
+            match canonicalize_browser_upload_path(&self.plugin_name, fp) {
+                Ok(path) => canonical_files.push(path.to_string_lossy().to_string()),
+                Err(e) => return Ok(Err(e)),
+            }
+        }
+        Ok(self
+            .browser_action(
+                "upload",
+                json!({
+                    "ref": ref_str,
+                    "files": canonical_files,
+                }),
+            )
+            .await)
+    }
+
+    async fn browser_upload_via_chooser(
+        &mut self,
+        filepaths: Vec<String>,
+        click_x: u32,
+        click_y: u32,
+    ) -> HostTrapResult<Result<String, String>> {
+        if filepaths.is_empty() {
+            return Ok(Err("browser_upload_via_chooser: filepaths is empty".to_string()));
+        }
+        // Canonicalize + sandbox-check every path (same policy as browser_upload).
+        let mut canonical_files = Vec::with_capacity(filepaths.len());
+        for fp in &filepaths {
+            match canonicalize_browser_upload_path(&self.plugin_name, fp) {
+                Ok(path) => canonical_files.push(path.to_string_lossy().to_string()),
+                Err(e) => return Ok(Err(e)),
+            }
+        }
+        Ok(self
+            .browser_action(
+                "upload_via_chooser",
+                json!({
+                    "files": canonical_files,
+                    "x": click_x,
+                    "y": click_y,
+                }),
+            )
+            .await)
+    }
+
     async fn browser_get_url(&mut self) -> HostTrapResult<Result<String, String>> {
         Ok(self.browser_action("get_url", json!({})).await)
     }

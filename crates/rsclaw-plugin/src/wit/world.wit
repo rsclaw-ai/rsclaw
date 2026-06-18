@@ -15,6 +15,17 @@ interface host-browser {
     browser-screenshot: func() -> result<string, string>;
     browser-download: func(ref-str: string, filename: string) -> result<string, string>;
     browser-upload: func(ref-str: string, filepath: string) -> result<string, string>;
+    /// Upload MULTIPLE files at once to a single (multiple-capable) file input
+    /// identified by data-ref. Equivalent to selecting several files in the OS
+    /// dialog: sets input.files to all paths and fires change once. Use for
+    /// galleries / multi-image uploaders backed by one `<input multiple>`.
+    browser-upload-multi: func(ref-str: string, filepaths: list<string>) -> result<string, string>;
+    /// Upload one or more files to an input opened via a native file-chooser
+    /// dialog (e.g. a button that triggers a transient or cross-origin-iframe
+    /// `<input type=file>`). Intercepts the chooser at the CDP level, clicks the
+    /// trigger at (click-x, click-y), then sets all files at once. Works across
+    /// iframes/origins where `browser-upload`'s main-document selector cannot.
+    browser-upload-via-chooser: func(filepaths: list<string>, click-x: u32, click-y: u32) -> result<string, string>;
     browser-get-url: func() -> result<string, string>;
 
     /// Wait for an element matching `css-selector` to be present in the DOM.
