@@ -36,46 +36,25 @@ pub(crate) fn start_wecom_if_configured(
         return;
     }
 
-    // Collect (account_name, bot_id, secret, ws_url) tuples.
+    // Collect (account_name, bot_id, secret, ws_url) tuples from
+    // accounts.<name>.{botId, secret, wsUrl?}
     let mut wc_accounts: Vec<(String, String, String, Option<String>)> = Vec::new();
-
-    // Legacy: single bot_id/secret at top level.
-    if let (Some(bot_id), Some(secret)) = (
-        wc_cfg.bot_id.as_deref().filter(|s| !s.is_empty()),
-        wc_cfg
-            .secret
-            .as_ref()
-            .and_then(|s| s.resolve_early())
-            .filter(|s| !s.is_empty()),
-    ) {
-        wc_accounts.push((
-            "default".to_owned(),
-            bot_id.to_owned(),
-            secret,
-            wc_cfg.ws_url.clone(),
-        ));
-    }
-
-    // Multi-account: channels.wecom.accounts.<name>.{botId, secret, wsUrl?}
     if let Some(accts) = &wc_cfg.accounts {
         for (name, acct) in accts {
             let bid = acct.get("botId").and_then(|v| v.as_str()).unwrap_or("");
             let sec = acct.get("secret").and_then(|v| v.as_str()).unwrap_or("");
             if !bid.is_empty() && !sec.is_empty() {
-                if !wc_accounts.iter().any(|(_, eid, _, _)| eid == bid) {
-                    let ws = acct
-                        .get("wsUrl")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_owned)
-                        .or_else(|| wc_cfg.ws_url.clone());
-                    wc_accounts.push((name.clone(), bid.to_owned(), sec.to_owned(), ws));
-                }
+                let ws = acct
+                    .get("wsUrl")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                wc_accounts.push((name.clone(), bid.to_owned(), sec.to_owned(), ws.or_else(|| wc_cfg.ws_url.clone())));
             }
         }
     }
 
     if wc_accounts.is_empty() {
-        warn!("wecom bot_id not set, channel disabled");
+        warn!("wecom.botId not set in accounts, channel disabled");
         return;
     }
 

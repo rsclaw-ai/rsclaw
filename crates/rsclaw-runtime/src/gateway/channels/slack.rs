@@ -35,50 +35,33 @@ pub(crate) fn start_slack_if_configured(
         return;
     }
 
-    // Collect (account_name, bot_token, app_token, api_base) tuples.
+    // Collect (account_name, bot_token, app_token, api_base) tuples from
+    // accounts.<name>.{botToken, appToken?, apiBase?}
     let mut sl_accounts: Vec<(String, String, Option<String>, Option<String>)> = Vec::new();
-
-    // Legacy: single bot_token at top level.
-    if let Some(bot_token) = sl_cfg.bot_token.as_ref().and_then(|t| t.as_plain()) {
-        let app_token = sl_cfg
-            .app_token
-            .as_ref()
-            .and_then(|t| t.as_plain())
-            .map(str::to_owned);
-        sl_accounts.push((
-            "default".to_owned(),
-            bot_token.to_owned(),
-            app_token,
-            sl_cfg.api_base.clone(),
-        ));
-    }
-
-    // Multi-account: channels.slack.accounts.<name>.{botToken, appToken?, apiBase?}
     if let Some(accts) = &sl_cfg.accounts {
         for (name, acct) in accts {
-            if let Some(bt) = acct.get("botToken").and_then(|v| v.as_str()) {
-                if !sl_accounts.iter().any(|(_, existing, _, _)| existing == bt) {
-                    let at = acct
-                        .get("appToken")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_owned);
-                    let ab = acct
-                        .get("apiBase")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_owned);
-                    sl_accounts.push((
-                        name.clone(),
-                        bt.to_owned(),
-                        at,
-                        ab.or_else(|| sl_cfg.api_base.clone()),
-                    ));
-                }
+            let bt = acct.get("botToken").and_then(|v| v.as_str()).unwrap_or("");
+            if !bt.is_empty() {
+                let at = acct
+                    .get("appToken")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                let ab = acct
+                    .get("apiBase")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                sl_accounts.push((
+                    name.clone(),
+                    bt.to_owned(),
+                    at,
+                    ab.or_else(|| sl_cfg.api_base.clone()),
+                ));
             }
         }
     }
 
     if sl_accounts.is_empty() {
-        warn!("slack bot_token not set");
+        warn!("slack.botToken not set in accounts, channel disabled");
         return;
     }
 

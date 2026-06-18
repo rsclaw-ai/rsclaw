@@ -7,7 +7,7 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use tokio::sync::{broadcast, mpsc};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::channels::{start_channels, start_custom_channels};
 use rsclaw_provider::build::build_providers;
@@ -1082,13 +1082,30 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
 
         let Ok(client) = client else { return };
 
-        let resp = client
-            .get("https://api.github.com/repos/rsclaw-ai/rsclaw/releases/latest")
-            .send()
-            .await;
+        // Primary: app.rsclaw.ai/api/version (array of release objects);
+        // fallback: GitHub releases list. Both go through the shared
+        // `parse_release_body` (array-or-object, v*-tag filtered) used by
+        // `rsclaw update`, so the gateway's passive check and the CLI
+        // updater agree on what "latest" means.
+        let sources = [
+            crate::cmd::update::RSCLAW_VERSION_URL,
+            "https://api.github.com/repos/rsclaw-ai/rsclaw/releases?per_page=10",
+        ];
+        let mut release: Option<serde_json::Value> = None;
+        for url in sources {
+            if let Ok(resp) = client.get(url).send().await {
+                if resp.status().is_success() {
+                    let body = resp.bytes().await.unwrap_or_default();
+                    if let Some(found) = crate::cmd::update::parse_release_body(&body) {
+                        release = Some(found);
+                        break;
+                    }
+                }
+            }
+        }
 
-        if let Ok(resp) = resp {
-            if let Ok(release) = resp.json::<serde_json::Value>().await {
+        if let Some(release) = release {
+            {
                 let latest_raw = release["tag_name"].as_str().unwrap_or("");
                 let current_raw = option_env!("RSCLAW_BUILD_VERSION").unwrap_or("dev");
                 // Extract bare version: "2026.4.1 (abc123)" -> "2026.4.1",
@@ -1126,6 +1143,77 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                     );
                 }
             }
+        }
+    });
+
+    // Background remote defaults.toml refresh (non-blocking).
+    //
+    // Fetches `https://app.rsclaw.ai/defaults.toml` and merges it into the
+    // on-disk file via the same version-gated merge as the embedded
+    // upgrade path (refresh shipped entries, preserve user-added, back up
+    // first). This lets new providers/channels/models ship WITHOUT a
+    // binary release. Throttled to once per 2h via a `$base_dir/.defaults_fetch`
+    // timestamp (persisted across restarts) so frequent reboots don't hammer
+    // the CDN. ANY failure — network, timeout, non-200, invalid TOML, or a
+    // remote that isn't newer — is a silent no-op: the local (embedded-merged)
+    // defaults.toml is always the fallback. Takes effect on the next config
+    // load / restart, never mutating the already-running config in place.
+    tokio::spawn(async {
+        const DEFAULTS_URL: &str = "https://app.rsclaw.ai/defaults.toml";
+        const THROTTLE: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
+
+        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+
+        let stamp = rsclaw_config::loader::base_dir().join(".defaults_fetch");
+        let now = std::time::SystemTime::now();
+        if let Ok(meta) = std::fs::metadata(&stamp) {
+            if let Ok(modified) = meta.modified() {
+                if now.duration_since(modified).unwrap_or(THROTTLE) < THROTTLE {
+                    debug!("remote defaults: throttled (checked < 2h ago)");
+                    return;
+                }
+            }
+        }
+
+        let Ok(client) = reqwest::Client::builder()
+            .user_agent("rsclaw/dev")
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+        else {
+            return;
+        };
+
+        match client.get(DEFAULTS_URL).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                // Touch the throttle stamp on a successful fetch so a
+                // transient outage retries on the next boot instead of
+                // being suppressed for 2h.
+                if let Err(e) = std::fs::write(&stamp, b"") {
+                    tracing::debug!(error = %e, "failed to write defaults fetch throttle stamp");
+                }
+                // Guard against an unexpectedly large response before
+                // downloading the full body.
+                if let Some(len) = resp.content_length() {
+                    if len > 1_048_576 {
+                        tracing::warn!(size = len, "remote defaults.toml too large, skipping");
+                        return;
+                    }
+                }
+                match resp.text().await {
+                    Ok(body) => match rsclaw_config::loader::merge_remote_defaults(&body) {
+                        Ok(true) => info!(
+                            "remote defaults.toml updated; takes effect on next restart"
+                        ),
+                        Ok(false) => debug!("remote defaults.toml not newer than local"),
+                        Err(e) => {
+                            debug!(error = %e, "remote defaults.toml invalid; keeping local")
+                        }
+                    },
+                    Err(e) => debug!(error = %e, "remote defaults.toml read failed; keeping local"),
+                }
+            }
+            Ok(resp) => debug!(status = %resp.status(), "remote defaults.toml fetch non-200"),
+            Err(e) => debug!(error = %e, "remote defaults.toml fetch failed; keeping local"),
         }
     });
 

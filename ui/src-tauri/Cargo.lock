@@ -3512,7 +3512,7 @@ dependencies = [
 
 [[package]]
 name = "rsclaw-ui"
-version = "2026.6.14"
+version = "2026.6.15"
 dependencies = [
  "auto-launch",
  "bytes",

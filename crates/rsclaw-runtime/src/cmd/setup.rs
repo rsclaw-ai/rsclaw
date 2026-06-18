@@ -2596,6 +2596,11 @@ async fn edit_channel_config(val: &mut serde_json::Value, ch: &ChannelDef) -> bo
         get_nested_value(val, &path)
             .and_then(|v| v.as_str())
             .is_some_and(|s| !s.is_empty())
+    }) || ch.multi_account && ch.fields.iter().any(|f| {
+        let path = format!("channels.{}.accounts.default.{}", ch.name, f.key);
+        get_nested_value(val, &path)
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty())
     });
 
     let lang = rsclaw_i18n::default_lang();
@@ -2633,14 +2638,26 @@ async fn edit_channel_config(val: &mut serde_json::Value, ch: &ChannelDef) -> bo
         match select_step(&format!("  {auth_prompt}"), &options_vec, default_idx) {
             StepResult::Next(0) => match run_channel_login(&ch.name).await {
                 Ok(fields) => {
-                    ensure_json_path(val, &["channels"]);
-                    ensure_json_path(val, &["channels", &ch.name]);
-                    for (k, v) in &fields {
-                        let path = format!("channels.{}.{}", ch.name, k);
-                        let _ = set_nested_value(val, &path, serde_json::json!(v));
+                    if ch.multi_account {
+                        ensure_json_path(val, &["channels", &ch.name, "accounts", "default"]);
+                        for (k, v) in &fields {
+                            let path = format!("channels.{}.accounts.default.{}", ch.name, k);
+                            let _ = set_nested_value(val, &path, serde_json::json!(v));
+                        }
+                        toggle_channel_enabled(val, &ch.name, true);
+                        edit_channel_multi_account(val, ch, lang);
+                        edit_channel_policies(val, &ch.name, lang);
+                        return true;
+                    } else {
+                        ensure_json_path(val, &["channels"]);
+                        ensure_json_path(val, &["channels", &ch.name]);
+                        for (k, v) in &fields {
+                            let path = format!("channels.{}.{}", ch.name, k);
+                            let _ = set_nested_value(val, &path, serde_json::json!(v));
+                        }
+                        toggle_channel_enabled(val, &ch.name, true);
+                        return true;
                     }
-                    toggle_channel_enabled(val, &ch.name, true);
-                    return true;
                 }
                 Err(e) => {
                     println!(
@@ -2719,7 +2736,12 @@ async fn edit_channel_config(val: &mut serde_json::Value, ch: &ChannelDef) -> bo
         );
     }
 
-    if edit_fields_at_prefix(val, &ch.fields, &format!("channels.{}", ch.name), lang) {
+    let prefix = if ch.multi_account && !has_accounts && !has_top {
+        format!("channels.{}.accounts.default", ch.name)
+    } else {
+        format!("channels.{}", ch.name)
+    };
+    if edit_fields_at_prefix(val, &ch.fields, &prefix, lang) {
         changed = true;
     }
 

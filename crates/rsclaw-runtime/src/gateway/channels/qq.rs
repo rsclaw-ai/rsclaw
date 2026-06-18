@@ -59,36 +59,21 @@ pub(crate) fn start_qq_if_configured(
         enforcers.insert("qq".to_owned(), Arc::clone(&enforcer));
     }
 
-    // Collect (account_name, app_id, app_secret) tuples.
+    // Collect (account_name, app_id, app_secret) tuples from
+    // accounts.<name>.{appId, appSecret}
     let mut qq_accounts: Vec<(String, String, String)> = Vec::new();
-
-    // Legacy: single appId/appSecret at top level.
-    if let (Some(id), Some(secret)) = (
-        qq_cfg.app_id.as_deref().filter(|s| !s.is_empty()),
-        qq_cfg
-            .app_secret
-            .as_ref()
-            .and_then(|s| s.as_plain())
-            .filter(|s| !s.is_empty()),
-    ) {
-        qq_accounts.push(("default".to_owned(), id.to_owned(), secret.to_owned()));
-    }
-
-    // Multi-account: channels.qq.accounts.<name>.{appId, appSecret}
     if let Some(accts) = &qq_cfg.accounts {
         for (name, acct) in accts {
             let id = acct.get("appId").and_then(|v| v.as_str()).unwrap_or("");
             let secret = acct.get("appSecret").and_then(|v| v.as_str()).unwrap_or("");
             if !id.is_empty() && !secret.is_empty() {
-                if !qq_accounts.iter().any(|(_, eid, _)| eid == id) {
-                    qq_accounts.push((name.clone(), id.to_owned(), secret.to_owned()));
-                }
+                qq_accounts.push((name.clone(), id.to_owned(), secret.to_owned()));
             }
         }
     }
 
     if qq_accounts.is_empty() {
-        warn!("qq appId not set, channel disabled");
+        warn!("qq.appId not set in accounts, channel disabled");
         return;
     }
 

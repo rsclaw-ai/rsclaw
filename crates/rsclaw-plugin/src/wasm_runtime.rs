@@ -1430,13 +1430,43 @@ async fn load_device_signing_key() -> Result<SigningKey, String> {
         }
         let key_bytes: [u8; 32] = rand::random();
         let encoded = general_purpose::STANDARD.encode(key_bytes);
-        std::fs::write(&path, encoded)
-            .map_err(|e| format!("host_device: write key failed: {e}"))?;
-        restrict_device_key_permissions(&path)?;
+        write_device_key_restricted(&path, &encoded)?;
         Ok(SigningKey::from_bytes(&key_bytes))
     })
     .await
     .map_err(|e| format!("host_device: key task failed: {e}"))?
+}
+
+/// Write the device key creating the file with `0o600` from the start, so
+/// the secret is never on disk under the default (world/group-readable)
+/// umask even briefly. A plain `fs::write` + later `chmod` leaves a
+/// TOCTOU window where a same-host attacker can read the key. On non-unix
+/// (no mode bits) fall back to a plain write; Windows protection relies on
+/// the per-user profile ACL.
+fn write_device_key_restricted(path: &std::path::Path, encoded: &str) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| format!("host_device: open key for write failed: {e}"))?;
+        f.write_all(encoded.as_bytes())
+            .map_err(|e| format!("host_device: write key failed: {e}"))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, encoded)
+            .map_err(|e| format!("host_device: write key failed: {e}"))?;
+    }
+    // Belt-and-suspenders: if the file pre-existed (concurrent create) the
+    // mode above is a no-op, so re-assert restrictive perms.
+    restrict_device_key_permissions(path)?;
+    Ok(())
 }
 
 fn restrict_device_key_permissions(path: &std::path::Path) -> Result<(), String> {
@@ -1882,6 +1912,17 @@ static ADB_UI_DUMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// dumps over a long session — failure to remove is silent (the next
 /// call uses a fresh path anyway).
 async fn adb_ui_xml(serial: Option<&str>, compressed: bool) -> Result<String, String> {
+    // Prefer the UIAutomator2 server: the built-in `uiautomator dump` blocks
+    // waiting for the UI to go idle and is KILLED on apps with continuous
+    // animation/content (Xianyu, Douyin, …). u2's /source dumps immediately.
+    // Fall back to the legacy dump if u2 can't be brought up (e.g. server APK
+    // not installed on the device).
+    match u2_ui_xml(serial).await {
+        Ok(xml) => return Ok(xml),
+        Err(e) => {
+            tracing::warn!("u2 source unavailable ({e}); falling back to uiautomator dump");
+        }
+    }
     let seq = ADB_UI_DUMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dest = format!("/sdcard/rsclaw_ui_dump_{}_{}.xml", std::process::id(), seq);
     let dump_args: &[&str] = if compressed {
@@ -1895,6 +1936,372 @@ async fn adb_ui_xml(serial: Option<&str>, compressed: bool) -> Result<String, St
     let xml = adb_run_str(serial, &["exec-out", "cat", &dest]).await?;
     let _ = adb_run_str(serial, &["shell", "rm", "-f", &dest]).await;
     Ok(xml)
+}
+
+// ---------------------------------------------------------------------------
+// UIAutomator2 server backend (host-android UI reads)
+// ---------------------------------------------------------------------------
+
+/// Device-side port the appium-uiautomator2 server listens on.
+const U2_DEVICE_PORT: u16 = 6790;
+
+struct U2Conn {
+    base: String,
+    /// A live u2 WebDriver session id (needed for /element/active + setValue).
+    /// `/source` is served session-less so reads don't require this.
+    session: Option<String>,
+    /// Held so the `am instrument` adb child isn't reaped (it keeps the
+    /// on-device server alive). Never awaited.
+    _instr: Option<tokio::process::Child>,
+}
+
+/// Per-serial u2 connection cache (process-global; HostState is per-call).
+fn u2_conns() -> &'static Mutex<std::collections::HashMap<String, U2Conn>> {
+    static M: OnceLock<Mutex<std::collections::HashMap<String, U2Conn>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Per-serial setup guards — prevents concurrent u2 setup of the SAME device
+/// while allowing different devices to set up in parallel.
+fn u2_setup_locks() -> &'static Mutex<HashMap<String, Arc<Mutex<()>>>> {
+    static M: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Clone the cached base URL for a serial, releasing the lock immediately.
+async fn u2_cached_base(key: &str) -> Option<String> {
+    u2_conns().lock().await.get(key).map(|c| c.base.clone())
+}
+
+/// Local forwarded port for a serial — distinct per device so multiple
+/// devices don't collide. Derived deterministically from the serial.
+fn u2_local_port(serial: Option<&str>) -> u16 {
+    match serial {
+        None => 6790,
+        Some(s) => {
+            let mut h: u32 = 2166136261;
+            for b in s.bytes() { h = (h ^ b as u32).wrapping_mul(16777619); }
+            6800 + (h % 600) as u16 // 6800..7400
+        }
+    }
+}
+
+/// Ensure the u2 server is running and forwarded; return its base URL.
+///
+/// The main connection cache lock is only held for brief map reads/writes,
+/// never across ADB commands, HTTP calls, or the readiness poll loop. A
+/// per-serial guard prevents concurrent setup of the same device while
+/// allowing different devices to set up in parallel.
+async fn u2_ensure(serial: Option<&str>) -> Result<String, String> {
+    let key = serial.unwrap_or("").to_string();
+
+    // Fast path: grab the cached base URL, release the lock, then verify
+    // liveness via HTTP without holding it.
+    if let Some(base) = u2_cached_base(&key).await {
+        if u2_status_ok(&base).await {
+            return Ok(base);
+        }
+        u2_conns().lock().await.remove(&key);
+    }
+
+    // Per-serial setup guard: only one task sets up a given device at a
+    // time, but different devices can set up concurrently.
+    let setup_guard = {
+        let mut locks = u2_setup_locks().lock().await;
+        locks
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    let _setup_guard = setup_guard.lock().await;
+
+    // Re-check cache: another task may have completed setup while we waited.
+    if let Some(base) = u2_cached_base(&key).await {
+        if u2_status_ok(&base).await {
+            return Ok(base);
+        }
+        u2_conns().lock().await.remove(&key);
+    }
+
+    // Require the server APKs (cls/appium install these; we don't bundle them).
+    let pkgs = adb_run_str(serial, &["shell", "pm", "list", "packages"]).await?;
+    if !pkgs.contains("io.appium.uiautomator2.server.test") {
+        return Err(
+            "appium-uiautomator2-server not installed on device (run `cls android uiauto setup` \
+             or appium first)"
+                .into(),
+        );
+    }
+
+    let local = u2_local_port(serial);
+    let base = format!("http://127.0.0.1:{local}");
+    let fwd = format!("tcp:{local}");
+    let dev = format!("tcp:{U2_DEVICE_PORT}");
+    adb_run_str(serial, &["forward", &fwd, &dev])
+        .await
+        .map_err(|e| format!("adb forward: {e}"))?;
+
+    // Already up (started by a previous run / cls / appium)? Reuse it.
+    if u2_status_ok(&base).await {
+        let session = u2_open_session(&base).await;
+        u2_conns()
+            .lock()
+            .await
+            .insert(key.clone(), U2Conn { base: base.clone(), session, _instr: None });
+        return Ok(base);
+    }
+
+    // Spawn the instrumentation server (long-lived; held in the cache).
+    // kill_on_drop ensures the process is terminated when a stale U2Conn is
+    // evicted from the cache, preventing orphaned instrumentation processes.
+    let mut cmd = tokio::process::Command::new("adb");
+    if let Some(s) = serial { cmd.arg("-s").arg(s); }
+    cmd.args([
+        "shell", "am", "instrument", "-w", "-e", "disableAnalytics", "true",
+        "io.appium.uiautomator2.server.test/androidx.test.runner.AndroidJUnitRunner",
+    ]);
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let child = cmd.spawn().map_err(|e| format!("spawn u2 instrument: {e}"))?;
+
+    // Poll /status up to ~30s.
+    let mut ok = false;
+    for _ in 0..60 {
+        if u2_status_ok(&base).await { ok = true; break; }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    if !ok {
+        return Err("u2 server did not become ready within 30s".into());
+    }
+    let session = u2_open_session(&base).await;
+    u2_conns()
+        .lock()
+        .await
+        .insert(key, U2Conn { base: base.clone(), session, _instr: Some(child) });
+    Ok(base)
+}
+
+/// Reuse an existing u2 session or create one. Returns None on failure
+/// (reads via /source still work; only focused-input needs a session).
+async fn u2_open_session(base: &str) -> Option<String> {
+    let client = host_http_client().ok()?;
+    // Reuse.
+    if let Ok(resp) = client.get(format!("{base}/sessions"))
+        .timeout(std::time::Duration::from_secs(5)).send().await
+        && let Ok(v) = resp.json::<Value>().await
+        && let Some(id) = v.get("value").and_then(|a| a.as_array()).and_then(|a| a.first())
+            .and_then(|s| s.get("sessionId").or_else(|| s.get("id"))).and_then(|x| x.as_str())
+        && !id.is_empty()
+    {
+        return Some(id.to_string());
+    }
+    // Create.
+    let caps = json!({"capabilities":{"alwaysMatch":{
+        "platformName":"Android","appium:automationName":"UiAutomator2","appium:noReset":true}}});
+    let resp = client.post(format!("{base}/session")).json(&caps)
+        .timeout(std::time::Duration::from_secs(20)).send().await.ok()?;
+    let v: Value = resp.json().await.ok()?;
+    v.pointer("/value/sessionId").or_else(|| v.get("sessionId"))
+        .and_then(|x| x.as_str()).map(String::from)
+}
+
+/// ADBKeyboard (com.android.adbkeyboard) IME package — injects arbitrary
+/// Unicode into the focused field via broadcast, IME-level, so it works even on
+/// Flutter-rendered inputs that expose NO accessibility element (where u2's
+/// element/setValue has nothing to target). This is the only reliable CJK path
+/// for such pages.
+const ADBKB_IME: &str = "com.android.adbkeyboard/.AdbIME";
+const ADBKB_PKG: &str = "com.android.adbkeyboard";
+
+/// Tracks which serials already have ADBKeyboard selected as the active IME.
+fn adbkb_ready() -> &'static Mutex<std::collections::HashSet<String>> {
+    static M: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Ensure ADBKeyboard is installed and selected as the active IME for `serial`.
+/// Self-healing: verifies the ACTUAL current IME rather than trusting the cache
+/// alone — the device IME can be changed out from under us (manual switch, another
+/// app), which previously left the cache stale and made CJK input silently no-op.
+async fn adbkb_ensure(serial: Option<&str>) -> Result<(), String> {
+    let key = serial.unwrap_or("").to_string();
+    // Fast path: cached AND the device confirms ADBKeyboard is still active.
+    if adbkb_ready().lock().await.contains(&key)
+        && adb_run_str(serial, &["shell", "settings", "get", "secure", "default_input_method"])
+            .await
+            .map(|out| out.contains(ADBKB_IME))
+            .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let pkgs = adb_run_str(serial, &["shell", "pm", "list", "packages"]).await?;
+    if !pkgs.contains(ADBKB_PKG) {
+        return Err("ADBKeyboard not installed (needed for CJK on Flutter inputs); \
+                    sideload https://github.com/senzhk/ADBKeyBoard ADBKeyboard.apk".into());
+    }
+    if let Err(e) = adb_run_str(serial, &["shell", "ime", "enable", ADBKB_IME]).await {
+        tracing::warn!(serial = ?serial, error = %e, "best-effort ime enable ADBKeyboard");
+    }
+    adb_run_str(serial, &["shell", "ime", "set", ADBKB_IME]).await
+        .map_err(|e| format!("ime set ADBKeyboard: {e}"))?;
+    // Let the IME switch settle.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    adbkb_ready().lock().await.insert(key);
+    Ok(())
+}
+
+/// Type `text` into the focused field via ADBKeyboard's base64 broadcast.
+async fn adbkb_type(serial: Option<&str>, text: &str) -> Result<(), String> {
+    adbkb_ensure(serial).await?;
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    adb_run_str(serial, &["shell", "am", "broadcast", "-a", "ADB_INPUT_B64", "--es", "msg", &b64])
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("ADBKeyboard broadcast: {e}"))
+}
+
+/// Percent-encode a string for safe use in a URL path segment. u2 session and
+/// element IDs come from the server's JSON responses and are typically
+/// alphanumeric, but encode defensively against any special characters.
+fn u2_url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Type `text` into the currently FOCUSED element via u2 (Unicode-capable —
+/// the device-side instrumentation handles CJK, unlike `adb shell input text`
+/// which is ASCII-only). Caller is expected to have already focused the field
+/// (e.g. by tapping it). Returns Err if u2 / a session isn't available.
+async fn u2_type_focused(serial: Option<&str>, text: &str) -> Result<(), String> {
+    let base = u2_ensure(serial).await?;
+    let sid = {
+        let map = u2_conns().lock().await;
+        map.get(serial.unwrap_or("")).and_then(|c| c.session.clone())
+            .ok_or("u2 session unavailable")?
+    };
+    let client = host_http_client()?;
+    // Focused element.
+    let resp = client.get(format!("{base}/session/{}/element/active", u2_url_encode(&sid)))
+        .timeout(std::time::Duration::from_secs(8)).send().await
+        .map_err(|e| format!("u2 active element: {e}"))?;
+    let v: Value = resp.json().await.map_err(|e| format!("u2 active body: {e}"))?;
+    let aid = v.get("value").and_then(|x| x.get("ELEMENT").or_else(|| x.get("element-6066-11e4-a52e-4f735466cecf")))
+        .and_then(|x| x.as_str())
+        .ok_or("no focused element (tap the field first)")?
+        .to_string();
+    let body = json!({ "text": text, "value": [text] });
+    let resp = client.post(format!(
+        "{base}/session/{}/element/{}/value",
+        u2_url_encode(&sid),
+        u2_url_encode(&aid),
+    ))
+        .json(&body).timeout(std::time::Duration::from_secs(10)).send().await
+        .map_err(|e| format!("u2 setValue: {e}"))?;
+    if resp.status().is_success() { Ok(()) }
+    else { Err(format!("u2 setValue http {}", resp.status())) }
+}
+
+async fn u2_status_ok(base: &str) -> bool {
+    let Ok(client) = host_http_client() else { return false };
+    match client
+        .get(format!("{base}/status"))
+        .timeout(std::time::Duration::from_secs(4))
+        .send()
+        .await
+    {
+        Ok(r) => r.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+/// Fetch the current UI hierarchy from u2 and normalize it to the legacy
+/// `<node ...>` tag shape the rest of the host (and plugins) parse.
+async fn u2_ui_xml(serial: Option<&str>) -> Result<String, String> {
+    let base = u2_ensure(serial).await?;
+    // The sessionless `GET /source` errors on this server build; the page
+    // source must be fetched under a live session (esp. for Flutter pages
+    // whose semantics tree only materializes within a session).
+    let sid = {
+        let map = u2_conns().lock().await;
+        map.get(serial.unwrap_or("")).and_then(|c| c.session.clone())
+    };
+    let path = match &sid {
+        Some(s) => format!("{base}/session/{}/source", u2_url_encode(s)),
+        None => format!("{base}/source"),
+    };
+    let client = host_http_client()?;
+    let resp = client
+        .get(&path)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("u2 /source: {e}"))?;
+    let body = resp.text().await.map_err(|e| format!("u2 /source body: {e}"))?;
+    // u2 returns {"value":"<xml>"} (or sometimes raw XML).
+    let xml = serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|v| v.get("value").and_then(|x| x.as_str()).map(String::from))
+        .unwrap_or(body);
+    Ok(u2_normalize_xml(&xml))
+}
+
+/// u2 emits one element per class-named tag (`<android.widget.TextView .../>`)
+/// whereas the built-in dump uses `<node class="…" …>`. The host/plugin
+/// parsers key on `<node `, so rewrite every element tag name — both open
+/// and closing — to `node` (attributes on open tags, including the existing
+/// `class="…"`, are preserved).
+fn u2_normalize_xml(xml: &str) -> String {
+    let mut out = String::with_capacity(xml.len() + 64);
+    let mut chars = xml.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '<' {
+            if let Some(&(_, n)) = chars.peek() {
+                if n.is_ascii_alphabetic() {
+                    // Element open tag — consume the tag name, emit `node`.
+                    let mut name = String::new();
+                    while let Some(&(_, ch)) = chars.peek() {
+                        if ch.is_whitespace() || ch == '>' || ch == '/' { break; }
+                        name.push(ch);
+                        chars.next();
+                    }
+                    let _ = (i, name);
+                    out.push_str("<node");
+                    continue;
+                } else if n == '/' {
+                    // Possible closing tag — consume '/' and peek further.
+                    chars.next();
+                    if let Some(&(_, m)) = chars.peek()
+                        && m.is_ascii_alphabetic()
+                    {
+                        let mut name = String::new();
+                        while let Some(&(_, ch)) = chars.peek() {
+                            if ch.is_whitespace() || ch == '>' { break; }
+                            name.push(ch);
+                            chars.next();
+                        }
+                        let _ = (i, name);
+                        out.push_str("</node");
+                        continue;
+                    }
+                    // Not an element close; emit consumed chars as-is.
+                    out.push_str("</");
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Decode XML character references (e.g. `&#10;` → newline) found in
@@ -2345,17 +2752,40 @@ impl rsclaw::plugin::host_android::Host for HostState {
     }
 
     async fn android_type(&mut self, text: String) -> HostTrapResult<Result<String, String>> {
-        // adb shell input text runs through the device shell. See
-        // `ADB_INPUT_REFUSED_CHARS` for the rejection list — includes
-        // `\n` / `\r` / `\0` so a malicious payload can't smuggle a
-        // second command past `input text`.
+        let serial = self.android_serial.clone();
+        // Types into the currently FOCUSED field (caller taps to focus first).
+        // For non-ASCII (CJK), prefer ADBKeyboard: u2 element/setValue can
+        // "succeed" (HTTP 200) yet only commit a stray char on Flutter-backed
+        // EditTexts (e.g. the Xianyu chat input), so it must NOT run first for CJK.
+        if !text.is_ascii() {
+            match adbkb_type(serial.as_deref(), &text).await {
+                Ok(()) => return Ok(Ok("typed".to_string())),
+                Err(e) => {
+                    if u2_type_focused(serial.as_deref(), &text).await.is_ok() {
+                        return Ok(Ok("typed".to_string()));
+                    }
+                    return Ok(Err(format!("CJK input needs ADBKeyboard/u2: {e}")));
+                }
+            }
+        }
+        // ASCII: u2 element/setValue is fast on native EditTexts.
+        if u2_type_focused(serial.as_deref(), &text).await.is_ok() {
+            return Ok(Ok("typed".to_string()));
+        }
+        // ADBKeyboard broadcast — IME-level, works on Flutter inputs too.
+        match adbkb_type(serial.as_deref(), &text).await {
+            Ok(()) => return Ok(Ok("typed".to_string())),
+            Err(e) => {
+                tracing::warn!("ADBKeyboard unavailable ({e}); falling back to adb input text");
+            }
+        }
+        // 3) adb input text — ASCII only, last resort.
         if let Some(bad) = text.chars().find(|c| ADB_INPUT_REFUSED_CHARS.contains(c)) {
             return Ok(Err(format!(
                 "android_type: refusing text with shell metachar '{}' (strip and retry)",
                 bad.escape_debug()
             )));
         }
-        let serial = self.android_serial.clone();
         let escaped = text.replace(' ', "%s");
         Ok(
             adb_run_str(serial.as_deref(), &["shell", "input", "text", &escaped])
@@ -2419,6 +2849,17 @@ impl rsclaw::plugin::host_android::Host for HostState {
     }
 
     async fn android_press(&mut self, key: String) -> HostTrapResult<Result<String, String>> {
+        // Pseudo-key (not a keyevent): make ADBKeyboard the active IME. Needed to
+        // prime the IME BEFORE a long-press→全选 text-replace on Flutter inputs —
+        // switching IME after a selection drops it, so the plugin primes first,
+        // selects, then types (adbkb_ensure caches, so the later type won't
+        // re-switch and clobber the selection).
+        if matches!(key.to_lowercase().as_str(), "ime-adbkb" | "ime_adbkb") {
+            let serial = self.android_serial.clone();
+            return Ok(adbkb_ensure(serial.as_deref())
+                .await
+                .map(|_| "ime adbkb".to_string()));
+        }
         let kc = match key.to_lowercase().as_str() {
             "back" => "KEYCODE_BACK",
             "home" => "KEYCODE_HOME",
@@ -2426,6 +2867,9 @@ impl rsclaw::plugin::host_android::Host for HostState {
             "enter" | "return" => "KEYCODE_ENTER",
             "tab" => "KEYCODE_TAB",
             "delete" | "del" => "KEYCODE_DEL",
+            "forward-del" | "forward_del" => "KEYCODE_FORWARD_DEL",
+            "move-end" | "move_end" => "KEYCODE_MOVE_END",
+            "move-home" | "move_home" => "KEYCODE_MOVE_HOME",
             "space" => "KEYCODE_SPACE",
             "escape" | "esc" => "KEYCODE_ESCAPE",
             "search" => "KEYCODE_SEARCH",
@@ -2613,12 +3057,9 @@ impl rsclaw::plugin::host_android::Host for HostState {
         selector_value: String,
         text: String,
     ) -> HostTrapResult<Result<String, String>> {
-        if let Some(bad) = text.chars().find(|c| ADB_INPUT_REFUSED_CHARS.contains(c)) {
-            return Ok(Err(format!(
-                "android_set_element_text: refusing text with shell metachar '{}'",
-                bad.escape_debug()
-            )));
-        }
+        // NB: no early metachar rejection here — the u2 path (below) sets text
+        // via instrumentation, not the shell, so CJK/punctuation are fine. The
+        // adb fallback re-checks metachars before it runs.
         let serial = self.android_serial.clone();
         // Find element and get center coords.
         let xml = match adb_ui_xml(serial.as_deref(), false).await {
@@ -2649,6 +3090,28 @@ impl rsclaw::plugin::host_android::Host for HostState {
         }
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
+        // The field is now focused. CJK → ADBKeyboard (works on Flutter too);
+        // else u2 element/setValue; else adb input text (ASCII).
+        if !text.is_ascii() {
+            match adbkb_type(serial.as_deref(), &text).await {
+                Ok(()) => return Ok(Ok("set".to_string())),
+                Err(e) => {
+                    if let Ok(()) = u2_type_focused(serial.as_deref(), &text).await {
+                        return Ok(Ok("set".to_string()));
+                    }
+                    return Ok(Err(format!("CJK input failed: {e}")));
+                }
+            }
+        }
+        if u2_type_focused(serial.as_deref(), &text).await.is_ok() {
+            return Ok(Ok("set".to_string()));
+        }
+        if let Some(bad) = text.chars().find(|c| ADB_INPUT_REFUSED_CHARS.contains(c)) {
+            return Ok(Err(format!(
+                "android_set_element_text: refusing text with shell metachar '{}'",
+                bad.escape_debug()
+            )));
+        }
         let escaped = text.replace(' ', "%s");
         Ok(
             adb_run_str(serial.as_deref(), &["shell", "input", "text", &escaped])

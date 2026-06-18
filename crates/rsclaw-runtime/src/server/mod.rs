@@ -206,10 +206,17 @@ pub use rsclaw_events::AgentEvent;
 
 #[derive(Debug, Deserialize)]
 pub struct SendMessageRequest {
+    // Aliases let the `rsclaw agent-turn` CLI (which posts to /api/v1/agent/turn
+    // with camelCase field names) share this handler. Extra agent-turn fields
+    // (deliver/thinking/local/timeout/replyTo/…) are ignored.
+    #[serde(alias = "message")]
     pub text: String,
+    #[serde(alias = "sessionId")]
     pub session_key: Option<String>,
+    #[serde(alias = "agent")]
     pub agent_id: Option<String>,
     pub channel: Option<String>,
+    #[serde(alias = "to")]
     pub peer_id: Option<String>,
     #[serde(default)]
     pub stream: bool,
@@ -266,6 +273,8 @@ struct PatchAgentRequest {
 pub fn build_router(state: AppState) -> Router {
     let mut api = Router::new()
         .route("/message", post(send_message))
+        // `rsclaw agent-turn` CLI alias — same handler, camelCase field aliases.
+        .route("/agent/turn", post(send_message))
         .route("/sessions", get(list_sessions))
         .route("/sessions/{id}", get(get_session).delete(delete_session))
         .route("/sessions/{id}/messages", get(get_session_messages))
@@ -917,6 +926,8 @@ async fn list_acp_connections(State(state): State<AppState>) -> impl IntoRespons
 ///     File-path PNG/JPEG/WEBP are slurped + base64-encoded into a data URI
 ///     here so the channel sender only deals with URI / URL forms.
 ///   - `replyTo` (optional): channel-native reply-anchor id
+///   - `account` (optional): account name to send from; bare `{channel}` if
+///     absent
 async fn message_send(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
@@ -925,6 +936,10 @@ async fn message_send(
     let text = body["message"].as_str().unwrap_or("");
     let channel = body["channel"].as_str().unwrap_or("");
     let media = body["media"].as_str().unwrap_or("");
+    let account = body["account"]
+        .as_str()
+        .map(str::to_owned)
+        .filter(|s| !s.is_empty());
 
     if target.is_empty() || channel.is_empty() || (text.is_empty() && media.is_empty()) {
         return (
@@ -957,7 +972,7 @@ async fn message_send(
         images,
         files: vec![],
         channel: Some(channel.to_string()),
-        account: None,
+        account,
     };
 
     match state.notification_tx.send(out) {
@@ -1127,6 +1142,10 @@ async fn message_broadcast(
         .as_array()
         .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
         .unwrap_or_default();
+    let account = body["account"]
+        .as_str()
+        .map(str::to_owned)
+        .filter(|s| !s.is_empty());
 
     if text.is_empty() || channel.is_empty() || targets.is_empty() {
         return (
@@ -1148,7 +1167,7 @@ async fn message_broadcast(
             images: vec![],
             files: vec![],
             channel: Some(channel.to_string()),
-            account: None,
+            account: account.clone(),
         };
         match state.notification_tx.send(out) {
             Ok(_) => sent += 1,

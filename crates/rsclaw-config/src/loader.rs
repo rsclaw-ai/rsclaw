@@ -89,6 +89,10 @@ pub fn load_json5(path: &Path) -> Result<Config> {
     // 3. Resolve $include directives recursively.
     resolve_includes(&mut value, base_dir, 0)?;
 
+    // 3b. Migrate legacy top-level credential fields → accounts.default.*
+    //     so the startup code only reads `accounts` (no dual-path).
+    migrate_channel_legacy_fields(&mut value);
+
     // 4. Deserialize into the typed schema.
     let config: Config = serde_json::from_value(value)
         .with_context(|| format!("schema error in {}", path.display()))?;
@@ -428,6 +432,54 @@ fn ensure_defaults_toml_up_to_date(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Merge a remotely-fetched `defaults.toml` into the on-disk file.
+///
+/// Reuses the same version-gated merge as the embedded upgrade path:
+/// `remote_raw` is treated as the "shipped" source, so it only takes
+/// effect when its `defaults_version` is newer than the user's current
+/// file — shipped entries are refreshed, user-added entries preserved,
+/// and the old file backed up first. No HTTP here: the caller (gateway
+/// startup) fetches the bytes and hands them in, so a fetch failure never
+/// reaches this function — the on-disk/local file is simply left intact.
+///
+/// Returns `Ok(true)` when the file was updated, `Ok(false)` when the
+/// remote was not newer (no-op), and `Err` only when the remote payload
+/// is not valid `defaults.toml` (unparseable / missing `defaults_version`)
+/// or the write fails — callers should treat `Err` as "keep local".
+pub fn merge_remote_defaults(remote_raw: &str) -> Result<bool> {
+    // Validate the remote is a well-formed defaults.toml carrying a
+    // version BEFORE touching the local file, so a corrupt/HTML error
+    // page served at the URL can't clobber anything.
+    let remote: DefaultsIndex =
+        toml::from_str(remote_raw).context("remote defaults.toml is not valid TOML")?;
+    if remote
+        .meta
+        .as_ref()
+        .and_then(|m| m.defaults_version.as_deref())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .is_none()
+    {
+        anyhow::bail!("remote defaults.toml has no defaults_version");
+    }
+
+    let path = base_dir().join("defaults.toml");
+    let local = std::fs::read_to_string(&path)
+        .unwrap_or_else(|_| embedded_defaults_toml().to_owned());
+
+    let Some(merged) = merge_defaults_toml(&local, remote_raw) else {
+        return Ok(false);
+    };
+
+    if path.exists() {
+        backup_defaults_before_upgrade(&path);
+    }
+    std::fs::write(&path, merged)
+        .with_context(|| format!("failed to write remote defaults.toml: {}", path.display()))?;
+    tracing::info!(path = %path.display(), "applied remote defaults.toml update");
+    Ok(true)
+}
+
 fn backup_defaults_before_upgrade(path: &Path) {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -636,6 +688,108 @@ fn expand_tilde_path(p: &str) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// Legacy channel field migration
+// ---------------------------------------------------------------------------
+
+/// Migrate top-level credential fields in each channel config to
+/// `accounts.default.<field>` format.
+///
+/// Before v0.6, channels were configured with flat top-level fields:
+///   `channels.feishu.appId`, `channels.wechat.botToken`, etc.
+/// Startup code then read both the top-level field AND `accounts.<name>`,
+/// deduplicating entries. This migration moves top-level credentials into
+/// `accounts.default.*` so startup code can read only `accounts`.
+///
+/// Operates at the raw JSON Value level (before typed deserialization)
+/// so the Config struct never sees the old format after migration.
+fn migrate_channel_legacy_fields(root: &mut serde_json::Value) {
+    /// (channel_name, [legacy_field1, legacy_field2, ...])
+    const LEGACY_FIELDS: &[(&str, &[&str])] = &[
+        ("telegram", &["botToken", "tokenFile"]),
+        ("discord", &["token"]),
+        ("slack", &["botToken", "appToken"]),
+        ("signal", &["phone"]),
+        ("wechat", &["botToken"]),
+        ("feishu", &["appId", "appSecret", "brand"]),
+        ("dingtalk", &["appKey", "appSecret", "robotCode"]),
+        ("qq", &["appId", "appSecret"]),
+        ("wecom", &["botId", "secret", "wsUrl"]),
+        ("line", &["channelAccessToken"]),
+        ("zalo", &["accessToken"]),
+        ("matrix", &["homeserver", "accessToken", "userId"]),
+    ];
+
+    let Some(channels) = root.get_mut("channels") else { return };
+    let Some(channels_map) = channels.as_object_mut() else { return };
+
+    for &(ch_name, fields) in LEGACY_FIELDS {
+        let Some(ch) = channels_map.get_mut(ch_name) else { continue };
+        let Some(ch_obj) = ch.as_object_mut() else { continue };
+
+        // Does this channel have any legacy top-level credential fields set?
+        let has_legacy = fields.iter().any(|f| {
+            ch_obj.get(*f).and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty())
+        });
+        if !has_legacy {
+            continue;
+        }
+
+        // Does it already have `accounts` with at least one non-empty entry?
+        let has_accounts = ch_obj.get("accounts").and_then(|a| a.as_object()).is_some_and(|m| {
+            m.values().any(|v| v.as_object().is_some_and(|o| {
+                fields.iter().any(|f| o.get(*f).and_then(|s| s.as_str()).is_some_and(|s| !s.is_empty()))
+            }))
+        });
+        if has_accounts {
+            // Accounts already configured — remove top-level fields to avoid
+            // confusion (the accounts path is canonical).
+            for f in fields {
+                ch_obj.remove(*f);
+            }
+            continue;
+        }
+
+        // No accounts yet — migrate top-level fields into accounts.default.
+        // Collect values upfront to avoid double-borrow on ch_obj.
+        let mut migrated: Vec<(String, serde_json::Value)> = Vec::new();
+        for f in fields {
+            if let Some(val) = ch_obj.remove(*f) {
+                if val.is_string() && val.as_str().is_some_and(|s| !s.is_empty()) {
+                    migrated.push((f.to_string(), val));
+                }
+            }
+        }
+        if !migrated.is_empty() {
+            let default_acct = ch_obj
+                .entry("accounts")
+                .or_insert_with(|| serde_json::json!({}));
+            let default_map = match default_acct.as_object_mut() {
+                Some(m) => m,
+                None => {
+                    tracing::warn!(channel = %ch_name, "accounts field is not an object, skipping migration");
+                    continue;
+                }
+            };
+            let default_entry = default_map
+                .entry("default")
+                .or_insert_with(|| serde_json::json!({}));
+            let entry_map = match default_entry.as_object_mut() {
+                Some(m) => m,
+                None => {
+                    tracing::warn!(channel = %ch_name, "account entry is not an object, skipping migration");
+                    continue;
+                }
+            };
+            for (key, val) in migrated {
+                entry_map.insert(key, val);
+            }
+        }
+
+        tracing::info!(channel = %ch_name, "migrated top-level fields to accounts.default");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -753,5 +907,19 @@ label = "OpenAI"
 "#;
         // Same version → not legacy → no rewrite.
         assert!(merge_defaults_toml(builtin, builtin).is_none());
+    }
+
+    #[test]
+    fn merge_remote_defaults_rejects_invalid_payload() {
+        // An HTML error page / garbage served at the URL must not be
+        // treated as defaults — bail BEFORE touching the local file.
+        let err = merge_remote_defaults("<html>404 Not Found</html>")
+            .expect_err("non-TOML remote must error");
+        assert!(err.to_string().contains("not valid TOML"));
+
+        // Valid TOML but no version → can't version-gate → reject.
+        let err = merge_remote_defaults("[[providers]]\nname = \"x\"\n")
+            .expect_err("versionless remote must error");
+        assert!(err.to_string().contains("no defaults_version"));
     }
 }

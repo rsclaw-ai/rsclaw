@@ -1276,6 +1276,7 @@ pub struct CustomChannelConfig {
 pub struct LineConfig {
     #[serde(flatten)]
     pub base: ChannelBase,
+    #[deprecated(note = "use `accounts.<name>.channelAccessToken` instead")]
     pub channel_access_token: Option<SecretOrString>,
     pub channel_secret: Option<SecretOrString>,
     /// REST API base URL override (for testing). Defaults to https://api.line.me/v2/bot
@@ -1290,6 +1291,7 @@ pub struct LineConfig {
 pub struct ZaloConfig {
     #[serde(flatten)]
     pub base: ChannelBase,
+    #[deprecated(note = "use `accounts.<name>.accessToken` instead")]
     pub access_token: Option<SecretOrString>,
     pub oa_secret: Option<SecretOrString>,
     /// REST API base URL override (for testing). Defaults to https://openapi.zalo.me/v3.0/oa
@@ -1304,8 +1306,11 @@ pub struct ZaloConfig {
 pub struct MatrixConfig {
     #[serde(flatten)]
     pub base: ChannelBase,
+    #[deprecated(note = "use `accounts.<name>.homeserver` instead")]
     pub homeserver: Option<String>,
+    #[deprecated(note = "use `accounts.<name>.accessToken` instead")]
     pub access_token: Option<SecretOrString>,
+    #[deprecated(note = "use `accounts.<name>.userId` instead")]
     pub user_id: Option<String>,
     pub device_id: Option<String>,
     pub recovery_key: Option<SecretOrString>,
@@ -1319,7 +1324,9 @@ pub struct MatrixConfig {
 pub struct QQBotConfig {
     #[serde(flatten)]
     pub base: ChannelBase,
+    #[deprecated(note = "use `accounts.<name>.appId` instead")]
     pub app_id: Option<String>,
+    #[deprecated(note = "use `accounts.<name>.appSecret` instead")]
     pub app_secret: Option<SecretOrString>,
     /// Use sandbox API endpoint (default: false).
     pub sandbox: Option<bool>,
@@ -1341,6 +1348,7 @@ pub struct WeChatPersonalConfig {
     pub base: ChannelBase,
     /// Saved bot_token from QR login (auto-populated after `channels login
     /// --channel wechat`)
+    #[deprecated(note = "use `accounts.<name>.botToken` instead")]
     pub bot_token: Option<SecretOrString>,
     /// Override the ilink API base URL (default: https://ilinkai.weixin.qq.com).
     /// Useful for testing with a mock server.
@@ -1391,7 +1399,9 @@ pub struct HealthMonitorConfig {
 pub struct TelegramConfig {
     #[serde(flatten)]
     pub base: ChannelBase,
+    #[deprecated(note = "use `accounts.<name>.botToken` instead")]
     pub bot_token: Option<SecretOrString>,
+    #[deprecated(note = "use `accounts.<name>.botToken` instead")]
     pub token_file: Option<String>,
     pub history_limit: Option<u32>,
     pub reply_to_mode: Option<ReplyToMode>,
@@ -1422,6 +1432,7 @@ pub struct TelegramConfig {
 pub struct DiscordConfig {
     #[serde(flatten)]
     pub base: ChannelBase,
+    #[deprecated(note = "use `accounts.<name>.token` instead")]
     pub token: Option<SecretOrString>,
     pub media_max_mb: Option<u32>,
     pub allow_bots: Option<bool>,
@@ -1448,7 +1459,9 @@ pub struct DiscordConfig {
 pub struct SlackConfig {
     #[serde(flatten)]
     pub base: ChannelBase,
+    #[deprecated(note = "use `accounts.<name>.botToken` instead")]
     pub bot_token: Option<SecretOrString>,
+    #[deprecated(note = "use `accounts.<name>.appToken` instead")]
     pub app_token: Option<SecretOrString>,
     /// Override the Slack API base URL (default: https://slack.com/api).
     /// Useful for pointing at a mock server during testing.
@@ -1488,6 +1501,7 @@ pub struct WhatsAppConfig {
 pub struct SignalConfig {
     #[serde(flatten)]
     pub base: ChannelBase,
+    #[deprecated(note = "use `accounts.<name>.phone` instead")]
     pub phone: Option<String>,
     pub text_chunk_limit: Option<usize>,
     pub retry: Option<RetryConfig>,
@@ -1556,12 +1570,15 @@ pub struct GoogleChatConfig {
 pub struct FeishuConfig {
     #[serde(flatten)]
     pub base: ChannelBase,
+    #[deprecated(note = "use `accounts.<name>.appId` instead")]
     pub app_id: Option<String>,
+    #[deprecated(note = "use `accounts.<name>.appSecret` instead")]
     pub app_secret: Option<SecretOrString>,
     pub verification_token: Option<SecretOrString>,
     pub encrypt_key: Option<SecretOrString>,
     pub streaming: Option<StreamingMode>,
     /// "feishu" (default, China) or "lark" (international)
+    #[deprecated(note = "use `accounts.<name>.brand` instead")]
     pub brand: Option<String>,
     /// REST API base URL override (for testing). Defaults to https://open.feishu.cn/open-apis
     pub api_base: Option<String>,
@@ -1579,8 +1596,11 @@ pub struct FeishuConfig {
 pub struct DingTalkConfig {
     #[serde(flatten)]
     pub base: ChannelBase,
+    #[deprecated(note = "use `accounts.<name>.appKey` instead")]
     pub app_key: Option<String>,
+    #[deprecated(note = "use `accounts.<name>.appSecret` instead")]
     pub app_secret: Option<SecretOrString>,
+    #[deprecated(note = "use `accounts.<name>.robotCode` instead")]
     pub robot_code: Option<String>,
     pub streaming: Option<StreamingMode>,
     /// API base URL override (for testing). Defaults to https://api.dingtalk.com
@@ -1598,14 +1618,17 @@ pub struct WeComConfig {
     #[serde(flatten)]
     pub base: ChannelBase,
     /// Bot ID (企业微信后台显示)
+    #[deprecated(note = "use `accounts.<name>.botId` instead")]
     pub bot_id: Option<String>,
     /// Bot secret (企业微信后台显示)
+    #[deprecated(note = "use `accounts.<name>.secret` instead")]
     pub secret: Option<SecretOrString>,
     pub token: Option<SecretOrString>,
     pub encoding_aes_key: Option<SecretOrString>,
     pub streaming: Option<StreamingMode>,
     /// WebSocket URL override (defaults to wss://openws.work.weixin.qq.com)
     #[serde(alias = "wsUrl")]
+    #[deprecated(note = "use `accounts.<name>.wsUrl` instead")]
     pub ws_url: Option<String>,
     pub accounts: Option<HashMap<String, Value>>,
 }

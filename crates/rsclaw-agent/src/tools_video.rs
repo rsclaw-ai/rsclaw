@@ -80,6 +80,13 @@ impl super::runtime::AgentRuntime {
             }
         }
 
+        // Optional driving video for v2v (model rsclaw-video-v1 — the server
+        // picks the v2v lane from the driving video; there is no separate
+        // "-ref" model) — local path / data-URI / http URL all accepted (local
+        // files normalised to a data-URI, same as the reference images).
+        let video_assets = normalize_gen_assets(&args["video"]).await;
+        let video_ref = video_assets.first().map(|s| s.as_str());
+
         // Resolve the configured video chain (head + optional fallbacks)
         // from `agents.defaults.model.video` or the per-agent handle
         // override. StringOrVec collapses single string + array into the
@@ -301,7 +308,7 @@ impl super::runtime::AgentRuntime {
                         aspect_ratio,
                         Some(model_id.as_str()),
                         &images,
-                        args["video"].as_str().filter(|s| s.starts_with("http")),
+                        video_ref,
                     )
                     .await
                     .map(|id| ("rsclaw", id)),
@@ -373,6 +380,7 @@ impl super::runtime::AgentRuntime {
                 },
                 is_group: !ctx.chat_id.is_empty() && ctx.chat_id != ctx.peer_id,
                 reply_to: None,
+                account: ctx.account.clone(),
             },
             rsclaw_types::ExternalJobOrigin::Agent,
             provider_key,
@@ -411,11 +419,13 @@ impl super::runtime::AgentRuntime {
         let Some(image_url) = images.first() else {
             return Ok(json!({ "error": "avatar_gen: a character `image` is required (local path, https URL, or data URI)" }));
         };
-        // Driving video (animate lane). Large files → http(s) URL only per
-        // the doc (data-URI not accepted), so pass it through verbatim.
-        let drive_video = args["video"].as_str().filter(|s| s.starts_with("http"));
+        // Driving video (animate lane) — local path / data-URI / http URL all
+        // accepted (normalised to a data-URI for local files, same as image/
+        // audio).
+        let drive = normalize_gen_assets(&args["video"]).await;
+        let drive_video = drive.first();
         if audio.first().is_none() && drive_video.is_none() {
-            return Ok(json!({ "error": "avatar_gen: provide a driving signal — either `audio` (speech → lip-sync) or `video` (a driving video URL → motion transfer)" }));
+            return Ok(json!({ "error": "avatar_gen: provide a driving signal — either `audio` (speech → lip-sync) or `video` (a driving video → motion transfer)" }));
         }
         let mut body = json!({
             "input_reference": { "image_url": image_url },
@@ -510,6 +520,7 @@ impl super::runtime::AgentRuntime {
                 },
                 is_group: !ctx.chat_id.is_empty() && ctx.chat_id != ctx.peer_id,
                 reply_to: None,
+                account: ctx.account.clone(),
             },
             rsclaw_types::ExternalJobOrigin::Agent,
             "rsclaw",
@@ -656,12 +667,26 @@ async fn submit_rsclaw_video(
     images: &[String],
     video_ref: Option<&str>,
 ) -> Result<String> {
+    // Default model by input shape: everything without a driving video
+    // (t2v, i2v, ti2v, first-last-frame) defaults to the faster 720p lane;
+    // only v2v (structure transfer from a driving video) needs the base
+    // model. An explicit model hint always wins.
+    let default_model = if video_ref.is_none() {
+        "rsclaw-video-v1-fast"
+    } else {
+        "rsclaw-video-v1"
+    };
     // Chain entries may arrive prefixed (`rsclaw/rsclaw-video-v1`); strip
     // the `provider/` segment so the upstream `model` field is the bare id.
     let model = model_hint
         .map(|m| m.rsplit('/').next().unwrap_or(m))
         .filter(|m| !m.is_empty() && *m != "rsclaw")
-        .unwrap_or("rsclaw-video-v1");
+        // `rsclaw-video-ref-v1` is NOT a real server model id — v2v is the
+        // base `rsclaw-video-v1` model with a driving video in
+        // `input_references`. Older prompt baselines advertised the bogus id;
+        // remap it so requests work even before the prefix is re-ingested.
+        .map(|m| if m == "rsclaw-video-ref-v1" { "rsclaw-video-v1" } else { m })
+        .unwrap_or(default_model);
     // gen-api.md §2: `seconds` is a STRING, `size` is WxH, and image-to-video
     // uses `input_reference.image_url` (first frame) + optional
     // `last_frame_reference.image_url` (last frame → first-last-frame).
@@ -680,9 +705,10 @@ async fn submit_rsclaw_video(
         "width": w,
         "height": h,
     });
-    // v2v structure transfer (model rsclaw-video-ref-v1): the driving video
-    // goes in `input_references` as a `video` item; an optional first image
-    // sets the opening frame's look.
+    // v2v structure transfer (model rsclaw-video-v1; the server selects the
+    // v2v lane from the driving video): the driving video goes in
+    // `input_references` as a `video` item; an optional first image sets the
+    // opening frame's look.
     if let Some(v) = video_ref {
         let mut refs = vec![json!({ "type": "video", "video_url": v })];
         if let Some(first) = images.first() {

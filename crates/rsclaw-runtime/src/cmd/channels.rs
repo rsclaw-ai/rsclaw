@@ -2,6 +2,7 @@ use anyhow::Result;
 
 use super::{
     config_json::{load_config_json, remove_nested_value, set_nested_value},
+    gateway_http,
     style::*,
 };
 use rsclaw_cli::ChannelsCommand;
@@ -221,15 +222,20 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
                             "dingtalk not configured -- add channels.dingtalk section to config"
                         )
                     })?;
-                    let app_key = dt
-                        .app_key
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("channels.dingtalk.appKey not set"))?;
-                    let app_secret = dt
-                        .app_secret
-                        .as_ref()
-                        .and_then(|s| s.as_plain())
-                        .ok_or_else(|| anyhow::anyhow!("channels.dingtalk.appSecret not set"))?;
+                    let accts = dt.accounts.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("channels.dingtalk.accounts not set")
+                    })?;
+                    let default_acct = accts.get("default").ok_or_else(|| {
+                        anyhow::anyhow!("channels.dingtalk.accounts.default not set")
+                    })?;
+                    let app_key = default_acct
+                        .get("appKey")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("channels.dingtalk.accounts.default.appKey not set"))?;
+                    let app_secret = default_acct
+                        .get("appSecret")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("channels.dingtalk.accounts.default.appSecret not set"))?;
                     let client = reqwest::Client::new();
                     rsclaw_channel::auth::dingtalk_auth::login(&client, app_key, app_secret, None)
                         .await?;
@@ -523,13 +529,19 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
                 .collect()
             };
 
-            // Open redb to read persisted pairings.
-            let data_dir = rsclaw_config::loader::base_dir().join("var/data");
-            let redb_store = rsclaw_store::redb_store::RedbStore::open(
-                &data_dir.join("redb/data.redb"),
-                rsclaw_platform::detect_memory_tier(),
-            )
-            .ok();
+            // Only attempt direct redb access when the gateway is not running
+            // (the gateway holds the exclusive redb lock, and `RedbStore::open`
+            // would block for 10s before `.ok()` gives up).
+            let redb_store = if !gateway_http::is_gateway_up().await {
+                let data_dir = rsclaw_config::loader::base_dir().join("var/data");
+                rsclaw_store::redb_store::RedbStore::open(
+                    &data_dir.join("redb/data.redb"),
+                    rsclaw_platform::detect_memory_tier(),
+                )
+                .ok()
+            } else {
+                None
+            };
 
             let mut found_any = false;
             for ch in &channels_to_check {
@@ -550,7 +562,7 @@ pub async fn cmd_channels(sub: ChannelsCommand) -> Result<()> {
                     }
                 }
 
-                // 2. From redb pairing store.
+                // 2. From redb pairing store (only when gateway is not running).
                 if let Some(ref store) = redb_store {
                     if let Ok(redb_peers) = store.list_pairings(ch) {
                         for p in redb_peers {

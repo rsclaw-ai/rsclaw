@@ -364,6 +364,7 @@ impl super::runtime::AgentRuntime {
                 },
                 is_group: !ctx.chat_id.is_empty() && ctx.chat_id != ctx.peer_id,
                 reply_to: None,
+                account: ctx.account.clone(),
             },
             rsclaw_types::ExternalJobOrigin::Agent,
             "rsclaw_image",

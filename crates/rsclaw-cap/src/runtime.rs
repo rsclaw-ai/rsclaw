@@ -22,6 +22,11 @@ use super::{bridge, permission};
 use rsclaw_types::OutboundMessage;
 use rsclaw_i18n as i18n;
 
+/// Per-turn timeout for a coding-agent driver run. A hung CLI can't tie
+/// up the actor indefinitely. Used by both task-mode (`actor_loop`) and
+/// live-mode (`live::actor_loop`) retry loops.
+pub(crate) const TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Which coding agent a `tool_cap` call dispatches to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AgentKind {
@@ -35,7 +40,7 @@ pub enum AgentKind {
 impl AgentKind {
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
-            "claudecode" => Some(Self::Claudecode),
+            "claudecode" | "claude" => Some(Self::Claudecode),
             "openclaude" => Some(Self::Openclaude),
             "opencode" => Some(Self::Opencode),
             "codex" => Some(Self::Codex),
@@ -184,7 +189,7 @@ impl CapAgentManager {
         let (tx, rx) = mpsc::channel::<ToolCapRequest>(8);
         let bus = self.bus.clone();
         let slot_for_actor = Arc::clone(&slot);
-        tokio::spawn(actor_loop(kind, driver, rx, bus, slot_for_actor));
+        tokio::spawn(actor_loop(kind, cwd, driver, rx, bus, slot_for_actor));
         *g = Some(tx.clone());
         Ok(tx)
     }
@@ -233,6 +238,46 @@ enum ResumeMode<'a> {
     None,
     ById(&'a str),
     ContinueLast,
+}
+
+/// Probe whether the local codex binary's `exec` subcommand still
+/// accepts the stream-json flags cap-rs drives (`--input-format`).
+/// Mainline codex-cli ≥0.139 dropped them in favour of `--json`, so we
+/// fall back to the MCP driver for those. Resolves the binary the same
+/// way cap-rs does: `$CODEX_BIN` override, else `codex` on PATH. Any
+/// probe failure (binary missing, help errored) returns `false` so we
+/// take the safer MCP path rather than spawn a driver that dies on
+/// arg-parse.
+async fn codex_supports_stream_json() -> bool {
+    let bin = std::env::var("CODEX_BIN").unwrap_or_else(|_| "codex".to_string());
+    let mut cmd = tokio::process::Command::new(&bin);
+    cmd.arg("exec").arg("--help");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    match cmd.output().await {
+        Ok(out) => {
+            let help = String::from_utf8_lossy(&out.stdout);
+            help.contains("--input-format")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Spawn the codex MCP driver (`codex mcp-server`). `why` is folded into
+/// the error context so a downstream failure makes clear we arrived here
+/// as a stream-json fallback, not a primary path.
+async fn spawn_codex_mcp(
+    cwd: &std::path::Path,
+    why: &str,
+) -> Result<cap_rs::driver::codex_mcp::CodexMcpDriver> {
+    cap_rs::driver::codex_mcp::CodexMcpDriver::builder(cwd)
+        .approval_policy("never")
+        .spawn()
+        .await
+        .map_err(|e| anyhow!("cap codex spawn (stream-json: {why}, MCP: {e})"))
 }
 
 async fn spawn_driver_inner(
@@ -298,28 +343,37 @@ async fn spawn_driver_inner(
             }
         }
         AgentKind::Codex => {
-            // Try stream-json first (`codex exec --input-format
-            // stream-json`). Fall back to MCP (`codex mcp-server`)
-            // if spawn fails — older codex binaries may not support
-            // the stream-json exec subcommand.
-            let mut b = ClaudeCodeDriver::codex_builder(cwd).dangerously_skip_permissions(true);
-            b = apply_resume_mode(b, resume_mode);
-            match b.spawn().await {
-                Ok(d) => Box::new(d),
-                Err(e) => {
-                    tracing::info!(
-                        target: "cap",
-                        error = %e,
-                        "codex stream-json spawn failed, falling back to MCP"
-                    );
-                    Box::new(
-                        cap_rs::driver::codex_mcp::CodexMcpDriver::builder(&cwd)
-                            .approval_policy("never")
-                            .spawn()
-                            .await
-                            .map_err(|e2| anyhow!("cap codex spawn (stream-json: {e}, MCP: {e2})"))?,
-                    )
+            // Codex stream-json needs `codex exec --input-format
+            // stream-json`. Mainline codex-cli (≥0.139) DROPPED those
+            // flags — its `exec` only speaks `--json` (one-shot JSONL),
+            // which cap-rs can't drive. Spawning stream-json against
+            // such a binary "succeeds" (the process launches) then dies
+            // on arg-parse, so a plain `match b.spawn()` never sees the
+            // error and never falls back → empty replies. Preflight the
+            // binary's `exec --help` for `--input-format` and route to
+            // the MCP driver (`codex mcp-server`, supported by mainline)
+            // when the stream-json flags are absent.
+            if codex_supports_stream_json().await {
+                let mut b =
+                    ClaudeCodeDriver::codex_builder(cwd).dangerously_skip_permissions(true);
+                b = apply_resume_mode(b, resume_mode);
+                match b.spawn().await {
+                    Ok(d) => Box::new(d),
+                    Err(e) => {
+                        tracing::info!(
+                            target: "cap",
+                            error = %e,
+                            "codex stream-json spawn failed, falling back to MCP"
+                        );
+                        Box::new(spawn_codex_mcp(cwd, &e.to_string()).await?)
+                    }
                 }
+            } else {
+                tracing::info!(
+                    target: "cap",
+                    "codex binary lacks stream-json exec flags; using MCP driver"
+                );
+                Box::new(spawn_codex_mcp(cwd, "stream-json flags unsupported").await?)
             }
         }
         AgentKind::Qoder => {
@@ -358,8 +412,52 @@ pub fn push_notif(target: &NotifTarget, text: String) {
     }
 }
 
+/// Replace a dead driver in-place with a freshly spawned one of the same
+/// `kind` (ResumeMode::None). Best-effort: shuts down the old driver,
+/// spawns a replacement, and swaps it into `*driver` on success. Returns
+/// `true` when the swap happened (caller may retry the prompt), `false`
+/// when the respawn failed (caller surfaces the original error). Shared
+/// shape with `live::respawn_driver`; kept separate to avoid coupling the
+/// task-mode actor to the live module.
+async fn respawn_cap_driver(
+    kind: AgentKind,
+    cwd: &std::path::Path,
+    driver: &mut Box<dyn Driver>,
+    session_id: &str,
+    reason: &str,
+) -> bool {
+    match spawn_driver(kind, cwd).await {
+        Ok(fresh) => {
+            if let Err(e) = driver.shutdown().await {
+                tracing::debug!(target: "cap", error = %e, "best-effort shutdown of dead driver");
+            }
+            *driver = fresh;
+            tracing::info!(
+                target: "cap",
+                session_id,
+                agent = kind.as_str(),
+                reason,
+                "cap respawned driver after death; retrying prompt once"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "cap",
+                session_id,
+                agent = kind.as_str(),
+                reason,
+                error = %e,
+                "cap driver respawn failed; surfacing error"
+            );
+            false
+        }
+    }
+}
+
 async fn actor_loop(
     kind: AgentKind,
+    cwd: std::path::PathBuf,
     mut driver: Box<dyn Driver>,
     mut rx: mpsc::Receiver<ToolCapRequest>,
     bus: broadcast::Sender<rsclaw_events::AgentEvent>,
@@ -390,57 +488,79 @@ async fn actor_loop(
                     session_id: session_id.clone(),
                 }));
 
-                // 3. Send the prompt frame to the driver.
-                if let Err(e) = driver
-                    .send(ClientFrame::Prompt {
-                        content: vec![Content::text(task)],
-                    })
-                    .await
-                {
-                    let err_text = format!("cap send: {e}");
-                    if let Some(n) = &notif {
-                        push_notif(
-                            n,
-                            i18n::t_fmt(
-                                "acp_error",
-                                n.lang,
-                                &[("name", display), ("error", &err_text)],
-                            ),
-                        );
-                    }
-                    // Driver send failure: actor probably dead; respawn
-                    // by exiting the loop.
-                    break;
-                }
-
-                // 4. Run the turn. `run_turn` streams ToolCallStart
-                //    progress to `notif` and accumulates the final text
-                //    into `reply_buf`. Wrap in a 5-minute timeout so a
-                //    driver that hangs (e.g. an external CLI that never
-                //    emits its terminator) doesn't tie up the actor
-                //    indefinitely — on timeout we treat it as an error,
-                //    notify the user, and let the loop break + respawn.
-                const TURN_TIMEOUT: std::time::Duration =
-                    std::time::Duration::from_secs(300);
+                // 3-4. Send the prompt + run the turn, with ONE automatic
+                //    retry on driver death (send failure or mid-turn
+                //    exit/timeout). Mirrors the cap_live retry: the first
+                //    `opencode acp` launch on a cold machine can die
+                //    mid-turn; respawning a fresh driver and replaying the
+                //    prompt hides that (and any transient CLI crash). A
+                //    fresh respawn loses in-process context, which is fine
+                //    for a driver that already died. `run_turn` is wrapped
+                //    in a 5-minute timeout so a hung CLI can't tie up the
+                //    actor indefinitely.
                 let mut reply_buf = String::new();
-                let outcome = match tokio::time::timeout(
-                    TURN_TIMEOUT,
-                    run_turn(
-                        driver.as_mut(),
-                        &bus,
-                        &session_id,
-                        agent_id,
-                        notif.as_ref(),
-                        &mut reply_buf,
-                    ),
-                )
-                .await
-                {
-                    Ok(r) => r,
-                    Err(_) => Err(anyhow!(
-                        "cap {display}: turn timed out after {}s (driver hang?)",
-                        TURN_TIMEOUT.as_secs()
-                    )),
+                let mut attempt = 0u8;
+                let outcome = loop {
+                    reply_buf.clear();
+                    if let Err(e) = driver
+                        .send(ClientFrame::Prompt {
+                            content: vec![Content::text(task.clone())],
+                        })
+                        .await
+                    {
+                        if attempt == 0
+                            && respawn_cap_driver(
+                                kind,
+                                &cwd,
+                                &mut driver,
+                                &session_id,
+                                "send failed",
+                            )
+                            .await
+                        {
+                            attempt += 1;
+                            continue;
+                        }
+                        break Err(anyhow!("cap send: {e}"));
+                    }
+                    let turn = match tokio::time::timeout(
+                        TURN_TIMEOUT,
+                        run_turn(
+                            driver.as_mut(),
+                            &bus,
+                            &session_id,
+                            agent_id,
+                            notif.as_ref(),
+                            &mut reply_buf,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(_) => Err(anyhow!(
+                            "cap {display}: turn timed out after {}s (driver hang?)",
+                            TURN_TIMEOUT.as_secs()
+                        )),
+                    };
+                    match turn {
+                        Ok(()) => break Ok(()),
+                        Err(e) => {
+                            if attempt == 0
+                                && respawn_cap_driver(
+                                    kind,
+                                    &cwd,
+                                    &mut driver,
+                                    &session_id,
+                                    "exited mid-turn",
+                                )
+                                .await
+                            {
+                                attempt += 1;
+                                continue;
+                            }
+                            break Err(e);
+                        }
+                    }
                 };
 
                 // 5. Completion / error notification + inbox reinjection.
@@ -499,7 +619,9 @@ async fn actor_loop(
             }
         }
     }
-    let _ = driver.shutdown().await;
+    if let Err(e) = driver.shutdown().await {
+        tracing::debug!(target: "cap", error = %e, "best-effort shutdown of dead driver");
+    }
     let mut g = slot.write().await;
     *g = None;
 }
@@ -567,6 +689,135 @@ mod tests {
     use cap_rs::core::{RiskLevel, StopReason, TextChannel, Usage};
     use cap_rs::driver::DriverError;
     use std::collections::VecDeque;
+
+    #[test]
+    fn agent_kind_aliases() {
+        assert_eq!(AgentKind::from_str("claude"), Some(AgentKind::Claudecode));
+        assert_eq!(AgentKind::from_str("claudecode"), Some(AgentKind::Claudecode));
+        assert_eq!(AgentKind::from_str("code"), None);
+        assert_eq!(AgentKind::from_str("openclaude"), Some(AgentKind::Openclaude));
+        assert_eq!(AgentKind::from_str("opencode"), Some(AgentKind::Opencode));
+        assert_eq!(AgentKind::from_str("codex"), Some(AgentKind::Codex));
+        assert_eq!(AgentKind::from_str("qoder"), Some(AgentKind::Qoder));
+        assert_eq!(AgentKind::from_str("unknown"), None);
+    }
+
+    /// Real-machine smoke: spawn each agent's CLI driver, fire one
+    /// trivial prompt, assert a non-empty reply. Exercises real binary
+    /// spawn (PATH resolution + protocol handshake) and, for
+    /// opencode/codex, the stream-json → ACP/MCP fallback. Ignored by
+    /// default (needs the CLIs installed + burns one LLM turn each); run
+    /// explicitly:
+    ///
+    ///   cargo test -p rsclaw-cap cap_live_invoke_all -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "spawns real coding-agent CLIs; run manually"]
+    async fn cap_live_invoke_all() {
+        let cwd = std::env::temp_dir();
+        let (bus, _rx) = broadcast::channel(64);
+        let mut failures = Vec::new();
+        for kind in [
+            AgentKind::Claudecode,
+            AgentKind::Openclaude,
+            AgentKind::Opencode,
+            AgentKind::Codex,
+            AgentKind::Qoder,
+        ] {
+            let name = kind.as_str();
+            let mut driver = match spawn_driver(kind, &cwd).await {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("[skip] {name}: spawn failed: {e}");
+                    continue;
+                }
+            };
+            if let Err(e) = driver
+                .send(ClientFrame::Prompt {
+                    content: vec![Content::text(
+                        "Reply with exactly the word OK and nothing else.".to_string(),
+                    )],
+                })
+                .await
+            {
+                failures.push(format!("{name}: send: {e}"));
+                if let Err(e) = driver.shutdown().await {
+                    tracing::debug!(target: "cap", error = %e, "best-effort shutdown of dead driver");
+                }
+                continue;
+            }
+            let mut reply = String::new();
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                run_turn(driver.as_mut(), &bus, "smoke", name, None, &mut reply),
+            )
+            .await;
+            if let Err(e) = driver.shutdown().await {
+                tracing::debug!(target: "cap", error = %e, "best-effort shutdown of dead driver");
+            }
+            match outcome {
+                Ok(Ok(())) if reply.trim().is_empty() => {
+                    failures.push(format!("{name}: empty reply"));
+                    eprintln!("[FAIL] {name}: empty reply");
+                }
+                Ok(Ok(())) => eprintln!("[ok] {name}: {:?}", reply.trim()),
+                Ok(Err(e)) => {
+                    failures.push(format!("{name}: run_turn error: {e}"));
+                    eprintln!("[FAIL] {name}: {e}");
+                }
+                Err(_) => {
+                    failures.push(format!("{name}: timed out after 120s"));
+                    eprintln!("[FAIL] {name}: timed out");
+                }
+            }
+        }
+        assert!(failures.is_empty(), "cap agent failures: {failures:?}");
+    }
+
+    /// Real-machine smoke for the opencode stream-json → ACP fallback
+    /// target. `cap_live_invoke_all` exercises opencode's PRIMARY
+    /// (stream-json) path; this drives the FALLBACK driver
+    /// (`opencode acp`) directly — the branch `spawn_driver_inner` takes
+    /// when stream-json spawn fails — so we know the fallback actually
+    /// works on this machine instead of only being wired. Ignored by
+    /// default; run explicitly:
+    ///
+    ///   cargo test -p rsclaw-cap opencode_acp_fallback -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "spawns real opencode ACP server; run manually"]
+    async fn opencode_acp_fallback() {
+        let cwd = std::env::temp_dir();
+        let (bus, _rx) = broadcast::channel(64);
+        let mut driver: Box<dyn Driver> = match cap_rs::driver::acp::AcpDriver::opencode(&cwd).await
+        {
+            Ok(d) => Box::new(d),
+            Err(e) => panic!("opencode ACP spawn failed: {e}"),
+        };
+        driver
+            .send(ClientFrame::Prompt {
+                content: vec![Content::text(
+                    "Reply with exactly the word OK and nothing else.".to_string(),
+                )],
+            })
+            .await
+            .expect("opencode ACP send");
+        let mut reply = String::new();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            run_turn(driver.as_mut(), &bus, "smoke", "opencode", None, &mut reply),
+        )
+        .await;
+        if let Err(e) = driver.shutdown().await {
+            tracing::debug!(target: "cap", error = %e, "best-effort shutdown of dead driver");
+        }
+        match outcome {
+            Ok(Ok(())) => {
+                assert!(!reply.trim().is_empty(), "opencode ACP: empty reply");
+                eprintln!("[ok] opencode (ACP fallback): {:?}", reply.trim());
+            }
+            Ok(Err(e)) => panic!("opencode ACP run_turn error: {e}"),
+            Err(_) => panic!("opencode ACP timed out after 120s"),
+        }
+    }
 
     struct FakeDriver {
         events: VecDeque<AgentEvent>,

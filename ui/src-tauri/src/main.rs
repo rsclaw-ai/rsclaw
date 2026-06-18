@@ -2130,7 +2130,7 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
             "openrouter"  => "https://openrouter.ai/api/v1",
             "gaterouter"  => "https://api.gaterouter.ai/openai/v1",
             "ollama"      => "http://localhost:11434",
-            "rsclaw"      => "https://api.rsclaw.ai/v1/agent",
+            "rsclaw"      => "https://api.rsclaw.ai/v1",
             "custom" | "codingplan" => "",
             _ => return Ok(serde_json::json!({"ok": false, "error": "unknown provider"})),
         }
@@ -2159,26 +2159,15 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
     // - Volcengine ARK (doubao) — `/v3/models` 404s; only the inference
     //   endpoint is public. Inference fallback below confirms the key
     //   but can't enumerate models.
-    // - rsclaw — cloud-managed via `api.rsclaw.ai/v1/agent`, custom path
-    //   shape (no `/models`). Fleet versioning ties the list to
-    //   `RSCLAW_DEFAULT_*` constants in `src/provider/rsclaw.rs` —
-    //   keep this list in sync when those bump.
     if provider == "minimax" {
         return Ok(serde_json::json!({
             "ok": true,
             "models": ["MiniMax-M2.7","MiniMax-M2.7-highspeed","MiniMax-M2.5","MiniMax-M2.5-highspeed","MiniMax-M2.1","MiniMax-M2.1-highspeed","MiniMax-M2"]
         }));
     }
-    if provider == "rsclaw" {
-        return Ok(serde_json::json!({
-            "ok": true,
-            "models": [
-                "rsclaw-agent-v1",
-                "rsclaw-flash-v1",
-                "rsclaw-vision-v1",
-            ]
-        }));
-    }
+    // rsclaw now exposes an OpenAI-compatible `/v1/models` (base_url is the
+    // `/v1` root), so it falls through to the live probe like any other
+    // provider — no hardcoded fallback list.
     if provider == "doubao" && api_type.is_none() {
         // Default doubao (ark v3, OpenAI-shape). When the user pinned an
         // explicit api_type (e.g. anthropic via CodingPlan) drop through
@@ -2191,8 +2180,6 @@ async fn test_provider(provider: String, api_key: String, base_url: Option<Strin
                 "doubao-seed-2.0-flash",
                 "doubao-seed-1.6-vision-thinking",
                 "doubao-seed-1.5-vision-pro",
-                "doubao-seedream-5-0-260128",
-                "doubao-seedance-2-0-260128",
             ]
         }));
     }

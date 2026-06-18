@@ -20,7 +20,7 @@ name       = "rsclaw"
 label      = "RsClaw (recommended)"
 env_var    = "RSCLAW_API_KEY"
 model      = "rsclaw/rsclaw-agent-v1"
-base_url   = "https://api.rsclaw.ai/v1/agent"
+base_url   = "https://api.rsclaw.ai/v1"
 api_type   = "rsclaw"
 needs_key  = true
 name_zh         = "RsClaw"
@@ -388,6 +388,7 @@ fields = [
 [[channels]]
 name  = "qq"
 label = "QQ Bot"
+multi_account = true
 name_zh  = "QQ Bot"
 icon     = "QQ"
 has_qr   = false
@@ -401,6 +402,7 @@ fields = [
 [[channels]]
 name  = "dingtalk"
 label = "DingTalk"
+multi_account = true
 name_zh  = "钉钉"
 icon     = "DT"
 has_qr   = false
@@ -444,6 +446,7 @@ fields = [
 [[channels]]
 name  = "discord"
 label = "Discord"
+multi_account = true
 name_zh  = "Discord"
 icon     = "Dc"
 has_qr   = false
@@ -484,6 +487,7 @@ fields = [
 [[channels]]
 name  = "signal"
 label = "Signal"
+multi_account = true
 name_zh  = "Signal"
 icon     = "Sg"
 has_qr   = false
@@ -496,6 +500,7 @@ fields = [
 [[channels]]
 name  = "line"
 label = "LINE"
+multi_account = true
 name_zh  = "LINE"
 icon     = "Li"
 has_qr   = false
@@ -509,6 +514,7 @@ fields = [
 [[channels]]
 name  = "zalo"
 label = "Zalo"
+multi_account = true
 name_zh  = "Zalo"
 icon     = "Za"
 has_qr   = false

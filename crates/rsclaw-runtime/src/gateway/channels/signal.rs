@@ -116,27 +116,19 @@ pub(crate) fn start_signal_if_configured(
         enforcers.insert("signal".to_owned(), Arc::clone(&enforcer));
     }
 
-    // Collect (account_name, phone) pairs.
+    // Collect (account_name, phone) pairs from accounts.<name>.phone.
     let mut sig_accounts: Vec<(String, String)> = Vec::new();
-
-    // Legacy: single phone at top level.
-    if let Some(p) = &sig_cfg.phone {
-        sig_accounts.push(("default".to_owned(), p.clone()));
-    }
-
-    // Multi-account: channels.signal.accounts.<name>.phone
     if let Some(accts) = &sig_cfg.accounts {
         for (name, acct) in accts {
-            if let Some(p) = acct.get("phone").and_then(|v| v.as_str()) {
-                if !sig_accounts.iter().any(|(_, ep)| ep == p) {
-                    sig_accounts.push((name.clone(), p.to_owned()));
-                }
+            let p = acct.get("phone").and_then(|v| v.as_str()).unwrap_or("");
+            if !p.is_empty() {
+                sig_accounts.push((name.clone(), p.to_owned()));
             }
         }
     }
 
     if sig_accounts.is_empty() {
-        warn!("signal.phone not set, signal disabled");
+        warn!("signal.phone not set in accounts, channel disabled");
         return;
     }
     let sig_cli_path = sig_cfg.cli_path.clone();

@@ -579,6 +579,7 @@ impl CapLiveManager {
         tokio::spawn(actor_loop(
             sid_owned,
             kind,
+            cwd.to_path_buf(),
             driver,
             rx,
             bus,
@@ -736,9 +737,58 @@ async fn capture_ready_session_id(
 /// Actor loop for one live session: serially process Prompt requests
 /// against the held driver, exit on Shutdown or driver failure.
 /// On exit, removes its own entry from the sessions map.
+/// Replace a dead driver in-place with a freshly spawned one of the same
+/// `kind`. Best-effort: shuts down the old driver, spawns a fresh
+/// (ResumeMode::None) replacement, and on success swaps it into `*driver`.
+/// Returns `true` when the swap happened (caller may retry the prompt),
+/// `false` when the respawn failed (caller surfaces the original error).
+async fn respawn_driver(
+    kind: &AgentKind,
+    cwd: &std::path::Path,
+    driver: &mut Box<dyn Driver>,
+    sid: &str,
+    reason: &str,
+    agent_sid_slot: &Arc<StdMutex<Option<String>>>,
+) -> bool {
+    match spawn_driver(*kind, cwd).await {
+        Ok(fresh) => {
+            if let Err(e) = driver.shutdown().await {
+                tracing::debug!(target: "cap", error = %e, "best-effort shutdown of dead driver");
+            }
+            *driver = fresh;
+            // Clear the stale agent session id from the dead driver.
+            // The respawned driver has a fresh session; the slot will be
+            // repopulated when it emits Ready.
+            if let Ok(mut g) = agent_sid_slot.lock() {
+                *g = None;
+            }
+            tracing::info!(
+                target: "cap",
+                session_id = %sid,
+                agent = kind.as_str(),
+                reason,
+                "cap_live respawned driver after death; retrying prompt once"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "cap",
+                session_id = %sid,
+                agent = kind.as_str(),
+                reason,
+                error = %e,
+                "cap_live driver respawn failed; surfacing error"
+            );
+            false
+        }
+    }
+}
+
 async fn actor_loop(
     sid: String,
     kind: AgentKind,
+    cwd: std::path::PathBuf,
     mut driver: Box<dyn Driver>,
     mut rx: mpsc::Receiver<LiveRequest>,
     bus: broadcast::Sender<rsclaw_events::AgentEvent>,
@@ -824,34 +874,82 @@ async fn actor_loop(
         };
         match req {
             LiveRequest::Prompt { task, notif, reply } => {
-                if let Err(e) = driver
-                    .send(ClientFrame::Prompt {
-                        content: vec![Content::text(task)],
-                    })
+                // One automatic retry on driver death (send failure or
+                // mid-turn exit). The motivating case is the FIRST
+                // `opencode acp` launch on a cold machine: the handshake
+                // succeeds, then the server exits while handling the
+                // first prompt, so `run_turn` returns "exited mid-turn".
+                // Respawning a fresh driver and replaying the same prompt
+                // hides that one-time flake (and any transient CLI crash)
+                // from the user. Fresh respawn = lost in-process context,
+                // which is correct here: the dead driver already lost it,
+                // and the cold-start case has no prior turns to preserve.
+                let mut attempt = 0u8;
+                let outcome = loop {
+                    let send_res = driver
+                        .send(ClientFrame::Prompt {
+                            content: vec![Content::text(task.clone())],
+                        })
+                        .await;
+                    if let Err(e) = send_res {
+                        if attempt == 0 {
+                            if respawn_driver(&kind, &cwd, &mut driver, &sid, "send failed", &agent_sid_slot).await {
+                                attempt += 1;
+                                continue;
+                            }
+                        }
+                        break Err(anyhow!("cap_live driver send: {e}"));
+                    }
+                    let mut reply_buf = String::new();
+                    let turn = match tokio::time::timeout(
+                        super::runtime::TURN_TIMEOUT,
+                        run_turn(
+                            driver.as_mut(),
+                            &bus,
+                            &pseudo_session_id,
+                            "cap-live",
+                            notif.as_ref(),
+                            &mut reply_buf,
+                        ),
+                    )
                     .await
-                {
-                    let _ = reply.send(Err(anyhow!("cap_live driver send: {e}")));
-                    break;
-                }
-                let mut reply_buf = String::new();
-                let outcome = run_turn(
-                    driver.as_mut(),
-                    &bus,
-                    &pseudo_session_id,
-                    "cap-live",
-                    notif.as_ref(),
-                    &mut reply_buf,
-                )
-                .await;
+                    {
+                        Ok(r) => r,
+                        Err(_) => Err(anyhow!(
+                            "cap_live: turn timed out after {}s (driver hang?)",
+                            super::runtime::TURN_TIMEOUT.as_secs()
+                        )),
+                    };
+                    match turn {
+                        Ok(()) => break Ok(reply_buf),
+                        Err(e) => {
+                            if attempt == 0
+                                && respawn_driver(
+                                    &kind,
+                                    &cwd,
+                                    &mut driver,
+                                    &sid,
+                                    "exited mid-turn",
+                                    &agent_sid_slot,
+                                )
+                                .await
+                            {
+                                attempt += 1;
+                                continue;
+                            }
+                            break Err(anyhow!("cap_live driver: {e}"));
+                        }
+                    }
+                };
                 match outcome {
-                    Ok(()) => {
+                    Ok(reply_buf) => {
                         let _ = reply.send(Ok(reply_buf));
                     }
                     Err(e) => {
-                        // Driver died mid-turn → propagate error, exit
-                        // the actor so the manager's GC entry cleanup
-                        // below runs; caller must open a new session.
-                        let _ = reply.send(Err(anyhow!("cap_live driver: {e}")));
+                        // Retry exhausted (or respawn failed) → propagate
+                        // error, exit the actor so the manager's GC entry
+                        // cleanup below runs; caller opens a new session.
+                        let _ = reply.send(Err(e));
                         break;
                     }
                 }
@@ -859,7 +957,9 @@ async fn actor_loop(
             LiveRequest::Shutdown => break,
         }
     }
-    let _ = driver.shutdown().await;
+    if let Err(e) = driver.shutdown().await {
+        tracing::debug!(target: "cap", error = %e, "best-effort shutdown of dead driver");
+    }
     {
         let mut g = sessions.write().await;
         g.remove(&sid);

@@ -2,8 +2,8 @@ use clap::Args;
 
 #[derive(Args, Debug)]
 pub struct CompletionArgs {
-    /// Target shell: zsh, bash, or fish.
-    #[arg(long, default_value = "zsh")]
+    /// Target shell: zsh, bash, fish, or powershell.
+    #[arg(default_value = "zsh")]
     pub shell: String,
 
     /// Install completions to the shell profile.

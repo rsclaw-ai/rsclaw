@@ -35,19 +35,12 @@ pub(crate) fn start_discord_if_configured(
         return;
     }
 
-    // Collect (account_name, token) pairs.
+    // Collect (account_name, token) pairs from accounts.<name>.token.
     let mut dc_accounts: Vec<(String, String)> = Vec::new();
-
-    // Legacy: single token at top level.
-    if let Some(token) = dc_cfg.token.as_ref().and_then(|t| t.as_plain()) {
-        dc_accounts.push(("default".to_owned(), token.to_owned()));
-    }
-
-    // Multi-account: channels.discord.accounts.<name>.token
     if let Some(accts) = &dc_cfg.accounts {
         for (name, acct) in accts {
             if let Some(t) = acct.get("token").and_then(|v| v.as_str()) {
-                if !dc_accounts.iter().any(|(_, existing)| existing == t) {
+                if !t.is_empty() {
                     dc_accounts.push((name.clone(), t.to_owned()));
                 }
             }
@@ -55,7 +48,7 @@ pub(crate) fn start_discord_if_configured(
     }
 
     if dc_accounts.is_empty() {
-        warn!("discord token not set");
+        warn!("discord.token not set in accounts, channel disabled");
         return;
     }
 

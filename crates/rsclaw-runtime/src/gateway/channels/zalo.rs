@@ -52,33 +52,23 @@ pub(crate) fn start_zalo_if_configured(
         enforcers.insert("zalo".to_owned(), Arc::clone(&enforcer));
     }
 
-    // Collect (account_name, access_token) pairs.
+    // Collect (account_name, access_token) pairs from
+    // accounts.<name>.accessToken.
     let mut zalo_accounts: Vec<(String, String)> = Vec::new();
-
-    // Legacy: single token at top level.
-    if let Some(token) = zalo_cfg
-        .access_token
-        .as_ref()
-        .and_then(|t| t.as_plain())
-        .map(str::to_owned)
-        .or_else(|| std::env::var("ZALO_ACCESS_TOKEN").ok())
-    {
-        zalo_accounts.push(("default".to_owned(), token));
-    }
-
-    // Multi-account: channels.zalo.accounts.<name>.accessToken
     if let Some(accts) = &zalo_cfg.accounts {
         for (name, acct) in accts {
-            if let Some(t) = acct.get("accessToken").and_then(|v| v.as_str()) {
-                if !zalo_accounts.iter().any(|(_, et)| et == t) {
-                    zalo_accounts.push((name.clone(), t.to_owned()));
-                }
+            let t = acct
+                .get("accessToken")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !t.is_empty() {
+                zalo_accounts.push((name.clone(), t.to_owned()));
             }
         }
     }
 
     if zalo_accounts.is_empty() {
-        warn!("ZALO access_token not set, zalo disabled");
+        warn!("zalo.accessToken not set in accounts, channel disabled");
         return;
     }
 

@@ -27,12 +27,13 @@ use super::{
     RecallMetadata, Role, StreamEvent, TokenUsage,
 };
 
-/// Default base for the rsclaw-server fleet. The `/v1/agent` suffix
-/// is the external API mount inside rsclaw-server — the rsclaw-llm
-/// `/sessions/...` protocol paths are exposed to clients under that
-/// prefix, distinct from `/v1/chat/completions` etc. Setting
-/// `RSCLAW_URL` overrides this; that variable should also include the
-/// `/v1/agent` segment.
+/// Default base for the rsclaw-server fleet: the OpenAI-compatible `/v1`
+/// root. The incremental-protocol `/sessions/...` paths live under the
+/// `/agent` mount (`/v1/agent/sessions`, …) which this provider prepends
+/// itself (see `send_following_redirects`), so the base stays at `/v1`
+/// where sibling resources like `/v1/models` resolve correctly. Legacy
+/// configs that set the base to `…/v1/agent` are normalized in the
+/// constructor (trailing `/agent` stripped). Setting `RSCLAW_URL` overrides.
 ///
 /// `api.rsclaw.ai` fronts the fleet behind a 308-emitting LB that
 /// pins clients (via the [`RedirectCache`] in this module) to their
@@ -40,7 +41,7 @@ use super::{
 /// window (1h by default). First request through any provider
 /// instance pays the redirect cost; everything within the TTL after
 /// goes direct, so steady-state latency matches a direct deployment.
-pub const RSCLAW_DEFAULT_BASE: &str = "https://api.rsclaw.ai/v1/agent";
+pub const RSCLAW_DEFAULT_BASE: &str = "https://api.rsclaw.ai/v1";
 
 /// Default `prefix_id` per protocol §2.1.1 / §2.10.1 — namespaced
 /// `<ns>/<ver>` string the gateway sends on `POST /sessions`. It's a
@@ -96,6 +97,13 @@ pub const RSCLAW_DEFAULT_VISION: &str = "rsclaw/rsclaw-vision-v1";
 /// Once the body stream begins this deadline no longer applies — the
 /// SSE body is allowed to take as long as the model needs.
 const TURN_HEADERS_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Read-idle bound applied per chunk once the SSE body is streaming. The
+/// headers deadline above no longer applies after the body begins, so this
+/// is the only thing that catches a worker that goes silent mid-generation
+/// (TCP alive, no bytes). 45s ≈ 15 missed heartbeats; matches the replay
+/// path's guard.
+const STREAM_READ_IDLE_SECS: u64 = 45;
 
 /// Hard cap on the in-memory `sessions` cache. Each entry is a few
 /// dozen bytes (`session_id` + `prefix_id` + counter), so 10_000 caps
@@ -170,9 +178,13 @@ async fn read_sse_terminal_event(resp: reqwest::Response) -> Result<(String, Str
     let mut parser = SseTerminalParser::default();
 
     loop {
-        let chunk = tokio::time::timeout(Duration::from_secs(45), stream.next())
+        let chunk = tokio::time::timeout(Duration::from_secs(STREAM_READ_IDLE_SECS), stream.next())
             .await
-            .map_err(|_| anyhow::anyhow!("rsclaw replay: SSE idle for 45s (heartbeats stopped)"))?;
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "rsclaw replay: SSE idle for {STREAM_READ_IDLE_SECS}s (heartbeats stopped)"
+                )
+            })?;
         let Some(chunk) = chunk else {
             anyhow::bail!("rsclaw replay: SSE stream ended without a terminal event");
         };
@@ -266,6 +278,14 @@ impl RsclawProvider {
         // base_url where stray whitespace flips reqwest into
         // url-parse-error territory.
         let base_url = base_url.into().trim().trim_end_matches('/').to_string();
+        // Back-compat: older configs set base_url to `…/v1/agent`. The provider
+        // now prepends the `/agent` protocol mount itself (so `/v1/models` and
+        // friends sit at the `/v1` root), so strip a trailing `/agent` to avoid
+        // doubling it into `/v1/agent/agent/sessions`.
+        let base_url = base_url
+            .strip_suffix("/agent")
+            .map(|s| s.trim_end_matches('/').to_string())
+            .unwrap_or(base_url);
         let bearer = bearer
             .map(|b| b.trim().to_string())
             .filter(|b| !b.is_empty());
@@ -966,7 +986,10 @@ impl RsclawProvider {
         idempotency_key: Option<&str>,
         accept_sse: bool,
     ) -> Result<reqwest::Response> {
-        let url = format!("{}{}", self.base_url, path);
+        // Protocol paths live under the `/agent` mount; `base_url` is the `/v1`
+        // root (see RSCLAW_DEFAULT_BASE), so prepend `/agent` here. `/models`
+        // and other OpenAI-compat resources go to the bare `/v1` root elsewhere.
+        let url = format!("{}/agent{}", self.base_url, path);
         self.fleet
             .post_following_redirects(
                 &url,
@@ -1336,7 +1359,7 @@ impl RsclawProvider {
         let resp = match tokio::time::timeout(TURN_HEADERS_TIMEOUT, send_fut).await {
             Ok(r) => r?,
             Err(_) => anyhow::bail!(
-                "rsclaw {path}: timed out waiting for response headers after {}s ({}{})",
+                "rsclaw {path}: timed out waiting for response headers after {}s ({}/agent{})",
                 TURN_HEADERS_TIMEOUT.as_secs(),
                 self.base_url,
                 path,
@@ -1392,11 +1415,27 @@ impl RsclawProvider {
         // openai.rs implementation (worker can split frames across
         // TCP segments) but the JSON shape is fastshot-native so we
         // parse it locally.
-        let byte_stream = resp.bytes_stream();
+        // Per-chunk read-idle guard. We deliberately dropped the total
+        // `.timeout()` above so long generations can stream past 60s, but
+        // that leaves no bound on a worker that goes silent mid-stream (TCP
+        // alive, no bytes) — the consumer would hang forever. Mirror the
+        // replay path's 45s read-idle timeout: a silent gap surfaces as an
+        // error event instead of an indefinite stall.
+        let path_owned = path.to_string();
+        let byte_stream = tokio_stream::StreamExt::timeout(
+            resp.bytes_stream(),
+            Duration::from_secs(STREAM_READ_IDLE_SECS),
+        )
+        .map(move |r| match r {
+            Ok(Ok(bytes)) => Ok(bytes),
+            Ok(Err(e)) => Err(anyhow::anyhow!("stream read error: {e}")),
+            Err(_) => Err(anyhow::anyhow!(
+                "rsclaw {path_owned}: SSE idle for {STREAM_READ_IDLE_SECS}s (worker stalled mid-generation)"
+            )),
+        });
         let line_buffer = Arc::new(tokio::sync::Mutex::new(String::new()));
         let utf8_remainder = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
         let event_stream = byte_stream
-            .map_err(|e| anyhow::anyhow!("stream read error: {e}"))
             .then(move |chunk| {
                 let line_buffer = line_buffer.clone();
                 let utf8_remainder = utf8_remainder.clone();
@@ -1457,7 +1496,7 @@ impl RsclawProvider {
             let resp = match tokio::time::timeout(TURN_HEADERS_TIMEOUT, send_fut).await {
                 Ok(r) => r?,
                 Err(_) => anyhow::bail!(
-                    "rsclaw turn: timed out waiting for response headers after {}s ({}{})",
+                    "rsclaw turn: timed out waiting for response headers after {}s ({}/agent{})",
                     TURN_HEADERS_TIMEOUT.as_secs(),
                     self.base_url,
                     path,

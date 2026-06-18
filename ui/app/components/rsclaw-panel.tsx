@@ -53,7 +53,6 @@ import {
   testProviderKey,
   listProviderModels,
 } from "../lib/rsclaw-api";
-import { MODELS } from "./onboarding";
 import {
   useCatalog,
   getProviderMap,
@@ -61,6 +60,7 @@ import {
   getChannelMap,
   getChannelOrder,
   getSearchEngines,
+  getProviderDefaultModel,
 } from "../lib/catalog";
 import {
   type ApiType,
@@ -2953,10 +2953,10 @@ function TauriConfigPageInner() {
       // If provider has key configured, mark as connected
       testState[provId] = "ok";
       if (selModel) selModels[provId] = selModel;
-      // Add fallback models from MODELS constant
-      if (MODELS[provId]) {
-        modelLists[provId] = MODELS[provId].map((m) => ({ id: m.id, tag: zh ? m.tag : m.tagEn }));
-      }
+      // Seed a single default-model entry so the dropdown has the
+      // preselected default before any live `/models` fetch.
+      const dm = getProviderDefaultModel(provId);
+      if (dm) modelLists[provId] = [{ id: dm, tag: "" }];
     }
     if (Object.keys(testState).length > 0) {
       setProvTest((prev) => ({ ...prev, ...testState }));
@@ -3191,26 +3191,10 @@ function TauriConfigPageInner() {
     setProvTest((prev) => ({ ...prev, [provId]: "testing" }));
     setProvErr((prev) => ({ ...prev, [provId]: "" }));
 
-    // rsclaw short-circuit — same rationale as the onboarding flow:
-    // the cloud agent endpoint doesn't expose an OpenAI-compatible
-    // `/models` listing, so the Tauri `test_provider` command bails
-    // out with "unknown provider". Trust the key, use the hardcoded
-    // MODELS["rsclaw"] preset list. Real validation happens at the
-    // gateway-start health check.
-    if (provId === "rsclaw") {
-      const presets = (MODELS["rsclaw"] || []).map((m) => ({
-        id: m.id,
-        tag: zh ? m.tag : m.tagEn,
-      }));
-      setProvTest((prev) => ({ ...prev, [provId]: "ok" }));
-      setProvModels((prev) => ({ ...prev, [provId]: presets }));
-      toast.success(
-        zh
-          ? `rsclaw 已就绪 (${presets.length} 个模型)`
-          : `rsclaw ready (${presets.length} models)`,
-      );
-      return;
-    }
+    // rsclaw flows through the normal `test_provider` path below — the
+    // Tauri command does a live `/v1/models` probe (rsclaw now exposes
+    // an OpenAI-compatible models endpoint), returning whatever the
+    // fleet advertises at probe time.
 
     try {
       const tauriInvoke = isTauri ? tauriInvokeV2 : null;
@@ -3257,37 +3241,11 @@ function TauriConfigPageInner() {
           apiModels = Array.from(families.values()).sort();
         }
         if (apiModels.length > 0) {
-          // Always surface MODELS[provId] presets at the top of the list,
-          // even when they aren't returned by the upstream /v1/models call
-          // (e.g. doubao's "rolling alias" ids like `doubao-seed-2.0-pro`
-          // never appear in the API \u2014 only dated snapshots do). Dedup by
-          // id so a preset that DOES appear upstream isn't duplicated, and
-          // cap the API tail at 30 so the picker stays manageable.
-          const presets = (MODELS[provId] || []).map((m) => ({ id: m.id, tag: zh ? m.tag : m.tagEn }));
-          const presetIds = new Set(presets.map((m) => m.id));
-          const apiEntries = apiModels
-            .filter((id) => !presetIds.has(id))
-            .slice(0, 30)
-            .map((id) => {
-              const fallback = (MODELS[provId] || []).find((fm) => fm.id === id);
-              return { id, tag: fallback ? (zh ? fallback.tag : fallback.tagEn) : "" };
-            });
+          const entries = apiModels.slice(0, 30).map((id) => ({ id, tag: "" }));
           setProvTest((prev) => ({ ...prev, [provId]: "ok" }));
-          setProvModels((prev) => ({ ...prev, [provId]: [...presets, ...apiEntries] }));
+          setProvModels((prev) => ({ ...prev, [provId]: entries }));
           toast.success(zh ? `${provId} \u8FDE\u63A5\u6210\u529F (${apiModels.length} \u4E2A\u6A21\u578B)` : `${provId} connected (${apiModels.length} models)`);
-        } else if ((MODELS[provId] || []).length > 0) {
-          // Upstream is reachable (ok=true) but returned no listing \u2014 happens
-          // when the backend has no `/models` route (Volcengine ARK CodingPlan
-          // at `/api/coding/v3`, the Tauri/HTTP probe-fallback path returns
-          // ok+empty). Fall back to the local MODELS preset so the user can
-          // still pick a model. Same surface as the listed path: tag-decorated
-          // entries from the preset table.
-          const presets = (MODELS[provId] || []).map((m) => ({ id: m.id, tag: zh ? m.tag : m.tagEn }));
-          setProvTest((prev) => ({ ...prev, [provId]: "ok" }));
-          setProvModels((prev) => ({ ...prev, [provId]: presets }));
-          toast.success(zh ? `${provId} \u5DF2\u8FDE\u63A5 (${presets.length} \u4E2A\u9884\u8BBE\u6A21\u578B)` : `${provId} connected (${presets.length} preset models)`);
         } else {
-          // API key works but no models returned and no presets to fall back on
           setProvTest((prev) => ({ ...prev, [provId]: "err" }));
           setProvErr((prev) => ({ ...prev, [provId]: zh ? "API Key \u6709\u6548\u4F46\u672A\u83B7\u53D6\u5230\u6A21\u578B\u5217\u8868" : "API Key valid but no models returned" }));
         }
@@ -4117,9 +4075,8 @@ function TauriConfigPageInner() {
                             <div style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 200, overflowY: "auto" }}>
                               {models.map((m) => {
                                 const isSel = selModel === m.id || (!selModel && models[0]?.id === m.id);
-                                const fallbackModel = (MODELS[p.id] || []).find((fm) => fm.id === m.id);
-                                const tag = m.tag || (fallbackModel ? (zh ? fallbackModel.tag : fallbackModel.tagEn) : "");
-                                const isRec = fallbackModel?.rec;
+                                const tag = m.tag || "";
+                                const isRec = false;
                                 return (
                                   <div key={m.id} onClick={() => handleSelectModel(p.id, m.id)}
                                     style={{ display: "flex", alignItems: "center", gap: 9, padding: "7px 10px", borderRadius: 7, cursor: "pointer", border: `1px solid ${isSel ? V.obrd : "transparent"}`, background: isSel ? V.olo : "transparent", transition: "all .12s" }}>
@@ -4132,6 +4089,12 @@ function TauriConfigPageInner() {
                                 );
                               })}
                             </div>
+                          </div>
+                        )}
+                        {/* Empty-state hint: no models loaded yet (option A) */}
+                        {models.length === 0 && (
+                          <div style={{ fontSize: 11, color: V.t3, marginTop: 4 }}>
+                            {zh ? "填好 Key 后点「获取模型」加载可用模型" : "Enter your key, then click Fetch Models to load the list"}
                           </div>
                         )}
                       </div>
@@ -5495,6 +5458,9 @@ function SkillsTab() {
   const [search, setSearch] = useState("");
   const [searchResults, setSearchResults] = useState<{ name: string; version?: string; description?: string; registry?: string; installs?: string; stars?: string }[]>([]);
   const [searching, setSearching] = useState(false);
+  // True once a clawhub search has run (until the query is changed/cleared).
+  // Drives "search mode": installed + hub lists hide, results / no-matches show.
+  const [searched, setSearched] = useState(false);
   // Hub recommended catalog (GET /api/v1/hub/skills). Shown below the
   // installed list when the user isn't actively searching clawhub.
   const [hubSkills, setHubSkills] = useState<HubSkillEntry[]>([]);
@@ -5557,8 +5523,9 @@ function SkillsTab() {
   };
 
   const doSearch = async () => {
-    if (!search.trim()) { setSearchResults([]); return; }
+    if (!search.trim()) { setSearchResults([]); setSearched(false); return; }
     setSearching(true);
+    setSearched(true);
     try {
       const tauriInvoke = isTauri ? tauriInvokeV2 : null;
       if (tauriInvoke) {
@@ -5579,13 +5546,16 @@ function SkillsTab() {
       <div style={{ padding: "12px 28px 28px", flex: 1, overflowY: "auto" }}>
         {/* Search */}
         <div style={{ marginBottom: 20 }}>
-          <input value={search} onChange={(e) => setSearch(e.target.value)}
+          <input value={search} onChange={(e) => { setSearch(e.target.value); setSearched(false); setSearchResults([]); }}
             onKeyDown={(e) => { if (e.key === "Enter") doSearch(); }}
             placeholder={zh ? "\u641C\u7D22\u6280\u80FD\uFF08\u56DE\u8F66\u8054\u7F51\u641C\u7D22\uFF09..." : "Search skills (Enter to search online)..."}
             style={{ width: "100%", background: V2.bg2, border: `1px solid ${V2.bd}`, borderRadius: 9, padding: "9px 14px", color: V2.t0, fontSize: 12, outline: "none" }} />
         </div>
 
-        {/* Installed */}
+        {/* Installed \u2014 hidden while a clawhub search is active so the search
+            results below surface at the top of the panel (otherwise a long
+            installed list buries them and you can't tell if there are hits). */}
+        {!searched && (<>
         <div style={{ fontSize: 11, fontWeight: 600, color: V2.t2, letterSpacing: 0.5, textTransform: "uppercase", marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
           {zh ? "\u5DF2\u5B89\u88C5" : "Installed"} <span style={{ fontSize: 9, padding: "1px 7px", borderRadius: 3, background: V2.bg4, color: V2.t2 }}>{installed.length}</span>
         </div>
@@ -5618,8 +5588,10 @@ function SkillsTab() {
             ))}
           </div>
         )}
+        </>)}
 
-        {/* Search results */}
+        {/* Search results — surfaces at the top during a search because the
+            installed list above is hidden while searching. */}
         {searchResults.length > 0 && (
           <>
             <div style={{ fontSize: 11, fontWeight: 600, color: V2.t2, letterSpacing: 0.5, textTransform: "uppercase", marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
@@ -5652,18 +5624,27 @@ function SkillsTab() {
         )}
         {searching && <div style={{ textAlign: "center", color: V2.t3, padding: 20 }}>...</div>}
 
+        {/* No matches — make it explicit that the search ran and found nothing,
+            instead of silently falling back to the installed/hub lists. */}
+        {searched && !searching && searchResults.length === 0 && (
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8, padding: "30px 0", color: V2.t3 }}>
+            <div style={{ fontSize: 26, opacity: 0.4 }}>{"🔍"}</div>
+            <div style={{ fontSize: 12 }}>{zh ? `没有找到匹配「${search.trim()}」的技能` : `No skills matching "${search.trim()}"`}</div>
+          </div>
+        )}
+
         {/* Hub recommended \u2014 GET /api/v1/hub/skills. Hidden while the user
             is browsing clawhub search results to avoid a cluttered double
             list. Install resolves the slug via `rsclaw skills install`
             (clawhub fallback). */}
-        {searchResults.length === 0 && !searching && hubSkillsErrored && (
+        {!searched && hubSkillsErrored && (
           <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 12, padding: "28px 0", color: V2.t3 }}>
             <div style={{ fontSize: 12 }}>{zh ? "无法加载推荐技能（hub 接口不可用）" : "Couldn't load recommended skills (hub endpoint unavailable)"}</div>
             <button onClick={() => void fetchHubSkills()} style={{ padding: "6px 14px", borderRadius: 7, border: `1px solid ${V2.gbrd}`, background: V2.glo, color: V2.green, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{zh ? "重试" : "Retry"}</button>
           </div>
         )}
 
-        {searchResults.length === 0 && !searching && !hubSkillsErrored && hubSkills.length > 0 && (
+        {!searched && !hubSkillsErrored && hubSkills.length > 0 && (
           <>
             <div style={{ fontSize: 11, fontWeight: 600, color: V2.t2, letterSpacing: 0.5, textTransform: "uppercase", marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
               {zh ? "\u63A8\u8350\u5B89\u88C5" : "Recommended"} <span style={{ fontSize: 9, padding: "1px 7px", borderRadius: 3, background: V2.bg4, color: V2.t2 }}>{hubSkills.length}</span>

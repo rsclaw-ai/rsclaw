@@ -58,33 +58,23 @@ pub(crate) fn start_line_if_configured(
         enforcers.insert("line".to_owned(), Arc::clone(&enforcer));
     }
 
-    // Collect (account_name, access_token) pairs.
+    // Collect (account_name, access_token) pairs from
+    // accounts.<name>.channelAccessToken.
     let mut line_accounts: Vec<(String, String)> = Vec::new();
-
-    // Legacy: single token at top level.
-    if let Some(token) = line_cfg
-        .channel_access_token
-        .as_ref()
-        .and_then(|t| t.as_plain())
-        .map(str::to_owned)
-        .or_else(|| std::env::var("LINE_CHANNEL_ACCESS_TOKEN").ok())
-    {
-        line_accounts.push(("default".to_owned(), token));
-    }
-
-    // Multi-account: channels.line.accounts.<name>.channelAccessToken
     if let Some(accts) = &line_cfg.accounts {
         for (name, acct) in accts {
-            if let Some(t) = acct.get("channelAccessToken").and_then(|v| v.as_str()) {
-                if !line_accounts.iter().any(|(_, et)| et == t) {
-                    line_accounts.push((name.clone(), t.to_owned()));
-                }
+            let t = acct
+                .get("channelAccessToken")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !t.is_empty() {
+                line_accounts.push((name.clone(), t.to_owned()));
             }
         }
     }
 
     if line_accounts.is_empty() {
-        warn!("LINE channel_access_token not set, line disabled");
+        warn!("line.channelAccessToken not set in accounts, channel disabled");
         return;
     }
 

@@ -429,7 +429,7 @@ impl ExternalJobsWorker {
             images: vec![],
             files: vec![(filename.to_string(), mime.to_string(), path.to_string())],
             channel: Some(job.delivery.channel.clone()),
-            account: None,
+            account: job.delivery.account.clone(),
         };
         match self.notification_tx.send(out) {
             Ok(_) => true,
@@ -447,15 +447,16 @@ impl ExternalJobsWorker {
         };
         let reason = job.error.as_deref().unwrap_or("unknown error");
         let prompt_preview: String = job.prompt.chars().take(80).collect();
+        let text = format!("[{kind_label} failed] {prompt_preview}: {reason}");
         let out = OutboundMessage {
             target_id: job.delivery.target_id.clone(),
             is_group: job.delivery.is_group,
-            text: format!("[{kind_label}] generation failed for: {prompt_preview}\n{reason}"),
+            text,
             reply_to: job.delivery.reply_to.clone(),
             images: vec![],
             files: vec![],
             channel: Some(job.delivery.channel.clone()),
-            account: None,
+            account: job.delivery.account.clone(),
         };
         match self.notification_tx.send(out) {
             Ok(_) => true,
