@@ -484,7 +484,35 @@ pub(crate) async fn try_preparse_locally_with_account(
         // already loaded an empty/stale view and won't reread on its
         // own. Best-effort: any write failure is logged inside the
         // helper and does not abort the bind.
-        let _ = rsclaw_cap::identity::write_identity_files(&cwd).await;
+        // Snapshot the currently-loaded plugins + installed skills so the
+        // freshly-written AGENTS.md lists the exact capabilities (names +
+        // call syntax) available to the coding agent right now.
+        let cap_plugins: Vec<String> = handle
+            .wasm_plugins_snapshot()
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        let cap_skills: Vec<String> = {
+            let mut names = Vec::new();
+            let base = rsclaw_config::loader::base_dir();
+            for dir in [base.join("skills"), workspace().join("skills")] {
+                if let Ok(entries) = std::fs::read_dir(&dir) {
+                    for e in entries.flatten() {
+                        let p = e.path();
+                        if p.is_dir() && p.join("SKILL.md").exists() {
+                            if let Some(n) = p.file_name().and_then(|n| n.to_str()) {
+                                names.push(n.to_owned());
+                            }
+                        }
+                    }
+                }
+            }
+            names.sort();
+            names.dedup();
+            names
+        };
+        let _ =
+            rsclaw_cap::identity::write_identity_files(&cwd, &cap_plugins, &cap_skills).await;
         match manager.open_session(kind, cwd).await {
             Ok(sid) => {
                 manager
