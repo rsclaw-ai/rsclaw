@@ -464,6 +464,15 @@ pub struct AgentDefaults {
     /// (browser/shell/cap): 100. Budget depletes on stagnation/errors, not on
     /// productive iterations. Set to 0 to use built-in defaults.
     pub max_iterations: Option<u32>,
+    /// Agent IDs that run as long-lived DAEMON loops (e.g. a realtime monitor
+    /// that polls forever). For these agents the turn-bounding guards are
+    /// disabled: the hard iteration ceiling, the stagnation budget, and the
+    /// same-call / same-name repeat breaks. They are meant to never self-
+    /// terminate, so a tight `wait`+poll loop (which looks like stagnation) is
+    /// expected. Use with care — such a turn only ends on error or external
+    /// stop. Empty/absent = no daemon agents (normal bounded behaviour).
+    #[serde(default)]
+    pub daemon_agent_ids: Option<Vec<String>>,
     /// Send intermediate text to user during multi-step tool calls. Default:
     /// true.
     pub intermediate_output: Option<bool>,

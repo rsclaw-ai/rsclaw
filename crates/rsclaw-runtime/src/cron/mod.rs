@@ -77,6 +77,8 @@ const CANCEL_BY_RELOAD: &str = "cron: cancelled by reload";
 pub struct CronRunner {
     jobs: Vec<CronJob>,
     agents: Arc<AgentRegistry>,
+    /// Agent IDs whose cron turns run without a timeout (daemon loops).
+    daemon_agent_ids: Vec<String>,
     channels: Arc<ChannelManager>,
     run_log_dir: PathBuf,
     store_path: PathBuf,
@@ -152,7 +154,17 @@ impl CronRunner {
             ws_conns,
             shutdown,
             parse_failed,
+            daemon_agent_ids: Vec::new(),
         }
+    }
+
+    /// Agent IDs that run as long-lived daemon loops — their cron-triggered
+    /// turns are NOT subject to the per-job timeout (they loop forever by
+    /// design; see `agents.defaults.daemon_agent_ids`).
+    #[must_use]
+    pub fn with_daemon_agent_ids(mut self, ids: Vec<String>) -> Self {
+        self.daemon_agent_ids = ids;
+        self
     }
 
     pub fn jobs(&self) -> &[CronJob] {
@@ -814,6 +826,7 @@ impl CronRunner {
                 cancel_flags.insert(job.id.clone(), Arc::clone(&cancelled));
                 let job_id_for_log = job.id.clone(); // Clone BEFORE async move
                 let agents = Arc::clone(&self.agents);
+                let daemon_agent_ids = self.daemon_agent_ids.clone();
                 let channels = Arc::clone(&self.channels);
                 let run_log_dir = self.run_log_dir.clone();
                 let default_delivery = self.default_delivery.clone();
@@ -865,7 +878,7 @@ impl CronRunner {
                     } else {
                         // Run with cancellation check — polls cancel flag every second.
                         tokio::select! {
-                            r = run_cron_job(&job, &agents) => r,
+                            r = run_cron_job(&job, &agents, &daemon_agent_ids) => r,
                             _ = async {
                                 loop {
                                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1073,7 +1086,7 @@ impl CronRunner {
             )
             .await
         } else {
-            run_cron_job(job, &self.agents).await
+            run_cron_job(job, &self.agents, &self.daemon_agent_ids).await
         };
         let success = result.is_ok();
 
@@ -1209,6 +1222,7 @@ impl Clone for CronRunner {
         Self {
             jobs: self.jobs.clone(),
             agents: Arc::clone(&self.agents),
+            daemon_agent_ids: self.daemon_agent_ids.clone(),
             channels: Arc::clone(&self.channels),
             run_log_dir: self.run_log_dir.clone(),
             store_path: self.store_path.clone(),
@@ -1226,7 +1240,11 @@ impl Clone for CronRunner {
 // Internal helpers (runner-only — touch rsclaw_agent / crate::gateway)
 // ---------------------------------------------------------------------------
 
-async fn run_cron_job(job: &CronJob, agents: &AgentRegistry) -> Result<String> {
+async fn run_cron_job(
+    job: &CronJob,
+    agents: &AgentRegistry,
+    daemon_agent_ids: &[String],
+) -> Result<String> {
     let session_key = job
         .session_key
         .clone()
@@ -1236,17 +1254,23 @@ async fn run_cron_job(job: &CronJob, agents: &AgentRegistry) -> Result<String> {
         .get(&job.agent_id)
         .with_context(|| format!("agent not found: {}", job.agent_id))?;
 
-    // Allow configurable timeout via payload.timeout_seconds, default 300s
-    let timeout_secs = job
-        .payload
-        .as_ref()
-        .and_then(|p| match p {
-            CronPayload::Structured {
-                timeout_seconds, ..
-            } => *timeout_seconds,
-            CronPayload::Text(_) => None,
-        })
-        .unwrap_or(300);
+    // Allow configurable timeout via payload.timeout_seconds, default 300s.
+    // Daemon agents (long-lived monitor loops) get NO timeout — they loop
+    // forever by design, so a cron-triggered (re)launch must not be killed at
+    // 300s. Treated the same as `timeout_seconds: 0` below.
+    let timeout_secs = if daemon_agent_ids.iter().any(|id| id == &job.agent_id) {
+        0
+    } else {
+        job.payload
+            .as_ref()
+            .and_then(|p| match p {
+                CronPayload::Structured {
+                    timeout_seconds, ..
+                } => *timeout_seconds,
+                CronPayload::Text(_) => None,
+            })
+            .unwrap_or(300)
+    };
 
     // Register abort flag for this session before dispatching
     let abort_flag = {
@@ -1324,37 +1348,44 @@ async fn run_cron_job(job: &CronJob, agents: &AgentRegistry) -> Result<String> {
 
     handle.tx.send(msg).await.context("agent inbox closed")?;
 
-    let reply = tokio::time::timeout(Duration::from_secs(timeout_secs), reply_rx)
-        .await
-        .map_err(|_| {
-            // Timeout fired: abort the agent execution and capture status for error
-            // reporting.
-            abort_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-            warn!(job_id = %job.id, session = %session_key, "cron: timeout fired, aborting agent");
+    // `timeout_seconds: 0` means NO timeout — for long-lived daemon/monitor
+    // turns that loop forever by design (paired with `agents.defaults.
+    // daemon_agent_ids`). Otherwise enforce the (default 300s) timeout.
+    let reply = if timeout_secs == 0 {
+        reply_rx.await.context("agent dropped reply channel")?
+    } else {
+        tokio::time::timeout(Duration::from_secs(timeout_secs), reply_rx)
+            .await
+            .map_err(|_| {
+                // Timeout fired: abort the agent execution and capture status for error
+                // reporting.
+                abort_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                warn!(job_id = %job.id, session = %session_key, "cron: timeout fired, aborting agent");
 
-            let agent_status = handle
-                .live_status
-                .try_read()
-                .map(|s| {
-                    let task = if s.current_task.is_empty() {
-                        "none".to_string()
-                    } else {
-                        s.current_task.chars().take(100).collect::<String>()
-                    };
-                    let tools = if s.tool_history.is_empty() {
-                        "none".to_string()
-                    } else {
-                        s.tool_history.join(", ")
-                    };
-                    format!(
-                        " (state: {}, task: \"{}\", tools called: [{}])",
-                        s.state, task, tools
-                    )
-                })
-                .unwrap_or_default();
-            anyhow!("cron job timed out after {}s{}", timeout_secs, agent_status)
-        })?
-        .context("agent dropped reply channel")?;
+                let agent_status = handle
+                    .live_status
+                    .try_read()
+                    .map(|s| {
+                        let task = if s.current_task.is_empty() {
+                            "none".to_string()
+                        } else {
+                            s.current_task.chars().take(100).collect::<String>()
+                        };
+                        let tools = if s.tool_history.is_empty() {
+                            "none".to_string()
+                        } else {
+                            s.tool_history.join(", ")
+                        };
+                        format!(
+                            " (state: {}, task: \"{}\", tools called: [{}])",
+                            s.state, task, tools
+                        )
+                    })
+                    .unwrap_or_default();
+                anyhow!("cron job timed out after {}s{}", timeout_secs, agent_status)
+            })?
+            .context("agent dropped reply channel")?
+    };
 
     // Clear abort flag after successful completion
     abort_flag.store(false, std::sync::atomic::Ordering::SeqCst);

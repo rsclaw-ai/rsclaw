@@ -4757,7 +4757,15 @@ impl AgentRuntime {
             }
         }
 
-        // Timeout wrapper.
+        // Timeout wrapper. Daemon agents (long-lived monitor loops) run with NO
+        // turn timeout — they loop forever by design; see `daemon_agent_ids`.
+        let daemon_mode: bool = self
+            .config
+            .agents
+            .defaults
+            .daemon_agent_ids
+            .as_ref()
+            .is_some_and(|ids| ids.iter().any(|id| id == &self.handle.id));
         let timeout_secs = self
             .config
             .agents
@@ -4898,26 +4906,29 @@ impl AgentRuntime {
         // when the user_system bytes change (i.e. install/uninstall),
         // which is the correct behaviour.
 
-        let reply = time::timeout(
-            Duration::from_secs(timeout_secs),
-            self.agent_loop(
-                &mut ctx,
-                &model,
-                primary_chain_tail.clone(),
-                &system_prompt,
-                tools,
-                deferred_tool_defs,
-                extra_tools,
-                abort_flag.clone(),
-            ),
-        )
-        .await
-        .map_err(|_| {
-            anyhow!(
-                "agent `{}` turn timed out after {timeout_secs}s",
-                self.handle.id
-            )
-        })??;
+        let agent_loop_fut = self.agent_loop(
+            &mut ctx,
+            &model,
+            primary_chain_tail.clone(),
+            &system_prompt,
+            tools,
+            deferred_tool_defs,
+            extra_tools,
+            abort_flag.clone(),
+        );
+        let reply = if daemon_mode {
+            // No turn timeout for daemon agents — they loop indefinitely.
+            agent_loop_fut.await?
+        } else {
+            time::timeout(Duration::from_secs(timeout_secs), agent_loop_fut)
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "agent `{}` turn timed out after {timeout_secs}s",
+                        self.handle.id
+                    )
+                })??
+        };
 
         // Update live status: turn finished.
         if let Ok(mut status) = self.live_status.try_write() {
@@ -5684,6 +5695,29 @@ impl AgentRuntime {
             .max_iterations
             .map(|v| v as usize)
             .unwrap_or(0);
+        // DAEMON mode: agents listed in `agents.defaults.daemon_agent_ids` run as
+        // long-lived loops that never self-terminate (e.g. a realtime monitor
+        // polling forever). For them we disable all turn-bounding guards below —
+        // the hard iteration ceiling, the stagnation budget/wrap-up, and the
+        // same-call/same-name repeat breaks — because a tight poll loop is the
+        // intended steady state, not stagnation. Tool-error breaks stay ON so a
+        // genuinely wedged turn still ends (and cron re-launches it).
+        let daemon_mode: bool = self
+            .live
+            .agents
+            .read()
+            .await
+            .defaults
+            .daemon_agent_ids
+            .as_ref()
+            .is_some_and(|ids| ids.iter().any(|id| id == &ctx.agent_id));
+        if daemon_mode {
+            warn!(
+                session = %ctx.session_key,
+                agent_id = %ctx.agent_id,
+                "agent_loop: DAEMON mode — turn-bounding guards disabled for this agent"
+            );
+        }
         // Track consecutive identical tool calls (same name + same args).
         let mut last_tool_key = String::new();
         let mut same_call_streak: usize = 0;
@@ -5739,7 +5773,8 @@ impl AgentRuntime {
             // progress-aware stagnation budget can't catch (productive-looking
             // paging / re-routing). A turn that legitimately needs >80 tool
             // iterations is itself pathological; stop and hand back what we have.
-            if iteration > HARD_MAX_ITERATIONS {
+            // (Daemon agents are exempt — they loop forever by design.)
+            if !daemon_mode && iteration > HARD_MAX_ITERATIONS {
                 warn!(
                     session = %ctx.session_key,
                     iterations = iteration,
@@ -5851,8 +5886,9 @@ impl AgentRuntime {
             }
             // Stagnation budget check: when budget depletes, inject a wrap-up
             // prompt (soft limit). If the LLM still calls tools after that,
-            // hard-stop with contextual message.
-            if budget <= 0 && !wrapup_injected {
+            // hard-stop with contextual message. (Daemon agents are exempt — a
+            // steady poll loop looks like stagnation but is the intended state.)
+            if !daemon_mode && budget <= 0 && !wrapup_injected {
                 warn!(
                     session = %ctx.session_key,
                     iterations = iteration,
@@ -5874,7 +5910,7 @@ impl AgentRuntime {
                 }
                 wrapup_injected = true;
                 // Give the LLM one more chance to produce a final answer.
-            } else if budget <= 0 && wrapup_injected {
+            } else if !daemon_mode && budget <= 0 && wrapup_injected {
                 // Hard stop: LLM called another tool despite the wrap-up prompt.
                 warn!(
                     session = %ctx.session_key,
@@ -7350,7 +7386,9 @@ impl AgentRuntime {
                     }
                     ctx.turn_metrics.same_call_streak_max =
                         ctx.turn_metrics.same_call_streak_max.max(same_call_streak);
-                    if same_call_streak >= MAX_SAME_CALL_STREAK {
+                    // Daemon agents poll the same tool forever by design — don't
+                    // treat a repeated identical call as a stagnation break.
+                    if !daemon_mode && same_call_streak >= MAX_SAME_CALL_STREAK {
                         warn!(
                             tool = %tool_name,
                             streak = same_call_streak,

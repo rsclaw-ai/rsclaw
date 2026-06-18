@@ -929,6 +929,14 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 cron_reload_tx.clone(),
                 Arc::clone(&ws_conns),
                 Some(shutdown.clone()),
+            )
+            .with_daemon_agent_ids(
+                config
+                    .agents
+                    .defaults
+                    .daemon_agent_ids
+                    .clone()
+                    .unwrap_or_default(),
             );
             tokio::spawn(async move {
                 if let Err(e) = runner.run().await {
