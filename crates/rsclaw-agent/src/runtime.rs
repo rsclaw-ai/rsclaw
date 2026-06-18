@@ -8676,7 +8676,7 @@ impl AgentRuntime {
             }
             "agent_spawn" | "sessions_spawn" => {
                 return self
-                    .tool_agent_consolidated(ctx, inject_action(args, "spawn"))
+                    .tool_agent_consolidated(ctx, inject_action(args, "create"))
                     .await;
             }
             "agent_list" | "agents_list" => {

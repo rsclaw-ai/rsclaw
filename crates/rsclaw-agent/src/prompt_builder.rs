@@ -193,7 +193,7 @@ pub(crate) fn build_help_text_filtered(allowed: &str, lang: &str) -> String {
         h.push_str(if zh {
             "  agent    创建/任务/列表/终止子智能体\n"
         } else {
-            "  agent    spawn/task/list/kill sub-agents\n"
+            "  agent    create/temp/list/kill sub-agents\n"
         });
         h.push_str(if zh {
             "  channel  发送/回复/置顶/删除跨渠道消息\n"
@@ -586,7 +586,7 @@ fn build_shared_system_prefix_uncached() -> String {
          ### Agent & Task Delegation\n\
          Delegate work to sub-agents for parallelism, never block.\n\
          - rsclaw HAS first-class multi-agent orchestration + task dispatch BUILT IN. ANY request to \
-create / spawn / delegate an agent, sub-agent, task-agent, task-proxy, worker, or sub-task \
+create / delegate an agent, sub-agent, task-agent, task-proxy, worker, or sub-task \
 (创建智能体 / 子智能体 / 任务智能体 / 任务代理 / 子代理 / 分发任务 / 并发执行) MUST go through the \
 built-in `agent` tool. NEVER simulate orchestration in your own head, and NEVER claim you \
 \"can't create agents\" or \"have no concurrency\" — you do, via this tool.\n\
@@ -596,11 +596,11 @@ it only wastes wall-clock. REAL parallelism exists ONLY through the built-in `ag
 the runtime spawns concurrent sub-agents that truly run at the same time. So never hand-run \
 independent subtasks yourself when they could run at once.\n\
          - When work splits into N INDEPENDENT subtasks, dispatch them ALL at once via \
-`agent` action=dispatch (set `toolset` per task), then collect — do NOT loop them one-by-one.\n\
-         - Trivial / single-step / inherently-sequential work -> do yourself (spawning buys no parallelism).\n\
+`agent` action=temp (set `toolset` per task), then collect — do NOT loop them one-by-one.\n\
+         - Trivial / single-step / inherently-sequential work -> do yourself (creating buys no parallelism).\n\
          - Pipeline: dispatch parallel -> collect results -> dispatch dependent tasks -> synthesize.\n\
          ### When to call the `task` tool (escalate to background)\n\
-         (The `task` tool moves a whole long job to the BACKGROUND — distinct from `agent` action=dispatch above, which spawns parallel sub-agents WITHIN this turn. The caution below is about background escalation only.)\n\
+         (The `task` tool moves a whole long job to the BACKGROUND — distinct from `agent` action=temp above, which spawns temporary sub-agents for parallel work WITHIN this turn. The caution below is about background escalation only.)\n\
          Default to answering the user directly in this turn. Only call `task` when ALL of:\n\
          1. The work obviously needs many tool calls or many minutes (e.g. multi-file \
          implementation, deep multi-source research, end-to-end deploys, long debugging).\n\
