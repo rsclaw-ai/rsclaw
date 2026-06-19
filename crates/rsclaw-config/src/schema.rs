@@ -2451,7 +2451,10 @@ pub struct KbConfig {
 pub struct KbRerankConfig {
     /// API root of an OpenAI/Jina-compatible rerank server, e.g.
     /// `http://117.50.139.244:5556/v1` (llama.cpp with `--reranking`).
-    /// `/rerank` is appended at request time.
+    /// `/rerank` is appended at request time. Optional: when empty and the
+    /// `model` is a `rsclaw-*` name, it resolves to the fleet API
+    /// (`https://api.rsclaw.ai/v1`) — see `KbReranker::from_config`.
+    #[serde(default)]
     pub base_url: String,
     /// Model name sent in the request body. Optional — single-model
     /// llama.cpp servers ignore it.
