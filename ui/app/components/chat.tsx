@@ -2326,6 +2326,14 @@ function _Chat() {
               style={{ overflowX: "hidden", width: "100%" }}
               scrollerRef={captureScroller}
               followOutput="auto"
+              // Keep auto-scroll glued to the bottom while a message streams.
+              // `followOutput="auto"` only sticks when Virtuoso thinks we're
+              // "at bottom", and the default threshold is 4px — fast token
+              // streaming grows the content past that every frame, so the
+              // at-bottom state flips false and scrolling stops following. A
+              // generous threshold (~2-3 lines) keeps it stuck during streaming
+              // while still letting a deliberate scroll-up detach.
+              atBottomThreshold={120}
               initialTopMostItemIndex={initialBottomIndex}
               atBottomStateChange={handleAtBottomStateChange}
               computeItemKey={computeChatItemKey}
