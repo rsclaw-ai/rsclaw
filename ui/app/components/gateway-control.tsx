@@ -8,10 +8,10 @@ import StopIcon from "../icons/pause.svg";
 import PowerIcon from "../icons/power.svg";
 import { useNavigate } from "react-router-dom";
 import { useEffect, useState, useCallback } from "react";
-import { Path } from "../constant";
+import { Path, RSCLAW_GATEWAY_API_BASE } from "../constant";
 import Locale from "../locales";
 
-const GATEWAY_BASE = "http://localhost:18888/api/v1";
+const GATEWAY_BASE = RSCLAW_GATEWAY_API_BASE;
 
 interface AgentInfo {
   id: string;

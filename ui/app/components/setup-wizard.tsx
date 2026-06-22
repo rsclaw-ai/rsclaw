@@ -6,7 +6,7 @@ import ReturnIcon from "../icons/return.svg";
 import ConfirmIcon from "../icons/confirm.svg";
 import { useNavigate } from "react-router-dom";
 import { useState, useEffect, useRef, useMemo } from "react";
-import { Path } from "../constant";
+import { Path, RSCLAW_GATEWAY_API_BASE } from "../constant";
 import { isTauri, invoke as tauriInvokeV2 } from "../utils/tauri";
 import { showToast } from "./ui-lib";
 import {
@@ -17,7 +17,7 @@ import {
 } from "../lib/provider-defaults";
 import { useCatalog, getProviderMap } from "../lib/catalog";
 
-const GATEWAY_BASE = "http://localhost:18888/api/v1";
+const GATEWAY_BASE = RSCLAW_GATEWAY_API_BASE;
 
 const LANGUAGES = [
   { code: "zh-CN", name: "简体中文" },
@@ -118,7 +118,7 @@ export function SetupWizardPage() {
           const cfg = JSON5.parse(raw || "{}");
           cfgLang = cfg?.gateway?.language;
         } else {
-          const res = await fetch("http://localhost:18888/api/v1/config");
+          const res = await fetch(`${GATEWAY_BASE}/config`);
           if (res.ok) {
             const cfg = await res.json();
             cfgLang = cfg?.gateway?.language;

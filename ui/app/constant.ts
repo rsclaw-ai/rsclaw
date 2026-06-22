@@ -12,6 +12,11 @@ export const RUNTIME_CONFIG_DOM = "danger-runtime-config";
 export const RSCLAW_GATEWAY_URL =
   process.env.NEXT_PUBLIC_RSCLAW_GATEWAY_URL || "http://localhost:18888";
 
+// `${gateway}/api/v1` — the REST base. Single source so changing the gateway
+// address (env or the default above) propagates everywhere instead of leaving
+// hardcoded `http://localhost:18888/api/v1` copies scattered across components.
+export const RSCLAW_GATEWAY_API_BASE = `${RSCLAW_GATEWAY_URL}/api/v1`;
+
 export const STABILITY_BASE_URL = "https://api.stability.ai";
 
 export const OPENAI_BASE_URL = RSCLAW_GATEWAY_URL;
