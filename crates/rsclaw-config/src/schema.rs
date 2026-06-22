@@ -663,7 +663,11 @@ impl StringOrVec {
                 let t = s.trim();
                 if t.is_empty() { vec![] } else { vec![t] }
             }
-            Self::Multi(v) => v.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect(),
+            Self::Multi(v) => v
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect(),
         }
     }
 
@@ -836,7 +840,10 @@ impl ModelConfig {
 
     /// Full primary chain as borrowed slice. Length 0 = unset.
     pub fn primary_chain(&self) -> Vec<&str> {
-        self.primary.as_ref().map(StringOrVec::chain).unwrap_or_default()
+        self.primary
+            .as_ref()
+            .map(StringOrVec::chain)
+            .unwrap_or_default()
     }
 
     /// First model id in the `flash` chain.
@@ -846,7 +853,10 @@ impl ModelConfig {
 
     /// Full flash chain.
     pub fn flash_chain(&self) -> Vec<&str> {
-        self.flash.as_ref().map(StringOrVec::chain).unwrap_or_default()
+        self.flash
+            .as_ref()
+            .map(StringOrVec::chain)
+            .unwrap_or_default()
     }
 
     /// First model id in the `vision` chain.
@@ -856,7 +866,10 @@ impl ModelConfig {
 
     /// Full vision chain.
     pub fn vision_chain(&self) -> Vec<&str> {
-        self.vision.as_ref().map(StringOrVec::chain).unwrap_or_default()
+        self.vision
+            .as_ref()
+            .map(StringOrVec::chain)
+            .unwrap_or_default()
     }
 
     /// First model id in the `image` chain.
@@ -866,7 +879,10 @@ impl ModelConfig {
 
     /// Full image chain.
     pub fn image_chain(&self) -> Vec<&str> {
-        self.image.as_ref().map(StringOrVec::chain).unwrap_or_default()
+        self.image
+            .as_ref()
+            .map(StringOrVec::chain)
+            .unwrap_or_default()
     }
 
     /// First model id in the `video` chain.
@@ -876,7 +892,10 @@ impl ModelConfig {
 
     /// Full video chain.
     pub fn video_chain(&self) -> Vec<&str> {
-        self.video.as_ref().map(StringOrVec::chain).unwrap_or_default()
+        self.video
+            .as_ref()
+            .map(StringOrVec::chain)
+            .unwrap_or_default()
     }
 }
 
@@ -1793,9 +1812,11 @@ pub struct CronDelivery {
     pub mode: Option<String>,
     /// Channel to send to: "feishu", "wechat", "telegram", etc.
     pub channel: Option<String>,
-    /// Target user/chat ID.
+    /// Target user/chat ID(s). Accepts a single id or a list (fan-out to
+    /// multiple recipients). When omitted, the cron runner falls back to the
+    /// peer of the agent's most-recent conversation (incl. a2a-delegated).
     #[serde(rename = "to")]
-    pub to: Option<String>,
+    pub to: Option<StringOrVec>,
     /// Thread/topic ID for channels that support it.
     pub thread_id: Option<String>,
     /// Account ID for multi-account setups.
