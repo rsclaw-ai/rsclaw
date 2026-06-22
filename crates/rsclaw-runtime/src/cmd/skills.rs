@@ -67,6 +67,46 @@ pub async fn cmd_skills(sub: SkillsCommand) -> Result<()> {
                 std::process::exit(1);
             }
         },
+        SkillsCommand::Use { skill } => {
+            // Mirror the in-agent `skill_use` tool: resolve the skill dir
+            // (live registry first, then disk for a just-installed skill),
+            // print SKILL.md verbatim, and tell the caller where scripts /
+            // references live so a CLI coding agent can follow the SOP.
+            let dir = match registry.get(&skill) {
+                Some(s) => s.dir.clone(),
+                None => {
+                    if !skill::valid_slug(&skill) {
+                        eprintln!("invalid skill name: {skill:?}");
+                        std::process::exit(1);
+                    }
+                    let disk = config::loader::base_dir().join("skills").join(&skill);
+                    if disk.join("SKILL.md").is_file() {
+                        disk
+                    } else {
+                        eprintln!("Skill '{}' not installed.", skill);
+                        eprintln!(
+                            "Use `rsclaw skills search {}` to find it, then `rsclaw skills install`.",
+                            skill
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            };
+            let skill_md = dir.join("SKILL.md");
+            match std::fs::read_to_string(&skill_md) {
+                Ok(body) => {
+                    println!("# Skill: {skill}");
+                    println!("# Directory: {}", dir.display());
+                    println!("# Follow the playbook below; scripts/references are under the directory above.");
+                    println!();
+                    println!("{body}");
+                }
+                Err(e) => {
+                    eprintln!("failed to read {}: {e}", skill_md.display());
+                    std::process::exit(1);
+                }
+            }
+        }
         SkillsCommand::Check { eligible } => {
             let mut skills: Vec<_> = registry.all().collect();
             skills.sort_by_key(|s| s.name.as_str());

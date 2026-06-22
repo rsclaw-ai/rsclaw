@@ -67,10 +67,25 @@ pub fn resolve_embedder(kb_root: &std::path::Path) -> std::sync::Arc<dyn KbEmbed
                     .model
                     .clone()
                     .unwrap_or_else(|| rsclaw_embed::OPENAI_DEFAULT_MODEL.to_owned());
+                // Auth resolution: explicit kb.embed.apiKey → for a
+                // first-party `rsclaw-*` model, the shared rsclaw provider key
+                // (same key OCR/rerank use) → OPENAI_API_KEY. Without the
+                // rsclaw fallback a `rsclaw-*` embed model resolves the fleet
+                // base URL but sends no bearer and 401s.
                 let api_key = cfg
                     .api_key
                     .as_ref()
                     .and_then(|s| s.resolve_early())
+                    .or_else(|| {
+                        if rsclaw_embed::is_rsclaw_model(&model) {
+                            rsclaw_config::load()
+                                .ok()
+                                .as_ref()
+                                .and_then(crate::ocr::rsclaw_provider_key)
+                        } else {
+                            None
+                        }
+                    })
                     .or_else(|| std::env::var("OPENAI_API_KEY").ok());
                 let dim = cfg
                     .dimensions

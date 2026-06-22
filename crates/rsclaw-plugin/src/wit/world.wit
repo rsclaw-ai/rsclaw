@@ -15,6 +15,17 @@ interface host-browser {
     browser-screenshot: func() -> result<string, string>;
     browser-download: func(ref-str: string, filename: string) -> result<string, string>;
     browser-upload: func(ref-str: string, filepath: string) -> result<string, string>;
+    /// Upload MULTIPLE files at once to a single (multiple-capable) file input
+    /// identified by data-ref. Equivalent to selecting several files in the OS
+    /// dialog: sets input.files to all paths and fires change once. Use for
+    /// galleries / multi-image uploaders backed by one `<input multiple>`.
+    browser-upload-multi: func(ref-str: string, filepaths: list<string>) -> result<string, string>;
+    /// Upload one or more files to an input opened via a native file-chooser
+    /// dialog (e.g. a button that triggers a transient or cross-origin-iframe
+    /// `<input type=file>`). Intercepts the chooser at the CDP level, clicks the
+    /// trigger at (click-x, click-y), then sets all files at once. Works across
+    /// iframes/origins where `browser-upload`'s main-document selector cannot.
+    browser-upload-via-chooser: func(filepaths: list<string>, click-x: u32, click-y: u32) -> result<string, string>;
     browser-get-url: func() -> result<string, string>;
 
     /// Wait for an element matching `css-selector` to be present in the DOM.
@@ -226,6 +237,14 @@ interface host-android {
 
     /// Wait up to timeout-ms for an element matching selector to appear. Returns "found" or error.
     android-wait-for-element: func(selector-type: string, selector-value: string, timeout-ms: u32) -> result<string, string>;
+
+    /// Tap the brand-yellow primary button by its RENDERED COLOR. Flutter confirm
+    /// dialogs (下架/删除/取消订单/发货) expose no UI tree, so element selectors
+    /// can't find their 确定/确认 button — but it's always the bright-yellow action.
+    /// Screenshots, finds the largest yellow region within the vertical band
+    /// [y-min, y-max) (pass 0,0 for the whole screen), and taps its center.
+    /// Returns "tapped:x,y" or an error if no yellow button is found.
+    android-tap-yellow-button: func(y-min: u32, y-max: u32) -> result<string, string>;
 }
 
 interface host-desktop {

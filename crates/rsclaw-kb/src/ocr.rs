@@ -137,9 +137,12 @@ impl OcrClient {
     }
 }
 
-/// Pull the rsclaw provider's API key from config so OCR (and other
-/// fleet calls) can authenticate without a dedicated `kb.ocr.apiKey`.
-fn rsclaw_provider_key(cfg: &rsclaw_config::runtime::RuntimeConfig) -> Option<String> {
+/// Pull the rsclaw provider's API key from config so fleet calls (OCR,
+/// embed, rerank — all first-party `rsclaw-*` models share this one key)
+/// can authenticate without a dedicated per-feature `apiKey`.
+pub(crate) fn rsclaw_provider_key(
+    cfg: &rsclaw_config::runtime::RuntimeConfig,
+) -> Option<String> {
     cfg.raw
         .models
         .as_ref()?

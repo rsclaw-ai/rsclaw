@@ -106,6 +106,9 @@ impl AgentSpawner {
             .and_then(|m| m.context_tokens)
             .or(self.config.agents.defaults.context_tokens)
             .unwrap_or(0) as usize;
+        let effective_model =
+            crate::runtime::resolve_primary_model_for(&entry, &self.config.agents.defaults)
+                .unwrap_or_else(|| "rsclaw/rsclaw-agent-v1".to_owned());
         let handle = Arc::new(AgentHandle {
             id: id.clone(),
             kind,
@@ -132,6 +135,7 @@ impl AgentSpawner {
             clear_signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             new_session_signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             context_window,
+            effective_model,
         });
 
         self.registry.insert_handle(Arc::clone(&handle));

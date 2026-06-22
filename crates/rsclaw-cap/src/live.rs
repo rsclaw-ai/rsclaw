@@ -756,11 +756,45 @@ async fn respawn_driver(
                 tracing::debug!(target: "cap", error = %e, "best-effort shutdown of dead driver");
             }
             *driver = fresh;
-            // Clear the stale agent session id from the dead driver.
-            // The respawned driver has a fresh session; the slot will be
-            // repopulated when it emits Ready.
-            if let Ok(mut g) = agent_sid_slot.lock() {
-                *g = None;
+            // Re-capture the fresh driver's native session id. The new driver
+            // emits a Ready (carrying its session id) during its init
+            // handshake, BEFORE it consumes the replayed prompt — so drain
+            // briefly for it here. The main loop's startup capture runs only
+            // once (before the loop) and never sees a respawn's Ready, so
+            // without this the slot would stay stale/None for the rest of the
+            // actor's life and get_agent_session_id / resume-by-id would break
+            // after any respawn. Bounded so a driver that never emits Ready
+            // can't stall the retry; on timeout the slot is left None.
+            {
+                use cap_rs::core::AgentEvent;
+                let mut captured: Option<String> = None;
+                let recapture_deadline =
+                    tokio::time::sleep(std::time::Duration::from_secs(8));
+                tokio::pin!(recapture_deadline);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut recapture_deadline => break,
+                        ev = driver.next_event() => match ev {
+                            Some(AgentEvent::Ready { session_id, .. }) => {
+                                captured = session_id;
+                                break;
+                            }
+                            Some(_) => continue,
+                            None => break,
+                        }
+                    }
+                }
+                if captured.is_none() {
+                    tracing::warn!(
+                        target: "cap",
+                        session_id = %sid,
+                        "no Ready captured after respawn; resume id unavailable until next bind"
+                    );
+                }
+                if let Ok(mut g) = agent_sid_slot.lock() {
+                    *g = captured;
+                }
             }
             tracing::info!(
                 target: "cap",
@@ -817,24 +851,21 @@ async fn actor_loop(
     let mut prebuf_request: Option<LiveRequest> = None;
     {
         use cap_rs::core::AgentEvent;
+        // Capture the native session id from the driver's Ready event so the
+        // resume hint can be sent. A queued first prompt must NOT pre-empt
+        // this: the old `biased; rx.recv()` arm broke capture whenever the
+        // user typed during the agent's cold start (claudecode/codex/opencode
+        // take 10-30s to emit Ready), leaving the resume id permanently None.
+        // But blocking purely on Ready stalled the prompt for 30s. Compromise:
+        // Ready-capture takes priority; a first prompt is BUFFERED (not a
+        // break) and only SHORTENS the remaining Ready wait to 8s so the
+        // prompt isn't delayed much while we still usually catch Ready.
         let capture_deadline = tokio::time::sleep(std::time::Duration::from_secs(30));
         tokio::pin!(capture_deadline);
         loop {
             tokio::select! {
                 biased;
-                first_req = rx.recv() => {
-                    prebuf_request = first_req;
-                    break;
-                }
-                _ = &mut capture_deadline => {
-                    tracing::warn!(
-                        target: "cap",
-                        session_id = %sid,
-                        agent = kind.as_str(),
-                        "no Ready captured in 30s; resume id unavailable until next bind"
-                    );
-                    break;
-                }
+                // Ready capture first — a same-tick prompt won't pre-empt it.
                 ev = driver.next_event() => match ev {
                     Some(AgentEvent::Ready { session_id, .. }) => {
                         if let Ok(mut g) = agent_sid_slot.lock() {
@@ -857,6 +888,27 @@ async fn actor_loop(
                         );
                         break;
                     }
+                },
+                // Buffer the first prompt but keep waiting (briefly) for Ready.
+                // Disabled once a prompt is already buffered so we never eat a
+                // second one here.
+                first_req = rx.recv(), if prebuf_request.is_none() => match first_req {
+                    Some(req) => {
+                        prebuf_request = Some(req);
+                        capture_deadline.as_mut().reset(
+                            tokio::time::Instant::now() + std::time::Duration::from_secs(8),
+                        );
+                    }
+                    None => break, // request channel closed
+                },
+                _ = &mut capture_deadline => {
+                    tracing::warn!(
+                        target: "cap",
+                        session_id = %sid,
+                        agent = kind.as_str(),
+                        "no Ready captured before deadline; resume id unavailable until next bind"
+                    );
+                    break;
                 }
             }
         }

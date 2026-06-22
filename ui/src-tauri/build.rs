@@ -96,7 +96,13 @@ fn check_sidecar_version() {
         return;
     }
 
-    if actual != expected {
+    // Normalise a leading `v`: the release pipelines bake the raw git tag
+    // (`v2026.6.16` for CLI, `app-v2026.6.16` → `v2026.6.16` for desktop) into
+    // the sidecar's `--version`, while CARGO_PKG_VERSION is always bare
+    // (`2026.6.16`). Compare on the bare version so the tag's `v` prefix
+    // doesn't spuriously trip the mismatch guard (the recurring desktop
+    // release failure).
+    if actual.trim_start_matches('v') != expected.trim_start_matches('v') {
         panic!(
             "\n\
              \n\

@@ -719,6 +719,42 @@ impl CdpClient {
         }
     }
 
+    /// Like `wait_event` but logs every event method seen while waiting, and on
+    /// timeout bails with the list of methods observed. Diagnostic aid for
+    /// interception flows (e.g. file chooser) where the expected event may not
+    /// arrive on the session we're listening on.
+    pub(crate) async fn wait_event_logged(
+        &self,
+        event_method: &str,
+        timeout_secs: u64,
+    ) -> Result<Value> {
+        let deadline = time::Instant::now() + Duration::from_secs(timeout_secs);
+        let mut rx = self.events_rx.lock().await;
+        let mut seen: Vec<String> = Vec::new();
+        loop {
+            match time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(val)) => {
+                    let m = val
+                        .get("method")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if m == event_method {
+                        return Ok(val);
+                    }
+                    if seen.len() < 60 {
+                        seen.push(m);
+                    }
+                }
+                Ok(None) => bail!("CDP event stream closed while waiting for {event_method}"),
+                Err(_) => bail!(
+                    "timeout waiting for CDP event {event_method}; events seen: [{}]",
+                    seen.join(", ")
+                ),
+            }
+        }
+    }
+
     /// Drain all pending events.
     fn drain_events(events_rx: &mut mpsc::UnboundedReceiver<Value>) -> Vec<Value> {
         let mut out = Vec::new();
@@ -1385,6 +1421,7 @@ impl BrowserSession {
             "find" => self.cmd_find(args).await,
             "get_article" => self.cmd_get_article().await,
             "upload" => self.cmd_upload(args).await,
+            "upload_via_chooser" => self.cmd_upload_via_chooser(args).await,
             "context" => self.cmd_context(args).await,
             "emulate" => self.cmd_emulate(args).await,
             "diff" => self.cmd_diff(args).await,
@@ -3700,6 +3737,101 @@ impl BrowserSession {
             .await?;
 
         Ok(json!({"action": "upload", "ref": eref, "files": files.len()}))
+    }
+
+    /// Upload files to an input that is opened via a native file-chooser dialog
+    /// (e.g. a button whose handler creates a transient/cross-origin-iframe
+    /// `<input type=file>` and calls `.click()`/`.showPicker()`). We intercept
+    /// the chooser at the CDP level — which works regardless of which frame or
+    /// origin the input lives in — click the trigger, await `fileChooserOpened`,
+    /// then set the files by the global `backendNodeId` from the event.
+    async fn cmd_upload_via_chooser(&self, args: &Value) -> Result<Value> {
+        let files: Vec<String> = args
+            .get("files")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if files.is_empty() {
+            bail!("upload_via_chooser: `files` array required");
+        }
+        let x = args.get("x").and_then(|v| v.as_f64());
+        let y = args.get("y").and_then(|v| v.as_f64());
+
+        // Ensure Page-domain events flow, then intercept the next file chooser.
+        self.cdp.send("Page.enable", json!({})).await?;
+        self.cdp
+            .send(
+                "Page.setInterceptFileChooserDialog",
+                json!({ "enabled": true }),
+            )
+            .await?;
+
+        // Run the trigger click + event wait, always disabling interception after.
+        let result = async {
+            // Click the trigger element that opens the chooser (if coords given).
+            if let (Some(x), Some(y)) = (x, y) {
+                self.cdp
+                    .send(
+                        "Input.dispatchMouseEvent",
+                        json!({ "type": "mouseMoved", "x": x, "y": y }),
+                    )
+                    .await?;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                self.cdp
+                    .send(
+                        "Input.dispatchMouseEvent",
+                        json!({ "type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1 }),
+                    )
+                    .await?;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                self.cdp
+                    .send(
+                        "Input.dispatchMouseEvent",
+                        json!({ "type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1 }),
+                    )
+                    .await?;
+            }
+
+            // Await the intercepted chooser (carries the global backendNodeId).
+            let ev = self
+                .cdp
+                .wait_event_logged("Page.fileChooserOpened", 15)
+                .await?;
+            let backend_node_id = ev
+                .get("params")
+                .and_then(|p| p.get("backendNodeId"))
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| anyhow!("upload_via_chooser: fileChooserOpened missing backendNodeId"))?;
+
+            self.cdp
+                .send(
+                    "DOM.setFileInputFiles",
+                    json!({ "files": files, "backendNodeId": backend_node_id }),
+                )
+                .await?;
+            Ok::<i64, anyhow::Error>(backend_node_id)
+        }
+        .await;
+
+        // Always disable interception so later normal choosers behave.
+        let _ = self
+            .cdp
+            .send(
+                "Page.setInterceptFileChooserDialog",
+                json!({ "enabled": false }),
+            )
+            .await;
+
+        let backend_node_id = result?;
+        Ok(json!({
+            "action": "upload_via_chooser",
+            "files": files.len(),
+            "backendNodeId": backend_node_id,
+        }))
     }
 
     async fn cmd_get_article(&self) -> Result<Value> {

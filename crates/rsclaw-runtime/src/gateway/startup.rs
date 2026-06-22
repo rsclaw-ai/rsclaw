@@ -929,6 +929,14 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 cron_reload_tx.clone(),
                 Arc::clone(&ws_conns),
                 Some(shutdown.clone()),
+            )
+            .with_daemon_agent_ids(
+                config
+                    .agents
+                    .defaults
+                    .daemon_agent_ids
+                    .clone()
+                    .unwrap_or_default(),
             );
             tokio::spawn(async move {
                 if let Err(e) = runner.run().await {
@@ -1191,15 +1199,44 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                 if let Err(e) = std::fs::write(&stamp, b"") {
                     tracing::debug!(error = %e, "failed to write defaults fetch throttle stamp");
                 }
-                // Guard against an unexpectedly large response before
-                // downloading the full body.
+                const MAX_DEFAULTS_BYTES: usize = 1_048_576;
+                // Fast-path reject on an honest Content-Length, but never
+                // TRUST it: a chunked / header-less / lying response would
+                // otherwise let resp.text() buffer an unbounded body into
+                // memory. Enforce the cap on the actual bytes by streaming.
                 if let Some(len) = resp.content_length() {
-                    if len > 1_048_576 {
+                    if len > MAX_DEFAULTS_BYTES as u64 {
                         tracing::warn!(size = len, "remote defaults.toml too large, skipping");
                         return;
                     }
                 }
-                match resp.text().await {
+                use futures::StreamExt;
+                let mut stream = resp.bytes_stream();
+                let mut buf: Vec<u8> = Vec::new();
+                let mut overflow = false;
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(bytes) => {
+                            if buf.len() + bytes.len() > MAX_DEFAULTS_BYTES {
+                                overflow = true;
+                                break;
+                            }
+                            buf.extend_from_slice(&bytes);
+                        }
+                        Err(e) => {
+                            debug!(error = %e, "remote defaults.toml read failed; keeping local");
+                            return;
+                        }
+                    }
+                }
+                if overflow {
+                    tracing::warn!(
+                        cap = MAX_DEFAULTS_BYTES,
+                        "remote defaults.toml exceeded size cap mid-stream, skipping"
+                    );
+                    return;
+                }
+                match String::from_utf8(buf) {
                     Ok(body) => match rsclaw_config::loader::merge_remote_defaults(&body) {
                         Ok(true) => info!(
                             "remote defaults.toml updated; takes effect on next restart"
@@ -1209,7 +1246,7 @@ pub async fn start_gateway(config: Arc<RuntimeConfig>, tier: MemoryTier) -> Resu
                             debug!(error = %e, "remote defaults.toml invalid; keeping local")
                         }
                     },
-                    Err(e) => debug!(error = %e, "remote defaults.toml read failed; keeping local"),
+                    Err(e) => debug!(error = %e, "remote defaults.toml not valid UTF-8; keeping local"),
                 }
             }
             Ok(resp) => debug!(status = %resp.status(), "remote defaults.toml fetch non-200"),
