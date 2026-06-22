@@ -137,20 +137,28 @@ impl OcrClient {
     }
 }
 
-/// Pull the rsclaw provider's API key from config so fleet calls (OCR,
-/// embed, rerank — all first-party `rsclaw-*` models share this one key)
-/// can authenticate without a dedicated per-feature `apiKey`.
+/// Pull the rsclaw provider's API key for fleet calls (OCR, embed, rerank —
+/// all first-party `rsclaw-*` models share this one key) so they can
+/// authenticate without a dedicated per-feature `apiKey`.
+///
+/// Resolution mirrors the main rsclaw chat provider: an explicit
+/// `models.providers.rsclaw.apiKey` if set, else the `RSCLAW_API_KEY` /
+/// `RSCLAW_KEY` env vars. The common deployment has no per-provider apiKey in
+/// config and relies entirely on the env var — without the env fallback here
+/// rerank/embed/ocr sent no Bearer and the fleet 401'd ("missing
+/// Authorization: Bearer header"), silently degrading KB rerank to fused order.
 pub(crate) fn rsclaw_provider_key(
     cfg: &rsclaw_config::runtime::RuntimeConfig,
 ) -> Option<String> {
     cfg.raw
         .models
-        .as_ref()?
-        .providers
-        .get("rsclaw")?
-        .api_key
         .as_ref()
+        .and_then(|m| m.providers.get("rsclaw"))
+        .and_then(|p| p.api_key.as_ref())
         .and_then(|s| s.resolve_early())
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("RSCLAW_API_KEY").ok().filter(|s| !s.is_empty()))
+        .or_else(|| std::env::var("RSCLAW_KEY").ok().filter(|s| !s.is_empty()))
 }
 
 impl std::fmt::Debug for OcrClient {
