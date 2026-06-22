@@ -655,39 +655,82 @@ pub(crate) fn start_feishu_if_configured(
             tracing::warn!("failed to register bare `feishu` channel: {e}");
         }
 
-        let fs_send = Arc::clone(&fs);
+        // Outbound throughput engine: hash-partitioned concurrent workers.
+        //
+        // A single sequential drain caps throughput at ~1/min_interval and, more
+        // importantly, blocks all recipients behind the slowest API call. Instead
+        // we fan out to N workers keyed by hash(account,target_id): every message
+        // for a given recipient always lands on the SAME worker, so per-recipient
+        // ordering (including multi-chunk replies) is preserved exactly as a
+        // sequential drain would; distinct recipients run concurrently for N×
+        // throughput. Each worker still applies the per-account floor interval so
+        // a single hot recipient can't trip feishu's per-app rate limit.
+        // Override workers via FEISHU_OUTBOUND_WORKERS, floor via
+        // FEISHU_OUTBOUND_MIN_MS.
+        let min_interval = std::time::Duration::from_millis(
+            std::env::var("FEISHU_OUTBOUND_MIN_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(40),
+        );
+        let num_workers = std::env::var("FEISHU_OUTBOUND_WORKERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(8);
+
+        // Spawn N per-worker queues; the dispatcher routes by hash.
+        let mut worker_txs: Vec<mpsc::Sender<OutboundMessage>> = Vec::with_capacity(num_workers);
+        for w in 0..num_workers {
+            let (wtx, mut wrx) = mpsc::channel::<OutboundMessage>(64);
+            worker_txs.push(wtx);
+            let fs_send = Arc::clone(&fs);
+            let shutdown_w = shutdown.clone();
+            tokio::spawn(async move {
+                let mut last_send: Option<std::time::Instant> = None;
+                loop {
+                    tokio::select! {
+                        () = shutdown_w.notified() => {
+                            info!(worker = w, "feishu: drain signaled, stopping outbound worker");
+                            break;
+                        }
+                        msg = wrx.recv() => {
+                            let Some(msg) = msg else { break };
+                            if let Some(prev) = last_send {
+                                let elapsed = prev.elapsed();
+                                if elapsed < min_interval {
+                                    tokio::time::sleep(min_interval - elapsed).await;
+                                }
+                            }
+                            if let Err(e) = fs_send.send(msg).await {
+                                error!("feishu send error: {e:#}");
+                            }
+                            last_send = Some(std::time::Instant::now());
+                        }
+                    }
+                }
+            });
+        }
+
         let shutdown_for_out = shutdown.clone();
         tokio::spawn(async move {
-            // Per-account outbound pacing: keeps bursts (e.g. broadcast fan-out)
-            // under feishu's per-app rate limit without tripping risk control.
-            // Sequential drain preserves multi-chunk reply ordering; the pacer
-            // only adds a floor interval between sends, so single messages and
-            // normal replies never wait. Override via FEISHU_OUTBOUND_MIN_MS.
-            let min_interval = std::time::Duration::from_millis(
-                std::env::var("FEISHU_OUTBOUND_MIN_MS")
-                    .ok()
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(40),
-            );
-            let mut last_send: Option<std::time::Instant> = None;
+            use std::hash::{Hash, Hasher};
             loop {
                 tokio::select! {
                     () = shutdown_for_out.notified() => {
-                        info!("feishu: drain signaled, stopping outbound sender");
+                        info!("feishu: drain signaled, stopping outbound dispatcher");
                         break;
                     }
                     msg = out_rx.recv() => {
                         let Some(msg) = msg else { break };
-                        if let Some(prev) = last_send {
-                            let elapsed = prev.elapsed();
-                            if elapsed < min_interval {
-                                tokio::time::sleep(min_interval - elapsed).await;
-                            }
+                        // Same (account,target) → same worker → ordering preserved.
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        msg.account.as_deref().unwrap_or("").hash(&mut h);
+                        msg.target_id.hash(&mut h);
+                        let idx = (h.finish() as usize) % worker_txs.len();
+                        if let Err(e) = worker_txs[idx].send(msg).await {
+                            error!("feishu outbound dispatch error: {e:#}");
                         }
-                        if let Err(e) = fs_send.send(msg).await {
-                            error!("feishu send error: {e:#}");
-                        }
-                        last_send = Some(std::time::Instant::now());
                     }
                 }
             }
