@@ -658,6 +658,18 @@ pub(crate) fn start_feishu_if_configured(
         let fs_send = Arc::clone(&fs);
         let shutdown_for_out = shutdown.clone();
         tokio::spawn(async move {
+            // Per-account outbound pacing: keeps bursts (e.g. broadcast fan-out)
+            // under feishu's per-app rate limit without tripping risk control.
+            // Sequential drain preserves multi-chunk reply ordering; the pacer
+            // only adds a floor interval between sends, so single messages and
+            // normal replies never wait. Override via FEISHU_OUTBOUND_MIN_MS.
+            let min_interval = std::time::Duration::from_millis(
+                std::env::var("FEISHU_OUTBOUND_MIN_MS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(40),
+            );
+            let mut last_send: Option<std::time::Instant> = None;
             loop {
                 tokio::select! {
                     () = shutdown_for_out.notified() => {
@@ -666,9 +678,16 @@ pub(crate) fn start_feishu_if_configured(
                     }
                     msg = out_rx.recv() => {
                         let Some(msg) = msg else { break };
+                        if let Some(prev) = last_send {
+                            let elapsed = prev.elapsed();
+                            if elapsed < min_interval {
+                                tokio::time::sleep(min_interval - elapsed).await;
+                            }
+                        }
                         if let Err(e) = fs_send.send(msg).await {
                             error!("feishu send error: {e:#}");
                         }
+                        last_send = Some(std::time::Instant::now());
                     }
                 }
             }
