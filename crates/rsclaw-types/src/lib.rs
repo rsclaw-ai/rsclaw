@@ -78,6 +78,16 @@ pub struct OutboundMessage {
     pub account: Option<String>,
 }
 
+/// Sentinel prefix on `OutboundMessage.target_id` marking a batch fan-out: the
+/// remainder is a comma-separated recipient id list that a batch-capable
+/// channel (feishu `im/v1/batch_messages`, ≤200 ids/call) delivers in one API
+/// call. Carried in `target_id` (rather than a new struct field) so the ~90
+/// existing `OutboundMessage` literals stay untouched; the dispatcher still
+/// hashes the whole string for worker routing. Only feishu decodes it; other
+/// channels would attempt to send to the literal id and fail, so this is only
+/// ever routed to feishu. Only individual user ids batch — not group/chat ids.
+pub const OUTBOUND_BATCH_PREFIX: &str = "\u{1}batch:";
+
 /// Names of all built-in agent tools. Lifted from agent/prompt_builder.rs
 /// (crate-split) so rsclaw-provider can reference it without depending on the
 /// runtime knot. Re-exported at crate::agent::prompt_builder::BUILTIN_TOOL_NAMES.
