@@ -161,6 +161,27 @@ pub(crate) fn rsclaw_provider_key(
         .or_else(|| std::env::var("RSCLAW_KEY").ok().filter(|s| !s.is_empty()))
 }
 
+/// The configured `models.providers.rsclaw.base_url`, if non-empty. Used to
+/// resolve an empty kb embed/rerank `base_url` for `rsclaw-*` models to the
+/// rsclaw provider's own base (honouring a self-hosted fleet) instead of the
+/// hardcoded `RSCLAW_API_BASE_URL` constant. The chat provider base may carry
+/// the `/agent` protocol mount; embed/rerank live at the `/v1` root, so a
+/// trailing `/agent` is stripped.
+pub(crate) fn rsclaw_provider_base_url(
+    cfg: &rsclaw_config::runtime::RuntimeConfig,
+) -> Option<String> {
+    cfg.raw
+        .models
+        .as_ref()
+        .and_then(|m| m.providers.get("rsclaw"))
+        .and_then(|p| p.base_url.as_ref())
+        .map(|s| {
+            let t = s.trim().trim_end_matches('/');
+            t.strip_suffix("/agent").unwrap_or(t).trim_end_matches('/').to_owned()
+        })
+        .filter(|s| !s.is_empty())
+}
+
 impl std::fmt::Debug for OcrClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OcrClient")

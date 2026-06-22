@@ -71,7 +71,10 @@ impl KbReranker {
         let base_raw = rr.base_url.trim();
         let base = if base_raw.is_empty() {
             if model_is_rsclaw {
-                rsclaw_embed::RSCLAW_API_BASE_URL.to_owned()
+                // Empty base + rsclaw-* model → the configured rsclaw provider
+                // base (self-hosted fleet honoured); fall back to the constant.
+                crate::ocr::rsclaw_provider_base_url(&cfg)
+                    .unwrap_or_else(|| rsclaw_embed::RSCLAW_API_BASE_URL.to_owned())
             } else {
                 return None;
             }
