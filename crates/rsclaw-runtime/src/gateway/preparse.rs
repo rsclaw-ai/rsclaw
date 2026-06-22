@@ -1071,10 +1071,14 @@ $g.Dispose();$b.Dispose()"#
         let id = format!("loop-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
         // ws transport is registered as "desktop" on the delivery side.
         let delivery_channel: &str = if channel == "ws" { "desktop" } else { channel };
+        // Inherit the originating session so each firing continues the same
+        // conversation history instead of starting a blank session.
+        let inherited_session_key = preparse_session_key(handle, channel, peer_id, account);
         let job = serde_json::json!({
             "id": id,
             "agentId": handle.id,
             "enabled": true,
+            "sessionKey": inherited_session_key,
             "schedule": {"kind": "every", "everyMs": every_ms, "anchorMs": now_ms},
             "payload": {"kind": "agentTurn", "text": prompt},
             "delivery": {"channel": delivery_channel, "to": peer_id, "mode": "always"},
