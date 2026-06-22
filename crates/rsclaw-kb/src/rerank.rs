@@ -171,7 +171,16 @@ impl KbReranker {
         let results = resp
             .get("results")
             .and_then(|v| v.as_array())
-            .context("rerank response missing results array")?;
+            .with_context(|| {
+                // Surface the backend's own error (e.g. "input too large /
+                // increase batch size") instead of an opaque "missing
+                // results" so rerank failures are diagnosable from the log.
+                let detail = resp
+                    .pointer("/error/message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("no results array in response");
+                format!("rerank backend returned no results: {detail}")
+            })?;
         let mut scores = vec![f32::NEG_INFINITY; docs.len()];
         for r in results {
             let idx = r.get("index").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as usize;
