@@ -169,6 +169,23 @@ pub struct AgentsRuntime {
     pub a2a: Vec<A2aPeerConfig>,
 }
 
+impl AgentsRuntime {
+    /// Is the agent `id` flagged `daemon: true` (long-lived monitor loop whose
+    /// turn-bounding guards and cron turn-timeout are disabled)?
+    pub fn is_daemon_agent(&self, id: &str) -> bool {
+        self.list.iter().any(|a| a.daemon && a.id == id)
+    }
+
+    /// IDs of all agents flagged `daemon: true`.
+    pub fn daemon_agent_ids(&self) -> Vec<String> {
+        self.list
+            .iter()
+            .filter(|a| a.daemon)
+            .map(|a| a.id.clone())
+            .collect()
+    }
+}
+
 /// Channel drivers + session routing.  Swappable per-channel.
 #[derive(Debug, Clone)]
 pub struct ChannelRuntime {

@@ -92,6 +92,7 @@ impl AgentRuntime {
             workspace: Some(rsclaw_config::loader::path_to_forward_slash(
                 &rsclaw_config::loader::base_dir().join(format!("workspace-{id}")),
             )),
+            daemon: false,
             model: Some(ModelConfig {
                 primary: Some(model.into()),
                 fallbacks: None,
@@ -217,6 +218,7 @@ impl AgentRuntime {
             description: None,
             default: Some(false),
             workspace: Some(rsclaw_config::loader::path_to_forward_slash(&ws_path)),
+            daemon: false,
             model: Some(ModelConfig {
                 primary: Some(model.into()),
                 fallbacks: None,

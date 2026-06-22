@@ -262,6 +262,7 @@ mod tests {
             .enumerate()
             .map(|(i, id)| AgentEntry {
                 id: id.to_string(),
+                daemon: false,
                 description: None,
                 name: None,
                 default: if i == 0 { Some(true) } else { None },

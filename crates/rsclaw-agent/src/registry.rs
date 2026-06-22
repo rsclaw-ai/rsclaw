@@ -710,6 +710,7 @@ impl AgentRegistry {
             let codex = cfg.agents.defaults.codex.clone();
             vec![rsclaw_config::schema::AgentEntry {
                 id: "main".to_owned(),
+                daemon: false,
                 description: None,
                 default: Some(true),
                 name: Some("Main Agent".to_owned()),
