@@ -2400,6 +2400,7 @@ fn open_path(path: String) -> Result<(), String> {
     }
     #[cfg(target_os = "windows")]
     {
+        // Intentionally visible — opens File Explorer for the user to browse files.
         std::process::Command::new("explorer")
             .arg(&path)
             .spawn()

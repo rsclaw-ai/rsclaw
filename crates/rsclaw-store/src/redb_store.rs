@@ -273,13 +273,16 @@ fn run_legacy_redb_upgrade_child(path: &Path) -> Result<()> {
         return run_legacy_redb_upgrade_helper(path);
     }
     let exe = std::env::current_exe().context("resolve current executable for redb upgrade")?;
-    let status = std::process::Command::new(exe)
-        .env(LEGACY_REDB_UPGRADE_HELPER_ENV, path)
+    let mut cmd = std::process::Command::new(exe);
+    cmd.env(LEGACY_REDB_UPGRADE_HELPER_ENV, path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .context("spawn redb upgrade helper")?;
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x08000000);
+    }
+    let status = cmd.status().context("spawn redb upgrade helper")?;
     if status.success() {
         Ok(())
     } else {

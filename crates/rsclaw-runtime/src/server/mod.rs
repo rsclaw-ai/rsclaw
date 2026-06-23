@@ -2485,9 +2485,13 @@ fn git_workdir(path: Option<&str>) -> PathBuf {
 }
 
 fn run_cmd(dir: &std::path::Path, program: &str, args: &[&str]) -> Result<String, String> {
-    let output = Command::new(program)
-        .args(args)
-        .current_dir(dir)
+    let mut cmd = Command::new(program);
+    cmd.args(args).current_dir(dir);
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x08000000);
+    }
+    let output = cmd
         .output()
         .map_err(|e| format!("{program}: {e}"))?;
     if output.status.success() {
@@ -4035,6 +4039,10 @@ async fn run_doctor_cmd(fix: bool) -> Response {
         cmd.env("RSCLAW_BASE_DIR", v);
     }
     cmd.env("NO_COLOR", "1"); // Strip ANSI for clean parsing.
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x08000000);
+    }
 
     match cmd.output() {
         Ok(output) => {

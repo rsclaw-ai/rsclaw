@@ -203,6 +203,7 @@ fn open_terminal_with(args: &[&str]) {
 
     #[cfg(target_os = "windows")]
     {
+        // Intentionally visible — opens a new terminal window running the REPL.
         let _ = std::process::Command::new("cmd")
             .args(["/c", "start", "cmd", "/k"])
             .arg(exe)
@@ -242,6 +243,7 @@ fn open_config() {
 
     #[cfg(target_os = "windows")]
     {
+        // Intentionally visible — opens Notepad for the user to edit config.
         let _ = std::process::Command::new("notepad")
             .arg(&config_path)
             .spawn();
