@@ -156,3 +156,18 @@ author: "@rsclaw"
 ```
 
 成片为 `final.mp4`。
+
+## Step 5: 交付
+
+把成片发给用户，并附一段文字版「爆款逻辑分析」（Step 1 的结论要点）：
+```json
+{"tool": "send_file", "path": "final.mp4"}
+```
+
+## Rules
+- 生成阶段：jimeng 可用则优先；否则内置工具链。
+- 口播必须用本人档案的脸（avatar_gen）+ 克隆音色（voice_gen reference_audio）。
+- 不复制原视频文案/画面，做「同款」重写，规避侵权。
+- ffmpeg 路径：所有中间文件用相对文件名（与 web-video-download 一致），不要 `~/` 或绝对路径作为输出 `path`。
+- BPM 测不准就不卡点，按脚本时长顺序拼接，不要硬猜。
+- 不自动配 BGM 歌词/人声，只用 music_gen 的纯 BGM。
