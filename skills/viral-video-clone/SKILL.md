@@ -35,3 +35,32 @@ author: "@rsclaw"
 ```
 
 若 `face.jpg` 或 `voice.wav` 缺失，停止并提示用户：先把正脸照放到 `~/.rsclaw/profiles/<name>/face.jpg`、语音样本放到 `voice.wav`（建议 10–30 秒清晰人声），再重试。
+
+## Step 1: 下载并拆解爆款逻辑
+
+### 1a. 拿到本地 mp4
+若输入是 URL（用 web-video-download skill 的方式抓真实地址再下载）：
+```json
+{"tool": "web_browser", "action": "capture_video", "url": "<viral_url>"}
+```
+```json
+{"tool": "web_download", "url": "<best_mp4_url>", "path": "ref.mp4", "use_browser_cookies": true}
+```
+若输入已是本地文件，跳过下载，记其路径为 `ref.mp4`。
+
+### 1b. 抽分镜帧 + 抽原声 + 测时长
+```json
+{"tool": "shell", "command": "ffmpeg -i ref.mp4 -vf fps=1/2 -vframes 12 frame_%02d.jpg -y && ffmpeg -i ref.mp4 -vn -ar 16000 -ac 1 ref.wav -y && ffprobe -v error -show_entries format=duration -of default=nk=1:nw=1 ref.mp4"}
+```
+
+### 1c. VLM 推理爆款逻辑
+把 `frame_01.jpg`..`frame_12.jpg` 作为图片输入，让视觉模型分析，产出结构化结论：
+- 选题/赛道
+- 钩子（前 3 秒发生了什么）
+- 节奏（镜头平均时长、快慢）
+- 分镜结构（开场→展开→反转→收尾，各占几镜）
+- 文案/口播风格
+- BGM 情绪与风格（用于后续 music_gen）
+- 估算 BPM（从原声节奏粗估，用于近似卡点；测不准则记 null）
+
+把结论以简洁要点写进上下文（后续步骤引用）。
