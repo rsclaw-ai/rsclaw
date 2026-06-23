@@ -5743,6 +5743,11 @@ impl AgentRuntime {
                 info!(session = %ctx.session_key, iteration, "agent_loop: canceled by A2A");
                 return Err(anyhow!("canceled by A2A CancelTask"));
             }
+            // Heartbeat for the progress-based stuck-turn watchdog: each loop
+            // iteration advances the counter, so a daemon that's actively
+            // looping is never killed, but one wedged on a non-returning tool
+            // (its counter frozen) gets cancelled.
+            ctx.turn_ctx.progress_tick();
             // Check abort flag at start of each iteration (allows /abort to
             // interrupt even when tool dispatch is blocking between LLM calls).
             if abort_flag.load(Ordering::SeqCst) {
